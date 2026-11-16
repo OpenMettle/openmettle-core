@@ -141,6 +141,8 @@ class GuardTests(unittest.TestCase):
     def test_child_environment_drops_inherited_targets(self):
         environ = {"KUBECONFIG": "/home/user/.kube/config", "DOCKER_HOST": "tcp://x",
                    "KIND_CLUSTER_NAME": "workstation", "KIND_EXPERIMENTAL_PROVIDER": "podman",
+                   "BUILDX_BUILDER": "remote", "BUILDKIT_HOST": "tcp://remote:1234",
+                   "BUILDX_CONFIG": "/tmp/foreign-builders",
                    "PATH": "/usr/bin"}
         env = qualify.child_environment(environ, Path("/tmp/q/kubeconfig"), "default",
                                         Path("/tmp/tools"))
@@ -149,6 +151,8 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(env["KIND_EXPERIMENTAL_PROVIDER"], "docker")
         self.assertNotIn("DOCKER_HOST", env)
         self.assertNotIn("KIND_CLUSTER_NAME", env)
+        for key in ("BUILDX_BUILDER", "BUILDKIT_HOST", "BUILDX_CONFIG"):
+            self.assertNotIn(key, env)
         self.assertTrue(env["PATH"].startswith("/tmp/tools"))
 
     def test_refuses_existing_cluster_and_unexpected_names(self):
@@ -217,6 +221,54 @@ class CleanupTests(unittest.TestCase):
         q = self.make()
         q.cleanup()
         self.assertEqual(q.run.calls, [])
+
+    def test_builds_use_validated_context_default_builder(self):
+        q = self.make()
+        calls = []
+        def run(args, **kwargs):
+            calls.append(args)
+            if args[:3] == ["docker", "image", "inspect"]:
+                role = "worker" if "worker" in args[-1] else "api"
+                return done(json.dumps({"ExposedPorts": {f"{q.contract[role]['port']}/tcp": {}},
+                                        "User": qualify.IMAGE_USER,
+                                        "Entrypoint": [f"/usr/local/bin/openmettle-{role}"]}))
+            return done()
+        q.run = run
+        q.build_images()
+        builds = [c for c in calls if c[:2] == ["docker", "build"]]
+        self.assertEqual(len(builds), 2)
+        self.assertTrue(all(c[2:4] == ["--builder", "default"] for c in builds))
+
+    def test_cleanup_attempts_remaining_resources_after_failure(self):
+        q = self.make()
+        q.cluster_attempted = True
+        q.built_images = list(q.images.values())
+        calls = []
+        def run(args, **kwargs):
+            calls.append(args)
+            if args[0] == "kind":
+                raise subprocess.TimeoutExpired(args, 300)
+            return done(returncode=1)
+        q.run = run
+        failures = q.cleanup()
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(failures), 3)
+        self.assertIn("TimeoutExpired", failures[0])
+
+    def test_cleanup_failure_overrides_successful_scenario(self):
+        q = self.make()
+        q.report["result"] = "passed"
+        report = q.kubeconfig.parent / "report.json"
+        with patch.object(qualify, "Qualification", return_value=q), \
+                patch.object(q, "preflight"), patch.object(q, "build_images"), \
+                patch.object(q, "create_cluster"), patch.object(q, "deploy"), \
+                patch.object(q, "scenario"), \
+                patch.object(q, "cleanup", return_value=["kind delete: exit 1"]), \
+                patch.object(qualify.tempfile, "mkdtemp", return_value=str(q.kubeconfig.parent)):
+            self.assertEqual(qualify.main(["--report", str(report)]), 1)
+        data = json.loads(report.read_text())
+        self.assertEqual(data["result"], "failed")
+        self.assertEqual(data["cleanup_errors"], ["kind delete: exit 1"])
 
     def test_cleanup_deletes_only_own_cluster_and_images(self):
         q = self.make()

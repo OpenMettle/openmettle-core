@@ -53,7 +53,8 @@ IMAGE_USER = "65532:65532"
 TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount"
 # Environment that could redirect tools to an inherited cluster or daemon.
 STRIPPED_ENV = ("KUBECONFIG", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG_CONTEXT",
-                "KIND_CLUSTER_NAME", "KIND_EXPERIMENTAL_PROVIDER")
+                "KIND_CLUSTER_NAME", "KIND_EXPERIMENTAL_PROVIDER", "BUILDX_BUILDER",
+                "BUILDKIT_HOST", "BUILDX_CONFIG")
 DNS_LABEL = re.compile(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?")
 
 
@@ -451,7 +452,7 @@ class Qualification:
         for role in ROLES:
             _log(f"building {self.images[role]} (local only; never pushed)")
             self.built_images.append(self.images[role])
-            self.run(["docker", "build", "--target", self.contract[role]["imageTarget"],
+            self.run(["docker", "build", "--builder", "default", "--target", self.contract[role]["imageTarget"],
                       "--tag", self.images[role], str(ROOT)], timeout=1800)
             config = json.loads(self.run(["docker", "image", "inspect", "--format",
                                           "{{json .Config}}", self.images[role]]).stdout)
@@ -702,12 +703,22 @@ class Qualification:
             print(result.stdout[-6000:] + result.stderr[-2000:], file=sys.stderr)
 
     def cleanup(self):
+        commands = []
         if self.cluster_attempted:
             _log(f"deleting kind cluster {self.name}")
-            self.run(["kind", "delete", "cluster", "--name", self.name,
-                      "--kubeconfig", str(self.kubeconfig)], check=False, timeout=300)
+            commands.append((["kind", "delete", "cluster", "--name", self.name,
+                              "--kubeconfig", str(self.kubeconfig)], 300))
         for image in self.built_images:
-            self.run(["docker", "image", "rm", image], check=False, timeout=120)
+            commands.append((["docker", "image", "rm", image], 120))
+        failures = []
+        for command, timeout in commands:
+            try:
+                result = self.run(command, check=False, timeout=timeout)
+                if result.returncode:
+                    failures.append(f"{' '.join(command)}: exit {result.returncode}")
+            except (Refusal, QualificationFailure, subprocess.TimeoutExpired, OSError) as exc:
+                failures.append(f"{' '.join(command)}: {type(exc).__name__}")
+        return failures
 
 
 def main(argv=None) -> int:
@@ -742,8 +753,16 @@ def main(argv=None) -> int:
         print(f"qualification failed: {exc}", file=sys.stderr)
         qualification.diagnostics()
     finally:
-        qualification.cleanup()
-        shutil.rmtree(workdir, ignore_errors=True)
+        cleanup_failures = qualification.cleanup()
+        if cleanup_failures:
+            status = 1
+            qualification.report["result"] = "failed"
+            qualification.report["cleanup_errors"] = cleanup_failures
+            for failure in cleanup_failures:
+                _log(f"cleanup failed: {failure}")
+            _log(f"temporary kubeconfig retained for recovery in {workdir}")
+        else:
+            shutil.rmtree(workdir, ignore_errors=True)
         if args.report:
             args.report.write_text(json.dumps(qualification.report, indent=2) + "\n")
     return status

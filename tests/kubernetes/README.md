@@ -35,7 +35,7 @@ The harness refuses to run (exit 3) and creates nothing unless all of these hold
 - The pinned `kind` and `kubectl` versions are on `PATH`, or in `--tools-dir`.
 - The generated cluster name `openmettle-dev-qual-<8 hex>` does not already exist.
 
-The harness strips inherited `KUBECONFIG` and `KIND_*` settings. It writes the kind kubeconfig to a new temporary directory and passes `--kubeconfig` and `--context` to every `kubectl` call. Before the first change and before each scale operation, it checks the cluster identity: the kubeconfig must hold only the created context, the API server must be loopback, there must be one node named after the cluster, and the node container must carry kind's cluster label. It also refuses to modify a namespace that lacks this run's label. Cleanup deletes only the cluster this run attempted to create and the image tags this run built. Exit codes: 0 passed, 1 qualification failed, 2 invalid contract, 3 refused.
+The harness strips inherited `KUBECONFIG`, `KIND_*` and builder-selection overrides (`BUILDX_BUILDER`, `BUILDKIT_HOST`, `BUILDX_CONFIG`). Image builds explicitly select the default builder attached to the validated Docker context. It writes the kind kubeconfig to a new temporary directory and passes `--kubeconfig` and `--context` to every `kubectl` call. Before the first change and before each scale operation, it checks the cluster identity: the kubeconfig must hold only the created context, the API server must be loopback, there must be one node named after the cluster, and the node container must carry kind's cluster label. It also refuses to modify a namespace that lacks this run's label. Cleanup deletes only the cluster this run attempted to create and the image tags this run built. Cleanup attempts all owned resources even if one deletion fails. Any cleanup failure makes the run fail, records `cleanup_errors` in the report and retains the temporary kubeconfig for manual recovery. Exit codes: 0 passed, 1 qualification or cleanup failed, 2 invalid contract, 3 refused.
 
 ## Running it
 
@@ -45,7 +45,7 @@ CI runs [`.github/workflows/kubernetes.yml`](../../.github/workflows/kubernetes.
 python3 -m unittest discover -s tests/kubernetes -v   # guards and fixtures, no cluster
 ```
 
-A local run needs a disposable Linux Docker daemon reached through a `unix://` context, about 4 GiB free disk and linux/amd64 for `install-tools.sh`. Do not point it at a workstation or serving stack daemon.
+A local run needs a disposable Linux Docker daemon reached through a `unix://` context, linux/amd64 for `install-tools.sh`, and capacity for the Rust build cache, container images, cluster and PostgreSQL fixture. Peak disk and memory requirements have not been measured. Do not point it at a workstation or serving stack daemon.
 
 ```sh
 bash tests/kubernetes/install-tools.sh "$(mktemp -d)/tools"
