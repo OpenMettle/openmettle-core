@@ -1,0 +1,22 @@
+[workspace]
+members = ["."]
+resolver = "3"
+
+[package]
+name = "openmettle-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "openmettle-api"
+path = "src/bin/api.rs"
+
+[[bin]]
+name = "openmettle-worker"
+path = "src/bin/worker.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
