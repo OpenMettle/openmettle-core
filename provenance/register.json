@@ -941,6 +941,112 @@
       "tracking": [
         "V1-42"
       ]
+    },
+    {
+      "id": "kind-cli",
+      "name": "kind (Kubernetes in Docker)",
+      "kind": "tooling",
+      "review_group": "core",
+      "distribution": "not-distributed",
+      "version": "v0.33.0",
+      "pin": "sha256:aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d",
+      "origin": "https://github.com/kubernetes-sigs/kind",
+      "source_evidence": [
+        "tests/kubernetes/install-tools.sh",
+        "GitHub release v0.33.0 asset kind-linux-amd64 and kind-linux-amd64.sha256sum, resolved 2026-11-16"
+      ],
+      "licence": {
+        "expression": "Apache-2.0",
+        "evidence": [
+          "kubernetes-sigs/kind v0.33.0 LICENSE (Apache License 2.0 header)"
+        ]
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "Kubernetes qualification test tooling only (tests/kubernetes); never shipped. Recorded by an agent; no review performed."
+      },
+      "tracking": [
+        "V1-01",
+        "V1-42"
+      ]
+    },
+    {
+      "id": "kubectl-cli",
+      "name": "kubectl",
+      "kind": "tooling",
+      "review_group": "core",
+      "distribution": "not-distributed",
+      "version": "v1.37.0",
+      "pin": "sha256:6129359f4e1f3848a5572ccb0b26cf28b8ca08cef38c95a765b2f64a2c961a2f",
+      "origin": "https://dl.k8s.io/release/v1.37.0/bin/linux/amd64/kubectl",
+      "source_evidence": [
+        "tests/kubernetes/install-tools.sh",
+        "dl.k8s.io kubectl.sha256 for v1.37.0 linux/amd64, resolved 2026-11-16"
+      ],
+      "licence": {
+        "expression": "Apache-2.0",
+        "evidence": [
+          "kubernetes/kubernetes v1.37.0 LICENSE (Apache License 2.0 header)"
+        ]
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "Kubernetes qualification test tooling only (tests/kubernetes); never shipped. Recorded by an agent; no review performed."
+      },
+      "tracking": [
+        "V1-01",
+        "V1-42"
+      ]
+    },
+    {
+      "id": "kind-node-image",
+      "name": "kind node image (Kubernetes 1.37.0)",
+      "kind": "container-image",
+      "review_group": "core",
+      "distribution": "not-distributed",
+      "version": "v1.37.0",
+      "pin": "sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5",
+      "origin": "docker.io/kindest/node",
+      "source_evidence": [
+        "tests/kubernetes/qualify.py",
+        "kind v0.33.0 release notes; Docker Hub manifest digest confirmed 2026-11-16"
+      ],
+      "licence": {
+        "expression": null,
+        "evidence": []
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "Kubernetes qualification test tooling only (tests/kubernetes); never shipped. Recorded by an agent; no review performed. The image bundles OS packages with individual licences; no image-wide licence is asserted. Kubernetes itself is Apache-2.0 (kubernetes/kubernetes v1.37.0 LICENSE)."
+      },
+      "tracking": [
+        "V1-01",
+        "V1-42"
+      ]
     }
   ]
 }
