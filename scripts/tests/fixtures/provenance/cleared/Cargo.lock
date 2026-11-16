@@ -1,0 +1,15 @@
+# Synthetic fixture for scripts/tests/test_provenance.py; not a real dependency graph.
+version = 4
+
+[[package]]
+name = "fixture-app"
+version = "0.1.0"
+dependencies = [
+ "fixture-dep",
+]
+
+[[package]]
+name = "fixture-dep"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000001"

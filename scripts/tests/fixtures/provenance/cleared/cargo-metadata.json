@@ -1,0 +1,7 @@
+{
+  "packages": [
+    {"name": "fixture-app", "version": "0.1.0", "source": null, "license": "MIT", "license_file": null, "repository": null},
+    {"name": "fixture-dep", "version": "1.2.3", "source": "registry+https://github.com/rust-lang/crates.io-index", "license": "Apache-2.0", "license_file": null, "repository": "https://example.invalid/fixture-dep"}
+  ],
+  "version": 1
+}

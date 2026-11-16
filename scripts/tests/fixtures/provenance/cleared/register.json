@@ -1,0 +1,269 @@
+{
+  "schema_version": 1,
+  "distribution_boundary": {
+    "status": "defined",
+    "description": "Synthetic fixture boundary.",
+    "tracking": [
+      "FIXTURE"
+    ],
+    "review": {
+      "status": "reviewed",
+      "reviewer": "fixture-reviewer",
+      "date": "2026-11-16",
+      "evidence": [
+        "synthetic decision record"
+      ],
+      "notes": "Synthetic scope and disposition reviewed."
+    }
+  },
+  "review_groups": {
+    "core": {
+      "status": "reviewed",
+      "summary": "Synthetic fixture disposition.",
+      "tracking": [
+        "FIXTURE"
+      ],
+      "review": {
+        "status": "reviewed",
+        "reviewer": "fixture-reviewer",
+        "date": "2026-11-16",
+        "evidence": [
+          "synthetic decision record"
+        ],
+        "notes": "Synthetic scope and disposition reviewed."
+      }
+    },
+    "graphiti": {
+      "status": "reviewed",
+      "summary": "Synthetic fixture disposition.",
+      "tracking": [
+        "FIXTURE"
+      ],
+      "review": {
+        "status": "reviewed",
+        "reviewer": "fixture-reviewer",
+        "date": "2026-11-16",
+        "evidence": [
+          "synthetic decision record"
+        ],
+        "notes": "Synthetic scope and disposition reviewed."
+      }
+    },
+    "database": {
+      "status": "reviewed",
+      "summary": "Synthetic fixture disposition.",
+      "tracking": [
+        "FIXTURE"
+      ],
+      "review": {
+        "status": "reviewed",
+        "reviewer": "fixture-reviewer",
+        "date": "2026-11-16",
+        "evidence": [
+          "synthetic decision record"
+        ],
+        "notes": "Synthetic scope and disposition reviewed."
+      }
+    },
+    "sandbox": {
+      "status": "reviewed",
+      "summary": "Synthetic fixture disposition.",
+      "tracking": [
+        "FIXTURE"
+      ],
+      "review": {
+        "status": "reviewed",
+        "reviewer": "fixture-reviewer",
+        "date": "2026-11-16",
+        "evidence": [
+          "synthetic decision record"
+        ],
+        "notes": "Synthetic scope and disposition reviewed."
+      }
+    },
+    "serving": {
+      "status": "reviewed",
+      "summary": "Synthetic fixture disposition.",
+      "tracking": [
+        "FIXTURE"
+      ],
+      "review": {
+        "status": "reviewed",
+        "reviewer": "fixture-reviewer",
+        "date": "2026-11-16",
+        "evidence": [
+          "synthetic decision record"
+        ],
+        "notes": "Synthetic scope and disposition reviewed."
+      }
+    },
+    "media": {
+      "status": "reviewed",
+      "summary": "Synthetic fixture disposition.",
+      "tracking": [
+        "FIXTURE"
+      ],
+      "review": {
+        "status": "reviewed",
+        "reviewer": "fixture-reviewer",
+        "date": "2026-11-16",
+        "evidence": [
+          "synthetic decision record"
+        ],
+        "notes": "Synthetic scope and disposition reviewed."
+      }
+    },
+    "application-fork": {
+      "status": "reviewed",
+      "summary": "Synthetic fixture disposition.",
+      "tracking": [
+        "FIXTURE"
+      ],
+      "review": {
+        "status": "reviewed",
+        "reviewer": "fixture-reviewer",
+        "date": "2026-11-16",
+        "evidence": [
+          "synthetic decision record"
+        ],
+        "notes": "Synthetic scope and disposition reviewed."
+      }
+    }
+  },
+  "cargo_reviews": [
+    {
+      "name": "fixture-app",
+      "version": "0.1.0",
+      "source": null,
+      "checksum": null,
+      "licence": {
+        "expression": "MIT",
+        "evidence": [
+          "synthetic evidence"
+        ]
+      },
+      "notices": {
+        "status": "recorded",
+        "files": [
+          "LICENSE"
+        ],
+        "obligations": [
+          "Retain the licence text."
+        ]
+      },
+      "review": {
+        "status": "reviewed",
+        "reviewer": "fixture-reviewer",
+        "date": "2026-11-16",
+        "evidence": [
+          "synthetic evidence"
+        ],
+        "notes": "Synthetic."
+      }
+    },
+    {
+      "name": "fixture-dep",
+      "version": "1.2.3",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "0000000000000000000000000000000000000000000000000000000000000001",
+      "licence": {
+        "expression": "Apache-2.0",
+        "evidence": [
+          "synthetic evidence"
+        ]
+      },
+      "notices": {
+        "status": "recorded",
+        "files": [
+          "LICENSE"
+        ],
+        "obligations": [
+          "Retain the licence text."
+        ]
+      },
+      "review": {
+        "status": "reviewed",
+        "reviewer": "fixture-reviewer",
+        "date": "2026-11-16",
+        "evidence": [
+          "synthetic evidence"
+        ],
+        "notes": "Synthetic."
+      }
+    }
+  ],
+  "components": [
+    {
+      "id": "fixture-image",
+      "name": "Fixture image",
+      "kind": "container-image",
+      "review_group": "database",
+      "distribution": "included",
+      "version": "1.0.0",
+      "pin": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+      "origin": "example.invalid/fixture-image",
+      "source_evidence": [
+        "synthetic evidence"
+      ],
+      "licence": {
+        "expression": "Apache-2.0",
+        "evidence": [
+          "synthetic evidence"
+        ]
+      },
+      "notices": {
+        "status": "recorded",
+        "files": [
+          "LICENSE"
+        ],
+        "obligations": [
+          "Retain the licence text."
+        ]
+      },
+      "review": {
+        "status": "reviewed",
+        "reviewer": "fixture-reviewer",
+        "date": "2026-11-16",
+        "evidence": [
+          "synthetic evidence"
+        ],
+        "notes": "Synthetic."
+      },
+      "tracking": [
+        "FIXTURE"
+      ]
+    },
+    {
+      "id": "fixture-excluded",
+      "name": "Excluded fixture",
+      "kind": "code",
+      "review_group": "sandbox",
+      "distribution": "excluded",
+      "version": null,
+      "pin": null,
+      "origin": null,
+      "source_evidence": [],
+      "licence": {
+        "expression": null,
+        "evidence": []
+      },
+      "notices": {
+        "status": "none-required",
+        "files": [],
+        "obligations": [],
+        "justification": "Not distributed in this recorded scope; required attribution must be preserved if later included."
+      },
+      "review": {
+        "status": "blocked",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "Synthetic incompatible licence."
+      },
+      "exclusion_reason": "Synthetic exclusion.",
+      "tracking": [
+        "FIXTURE"
+      ]
+    }
+  ]
+}
