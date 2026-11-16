@@ -1,0 +1,943 @@
+{
+  "schema_version": 1,
+  "distribution_boundary": {
+    "status": "undefined",
+    "description": "No accepted decision yet states which components an OpenMettle distribution ships (core binaries only, container images, Helm-referenced images, curated forks or model artifacts). Until the owner defines it, every candidate component blocks distribution readiness.",
+    "tracking": [
+      "V1-42",
+      "V1-36"
+    ]
+  },
+  "review_groups": {
+    "core": {
+      "status": "pending",
+      "summary": "Rust workspace, retained repository-template starter and the Rust dependency graph resolved in Cargo.lock. The runtime dependency set is not final until V1-01 merges.",
+      "tracking": [
+        "V1-01",
+        "V1-42"
+      ]
+    },
+    "graphiti": {
+      "status": "pending",
+      "summary": "Graphiti library, its Python lock and the memory-service image, reviewed separately from the graph database.",
+      "tracking": [
+        "V1-23",
+        "V1-42"
+      ]
+    },
+    "database": {
+      "status": "pending",
+      "summary": "PostgreSQL, Neo4j Community and experimental graph databases. Neo4j Community is recorded by the baseline as GPLv3 and needs its own corresponding-source review. HelixDB experimentation does not clear the stack.",
+      "tracking": [
+        "V1-02",
+        "V1-23",
+        "V1-37",
+        "V1-42"
+      ]
+    },
+    "sandbox": {
+      "status": "pending",
+      "summary": "Agent Sandbox controller, sandboxd and gVisor. Versions are not pinned yet. The restrictive Open WebUI Terminals controller is excluded.",
+      "tracking": [
+        "V1-27",
+        "V1-42"
+      ]
+    },
+    "serving": {
+      "status": "pending",
+      "summary": "Curated SGLang fork, serving-fork evidence repository, serving images, embedding/reranking images and served model weights.",
+      "tracking": [
+        "V1-42"
+      ]
+    },
+    "media": {
+      "status": "pending",
+      "summary": "Image/video generation services, adapters and media model weights. No version, image or model pins are recorded in this repository.",
+      "tracking": [
+        "V1-21",
+        "V1-42"
+      ]
+    },
+    "application-fork": {
+      "status": "pending",
+      "summary": "The Open WebUI fork is source evidence only and is not distributed. Translating its code into another language does not by itself make an independent implementation. The local coding agent (ACP) is a separate repository with its own licence and NOTICE.",
+      "tracking": [
+        "V1-42"
+      ]
+    }
+  },
+  "cargo_reviews": [
+    {
+      "name": "openmettle-core",
+      "version": "0.1.0",
+      "source": null,
+      "checksum": null,
+      "licence": {
+        "expression": "MIT",
+        "evidence": [
+          "Cargo.toml package.license",
+          "LICENSE",
+          "UPSTREAM.md"
+        ]
+      },
+      "notices": {
+        "status": "pending",
+        "files": [
+          "LICENSE"
+        ],
+        "obligations": [
+          "Retain the MIT copyright and permission notice from LICENSE in source and binary distributions."
+        ]
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "First-party workspace package. UPSTREAM.md records it as authored for OpenMettle with the MIT starter retained. An owner review of the final V1-01 sources is still required."
+      }
+    }
+  ],
+  "components": [
+    {
+      "id": "repository-template",
+      "name": "OpenMettle repository-template starter",
+      "kind": "code",
+      "review_group": "core",
+      "distribution": "included",
+      "version": "eb327e329929a054fde30c75c2cfd7e862057040",
+      "pin": "git:eb327e329929a054fde30c75c2cfd7e862057040",
+      "origin": "https://github.com/OpenMettle/repository-template",
+      "source_evidence": [
+        "UPSTREAM.md"
+      ],
+      "licence": {
+        "expression": "MIT",
+        "evidence": [
+          "UPSTREAM.md",
+          "LICENSE"
+        ]
+      },
+      "notices": {
+        "status": "pending",
+        "files": [
+          "LICENSE"
+        ],
+        "obligations": [
+          "Retain the MIT notice."
+        ]
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "Licence is as recorded in UPSTREAM.md; awaiting owner review."
+      },
+      "tracking": [
+        "V1-42"
+      ]
+    },
+    {
+      "id": "rust-toolchain",
+      "name": "Rust toolchain",
+      "kind": "tooling",
+      "review_group": "core",
+      "distribution": "not-distributed",
+      "version": "1.100.0",
+      "pin": "rust-toolchain.toml channel 1.100.0",
+      "origin": "https://rustup.rs/",
+      "source_evidence": [
+        "rust-toolchain.toml"
+      ],
+      "licence": {
+        "expression": null,
+        "evidence": []
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "Build tool. Standard-library code linked into binaries must be covered by the binary notice review once release artifacts exist."
+      },
+      "tracking": [
+        "V1-01",
+        "V1-42"
+      ]
+    },
+    {
+      "id": "rust-build-image",
+      "name": "Rust build image",
+      "kind": "container-image",
+      "review_group": "core",
+      "distribution": "not-distributed",
+      "version": "1.100.0-slim-bookworm",
+      "pin": "sha256:7c7d4eb4d05b7781187a327809466cfddf29753f6defdc3d19a0e291951b7a37",
+      "origin": "docker.io/library/rust",
+      "source_evidence": [
+        "openmettle-core PR #35 head 32e21a7b43918844cc6a3b90ddfc2227c461ea59: Dockerfile and docs/adr/0002-cpu-runtime.md (unmerged when recorded)"
+      ],
+      "licence": {
+        "expression": null,
+        "evidence": []
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "Build stage only. The shipped binaries still include the Rust standard library and all Cargo.lock crates, which need their own notices."
+      },
+      "tracking": [
+        "V1-01"
+      ]
+    },
+    {
+      "id": "debian-runtime-image",
+      "name": "Debian runtime base image",
+      "kind": "container-image",
+      "review_group": "core",
+      "distribution": "candidate",
+      "version": "bookworm-slim",
+      "pin": "sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc",
+      "origin": "docker.io/library/debian",
+      "source_evidence": [
+        "openmettle-core PR #35 head 32e21a7b43918844cc6a3b90ddfc2227c461ea59: Dockerfile and docs/adr/0002-cpu-runtime.md (unmerged when recorded)"
+      ],
+      "licence": {
+        "expression": null,
+        "evidence": []
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "Base layer of the API and worker images. Debian packages have individual licences, and no package inventory exists yet. The images do not yet include licence or notice files for the bundled Rust crates. It also carries the CA certificate bundle copied from the build stage."
+      },
+      "tracking": [
+        "V1-01"
+      ]
+    },
+    {
+      "id": "postgresql-test-image",
+      "name": "PostgreSQL CI test-service image",
+      "kind": "container-image",
+      "review_group": "database",
+      "distribution": "not-distributed",
+      "version": "18.1-bookworm",
+      "pin": "sha256:cc9f4143a8d2fa8cf3749d0cb4d26ecf2d53a77a2ac807e9ebd67ae22426221a",
+      "origin": "docker.io/library/postgres",
+      "source_evidence": [
+        "openmettle-core PR #35 head 32e21a7b43918844cc6a3b90ddfc2227c461ea59: Dockerfile and docs/adr/0002-cpu-runtime.md (unmerged when recorded)"
+      ],
+      "licence": {
+        "expression": null,
+        "evidence": []
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "CI test service only. The runtime ADR states that PostgreSQL uses the PostgreSQL License, but no image-wide licence is asserted."
+      },
+      "tracking": [
+        "V1-01"
+      ]
+    },
+    {
+      "id": "graphiti-core",
+      "name": "graphiti-core",
+      "kind": "library",
+      "review_group": "graphiti",
+      "distribution": "candidate",
+      "version": "0.31.2",
+      "pin": "sha256:b26e1f350482266aec24beb1cd4c58d5e32ede1a897af8fa25b10800a16bbb8d",
+      "origin": "https://pypi.org/project/graphiti-core/0.31.2/",
+      "source_evidence": [
+        "SOURCE-REFERENCES.md S16 (workstation-stack f9c8844b94faac4ff4c72e7ffcf6fa74aa8c714c infrastructure/graphiti/requirements-python314.lock)"
+      ],
+      "licence": {
+        "expression": "Apache-2.0",
+        "evidence": [
+          "ARCHITECTURE-v1.md 'Graphiti licence check — 16 November 2026'"
+        ]
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": [
+          "Retain the Apache-2.0 licence and any NOTICE attribution; mark modified files."
+        ]
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "The baseline checked the wheel hash and declared licence. The transitive Python lock (including the neo4j driver) is not yet reviewed."
+      },
+      "tracking": [
+        "V1-23"
+      ]
+    },
+    {
+      "id": "neo4j-python-driver",
+      "name": "neo4j (Python driver)",
+      "kind": "library",
+      "review_group": "graphiti",
+      "distribution": "candidate",
+      "version": "6.4.1",
+      "pin": "sha256:f56a281c74355522fc2642df8919bec450115431531b8f3f6fe1cc17acb57a27",
+      "origin": "https://pypi.org/project/neo4j/6.4.1/",
+      "source_evidence": [
+        "SOURCE-REFERENCES.md S16 (workstation-stack f9c8844b94faac4ff4c72e7ffcf6fa74aa8c714c infrastructure/graphiti/requirements-python314.lock)"
+      ],
+      "licence": {
+        "expression": null,
+        "evidence": []
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "Licence not yet recorded from release metadata."
+      },
+      "tracking": [
+        "V1-23"
+      ]
+    },
+    {
+      "id": "graphiti-memory-image",
+      "name": "Graphiti memory-service image",
+      "kind": "container-image",
+      "review_group": "graphiti",
+      "distribution": "candidate",
+      "version": null,
+      "pin": null,
+      "origin": null,
+      "source_evidence": [
+        "SOURCE-REFERENCES.md S07 (workstation-stack f9c8844b94faac4ff4c72e7ffcf6fa74aa8c714c apps/components/memory/workloads.yaml references a locally built image without a digest)"
+      ],
+      "licence": {
+        "expression": null,
+        "evidence": []
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "Locally built image with no digest pin. The base image and OS packages are unknown."
+      },
+      "tracking": [
+        "V1-23"
+      ]
+    },
+    {
+      "id": "neo4j-community-image",
+      "name": "Neo4j Community container image",
+      "kind": "container-image",
+      "review_group": "database",
+      "distribution": "candidate",
+      "version": "5.26.32-community",
+      "pin": "sha256:42ef3ebfd671ebd01fdebb6dcbe80cf7b45eef2aa3d346ef4132f7ef31e67d2f",
+      "origin": "docker.io/library/neo4j",
+      "source_evidence": [
+        "SOURCE-REFERENCES.md S07 (workstation-stack f9c8844b94faac4ff4c72e7ffcf6fa74aa8c714c apps/components/memory/workloads.yaml)"
+      ],
+      "licence": {
+        "expression": "GPL-3.0",
+        "evidence": [
+          "ARCHITECTURE-v1.md 'Fresh installation and licensing' (Neo4j Community Edition is GPLv3)"
+        ]
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": [
+          "Redistributing the binaries or image needs a corresponding-source compliance review."
+        ]
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "The baseline records the GPLv3 licence. Whether OpenMettle redistributes this image or only references it depends on the undefined distribution boundary. The image's OS packages are not reviewed."
+      },
+      "tracking": [
+        "V1-23"
+      ]
+    },
+    {
+      "id": "postgresql-image",
+      "name": "PostgreSQL container image",
+      "kind": "container-image",
+      "review_group": "database",
+      "distribution": "candidate",
+      "version": "18.6-bookworm",
+      "pin": "sha256:6b38fe68f2c02cafffbbce7496f76d110d8a947c039bd22c067e9a43c2250240",
+      "origin": "docker.io/library/postgres",
+      "source_evidence": [
+        "workstation-stack f9c8844b94faac4ff4c72e7ffcf6fa74aa8c714c apps/base/shared-api/workloads.yaml (current-stack reference; V1-01/V1-02 may select another version)"
+      ],
+      "licence": {
+        "expression": null,
+        "evidence": []
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "Current-stack pin only. The licences of PostgreSQL and the Debian base packages are not recorded here yet."
+      },
+      "tracking": [
+        "V1-01",
+        "V1-02"
+      ]
+    },
+    {
+      "id": "helixdb",
+      "name": "HelixDB (experiment)",
+      "kind": "service",
+      "review_group": "database",
+      "distribution": "not-distributed",
+      "version": null,
+      "pin": null,
+      "origin": "https://github.com/HelixDB/helix-db",
+      "source_evidence": [
+        "ARCHITECTURE-v1.md 'Rust alternatives reviewed — 16 November 2026'"
+      ],
+      "licence": {
+        "expression": "Apache-2.0",
+        "evidence": [
+          "ARCHITECTURE-v1.md 'Rust alternatives reviewed — 16 November 2026' (unpinned)"
+        ]
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "Experiment only (V1-37). It does not clear the Graphiti/Neo4j stack. A pinned build needs its own image and dependency review before any adoption."
+      },
+      "tracking": [
+        "V1-37"
+      ]
+    },
+    {
+      "id": "agent-sandbox-controller",
+      "name": "Kubernetes SIG Agent Sandbox controller",
+      "kind": "service",
+      "review_group": "sandbox",
+      "distribution": "candidate",
+      "version": null,
+      "pin": null,
+      "origin": "https://github.com/kubernetes-sigs/agent-sandbox",
+      "source_evidence": [
+        "ARCHITECTURE-v1.md sandbox replacement section"
+      ],
+      "licence": {
+        "expression": "Apache-2.0",
+        "evidence": [
+          "ARCHITECTURE-v1.md (project 'currently' uses Apache-2.0; unpinned, not a guarantee for releases or bundled dependencies)"
+        ]
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "No release, image digest or transitive dependency review yet."
+      },
+      "tracking": [
+        "V1-27"
+      ]
+    },
+    {
+      "id": "sandboxd",
+      "name": "sandboxd execution daemon",
+      "kind": "service",
+      "review_group": "sandbox",
+      "distribution": "candidate",
+      "version": null,
+      "pin": null,
+      "origin": "https://agent-sandbox.sigs.k8s.io/docs/api/runtime/",
+      "source_evidence": [
+        "ARCHITECTURE-v1.md sandbox replacement section"
+      ],
+      "licence": {
+        "expression": null,
+        "evidence": []
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "No licence evidence specific to the sandboxd reference daemon or its image is recorded."
+      },
+      "tracking": [
+        "V1-27"
+      ]
+    },
+    {
+      "id": "gvisor",
+      "name": "gVisor (runsc)",
+      "kind": "service",
+      "review_group": "sandbox",
+      "distribution": "candidate",
+      "version": null,
+      "pin": null,
+      "origin": "https://github.com/google/gvisor",
+      "source_evidence": [
+        "ARCHITECTURE-v1.md sandbox replacement section"
+      ],
+      "licence": {
+        "expression": "Apache-2.0",
+        "evidence": [
+          "ARCHITECTURE-v1.md (links the gVisor master LICENSE; unpinned)"
+        ]
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "Operator-selected RuntimeClass. Whether OpenMettle ships it or requires the operator to install it is undecided."
+      },
+      "tracking": [
+        "V1-27"
+      ]
+    },
+    {
+      "id": "open-webui-terminals",
+      "name": "Open WebUI Terminals controller",
+      "kind": "code",
+      "review_group": "sandbox",
+      "distribution": "excluded",
+      "version": "4c7a747634d7a521ecc82f6f09dab204a3ded60e",
+      "pin": "git:4c7a747634d7a521ecc82f6f09dab204a3ded60e",
+      "origin": "https://github.com/open-webui/terminals",
+      "source_evidence": [
+        "ARCHITECTURE-v1.md 'Controller replacement and licensing'"
+      ],
+      "licence": {
+        "expression": null,
+        "evidence": [
+          "ARCHITECTURE-v1.md: the pinned licence restricts production use and redistribution"
+        ]
+      },
+      "notices": {
+        "status": "none-required",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "blocked",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "Incompatible with intended distribution. Replace it; do not import or translate it."
+      },
+      "exclusion_reason": "Agreed replacement direction (16 November 2026): the pinned licence restricts production use and redistribution.",
+      "tracking": [
+        "V1-27"
+      ]
+    },
+    {
+      "id": "open-terminal",
+      "name": "Open Terminal",
+      "kind": "code",
+      "review_group": "sandbox",
+      "distribution": "excluded",
+      "version": "d0301c5d633a176631cd36a4adf7fcc26bb38402",
+      "pin": "git:d0301c5d633a176631cd36a4adf7fcc26bb38402",
+      "origin": "https://github.com/open-webui/open-terminal",
+      "source_evidence": [
+        "ARCHITECTURE-v1.md 'Controller replacement and licensing'"
+      ],
+      "licence": {
+        "expression": "MIT",
+        "evidence": [
+          "ARCHITECTURE-v1.md (pinned LICENSE is MIT)"
+        ]
+      },
+      "notices": {
+        "status": "none-required",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "Removed from the default server path by the agreed sandbox direction."
+      },
+      "exclusion_reason": "The proposed replacement removes Open Terminal from the default server path.",
+      "tracking": [
+        "V1-27"
+      ]
+    },
+    {
+      "id": "sglang-curated-fork",
+      "name": "OpenMettle SGLang curated fork",
+      "kind": "curated-fork",
+      "review_group": "serving",
+      "distribution": "candidate",
+      "version": null,
+      "pin": null,
+      "origin": "https://github.com/OpenMettle/sglang",
+      "source_evidence": [
+        "Observed read-only on 16 November 2026: branch openmettle/rdna4 at 2e9dc033cfc7886371dc71ef632848ae7a63fa52 has LICENSE (Apache License 2.0 header), LICENSES/ and OPENMETTLE-NOTICES.md. This is not a reviewed release pin."
+      ],
+      "licence": {
+        "expression": null,
+        "evidence": []
+      },
+      "notices": {
+        "status": "pending",
+        "files": [
+          "LICENSE",
+          "LICENSES/",
+          "OPENMETTLE-NOTICES.md"
+        ],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "The release revision is not selected. The upstream base revision, patch authorship and bundled third-party licences under LICENSES/ need review."
+      },
+      "tracking": [
+        "V1-42"
+      ]
+    },
+    {
+      "id": "serving-fork-evidence",
+      "name": "serving-fork evidence repository",
+      "kind": "curated-fork",
+      "review_group": "serving",
+      "distribution": "candidate",
+      "version": "8a53e9c2bf2837d4cd9296b18627067be98f27e8",
+      "pin": "git:8a53e9c2bf2837d4cd9296b18627067be98f27e8",
+      "origin": "serving-fork (SOURCE-REFERENCES.md alias)",
+      "source_evidence": [
+        "ARCHITECTURE-v1.md source table",
+        "SOURCE-REFERENCES.md S27"
+      ],
+      "licence": {
+        "expression": null,
+        "evidence": []
+      },
+      "notices": {
+        "status": "pending",
+        "files": [
+          "LICENSE",
+          "LICENSES/"
+        ],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "Its LICENSE carries a personal copyright holder name. Reconcile authorship preservation with personal-reference removal through the existing publication tickets before distribution."
+      },
+      "tracking": [
+        "V1-42"
+      ]
+    },
+    {
+      "id": "sglang-serving-image",
+      "name": "SGLang serving image",
+      "kind": "container-image",
+      "review_group": "serving",
+      "distribution": "candidate",
+      "version": null,
+      "pin": "sha256:c9e4d0e0ea8818de29ccef4249119fc1c096d7a924b86c63567a6b9f9d5c3c8b",
+      "origin": null,
+      "source_evidence": [
+        "workstation-stack f9c8844b94faac4ff4c72e7ffcf6fa74aa8c714c apps/base/sglang/deployment.yaml (locally built image digest)"
+      ],
+      "licence": {
+        "expression": null,
+        "evidence": []
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "The image is built locally and has no published origin. Its base image, ROCm/GPU runtime libraries and Python wheels are not reviewed."
+      },
+      "tracking": [
+        "V1-42"
+      ]
+    },
+    {
+      "id": "text-embeddings-inference-image",
+      "name": "Text Embeddings Inference CPU image",
+      "kind": "container-image",
+      "review_group": "serving",
+      "distribution": "candidate",
+      "version": "cpu-sha-da9a9ce",
+      "pin": "sha256:50c39e698cda14212ea5bb0c17400ad3c72ee3432e03326a17dc8a096aeb9f33",
+      "origin": "ghcr.io/huggingface/text-embeddings-inference",
+      "source_evidence": [
+        "SOURCE-REFERENCES.md S07 (workstation-stack f9c8844b94faac4ff4c72e7ffcf6fa74aa8c714c apps/components/memory/workloads.yaml)"
+      ],
+      "licence": {
+        "expression": null,
+        "evidence": []
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "No licence evidence is recorded for the image or the embedding model it serves."
+      },
+      "tracking": [
+        "V1-42"
+      ]
+    },
+    {
+      "id": "served-model-weights",
+      "name": "Served chat, embedding and reranking model weights",
+      "kind": "model",
+      "review_group": "serving",
+      "distribution": "candidate",
+      "version": null,
+      "pin": null,
+      "origin": null,
+      "source_evidence": [],
+      "licence": {
+        "expression": null,
+        "evidence": []
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "Model identities, revisions and licences are not recorded. Operator-downloaded weights may sit outside the distribution boundary, but that is undecided."
+      },
+      "tracking": [
+        "V1-42"
+      ]
+    },
+    {
+      "id": "media-generation-services",
+      "name": "Image and video generation services and adapters",
+      "kind": "service",
+      "review_group": "media",
+      "distribution": "candidate",
+      "version": null,
+      "pin": null,
+      "origin": null,
+      "source_evidence": [
+        "ARCHITECTURE-v1.md (existing ComfyUI image/video adapters)"
+      ],
+      "licence": {
+        "expression": null,
+        "evidence": []
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "No service version, image digest, custom nodes or adapter source pins are recorded."
+      },
+      "tracking": [
+        "V1-21"
+      ]
+    },
+    {
+      "id": "media-model-weights",
+      "name": "Image and video model weights",
+      "kind": "model",
+      "review_group": "media",
+      "distribution": "candidate",
+      "version": null,
+      "pin": null,
+      "origin": null,
+      "source_evidence": [],
+      "licence": {
+        "expression": null,
+        "evidence": []
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "Model identities, revisions and licences are not recorded."
+      },
+      "tracking": [
+        "V1-21"
+      ]
+    },
+    {
+      "id": "open-webui-fork",
+      "name": "OpenMettle Open WebUI fork",
+      "kind": "curated-fork",
+      "review_group": "application-fork",
+      "distribution": "excluded",
+      "version": "e02e69af9717cc8443f22fa2a0c89570a74abc9b",
+      "pin": "git:e02e69af9717cc8443f22fa2a0c89570a74abc9b",
+      "origin": "https://github.com/OpenMettle/open-webui",
+      "source_evidence": [
+        "ARCHITECTURE-v1.md source table",
+        "REPOSITORIES.md"
+      ],
+      "licence": {
+        "expression": null,
+        "evidence": [
+          "ARCHITECTURE-v1.md: Open WebUI License with branding clause from v0.6.6 (19 April 2025); earlier materials keep prior terms"
+        ]
+      },
+      "notices": {
+        "status": "none-required",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "Source and requirements evidence only. Do not copy or translate its implementation into OpenMettle repositories."
+      },
+      "exclusion_reason": "REPOSITORIES.md: the fork is source evidence and current-stack work, not the replacement's source tree.",
+      "tracking": [
+        "V1-42"
+      ]
+    },
+    {
+      "id": "openmettle-acp",
+      "name": "OpenMettle ACP local coding agent",
+      "kind": "code",
+      "review_group": "application-fork",
+      "distribution": "candidate",
+      "version": "d411a4e2c9cba79d63f466fb8ca2afa0d1e1893c",
+      "pin": "git:d411a4e2c9cba79d63f466fb8ca2afa0d1e1893c",
+      "origin": "https://github.com/OpenMettle/openmettle-acp",
+      "source_evidence": [
+        "ARCHITECTURE-v1.md source table (reviewed revision); LICENSE (MIT header) and NOTICE are present at that revision"
+      ],
+      "licence": {
+        "expression": null,
+        "evidence": []
+      },
+      "notices": {
+        "status": "pending",
+        "files": [
+          "LICENSE",
+          "NOTICE"
+        ],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "Separate repository and release. Its NOTICE contents and dependencies are not reviewed here."
+      },
+      "tracking": [
+        "V1-42"
+      ]
+    }
+  ]
+}

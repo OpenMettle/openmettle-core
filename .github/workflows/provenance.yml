@@ -1,0 +1,62 @@
+name: Provenance
+# V1-42: a dependency inventory and notice-obligation report on every change.
+# A green inventory job is NOT distribution clearance. The distribution-readiness job is
+# fail-closed and runs only on manual dispatch. This workflow never publishes or releases.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  inventory:
+    name: Dependency inventory (not clearance)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6; resolved 2026-11-14
+        with:
+          persist-credentials: false
+      - name: Test provenance tooling
+        run: python3 -m unittest discover -s scripts/tests -v
+      - name: Install pinned toolchain
+        run: rustup toolchain install 1.100.0 --profile minimal
+      - name: Resolve declared crate metadata from Cargo.lock
+        run: cargo metadata --locked --format-version 1 > "$RUNNER_TEMP/cargo-metadata.json"
+      - name: Generate inventory twice and require identical output
+        run: |
+          for run in a b; do
+            python3 scripts/provenance.py inventory \
+              --cargo-metadata "$RUNNER_TEMP/cargo-metadata.json" \
+              --output-dir "$RUNNER_TEMP/provenance-$run"
+          done
+          diff -r "$RUNNER_TEMP/provenance-a" "$RUNNER_TEMP/provenance-b"
+          cat "$RUNNER_TEMP/provenance-a/notice-obligations.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload inventory
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2; resolved 2026-11-16
+        with:
+          name: provenance-inventory
+          path: ${{ runner.temp }}/provenance-a
+          if-no-files-found: error
+
+  distribution-readiness:
+    name: Distribution readiness (fail-closed)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6; resolved 2026-11-14
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install 1.100.0 --profile minimal
+      - name: Resolve declared crate metadata from Cargo.lock
+        run: cargo metadata --locked --format-version 1 > "$RUNNER_TEMP/cargo-metadata.json"
+      - name: Fail unless every shipped component is reviewed
+        run: python3 scripts/provenance.py check-distribution --cargo-metadata "$RUNNER_TEMP/cargo-metadata.json"
