@@ -33,10 +33,14 @@ python3 scripts/provenance.py check-distribution --cargo-metadata /tmp/cargo-met
 
 - **Inventory success** means the register is valid, every `Cargo.lock` package is listed, and the output is reproducible. It says nothing about whether distribution is permitted.
 - **Distribution readiness** fails until all of the following hold:
-  - the distribution boundary is defined;
-  - every required review group (core, graphiti, database, sandbox, serving, media, application-fork) has a reviewed disposition;
+  - the distribution boundary has a nonblank description and a dated, attributed decision review with evidence;
+  - every required review group (core, graphiti, database, sandbox, serving, media, application-fork) has a nonblank disposition and a dated, attributed decision review with evidence;
   - every `Cargo.lock` package has a review at the exact name, version, source and checksum, and its licence matches the declared crate metadata;
   - every `included` component has a version, pin, origin, licence with evidence, recorded notices and a dated review, and no shipped component remains a `candidate`.
+
+Recorded notices require nonempty notice references and obligations. A `none-required` disposition requires an explicit justification and the component or crate review must still be complete before inclusion can pass. Evidence entries must be nonblank strings and review dates must be real calendar dates.
+
+Automatic discovery covers Cargo packages only. The component register is manually curated; the gate cannot detect an omitted image, asset or model. A release reviewer must reconcile the actual distribution against the register. A passing gate checks recorded evidence, not the truth or completeness of external evidence. Absolute Cargo licence-file paths are reduced to filenames in artifacts; the source package still owns the full notice.
 
 `Cargo.lock` is read on every run. A new or upgraded crate has no exact-version review, so it blocks readiness. This includes the V1-01 runtime dependencies once they land. A review for a version no longer in the lockfile produces a stale-review warning.
 
@@ -57,7 +61,7 @@ python3 scripts/provenance.py check-distribution --cargo-metadata /tmp/cargo-met
 - The register records the PR #35 build, runtime and test images by digest. Once V1-01 merges, rerun the gate against the merged `Cargo.lock`, Dockerfile and crate metadata. The runtime images do not yet include licence or notice files for the bundled crates or Debian packages.
 - These pins are taken from read-only source evidence: Graphiti 0.31.2 and the neo4j driver 6.4.1 (wheel hashes), the Neo4j Community 5.26.32 and PostgreSQL 18.6 image digests, the Text Embeddings Inference image digest and a locally built SGLang image digest (all at the `workstation-stack` revision cited in `SOURCE-REFERENCES.md`), plus the reviewed revisions of the forks and evidence repositories.
 - These are missing: versions and pins for Agent Sandbox, sandboxd and gVisor; the Graphiti memory image; the SGLang release revision; the media services; and all model weights. Licences are also missing for several pinned components.
-- The `serving-fork` licence file names a personal copyright holder. The obligation to preserve authorship conflicts with removing personal references, so it must be resolved through the existing publication tickets before distribution.
+- The `serving-fork` licence file names a personal copyright holder. Preserve required copyright and authorship notices. Removing private site configuration does not authorize deleting attribution; track packaging and notice preservation through the existing publication tickets.
 
 ## Related publication and scanner work
 

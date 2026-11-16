@@ -94,6 +94,92 @@ class PositiveTests(FixtureCase):
 
 
 class NegativeTests(FixtureCase):
+    def test_recorded_notices_require_references_and_obligations(self):
+        for section in ("cargo_reviews", "components"):
+            for field in ("files", "obligations"):
+                with self.subTest(section=section, field=field):
+                    reg = json.loads((FIXTURE / "register.json").read_text())
+                    reg[section][0]["notices"][field] = []
+                    self.save(reg)
+                    self.assert_invalid("recorded notices need nonempty")
+
+    def test_none_required_needs_justification(self):
+        reg = self.register()
+        reg["components"][0]["notices"] = {"status": "none-required", "files": [], "obligations": []}
+        self.save(reg)
+        self.assert_invalid("none-required notices need a justification")
+
+    def test_status_only_decisions_are_invalid(self):
+        reg = self.register()
+        reg["distribution_boundary"] = {"status": "defined"}
+        self.save(reg)
+        self.assert_invalid("distribution_boundary")
+        reg = json.loads((FIXTURE / "register.json").read_text())
+        reg["review_groups"] = {g: {"status": "reviewed"} for g in provenance.REQUIRED_GROUPS}
+        self.save(reg)
+        self.assert_invalid("completed decision review")
+
+    def test_decisions_need_substance_and_completed_review(self):
+        for target, text_field in (("distribution_boundary", "description"), ("core", "summary")):
+            for field, value in ((text_field, " "), ("review", {"status": "pending", "evidence": [], "notes": "Pending"})):
+                with self.subTest(target=target, field=field):
+                    reg = json.loads((FIXTURE / "register.json").read_text())
+                    decision = reg[target] if target == "distribution_boundary" else reg["review_groups"][target]
+                    decision[field] = value
+                    self.save(reg)
+                    self.assertEqual(self.gate()[0], 2)
+
+    def test_whitespace_component_facts_are_invalid(self):
+        for field in ("version", "pin", "origin"):
+            with self.subTest(field=field):
+                reg = json.loads((FIXTURE / "register.json").read_text())
+                reg["components"][0][field] = " \t"
+                self.save(reg)
+                self.assert_invalid(field)
+
+    def test_malformed_review_facts_are_invalid(self):
+        for field, value in (("reviewer", 123), ("reviewer", " "), ("evidence", [None]),
+                             ("evidence", [" "]), ("date", "2026-99-99"), ("date", "2026-02-30")):
+            with self.subTest(field=field, value=value):
+                reg = json.loads((FIXTURE / "register.json").read_text())
+                reg["components"][0]["review"][field] = value
+                self.save(reg)
+                self.assertEqual(self.gate()[0], 2)
+
+    def test_malformed_list_members_are_invalid(self):
+        for section, field in (("licence", "evidence"), ("notices", "files"), ("notices", "obligations")):
+            reg = json.loads((FIXTURE / "register.json").read_text())
+            reg["components"][0][section][field] = [None]
+            self.save(reg)
+            self.assert_invalid("nonblank strings")
+
+    def test_unhashable_fields_produce_input_error(self):
+        for section, field in (("cargo_reviews", "name"), ("cargo_reviews", "source"),
+                               ("components", "kind"), ("components", "review_group"),
+                               ("components", "distribution")):
+            reg = json.loads((FIXTURE / "register.json").read_text())
+            reg[section][0][field] = []
+            self.save(reg)
+            self.assertEqual(self.gate()[0], 2)
+
+    def test_malformed_metadata_produces_input_error(self):
+        for data in ({"packages": {}}, {"packages": [None]}, {"packages": [{"name": []}]}):
+            self.metadata_path.write_text(json.dumps(data))
+            self.assert_invalid("cargo metadata")
+
+    def test_machine_specific_licence_paths_are_not_exported(self):
+        for path in ("/private/synthetic-user/source/LICENSE", "C:\\Users\\synthetic-user\\LICENSE"):
+            meta = json.loads((FIXTURE / "cargo-metadata.json").read_text())
+            meta["packages"][1]["license_file"] = path
+            self.metadata_path.write_text(json.dumps(meta))
+            out_dir = self.root / "inventory"
+            code, _, err = run_cli("inventory", "--root", str(self.root), "--register", str(self.register_path),
+                                   "--cargo-metadata", str(self.metadata_path), "--output-dir", str(out_dir))
+            self.assertEqual(code, 0, err)
+            report = (out_dir / "dependency-inventory.json").read_text()
+            self.assertNotIn("synthetic-user", report)
+            self.assertEqual(json.loads(report)["cargo_packages"][1]["declared_licence_file"], "LICENSE")
+
     def test_new_lock_dependency_without_review_blocks(self):
         lock = self.root / "Cargo.lock"
         lock.write_text(lock.read_text() + '\n[[package]]\nname = "fixture-new"\nversion = "0.9.0"\n'

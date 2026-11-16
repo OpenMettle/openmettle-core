@@ -591,7 +591,8 @@
       "notices": {
         "status": "none-required",
         "files": [],
-        "obligations": []
+        "obligations": [],
+        "justification": "Not distributed in this recorded scope; required attribution must be preserved if later included."
       },
       "review": {
         "status": "blocked",
@@ -626,7 +627,8 @@
       "notices": {
         "status": "none-required",
         "files": [],
-        "obligations": []
+        "obligations": [],
+        "justification": "Not distributed in this recorded scope; required attribution must be preserved if later included."
       },
       "review": {
         "status": "pending",
@@ -706,7 +708,7 @@
         "reviewer": null,
         "date": null,
         "evidence": [],
-        "notes": "Its LICENSE carries a personal copyright holder name. Reconcile authorship preservation with personal-reference removal through the existing publication tickets before distribution."
+        "notes": "Its LICENSE carries a personal copyright holder name. Preserve required copyright attribution. Site-privacy cleanup does not authorize removing notices; track packaging obligations through the existing publication tickets."
       },
       "tracking": [
         "V1-42"
@@ -890,7 +892,8 @@
       "notices": {
         "status": "none-required",
         "files": [],
-        "obligations": []
+        "obligations": [],
+        "justification": "Not distributed in this recorded scope; required attribution must be preserved if later included."
       },
       "review": {
         "status": "pending",

@@ -5,7 +5,16 @@
     "description": "Synthetic fixture boundary.",
     "tracking": [
       "FIXTURE"
-    ]
+    ],
+    "review": {
+      "status": "reviewed",
+      "reviewer": "fixture-reviewer",
+      "date": "2026-11-16",
+      "evidence": [
+        "synthetic decision record"
+      ],
+      "notes": "Synthetic scope and disposition reviewed."
+    }
   },
   "review_groups": {
     "core": {
@@ -13,49 +22,112 @@
       "summary": "Synthetic fixture disposition.",
       "tracking": [
         "FIXTURE"
-      ]
+      ],
+      "review": {
+        "status": "reviewed",
+        "reviewer": "fixture-reviewer",
+        "date": "2026-11-16",
+        "evidence": [
+          "synthetic decision record"
+        ],
+        "notes": "Synthetic scope and disposition reviewed."
+      }
     },
     "graphiti": {
       "status": "reviewed",
       "summary": "Synthetic fixture disposition.",
       "tracking": [
         "FIXTURE"
-      ]
+      ],
+      "review": {
+        "status": "reviewed",
+        "reviewer": "fixture-reviewer",
+        "date": "2026-11-16",
+        "evidence": [
+          "synthetic decision record"
+        ],
+        "notes": "Synthetic scope and disposition reviewed."
+      }
     },
     "database": {
       "status": "reviewed",
       "summary": "Synthetic fixture disposition.",
       "tracking": [
         "FIXTURE"
-      ]
+      ],
+      "review": {
+        "status": "reviewed",
+        "reviewer": "fixture-reviewer",
+        "date": "2026-11-16",
+        "evidence": [
+          "synthetic decision record"
+        ],
+        "notes": "Synthetic scope and disposition reviewed."
+      }
     },
     "sandbox": {
       "status": "reviewed",
       "summary": "Synthetic fixture disposition.",
       "tracking": [
         "FIXTURE"
-      ]
+      ],
+      "review": {
+        "status": "reviewed",
+        "reviewer": "fixture-reviewer",
+        "date": "2026-11-16",
+        "evidence": [
+          "synthetic decision record"
+        ],
+        "notes": "Synthetic scope and disposition reviewed."
+      }
     },
     "serving": {
       "status": "reviewed",
       "summary": "Synthetic fixture disposition.",
       "tracking": [
         "FIXTURE"
-      ]
+      ],
+      "review": {
+        "status": "reviewed",
+        "reviewer": "fixture-reviewer",
+        "date": "2026-11-16",
+        "evidence": [
+          "synthetic decision record"
+        ],
+        "notes": "Synthetic scope and disposition reviewed."
+      }
     },
     "media": {
       "status": "reviewed",
       "summary": "Synthetic fixture disposition.",
       "tracking": [
         "FIXTURE"
-      ]
+      ],
+      "review": {
+        "status": "reviewed",
+        "reviewer": "fixture-reviewer",
+        "date": "2026-11-16",
+        "evidence": [
+          "synthetic decision record"
+        ],
+        "notes": "Synthetic scope and disposition reviewed."
+      }
     },
     "application-fork": {
       "status": "reviewed",
       "summary": "Synthetic fixture disposition.",
       "tracking": [
         "FIXTURE"
-      ]
+      ],
+      "review": {
+        "status": "reviewed",
+        "reviewer": "fixture-reviewer",
+        "date": "2026-11-16",
+        "evidence": [
+          "synthetic decision record"
+        ],
+        "notes": "Synthetic scope and disposition reviewed."
+      }
     }
   },
   "cargo_reviews": [
@@ -178,7 +250,8 @@
       "notices": {
         "status": "none-required",
         "files": [],
-        "obligations": []
+        "obligations": [],
+        "justification": "Not distributed in this recorded scope; required attribution must be preserved if later included."
       },
       "review": {
         "status": "blocked",

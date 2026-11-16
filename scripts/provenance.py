@@ -9,12 +9,13 @@ Requires Python 3.11+ (tomllib). It uses only the standard library and makes no 
 from __future__ import annotations
 
 import argparse
+from datetime import date
 import hashlib
 import json
 import re
 import sys
 import tomllib
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_VERSION = 1
@@ -45,8 +46,11 @@ def load_lock(path: Path) -> list[dict]:
         raise InputError(f"{path.name}: no [[package]] entries")
     result = []
     for pkg in packages:
-        if not isinstance(pkg.get("name"), str) or not isinstance(pkg.get("version"), str):
+        if not isinstance(pkg, dict) or not _text(pkg.get("name")) or not _text(pkg.get("version")):
             raise InputError(f"{path.name}: package entry without name/version")
+        for field in ("source", "checksum"):
+            if pkg.get(field) is not None and not _text(pkg[field]):
+                raise InputError(f"{path.name}: invalid package {field}")
         result.append({"name": pkg["name"], "version": pkg["version"],
                        "source": pkg.get("source"), "checksum": pkg.get("checksum")})
     return sorted(result, key=_pkg_key)
@@ -66,10 +70,27 @@ def load_metadata(path: Path | None, lock: list[dict]) -> dict | None:
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise InputError(f"cargo metadata: unreadable: {exc}") from exc
     declared = {}
+    if not isinstance(packages, list):
+        raise InputError("cargo metadata: packages must be a list")
     for pkg in packages:
+        if not isinstance(pkg, dict) or not _text(pkg.get("name")) or not _text(pkg.get("version")):
+            raise InputError("cargo metadata: invalid package name/version")
+        for field in ("source", "license", "license_file", "repository"):
+            if pkg.get(field) is not None and not _text(pkg[field]):
+                raise InputError(f"cargo metadata: invalid package {field}")
         source = pkg.get("source")
         key = (pkg["name"], pkg["version"], source or "")
-        declared[key] = {"license": pkg.get("license"), "license_file": pkg.get("license_file"),
+        if key in declared:
+            raise InputError("cargo metadata: duplicate package")
+        licence_file = pkg.get("license_file")
+        if licence_file:
+            # Cargo metadata can contain paths in the local registry or checkout.
+            # Retain the notice filename, never the machine-specific prefix.
+            if PureWindowsPath(licence_file).is_absolute():
+                licence_file = PureWindowsPath(licence_file).name
+            elif Path(licence_file).is_absolute() or ".." in Path(licence_file).parts:
+                licence_file = Path(licence_file).name
+        declared[key] = {"license": pkg.get("license"), "license_file": licence_file,
                          "repository": pkg.get("repository")}
     lock_keys = {_pkg_key(p) for p in lock}
     # Path (workspace) packages have no source in Cargo.lock; cargo metadata gives them none either.
@@ -85,21 +106,34 @@ def _need(obj: dict, field: str, where: str, errors: list[str], types) -> None:
         errors.append(f"{where}: missing '{field}'")
     elif not isinstance(obj[field], types):
         errors.append(f"{where}: '{field}' has the wrong type")
+    elif types is str and not obj[field].strip():
+        errors.append(f"{where}: '{field}' must not be blank")
+    elif types is list and any(not isinstance(v, str) or not v.strip() for v in obj[field]):
+        errors.append(f"{where}: '{field}' must contain nonblank strings")
+
+
+def _text(value) -> bool:
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _validate_review(review, where, errors):
     if not isinstance(review, dict):
         errors.append(f"{where}: 'review' must be an object")
         return
-    if review.get("status") not in REVIEW_STATUS:
+    if not isinstance(review.get("status"), str) or review["status"] not in REVIEW_STATUS:
         errors.append(f"{where}: review.status must be one of {sorted(REVIEW_STATUS)}")
     _need(review, "evidence", f"{where}.review", errors, list)
     _need(review, "notes", f"{where}.review", errors, str)
     if review.get("status") == "reviewed":
-        if not review.get("reviewer"):
+        if not _text(review.get("reviewer")):
             errors.append(f"{where}: a reviewed entry needs a reviewer")
         if not isinstance(review.get("date"), str) or not DATE.fullmatch(review["date"]):
             errors.append(f"{where}: a reviewed entry needs a YYYY-MM-DD date")
+        else:
+            try:
+                date.fromisoformat(review["date"])
+            except ValueError:
+                errors.append(f"{where}: review date is not a valid calendar date")
         if not review.get("evidence"):
             errors.append(f"{where}: a reviewed entry needs evidence")
 
@@ -108,13 +142,20 @@ def _validate_licence_notices(entry, where, errors):
     licence, notices = entry.get("licence"), entry.get("notices")
     if not isinstance(licence, dict) or "expression" not in licence or not isinstance(licence.get("evidence"), list):
         errors.append(f"{where}: 'licence' needs 'expression' (string or null) and 'evidence' (list)")
-    elif licence["expression"] is not None and not isinstance(licence["expression"], str):
-        errors.append(f"{where}: licence.expression must be a string or null")
-    if not isinstance(notices, dict) or notices.get("status") not in NOTICE_STATUS:
+    else:
+        if licence["expression"] is not None and not _text(licence["expression"]):
+            errors.append(f"{where}: licence.expression must be a nonblank string or null")
+        _need(licence, "evidence", f"{where}.licence", errors, list)
+    if (not isinstance(notices, dict) or not isinstance(notices.get("status"), str)
+            or notices["status"] not in NOTICE_STATUS):
         errors.append(f"{where}: notices.status must be one of {sorted(NOTICE_STATUS)}")
     else:
         _need(notices, "files", f"{where}.notices", errors, list)
         _need(notices, "obligations", f"{where}.notices", errors, list)
+        if notices["status"] == "recorded" and (not notices.get("files") or not notices.get("obligations")):
+            errors.append(f"{where}: recorded notices need nonempty files and obligations")
+        if notices["status"] == "none-required" and not _text(notices.get("justification")):
+            errors.append(f"{where}: none-required notices need a justification")
 
 
 def validate_register(register) -> list[str]:
@@ -124,8 +165,13 @@ def validate_register(register) -> list[str]:
     if register.get("schema_version") != SCHEMA_VERSION:
         errors.append(f"register: schema_version must be {SCHEMA_VERSION}")
     boundary = register.get("distribution_boundary")
-    if not isinstance(boundary, dict) or boundary.get("status") not in {"defined", "undefined"}:
+    if not isinstance(boundary, dict) or boundary.get("status") not in ("defined", "undefined"):
         errors.append("register: distribution_boundary.status must be 'defined' or 'undefined'")
+    elif boundary["status"] == "defined":
+        _need(boundary, "description", "distribution_boundary", errors, str)
+        _validate_review(boundary.get("review"), "distribution_boundary", errors)
+        if not isinstance(boundary.get("review"), dict) or boundary["review"].get("status") != "reviewed":
+            errors.append("distribution_boundary: defined boundary needs a completed decision review")
     groups = register.get("review_groups")
     if not isinstance(groups, dict):
         errors.append("register: review_groups must be an object")
@@ -134,8 +180,13 @@ def validate_register(register) -> list[str]:
         if name not in groups:
             errors.append(f"review_groups: required group '{name}' is missing")
     for name, group in groups.items():
-        if not isinstance(group, dict) or group.get("status") not in {"pending", "reviewed"}:
+        if not isinstance(group, dict) or group.get("status") not in ("pending", "reviewed"):
             errors.append(f"review_groups.{name}: status must be 'pending' or 'reviewed'")
+        elif group["status"] == "reviewed":
+            _need(group, "summary", f"review_groups.{name}", errors, str)
+            _validate_review(group.get("review"), f"review_groups.{name}", errors)
+            if not isinstance(group.get("review"), dict) or group["review"].get("status") != "reviewed":
+                errors.append(f"review_groups.{name}: reviewed disposition needs a completed decision review")
     seen = set()
     cargo_reviews = register.get("cargo_reviews")
     if not isinstance(cargo_reviews, list):
@@ -149,8 +200,11 @@ def validate_register(register) -> list[str]:
         _need(entry, "name", where, errors, str)
         _need(entry, "version", where, errors, str)
         for field in ("source", "checksum"):
-            if field not in entry or not (entry[field] is None or isinstance(entry[field], str)):
+            if field not in entry or not (entry[field] is None or _text(entry[field])):
                 errors.append(f"{where}: '{field}' must be present (string or null)")
+        if not all(_text(entry.get(k)) for k in ("name", "version")) or not (
+                entry.get("source") is None or _text(entry.get("source"))):
+            continue
         key = (entry.get("name"), entry.get("version"), entry.get("source") or "")
         if key in seen:
             errors.append(f"{where}: duplicate review for {key[0]} {key[1]}")
@@ -168,7 +222,7 @@ def validate_register(register) -> list[str]:
             errors.append(f"{where}: must be an object")
             continue
         cid = comp.get("id")
-        if not isinstance(cid, str) or not cid:
+        if not _text(cid):
             errors.append(f"{where}: missing 'id'")
         elif cid in ids:
             errors.append(f"{where}: duplicate id '{cid}'")
@@ -176,20 +230,20 @@ def validate_register(register) -> list[str]:
             ids.add(cid)
             where = f"components.{cid}"
         _need(comp, "name", where, errors, str)
-        if comp.get("kind") not in KINDS:
+        if not isinstance(comp.get("kind"), str) or comp["kind"] not in KINDS:
             errors.append(f"{where}: kind must be one of {sorted(KINDS)}")
-        if comp.get("review_group") not in groups:
+        if not isinstance(comp.get("review_group"), str) or comp["review_group"] not in groups:
             errors.append(f"{where}: review_group '{comp.get('review_group')}' is not declared")
-        if comp.get("distribution") not in DISTRIBUTION:
+        if not isinstance(comp.get("distribution"), str) or comp["distribution"] not in DISTRIBUTION:
             errors.append(f"{where}: distribution must be one of {sorted(DISTRIBUTION)}")
         for field in ("version", "pin", "origin"):
-            if field not in comp or not (comp[field] is None or isinstance(comp[field], str)):
+            if field not in comp or not (comp[field] is None or _text(comp[field])):
                 errors.append(f"{where}: '{field}' must be present (string or null)")
         _need(comp, "source_evidence", where, errors, list)
         _need(comp, "tracking", where, errors, list)
         _validate_licence_notices(comp, where, errors)
         _validate_review(comp.get("review"), where, errors)
-        if comp.get("distribution") == "excluded" and not comp.get("exclusion_reason"):
+        if comp.get("distribution") == "excluded" and not _text(comp.get("exclusion_reason")):
             errors.append(f"{where}: excluded components need an exclusion_reason")
     return errors
 
