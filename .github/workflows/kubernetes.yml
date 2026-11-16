@@ -1,0 +1,55 @@
+name: Kubernetes qualification
+# V1-01: exercises the core API/worker process contract on an ephemeral kind cluster
+# classified dev. Images are built and loaded locally; nothing is pushed, published or deployed.
+# Test fixtures only: generic Helm packaging belongs to openmettle-deploy (V1-32).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  harness:
+    name: Harness guards and fixtures (no cluster)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6; resolved 2026-11-14
+        with:
+          persist-credentials: false
+      - name: Test guards and contract-derived fixtures
+        run: python3 -m unittest discover -s tests/kubernetes -v
+      - name: Lint tool installer
+        run: shellcheck tests/kubernetes/install-tools.sh
+
+  kind:
+    name: Process contract on ephemeral kind (dev)
+    needs: harness
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6; resolved 2026-11-14
+        with:
+          persist-credentials: false
+      - name: Install pinned kind and kubectl (SHA-256 verified)
+        run: bash tests/kubernetes/install-tools.sh "$RUNNER_TEMP/k8s-tools"
+      - name: Qualify process contract
+        env:
+          OPENMETTLE_K8S_QUALIFICATION: isolated-dev
+          OPENMETTLE_K8S_DOCKER_CONTEXT: default
+        run: >-
+          python3 tests/kubernetes/qualify.py
+          --tools-dir "$RUNNER_TEMP/k8s-tools"
+          --report "$RUNNER_TEMP/qualification.json"
+      - name: Publish observed results to the job summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/qualification.json" ]; then
+            { echo '```json'; cat "$RUNNER_TEMP/qualification.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
