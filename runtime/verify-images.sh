@@ -5,9 +5,15 @@ set -euo pipefail
 api=""
 worker=""
 cleanup() {
-  if [ -n "$api" ]; then docker rm -f "$api" >/dev/null; fi
-  if [ -n "$worker" ]; then docker rm -f "$worker" >/dev/null; fi
-  docker start "$POSTGRES_CONTAINER" >/dev/null
+  local status=$?
+  if [ "$status" -ne 0 ]; then
+    if [ -n "$api" ]; then docker logs "$api" >&2 || true; fi
+    if [ -n "$worker" ]; then docker logs "$worker" >&2 || true; fi
+  fi
+  if [ -n "$api" ]; then docker rm -f "$api" >/dev/null || true; fi
+  if [ -n "$worker" ]; then docker rm -f "$worker" >/dev/null || true; fi
+  docker start "$POSTGRES_CONTAINER" >/dev/null || true
+  return "$status"
 }
 trap cleanup EXIT
 wait_status() {
