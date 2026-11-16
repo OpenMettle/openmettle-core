@@ -1,6 +1,6 @@
 # OpenMettle core
 
-Rust API and workers for OpenMettle. **Bootstrap only:** the two binaries intentionally exit with configuration status 78; neither starts a server or processes work. No authentication, persistence, GPU orchestration or production endpoint is implemented yet.
+Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. No domain schema, product API, authentication or GPU orchestration is implemented. Runtime qualification and deployment acceptance remain separate gates.
 
 ## Start here
 
@@ -17,13 +17,36 @@ python3 scripts/check_repository.py
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo build --workspace --locked
+cargo test --workspace --locked
 ```
 
-API and worker remain in one workspace and can be built independently with `cargo build --bin openmettle-api` and `cargo build --bin openmettle-worker`. Add shared crates as real boundaries emerge. The initial workspace uses only the Rust standard library.
+API and worker share operational code and build independently with `cargo build --locked --bin openmettle-api` and `cargo build --locked --bin openmettle-worker`. After `cargo fetch --locked`, add `--offline` to build, Clippy and test commands. Locked resolution and digest-pinned images constrain inputs; they do not prove bit-for-bit reproducibility.
 
-## First implementation
+## Runtime
 
-V1-01 introduces actual runtime configuration, shutdown, health and packaging. V1-02 owns schema/migrations; V1-03 owns the application/event/capacity contracts. Add the version-pinned runtime dependencies in a reviewed ADR, then commit the resolved lockfile. Keep provider APIs distinct from the application API. V1-42 tracks distribution provenance.
+Read [runtime ADR 0002](docs/adr/0002-cpu-runtime.md) for dependency origins, licences, configuration bounds and shutdown behavior. Supply each process's database URI through deployment-managed environment configuration. Do not commit credentials. For an isolated local test database only:
+
+```sh
+export OPENMETTLE_API_DATABASE_URL='postgres://fixture:fixture@127.0.0.1:5432/fixture?sslmode=disable'
+cargo run --locked --bin openmettle-api
+```
+
+In another terminal, `curl --fail http://127.0.0.1:8080/healthz` returns `ok`. `/readyz` returns `ready` after a successful database query, or HTTP 503 if PostgreSQL is unavailable. Restoring PostgreSQL allows a later probe to succeed without restarting the process. No tables are created. These endpoints are operational and must not be exposed as a public product API.
+
+The worker uses `OPENMETTLE_WORKER_DATABASE_URL` and port 8081. Every setting is independent: `BIND`, `DATABASE_URL`, `DB_MAX_CONNECTIONS`, `DB_TIMEOUT_MS` and `SHUTDOWN_TIMEOUT_MS` use the corresponding `OPENMETTLE_API_` or `OPENMETTLE_WORKER_` prefix. Defaults bind loopback; containers bind all interfaces unless overridden. Send SIGTERM or SIGINT to drain and stop. Invalid configuration exits 78; runtime failures or shutdown deadline expiry exit 1. Correct configuration and restart after these errors. Database failures affect readiness, not liveness.
+
+Run the real PostgreSQL subprocess test against an isolated test database:
+
+```sh
+export TEST_DATABASE_URL='postgres://fixture:fixture@127.0.0.1:5432/fixture?sslmode=disable'
+cargo test --locked --test runtime -- --ignored
+```
+
+The normal test suite covers configuration rejection, bind failure, database timeout, liveness and shutdown without PostgreSQL. CI separately requires the PostgreSQL test, builds both Docker targets and exercises database loss/recovery and API survival after stopping the worker. Test credentials above are synthetic and must never be used for a deployment.
+
+Build separate images with `docker build --target api -t openmettle-api:test .` and `docker build --target worker -t openmettle-worker:test .`. No images are published by CI. The [process contract fixture](runtime/process-contract.json) supplies separate service-account names, resource request examples and probes for deploy. Resource sizing is unqualified; Kubernetes manifests, service accounts/RBAC and Helm qualification belong to deploy and remain acceptance gaps here.
+
+V1-02 owns schema/migrations, V1-03 owns application/event/capacity contracts, and V1-42 owns transitive provenance and distribution clearance. Supported runtime targets for this increment are Linux containers and Unix development hosts; Windows signal behavior is not implemented.
 
 The app repository consumes core APIs. The deploy repository owns generic Helm packages. Private site values and curated fork implementations stay outside this tree.
 

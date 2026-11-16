@@ -1,4 +1,6 @@
-fn main() {
-    eprintln!("openmettle-worker: bootstrap only; runtime implementation is pending V1-01");
-    std::process::exit(78);
+#[tokio::main(worker_threads = 2)]
+async fn main() -> std::process::ExitCode {
+    openmettle_core::run(openmettle_core::Role::Worker)
+        .await
+        .into()
 }

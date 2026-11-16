@@ -23,15 +23,60 @@ jobs:
         run: python3 scripts/check_repository.py
 
   rust:
-    name: Rust bootstrap
+    name: Rust runtime
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
       - name: Install pinned toolchain
         run: rustup toolchain install 1.100.0 --profile minimal --component rustfmt --component clippy
+      - run: cargo fetch --locked
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo build --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+      - run: cargo build --workspace --locked --offline
+      - run: cargo test --workspace --locked --offline
+      - name: PostgreSQL process integration
+        run: cargo test --locked --offline --test runtime -- --ignored
+        env:
+          TEST_DATABASE_URL: postgres://fixture:fixture@127.0.0.1:5432/fixture?sslmode=disable
+    services:
+      postgres:
+        image: postgres:18.1-bookworm@sha256:cc9f4143a8d2fa8cf3749d0cb4d26ecf2d53a77a2ac807e9ebd67ae22426221a
+        env:
+          POSTGRES_USER: fixture
+          POSTGRES_PASSWORD: fixture
+          POSTGRES_DB: fixture
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fixture -d fixture"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+
+  images:
+    name: CPU images and dependency recovery
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - run: docker build --target api --tag openmettle-api:test .
+      - run: docker build --target worker --tag openmettle-worker:test .
+      - name: Exercise isolated runtime images
+        run: bash runtime/verify-images.sh
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+    services:
+      postgres:
+        image: postgres:18.1-bookworm@sha256:cc9f4143a8d2fa8cf3749d0cb4d26ecf2d53a77a2ac807e9ebd67ae22426221a
+        env:
+          POSTGRES_USER: fixture
+          POSTGRES_PASSWORD: fixture
+          POSTGRES_DB: fixture
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fixture -d fixture"
+          --health-interval 2s --health-timeout 5s --health-retries 30
