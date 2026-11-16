@@ -344,7 +344,7 @@ def http_get(port: int, path: str):
 class PortForward:
     def __init__(self, kubectl_args, env, target: str, port: int):
         self.proc = subprocess.Popen(
-            [*kubectl_args, "port-forward", "--address", "127.0.0.1", target, f":{port}"],
+            [*kubectl_args, "--namespace", APP_NAMESPACE, "port-forward", "--address", "127.0.0.1", target, f":{port}"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
         lines: queue.Queue = queue.Queue()
 

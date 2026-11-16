@@ -4,11 +4,13 @@ These cover refusal paths and manifest derivation only. Passing them is not qual
 the qualification evidence is the kind run in .github/workflows/kubernetes.yml.
 """
 import copy
+import io
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -181,6 +183,22 @@ class GuardTests(unittest.TestCase):
         for config, nodes, label in cases:
             with self.assertRaises(qualify.Refusal):
                 qualify.check_cluster_identity(config, nodes, label, NAME)
+
+
+class PortForwardTests(unittest.TestCase):
+    def test_port_forward_targets_application_namespace(self):
+        proc = Mock()
+        proc.stdout = io.StringIO("Forwarding from 127.0.0.1:12345 -> 8080\n")
+        proc.poll.return_value = 0
+        args = ["kubectl", "--kubeconfig", "/tmp/fixture/config", "--context", "kind-fixture"]
+        with patch.object(qualify.subprocess, "Popen", return_value=proc) as popen:
+            forward = qualify.PortForward(args, {}, "pod/api-fixture", 8080)
+            self.assertEqual(forward.port, 12345)
+            command = popen.call_args.args[0]
+            self.assertEqual(command[:len(args)], args)
+            self.assertEqual(command[len(args):len(args) + 2], ["--namespace", qualify.APP_NAMESPACE])
+            self.assertIn("pod/api-fixture", command)
+            forward.close()
 
 
 class CleanupTests(unittest.TestCase):
