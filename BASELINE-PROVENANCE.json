@@ -1,0 +1,12 @@
+{
+  "source_page": "https://chatgpt.com/space/page_fef707d85d8c8191a14f162d6281307d",
+  "accepted_on": "2026-11-16",
+  "exported_on": "2026-11-16",
+  "source_blocks": 265,
+  "transformations": [
+    "Add document title",
+    "Replace personal repository URLs/names with neutral source aliases and preserved revisions/paths",
+    "Resolve the native workbook link through its planning archive"
+  ],
+  "maintained_baseline": "ARCHITECTURE-v1.md"
+}
