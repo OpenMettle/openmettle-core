@@ -14,6 +14,10 @@ pub(crate) struct ResponseBarrier {
 }
 impl ResponseBarrier {
     pub(crate) fn new(command: &'static [u8]) -> Self {
+        Self::nth(command, 1)
+    }
+    /// Withholds ReadyForQuery after the `occurrence`-th matching CommandComplete (1-based).
+    pub(crate) fn nth(command: &'static [u8], occurrence: usize) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let options: sqlx::postgres::PgConnectOptions = std::env::var("TEST_DATABASE_URL")
@@ -35,6 +39,7 @@ impl ResponseBarrier {
             });
             let mut reached_tx = Some(reached_tx);
             let mut selected = false;
+            let mut matched = 0;
             let result = (|| {
                 loop {
                     let mut header = [0; 5];
@@ -49,7 +54,8 @@ impl ResponseBarrier {
                     let mut body = vec![0; length - 4];
                     server.read_exact(&mut body)?;
                     if header[0] == b'C' && body == command {
-                        selected = true;
+                        matched += 1;
+                        selected |= matched == occurrence;
                     }
                     if header[0] == b'Z'
                         && selected

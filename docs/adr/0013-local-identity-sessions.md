@@ -320,7 +320,9 @@ DELETE FROM openmettle.local_sessions s USING candidates c WHERE s.id=c.id;
 ```
 
 Commit this batch before selecting login rows. Then a separate bounded transaction can remove
-expired, consumed gates that no session references:
+expired, consumed gates that no session references. For schema version 9 onward, use
+[ADR 0014's gate cleanup script](0014-login-admission.md#expired-gate-cleanup) instead; it
+also removes expired unconsumed gates and refuses invalid batches. The version-8 statement:
 
 ```sql
 WITH candidates AS (

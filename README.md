@@ -1,6 +1,6 @@
 # OpenMettle core
 
-Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures, but no `/v1` route serves it. Internal managed login, local identity approval and opaque-session primitives are implemented. No product API, upload service, request authentication, per-user authorization or GPU orchestration is exposed. Runtime qualification and deployment acceptance remain separate gates.
+Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures, but no `/v1` route serves it. Internal managed login, an owner-configured outstanding-login cap, local identity approval and opaque-session primitives are implemented. No product API, upload service, request authentication, per-user authorization or GPU orchestration is exposed. Runtime qualification and deployment acceptance remain separate gates.
 
 ## Start here
 
@@ -92,8 +92,9 @@ is no login route.
 The nonce verifier accepts stored digests without weakening the existing token checks.
 
 Deployment key loading, browser cookies, native handoff and account creation remain
-unimplemented. Internal local approval and sessions are described below. Public exposure is blocked on bounded pruning
-and rate-limit policies. After database restore, invalidate pending login transactions and
+unimplemented. Internal local approval and sessions are described below. The outstanding-login
+cap below is not a rate limit; public exposure remains blocked on request/rate/concurrency
+controls, operated cleanup and retired-key reservation reclamation. After database restore, invalidate pending login transactions and
 rotate the active login encryption key before any encryption; never resume restored logins.
 These are deployment requirements, not provided recovery commands. Lost/ambiguous logins
 restart rather than retrying single-use authorization codes.
@@ -191,6 +192,30 @@ There are no routes, cookies, native handoff, loader, tenant/group qualification
 Run the managed PostgreSQL tests only in isolated CI with the explicit module filter above;
 normal workspace tests leave them ignored. Migration 8 and authentic v7 compatibility are CI gates.
 
+## Outstanding login admission
+
+[ADR 0014](docs/adr/0014-login-admission.md) adds migration 9: one owner-configured limit on
+outstanding login rows (unexpired, no issued session, consumed or not). It is an
+outstanding-work cap, not a rate limiter, request/concurrency control or storage bound. The
+limit installs as NULL, so **every login initiation is refused until the owner sets it**; 65 536
+is an implementation ceiling, not a deployment default. The API can read and lock the row
+but not change it.
+
+Initiation first runs an advisory read-only precheck, so unconfigured, full or
+stale-authority attempts spend no nonce reservation. It then reserves a nonce as before and
+rechecks under an exclusive lock with the primary clock sampled after the wait. Concurrent,
+cancelled or refused-after-precheck attempts still spend one permanent reservation each;
+reservations keep growing by design. Begin and consume now await rollback on every returned
+error so idle connections never keep row or admission locks.
+
+Change the limit only with
+[`docs/operator/login-admission-limit.psql`](docs/operator/login-admission-limit.psql)
+(compare-and-set; lowering preserves existing rows). Remove expired, unreferenced login gates
+with [`docs/operator/login-gate-cleanup.psql`](docs/operator/login-gate-cleanup.psql)
+(batch 1–1000, `SKIP LOCKED`; never deletes nonce reservations). CI runs both scripts
+unchanged with the pinned PostgreSQL 18 `psql`. No limit, schedule or retention value is
+selected. Old version-8 replicas do not enforce the cap during a rolling upgrade.
+
 ## Schema migrations
 
 Read [ADR 0003](docs/adr/0003-schema-migrations.md) for the migration, role and ownership contract and [ADR 0004](docs/adr/0004-run-persistence.md) for run/event/operation persistence, limits and replay semantics, [ADR 0005](docs/adr/0005-artifact-storage-accounting.md) for artifact revisions, storage reservations and byte accounting, and [ADR 0006](docs/adr/0006-grant-persistence.md) for grant provenance, replay and revocation persistence. PostgreSQL 18 is the only qualified major version. Migrations in `migrations/` are embedded in the `openmettle-migrate` binary, forward-only and transactional; released migrations are never edited. Run the migrate image once per release, before rolling out new API and worker versions. Each release's migrations must remain compatible with the previous API and worker.
@@ -217,7 +242,7 @@ Storage limits are durable deployment inputs that only `openmettle_owner` sets, 
 
 Connection budget: `api_replicas × API DB_MAX_CONNECTIONS + worker_replicas × worker DB_MAX_CONNECTIONS + 1 migrator + admin/backup headroom` must not exceed `max_connections − superuser_reserved_connections − reserved_connections`. Count surge replicas during a rolling update. For example, 2 × 4 + 2 × 4 + 1 + 3 = 20. Enforce each process's share with its login role's `CONNECTION LIMIT`. These figures are illustrative, not qualified sizing.
 
-The schema tests also require `OLD_BINARY_DIR` pointing to binaries built from release `18f52463c9d6bc12dda4bd1558e4597e067018f8` and `V3_BINARY_DIR` pointing to binaries built from release `2f1be947aa933177c2e407cd7290bf9909bd08ca`; CI builds those exact archives for compatibility checks. Set `V4_BINARY_DIR` to binaries built from `d80e37819f847072dfa272bdddcc1fbee6d622ef` for migration 5 compatibility; CI builds that archive too. Set `V5_BINARY_DIR` to authentic binaries from `4a51242839e16e1d7b8ad3538887bf8e41081e6e` for migration 6 compatibility, and `V6_BINARY_DIR` to authentic binaries from `3978dff2864488bbdd9e748afd7116f39683f129` for migration 7 compatibility. Do not substitute the current binary with a truncated migration list.
+The schema tests also require `OLD_BINARY_DIR` pointing to binaries built from release `18f52463c9d6bc12dda4bd1558e4597e067018f8` and `V3_BINARY_DIR` pointing to binaries built from release `2f1be947aa933177c2e407cd7290bf9909bd08ca`; CI builds those exact archives for compatibility checks. Set `V4_BINARY_DIR` to binaries built from `d80e37819f847072dfa272bdddcc1fbee6d622ef` for migration 5 compatibility; CI builds that archive too. Set `V5_BINARY_DIR` to authentic binaries from `4a51242839e16e1d7b8ad3538887bf8e41081e6e` for migration 6 compatibility, and `V6_BINARY_DIR` to authentic binaries from `3978dff2864488bbdd9e748afd7116f39683f129` for migration 7 compatibility. `V7_BINARY_DIR` (`5ff1d2a8ed5e7424be006e78c16f0c30e784336d`) and `V8_BINARY_DIR` (`e55aff07527ad6452f8a0d49953b3fc2ffc51352`) cover migrations 8 and 9. The ADR 0014 operator-script tests also need `POSTGRES_CONTAINER`, the isolated CI PostgreSQL service container whose `psql` runs them. Do not substitute the current binary with a truncated migration list.
 
 The schema tests need a superuser on an isolated, disposable PostgreSQL 18 service. They create synthetic `openmettle_*` cluster roles with a test-only password and one database per test. Never point them at a shared server.
 

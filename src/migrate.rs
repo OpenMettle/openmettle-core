@@ -65,6 +65,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "local identity approval and sessions",
         sql: include_str!("../migrations/0008_local_identity_sessions.sql"),
     },
+    Source {
+        version: 9,
+        description: "login admission limit",
+        sql: include_str!("../migrations/0009_login_admission.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

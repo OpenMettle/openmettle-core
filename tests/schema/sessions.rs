@@ -134,7 +134,7 @@ async fn migration_eight_rollback_and_version_gated_privileges() {
     migrate::apply(&db.settings(Duration::from_secs(5)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
 }
 
 #[test]

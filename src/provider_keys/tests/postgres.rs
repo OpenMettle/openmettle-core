@@ -199,6 +199,15 @@ async fn write(owner: &mut PgConnection, revision: Option<&str>) -> i64 {
 fn keys() -> KeyRing {
     KeyRing::new(vec![("active".into(), [7; 32])]).unwrap()
 }
+/// Explicit synthetic outstanding-login limit (ADR 0014) for tests that need a successful
+/// begin. Fresh migrations keep NULL, which refuses every initiation.
+async fn admit(owner: &mut PgConnection, limit: Option<i32>) {
+    sqlx::query("UPDATE openmettle.login_admission SET outstanding_limit=$1,changed_by='fixture-owner',change_reason='synthetic test limit',changed_at=clock_timestamp() WHERE id")
+        .bind(limit)
+        .execute(owner)
+        .await
+        .unwrap();
+}
 fn locator(started: &Started) -> String {
     started.state.expose().split_once('.').unwrap().0.to_owned()
 }
@@ -227,6 +236,8 @@ impl Flow {
         let api = db.connect(API).await;
         let mut owner = db.connect(OWNER).await;
         add_provider(&mut owner, signing::ISSUER, signing::CLIENT, "v1").await;
+        // Every Flow test starts logins; admission-specific tests lower or clear this.
+        admit(&mut owner, Some(64)).await;
         Self { h, db, api, owner }
     }
     async fn begin(&mut self, p: &ManagedProvider) -> Started {
@@ -353,6 +364,7 @@ async fn begin_requires_committed_matching_authority() {
     let db = Db::new().await;
     let mut api = db.connect(API).await;
     let mut owner = db.connect(OWNER).await;
+    admit(&mut owner, Some(64)).await;
     let p = h.provider.clone();
     let refused = async |api: &mut PgConnection, why: &str| {
         assert_eq!(
@@ -614,6 +626,7 @@ async fn operator_writers_serialize_in_commit_order() {
     let mut first = db.connect(OWNER).await;
     let mut second = db.connect(OWNER).await;
     add_provider(&mut first, signing::ISSUER, signing::CLIENT, "v1").await;
+    admit(&mut first, Some(64)).await;
     for (held, waiting, active) in [(None, Some("v1"), true), (Some("v1"), None, false)] {
         let held_epoch = open_write(&mut first, held).await;
         let blocked = async {
@@ -735,4 +748,5 @@ async fn operator_writers_serialize_in_commit_order() {
     );
 }
 
+mod admission;
 mod sessions;

@@ -1,0 +1,24 @@
+-- ADR 0014: set, raise, lower or clear the outstanding-login limit (schema version 9+).
+-- Run against the primary as openmettle_owner under deployment change control. Supply every
+-- variable: expected_limit (current value, empty when unset), limit (1-65536, or empty to
+-- refuse all new initiation), actor and reason (synthetic operator identifiers only).
+-- A stale expectation or invalid value rolls back and exits non-zero; existing rows remain.
+\set ON_ERROR_STOP on
+BEGIN;
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '5s';
+SET LOCAL synchronous_commit = on;
+SELECT outstanding_limit IS NOT DISTINCT FROM NULLIF(:'expected_limit', '')::integer
+   AND (NULLIF(:'limit', '') IS NULL
+        OR (:'limit' ~ '^[0-9]{1,5}$' AND :'limit'::integer BETWEEN 1 AND 65536)) AS expected
+  FROM openmettle.login_admission WHERE id FOR UPDATE \gset
+\if :expected
+  UPDATE openmettle.login_admission
+     SET outstanding_limit = NULLIF(:'limit', '')::integer,
+         changed_by = :'actor', change_reason = :'reason', changed_at = clock_timestamp()
+   WHERE id;
+  COMMIT;
+\else
+  ROLLBACK;
+  DO $refused$ BEGIN RAISE EXCEPTION 'operator change refused; no changes committed'; END; $refused$;
+\endif

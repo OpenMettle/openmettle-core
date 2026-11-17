@@ -58,6 +58,7 @@ async fn counts(db: &TestDb) -> (i64, i64, i64) {
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn bound_exchange_denials_rotation_and_single_use_race() {
     let db = TestDb::migrated().await;
+    db.admit(64).await;
     let p = provider("v1", true);
     let fake = fixture::FakeProvider::new();
     let start = begin(&db, &p).await;
@@ -161,6 +162,7 @@ async fn bound_exchange_denials_rotation_and_single_use_race() {
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn reservation_commit_uncertainty_and_consumption_cancellation() {
     let db = TestDb::migrated().await;
+    db.admit(64).await;
     let p = provider("v1", true);
     // COMMIT has executed but its acknowledgement never reaches the caller. No begin result,
     // no ciphertext, and no transaction row: encryption must follow the reservation ACK.
@@ -218,6 +220,7 @@ async fn reservation_commit_uncertainty_and_consumption_cancellation() {
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn expiry_is_observed_after_waiting_for_row_lock() {
     let db = TestDb::migrated().await;
+    db.admit(64).await;
     let p = provider("v1", true);
     let start = login::begin(
         &mut connect(&db.0, API).await,
@@ -268,6 +271,7 @@ async fn authenticated_row_tampering_cannot_consume_login() {
     use sha2::{Digest, Sha256};
 
     let db = TestDb::migrated().await;
+    db.admit(64).await;
     let p = provider("v1", true);
     let all_keys = KeyRing::new(vec![
         ("test-v1".into(), [7; 32]),
@@ -372,6 +376,7 @@ async fn authenticated_row_tampering_cannot_consume_login() {
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn tampering_reservations_and_role_boundaries() {
     let db = TestDb::migrated().await;
+    db.admit(64).await;
     let p = provider("v1", true);
     let start = begin(&db, &p).await;
     let id = start.state.expose().split_once('.').unwrap().0;
@@ -488,6 +493,7 @@ async fn consume_child() {
 async fn killed_consumer_rolls_back_without_releasing_permit() {
     use std::os::unix::process::ExitStatusExt;
     let db = TestDb::migrated().await;
+    db.admit(64).await;
     let p = provider("v1", true);
     for (command, spent) in [
         (b"UPDATE 1\0".as_slice(), false),
@@ -547,13 +553,14 @@ async fn migration_six_failure_rolls_back_reservations_and_retries() {
     migrate::apply(&db.settings(Duration::from_secs(5)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
 }
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn failed_begin_retains_reserved_nonce_without_partial_transaction() {
     let db = TestDb::migrated().await;
+    db.admit(64).await;
     let p = provider("v1", true);
     let mut owner = connect(&db.0, OWNER).await;
     owner
@@ -779,8 +786,11 @@ async fn migration_seven_is_atomic_and_gated_by_history() {
     migrate::apply(&db.settings(Duration::from_secs(5)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
     for table in AUTHORITY_TABLES {
         assert!(db.exists(table).await);
     }
 }
+
+#[path = "admission.rs"]
+mod admission;

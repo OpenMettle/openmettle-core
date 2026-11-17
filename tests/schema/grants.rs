@@ -631,7 +631,7 @@ async fn migration_five_failure_kill_timeout_and_concurrent_retry() {
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success(), "{}", stderr(&out));
     }
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
     assert_eq!(
         count(&db, "SELECT count(*) FROM openmettle.grant_mapping_rules").await,
         0
@@ -689,6 +689,11 @@ async fn populated_v6_upgrade_and_authentic_v6_binaries() {
 #[ignore = "isolated PostgreSQL 18 and authentic V7_BINARY_DIR required"]
 async fn populated_v7_upgrade_and_authentic_v7_binaries() {
     populated_upgrade("V7_BINARY_DIR", &[1, 2, 3, 4, 5, 6, 7], true).await;
+}
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 and authentic V8_BINARY_DIR required"]
+async fn populated_v8_upgrade_and_authentic_v8_binaries() {
+    populated_upgrade("V8_BINARY_DIR", &[1, 2, 3, 4, 5, 6, 7, 8], true).await;
 }
 // Synthetic protected-login rows written with the API role's version-6 column grants.
 async fn login_snapshot(db: &TestDb) -> Vec<String> {
@@ -817,9 +822,57 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
         api.execute("INSERT INTO openmettle.login_nonce_reservations (key_id, nonce) VALUES ('upgrade-key', decode(repeat('01', 12), 'hex'))").await.unwrap();
         api.execute("INSERT INTO openmettle.login_transactions (id,binding,expires_ms,state_hash,nonce_hash,caller_hash,key_id,nonce,ciphertext) VALUES (repeat('a', 43), 'synthetic-binding'::bytea, 1, decode(repeat('02', 32), 'hex'), decode(repeat('03', 32), 'hex'), decode(repeat('04', 32), 'hex'), 'upgrade-key', decode(repeat('01', 12), 'hex'), decode(repeat('05', 59), 'hex'))").await.unwrap();
     }
-    if versions.contains(&7) {
+    // Version 8 removed the provider provenance defaults; its writers must supply them.
+    let with_sessions = versions.contains(&8);
+    if with_sessions {
+        owner.execute("INSERT INTO openmettle.login_providers(id,issuer,client_id,changed_by,change_reason) VALUES ('00000000-0000-0000-0000-000000000007','https://upgrade.example.test','synthetic','fixture-owner','synthetic provider'); INSERT INTO openmettle.login_provider_revisions(provider_id,revision) VALUES ('00000000-0000-0000-0000-000000000007','v1')").await.unwrap();
+    } else if versions.contains(&7) {
         owner.execute("INSERT INTO openmettle.login_providers(id,issuer,client_id) VALUES ('00000000-0000-0000-0000-000000000007','https://upgrade.example.test','synthetic'); INSERT INTO openmettle.login_provider_revisions(provider_id,revision) VALUES ('00000000-0000-0000-0000-000000000007','v1')").await.unwrap();
     }
+    let session_tables = [
+        "login_providers",
+        "local_identity_approvals",
+        "local_sessions",
+    ];
+    if with_sessions {
+        // An owner approval, an issued gate and its retained session, written through the
+        // version-8 owner and API grants, plus an advanced user session generation.
+        owner.execute("INSERT INTO openmettle.local_identity_approvals(id,provider_id,identity_id,active,expires_ms,changed_by,change_reason) SELECT '00000000-0000-0000-0000-0000000000a8','00000000-0000-0000-0000-000000000007',id,true,4102444800000,'fixture-owner','synthetic approval' FROM openmettle.user_identities WHERE subject='synthetic-subject'").await.unwrap();
+        let mut api = connect(&db.0, API).await;
+        api.execute("INSERT INTO openmettle.login_nonce_reservations (key_id, nonce) VALUES ('upgrade-key', decode(repeat('06', 12), 'hex'))").await.unwrap();
+        api.execute("INSERT INTO openmettle.login_transactions (id,binding,expires_ms,state_hash,nonce_hash,caller_hash,key_id,nonce,ciphertext) VALUES (repeat('b', 43), 'synthetic-binding'::bytea, 4102444800000, decode(repeat('07', 32), 'hex'), decode(repeat('08', 32), 'hex'), decode(repeat('09', 32), 'hex'), 'upgrade-key', decode(repeat('06', 12), 'hex'), decode(repeat('05', 59), 'hex'))").await.unwrap();
+        api.execute("UPDATE openmettle.login_transactions SET consumed=true,ciphertext=NULL,session_issued=true WHERE id=repeat('b', 43)").await.unwrap();
+        api.execute("INSERT INTO openmettle.local_sessions(id,secret_hash,login_id,provider_id,identity_id,approval_id,user_id,issued_client,issued_epoch,issued_revision,provider_generation,approval_generation,user_generation,created_ms,expires_ms) SELECT repeat('s', 43),decode(repeat('0a', 32), 'hex'),repeat('b', 43),a.provider_id,a.identity_id,a.id,i.user_id,'synthetic',(SELECT max(epoch) FROM openmettle.login_provider_revisions),1,0,0,0,1,4102444800000 FROM openmettle.local_identity_approvals a JOIN openmettle.user_identities i ON i.id=a.identity_id").await.unwrap();
+        api.execute("UPDATE openmettle.users SET session_generation=1 WHERE id IN (SELECT user_id FROM openmettle.user_identities WHERE subject='synthetic-subject')").await.unwrap();
+    }
+    let session_snapshot = async || {
+        let mut c = db.admin().await;
+        let mut rows: Vec<String> = sqlx::query_scalar(
+            "SELECT id::text || ':' || session_generation FROM openmettle.users ORDER BY 1",
+        )
+        .fetch_all(&mut c)
+        .await
+        .unwrap();
+        for table in session_tables {
+            let table_rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                "SELECT to_jsonb(t)::text FROM openmettle.{table} t ORDER BY 1"
+            )))
+            .fetch_all(&mut c)
+            .await
+            .unwrap();
+            assert!(
+                !table_rows.is_empty(),
+                "upgrade fixture must populate {table}"
+            );
+            rows.extend(table_rows);
+        }
+        rows
+    };
+    let sessions_before = if with_sessions {
+        session_snapshot().await
+    } else {
+        vec![]
+    };
     let authority_before: Vec<String> = if versions.contains(&7) {
         sqlx::query_scalar("SELECT row(id,issuer,client_id,created_at)::text FROM openmettle.login_providers ORDER BY id").fetch_all(&mut owner).await.unwrap()
     } else {
@@ -844,7 +897,7 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
     migrate::apply(&db.settings(Duration::from_secs(10)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
     assert_eq!(old_domain_snapshot(&db).await, before);
     if with_grants {
         assert_eq!(grant_snapshot(&db).await, grant_before);
@@ -852,9 +905,22 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
     if with_login {
         assert_eq!(login_snapshot(&db).await, login_before);
     }
+    // Migration 9 installs only an unconfigured limit: initiation stays refused until the owner
+    // configures it, and existing login, approval and session rows are untouched.
+    let admission: (Option<i32>, String) =
+        sqlx::query_as("SELECT outstanding_limit,changed_by FROM openmettle.login_admission")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    assert_eq!(admission, (None, "migration-9".into()));
+    if with_sessions {
+        assert_eq!(session_snapshot().await, sessions_before);
+    }
     if versions.contains(&7) {
         let after: Vec<String> = sqlx::query_scalar("SELECT row(id,issuer,client_id,created_at)::text FROM openmettle.login_providers ORDER BY id").fetch_all(&mut owner).await.unwrap();
         assert_eq!(after, authority_before);
+    }
+    if versions.contains(&7) && !with_sessions {
         assert_eq!(
             count(
                 &db,
