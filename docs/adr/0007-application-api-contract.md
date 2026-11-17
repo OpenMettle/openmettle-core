@@ -231,7 +231,13 @@ Hidden entries return no result. Visible entries retain Allowed, Denied or Unkno
 independently of installation. Uninstalled entries have no readiness. Installed entries
 start unknown. Disabled entries retain unknown readiness with reason `disabled`; they
 are never offered or queried. Denied and unknown authorization also skip observation.
-Only installed, enabled, explicitly allowed entries call the observer.
+Only installed, enabled, explicitly allowed entries call the observer. This is a deliberate
+privacy boundary: a non-allowed caller receives unknown readiness, not an inference about
+provider health. The schema permits independent observations such as denied authorization
+with observed unavailable readiness; this evaluator does not produce every valid combination.
+Example reasons such as `not_observed` and `provider_unreachable` are illustrative open
+vocabulary. This evaluator emits only the reason codes described below and `disabled`;
+skipped observations for non-allowed callers carry no reason.
 
 The seam accepts bounded enum outcomes, never raw errors, URLs, credentials or user data.
 Ready, degraded and unavailable observations carry a completion `SystemTime`; unknown
@@ -253,13 +259,15 @@ checks cover unknown kinds, readiness vocabulary and API versions without Flutte
 The ignored `tests/runtime.rs` PostgreSQL test starts the real API binary and probes
 `/readyz` while the evaluator in the harness fails, is disabled or is actively pending.
 It checks timeout and cancellation cleanup, readiness afterward, and the absent product
-route. The existing CI runtime command runs it against isolated PostgreSQL. This proves
-the current separation; it does not qualify an in-process adapter or future API handler.
-There is no optional observation in the production health/readiness path.
+route. The existing CI runtime command runs it against isolated PostgreSQL. This is a
+regression guard for the current runtime. Structural inspection establishes isolation:
+there is no optional observation in the production health/readiness path. The test does not
+qualify an in-process adapter or future API handler; the first handler to host an observer
+must supply that evidence.
 
 Acceptance evidence: schemas/fixtures and compatibility are supplied by the first
-increment; dimension separation and optional failure isolation by these evaluator and
-runtime tests when passing. Policy, provisioning, validation, quota, timeout and provider
+increment; dimension separation by evaluator tests, and current optional failure isolation by
+structural separation plus passing runtime regression tests. Policy, provisioning, validation, quota, timeout and provider
 failure remain distinct contract error categories. Bounded evaluator outcomes add no
 raw diagnostic fields, but do not prove HTTP error mapping, cross-user enforcement or
 runtime redaction. Those are downstream V1-04/05 responsibilities, not circular closure
