@@ -1,6 +1,6 @@
 # OpenMettle core
 
-Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures, but no `/v1` route serves it. Internal managed login, an owner-configured outstanding-login cap, local identity approval and opaque-session primitives are implemented, with an offline check for mounted browser-auth settings that the running API does not load yet. No product API, upload service, request authentication, per-user authorization or GPU orchestration is exposed. Runtime qualification and deployment acceptance remain separate gates.
+Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures, but no `/v1` route serves it. Internal managed login, an owner-configured outstanding-login cap, local identity approval and opaque-session primitives are implemented, with an offline check for mounted browser-auth settings that the running API does not load yet, and an internal pooled browser-auth service that no process constructs yet. No product API, upload service, request authentication, per-user authorization or GPU orchestration is exposed. Runtime qualification and deployment acceptance remain separate gates.
 
 ## Start here
 
@@ -264,6 +264,40 @@ ADR 0012, and the ADR 0014 limit must be set. Keep the document, keys and bundle
 on every replica for a revision. Follow ADR 0015 for login-key rotation, provider revision
 changes and the unchanged restore requirements. `cargo test --locked --offline --lib auth_config`
 runs the loader tests without PostgreSQL or network access.
+
+## Pooled browser-auth service
+
+[ADR 0016](docs/adr/0016-pooled-browser-auth-service.md) adds `src/browser_auth.rs`, one
+internal service built from the validated settings above and a handle to the API's existing
+primary pool. It starts a login for an exactly configured provider UUID, completes a
+callback (committed consumption, one token request, session issuance from the sealed proof)
+and validates or logs out local sessions. **No process constructs it**: the API, worker and
+migrator are unchanged, `/readyz` checks the database only, and there is no route, cookie,
+CSRF handling, native handoff or rate policy.
+
+The service holds a pooled connection only while database work runs, never during a
+provider document fetch or the token request. Waiting for a connection counts against the
+existing deadlines and never extends the login's expiry or the proof's original deadline.
+Validation and logout contact no provider.
+
+A connection returns to the pool only after success or an ordinary denial whose COMMIT or
+ROLLBACK was acknowledged. After cancellation, a deadline, a panic or a `Database` or
+`Timeout` error it is closed and the pool opens a replacement. Nothing is retried; restart
+the login after any failure. Limits to plan for before exposure:
+
+- SQLx closes the connection on its own task (at most 5 seconds) and keeps the pool slot
+  counted until then.
+- Closing the socket does not interrupt PostgreSQL. A cancelled backend can keep row locks
+  until its statement ends, normally within the 2-second lock and 3-second statement
+  timeouts these transactions set.
+- A replacement can briefly coexist with the old backend, so server connections can exceed
+  `DB_MAX_CONNECTIONS` for that process. The connection budget below does not include this.
+
+ADR 0016 lists the reuse rules per error category and the evidence. Its PostgreSQL tests run
+only in isolated CI, under the existing `provider_keys::tests::postgres` filter. Locally,
+`cargo test --locked --offline --lib browser_auth` and
+`cargo test --locked --offline --lib provider_keys::tests::service` run the tests that need
+no database. Connection churn and capacity under load are unmeasured.
 
 ## Schema migrations
 

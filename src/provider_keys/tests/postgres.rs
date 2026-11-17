@@ -749,4 +749,5 @@ async fn operator_writers_serialize_in_commit_order() {
 }
 
 mod admission;
+mod pooled;
 mod sessions;

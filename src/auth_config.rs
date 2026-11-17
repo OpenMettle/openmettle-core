@@ -345,6 +345,25 @@ impl AuthConfig {
     pub fn providers(&self) -> &[ManagedProvider] {
         &self.providers
     }
+    /// Test-only assembly from parts built with fixture trust. Production state comes from
+    /// [`load`] alone.
+    #[cfg(test)]
+    pub(crate) fn fixture(
+        keys: KeyRing,
+        login_lifetime: Duration,
+        session_policy: sessions::Policy,
+        manager: ProviderManager,
+        providers: Vec<ManagedProvider>,
+    ) -> Self {
+        Self {
+            keys,
+            login_lifetime,
+            token_policy: auth::Policy::default(),
+            session_policy,
+            manager,
+            providers,
+        }
+    }
 }
 
 /// Loads and validates the document at `path` and every file it names. Offline and read-only.

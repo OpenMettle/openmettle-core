@@ -251,9 +251,10 @@ impl ProviderManager {
             return Err(Error::Capacity);
         }
         let entry = entries
-            .entry(id)
+            .entry(id.clone())
             .or_insert_with(|| {
                 Arc::new(Entry {
+                    id,
                     issuer: config.identity.binding().1.to_owned(),
                     client: config.identity.binding().2.to_owned(),
                     state: Mutex::new(State {
@@ -305,6 +306,7 @@ impl ProviderManager {
     }
 }
 struct Entry {
+    id: String,
     issuer: String,
     client: String,
     state: Mutex<State>,
@@ -599,25 +601,59 @@ impl ManagedProvider {
         }
         assertion.check(now.wall).map_err(|_| Error::Verification)
     }
+    /// The configured provider UUID this handle was registered under.
+    pub(crate) fn id(&self) -> &str {
+        &self.entry.id
+    }
+    // Begin and consume share four phases with the pooled service (ADR 0016), so neither path
+    // repeats a check. The caller-owned connection API below runs them back to back; the
+    // pooled service waits for a connection between `fresh` and `login_provider`.
+    /// Manager admission and the deadline that bounds the whole phase: preflight, any wait
+    /// for a pooled connection and the database work.
+    pub(crate) fn login_phase(&self) -> Result<(OwnedSemaphorePermit, Instant), login::Error> {
+        let admission = self.admission().map_err(|_| login::Error::Rejected)?;
+        Ok((admission, Instant::now() + self.manager.policy.deadline))
+    }
+    /// Managed preflight. It may fetch provider documents and needs no database connection.
+    pub(crate) async fn fresh(&self) -> Result<(), login::Error> {
+        self.ensure().await.map_err(|_| login::Error::Rejected)?;
+        Ok(())
+    }
+    /// Active configuration with unexpired keys inside the phase deadline. No network or
+    /// database work, so it is also the validity check after a wait and before any write.
+    pub(crate) fn login_provider(
+        &self,
+        deadline: Instant,
+    ) -> Result<Arc<login::Provider>, login::Error> {
+        let snapshot = self.snapshot().map_err(|_| login::Error::Rejected)?;
+        let config = self.config().map_err(|_| login::Error::Rejected)?;
+        if Instant::now() >= deadline {
+            return Err(login::Error::Rejected);
+        }
+        config
+            .login(&snapshot)
+            .map_err(|_| login::Error::Configuration)
+    }
+    /// After the database work: keys still fresh and the phase deadline unspent.
+    pub(crate) fn confirm(&self, deadline: Instant) -> Result<(), login::Error> {
+        self.snapshot().map_err(|_| login::Error::Rejected)?;
+        if Instant::now() >= deadline {
+            return Err(login::Error::Rejected);
+        }
+        Ok(())
+    }
     pub async fn begin(
         &self,
         connection: &mut sqlx::PgConnection,
         keys: &login::KeyRing,
         lifetime: Duration,
     ) -> Result<login::Started, login::Error> {
-        let _admission = self.admission().map_err(|_| login::Error::Rejected)?;
-        let deadline = Instant::now() + self.manager.policy.deadline;
+        let (_admission, deadline) = self.login_phase()?;
         tokio::time::timeout_at(deadline, async {
-            let snapshot = self.ensure().await.map_err(|_| login::Error::Rejected)?;
-            let config = self.config().map_err(|_| login::Error::Rejected)?;
-            let p = config
-                .login(&snapshot)
-                .map_err(|_| login::Error::Configuration)?;
+            self.fresh().await?;
+            let p = self.login_provider(deadline)?;
             let started = login::begin(connection, &p, keys, lifetime).await?;
-            self.snapshot().map_err(|_| login::Error::Rejected)?;
-            if Instant::now() >= deadline {
-                return Err(login::Error::Rejected);
-            }
+            self.confirm(deadline)?;
             Ok(started)
         })
         .await
@@ -629,19 +665,12 @@ impl ManagedProvider {
         keys: &login::KeyRing,
         callback: login::Callback<'_>,
     ) -> Result<login::ExchangePermit, login::Error> {
-        let _admission = self.admission().map_err(|_| login::Error::Rejected)?;
-        let deadline = Instant::now() + self.manager.policy.deadline;
+        let (_admission, deadline) = self.login_phase()?;
         tokio::time::timeout_at(deadline, async {
-            let snapshot = self.ensure().await.map_err(|_| login::Error::Rejected)?;
-            let config = self.config().map_err(|_| login::Error::Rejected)?;
-            let p = config
-                .login(&snapshot)
-                .map_err(|_| login::Error::Configuration)?;
+            self.fresh().await?;
+            let p = self.login_provider(deadline)?;
             let permit = login::consume(connection, p, keys, callback).await?;
-            self.snapshot().map_err(|_| login::Error::Rejected)?;
-            if Instant::now() >= deadline {
-                return Err(login::Error::Rejected);
-            }
+            self.confirm(deadline)?;
             Ok(permit)
         })
         .await
@@ -727,11 +756,38 @@ impl ManagedProvider {
         exchanged: ExchangedIdentity,
         policy: &crate::sessions::Policy,
     ) -> Result<crate::sessions::Credential, crate::sessions::Error> {
-        use crate::sessions::{self, Error as SessionError};
+        let (_admission, deadline) = self.session_phase(&exchanged, policy)?;
+        self.issue_admitted(connection, exchanged, policy, deadline)
+            .await
+    }
+    /// Handle binding, manager admission and the issuance deadline: the proof's original
+    /// exchange deadline, further limited by the session operation deadline from now. The
+    /// pooled service (ADR 0016) computes it before waiting for a connection, so a wait
+    /// never starts a new window.
+    pub(crate) fn session_phase(
+        &self,
+        exchanged: &ExchangedIdentity,
+        policy: &crate::sessions::Policy,
+    ) -> Result<(OwnedSemaphorePermit, Instant), crate::sessions::Error> {
+        use crate::sessions::Error as SessionError;
         if !Arc::ptr_eq(&self.entry, &exchanged.entry) || self.generation != exchanged.generation {
             return Err(SessionError::Rejected);
         }
-        let _admission = self.admission().map_err(|_| SessionError::Rejected)?;
+        let admission = self.admission().map_err(|_| SessionError::Rejected)?;
+        let deadline = exchanged.deadline.min(Instant::now() + policy.deadline());
+        Ok((admission, deadline))
+    }
+    /// Issuance under a held `session_phase` admission. `deadline` bounds the transaction
+    /// and the postcommit validation; the proof keeps its own original deadline in every
+    /// in-memory check.
+    pub(crate) async fn issue_admitted(
+        &self,
+        connection: &mut sqlx::PgConnection,
+        exchanged: ExchangedIdentity,
+        policy: &crate::sessions::Policy,
+        deadline: Instant,
+    ) -> Result<crate::sessions::Credential, crate::sessions::Error> {
+        use crate::sessions::{self, Error as SessionError};
         let config = self.config().map_err(|_| SessionError::Rejected)?;
         let (login, login_expiry) = exchanged.origin.as_ref().ok_or(SessionError::Rejected)?;
         let identity = exchanged.assertion.identity();
@@ -751,7 +807,7 @@ impl ManagedProvider {
                 login,
                 login_expiry: *login_expiry,
                 binding: persisted(&config.binding, exchanged.epoch),
-                deadline: exchanged.deadline,
+                deadline,
             },
             policy,
             || {
