@@ -1,6 +1,6 @@
 # OpenMettle core
 
-Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures, but no `/v1` route serves it. No product API, upload service, authentication, per-user authorization or GPU orchestration is implemented. Runtime qualification and deployment acceptance remain separate gates.
+Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures, but no `/v1` route serves it. Internal managed login, local identity approval and opaque-session primitives are implemented. No product API, upload service, request authentication, per-user authorization or GPU orchestration is exposed. Runtime qualification and deployment acceptance remain separate gates.
 
 ## Start here
 
@@ -91,8 +91,8 @@ code/challenge/client/callback binding. The production transport is described be
 is no login route.
 The nonce verifier accepts stored digests without weakening the existing token checks.
 
-Deployment key loading, browser cookies, native handoff, admission, account creation and
-application sessions remain unimplemented. Public exposure is blocked on bounded pruning
+Deployment key loading, browser cookies, native handoff and account creation remain
+unimplemented. Internal local approval and sessions are described below. Public exposure is blocked on bounded pruning
 and rate-limit policies. After database restore, invalidate pending login transactions and
 rotate the active login encryption key before any encryption; never resume restored logins.
 These are deployment requirements, not provided recovery commands. Lost/ambiguous logins
@@ -139,8 +139,8 @@ a changed configuration or a retire/restore retains cooldown and invalidates key
 expiring before cooldown ends blocks login until another refresh is allowed. Provider Age,
 short cache lifetimes and clock skew can reduce availability; qualify policy values against
 actual provider behavior. Configuration file/environment loading remains unimplemented.
-The new path provides no route, cookie, application session, admission or account
-creation. `cargo test --lib provider_keys --locked --offline` exercises isolated TLS,
+The managed provider path itself provides no route, cookie or account creation. Its sealed
+proof now has the internal local-approval/session consumer described below. `cargo test --lib provider_keys --locked --offline` exercises isolated TLS,
 rotation, cancellation, capacity and freshness behavior without PostgreSQL.
 
 ## Login provider authority
@@ -166,6 +166,30 @@ commits must survive failover; lagging standbys and asynchronous failover are un
 The database stores revisions, not full configuration: keep configuration identical across
 replicas for the same revision. `cargo test --locked --offline --lib provider_keys::tests::postgres -- --ignored`
 runs the managed PostgreSQL tests against an isolated test database only.
+
+## Local identity approval and sessions
+
+[ADR 0013](docs/adr/0013-local-identity-sessions.md) adds internal sessions for already-existing
+exact issuer/subject identities with a personal scope and owner-recorded local approval. This
+is not invitation delivery or account provisioning. `ManagedProvider::issue_session` consumes
+only its sealed online proof; an offline `VerifiedIdentity` cannot mint a session.
+
+Routine configuration/approval revisions preserve sessions. Explicit revoke, provider retirement,
+approval withdrawal and user disablement advance access generations; restoration never revives
+old sessions. Follow ADR 0013's updated owner write protocol, including the provider lock before
+epoch allocation. Validation and logout use the primary database without provider network access.
+Session context does not grant resource access; V1-05 checks remain required before exposure.
+
+Credentials are random opaque values; only domain-separated digests are stored. Lifetime,
+retained-row allowance and operation deadline are explicit bounded inputs with no deployment
+defaults. Issuance must finish before the originating login's existing expiry. A delayed commit
+can leave an undisclosed row but never returns a credential after failed final checks. Operator
+cleanup is bounded and preserves replay markers until the login gate becomes unusable. Never
+purge active-key nonce reservations as part of session cleanup.
+
+There are no routes, cookies, native handoff, loader, tenant/group qualification or reconciliation.
+Run the managed PostgreSQL tests only in isolated CI with the explicit module filter above;
+normal workspace tests leave them ignored. Migration 8 and authentic v7 compatibility are CI gates.
 
 ## Schema migrations
 

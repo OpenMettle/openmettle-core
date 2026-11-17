@@ -5,6 +5,10 @@ Refs #5; Refs #34. Independent review remains required. #5 remains open.
 Supersedes only ADR 0011's process-local registration-serial binding and its
 "identical re-registration clears keys" behaviour. Every other ADR 0011 rule stands.
 
+Migration 8 / [ADR 0013](0013-local-identity-sessions.md) adds constrained lock permission and
+separate session access generations. Use its owner revocation/retirement protocol once sessions
+are installed; the epoch allocation order and current-row checks below still apply.
+
 ## Problem
 
 ADR 0011 persisted a managed login binding that included a process-local registration
@@ -42,6 +46,11 @@ configuration under the same UUID and revision, logins begun on one fail binding
 on the other. The database does not detect that drift.
 
 ### Operator write protocol
+
+The examples and lifecycle table below describe schema version 7. For version 8 onward,
+use [ADR 0013’s complete operator procedures](0013-local-identity-sessions.md#operator-protocol):
+revocation and retirement must atomically advance the session access generation and append
+a fresh epoch. The older retirement INSERT alone does not implement session revocation.
 
 Identity values are allocated when `nextval` runs, not at commit, and aborted allocations
 leave gaps ([PostgreSQL 18, sequence functions](https://www.postgresql.org/docs/18/functions-sequence.html)).

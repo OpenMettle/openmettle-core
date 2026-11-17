@@ -91,6 +91,11 @@ jobs:
           mkdir -p "$RUNNER_TEMP/openmettle-v6"
           git archive 3978dff2864488bbdd9e748afd7116f39683f129 | tar -x -C "$RUNNER_TEMP/openmettle-v6"
           cargo build --manifest-path "$RUNNER_TEMP/openmettle-v6/Cargo.toml" --locked --offline --bins
+      - name: Build authentic version-7 release for schema compatibility
+        run: |
+          mkdir -p "$RUNNER_TEMP/openmettle-v7"
+          git archive 5ff1d2a8ed5e7424be006e78c16f0c30e784336d | tar -x -C "$RUNNER_TEMP/openmettle-v7"
+          cargo build --manifest-path "$RUNNER_TEMP/openmettle-v7/Cargo.toml" --locked --offline --bins
       - name: PostgreSQL schema, migration and role integration
         run: cargo test --locked --offline --test schema -- --ignored
         env:
@@ -98,6 +103,7 @@ jobs:
           V3_BINARY_DIR: ${{ runner.temp }}/openmettle-v3/target/debug
           V5_BINARY_DIR: ${{ runner.temp }}/openmettle-v5/target/debug
           V4_BINARY_DIR: ${{ runner.temp }}/openmettle-v4/target/debug
+          V7_BINARY_DIR: ${{ runner.temp }}/openmettle-v7/target/debug
           V6_BINARY_DIR: ${{ runner.temp }}/openmettle-v6/target/debug
           TEST_DATABASE_URL: postgres://fixture:fixture@127.0.0.1:5432/fixture?sslmode=disable
       # Explicit module filter: runs only the managed-login PostgreSQL tests, never the

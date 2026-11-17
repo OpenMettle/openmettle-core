@@ -547,7 +547,7 @@ async fn migration_six_failure_rolls_back_reservations_and_retries() {
     migrate::apply(&db.settings(Duration::from_secs(5)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8]);
 }
 
 #[tokio::test]
@@ -606,7 +606,10 @@ const AUTHORITY_TABLES: [&str; 2] = [
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn migration_seven_authority_is_operator_owned() {
-    let db = TestDb::migrated().await;
+    let db = TestDb::new().await;
+    migrate::apply(&db.settings(Duration::from_secs(5)), &MIGRATIONS[..7])
+        .await
+        .unwrap();
     let mut admin = db.admin().await;
     for table in AUTHORITY_TABLES {
         for (role, privilege, expected) in [
@@ -724,12 +727,12 @@ async fn migration_seven_authority_is_operator_owned() {
     ] {
         admin.execute(AssertSqlSafe(grant)).await.unwrap();
         assert!(matches!(
-            migrate::apply(&db.settings(Duration::from_secs(5)), MIGRATIONS).await,
+            migrate::apply(&db.settings(Duration::from_secs(5)), &MIGRATIONS[..7]).await,
             Err(Failure::Refused(_))
         ));
         admin.execute(AssertSqlSafe(revoke)).await.unwrap();
     }
-    migrate::apply(&db.settings(Duration::from_secs(5)), MIGRATIONS)
+    migrate::apply(&db.settings(Duration::from_secs(5)), &MIGRATIONS[..7])
         .await
         .unwrap();
 }
@@ -776,7 +779,7 @@ async fn migration_seven_is_atomic_and_gated_by_history() {
     migrate::apply(&db.settings(Duration::from_secs(5)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8]);
     for table in AUTHORITY_TABLES {
         assert!(db.exists(table).await);
     }
