@@ -86,6 +86,11 @@ jobs:
           mkdir -p "$RUNNER_TEMP/openmettle-v5"
           git archive 4a51242839e16e1d7b8ad3538887bf8e41081e6e | tar -x -C "$RUNNER_TEMP/openmettle-v5"
           cargo build --manifest-path "$RUNNER_TEMP/openmettle-v5/Cargo.toml" --locked --offline --bins
+      - name: Build authentic version-6 release for schema compatibility
+        run: |
+          mkdir -p "$RUNNER_TEMP/openmettle-v6"
+          git archive 3978dff2864488bbdd9e748afd7116f39683f129 | tar -x -C "$RUNNER_TEMP/openmettle-v6"
+          cargo build --manifest-path "$RUNNER_TEMP/openmettle-v6/Cargo.toml" --locked --offline --bins
       - name: PostgreSQL schema, migration and role integration
         run: cargo test --locked --offline --test schema -- --ignored
         env:
@@ -93,6 +98,13 @@ jobs:
           V3_BINARY_DIR: ${{ runner.temp }}/openmettle-v3/target/debug
           V5_BINARY_DIR: ${{ runner.temp }}/openmettle-v5/target/debug
           V4_BINARY_DIR: ${{ runner.temp }}/openmettle-v4/target/debug
+          V6_BINARY_DIR: ${{ runner.temp }}/openmettle-v6/target/debug
+          TEST_DATABASE_URL: postgres://fixture:fixture@127.0.0.1:5432/fixture?sslmode=disable
+      # Explicit module filter: runs only the managed-login PostgreSQL tests, never the
+      # ignored provider_http proxy child fixture.
+      - name: PostgreSQL managed login authority integration
+        run: cargo test --locked --offline --lib provider_keys::tests::postgres -- --ignored
+        env:
           TEST_DATABASE_URL: postgres://fixture:fixture@127.0.0.1:5432/fixture?sslmode=disable
       - name: Save Cargo dependencies and build outputs
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'

@@ -64,6 +64,8 @@ struct Script {
     metadata_cache: String,
     mode: &'static str,
     token: String,
+    // PKCE challenge from a real managed begin; None keeps the fixed fixture verifier.
+    challenge: Option<String>,
     gate: Arc<tokio::sync::Notify>,
 }
 struct Harness {
@@ -88,6 +90,7 @@ impl Harness {
             cache: "max-age=100".into(),
             metadata_cache: "max-age=100".into(),
             mode: "ok",
+            challenge: None,
             token: signing::signed(
                 &"n".repeat(43),
                 signing::ISSUER,
@@ -105,7 +108,8 @@ impl Harness {
             if !discovery && !jwks {
                 assert!(request.head.starts_with("POST /token "));
                 let params:HashMap<String,String>=openidconnect::url::form_urlencoded::parse(&request.body).into_owned().collect();
-                assert_eq!(params["code"],"synthetic-code");assert_eq!(params["code_verifier"],"v".repeat(43));assert_eq!(params["client_id"],signing::CLIENT);assert_eq!(params["redirect_uri"],signing::CALLBACK);
+                assert_eq!(params["code"],"synthetic-code");
+                match &s.challenge {Some(c)=>assert_eq!(&URL_SAFE_NO_PAD.encode(Sha256::digest(params["code_verifier"].as_bytes())),c),None=>assert_eq!(params["code_verifier"],"v".repeat(43))}assert_eq!(params["client_id"],signing::CLIENT);assert_eq!(params["redirect_uri"],signing::CALLBACK);
                 let bytes=tls::json(&serde_json::to_vec(&json!({"access_token":"synthetic-access","token_type":"Bearer","id_token":s.token})).unwrap());
                 return if s.mode=="gate-post" {tls::Reply::Gate(s.gate.clone(),bytes)} else {tls::Reply::Bytes(bytes)};
             }
@@ -186,22 +190,24 @@ impl Harness {
     fn permit(&self) -> login::ExchangePermit {
         let c = self.provider.config().unwrap();
         let s = self.provider.snapshot().unwrap();
-        login::fixture_permit(c.login(&s).unwrap())
+        login::fixture_permit(c.login(&s).unwrap(), Some(1))
     }
 }
 async fn verify(p: &ManagedProvider, token: UnverifiedIdToken) -> Result<VerifiedIdentity, Error> {
     let _slot = p.admission()?;
-    tokio::time::timeout(
-        p.manager.policy.deadline,
-        p.verify(
-            &token,
-            &nonce(),
-            &auth::Policy::default(),
-            Instant::now() + p.manager.policy.deadline,
-        ),
+    let deadline = Instant::now() + p.manager.policy.deadline;
+    let (generation, assertion) = tokio::time::timeout_at(
+        deadline,
+        p.verify(&token, &nonce(), &auth::Policy::default()),
     )
     .await
-    .map_err(|_| Error::Timeout)?
+    .map_err(|_| Error::Timeout)??;
+    p.finish(generation, assertion, deadline)
+}
+/// In-memory release only. The committed-authority read is exercised by the PostgreSQL suite.
+fn finish_in_memory(p: &ManagedProvider, e: ExchangedIdentity) -> Result<VerifiedIdentity, Error> {
+    assert!(Arc::ptr_eq(&p.entry, &e.entry) && p.generation == e.generation);
+    p.finish(e.key_generation, e.assertion, e.deadline)
 }
 fn metadata(c: &ProviderConfig) -> Value {
     json!({"issuer":c.identity.binding().1,"authorization_endpoint":c.authorization,"token_endpoint":c.token_url,"jwks_uri":c.jwks_url,"response_types_supported":["code"],"subject_types_supported":["public"],"id_token_signing_alg_values_supported":["RS256"],"token_endpoint_auth_methods_supported":["none"],"code_challenge_methods_supported":["S256"],"authorization_response_iss_parameter_supported":true})
@@ -225,10 +231,12 @@ async fn cold_start_and_one_post_with_unknown_key_refresh() {
             1799999990,
         );
     }
-    let identity = permit
+    let exchanged = permit
         .exchange_with_keys(&h.provider, &auth::Policy::default())
         .await
         .unwrap();
+    assert_eq!(format!("{exchanged:?}"), "ExchangedIdentity(..)");
+    let identity = finish_in_memory(&h.provider, exchanged).unwrap();
     assert_eq!(identity.subject(), "synthetic-subject");
     assert_eq!(h.count(), 5);
     {
@@ -478,31 +486,94 @@ async fn known_ineligible_kids_do_not_spend_refresh_budget() {
 }
 
 #[tokio::test]
-async fn expiry_and_identical_registration_preserve_cooldown_outage() {
-    for reload in [false, true] {
-        let h = Harness::new().await;
-        if !reload {
-            h.script.lock().unwrap().cache = "max-age=1".into();
-        }
-        h.provider.preflight().await.unwrap();
-        let current = if reload {
-            h.manager
-                .register(Harness::config(&h.server, &h.ca, "v1"))
-                .unwrap()
-        } else {
-            h.advance(1);
-            h.provider.clone()
-        };
-        assert_eq!(current.preflight().await, Err(Error::Cooldown));
-        assert_eq!(h.count(), 2);
-        assert!(current.snapshot().is_err());
-        h.ticks.store(2, Ordering::SeqCst);
-        h.script.lock().unwrap().cache = "max-age=100".into();
-        current.preflight().await.unwrap();
-        assert_eq!(h.count(), 4);
-    }
+async fn expiry_inside_cooldown_is_an_outage() {
+    let h = Harness::new().await;
+    h.script.lock().unwrap().cache = "max-age=1".into();
+    h.provider.preflight().await.unwrap();
+    h.advance(1);
+    assert_eq!(h.provider.preflight().await, Err(Error::Cooldown));
+    assert_eq!(h.count(), 2);
+    assert!(h.provider.snapshot().is_err());
+    h.ticks.store(2, Ordering::SeqCst);
+    h.script.lock().unwrap().cache = "max-age=100".into();
+    h.provider.preflight().await.unwrap();
+    assert_eq!(h.count(), 4);
 }
-
+#[tokio::test]
+async fn identical_registration_is_noop_and_changes_or_restores_invalidate() {
+    let h = Harness::new().await;
+    h.provider.preflight().await.unwrap();
+    let permit = h.permit();
+    // Identical reload keeps keys, handles and budget; no outage and no fetch.
+    let same = h
+        .manager
+        .register(Harness::config(&h.server, &h.ca, "v1"))
+        .unwrap();
+    assert_eq!(same.generation, h.provider.generation);
+    same.preflight().await.unwrap();
+    h.provider.preflight().await.unwrap();
+    assert!(h.verify(false).await.is_ok());
+    assert_eq!(h.count(), 2);
+    // A permit issued before the identical reload still exchanges once.
+    let exchanged = permit
+        .exchange_with_keys(&same, &auth::Policy::default())
+        .await
+        .unwrap();
+    assert!(finish_in_memory(&h.provider, exchanged).is_ok());
+    assert_eq!(h.count(), 3);
+    // Every canonical binding input change invalidates handles and keys, keeping cooldown.
+    let ca = tls::Ca::new();
+    let base = format!("https://{}:{}", tls::HOST, h.server.port);
+    let variants: Vec<Box<dyn Fn() -> ProviderConfig>> = vec![
+        Box::new(|| Harness::config(&h.server, &h.ca, "v2")),
+        Box::new(|| Harness::config(&h.server, &ca, "v1")),
+        Box::new(|| {
+            let mut c = Harness::config(&h.server, &h.ca, "v1");
+            c.discovery_url = format!("{base}/other-discovery");
+            rebind(&mut c);
+            c
+        }),
+        Box::new(|| {
+            let mut c = Harness::config(&h.server, &h.ca, "v1");
+            c.callback = "https://app.example.test/other".into();
+            rebind(&mut c);
+            c
+        }),
+        Box::new(|| {
+            let mut c = Harness::config(&h.server, &h.ca, "v1");
+            c.destination = "other".into();
+            rebind(&mut c);
+            c
+        }),
+    ];
+    let mut current = h.provider.clone();
+    for variant in variants {
+        let next = h.manager.register(variant()).unwrap();
+        assert!(next.generation > current.generation);
+        assert_eq!(current.preflight().await, Err(Error::Retired));
+        assert!(next.snapshot().is_err());
+        assert_eq!(next.preflight().await, Err(Error::Cooldown));
+        current = next;
+    }
+    // Retire then restore identical configuration is a new generation, still within budget.
+    let restored_from = h
+        .manager
+        .register(Harness::config(&h.server, &h.ca, "v1"))
+        .unwrap();
+    h.manager.retire(&restored_from).unwrap();
+    let restored = h
+        .manager
+        .register(Harness::config(&h.server, &h.ca, "v1"))
+        .unwrap();
+    assert!(restored.generation > restored_from.generation);
+    assert_eq!(restored_from.preflight().await, Err(Error::Retired));
+    assert_eq!(restored.preflight().await, Err(Error::Cooldown));
+    assert_eq!(h.count(), 3);
+}
+// Recompute the canonical binding after a test edits one input field directly.
+fn rebind(c: &mut ProviderConfig) {
+    c.binding = c.canonical_binding();
+}
 fn unknown(kid: &str) -> UnverifiedIdToken {
     let t = signing::signed(
         &"n".repeat(43),
@@ -629,10 +700,10 @@ async fn capacities_and_managed_offline_bypass_are_closed() {
         .unwrap();
     h.advance(2);
     p.preflight().await.unwrap();
-    assert_eq!(
+    assert!(matches!(
         old.exchange_with_keys(&p, &auth::Policy::default()).await,
         Err(login::Error::Rejected)
-    );
+    ));
     assert_eq!(h.count(), 4);
 }
 
@@ -1025,9 +1096,14 @@ async fn manager_registration_network_capacity_and_effective_policy_binding() {
     )
     .unwrap();
     assert!(matches!(h.manager.register(third), Err(Error::Capacity)));
+    // Identical canonical configuration (no process generation in it) is a no-op.
+    assert_eq!(old.binding, old_binding);
     let replacement = h.manager.register(raw).unwrap();
-    assert_ne!(old.binding, replacement.config().unwrap().binding);
-    assert_ne!(old_binding, replacement.config().unwrap().binding);
+    assert_eq!(replacement.generation, h.provider.generation);
+    assert!(Arc::ptr_eq(&old, &replacement.config().unwrap()));
+    assert!(h.provider.config().is_ok() && h.provider.snapshot().is_ok());
+    let changed = h.manager.register(different).unwrap();
+    assert_ne!(changed.config().unwrap().binding, old_binding);
     assert!(h.provider.config().is_err());
 }
 #[tokio::test]
@@ -1209,7 +1285,7 @@ async fn exchange_deadline_is_shared_by_post_and_following_document_wait() {
         permit.exchange_with_keys(&h.provider, &policy),
     );
     let (result, ()) = tokio::join!(exchange, control);
-    assert_eq!(result.unwrap(), Err(login::Error::Exchange));
+    assert!(matches!(result.unwrap(), Err(login::Error::Exchange)));
     assert_eq!(h.count(), 4);
     assert_eq!(h.manager.inner.callers.available_permits(), 32);
     assert_eq!(h.manager.inner.gets.available_permits(), 2);
@@ -1224,3 +1300,6 @@ async fn exchange_deadline_is_shared_by_post_and_following_document_wait() {
         1
     );
 }
+
+// Managed begin -> consume -> POST -> release against isolated CI PostgreSQL (ADR 0012).
+mod postgres;

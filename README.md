@@ -122,8 +122,8 @@ unimplemented, and no real provider has been qualified.
 [ADR 0011](docs/adr/0011-managed-provider-keys.md) adds an internal managed login path.
 Deployment supplies a keyless identity, exact discovery/JWKS and login endpoints, TLS/egress
 configuration, and explicit freshness/cooldown/deadline/capacity policy. A process-owned
-`ProviderManager` registers generation-bound handles for preflight, begin, consume and
-`ExchangePermit::exchange_with_keys`. Discovery confirms configured destinations; it never
+`ProviderManager` registers generation-bound handles for preflight, begin, consume,
+`ExchangePermit::exchange_with_keys` and `ManagedProvider::release`. Discovery confirms configured destinations; it never
 selects URLs. The existing offline APIs and POST-only transport remain available.
 
 Managed exchange sends the authorization code once, then verifies the original ID token with
@@ -134,15 +134,38 @@ S256 and RFC 9207 support, and reusable responses with explicit max-age/Date. Th
 compatibility limits, not real-provider qualification. The maintained verifier supports RSA
 through 4096 bits; the online document parser's 8192-bit ceiling does not expand that support.
 
-Configuration loading and coordinated revision lifecycle across restarts/replicas remain
-unimplemented. Keep the manager alive across requests; retirement/re-registration retains
-cooldown. A document expiring before cooldown ends blocks login until another refresh is
-allowed; even identical re-registration clears keys and can impose that outage. Provider
-Age, short cache lifetimes and clock skew can reduce availability. The future loader must
-avoid needless re-registration and qualify policy values against actual provider behavior.
+Keep the manager alive across requests. Registering identical configuration is a no-op;
+a changed configuration or a retire/restore retains cooldown and invalidates keys. A document
+expiring before cooldown ends blocks login until another refresh is allowed. Provider Age,
+short cache lifetimes and clock skew can reduce availability; qualify policy values against
+actual provider behavior. Configuration file/environment loading remains unimplemented.
 The new path provides no route, cookie, application session, admission or account
 creation. `cargo test --lib provider_keys --locked --offline` exercises isolated TLS,
 rotation, cancellation, capacity and freshness behavior without PostgreSQL.
+
+## Login provider authority
+
+[ADR 0012](docs/adr/0012-login-provider-authority.md) makes managed login depend on a durable,
+operator-owned authority in migration 7. `openmettle.login_providers` fixes each provider
+UUID to its issuer and client; `openmettle.login_provider_revisions` is an append-only log
+whose latest epoch per provider is current, with a `NULL` revision meaning retired. Only
+`openmettle_owner` writes these tables, using the locked protocol transaction in ADR 0012;
+the API can only read them. Stored logins bind the full configuration and that epoch, never a
+process counter.
+
+Begin and consume read authority inside their transactions. A managed exchange returns a sealed
+result; `ManagedProvider::release` rechecks authority in a fresh read-only transaction before
+returning an identity. Retiring or changing a revision therefore refuses pending logins and
+in-flight exchanges on every replica at their next authority read. Release linearizes at its
+read snapshot; a change committed after that snapshot is ordered after the release. After an
+upgrade the tables are empty and managed login fails closed until providers are recorded.
+
+After restoring the database, append the current revision for every provider and rotate the
+ADR 0009 login key before reopening. Authority reads must use the primary, and acknowledged
+commits must survive failover; lagging standbys and asynchronous failover are unsupported.
+The database stores revisions, not full configuration: keep configuration identical across
+replicas for the same revision. `cargo test --locked --offline --lib provider_keys::tests::postgres -- --ignored`
+runs the managed PostgreSQL tests against an isolated test database only.
 
 ## Schema migrations
 
@@ -170,7 +193,7 @@ Storage limits are durable deployment inputs that only `openmettle_owner` sets, 
 
 Connection budget: `api_replicas × API DB_MAX_CONNECTIONS + worker_replicas × worker DB_MAX_CONNECTIONS + 1 migrator + admin/backup headroom` must not exceed `max_connections − superuser_reserved_connections − reserved_connections`. Count surge replicas during a rolling update. For example, 2 × 4 + 2 × 4 + 1 + 3 = 20. Enforce each process's share with its login role's `CONNECTION LIMIT`. These figures are illustrative, not qualified sizing.
 
-The schema tests also require `OLD_BINARY_DIR` pointing to binaries built from release `18f52463c9d6bc12dda4bd1558e4597e067018f8` and `V3_BINARY_DIR` pointing to binaries built from release `2f1be947aa933177c2e407cd7290bf9909bd08ca`; CI builds those exact archives for compatibility checks. Set `V4_BINARY_DIR` to binaries built from `d80e37819f847072dfa272bdddcc1fbee6d622ef` for migration 5 compatibility; CI builds that archive too. Set `V5_BINARY_DIR` to authentic binaries from `4a51242839e16e1d7b8ad3538887bf8e41081e6e` for migration 6 compatibility. Do not substitute the current binary with a truncated migration list.
+The schema tests also require `OLD_BINARY_DIR` pointing to binaries built from release `18f52463c9d6bc12dda4bd1558e4597e067018f8` and `V3_BINARY_DIR` pointing to binaries built from release `2f1be947aa933177c2e407cd7290bf9909bd08ca`; CI builds those exact archives for compatibility checks. Set `V4_BINARY_DIR` to binaries built from `d80e37819f847072dfa272bdddcc1fbee6d622ef` for migration 5 compatibility; CI builds that archive too. Set `V5_BINARY_DIR` to authentic binaries from `4a51242839e16e1d7b8ad3538887bf8e41081e6e` for migration 6 compatibility, and `V6_BINARY_DIR` to authentic binaries from `3978dff2864488bbdd9e748afd7116f39683f129` for migration 7 compatibility. Do not substitute the current binary with a truncated migration list.
 
 The schema tests need a superuser on an isolated, disposable PostgreSQL 18 service. They create synthetic `openmettle_*` cluster roles with a test-only password and one database per test. Never point them at a shared server.
 

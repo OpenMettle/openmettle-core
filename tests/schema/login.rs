@@ -547,7 +547,7 @@ async fn migration_six_failure_rolls_back_reservations_and_retries() {
     migrate::apply(&db.settings(Duration::from_secs(5)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7]);
 }
 
 #[tokio::test]
@@ -579,4 +579,205 @@ async fn failed_begin_retains_reserved_nonce_without_partial_transaction() {
         .unwrap();
     let _start = begin(&db, &p).await;
     assert_eq!(counts(&db).await, (2, 1, 0));
+}
+
+#[test]
+fn released_login_migrations_are_frozen() {
+    use sha2::{Digest, Sha256};
+    for (sql, expected) in [
+        (
+            MIGRATIONS[5].sql,
+            "6ebaec059411b63e6b787ca7bb72de9e152809174c462c48a2173bdf7b10e078",
+        ),
+        (
+            MIGRATIONS[6].sql,
+            "42e5ef4abffbbd6023f6e65a954a6f6ebedbdbcf46439f28f64e61260280842d",
+        ),
+    ] {
+        assert_eq!(format!("{:x}", Sha256::digest(sql.as_bytes())), expected);
+    }
+}
+
+const AUTHORITY_TABLES: [&str; 2] = [
+    "openmettle.login_providers",
+    "openmettle.login_provider_revisions",
+];
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn migration_seven_authority_is_operator_owned() {
+    let db = TestDb::migrated().await;
+    let mut admin = db.admin().await;
+    for table in AUTHORITY_TABLES {
+        for (role, privilege, expected) in [
+            (API, "SELECT", true),
+            (API, "INSERT", false),
+            (API, "UPDATE", false),
+            (API, "DELETE", false),
+            (API, "TRUNCATE", false),
+            (API, "REFERENCES", false),
+            (API, "TRIGGER", false),
+            (WORKER, "SELECT", false),
+            (WORKER, "INSERT", false),
+            ("public", "SELECT", false),
+        ] {
+            let granted: bool = sqlx::query_scalar("SELECT has_table_privilege($1, $2, $3)")
+                .bind(role)
+                .bind(table)
+                .bind(privilege)
+                .fetch_one(&mut admin)
+                .await
+                .unwrap();
+            assert_eq!(granted, expected, "{role} {privilege} {table}");
+        }
+    }
+    // The identity sequence is owner-only: no application role allocates or observes epochs.
+    for role in [API, WORKER, "public"] {
+        for privilege in ["USAGE", "SELECT", "UPDATE"] {
+            let granted: bool = sqlx::query_scalar(
+                "SELECT has_sequence_privilege($1, 'openmettle.login_provider_revisions_epoch_seq', $2)",
+            )
+            .bind(role)
+            .bind(privilege)
+            .fetch_one(&mut admin)
+            .await
+            .unwrap();
+            assert!(!granted, "{role} {privilege} sequence");
+        }
+    }
+    let mut owner = connect(&db.0, OWNER).await;
+    owner
+        .execute("INSERT INTO openmettle.login_providers (id, issuer, client_id) VALUES ('0b5c6f4e-2a1d-4c3b-9e8f-7a6b5c4d3e2f', 'https://issuer.example.test/realm', 'synthetic-client')")
+        .await
+        .unwrap();
+    owner
+        .execute("INSERT INTO openmettle.login_provider_revisions (provider_id, revision) VALUES ('0b5c6f4e-2a1d-4c3b-9e8f-7a6b5c4d3e2f', 'v1'), ('0b5c6f4e-2a1d-4c3b-9e8f-7a6b5c4d3e2f', NULL)")
+        .await
+        .unwrap();
+    for (sql, code) in [
+        // Explicit epochs are refused unless the owner deliberately overrides the identity.
+        (
+            "INSERT INTO openmettle.login_provider_revisions (epoch, provider_id, revision) VALUES (99, '0b5c6f4e-2a1d-4c3b-9e8f-7a6b5c4d3e2f', 'v1')",
+            "428C9",
+        ),
+        (
+            "INSERT INTO openmettle.login_provider_revisions (provider_id, revision) VALUES ('1b5c6f4e-2a1d-4c3b-9e8f-7a6b5c4d3e2f', 'v1')",
+            "23503",
+        ),
+        (
+            "INSERT INTO openmettle.login_provider_revisions (provider_id, revision) VALUES ('0b5c6f4e-2a1d-4c3b-9e8f-7a6b5c4d3e2f', 'bad revision')",
+            "23514",
+        ),
+        (
+            "INSERT INTO openmettle.login_provider_revisions (provider_id, revision) VALUES ('0b5c6f4e-2a1d-4c3b-9e8f-7a6b5c4d3e2f', '')",
+            "23514",
+        ),
+        (
+            "INSERT INTO openmettle.login_providers (id, issuer, client_id) VALUES ('2b5c6f4e-2a1d-4c3b-9e8f-7a6b5c4d3e2f', 'https://issuer.example.test', repeat('c', 256))",
+            "23514",
+        ),
+        (
+            "INSERT INTO openmettle.login_providers (id, issuer, client_id) VALUES ('2b5c6f4e-2a1d-4c3b-9e8f-7a6b5c4d3e2f', '', 'c')",
+            "23514",
+        ),
+    ] {
+        expect_state(&mut owner, sql, code).await;
+    }
+    let mut api = connect(&db.0, API).await;
+    let visible: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM openmettle.login_provider_revisions")
+            .fetch_one(&mut api)
+            .await
+            .unwrap();
+    assert_eq!(visible, 2);
+    for sql in [
+        "INSERT INTO openmettle.login_providers (id, issuer, client_id) VALUES (gen_random_uuid(), 'https://x.example.test', 'c')",
+        "INSERT INTO openmettle.login_provider_revisions (provider_id, revision) SELECT id, 'v9' FROM openmettle.login_providers",
+        "UPDATE openmettle.login_provider_revisions SET revision = 'v1'",
+        "UPDATE openmettle.login_providers SET client_id = 'other'",
+        "DELETE FROM openmettle.login_provider_revisions",
+        "TRUNCATE openmettle.login_providers",
+        "SELECT nextval('openmettle.login_provider_revisions_epoch_seq')",
+        "SELECT last_value FROM openmettle.login_provider_revisions_epoch_seq",
+        "SELECT * FROM openmettle.login_providers FOR UPDATE",
+    ] {
+        expect_state(&mut api, sql, "42501").await;
+    }
+    let mut worker = connect(&db.0, WORKER).await;
+    for table in AUTHORITY_TABLES {
+        expect_state(&mut worker, &format!("SELECT * FROM {table}"), "42501").await;
+    }
+    // Any authority privilege beyond the contract is refused by the boundary check.
+    for (grant, revoke) in [
+        (
+            "GRANT INSERT ON openmettle.login_provider_revisions TO openmettle_api",
+            "REVOKE INSERT ON openmettle.login_provider_revisions FROM openmettle_api",
+        ),
+        (
+            "GRANT USAGE ON SEQUENCE openmettle.login_provider_revisions_epoch_seq TO openmettle_api",
+            "REVOKE USAGE ON SEQUENCE openmettle.login_provider_revisions_epoch_seq FROM openmettle_api",
+        ),
+        (
+            "GRANT SELECT ON openmettle.login_providers TO openmettle_worker",
+            "REVOKE SELECT ON openmettle.login_providers FROM openmettle_worker",
+        ),
+    ] {
+        admin.execute(AssertSqlSafe(grant)).await.unwrap();
+        assert!(matches!(
+            migrate::apply(&db.settings(Duration::from_secs(5)), MIGRATIONS).await,
+            Err(Failure::Refused(_))
+        ));
+        admin.execute(AssertSqlSafe(revoke)).await.unwrap();
+    }
+    migrate::apply(&db.settings(Duration::from_secs(5)), MIGRATIONS)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn migration_seven_is_atomic_and_gated_by_history() {
+    // Version-7 permissions are not accepted before migration 7 is recorded.
+    let early = TestDb::new().await;
+    migrate::apply(&early.settings(Duration::from_secs(5)), &MIGRATIONS[..6])
+        .await
+        .unwrap();
+    let mut owner = connect(&early.0, OWNER).await;
+    owner
+        .execute("CREATE TABLE openmettle.login_providers (id uuid); GRANT SELECT ON openmettle.login_providers TO openmettle_api")
+        .await
+        .unwrap();
+    assert!(matches!(
+        migrate::apply(&early.settings(Duration::from_secs(5)), MIGRATIONS).await,
+        Err(Failure::Refused(_))
+    ));
+    assert_eq!(early.history().await, [1, 2, 3, 4, 5, 6]);
+    // A failure inside migration 7 leaves no partial authority objects and can be retried.
+    let db = TestDb::new().await;
+    migrate::apply(&db.settings(Duration::from_secs(5)), &MIGRATIONS[..6])
+        .await
+        .unwrap();
+    let mut owner = connect(&db.0, OWNER).await;
+    owner
+        .execute("CREATE TABLE openmettle.login_provider_revisions (conflict text)")
+        .await
+        .unwrap();
+    assert!(
+        migrate::apply(&db.settings(Duration::from_secs(5)), MIGRATIONS)
+            .await
+            .is_err()
+    );
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6]);
+    assert!(!db.exists("openmettle.login_providers").await);
+    owner
+        .execute("DROP TABLE openmettle.login_provider_revisions")
+        .await
+        .unwrap();
+    migrate::apply(&db.settings(Duration::from_secs(5)), MIGRATIONS)
+        .await
+        .unwrap();
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7]);
+    for table in AUTHORITY_TABLES {
+        assert!(db.exists(table).await);
+    }
 }

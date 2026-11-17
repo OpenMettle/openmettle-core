@@ -631,7 +631,7 @@ async fn migration_five_failure_kill_timeout_and_concurrent_retry() {
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success(), "{}", stderr(&out));
     }
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7]);
     assert_eq!(
         count(&db, "SELECT count(*) FROM openmettle.grant_mapping_rules").await,
         0
@@ -679,6 +679,27 @@ async fn populated_v4_upgrade_and_authentic_v4_binaries() {
 #[ignore = "isolated PostgreSQL 18 and authentic V5_BINARY_DIR required"]
 async fn populated_v5_upgrade_and_authentic_v5_binaries() {
     populated_upgrade("V5_BINARY_DIR", &[1, 2, 3, 4, 5], true).await;
+}
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 and authentic V6_BINARY_DIR required"]
+async fn populated_v6_upgrade_and_authentic_v6_binaries() {
+    populated_upgrade("V6_BINARY_DIR", &[1, 2, 3, 4, 5, 6], true).await;
+}
+// Synthetic protected-login rows written with the API role's version-6 column grants.
+async fn login_snapshot(db: &TestDb) -> Vec<String> {
+    let mut c = db.admin().await;
+    let mut result = Vec::new();
+    for table in ["login_nonce_reservations", "login_transactions"] {
+        let rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT t::text FROM openmettle.{table} t ORDER BY t::text"
+        )))
+        .fetch_all(&mut c)
+        .await
+        .unwrap();
+        assert!(!rows.is_empty(), "upgrade fixture must populate {table}");
+        result.extend(rows);
+    }
+    result
 }
 async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool) {
     use openmettle_core::storage::{self as accounting, ReservationInput, Settlement};
@@ -785,6 +806,17 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
         grant.mapping_revision = Some(1);
         change(&db, &grant).await.unwrap();
     }
+    let with_login = versions.contains(&6);
+    if with_login {
+        let mut api = connect(&db.0, API).await;
+        api.execute("INSERT INTO openmettle.login_nonce_reservations (key_id, nonce) VALUES ('upgrade-key', decode(repeat('01', 12), 'hex'))").await.unwrap();
+        api.execute("INSERT INTO openmettle.login_transactions (id,binding,expires_ms,state_hash,nonce_hash,caller_hash,key_id,nonce,ciphertext) VALUES (repeat('a', 43), 'synthetic-binding'::bytea, 1, decode(repeat('02', 32), 'hex'), decode(repeat('03', 32), 'hex'), decode(repeat('04', 32), 'hex'), 'upgrade-key', decode(repeat('01', 12), 'hex'), decode(repeat('05', 59), 'hex'))").await.unwrap();
+    }
+    let login_before = if with_login {
+        login_snapshot(&db).await
+    } else {
+        vec![]
+    };
     let grant_before = if with_grants {
         grant_snapshot(&db).await
     } else {
@@ -799,10 +831,26 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
     migrate::apply(&db.settings(Duration::from_secs(10)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7]);
     assert_eq!(old_domain_snapshot(&db).await, before);
     if with_grants {
         assert_eq!(grant_snapshot(&db).await, grant_before);
+    }
+    if with_login {
+        assert_eq!(login_snapshot(&db).await, login_before);
+    }
+    // Migration 7 creates empty authority tables: no managed provider is active until the
+    // operator records one, so an upgraded deployment fails closed for managed login.
+    if versions.len() < MIGRATIONS.len() {
+        assert_eq!(
+            count(&db, "SELECT count(*) FROM openmettle.login_providers").await
+                + count(
+                    &db,
+                    "SELECT count(*) FROM openmettle.login_provider_revisions"
+                )
+                .await,
+            0
+        );
     }
     let kept: Vec<String> = sqlx::query_scalar(
         "SELECT t::text FROM openmettle._sqlx_migrations t WHERE version<=$1 ORDER BY version",

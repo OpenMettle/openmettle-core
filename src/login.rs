@@ -138,7 +138,8 @@ pub(crate) fn validate_definition(
     Ok(())
 }
 pub struct Provider {
-    managed_binding: Option<Vec<u8>>,
+    // Managed only: canonical full configuration binding before the durable authority epoch.
+    managed: Option<Vec<u8>>,
     trusted: TrustedProvider,
     revision: String,
     authorization: String,
@@ -164,7 +165,7 @@ impl Provider {
             return Err(Error::Configuration);
         }
         Ok(Self {
-            managed_binding: None,
+            managed: None,
             trusted,
             revision: d.revision.into(),
             authorization: d.authorization_endpoint.into(),
@@ -174,13 +175,24 @@ impl Provider {
             enabled: d.enabled,
         })
     }
-    pub(crate) fn set_managed_binding(&mut self, binding: Vec<u8>) {
-        self.managed_binding = Some(binding);
+    pub(crate) fn set_managed(&mut self, config_binding: Vec<u8>) {
+        self.managed = Some(config_binding);
+    }
+    /// The stored transaction binding. Managed providers read the committed provider authority
+    /// inside the caller's transaction (ADR 0012); offline providers keep the ADR 0009 binding.
+    async fn persisted_binding(
+        &self,
+        connection: &mut PgConnection,
+    ) -> Result<(Vec<u8>, Option<i64>), Error> {
+        let Some(config) = &self.managed else {
+            return Ok((self.binding(), None));
+        };
+        let (id, issuer, client) = self.trusted.binding();
+        let epoch =
+            crate::provider_keys::authority(connection, id, issuer, client, &self.revision).await?;
+        Ok((crate::provider_keys::persisted(config, epoch), Some(epoch)))
     }
     fn binding(&self) -> Vec<u8> {
-        if let Some(binding) = &self.managed_binding {
-            return binding.clone();
-        }
         let (id, issuer, client) = self.trusted.binding();
         identity(
             b"openmettle/login-provider/1\0",
@@ -339,7 +351,8 @@ async fn begin_inner(
     let expiry = now
         .checked_add(lifetime.as_millis() as i64)
         .ok_or(Error::Configuration)?;
-    let binding = p.binding();
+    // Managed authority is read in this transaction, after the clock statement.
+    let (binding, _) = p.persisted_binding(tx.connection()?).await?;
     let (state_hash, nonce_hash, caller_hash) = (hash(&state.0), hash(&nonce.0), hash(&caller.0));
     let context = aad(
         &id.0,
@@ -399,6 +412,8 @@ pub struct Callback<'a> {
 /// Created only after acknowledged consumption commit. Owns the code and exact provider.
 pub struct ExchangePermit {
     provider: Arc<Provider>,
+    // Managed only: the durable authority epoch committed with this consumption.
+    epoch: Option<i64>,
     code: Secret,
     verifier: Secret,
     nonce: ExpectedNonceDigest,
@@ -461,9 +476,12 @@ async fn consume_inner(
     let state: Vec<u8> = row.try_get("state_hash")?;
     let nonce: Vec<u8> = row.try_get("nonce_hash")?;
     let caller: Vec<u8> = row.try_get("caller_hash")?;
+    // Managed authority is read only after the row lock, so a waiting consumer observes
+    // provider revisions committed while it waited (ADR 0012).
+    let (expected, epoch) = p.persisted_binding(tx.connection()?).await?;
     if row.try_get::<bool, _>("consumed")?
         || now >= expiry
-        || binding != p.binding()
+        || binding != expected
         || !equal(&state, &hash(c.state))
         || !equal(&caller, &hash(c.caller_binding))
     {
@@ -497,6 +515,7 @@ async fn consume_inner(
     }
     let permit = ExchangePermit {
         provider: p,
+        epoch,
         code: Secret(c.code.into()),
         verifier: Secret(verifier.into()),
         nonce: ExpectedNonceDigest::new(nonce.try_into().map_err(|_| Error::Protection)?),
@@ -555,7 +574,7 @@ impl ExchangePermit {
     where
         C: AsyncHttpClient<'c>,
     {
-        if self.provider.managed_binding.is_some() {
+        if self.provider.managed.is_some() {
             return Err(Error::Rejected);
         }
         let provider = self.provider.clone();
@@ -565,15 +584,20 @@ impl ExchangePermit {
             .verify_digest(&token, &nonce, policy, now())
             .map_err(|_| Error::Verification)
     }
+    /// Managed exchange. The result is sealed until `ManagedProvider::release` rechecks the
+    /// committed provider authority and the in-memory configuration/key generation.
     pub async fn exchange_with_keys(
         self,
         provider: &crate::provider_keys::ManagedProvider,
         policy: &Policy,
-    ) -> Result<VerifiedIdentity, Error> {
+    ) -> Result<crate::provider_keys::ExchangedIdentity, Error> {
         provider.exchange(self, policy).await
     }
-    pub(crate) fn managed_binding(&self) -> Option<&[u8]> {
-        self.provider.managed_binding.as_deref()
+    pub(crate) fn managed_config(&self) -> Option<&[u8]> {
+        self.provider.managed.as_deref()
+    }
+    pub(crate) fn epoch(&self) -> Option<i64> {
+        self.epoch
     }
     pub(crate) async fn exchange_token<'c, C>(
         self,
@@ -635,9 +659,10 @@ impl ExchangePermit {
 #[path = "../tests/login_support/mod.rs"]
 pub(crate) mod fixture;
 #[cfg(test)]
-pub(crate) fn fixture_permit(provider: Arc<Provider>) -> ExchangePermit {
+pub(crate) fn fixture_permit(provider: Arc<Provider>, epoch: Option<i64>) -> ExchangePermit {
     ExchangePermit {
         provider,
+        epoch,
         code: Secret("synthetic-code".into()),
         verifier: Secret("v".repeat(43)),
         nonce: ExpectedNonceDigest::new(hash(&"n".repeat(43))),
@@ -672,6 +697,7 @@ mod tests {
     fn permit() -> ExchangePermit {
         ExchangePermit {
             provider: provider(),
+            epoch: None,
             code: Secret("code".into()),
             verifier: Secret("v".repeat(43)),
             nonce: ExpectedNonceDigest::new(hash(&"n".repeat(43))),
@@ -772,6 +798,7 @@ mod tests {
         let http = |request| std::future::ready(fake.exchange(request));
         let permit = ExchangePermit {
             provider: p,
+            epoch: None,
             code: Secret(code),
             verifier: Secret(verifier),
             nonce: ExpectedNonceDigest::new(hash(&nonce)),
@@ -799,6 +826,7 @@ mod tests {
             }
             let permit = ExchangePermit {
                 provider: Arc::new(p),
+                epoch: None,
                 code: Secret(code),
                 verifier: Secret(if mismatch == 0 {
                     "x".repeat(43)
@@ -879,6 +907,7 @@ mod tests {
             p.token = token;
             ExchangePermit {
                 provider: Arc::new(p),
+                epoch: None,
                 code: Secret(fake.authorize(url.as_str(), "synthetic-state")),
                 verifier: Secret(verifier.clone()),
                 nonce: ExpectedNonceDigest::new(hash(&nonce)),
