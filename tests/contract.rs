@@ -894,3 +894,69 @@ fn api_does_not_serve_contract_routes() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[tokio::test]
+async fn evaluated_capabilities_match_canonical_schema() {
+    use openmettle_core::capabilities::*;
+    use std::time::Duration;
+    let validator = validator_for("#/components/schemas/Capability");
+    for installed in [false, true] {
+        for enabled in [false, true] {
+            for authorization in [
+                Authorization::Allowed,
+                Authorization::Denied,
+                Authorization::Unknown,
+            ] {
+                for outcome in [
+                    Some(Observation::Status(Status::Ready)),
+                    Some(Observation::Status(Status::Degraded)),
+                    Some(Observation::Status(Status::Unavailable)),
+                    Some(Observation::Status(Status::Unknown)),
+                    Some(Observation::ProviderFailure),
+                    None, // A yielding observer that never completes.
+                ] {
+                    let result = evaluate(
+                        Input {
+                            installed,
+                            enabled,
+                            caller: Caller::Visible(authorization),
+                        },
+                        Duration::from_millis(1),
+                        || async {
+                            match outcome {
+                                Some(value) => value,
+                                None => std::future::pending().await,
+                            }
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    // Test projection only: production has no HTTP serializer. A fixed
+                    // canonical timestamp stands in for the actual SystemTime metadata.
+                    let mut wire = json!({"id":"synthetic.tool", "kind":"tool", "installed":result.installed, "authorization":match result.authorization { Authorization::Allowed => Some(true), Authorization::Denied => Some(false), Authorization::Unknown => None }});
+                    if let Some(r) = result.readiness {
+                        let mut readiness = json!({"state":match r.status { Status::Ready => "ready", Status::Degraded => "degraded", Status::Unavailable => "unavailable", Status::Unknown => "unknown" }});
+                        if r.observed_at.is_some() {
+                            readiness["observed_at"] = json!("2026-11-17T09:00:00.000000Z");
+                        }
+                        if let Some(reason) = r.reason {
+                            readiness["reason"] = json!(match reason {
+                                Reason::Disabled => "disabled",
+                                Reason::Timeout => "timeout",
+                                Reason::ProviderFailure => "provider_failure",
+                            });
+                        }
+                        wire["readiness"] = readiness;
+                    }
+                    assert!(validator.is_valid(&wire), "{:?}", errors(&validator, &wire));
+                    let decoded = consumer::decode_capabilities(&json!({
+                        "generated_at": "2026-11-17T09:00:00.000000Z",
+                        "capabilities": [wire],
+                    }))
+                    .unwrap();
+                    assert_eq!(decoded[0].offerable(), result.offered());
+                }
+            }
+        }
+    }
+}
