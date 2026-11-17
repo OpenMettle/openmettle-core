@@ -62,6 +62,10 @@ impl Policy {
             deadline,
         })
     }
+    /// Bound on one session operation, including any wait for a pooled connection (ADR 0016).
+    pub(crate) fn deadline(&self) -> Duration {
+        self.deadline
+    }
 }
 /// Returned only after acknowledged issuance and fresh local validation. Never log expose().
 pub struct Credential(String);
@@ -128,6 +132,10 @@ fn parse(value: &str) -> Result<(&str, [u8; 32]), Error> {
         .try_into()
         .map_err(|_| Error::Rejected)?;
     Ok((id, digest(id, &secret)))
+}
+/// Shape check alone, so a malformed credential never costs a pooled connection (ADR 0016).
+pub(crate) fn well_formed(value: &str) -> Result<(), Error> {
+    parse(value).map(|_| ())
 }
 fn matches(stored: Option<&[u8]>, supplied: &[u8; 32]) -> bool {
     let expected: [u8; 32] = stored.and_then(|v| v.try_into().ok()).unwrap_or([0; 32]);

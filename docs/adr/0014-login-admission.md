@@ -103,6 +103,7 @@ future can otherwise leave the singleton locked on an idle connection and block 
 replica's login starts until that connection is closed or its queued rollback is flushed.
 Returned ordinary errors with successful rollback do not retain that lock. This connection
 lifecycle qualification is an exposure gate; it is not supplied by the outstanding-work cap.
+[ADR 0016](0016-pooled-browser-auth-service.md) adds the pool integration and its evidence.
 
 ## Operator procedures
 

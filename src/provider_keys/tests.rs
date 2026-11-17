@@ -1303,3 +1303,4 @@ async fn exchange_deadline_is_shared_by_post_and_following_document_wait() {
 
 // Managed begin -> consume -> POST -> release against isolated CI PostgreSQL (ADR 0012).
 mod postgres;
+mod service;
