@@ -741,6 +741,84 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    /// The real TLS transport (ADR 0010) carries the library exchange to the fake provider.
+    #[tokio::test]
+    async fn real_tls_transport_exchanges_once_and_never_follows_redirects() {
+        use crate::provider_http::fixture as tls;
+        let ca = tls::Ca::new();
+        let fake = Arc::new(fixture::FakeProvider::new());
+        let relay = fake.clone();
+        let server = tls::Server::start(ca.leaf(tls::HOST, false), move |received| {
+            let request = openidconnect::http::Request::builder()
+                .method("POST")
+                .uri(fixture::TOKEN)
+                .body(received.body.clone())
+                .unwrap();
+            match relay.exchange(request) {
+                Ok(response) => tls::Reply::Bytes(tls::json(response.body())),
+                Err(_) => tls::Reply::Bytes(tls::response(
+                    400,
+                    &[("content-type", "application/json")],
+                    br#"{"error":"invalid_grant"}"#,
+                )),
+            }
+        })
+        .await;
+        let verifier = "v".repeat(43);
+        let nonce = "n".repeat(43);
+        let challenge =
+            PkceCodeChallenge::from_code_verifier_sha256(&PkceCodeVerifier::new(verifier.clone()));
+        let mut url = openidconnect::url::Url::parse(fixture::AUTH).unwrap();
+        url.query_pairs_mut().extend_pairs([
+            ("client_id", fixture::CLIENT),
+            ("redirect_uri", fixture::CALLBACK),
+            ("response_type", "code"),
+            ("scope", "openid"),
+            ("state", "synthetic-state"),
+            ("nonce", &nonce),
+            ("code_challenge_method", "S256"),
+            ("code_challenge", challenge.as_str()),
+        ]);
+        let permit = |token: String| {
+            let mut p = Arc::try_unwrap(provider()).unwrap();
+            p.token = token;
+            ExchangePermit {
+                provider: Arc::new(p),
+                code: Secret(fake.authorize(url.as_str(), "synthetic-state")),
+                verifier: Secret(verifier.clone()),
+                nonce: ExpectedNonceDigest::new(hash(&nonce)),
+            }
+        };
+        let http = tls::transport(server.port, &ca);
+        let identity = permit(tls::url(server.port))
+            .exchange(&http, &Policy::default(), fixture::now)
+            .await
+            .unwrap();
+        assert_eq!(identity.subject(), "synthetic-subject");
+        assert_eq!(server.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let target = tls::url(server.port);
+        let redirect = tls::Server::start(ca.leaf(tls::HOST, false), move |_| {
+            tls::Reply::Bytes(tls::response(307, &[("location", &target)], b""))
+        })
+        .await;
+        let http = tls::transport(redirect.port, &ca);
+        assert_eq!(
+            permit(tls::url(redirect.port))
+                .exchange(&http, &Policy::default(), fixture::now)
+                .await
+                .unwrap_err(),
+            Error::Exchange
+        );
+        assert_eq!(
+            redirect.requests.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            server.connections.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
     #[test]
     fn provider_configuration_rejects_unsafe_urls_and_unbounded_names() {
         for bad in [

@@ -42,6 +42,18 @@ serde_json = { version = "=1.0.154", default-features = false, features = ["std"
 # Decode the library-parsed public RSA modulus for its minimum-strength check (ADR 0008).
 base64 = { version = "=0.22.1", default-features = false, features = ["std"] }
 
+# Provider token transport (ADR 0010): one HTTP/1.1 request per TLS connection, driven in the
+# caller's future. hyper, hyper-util, http-body-util, rustls, rustls-native-certs and bytes were
+# already locked; tokio-rustls (github.com/rustls/tokio-rustls, MIT OR Apache-2.0) is new and
+# uses the explicit ring provider. No aws-lc-rs, HTTP/2, proxy or reqwest.
+hyper = { version = "=1.12.0", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "=0.1.21", default-features = false, features = ["tokio"] }
+http-body-util = { version = "=0.1.5", default-features = false }
+bytes = { version = "=1.12.1", default-features = false, features = ["std"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = { version = "=0.8.5", default-features = false }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
+
 # Login protection: ring (Apache-2.0 AND ISC), subtle (BSD-3-Clause), already locked.
 # Origins: github.com/briansmith/ring; github.com/dalek-cryptography/subtle.
 [dependencies.ring]
@@ -58,3 +70,5 @@ default-features = false
 jsonschema = { version = "=0.61.2", default-features = false }
 rsa = { version = "=0.9.10", default-features = false, features = ["std", "pem"] }
 rand_core = { version = "=0.6.4", default-features = false, features = ["getrandom"] }
+# ADR 0010: in-memory synthetic TLS CA and leaf certificates (github.com/rustls/rcgen, MIT OR Apache-2.0).
+rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }

@@ -4,6 +4,7 @@ pub mod capabilities;
 pub mod grants;
 pub mod login;
 pub mod migrate;
+pub mod provider_http;
 pub mod runs;
 pub mod storage;
 
