@@ -247,7 +247,10 @@ impl Flow {
     }
     /// The fixture provider issues an ID token for this login's nonce and checks its challenge.
     fn arm(&self, started: &Started) {
-        let url = openidconnect::url::Url::parse(started.authorization_url.expose()).unwrap();
+        self.arm_url(started.authorization_url.expose());
+    }
+    fn arm_url(&self, authorization_url: &str) {
+        let url = openidconnect::url::Url::parse(authorization_url).unwrap();
         let params: HashMap<String, String> = url.query_pairs().into_owned().collect();
         let mut s = self.h.script.lock().unwrap();
         s.challenge = Some(params["code_challenge"].clone());
@@ -749,5 +752,6 @@ async fn operator_writers_serialize_in_commit_order() {
 }
 
 mod admission;
+mod handoff;
 mod pooled;
 mod sessions;

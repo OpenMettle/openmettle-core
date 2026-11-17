@@ -605,6 +605,15 @@ impl ManagedProvider {
     pub(crate) fn id(&self) -> &str {
         &self.entry.id
     }
+    /// The issuer this provider UUID is fixed to.
+    pub(crate) fn issuer(&self) -> &str {
+        &self.entry.issuer
+    }
+    /// The exact registered callback of the active configuration. A retired or replaced
+    /// handle refuses.
+    pub(crate) fn callback(&self) -> Result<String, Error> {
+        Ok(self.config()?.callback.clone())
+    }
     // Begin and consume share four phases with the pooled service (ADR 0016), so neither path
     // repeats a check. The caller-owned connection API below runs them back to back; the
     // pooled service waits for a connection between `fresh` and `login_provider`.

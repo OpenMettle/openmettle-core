@@ -13,13 +13,13 @@ use sqlx::{PgPool, postgres::PgPoolOptions};
 type Backend = (i32, String);
 
 // The acquire timeout is far above every deadline under test, so a deadline always fires first.
-fn one_slot(options: PgConnectOptions) -> PgPool {
+pub(super) fn one_slot(options: PgConnectOptions) -> PgPool {
     PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(Duration::from_secs(20))
         .connect_lazy_with(options)
 }
-fn service_over(f: &Flow, pool: &PgPool) -> BrowserAuth {
+pub(super) fn service_over(f: &Flow, pool: &PgPool) -> BrowserAuth {
     service::browser_auth(
         &f.h,
         pool.clone(),
@@ -68,7 +68,7 @@ async fn gone(observer: &mut PgConnection, backend: &Backend) {
     .await
     .expect("discarded backend did not exit");
 }
-fn posts(f: &Flow) -> usize {
+pub(super) fn posts(f: &Flow) -> usize {
     let heads = f.h.server.heads.lock().unwrap();
     heads.iter().filter(|head| head.starts_with("POST")).count()
 }

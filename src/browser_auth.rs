@@ -1,9 +1,11 @@
 //! Internal managed browser-auth service over the API's primary PostgreSQL pool (ADR 0016).
 //!
 //! It joins validated settings ([`AuthConfig`], ADR 0015) to the existing managed login and
-//! session operations and owns every pooled connection those operations use. There is no
-//! route, cookie, CSRF handling, native handoff, runtime loader or rate policy here, and no
-//! running process constructs this service yet.
+//! session operations and owns every pooled connection those operations use. The service
+//! itself has no cookie or request handling; [`handoff`] holds the unmounted browser
+//! adapter (ADR 0017). There is no route, native handoff, runtime loader or rate policy,
+//! and no running process constructs this service yet.
+pub mod handoff;
 use crate::{
     auth_config::AuthConfig,
     login,
