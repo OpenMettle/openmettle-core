@@ -858,6 +858,8 @@ async fn nontransactional_migrations_are_refused() {
     for sql in [
         "CREATE TABLE openmettle.p (id int); COMMIT; CREATE TABLE openmettle.q (id int);",
         "CREATE TABLE openmettle.probe (id int); -- comment\rCOMMIT;\nSELECT 1/0;",
+        "CREATE TABLE openmettle.probe (id int); SELECT E''\n'\\''; COMMIT; --';\nSELECT 1/0;",
+        "CREATE TABLE openmettle.probe (id int); SELECT E'' -- continuation\n'\\''; COMMIT; --';\nSELECT 1/0;",
     ] {
         let committing = [Source {
             version: 1,
@@ -929,6 +931,16 @@ async fn checksum_drift_and_newer_database_are_refused() {
     assert_eq!(db.history().await, [1, 2]);
     assert!(!db.exists("openmettle.probe_three").await);
 
+    // Before version 3 exists, the release binary detects the different version-2 source.
+    let output = migrate_command(&db.url(OWNER), &[]).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("checksum mismatch"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!stderr(&output).contains(PASSWORD));
+
     migrate::apply(&settings, &[MIGRATIONS[0], PROBE_TWO, third])
         .await
         .unwrap();
@@ -940,7 +952,7 @@ async fn checksum_drift_and_newer_database_are_refused() {
     let output = migrate_command(&db.url(OWNER), &[]).output().unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(
-        stderr(&output).contains("checksum mismatch"),
+        stderr(&output).contains("database has migration 3, which this release does not contain"),
         "{}",
         stderr(&output)
     );
@@ -1165,6 +1177,26 @@ async fn unsafe_privileges_defaults_and_ownership_are_refused() {
 
     // Grants added after installation are refused on the next run.
     let rerun: Vec<(String, String, &str)> = vec![
+        (
+            "GRANT SELECT ON openmettle.user_identities TO openmettle_api WITH GRANT OPTION".into(),
+            "REVOKE GRANT OPTION FOR SELECT ON openmettle.user_identities FROM openmettle_api".into(),
+            "openmettle_api has grant option for SELECT on openmettle.user_identities",
+        ),
+        (
+            format!("GRANT CONNECT ON DATABASE {name} TO openmettle_fixture_capped WITH GRANT OPTION"),
+            format!("REVOKE GRANT OPTION FOR CONNECT ON DATABASE {name} FROM openmettle_fixture_capped"),
+            "openmettle_fixture_capped has grant option for CONNECT on the database",
+        ),
+        (
+            "GRANT USAGE ON SCHEMA openmettle TO openmettle_worker WITH GRANT OPTION".into(),
+            "REVOKE GRANT OPTION FOR USAGE ON SCHEMA openmettle FROM openmettle_worker".into(),
+            "openmettle_worker has grant option for USAGE on schema openmettle",
+        ),
+        (
+            "GRANT UPDATE (disabled_at) ON openmettle.users TO openmettle_api WITH GRANT OPTION".into(),
+            "REVOKE GRANT OPTION FOR UPDATE (disabled_at) ON openmettle.users FROM openmettle_api".into(),
+            "openmettle_api has grant option for UPDATE on openmettle.users.disabled_at",
+        ),
         (
             "GRANT DELETE ON openmettle.users TO openmettle_api".into(),
             "REVOKE DELETE ON openmettle.users FROM openmettle_api".into(),

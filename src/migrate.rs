@@ -194,7 +194,8 @@ fn is_space(byte: u8) -> bool {
 /// itself rejects statements that cannot run inside a transaction block, such as
 /// `CREATE INDEX CONCURRENTLY` or `VACUUM`. This lexical check fails closed: SQL-standard
 /// `BEGIN ATOMIC` bodies are refused; use dollar-quoted bodies instead. The check models
-/// `standard_conforming_strings = on`, which `apply` sets before every migration.
+/// `standard_conforming_strings = on`, which `apply` sets before every migration. Adjacent
+/// string literals (including newline/comment continuations) are refused; use one literal.
 pub fn check_transactional(sql: &str) -> Result<(), &'static str> {
     const REFUSED: &str = "transaction control statements are not permitted in migrations";
     if sql.trim_start().starts_with("-- no-transaction") {
@@ -203,6 +204,7 @@ pub fn check_transactional(sql: &str) -> Result<(), &'static str> {
     let b = sql.as_bytes();
     let mut i = 0;
     let mut statement_start = true;
+    let mut previous_string = false;
     while i < b.len() {
         let c = b[i];
         if c == b'-' && b.get(i + 1) == Some(&b'-') {
@@ -232,6 +234,7 @@ pub fn check_transactional(sql: &str) -> Result<(), &'static str> {
             continue;
         }
         if c == b';' {
+            previous_string = false;
             statement_start = true;
             i += 1;
             continue;
@@ -240,6 +243,12 @@ pub fn check_transactional(sql: &str) -> Result<(), &'static str> {
             i += 1;
             continue;
         }
+        // PostgreSQL retains E-string escape mode across string continuations. Refuse
+        // adjacent literals instead of trying to duplicate that contextual lexer rule.
+        if previous_string && c == b'\'' {
+            return Err("adjacent string literals are not permitted in migrations");
+        }
+        previous_string = false;
         let first = std::mem::replace(&mut statement_start, false);
         if is_word(c) {
             let start = i;
@@ -263,6 +272,7 @@ pub fn check_transactional(sql: &str) -> Result<(), &'static str> {
                     && matches!(b[i - 1], b'E' | b'e')
                     && (i == 1 || !(is_word(b[i - 2]) || b[i - 2] == b'$'));
                 i = skip_quoted(b, i, b'\'', escapes)?;
+                previous_string = true;
             }
             b'"' => i = skip_quoted(b, i, b'"', false)?,
             b'$' => {
@@ -492,6 +502,18 @@ mod tests {
         ] {
             assert!(check_transactional(sql).is_err(), "accepted: {sql}");
         }
+    }
+
+    #[test]
+    fn refuses_string_continuations() {
+        for separator in ["\n", "\r\n", " -- continuation\n", " /* continuation */\n"] {
+            let sql = format!(
+                "CREATE TABLE openmettle.probe (id int); SELECT E''{separator}'\\''; COMMIT; --';\nSELECT 1 / 0;"
+            );
+            assert!(check_transactional(&sql).is_err(), "accepted: {sql}");
+        }
+        assert!(check_transactional("SELECT 'one'\n 'two'").is_err());
+        assert_eq!(check_transactional("SELECT E'one' || 'two'"), Ok(()));
     }
 
     #[test]

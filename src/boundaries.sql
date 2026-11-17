@@ -53,27 +53,27 @@ user_schemas AS (
       AND nspname NOT LIKE 'pg\_toast%'
       AND nspname NOT LIKE 'pg\_temp\_%'
 ),
-grants (target, kind, schema_name, object_name, column_name, grantee, privilege) AS (
+grants (target, kind, schema_name, object_name, column_name, grantee, privilege, is_grantable) AS (
     SELECT 'the database', 'database', NULL::name, NULL::name, NULL::name,
-           a.grantee, a.privilege_type
+           a.grantee, a.privilege_type, a.is_grantable
     FROM pg_database AS d,
          aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) AS a
     WHERE d.datname = current_database()
     UNION ALL
     SELECT 'schema ' || s.nspname, 'schema', s.nspname, NULL, NULL,
-           a.grantee, a.privilege_type
+           a.grantee, a.privilege_type, a.is_grantable
     FROM user_schemas AS s,
          aclexplode(coalesce(s.nspacl, acldefault('n', s.nspowner))) AS a
     UNION ALL
     SELECT s.nspname || '.' || c.relname, 'relation', s.nspname, c.relname, NULL,
-           a.grantee, a.privilege_type
+           a.grantee, a.privilege_type, a.is_grantable
     FROM pg_class AS c
     JOIN user_schemas AS s ON s.oid = c.relnamespace,
          aclexplode(coalesce(c.relacl, acldefault(
              CASE c.relkind WHEN 'S' THEN 's'::"char" ELSE 'r'::"char" END, c.relowner))) AS a
     UNION ALL
     SELECT s.nspname || '.' || c.relname || '.' || t.attname, 'column', s.nspname, c.relname,
-           t.attname, a.grantee, a.privilege_type
+           t.attname, a.grantee, a.privilege_type, a.is_grantable
     FROM pg_attribute AS t
     JOIN pg_class AS c ON c.oid = t.attrelid
     JOIN user_schemas AS s ON s.oid = c.relnamespace,
@@ -81,7 +81,7 @@ grants (target, kind, schema_name, object_name, column_name, grantee, privilege)
     WHERE t.attnum > 0 AND NOT t.attisdropped AND t.attacl IS NOT NULL
     UNION ALL
     SELECT 'function ' || p.oid::regprocedure::text, 'function', s.nspname, p.proname, NULL,
-           a.grantee, a.privilege_type
+           a.grantee, a.privilege_type, a.is_grantable
     FROM pg_proc AS p
     JOIN user_schemas AS s ON s.oid = p.pronamespace,
          aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) AS a
@@ -146,6 +146,13 @@ violations (violation) AS (
                AND (g.object_name::text, g.column_name::text,
                     pg_get_userbyid(g.grantee)::text, g.privilege)
                    IN (SELECT relation, attribute, role, privilege FROM column_contract))
+    UNION ALL
+    -- Even permitted privileges must not be delegable to another application principal.
+    SELECT format('%s has grant option for %s on %s',
+                  CASE g.grantee WHEN 0 THEN 'PUBLIC' ELSE pg_get_userbyid(g.grantee) END,
+                  g.privilege, g.target)
+    FROM grants AS g
+    WHERE g.grantee IN (SELECT oid FROM principals) AND g.is_grantable
     UNION ALL
     -- Default privileges would grant future migration objects outside the contract.
     SELECT format('default privileges of openmettle_owner%s grant %s on new %s to %s',
