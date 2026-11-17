@@ -2,10 +2,10 @@
 //!
 //! One strict, versioned JSON document and the files it names become validated in-memory state
 //! through the existing constructors. Loading performs no network, DNS, database or listener
-//! work, reads no environment variable for settings or secrets, and never creates a file or
-//! changes a permission. Success proves only that these local files are acceptable to this
-//! build. Provider reachability, durable authority (ADR 0012) and agreement between replicas
-//! are not checked, and nothing in the running API consumes this state yet.
+//! work. Settings and login secrets come from the deployment files. Native trust follows
+//! ADR 0010 and honors `SSL_CERT_FILE` and `SSL_CERT_DIR`. Success validates local inputs
+//! for this build. Provider reachability, durable authority (ADR 0012) and agreement between
+//! replicas require separate checks.
 use crate::{
     auth::{self, ProviderIdentity},
     login::{self, KeyRing},
@@ -439,9 +439,9 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
     })
 }
 
-/// `openmettle-api` with arguments: exactly `--check-auth-config PATH`. Prints [`VALID`] and
-/// returns 0, or prints one fixed category and returns 78. Any other argument list is refused
-/// the same way, so a mistyped check never falls through to serving.
+/// `openmettle-api` with arguments accepts exactly `--check-auth-config PATH`.
+/// Returns 0 after writing [`VALID`], 1 if that write fails, or 78 with a fixed diagnostic
+/// for invalid settings or arguments.
 pub fn check_command(arguments: &[OsString]) -> u8 {
     let path = match arguments {
         [flag, path] if flag == "--check-auth-config" => path,

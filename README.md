@@ -226,18 +226,20 @@ loader for mounted browser-auth settings, and one API argument form that runs it
 openmettle-api --check-auth-config /etc/openmettle/auth/auth.json
 ```
 
-Exit 0 prints `auth configuration valid (local files only)`. Exit 78 prints
-`auth configuration error:` and one fixed category, with no path, value, URL or parser text.
-Any other argument list also exits 78. The check needs no `DATABASE_URL`, opens no listener and
-makes no DNS, provider or database request. Run it in the API image, with the mounts and
-environment the API will use, before installing changed settings.
+Use the exit status to check the result. Exit 0 indicates success and writes
+`auth configuration valid (local files only)` to stdout. A write error returns 1.
+Invalid configuration returns 78 with `auth configuration error:` and one fixed category.
+Invalid arguments also return 78. The check needs no `DATABASE_URL`, opens no listener and
+makes no DNS, provider or database request. Run it in the API image with the mounts and
+environment the API will use before installing changed settings.
 
 Starting the API without arguments is unchanged and loads none of these files. The worker and
 migrator never read them. Nothing consumes the settings at runtime yet, and there is no live
 reload.
 
-The check reads one version-1 JSON document and the files it names. ADR 0015 gives the full
-shape with synthetic values. In summary:
+The check reads one version-1 JSON document and the files it names. Native trust also loads
+platform roots and honors `SSL_CERT_FILE` and `SSL_CERT_DIR` under ADR 0010. ADR 0015 gives
+the full document shape with synthetic values.
 
 - Every setting is required, with its unit in the field name. There are no defaults, and no
   operational value is selected. Unknown, repeated, missing or mistyped fields are refused in

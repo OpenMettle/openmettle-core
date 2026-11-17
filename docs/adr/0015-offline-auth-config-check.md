@@ -21,13 +21,15 @@ openmettle-api --check-auth-config /etc/openmettle/auth/auth.json
 
 | Outcome | Exit | Output |
 | --- | --- | --- |
-| Every file is acceptable | 0 | stdout: `auth configuration valid (local files only)` |
+| Validation succeeds and the success line is written | 0 | stdout: `auth configuration valid (local files only)` |
+| Writing the success line fails | 1 | No success line guaranteed |
 | A file or value is refused | 78 | stderr: `auth configuration error: ` and one fixed category |
 | Any other argument list | 78 | stderr: `usage error: expected no arguments or --check-auth-config PATH` |
 
-The check runs before the async runtime starts. It reads no `OPENMETTLE_*` setting, needs no
-`DATABASE_URL`, opens no listener and makes no DNS, HTTP or database request. It never
-creates a file, changes a permission or generates a key.
+Use the exit status to check the result. The check runs before the async runtime starts.
+It reads no `OPENMETTLE_*` setting, needs no `DATABASE_URL`, opens no listener and makes no
+DNS, HTTP or database request. Native trust follows ADR 0010, including `SSL_CERT_FILE`
+and `SSL_CERT_DIR`. The check never creates a file, changes a permission or generates a key.
 
 Starting the API without arguments is unchanged: it serves `/healthz` and `/readyz` and
 loads no auth file. **Nothing in the running API consumes these settings yet**, and there is
