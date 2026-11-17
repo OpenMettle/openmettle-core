@@ -163,8 +163,10 @@ queued work and external dispatch need V1-05 checks at their own defined boundar
 
 Run these blocks as psql scripts with `ON_ERROR_STOP` against the primary as
 `openmettle_owner`, under deployment change controls. Supply every named variable explicitly.
-Do not continue after an error. A failed expectation rolls back; read current state and review
-it before retrying the complete transaction. Operator changes use bounded transactions and
+Do not continue after an error. A failed expectation rolls back and raises an explicit SQL
+exception; [psql `ON_ERROR_STOP`](https://www.postgresql.org/docs/18/app-psql.html#APP-PSQL-EXIT-STATUS)
+makes the script exit non-zero. Read current state and review it
+before retrying the complete transaction. Operator changes use bounded transactions and
 synchronous commit. Multi-row operations lock stable IDs in ascending order.
 
 ### Provider revision, revocation, retirement and restoration
@@ -206,9 +208,11 @@ SELECT :observed_generation = :expected_generation
     COMMIT;
   \else
     ROLLBACK;
+    DO $refused$ BEGIN RAISE EXCEPTION 'operator change refused; no changes committed'; END; $refused$;
   \endif
 \else
   ROLLBACK;
+  DO $refused$ BEGIN RAISE EXCEPTION 'operator change refused; no changes committed'; END; $refused$;
 \endif
 ```
 
@@ -261,6 +265,7 @@ SELECT :observed_revision = :expected_revision AND :observed_generation = :expec
   COMMIT;
 \else
   ROLLBACK;
+  DO $refused$ BEGIN RAISE EXCEPTION 'operator change refused; no changes committed'; END; $refused$;
 \endif
 ```
 
@@ -294,6 +299,7 @@ SELECT :observed_generation = :expected_generation AS expected \gset
   COMMIT;
 \else
   ROLLBACK;
+  DO $refused$ BEGIN RAISE EXCEPTION 'operator change refused; no changes committed'; END; $refused$;
 \endif
 ```
 
@@ -363,8 +369,8 @@ Claude review is a separate coordinator gate. #5 remains open; this does not com
 native login, invitation delivery, provisioning, reconciliation, recovery or #6 authorization.
 
 Observed local implementation checks: formatting, all-target Clippy with warnings denied,
-locked offline workspace build and 118 non-PostgreSQL Rust tests passed. The 90 ignored entries
-are 22 managed PostgreSQL tests, 65 schema tests, 2 process tests and the proxy child invoked
+locked offline workspace build and 119 non-PostgreSQL Rust tests passed after review corrections.
+The 96 ignored entries are 27 managed PostgreSQL tests, 66 schema tests, 2 process tests and the proxy child invoked
 by its parent. None of the PostgreSQL tests ran locally. All 52 Python tests and 180-fixture
 freshness passed. Two inventories were identical: 333 packages, 433 existing distribution
 blockers. Cargo manifests/lockfile are unchanged. An initial cache-miss compilation was
