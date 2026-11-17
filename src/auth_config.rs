@@ -25,8 +25,7 @@ use std::{
 
 /// The only accepted document version.
 pub const VERSION: u64 = 1;
-/// Document ceiling, applied before parsing. It admits the largest document the existing
-/// ceilings allow (64 providers, each within the 12 KiB binding bound).
+/// Maximum serialized document size, applied before parsing.
 pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 /// Exact length of each raw login key file.
 pub const KEY_BYTES: usize = 32;
@@ -362,11 +361,12 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
     )
     .map_err(|_| Error::TokenPolicy)?;
     let count = |value: u64| usize::try_from(value).map_err(|_| Error::RefreshPolicy);
+    let max_providers = count(document.max_providers)?;
     let refresh_policy = RefreshPolicy::new(
         Duration::from_secs(document.freshness_seconds),
         Duration::from_secs(document.cooldown_seconds),
         Duration::from_millis(document.refresh_deadline_milliseconds),
-        count(document.max_providers)?,
+        max_providers,
         count(document.max_callers)?,
         count(document.max_document_gets)?,
     )
@@ -378,15 +378,16 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
     )
     .map_err(|_| Error::SessionPolicy)?;
 
+    if !(1..=max_providers).contains(&document.providers.len()) {
+        return Err(Error::ProviderCount);
+    }
+
     let keys = KeyRing::new(key_material(
         &document.active_key,
         &document.decrypt_only_keys,
     )?)
     .map_err(|_| Error::KeyRing)?;
 
-    if document.providers.is_empty() {
-        return Err(Error::ProviderCount);
-    }
     let manager = ProviderManager::new(refresh_policy);
     let mut seen = HashSet::new();
     let mut providers = Vec::with_capacity(document.providers.len());
@@ -426,11 +427,7 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
             &ranges,
         )
         .map_err(|_| Error::Provider)?;
-        // The chosen manager policy bounds the provider count.
-        providers.push(manager.register(config).map_err(|e| match e {
-            provider_keys::Error::Capacity => Error::ProviderCount,
-            _ => Error::Provider,
-        })?);
+        providers.push(manager.register(config).map_err(|_| Error::Provider)?);
     }
     Ok(AuthConfig {
         keys,

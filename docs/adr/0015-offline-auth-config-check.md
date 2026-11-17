@@ -114,15 +114,16 @@ the document. Each entry passes through `ProviderIdentity::new`, `ProviderConfig
 `ProviderManager::register`, so the exact issuer and client rules (ADR 0008), HTTPS endpoint,
 callback, revision and destination rules (ADRs 0009–0011), the private-CIDR allowlist and
 trust-anchor rules (ADR 0010) and the 12 KiB binding bound (ADR 0011) are unchanged and live
-in one place. The document's own `max_providers` bounds the count through registration.
+in one place. The loader checks the provider count against `max_providers` before reading
+key or bundle files. Registration uses the same capacity.
 `trust.roots` is `"native"` (no other member) or `"bundle"` with one `bundle_path`. A bundle
 replaces the native roots, as before. The file lists enabled providers only; retirement is a
 database authority change (ADR 0012).
 
 ### Strictness
 
-- The document is bounded at 1 MiB **before** parsing. That admits the largest document the
-  existing ceilings allow (64 providers within the binding bound).
+- The loader applies a 1 MiB limit to the serialized JSON before parsing, including
+  whitespace and escaped characters. The provider count and binding limits also apply.
 - A repeated member name is refused at every depth, known or not, using the duplicate-refusing
   parser that ADR 0011 already applies to provider documents.
 - `version` is checked first, so a later version is reported as unsupported, not as unknown

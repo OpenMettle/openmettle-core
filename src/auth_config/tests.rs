@@ -538,9 +538,12 @@ fn providers_are_bounded_unique_and_judged_by_managed_constructors() {
     let third = other("2d7e8b60-4c3f-4e5d-9a0b-9c8d7e6f5a41");
 
     assert_eq!(fixture.with("/providers", json!([])), Error::ProviderCount);
-    // The document's own manager policy (two providers) bounds registration.
+    // Refuse excess providers before opening any referenced files.
+    let mut over_limit = fixture.document.clone();
+    over_limit["providers"] = json!([first, second, third]);
+    over_limit["login"]["keys"]["active"]["path"] = json!(fixture.dir.path("absent-key"));
     assert_eq!(
-        fixture.with("/providers", json!([first, second, third])),
+        refusal(fixture.load_bytes(over_limit.to_string().as_bytes())),
         Error::ProviderCount
     );
     assert_eq!(
