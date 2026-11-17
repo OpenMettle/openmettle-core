@@ -90,6 +90,14 @@ fn released_migrations_are_unchanged() {
             MIGRATIONS[1].sql,
             "b1bf6e677a74226d258292dc6d987158a5d81fe2fa0ba00d4e3ed1afdd0a4e5c",
         ),
+        (
+            MIGRATIONS[2].sql,
+            "1744f1ca3e4ef146e151e2c622dd7d19d02b295281db1c819d747970807111c1",
+        ),
+        (
+            MIGRATIONS[3].sql,
+            "6c4a1794d1c132739fdaf1b48706e8b2884ef51e903f0f2a979837919a8f53f3",
+        ),
     ] {
         assert_eq!(format!("{:x}", Sha256::digest(sql.as_bytes())), expected);
     }
@@ -674,7 +682,7 @@ async fn killed_migration_three_preserves_version_two() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert_eq!(db.history().await, [1, 2, 3]);
+    assert_eq!(db.history().await, [1, 2, 3, 4]);
     db.wait_no_migration_session().await;
 }
 
@@ -719,7 +727,7 @@ async fn version_three_failure_timeout_concurrent_upgrade() {
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success(), "{}", stderr(&out));
     }
-    assert_eq!(db.history().await, [1, 2, 3]);
+    assert_eq!(db.history().await, [1, 2, 3, 4]);
     db.wait_no_migration_session().await;
 }
 
@@ -920,3 +928,5 @@ async fn concurrent_observations_have_one_revision_winner() {
 
 #[path = "cancellation.rs"]
 mod cancellation;
+#[path = "storage.rs"]
+mod storage;

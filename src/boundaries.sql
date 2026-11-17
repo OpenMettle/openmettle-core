@@ -1,9 +1,8 @@
 -- Read-only database boundary check (ADR 0003). openmettle-migrate runs it before SQLx creates
 -- any schema or history object, and again after migrations. It returns one row per violation.
--- $1: whether migration 1 has been applied (it revokes the PUBLIC database/public-schema
--- defaults, which are tolerated only before that).
---
--- $2: whether migration 3 has been applied successfully.
+-- $1: the highest successfully applied migration version (0 before migration 1). Migration 1
+-- revokes the PUBLIC database/public-schema defaults, which are tolerated only before that.
+-- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_worker, every role that is directly or indirectly
 -- a member of either (for example their login roles), and PUBLIC. They may hold only the
 -- privileges in `contract`, CONNECT on the database and USAGE on schema openmettle.
@@ -55,7 +54,15 @@ contract (relation, role, privilege) AS (
         ('run_events', 'openmettle_worker', 'SELECT'), ('run_events', 'openmettle_worker', 'INSERT'),
         ('operations', 'openmettle_api', 'SELECT'),
         ('operations', 'openmettle_worker', 'SELECT')
-    ) AS durable(relation, role, privilege) WHERE $2
+    ) AS durable(relation, role, privilege) WHERE $1 >= 3
+    UNION ALL
+    SELECT relation, role, privilege FROM (VALUES
+        ('storage_instance'), ('storage_accounts'), ('artifacts'), ('storage_reservations'),
+        ('artifact_revisions')
+    ) AS storage(relation),
+    (VALUES ('openmettle_api'), ('openmettle_worker')) AS r(role),
+    (VALUES ('SELECT')) AS p(privilege)
+    WHERE $1 >= 4
 ),
 column_contract (relation, attribute, role, privilege) AS (
     VALUES ('users', 'disabled_at', 'openmettle_api', 'UPDATE')
@@ -93,7 +100,54 @@ column_contract (relation, attribute, role, privilege) AS (
         ('operations', 'observation_format', 'openmettle_worker', 'UPDATE'),
         ('operations', 'observation_version', 'openmettle_worker', 'UPDATE'),
         ('operations', 'evidence', 'openmettle_worker', 'UPDATE')
-    ) AS durable(relation, attribute, role, privilege) WHERE $2
+    ) AS durable(relation, attribute, role, privilege) WHERE $1 >= 3
+    UNION ALL
+    SELECT relation, attribute, role, privilege FROM (VALUES
+        ('storage_instance', 'active_bytes', 'UPDATE'),
+        ('storage_instance', 'retained_bytes', 'UPDATE'),
+        ('storage_instance', 'reserved_bytes', 'UPDATE'),
+        ('storage_accounts', 'active_bytes', 'UPDATE'),
+        ('storage_accounts', 'retained_bytes', 'UPDATE'),
+        ('storage_accounts', 'reserved_bytes', 'UPDATE'),
+        ('storage_accounts', 'scope_id', 'INSERT'),
+        ('artifacts', 'id', 'INSERT'),
+        ('artifacts', 'scope_id', 'INSERT'),
+        ('artifacts', 'scope_kind', 'INSERT'),
+        ('artifacts', 'owner_user_id', 'INSERT'),
+        ('artifacts', 'last_revision', 'UPDATE'),
+        ('storage_reservations', 'id', 'INSERT'),
+        ('storage_reservations', 'scope_id', 'INSERT'),
+        ('storage_reservations', 'actor_user_id', 'INSERT'),
+        ('storage_reservations', 'idempotency_key', 'INSERT'),
+        ('storage_reservations', 'artifact_id', 'INSERT'),
+        ('storage_reservations', 'max_bytes', 'INSERT'),
+        ('storage_reservations', 'run_id', 'INSERT'),
+        ('storage_reservations', 'operation_id', 'INSERT'),
+        ('storage_reservations', 'request_identity', 'INSERT'),
+        ('storage_reservations', 'request_digest', 'INSERT'),
+        ('storage_reservations', 'state', 'UPDATE'),
+        ('storage_reservations', 'settled_bytes', 'UPDATE'),
+        ('storage_reservations', 'closed_at', 'UPDATE'),
+        ('artifact_revisions', 'id', 'INSERT'),
+        ('artifact_revisions', 'scope_id', 'INSERT'),
+        ('artifact_revisions', 'artifact_id', 'INSERT'),
+        ('artifact_revisions', 'revision', 'INSERT'),
+        ('artifact_revisions', 'reservation_id', 'INSERT'),
+        ('artifact_revisions', 'size_bytes', 'INSERT'),
+        ('artifact_revisions', 'content_digest', 'INSERT'),
+        ('artifact_revisions', 'media_type', 'INSERT'),
+        ('artifact_revisions', 'created_by_user_id', 'INSERT'),
+        ('artifact_revisions', 'state', 'UPDATE')
+    ) AS storage(relation, attribute, privilege),
+    (VALUES ('openmettle_api'), ('openmettle_worker')) AS r(role)
+    WHERE $1 >= 4
+    UNION ALL
+    SELECT * FROM (VALUES
+        ('artifact_revisions', 'retained_at', 'openmettle_api', 'UPDATE'),
+        ('artifact_revisions', 'purge_after', 'openmettle_api', 'UPDATE'),
+        ('artifact_revisions', 'purging_at', 'openmettle_worker', 'UPDATE'),
+        ('artifact_revisions', 'purged_at', 'openmettle_worker', 'UPDATE')
+    ) AS retention(relation, attribute, role, privilege) WHERE $1 >= 4
 ),
 user_schemas AS (
     SELECT oid, nspname, nspowner, nspacl FROM pg_namespace
@@ -181,11 +235,11 @@ violations (violation) AS (
     FROM grants AS g
     WHERE g.grantee IN (SELECT oid FROM principals)
       AND NOT (g.kind = 'database' AND g.grantee <> 0 AND g.privilege = 'CONNECT')
-      AND NOT (g.kind = 'database' AND g.grantee = 0 AND NOT $1
+      AND NOT (g.kind = 'database' AND g.grantee = 0 AND $1 < 1
                AND g.privilege IN ('CONNECT', 'TEMPORARY'))
       AND NOT (g.kind = 'schema' AND g.schema_name = 'openmettle' AND g.privilege = 'USAGE'
                AND g.grantee IN (SELECT oid FROM privilege_roles))
-      AND NOT (g.kind = 'schema' AND g.schema_name = 'public' AND g.grantee = 0 AND NOT $1
+      AND NOT (g.kind = 'schema' AND g.schema_name = 'public' AND g.grantee = 0 AND $1 < 1
                AND g.privilege = 'USAGE')
       AND NOT (g.kind = 'relation' AND g.schema_name = 'openmettle'
                AND (g.object_name::text, pg_get_userbyid(g.grantee)::text, g.privilege)
