@@ -1,5 +1,6 @@
 //! Shared operational contract; no domain APIs or worker queue yet.
 pub mod migrate;
+pub mod runs;
 
 use axum::{Router, extract::State, http::StatusCode, routing::get};
 use sqlx::{

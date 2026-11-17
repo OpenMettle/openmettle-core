@@ -2,7 +2,7 @@
 use sqlx::{
     ConnectOptions, Connection, Executor, PgConnection, SqlSafeStr, postgres::PgConnectOptions,
 };
-use sqlx_core::migrate::{MigrateError, Migration, MigrationType, Migrator};
+use sqlx_core::migrate::{Migrate, MigrateError, Migration, MigrationType, Migrator};
 use std::{borrow::Cow, fmt, time::Duration};
 
 /// Schema that owns every OpenMettle object, including migration history.
@@ -34,6 +34,11 @@ pub const MIGRATIONS: &[Source] = &[
         version: 2,
         description: "conversations and messages",
         sql: include_str!("../migrations/0002_conversations_and_messages.sql"),
+    },
+    Source {
+        version: 3,
+        description: "runs events and operations",
+        sql: include_str!("../migrations/0003_runs_events_operations.sql"),
     },
 ];
 
@@ -379,8 +384,15 @@ async fn boundary_violations(connection: &mut PgConnection) -> Result<Vec<String
         )
         .fetch_one(&mut *connection)
         .await?;
+    let durable = history
+        && sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT FROM openmettle._sqlx_migrations WHERE version = 3 AND success)",
+        )
+        .fetch_one(&mut *connection)
+        .await?;
     sqlx::query_scalar(BOUNDARIES)
         .bind(initialized)
+        .bind(durable)
         .fetch_all(connection)
         .await
 }
@@ -389,6 +401,10 @@ async fn migrate_within_boundaries(
     migrator: &Migrator,
     connection: &mut PgConnection,
 ) -> Result<(), Failure> {
+    // Hold the same session-level advisory lock across boundary snapshots and all versions.
+    // SQLx run_to locks reentrantly and releases its own acquisition; closing our dedicated
+    // connection releases this outer acquisition on success, error or cancellation.
+    connection.lock().await.map_err(Failure::Migrate)?;
     // Refuse before SQLx creates the schema or history table, on every run.
     let violations = boundary_violations(connection)
         .await

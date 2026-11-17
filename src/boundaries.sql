@@ -3,6 +3,7 @@
 -- $1: whether migration 1 has been applied (it revokes the PUBLIC database/public-schema
 -- defaults, which are tolerated only before that).
 --
+-- $2: whether migration 3 has been applied successfully.
 -- Principals are openmettle_api, openmettle_worker, every role that is directly or indirectly
 -- a member of either (for example their login roles), and PUBLIC. They may hold only the
 -- privileges in `contract`, CONNECT on the database and USAGE on schema openmettle.
@@ -43,9 +44,56 @@ contract (relation, role, privilege) AS (
         ('conversations', 'openmettle_worker', 'SELECT'),
         ('messages', 'openmettle_worker', 'SELECT'),
         ('messages', 'openmettle_worker', 'INSERT')
+    UNION ALL
+    SELECT * FROM (VALUES
+        ('conversation_branches', 'openmettle_api', 'SELECT'),
+        ('conversation_branches', 'openmettle_api', 'INSERT'),
+        ('conversation_branches', 'openmettle_worker', 'SELECT'),
+        ('runs', 'openmettle_api', 'SELECT'),
+        ('runs', 'openmettle_worker', 'SELECT'),
+        ('run_events', 'openmettle_api', 'SELECT'), ('run_events', 'openmettle_api', 'INSERT'),
+        ('run_events', 'openmettle_worker', 'SELECT'), ('run_events', 'openmettle_worker', 'INSERT'),
+        ('operations', 'openmettle_api', 'SELECT'),
+        ('operations', 'openmettle_worker', 'SELECT')
+    ) AS durable(relation, role, privilege) WHERE $2
 ),
 column_contract (relation, attribute, role, privilege) AS (
     VALUES ('users', 'disabled_at', 'openmettle_api', 'UPDATE')
+    UNION ALL
+    SELECT * FROM (VALUES
+        ('runs', 'id', 'openmettle_api', 'INSERT'),
+        ('runs', 'scope_id', 'openmettle_api', 'INSERT'),
+        ('runs', 'actor_user_id', 'openmettle_api', 'INSERT'),
+        ('runs', 'conversation_id', 'openmettle_api', 'INSERT'),
+        ('runs', 'branch_id', 'openmettle_api', 'INSERT'),
+        ('runs', 'input_message_id', 'openmettle_api', 'INSERT'),
+        ('runs', 'idempotency_key', 'openmettle_api', 'INSERT'),
+        ('runs', 'snapshot_format', 'openmettle_api', 'INSERT'),
+        ('runs', 'snapshot_version', 'openmettle_api', 'INSERT'),
+        ('runs', 'input_snapshot', 'openmettle_api', 'INSERT'),
+        ('runs', 'config_snapshot', 'openmettle_api', 'INSERT'),
+        ('runs', 'request_identity', 'openmettle_api', 'INSERT'),
+        ('runs', 'request_digest', 'openmettle_api', 'INSERT'),
+        ('operations', 'id', 'openmettle_worker', 'INSERT'),
+        ('operations', 'scope_id', 'openmettle_worker', 'INSERT'),
+        ('operations', 'run_id', 'openmettle_worker', 'INSERT'),
+        ('operations', 'logical_key', 'openmettle_worker', 'INSERT'),
+        ('operations', 'target', 'openmettle_worker', 'INSERT'),
+        ('operations', 'capability', 'openmettle_worker', 'INSERT'),
+        ('operations', 'format', 'openmettle_worker', 'INSERT'),
+        ('operations', 'format_version', 'openmettle_worker', 'INSERT'),
+        ('operations', 'request', 'openmettle_worker', 'INSERT'),
+        ('operations', 'request_identity', 'openmettle_worker', 'INSERT'),
+        ('operations', 'request_digest', 'openmettle_worker', 'INSERT'),
+        ('runs', 'last_event_sequence', 'openmettle_api', 'UPDATE'),
+        ('runs', 'last_event_sequence', 'openmettle_worker', 'UPDATE'),
+        ('operations', 'outcome', 'openmettle_worker', 'UPDATE'),
+        ('operations', 'revision', 'openmettle_worker', 'UPDATE'),
+        ('operations', 'downstream_handle', 'openmettle_worker', 'UPDATE'),
+        ('operations', 'observation_format', 'openmettle_worker', 'UPDATE'),
+        ('operations', 'observation_version', 'openmettle_worker', 'UPDATE'),
+        ('operations', 'evidence', 'openmettle_worker', 'UPDATE')
+    ) AS durable(relation, attribute, role, privilege) WHERE $2
 ),
 user_schemas AS (
     SELECT oid, nspname, nspowner, nspacl FROM pg_namespace
