@@ -1,0 +1,456 @@
+//! One-shot schema migration process (ADR 0003). API and worker processes never call this.
+use sqlx::{ConnectOptions, Connection, PgConnection, SqlSafeStr, postgres::PgConnectOptions};
+use sqlx_core::migrate::{MigrateError, Migration, MigrationType, Migrator};
+use std::{borrow::Cow, fmt, time::Duration};
+
+/// Schema that owns every OpenMettle object, including migration history.
+pub const SCHEMA: &str = "openmettle";
+/// Migration history table, kept inside the owned schema rather than `public`.
+pub const HISTORY_TABLE: &str = "openmettle._sqlx_migrations";
+/// Reported as `application_name` so operators can identify migration sessions.
+pub const APPLICATION_NAME: &str = "openmettle-migrate";
+
+/// An embedded forward-only migration. Released migrations are immutable: their checksum is
+/// recorded in the history table and any later edit is refused.
+#[derive(Clone, Copy)]
+pub struct Source {
+    pub version: i64,
+    pub description: &'static str,
+    pub sql: &'static str,
+}
+
+/// The release's ordered migration set.
+pub const MIGRATIONS: &[Source] = &[
+    Source {
+        version: 1,
+        description: "identity and ownership scopes",
+        sql: include_str!("../migrations/0001_identity_and_scopes.sql"),
+    },
+    Source {
+        version: 2,
+        description: "conversations and messages",
+        sql: include_str!("../migrations/0002_conversations_and_messages.sql"),
+    },
+];
+
+/// Connection and deadline settings for one migration run.
+pub struct Settings {
+    pub database: PgConnectOptions,
+    pub connect_timeout: Duration,
+    pub lock_timeout: Duration,
+    pub statement_timeout: Duration,
+}
+
+impl Settings {
+    fn load() -> Result<Self, &'static str> {
+        Self::parse(
+            |key| match std::env::var(format!("OPENMETTLE_MIGRATE_{key}")) {
+                Ok(value) => Ok(Some(value)),
+                Err(std::env::VarError::NotPresent) => Ok(None),
+                Err(_) => Err("configuration must be UTF-8"),
+            },
+        )
+    }
+
+    fn parse(
+        get: impl Fn(&str) -> Result<Option<String>, &'static str>,
+    ) -> Result<Self, &'static str> {
+        let url = get("DATABASE_URL")?.ok_or("DATABASE_URL is required")?;
+        if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
+            return Err("invalid DATABASE_URL scheme");
+        }
+        let database = url
+            .parse::<PgConnectOptions>()
+            .map_err(|_| "invalid DATABASE_URL")?;
+        let millis = |key, default, max| -> Result<Duration, &'static str> {
+            let value: u64 = match get(key)? {
+                Some(value) => value.parse().map_err(|_| "invalid numeric configuration")?,
+                None => default,
+            };
+            if value == 0 || value > max {
+                return Err("configuration outside allowed range");
+            }
+            Ok(Duration::from_millis(value))
+        };
+        Ok(Self {
+            database,
+            connect_timeout: millis("CONNECT_TIMEOUT_MS", 5_000, 60_000)?,
+            lock_timeout: millis("LOCK_TIMEOUT_MS", 15_000, 600_000)?,
+            statement_timeout: millis("STATEMENT_TIMEOUT_MS", 300_000, 3_600_000)?,
+        })
+    }
+}
+
+/// Migration failure. `Display` never includes connection details, SQL text or row values.
+#[derive(Debug)]
+pub enum Failure {
+    Invalid(&'static str),
+    ConnectTimeout,
+    Connect(sqlx::Error),
+    Migrate(MigrateError),
+}
+
+fn describe(error: &sqlx::Error) -> String {
+    match error {
+        sqlx::Error::Database(e) => format!("SQLSTATE {}", e.code().unwrap_or_default()),
+        sqlx::Error::Io(_) => "I/O error".into(),
+        sqlx::Error::Tls(_) => "TLS error".into(),
+        _ => "protocol or driver error".into(),
+    }
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(message) => write!(f, "invalid migration set: {message}"),
+            Self::ConnectTimeout => f.write_str("database connection deadline exceeded"),
+            Self::Connect(e) => write!(f, "database connection failed ({})", describe(e)),
+            Self::Migrate(e) => match e {
+                MigrateError::ExecuteMigration(e, version) => {
+                    write!(f, "migration {version} failed ({})", describe(e))
+                }
+                MigrateError::Execute(e) => {
+                    write!(f, "migration control statement failed ({})", describe(e))
+                }
+                MigrateError::VersionMismatch(version) => write!(
+                    f,
+                    "applied migration {version} differs from this release (checksum mismatch)"
+                ),
+                MigrateError::VersionMissing(version) => write!(
+                    f,
+                    "database has migration {version}, which this release does not contain"
+                ),
+                MigrateError::Dirty(version) => {
+                    write!(f, "migration {version} is recorded as partially applied")
+                }
+                _ => f.write_str("migration failed"),
+            },
+        }
+    }
+}
+
+const TRANSACTION_CONTROL: &[&str] = &[
+    "ABORT",
+    "BEGIN",
+    "COMMIT",
+    "END",
+    "PREPARE",
+    "RELEASE",
+    "ROLLBACK",
+    "SAVEPOINT",
+    "START",
+];
+
+fn skip_quoted(sql: &[u8], start: usize, quote: u8, escapes: bool) -> Result<usize, &'static str> {
+    let mut i = start + 1;
+    while i < sql.len() {
+        if escapes && sql[i] == b'\\' {
+            i += 2;
+        } else if sql[i] == quote {
+            if sql.get(i + 1) == Some(&quote) {
+                i += 2;
+            } else {
+                return Ok(i + 1);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    Err("unterminated quoted text")
+}
+
+fn is_word(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80
+}
+
+/// Each migration commits atomically with its history row, so top-level transaction control
+/// (which would commit part of a migration early) is refused before connecting. PostgreSQL
+/// itself rejects statements that cannot run inside a transaction block, such as
+/// `CREATE INDEX CONCURRENTLY` or `VACUUM`. This lexical check fails closed: SQL-standard
+/// `BEGIN ATOMIC` bodies are refused; use dollar-quoted bodies instead.
+pub fn check_transactional(sql: &str) -> Result<(), &'static str> {
+    const REFUSED: &str = "transaction control statements are not permitted in migrations";
+    if sql.trim_start().starts_with("-- no-transaction") {
+        return Err("non-transactional migrations are not permitted");
+    }
+    let b = sql.as_bytes();
+    let mut i = 0;
+    let mut statement_start = true;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'-' && b.get(i + 1) == Some(&b'-') {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            let mut depth = 1;
+            i += 2;
+            while depth > 0 {
+                if i + 1 >= b.len() {
+                    return Err("unterminated comment");
+                }
+                if b[i] == b'/' && b[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if b[i] == b'*' && b[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if c == b';' {
+            statement_start = true;
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let first = std::mem::replace(&mut statement_start, false);
+        if is_word(c) {
+            let start = i;
+            while i < b.len() && (is_word(b[i]) || b[i] == b'$') {
+                i += 1;
+            }
+            if first
+                && TRANSACTION_CONTROL
+                    .iter()
+                    .any(|word| sql[start..i].eq_ignore_ascii_case(word))
+            {
+                return Err(REFUSED);
+            }
+            continue;
+        }
+        match c {
+            b'\'' => {
+                let escapes = i > 0 && matches!(b[i - 1], b'E' | b'e');
+                i = skip_quoted(b, i, b'\'', escapes)?;
+            }
+            b'"' => i = skip_quoted(b, i, b'"', false)?,
+            b'$' => {
+                let mut end = i + 1;
+                if end < b.len() && !b[end].is_ascii_digit() {
+                    while end < b.len() && is_word(b[end]) {
+                        end += 1;
+                    }
+                }
+                if end < b.len() && b[end] == b'$' && !b.get(i + 1).is_some_and(u8::is_ascii_digit)
+                {
+                    let tag = &sql[i..=end];
+                    let body = end + 1;
+                    let close = sql[body..]
+                        .find(tag)
+                        .ok_or("unterminated dollar-quoted text")?;
+                    i = body + close + tag.len();
+                } else {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(())
+}
+
+/// Validates a migration set and builds a locking, transactional migrator for it.
+pub fn migrator(sources: &[Source]) -> Result<Migrator, Failure> {
+    if sources.is_empty() {
+        return Err(Failure::Invalid("no migrations"));
+    }
+    let mut migrations = Vec::with_capacity(sources.len());
+    for (index, source) in sources.iter().enumerate() {
+        if usize::try_from(source.version).ok() != Some(index + 1) {
+            return Err(Failure::Invalid(
+                "versions must be contiguous and start at 1",
+            ));
+        }
+        if source.description.trim().is_empty() {
+            return Err(Failure::Invalid("description required"));
+        }
+        check_transactional(source.sql).map_err(Failure::Invalid)?;
+        migrations.push(Migration::new(
+            source.version,
+            Cow::Borrowed(source.description),
+            MigrationType::Simple,
+            source.sql.into_sql_str(),
+            false,
+        ));
+    }
+    let mut migrator = Migrator::with_migrations(migrations);
+    migrator.dangerous_set_table_name(HISTORY_TABLE);
+    migrator.create_schema(SCHEMA);
+    migrator.set_locking(true).set_ignore_missing(false);
+    Ok(migrator)
+}
+
+/// Applies `sources` over one dedicated, non-pooled connection, then ends that session on every
+/// outcome. SQLx holds a session-level advisory lock while migrating and does not release it
+/// when a migration fails; ending the session releases it. Deadlines are server-side session
+/// settings, so lock waits and statements stop even if this process stalls.
+pub async fn apply(settings: &Settings, sources: &[Source]) -> Result<(), Failure> {
+    let migrator = migrator(sources)?;
+    let millis = |d: Duration| format!("{}ms", d.as_millis());
+    let options = settings
+        .database
+        .clone()
+        .disable_statement_logging()
+        .application_name(APPLICATION_NAME)
+        .options([
+            ("lock_timeout", millis(settings.lock_timeout)),
+            ("statement_timeout", millis(settings.statement_timeout)),
+            // Ends the server session soon after this client disappears, even mid-wait.
+            ("client_connection_check_interval", "1000ms".to_owned()),
+            // Migrations must schema-qualify OpenMettle objects.
+            ("search_path", "pg_catalog,pg_temp".to_owned()),
+        ]);
+    let mut connection = tokio::time::timeout(
+        settings.connect_timeout,
+        PgConnection::connect_with(&options),
+    )
+    .await
+    .map_err(|_| Failure::ConnectTimeout)?
+    .map_err(Failure::Connect)?;
+    let result = migrator.run(&mut connection).await;
+    // Dropping the connection on timeout also closes the socket.
+    let _ = tokio::time::timeout(settings.connect_timeout, connection.close()).await;
+    result.map_err(Failure::Migrate)
+}
+
+/// Entry point for `openmettle-migrate`: 0 success, 78 invalid configuration, 1 failure.
+pub async fn run() -> u8 {
+    let settings = match Settings::load() {
+        Ok(settings) => settings,
+        Err(message) => {
+            eprintln!("configuration error: {message}");
+            return 78;
+        }
+    };
+    use tokio::signal::unix::{SignalKind, signal};
+    let (Ok(mut terminate), Ok(mut interrupt)) = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) else {
+        eprintln!("runtime error: cannot register signal handlers");
+        return 1;
+    };
+    // A signal drops the migration future and its connection; PostgreSQL rolls back the
+    // open transaction and releases the session lock.
+    tokio::select! {
+        result = apply(&settings, MIGRATIONS) => match result {
+            Ok(()) => {
+                println!("schema is at migration {}", MIGRATIONS.len());
+                0
+            }
+            Err(failure) => {
+                eprintln!("migration error: {failure}");
+                1
+            }
+        },
+        _ = terminate.recv() => {
+            eprintln!("migration interrupted");
+            1
+        }
+        _ = interrupt.recv() => {
+            eprintln!("migration interrupted");
+            1
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_migrations_are_valid() {
+        let migrator = migrator(MIGRATIONS).unwrap();
+        assert_eq!(migrator.iter().count(), MIGRATIONS.len());
+        assert!(migrator.iter().all(|m| !m.no_tx));
+    }
+
+    #[test]
+    fn refuses_top_level_transaction_control() {
+        for sql in [
+            "COMMIT;",
+            "create table a (id int); commit; create table b (id int);",
+            "BEGIN; CREATE TABLE a (id int);",
+            "SELECT 1;\n  End",
+            "ROLLBACK",
+            "abort;",
+            "START TRANSACTION",
+            "SAVEPOINT s",
+            "RELEASE SAVEPOINT s",
+            "PREPARE TRANSACTION 'x'",
+            "COMMIT PREPARED 'x'",
+            "/* a */ -- b\n COMMIT",
+            "-- no-transaction\nCREATE INDEX CONCURRENTLY i ON t (c);",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; END;",
+        ] {
+            assert!(check_transactional(sql).is_err(), "accepted: {sql}");
+        }
+    }
+
+    #[test]
+    fn accepts_transaction_words_inside_bodies_strings_and_identifiers() {
+        for sql in [
+            "DO $$ BEGIN RAISE NOTICE 'x'; END $$;",
+            "DO $body$ BEGIN COMMIT; END $body$;",
+            "SELECT 'commit; rollback';",
+            "SELECT E'it\\'s; COMMIT';",
+            "SELECT 1 AS \"x; COMMIT\";",
+            "-- COMMIT\nSELECT 1; /* ; ROLLBACK /* nested */ */ SELECT 2;",
+            "CREATE TABLE t (begin_at int, commit_id int); SELECT begin_at FROM t;",
+            "SELECT $1::int;",
+        ] {
+            assert_eq!(check_transactional(sql), Ok(()), "{sql}");
+        }
+        assert!(check_transactional("SELECT 'open").is_err());
+        assert!(check_transactional("DO $$ BEGIN").is_err());
+    }
+
+    #[test]
+    fn refuses_invalid_migration_sets() {
+        let source = |version, sql| Source {
+            version,
+            description: "x",
+            sql,
+        };
+        assert!(migrator(&[]).is_err());
+        assert!(migrator(&[source(2, "SELECT 1")]).is_err());
+        assert!(migrator(&[source(1, "SELECT 1"), source(3, "SELECT 1")]).is_err());
+        assert!(migrator(&[source(1, "SELECT 1; COMMIT")]).is_err());
+    }
+
+    #[test]
+    fn configuration_is_bounded() {
+        let parse = |pairs: &[(&str, &str)]| {
+            let pairs: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            Settings::parse(move |key| {
+                Ok(pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()))
+            })
+        };
+        let url = ("DATABASE_URL", "postgres://localhost/test");
+        let settings = parse(&[url]).unwrap();
+        assert_eq!(settings.lock_timeout, Duration::from_secs(15));
+        assert!(parse(&[]).is_err());
+        assert!(parse(&[("DATABASE_URL", "mysql://localhost/test")]).is_err());
+        for key in [
+            "CONNECT_TIMEOUT_MS",
+            "LOCK_TIMEOUT_MS",
+            "STATEMENT_TIMEOUT_MS",
+        ] {
+            assert!(parse(&[url, (key, "0")]).is_err());
+            assert!(parse(&[url, (key, "3600001")]).is_err());
+            assert!(parse(&[url, (key, "x")]).is_err());
+        }
+    }
+}

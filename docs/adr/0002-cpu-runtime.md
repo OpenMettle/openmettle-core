@@ -22,7 +22,7 @@ Direct crates are exact pins from the crates.io registry (`https://github.com/ru
 | tokio | 1.54.1 | https://github.com/tokio-rs/tokio | MIT | Async runtime, sockets, signals and deadlines |
 | sqlx | 0.9.0 | https://github.com/launchbadge/sqlx | MIT OR Apache-2.0 | PostgreSQL pool and queries, rustls TLS |
 
-Default features are disabled. SQLx macros, migration support and other database drivers are excluded. `SELECT 1` uses runtime queries, so build/lint/unit tests need no database or generated SQL metadata. Fetch dependencies once, then run locked offline checks. V1-42 owns the dynamically resolved transitive licence/notice inventory and distribution clearance; these direct declarations do not clear images or the complete graph for publication.
+Default features are disabled. SQLx macros and other database drivers are excluded. Correction (ADR 0003): SQLx 0.9.0 always enables `sqlx-core`'s migration code, so it was compiled here, but no migration API was exposed or used; ADR 0003 adds the PostgreSQL migrator for the separate migrate process. `SELECT 1` uses runtime queries, so build/lint/unit tests need no database or generated SQL metadata. Fetch dependencies once, then run locked offline checks. V1-42 owns the dynamically resolved transitive licence/notice inventory and distribution clearance; these direct declarations do not clear images or the complete graph for publication.
 
 A hand-written HTTP server would add protocol maintenance. A synchronous database client would block async request execution. An external broker and domain scaffolding have no consumer in this increment. Keep shared code limited to the actual process contract.
 

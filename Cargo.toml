@@ -18,6 +18,10 @@ path = "src/bin/api.rs"
 name = "openmettle-worker"
 path = "src/bin/worker.rs"
 
+[[bin]]
+name = "openmettle-migrate"
+path = "src/bin/migrate.rs"
+
 [lints.rust]
 unsafe_code = "forbid"
 
@@ -25,3 +29,5 @@ unsafe_code = "forbid"
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
 tokio = { version = "=1.54.1", default-features = false, features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
 sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-native-roots"] }
+sqlx-core = { version = "=0.9.0", default-features = false }
+sqlx-postgres = { version = "=0.9.0", default-features = false, features = ["migrate"] }
