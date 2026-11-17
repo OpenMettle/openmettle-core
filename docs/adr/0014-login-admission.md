@@ -132,7 +132,7 @@ SET LOCAL statement_timeout = '5s';
 SET LOCAL synchronous_commit = on;
 SELECT outstanding_limit IS NOT DISTINCT FROM NULLIF(:'expected_limit', '')::integer
    AND (NULLIF(:'limit', '') IS NULL
-        OR (:'limit' ~ '^[0-9]{1,5}$' AND :'limit'::integer BETWEEN 1 AND 65536)) AS expected
+        OR (:'limit' ~ '^[0-9]{1,5}$' AND NULLIF(:'limit', '')::integer BETWEEN 1 AND 65536)) AS expected
   FROM openmettle.login_admission WHERE id FOR UPDATE \gset
 \if :expected
   UPDATE openmettle.login_admission
