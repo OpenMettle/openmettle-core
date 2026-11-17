@@ -1,9 +1,11 @@
 # 0007 — Application API contract and consumer fixtures
 
 Status: coordinator-agreed first V1-03 increment, 17 November 2026. Related: core #4 and
-sprint #34. Independent review remains required. This increment publishes a contract and
-its checks only. It adds no route, authentication, authorization, cursor signing, runtime
-error handling or capability evaluation. It does not complete V1-03.
+sprint #34. Independent review remains required. The first increment published the contract
+and its checks. The second adds an internal
+capability evaluator and qualification tests. Neither adds a route, authentication,
+authorization enforcement, cursor signing or runtime HTTP error handling. Final V1-03
+acceptance belongs to the coordinator after review and owner merge.
 
 ## Canonical source and versions
 
@@ -33,7 +35,7 @@ Generated fixtures live in `contracts/fixtures/`; do not edit them by hand. Rege
 | Pagination | `cursor`/`limit` parameters and `PageInfo` | Cursor issuance, binding and MAC |
 | Idempotency | `Idempotency-Key` parameter and `idempotency_conflict` | Request identity storage (V1-10) |
 | Events | `RunEvent` envelope, `RunEventItem` and `RunEventStream` media type, `Last-Event-ID`/`after` | SSE endpoint, retention, resync (V1-12) |
-| Capabilities | `CapabilityList`, `Capability`, `Readiness` | Evaluation, provider observation, authorization (V1-04/05) |
+| Capabilities | `CapabilityList`, `Capability`, `Readiness` | Provider adapters, authenticated serving and authorization (V1-04/05) |
 
 Run states, wait reasons, persistence identity digests, grant assignment formats and other
 storage vocabulary from ADRs 0004–0006 are not wire policy. Run resources are excluded until
@@ -144,8 +146,8 @@ No dimension implies another. An empty list is a valid core-only installation. C
 readiness is not an input to `/readyz`, which remains a PostgreSQL check (ADR 0002). Capability
 objects never carry provider endpoints, credentials, model secrets or other users' inventory;
 a contract lint rejects sensitive property names, but it is not a complete privacy scanner.
-There is no unauthenticated capability endpoint. Failing-provider evaluation and its isolation
-from core readiness are the next increment and are not evidenced here.
+There is no unauthenticated capability endpoint. The internal evaluator and isolation tests
+are described below.
 
 ## Validation and fixtures
 
@@ -214,10 +216,54 @@ component in `provenance/register.json`.
 
 ## Remaining V1-03 work
 
-Before #4 can close, qualify an internal capability evaluator that keeps installed,
-authorization and readiness distinct. Include a simulated failing or disabled provider
-and prove that core readiness is unaffected. Reconcile all four ticket criteria against
-the contract, compatibility and evaluator evidence; this PR alone does not complete #4.
+Keep #4 open for independent review, final-head CI evidence, owner merge and the
+coordinator's audit of all four criteria. This increment leaves the initial contract,
+generated fixtures and independent consumer unchanged as the compatibility baseline.
+
+## Internal capability evaluation
+
+`src/capabilities.rs` evaluates one entry using deployment installation/enabled flags,
+a supplied caller visibility/authorization decision and a lazy observation future. These
+inputs are for future server policy; they must never be populated from client claims.
+This helper does not implement authorization or discover any user inventory.
+
+Hidden entries return no result. Visible entries retain Allowed, Denied or Unknown
+independently of installation. Uninstalled entries have no readiness. Installed entries
+start unknown. Disabled entries retain unknown readiness with reason `disabled`; they
+are never offered or queried. Denied and unknown authorization also skip observation.
+Only installed, enabled, explicitly allowed entries call the observer.
+
+The seam accepts bounded enum outcomes, never raw errors, URLs, credentials or user data.
+Ready, degraded and unavailable observations carry a completion `SystemTime`; unknown
+and unrecognized status vocabulary have no observation timestamp and are not offered.
+Provider failure produces unavailable with reason `provider_failure` and an observation
+time. Timeout produces unknown with reason `timeout`: it does not establish provider
+status. Deadlines are clamped to 1 ms–5 s. Cancellation drops the observation future.
+Observers must yield and be cancellation-safe; this does not stop blocking code,
+detached tasks or external side effects. There are no adapters or detached tasks here.
+The offer predicate is a discovery hint; consumers must recognize capability kinds and
+recheck current permissions on execution. No production HTTP serializer is supplied.
+
+`tests/capabilities.rs` exercises dimension combinations, lazy-call counts, failures,
+unknown vocabulary, timeout and drop cancellation. `tests/contract.rs` validates test
+projections of actual results against the canonical schema. Its fixed timestamp checks
+the projected shape, not production time formatting. Existing independent consumer
+checks cover unknown kinds, readiness vocabulary and API versions without Flutter.
+
+The ignored `tests/runtime.rs` PostgreSQL test starts the real API binary and probes
+`/readyz` while the evaluator in the harness fails, is disabled or is actively pending.
+It checks timeout and cancellation cleanup, readiness afterward, and the absent product
+route. The existing CI runtime command runs it against isolated PostgreSQL. This proves
+the current separation; it does not qualify an in-process adapter or future API handler.
+There is no optional observation in the production health/readiness path.
+
+Acceptance evidence: schemas/fixtures and compatibility are supplied by the first
+increment; dimension separation and optional failure isolation by these evaluator and
+runtime tests when passing. Policy, provisioning, validation, quota, timeout and provider
+failure remain distinct contract error categories. Bounded evaluator outcomes add no
+raw diagnostic fields, but do not prove HTTP error mapping, cross-user enforcement or
+runtime redaction. Those are downstream V1-04/05 responsibilities, not circular closure
+prerequisites for the contract/evaluator. No dependency or feature changes are required.
 
 ## Downstream implementation
 

@@ -198,3 +198,107 @@ fn postgres_readiness_and_stopped_worker_survival() {
     }
     stop(&mut api, "-TERM");
 }
+
+/// The evaluator runs in this harness, not behind a runtime injection endpoint.
+/// This qualifies the real readiness boundary while optional work fails or stalls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn postgres_readiness_is_independent_of_optional_evaluation() {
+    use openmettle_core::capabilities::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL required");
+    let bind = address();
+    let mut api = start(false, &bind, &url);
+    wait_status(&mut api, &bind, "/readyz", 200);
+    let input = Input {
+        installed: true,
+        enabled: true,
+        caller: Caller::Visible(Authorization::Allowed),
+    };
+    for enabled in [false, true] {
+        let result = evaluate(
+            Input { enabled, ..input },
+            Duration::from_millis(50),
+            || {
+                assert!(enabled, "disabled observer called");
+                async { Observation::ProviderFailure }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!result.offered());
+        assert_eq!(
+            result.readiness.unwrap().reason,
+            Some(if enabled {
+                Reason::ProviderFailure
+            } else {
+                Reason::Disabled
+            })
+        );
+        assert!(
+            response(&bind, "/readyz")
+                .unwrap()
+                .starts_with("HTTP/1.1 200")
+        );
+    }
+    // Signal only after the fake is polled; prove readiness while it is pending.
+    for cancel in [false, true] {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(dropped.clone());
+        let (started, received) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(evaluate(input, Duration::from_secs(5), || async move {
+            let _guard = guard;
+            started.send(()).unwrap();
+            std::future::pending().await
+        }));
+        tokio::time::timeout(Duration::from_secs(1), received)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!task.is_finished());
+        assert!(
+            response(&bind, "/readyz")
+                .unwrap()
+                .starts_with("HTTP/1.1 200")
+        );
+        assert!(
+            !task.is_finished(),
+            "observation must still be pending during readiness"
+        );
+        if cancel {
+            task.abort();
+        }
+        let joined = tokio::time::timeout(Duration::from_secs(6), task)
+            .await
+            .unwrap();
+        if cancel {
+            assert!(joined.unwrap_err().is_cancelled());
+        } else {
+            let result = joined.unwrap().unwrap();
+            assert_eq!(result.readiness.unwrap().reason, Some(Reason::Timeout));
+            assert_eq!(result.readiness.unwrap().status, Status::Unknown);
+            assert!(!result.offered());
+        }
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(
+            response(&bind, "/readyz")
+                .unwrap()
+                .starts_with("HTTP/1.1 200")
+        );
+    }
+    assert!(
+        response(&bind, "/v1/capabilities")
+            .unwrap()
+            .starts_with("HTTP/1.1 404")
+    );
+    stop(&mut api, "-TERM");
+}
