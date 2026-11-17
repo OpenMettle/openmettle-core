@@ -113,6 +113,20 @@ async fn provenance_replay_revocation_and_fresh_cycles() {
         change(&db, &again).await,
         Err(Error::StaleRevision)
     ));
+    // Current revision alone is insufficient: a disabled rule cannot grant again.
+    let before = count(&db, "SELECT count(*) FROM openmettle.grant_changes").await;
+    let mut current_disabled = again;
+    current_disabled.key = "current-disabled";
+    current_disabled.mapping_revision = Some(2);
+    assert!(matches!(
+        change(&db, &current_disabled).await,
+        Err(Error::StaleRevision)
+    ));
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM openmettle.grant_changes").await,
+        before
+    );
+    assert!(!state(&db, &c.scope, &m1.assignment).await.recorded_active);
     map(&db, &mapping(&c, RULE1, "replace", 2)).await.unwrap();
     again.mapping_revision = Some(3);
     let new = change(&db, &again).await.unwrap();
@@ -125,6 +139,21 @@ async fn provenance_replay_revocation_and_fresh_cycles() {
         change(&db, &revoke).await,
         Err(Error::StaleRevision)
     ));
+    // A correct cycle still cannot be revoked using a different mapping revision.
+    let before = count(&db, "SELECT count(*) FROM openmettle.grant_changes").await;
+    let mut wrong_mapping = revoke;
+    wrong_mapping.key = "wrong-mapping-revision";
+    wrong_mapping.decision = Decision::Revoke(new.cycle.as_deref());
+    assert_eq!(wrong_mapping.mapping_revision, Some(1));
+    assert!(matches!(
+        change(&db, &wrong_mapping).await,
+        Err(Error::Conflict)
+    ));
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM openmettle.grant_changes").await,
+        before
+    );
+    assert!(state(&db, &c.scope, &new.assignment).await.recorded_active);
     assert_eq!(change(&db, &mapped1).await.unwrap(), m1);
     assert_eq!(state(&db, &c.scope, &new.assignment).await.revision, 3);
     let mut active = again;
