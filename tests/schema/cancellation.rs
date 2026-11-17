@@ -4,14 +4,14 @@ use super::*;
 use std::net::Shutdown;
 use std::sync::mpsc;
 
-struct ResponseBarrier {
-    port: u16,
+pub(super) struct ResponseBarrier {
+    pub(super) port: u16,
     reached: Option<tokio::sync::oneshot::Receiver<()>>,
     resume: Option<mpsc::Sender<()>>,
     thread: Option<thread::JoinHandle<std::io::Result<()>>>,
 }
 impl ResponseBarrier {
-    fn new(command: &'static [u8]) -> Self {
+    pub(super) fn new(command: &'static [u8]) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let options = admin_options();
@@ -87,8 +87,8 @@ impl Drop for ResponseBarrier {
     }
 }
 
-// Generic only over the four concrete helper futures being tested, not production behavior.
-async fn cancel_at_response<F>(barrier: &mut ResponseBarrier, future: F)
+// Generic only over the concrete helper and commit futures being tested, not production behavior.
+pub(super) async fn cancel_at_response<F>(barrier: &mut ResponseBarrier, future: F)
 where
     F: std::future::Future,
 {

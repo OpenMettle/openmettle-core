@@ -40,6 +40,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "runs events and operations",
         sql: include_str!("../migrations/0003_runs_events_operations.sql"),
     },
+    Source {
+        version: 4,
+        description: "artifacts storage accounting",
+        sql: include_str!("../migrations/0004_artifacts_storage_accounting.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.
@@ -378,21 +383,18 @@ async fn boundary_violations(connection: &mut PgConnection) -> Result<Vec<String
         sqlx::query_scalar("SELECT to_regclass('openmettle._sqlx_migrations') IS NOT NULL")
             .fetch_one(&mut *connection)
             .await?;
-    let initialized = history
-        && sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (SELECT FROM openmettle._sqlx_migrations WHERE version = 1 AND success)",
+    // Explicit grants are allowed per version only after that version has applied.
+    let applied: i64 = if history {
+        sqlx::query_scalar(
+            "SELECT coalesce(max(version), 0) FROM openmettle._sqlx_migrations WHERE success",
         )
         .fetch_one(&mut *connection)
-        .await?;
-    let durable = history
-        && sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (SELECT FROM openmettle._sqlx_migrations WHERE version = 3 AND success)",
-        )
-        .fetch_one(&mut *connection)
-        .await?;
+        .await?
+    } else {
+        0
+    };
     sqlx::query_scalar(BOUNDARIES)
-        .bind(initialized)
-        .bind(durable)
+        .bind(applied)
         .fetch_all(connection)
         .await
 }

@@ -12,6 +12,16 @@ pub enum Error {
     StaleRevision,
     TransactionUnavailable,
     Database(sqlx::Error),
+    /// Storage limits are not configured; new reservations are refused.
+    LimitUnconfigured,
+    /// The owner scope's byte limit would be exceeded.
+    OwnerLimit,
+    /// The instance's logical storage budget would be exceeded.
+    InstanceLimit,
+    /// A linked external operation has no known outcome; capacity stays reserved.
+    Unresolved,
+    /// The lifecycle state or deadline does not permit this transition now.
+    NotEligible,
 }
 impl From<sqlx::Error> for Error {
     fn from(value: sqlx::Error) -> Self {
@@ -30,6 +40,11 @@ impl std::fmt::Display for Error {
                 "transaction unavailable after cancellation or cleanup failure"
             }
             Self::Database(_) => "persistence database error",
+            Self::LimitUnconfigured => "storage limits are not configured",
+            Self::OwnerLimit => "owner storage limit exceeded",
+            Self::InstanceLimit => "instance storage budget exceeded",
+            Self::Unresolved => "linked operation outcome unresolved",
+            Self::NotEligible => "lifecycle transition not eligible",
         })
     }
 }
@@ -54,10 +69,10 @@ impl Payload<'_> {
         Ok(())
     }
 }
-fn bounded(s: &str, max: usize) -> bool {
+pub(crate) fn bounded(s: &str, max: usize) -> bool {
     !s.is_empty() && s.len() <= max && !s.contains('\0')
 }
-fn uuid(s: &str) -> Result<(), Error> {
+pub(crate) fn uuid(s: &str) -> Result<(), Error> {
     if s.len() != 36
         || !s.bytes().enumerate().all(|(i, b)| {
             if [8, 13, 18, 23].contains(&i) {
@@ -73,7 +88,7 @@ fn uuid(s: &str) -> Result<(), Error> {
 }
 /// Domain is a fixed ASCII constant, then each field is u64 big-endian length + bytes.
 /// Numeric fields are fixed-width big-endian bytes inside that envelope.
-fn identity(domain: &[u8], fields: &[&[u8]]) -> Vec<u8> {
+pub(crate) fn identity(domain: &[u8], fields: &[&[u8]]) -> Vec<u8> {
     let mut result = domain.to_vec();
     for field in fields {
         result.extend_from_slice(&(field.len() as u64).to_be_bytes());
@@ -81,7 +96,7 @@ fn identity(domain: &[u8], fields: &[&[u8]]) -> Vec<u8> {
     }
     result
 }
-fn digest(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn digest(bytes: &[u8]) -> Vec<u8> {
     Sha256::digest(bytes).to_vec()
 }
 /// Caller-controlled composition boundary. No raw Transaction can be extracted or borrowed.
@@ -111,7 +126,7 @@ impl<'c> WriteTransaction<'c> {
         }
         Ok(())
     }
-    fn take_active(&mut self) -> Result<Transaction<'c, Postgres>, Error> {
+    pub(crate) fn take_active(&mut self) -> Result<Transaction<'c, Postgres>, Error> {
         self.ensure_active()?;
         self.inner.take().ok_or(Error::TransactionUnavailable)
     }
@@ -121,6 +136,11 @@ impl<'c> WriteTransaction<'c> {
         self.inner
             .as_deref_mut()
             .ok_or(Error::TransactionUnavailable)
+    }
+    /// Restore the transaction a helper took, after its savepoint closed successfully.
+    /// No await point may separate savepoint cleanup from this call.
+    pub(crate) fn restore(&mut self, tx: Transaction<'c, Postgres>) {
+        self.inner = Some(tx);
     }
     pub async fn commit(mut self) -> Result<(), Error> {
         self.take_active()?.commit().await?;
@@ -134,7 +154,7 @@ impl<'c> WriteTransaction<'c> {
 
 // Outer Err means cleanup failed: never restore a commit-capable handle. Inner Err is an
 // ordinary helper error whose savepoint rollback succeeded, preserving prior caller writes.
-async fn finish<T>(
+pub(crate) async fn finish<T>(
     tx: Transaction<'_, Postgres>,
     result: Result<T, Error>,
 ) -> Result<Result<T, Error>, Error> {
@@ -221,7 +241,11 @@ pub async fn create_run(tx: &mut WriteTransaction<'_>, r: &RunInput<'_>) -> Resu
     result
 }
 
-async fn lock_run(tx: &mut Transaction<'_, Postgres>, scope: &str, run: &str) -> Result<(), Error> {
+pub(crate) async fn lock_run(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: &str,
+    run: &str,
+) -> Result<(), Error> {
     // Column UPDATE privilege suffices for a row lock; no ownership/state UPDATE is granted.
     let exists: Option<i64> = sqlx::query_scalar("SELECT last_event_sequence FROM openmettle.runs WHERE scope_id=$1::uuid AND id=$2::uuid FOR NO KEY UPDATE")
         .bind(scope).bind(run).fetch_optional(&mut **tx).await?;

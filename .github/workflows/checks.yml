@@ -69,10 +69,16 @@ jobs:
           mkdir -p "$RUNNER_TEMP/openmettle-v2"
           git archive 18f52463c9d6bc12dda4bd1558e4597e067018f8 | tar -x -C "$RUNNER_TEMP/openmettle-v2"
           cargo build --manifest-path "$RUNNER_TEMP/openmettle-v2/Cargo.toml" --locked --offline --bins
+      - name: Build authentic version-3 release for schema compatibility
+        run: |
+          mkdir -p "$RUNNER_TEMP/openmettle-v3"
+          git archive 2f1be947aa933177c2e407cd7290bf9909bd08ca | tar -x -C "$RUNNER_TEMP/openmettle-v3"
+          cargo build --manifest-path "$RUNNER_TEMP/openmettle-v3/Cargo.toml" --locked --offline --bins
       - name: PostgreSQL schema, migration and role integration
         run: cargo test --locked --offline --test schema -- --ignored
         env:
           OLD_BINARY_DIR: ${{ runner.temp }}/openmettle-v2/target/debug
+          V3_BINARY_DIR: ${{ runner.temp }}/openmettle-v3/target/debug
           TEST_DATABASE_URL: postgres://fixture:fixture@127.0.0.1:5432/fixture?sslmode=disable
       - name: Save Cargo dependencies and build outputs
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
