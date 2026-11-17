@@ -32,9 +32,18 @@ sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "
 sqlx-core = { version = "=0.9.0", default-features = false }
 sqlx-postgres = { version = "=0.9.0", default-features = false, features = ["migrate"] }
 sha2 = { version = "=0.10.9", default-features = false }
-
-# Contract tests only (ADR 0007); not linked into any binary.
-[dev-dependencies]
-jsonschema = { version = "=0.61.2", default-features = false }
+# Offline OIDC ID-token verification (ADR 0008): no HTTP client feature. chrono, serde and
+# serde_json were already locked; they are direct only for the verifier's clock and claims types.
+openidconnect = { version = "=4.1.0", default-features = false }
+chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 serde = { version = "=1.0.229", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }
+
+# Decode the library-parsed public RSA modulus for its minimum-strength check (ADR 0008).
+base64 = { version = "=0.22.1", default-features = false, features = ["std"] }
+
+# Test-only (ADR 0007 contract tests; ADR 0008 in-memory signing keys); not linked into binaries.
+[dev-dependencies]
+jsonschema = { version = "=0.61.2", default-features = false }
+rsa = { version = "=0.9.10", default-features = false, features = ["std", "pem"] }
+rand_core = { version = "=0.6.4", default-features = false, features = ["getrandom"] }

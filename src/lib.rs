@@ -1,4 +1,5 @@
 //! Shared operational contract and persistence primitives; no domain APIs or worker queue yet.
+pub mod auth;
 pub mod capabilities;
 pub mod grants;
 pub mod migrate;
