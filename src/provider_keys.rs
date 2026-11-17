@@ -300,6 +300,7 @@ struct State {
 struct Snapshot {
     trusted: auth::TrustedProvider,
     kids: Vec<Option<String>>,
+    known_kids: Vec<String>,
     expires: Instant,
     generation: u64,
 }
@@ -497,6 +498,7 @@ impl ManagedProvider {
             Some((m, k)) => Some(Arc::new(Snapshot {
                 trusted: c.identity.with_keys(keys.keys),
                 kids: keys.kids,
+                known_kids: keys.known_kids,
                 expires: m.min(k),
                 generation: s.key_generation,
             })),
@@ -525,7 +527,7 @@ impl ManagedProvider {
             .trusted
             .verify_assertion(token, nonce, policy, self.manager.now().wall);
         let (snapshot, identity) = if matches!(result, Err(auth::VerifyError::UnknownKey))
-            && kid.is_some_and(|k| !first.kids.iter().any(|known| known.as_deref() == Some(k)))
+            && kid.is_some_and(|k| !first.known_kids.iter().any(|known| known == k))
         {
             self.refresh(Some(first.generation)).await?;
             let snapshot = self.snapshot()?;

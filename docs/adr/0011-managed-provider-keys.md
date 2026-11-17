@@ -99,6 +99,18 @@ remain in the maintained verifier plus ADR 0008's local checks.
 These ceilings bound resources, not recommended deployment settings. The owner must supply
 operational values before exposure. This implementation needs no stale-key grace decision.
 
+Cooldown is a hard availability trade-off: if a response's remaining freshness is shorter
+than cooldown, logins fail after expiry until the next attempt is allowed. Age and network
+delay can shorten that window even when the configured freshness cap exceeds cooldown.
+Re-registering even identical configuration clears keys and preserves cooldown, so a reload
+can block logins for the remaining interval (up to the configured one-hour ceiling).
+The future loader must avoid unnecessary re-registration; deployment qualification must
+compare cooldown with observed remaining document freshness and tolerate this outage.
+Reducing cooldown permits more provider traffic; increasing freshness does not override a
+shorter provider lifetime. This increment supplies no proactive refresh or stale-key fallback.
+The strict future-Date rejection below can also make a replacement unavailable when provider
+and local clocks differ. Clock synchronization is therefore part of provider qualification.
+
 The first profile uses unconditional GET, explicit `max-age`, a valid Date, and optional
 Age. It subtracts the larger of apparent age and Age plus monotonic request delay, then
 uses a monotonic expiry capped by the configured lifetime. Duplicate headers/directives,
@@ -170,7 +182,9 @@ be recalled when configuration changes, but its identity cannot escape afterward
 
 Only a bounded genuinely absent kid can trigger one refresh after verification reports no
 matching key. A missing kid with ambiguous candidates, invalid header, disallowed algorithm,
-claim failure or known-key invalid signature does not refresh. The same original signed ID
+claim failure or known-key invalid signature does not refresh. An identifier present on an
+ineligible raw key also suppresses refresh; the snapshot retains all bounded raw identifiers
+separately from eligible signing keys. After an allowed refresh, the same original signed ID
 token and nonce digest are verified once more after waiting, using a fresh wall clock.
 Access/refresh tokens remain discarded; no unverified token becomes an API credential.
 

@@ -438,6 +438,71 @@ async fn unknown_kid_flood_and_known_signature_failure_are_bounded() {
     );
     assert_eq!(h.count(), 3);
 }
+#[tokio::test]
+async fn known_ineligible_kids_do_not_spend_refresh_budget() {
+    for kind in ["algorithm", "use", "curve", "size"] {
+        let h = Harness::new().await;
+        let mut document: Value = serde_json::from_slice(&signing::jwks()).unwrap();
+        let mut filtered = document["keys"][0].clone();
+        match kind {
+            "algorithm" => filtered["alg"] = "RS384".into(),
+            "use" => filtered["use"] = "enc".into(),
+            "curve" => {
+                filtered = json!({"kty":"EC","crv":"P-256","x":URL_SAFE_NO_PAD.encode([1;32]),"y":URL_SAFE_NO_PAD.encode([2;32]),"alg":"ES256"})
+            }
+            "size" => {
+                let mut modulus = vec![0; 1024];
+                modulus[0] = 0x80;
+                modulus[1023] = 1;
+                filtered["n"] = URL_SAFE_NO_PAD.encode(modulus).into();
+            }
+            _ => unreachable!(),
+        }
+        filtered["kid"] = "filtered".into();
+        document["keys"].as_array_mut().unwrap().push(filtered);
+        h.script.lock().unwrap().keys = serde_json::to_vec(&document).unwrap();
+        h.provider.preflight().await.unwrap();
+        h.advance(2); // Refresh is permitted, so a missing-key misclassification sends GETs.
+        assert_eq!(
+            verify(&h.provider, unknown("filtered")).await,
+            Err(Error::Verification),
+            "{kind}"
+        );
+        assert_eq!(h.count(), 2, "{kind}");
+        assert!(h.verify(false).await.is_ok());
+        verify(&h.provider, unknown("actually-absent"))
+            .await
+            .unwrap_err();
+        assert_eq!(h.count(), 4, "unused refresh budget: {kind}");
+    }
+}
+
+#[tokio::test]
+async fn expiry_and_identical_registration_preserve_cooldown_outage() {
+    for reload in [false, true] {
+        let h = Harness::new().await;
+        if !reload {
+            h.script.lock().unwrap().cache = "max-age=1".into();
+        }
+        h.provider.preflight().await.unwrap();
+        let current = if reload {
+            h.manager
+                .register(Harness::config(&h.server, &h.ca, "v1"))
+                .unwrap()
+        } else {
+            h.advance(1);
+            h.provider.clone()
+        };
+        assert_eq!(current.preflight().await, Err(Error::Cooldown));
+        assert_eq!(h.count(), 2);
+        assert!(current.snapshot().is_err());
+        h.ticks.store(2, Ordering::SeqCst);
+        h.script.lock().unwrap().cache = "max-age=100".into();
+        current.preflight().await.unwrap();
+        assert_eq!(h.count(), 4);
+    }
+}
+
 fn unknown(kid: &str) -> UnverifiedIdToken {
     let t = signing::signed(
         &"n".repeat(43),
@@ -494,7 +559,12 @@ async fn retirement_blocks_late_fetch_post_and_identity_release() {
 async fn release_rechecks_generation_expiry_token_time_and_clock_rollback() {
     for kind in ["generation", "keys-expire", "token-expire", "rollback"] {
         let h = Harness::new().await;
-        h.script.lock().unwrap().cache = "max-age=600".into();
+        h.script.lock().unwrap().cache = if kind == "keys-expire" {
+            "max-age=10"
+        } else {
+            "max-age=600"
+        }
+        .into();
         h.script.lock().unwrap().metadata_cache = "max-age=600".into();
         h.provider.preflight().await.unwrap();
         let entry = h.provider.entry.clone();
@@ -502,10 +572,19 @@ async fn release_rechecks_generation_expiry_token_time_and_clock_rollback() {
         let wall = h.wall.clone();
         *h.manager.inner.release_hook.lock().unwrap() = Some(Arc::new(move || match kind {
             "generation" => {
-                entry.state.lock().unwrap().snapshot = None;
+                let mut state = entry.state.lock().unwrap();
+                let previous = state.snapshot.as_ref().unwrap();
+                state.snapshot = Some(Arc::new(Snapshot {
+                    trusted: previous.trusted.clone(),
+                    kids: previous.kids.clone(),
+                    known_kids: previous.known_kids.clone(),
+                    expires: previous.expires,
+                    generation: previous.generation + 1,
+                }));
             }
             "keys-expire" => {
-                ticks.store(600, Ordering::SeqCst);
+                // Token exp/iat remain valid; only the key snapshot has expired.
+                ticks.store(10, Ordering::SeqCst);
             }
             "token-expire" => {
                 ticks.store(300, Ordering::SeqCst);
@@ -514,7 +593,15 @@ async fn release_rechecks_generation_expiry_token_time_and_clock_rollback() {
                 wall.store(1, Ordering::SeqCst);
             }
         }));
-        assert!(h.verify(false).await.is_err());
+        assert_eq!(
+            h.verify(false).await,
+            Err(if kind == "token-expire" {
+                Error::Verification
+            } else {
+                Error::Unavailable
+            }),
+            "{kind}"
+        );
     }
 }
 #[tokio::test]

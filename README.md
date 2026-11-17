@@ -136,7 +136,11 @@ through 4096 bits; the online document parser's 8192-bit ceiling does not expand
 
 Configuration loading and coordinated revision lifecycle across restarts/replicas remain
 unimplemented. Keep the manager alive across requests; retirement/re-registration retains
-cooldown. The new path provides no route, cookie, application session, admission or account
+cooldown. A document expiring before cooldown ends blocks login until another refresh is
+allowed; even identical re-registration clears keys and can impose that outage. Provider
+Age, short cache lifetimes and clock skew can reduce availability. The future loader must
+avoid needless re-registration and qualify policy values against actual provider behavior.
+The new path provides no route, cookie, application session, admission or account
 creation. `cargo test --lib provider_keys --locked --offline` exercises isolated TLS,
 rotation, cancellation, capacity and freshness behavior without PostgreSQL.
 

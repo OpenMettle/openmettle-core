@@ -147,6 +147,7 @@ pub(super) fn metadata(bytes: &[u8], config: &ProviderConfig) -> Result<(), Erro
 pub(super) struct Keys {
     pub keys: CoreJsonWebKeySet,
     pub kids: Vec<Option<String>>,
+    pub known_kids: Vec<String>,
 }
 fn optional_string<'a>(key: &'a Map<String, Value>, name: &str) -> Result<Option<&'a str>, Error> {
     key.get(name)
@@ -171,6 +172,7 @@ pub(super) fn keys(bytes: &[u8]) -> Result<Keys, Error> {
     }
     let mut selected = Vec::new();
     let mut kids = Vec::new();
+    let mut known_kids = Vec::new();
     let mut seen = HashSet::new();
     for raw_key in raw {
         let key = raw_key.as_object().ok_or(Error::Document)?;
@@ -185,6 +187,11 @@ pub(super) fn keys(bytes: &[u8]) -> Result<Keys, Error> {
         let kid = optional_string(key, "kid")?;
         if kid.is_some_and(|v| v.len() > 256 || v.contains('\0')) {
             return Err(Error::Document);
+        }
+        // Presence in a valid document suppresses refresh even if the key is
+        // ineligible for this verifier. This list remains bounded by the raw-key cap.
+        if let Some(kid) = kid {
+            known_kids.push(kid.to_owned());
         }
         let alg = optional_string(key, "alg")?;
         let usage = optional_string(key, "use")?;
@@ -302,6 +309,7 @@ pub(super) fn keys(bytes: &[u8]) -> Result<Keys, Error> {
     Ok(Keys {
         keys: CoreJsonWebKeySet::new(selected),
         kids,
+        known_kids,
     })
 }
 pub(super) fn media(response: &HttpResponse, jwks: bool) -> Result<(), Error> {
