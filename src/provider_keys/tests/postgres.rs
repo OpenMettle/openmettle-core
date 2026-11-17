@@ -150,7 +150,7 @@ impl Drop for Db {
 async fn add_provider(owner: &mut PgConnection, issuer: &str, client: &str, revision: &str) {
     owner.execute(PROTOCOL).await.unwrap();
     sqlx::query(
-        "INSERT INTO openmettle.login_providers (id, issuer, client_id) VALUES ($1::uuid, $2, $3)",
+        "INSERT INTO openmettle.login_providers (id, issuer, client_id, changed_by, change_reason) VALUES ($1::uuid, $2, $3, 'fixture-owner', 'synthetic provider')",
     )
     .bind(signing::ID)
     .bind(issuer)
@@ -370,7 +370,7 @@ async fn begin_requires_committed_matching_authority() {
     };
     refused(&mut api, "no provider row").await;
     owner.execute(PROTOCOL).await.unwrap();
-    sqlx::query("INSERT INTO openmettle.login_providers (id, issuer, client_id) VALUES ($1::uuid, 'https://other.example.test', $2)")
+    sqlx::query("INSERT INTO openmettle.login_providers (id, issuer, client_id, changed_by, change_reason) VALUES ($1::uuid, 'https://other.example.test', $2, 'fixture-owner', 'synthetic mismatch')")
         .bind(signing::ID).bind(signing::CLIENT).execute(&mut owner).await.unwrap();
     owner.execute("COMMIT").await.unwrap();
     refused(&mut api, "no revision row").await;

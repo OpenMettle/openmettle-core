@@ -113,6 +113,9 @@ Commit acknowledgement can arrive after token expiry, authority revocation or de
 Then a bounded committed session and issuance marker can remain, but no credential is returned.
 Cancellation or ambiguous commit also returns no credential. Discard uncertain connections and
 start a new managed login; do not retry the authorization code or clear an issuance marker.
+For ordinary returned errors before commit, the helper awaits rollback before returning, so
+an idle caller connection does not retain row locks. A rollback failure returns a database
+error and requires discarding the connection. Cancellation during cleanup remains uncertain.
 Memory generation checks and PostgreSQL commit are separate observation points, not one atomic
 operation. Revocation after final validation is ordered after that check. No validity-through-
 network-delivery or retraction of already-issued external effects is promised.
@@ -150,18 +153,28 @@ UPDATE privilege does not prevent raw SQL from violating this protocol.
 
 All waits consume the existing API connection budget, with no new pool or background task.
 Keep the ADR 0003 budget including rollout surge, workers, migrator and administrative headroom.
+Validation takes SHARE locks, including on the common provider row. These locks permit
+concurrent validators but add transaction and WAL overhead and can form multixacts. Their
+throughput and latency are unmeasured; qualify them before exposing per-request validation.
 Logout takes no provider lock, so an owner provider lock cannot prevent logout. Long streams,
 queued work and external dispatch need V1-05 checks at their own defined boundaries.
 
 ## Operator protocol
 
-Run only as openmettle_owner against the primary under deployment change controls. Use bounded
-transactions, synchronous commit and explicit expected epoch/revision/generation. Obtain the
-stable row lock before checking expectations and before allocating an epoch. Zero-row CAS,
-overflow, an unexpected latest epoch or any SQL error requires ROLLBACK. Examples use psql
-variables and `ON_ERROR_STOP`; they are not automatic deployment commands.
+Run these blocks as psql scripts with `ON_ERROR_STOP` against the primary as
+`openmettle_owner`, under deployment change controls. Supply every named variable explicitly.
+Do not continue after an error. A failed expectation rolls back; read current state and review
+it before retrying the complete transaction. Operator changes use bounded transactions and
+synchronous commit. Multi-row operations lock stable IDs in ascending order.
 
-For a routine provider revision change:
+### Provider revision, revocation, retirement and restoration
+
+Supply `provider`, `expected_generation`, `expected_epoch`, `actor`, `reason`, `action` and
+`revision`. Use action `routine` to change an active configuration without signing users out;
+`revoke` to invalidate sessions and pending logins while keeping the provider active;
+`retire` to disable it; or `restore` to reactivate a retired provider. For `revoke`, `revision`
+may be the current string, but **a fresh epoch is mandatory**. For `retire`, supply an empty
+revision variable: the CASE expression writes literal SQL NULL, not its text value.
 
 ```sql
 \set ON_ERROR_STOP on
@@ -169,16 +182,24 @@ BEGIN;
 SET LOCAL lock_timeout = '2s';
 SET LOCAL statement_timeout = '5s';
 SET LOCAL synchronous_commit = on;
-SELECT access_generation FROM openmettle.login_providers
- WHERE id = :'provider'::uuid AND access_generation = :expected_generation FOR UPDATE \gset
-SELECT epoch AS observed_epoch FROM openmettle.login_provider_revisions
- WHERE provider_id = :'provider'::uuid ORDER BY epoch DESC LIMIT 1 \gset
-SELECT :observed_epoch = :expected_epoch AS expected \gset
+SELECT access_generation AS observed_generation FROM openmettle.login_providers
+ WHERE id=:'provider'::uuid FOR UPDATE \gset
+SELECT epoch AS observed_epoch, revision IS NULL AS retired
+ FROM openmettle.login_provider_revisions
+ WHERE provider_id=:'provider'::uuid ORDER BY epoch DESC LIMIT 1 \gset
+SELECT :observed_generation = :expected_generation
+ AND :observed_epoch = :expected_epoch
+ AND ((:'action' IN ('routine','revoke','retire') AND NOT :'retired'::boolean)
+      OR (:'action' = 'restore' AND :'retired'::boolean)) AS expected \gset
 \if :expected
-  UPDATE openmettle.login_providers SET changed_by=:'actor', change_reason=:'reason',
-    changed_at=clock_timestamp() WHERE id=:'provider'::uuid;
+  UPDATE openmettle.login_providers
+   SET access_generation=access_generation +
+         CASE WHEN :'action' IN ('revoke','retire') THEN 1 ELSE 0 END,
+       changed_by=:'actor', change_reason=:'reason', changed_at=clock_timestamp()
+   WHERE id=:'provider'::uuid;
   INSERT INTO openmettle.login_provider_revisions(provider_id,revision)
-    VALUES (:'provider'::uuid, :'revision') RETURNING epoch AS new_epoch \gset
+   VALUES (:'provider'::uuid, CASE WHEN :'action'='retire' THEN NULL ELSE :'revision' END)
+   RETURNING epoch AS new_epoch \gset
   SELECT NOT EXISTS (SELECT FROM openmettle.login_provider_revisions
     WHERE provider_id=:'provider'::uuid AND epoch > :new_epoch) AS current \gset
   \if :current
@@ -191,48 +212,90 @@ SELECT :observed_epoch = :expected_epoch AS expected \gset
 \endif
 ```
 
-Explicit provider revocation uses the same locked transaction and expected checks, but advances
-`access_generation=access_generation+1` in the UPDATE. It may append the same revision string;
-this also fences pending logins. Retirement advances the generation and uses this INSERT:
+Locking precedes epoch allocation. Revocation and retirement increment the access generation
+and append the epoch **in the same transaction**. A generation-only update invalidates existing
+sessions but does not fence an already-exchanged login proof; it is not this revocation protocol.
+Overflow aborts the transaction. Restoration preserves the advanced generation and allocates a
+new epoch. Validation also refuses sessions issued before any later retirement tombstone, so
+using the older migration-7 retirement recipe cannot revive sessions on restoration. Routine
+non-NULL revisions remain compatible with existing sessions.
+
+This supersedes ADR 0012's write examples for schema version 8 onward. Its allocator repair
+requirements still apply. A new provider and its first revision must be inserted in one owner
+transaction with explicit actor/reason; defaults backfill existing rows during migration only.
+Owner writes that bypass the protocol remain outside its concurrency guarantee.
+
+### Approval edits, revocation, withdrawal and reapproval
+
+Supply `approval`, `expected_revision`, `expected_generation`, `actor`, `reason`, `action` and
+`expires_ms`. Use `routine` only for an active, unexpired approval; `revoke` to invalidate its
+sessions while retaining eligibility; `withdraw` to remove eligibility; or `restore` to
+reapprove an inactive or expired identity. `expires_ms` is used by routine edits and restoration;
+supply it explicitly even for other actions, which retain the stored expiry.
 
 ```sql
-INSERT INTO openmettle.login_provider_revisions(provider_id,revision)
- VALUES (:'provider'::uuid, NULL) RETURNING epoch AS new_epoch \gset
+\set ON_ERROR_STOP on
+BEGIN;
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '5s';
+SET LOCAL synchronous_commit = on;
+SELECT revision AS observed_revision, access_generation AS observed_generation,
+       active AS was_active, expires_ms AS old_expiry
+ FROM openmettle.local_identity_approvals WHERE id=:'approval'::uuid FOR UPDATE \gset
+SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint AS observed_ms \gset
+SELECT :observed_revision = :expected_revision AND :observed_generation = :expected_generation
+ AND ((:'action'='routine' AND :'was_active'::boolean AND :old_expiry > :observed_ms
+                         AND :expires_ms > :observed_ms)
+   OR (:'action' IN ('revoke','withdraw') AND :'was_active'::boolean)
+   OR (:'action'='restore' AND (NOT :'was_active'::boolean OR :old_expiry <= :observed_ms)
+                          AND :expires_ms > :observed_ms)) AS expected \gset
+\if :expected
+  UPDATE openmettle.local_identity_approvals
+   SET revision=revision+1,
+       access_generation=access_generation + CASE WHEN :'action'='routine' THEN 0 ELSE 1 END,
+       active=CASE WHEN :'action'='withdraw' THEN false
+                   WHEN :'action'='restore' THEN true ELSE active END,
+       expires_ms=CASE WHEN :'action' IN ('routine','restore') THEN :expires_ms ELSE expires_ms END,
+       changed_by=:'actor', change_reason=:'reason', changed_at=clock_timestamp()
+   WHERE id=:'approval'::uuid;
+  COMMIT;
+\else
+  ROLLBACK;
+\endif
 ```
 
-Use literal NULL, not quoted `'NULL'`. Restore appends an active revision using the routine
-protocol and preserves the already-advanced generation. Never reuse an old epoch or lower a
-generation. The current-row check and allocator repair requirements in ADR 0012 remain.
-An initial provider plus first revision is created in one owner transaction as before; record
-its actor/reason/time. Existing providers receive migration provenance, not invented authors.
+Restoration advances the generation again, including when the previous approval merely expired.
+It cannot revive sessions bound to that earlier approval. Never change provider/identity on an
+existing approval. Create a distinct approval only for an existing exact identity and compatible
+provider issuer, with explicit expiry and operator provenance. No API admission-write or user-
+provisioning helper is provided.
 
-For approval changes, take `FOR UPDATE` on the exact approval ID, require the expected revision
-and generation, then UPDATE in that transaction with `RETURNING revision` (exactly one row):
+### User disablement and re-enable
+
+Supply `user`, `expected_generation` and boolean psql variable `disable`. Disabling advances
+the generation atomically; re-enable clears disablement without resetting it. Both require the
+expected generation. An old script that only sets `disabled_at` does not implement this protocol.
+The internal disable helper provides the same generation fence for a separately authorized caller.
 
 ```sql
-UPDATE openmettle.local_identity_approvals SET revision=revision+1,
-  expires_ms=:expires_ms, changed_by=:'actor', change_reason=:'reason',
-  changed_at=clock_timestamp()
- WHERE id=:'approval'::uuid AND revision=:expected_revision
-   AND access_generation=:expected_generation AND active
-   AND expires_ms > floor(extract(epoch FROM clock_timestamp())*1000)::bigint
-   AND :expires_ms > floor(extract(epoch FROM clock_timestamp())*1000)::bigint
- RETURNING revision;
+\set ON_ERROR_STOP on
+BEGIN;
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '5s';
+SET LOCAL synchronous_commit = on;
+SELECT session_generation AS observed_generation FROM openmettle.users
+ WHERE id=:'user'::uuid FOR UPDATE \gset
+SELECT :observed_generation = :expected_generation AS expected \gset
+\if :expected
+  UPDATE openmettle.users
+   SET session_generation=session_generation + CASE WHEN :'disable'::boolean THEN 1 ELSE 0 END,
+       disabled_at=CASE WHEN :'disable'::boolean THEN GREATEST(created_at,clock_timestamp()) ELSE NULL END
+   WHERE id=:'user'::uuid;
+  COMMIT;
+\else
+  ROLLBACK;
+\endif
 ```
-
-This is a routine edit of a still-active, unexpired approval, preserving generation and active
-state. An edit that removes eligibility or restores an expired approval must advance generation;
-it is not a routine extension. Explicit revoke adds
-`access_generation=access_generation+1`; withdrawal also sets `active=false`. Restoration sets
-`active=true` and advances revision, preserving generation. Never change provider_id/identity_id
-on an existing approval: use a distinct approval. Create an approval only for an existing exact
-identity and compatible provider issuer, with explicit positive expires_ms and actor/reason.
-No API admission-write or user-provisioning helper is provided. A zero-row result is not success.
-
-For owner user re-enable, lock the user FOR UPDATE, compare the expected generation, then clear
-only disabled_at and commit. Disable must advance generation in the same transaction; prefer
-the internal helper once a separately authorized administrative caller exists. Do not apply a
-routine UPDATE(disabled_at) from an old script. Old API/worker binaries have no such handlers.
 
 ## Bounded owner cleanup and restore
 

@@ -6,7 +6,7 @@ use super::*;
 async fn exact_session_privileges_and_inert_lock_columns() {
     let db = TestDb::migrated().await;
     let mut owner = connect(&db.0, OWNER).await;
-    owner.execute("INSERT INTO openmettle.login_providers(id,issuer,client_id) VALUES ('00000000-0000-0000-0000-000000000008','https://session.example.test','synthetic')").await.unwrap();
+    owner.execute("INSERT INTO openmettle.login_providers(id,issuer,client_id,changed_by,change_reason) VALUES ('00000000-0000-0000-0000-000000000008','https://session.example.test','synthetic','fixture-owner','synthetic provider')").await.unwrap();
     let mut api = connect(&db.0, API).await;
     api.execute("SELECT id FROM openmettle.login_providers FOR SHARE")
         .await
@@ -155,4 +155,47 @@ fn released_migrations_one_through_seven_are_unchanged() {
             hash
         );
     }
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn provider_provenance_backfills_v7_but_requires_explicit_values_after_upgrade() {
+    let db = TestDb::new().await;
+    migrate::apply(&db.settings(Duration::from_secs(5)), &MIGRATIONS[..7])
+        .await
+        .unwrap();
+    let mut owner = connect(&db.0, OWNER).await;
+    owner.execute("INSERT INTO openmettle.login_providers(id,issuer,client_id) VALUES ('00000000-0000-0000-0000-000000000008','https://session.example.test','synthetic')").await.unwrap();
+    migrate::apply(&db.settings(Duration::from_secs(5)), MIGRATIONS)
+        .await
+        .unwrap();
+    let provenance: (String, String) =
+        sqlx::query_as("SELECT changed_by,change_reason FROM openmettle.login_providers")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    assert_eq!(
+        provenance,
+        ("migration-8".into(), "initial session authority".into())
+    );
+    let defaults: Vec<Option<String>> = sqlx::query_scalar("SELECT column_default FROM information_schema.columns WHERE table_schema='openmettle' AND table_name='login_providers' AND column_name IN ('changed_by','change_reason')")
+        .fetch_all(&mut owner).await.unwrap();
+    assert_eq!(defaults, vec![None, None]);
+    for sql in [
+        "INSERT INTO openmettle.login_providers(id,issuer,client_id) VALUES (gen_random_uuid(),'https://new.example.test','synthetic')",
+        "INSERT INTO openmettle.login_providers(id,issuer,client_id,changed_by) VALUES (gen_random_uuid(),'https://new.example.test','synthetic','fixture-owner')",
+        "INSERT INTO openmettle.login_providers(id,issuer,client_id,change_reason) VALUES (gen_random_uuid(),'https://new.example.test','synthetic','new provider')",
+    ] {
+        expect_state(&mut owner, sql, "23502").await;
+    }
+    owner.execute("INSERT INTO openmettle.login_providers(id,issuer,client_id,changed_by,change_reason) VALUES (gen_random_uuid(),'https://new.example.test','synthetic','fixture-owner','new provider')").await.unwrap();
+}
+
+#[test]
+fn migration_eight_contract_hash() {
+    use sha2::{Digest, Sha256};
+    assert_eq!(
+        format!("{:x}", Sha256::digest(MIGRATIONS[7].sql.as_bytes())),
+        "9a77a03a838fa058ad3919ed8db5e483619755cc4a96959240202d6c35b3939a"
+    );
 }

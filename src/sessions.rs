@@ -140,15 +140,37 @@ async fn transaction(c: &mut PgConnection) -> Result<WriteTransaction<'_>, Error
         return Err(Error::Rejected);
     }
     let mut tx = WriteTransaction::begin(c).await?;
-    for sql in [
-        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-        "SET LOCAL synchronous_commit = on",
-        "SET LOCAL lock_timeout = '2s'",
-        "SET LOCAL statement_timeout = '3s'",
-    ] {
-        sqlx::query(sql).execute(tx.connection()?).await?;
+    let setup: Result<(), Error> = async {
+        for sql in [
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            "SET LOCAL synchronous_commit = on",
+            "SET LOCAL lock_timeout = '2s'",
+            "SET LOCAL statement_timeout = '3s'",
+        ] {
+            sqlx::query(sql).execute(tx.connection()?).await?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = setup {
+        tx.rollback().await?;
+        return Err(error);
     }
     Ok(tx)
+}
+// Returned errors must release locks before the caller gets its connection back. Drop
+// only queues SQLx rollback; cancellation/timeout remains an uncertain-discard boundary.
+async fn finish<T>(tx: WriteTransaction<'_>, result: Result<T, Error>) -> Result<T, Error> {
+    match result {
+        Ok(value) => {
+            tx.commit().await?;
+            Ok(value)
+        }
+        Err(error) => {
+            tx.rollback().await?;
+            Err(error)
+        }
+    }
 }
 async fn now(c: &mut PgConnection) -> Result<i64, Error> {
     Ok(
@@ -180,6 +202,7 @@ pub(crate) async fn issue(
     tokio::time::timeout_at(deadline, async {
         check()?;
         let mut tx = transaction(c).await?;
+        let result: Result<Credential, Error> = async {
         let gate = sqlx::query("SELECT binding,expires_ms,consumed,session_issued FROM openmettle.login_transactions WHERE id=$1 FOR UPDATE")
             .bind(input.login).fetch_optional(tx.connection()?).await?.ok_or(Error::Rejected)?;
         if !gate.try_get::<bool,_>("consumed")? || gate.try_get::<bool,_>("session_issued")?
@@ -222,7 +245,9 @@ pub(crate) async fn issue(
         let final_time = now(tx.connection()?).await?;
         if final_time < timestamp || final_time >= expiry || final_time >= approval_expiry || final_time >= input.login_expiry { return Err(Error::Rejected); }
         check()?;
-        tx.commit().await?;
+        Ok(credential)
+        }.await;
+        let credential = finish(tx, result).await?;
         check()?;
         // The acknowledgement can be delayed past revocation or local expiry. A new primary
         // transaction observes that; the issued row/marker may remain without a credential.
@@ -246,6 +271,7 @@ pub async fn validate(
 async fn validate_inner(c: &mut PgConnection, credential: &str) -> Result<Context, Error> {
     let (id, hash) = parse(credential)?;
     let mut tx = transaction(c).await?;
+    let result: Result<Context, Error> = async {
     let row = sqlx::query("SELECT secret_hash,provider_id::text,approval_id::text,user_id::text FROM openmettle.local_sessions WHERE id=$1")
         .bind(id).fetch_optional(tx.connection()?).await?;
     let stored = row
@@ -279,35 +305,39 @@ async fn validate_inner(c: &mut PgConnection, credential: &str) -> Result<Contex
         .await?
         .ok_or(Error::Rejected)?;
     let timestamp = now(tx.connection()?).await?;
-    let current = sqlx::query("SELECT s.user_id::text,sc.id::text AS scope_id FROM openmettle.local_sessions s JOIN openmettle.login_providers p ON p.id=s.provider_id JOIN LATERAL (SELECT revision FROM openmettle.login_provider_revisions WHERE provider_id=p.id ORDER BY epoch DESC LIMIT 1) r ON true JOIN openmettle.local_identity_approvals a ON a.id=s.approval_id JOIN openmettle.user_identities i ON i.id=s.identity_id JOIN openmettle.users u ON u.id=s.user_id JOIN openmettle.scopes sc ON sc.personal_user_id=u.id AND sc.kind='personal' WHERE s.id=$1 AND s.secret_hash=$2 AND NOT s.revoked AND s.created_ms <= $3 AND s.expires_ms > $3 AND r.revision IS NOT NULL AND p.issuer=i.issuer AND p.client_id=s.issued_client AND i.user_id=u.id AND a.provider_id=p.id AND a.identity_id=i.id AND a.active AND a.expires_ms > $3 AND u.disabled_at IS NULL AND s.provider_generation=p.access_generation AND s.approval_generation=a.access_generation AND s.user_generation=u.session_generation")
+    let current = sqlx::query("SELECT s.user_id::text,sc.id::text AS scope_id FROM openmettle.local_sessions s JOIN openmettle.login_providers p ON p.id=s.provider_id JOIN LATERAL (SELECT revision FROM openmettle.login_provider_revisions WHERE provider_id=p.id ORDER BY epoch DESC LIMIT 1) r ON true JOIN openmettle.local_identity_approvals a ON a.id=s.approval_id JOIN openmettle.user_identities i ON i.id=s.identity_id JOIN openmettle.users u ON u.id=s.user_id JOIN openmettle.scopes sc ON sc.personal_user_id=u.id AND sc.kind='personal' WHERE s.id=$1 AND s.secret_hash=$2 AND NOT s.revoked AND s.created_ms <= $3 AND s.expires_ms > $3 AND r.revision IS NOT NULL AND NOT EXISTS (SELECT FROM openmettle.login_provider_revisions retired WHERE retired.provider_id=p.id AND retired.epoch>s.issued_epoch AND retired.revision IS NULL) AND p.issuer=i.issuer AND p.client_id=s.issued_client AND i.user_id=u.id AND a.provider_id=p.id AND a.identity_id=i.id AND a.active AND a.expires_ms > $3 AND u.disabled_at IS NULL AND s.provider_generation=p.access_generation AND s.approval_generation=a.access_generation AND s.user_generation=u.session_generation")
         .bind(id).bind(hash.as_slice()).bind(timestamp).fetch_optional(tx.connection()?).await?.ok_or(Error::Rejected)?;
     let context = Context {
         user: current.try_get("user_id")?,
         personal_scope: current.try_get("scope_id")?,
     };
-    tx.commit().await?;
     Ok(context)
+    }.await;
+    finish(tx, result).await
 }
 /// Revokes by possession of the credential even when all current eligibility has been lost.
 pub async fn logout(c: &mut PgConnection, credential: &str, policy: &Policy) -> Result<(), Error> {
     tokio::time::timeout(policy.deadline, async {
         let (id, hash) = parse(credential)?;
         let mut tx = transaction(c).await?;
-        let stored: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT secret_hash FROM openmettle.local_sessions WHERE id=$1 FOR UPDATE",
-        )
-        .bind(id)
-        .fetch_optional(tx.connection()?)
-        .await?;
-        if !matches(stored.as_deref(), &hash) {
-            return Err(Error::Rejected);
-        }
-        sqlx::query("UPDATE openmettle.local_sessions SET revoked=true WHERE id=$1")
+        let result: Result<(), Error> = async {
+            let stored: Option<Vec<u8>> = sqlx::query_scalar(
+                "SELECT secret_hash FROM openmettle.local_sessions WHERE id=$1 FOR UPDATE",
+            )
             .bind(id)
-            .execute(tx.connection()?)
+            .fetch_optional(tx.connection()?)
             .await?;
-        tx.commit().await?;
-        Ok(())
+            if !matches(stored.as_deref(), &hash) {
+                return Err(Error::Rejected);
+            }
+            sqlx::query("UPDATE openmettle.local_sessions SET revoked=true WHERE id=$1")
+                .bind(id)
+                .execute(tx.connection()?)
+                .await?;
+            Ok(())
+        }
+        .await;
+        finish(tx, result).await
     })
     .await
     .map_err(|_| Error::Timeout)?
@@ -324,13 +354,15 @@ pub async fn disable_user(
     tokio::time::timeout(policy.deadline, async {
         let next = expected_generation.checked_add(1).filter(|_| expected_generation >= 0).ok_or(Error::Rejected)?;
         let mut tx = transaction(c).await?;
+        let result: Result<(), Error> = async {
         let generation: i64 = sqlx::query_scalar("SELECT session_generation FROM openmettle.users WHERE id=$1::uuid FOR UPDATE")
             .bind(user).fetch_optional(tx.connection()?).await?.ok_or(Error::Rejected)?;
         if generation != expected_generation { return Err(Error::Rejected); }
         sqlx::query("UPDATE openmettle.users SET disabled_at=GREATEST(created_at,clock_timestamp()),session_generation=$2 WHERE id=$1::uuid")
             .bind(user).bind(next).execute(tx.connection()?).await?;
-        tx.commit().await?;
         Ok(())
+        }.await;
+        finish(tx, result).await
     }).await.map_err(|_| Error::Timeout)?
 }
 

@@ -36,6 +36,38 @@ async fn issue(f: &mut Flow) -> local::Credential {
         .await
         .unwrap()
 }
+// Caller holds the stable provider row FOR UPDATE in this transaction. Generation and
+// a fresh epoch commit together, including explicit revoke with an unchanged revision.
+async fn revoke_locked(owner: &mut PgConnection, revision: Option<&str>) -> i64 {
+    sqlx::query("UPDATE openmettle.login_providers SET access_generation=access_generation+1,changed_by='fixture-owner',change_reason='explicit revoke or retire',changed_at=clock_timestamp() WHERE id=$1::uuid")
+        .bind(signing::ID).execute(&mut *owner).await.unwrap();
+    let epoch = sqlx::query_scalar(APPEND)
+        .bind(signing::ID)
+        .bind(revision)
+        .fetch_one(&mut *owner)
+        .await
+        .unwrap();
+    assert!(is_current(owner, epoch).await);
+    epoch
+}
+async fn revoke_provider(owner: &mut PgConnection, revision: Option<&str>) -> i64 {
+    let mut tx = owner.begin().await.unwrap();
+    for sql in [
+        "SET LOCAL lock_timeout='2s'",
+        "SET LOCAL statement_timeout='5s'",
+        "SET LOCAL synchronous_commit=on",
+    ] {
+        sqlx::query(sql).execute(&mut *tx).await.unwrap();
+    }
+    sqlx::query(LOCK)
+        .bind(signing::ID)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    let epoch = revoke_locked(&mut tx, revision).await;
+    tx.commit().await.unwrap();
+    epoch
+}
 async fn session_count(f: &mut Flow) -> i64 {
     sqlx::query_scalar("SELECT count(*) FROM openmettle.local_sessions")
         .fetch_one(&mut f.owner)
@@ -78,7 +110,7 @@ async fn routine_changes_preserve_sessions_and_explicit_revocations_do_not_reviv
         requests,
         "local validation must not fetch provider documents"
     );
-    write(&mut f,"UPDATE openmettle.login_providers SET access_generation=access_generation+1,changed_by='fixture-owner',change_reason='explicit revoke'").await;
+    revoke_provider(&mut f.owner, Some("v2")).await;
     assert!(
         local::validate(&mut f.api, credential.expose(), &session_policy())
             .await
@@ -97,9 +129,7 @@ async fn routine_changes_preserve_sessions_and_explicit_revocations_do_not_reviv
         let logout_target = issue(&mut f).await;
         match action {
             "retire" => {
-                open_write(&mut f.owner,None).await;
-                f.owner.execute("UPDATE openmettle.login_providers SET access_generation=access_generation+1").await.unwrap();
-                f.owner.execute("COMMIT").await.unwrap();
+                revoke_provider(&mut f.owner,None).await;
             },
             "withdraw" => write(&mut f,"UPDATE openmettle.local_identity_approvals SET active=false,revision=revision+1,access_generation=access_generation+1").await,
             _ => local::disable_user(&mut f.api,&user,0,&session_policy()).await.unwrap(),
@@ -120,7 +150,7 @@ async fn routine_changes_preserve_sessions_and_explicit_revocations_do_not_reviv
             }
             "withdraw" => write(
                 &mut f,
-                "UPDATE openmettle.local_identity_approvals SET active=true,revision=revision+1",
+                "UPDATE openmettle.local_identity_approvals SET active=true,revision=revision+1,access_generation=access_generation+1",
             )
             .await,
             _ => write(&mut f, "UPDATE openmettle.users SET disabled_at=NULL").await,
@@ -525,13 +555,7 @@ async fn authority_and_disablement_are_rechecked_after_real_lock_waits() {
                     held.execute("UPDATE openmettle.users SET disabled_at=clock_timestamp(),session_generation=session_generation+1").await.unwrap();
                 }
                 "provider-retire" => {
-                    held.execute("UPDATE openmettle.login_providers SET access_generation=access_generation+1").await.unwrap();
-                    sqlx::query(APPEND)
-                        .bind(signing::ID)
-                        .bind(Option::<&str>::None)
-                        .execute(&mut *held)
-                        .await
-                        .unwrap();
+                    revoke_locked(&mut held, None).await;
                 }
                 _ => {
                     sqlx::query(APPEND)
@@ -679,18 +703,18 @@ async fn issuance_first_blocks_provider_and_user_writers() {
         let mut observer = f.db.connect(OWNER).await;
         let revoke = async {
             barrier.wait_reached().await;
-            let sql = if target == "provider" {
-                "UPDATE openmettle.login_providers SET access_generation=access_generation+1"
-            } else {
-                "UPDATE openmettle.users SET disabled_at=clock_timestamp(),session_generation=session_generation+1"
+            let update = async {
+                if target == "provider" {
+                    revoke_provider(&mut f.owner, Some("v1")).await;
+                } else {
+                    sqlx::query("UPDATE openmettle.users SET disabled_at=clock_timestamp(),session_generation=session_generation+1").execute(&mut f.owner).await.unwrap();
+                }
             };
-            let update = sqlx::query(sql).execute(&mut f.owner);
             let release = async {
                 waiting(&mut observer, pid).await;
                 barrier.resume();
             };
-            let (result, ()) = tokio::join!(update, release);
-            result.unwrap();
+            let ((), ()) = tokio::join!(update, release);
         };
         let policy = session_policy();
         let (result, ()) = tokio::join!(p.issue_session(&mut cn, proof, &policy), revoke);
@@ -742,4 +766,205 @@ async fn proof_expiry_after_user_wait_rolls_back_session_and_marker() {
             .await
             .unwrap();
     assert!(!issued);
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn returned_errors_release_locks_while_rejected_connection_stays_idle() {
+    for rejection in ["validate", "capacity", "logout", "disable"] {
+        let mut f = Flow::new().await;
+        let user = seed(&mut f, true, true).await;
+        let credential = issue(&mut f).await;
+        let policy = session_policy();
+        let result = match rejection {
+            "validate" => {
+                write(&mut f, "UPDATE openmettle.local_sessions SET revoked=true").await;
+                local::validate(&mut f.api, credential.expose(), &policy)
+                    .await
+                    .map(|_| ())
+            }
+            "capacity" => {
+                let p = f.h.provider.clone();
+                let (_, proof) = f.exchanged(&p).await;
+                let cap = local::Policy::new(Duration::from_secs(60), 1, Duration::from_secs(10))
+                    .unwrap();
+                p.issue_session(&mut f.api, proof, &cap).await.map(|_| ())
+            }
+            "logout" => {
+                // A different canonical secret with the real lookup ID reaches the row lock.
+                let (id, secret) = credential.expose().split_once('.').unwrap();
+                let bad = if secret == "A".repeat(43) {
+                    "B".repeat(42) + "A"
+                } else {
+                    "A".repeat(43)
+                };
+                local::logout(&mut f.api, &format!("{id}.{bad}"), &policy).await
+            }
+            _ => local::disable_user(&mut f.api, &user, 1, &policy).await,
+        };
+        assert_eq!(
+            result,
+            Err(if rejection == "capacity" {
+                SessionError::Capacity
+            } else {
+                SessionError::Rejected
+            })
+        );
+        // Do not close, query, or reuse f.api: SQLx's queued Drop rollback would hide the bug.
+        // The separate owner must immediately acquire every possible held lock, including
+        // the session lock for bad-secret logout and the user lock for a stale disable CAS.
+        let mut owner = f.owner.begin().await.unwrap();
+        owner
+            .execute("SET LOCAL lock_timeout='500ms'")
+            .await
+            .unwrap();
+        for sql in [
+            "SELECT id FROM openmettle.login_transactions FOR UPDATE",
+            "SELECT id FROM openmettle.login_providers FOR UPDATE",
+            "SELECT id FROM openmettle.local_identity_approvals FOR UPDATE",
+            "SELECT id FROM openmettle.users FOR UPDATE",
+            "SELECT id FROM openmettle.local_sessions FOR UPDATE",
+        ] {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                sqlx::query(sql).fetch_all(&mut *owner),
+            )
+            .await
+            .expect("owner lock deadline")
+            .expect(rejection);
+        }
+        owner.rollback().await.unwrap();
+        assert_eq!(session_count(&mut f).await, 1);
+    }
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn explicit_provider_revoke_fences_exchanged_proof_even_with_same_revision() {
+    let mut f = Flow::new().await;
+    seed(&mut f, true, true).await;
+    let p = f.h.provider.clone();
+    let (started, proof) = f.exchanged(&p).await;
+    let previous_epoch = proof.epoch;
+    assert!(revoke_provider(&mut f.owner, Some("v1")).await > previous_epoch);
+    assert!(matches!(
+        p.issue_session(&mut f.api, proof, &session_policy()).await,
+        Err(SessionError::Rejected)
+    ));
+    assert_eq!(session_count(&mut f).await, 0);
+    let marked: bool =
+        sqlx::query_scalar("SELECT session_issued FROM openmettle.login_transactions WHERE id=$1")
+            .bind(locator(&started))
+            .fetch_one(&mut f.owner)
+            .await
+            .unwrap();
+    assert!(!marked);
+    // A new login after the revocation observes its new authority epoch and can succeed.
+    let credential = issue(&mut f).await;
+    local::validate(&mut f.api, credential.expose(), &session_policy())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn legacy_null_retirement_never_revives_sessions_on_restore() {
+    let mut f = Flow::new().await;
+    seed(&mut f, true, true).await;
+    let old = issue(&mut f).await;
+    // Deliberately use the historical v7 protocol, with no access-generation update.
+    super::write(&mut f.owner, None).await;
+    assert!(matches!(
+        local::validate(&mut f.api, old.expose(), &session_policy()).await,
+        Err(SessionError::Rejected)
+    ));
+    super::write(&mut f.owner, Some("v1")).await;
+    let generation: i64 = sqlx::query_scalar(
+        "SELECT access_generation FROM openmettle.login_providers WHERE id=$1::uuid",
+    )
+    .bind(signing::ID)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        generation, 0,
+        "test must exercise the legacy retirement fence alone"
+    );
+    assert!(matches!(
+        local::validate(&mut f.api, old.expose(), &session_policy()).await,
+        Err(SessionError::Rejected)
+    ));
+    let new = issue(&mut f).await;
+    local::validate(&mut f.api, new.expose(), &session_policy())
+        .await
+        .unwrap();
+    super::write(&mut f.owner, Some("v2")).await;
+    local::validate(&mut f.api, new.expose(), &session_policy())
+        .await
+        .unwrap();
+    assert!(
+        local::validate(&mut f.api, old.expose(), &session_policy())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn expired_approval_restoration_advances_generation_and_does_not_revive() {
+    let mut f = Flow::new().await;
+    seed(&mut f, true, true).await;
+    let old = issue(&mut f).await;
+    write(&mut f, "UPDATE openmettle.local_identity_approvals SET expires_ms=floor(extract(epoch FROM clock_timestamp())*1000)::bigint-1,revision=revision+1").await;
+    assert!(
+        local::validate(&mut f.api, old.expose(), &session_policy())
+            .await
+            .is_err()
+    );
+    // Restoration of an expired but active approval is a new access generation too.
+    let mut tx = f.owner.begin().await.unwrap();
+    tx.execute("SELECT id FROM openmettle.local_identity_approvals FOR UPDATE")
+        .await
+        .unwrap();
+    tx.execute("UPDATE openmettle.local_identity_approvals SET expires_ms=floor(extract(epoch FROM clock_timestamp())*1000)::bigint+600000,revision=revision+1,access_generation=access_generation+1,changed_at=clock_timestamp(),changed_by='fixture-owner',change_reason='restore expired approval'").await.unwrap();
+    tx.commit().await.unwrap();
+    assert!(
+        local::validate(&mut f.api, old.expose(), &session_policy())
+            .await
+            .is_err()
+    );
+    let new = issue(&mut f).await;
+    local::validate(&mut f.api, new.expose(), &session_policy())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn cancellation_during_explicit_error_rollback_returns_no_success() {
+    let mut f = Flow::new().await;
+    let user = seed(&mut f, true, true).await;
+    let mut barrier = ResponseBarrier::new(b"ROLLBACK\0");
+    let options =
+        f.db.options(API)
+            .host("127.0.0.1")
+            .port(barrier.port)
+            .ssl_mode(sqlx::postgres::PgSslMode::Disable);
+    let mut cn = PgConnection::connect_with(&options).await.unwrap();
+    cancel_at_response(
+        &mut barrier,
+        local::disable_user(&mut cn, &user, 1, &session_policy()),
+    )
+    .await;
+    // Even cancellation during rollback acknowledgment uses the uncertain-discard contract.
+    cn.close().await.unwrap();
+    drop(barrier);
+    let state: (bool, i64) = sqlx::query_as(
+        "SELECT disabled_at IS NULL, session_generation FROM openmettle.users WHERE id=$1::uuid",
+    )
+    .bind(user)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(state, (true, 0));
 }

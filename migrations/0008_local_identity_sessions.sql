@@ -6,6 +6,11 @@ ALTER TABLE openmettle.login_providers
     ADD COLUMN changed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     ADD COLUMN changed_by text NOT NULL DEFAULT 'migration-8' CHECK (octet_length(changed_by) BETWEEN 1 AND 128),
     ADD COLUMN change_reason text NOT NULL DEFAULT 'initial session authority' CHECK (octet_length(change_reason) BETWEEN 1 AND 512);
+-- Migration provenance applies only to rows that existed at upgrade. New providers must
+-- supply their real operator provenance; no permanent migration author default.
+ALTER TABLE openmettle.login_providers
+    ALTER COLUMN changed_by DROP DEFAULT,
+    ALTER COLUMN change_reason DROP DEFAULT;
 ALTER TABLE openmettle.users
     ADD COLUMN session_generation bigint NOT NULL DEFAULT 0 CHECK (session_generation >= 0);
 -- Table-wide INSERT on users remains for compatibility. Generation initialization and
