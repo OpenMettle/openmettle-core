@@ -36,10 +36,16 @@ pub enum Error {
     Protection,
     Exchange,
     Verification,
+    /// The owner-configured outstanding-login limit is reached (ADR 0014).
+    Capacity,
+    /// No outstanding-login limit is configured; initiation fails closed (ADR 0014).
+    Unconfigured,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::Capacity => "outstanding login limit reached",
+            Self::Unconfigured => "login admission limit not configured",
             Self::Configuration => "invalid login configuration",
             Self::Random => "login randomness unavailable",
             Self::Database => "login persistence failed; restart login",
@@ -251,29 +257,119 @@ impl KeyRing {
 }
 
 async fn transaction(connection: &mut PgConnection) -> Result<WriteTransaction<'_>, Error> {
+    open(connection, false).await
+}
+async fn open(
+    connection: &mut PgConnection,
+    read_only: bool,
+) -> Result<WriteTransaction<'_>, Error> {
     let mut tx = WriteTransaction::begin(connection).await?;
-    sqlx::query("SET LOCAL synchronous_commit = on")
-        .execute(tx.connection()?)
-        .await?;
-    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-        .execute(tx.connection()?)
-        .await?;
-    sqlx::query("SET LOCAL lock_timeout = '2s'")
-        .execute(tx.connection()?)
-        .await?;
-    sqlx::query("SET LOCAL statement_timeout = '3s'")
-        .execute(tx.connection()?)
-        .await?;
-    Ok(tx)
+    let setup: Result<(), Error> = async {
+        for sql in [
+            "SET LOCAL synchronous_commit = on",
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            "SET LOCAL lock_timeout = '2s'",
+            "SET LOCAL statement_timeout = '3s'",
+        ] {
+            sqlx::query(sql).execute(tx.connection()?).await?;
+        }
+        if read_only {
+            sqlx::query("SET TRANSACTION READ ONLY")
+                .execute(tx.connection()?)
+                .await?;
+        }
+        Ok(())
+    }
+    .await;
+    match setup {
+        Ok(()) => Ok(tx),
+        Err(error) => finish(tx, Err(error)).await,
+    }
+}
+// Every ordinary returned error awaits ROLLBACK, so an idle caller connection never keeps
+// row or admission locks (dropping a SQLx transaction only queues the rollback). The original
+// error survives successful cleanup; a failed cleanup is Database: discard the connection.
+// Cancellation and timeouts remain uncertain-discard boundaries.
+async fn finish<T>(tx: WriteTransaction<'_>, result: Result<T, Error>) -> Result<T, Error> {
+    match result {
+        Ok(value) => {
+            tx.commit().await?;
+            Ok(value)
+        }
+        Err(error) => {
+            tx.rollback().await.map_err(|_| Error::Database)?;
+            Err(error)
+        }
+    }
 }
 
 // Its own root commit: never seal before this succeeds. Reservations have no delete privilege.
 async fn reserve(connection: &mut PgConnection, key: &str, iv: &[u8; 12]) -> Result<bool, Error> {
     let mut tx = transaction(connection).await?;
-    let inserted = sqlx::query("INSERT INTO openmettle.login_nonce_reservations (key_id, nonce) VALUES ($1,$2) ON CONFLICT DO NOTHING")
-        .bind(key).bind(iv.as_slice()).execute(tx.connection()?).await?.rows_affected() == 1;
-    tx.commit().await?;
-    Ok(inserted)
+    let result: Result<bool, Error> = async {
+        Ok(sqlx::query("INSERT INTO openmettle.login_nonce_reservations (key_id, nonce) VALUES ($1,$2) ON CONFLICT DO NOTHING")
+            .bind(key).bind(iv.as_slice()).execute(tx.connection()?).await?.rows_affected() == 1)
+    }
+    .await;
+    finish(tx, result).await
+}
+
+/// Implementation ceiling for the owner-configured limit (migration 9); not a deployment value.
+pub const MAX_OUTSTANDING_LOGINS: i32 = 65536;
+// The singleton limit. NULL, a missing row or an out-of-range value refuses initiation.
+async fn admission_limit(c: &mut PgConnection, lock: bool) -> Result<i64, Error> {
+    let sql = if lock {
+        "SELECT outstanding_limit FROM openmettle.login_admission WHERE id FOR UPDATE"
+    } else {
+        "SELECT outstanding_limit FROM openmettle.login_admission WHERE id"
+    };
+    match sqlx::query_scalar::<_, Option<i32>>(sql)
+        .fetch_optional(c)
+        .await?
+        .flatten()
+    {
+        Some(limit) if (1..=MAX_OUTSTANDING_LOGINS).contains(&limit) => Ok(limit.into()),
+        _ => Err(Error::Unconfigured),
+    }
+}
+async fn database_ms(c: &mut PgConnection) -> Result<i64, Error> {
+    Ok(
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(c)
+            .await?,
+    )
+}
+// Unexpired rows without an issued session, consumed or not, counted up to the limit.
+// A consumed row whose exchange failed keeps its slot until its original expiry.
+async fn below_limit(c: &mut PgConnection, now: i64, limit: i64) -> Result<(), Error> {
+    let outstanding: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM (SELECT 1 FROM openmettle.login_transactions
+         WHERE NOT session_issued AND expires_ms > $1 LIMIT $2) AS outstanding",
+    )
+    .bind(now)
+    .bind(limit)
+    .fetch_one(c)
+    .await?;
+    if outstanding >= limit {
+        return Err(Error::Capacity);
+    }
+    Ok(())
+}
+// Advisory read before any nonce reservation: refuses obvious unconfigured, full or
+// stale-authority attempts without spending a reservation. It always rolls back. Concurrent,
+// cancelled or later-refused attempts can still spend a permanent reservation each; the
+// locked recheck in the insert transaction is authoritative.
+async fn precheck(connection: &mut PgConnection, p: &Provider) -> Result<(), Error> {
+    let mut tx = open(connection, true).await?;
+    let result: Result<(), Error> = async {
+        let limit = admission_limit(tx.connection()?, false).await?;
+        p.persisted_binding(tx.connection()?).await?;
+        let now = database_ms(tx.connection()?).await?;
+        below_limit(tx.connection()?, now, limit).await
+    }
+    .await;
+    tx.rollback().await.map_err(|_| Error::Database)?;
+    result
 }
 async fn reserve_random(connection: &mut PgConnection, key: &str) -> Result<[u8; 12], Error> {
     for _ in 0..3 {
@@ -342,63 +438,72 @@ async fn begin_inner(
     let caller = secret()?;
     let verifier = secret()?;
     let key = &keys.keys[0].0;
+    // Advisory: avoid spending a permanent reservation on obviously refused attempts.
+    precheck(connection, p).await?;
     let iv = reserve_random(connection, key).await?;
     let mut tx = transaction(connection).await?;
-    let now: i64 =
-        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
-            .fetch_one(tx.connection()?)
-            .await?;
-    let expiry = now
-        .checked_add(lifetime.as_millis() as i64)
-        .ok_or(Error::Configuration)?;
-    // Managed authority is read in this transaction, after the clock statement.
-    let (binding, _) = p.persisted_binding(tx.connection()?).await?;
-    let (state_hash, nonce_hash, caller_hash) = (hash(&state.0), hash(&nonce.0), hash(&caller.0));
-    let context = aad(
-        &id.0,
-        &binding,
-        expiry,
-        &state_hash,
-        &nonce_hash,
-        &caller_hash,
-        key,
-    );
-    let mut encrypted = verifier.0.as_bytes().to_vec();
-    keys.key(key)?
-        .seal_in_place_append_tag(
-            aead::Nonce::assume_unique_for_key(iv),
-            aead::Aad::from(&context),
-            &mut encrypted,
+    let result: Result<Started, Error> = async {
+        // Authoritative admission: serialize on the singleton, then sample the primary clock
+        // only after any lock wait, and count outstanding rows against the limit just read.
+        let limit = admission_limit(tx.connection()?, true).await?;
+        let now = database_ms(tx.connection()?).await?;
+        below_limit(tx.connection()?, now, limit).await?;
+        let expiry = now
+            .checked_add(lifetime.as_millis() as i64)
+            .ok_or(Error::Configuration)?;
+        // Managed authority is read in this transaction, after the clock statement.
+        let (binding, _) = p.persisted_binding(tx.connection()?).await?;
+        let (state_hash, nonce_hash, caller_hash) =
+            (hash(&state.0), hash(&nonce.0), hash(&caller.0));
+        let context = aad(
+            &id.0,
+            &binding,
+            expiry,
+            &state_hash,
+            &nonce_hash,
+            &caller_hash,
+            key,
+        );
+        let mut encrypted = verifier.0.as_bytes().to_vec();
+        keys.key(key)?
+            .seal_in_place_append_tag(
+                aead::Nonce::assume_unique_for_key(iv),
+                aead::Aad::from(&context),
+                &mut encrypted,
+            )
+            .map_err(|_| Error::Protection)?;
+        sqlx::query("INSERT INTO openmettle.login_transactions (id,binding,expires_ms,state_hash,nonce_hash,caller_hash,key_id,nonce,ciphertext) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)")
+            .bind(&id.0).bind(&binding).bind(expiry).bind(state_hash.as_slice()).bind(nonce_hash.as_slice())
+            .bind(caller_hash.as_slice()).bind(key).bind(iv.as_slice()).bind(encrypted).execute(tx.connection()?).await?;
+        let (_, issuer, client) = p.trusted.binding();
+        let client = CoreClient::new(
+            ClientId::new(client.into()),
+            IssuerUrl::new(issuer.into()).map_err(|_| Error::Configuration)?,
+            CoreJsonWebKeySet::new(vec![]),
         )
-        .map_err(|_| Error::Protection)?;
-    sqlx::query("INSERT INTO openmettle.login_transactions (id,binding,expires_ms,state_hash,nonce_hash,caller_hash,key_id,nonce,ciphertext) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)")
-        .bind(&id.0).bind(&binding).bind(expiry).bind(state_hash.as_slice()).bind(nonce_hash.as_slice())
-        .bind(caller_hash.as_slice()).bind(key).bind(iv.as_slice()).bind(encrypted).execute(tx.connection()?).await?;
-    let (_, issuer, client) = p.trusted.binding();
-    let client = CoreClient::new(
-        ClientId::new(client.into()),
-        IssuerUrl::new(issuer.into()).map_err(|_| Error::Configuration)?,
-        CoreJsonWebKeySet::new(vec![]),
-    )
-    .set_auth_uri(AuthUrl::new(p.authorization.clone()).map_err(|_| Error::Configuration)?)
-    .set_redirect_uri(RedirectUrl::new(p.callback.clone()).map_err(|_| Error::Configuration)?);
-    let challenge =
-        PkceCodeChallenge::from_code_verifier_sha256(&PkceCodeVerifier::new(verifier.0));
-    let state_copy = state.0.clone();
-    let (url, _, _) = client
-        .authorize_url(
-            AuthenticationFlow::<CoreResponseType>::AuthorizationCode,
-            move || CsrfToken::new(state_copy),
-            move || Nonce::new(nonce.0),
-        )
-        .set_pkce_challenge(challenge)
-        .url();
-    tx.commit().await?;
-    Ok(Started {
-        authorization_url: Secret(url.to_string()),
-        state,
-        caller_binding: caller,
-    })
+        .set_auth_uri(AuthUrl::new(p.authorization.clone()).map_err(|_| Error::Configuration)?)
+        .set_redirect_uri(
+            RedirectUrl::new(p.callback.clone()).map_err(|_| Error::Configuration)?,
+        );
+        let challenge =
+            PkceCodeChallenge::from_code_verifier_sha256(&PkceCodeVerifier::new(verifier.0));
+        let state_copy = state.0.clone();
+        let (url, _, _) = client
+            .authorize_url(
+                AuthenticationFlow::<CoreResponseType>::AuthorizationCode,
+                move || CsrfToken::new(state_copy),
+                move || Nonce::new(nonce.0),
+            )
+            .set_pkce_challenge(challenge)
+            .url();
+        Ok(Started {
+            authorization_url: Secret(url.to_string()),
+            state,
+            caller_binding: caller,
+        })
+    }
+    .await;
+    finish(tx, result).await
 }
 
 /// Parsed callback inputs, still untrusted. No Debug implementation.
@@ -465,71 +570,75 @@ async fn consume_inner(
         return Err(Error::Rejected);
     }
     let mut tx = transaction(connection).await?;
-    let row = sqlx::query("SELECT binding,expires_ms,state_hash,nonce_hash,caller_hash,key_id,nonce,ciphertext,consumed FROM openmettle.login_transactions WHERE id=$1 FOR UPDATE")
-        .bind(id).fetch_optional(tx.connection()?).await?.ok_or(Error::Rejected)?;
-    // A separate statement AFTER the lock: neither the transaction-start time nor pre-wait snapshot.
-    let now: i64 =
-        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
-            .fetch_one(tx.connection()?)
-            .await?;
-    let binding: Vec<u8> = row.try_get("binding")?;
-    let expiry: i64 = row.try_get("expires_ms")?;
-    let state: Vec<u8> = row.try_get("state_hash")?;
-    let nonce: Vec<u8> = row.try_get("nonce_hash")?;
-    let caller: Vec<u8> = row.try_get("caller_hash")?;
-    // Managed authority is read only after the row lock, so a waiting consumer observes
-    // provider revisions committed while it waited (ADR 0012).
-    let (expected, epoch) = p.persisted_binding(tx.connection()?).await?;
-    if row.try_get::<bool, _>("consumed")?
-        || now >= expiry
-        || binding != expected
-        || !equal(&state, &hash(c.state))
-        || !equal(&caller, &hash(c.caller_binding))
-    {
-        return Err(Error::Rejected);
-    }
-    let key: String = row.try_get("key_id")?;
-    let iv: Vec<u8> = row.try_get("nonce")?;
-    let mut encrypted: Vec<u8> = row
-        .try_get::<Option<Vec<u8>>, _>("ciphertext")?
-        .ok_or(Error::Protection)?;
-    if encrypted.len() != 59 {
-        return Err(Error::Protection);
-    }
-    let context = aad(id, &binding, expiry, &state, &nonce, &caller, &key);
-    let iv: [u8; 12] = iv.try_into().map_err(|_| Error::Protection)?;
-    let decrypt_key = keys.key(&key)?;
-    let plain = decrypt_key
-        .open_in_place(
-            aead::Nonce::assume_unique_for_key(iv),
-            aead::Aad::from(&context),
-            &mut encrypted,
+    // Rejections after the row lock await rollback; the permit escapes only after COMMIT.
+    let result: Result<ExchangePermit, Error> = async {
+        let row = sqlx::query("SELECT binding,expires_ms,state_hash,nonce_hash,caller_hash,key_id,nonce,ciphertext,consumed FROM openmettle.login_transactions WHERE id=$1 FOR UPDATE")
+            .bind(id).fetch_optional(tx.connection()?).await?.ok_or(Error::Rejected)?;
+        // A separate statement AFTER the lock: neither the transaction-start time nor pre-wait snapshot.
+        let now: i64 =
+            sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+                .fetch_one(tx.connection()?)
+                .await?;
+        let binding: Vec<u8> = row.try_get("binding")?;
+        let expiry: i64 = row.try_get("expires_ms")?;
+        let state: Vec<u8> = row.try_get("state_hash")?;
+        let nonce: Vec<u8> = row.try_get("nonce_hash")?;
+        let caller: Vec<u8> = row.try_get("caller_hash")?;
+        // Managed authority is read only after the row lock, so a waiting consumer observes
+        // provider revisions committed while it waited (ADR 0012).
+        let (expected, epoch) = p.persisted_binding(tx.connection()?).await?;
+        if row.try_get::<bool, _>("consumed")?
+            || now >= expiry
+            || binding != expected
+            || !equal(&state, &hash(c.state))
+            || !equal(&caller, &hash(c.caller_binding))
+        {
+            return Err(Error::Rejected);
+        }
+        let key: String = row.try_get("key_id")?;
+        let iv: Vec<u8> = row.try_get("nonce")?;
+        let mut encrypted: Vec<u8> = row
+            .try_get::<Option<Vec<u8>>, _>("ciphertext")?
+            .ok_or(Error::Protection)?;
+        if encrypted.len() != 59 {
+            return Err(Error::Protection);
+        }
+        let context = aad(id, &binding, expiry, &state, &nonce, &caller, &key);
+        let iv: [u8; 12] = iv.try_into().map_err(|_| Error::Protection)?;
+        let decrypt_key = keys.key(&key)?;
+        let plain = decrypt_key
+            .open_in_place(
+                aead::Nonce::assume_unique_for_key(iv),
+                aead::Aad::from(&context),
+                &mut encrypted,
+            )
+            .map_err(|_| Error::Protection)?;
+        let verifier = std::str::from_utf8(plain).map_err(|_| Error::Protection)?;
+        if verifier.len() != 43
+            || !verifier
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+        {
+            return Err(Error::Protection);
+        }
+        let permit = ExchangePermit {
+            origin: Some((id.to_owned(), expiry)),
+            provider: p,
+            epoch,
+            code: Secret(c.code.into()),
+            verifier: Secret(verifier.into()),
+            nonce: ExpectedNonceDigest::new(nonce.try_into().map_err(|_| Error::Protection)?),
+        };
+        sqlx::query(
+            "UPDATE openmettle.login_transactions SET consumed=true,ciphertext=NULL WHERE id=$1",
         )
-        .map_err(|_| Error::Protection)?;
-    let verifier = std::str::from_utf8(plain).map_err(|_| Error::Protection)?;
-    if verifier.len() != 43
-        || !verifier
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
-    {
-        return Err(Error::Protection);
+        .bind(id)
+        .execute(tx.connection()?)
+        .await?;
+        Ok(permit)
     }
-    let permit = ExchangePermit {
-        origin: Some((id.to_owned(), expiry)),
-        provider: p,
-        epoch,
-        code: Secret(c.code.into()),
-        verifier: Secret(verifier.into()),
-        nonce: ExpectedNonceDigest::new(nonce.try_into().map_err(|_| Error::Protection)?),
-    };
-    sqlx::query(
-        "UPDATE openmettle.login_transactions SET consumed=true,ciphertext=NULL WHERE id=$1",
-    )
-    .bind(id)
-    .execute(tx.connection()?)
-    .await?;
-    tx.commit().await?;
-    Ok(permit)
+    .await;
+    finish(tx, result).await
 }
 
 type TokenClient = CoreClient<

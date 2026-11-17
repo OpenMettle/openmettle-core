@@ -32,7 +32,8 @@ jobs:
   rust:
     name: Rust runtime
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # Seven authentic prior-release builds run serially; keep headroom over the ~14-minute warm run.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
@@ -96,9 +97,17 @@ jobs:
           mkdir -p "$RUNNER_TEMP/openmettle-v7"
           git archive 5ff1d2a8ed5e7424be006e78c16f0c30e784336d | tar -x -C "$RUNNER_TEMP/openmettle-v7"
           cargo build --manifest-path "$RUNNER_TEMP/openmettle-v7/Cargo.toml" --locked --offline --bins
+      - name: Build authentic version-8 release for schema compatibility
+        run: |
+          mkdir -p "$RUNNER_TEMP/openmettle-v8"
+          git archive e55aff07527ad6452f8a0d49953b3fc2ffc51352 | tar -x -C "$RUNNER_TEMP/openmettle-v8"
+          cargo build --manifest-path "$RUNNER_TEMP/openmettle-v8/Cargo.toml" --locked --offline --bins
+      # POSTGRES_CONTAINER runs the exact ADR 0014 operator scripts with the pinned service psql.
       - name: PostgreSQL schema, migration and role integration
         run: cargo test --locked --offline --test schema -- --ignored
         env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          V8_BINARY_DIR: ${{ runner.temp }}/openmettle-v8/target/debug
           OLD_BINARY_DIR: ${{ runner.temp }}/openmettle-v2/target/debug
           V3_BINARY_DIR: ${{ runner.temp }}/openmettle-v3/target/debug
           V5_BINARY_DIR: ${{ runner.temp }}/openmettle-v5/target/debug

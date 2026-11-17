@@ -1,0 +1,27 @@
+-- ADR 0014: delete one bounded batch of expired login gates that no session references
+-- (schema version 9+). Covers unconsumed, consumed and issued-but-session-deleted gates.
+-- Run against the primary as openmettle_owner. Supply batch (1-1000). Run ADR 0013 session
+-- cleanup first if session-referenced gates should become eligible. Never deletes nonce
+-- reservations or unexpired gates; locked rows are skipped for a later batch.
+\set ON_ERROR_STOP on
+SELECT :'batch' ~ '^[0-9]{1,4}$' AND :'batch'::integer BETWEEN 1 AND 1000 AS valid \gset
+\if :valid
+  BEGIN;
+  SET LOCAL lock_timeout = '2s';
+  SET LOCAL statement_timeout = '5s';
+  SET LOCAL synchronous_commit = on;
+  WITH candidates AS (
+    SELECT l.id FROM openmettle.login_transactions AS l
+     WHERE l.expires_ms <= floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
+       AND NOT EXISTS (SELECT FROM openmettle.local_sessions AS s WHERE s.login_id = l.id)
+     ORDER BY l.id
+     LIMIT :batch
+     FOR UPDATE OF l SKIP LOCKED
+  )
+  DELETE FROM openmettle.login_transactions AS l USING candidates AS c
+   WHERE l.id = c.id
+     AND l.expires_ms <= floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint;
+  COMMIT;
+\else
+  DO $refused$ BEGIN RAISE EXCEPTION 'cleanup refused: batch must be 1-1000; nothing deleted'; END; $refused$;
+\endif

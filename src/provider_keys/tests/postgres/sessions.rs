@@ -3,10 +3,10 @@ use super::*;
 use crate::response_barrier::{ResponseBarrier, cancel_at_response};
 use crate::sessions::{self as local, Error as SessionError};
 
-fn session_policy() -> local::Policy {
+pub(super) fn session_policy() -> local::Policy {
     local::Policy::new(Duration::from_secs(60), 16, Duration::from_secs(10)).unwrap()
 }
-async fn seed(f: &mut Flow, approved: bool, scope: bool) -> String {
+pub(super) async fn seed(f: &mut Flow, approved: bool, scope: bool) -> String {
     let user: String =
         sqlx::query_scalar("INSERT INTO openmettle.users DEFAULT VALUES RETURNING id::text")
             .fetch_one(&mut f.owner)
@@ -29,7 +29,7 @@ async fn seed(f: &mut Flow, approved: bool, scope: bool) -> String {
     }
     user
 }
-async fn issue(f: &mut Flow) -> local::Credential {
+pub(super) async fn issue(f: &mut Flow) -> local::Credential {
     let p = f.h.provider.clone();
     let (_, proof) = f.exchanged(&p).await;
     p.issue_session(&mut f.api, proof, &session_policy())
@@ -79,12 +79,12 @@ async fn write(f: &mut Flow, sql: &'static str) {
 }
 // pg_stat_activity hides other roles' wait details from openmettle_owner. Use the
 // existing isolated-fixture administrator solely for observation, never the operation.
-async fn statistics_observer(db: &Db) -> PgConnection {
+pub(super) async fn statistics_observer(db: &Db) -> PgConnection {
     PgConnection::connect_with(&admin_options().database(&db.name))
         .await
         .unwrap()
 }
-async fn waiting(observer: &mut PgConnection, pid: i32) {
+pub(super) async fn waiting(observer: &mut PgConnection, pid: i32) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let blocked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT FROM pg_stat_activity WHERE pid=$1 AND wait_event_type='Lock')").bind(pid).fetch_one(&mut *observer).await.unwrap();
