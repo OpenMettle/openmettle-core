@@ -1,6 +1,6 @@
 # OpenMettle core
 
-Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures, but no `/v1` route serves it. Internal managed login, an owner-configured outstanding-login cap, local identity approval and opaque-session primitives are implemented, with an offline check for mounted browser-auth settings that the running API does not load yet, and an internal pooled browser-auth service that no process constructs yet. No product API, upload service, request authentication, per-user authorization or GPU orchestration is exposed. Runtime qualification and deployment acceptance remain separate gates.
+Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures, but no `/v1` route serves it. Internal managed login, an owner-configured outstanding-login cap, local identity approval and opaque-session primitives are implemented, with an offline check for mounted browser-auth settings that the running API does not load yet, an internal pooled browser-auth service that no process constructs yet, and an unmounted same-origin browser login handoff over it. No product API, upload service, request authentication, per-user authorization or GPU orchestration is exposed. Runtime qualification and deployment acceptance remain separate gates.
 
 ## Start here
 
@@ -91,8 +91,8 @@ code/challenge/client/callback binding. The production transport is described be
 is no login route.
 The nonce verifier accepts stored digests without weakening the existing token checks.
 
-Browser cookies, native handoff and account creation remain unimplemented; key files are read
-only by the offline check below. Internal local approval and sessions are described below. The outstanding-login
+Native handoff and account creation remain unimplemented; the browser cookie handoff below is
+not mounted. Key files are read only by the offline check below. Internal local approval and sessions are described below. The outstanding-login
 cap below is not a rate limit; public exposure remains blocked on request/rate/concurrency
 controls, operated cleanup and retired-key reservation reclamation. After database restore, invalidate pending login transactions and
 rotate the active login encryption key before any encryption; never resume restored logins.
@@ -189,7 +189,7 @@ can leave an undisclosed row but never returns a credential after failed final c
 cleanup is bounded and preserves replay markers until the login gate becomes unusable. Never
 purge active-key nonce reservations as part of session cleanup.
 
-There are no routes, cookies, native handoff, runtime loader, tenant/group qualification or reconciliation.
+There are no routes, native handoff, runtime loader, tenant/group qualification or reconciliation; the cookie handoff below is not mounted.
 Run the managed PostgreSQL tests only in isolated CI with the explicit module filter above;
 normal workspace tests leave them ignored. Migration 8 and authentic v7 compatibility are CI gates.
 
@@ -272,8 +272,9 @@ internal service built from the validated settings above and a handle to the API
 primary pool. It starts a login for an exactly configured provider UUID, completes a
 callback (committed consumption, one token request, session issuance from the sealed proof)
 and validates or logs out local sessions. **No process constructs it**: the API, worker and
-migrator are unchanged, `/readyz` checks the database only, and there is no route, cookie,
-CSRF handling, native handoff or rate policy.
+migrator are unchanged, `/readyz` checks the database only, and there is no route, native
+handoff or rate policy. The service handles no request or cookie itself; the unmounted
+adapter below does.
 
 The service holds a pooled connection only while database work runs, never during a
 provider document fetch or the token request. Waiting for a connection counts against the
@@ -298,6 +299,45 @@ only in isolated CI, under the existing `provider_keys::tests::postgres` filter.
 `cargo test --locked --offline --lib browser_auth` and
 `cargo test --locked --offline --lib provider_keys::tests::service` run the tests that need
 no database. Connection churn and capacity under load are unmeasured.
+
+## Browser login handoff
+
+[ADR 0017](docs/adr/0017-browser-login-handoff.md) adds `src/browser_auth/handoff.rs`, an
+adapter that turns one browser request into one response over the service above. **It is
+not mounted**: no process constructs it, the API still serves `/healthz` and `/readyz` only
+and answers `404` for a callback path, and no browser has been qualified.
+
+It takes three explicit settings with no defaults: the canonical HTTPS application origin,
+a landing path on that origin and one configured provider UUID. They are not part of the
+auth settings document, which is unchanged. The issuer and the exact registered callback
+come from that provider. `Host`, forwarded headers, callback fields and return URLs never
+select an origin, provider, callback or destination.
+
+- **Initiation** accepts a form `POST` with exactly one `Origin` equal to the application
+  origin. It answers `303` to the provider's authorization URL and sets
+  `__Host-openmettle-login` (`Secure`, `HttpOnly`, `Path=/`, `SameSite=Lax`, `Max-Age` equal
+  to the login lifetime). The page with the form must not use `Referrer-Policy: no-referrer`,
+  which makes browsers send `Origin: null`.
+- **Callback** accepts a `GET` on the exact registered callback path. It refuses malformed
+  escapes, repeated parameters, provider errors, an incomplete response, a missing or
+  different `iss` and a missing, repeated or mismatched caller cookie before calling the
+  service. Success answers `303` to the landing and sets `__Host-openmettle-session` with
+  the same attributes and no `Max-Age`; expiry in the database stays authoritative.
+- **Every response** has `Cache-Control: no-store` and `Referrer-Policy: no-referrer`.
+  Refusals are fixed lines that set and delete no cookie. No credential appears in a URL or
+  body.
+
+A browser holds one caller cookie, so only the most recently stored login can complete. An
+older login's callback is refused without being consumed and keeps its admission slot until
+it expires. A new login overwrites the session cookie without ending the earlier session.
+
+Before any exposure these remain outstanding: browser qualification; trusted ingress
+routing for the application origin and redaction of request targets and cookies in
+telemetry; session validation and logout handlers with CSRF protection for unsafe methods;
+request, rate and concurrency controls; operated cleanup and retired-key reservation
+reclamation; and runtime enablement. `cargo test --locked --offline --lib handoff` runs the
+tests that need no database; the end-to-end test runs only in isolated CI under the existing
+`provider_keys::tests::postgres` filter.
 
 ## Schema migrations
 

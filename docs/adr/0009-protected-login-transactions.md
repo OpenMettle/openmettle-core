@@ -47,7 +47,8 @@ by the public locator. Database index lookup is not claimed to be constant-time.
 The future browser route must deliver the caller secret only to the initiating browser
 using a Secure, HttpOnly, host-only cookie, with suitable SameSite and expiry rules.
 Initiation CSRF and concurrent-tab behavior require qualification. State alone is
-insufficient to consume a transaction. Cookie transport is not implemented here.
+insufficient to consume a transaction. Cookie transport is not implemented here;
+[ADR 0017](0017-browser-login-handoff.md) adds an unmounted adapter for it.
 Native flow and native-to-API handoff remain deferred; this module accepts no native flow.
 
 The initial callback profile requires RFC 9207 `iss`, exactly equal to the configured

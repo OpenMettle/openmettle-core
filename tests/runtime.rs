@@ -65,12 +65,16 @@ fn start_with_timeout(worker: bool, address: &str, url: &str, timeout_ms: u64) -
     )
 }
 fn response(address: &str, path: &str) -> std::io::Result<String> {
+    send(
+        address,
+        &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+    )
+}
+fn send(address: &str, request: &str) -> std::io::Result<String> {
     let mut stream =
         TcpStream::connect_timeout(&address.parse().unwrap(), Duration::from_millis(300))?;
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-    stream.write_all(
-        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes(),
-    )?;
+    stream.write_all(request.as_bytes())?;
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
     Ok(response)
@@ -305,6 +309,34 @@ fn unavailable_database_keeps_liveness_and_bounded_readiness() {
                 .unwrap()
                 .starts_with("HTTP/1.1 404")
         );
+        // ADR 0017: the browser login handoff is not mounted. The synthetic callback path
+        // and a form POST are unknown routes, no response sets a cookie or redirects, and
+        // the two operational routes still answer GET alone.
+        for (method, path, status) in [
+            (
+                "GET",
+                "/callback?code=synthetic&state=synthetic&iss=synthetic",
+                404,
+            ),
+            ("POST", "/callback", 404),
+            ("POST", "/login", 404),
+            ("POST", "/", 404),
+            ("POST", "/healthz", 405),
+            ("POST", "/readyz", 405),
+        ] {
+            // Shaped like a same-origin browser request, with an empty body.
+            let request = format!(
+                "{method} {path} HTTP/1.1\r\nHost: localhost\r\n\
+                 Origin: https://app.example.test\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+            );
+            let response = send(&bind, &request).unwrap().to_ascii_lowercase();
+            assert!(
+                response.starts_with(&format!("http/1.1 {status}")),
+                "{method} {path}"
+            );
+            assert!(!response.contains("set-cookie") && !response.contains("location"));
+        }
         stop(&mut process, if worker { "-INT" } else { "-TERM" });
     }
 }

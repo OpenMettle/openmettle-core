@@ -29,13 +29,12 @@ pub(super) fn browser_auth(
         pool,
     )
 }
-fn assert_send<T: Send>(_: &T) {}
-
-#[tokio::test]
-async fn provider_work_precedes_checkout_and_refusals_never_check_out() {
+pub(super) fn assert_send<T: Send>(_: &T) {}
+/// A listener that never speaks the PostgreSQL protocol and a one-slot pool that connects
+/// to it lazily: a checkout attempt is one accepted connection, and it fails after 300 ms.
+pub(super) fn silent_database() -> (std::net::TcpListener, sqlx::PgPool) {
     let database = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     database.set_nonblocking(true).unwrap();
-    let attempted = || database.accept().is_ok();
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(Duration::from_millis(300))
@@ -47,6 +46,13 @@ async fn provider_work_precedes_checkout_and_refusals_never_check_out() {
                 .database("fixture")
                 .ssl_mode(PgSslMode::Disable),
         );
+    (database, pool)
+}
+
+#[tokio::test]
+async fn provider_work_precedes_checkout_and_refusals_never_check_out() {
+    let (database, pool) = silent_database();
+    let attempted = || database.accept().is_ok();
     let h = Harness::new().await;
     let policy = sessions::Policy::new(Duration::from_secs(60), 16, Duration::from_secs(5));
     let auth = browser_auth(&h, pool, Duration::from_secs(300), policy.unwrap());
