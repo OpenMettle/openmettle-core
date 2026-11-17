@@ -73,7 +73,7 @@ impl FakeProvider {
             issued: Mutex::new(HashMap::new()),
         }
     }
-    pub fn authorize(&self, url: &str) -> String {
+    pub fn authorize(&self, url: &str, expected_state: &str) -> String {
         let url = openidconnect::url::Url::parse(url).unwrap();
         assert_eq!(url.origin().ascii_serialization() + url.path(), AUTH);
         let params: HashMap<String, String> = url.query_pairs().into_owned().collect();
@@ -82,6 +82,7 @@ impl FakeProvider {
         assert_eq!(params["code_challenge_method"], "S256");
         assert_eq!(params["response_type"], "code");
         assert_eq!(params["scope"], "openid");
+        assert_eq!(params["state"], expected_state);
         assert_eq!(params["nonce"].len(), 43);
         let code = format!("synthetic-code-{}", self.issued.lock().unwrap().len());
         self.issued.lock().unwrap().insert(code.clone(), params);

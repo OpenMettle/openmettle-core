@@ -61,7 +61,7 @@ async fn bound_exchange_denials_rotation_and_single_use_race() {
     let p = provider("v1", true);
     let fake = fixture::FakeProvider::new();
     let start = begin(&db, &p).await;
-    let code = fake.authorize(start.authorization_url.expose());
+    let code = fake.authorize(start.authorization_url.expose(), start.state.expose());
     for which in 0..7 {
         let mut c = callback(&start, &code);
         let wrong_state = format!(
@@ -258,6 +258,112 @@ async fn expiry_is_observed_after_waiting_for_row_lock() {
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
+async fn authenticated_row_tampering_cannot_consume_login() {
+    use sha2::{Digest, Sha256};
+
+    let db = TestDb::migrated().await;
+    let p = provider("v1", true);
+    let all_keys = KeyRing::new(vec![
+        ("test-v1".into(), [7; 32]),
+        ("test-v2".into(), [8; 32]),
+    ])
+    .unwrap();
+    let mut admin = db.admin().await;
+    for change in ["expiry", "state", "caller", "encrypted-row"] {
+        let start = begin(&db, &p).await;
+        let id = start.state.expose().split_once('.').unwrap().0;
+        let attacker_state = format!("{id}.{}", "A".repeat(43));
+        let attacker_caller = "B".repeat(43);
+        let mut presented = callback(&start, "synthetic-code");
+        match change {
+            "expiry" => {
+                sqlx::query("UPDATE openmettle.login_transactions SET expires_ms=expires_ms+60000 WHERE id=$1")
+                    .bind(id).execute(&mut admin).await.unwrap();
+            }
+            "state" | "caller" => {
+                // Matching attacker-controlled callback values pass the plain digest
+                // comparisons, so only authenticated decryption can reject this edit.
+                let (statement, value) = if change == "state" {
+                    presented.state = &attacker_state;
+                    (
+                        "UPDATE openmettle.login_transactions SET state_hash=$1 WHERE id=$2",
+                        attacker_state.as_str(),
+                    )
+                } else {
+                    presented.caller_binding = &attacker_caller;
+                    (
+                        "UPDATE openmettle.login_transactions SET caller_hash=$1 WHERE id=$2",
+                        attacker_caller.as_str(),
+                    )
+                };
+                sqlx::query(statement)
+                    .bind(Sha256::digest(value.as_bytes()).to_vec())
+                    .bind(id)
+                    .execute(&mut admin)
+                    .await
+                    .unwrap();
+            }
+            "encrypted-row" => {
+                let donor = login::begin(
+                    &mut connect(&db.0, API).await,
+                    &p,
+                    &KeyRing::new(vec![("test-v2".into(), [8; 32])]).unwrap(),
+                    Duration::from_secs(60),
+                )
+                .await
+                .unwrap();
+                let donor_id = donor.state.expose().split_once('.').unwrap().0;
+                let encrypted: (String, Vec<u8>, Vec<u8>) = sqlx::query_as(
+                    "SELECT key_id,nonce,ciphertext FROM openmettle.login_transactions WHERE id=$1",
+                )
+                .bind(donor_id)
+                .fetch_one(&mut admin)
+                .await
+                .unwrap();
+                // Owner-only deletion frees the unique encrypted-row tuple; the
+                // durable nonce reservation remains. Both keys are valid and loaded.
+                sqlx::query("DELETE FROM openmettle.login_transactions WHERE id=$1")
+                    .bind(donor_id)
+                    .execute(&mut admin)
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE openmettle.login_transactions SET key_id=$1,nonce=$2,ciphertext=$3 WHERE id=$4")
+                    .bind(encrypted.0).bind(encrypted.1).bind(encrypted.2).bind(id)
+                    .execute(&mut admin).await.unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let ciphertext: Vec<u8> =
+            sqlx::query_scalar("SELECT ciphertext FROM openmettle.login_transactions WHERE id=$1")
+                .bind(id)
+                .fetch_one(&mut admin)
+                .await
+                .unwrap();
+        assert_eq!(
+            login::consume(
+                &mut connect(&db.0, API).await,
+                p.clone(),
+                &all_keys,
+                presented
+            )
+            .await
+            .unwrap_err(),
+            Error::Protection,
+            "tampering case: {change}",
+        );
+        let after: (bool, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT consumed,ciphertext FROM openmettle.login_transactions WHERE id=$1",
+        )
+        .bind(id)
+        .fetch_one(&mut admin)
+        .await
+        .unwrap();
+        assert_eq!(after, (false, Some(ciphertext)), "tampering case: {change}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
 async fn tampering_reservations_and_role_boundaries() {
     let db = TestDb::migrated().await;
     let p = provider("v1", true);
@@ -374,6 +480,7 @@ async fn consume_child() {
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn killed_consumer_rolls_back_without_releasing_permit() {
+    use std::os::unix::process::ExitStatusExt;
     let db = TestDb::migrated().await;
     let p = provider("v1", true);
     for (command, spent) in [
@@ -395,7 +502,7 @@ async fn killed_consumer_rolls_back_without_releasing_permit() {
         let mut child = Process(child);
         barrier.wait_reached().await;
         signal(&child.0, "-KILL");
-        assert!(!child.0.wait().unwrap().success());
+        assert_eq!(child.0.wait().unwrap().signal(), Some(9));
         drop(barrier);
         let result = login::consume(
             &mut connect(&db.0, API).await,

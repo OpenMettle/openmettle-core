@@ -668,11 +668,12 @@ mod tests {
             ("redirect_uri", fixture::CALLBACK),
             ("response_type", "code"),
             ("scope", "openid"),
+            ("state", "synthetic-state"),
             ("nonce", &nonce),
             ("code_challenge_method", "S256"),
             ("code_challenge", challenge.as_str()),
         ]);
-        let code = fake.authorize(url.as_str());
+        let code = fake.authorize(url.as_str(), "synthetic-state");
         let http = |request| std::future::ready(fake.exchange(request));
         let permit = ExchangePermit {
             provider: p,
@@ -687,7 +688,7 @@ mod tests {
                 .is_ok()
         );
         for mismatch in 0..3 {
-            let code = fake.authorize(url.as_str());
+            let code = fake.authorize(url.as_str(), "synthetic-state");
             let mut p = Arc::try_unwrap(provider()).unwrap();
             if mismatch == 1 {
                 p.trusted = TrustedProvider::new(

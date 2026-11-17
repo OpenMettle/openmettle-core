@@ -99,6 +99,8 @@ Protection covers database-only disclosure and authenticated-field tampering wit
 keys. It does not cover API-process compromise, combined database/key compromise,
 privileged rollback, or a malicious deployment authority. Application SQL privileges
 bound the process, not individual users, and cannot enforce the helper's whole protocol.
+In particular, raw API-role SQL can reset consumption and restore previously captured
+ciphertext. Single-use consumption is enforced by the helper, not a database trigger.
 Secrets and permits redact Debug; errors are fixed enums. Memory zeroization, swap and
 core-dump protection are not claimed. URLs, callbacks, bodies and secret wrappers must
 not be logged by future callers or transports.
@@ -119,8 +121,8 @@ The winning consumer decrypts, sets `consumed=true`, scrubs ciphertext and commi
 Concurrent callbacks have one winner. Consumed rows never return another permit.
 
 Cancellation/error drops the transaction owner. Discard the connection whenever protocol
-cleanup or commit outcome is uncertain. A consumed transaction is never reset or leased
-for retry. Crash after commit but before exchange loses that login. Unknown commit emits
+cleanup or commit outcome is uncertain. The helper never resets or leases a consumed
+transaction for retry. Crash after commit but before exchange loses that login. Unknown commit emits
 no permit. Exchange cancellation, timeout, error or ambiguous response requires a new
 login; never retry the authorization code automatically. There is no external HTTP under
 a database lock and no exactly-once claim across PostgreSQL and the provider.
@@ -156,7 +158,8 @@ and the old migrator must refuse without mutation. Migration image expectations 
 
 Tests cover real fake-provider challenge/client/callback checks, signed claim failures,
 redaction, key aliases/rotation, authenticated-data tampering, PostgreSQL consumption races,
-expiry after lock wait, reservation collision, denied roles and over-grants. Protocol
+expiry after lock wait, duplicate-reservation refusal by SQL uniqueness, denied roles and
+over-grants. The random-reservation retry/exhaustion path is not directly tested. Protocol
 barriers hold observed PostgreSQL responses for cancellation, process kill and lost commit
 acknowledgement. The fake transport does not establish TLS, DNS, redirect, streaming or
 real-provider interoperability. PostgreSQL tests require isolated CI PostgreSQL 18; they
