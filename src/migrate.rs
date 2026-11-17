@@ -55,6 +55,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "protected login transactions",
         sql: include_str!("../migrations/0006_login_transactions.sql"),
     },
+    Source {
+        version: 7,
+        description: "login provider authority",
+        sql: include_str!("../migrations/0007_login_provider_authority.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

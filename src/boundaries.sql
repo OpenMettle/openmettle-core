@@ -73,6 +73,10 @@ contract (relation, role, privilege) AS (
     SELECT relation, 'openmettle_api', 'SELECT' FROM (VALUES
         ('login_transactions'), ('login_nonce_reservations')
     ) AS login(relation) WHERE $1 >= 6
+    UNION ALL
+    SELECT relation, 'openmettle_api', 'SELECT' FROM (VALUES
+        ('login_providers'), ('login_provider_revisions')
+    ) AS authority(relation) WHERE $1 >= 7
 ),
 column_contract (relation, attribute, role, privilege) AS (
     VALUES ('users', 'disabled_at', 'openmettle_api', 'UPDATE')
