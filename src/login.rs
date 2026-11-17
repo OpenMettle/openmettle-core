@@ -122,7 +122,23 @@ pub struct ProviderDefinition<'a> {
     pub destination: &'a str,
     pub enabled: bool,
 }
+pub(crate) fn validate_definition(
+    identity: &crate::auth::ProviderIdentity,
+    d: &ProviderDefinition<'_>,
+) -> Result<(), Error> {
+    if !name(d.revision)
+        || !name(d.destination)
+        || !https(identity.binding().1)
+        || !https(d.authorization_endpoint)
+        || !https(d.token_endpoint)
+        || !https(d.callback)
+    {
+        return Err(Error::Configuration);
+    }
+    Ok(())
+}
 pub struct Provider {
+    managed_binding: Option<Vec<u8>>,
     trusted: TrustedProvider,
     revision: String,
     authorization: String,
@@ -148,6 +164,7 @@ impl Provider {
             return Err(Error::Configuration);
         }
         Ok(Self {
+            managed_binding: None,
             trusted,
             revision: d.revision.into(),
             authorization: d.authorization_endpoint.into(),
@@ -157,7 +174,13 @@ impl Provider {
             enabled: d.enabled,
         })
     }
+    pub(crate) fn set_managed_binding(&mut self, binding: Vec<u8>) {
+        self.managed_binding = Some(binding);
+    }
     fn binding(&self) -> Vec<u8> {
+        if let Some(binding) = &self.managed_binding {
+            return binding.clone();
+        }
         let (id, issuer, client) = self.trusted.binding();
         identity(
             b"openmettle/login-provider/1\0",
@@ -488,9 +511,41 @@ async fn consume_inner(
     Ok(permit)
 }
 
+type TokenClient = CoreClient<
+    openidconnect::EndpointNotSet,
+    openidconnect::EndpointNotSet,
+    openidconnect::EndpointNotSet,
+    openidconnect::EndpointNotSet,
+    openidconnect::EndpointSet,
+>;
+fn token_client(p: &Provider) -> Result<TokenClient, Error> {
+    let (_, issuer, client) = p.trusted.binding();
+    Ok(CoreClient::new(
+        ClientId::new(client.into()),
+        IssuerUrl::new(issuer.into()).map_err(|_| Error::Configuration)?,
+        CoreJsonWebKeySet::new(vec![]),
+    )
+    .set_token_uri(TokenUrl::new(p.token.clone()).map_err(|_| Error::Configuration)?)
+    .set_redirect_uri(RedirectUrl::new(p.callback.clone()).map_err(|_| Error::Configuration)?))
+}
+fn exchanged_token(
+    response: openidconnect::core::CoreTokenResponse,
+    nonce: ExpectedNonceDigest,
+) -> Result<(UnverifiedIdToken, ExpectedNonceDigest), Error> {
+    let token = response
+        .extra_fields()
+        .id_token()
+        .ok_or(Error::Verification)?;
+    // Serialization retains the original signing input, including additional nbf claims.
+    Ok((
+        UnverifiedIdToken::new(&token.to_string()).map_err(|_| Error::Verification)?,
+        nonce,
+    ))
+}
+
 impl ExchangePermit {
     /// Exactly one library request through a caller-supplied transport. The transport must not
-    /// retry, spawn detached work or allocate unbounded bodies. No production adapter exists.
+    /// retry, spawn detached work or allocate unbounded bodies. Managed permits use exchange_with_keys.
     pub async fn exchange<'c, C>(
         self,
         http: &'c C,
@@ -500,16 +555,35 @@ impl ExchangePermit {
     where
         C: AsyncHttpClient<'c>,
     {
-        let p = self.provider;
-        let (_, issuer, client) = p.trusted.binding();
-        let client = CoreClient::new(
-            ClientId::new(client.into()),
-            IssuerUrl::new(issuer.into()).map_err(|_| Error::Configuration)?,
-            CoreJsonWebKeySet::new(vec![]),
-        )
-        .set_token_uri(TokenUrl::new(p.token.clone()).map_err(|_| Error::Configuration)?)
-        .set_redirect_uri(RedirectUrl::new(p.callback.clone()).map_err(|_| Error::Configuration)?);
-        let bounded = |request: HttpRequest| async {
+        if self.provider.managed_binding.is_some() {
+            return Err(Error::Rejected);
+        }
+        let provider = self.provider.clone();
+        let (token, nonce) = self.exchange_token(http).await?;
+        provider
+            .trusted
+            .verify_digest(&token, &nonce, policy, now())
+            .map_err(|_| Error::Verification)
+    }
+    pub async fn exchange_with_keys(
+        self,
+        provider: &crate::provider_keys::ManagedProvider,
+        policy: &Policy,
+    ) -> Result<VerifiedIdentity, Error> {
+        provider.exchange(self, policy).await
+    }
+    pub(crate) fn managed_binding(&self) -> Option<&[u8]> {
+        self.provider.managed_binding.as_deref()
+    }
+    pub(crate) async fn exchange_token<'c, C>(
+        self,
+        http: &'c C,
+    ) -> Result<(UnverifiedIdToken, ExpectedNonceDigest), Error>
+    where
+        C: AsyncHttpClient<'c>,
+    {
+        let client = token_client(&self.provider)?;
+        let bounded = |request: HttpRequest| async move {
             let response = http.call(request).await.map_err(|_| Error::Exchange)?;
             if response.body().len() > MAX_RESPONSE_BYTES
                 || response.headers().len() > 32
@@ -534,21 +608,42 @@ impl ExchangePermit {
         .await
         .map_err(|_| Error::Exchange)?
         .map_err(|_| Error::Exchange)?;
-        let token = response
-            .extra_fields()
-            .id_token()
-            .ok_or(Error::Verification)?;
-        // Library serialization retains original signing_input, including unrecognized nbf.
-        let token = UnverifiedIdToken::new(&token.to_string()).map_err(|_| Error::Verification)?;
-        p.trusted
-            .verify_digest(&token, &self.nonce, policy, now())
-            .map_err(|_| Error::Verification)
+        exchanged_token(response, self.nonce)
+    }
+    // The concrete production transport enforces all bounds before library parsing. Keep this
+    // path separate from the legacy injected-client adapter so its future remains Send.
+    pub(crate) async fn request_token(
+        self,
+        http: &crate::provider_http::ProviderTransport,
+    ) -> Result<(UnverifiedIdToken, ExpectedNonceDigest), Error> {
+        let client = token_client(&self.provider)?;
+        let response = tokio::time::timeout(
+            DEADLINE,
+            client
+                .exchange_code(AuthorizationCode::new(self.code.0))
+                .set_pkce_verifier(PkceCodeVerifier::new(self.verifier.0))
+                .request_async(http),
+        )
+        .await
+        .map_err(|_| Error::Exchange)?
+        .map_err(|_| Error::Exchange)?;
+        exchanged_token(response, self.nonce)
     }
 }
 
 #[cfg(test)]
 #[path = "../tests/login_support/mod.rs"]
-mod fixture;
+pub(crate) mod fixture;
+#[cfg(test)]
+pub(crate) fn fixture_permit(provider: Arc<Provider>) -> ExchangePermit {
+    ExchangePermit {
+        provider,
+        code: Secret("synthetic-code".into()),
+        verifier: Secret("v".repeat(43)),
+        nonce: ExpectedNonceDigest::new(hash(&"n".repeat(43))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

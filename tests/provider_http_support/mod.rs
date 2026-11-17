@@ -87,6 +87,8 @@ pub enum Reply {
     Bytes(Vec<u8>),
     /// Close without a response after reading the request.
     Close,
+    /// Wait for a deterministic test barrier before responding.
+    Gate(Arc<Notify>, Vec<u8>),
     /// Write (possibly nothing), then wait for the client to disconnect.
     Stall(Vec<u8>),
     /// Write this chunk every 50 ms until the client disconnects.
@@ -155,6 +157,11 @@ impl Server {
                         let _ = tls.shutdown().await;
                     }
                     Reply::Close => drop(tls),
+                    Reply::Gate(gate, bytes) => {
+                        gate.notified().await;
+                        let _ = tls.write_all(&bytes).await;
+                        let _ = tls.shutdown().await;
+                    }
                     Reply::Stall(bytes) => {
                         let _ = tls.write_all(&bytes).await;
                         let _ = tls.flush().await;
