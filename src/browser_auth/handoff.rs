@@ -83,7 +83,7 @@ enum Refusal {
     Response,
     /// The caller cookie is absent, repeated, malformed or bound to another login.
     Binding,
-    Denied,
+    CompletionRejected,
     Unavailable,
 }
 impl Refusal {
@@ -99,7 +99,9 @@ impl Refusal {
                 StatusCode::BAD_REQUEST,
                 "login browser binding missing or superseded; restart login\n",
             ),
-            Self::Denied => (StatusCode::FORBIDDEN, "login denied\n"),
+            Self::CompletionRejected => {
+                (StatusCode::FORBIDDEN, "login refused. Start a new login.\n")
+            }
             Self::Unavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "login unavailable; restart login\n",
@@ -154,9 +156,10 @@ fn completion_refusal(error: Error) -> Refusal {
     use login::Error as L;
     use sessions::Error as S;
     match error {
-        // The transaction, the provider's assertion or the local approval said no.
+        // The consume phase also reports provider preflight, admission and deadline
+        // failures as Rejected. Use one neutral message for these outcomes.
         Error::Login(L::Rejected | L::Verification) | Error::Session(S::Rejected) => {
-            Refusal::Denied
+            Refusal::CompletionRejected
         }
         Error::Login(
             L::Configuration
@@ -486,15 +489,15 @@ mod tests {
             assert!(!response.headers().contains_key(header::SET_COOKIE));
             (response.status(), *response.body())
         };
-        for denied in [
+        for rejected in [
             Error::Login(L::Rejected),
             Error::Login(L::Verification),
             Error::Session(S::Rejected),
         ] {
             assert_eq!(
-                line(denied),
-                (StatusCode::FORBIDDEN, "login denied\n"),
-                "{denied:?}"
+                line(rejected),
+                (StatusCode::FORBIDDEN, "login refused. Start a new login.\n"),
+                "{rejected:?}"
             );
         }
         for unavailable in [

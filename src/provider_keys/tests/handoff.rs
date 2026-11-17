@@ -18,7 +18,7 @@ pub(super) const ORIGIN: &str = "https://app.example.test";
 pub(super) const RESPONSE_REFUSED: &str = "login response refused; restart login\n";
 pub(super) const BINDING_REFUSED: &str =
     "login browser binding missing or superseded; restart login\n";
-pub(super) const DENIED: &str = "login denied\n";
+pub(super) const LOGIN_REFUSED: &str = "login refused. Start a new login.\n";
 const UNAVAILABLE: &str = "login unavailable; restart login\n";
 
 pub(super) fn settings() -> Settings<'static> {
@@ -364,7 +364,8 @@ async fn callback_decides_the_response_and_binding_before_the_service() {
     assert!(!attempted());
 
     // Admitted: unknown well-formed parameters and unrelated cookies beside the one binding.
-    // The stand-in database never answers, so each attempt ends as unavailable.
+    // The pool acquisition times out at the silent database before the phase deadline.
+    // That database error maps to unavailable.
     let target = format!("/callback?{success}&session_state=synthetic&scope=openid+profile&x=&y");
     let cookies = format!("theme=dark;{cookie};\t{SESSION_COOKIE}=synthetic-earlier");
     let response = handoff.callback(&get(&target, &[&cookies])).await;

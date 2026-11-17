@@ -324,12 +324,14 @@ select an origin, provider, callback or destination.
   service. Success answers `303` to the landing and sets `__Host-openmettle-session` with
   the same attributes and no `Max-Age`; expiry in the database stays authoritative.
 - **Every response** has `Cache-Control: no-store` and `Referrer-Policy: no-referrer`.
-  Refusals are fixed lines that set and delete no cookie. No credential appears in a URL or
-  body.
+  Refusals are fixed lines that set and delete no cookie. The landing URL and response
+  bodies carry no credential, code, state or caller secret.
 
-A browser holds one caller cookie, so only the most recently stored login can complete. An
-older login's callback is refused without being consumed and keeps its admission slot until
-it expires. A new login overwrites the session cookie without ending the earlier session.
+A browser holds one caller cookie for the application hostname. If a callback carries
+another login's cookie, the transaction named by the callback stays unconsumed and holds its
+admission slot until expiry. A callback already sent with its matching cookie can still
+finish. A new login replaces the browser's session cookie. The earlier session stays valid
+until expiry or revocation.
 
 Before any exposure these remain outstanding: browser qualification; trusted ingress
 routing for the application origin and redaction of request targets and cookies in

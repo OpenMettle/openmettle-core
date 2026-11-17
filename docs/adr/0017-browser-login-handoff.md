@@ -70,10 +70,10 @@ The cookie has no `Domain`, so it is host-only. `Max-Age` is the configured logi
 
 ### One caller-cookie slot
 
-A browser holds one caller cookie for the origin. A later initiation replaces it. The
-callback requires the cookie's locator to equal the locator in `state`, so the callback of
-an older login is refused once the newer cookie is stored. That refusal happens before any
-service call and consumes neither login.
+A browser holds one caller cookie for the application hostname. Each initiation response
+replaces it when the browser stores the cookie. The callback requires the cookie's locator
+to equal the locator in `state`. If the older login's callback carries the newer login's
+cookie, the adapter refuses it before any service call and consumes neither login.
 
 The callback never deletes the caller cookie. A deletion sent with the response to login A
 could arrive after login B's cookie was stored and erase it. The retained value is harmless:
@@ -131,8 +131,12 @@ a 4096-byte code, a 2048-byte issuer and the state with every byte percent-encod
 | `404` | `not found` | Callback path |
 | `400` | `login response refused; restart login` | Callback rules 3–7 |
 | `400` | `login browser binding missing or superseded; restart login` | Callback rules 8–9 |
-| `403` | `login denied` | `complete` returned `Rejected` or `Verification` |
+| `403` | `login refused. Start a new login.` | `complete` returned `Rejected` or `Verification` |
 | `503` | `login unavailable; restart login` | Any `begin` failure; every other `complete` failure |
+
+The pooled consume phase also returns `Rejected` for manager admission, provider
+preflight and phase deadline failures. The `403` response can include these transient
+failures, so its text gives restart guidance for all of them. [ADR 0016](0016-pooled-browser-auth-service.md)
 
 - Every response has `Cache-Control: no-store` and `Referrer-Policy: no-referrer`.
 - A refusal sets no cookie, deletes no cookie and has no `Location`. A denied or replayed
@@ -151,9 +155,10 @@ stored, and the issuer check against mix-up.
 
 ## Limits
 
-- **Concurrent initiations.** The browser keeps the cookie from whichever initiation
-  response it stores last, which need not be the last one started. Only that login can
-  complete. The other is refused at its callback and keeps its row until expiry.
+- **Concurrent initiations.** Response arrival order determines which login the browser's
+  cookie names. A callback already sent with its matching cookie can still finish after
+  the browser replaces that cookie. A callback carrying a different login's cookie leaves
+  its row unconsumed until expiry.
 - **Refused logins keep their admission slot.** A stale, provider-denied or abandoned login
   is not consumed and counts against the outstanding limit until it expires (ADR 0014).
 - **A new login does not end the previous session.** The browser's session cookie is
@@ -167,9 +172,12 @@ stored, and the issuer check against mix-up.
 - **`__Host-` and `SameSite` are enforced by the browser.** The binding assumes a browser
   that refuses a `__Host-` cookie set by another host or without `Secure`, including through
   a nameless cookie. No browser has been qualified.
-- **The request's authority is not checked.** `Host`, forwarded headers and an
-  absolute-form target are ignored. Trusted ingress must terminate TLS for the application
-  origin and route only that host to the adapter.
+- **Cookie scope.** Host-only cookies are shared across HTTPS ports on the same hostname.
+  Use a dedicated application hostname across all ports. [RFC 6265, §8.5](https://www.rfc-editor.org/rfc/rfc6265.html#section-8.5)
+- **Routing.** Trusted ingress must terminate TLS for the configured application origin
+  and route only that origin to the adapter. `Host`, forwarded headers and the authority
+  of an absolute-form target are ignored. Pass the original callback request path before
+  any rewriting or normalization. The router is responsible for the initiation path.
 - **Telemetry is outside the adapter.** An access log or trace that records request
   targets or headers would capture codes, states and cookies. Redaction must be in place
   before mounting.
@@ -200,8 +208,8 @@ the PostgreSQL protocol:
   `Location`. After all refusals the provider has received no request and the database
   stand-in no connection;
 - requests at exactly the query, parameter and cookie ceilings, with a maximal
-  percent-encoded code, reach the service. They end as `503` because the stand-in never
-  answers.
+  percent-encoded code, reach the service. The stand-in pool reaches its 300 ms acquisition
+  timeout before the phase deadline. This database error maps to `503`.
 
 No login can start without PostgreSQL, so unit tests
 (`cargo test --locked --offline --lib browser_auth::handoff`) check the two success

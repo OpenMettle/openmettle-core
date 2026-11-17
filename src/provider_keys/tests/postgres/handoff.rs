@@ -1,7 +1,7 @@
 //! The browser login handoff (ADR 0017) through the pooled service: one form POST to one
 //! session cookie, with the fixture TLS provider. Isolated CI PostgreSQL 18 only.
 use super::super::handoff::{
-    BINDING_REFUSED, DENIED, ORIGIN, RESPONSE_REFUSED, refused, request, settings,
+    BINDING_REFUSED, LOGIN_REFUSED, ORIGIN, RESPONSE_REFUSED, refused, request, settings,
 };
 use super::pooled::{one_slot, posts, service_over};
 use super::sessions::seed;
@@ -100,15 +100,16 @@ async fn form_post_becomes_one_session_cookie_and_stale_or_replayed_callbacks_se
     assert_ne!(older.cookie, current.cookie);
     assert_eq!(f.rows().await, 2);
 
-    // The older login's callback arrives with the newer cookie. It is refused on the
-    // locator before any service call: no provider request and nothing consumed.
+    // The binding refusal identifies the adapter's locator check. The request count and
+    // row state also confirm that no further provider request or consumption occurred.
     let requests = f.h.count();
     let stale = handoff.callback(&callback(&older, &current.cookie)).await;
     refused(&stale, StatusCode::BAD_REQUEST, BINDING_REFUSED);
     assert_eq!(f.h.count(), requests);
     assert!(!consumed(&mut f, &older).await);
 
-    // A provider error for the current login is refused without spending it.
+    // The response refusal identifies the adapter's provider-error check. The login
+    // remains unconsumed and the provider has received no token POST.
     let target = format!(
         "/callback?error=access_denied&error_description=SECRET-provider-text&state={}",
         current.state
@@ -142,7 +143,7 @@ async fn form_post_becomes_one_session_cookie_and_stale_or_replayed_callbacks_se
     // request and no cookie, so the session the browser holds is neither replaced nor
     // cleared and still validates.
     let replay = handoff.callback(&callback(&current, &cookies)).await;
-    refused(&replay, StatusCode::FORBIDDEN, DENIED);
+    refused(&replay, StatusCode::FORBIDDEN, LOGIN_REFUSED);
     assert_eq!(posts(&f), 1);
     auth.validate(credential).await.unwrap();
     let sessions: i64 = sqlx::query_scalar("SELECT count(*) FROM openmettle.local_sessions")
