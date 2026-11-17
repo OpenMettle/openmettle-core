@@ -1047,6 +1047,41 @@
         "V1-01",
         "V1-42"
       ]
+    },
+    {
+      "id": "github-actions-cache",
+      "name": "GitHub Actions cache (restore/save)",
+      "kind": "tooling",
+      "review_group": "core",
+      "distribution": "not-distributed",
+      "version": "v5",
+      "pin": "caa296126883cff596d87d8935842f9db880ef25",
+      "origin": "https://github.com/actions/cache",
+      "source_evidence": [
+        ".github/workflows/checks.yml",
+        "actions/cache refs/tags/v5 resolved 2026-11-17; restore/action.yml and save/action.yml at the pinned commit use node24"
+      ],
+      "licence": {
+        "expression": "MIT",
+        "evidence": [
+          "https://github.com/actions/cache/blob/caa296126883cff596d87d8935842f9db880ef25/LICENSE"
+        ]
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "CI tooling only; not part of the shipped runtime. Source pin and licence recorded by an agent; no distribution review performed."
+      },
+      "tracking": [
+        "V1-42"
+      ]
     }
   ]
 }
