@@ -1,14 +1,16 @@
 //! Composable persistence primitives, not admission or execution policy (ADR 0004).
-//! Every public writer uses a savepoint. Success releases it, never commits the caller's
-//! transaction. Errors roll it back; cancellation queues rollback through SQLx's Drop.
+//! Writers temporarily own the outer transaction while opening/using/closing a savepoint.
+//! Cancellation drops that transaction and leaves WriteTransaction unusable. Only the caller
+//! can commit; ordinary errors restore the owner after successful savepoint rollback.
 use sha2::{Digest, Sha256};
-use sqlx::{Acquire, Postgres, Row, Transaction};
+use sqlx::{Acquire, Connection, PgConnection, Postgres, Row, Transaction};
 
 pub enum Error {
     Invalid,
     Conflict,
     NotFound,
     StaleRevision,
+    TransactionUnavailable,
     Database(sqlx::Error),
 }
 impl From<sqlx::Error> for Error {
@@ -24,6 +26,9 @@ impl std::fmt::Display for Error {
             Self::Conflict => "identity conflict",
             Self::NotFound => "record not found",
             Self::StaleRevision => "stale operation revision",
+            Self::TransactionUnavailable => {
+                "transaction unavailable after cancellation or cleanup failure"
+            }
             Self::Database(_) => "persistence database error",
         })
     }
@@ -79,15 +84,62 @@ fn identity(domain: &[u8], fields: &[&[u8]]) -> Vec<u8> {
 fn digest(bytes: &[u8]) -> Vec<u8> {
     Sha256::digest(bytes).to_vec()
 }
-async fn finish<T>(tx: Transaction<'_, Postgres>, result: Result<T, Error>) -> Result<T, Error> {
+/// Caller-controlled composition boundary. No raw Transaction can be extracted or borrowed.
+/// A cancelled helper permanently consumes the inner transaction. Begin a new owner on the
+/// connection after dropping this one. Discard the connection after cancellation if protocol
+/// cleanup is uncertain (especially during savepoint release); use a fresh connection.
+/// Raw connection access is for statement composition, not manual transaction control.
+pub struct WriteTransaction<'c> {
+    inner: Option<Transaction<'c, Postgres>>,
+}
+impl<'c> WriteTransaction<'c> {
+    /// Start a root transaction; reject nesting into someone else's transaction.
+    pub async fn begin(connection: &'c mut PgConnection) -> Result<Self, Error> {
+        if connection.is_in_transaction() {
+            return Err(Error::Invalid);
+        }
+        Ok(Self {
+            inner: Some(Connection::begin(connection).await?),
+        })
+    }
+    /// Compose SQL in the same transaction. Unavailable after cancellation/cleanup failure.
+    pub fn connection(&mut self) -> Result<&mut PgConnection, Error> {
+        self.inner
+            .as_deref_mut()
+            .ok_or(Error::TransactionUnavailable)
+    }
+    pub async fn commit(mut self) -> Result<(), Error> {
+        self.inner
+            .take()
+            .ok_or(Error::TransactionUnavailable)?
+            .commit()
+            .await?;
+        Ok(())
+    }
+    pub async fn rollback(mut self) -> Result<(), Error> {
+        self.inner
+            .take()
+            .ok_or(Error::TransactionUnavailable)?
+            .rollback()
+            .await?;
+        Ok(())
+    }
+}
+
+// Outer Err means cleanup failed: never restore a commit-capable handle. Inner Err is an
+// ordinary helper error whose savepoint rollback succeeded, preserving prior caller writes.
+async fn finish<T>(
+    tx: Transaction<'_, Postgres>,
+    result: Result<T, Error>,
+) -> Result<Result<T, Error>, Error> {
     match result {
         Ok(value) => {
             tx.commit().await?;
-            Ok(value)
+            Ok(Ok(value))
         }
         Err(error) => {
             tx.rollback().await?;
-            Err(error)
+            Ok(Err(error))
         }
     }
 }
@@ -106,10 +158,7 @@ pub struct RunInput<'a> {
 }
 /// Insert or recover the same run. Initial event is deterministic and empty; callers may
 /// compose messages/reservations before calling. Rejected outer work must be rolled back.
-pub async fn create_run(
-    tx: &mut Transaction<'_, Postgres>,
-    r: &RunInput<'_>,
-) -> Result<String, Error> {
+pub async fn create_run(tx: &mut WriteTransaction<'_>, r: &RunInput<'_>) -> Result<String, Error> {
     for id in [r.scope, r.actor, r.conversation, r.branch, r.message] {
         uuid(id)?;
     }
@@ -136,7 +185,8 @@ pub async fn create_run(
         ],
     );
     let hash = digest(&id);
-    let mut sp = tx.begin().await?;
+    let mut outer = tx.inner.take().ok_or(Error::TransactionUnavailable)?;
+    let mut sp = outer.begin().await?;
     let result = async {
         let inserted: Option<String> = sqlx::query_scalar("INSERT INTO openmettle.runs
              (scope_id,actor_user_id,conversation_id,branch_id,input_message_id,idempotency_key,snapshot_format,snapshot_version,input_snapshot,config_snapshot,request_identity,request_digest)
@@ -144,7 +194,9 @@ pub async fn create_run(
              (scope_id,actor_user_id,idempotency_key) DO NOTHING RETURNING id::text")
             .bind(r.scope).bind(r.actor).bind(r.conversation).bind(r.branch).bind(r.message).bind(r.key).bind(r.format).bind(r.version).bind(r.input).bind(r.config).bind(&id).bind(&hash).fetch_optional(&mut *sp).await?;
         if let Some(run) = inserted {
-            append_event(&mut sp,r.scope,&run,"run-created",Payload{format:"openmettle.run-created",version:1,bytes:b""}).await?;
+            let payload = Payload { format: "openmettle.run-created", version: 1, bytes: b"" };
+            let event_id = event_identity(r.scope, &run, "run-created", payload);
+            append_locked(&mut sp, r.scope, &run, "run-created", &event_id, payload).await?;
             Ok(run)
         } else {
             let row = sqlx::query("SELECT id::text, request_identity, request_digest, conversation_id::text, branch_id::text,
@@ -158,7 +210,9 @@ pub async fn create_run(
             Ok(row.get("id"))
         }
     }.await;
-    finish(sp, result).await
+    let result = finish(sp, result).await?;
+    tx.inner = Some(outer);
+    result
 }
 
 async fn lock_run(tx: &mut Transaction<'_, Postgres>, scope: &str, run: &str) -> Result<(), Error> {
@@ -213,8 +267,21 @@ async fn append_locked(
         .bind(scope).bind(run).bind(seq).bind(key).bind(p.format).bind(p.version).bind(p.bytes).bind(id).bind(digest(id)).execute(&mut **tx).await?;
     Ok(seq)
 }
+fn event_identity(scope: &str, run: &str, key: &str, p: Payload<'_>) -> Vec<u8> {
+    identity(
+        b"openmettle/event/1\0",
+        &[
+            scope.as_bytes(),
+            run.as_bytes(),
+            key.as_bytes(),
+            p.format.as_bytes(),
+            &p.version.to_be_bytes(),
+            p.bytes,
+        ],
+    )
+}
 pub async fn append_event(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut WriteTransaction<'_>,
     scope: &str,
     run: &str,
     key: &str,
@@ -226,24 +293,17 @@ pub async fn append_event(
     if !bounded(key, 128) {
         return Err(Error::Invalid);
     }
-    let id = identity(
-        b"openmettle/event/1\0",
-        &[
-            scope.as_bytes(),
-            run.as_bytes(),
-            key.as_bytes(),
-            p.format.as_bytes(),
-            &p.version.to_be_bytes(),
-            p.bytes,
-        ],
-    );
-    let mut sp = tx.begin().await?;
+    let id = event_identity(scope, run, key, p);
+    let mut outer = tx.inner.take().ok_or(Error::TransactionUnavailable)?;
+    let mut sp = outer.begin().await?;
     let result = async {
         lock_run(&mut sp, scope, run).await?;
         append_locked(&mut sp, scope, run, key, &id, p).await
     }
     .await;
-    finish(sp, result).await
+    let result = finish(sp, result).await?;
+    tx.inner = Some(outer);
+    result
 }
 
 pub struct Intent<'a> {
@@ -254,10 +314,7 @@ pub struct Intent<'a> {
     pub capability: &'a str,
     pub request: Payload<'a>,
 }
-pub async fn record_intent(
-    tx: &mut Transaction<'_, Postgres>,
-    r: &Intent<'_>,
-) -> Result<String, Error> {
+pub async fn record_intent(tx: &mut WriteTransaction<'_>, r: &Intent<'_>) -> Result<String, Error> {
     uuid(r.scope)?;
     uuid(r.run)?;
     r.request.validate(65536)?;
@@ -280,7 +337,8 @@ pub async fn record_intent(
             r.request.bytes,
         ],
     );
-    let mut sp = tx.begin().await?;
+    let mut outer = tx.inner.take().ok_or(Error::TransactionUnavailable)?;
+    let mut sp = outer.begin().await?;
     let result = async {
         lock_run(&mut sp,r.scope,r.run).await?;
         let old = sqlx::query("SELECT id::text,request_identity,request_digest,target,capability,format,format_version,request FROM
@@ -301,7 +359,9 @@ pub async fn record_intent(
         append_locked(&mut sp,r.scope,r.run,&format!("intent:{operation}"),&event_id,Payload{format:"openmettle.operation-intent",version:1,bytes:operation.as_bytes()}).await?;
         Ok(operation)
     }.await;
-    finish(sp, result).await
+    let result = finish(sp, result).await?;
+    tx.inner = Some(outer);
+    result
 }
 pub struct Observation<'a> {
     pub scope: &'a str,
@@ -316,7 +376,7 @@ pub struct Observation<'a> {
 /// Observation key is in the run's event namespace. Exact retries recover their original
 /// revision even after later observations. Known outcomes are immutable through this helper.
 pub async fn record_observation(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut WriteTransaction<'_>,
     o: &Observation<'_>,
 ) -> Result<i64, Error> {
     uuid(o.scope)?;
@@ -349,7 +409,8 @@ pub async fn record_observation(
             o.evidence.bytes,
         ],
     );
-    let mut sp = tx.begin().await?;
+    let mut outer = tx.inner.take().ok_or(Error::TransactionUnavailable)?;
+    let mut sp = outer.begin().await?;
     let result = async {
         lock_run(&mut sp,o.scope,o.run).await?;
         if existing_event(&mut sp,o.scope,o.run,o.key,&id,o.evidence).await?.is_some() { return Ok(o.expected_revision+1); }
@@ -368,7 +429,9 @@ pub async fn record_observation(
         append_locked(&mut sp,o.scope,o.run,o.key,&id,o.evidence).await?;
         Ok(o.expected_revision+1)
     }.await;
-    finish(sp, result).await
+    let result = finish(sp, result).await?;
+    tx.inner = Some(outer);
+    result
 }
 
 #[cfg(test)]

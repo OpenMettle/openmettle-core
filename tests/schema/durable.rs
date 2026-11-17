@@ -1,6 +1,8 @@
 //! Uses the existing isolated database/role fixture and the real persistence helpers.
 use super::*;
-use openmettle_core::runs::{self, Error, Intent, Observation, Payload, RunInput};
+use openmettle_core::runs::{
+    self, Error, Intent, Observation, Payload, RunInput, WriteTransaction,
+};
 use sha2::{Digest, Sha256};
 
 #[derive(Clone)]
@@ -47,7 +49,7 @@ impl Context {
     }
     async fn run(&self, db: &TestDb, key: &str) -> String {
         let mut c = connect(&db.0, API).await;
-        let mut tx = c.begin().await.unwrap();
+        let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
         let run = runs::create_run(&mut tx, &self.input(key)).await.unwrap();
         tx.commit().await.unwrap();
         run
@@ -224,7 +226,7 @@ async fn duplicate_run_identity_and_savepoint_failures() {
         let opts = role_options(&db.0, API);
         tasks.push(tokio::spawn(async move {
             let mut cn = PgConnection::connect_with(&opts).await.unwrap();
-            let mut tx = cn.begin().await.unwrap();
+            let mut tx = WriteTransaction::begin(&mut cn).await.unwrap();
             b.wait().await;
             let id = runs::create_run(&mut tx, &c.input("same")).await.unwrap();
             tx.commit().await.unwrap();
@@ -237,7 +239,7 @@ async fn duplicate_run_identity_and_savepoint_failures() {
     }
     assert!(ids.iter().all(|id| id == &ids[0]));
     let mut api = connect(&db.0, API).await;
-    let mut tx = api.begin().await.unwrap();
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
     let mut changed = c.input("same");
     changed.config = b"changed";
     assert!(matches!(
@@ -255,13 +257,13 @@ async fn duplicate_run_identity_and_savepoint_failures() {
     assert_ne!(other.run(&db, "same").await, ids[0]);
     let mut input = c.input("same");
     input.actor = &other.actor;
-    let mut tx = api.begin().await.unwrap();
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
     assert_ne!(runs::create_run(&mut tx, &input).await.unwrap(), ids[0]);
     tx.commit().await.unwrap();
     // Failure after run INSERT, while appending its initial event, rolls back the run.
     let mut admin = db.admin().await;
     admin.execute("ALTER TABLE openmettle.run_events ADD CONSTRAINT fixture_failure CHECK (append_key <> 'run-created') NOT VALID").await.unwrap();
-    let mut tx = api.begin().await.unwrap();
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
     assert!(matches!(
         runs::create_run(&mut tx, &c.input("failed")).await,
         Err(Error::Database(_))
@@ -280,10 +282,15 @@ async fn duplicate_run_identity_and_savepoint_failures() {
         0
     );
     // Caller-owned message+run transaction: no orphan after explicit outer rollback.
-    let mut tx = api.begin().await.unwrap();
-    let msg = message(&mut tx, &c.scope, &c.conversation, Some(&c.message))
-        .await
-        .unwrap();
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    let msg = message(
+        tx.connection().unwrap(),
+        &c.scope,
+        &c.conversation,
+        Some(&c.message),
+    )
+    .await
+    .unwrap();
     let mut input = c.input("rollback");
     input.message = &msg;
     runs::create_run(&mut tx, &input).await.unwrap();
@@ -308,7 +315,7 @@ async fn duplicate_run_identity_and_savepoint_failures() {
         .execute(&mut admin)
         .await
         .unwrap();
-    let mut tx = api.begin().await.unwrap();
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
     assert!(matches!(
         runs::create_run(&mut tx, &c.input("same")).await,
         Err(Error::Conflict)
@@ -324,7 +331,7 @@ async fn event_commit_order_rollback_disconnect_and_replay() {
     let run = c.run(&db, "one").await;
     let other = c.run(&db, "other").await;
     let mut first = connect(&db.0, WORKER).await;
-    let mut tx = first.begin().await.unwrap();
+    let mut tx = WriteTransaction::begin(&mut first).await.unwrap();
     assert_eq!(
         runs::append_event(&mut tx, &c.scope, &run, "a", payload(b"a"))
             .await
@@ -332,7 +339,7 @@ async fn event_commit_order_rollback_disconnect_and_replay() {
         2
     );
     let mut second = connect(&db.0, WORKER).await;
-    let mut later = second.begin().await.unwrap();
+    let mut later = WriteTransaction::begin(&mut second).await.unwrap();
     let mut pending = Box::pin(runs::append_event(
         &mut later,
         &c.scope,
@@ -350,7 +357,7 @@ async fn event_commit_order_rollback_disconnect_and_replay() {
         1
     );
     let mut independent = connect(&db.0, API).await;
-    let mut separate = independent.begin().await.unwrap();
+    let mut separate = WriteTransaction::begin(&mut independent).await.unwrap();
     tokio::time::timeout(
         Duration::from_secs(2),
         runs::append_event(
@@ -370,7 +377,7 @@ async fn event_commit_order_rollback_disconnect_and_replay() {
     later.commit().await.unwrap();
     // Uncommitted connection loss also returns the counter to its committed value.
     let mut lost = connect(&db.0, WORKER).await;
-    let mut lost_tx = lost.begin().await.unwrap();
+    let mut lost_tx = WriteTransaction::begin(&mut lost).await.unwrap();
     assert_eq!(
         runs::append_event(&mut lost_tx, &c.scope, &run, "lost", payload(b"lost"))
             .await
@@ -378,7 +385,7 @@ async fn event_commit_order_rollback_disconnect_and_replay() {
         3
     );
     let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *lost_tx)
+        .fetch_one(lost_tx.connection().unwrap())
         .await
         .unwrap();
     sqlx::query("SELECT pg_terminate_backend($1)")
@@ -388,7 +395,7 @@ async fn event_commit_order_rollback_disconnect_and_replay() {
         .unwrap();
     drop(lost_tx);
     drop(lost);
-    let mut tx = second.begin().await.unwrap();
+    let mut tx = WriteTransaction::begin(&mut second).await.unwrap();
     assert_eq!(
         runs::append_event(&mut tx, &c.scope, &run, "b", payload(b"b"))
             .await
@@ -409,7 +416,7 @@ async fn event_commit_order_rollback_disconnect_and_replay() {
     // Failed event INSERT rolls back the allocated sequence, even if caller commits.
     let mut admin = db.admin().await;
     admin.execute("ALTER TABLE openmettle.run_events ADD CONSTRAINT fixture_failure CHECK (append_key <> 'reject') NOT VALID").await.unwrap();
-    let mut tx = second.begin().await.unwrap();
+    let mut tx = WriteTransaction::begin(&mut second).await.unwrap();
     assert!(
         runs::append_event(&mut tx, &c.scope, &run, "reject", payload(b"x"))
             .await
@@ -420,7 +427,7 @@ async fn event_commit_order_rollback_disconnect_and_replay() {
         .execute("ALTER TABLE openmettle.run_events DROP CONSTRAINT fixture_failure")
         .await
         .unwrap();
-    let mut tx = second.begin().await.unwrap();
+    let mut tx = WriteTransaction::begin(&mut second).await.unwrap();
     assert_eq!(
         runs::append_event(&mut tx, &c.scope, &run, "d", payload(b"d"))
             .await
@@ -429,11 +436,11 @@ async fn event_commit_order_rollback_disconnect_and_replay() {
     );
     tx.commit().await.unwrap();
     // Commit first writer before allowing second: ordered visibility, not only rollback.
-    let mut tx = first.begin().await.unwrap();
+    let mut tx = WriteTransaction::begin(&mut first).await.unwrap();
     runs::append_event(&mut tx, &c.scope, &run, "e", payload(b"e"))
         .await
         .unwrap();
-    let mut later = second.begin().await.unwrap();
+    let mut later = WriteTransaction::begin(&mut second).await.unwrap();
     let mut pending = Box::pin(runs::append_event(
         &mut later,
         &c.scope,
@@ -466,7 +473,7 @@ async fn operations_replay_revision_evidence_and_atomic_failure() {
         let opts = role_options(&db.0, WORKER);
         tasks.push(tokio::spawn(async move {
             let mut cn = PgConnection::connect_with(&opts).await.unwrap();
-            let mut tx = cn.begin().await.unwrap();
+            let mut tx = WriteTransaction::begin(&mut cn).await.unwrap();
             b.wait().await;
             let id = runs::record_intent(&mut tx, &intent(&c, &run))
                 .await
@@ -482,7 +489,7 @@ async fn operations_replay_revision_evidence_and_atomic_failure() {
     assert!(ids.iter().all(|id| id == &ids[0]));
     let op = &ids[0];
     let mut worker = connect(&db.0, WORKER).await;
-    let mut tx = worker.begin().await.unwrap();
+    let mut tx = WriteTransaction::begin(&mut worker).await.unwrap();
     let mut changed = intent(&c, &run);
     changed.target = "different";
     assert!(matches!(
@@ -500,7 +507,7 @@ async fn operations_replay_revision_evidence_and_atomic_failure() {
         handle: Some("job-1"),
         evidence: payload(b"timeout is not failure"),
     };
-    let mut tx = worker.begin().await.unwrap();
+    let mut tx = WriteTransaction::begin(&mut worker).await.unwrap();
     assert_eq!(
         runs::record_observation(&mut tx, &observation)
             .await
@@ -511,7 +518,7 @@ async fn operations_replay_revision_evidence_and_atomic_failure() {
     drop(worker);
     // Reconnect after an acknowledgement is lost; recover same key, no duplicate event.
     let mut worker = connect(&db.0, WORKER).await;
-    let mut tx = worker.begin().await.unwrap();
+    let mut tx = WriteTransaction::begin(&mut worker).await.unwrap();
     assert_eq!(
         runs::record_observation(&mut tx, &observation)
             .await
@@ -528,7 +535,7 @@ async fn operations_replay_revision_evidence_and_atomic_failure() {
     observation.expected_revision = 1;
     observation.outcome = "failed";
     observation.evidence = payload(b"");
-    let mut tx = worker.begin().await.unwrap();
+    let mut tx = WriteTransaction::begin(&mut worker).await.unwrap();
     assert!(matches!(
         runs::record_observation(&mut tx, &observation).await,
         Err(Error::Invalid)
@@ -537,7 +544,7 @@ async fn operations_replay_revision_evidence_and_atomic_failure() {
     observation.evidence = payload(b"authoritative failure");
     let mut admin = db.admin().await;
     admin.execute("ALTER TABLE openmettle.run_events ADD CONSTRAINT fixture_failure CHECK (append_key <> 'settled') NOT VALID").await.unwrap();
-    let mut tx = worker.begin().await.unwrap();
+    let mut tx = WriteTransaction::begin(&mut worker).await.unwrap();
     assert!(
         runs::record_observation(&mut tx, &observation)
             .await
@@ -552,7 +559,7 @@ async fn operations_replay_revision_evidence_and_atomic_failure() {
         .execute("ALTER TABLE openmettle.run_events DROP CONSTRAINT fixture_failure")
         .await
         .unwrap();
-    let mut tx = worker.begin().await.unwrap();
+    let mut tx = WriteTransaction::begin(&mut worker).await.unwrap();
     assert_eq!(
         runs::record_observation(&mut tx, &observation)
             .await
@@ -565,7 +572,7 @@ async fn operations_replay_revision_evidence_and_atomic_failure() {
         .await
         .unwrap();
     assert_eq!(outcome, "failed");
-    let mut tx = worker.begin().await.unwrap();
+    let mut tx = WriteTransaction::begin(&mut worker).await.unwrap();
     assert_eq!(
         runs::record_observation(&mut tx, &observation)
             .await
@@ -586,7 +593,7 @@ async fn operations_replay_revision_evidence_and_atomic_failure() {
     );
     // Intent INSERT is rolled back when its event fails.
     admin.execute("ALTER TABLE openmettle.run_events ADD CONSTRAINT fixture_failure CHECK (format <> 'openmettle.operation-intent') NOT VALID").await.unwrap();
-    let mut tx = worker.begin().await.unwrap();
+    let mut tx = WriteTransaction::begin(&mut worker).await.unwrap();
     let mut new = intent(&c, &run);
     new.key = "new";
     assert!(runs::record_intent(&mut tx, &new).await.is_err());
@@ -668,6 +675,7 @@ async fn killed_migration_three_preserves_version_two() {
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(db.history().await, [1, 2, 3]);
+    db.wait_no_migration_session().await;
 }
 
 #[tokio::test]
@@ -712,6 +720,7 @@ async fn version_three_failure_timeout_concurrent_upgrade() {
         assert!(out.status.success(), "{}", stderr(&out));
     }
     assert_eq!(db.history().await, [1, 2, 3]);
+    db.wait_no_migration_session().await;
 }
 
 #[tokio::test]
@@ -789,7 +798,7 @@ async fn durable_roles_and_ownership_are_bounded() {
     let grants:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.role_table_grants WHERE table_schema='openmettle' AND
              grantee IN ('openmettle_api','openmettle_worker') AND is_grantable='YES'").fetch_one(&mut db.admin().await).await.unwrap();
     assert_eq!(grants, 0);
-    let mut tx = api.begin().await.unwrap();
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
     let mut wrong = c.input("cross");
     wrong.branch = &other.branch;
     assert!(
@@ -802,7 +811,9 @@ async fn durable_roles_and_ownership_are_bounded() {
     );
     wrong = c.input("cross");
     wrong.scope = &other.scope;
-    assert!(runs::create_run(&mut tx, &wrong).await.is_err());
+    assert!(
+        matches!(runs::create_run(&mut tx, &wrong).await, Err(Error::Database(ref e)) if e.as_database_error().unwrap().code().as_deref() == Some("23503"))
+    );
     tx.commit().await.unwrap();
     let branch_error = sqlx::query(
         "INSERT INTO openmettle.conversation_branches(scope_id,conversation_id,fork_message_id)
@@ -814,7 +825,7 @@ async fn durable_roles_and_ownership_are_bounded() {
     .execute(&mut api)
     .await;
     assert_eq!(sqlstate(branch_error), "23503");
-    let mut tx = worker.begin().await.unwrap();
+    let mut tx = WriteTransaction::begin(&mut worker).await.unwrap();
     let mut wrong = intent(&c, &run);
     wrong.scope = &other.scope;
     assert!(matches!(
@@ -856,7 +867,7 @@ async fn concurrent_observations_have_one_revision_winner() {
     let c = Context::new(&db).await;
     let run = c.run(&db, "race").await;
     let mut worker = connect(&db.0, WORKER).await;
-    let mut tx = worker.begin().await.unwrap();
+    let mut tx = WriteTransaction::begin(&mut worker).await.unwrap();
     let operation = runs::record_intent(&mut tx, &intent(&c, &run))
         .await
         .unwrap();
@@ -871,7 +882,7 @@ async fn concurrent_observations_have_one_revision_winner() {
         let b = barrier.clone();
         tasks.push(tokio::spawn(async move {
             let mut cn = PgConnection::connect_with(&opts).await.unwrap();
-            let mut tx = cn.begin().await.unwrap();
+            let mut tx = WriteTransaction::begin(&mut cn).await.unwrap();
             b.wait().await;
             let result = runs::record_observation(
                 &mut tx,
@@ -906,3 +917,6 @@ async fn concurrent_observations_have_one_revision_winner() {
         3
     );
 }
+
+#[path = "cancellation.rs"]
+mod cancellation;

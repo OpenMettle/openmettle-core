@@ -59,17 +59,41 @@ Initial persistence limits, not measured capacity or a final wire schema:
   with positive event sequences. Overflow fails atomically.
 
 Identity columns allow envelope overhead: 264 KiB for run identity and 72 KiB for event and
-operation identity. Large files belong in future immutable artifact storage, not these fields.
+operation identity. Run identity repeats the input/configuration bytes, so the row can contain
+256 KiB of snapshots plus up to 264 KiB of identity, before tuple/index/WAL overhead. Event and
+operation identity similarly repeat payload bytes. These are conservative storage bounds, not
+measured compressed/on-disk sizing; include the duplication when sizing retention and writes.
+Large files belong in future immutable artifact storage, not these fields.
 
 ## Transactions and recovery
 
-Public helpers accept a caller-owned SQLx PostgreSQL transaction. Use READ COMMITTED and
-bounded caller connection/statement/lock deadlines. They create nested savepoints, release
-on success and roll back on any returned error. SQLx queues rollback when a cancelled helper
-drops its savepoint. If rollback fails or the connection is lost, abandon the transaction;
-never acknowledge a successful commit. Helpers never commit the outer transaction. They do
-not undo writes made by the caller before the helper: the caller must roll back the outer
-transaction when rejecting a composed admission.
+Public helpers borrow a `WriteTransaction`, which owns a root SQLx PostgreSQL transaction.
+Start it with `WriteTransaction::begin(&mut connection)`; nested construction is refused.
+Compose caller SQL through `connection()`, then call the helpers and finally `commit()` or
+`rollback()`. Raw connection access is for ordinary statements, not manual transaction control.
+Use READ COMMITTED and bounded connection/statement/lock deadlines.
+
+Each helper takes the inner transaction out of its owner before opening a savepoint. It
+restores that transaction only after the helper succeeds and releases its savepoint, or after
+an ordinary helper error and successful savepoint rollback. Restoration has no await point.
+Previous caller writes survive ordinary returned conflicts and query errors whose savepoint
+rollback succeeds. Helpers never commit the outer transaction. The caller must still roll
+back when rejecting a composed admission, including its own earlier writes.
+
+Dropping a polled helper during savepoint opening, a statement, release or rollback drops
+the owned transaction and leaves `WriteTransaction` permanently unavailable. Further helper
+writes, connection access and commit return `TransactionUnavailable`; the caller cannot
+accidentally receive a successful commit or start a nested helper as an independent transaction.
+Cleanup errors also leave the owner unavailable. A rollback failure is returned instead of
+the original helper error; no commit-capable handle is restored. Discard the connection after
+cancellation or uncertain cleanup and begin a new owner on a fresh connection. No successful
+commit may be inferred from an interrupted commit response.
+
+This ownership boundary is necessary with pinned SQLx 0.9.0: PostgreSQL savepoint opening
+increments the driver's transaction depth only after the response. Its cancellation guard can
+queue a full rollback at the previous depth. Retaining a borrowed raw Transaction would then
+permit a successful no-op commit or a later helper to begin/commit a root transaction. The
+wrapper prevents both uses without changing SQLx or adding a transaction framework.
 
 `create_run` inserts a run and its deterministic empty `openmettle.run-created` version-1
 event under append key `run-created`. Unique `(scope_id, actor_user_id, idempotency_key)`
@@ -77,7 +101,11 @@ serializes duplicates. On conflict a separate statement reads the committed winn
 identity returns its run ID; changed identity conflicts. This is persistence, not admission:
 current authorization, branch guards, budgets and request validation are absent. V1-10 must
 look up authorized replays before making new-message/branch decisions and compose accepted
-messages, reservations and the run in the same outer transaction.
+messages, reservations and the run in the same outer transaction. The input message UUID is
+part of run identity. Generating a new message UUID on retry changes that identity even when
+other request bytes match. V1-10 must look up an existing authorized admission first and reuse
+its original stable input identity; after rollback, retries must preserve the intended input
+identity rather than manufacture a different request under the same key.
 
 `append_event` locks the run with FOR NO KEY UPDATE, checks `(run_id, append_key)`, increments
 its counter, then inserts the event. Counter and event commit together. The lock is held until
@@ -85,7 +113,11 @@ the outer transaction ends. Thus later committed sequences for the same run cann
 an earlier uncommitted append. Other runs remain independent. Rollback returns the counter
 to its committed value. Exact replay returns the original sequence; changed identity conflicts.
 This ordering is a helper protocol; raw INSERT privileges do not force every writer to follow
-it. Unique keys/FKs enforce only their stated relational constraints. There is no global order.
+it. Raw column UPDATE privileges also allow counter rewind and operation outcome/revision
+changes outside the helpers. Unique keys/FKs enforce only their stated relational constraints;
+there is no database fencing or global event order. V1-11 must establish enforcement of worker
+ownership and mutations before execution is enabled. This increment does not claim those
+helper invariants against arbitrary application-role SQL.
 
 `record_intent` locks the run and deduplicates `(run_id, logical_key)` by exact identity. It
 inserts the operation and an event keyed `intent:<operation UUID>` atomically. Capability
@@ -151,7 +183,11 @@ ordering/replay/connection loss, operation observations, ownership and role deni
 migration failure/timeout/termination/retry. Released migration byte hashes are pinned in a
 non-database test. CI builds the authentic 18f52463c9d6bc12dda4bd1558e4597e067018f8 release
 from `git archive` and sets OLD_BINARY_DIR for populated upgrade and prior-binary checks.
-These are required tests; their presence is not a claim that a particular run passed.
+`tests/schema/cancellation.rs` withholds an observed PostgreSQL ReadyForQuery response after
+SAVEPOINT, RELEASE or ROLLBACK to cancel at deterministic protocol boundaries. It also observes
+a real run-lock wait through pg_stat_activity. Tests require an unavailable old owner, rollback
+of prior caller writes, and a working new transaction. No protocol payload is logged. These
+are required tests; their presence is not a claim that a particular run passed.
 
 V1-02 still owes grants, artifacts/revisions and reservations/accounting constraints. V1-03
 owns wire mapping; V1-05 authorization; V1-07 branch editing; V1-10 admission and queue policy;
