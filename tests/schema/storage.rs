@@ -346,6 +346,52 @@ async fn admission_composes_run_and_reservation_atomically() {
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
+async fn concurrent_reservations_cannot_exceed_one_owner_limit() {
+    let db = TestDb::migrated().await;
+    // The instance can accommodate every request; only this owner's limit can bind.
+    configure(&db, Some(10_000), Some(500), Some(500)).await;
+    let owner = Context::new(&db).await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(8));
+    let mut tasks = Vec::new();
+    for i in 0..8 {
+        let c = owner.clone();
+        let b = barrier.clone();
+        let artifact = new_uuid(&db).await;
+        let opts = role_options(&db.0, if i % 2 == 0 { API } else { WORKER });
+        tasks.push(tokio::spawn(async move {
+            let mut cn = PgConnection::connect_with(&opts).await.unwrap();
+            let mut tx = WriteTransaction::begin(&mut cn).await.unwrap();
+            b.wait().await;
+            let key = format!("owner-race-{i}");
+            let result =
+                storage::reserve(&mut tx, &input(&c.scope, &c.actor, &key, &artifact, 100)).await;
+            // Refused attempts must leave no partial reservation or counter update, even
+            // when the caller commits the otherwise valid transaction.
+            tx.commit().await.unwrap();
+            result
+        }));
+    }
+    let (mut accepted, mut refused) = (0, 0);
+    for task in tasks {
+        match task.await.unwrap() {
+            Ok(r) => {
+                assert_eq!(r.state, ReservationState::Reserved);
+                accepted += 1;
+            }
+            Err(Error::OwnerLimit) => refused += 1,
+            Err(other) => panic!("unexpected owner-race result: {other}"),
+        }
+    }
+    assert_eq!((accepted, refused), (5, 3));
+    assert_eq!(account(&db, &owner.scope).await, (0, 0, 500));
+    let rows: (i64, i64) = sqlx::query_as("SELECT count(*), coalesce(sum(max_bytes),0)::bigint FROM openmettle.storage_reservations WHERE scope_id=$1::uuid")
+        .bind(&owner.scope).fetch_one(&mut db.admin().await).await.unwrap();
+    assert_eq!(rows, (5, 500));
+    assert_totals(&db).await;
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
 async fn concurrent_owners_and_limit_reduction_never_oversubscribe() {
     let db = TestDb::migrated().await;
     // Ten owners with ample personal limits race for a 500-byte instance budget.
