@@ -45,6 +45,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "artifacts storage accounting",
         sql: include_str!("../migrations/0004_artifacts_storage_accounting.sql"),
     },
+    Source {
+        version: 5,
+        description: "grant persistence",
+        sql: include_str!("../migrations/0005_grant_persistence.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.
