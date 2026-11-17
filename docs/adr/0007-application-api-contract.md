@@ -214,8 +214,15 @@ component in `provenance/register.json`.
 
 ## Remaining V1-03 work
 
-Before #4 can close: an internal capability evaluator that keeps installed, authorization and
-readiness distinct, with a simulated failing or disabled provider showing that core readiness
-is unaffected. Authenticated serving of `/v1/capabilities`, runtime problem mapping and redaction
-tests need V1-04/05. Idempotency (V1-10), SSE replay (V1-12) and deploy (V1-32) consume this
-contract. ACP and backend consumer qualification remain separate evidence.
+Before #4 can close, qualify an internal capability evaluator that keeps installed,
+authorization and readiness distinct. Include a simulated failing or disabled provider
+and prove that core readiness is unaffected. Reconcile all four ticket criteria against
+the contract, compatibility and evaluator evidence; this PR alone does not complete #4.
+
+## Downstream implementation
+
+Authenticated serving of `/v1/capabilities`, runtime problem mapping and runtime redaction
+tests belong to V1-04/05. Idempotency (V1-10), SSE replay (V1-12), deploy (V1-32), and ACP
+consume the qualified contract. These dependents are not prerequisites for closing #4:
+V1-04 itself depends on V1-03. Contract fixtures do not establish runtime privacy or
+consumer adoption; those require separate evidence in their owning tickets.

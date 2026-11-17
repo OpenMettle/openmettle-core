@@ -639,7 +639,7 @@
             "description": "RFC 6901 JSON Pointer into the body, or /name for a parameter.",
             "type": "string",
             "maxLength": 256,
-            "pattern": "^(?:/[^/]*)*$"
+            "pattern": "^(?:/(?:[^~/]|~[01])*)*$"
           },
           "reason": {
             "$ref": "#/components/schemas/Code"
@@ -1002,7 +1002,7 @@
               "name": "unrecognized-kind",
               "class": "compat",
               "op": "set",
-              "path": "/capabilities/3/kind",
+              "path": "/capabilities/0/kind",
               "value": "hologram"
             }
           ]
@@ -1117,6 +1117,49 @@
               "op": "set",
               "path": "/code",
               "value": "schema_epoch_mismatch"
+            },
+            {
+              "name": "pointer-escaped-tokens",
+              "class": "valid",
+              "op": "set",
+              "path": "/errors/0/pointer",
+              "value": "/a~1b/~0key"
+            },
+            {
+              "name": "pointer-root",
+              "class": "valid",
+              "op": "set",
+              "path": "/errors/0/pointer",
+              "value": ""
+            },
+            {
+              "name": "pointer-empty-token",
+              "class": "valid",
+              "op": "set",
+              "path": "/errors/0/pointer",
+              "value": "/"
+            },
+            {
+              "name": "pointer-invalid-escape",
+              "class": "invalid",
+              "op": "set",
+              "path": "/errors/0/pointer",
+              "value": "/bad~2key",
+              "expect": {
+                "instancePath": "/errors/0/pointer",
+                "keyword": "pattern"
+              }
+            },
+            {
+              "name": "pointer-trailing-tilde",
+              "class": "invalid",
+              "op": "set",
+              "path": "/errors/0/pointer",
+              "value": "/trailing~",
+              "expect": {
+                "instancePath": "/errors/0/pointer",
+                "keyword": "pattern"
+              }
             }
           ]
         }

@@ -94,10 +94,33 @@ pub struct Readiness {
     pub observed: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum CapabilityKind {
+    Inference,
+    Tool,
+    Media,
+    Memory,
+    Retrieval,
+    Unrecognized(String),
+}
+
+impl CapabilityKind {
+    fn from_wire(kind: String) -> Self {
+        match kind.as_str() {
+            "inference" => Self::Inference,
+            "tool" => Self::Tool,
+            "media" => Self::Media,
+            "memory" => Self::Memory,
+            "retrieval" => Self::Retrieval,
+            _ => Self::Unrecognized(kind),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Capability {
     pub id: String,
-    pub kind: String,
+    pub kind: CapabilityKind,
     pub installed: bool,
     pub authorization: Authorization,
     pub readiness: Option<Readiness>,
@@ -106,7 +129,8 @@ pub struct Capability {
 impl Capability {
     /// A client may offer the capability only when every dimension positively allows it.
     pub fn offerable(&self) -> bool {
-        self.installed
+        !matches!(self.kind, CapabilityKind::Unrecognized(_))
+            && self.installed
             && self.authorization == Authorization::Allowed
             && self.readiness.as_ref().is_some_and(|r| r.state.usable())
     }
@@ -155,7 +179,7 @@ pub fn decode_capabilities(value: &Value) -> Result<Vec<Capability>, String> {
         }
         out.push(Capability {
             id: wire.id,
-            kind: wire.kind,
+            kind: CapabilityKind::from_wire(wire.kind),
             installed: wire.installed,
             authorization: match wire.authorization {
                 Some(true) => Authorization::Allowed,

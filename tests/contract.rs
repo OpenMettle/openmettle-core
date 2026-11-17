@@ -691,8 +691,17 @@ fn consumer_keeps_capability_dimensions_independent() {
     assert!(!newer[0].offerable());
     let kinds =
         consumer::decode_capabilities(&fixture("CapabilitiesMixed--unrecognized-kind")).unwrap();
-    assert_eq!(kinds[3].kind, "hologram");
-    assert_eq!(kinds[3].id, "memory.graph");
+    assert_eq!(
+        kinds[0].kind,
+        consumer::CapabilityKind::Unrecognized("hologram".into())
+    );
+    assert_eq!(kinds[0].id, "chat.completions");
+    assert!(kinds[0].installed && kinds[0].authorization == Allowed);
+    assert_eq!(
+        kinds[0].readiness.as_ref().unwrap().state,
+        ReadinessState::Ready
+    );
+    assert!(!kinds[0].offerable());
     // A core-only installation decodes to no capabilities and nothing else.
     assert!(
         consumer::decode_capabilities(&fixture("CapabilitiesCoreOnly"))

@@ -12,7 +12,7 @@
         "authorization": true,
         "id": "chat.completions",
         "installed": true,
-        "kind": "inference",
+        "kind": "hologram",
         "readiness": {
           "observed_at": "2026-11-17T08:59:58.000000Z",
           "state": "ready"
@@ -39,7 +39,7 @@
         "authorization": null,
         "id": "memory.graph",
         "installed": true,
-        "kind": "hologram",
+        "kind": "memory",
         "readiness": {
           "reason": "not_observed",
           "state": "unknown"
@@ -62,7 +62,7 @@
   "mutation": {
     "name": "unrecognized-kind",
     "op": "set",
-    "path": "/capabilities/3/kind",
+    "path": "/capabilities/0/kind",
     "value": "hologram"
   },
   "schema": "#/components/schemas/CapabilityList",
