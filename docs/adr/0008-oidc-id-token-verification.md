@@ -94,7 +94,8 @@ problem-response redaction, which remains with the future endpoint owner.
 | openidconnect | 4.1.0, `default-features = false` | https://github.com/ramosbugs/openidconnect-rs | MIT | ID-token parsing and verification; minimum Rust 1.88. Registry checksum `df0d098a59353679624d406825940139e2b2d554a52b64c9fb1b1bc42a11fe5c` |
 | chrono | 0.4.45 (`std`) | https://github.com/chronotope/chrono | MIT OR Apache-2.0 | Clock type the verifier requires; already a transitive dependency |
 | serde, serde_json | 1.0.229, 1.0.154 | serde-rs | MIT OR Apache-2.0 | Moved from dev to production for the `nbf` claim type and JWKS parsing; already locked |
-| rsa, rand_core, base64 (dev only) | 0.9.10, 0.6.4, 0.22.1 | RustCrypto, rust-random, marshallpierce | MIT OR Apache-2.0 | In-memory test keys and raw malformed tokens; already locked by this change |
+| rsa, rand_core (dev only) | 0.9.10, 0.6.4 | RustCrypto, rust-random | MIT OR Apache-2.0 | In-memory test signing keys; already locked by this change |
+| base64 | 0.22.1 | https://github.com/marshallpierce/rust-base64 | MIT OR Apache-2.0 | Production RSA modulus decoding for the strength check; also used by malformed-token tests; already locked |
 
 Disabling the default features removes `oauth2`'s HTTP clients, so no reqwest, curl or ureq is
 present. Choosing an HTTP transport is deferred. A custom hyper transport is not approved just to
