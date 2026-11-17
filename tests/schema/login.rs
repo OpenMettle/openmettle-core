@@ -118,11 +118,16 @@ async fn bound_exchange_denials_rotation_and_single_use_race() {
     .unwrap();
     let mut a = connect(&db.0, API).await;
     let mut b = connect(&db.0, API).await;
-    let (a, b) = tokio::join!(
+    let (a_result, b_result) = tokio::join!(
         login::consume(&mut a, p.clone(), &rotated, callback(&start, &code)),
         login::consume(&mut b, p.clone(), &rotated, callback(&start, &code))
     );
-    let permit = match (a, b) {
+    // The rejected consumer drops its transaction, which queues SQLx rollback.
+    // Close the owned connections before network work or a fresh replay probe;
+    // shadowing them would leave the loser's row lock held until scope exit.
+    a.close().await.unwrap();
+    b.close().await.unwrap();
+    let permit = match (a_result, b_result) {
         (Ok(p), Err(Error::Rejected)) | (Err(Error::Rejected), Ok(p)) => p,
         _ => panic!("one winner required"),
     };
@@ -133,16 +138,17 @@ async fn bound_exchange_denials_rotation_and_single_use_race() {
         .unwrap();
     assert_eq!(identity.subject(), "synthetic-subject");
     assert_eq!(counts(&db).await, (1, 1, 1));
-    assert!(matches!(
+    assert_eq!(
         login::consume(
             &mut connect(&db.0, API).await,
             p,
             &rotated,
             callback(&start, &code)
         )
-        .await,
-        Err(Error::Rejected)
-    ));
+        .await
+        .unwrap_err(),
+        Error::Rejected
+    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM openmettle.users")
             .fetch_one(&mut db.admin().await)
