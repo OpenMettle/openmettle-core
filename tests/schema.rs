@@ -614,7 +614,13 @@ async fn concurrent_migrators_apply_each_version_once() {
     .fetch_all(&mut db.admin().await)
     .await
     .unwrap();
-    assert_eq!(rows, [(1, 1), (2, 1), (3, 1)]);
+    assert_eq!(
+        rows,
+        MIGRATIONS
+            .iter()
+            .map(|m| (m.version, 1))
+            .collect::<Vec<_>>()
+    );
     db.wait_no_migration_session().await;
 }
 
@@ -941,27 +947,37 @@ async fn checksum_drift_and_newer_database_are_refused() {
     );
     assert!(!stderr(&output).contains(PASSWORD));
 
-    let fourth = Source {
-        version: 4,
-        description: "probe four",
-        sql: "CREATE TABLE openmettle.probe_four (id int)",
-    };
-    migrate::apply(&settings, &[MIGRATIONS[0], PROBE_TWO, third, fourth])
-        .await
-        .unwrap();
-    match migrate::apply(&settings, &[MIGRATIONS[0], PROBE_TWO, third]).await {
-        Err(Failure::Migrate(MigrateError::VersionMissing(4))) => {}
+    // Use authentic current migrations, then one contiguous future version. Keep this
+    // distinct from checksum drift so both refusal reasons are exercised independently.
+    drop(db);
+    let future_db = TestDb::migrated().await;
+    let future_settings = future_db.settings(Duration::from_secs(1));
+    let next_version = MIGRATIONS.last().unwrap().version + 1;
+    let mut future = MIGRATIONS.to_vec();
+    future.push(Source {
+        version: next_version,
+        description: "future probe",
+        sql: "CREATE TABLE openmettle.future_probe (id int)",
+    });
+    migrate::apply(&future_settings, &future).await.unwrap();
+    match migrate::apply(&future_settings, MIGRATIONS).await {
+        Err(Failure::Migrate(MigrateError::VersionMissing(v))) if v == next_version => {}
         other => panic!("unexpected result: {other:?}"),
     }
-    // The release binary refuses the same way and reports no SQL or connection details.
-    let output = migrate_command(&db.url(OWNER), &[]).output().unwrap();
+    let before = future_db.history().await;
+    let output = migrate_command(&future_db.url(OWNER), &[])
+        .output()
+        .unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(
-        stderr(&output).contains("database has migration 4, which this release does not contain"),
+        stderr(&output).contains(&format!(
+            "database has migration {next_version}, which this release does not contain"
+        )),
         "{}",
         stderr(&output)
     );
     assert!(!stderr(&output).contains(PASSWORD));
+    assert_eq!(future_db.history().await, before);
 }
 
 #[tokio::test]
