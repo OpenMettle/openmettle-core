@@ -41,6 +41,10 @@ jobs:
         run: cargo test --locked --offline --test runtime -- --ignored
         env:
           TEST_DATABASE_URL: postgres://fixture:fixture@127.0.0.1:5432/fixture?sslmode=disable
+      - name: PostgreSQL schema, migration and role integration
+        run: cargo test --locked --offline --test schema -- --ignored
+        env:
+          TEST_DATABASE_URL: postgres://fixture:fixture@127.0.0.1:5432/fixture?sslmode=disable
     services:
       postgres:
         image: postgres:18.1-bookworm@sha256:cc9f4143a8d2fa8cf3749d0cb4d26ecf2d53a77a2ac807e9ebd67ae22426221a
@@ -64,8 +68,13 @@ jobs:
           persist-credentials: false
       - run: docker build --target api --tag openmettle-api:test .
       - run: docker build --target worker --tag openmettle-worker:test .
+      - run: docker build --target migrate --tag openmettle-migrate:test .
       - name: Exercise isolated runtime images
         run: bash runtime/verify-images.sh
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+      - name: Exercise isolated migrate image
+        run: bash runtime/verify-migrate-image.sh
         env:
           POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
     services:
