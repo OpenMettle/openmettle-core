@@ -77,6 +77,13 @@ async fn session_count(f: &mut Flow) -> i64 {
 async fn write(f: &mut Flow, sql: &'static str) {
     f.owner.execute(sql).await.unwrap();
 }
+// pg_stat_activity hides other roles' wait details from openmettle_owner. Use the
+// existing isolated-fixture administrator solely for observation, never the operation.
+async fn statistics_observer(db: &Db) -> PgConnection {
+    PgConnection::connect_with(&admin_options().database(&db.name))
+        .await
+        .unwrap()
+}
 async fn waiting(observer: &mut PgConnection, pid: i32) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -341,10 +348,8 @@ async fn postcommit_ack_delay_rechecks_proof_and_database() {
         f.h.script.lock().unwrap().cache = "max-age=1000".into();
         f.h.script.lock().unwrap().metadata_cache = "max-age=1000".into();
         let p = f.h.provider.clone();
-        let (_, mut proof) = f.exchanged(&p).await;
-        if change == "deadline" {
-            proof.deadline = Instant::now() + Duration::from_millis(500);
-        }
+        let (_, proof) = f.exchanged(&p).await;
+        let deadline = proof.deadline;
         let mut barrier = ResponseBarrier::new(b"COMMIT\0");
         let options =
             f.db.options(API)
@@ -352,25 +357,35 @@ async fn postcommit_ack_delay_rechecks_proof_and_database() {
                 .port(barrier.port)
                 .ssl_mode(sqlx::postgres::PgSslMode::Disable);
         let mut cn = PgConnection::connect_with(&options).await.unwrap();
-        let control = async {
-            barrier.wait_reached().await;
-            match change {
-                "token-expiry" => f.h.advance(301),
-                "local-expiry" => {
-                    f.owner
-                        .execute("UPDATE openmettle.local_sessions SET expires_ms=created_ms+1")
-                        .await
-                        .unwrap();
-                }
-                "revoke" => {
-                    f.owner.execute("UPDATE openmettle.local_identity_approvals SET active=false,access_generation=access_generation+1,revision=revision+1").await.unwrap();
-                }
-                _ => tokio::time::sleep(Duration::from_millis(550)).await,
+        let result = {
+            let policy = session_policy();
+            let issuance = p.issue_session(&mut cn, proof, &policy);
+            tokio::pin!(issuance);
+            tokio::select! {
+                () = barrier.wait_reached() => {},
+                result = &mut issuance => panic!("issuance ended before COMMIT barrier ({change}): {result:?}"),
             }
-            barrier.resume();
+            let control = async {
+                match change {
+                    "token-expiry" => f.h.advance(301),
+                    "local-expiry" => {
+                        f.owner
+                            .execute("UPDATE openmettle.local_sessions SET expires_ms=created_ms+1")
+                            .await
+                            .unwrap();
+                    }
+                    "revoke" => {
+                        f.owner.execute("UPDATE openmettle.local_identity_approvals SET active=false,access_generation=access_generation+1,revision=revision+1").await.unwrap();
+                    }
+                    // Keep the original exchange deadline. COMMIT is already confirmed by the
+                    // barrier, so this tests delayed acknowledgement, not proxy setup time.
+                    _ => tokio::time::sleep_until(deadline + Duration::from_millis(1)).await,
+                }
+                barrier.resume();
+            };
+            let (result, ()) = tokio::join!(&mut issuance, control);
+            result
         };
-        let policy = session_policy();
-        let (result, ()) = tokio::join!(p.issue_session(&mut cn, proof, &policy), control);
         assert!(result.is_err(), "{change}");
         cn.close().await.unwrap();
         drop(barrier);
@@ -399,7 +414,7 @@ async fn approval_writer_first_waits_and_reads_new_state_or_rollback() {
             .fetch_one(&mut f.api)
             .await
             .unwrap();
-        let mut observer = f.db.connect(OWNER).await;
+        let mut observer = statistics_observer(&f.db).await;
         let control = async {
             waiting(&mut observer, pid).await;
             if action == "routine" {
@@ -449,7 +464,7 @@ async fn issuance_first_blocks_revocation_until_transaction_finishes() {
         .fetch_one(&mut f.owner)
         .await
         .unwrap();
-    let mut observer = f.db.connect(OWNER).await;
+    let mut observer = statistics_observer(&f.db).await;
     let revoke = async {
         barrier.wait_reached().await;
         let update=sqlx::query("UPDATE openmettle.local_identity_approvals SET active=false,revision=revision+1,access_generation=access_generation+1").execute(&mut f.owner);
@@ -491,7 +506,7 @@ async fn disable_waiter_and_generation_overflow_are_fail_closed() {
         .fetch_one(&mut f.api)
         .await
         .unwrap();
-    let mut observer = f.db.connect(OWNER).await;
+    let mut observer = statistics_observer(&f.db).await;
     let control = async {
         waiting(&mut observer, pid).await;
         held.execute("UPDATE openmettle.users SET disabled_at=clock_timestamp(),session_generation=session_generation+1").await.unwrap();
@@ -547,7 +562,7 @@ async fn authority_and_disablement_are_rechecked_after_real_lock_waits() {
             .fetch_one(&mut f.api)
             .await
             .unwrap();
-        let mut observer = f.db.connect(OWNER).await;
+        let mut observer = statistics_observer(&f.db).await;
         let control = async {
             waiting(&mut observer, pid).await;
             match action {
@@ -603,7 +618,7 @@ async fn original_login_expiry_is_checked_with_primary_clock_after_wait() {
         .fetch_one(&mut f.api)
         .await
         .unwrap();
-    let mut observer = f.db.connect(OWNER).await;
+    let mut observer = statistics_observer(&f.db).await;
     let control = async {
         waiting(&mut observer, pid).await;
         sqlx::query("SELECT pg_sleep(GREATEST(0,expires_ms/1000.0-extract(epoch FROM clock_timestamp()))) FROM openmettle.login_transactions WHERE id=$1")
@@ -631,7 +646,7 @@ async fn validator_waits_for_admission_and_logout_has_no_provider_lock() {
         .fetch_one(&mut f.api)
         .await
         .unwrap();
-    let mut observer = f.db.connect(OWNER).await;
+    let mut observer = statistics_observer(&f.db).await;
     let control = async {
         waiting(&mut observer, pid).await;
         held.execute("UPDATE openmettle.local_identity_approvals SET active=false,access_generation=access_generation+1,revision=revision+1").await.unwrap();
@@ -670,7 +685,7 @@ async fn validation_uses_primary_session_expiry_after_wait() {
         .fetch_one(&mut f.api)
         .await
         .unwrap();
-    let mut observer = f.db.connect(OWNER).await;
+    let mut observer = statistics_observer(&f.db).await;
     let control = async {
         waiting(&mut observer, pid).await;
         sqlx::query("SELECT pg_sleep(GREATEST(0,expires_ms/1000.0-extract(epoch FROM clock_timestamp()))) FROM openmettle.local_sessions")
@@ -700,7 +715,7 @@ async fn issuance_first_blocks_provider_and_user_writers() {
             .fetch_one(&mut f.owner)
             .await
             .unwrap();
-        let mut observer = f.db.connect(OWNER).await;
+        let mut observer = statistics_observer(&f.db).await;
         let revoke = async {
             barrier.wait_reached().await;
             let update = async {
@@ -749,7 +764,7 @@ async fn proof_expiry_after_user_wait_rolls_back_session_and_marker() {
         .fetch_one(&mut f.api)
         .await
         .unwrap();
-    let mut observer = f.db.connect(OWNER).await;
+    let mut observer = statistics_observer(&f.db).await;
     let control = async {
         waiting(&mut observer, pid).await;
         f.h.advance(301);
