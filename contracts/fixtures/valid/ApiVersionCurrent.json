@@ -1,0 +1,13 @@
+{
+  "class": "valid",
+  "direction": "value",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "ApiVersionCurrent",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": "1.0",
+  "mutation": null,
+  "schema": "#/components/schemas/ApiVersion",
+  "source": "#/components/examples/ApiVersionCurrent"
+}

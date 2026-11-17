@@ -1,0 +1,27 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "/status",
+    "keyword": "const",
+    "valid": false
+  },
+  "fixture": "ProblemIdempotencyConflict--idempotency-conflict-as-422",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "code": "idempotency_conflict",
+    "detail": "The idempotency key was already used with a different request.",
+    "request_id": "2d3e4f5a-6b7c-4d8e-9f0a-1b2c3d4e5f6a",
+    "status": 422,
+    "title": "Conflict",
+    "type": "about:blank"
+  },
+  "mutation": {
+    "name": "idempotency-conflict-as-422",
+    "op": "set",
+    "path": "/status",
+    "value": 422
+  },
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemIdempotencyConflict"
+}

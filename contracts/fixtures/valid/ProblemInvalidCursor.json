@@ -1,0 +1,20 @@
+{
+  "class": "valid",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "ProblemInvalidCursor",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "code": "invalid_cursor",
+    "detail": "The cursor is not valid for this request.",
+    "request_id": "0b7d3f52-1a2e-4f6c-9d8b-7e6a5c4b3a21",
+    "status": 400,
+    "title": "Bad Request",
+    "type": "about:blank"
+  },
+  "mutation": null,
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemInvalidCursor"
+}

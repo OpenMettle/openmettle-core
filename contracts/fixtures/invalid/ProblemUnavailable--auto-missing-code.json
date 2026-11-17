@@ -1,0 +1,25 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ProblemUnavailable--auto-missing-code",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "detail": "A required service is temporarily unavailable.",
+    "request_id": "7c8d9e0f-1a2b-4c3d-8e5f-6a7b8c9d0e1f",
+    "status": 503,
+    "title": "Service Unavailable",
+    "type": "about:blank"
+  },
+  "mutation": {
+    "name": "auto-missing-code",
+    "op": "remove",
+    "path": "/code"
+  },
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemUnavailable"
+}

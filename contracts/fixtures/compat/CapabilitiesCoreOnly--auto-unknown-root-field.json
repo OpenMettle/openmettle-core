@@ -1,0 +1,23 @@
+{
+  "class": "compat",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "CapabilitiesCoreOnly--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "capabilities": [],
+    "generated_at": "2026-11-17T09:00:00.000000Z",
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/CapabilityList",
+  "source": "#/components/examples/CapabilitiesCoreOnly"
+}

@@ -1,0 +1,13 @@
+{
+  "class": "valid",
+  "direction": "value",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "IdempotencyKeyTypical",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": "retry-7f3a:create-run",
+  "mutation": null,
+  "schema": "#/components/schemas/IdempotencyKey",
+  "source": "#/components/examples/IdempotencyKeyTypical"
+}

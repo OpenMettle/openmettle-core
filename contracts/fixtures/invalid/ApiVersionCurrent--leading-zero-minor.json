@@ -1,0 +1,20 @@
+{
+  "class": "invalid",
+  "direction": "value",
+  "expect": {
+    "instancePath": "",
+    "keyword": "pattern",
+    "valid": false
+  },
+  "fixture": "ApiVersionCurrent--leading-zero-minor",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": "1.01",
+  "mutation": {
+    "name": "leading-zero-minor",
+    "op": "set",
+    "path": "",
+    "value": "1.01"
+  },
+  "schema": "#/components/schemas/ApiVersion",
+  "source": "#/components/examples/ApiVersionCurrent"
+}

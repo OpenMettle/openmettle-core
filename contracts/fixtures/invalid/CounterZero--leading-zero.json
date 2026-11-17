@@ -1,0 +1,20 @@
+{
+  "class": "invalid",
+  "direction": "value",
+  "expect": {
+    "instancePath": "",
+    "keyword": "pattern",
+    "valid": false
+  },
+  "fixture": "CounterZero--leading-zero",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": "007",
+  "mutation": {
+    "name": "leading-zero",
+    "op": "set",
+    "path": "",
+    "value": "007"
+  },
+  "schema": "#/components/schemas/NonNegativeDecimal",
+  "source": "#/components/examples/CounterZero"
+}

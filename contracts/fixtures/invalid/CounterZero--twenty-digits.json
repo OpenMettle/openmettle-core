@@ -1,0 +1,20 @@
+{
+  "class": "invalid",
+  "direction": "value",
+  "expect": {
+    "instancePath": "",
+    "keyword": "maxLength",
+    "valid": false
+  },
+  "fixture": "CounterZero--twenty-digits",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": "10000000000000000000",
+  "mutation": {
+    "name": "twenty-digits",
+    "op": "set",
+    "path": "",
+    "value": "10000000000000000000"
+  },
+  "schema": "#/components/schemas/NonNegativeDecimal",
+  "source": "#/components/examples/CounterZero"
+}

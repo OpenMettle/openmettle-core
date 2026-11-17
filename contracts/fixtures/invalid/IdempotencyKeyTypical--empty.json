@@ -1,0 +1,20 @@
+{
+  "class": "invalid",
+  "direction": "value",
+  "expect": {
+    "instancePath": "",
+    "keyword": "minLength",
+    "valid": false
+  },
+  "fixture": "IdempotencyKeyTypical--empty",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": "",
+  "mutation": {
+    "name": "empty",
+    "op": "set",
+    "path": "",
+    "value": ""
+  },
+  "schema": "#/components/schemas/IdempotencyKey",
+  "source": "#/components/examples/IdempotencyKeyTypical"
+}

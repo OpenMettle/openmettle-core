@@ -1,0 +1,18 @@
+{
+  "class": "compat",
+  "direction": "value",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "ApiVersionCurrent--newer-minor",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": "1.12",
+  "mutation": {
+    "name": "newer-minor",
+    "op": "set",
+    "path": "",
+    "value": "1.12"
+  },
+  "schema": "#/components/schemas/ApiVersion",
+  "source": "#/components/examples/ApiVersionCurrent"
+}

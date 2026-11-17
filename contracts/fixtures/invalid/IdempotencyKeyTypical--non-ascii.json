@@ -1,0 +1,20 @@
+{
+  "class": "invalid",
+  "direction": "value",
+  "expect": {
+    "instancePath": "",
+    "keyword": "pattern",
+    "valid": false
+  },
+  "fixture": "IdempotencyKeyTypical--non-ascii",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": "cl\u00e9",
+  "mutation": {
+    "name": "non-ascii",
+    "op": "set",
+    "path": "",
+    "value": "cl\u00e9"
+  },
+  "schema": "#/components/schemas/IdempotencyKey",
+  "source": "#/components/examples/IdempotencyKeyTypical"
+}

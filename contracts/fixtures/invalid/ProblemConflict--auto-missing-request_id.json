@@ -1,0 +1,25 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ProblemConflict--auto-missing-request_id",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "code": "conflict",
+    "detail": "The resource changed since it was read.",
+    "status": 409,
+    "title": "Conflict",
+    "type": "about:blank"
+  },
+  "mutation": {
+    "name": "auto-missing-request_id",
+    "op": "remove",
+    "path": "/request_id"
+  },
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemConflict"
+}

@@ -1,0 +1,70 @@
+{
+  "class": "compat",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "CapabilitiesMixed--unrecognized-kind",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "capabilities": [
+      {
+        "authorization": true,
+        "id": "chat.completions",
+        "installed": true,
+        "kind": "inference",
+        "readiness": {
+          "observed_at": "2026-11-17T08:59:58.000000Z",
+          "state": "ready"
+        }
+      },
+      {
+        "authorization": false,
+        "id": "search.web",
+        "installed": true,
+        "kind": "tool",
+        "readiness": {
+          "observed_at": "2026-11-17T08:59:41.250000Z",
+          "reason": "provider_unreachable",
+          "state": "unavailable"
+        }
+      },
+      {
+        "authorization": null,
+        "id": "media.image",
+        "installed": false,
+        "kind": "media"
+      },
+      {
+        "authorization": null,
+        "id": "memory.graph",
+        "installed": true,
+        "kind": "hologram",
+        "readiness": {
+          "reason": "not_observed",
+          "state": "unknown"
+        }
+      },
+      {
+        "authorization": true,
+        "id": "retrieval.rerank",
+        "installed": true,
+        "kind": "retrieval",
+        "readiness": {
+          "observed_at": "2026-11-17T08:59:30.000001Z",
+          "reason": "capacity_limited",
+          "state": "degraded"
+        }
+      }
+    ],
+    "generated_at": "2026-11-17T09:00:00.000000Z"
+  },
+  "mutation": {
+    "name": "unrecognized-kind",
+    "op": "set",
+    "path": "/capabilities/3/kind",
+    "value": "hologram"
+  },
+  "schema": "#/components/schemas/CapabilityList",
+  "source": "#/components/examples/CapabilitiesMixed"
+}

@@ -1,0 +1,21 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "CapabilitiesCoreOnly--auto-missing-generated_at",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "capabilities": []
+  },
+  "mutation": {
+    "name": "auto-missing-generated_at",
+    "op": "remove",
+    "path": "/generated_at"
+  },
+  "schema": "#/components/schemas/CapabilityList",
+  "source": "#/components/examples/CapabilitiesCoreOnly"
+}

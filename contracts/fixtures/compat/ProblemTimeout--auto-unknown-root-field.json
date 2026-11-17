@@ -1,0 +1,27 @@
+{
+  "class": "compat",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "ProblemTimeout--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "code": "timeout",
+    "detail": "The operation did not finish in time; its outcome may still be unknown.",
+    "request_id": "9e0f1a2b-3c4d-4e5f-8a7b-8c9d0e1f2a3b",
+    "status": 504,
+    "title": "Gateway Timeout",
+    "type": "about:blank",
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemTimeout"
+}

@@ -1,0 +1,23 @@
+{
+  "class": "invalid",
+  "direction": "value",
+  "expect": {
+    "instancePath": "",
+    "keyword": "maxLength",
+    "valid": false
+  },
+  "fixture": "IdempotencyKeyTypical--too-long",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+  "mutation": {
+    "name": "too-long",
+    "op": "set",
+    "path": "",
+    "repeat": [
+      "k",
+      129
+    ]
+  },
+  "schema": "#/components/schemas/IdempotencyKey",
+  "source": "#/components/examples/IdempotencyKeyTypical"
+}

@@ -1,0 +1,27 @@
+{
+  "class": "compat",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "ProblemProviderFailure--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "code": "provider_failure",
+    "detail": "The provider did not complete the request.",
+    "request_id": "6b7c8d9e-0f1a-4b2c-9d4e-5f6a7b8c9d0e",
+    "status": 502,
+    "title": "Bad Gateway",
+    "type": "about:blank",
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemProviderFailure"
+}

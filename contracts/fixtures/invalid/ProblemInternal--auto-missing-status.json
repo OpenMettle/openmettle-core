@@ -1,0 +1,24 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ProblemInternal--auto-missing-status",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "code": "internal",
+    "request_id": "5a6b7c8d-9e0f-4a1b-8c3d-4e5f6a7b8c9d",
+    "title": "Internal Server Error",
+    "type": "about:blank"
+  },
+  "mutation": {
+    "name": "auto-missing-status",
+    "op": "remove",
+    "path": "/status"
+  },
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemInternal"
+}

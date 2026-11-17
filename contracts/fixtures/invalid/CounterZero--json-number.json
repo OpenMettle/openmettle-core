@@ -1,0 +1,20 @@
+{
+  "class": "invalid",
+  "direction": "value",
+  "expect": {
+    "instancePath": "",
+    "keyword": "type",
+    "valid": false
+  },
+  "fixture": "CounterZero--json-number",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": 9007199254740993,
+  "mutation": {
+    "name": "json-number",
+    "op": "set",
+    "path": "",
+    "value": 9007199254740993
+  },
+  "schema": "#/components/schemas/NonNegativeDecimal",
+  "source": "#/components/examples/CounterZero"
+}

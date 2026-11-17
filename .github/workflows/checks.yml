@@ -26,6 +26,8 @@ jobs:
           persist-credentials: false
       - name: Check repository hygiene
         run: python3 scripts/check_repository.py
+      - name: Check generated API contract fixtures are current
+        run: python3 scripts/contract_fixtures.py --check
 
   rust:
     name: Rust runtime

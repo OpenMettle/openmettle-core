@@ -1,0 +1,20 @@
+{
+  "class": "invalid",
+  "direction": "value",
+  "expect": {
+    "instancePath": "",
+    "keyword": "pattern",
+    "valid": false
+  },
+  "fixture": "CounterZero--above-signed-64",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": "9223372036854775808",
+  "mutation": {
+    "name": "above-signed-64",
+    "op": "set",
+    "path": "",
+    "value": "9223372036854775808"
+  },
+  "schema": "#/components/schemas/NonNegativeDecimal",
+  "source": "#/components/examples/CounterZero"
+}

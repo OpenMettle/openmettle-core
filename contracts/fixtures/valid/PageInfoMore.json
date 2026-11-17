@@ -1,0 +1,15 @@
+{
+  "class": "valid",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "PageInfoMore",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "next_cursor": "c3ludGhldGljLWN1cnNvcg"
+  },
+  "mutation": null,
+  "schema": "#/components/schemas/PageInfo",
+  "source": "#/components/examples/PageInfoMore"
+}

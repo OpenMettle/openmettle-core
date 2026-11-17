@@ -1,0 +1,20 @@
+{
+  "class": "valid",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "ProblemPolicy",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "code": "policy",
+    "detail": "Your access to this resource does not permit this action.",
+    "request_id": "5d4c3b2a-1f0e-4d9c-8b7a-6f5e4d3c2b1a",
+    "status": 403,
+    "title": "Forbidden",
+    "type": "about:blank"
+  },
+  "mutation": null,
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemPolicy"
+}

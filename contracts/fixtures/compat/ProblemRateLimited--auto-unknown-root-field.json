@@ -1,0 +1,26 @@
+{
+  "class": "compat",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "ProblemRateLimited--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "code": "rate_limited",
+    "request_id": "4f5a6b7c-8d9e-4f0a-9b2c-3d4e5f6a7b8c",
+    "status": 429,
+    "title": "Too Many Requests",
+    "type": "about:blank",
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemRateLimited"
+}

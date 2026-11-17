@@ -1,0 +1,75 @@
+{
+  "class": "compat",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "CapabilitiesMixed--nested-unknown-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "capabilities": [
+      {
+        "authorization": true,
+        "id": "chat.completions",
+        "installed": true,
+        "kind": "inference",
+        "readiness": {
+          "observed_at": "2026-11-17T08:59:58.000000Z",
+          "state": "ready"
+        }
+      },
+      {
+        "authorization": false,
+        "id": "search.web",
+        "installed": true,
+        "kind": "tool",
+        "readiness": {
+          "observed_at": "2026-11-17T08:59:41.250000Z",
+          "reason": "provider_unreachable",
+          "state": "unavailable"
+        },
+        "x_future_detail": {
+          "added_in": "1.9"
+        }
+      },
+      {
+        "authorization": null,
+        "id": "media.image",
+        "installed": false,
+        "kind": "media"
+      },
+      {
+        "authorization": null,
+        "id": "memory.graph",
+        "installed": true,
+        "kind": "memory",
+        "readiness": {
+          "reason": "not_observed",
+          "state": "unknown"
+        }
+      },
+      {
+        "authorization": true,
+        "id": "retrieval.rerank",
+        "installed": true,
+        "kind": "retrieval",
+        "readiness": {
+          "observed_at": "2026-11-17T08:59:30.000001Z",
+          "reason": "capacity_limited",
+          "state": "degraded"
+        }
+      }
+    ],
+    "generated_at": "2026-11-17T09:00:00.000000Z"
+  },
+  "mutation": {
+    "name": "nested-unknown-field",
+    "op": "set",
+    "path": "/capabilities/1/x_future_detail",
+    "value": {
+      "added_in": "1.9"
+    }
+  },
+  "schema": "#/components/schemas/CapabilityList",
+  "source": "#/components/examples/CapabilitiesMixed"
+}

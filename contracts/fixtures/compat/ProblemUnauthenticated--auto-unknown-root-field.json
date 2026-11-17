@@ -1,0 +1,26 @@
+{
+  "class": "compat",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "ProblemUnauthenticated--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "code": "unauthenticated",
+    "request_id": "a3e1c0d9-8b7f-4e6d-9c5b-4a3f2e1d0c9b",
+    "status": 401,
+    "title": "Unauthorized",
+    "type": "about:blank",
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemUnauthenticated"
+}

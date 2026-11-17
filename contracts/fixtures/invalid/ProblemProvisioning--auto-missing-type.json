@@ -1,0 +1,25 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ProblemProvisioning--auto-missing-type",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "code": "provisioning",
+    "detail": "This account is not yet provisioned for the requested service.",
+    "request_id": "8d9e0f1a-2b3c-4d4e-9f6a-7b8c9d0e1f2a",
+    "status": 503,
+    "title": "Service Unavailable"
+  },
+  "mutation": {
+    "name": "auto-missing-type",
+    "op": "remove",
+    "path": "/type"
+  },
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemProvisioning"
+}

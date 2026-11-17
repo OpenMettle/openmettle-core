@@ -1,0 +1,23 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "/capabilities",
+    "keyword": "type",
+    "valid": false
+  },
+  "fixture": "CapabilitiesCoreOnly--capabilities-null",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "capabilities": null,
+    "generated_at": "2026-11-17T09:00:00.000000Z"
+  },
+  "mutation": {
+    "name": "capabilities-null",
+    "op": "set",
+    "path": "/capabilities",
+    "value": null
+  },
+  "schema": "#/components/schemas/CapabilityList",
+  "source": "#/components/examples/CapabilitiesCoreOnly"
+}

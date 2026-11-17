@@ -1,6 +1,6 @@
 # OpenMettle core
 
-Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. No product API, upload service, authentication, per-user authorization or GPU orchestration is implemented. Runtime qualification and deployment acceptance remain separate gates.
+Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures, but no `/v1` route serves it. No product API, upload service, authentication, per-user authorization or GPU orchestration is implemented. Runtime qualification and deployment acceptance remain separate gates.
 
 ## Start here
 
@@ -14,6 +14,8 @@ Install Rust through the [official rustup installer](https://rustup.rs/). The re
 
 ```sh
 python3 scripts/check_repository.py
+python3 scripts/contract_fixtures.py --check
+python3 -m unittest discover -s scripts/tests
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo build --workspace --locked
@@ -69,6 +71,10 @@ The normal test suite covers configuration rejection, bind failure, database tim
 
 Build separate images with `docker build --target api -t openmettle-api:test .` and `docker build --target worker -t openmettle-worker:test .`. No images are published by CI. The [process contract fixture](runtime/process-contract.json) supplies separate service-account names, resource request examples and probes for deploy. The [Kubernetes qualification](tests/kubernetes/README.md) workflow runs that contract on an ephemeral kind cluster classified dev. It observes separate ServiceAccounts with token automount disabled, the requested resources, independent process settings, readiness, API survival with the worker scaled to zero, independent scaling and clean shutdown. Its manifests are test fixtures. Resource sizing is unqualified, and generic Helm packaging and RBAC belong to deploy (V1-32).
 
+## Application API contract
+
+[ADR 0007](docs/adr/0007-application-api-contract.md) defines the v1 HTTP/JSON contract in [contracts/](contracts/README.md): one canonical OpenAPI 3.2.1 document, fixtures generated from its examples and offline compatibility checks that need no Flutter client. It specifies errors, pagination, idempotency, run-event SSE items and capabilities with independent installed, authorization and readiness dimensions. Only `GET /v1/capabilities` is described, as an authenticated, unimplemented operation; the running API returns 404 for it. Security schemes are provisional until V1-04. After editing the document, run `python3 scripts/contract_fixtures.py` and commit the regenerated fixtures. `cargo test --test contract` validates the document against the vendored official OpenAPI 3.2 schema, checks every fixture with a JSON Schema 2020-12 validator (a development-only dependency) and decodes fixtures with an independent typed consumer. Capability evaluation and failing-provider readiness isolation remain outstanding V1-03 work.
+
 ## Schema migrations
 
 Read [ADR 0003](docs/adr/0003-schema-migrations.md) for the migration, role and ownership contract and [ADR 0004](docs/adr/0004-run-persistence.md) for run/event/operation persistence, limits and replay semantics, [ADR 0005](docs/adr/0005-artifact-storage-accounting.md) for artifact revisions, storage reservations and byte accounting, and [ADR 0006](docs/adr/0006-grant-persistence.md) for grant provenance, replay and revocation persistence. PostgreSQL 18 is the only qualified major version. Migrations in `migrations/` are embedded in the `openmettle-migrate` binary, forward-only and transactional; released migrations are never edited. Run the migrate image once per release, before rolling out new API and worker versions. Each release's migrations must remain compatible with the previous API and worker.
@@ -108,7 +114,7 @@ Build the migrate image with `docker build --target migrate -t openmettle-migrat
 
 ## Ownership
 
-V1-02 owns schema/migrations (run/event/operation, artifact/reservation/accounting and grant persistence are implemented; final acceptance and independent review remain open), V1-03 owns application/event/capacity contracts, and V1-42 owns transitive provenance and distribution clearance. Supported runtime targets for this increment are Linux containers and Unix development hosts; Windows signal behavior is not implemented.
+V1-02 owns schema/migrations (run/event/operation, artifact/reservation/accounting and grant persistence are implemented; final acceptance and independent review remain open), V1-03 owns application/event/capacity contracts (the first contract increment is published; runtime evaluation and closure evidence remain open), and V1-42 owns transitive provenance and distribution clearance. Supported runtime targets for this increment are Linux containers and Unix development hosts; Windows signal behavior is not implemented.
 
 The app repository consumes core APIs. The deploy repository owns generic Helm packages. Private site values and curated fork implementations stay outside this tree.
 
