@@ -30,6 +30,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Install pinned toolchain
         run: rustup toolchain install 1.100.0 --profile minimal --component rustfmt --component clippy
       - run: cargo fetch --locked
@@ -41,9 +42,15 @@ jobs:
         run: cargo test --locked --offline --test runtime -- --ignored
         env:
           TEST_DATABASE_URL: postgres://fixture:fixture@127.0.0.1:5432/fixture?sslmode=disable
+      - name: Build authentic previous release for schema compatibility
+        run: |
+          mkdir -p "$RUNNER_TEMP/openmettle-v2"
+          git archive 18f52463c9d6bc12dda4bd1558e4597e067018f8 | tar -x -C "$RUNNER_TEMP/openmettle-v2"
+          cargo build --manifest-path "$RUNNER_TEMP/openmettle-v2/Cargo.toml" --locked --offline --bins
       - name: PostgreSQL schema, migration and role integration
         run: cargo test --locked --offline --test schema -- --ignored
         env:
+          OLD_BINARY_DIR: ${{ runner.temp }}/openmettle-v2/target/debug
           TEST_DATABASE_URL: postgres://fixture:fixture@127.0.0.1:5432/fixture?sslmode=disable
     services:
       postgres:

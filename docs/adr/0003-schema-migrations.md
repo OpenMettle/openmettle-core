@@ -1,6 +1,6 @@
 # 0003 — Schema ownership, migrations and bounded database roles
 
-Status: implementation decision for review, 17 November 2026. Implements the first increment of V1-02 (#3); follows ADR 0002 and architecture v1. V1-02 remains open: runs, events, admission, grants, artifacts, reservations and operation records are not implemented here.
+Status: implementation decision for review, 17 November 2026. Implements the first increment of V1-02 (#3); follows ADR 0002 and architecture v1. V1-02 remains open. ADR 0004 extends this first increment with run/event/operation persistence; admission, grants, artifacts and reservations remain outstanding.
 
 ## Decision
 
@@ -38,7 +38,7 @@ Application principals are `openmettle_api`, `openmettle_worker`, every role tha
 - `openmettle_owner`'s default privileges (global or per schema) grant nothing to a principal;
 - principals own no schema, relation, function or type, and `openmettle_owner` owns schema `openmettle` and every relation in it.
 
-Application roles therefore cannot `SET ROLE` to the owner or obtain DDL, DELETE, TRUNCATE, REFERENCES, TRIGGER, MAINTAIN, `TEMP` or history access. The check never changes cluster roles, memberships or default privileges; it reports what to fix. It does not inspect large objects, foreign data wrappers, languages or `GRANT … ON PARAMETER`; the migration contract uses none of them. `src/boundaries.sql` is the authoritative privilege contract; migrations must grant within it, and the post-migration check enforces that.
+Application roles therefore cannot `SET ROLE` to the owner or obtain DDL, DELETE, TRUNCATE, REFERENCES, TRIGGER, MAINTAIN, `TEMP` or history access. The check never changes cluster roles, memberships or default privileges; it reports what to fix. It does not inspect large objects, foreign data wrappers, languages or `GRANT … ON PARAMETER`; the migration contract uses none of them. ADR 0004 adds explicit migration-3 table/column privileges only after its successful history record. `src/boundaries.sql` is the authoritative privilege contract; migrations must grant within it, and the post-migration check enforces that.
 
 Role names are cluster-global. Each installation uses one dedicated database. Installations sharing one PostgreSQL cluster would share these role names and therefore each other's database access; this increment does not isolate them. Parameterized role names are a future change if that layout is needed. Unrelated cluster roles and databases are not modified.
 
@@ -70,4 +70,4 @@ SQLx 0.9.0 always compiles `sqlx-core`'s migration code, so `sha2` and `crc` wer
 
 `tests/schema.rs` runs against the isolated CI PostgreSQL service: fresh install and idempotent rerun, populated version 1 → 2 upgrade preserving rows, four concurrent migrators, held-lock timeout (SQLSTATE 55P03), SIGTERM/SIGKILL of a lock waiter and of a migrator holding the lock inside migration 2's uncommitted DDL (rollback, session and lock removal, immediate rerun), failed and timed-out migrations leaving no partial state followed by an immediate retry, refusal of non-transactional migrations including a CR-terminated comment and a committed `standard_conforming_strings` change, checksum drift and newer databases, wrong-login refusal before bootstrap followed by an immediate owner success, refused role memberships (direct, `SET`-only, indirect, login roles, both privilege roles, owner) and attributes, refused database, schema, table, column, default and ownership privileges on fresh and migrated databases, a post-migration over-grant, the privilege matrix and actual denied operations, cross-scope and wrong-parent rejection, a concurrent unique identity race, a role connection limit, and API/worker readiness under the bounded roles without migrating. `runtime/verify-migrate-image.sh` checks the image's non-root user, exit 78, fresh install and rerun.
 
-Not covered: runs, events and admission idempotency, grants, artifacts, reservations, operation records, a schema-compatibility readiness gate, Helm Job/hook and production role provisioning (V1-32), backup/restore of roles (V1-30/V1-31), and connection sizing under load.
+Not covered by the original increment (run/event/operation extensions are in ADR 0004): grants, artifacts, reservations, admission policy, a schema-compatibility readiness gate, Helm Job/hook and production role provisioning (V1-32), backup/restore of roles (V1-30/V1-31), and connection sizing under load.

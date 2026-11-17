@@ -35,6 +35,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "conversations and messages",
         sql: include_str!("../migrations/0002_conversations_and_messages.sql"),
     },
+    Source {
+        version: 3,
+        description: "runs events and operations",
+        sql: include_str!("../migrations/0003_runs_events_operations.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.
@@ -379,8 +384,15 @@ async fn boundary_violations(connection: &mut PgConnection) -> Result<Vec<String
         )
         .fetch_one(&mut *connection)
         .await?;
+    let durable = history
+        && sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT FROM openmettle._sqlx_migrations WHERE version = 3 AND success)",
+        )
+        .fetch_one(&mut *connection)
+        .await?;
     sqlx::query_scalar(BOUNDARIES)
         .bind(initialized)
+        .bind(durable)
         .fetch_all(connection)
         .await
 }
