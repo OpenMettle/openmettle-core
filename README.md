@@ -1,6 +1,6 @@
 # OpenMettle core
 
-Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures, but no `/v1` route serves it. Internal managed login, an owner-configured outstanding-login cap, local identity approval and opaque-session primitives are implemented. No product API, upload service, request authentication, per-user authorization or GPU orchestration is exposed. Runtime qualification and deployment acceptance remain separate gates.
+Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures, but no `/v1` route serves it. Internal managed login, an owner-configured outstanding-login cap, local identity approval and opaque-session primitives are implemented, with an offline check for mounted browser-auth settings that the running API does not load yet. No product API, upload service, request authentication, per-user authorization or GPU orchestration is exposed. Runtime qualification and deployment acceptance remain separate gates.
 
 ## Start here
 
@@ -91,8 +91,8 @@ code/challenge/client/callback binding. The production transport is described be
 is no login route.
 The nonce verifier accepts stored digests without weakening the existing token checks.
 
-Deployment key loading, browser cookies, native handoff and account creation remain
-unimplemented. Internal local approval and sessions are described below. The outstanding-login
+Browser cookies, native handoff and account creation remain unimplemented; key files are read
+only by the offline check below. Internal local approval and sessions are described below. The outstanding-login
 cap below is not a rate limit; public exposure remains blocked on request/rate/concurrency
 controls, operated cleanup and retired-key reservation reclamation. After database restore, invalidate pending login transactions and
 rotate the active login encryption key before any encryption; never resume restored logins.
@@ -115,8 +115,8 @@ retries, pools connections or reads proxy environment variables. Abandoned OS DN
 the only work that can outlive a dropped request, limited to 8 process-wide slots.
 
 Deployments behind an egress proxy are unsupported. Network policy remains a deployment
-control. Managed discovery/JWKS support is described below. Configuration loading and routes remain
-unimplemented, and no real provider has been qualified.
+control. Managed discovery/JWKS support is described below. Runtime configuration loading and routes
+remain unimplemented, and no real provider has been qualified.
 
 ## Managed discovery and signing keys
 
@@ -139,7 +139,8 @@ Keep the manager alive across requests. Registering identical configuration is a
 a changed configuration or a retire/restore retains cooldown and invalidates keys. A document
 expiring before cooldown ends blocks login until another refresh is allowed. Provider Age,
 short cache lifetimes and clock skew can reduce availability; qualify policy values against
-actual provider behavior. Configuration file/environment loading remains unimplemented.
+actual provider behavior. The offline check below validates configuration files; the running API
+does not load them.
 The managed provider path itself provides no route, cookie or account creation. Its sealed
 proof now has the internal local-approval/session consumer described below. `cargo test --lib provider_keys --locked --offline` exercises isolated TLS,
 rotation, cancellation, capacity and freshness behavior without PostgreSQL.
@@ -188,7 +189,7 @@ can leave an undisclosed row but never returns a credential after failed final c
 cleanup is bounded and preserves replay markers until the login gate becomes unusable. Never
 purge active-key nonce reservations as part of session cleanup.
 
-There are no routes, cookies, native handoff, loader, tenant/group qualification or reconciliation.
+There are no routes, cookies, native handoff, runtime loader, tenant/group qualification or reconciliation.
 Run the managed PostgreSQL tests only in isolated CI with the explicit module filter above;
 normal workspace tests leave them ignored. Migration 8 and authentic v7 compatibility are CI gates.
 
@@ -215,6 +216,52 @@ with [`docs/operator/login-gate-cleanup.psql`](docs/operator/login-gate-cleanup.
 (batch 1–1000, `SKIP LOCKED`; never deletes nonce reservations). CI runs both scripts
 unchanged with the pinned PostgreSQL 18 `psql`. No limit, schedule or retention value is
 selected. Old version-8 replicas do not enforce the cap during a rolling upgrade.
+
+## Offline browser-auth configuration check
+
+[ADR 0015](docs/adr/0015-offline-auth-config-check.md) adds `src/auth_config.rs`, a typed
+loader for mounted browser-auth settings, and one API argument form that runs it and exits:
+
+```sh
+openmettle-api --check-auth-config /etc/openmettle/auth/auth.json
+```
+
+Exit 0 prints `auth configuration valid (local files only)`. Exit 78 prints
+`auth configuration error:` and one fixed category, with no path, value, URL or parser text.
+Any other argument list also exits 78. The check needs no `DATABASE_URL`, opens no listener and
+makes no DNS, provider or database request. Run it in the API image, with the mounts and
+environment the API will use, before installing changed settings.
+
+Starting the API without arguments is unchanged and loads none of these files. The worker and
+migrator never read them. Nothing consumes the settings at runtime yet, and there is no live
+reload.
+
+The check reads one version-1 JSON document and the files it names. ADR 0015 gives the full
+shape with synthetic values. In summary:
+
+- Every setting is required, with its unit in the field name. There are no defaults, and no
+  operational value is selected. Unknown, repeated, missing or mistyped fields are refused in
+  every object.
+- At least one provider, each with a unique canonical UUID, exact issuer and client, revision,
+  HTTPS endpoints, callback, destination tag, private CIDRs and either native roots or one PEM
+  bundle. The existing constructors (ADRs 0008–0013) judge every value.
+- Every path is absolute. Symbolic links are followed, so Kubernetes projected volumes work,
+  but each must resolve to a regular file. Directories, FIFOs, sockets and devices are
+  refused without being opened.
+- Login keys are files of exactly 32 raw bytes: the active key first, then up to three
+  decrypt-only keys. Secrets cannot be inlined or supplied through the environment. The check
+  never creates a file, changes a permission or generates a key.
+
+File ownership and mode are not inspected. Mount the document, keys and bundles read-only
+from directories that only the deployment authority can write. The check does not defend
+against a hostile local writer.
+
+A successful check covers local files only. It does not show that a provider is reachable or
+that the database agrees: each `revision` must equal the current revision recorded under
+ADR 0012, and the ADR 0014 limit must be set. Keep the document, keys and bundles identical
+on every replica for a revision. Follow ADR 0015 for login-key rotation, provider revision
+changes and the unchanged restore requirements. `cargo test --locked --offline --lib auth_config`
+runs the loader tests without PostgreSQL or network access.
 
 ## Schema migrations
 

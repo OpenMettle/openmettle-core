@@ -26,6 +26,11 @@ const FORMAT: &[u8] = b"aes256gcm-v1";
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MAX_CODE_BYTES: usize = 4096;
 const DEADLINE: Duration = Duration::from_secs(10);
+/// Login transaction lifetime bounds (ADR 0009), shared with the deployment loader.
+pub const MIN_LOGIN_LIFETIME: Duration = Duration::from_secs(1);
+pub const MAX_LOGIN_LIFETIME: Duration = Duration::from_secs(600);
+/// Key ring capacity: one active key and up to three decrypt-only keys.
+pub const MAX_KEYS: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -230,7 +235,7 @@ impl fmt::Debug for KeyRing {
 }
 impl KeyRing {
     pub fn new(keys: Vec<(String, [u8; 32])>) -> Result<Self, Error> {
-        if keys.is_empty() || keys.len() > 4 {
+        if keys.is_empty() || keys.len() > MAX_KEYS {
             return Err(Error::Configuration);
         }
         for (i, (id, material)) in keys.iter().enumerate() {
@@ -429,7 +434,7 @@ async fn begin_inner(
     keys: &KeyRing,
     lifetime: Duration,
 ) -> Result<Started, Error> {
-    if !p.enabled || lifetime < Duration::from_secs(1) || lifetime > Duration::from_secs(600) {
+    if !p.enabled || !(MIN_LOGIN_LIFETIME..=MAX_LOGIN_LIFETIME).contains(&lifetime) {
         return Err(Error::Configuration);
     }
     let id = secret()?;
