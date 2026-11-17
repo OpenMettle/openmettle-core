@@ -22,6 +22,29 @@ cargo test --workspace --locked
 
 API and worker share operational code and build independently with `cargo build --locked --bin openmettle-api` and `cargo build --locked --bin openmettle-worker`. After `cargo fetch --locked`, add `--offline` to build, Clippy and test commands. Locked resolution and digest-pinned images constrain inputs; they do not prove bit-for-bit reproducibility.
 
+### CI caching
+
+The Rust runtime job restores Cargo downloads and `target/` build outputs before
+running the normal checks. Every format, lint, build, unit test and PostgreSQL
+integration command still runs; a cache hit never substitutes for a test result.
+Keys separate operating systems and architectures and include the toolchain,
+Cargo manifests/lockfiles, Cargo configuration and workflow. Each commit can save
+an updated build cache while restoring a compatible earlier entry. Cargo decides
+which outputs need rebuilding. Incremental compiler state is excluded.
+
+Only successful pushes to `main` save caches. Pull requests restore them without
+writing. A miss rebuilds normally with `cargo fetch --locked`; subsequent checks
+remain locked and offline. Do not add credentials, database data, kubeconfigs or
+qualification reports to the cached paths. The pinned GitHub `actions/cache` v5
+restore/save actions are MIT-licensed CI tooling (see `provenance/register.json`).
+
+For a cold verification run, dispatch **CI** with **use_cache** disabled. To
+invalidate the shared cache namespace, increment `cargo-v1` in both key prefixes.
+Compare the Rust job's restore, compile/test and save durations on cold and warm
+runs before claiming a speed improvement. Cache storage and transfer overhead
+must remain worthwhile as the workspace grows. This cache does not accelerate
+the separate Docker image or kind build jobs; those need BuildKit layer caching.
+
 ## Runtime
 
 Read [runtime ADR 0002](docs/adr/0002-cpu-runtime.md) for dependency origins, licences, configuration bounds and shutdown behavior. Supply each process's database URI through deployment-managed environment configuration. Do not commit credentials. For an isolated local test database only:
