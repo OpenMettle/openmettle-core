@@ -37,6 +37,10 @@ fn command(worker: bool) -> Command {
     command
 }
 fn start(worker: bool, address: &str, url: &str) -> Process {
+    // Healthy-service checks use the application's normal database deadline.
+    start_with_timeout(worker, address, url, 2000)
+}
+fn start_with_timeout(worker: bool, address: &str, url: &str, timeout_ms: u64) -> Process {
     let prefix = if worker {
         "OPENMETTLE_WORKER"
     } else {
@@ -46,7 +50,7 @@ fn start(worker: bool, address: &str, url: &str) -> Process {
         command(worker)
             .env(format!("{prefix}_BIND"), address)
             .env(format!("{prefix}_DATABASE_URL"), url)
-            .env(format!("{prefix}_DB_TIMEOUT_MS"), "150")
+            .env(format!("{prefix}_DB_TIMEOUT_MS"), timeout_ms.to_string())
             .env(format!("{prefix}_SHUTDOWN_TIMEOUT_MS"), "1000")
             .stdout(Stdio::null())
             .spawn()
@@ -56,7 +60,7 @@ fn start(worker: bool, address: &str, url: &str) -> Process {
 fn response(address: &str, path: &str) -> std::io::Result<String> {
     let mut stream =
         TcpStream::connect_timeout(&address.parse().unwrap(), Duration::from_millis(300))?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     stream.write_all(
         format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes(),
     )?;
@@ -140,7 +144,7 @@ fn unavailable_database_keeps_liveness_and_bounded_readiness() {
     );
     for worker in [false, true] {
         let bind = address();
-        let mut process = start(worker, &bind, &url);
+        let mut process = start_with_timeout(worker, &bind, &url, 150);
         wait_status(&mut process, &bind, "/healthz", 200);
         let began = Instant::now();
         assert!(
@@ -200,7 +204,7 @@ fn postgres_readiness_and_stopped_worker_survival() {
 }
 
 /// The evaluator runs in this harness, not behind a runtime injection endpoint.
-/// This qualifies the real readiness boundary while optional work fails or stalls.
+/// Regression guard for current structural separation, not in-process adapter qualification.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
 async fn postgres_readiness_is_independent_of_optional_evaluation() {

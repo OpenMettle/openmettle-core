@@ -69,9 +69,29 @@ contract (relation, role, privilege) AS (
         ('grant_assignments'), ('grant_changes')
     ) AS g(relation), (VALUES ('openmettle_api'), ('openmettle_worker')) AS r(role)
     WHERE $1 >= 5
+    UNION ALL
+    SELECT relation, 'openmettle_api', 'SELECT' FROM (VALUES
+        ('login_transactions'), ('login_nonce_reservations')
+    ) AS login(relation) WHERE $1 >= 6
 ),
 column_contract (relation, attribute, role, privilege) AS (
     VALUES ('users', 'disabled_at', 'openmettle_api', 'UPDATE')
+    UNION ALL
+    SELECT relation, attribute, 'openmettle_api', privilege FROM (VALUES
+        ('login_nonce_reservations','key_id','INSERT'),
+        ('login_nonce_reservations','nonce','INSERT'),
+        ('login_transactions','id','INSERT'),
+        ('login_transactions','binding','INSERT'),
+        ('login_transactions','expires_ms','INSERT'),
+        ('login_transactions','state_hash','INSERT'),
+        ('login_transactions','nonce_hash','INSERT'),
+        ('login_transactions','caller_hash','INSERT'),
+        ('login_transactions','key_id','INSERT'),
+        ('login_transactions','nonce','INSERT'),
+        ('login_transactions','ciphertext','INSERT'),
+        ('login_transactions','consumed','UPDATE'),
+        ('login_transactions','ciphertext','UPDATE')
+    ) AS login(relation,attribute,privilege) WHERE $1 >= 6
     UNION ALL
     SELECT * FROM (VALUES
         ('runs', 'id', 'openmettle_api', 'INSERT'),

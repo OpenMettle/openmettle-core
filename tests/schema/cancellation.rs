@@ -71,6 +71,12 @@ impl ResponseBarrier {
             thread: Some(worker),
         }
     }
+    pub(super) async fn wait_reached(&mut self) {
+        tokio::time::timeout(Duration::from_secs(30), self.reached.take().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+    }
     fn resume(&mut self) {
         if let Some(sender) = self.resume.take() {
             let _ = sender.send(());

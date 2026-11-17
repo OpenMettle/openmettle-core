@@ -42,6 +42,17 @@ serde_json = { version = "=1.0.154", default-features = false, features = ["std"
 # Decode the library-parsed public RSA modulus for its minimum-strength check (ADR 0008).
 base64 = { version = "=0.22.1", default-features = false, features = ["std"] }
 
+# Login protection: ring (Apache-2.0 AND ISC), subtle (BSD-3-Clause), already locked.
+# Origins: github.com/briansmith/ring; github.com/dalek-cryptography/subtle.
+[dependencies.ring]
+version = "=0.17.14"
+default-features = false
+features = ["std"]
+
+[dependencies.subtle]
+version = "=2.6.1"
+default-features = false
+
 # Test-only (ADR 0007 contract tests; ADR 0008 in-memory signing keys); not linked into binaries.
 [dev-dependencies]
 jsonschema = { version = "=0.61.2", default-features = false }

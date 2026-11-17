@@ -491,7 +491,7 @@ async fn fresh_install_is_idempotent_and_owned() {
     let db = TestDb::new().await;
     let output = migrate_command(&db.url(OWNER), &[]).output().unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6]);
 
     let mut admin = db.admin().await;
     let recorded: Vec<Vec<u8>> =
@@ -574,7 +574,7 @@ async fn populated_upgrade_preserves_identity_and_ownership() {
 
     let output = migrate_command(&db.url(OWNER), &[]).output().unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6]);
 
     let mut api = connect(&db.0, API).await;
     assert_eq!(snapshot(&mut api, &tables).await, before);
@@ -659,7 +659,7 @@ async fn held_lock_times_out_and_is_released_for_retry() {
         .output()
         .unwrap();
     assert_eq!(retry.status.code(), Some(0), "{}", stderr(&retry));
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6]);
 }
 
 #[tokio::test]
@@ -799,7 +799,7 @@ async fn killed_migrator_holding_the_lock_mid_migration_rolls_back() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6]);
 }
 
 /// Custom sets start with the real migration 1 so the post-migration boundary check sees the
@@ -1010,7 +1010,7 @@ async fn wrong_login_is_refused_before_bootstrap_and_owner_retry_succeeds() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6]);
 
     // Later runs check identity as well.
     let mut wrong = db.settings(Duration::from_secs(1));
@@ -1274,7 +1274,7 @@ async fn unsafe_privileges_defaults_and_ownership_are_refused() {
         admin.execute(AssertSqlSafe(revoke.clone())).await.unwrap();
     }
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6]);
 
     // A migration that grants beyond the contract is reported after it commits.
     let overgrant = [
@@ -1283,8 +1283,9 @@ async fn unsafe_privileges_defaults_and_ownership_are_refused() {
         MIGRATIONS[2],
         MIGRATIONS[3],
         MIGRATIONS[4],
+        MIGRATIONS[5],
         Source {
-            version: 6,
+            version: 7,
             description: "over-grant",
             sql: "GRANT DELETE ON openmettle.messages TO openmettle_worker",
         },
@@ -1672,7 +1673,7 @@ async fn runtime_readiness_with_bounded_roles_never_migrates() {
         let status = process.0.wait().unwrap();
         assert!(status.success(), "worker={worker}");
     }
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6]);
 }
 
 #[path = "schema/durable.rs"]

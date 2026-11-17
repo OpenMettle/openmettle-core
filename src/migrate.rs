@@ -50,6 +50,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "grant persistence",
         sql: include_str!("../migrations/0005_grant_persistence.sql"),
     },
+    Source {
+        version: 6,
+        description: "protected login transactions",
+        sql: include_str!("../migrations/0006_login_transactions.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.
