@@ -1633,6 +1633,7 @@ dependencies = [
  "bytes",
  "chrono",
  "http-body-util",
+ "httpdate",
  "hyper",
  "hyper-util",
  "jsonschema",

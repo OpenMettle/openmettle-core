@@ -157,8 +157,56 @@ impl Default for Policy {
     }
 }
 
+/// Validated deployment identity, independent of fetched signing keys.
+#[derive(Clone)]
+pub struct ProviderIdentity {
+    provider_config_id: String,
+    issuer: IssuerUrl,
+    client_id: ClientId,
+}
+impl fmt::Debug for ProviderIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProviderIdentity(..)")
+    }
+}
+impl ProviderIdentity {
+    pub fn new(id: &str, issuer: &str, client: &str) -> Result<Self, ConfigError> {
+        if !canonical_uuid(id) {
+            return Err(ConfigError::ProviderConfigId);
+        }
+        let issuer = trusted_issuer(issuer).ok_or(ConfigError::Issuer)?;
+        if client.is_empty()
+            || client.len() > MAX_CLIENT_ID_BYTES
+            || !client.bytes().all(|b| (0x20..0x7f).contains(&b))
+        {
+            return Err(ConfigError::ClientId);
+        }
+        Ok(Self {
+            provider_config_id: id.into(),
+            issuer,
+            client_id: ClientId::new(client.into()),
+        })
+    }
+    pub(crate) fn binding(&self) -> (&str, &str, &str) {
+        (
+            &self.provider_config_id,
+            self.issuer.as_str(),
+            self.client_id.as_str(),
+        )
+    }
+    pub(crate) fn with_keys(&self, keys: CoreJsonWebKeySet) -> TrustedProvider {
+        TrustedProvider {
+            provider_config_id: self.provider_config_id.clone(),
+            issuer: self.issuer.clone(),
+            client_id: self.client_id.clone(),
+            keys,
+        }
+    }
+}
+
 /// Trusted provider inputs. The issuer, client and keys come only from deployment configuration;
 /// nothing in a token selects them.
+#[derive(Clone)]
 pub struct TrustedProvider {
     provider_config_id: String,
     issuer: IssuerUrl,
@@ -250,6 +298,16 @@ impl TrustedProvider {
         policy: &Policy,
         now: SystemTime,
     ) -> Result<VerifiedIdentity, VerifyError> {
+        self.verify_assertion(token, nonce, policy, now)
+            .map(|v| v.identity)
+    }
+    pub(crate) fn verify_assertion(
+        &self,
+        token: &UnverifiedIdToken,
+        nonce: &ExpectedNonceDigest,
+        policy: &Policy,
+        now: SystemTime,
+    ) -> Result<VerifiedAssertion, VerifyError> {
         let now = utc(now)?;
         let parsed = IdToken::<
             TimeClaims,
@@ -305,11 +363,45 @@ impl TrustedProvider {
         {
             return Err(VerifyError::Subject);
         }
-        Ok(VerifiedIdentity {
-            provider_config_id: self.provider_config_id.clone(),
-            issuer: self.issuer.as_str().to_owned(),
-            subject: subject.to_owned(),
+        Ok(VerifiedAssertion {
+            identity: VerifiedIdentity {
+                provider_config_id: self.provider_config_id.clone(),
+                issuer: self.issuer.as_str().to_owned(),
+                subject: subject.to_owned(),
+            },
+            checked_at: now,
+            expires: claims.expiration(),
+            issued,
+            max_age: delta(policy.max_issued_at_age)?,
         })
+    }
+}
+
+/// Signature-verified evidence kept private until the managed generation check.
+pub(crate) struct VerifiedAssertion {
+    identity: VerifiedIdentity,
+    checked_at: DateTime<Utc>,
+    expires: DateTime<Utc>,
+    issued: DateTime<Utc>,
+    max_age: TimeDelta,
+}
+impl VerifiedAssertion {
+    pub(crate) fn release(self, now: SystemTime) -> Result<VerifiedIdentity, VerifyError> {
+        let now = utc(now)?;
+        if now < self.checked_at {
+            return Err(VerifyError::Clock);
+        }
+        if now >= self.expires {
+            return Err(VerifyError::Expired);
+        }
+        if self.issued
+            < now
+                .checked_sub_signed(self.max_age)
+                .ok_or(VerifyError::Clock)?
+        {
+            return Err(VerifyError::IssuedTooLongAgo);
+        }
+        Ok(self.identity)
     }
 }
 
@@ -359,6 +451,12 @@ impl fmt::Debug for UnverifiedIdToken {
 }
 
 impl UnverifiedIdToken {
+    pub(crate) fn header(&self) -> Result<serde_json::Value, VerifyError> {
+        let bytes = URL_SAFE_NO_PAD
+            .decode(self.0.split('.').next().ok_or(VerifyError::Malformed)?)
+            .map_err(|_| VerifyError::Malformed)?;
+        crate::provider_keys::documents::json(&bytes).map_err(|_| VerifyError::Malformed)
+    }
     /// Bounds the input and checks the compact-serialization alphabet before any parsing.
     pub fn new(token: &str) -> Result<Self, VerifyError> {
         if token.is_empty()

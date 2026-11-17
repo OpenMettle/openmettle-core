@@ -1,10 +1,11 @@
-//! Provider token transport (ADR 0010): one public-client token POST per TLS connection.
+//! Configured provider transport (ADRs 0010/0011): one request per TLS connection.
 //!
 //! Every outbound byte goes to a deployment-configured HTTPS endpoint, after DNS answers pass an
 //! address policy. hyper parses HTTP/1.1 and rustls (ring) performs TLS. The connection is driven
 //! inside the caller's future: nothing HTTP- or credential-bearing is spawned, pooled, retried or
 //! redirected, and dropping the future closes the socket. The only work that can outlive a dropped
-//! request is a bounded operating-system DNS lookup (see `resolve`). No discovery, JWKS fetch,
+//! request is a bounded operating-system DNS lookup (see `resolve`). Configured document GETs
+//! share these bounds; metadata cannot select destinations. No
 //! proxy, HTTP/2, compression, client certificate or early data.
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
@@ -265,6 +266,7 @@ fn masked(ip: IpAddr, prefix: u8) -> IpAddr {
 }
 
 /// A canonical HTTPS URL with a DNS host; IP literals and every ambiguous form are refused.
+#[derive(Clone)]
 struct Endpoint {
     url: String,
     host: String,
@@ -356,7 +358,10 @@ fn system_lookup(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
 }
 
 /// Token-endpoint transport for one provider. Implements the library's `AsyncHttpClient`.
+#[derive(Clone)]
 pub struct ProviderTransport {
+    method: http::Method,
+    trust_digest: [u8; 32],
     endpoint: Endpoint,
     allowed: Vec<Range>,
     tls: Arc<rustls::ClientConfig>,
@@ -390,16 +395,35 @@ impl ProviderTransport {
             .iter()
             .map(|r| private_range(r))
             .collect::<Result<Vec<_>, _>>()?;
+        use sha2::{Digest, Sha256};
+        let roots = roots(trust)?;
+        let mut hash = Sha256::new();
+        for root in &roots.roots {
+            for value in [
+                root.subject.as_ref(),
+                root.subject_public_key_info.as_ref(),
+                root.name_constraints
+                    .as_ref()
+                    .map(|v| v.as_ref())
+                    .unwrap_or_default(),
+            ] {
+                hash.update((value.len() as u64).to_be_bytes());
+                hash.update(value);
+            }
+        }
+        let trust_digest = hash.finalize().into();
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut tls = rustls::ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
             .map_err(|_| Error::Configuration)?
-            .with_root_certificates(roots(trust)?)
+            .with_root_certificates(roots)
             .with_no_client_auth();
         tls.alpn_protocols = vec![b"http/1.1".to_vec()];
         tls.resumption = rustls::client::Resumption::disabled();
         tls.enable_early_data = false;
         Ok(Self {
+            method: http::Method::POST,
+            trust_digest,
             endpoint,
             allowed,
             tls: Arc::new(tls),
@@ -422,10 +446,13 @@ impl ProviderTransport {
         permitted(ip, &self.allowed)
     }
 
-    /// Exact configured URL, POST, Accept/Content-Type only and bounded sizes, before any DNS.
+    /// Exact configured URL/method and bounded headers/body, before any DNS.
+    /// The public token constructor remains POST-only; document GET permits only Accept.
     fn admit(&self, request: &HttpRequest) -> Result<(), Error> {
         let headers = request.headers();
-        if request.method() != http::Method::POST
+        if request.method() != self.method
+            || (self.method == http::Method::GET
+                && (!request.body().is_empty() || headers.keys().any(|k| k != header::ACCEPT)))
             || request.uri().to_string() != self.endpoint.url
             || request.version() != http::Version::HTTP_11
             || request.body().len() > MAX_REQUEST_BODY_BYTES
@@ -531,7 +558,7 @@ impl ProviderTransport {
             .map_err(|_| Error::Protocol)?;
         let (parts, body) = request.into_parts();
         let mut outbound = http::Request::builder()
-            .method(http::Method::POST)
+            .method(self.method.clone())
             .uri(self.endpoint.path.as_str())
             .header(header::HOST, self.endpoint.authority.as_str())
             .header(header::CONNECTION, "close");
@@ -640,6 +667,67 @@ impl<'c> AsyncHttpClient<'c> for ProviderTransport {
     type Future = Pin<Box<dyn Future<Output = Result<HttpResponse, Error>> + Send + 'c>>;
     fn call(&'c self, request: HttpRequest) -> Self::Future {
         Box::pin(self.send(request))
+    }
+}
+
+/// Two deployment-configured document capabilities. No URL is accepted at fetch time.
+#[derive(Clone)]
+pub struct ProviderDocuments {
+    discovery: ProviderTransport,
+    jwks: ProviderTransport,
+}
+impl fmt::Debug for ProviderDocuments {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProviderDocuments(..)")
+    }
+}
+impl ProviderDocuments {
+    pub(crate) fn configured(
+        token: &ProviderTransport,
+        discovery: &str,
+        jwks: &str,
+    ) -> Result<Self, Error> {
+        let get = |url: &str| -> Result<ProviderTransport, Error> {
+            let mut transport = token.clone();
+            transport.endpoint = endpoint(url)?;
+            transport.method = http::Method::GET;
+            Ok(transport)
+        };
+        Ok(Self {
+            discovery: get(discovery)?,
+            jwks: get(jwks)?,
+        })
+    }
+    pub async fn fetch_discovery(&self) -> Result<HttpResponse, Error> {
+        Self::fetch(&self.discovery).await
+    }
+    pub async fn fetch_jwks(&self) -> Result<HttpResponse, Error> {
+        Self::fetch(&self.jwks).await
+    }
+    async fn fetch(transport: &ProviderTransport) -> Result<HttpResponse, Error> {
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(&transport.endpoint.url)
+            .header(header::ACCEPT, "application/json, application/jwk-set+json")
+            .body(Vec::new())
+            .map_err(|_| Error::Destination)?;
+        transport.send(request).await
+    }
+}
+impl ProviderTransport {
+    // Hash the effective roots, not a caller-provided policy label. Address policy is included.
+    pub(crate) fn policy_binding(&self) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        // Construction fingerprints the effective trust anchors, including name constraints.
+        digest.update(self.trust_digest);
+        for range in &self.allowed {
+            let network = range.network.to_string();
+            digest.update((network.len() as u64).to_be_bytes());
+            digest.update(network.as_bytes());
+            digest.update([range.prefix]);
+        }
+        digest.finalize().to_vec()
     }
 }
 

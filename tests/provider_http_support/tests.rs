@@ -817,3 +817,69 @@ fn environment_proxies_are_ignored() {
         "a proxy connection was made"
     );
 }
+
+#[tokio::test]
+async fn document_get_capabilities_keep_destination_method_and_stream_bounds() {
+    let ca = fixture::Ca::new();
+    let server = fixture::Server::start(ca.leaf(fixture::HOST, false), |received| {
+        assert!(
+            received.head.starts_with("GET /discovery ") || received.head.starts_with("GET /jwks ")
+        );
+        assert!(received.body.is_empty());
+        fixture::Reply::Bytes(fixture::response(
+            200,
+            &[("content-type", "application/json")],
+            b"{}",
+        ))
+    })
+    .await;
+    let token = fixture::transport(server.port, &ca);
+    let base = format!("https://{}:{}", fixture::HOST, server.port);
+    let documents = ProviderDocuments::configured(
+        &token,
+        &format!("{base}/discovery"),
+        &format!("{base}/jwks"),
+    )
+    .unwrap();
+    documents.fetch_discovery().await.unwrap();
+    documents.fetch_jwks().await.unwrap();
+    for path in ["/token", "/other", "/discovery?query=yes"] {
+        let request = http::Request::builder()
+            .method("GET")
+            .uri(format!("{base}{path}"))
+            .body(vec![])
+            .unwrap();
+        assert_eq!(
+            documents.discovery.send(request).await.unwrap_err(),
+            Error::Destination
+        );
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("{base}/discovery"))
+        .body(vec![])
+        .unwrap();
+    assert_eq!(
+        documents.discovery.send(request).await.unwrap_err(),
+        Error::Destination
+    );
+    let request = http::Request::builder()
+        .method("GET")
+        .uri(format!("{base}/discovery"))
+        .header("authorization", "synthetic-marker")
+        .body(vec![])
+        .unwrap();
+    assert_eq!(
+        documents.discovery.send(request).await.unwrap_err(),
+        Error::Destination
+    );
+    assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+    let oversized = fixture::Server::start(ca.leaf(fixture::HOST, false), |_| {
+        fixture::Reply::Stall(b"HTTP/1.1 200 OK\r\ncontent-length: 65537\r\n\r\n".to_vec())
+    })
+    .await;
+    let token = fixture::transport(oversized.port, &ca);
+    let url = fixture::url(oversized.port);
+    let documents = ProviderDocuments::configured(&token, &url, &url).unwrap();
+    assert_eq!(documents.fetch_jwks().await.unwrap_err(), Error::TooLarge);
+}

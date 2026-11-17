@@ -114,8 +114,31 @@ retries, pools connections or reads proxy environment variables. Abandoned OS DN
 the only work that can outlive a dropped request, limited to 8 process-wide slots.
 
 Deployments behind an egress proxy are unsupported. Network policy remains a deployment
-control. Discovery, JWKS refresh, configuration loading and routes are not implemented, and
-no real provider has been qualified.
+control. Managed discovery/JWKS support is described below. Configuration loading and routes remain
+unimplemented, and no real provider has been qualified.
+
+## Managed discovery and signing keys
+
+[ADR 0011](docs/adr/0011-managed-provider-keys.md) adds an internal managed login path.
+Deployment supplies a keyless identity, exact discovery/JWKS and login endpoints, TLS/egress
+configuration, and explicit freshness/cooldown/deadline/capacity policy. A process-owned
+`ProviderManager` registers generation-bound handles for preflight, begin, consume and
+`ExchangePermit::exchange_with_keys`. Discovery confirms configured destinations; it never
+selects URLs. The existing offline APIs and POST-only transport remain available.
+
+Managed exchange sends the authorization code once, then verifies the original ID token with
+fresh current keys. A bounded unknown-key refresh can reverify that token once. Valid
+replacements retire removed keys, and expired keys never receive outage grace. Both metadata
+and keys must remain fresh. The initial profile requires advertised public-client `none`,
+S256 and RFC 9207 support, and reusable responses with explicit max-age/Date. These are
+compatibility limits, not real-provider qualification. The maintained verifier supports RSA
+through 4096 bits; the online document parser's 8192-bit ceiling does not expand that support.
+
+Configuration loading and coordinated revision lifecycle across restarts/replicas remain
+unimplemented. Keep the manager alive across requests; retirement/re-registration retains
+cooldown. The new path provides no route, cookie, application session, admission or account
+creation. `cargo test --lib provider_keys --locked --offline` exercises isolated TLS,
+rotation, cancellation, capacity and freshness behavior without PostgreSQL.
 
 ## Schema migrations
 

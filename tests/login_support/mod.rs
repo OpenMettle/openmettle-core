@@ -45,6 +45,15 @@ struct Extra {
 }
 impl openidconnect::AdditionalClaims for Extra {}
 pub fn signed(nonce: &str, issuer: &str, audience: &str, nbf: i64) -> String {
+    signed_using(key(), nonce, issuer, audience, nbf)
+}
+pub fn signed_using(
+    signing_key: &CoreRsaPrivateSigningKey,
+    nonce: &str,
+    issuer: &str,
+    audience: &str,
+    nbf: i64,
+) -> String {
     let claims = IdTokenClaims::<Extra, CoreGenderClaim>::new(
         IssuerUrl::new(issuer.into()).unwrap(),
         vec![Audience::new(audience.into())],
@@ -56,7 +65,7 @@ pub fn signed(nonce: &str, issuer: &str, audience: &str, nbf: i64) -> String {
     .set_nonce(Some(Nonce::new(nonce.into())));
     IdToken::<_, _, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm>::new(
         claims,
-        key(),
+        signing_key,
         CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256,
         None,
         None,
