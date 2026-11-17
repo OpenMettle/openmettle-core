@@ -107,8 +107,8 @@ guard together with the cancelled borrow.
 - From the first lend, dropping the guard closes the connection, unless the stage settled
   it as reusable.
 - A stage settles as reusable only from the returned result: success, or a denial that is
-  returned before any statement or after an awaited COMMIT or ROLLBACK. A connection that
-  still reports an open transaction is never reusable.
+  returned before any statement or after an awaited COMMIT or ROLLBACK. The guard also
+  refuses reuse when SQLx still tracks an open transaction.
 
 | Result | Connection |
 | --- | --- |
@@ -123,6 +123,9 @@ Each reusable category was checked against the helper that returns it: every suc
 happens before the first statement, between transactions, or after `finish` awaited the
 rollback, and a failed rollback is reported as `Database` instead (ADRs 0013 and 0014). The
 match is exhaustive, so a new category must be classified before the crate compiles.
+SQLx's tracked depth can clear when it queues a rollback. Reuse relies on the helper
+finishing each transaction explicitly. SQLx flushes any queued work during the pool return
+ping before making the connection available.
 
 `Database` is closed even when its rollback succeeded, because the category alone cannot
 show that. This is deliberately conservative.
@@ -140,6 +143,11 @@ These are properties of SQLx 0.9.0 and PostgreSQL, not qualified operating bound
   for at most 5 seconds. The pool slot stays counted until that task ends, so a waiting
   caller can wait that long inside its own deadline. Returning a reusable connection is also
   an SQLx task (a liveness round trip, then release).
+- **Shutdown waits for connection cleanup.** The API shutdown path drains requests and then
+  waits for `pool.close()` within the same deadline. A discard can hold a pool permit for up
+  to 5 seconds, which is also the default `SHUTDOWN_TIMEOUT_MS` budget. When integrating the
+  service, allow for both request drain and connection cleanup. The process exits 1 if the
+  shutdown deadline elapses first.
 - **Closing the socket does not interrupt the backend.** A backend that is executing a
   statement sees the disconnect only when the statement returns. A cancelled backend that is
   waiting for a row lock keeps the locks it already holds until its wait ends. Every
@@ -164,7 +172,8 @@ These are properties of SQLx 0.9.0 and PostgreSQL, not qualified operating bound
 
 Managed PostgreSQL tests (`provider_keys::tests::postgres::pooled`) run in the existing CI
 step and filter, against the isolated PostgreSQL 18 service, with a one-slot pool, the
-synthetic TLS provider and a separate observation connection:
+synthetic TLS provider and a separate administrator connection to observe fixture backends
+and signal the backend selected for the connection-loss case:
 
 - begin, consume, exchange, issue, validate and logout on one slot and one backend; callback
   replay refused with exactly one token POST; no lock left and the same backend afterwards;
@@ -172,8 +181,8 @@ synthetic TLS provider and a separate observation connection:
 - a key-document GET held open during preflight and a token POST held open after
   consumption, each while an unrelated query obtains the only slot;
 - cancellation while issuance holds the login row lock and waits for a user row: the slot
-  returns with a different backend, the old backend exits at its lock timeout while the
-  blocker is still held, and the login row is then lockable;
+  returns with a different backend. The cancelled backend exits and the login row becomes
+  lockable while the fixture still holds the user row;
 - a session-deadline timeout during a blocked validation, a `Database` error with a
   successful rollback, and a terminated backend (statement and rollback both fail): each
   replaces the backend, leaves no lock and loses no capacity;

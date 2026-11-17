@@ -1,6 +1,7 @@
 //! The pooled browser-auth service (ADR 0016) on a one-slot pool: connection ownership across
 //! provider requests, reuse after acknowledged outcomes and replacement after uncertain ones.
-//! Isolated CI PostgreSQL 18 only. The fixture administrator only observes other backends.
+//! Isolated CI PostgreSQL 18 only. The fixture administrator observes pool backends and
+//! terminates one identified fixture backend to exercise connection loss.
 use super::sessions::{issue, seed, session_policy, statistics_observer, waiting};
 use super::*;
 use crate::browser_auth::{BrowserAuth, Error};
@@ -212,12 +213,11 @@ async fn cancellation_timeout_and_database_errors_replace_the_connection() {
             () = waiting(&mut observer, cancelled.0) => {},
         }
     }
-    // The slot comes back as soon as SQLx has closed the socket, with a different backend,
-    // although the cancelled backend is still blocked in its statement.
+    // A different backend can use the slot after SQLx closes the cancelled checkout.
     let replacement = backend(&pool).await;
     assert_ne!(replacement, cancelled);
-    // That backend leaves when its lock wait ends, here at the transaction's own lock
-    // timeout, because the blocker is never released. Its login row lock goes with it.
+    // Keep the blocker held while checking that the cancelled backend exits and releases
+    // its login row lock.
     gone(&mut observer, &cancelled).await;
     sqlx::query("SELECT id FROM openmettle.login_transactions WHERE id=$1 FOR UPDATE NOWAIT")
         .bind(locator(&started))
@@ -295,11 +295,17 @@ async fn cancellation_timeout_and_database_errors_replace_the_connection() {
         .unwrap();
     let control = async {
         waiting(&mut observer, after_error.0).await;
-        sqlx::query("SELECT pg_terminate_backend($1)")
-            .bind(after_error.0)
-            .execute(&mut observer)
-            .await
-            .unwrap();
+        let signalled: Option<bool> = sqlx::query_scalar(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+             WHERE pid = $1 AND backend_start::text = $2 AND datname = current_database()
+               AND wait_event_type = 'Lock'",
+        )
+        .bind(after_error.0)
+        .bind(&after_error.1)
+        .fetch_optional(&mut observer)
+        .await
+        .unwrap();
+        assert_eq!(signalled, Some(true), "signal the blocked fixture backend");
     };
     let (result, ()) = tokio::join!(auth.issue(&p, proof), control);
     assert_eq!(result.unwrap_err(), SessionError::Database);
@@ -403,11 +409,19 @@ async fn pool_waits_stay_inside_the_original_deadlines() {
     );
     let now = Instant::now();
     assert!(now >= original && now < original + Duration::from_secs(3));
-    // Initiation waits only until the manager phase deadline.
+    // Initiation waits for a slot until its manager phase deadline, with fresh cached keys.
+    let requests = f.h.count();
+    let began = Instant::now();
     assert_eq!(
         auth.begin(signing::ID).await.unwrap_err(),
         Error::Login(login::Error::Rejected)
     );
+    let elapsed = began.elapsed();
+    assert!(
+        (brief.deadline..brief.deadline + Duration::from_secs(3)).contains(&elapsed),
+        "initiation must wait for the manager deadline (elapsed {elapsed:?})"
+    );
+    assert_eq!(f.h.count(), requests);
     drop(slot);
     pool_state(&pool, 1, 1).await;
     assert_eq!(sessions(&mut f).await, 0);

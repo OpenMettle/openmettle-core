@@ -64,8 +64,9 @@ impl Checkout {
         self.in_doubt = true;
         &mut self.connection
     }
-    /// Ends the phase. `reusable` must mean that every transaction on this connection ended
-    /// with an acknowledged COMMIT or ROLLBACK; an open transaction is never reusable.
+    /// Ends the phase. `reusable` requires an acknowledgement for every transaction the helper
+    /// opened. The depth check rejects a tracked open transaction. SQLx can clear its tracked
+    /// depth while a rollback is still queued, so safe reuse depends on the helper's outcome.
     fn settle(mut self, reusable: bool) {
         self.in_doubt = !reusable || self.connection.is_in_transaction();
     }
