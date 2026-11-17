@@ -913,7 +913,7 @@ async fn checksum_drift_and_newer_database_are_refused() {
     let db = TestDb::new().await;
     let settings = db.settings(Duration::from_secs(1));
     let third = Source {
-        version: 99,
+        version: 3,
         description: "probe three",
         sql: "CREATE TABLE openmettle.probe_three (id int)",
     };
@@ -941,18 +941,23 @@ async fn checksum_drift_and_newer_database_are_refused() {
     );
     assert!(!stderr(&output).contains(PASSWORD));
 
-    migrate::apply(&settings, &[MIGRATIONS[0], PROBE_TWO, third])
+    let fourth = Source {
+        version: 4,
+        description: "probe four",
+        sql: "CREATE TABLE openmettle.probe_four (id int)",
+    };
+    migrate::apply(&settings, &[MIGRATIONS[0], PROBE_TWO, third, fourth])
         .await
         .unwrap();
-    match migrate::apply(&settings, &[MIGRATIONS[0], PROBE_TWO]).await {
-        Err(Failure::Migrate(MigrateError::VersionMissing(99))) => {}
+    match migrate::apply(&settings, &[MIGRATIONS[0], PROBE_TWO, third]).await {
+        Err(Failure::Migrate(MigrateError::VersionMissing(4))) => {}
         other => panic!("unexpected result: {other:?}"),
     }
     // The release binary refuses the same way and reports no SQL or connection details.
     let output = migrate_command(&db.url(OWNER), &[]).output().unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(
-        stderr(&output).contains("database has migration 99, which this release does not contain"),
+        stderr(&output).contains("database has migration 4, which this release does not contain"),
         "{}",
         stderr(&output)
     );
