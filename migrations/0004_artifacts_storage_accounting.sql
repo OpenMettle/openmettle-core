@@ -77,9 +77,9 @@ CREATE TABLE openmettle.storage_reservations (
         REFERENCES openmettle.operations (scope_id, run_id, id),
     CONSTRAINT storage_reservations_operation_run_check
         CHECK (operation_id IS NULL OR run_id IS NOT NULL),
-    CONSTRAINT storage_reservations_state_check CHECK (
+    CONSTRAINT storage_reservations_lifecycle_check CHECK (
         (state = 'reserved' AND settled_bytes IS NULL AND closed_at IS NULL)
-        OR (state = 'settled' AND settled_bytes BETWEEN 0 AND max_bytes
+        OR (state = 'settled' AND settled_bytes IS NOT NULL AND settled_bytes BETWEEN 0 AND max_bytes
             AND closed_at IS NOT NULL AND closed_at >= created_at)
         OR (state = 'released' AND settled_bytes IS NULL
             AND closed_at IS NOT NULL AND closed_at >= created_at)
@@ -122,11 +122,13 @@ CREATE TABLE openmettle.artifact_revisions (
     CONSTRAINT artifact_revisions_lifecycle_check CHECK (
         (state = 'active' AND retained_at IS NULL AND purge_after IS NULL
             AND purging_at IS NULL AND purged_at IS NULL)
-        OR (state = 'retained' AND retained_at IS NOT NULL AND purge_after > retained_at
+        OR (state = 'retained' AND retained_at IS NOT NULL AND purge_after IS NOT NULL AND purge_after > retained_at
             AND purging_at IS NULL AND purged_at IS NULL)
-        OR (state = 'purging' AND retained_at IS NOT NULL AND purge_after > retained_at
+        OR (state = 'purging' AND retained_at IS NOT NULL AND purge_after IS NOT NULL AND purge_after > retained_at
+            AND purging_at IS NOT NULL
             AND purging_at >= purge_after AND purged_at IS NULL)
-        OR (state = 'purged' AND retained_at IS NOT NULL AND purge_after > retained_at
+        OR (state = 'purged' AND retained_at IS NOT NULL AND purge_after IS NOT NULL AND purge_after > retained_at
+            AND purging_at IS NOT NULL AND purged_at IS NOT NULL
             AND purging_at >= purge_after AND purged_at >= purging_at)
     )
 );

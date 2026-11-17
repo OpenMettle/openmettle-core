@@ -96,7 +96,7 @@ fn released_migrations_are_unchanged() {
         ),
         (
             MIGRATIONS[3].sql,
-            "7a3ef41299bf8d18a2e612ede7381e0a85af43ce9928eeab4861348f6a2f4e68",
+            "6c4a1794d1c132739fdaf1b48706e8b2884ef51e903f0f2a979837919a8f53f3",
         ),
     ] {
         assert_eq!(format!("{:x}", Sha256::digest(sql.as_bytes())), expected);

@@ -468,10 +468,23 @@ async fn cross_owner_deadlock_is_retried_as_a_whole_transaction() {
     reserve(&db, API, &input(&b.scope, &b.actor, "seed", &fb, 1))
         .await
         .unwrap();
+    // Acquire the instance lock before the peer starts; otherwise it can finish first.
+    let cross_artifact = new_uuid(&db).await;
+    let mut cn = connect(&db.0, API).await;
+    let mut tx = WriteTransaction::begin(&mut cn).await.unwrap();
+    storage::reserve(&mut tx, &input(&a.scope, &a.actor, "one", &fa, 10))
+        .await
+        .unwrap();
     let opts = role_options(&db.0, API);
     let (b2, fb2) = (b.clone(), fb.clone());
+    let (pid_send, pid_recv) = tokio::sync::oneshot::channel();
     let second = tokio::spawn(async move {
         let mut cn = PgConnection::connect_with(&opts).await.unwrap();
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut cn)
+            .await
+            .unwrap();
+        pid_send.send(pid).unwrap();
         let mut tx = WriteTransaction::begin(&mut cn).await.unwrap();
         match storage::reserve(&mut tx, &input(&b2.scope, &b2.actor, "two", &fb2, 10)).await {
             Ok(_) => {
@@ -484,18 +497,15 @@ async fn cross_owner_deadlock_is_retried_as_a_whole_transaction() {
             }
         }
     });
-    let mut cn = connect(&db.0, API).await;
-    let mut tx = WriteTransaction::begin(&mut cn).await.unwrap();
-    storage::reserve(&mut tx, &input(&a.scope, &a.actor, "one", &fa, 10))
-        .await
-        .unwrap();
+    let second_pid = pid_recv.await.unwrap();
     // `second` now holds b's owner row and waits for the instance row this transaction holds.
     let mut admin = db.admin().await;
     let deadline = Instant::now() + Duration::from_secs(10);
     while sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM pg_stat_activity WHERE datname=$1 AND wait_event_type='Lock'",
+        "SELECT count(*) FROM pg_stat_activity WHERE datname=$1 AND pid=$2 AND wait_event_type='Lock'",
     )
     .bind(&db.0)
+    .bind(second_pid)
     .fetch_one(&mut admin)
     .await
     .unwrap()
@@ -506,7 +516,7 @@ async fn cross_owner_deadlock_is_retried_as_a_whole_transaction() {
     }
     let mine = storage::reserve(
         &mut tx,
-        &input(&b.scope, &a.actor, "cross", &new_uuid(&db).await, 10),
+        &input(&b.scope, &a.actor, "cross", &cross_artifact, 10),
     )
     .await;
     let mine = match mine {
@@ -535,6 +545,12 @@ async fn cross_owner_deadlock_is_retried_as_a_whole_transaction() {
         storage::reserve(&mut tx, &input(&a.scope, &a.actor, "one", &fa, 10))
             .await
             .unwrap();
+        storage::reserve(
+            &mut tx,
+            &input(&b.scope, &a.actor, "cross", &cross_artifact, 10),
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
     } else {
         reserve(&db, API, &input(&b.scope, &b.actor, "two", &fb, 10))
@@ -548,6 +564,11 @@ async fn cross_owner_deadlock_is_retried_as_a_whole_transaction() {
         .await
         .unwrap();
     assert_eq!(account(&db, &a.scope).await.2, 11);
+    assert_eq!(account(&db, &b.scope).await.2, 21);
+    let cross_count: i64 = sqlx::query_scalar("SELECT count(*) FROM openmettle.storage_reservations WHERE scope_id=$1::uuid AND actor_user_id=$2::uuid AND idempotency_key='cross' AND artifact_id=$3::uuid AND max_bytes=10")
+        .bind(&b.scope).bind(&a.actor).bind(&cross_artifact)
+        .fetch_one(&mut admin).await.unwrap();
+    assert_eq!(cross_count, 1);
     assert_totals(&db).await;
 }
 
@@ -1130,4 +1151,63 @@ async fn populated_v3_upgrade_and_authentic_v3_binaries() {
         .await
         .unwrap();
     message(&mut api, &c.scope, &chat, None).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn lifecycle_constraints_reject_missing_values() {
+    let db = TestDb::migrated().await;
+    configure(&db, Some(1000), Some(1000), Some(1000)).await;
+    let c = Context::new(&db).await;
+    let doc = new_uuid(&db).await;
+    let r = reserve(
+        &db,
+        API,
+        &input(&c.scope, &c.actor, "null-checks", &doc, 10),
+    )
+    .await
+    .unwrap();
+    let rev = settle(&db, &c.scope, &r.id, 5, b"x", "text/plain")
+        .await
+        .unwrap();
+    let mut cn = connect(&db.0, API).await;
+    let mut tx = WriteTransaction::begin(&mut cn).await.unwrap();
+    storage::retain_revision(&mut tx, &c.scope, &rev, 60)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    // Both roles can change state, but neither may bypass mandatory lifecycle values.
+    for role in [API, WORKER] {
+        let mut cn = connect(&db.0, role).await;
+        for state in ["purging", "purged"] {
+            let result =
+                sqlx::query("UPDATE openmettle.artifact_revisions SET state=$2 WHERE id=$1::uuid")
+                    .bind(&rev)
+                    .bind(state)
+                    .execute(&mut cn)
+                    .await;
+            assert_eq!(sqlstate(result), "23514");
+        }
+        let result = sqlx::query(
+            "UPDATE openmettle.storage_reservations SET settled_bytes=NULL WHERE id=$1::uuid",
+        )
+        .bind(&r.id)
+        .execute(&mut cn)
+        .await;
+        assert_eq!(sqlstate(result), "23514");
+    }
+    // Use owner privileges to isolate CHECK enforcement from column grant enforcement.
+    let mut owner = connect(&db.0, OWNER).await;
+    for query in [
+        "UPDATE openmettle.artifact_revisions SET state='retained', purge_after=NULL WHERE id=$1::uuid",
+        "UPDATE openmettle.artifact_revisions SET state='retained', retained_at=NULL WHERE id=$1::uuid",
+        "UPDATE openmettle.artifact_revisions SET state='purging', purging_at=NULL WHERE id=$1::uuid",
+        "UPDATE openmettle.artifact_revisions SET state='purging', purging_at=purge_after, purge_after=NULL WHERE id=$1::uuid",
+        "UPDATE openmettle.artifact_revisions SET state='purged', purging_at=purge_after, purged_at=NULL WHERE id=$1::uuid",
+        "UPDATE openmettle.artifact_revisions SET state='purged', purging_at=NULL, purged_at=purge_after WHERE id=$1::uuid",
+    ] {
+        let result = sqlx::query(query).bind(&rev).execute(&mut owner).await;
+        assert_eq!(sqlstate(result), "23514", "{query}");
+    }
+    assert_totals(&db).await;
 }
