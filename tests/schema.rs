@@ -199,12 +199,58 @@ async fn ensure_roles(admin: &mut PgConnection) {
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// Advisory key serializing tests that change cluster-wide fixture roles: every test database
+/// holds it shared; a test that alters role memberships or attributes holds it exclusively.
+const ROLE_STATE_LOCK: i64 = 720203;
+
+/// Runs statements as the fixture superuser on a blocking thread; used for cleanup in `Drop`.
+fn admin_blocking(database: Option<String>, statements: Vec<String>) {
+    let _ = thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut options = admin_options();
+                if let Some(database) = &database {
+                    options = options.database(database);
+                }
+                if let Ok(mut admin) = PgConnection::connect_with(&options).await {
+                    for statement in statements {
+                        let _ = admin.execute(AssertSqlSafe(statement)).await;
+                    }
+                }
+            })
+    })
+    .join();
+}
+
+/// Restores cluster role state when dropped, including after a failed assertion.
+struct Restore(&'static [&'static str]);
+impl Drop for Restore {
+    fn drop(&mut self) {
+        admin_blocking(None, self.0.iter().map(|s| s.to_string()).collect());
+    }
+}
+
 /// A fresh database owned by openmettle_owner, dropped when the test ends.
-struct TestDb(String);
+struct TestDb(String, #[allow(dead_code)] PgConnection);
 impl TestDb {
     async fn new() -> Self {
+        Self::create("SELECT pg_advisory_lock_shared($1)").await
+    }
+    /// For tests that change cluster-wide role state; excludes all other test databases.
+    async fn exclusive() -> Self {
+        Self::create("SELECT pg_advisory_lock($1)").await
+    }
+    async fn create(lock: &'static str) -> Self {
         let mut admin = admin(None).await;
         ensure_roles(&mut admin).await;
+        sqlx::query(lock)
+            .bind(ROLE_STATE_LOCK)
+            .execute(&mut admin)
+            .await
+            .unwrap();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -220,7 +266,14 @@ impl TestDb {
             )))
             .await
             .unwrap();
-        Self(name)
+        // `admin` keeps the role-state lock for the database's lifetime.
+        Self(name, admin)
+    }
+    async fn schema_exists(&self) -> bool {
+        sqlx::query_scalar("SELECT to_regnamespace('openmettle') IS NOT NULL")
+            .fetch_one(&mut self.admin().await)
+            .await
+            .unwrap()
     }
     fn url(&self, role: &str) -> String {
         role_url(&self.0, role)
@@ -288,23 +341,10 @@ impl TestDb {
 }
 impl Drop for TestDb {
     fn drop(&mut self) {
-        let name = self.0.clone();
-        let _ = thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async {
-                    if let Ok(mut admin) = PgConnection::connect_with(&admin_options()).await {
-                        let _ = admin
-                            .execute(AssertSqlSafe(format!(
-                                "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
-                            )))
-                            .await;
-                    }
-                })
-        })
-        .join();
+        admin_blocking(
+            None,
+            vec![format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", self.0)],
+        );
     }
 }
 
@@ -686,10 +726,82 @@ async fn interrupted_or_killed_migrator_leaves_no_session() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
 }
 
-const PROBE_ONE: Source = Source {
-    version: 1,
-    description: "probe one",
-    sql: "CREATE TABLE openmettle.probe_one (id int)",
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn killed_migrator_holding_the_lock_mid_migration_rolls_back() {
+    let db = TestDb::new().await;
+    migrate::apply(&db.settings(Duration::from_secs(10)), &MIGRATIONS[..1])
+        .await
+        .unwrap();
+    // Migration 2's foreign key to users waits behind this lock, after it has written catalog
+    // rows in its transaction and while it holds the migration advisory lock.
+    let mut blocker = db.admin().await;
+    blocker.execute("BEGIN").await.unwrap();
+    blocker
+        .execute("LOCK TABLE openmettle.users IN ACCESS EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    let mut admin = db.admin().await;
+    for kill in ["-TERM", "-KILL"] {
+        let mut child = migrate_command(
+            &db.url(OWNER),
+            &[
+                ("LOCK_TIMEOUT_MS", "60000"),
+                ("STATEMENT_TIMEOUT_MS", "60000"),
+            ],
+        )
+        .spawn()
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let state: Option<(bool, bool)> = sqlx::query_as(
+                "SELECT a.backend_xid IS NOT NULL,
+                        EXISTS (SELECT FROM pg_locks AS l
+                                WHERE l.pid = a.pid AND l.locktype = 'advisory' AND l.granted)
+                 FROM pg_stat_activity AS a
+                 WHERE a.datname = $1 AND a.application_name = $2
+                   AND a.wait_event_type = 'Lock'",
+            )
+            .bind(&db.0)
+            .bind(migrate::APPLICATION_NAME)
+            .fetch_optional(&mut admin)
+            .await
+            .unwrap();
+            // Uncommitted migration writes plus the held migration lock.
+            if state == Some((true, true)) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "migrator never blocked inside migration 2 holding the lock: {state:?}"
+            );
+            assert!(child.try_wait().unwrap().is_none(), "migrator exited early");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        signal(&child, kill);
+        let status = child.wait().unwrap();
+        if kill == "-TERM" {
+            assert_eq!(status.code(), Some(1));
+        }
+        // PostgreSQL ends the session, rolls back migration 2 and releases the lock.
+        db.wait_no_migration_session().await;
+        assert!(!db.exists("openmettle.conversations").await, "{kill}");
+        assert_eq!(db.history().await, [1], "{kill}");
+    }
+    blocker.execute("ROLLBACK").await.unwrap();
+    let output = migrate_command(&db.url(OWNER), &[("LOCK_TIMEOUT_MS", "1000")])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(db.history().await, [1, 2]);
+}
+
+/// Custom sets start with the real migration 1 so the post-migration boundary check sees the
+/// contract's database and schema privileges.
+const PROBE_TWO: Source = Source {
+    version: 2,
+    description: "probe two",
+    sql: "CREATE TABLE openmettle.probe_two (id int)",
 };
 
 #[tokio::test]
@@ -698,11 +810,10 @@ async fn failed_migration_rolls_back_and_immediate_retry_succeeds() {
     let db = TestDb::new().await;
     let settings = db.settings(Duration::from_secs(1));
     let failing = [
-        PROBE_ONE,
+        MIGRATIONS[0],
         Source {
-            version: 2,
-            description: "probe two",
             sql: "CREATE TABLE openmettle.probe_two (id int); SELECT 1 / 0;",
+            ..PROBE_TWO
         },
     ];
     match migrate::apply(&settings, &failing).await {
@@ -710,18 +821,11 @@ async fn failed_migration_rolls_back_and_immediate_retry_succeeds() {
         other => panic!("unexpected result: {other:?}"),
     }
     assert_eq!(db.history().await, [1]);
-    assert!(db.exists("openmettle.probe_one").await);
+    assert!(db.exists("openmettle.users").await);
     assert!(!db.exists("openmettle.probe_two").await);
     // No live lock or session survives; the retry needs the lock within one second.
     db.wait_no_migration_session().await;
-    let fixed = [
-        PROBE_ONE,
-        Source {
-            version: 2,
-            description: "probe two",
-            sql: "CREATE TABLE openmettle.probe_two (id int)",
-        },
-    ];
+    let fixed = [MIGRATIONS[0], PROBE_TWO];
     migrate::apply(&settings, &fixed).await.unwrap();
     assert_eq!(db.history().await, [1, 2]);
 
@@ -750,20 +854,22 @@ async fn nontransactional_migrations_are_refused() {
     let db = TestDb::new().await;
     let settings = db.settings(Duration::from_secs(1));
     // Early COMMIT would split a migration from its history row: refused before connecting.
-    let committing = [Source {
-        version: 1,
-        description: "split",
-        sql: "CREATE TABLE openmettle.p (id int); COMMIT; CREATE TABLE openmettle.q (id int);",
-    }];
-    assert!(matches!(
-        migrate::apply(&settings, &committing).await,
-        Err(Failure::Invalid(_))
-    ));
-    let schema: Option<String> = sqlx::query_scalar("SELECT to_regnamespace('openmettle')::text")
-        .fetch_one(&mut db.admin().await)
-        .await
-        .unwrap();
-    assert_eq!(schema, None);
+    // PostgreSQL ends a `--` comment at CR, so the second COMMIT is real SQL too.
+    for sql in [
+        "CREATE TABLE openmettle.p (id int); COMMIT; CREATE TABLE openmettle.q (id int);",
+        "CREATE TABLE openmettle.probe (id int); -- comment\rCOMMIT;\nSELECT 1/0;",
+    ] {
+        let committing = [Source {
+            version: 1,
+            description: "split",
+            sql,
+        }];
+        assert!(matches!(
+            migrate::apply(&settings, &committing).await,
+            Err(Failure::Invalid(_))
+        ));
+        assert!(!db.schema_exists().await, "{sql:?}");
+    }
     // Operations PostgreSQL cannot run in a transaction fail inside the migration transaction.
     let concurrent = [Source {
         version: 1,
@@ -774,6 +880,29 @@ async fn nontransactional_migrations_are_refused() {
     assert!(failure.to_string().contains("SQLSTATE 25001"), "{failure}");
     assert!(db.history().await.is_empty());
     assert!(!db.exists("openmettle.p").await);
+
+    // A session setting committed by one migration must not change how the next is scanned.
+    // With standard_conforming_strings off, PostgreSQL would read `'\''` as a closed string and
+    // run the COMMIT that the check (and a reset session) treat as string content.
+    let lexing = [
+        Source {
+            version: 1,
+            description: "conforming strings off",
+            sql: "SET standard_conforming_strings = off",
+        },
+        Source {
+            version: 2,
+            description: "hidden commit",
+            sql: "CREATE TABLE openmettle.probe (id int); SELECT '\\''; COMMIT; --'; SELECT 1 / 0;",
+        },
+    ];
+    match migrate::apply(&settings, &lexing).await {
+        Err(Failure::Migrate(MigrateError::ExecuteMigration(_, 2))) => {}
+        other => panic!("unexpected result: {other:?}"),
+    }
+    assert_eq!(db.history().await, [1]);
+    assert!(!db.exists("openmettle.probe").await);
+    db.wait_no_migration_session().await;
 }
 
 #[tokio::test]
@@ -781,29 +910,30 @@ async fn nontransactional_migrations_are_refused() {
 async fn checksum_drift_and_newer_database_are_refused() {
     let db = TestDb::new().await;
     let settings = db.settings(Duration::from_secs(1));
-    let second = Source {
-        version: 2,
-        description: "probe two",
-        sql: "CREATE TABLE openmettle.probe_two (id int)",
+    let third = Source {
+        version: 3,
+        description: "probe three",
+        sql: "CREATE TABLE openmettle.probe_three (id int)",
     };
-    migrate::apply(&settings, &[PROBE_ONE]).await.unwrap();
-    let edited = Source {
-        version: 1,
-        description: "probe one",
-        sql: "CREATE TABLE openmettle.probe_one (id bigint)",
-    };
-    match migrate::apply(&settings, &[edited, second]).await {
-        Err(Failure::Migrate(MigrateError::VersionMismatch(1))) => {}
-        other => panic!("unexpected result: {other:?}"),
-    }
-    assert_eq!(db.history().await, [1]);
-    assert!(!db.exists("openmettle.probe_two").await);
-
-    migrate::apply(&settings, &[PROBE_ONE, second])
+    migrate::apply(&settings, &[MIGRATIONS[0], PROBE_TWO])
         .await
         .unwrap();
-    match migrate::apply(&settings, &[PROBE_ONE]).await {
-        Err(Failure::Migrate(MigrateError::VersionMissing(2))) => {}
+    let edited = Source {
+        sql: "CREATE TABLE openmettle.probe_two (id bigint)",
+        ..PROBE_TWO
+    };
+    match migrate::apply(&settings, &[MIGRATIONS[0], edited, third]).await {
+        Err(Failure::Migrate(MigrateError::VersionMismatch(2))) => {}
+        other => panic!("unexpected result: {other:?}"),
+    }
+    assert_eq!(db.history().await, [1, 2]);
+    assert!(!db.exists("openmettle.probe_three").await);
+
+    migrate::apply(&settings, &[MIGRATIONS[0], PROBE_TWO, third])
+        .await
+        .unwrap();
+    match migrate::apply(&settings, &[MIGRATIONS[0], PROBE_TWO]).await {
+        Err(Failure::Migrate(MigrateError::VersionMissing(3))) => {}
         other => panic!("unexpected result: {other:?}"),
     }
     // The release binary refuses the same way and reports no SQL or connection details.
@@ -819,20 +949,298 @@ async fn checksum_drift_and_newer_database_are_refused() {
 
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
-async fn migrations_refuse_a_role_other_than_the_owner() {
+async fn wrong_login_is_refused_before_bootstrap_and_owner_retry_succeeds() {
     let db = TestDb::new().await;
-    // The superuser fixture is a stand-in for any role other than openmettle_owner.
-    let mut settings = db.settings(Duration::from_secs(1));
-    settings.database = admin_options().database(&db.0);
+    // The superuser fixture stands in for any login other than openmettle_owner.
+    let mut wrong = db.settings(Duration::from_secs(1));
+    wrong.database = admin_options().database(&db.0);
+    for settings in [
+        wrong,
+        Settings {
+            database: role_options(&db.0, API),
+            ..db.settings(Duration::from_secs(1))
+        },
+    ] {
+        let failure = migrate::apply(&settings, MIGRATIONS).await.unwrap_err();
+        assert!(
+            matches!(failure, Failure::Refused(_))
+                && failure
+                    .to_string()
+                    .contains("migrations must log in as openmettle_owner"),
+            "{failure}"
+        );
+        // Nothing was bootstrapped, so the owner is not blocked by foreign-owned objects.
+        assert!(!db.schema_exists().await);
+    }
+    db.wait_no_migration_session().await;
+    let output = migrate_command(&db.url(OWNER), &[("LOCK_TIMEOUT_MS", "1000")])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(db.history().await, [1, 2]);
+
+    // Later runs check identity as well.
+    let mut wrong = db.settings(Duration::from_secs(1));
+    wrong.database = admin_options().database(&db.0);
+    assert!(matches!(
+        migrate::apply(&wrong, MIGRATIONS).await,
+        Err(Failure::Refused(_))
+    ));
+}
+
+/// Statements that restore every role change made by the membership test.
+const ROLE_RESTORE: &[&str] = &[
+    "REVOKE pg_write_all_data FROM openmettle_api",
+    "REVOKE pg_read_all_data FROM openmettle_worker",
+    "DROP ROLE IF EXISTS openmettle_fixture_group",
+    "REVOKE pg_write_all_data FROM openmettle_fixture_capped",
+    "REVOKE openmettle_worker FROM openmettle_fixture_capped",
+    "REVOKE openmettle_owner FROM openmettle_fixture_capped",
+    "REVOKE pg_read_server_files FROM openmettle_owner",
+    "ALTER ROLE openmettle_api NOBYPASSRLS",
+];
+
+async fn restore_roles(admin: &mut PgConnection) {
+    for statement in ROLE_RESTORE {
+        admin.execute(*statement).await.unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn unsafe_role_memberships_and_attributes_are_refused() {
+    let db = TestDb::exclusive().await;
+    let _restore = Restore(ROLE_RESTORE);
+    let mut admin = admin(None).await;
+    restore_roles(&mut admin).await;
+    let settings = db.settings(Duration::from_secs(1));
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["GRANT pg_write_all_data TO openmettle_api"],
+            "role openmettle_api must not be a member of pg_write_all_data",
+        ),
+        // Not inherited, but assumable with SET ROLE.
+        (
+            &["GRANT pg_read_all_data TO openmettle_worker WITH INHERIT FALSE, SET TRUE"],
+            "role openmettle_worker must not be a member of pg_read_all_data",
+        ),
+        // Indirect, through an intermediate group.
+        (
+            &[
+                "CREATE ROLE openmettle_fixture_group NOLOGIN",
+                "GRANT pg_write_all_data TO openmettle_fixture_group",
+                "GRANT openmettle_fixture_group TO openmettle_api",
+            ],
+            "role openmettle_api must not be a member of openmettle_fixture_group",
+        ),
+        // A login role that holds the API privileges must not carry other privileges.
+        (
+            &["GRANT pg_write_all_data TO openmettle_fixture_capped WITH INHERIT FALSE"],
+            "role openmettle_fixture_capped, a member of an application role, must not be a member of pg_write_all_data",
+        ),
+        (
+            &["GRANT openmettle_worker TO openmettle_fixture_capped"],
+            "role openmettle_fixture_capped has both API and worker privileges",
+        ),
+        (
+            &["GRANT openmettle_owner TO openmettle_fixture_capped"],
+            "role openmettle_fixture_capped, a member of an application role, must not be a member of openmettle_owner",
+        ),
+        (
+            &["GRANT pg_read_server_files TO openmettle_owner"],
+            "role openmettle_owner must not be a member of pg_read_server_files",
+        ),
+        (
+            &["ALTER ROLE openmettle_api BYPASSRLS"],
+            "role openmettle_api must not be superuser or hold CREATEROLE, CREATEDB, REPLICATION or BYPASSRLS",
+        ),
+    ];
+    for (setup, expected) in cases {
+        for statement in *setup {
+            admin.execute(*statement).await.unwrap();
+        }
+        let failure = migrate::apply(&settings, MIGRATIONS).await.unwrap_err();
+        assert!(
+            matches!(failure, Failure::Refused(_)) && failure.to_string().contains(expected),
+            "expected {expected:?}, got {failure}"
+        );
+        assert!(!db.schema_exists().await, "{expected}");
+        restore_roles(&mut admin).await;
+    }
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+
+    // The same boundary holds on later runs against a populated schema.
+    admin
+        .execute("GRANT pg_write_all_data TO openmettle_api WITH INHERIT FALSE")
+        .await
+        .unwrap();
     let failure = migrate::apply(&settings, MIGRATIONS).await.unwrap_err();
     assert!(
-        failure
-            .to_string()
-            .contains("migration 1 failed (SQLSTATE P0001)"),
+        failure.to_string().contains("pg_write_all_data"),
         "{failure}"
     );
-    assert!(db.history().await.is_empty());
-    assert!(!db.exists("openmettle.users").await);
+    restore_roles(&mut admin).await;
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn unsafe_privileges_defaults_and_ownership_are_refused() {
+    let db = TestDb::new().await;
+    let settings = db.settings(Duration::from_secs(1));
+    let name = db.0.clone();
+    let fixture = admin_options().get_username().to_owned();
+    let mut admin = db.admin().await;
+    let fresh: Vec<(Vec<String>, Vec<String>, &str)> = vec![
+        (
+            vec!["ALTER DEFAULT PRIVILEGES FOR ROLE openmettle_owner GRANT ALL ON TABLES TO openmettle_api".into()],
+            vec!["ALTER DEFAULT PRIVILEGES FOR ROLE openmettle_owner REVOKE ALL ON TABLES FROM openmettle_api".into()],
+            "default privileges of openmettle_owner grant DELETE on new tables to openmettle_api",
+        ),
+        (
+            vec!["ALTER DEFAULT PRIVILEGES FOR ROLE openmettle_owner IN SCHEMA public GRANT SELECT ON TABLES TO PUBLIC".into()],
+            vec!["ALTER DEFAULT PRIVILEGES FOR ROLE openmettle_owner IN SCHEMA public REVOKE SELECT ON TABLES FROM PUBLIC".into()],
+            "default privileges of openmettle_owner in schema public grant SELECT on new tables to PUBLIC",
+        ),
+        (
+            vec!["ALTER DEFAULT PRIVILEGES FOR ROLE openmettle_owner GRANT CREATE ON SCHEMAS TO openmettle_worker".into()],
+            vec!["ALTER DEFAULT PRIVILEGES FOR ROLE openmettle_owner REVOKE CREATE ON SCHEMAS FROM openmettle_worker".into()],
+            "default privileges of openmettle_owner grant CREATE on new schemas to openmettle_worker",
+        ),
+        (
+            vec![format!("GRANT CREATE, TEMPORARY ON DATABASE {name} TO openmettle_api")],
+            vec![format!("REVOKE CREATE, TEMPORARY ON DATABASE {name} FROM openmettle_api")],
+            "openmettle_api has CREATE on the database",
+        ),
+        (
+            vec![format!("GRANT CREATE ON DATABASE {name} TO PUBLIC")],
+            vec![format!("REVOKE CREATE ON DATABASE {name} FROM PUBLIC")],
+            "PUBLIC has CREATE on the database",
+        ),
+        (
+            vec!["GRANT CREATE ON SCHEMA public TO openmettle_worker".into()],
+            vec!["REVOKE CREATE ON SCHEMA public FROM openmettle_worker".into()],
+            "openmettle_worker has CREATE on schema public",
+        ),
+        (
+            vec![
+                "CREATE TABLE public.intruder (id int)".into(),
+                "ALTER TABLE public.intruder OWNER TO openmettle_api".into(),
+            ],
+            vec!["DROP TABLE public.intruder".into()],
+            "openmettle_api owns public.intruder",
+        ),
+        (
+            vec!["CREATE SCHEMA intruder AUTHORIZATION openmettle_worker".into()],
+            vec!["DROP SCHEMA intruder".into()],
+            "openmettle_worker owns schema intruder",
+        ),
+        (
+            vec![format!("ALTER DATABASE {name} OWNER TO {fixture}")],
+            vec![format!("ALTER DATABASE {name} OWNER TO openmettle_owner")],
+            "the database must be owned by openmettle_owner",
+        ),
+    ];
+    for (setup, restore, expected) in &fresh {
+        for statement in setup {
+            admin
+                .execute(AssertSqlSafe(statement.clone()))
+                .await
+                .unwrap();
+        }
+        let failure = migrate::apply(&settings, MIGRATIONS).await.unwrap_err();
+        assert!(
+            matches!(failure, Failure::Refused(_)) && failure.to_string().contains(expected),
+            "expected {expected:?}, got {failure}"
+        );
+        assert!(!db.schema_exists().await, "{expected}");
+        for statement in restore {
+            admin
+                .execute(AssertSqlSafe(statement.clone()))
+                .await
+                .unwrap();
+        }
+    }
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+
+    // Grants added after installation are refused on the next run.
+    let rerun: Vec<(String, String, &str)> = vec![
+        (
+            "GRANT DELETE ON openmettle.users TO openmettle_api".into(),
+            "REVOKE DELETE ON openmettle.users FROM openmettle_api".into(),
+            "openmettle_api has DELETE on openmettle.users",
+        ),
+        (
+            "GRANT SELECT ON openmettle._sqlx_migrations TO openmettle_worker".into(),
+            "REVOKE SELECT ON openmettle._sqlx_migrations FROM openmettle_worker".into(),
+            "openmettle_worker has SELECT on openmettle._sqlx_migrations",
+        ),
+        (
+            "GRANT UPDATE (id) ON openmettle.users TO openmettle_api".into(),
+            "REVOKE UPDATE (id) ON openmettle.users FROM openmettle_api".into(),
+            "openmettle_api has UPDATE on openmettle.users.id",
+        ),
+        (
+            "GRANT SELECT ON openmettle.messages TO PUBLIC".into(),
+            "REVOKE SELECT ON openmettle.messages FROM PUBLIC".into(),
+            "PUBLIC has SELECT on openmettle.messages",
+        ),
+        (
+            format!("GRANT CONNECT ON DATABASE {name} TO PUBLIC"),
+            format!("REVOKE CONNECT ON DATABASE {name} FROM PUBLIC"),
+            "PUBLIC has CONNECT on the database",
+        ),
+        (
+            format!("GRANT TEMPORARY ON DATABASE {name} TO openmettle_worker"),
+            format!("REVOKE TEMPORARY ON DATABASE {name} FROM openmettle_worker"),
+            "openmettle_worker has TEMPORARY on the database",
+        ),
+        (
+            "GRANT INSERT ON openmettle.user_identities TO openmettle_fixture_capped".into(),
+            "REVOKE INSERT ON openmettle.user_identities FROM openmettle_fixture_capped".into(),
+            "openmettle_fixture_capped has INSERT on openmettle.user_identities",
+        ),
+        (
+            "GRANT USAGE ON SCHEMA public TO openmettle_api".into(),
+            "REVOKE USAGE ON SCHEMA public FROM openmettle_api".into(),
+            "openmettle_api has USAGE on schema public",
+        ),
+        (
+            "ALTER DEFAULT PRIVILEGES FOR ROLE openmettle_owner IN SCHEMA openmettle GRANT SELECT ON TABLES TO openmettle_worker".into(),
+            "ALTER DEFAULT PRIVILEGES FOR ROLE openmettle_owner IN SCHEMA openmettle REVOKE SELECT ON TABLES FROM openmettle_worker".into(),
+            "default privileges of openmettle_owner in schema openmettle grant SELECT on new tables to openmettle_worker",
+        ),
+    ];
+    for (grant, revoke, expected) in &rerun {
+        admin.execute(AssertSqlSafe(grant.clone())).await.unwrap();
+        let failure = migrate::apply(&settings, MIGRATIONS).await.unwrap_err();
+        assert!(
+            matches!(failure, Failure::Refused(_)) && failure.to_string().contains(expected),
+            "expected {expected:?}, got {failure}"
+        );
+        admin.execute(AssertSqlSafe(revoke.clone())).await.unwrap();
+    }
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+    assert_eq!(db.history().await, [1, 2]);
+
+    // A migration that grants beyond the contract is reported after it commits.
+    let overgrant = [
+        MIGRATIONS[0],
+        MIGRATIONS[1],
+        Source {
+            version: 3,
+            description: "over-grant",
+            sql: "GRANT DELETE ON openmettle.messages TO openmettle_worker",
+        },
+    ];
+    let failure = migrate::apply(&settings, &overgrant).await.unwrap_err();
+    assert!(
+        matches!(failure, Failure::Violated(_))
+            && failure
+                .to_string()
+                .contains("openmettle_worker has DELETE on openmettle.messages"),
+        "{failure}"
+    );
 }
 
 #[tokio::test]

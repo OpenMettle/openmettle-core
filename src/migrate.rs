@@ -1,5 +1,7 @@
 //! One-shot schema migration process (ADR 0003). API and worker processes never call this.
-use sqlx::{ConnectOptions, Connection, PgConnection, SqlSafeStr, postgres::PgConnectOptions};
+use sqlx::{
+    ConnectOptions, Connection, Executor, PgConnection, SqlSafeStr, postgres::PgConnectOptions,
+};
 use sqlx_core::migrate::{MigrateError, Migration, MigrationType, Migrator};
 use std::{borrow::Cow, fmt, time::Duration};
 
@@ -9,6 +11,8 @@ pub const SCHEMA: &str = "openmettle";
 pub const HISTORY_TABLE: &str = "openmettle._sqlx_migrations";
 /// Reported as `application_name` so operators can identify migration sessions.
 pub const APPLICATION_NAME: &str = "openmettle-migrate";
+/// Read-only role, privilege and ownership check run before SQLx bootstrap and after migrating.
+const BOUNDARIES: &str = include_str!("boundaries.sql");
 
 /// An embedded forward-only migration. Released migrations are immutable: their checksum is
 /// recorded in the history table and any later edit is refused.
@@ -87,6 +91,12 @@ pub enum Failure {
     Invalid(&'static str),
     ConnectTimeout,
     Connect(sqlx::Error),
+    /// The boundary check or a session reset could not run.
+    Check(sqlx::Error),
+    /// Provisioned roles, privileges or ownership violate the contract; nothing was changed.
+    Refused(Vec<String>),
+    /// Migrations committed, but the result violates the privilege contract.
+    Violated(Vec<String>),
     Migrate(MigrateError),
 }
 
@@ -105,6 +115,17 @@ impl fmt::Display for Failure {
             Self::Invalid(message) => write!(f, "invalid migration set: {message}"),
             Self::ConnectTimeout => f.write_str("database connection deadline exceeded"),
             Self::Connect(e) => write!(f, "database connection failed ({})", describe(e)),
+            Self::Check(e) => write!(f, "database boundary check failed ({})", describe(e)),
+            Self::Refused(violations) => write!(
+                f,
+                "database boundary check refused to migrate: {}",
+                violations.join("; ")
+            ),
+            Self::Violated(violations) => write!(
+                f,
+                "migrated schema violates the privilege contract: {}",
+                violations.join("; ")
+            ),
             Self::Migrate(e) => match e {
                 MigrateError::ExecuteMigration(e, version) => {
                     write!(f, "migration {version} failed ({})", describe(e))
@@ -163,11 +184,17 @@ fn is_word(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80
 }
 
+/// PostgreSQL's scanner whitespace (scan.l `space`), which includes vertical tab.
+fn is_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+}
+
 /// Each migration commits atomically with its history row, so top-level transaction control
 /// (which would commit part of a migration early) is refused before connecting. PostgreSQL
 /// itself rejects statements that cannot run inside a transaction block, such as
 /// `CREATE INDEX CONCURRENTLY` or `VACUUM`. This lexical check fails closed: SQL-standard
-/// `BEGIN ATOMIC` bodies are refused; use dollar-quoted bodies instead.
+/// `BEGIN ATOMIC` bodies are refused; use dollar-quoted bodies instead. The check models
+/// `standard_conforming_strings = on`, which `apply` sets before every migration.
 pub fn check_transactional(sql: &str) -> Result<(), &'static str> {
     const REFUSED: &str = "transaction control statements are not permitted in migrations";
     if sql.trim_start().starts_with("-- no-transaction") {
@@ -179,7 +206,8 @@ pub fn check_transactional(sql: &str) -> Result<(), &'static str> {
     while i < b.len() {
         let c = b[i];
         if c == b'-' && b.get(i + 1) == Some(&b'-') {
-            while i < b.len() && b[i] != b'\n' {
+            // PostgreSQL ends a `--` comment at either LF or CR (scan.l `newline`).
+            while i < b.len() && !matches!(b[i], b'\n' | b'\r') {
                 i += 1;
             }
             continue;
@@ -208,7 +236,7 @@ pub fn check_transactional(sql: &str) -> Result<(), &'static str> {
             i += 1;
             continue;
         }
-        if c.is_ascii_whitespace() {
+        if is_space(c) {
             i += 1;
             continue;
         }
@@ -229,7 +257,11 @@ pub fn check_transactional(sql: &str) -> Result<(), &'static str> {
         }
         match c {
             b'\'' => {
-                let escapes = i > 0 && matches!(b[i - 1], b'E' | b'e');
+                // An escape string is a standalone E/e prefix; `time'\'` is a typed literal
+                // whose standard string ends at the second quote.
+                let escapes = i > 0
+                    && matches!(b[i - 1], b'E' | b'e')
+                    && (i == 1 || !(is_word(b[i - 2]) || b[i - 2] == b'$'));
                 i = skip_quoted(b, i, b'\'', escapes)?;
             }
             b'"' => i = skip_quoted(b, i, b'"', false)?,
@@ -308,6 +340,9 @@ pub async fn apply(settings: &Settings, sources: &[Source]) -> Result<(), Failur
             ("client_connection_check_interval", "1000ms".to_owned()),
             // Migrations must schema-qualify OpenMettle objects.
             ("search_path", "pg_catalog,pg_temp".to_owned()),
+            // The transaction-control check models conforming strings; pin it over any
+            // database or role default.
+            ("standard_conforming_strings", "on".to_owned()),
         ]);
     let mut connection = tokio::time::timeout(
         settings.connect_timeout,
@@ -316,10 +351,66 @@ pub async fn apply(settings: &Settings, sources: &[Source]) -> Result<(), Failur
     .await
     .map_err(|_| Failure::ConnectTimeout)?
     .map_err(Failure::Connect)?;
-    let result = migrator.run(&mut connection).await;
+    let result = migrate_within_boundaries(&migrator, &mut connection).await;
     // Dropping the connection on timeout also closes the socket.
     let _ = tokio::time::timeout(settings.connect_timeout, connection.close()).await;
-    result.map_err(Failure::Migrate)
+    result
+}
+
+/// Returns boundary violations; empty when provisioning matches the contract.
+async fn boundary_violations(connection: &mut PgConnection) -> Result<Vec<String>, sqlx::Error> {
+    let history: bool =
+        sqlx::query_scalar("SELECT to_regclass('openmettle._sqlx_migrations') IS NOT NULL")
+            .fetch_one(&mut *connection)
+            .await?;
+    let initialized = history
+        && sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT FROM openmettle._sqlx_migrations WHERE version = 1 AND success)",
+        )
+        .fetch_one(&mut *connection)
+        .await?;
+    sqlx::query_scalar(BOUNDARIES)
+        .bind(initialized)
+        .fetch_all(connection)
+        .await
+}
+
+async fn migrate_within_boundaries(
+    migrator: &Migrator,
+    connection: &mut PgConnection,
+) -> Result<(), Failure> {
+    // Refuse before SQLx creates the schema or history table, on every run.
+    let violations = boundary_violations(connection)
+        .await
+        .map_err(Failure::Check)?;
+    if !violations.is_empty() {
+        return Err(Failure::Refused(violations));
+    }
+    // One version at a time, restoring the startup session settings first, so a setting
+    // changed by one migration (for example standard_conforming_strings) cannot change how
+    // PostgreSQL scans the next one.
+    for version in migrator.iter().map(|m| m.version) {
+        connection
+            .execute("RESET ALL")
+            .await
+            .map_err(Failure::Check)?;
+        migrator
+            .run_to(version, &mut *connection)
+            .await
+            .map_err(Failure::Migrate)?;
+    }
+    connection
+        .execute("RESET ALL")
+        .await
+        .map_err(Failure::Check)?;
+    let violations = boundary_violations(connection)
+        .await
+        .map_err(Failure::Check)?;
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(Failure::Violated(violations))
+    }
 }
 
 /// Entry point for `openmettle-migrate`: 0 success, 78 invalid configuration, 1 failure.
@@ -391,6 +482,13 @@ mod tests {
             "/* a */ -- b\n COMMIT",
             "-- no-transaction\nCREATE INDEX CONCURRENTLY i ON t (c);",
             "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; END;",
+            // PostgreSQL ends `--` comments at CR as well as LF.
+            "CREATE TABLE openmettle.probe (id int); -- comment\rCOMMIT;\nSELECT 1/0;",
+            // Vertical tab is scanner whitespace.
+            "SELECT 1;\x0bCOMMIT",
+            // A typed literal is a standard string: the backslash does not escape the quote.
+            "SELECT time'\\'; COMMIT; --'",
+            "SELECT 1 AS x, e'\\''; COMMIT; --'",
         ] {
             assert!(check_transactional(sql).is_err(), "accepted: {sql}");
         }
@@ -407,6 +505,9 @@ mod tests {
             "-- COMMIT\nSELECT 1; /* ; ROLLBACK /* nested */ */ SELECT 2;",
             "CREATE TABLE t (begin_at int, commit_id int); SELECT begin_at FROM t;",
             "SELECT $1::int;",
+            "SELECT E'\\'; COMMIT; --';",
+            "SELECT 1; e'\\'; COMMIT'",
+            "-- comment\r\nSELECT 1;",
         ] {
             assert_eq!(check_transactional(sql), Ok(()), "{sql}");
         }

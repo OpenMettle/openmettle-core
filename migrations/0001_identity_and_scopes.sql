@@ -1,35 +1,12 @@
 -- V1-02 migration 1: database boundary, user identities and ownership scopes.
 -- Released migrations are immutable. Runs once per release as openmettle_owner in one
 -- transaction with search_path pg_catalog,pg_temp; see docs/adr/0003-schema-migrations.md.
--- Roles are provisioned outside migrations. This migration verifies their bounds and grants
--- object privileges only; it never creates, alters or grants cluster roles.
+-- Roles are provisioned outside migrations. openmettle-migrate checks identity, role
+-- memberships, privileges and default privileges (src/boundaries.sql) before this runs; this
+-- migration grants object privileges only and never creates, alters or grants cluster roles.
 
 DO $$
 BEGIN
-    IF current_user <> 'openmettle_owner' THEN
-        RAISE EXCEPTION 'OpenMettle migrations must run as openmettle_owner';
-    END IF;
-    IF (SELECT pg_get_userbyid(datdba) FROM pg_database
-        WHERE datname = current_database()) <> 'openmettle_owner' THEN
-        RAISE EXCEPTION 'the OpenMettle database must be owned by openmettle_owner';
-    END IF;
-    IF (SELECT count(*) FROM pg_roles
-        WHERE rolname IN ('openmettle_api', 'openmettle_worker')) <> 2 THEN
-        RAISE EXCEPTION 'roles openmettle_api and openmettle_worker must be provisioned first';
-    END IF;
-    IF EXISTS (
-        SELECT FROM pg_roles
-        WHERE rolname IN ('openmettle_owner', 'openmettle_api', 'openmettle_worker')
-          AND (rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls)
-    ) THEN
-        RAISE EXCEPTION 'OpenMettle roles must not be superuser or hold CREATEROLE, CREATEDB, REPLICATION or BYPASSRLS';
-    END IF;
-    IF pg_has_role('openmettle_api', 'openmettle_owner', 'MEMBER')
-        OR pg_has_role('openmettle_worker', 'openmettle_owner', 'MEMBER')
-        OR pg_has_role('openmettle_api', 'openmettle_worker', 'MEMBER')
-        OR pg_has_role('openmettle_worker', 'openmettle_api', 'MEMBER') THEN
-        RAISE EXCEPTION 'application roles must not be members of the owner or of each other';
-    END IF;
     -- Dedicated database: only the application roles may connect; nobody else gets TEMP.
     EXECUTE format('REVOKE ALL ON DATABASE %I FROM PUBLIC', current_database());
     EXECUTE format('GRANT CONNECT ON DATABASE %I TO openmettle_api, openmettle_worker',

@@ -1,0 +1,190 @@
+-- Read-only database boundary check (ADR 0003). openmettle-migrate runs it before SQLx creates
+-- any schema or history object, and again after migrations. It returns one row per violation.
+-- $1: whether migration 1 has been applied (it revokes the PUBLIC database/public-schema
+-- defaults, which are tolerated only before that).
+--
+-- Principals are openmettle_api, openmettle_worker, every role that is directly or indirectly
+-- a member of either (for example their login roles), and PUBLIC. They may hold only the
+-- privileges in `contract`, CONNECT on the database and USAGE on schema openmettle.
+WITH RECURSIVE
+privilege_roles AS (
+    SELECT oid FROM pg_roles WHERE rolname IN ('openmettle_api', 'openmettle_worker')
+),
+owner_role AS (
+    SELECT oid FROM pg_roles WHERE rolname = 'openmettle_owner'
+),
+application (oid, base) AS (
+    SELECT oid, oid FROM privilege_roles
+    UNION
+    SELECT m.member, a.base FROM pg_auth_members AS m JOIN application AS a ON m.roleid = a.oid
+),
+principals (oid) AS (
+    SELECT oid FROM application
+    UNION
+    SELECT 0::oid
+),
+contract (relation, role, privilege) AS (
+    VALUES
+        ('users', 'openmettle_api', 'SELECT'),
+        ('users', 'openmettle_api', 'INSERT'),
+        ('user_identities', 'openmettle_api', 'SELECT'),
+        ('user_identities', 'openmettle_api', 'INSERT'),
+        ('scopes', 'openmettle_api', 'SELECT'),
+        ('scopes', 'openmettle_api', 'INSERT'),
+        ('projects', 'openmettle_api', 'SELECT'),
+        ('projects', 'openmettle_api', 'INSERT'),
+        ('conversations', 'openmettle_api', 'SELECT'),
+        ('conversations', 'openmettle_api', 'INSERT'),
+        ('messages', 'openmettle_api', 'SELECT'),
+        ('messages', 'openmettle_api', 'INSERT'),
+        ('users', 'openmettle_worker', 'SELECT'),
+        ('scopes', 'openmettle_worker', 'SELECT'),
+        ('projects', 'openmettle_worker', 'SELECT'),
+        ('conversations', 'openmettle_worker', 'SELECT'),
+        ('messages', 'openmettle_worker', 'SELECT'),
+        ('messages', 'openmettle_worker', 'INSERT')
+),
+column_contract (relation, attribute, role, privilege) AS (
+    VALUES ('users', 'disabled_at', 'openmettle_api', 'UPDATE')
+),
+user_schemas AS (
+    SELECT oid, nspname, nspowner, nspacl FROM pg_namespace
+    WHERE nspname NOT IN ('pg_catalog', 'information_schema')
+      AND nspname NOT LIKE 'pg\_toast%'
+      AND nspname NOT LIKE 'pg\_temp\_%'
+),
+grants (target, kind, schema_name, object_name, column_name, grantee, privilege) AS (
+    SELECT 'the database', 'database', NULL::name, NULL::name, NULL::name,
+           a.grantee, a.privilege_type
+    FROM pg_database AS d,
+         aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) AS a
+    WHERE d.datname = current_database()
+    UNION ALL
+    SELECT 'schema ' || s.nspname, 'schema', s.nspname, NULL, NULL,
+           a.grantee, a.privilege_type
+    FROM user_schemas AS s,
+         aclexplode(coalesce(s.nspacl, acldefault('n', s.nspowner))) AS a
+    UNION ALL
+    SELECT s.nspname || '.' || c.relname, 'relation', s.nspname, c.relname, NULL,
+           a.grantee, a.privilege_type
+    FROM pg_class AS c
+    JOIN user_schemas AS s ON s.oid = c.relnamespace,
+         aclexplode(coalesce(c.relacl, acldefault(
+             CASE c.relkind WHEN 'S' THEN 's'::"char" ELSE 'r'::"char" END, c.relowner))) AS a
+    UNION ALL
+    SELECT s.nspname || '.' || c.relname || '.' || t.attname, 'column', s.nspname, c.relname,
+           t.attname, a.grantee, a.privilege_type
+    FROM pg_attribute AS t
+    JOIN pg_class AS c ON c.oid = t.attrelid
+    JOIN user_schemas AS s ON s.oid = c.relnamespace,
+         aclexplode(t.attacl) AS a
+    WHERE t.attnum > 0 AND NOT t.attisdropped AND t.attacl IS NOT NULL
+    UNION ALL
+    SELECT 'function ' || p.oid::regprocedure::text, 'function', s.nspname, p.proname, NULL,
+           a.grantee, a.privilege_type
+    FROM pg_proc AS p
+    JOIN user_schemas AS s ON s.oid = p.pronamespace,
+         aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) AS a
+    WHERE s.nspname = 'openmettle'
+),
+violations (violation) AS (
+    -- Identity: SQLx must not bootstrap anything under another login or database owner.
+    SELECT format('migrations must log in as openmettle_owner, not %s', session_user)
+    WHERE session_user <> 'openmettle_owner' OR current_user <> 'openmettle_owner'
+    UNION ALL
+    SELECT 'the database must be owned by openmettle_owner'
+    FROM pg_database
+    WHERE datname = current_database() AND pg_get_userbyid(datdba) <> 'openmettle_owner'
+    UNION ALL
+    SELECT format('role %s is missing', r)
+    FROM unnest(ARRAY['openmettle_owner', 'openmettle_api', 'openmettle_worker']) AS r
+    WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = r)
+    UNION ALL
+    -- Role attributes of the owner and every application principal.
+    SELECT format('role %s must not be superuser or hold CREATEROLE, CREATEDB, REPLICATION '
+                  'or BYPASSRLS', rolname)
+    FROM pg_roles
+    WHERE (oid IN (SELECT oid FROM application) OR oid IN (SELECT oid FROM owner_role))
+      AND (rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls)
+    UNION ALL
+    -- Memberships: any membership, inherited or only assumable with SET ROLE, can carry
+    -- privileges (for example pg_write_all_data) outside the contract.
+    SELECT format('role %s must not be a member of %s',
+                  pg_get_userbyid(m.member), pg_get_userbyid(m.roleid))
+    FROM pg_auth_members AS m
+    WHERE m.member IN (SELECT oid FROM privilege_roles UNION ALL SELECT oid FROM owner_role)
+    UNION ALL
+    SELECT format('role %s, a member of an application role, must not be a member of %s',
+                  pg_get_userbyid(m.member), pg_get_userbyid(m.roleid))
+    FROM pg_auth_members AS m
+    WHERE m.member IN (SELECT oid FROM application)
+      AND m.member NOT IN (SELECT oid FROM privilege_roles)
+      AND m.roleid NOT IN (SELECT oid FROM application)
+    UNION ALL
+    SELECT format('role %s has both API and worker privileges', pg_get_userbyid(oid))
+    FROM application
+    GROUP BY oid
+    HAVING count(DISTINCT base) > 1
+    UNION ALL
+    -- Object privileges held by principals outside the contract.
+    SELECT format('%s has %s on %s',
+                  CASE g.grantee WHEN 0 THEN 'PUBLIC' ELSE pg_get_userbyid(g.grantee) END,
+                  g.privilege, g.target)
+    FROM grants AS g
+    WHERE g.grantee IN (SELECT oid FROM principals)
+      AND NOT (g.kind = 'database' AND g.grantee <> 0 AND g.privilege = 'CONNECT')
+      AND NOT (g.kind = 'database' AND g.grantee = 0 AND NOT $1
+               AND g.privilege IN ('CONNECT', 'TEMPORARY'))
+      AND NOT (g.kind = 'schema' AND g.schema_name = 'openmettle' AND g.privilege = 'USAGE'
+               AND g.grantee IN (SELECT oid FROM privilege_roles))
+      AND NOT (g.kind = 'schema' AND g.schema_name = 'public' AND g.grantee = 0 AND NOT $1
+               AND g.privilege = 'USAGE')
+      AND NOT (g.kind = 'relation' AND g.schema_name = 'openmettle'
+               AND (g.object_name::text, pg_get_userbyid(g.grantee)::text, g.privilege)
+                   IN (SELECT relation, role, privilege FROM contract))
+      AND NOT (g.kind = 'column' AND g.schema_name = 'openmettle'
+               AND (g.object_name::text, g.column_name::text,
+                    pg_get_userbyid(g.grantee)::text, g.privilege)
+                   IN (SELECT relation, attribute, role, privilege FROM column_contract))
+    UNION ALL
+    -- Default privileges would grant future migration objects outside the contract.
+    SELECT format('default privileges of openmettle_owner%s grant %s on new %s to %s',
+                  coalesce(' in schema ' || s.nspname, ''), a.privilege_type,
+                  CASE d.defaclobjtype WHEN 'r' THEN 'tables' WHEN 'S' THEN 'sequences'
+                      WHEN 'f' THEN 'functions' WHEN 'T' THEN 'types'
+                      WHEN 'n' THEN 'schemas' ELSE 'objects' END,
+                  CASE a.grantee WHEN 0 THEN 'PUBLIC' ELSE pg_get_userbyid(a.grantee) END)
+    FROM pg_default_acl AS d
+    LEFT JOIN pg_namespace AS s ON s.oid = d.defaclnamespace,
+         aclexplode(d.defaclacl) AS a
+    WHERE d.defaclrole IN (SELECT oid FROM owner_role)
+      AND a.grantee IN (SELECT oid FROM principals)
+    UNION ALL
+    -- Ownership grants DDL; principals own nothing and the owner owns schema openmettle.
+    SELECT format('%s owns schema %s', pg_get_userbyid(nspowner), nspname)
+    FROM user_schemas
+    WHERE nspowner IN (SELECT oid FROM application)
+    UNION ALL
+    SELECT format('%s owns %s.%s', pg_get_userbyid(c.relowner), s.nspname, c.relname)
+    FROM pg_class AS c
+    JOIN pg_namespace AS s ON s.oid = c.relnamespace
+    WHERE c.relowner IN (SELECT oid FROM application)
+    UNION ALL
+    SELECT format('%s owns function %s', pg_get_userbyid(proowner), oid::regprocedure)
+    FROM pg_proc
+    WHERE proowner IN (SELECT oid FROM application)
+    UNION ALL
+    SELECT format('%s owns type %s', pg_get_userbyid(typowner), oid::regtype)
+    FROM pg_type
+    WHERE typowner IN (SELECT oid FROM application) AND typrelid = 0
+    UNION ALL
+    SELECT 'schema openmettle must be owned by openmettle_owner'
+    FROM pg_namespace
+    WHERE nspname = 'openmettle' AND pg_get_userbyid(nspowner) <> 'openmettle_owner'
+    UNION ALL
+    SELECT format('openmettle.%s must be owned by openmettle_owner', c.relname)
+    FROM pg_class AS c
+    JOIN pg_namespace AS s ON s.oid = c.relnamespace
+    WHERE s.nspname = 'openmettle' AND pg_get_userbyid(c.relowner) <> 'openmettle_owner'
+)
+SELECT DISTINCT violation FROM violations ORDER BY violation LIMIT 20
