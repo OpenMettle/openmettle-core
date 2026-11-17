@@ -63,6 +63,12 @@ contract (relation, role, privilege) AS (
     (VALUES ('openmettle_api'), ('openmettle_worker')) AS r(role),
     (VALUES ('SELECT')) AS p(privilege)
     WHERE $1 >= 4
+    UNION ALL
+    SELECT relation, role, 'SELECT' FROM (VALUES
+        ('grant_mapping_rules'), ('grant_mapping_revisions'),
+        ('grant_assignments'), ('grant_changes')
+    ) AS g(relation), (VALUES ('openmettle_api'), ('openmettle_worker')) AS r(role)
+    WHERE $1 >= 5
 ),
 column_contract (relation, attribute, role, privilege) AS (
     VALUES ('users', 'disabled_at', 'openmettle_api', 'UPDATE')
@@ -148,6 +154,53 @@ column_contract (relation, attribute, role, privilege) AS (
         ('artifact_revisions', 'purging_at', 'openmettle_worker', 'UPDATE'),
         ('artifact_revisions', 'purged_at', 'openmettle_worker', 'UPDATE')
     ) AS retention(relation, attribute, role, privilege) WHERE $1 >= 4
+    UNION ALL
+    SELECT * FROM (VALUES
+        ('grant_mapping_rules', 'id', 'openmettle_api', 'INSERT'),
+        ('grant_mapping_rules', 'provider_config_id', 'openmettle_api', 'INSERT'),
+        ('grant_mapping_rules', 'issuer', 'openmettle_api', 'INSERT'),
+        ('grant_mapping_rules', 'created_by_user_id', 'openmettle_api', 'INSERT'),
+        ('grant_mapping_rules', 'last_revision', 'openmettle_api', 'UPDATE'),
+        ('grant_mapping_revisions', 'rule_id', 'openmettle_api', 'INSERT'),
+        ('grant_mapping_revisions', 'revision', 'openmettle_api', 'INSERT'),
+        ('grant_mapping_revisions', 'actor_user_id', 'openmettle_api', 'INSERT'),
+        ('grant_mapping_revisions', 'request_key', 'openmettle_api', 'INSERT'),
+        ('grant_mapping_revisions', 'enabled', 'openmettle_api', 'INSERT'),
+        ('grant_mapping_revisions', 'selector_kind', 'openmettle_api', 'INSERT'),
+        ('grant_mapping_revisions', 'claim_name', 'openmettle_api', 'INSERT'),
+        ('grant_mapping_revisions', 'claim_value', 'openmettle_api', 'INSERT'),
+        ('grant_mapping_revisions', 'binding_format', 'openmettle_api', 'INSERT'),
+        ('grant_mapping_revisions', 'binding_version', 'openmettle_api', 'INSERT'),
+        ('grant_mapping_revisions', 'binding', 'openmettle_api', 'INSERT'),
+        ('grant_mapping_revisions', 'request_identity', 'openmettle_api', 'INSERT'),
+        ('grant_mapping_revisions', 'request_digest', 'openmettle_api', 'INSERT'),
+        ('grant_assignments', 'scope_id', 'openmettle_api', 'INSERT'),
+        ('grant_assignments', 'target_kind', 'openmettle_api', 'INSERT'),
+        ('grant_assignments', 'project_id', 'openmettle_api', 'INSERT'),
+        ('grant_assignments', 'conversation_id', 'openmettle_api', 'INSERT'),
+        ('grant_assignments', 'artifact_id', 'openmettle_api', 'INSERT'),
+        ('grant_assignments', 'grantee_user_id', 'openmettle_api', 'INSERT'),
+        ('grant_assignments', 'assignment_format', 'openmettle_api', 'INSERT'),
+        ('grant_assignments', 'assignment_version', 'openmettle_api', 'INSERT'),
+        ('grant_assignments', 'assignment_key', 'openmettle_api', 'INSERT'),
+        ('grant_assignments', 'source_kind', 'openmettle_api', 'INSERT'),
+        ('grant_assignments', 'mapping_rule_id', 'openmettle_api', 'INSERT'),
+        ('grant_assignments', 'created_by_user_id', 'openmettle_api', 'INSERT'),
+        ('grant_assignments', 'last_revision', 'openmettle_api', 'UPDATE'),
+        ('grant_changes', 'id', 'openmettle_api', 'INSERT'),
+        ('grant_changes', 'scope_id', 'openmettle_api', 'INSERT'),
+        ('grant_changes', 'assignment_id', 'openmettle_api', 'INSERT'),
+        ('grant_changes', 'revision', 'openmettle_api', 'INSERT'),
+        ('grant_changes', 'source_kind', 'openmettle_api', 'INSERT'),
+        ('grant_changes', 'mapping_rule_id', 'openmettle_api', 'INSERT'),
+        ('grant_changes', 'mapping_revision', 'openmettle_api', 'INSERT'),
+        ('grant_changes', 'actor_user_id', 'openmettle_api', 'INSERT'),
+        ('grant_changes', 'request_key', 'openmettle_api', 'INSERT'),
+        ('grant_changes', 'decision', 'openmettle_api', 'INSERT'),
+        ('grant_changes', 'cycle_id', 'openmettle_api', 'INSERT'),
+        ('grant_changes', 'request_identity', 'openmettle_api', 'INSERT'),
+        ('grant_changes', 'request_digest', 'openmettle_api', 'INSERT')
+    ) AS grants(relation, attribute, role, privilege) WHERE $1 >= 5
 ),
 user_schemas AS (
     SELECT oid, nspname, nspowner, nspacl FROM pg_namespace

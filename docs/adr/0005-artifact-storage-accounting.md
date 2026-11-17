@@ -200,9 +200,10 @@ passed. Throughput, hot-row contention and sizing are not measured.
 
 ## Remaining
 
-V1-02 still owes grants: project membership and resource grants with direct and group
-provenance and revocation, depending on V1-04 group-mapping identity and the V1-05 permission
-vocabulary. Other areas stay with their own tickets:
+ADR 0006 adds project/resource grant persistence with direct and mapped provenance and
+revocation history. V1-04 mapping behavior and V1-05 permission meanings are consumer contracts,
+not prerequisites to this storage vocabulary. V1-02 final acceptance remains open. Other areas
+stay with their own tickets:
 
 - V1-15: uploads, staging, paths and downloads.
 - V1-16: references, purge execution and the deletion journal.
