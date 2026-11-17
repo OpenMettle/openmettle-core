@@ -49,7 +49,7 @@ Allocation order is therefore not commit order. Every change uses one bounded ow
 transaction that serializes writers on the stable provider row before allocating:
 
 ```sql
--- psql variables: :'provider' (uuid), :'revision' (text, or NULL to retire)
+-- psql variables for activation: :'provider' (uuid), :'revision' (revision text)
 BEGIN;
 SET LOCAL lock_timeout = '2s';
 SET LOCAL statement_timeout = '5s';
@@ -61,6 +61,19 @@ SELECT NOT EXISTS (SELECT FROM openmettle.login_provider_revisions
     WHERE provider_id = :'provider' AND epoch > :new_epoch) AS current; -- must be true
 COMMIT; -- or ROLLBACK if no provider row, current is false, or anything failed
 ```
+
+To retire a provider, use the same transaction, lock and checks, but replace only
+the `INSERT` above with this statement:
+
+```sql
+INSERT INTO openmettle.login_provider_revisions (provider_id, revision)
+    VALUES (:'provider', NULL) RETURNING epoch AS new_epoch \gset
+```
+
+Use literal SQL `NULL` for retirement. Setting the psql `revision` variable to
+`NULL` does not work: `:'revision'` quotes it as the text `'NULL'`, which is an
+active revision string, not a retirement tombstone
+([psql variable interpolation](https://www.postgresql.org/docs/18/app-psql.html#APP-PSQL-INTERPOLATION)).
 
 A second writer's `FOR UPDATE` waits for the first to commit or roll back
 ([PostgreSQL 18, Read Committed](https://www.postgresql.org/docs/18/transaction-iso.html#XACT-READ-COMMITTED)),
