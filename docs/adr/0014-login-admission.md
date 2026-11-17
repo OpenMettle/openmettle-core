@@ -97,6 +97,13 @@ and the connection must be discarded. Root transaction ownership, single-use con
 commit-before-permit, original expiry and the separation of network work from database locks
 are unchanged.
 
+Before exposing login routes, the route/pool integration must prove that cancellation,
+timeout and `Database` errors discard the connection, including cleanup failure. A dropped
+future can otherwise leave the singleton locked on an idle connection and block every
+replica's login starts until that connection is closed or its queued rollback is flushed.
+Returned ordinary errors with successful rollback do not retain that lock. This connection
+lifecycle qualification is an exposure gate; it is not supplied by the outstanding-work cap.
+
 ## Operator procedures
 
 Run these exact scripts with `psql` against the primary as `openmettle_owner` under deployment

@@ -348,11 +348,11 @@ async fn cleanup_script_removes_only_expired_unreferenced_gates() {
     let id = |s: &Started| s.state.expose().split_once('.').unwrap().0.to_owned();
     // a: expired unconsumed. b: expired consumed. c: live. d: expired with a retained session.
     // e: expired but locked by a concurrent transaction.
-    let a = try_begin(&db, 1).await.unwrap();
-    let b = try_begin(&db, 1).await.unwrap();
+    let a = try_begin(&db, 5).await.unwrap();
+    let b = try_begin(&db, 5).await.unwrap();
     let c = try_begin(&db, 600).await.unwrap();
-    let d = try_begin(&db, 1).await.unwrap();
-    let e = try_begin(&db, 1).await.unwrap();
+    let d = try_begin(&db, 5).await.unwrap();
+    let e = try_begin(&db, 5).await.unwrap();
     for s in [&b, &d] {
         login::consume(&mut api, p.clone(), &keys(), callback(s, "code"))
             .await

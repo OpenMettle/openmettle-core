@@ -113,7 +113,7 @@ async fn issued_and_expired_rows_free_capacity() {
     );
     admit(&mut f.owner, Some(2)).await;
     let short = p
-        .begin(&mut f.api, &keys(), Duration::from_secs(1))
+        .begin(&mut f.api, &keys(), Duration::from_secs(5))
         .await
         .unwrap();
     f.begin(&p).await;
@@ -194,15 +194,21 @@ async fn waiting_begin_reads_limit_and_primary_clock_after_lock() {
     let p = f.h.provider.clone();
     let mut observer = statistics_observer(&f.db).await;
     admit(&mut f.owner, Some(2)).await;
+    let mut x = f.db.connect(API).await;
+    let px = pid(&mut x).await;
     let short = p
         .begin(&mut f.api, &keys(), Duration::from_secs(1))
         .await
         .unwrap();
-    let mut x = f.db.connect(API).await;
-    let px = pid(&mut x).await;
     hold_limit(&mut f.owner, Some(Some(1))).await;
     let control = async {
         waiting(&mut observer, px).await;
+        let live: bool = sqlx::query_scalar("SELECT expires_ms > floor(extract(epoch FROM clock_timestamp())*1000)::bigint FROM openmettle.login_transactions WHERE id=$1")
+            .bind(locator(&short)).fetch_one(&mut f.owner).await.unwrap();
+        assert!(
+            live,
+            "the outstanding row must expire during the observed lock wait"
+        );
         sleep_past_expiry(&mut f.owner, &short).await;
         f.owner.execute("COMMIT").await.unwrap();
     };
