@@ -1,0 +1,25 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ProblemInvalidCursor--auto-missing-type",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "code": "invalid_cursor",
+    "detail": "The cursor is not valid for this request.",
+    "request_id": "0b7d3f52-1a2e-4f6c-9d8b-7e6a5c4b3a21",
+    "status": 400,
+    "title": "Bad Request"
+  },
+  "mutation": {
+    "name": "auto-missing-type",
+    "op": "remove",
+    "path": "/type"
+  },
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemInvalidCursor"
+}

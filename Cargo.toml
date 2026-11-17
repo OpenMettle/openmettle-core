@@ -32,3 +32,9 @@ sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "
 sqlx-core = { version = "=0.9.0", default-features = false }
 sqlx-postgres = { version = "=0.9.0", default-features = false, features = ["migrate"] }
 sha2 = { version = "=0.10.9", default-features = false }
+
+# Contract tests only (ADR 0007); not linked into any binary.
+[dev-dependencies]
+jsonschema = { version = "=0.61.2", default-features = false }
+serde = { version = "=1.0.229", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }

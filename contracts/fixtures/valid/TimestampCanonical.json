@@ -1,0 +1,13 @@
+{
+  "class": "valid",
+  "direction": "value",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "TimestampCanonical",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": "2026-11-17T09:00:00.123456Z",
+  "mutation": null,
+  "schema": "#/components/schemas/Timestamp",
+  "source": "#/components/examples/TimestampCanonical"
+}

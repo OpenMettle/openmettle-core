@@ -1,0 +1,18 @@
+{
+  "class": "valid",
+  "direction": "value",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "CounterZero--signed-64-maximum",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": "9223372036854775807",
+  "mutation": {
+    "name": "signed-64-maximum",
+    "op": "set",
+    "path": "",
+    "value": "9223372036854775807"
+  },
+  "schema": "#/components/schemas/NonNegativeDecimal",
+  "source": "#/components/examples/CounterZero"
+}

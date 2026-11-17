@@ -1,0 +1,16 @@
+{
+  "class": "valid",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "CapabilitiesCoreOnly",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "capabilities": [],
+    "generated_at": "2026-11-17T09:00:00.000000Z"
+  },
+  "mutation": null,
+  "schema": "#/components/schemas/CapabilityList",
+  "source": "#/components/examples/CapabilitiesCoreOnly"
+}

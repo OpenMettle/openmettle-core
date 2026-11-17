@@ -1,0 +1,22 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "/next_cursor",
+    "keyword": "oneOf",
+    "valid": false
+  },
+  "fixture": "PageInfoMore--cursor-empty",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "next_cursor": ""
+  },
+  "mutation": {
+    "name": "cursor-empty",
+    "op": "set",
+    "path": "/next_cursor",
+    "value": ""
+  },
+  "schema": "#/components/schemas/PageInfo",
+  "source": "#/components/examples/PageInfoMore"
+}

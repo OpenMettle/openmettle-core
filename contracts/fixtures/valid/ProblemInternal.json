@@ -1,0 +1,19 @@
+{
+  "class": "valid",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "ProblemInternal",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "code": "internal",
+    "request_id": "5a6b7c8d-9e0f-4a1b-8c3d-4e5f6a7b8c9d",
+    "status": 500,
+    "title": "Internal Server Error",
+    "type": "about:blank"
+  },
+  "mutation": null,
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemInternal"
+}

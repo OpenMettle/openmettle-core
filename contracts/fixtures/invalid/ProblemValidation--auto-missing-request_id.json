@@ -1,0 +1,32 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ProblemValidation--auto-missing-request_id",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "code": "validation",
+    "detail": "The request does not satisfy the API contract.",
+    "errors": [
+      {
+        "in": "query",
+        "pointer": "/limit",
+        "reason": "out_of_range"
+      }
+    ],
+    "status": 400,
+    "title": "Bad Request",
+    "type": "about:blank"
+  },
+  "mutation": {
+    "name": "auto-missing-request_id",
+    "op": "remove",
+    "path": "/request_id"
+  },
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemValidation"
+}

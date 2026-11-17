@@ -1,0 +1,13 @@
+{
+  "class": "valid",
+  "direction": "value",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "UuidCanonical",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": "0f0e0d0c-0b0a-4908-8706-050403020100",
+  "mutation": null,
+  "schema": "#/components/schemas/Uuid",
+  "source": "#/components/examples/UuidCanonical"
+}

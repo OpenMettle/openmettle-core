@@ -1,0 +1,25 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ProblemUnavailable--auto-missing-status",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "code": "unavailable",
+    "detail": "A required service is temporarily unavailable.",
+    "request_id": "7c8d9e0f-1a2b-4c3d-8e5f-6a7b8c9d0e1f",
+    "title": "Service Unavailable",
+    "type": "about:blank"
+  },
+  "mutation": {
+    "name": "auto-missing-status",
+    "op": "remove",
+    "path": "/status"
+  },
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemUnavailable"
+}

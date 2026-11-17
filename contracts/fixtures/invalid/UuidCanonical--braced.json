@@ -1,0 +1,20 @@
+{
+  "class": "invalid",
+  "direction": "value",
+  "expect": {
+    "instancePath": "",
+    "keyword": "maxLength",
+    "valid": false
+  },
+  "fixture": "UuidCanonical--braced",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": "{0f0e0d0c-0b0a-4908-8706-050403020100}",
+  "mutation": {
+    "name": "braced",
+    "op": "set",
+    "path": "",
+    "value": "{0f0e0d0c-0b0a-4908-8706-050403020100}"
+  },
+  "schema": "#/components/schemas/Uuid",
+  "source": "#/components/examples/UuidCanonical"
+}

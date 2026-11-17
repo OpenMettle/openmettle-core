@@ -1,0 +1,21 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "RunEventItemNote--auto-missing-id",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "data": "{\"data\":{},\"occurred_at\":\"2026-11-17T09:00:01.000000Z\",\"run_id\":\"0f0e0d0c-0b0a-4908-8706-050403020100\",\"sequence\":\"42\",\"type\":\"example.note\",\"type_version\":1}"
+  },
+  "mutation": {
+    "name": "auto-missing-id",
+    "op": "remove",
+    "path": "/id"
+  },
+  "schema": "#/components/schemas/RunEventItem",
+  "source": "#/components/examples/RunEventItemNote"
+}

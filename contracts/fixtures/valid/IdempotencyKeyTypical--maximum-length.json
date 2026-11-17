@@ -1,0 +1,21 @@
+{
+  "class": "valid",
+  "direction": "value",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "IdempotencyKeyTypical--maximum-length",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+  "mutation": {
+    "name": "maximum-length",
+    "op": "set",
+    "path": "",
+    "repeat": [
+      "k",
+      128
+    ]
+  },
+  "schema": "#/components/schemas/IdempotencyKey",
+  "source": "#/components/examples/IdempotencyKeyTypical"
+}

@@ -1,0 +1,21 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "CapabilitiesMixed--auto-missing-capabilities",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "generated_at": "2026-11-17T09:00:00.000000Z"
+  },
+  "mutation": {
+    "name": "auto-missing-capabilities",
+    "op": "remove",
+    "path": "/capabilities"
+  },
+  "schema": "#/components/schemas/CapabilityList",
+  "source": "#/components/examples/CapabilitiesMixed"
+}

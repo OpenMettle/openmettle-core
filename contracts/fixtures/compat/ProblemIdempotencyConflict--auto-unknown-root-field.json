@@ -1,0 +1,27 @@
+{
+  "class": "compat",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "ProblemIdempotencyConflict--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "code": "idempotency_conflict",
+    "detail": "The idempotency key was already used with a different request.",
+    "request_id": "2d3e4f5a-6b7c-4d8e-9f0a-1b2c3d4e5f6a",
+    "status": 409,
+    "title": "Conflict",
+    "type": "about:blank",
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemIdempotencyConflict"
+}

@@ -1,0 +1,13 @@
+{
+  "class": "valid",
+  "direction": "value",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "CounterZero",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": "0",
+  "mutation": null,
+  "schema": "#/components/schemas/NonNegativeDecimal",
+  "source": "#/components/examples/CounterZero"
+}

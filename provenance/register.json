@@ -1082,6 +1082,46 @@
       "tracking": [
         "V1-42"
       ]
+    },
+    {
+      "id": "openapi-3.2-schemas",
+      "name": "OpenAPI 3.2 official JSON Schemas (schema-base, schema, dialect, meta)",
+      "kind": "asset",
+      "review_group": "core",
+      "distribution": "candidate",
+      "version": "OAS 3.2 schema/schema-base 2026-11-12; dialect/meta 2026-02-26",
+      "pin": "sha256: schema-base 8e432f0f148597960daa3aafa0c0030d8aae7538d32c217854a1e3aada595216, schema f1f7ee38d431a7bb1082e4df2288dbe1d4d3f49081b497af249c07b77737fb43, dialect 9375b7042aa0b01848403f0a9ebf12a3425e01a9e24337ce12624f10fea73833, meta f444d02ef7d36f30293983fad8118c823a3c70a49a8e5aa6f1afe21215e35417",
+      "origin": "https://github.com/OAI/OpenAPI-Specification",
+      "source_evidence": [
+        "contracts/vendor/oas-3.2/README.md",
+        "Retrieved unmodified from https://spec.openapis.org/oas/3.2/ on 2026-11-17; digests pinned in tests/contract.rs"
+      ],
+      "licence": {
+        "expression": "Apache-2.0",
+        "evidence": [
+          "contracts/vendor/oas-3.2/LICENSE (copied from OAI/OpenAPI-Specification main LICENSE, sha256 4948367c65e1ce06690e2cadc6e86fce1a6a6db55ef874ce4b78c0f472ce5f13)"
+        ]
+      },
+      "notices": {
+        "status": "pending",
+        "files": [
+          "contracts/vendor/oas-3.2/LICENSE"
+        ],
+        "obligations": [
+          "Retain the Apache-2.0 licence with the vendored files in any source distribution; the files are unmodified and the upstream repository has no NOTICE file."
+        ]
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "Contract-validation input for tests/contract.rs (ADR 0007). Not compiled into binaries or images; present in the source tree, so distribution depends on the undefined source-distribution boundary. Recorded by an agent; no review performed."
+      },
+      "tracking": [
+        "V1-03",
+        "V1-42"
+      ]
     }
   ]
 }

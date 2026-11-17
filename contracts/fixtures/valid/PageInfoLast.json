@@ -1,0 +1,15 @@
+{
+  "class": "valid",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "PageInfoLast",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "next_cursor": null
+  },
+  "mutation": null,
+  "schema": "#/components/schemas/PageInfo",
+  "source": "#/components/examples/PageInfoLast"
+}

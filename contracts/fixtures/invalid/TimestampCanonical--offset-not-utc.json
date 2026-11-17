@@ -1,0 +1,20 @@
+{
+  "class": "invalid",
+  "direction": "value",
+  "expect": {
+    "instancePath": "",
+    "keyword": "maxLength",
+    "valid": false
+  },
+  "fixture": "TimestampCanonical--offset-not-utc",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": "2026-11-17T09:00:00.123456+01:00",
+  "mutation": {
+    "name": "offset-not-utc",
+    "op": "set",
+    "path": "",
+    "value": "2026-11-17T09:00:00.123456+01:00"
+  },
+  "schema": "#/components/schemas/Timestamp",
+  "source": "#/components/examples/TimestampCanonical"
+}

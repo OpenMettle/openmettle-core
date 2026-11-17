@@ -1,0 +1,20 @@
+{
+  "class": "invalid",
+  "direction": "value",
+  "expect": {
+    "instancePath": "",
+    "keyword": "pattern",
+    "valid": false
+  },
+  "fixture": "CounterZero--exponent",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": "1e3",
+  "mutation": {
+    "name": "exponent",
+    "op": "set",
+    "path": "",
+    "value": "1e3"
+  },
+  "schema": "#/components/schemas/NonNegativeDecimal",
+  "source": "#/components/examples/CounterZero"
+}

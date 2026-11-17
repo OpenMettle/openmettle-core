@@ -1,0 +1,24 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ProblemInternal--auto-missing-request_id",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "code": "internal",
+    "status": 500,
+    "title": "Internal Server Error",
+    "type": "about:blank"
+  },
+  "mutation": {
+    "name": "auto-missing-request_id",
+    "op": "remove",
+    "path": "/request_id"
+  },
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemInternal"
+}

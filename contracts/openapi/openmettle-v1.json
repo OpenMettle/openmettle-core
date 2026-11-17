@@ -1,0 +1,1841 @@
+{
+  "openapi": "3.2.1",
+  "jsonSchemaDialect": "https://spec.openapis.org/oas/3.2/dialect/2026-02-26",
+  "info": {
+    "title": "OpenMettle application API",
+    "version": "1.0.0-draft.1",
+    "summary": "Versioned application contract (V1-03). Contract only: no operation in this document is implemented.",
+    "description": "Canonical source for the OpenMettle v1 application API contract. Wire rules, compatibility policy and limits are recorded in docs/adr/0007-application-api-contract.md. Every operation carries x-openmettle-implementation; `not-implemented` means the running API does not serve the route. Security schemes are provisional bindings until V1-04 settles session transport. Fixtures under contracts/fixtures are generated from the examples in this document by scripts/contract_fixtures.py.",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    }
+  },
+  "paths": {
+    "/v1/capabilities": {
+      "get": {
+        "operationId": "listCapabilities",
+        "summary": "List capabilities visible to the authenticated caller",
+        "description": "Returns installed, authorization and readiness dimensions independently for each capability. Absence of an optional provider never makes the core unavailable, and this operation is not an input to the operational /readyz probe. The response never contains provider endpoints, credentials, model secrets or another user's inventory. Not implemented: the running API returns 404 for this path until authentication (V1-04) and resource authorization (V1-05) exist.",
+        "x-openmettle-implementation": "not-implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Capabilities visible to the caller.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilityList"
+                },
+                "examples": {
+                  "mixed": {
+                    "$ref": "#/components/examples/CapabilitiesMixed"
+                  },
+                  "coreOnly": {
+                    "$ref": "#/components/examples/CapabilitiesCoreOnly"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "browserSession": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "__Host-openmettle-session",
+        "description": "Provisional binding. Flutter web uses an OpenMettle application session held in a Secure, HttpOnly cookie with CSRF protection for unsafe methods (architecture v1). Cookie name, lifetime, rotation and CSRF mechanism are owned by V1-04 and may change before any operation is implemented.",
+        "x-openmettle-provisional": true
+      },
+      "nativeSession": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "opaque OpenMettle application session credential",
+        "description": "Provisional binding. Native clients present an OpenMettle-issued application session credential obtained through the system-browser code/PKCE handoff owned by V1-04. Upstream OIDC provider tokens are never accepted as OpenMettle API credentials.",
+        "x-openmettle-provisional": true
+      }
+    },
+    "headers": {
+      "ApiVersion": {
+        "description": "Major.minor contract version of the response. The major always matches the /v1 path prefix. Consumers reject a major they do not support and accept any newer minor.",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/ApiVersion"
+        }
+      },
+      "RetryAfter": {
+        "description": "Delay in seconds before a retry may succeed. Advisory; absence does not imply that a retry is safe or useful.",
+        "schema": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 86400
+        }
+      }
+    },
+    "parameters": {
+      "Cursor": {
+        "name": "cursor",
+        "in": "query",
+        "description": "Opaque page cursor returned as next_cursor. A cursor is valid only for the same caller, operation, filters and sort order that produced it. Malformed, foreign, expired or tampered cursors fail with invalid_cursor.",
+        "schema": {
+          "$ref": "#/components/schemas/Cursor"
+        }
+      },
+      "Limit": {
+        "name": "limit",
+        "in": "query",
+        "description": "Maximum number of items to return. The server may return fewer.",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 50
+        }
+      },
+      "IdempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": true,
+        "description": "Client-chosen key for a state-changing request. The server scopes it to the authenticated actor, the operation and the authorized scope; any actor or user identity in the request body is never used for this purpose. Repeating the same key with the identical request returns the original outcome; the same key with a different request fails with idempotency_conflict. Retries after an uncertain outcome must resend the identical request, including any client-supplied input identity. No retention period or exactly-once execution is promised.",
+        "schema": {
+          "$ref": "#/components/schemas/IdempotencyKey"
+        }
+      },
+      "LastEventId": {
+        "name": "Last-Event-ID",
+        "in": "header",
+        "description": "SSE resume cursor, as sent automatically by EventSource clients. If both Last-Event-ID and after are present they must be identical; differing values fail with validation.",
+        "schema": {
+          "$ref": "#/components/schemas/Cursor"
+        }
+      },
+      "After": {
+        "name": "after",
+        "in": "query",
+        "description": "Explicit SSE resume cursor for clients that cannot set Last-Event-ID. Must equal Last-Event-ID when both are sent.",
+        "schema": {
+          "$ref": "#/components/schemas/Cursor"
+        }
+      }
+    },
+    "mediaTypes": {
+      "RunEventStream": {
+        "itemSchema": {
+          "$ref": "#/components/schemas/RunEventItem"
+        },
+        "examples": {
+          "note": {
+            "$ref": "#/components/examples/RunEventItemNote"
+          }
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "The request is malformed or violates the contract (validation or invalid_cursor).",
+        "headers": {
+          "OpenMettle-API-Version": {
+            "$ref": "#/components/headers/ApiVersion"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "examples": {
+              "validation": {
+                "$ref": "#/components/examples/ProblemValidation"
+              },
+              "invalidCursor": {
+                "$ref": "#/components/examples/ProblemInvalidCursor"
+              }
+            }
+          }
+        }
+      },
+      "Unauthenticated": {
+        "description": "No valid OpenMettle application session was presented.",
+        "headers": {
+          "OpenMettle-API-Version": {
+            "$ref": "#/components/headers/ApiVersion"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "examples": {
+              "unauthenticated": {
+                "$ref": "#/components/examples/ProblemUnauthenticated"
+              }
+            }
+          }
+        }
+      },
+      "TooManyRequests": {
+        "description": "A quota or rate limit refused the request.",
+        "headers": {
+          "OpenMettle-API-Version": {
+            "$ref": "#/components/headers/ApiVersion"
+          },
+          "Retry-After": {
+            "$ref": "#/components/headers/RetryAfter"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "examples": {
+              "quota": {
+                "$ref": "#/components/examples/ProblemQuota"
+              },
+              "rateLimited": {
+                "$ref": "#/components/examples/ProblemRateLimited"
+              }
+            }
+          }
+        }
+      },
+      "Internal": {
+        "description": "An unexpected server failure. No internal detail is disclosed.",
+        "headers": {
+          "OpenMettle-API-Version": {
+            "$ref": "#/components/headers/ApiVersion"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "examples": {
+              "internal": {
+                "$ref": "#/components/examples/ProblemInternal"
+              }
+            }
+          }
+        }
+      },
+      "Unavailable": {
+        "description": "A required service is unavailable or the account or deployment is not provisioned for the request.",
+        "headers": {
+          "OpenMettle-API-Version": {
+            "$ref": "#/components/headers/ApiVersion"
+          },
+          "Retry-After": {
+            "$ref": "#/components/headers/RetryAfter"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "examples": {
+              "unavailable": {
+                "$ref": "#/components/examples/ProblemUnavailable"
+              },
+              "provisioning": {
+                "$ref": "#/components/examples/ProblemProvisioning"
+              }
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "ApiVersion": {
+        "description": "Major.minor contract version. This document defines major 1.",
+        "type": "string",
+        "maxLength": 9,
+        "pattern": "^1\\.(?:0|[1-9][0-9]{0,6})$"
+      },
+      "Uuid": {
+        "description": "Canonical lowercase UUID. Identifiers are random and never derived from secrets, digests or request content.",
+        "type": "string",
+        "format": "uuid",
+        "minLength": 36,
+        "maxLength": 36,
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+      },
+      "Timestamp": {
+        "description": "RFC 3339 UTC timestamp with exactly six fractional digits and a Z offset.",
+        "type": "string",
+        "format": "date-time",
+        "minLength": 27,
+        "maxLength": 27,
+        "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{6}Z$"
+      },
+      "NonNegativeDecimal": {
+        "description": "Canonical base-10 integer from 0 to 9223372036854775807 (signed 64-bit maximum) encoded as a string, without sign, leading zeros, exponent or fraction. Used for byte sizes and counters so JavaScript and Dart consumers cannot silently lose precision.",
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 19,
+        "pattern": "^(?:0|[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$"
+      },
+      "PositiveSequence": {
+        "description": "Canonical base-10 integer from 1 to 9223372036854775807 encoded as a string. Per-run event sequences start at 1.",
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 19,
+        "pattern": "^(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)$"
+      },
+      "IdempotencyKey": {
+        "description": "1 to 128 visible ASCII characters (0x21-0x7E). Character and byte length are therefore equal.",
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[!-~]{1,128}$"
+      },
+      "Cursor": {
+        "description": "Opaque, server-issued cursor in unpadded base64url characters. Clients store and return it unchanged and never parse it. Binding cursors to the caller and request context is a runtime obligation; this contract does not claim an implemented signature or MAC.",
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": "^[A-Za-z0-9_-]{1,512}$"
+      },
+      "Code": {
+        "description": "Stable machine-readable code from an open vocabulary. Consumers must tolerate values they do not recognize.",
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "pattern": "^[a-z][a-z0-9_]{0,63}$"
+      },
+      "PageInfo": {
+        "description": "Pagination state for list responses. next_cursor is null on the final page.",
+        "type": "object",
+        "required": [
+          "next_cursor"
+        ],
+        "properties": {
+          "next_cursor": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Cursor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "Problem": {
+        "description": "RFC 9457 problem details. detail is a bounded, safe message: it never contains credentials, upstream provider bodies, identity claims, internal identifiers or information about other users' resources. A resource the caller may not know about yields not_found rather than policy. Known codes are bound to their HTTP status; unrecognized codes are classified by status.",
+        "type": "object",
+        "required": [
+          "type",
+          "title",
+          "status",
+          "code",
+          "request_id"
+        ],
+        "properties": {
+          "type": {
+            "description": "Problem type URI reference. v1 emits about:blank and relies on code for classification.",
+            "type": "string",
+            "format": "uri-reference",
+            "maxLength": 256
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "status": {
+            "type": "integer",
+            "minimum": 400,
+            "maximum": 599
+          },
+          "code": {
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "validation",
+              "invalid_cursor",
+              "unauthenticated",
+              "policy",
+              "not_found",
+              "conflict",
+              "idempotency_conflict",
+              "quota",
+              "rate_limited",
+              "unavailable",
+              "provisioning",
+              "timeout",
+              "provider_failure",
+              "internal"
+            ]
+          },
+          "detail": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "errors": {
+            "description": "Request locations that failed validation. Values supplied by the client are never echoed.",
+            "type": "array",
+            "maxItems": 32,
+            "items": {
+              "$ref": "#/components/schemas/ProblemField"
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "code": {
+                  "enum": [
+                    "validation",
+                    "invalid_cursor"
+                  ]
+                }
+              },
+              "required": [
+                "code"
+              ]
+            },
+            "then": {
+              "properties": {
+                "status": {
+                  "const": 400
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "code": {
+                  "const": "unauthenticated"
+                }
+              },
+              "required": [
+                "code"
+              ]
+            },
+            "then": {
+              "properties": {
+                "status": {
+                  "const": 401
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "code": {
+                  "const": "policy"
+                }
+              },
+              "required": [
+                "code"
+              ]
+            },
+            "then": {
+              "properties": {
+                "status": {
+                  "const": 403
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "code": {
+                  "const": "not_found"
+                }
+              },
+              "required": [
+                "code"
+              ]
+            },
+            "then": {
+              "properties": {
+                "status": {
+                  "const": 404
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "code": {
+                  "enum": [
+                    "conflict",
+                    "idempotency_conflict"
+                  ]
+                }
+              },
+              "required": [
+                "code"
+              ]
+            },
+            "then": {
+              "properties": {
+                "status": {
+                  "const": 409
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "code": {
+                  "enum": [
+                    "quota",
+                    "rate_limited"
+                  ]
+                }
+              },
+              "required": [
+                "code"
+              ]
+            },
+            "then": {
+              "properties": {
+                "status": {
+                  "const": 429
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "code": {
+                  "const": "internal"
+                }
+              },
+              "required": [
+                "code"
+              ]
+            },
+            "then": {
+              "properties": {
+                "status": {
+                  "const": 500
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "code": {
+                  "const": "provider_failure"
+                }
+              },
+              "required": [
+                "code"
+              ]
+            },
+            "then": {
+              "properties": {
+                "status": {
+                  "const": 502
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "code": {
+                  "enum": [
+                    "unavailable",
+                    "provisioning"
+                  ]
+                }
+              },
+              "required": [
+                "code"
+              ]
+            },
+            "then": {
+              "properties": {
+                "status": {
+                  "const": 503
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "code": {
+                  "const": "timeout"
+                }
+              },
+              "required": [
+                "code"
+              ]
+            },
+            "then": {
+              "properties": {
+                "status": {
+                  "const": 504
+                }
+              }
+            }
+          }
+        ]
+      },
+      "ProblemField": {
+        "type": "object",
+        "required": [
+          "in",
+          "pointer",
+          "reason"
+        ],
+        "properties": {
+          "in": {
+            "description": "Request part: body, query, header or path (open vocabulary).",
+            "$ref": "#/components/schemas/Code"
+          },
+          "pointer": {
+            "description": "RFC 6901 JSON Pointer into the body, or /name for a parameter.",
+            "type": "string",
+            "maxLength": 256,
+            "pattern": "^(?:/(?:[^~/]|~[01])*)*$"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/Code"
+          }
+        }
+      },
+      "CapabilityList": {
+        "description": "Capabilities visible to the authenticated caller. An empty list is valid: the core has no optional provider installed.",
+        "type": "object",
+        "required": [
+          "generated_at",
+          "capabilities"
+        ],
+        "properties": {
+          "generated_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "capabilities": {
+            "type": "array",
+            "maxItems": 256,
+            "items": {
+              "$ref": "#/components/schemas/Capability"
+            }
+          }
+        }
+      },
+      "Capability": {
+        "description": "One capability with independent dimensions. installed reports deployment configuration. authorization reports whether the caller may use it: true, false or null when not yet determined; null is unknown, never false. readiness reports provider observation and is present only when installed. No dimension implies another.",
+        "type": "object",
+        "required": [
+          "id",
+          "kind",
+          "installed",
+          "authorization"
+        ],
+        "properties": {
+          "id": {
+            "description": "Stable capability identifier (open vocabulary).",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[a-z][a-z0-9._-]{0,63}$"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/Code"
+          },
+          "installed": {
+            "type": "boolean"
+          },
+          "authorization": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "readiness": {
+            "$ref": "#/components/schemas/Readiness"
+          }
+        },
+        "if": {
+          "properties": {
+            "installed": {
+              "const": true
+            }
+          },
+          "required": [
+            "installed"
+          ]
+        },
+        "then": {
+          "required": [
+            "readiness"
+          ]
+        },
+        "else": {
+          "not": {
+            "required": [
+              "readiness"
+            ]
+          }
+        }
+      },
+      "Readiness": {
+        "description": "Provider readiness. Known states are ready, degraded, unavailable and unknown (open vocabulary). ready, degraded and unavailable are observations and carry observed_at. unknown means no current observation; it is not unavailable and not ready. Consumers treat unrecognized states as not ready.",
+        "type": "object",
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "state": {
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "ready",
+              "degraded",
+              "unavailable",
+              "unknown"
+            ]
+          },
+          "observed_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/Code"
+          }
+        },
+        "if": {
+          "properties": {
+            "state": {
+              "enum": [
+                "ready",
+                "degraded",
+                "unavailable"
+              ]
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        "then": {
+          "required": [
+            "observed_at"
+          ]
+        }
+      },
+      "RunEventItem": {
+        "description": "One parsed text/event-stream item of the RunEventStream media type (OAS 3.2 sequential media type with itemSchema). id is the opaque resume cursor. data carries one JSON RunEvent; contentSchema is not validated automatically by OAS tooling, so consumers decode and validate it explicitly. Clients ignore event types they do not recognize but still advance their cursor to the item id. Comments and unknown SSE fields are discarded by SSE parsing before this schema applies.",
+        "type": "object",
+        "required": [
+          "id",
+          "data"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Cursor"
+          },
+          "event": {
+            "type": "string",
+            "maxLength": 64
+          },
+          "retry": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 600000
+          },
+          "data": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 131072,
+            "contentMediaType": "application/json",
+            "contentSchema": {
+              "$ref": "#/components/schemas/RunEvent"
+            }
+          }
+        }
+      },
+      "RunEvent": {
+        "description": "Persisted run event envelope. sequence is monotonic per run. type is an open vocabulary; this contract defines no event types yet and consumers must ignore types they do not recognize.",
+        "type": "object",
+        "required": [
+          "run_id",
+          "sequence",
+          "type",
+          "type_version",
+          "occurred_at",
+          "data"
+        ],
+        "properties": {
+          "run_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "sequence": {
+            "$ref": "#/components/schemas/PositiveSequence"
+          },
+          "type": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[a-z][a-z0-9._-]{0,127}$"
+          },
+          "type_version": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2147483647
+          },
+          "occurred_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "data": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "examples": {
+      "CapabilitiesMixed": {
+        "summary": "Independent installed, authorization and readiness dimensions (synthetic, illustrative identifiers)",
+        "dataValue": {
+          "generated_at": "2026-11-17T09:00:00.000000Z",
+          "capabilities": [
+            {
+              "id": "chat.completions",
+              "kind": "inference",
+              "installed": true,
+              "authorization": true,
+              "readiness": {
+                "state": "ready",
+                "observed_at": "2026-11-17T08:59:58.000000Z"
+              }
+            },
+            {
+              "id": "search.web",
+              "kind": "tool",
+              "installed": true,
+              "authorization": false,
+              "readiness": {
+                "state": "unavailable",
+                "observed_at": "2026-11-17T08:59:41.250000Z",
+                "reason": "provider_unreachable"
+              }
+            },
+            {
+              "id": "media.image",
+              "kind": "media",
+              "installed": false,
+              "authorization": null
+            },
+            {
+              "id": "memory.graph",
+              "kind": "memory",
+              "installed": true,
+              "authorization": null,
+              "readiness": {
+                "state": "unknown",
+                "reason": "not_observed"
+              }
+            },
+            {
+              "id": "retrieval.rerank",
+              "kind": "retrieval",
+              "installed": true,
+              "authorization": true,
+              "readiness": {
+                "state": "degraded",
+                "observed_at": "2026-11-17T08:59:30.000001Z",
+                "reason": "capacity_limited"
+              }
+            }
+          ]
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/CapabilityList",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "authorization-not-boolean",
+              "class": "invalid",
+              "op": "set",
+              "path": "/capabilities/0/authorization",
+              "value": "yes",
+              "expect": {
+                "instancePath": "/capabilities/0/authorization",
+                "keyword": "type"
+              }
+            },
+            {
+              "name": "authorization-missing",
+              "class": "invalid",
+              "op": "remove",
+              "path": "/capabilities/2/authorization",
+              "expect": {
+                "instancePath": "/capabilities/2",
+                "keyword": "required"
+              }
+            },
+            {
+              "name": "installed-without-readiness",
+              "class": "invalid",
+              "op": "remove",
+              "path": "/capabilities/0/readiness",
+              "expect": {
+                "instancePath": "/capabilities/0",
+                "keyword": "required"
+              }
+            },
+            {
+              "name": "absent-with-readiness",
+              "class": "invalid",
+              "op": "set",
+              "path": "/capabilities/2/readiness",
+              "value": {
+                "state": "unavailable",
+                "observed_at": "2026-11-17T08:59:41.250000Z"
+              },
+              "expect": {
+                "instancePath": "/capabilities/2",
+                "keyword": "not"
+              }
+            },
+            {
+              "name": "unavailable-without-observation",
+              "class": "invalid",
+              "op": "remove",
+              "path": "/capabilities/1/readiness/observed_at",
+              "expect": {
+                "instancePath": "/capabilities/1/readiness",
+                "keyword": "required"
+              }
+            },
+            {
+              "name": "installed-not-boolean",
+              "class": "invalid",
+              "op": "set",
+              "path": "/capabilities/0/installed",
+              "value": "true",
+              "expect": {
+                "instancePath": "/capabilities/0/installed",
+                "keyword": "type"
+              }
+            },
+            {
+              "name": "observed-at-without-microseconds",
+              "class": "invalid",
+              "op": "set",
+              "path": "/capabilities/0/readiness/observed_at",
+              "value": "2026-11-17T08:59:58Z",
+              "expect": {
+                "instancePath": "/capabilities/0/readiness/observed_at",
+                "keyword": "pattern"
+              }
+            },
+            {
+              "name": "capability-id-uppercase",
+              "class": "invalid",
+              "op": "set",
+              "path": "/capabilities/0/id",
+              "value": "Chat",
+              "expect": {
+                "instancePath": "/capabilities/0/id",
+                "keyword": "pattern"
+              }
+            },
+            {
+              "name": "unrecognized-readiness-state",
+              "class": "compat",
+              "op": "set",
+              "path": "/capabilities/0/readiness/state",
+              "value": "warming"
+            },
+            {
+              "name": "nested-unknown-field",
+              "class": "compat",
+              "op": "set",
+              "path": "/capabilities/1/x_future_detail",
+              "value": {
+                "added_in": "1.9"
+              }
+            },
+            {
+              "name": "unrecognized-kind",
+              "class": "compat",
+              "op": "set",
+              "path": "/capabilities/0/kind",
+              "value": "hologram"
+            }
+          ]
+        }
+      },
+      "CapabilitiesCoreOnly": {
+        "summary": "Core installation with no optional provider installed",
+        "dataValue": {
+          "generated_at": "2026-11-17T09:00:00.000000Z",
+          "capabilities": []
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/CapabilityList",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "capabilities-null",
+              "class": "invalid",
+              "op": "set",
+              "path": "/capabilities",
+              "value": null,
+              "expect": {
+                "instancePath": "/capabilities",
+                "keyword": "type"
+              }
+            }
+          ]
+        }
+      },
+      "ProblemValidation": {
+        "summary": "validation (400)",
+        "dataValue": {
+          "type": "about:blank",
+          "title": "Bad Request",
+          "status": 400,
+          "code": "validation",
+          "detail": "The request does not satisfy the API contract.",
+          "request_id": "6f1c2b9e-3d4a-4c5b-8e7f-0a1b2c3d4e5f",
+          "errors": [
+            {
+              "in": "query",
+              "pointer": "/limit",
+              "reason": "out_of_range"
+            }
+          ]
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Problem",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "status-422",
+              "class": "invalid",
+              "op": "set",
+              "path": "/status",
+              "value": 422,
+              "expect": {
+                "instancePath": "/status",
+                "keyword": "const"
+              }
+            },
+            {
+              "name": "detail-too-long",
+              "class": "invalid",
+              "op": "set",
+              "path": "/detail",
+              "repeat": [
+                "x",
+                513
+              ],
+              "expect": {
+                "instancePath": "/detail",
+                "keyword": "maxLength"
+              }
+            },
+            {
+              "name": "code-not-snake-case",
+              "class": "invalid",
+              "op": "set",
+              "path": "/code",
+              "value": "Validation-Error",
+              "expect": {
+                "instancePath": "/code",
+                "keyword": "pattern"
+              }
+            },
+            {
+              "name": "request-id-uppercase",
+              "class": "invalid",
+              "op": "set",
+              "path": "/request_id",
+              "value": "6F1C2B9E-3D4A-4C5B-8E7F-0A1B2C3D4E5F",
+              "expect": {
+                "instancePath": "/request_id",
+                "keyword": "pattern"
+              }
+            },
+            {
+              "name": "error-pointer-malformed",
+              "class": "invalid",
+              "op": "set",
+              "path": "/errors/0/pointer",
+              "value": "limit",
+              "expect": {
+                "instancePath": "/errors/0/pointer",
+                "keyword": "pattern"
+              }
+            },
+            {
+              "name": "unrecognized-code",
+              "class": "compat",
+              "op": "set",
+              "path": "/code",
+              "value": "schema_epoch_mismatch"
+            },
+            {
+              "name": "pointer-escaped-tokens",
+              "class": "valid",
+              "op": "set",
+              "path": "/errors/0/pointer",
+              "value": "/a~1b/~0key"
+            },
+            {
+              "name": "pointer-root",
+              "class": "valid",
+              "op": "set",
+              "path": "/errors/0/pointer",
+              "value": ""
+            },
+            {
+              "name": "pointer-empty-token",
+              "class": "valid",
+              "op": "set",
+              "path": "/errors/0/pointer",
+              "value": "/"
+            },
+            {
+              "name": "pointer-invalid-escape",
+              "class": "invalid",
+              "op": "set",
+              "path": "/errors/0/pointer",
+              "value": "/bad~2key",
+              "expect": {
+                "instancePath": "/errors/0/pointer",
+                "keyword": "pattern"
+              }
+            },
+            {
+              "name": "pointer-trailing-tilde",
+              "class": "invalid",
+              "op": "set",
+              "path": "/errors/0/pointer",
+              "value": "/trailing~",
+              "expect": {
+                "instancePath": "/errors/0/pointer",
+                "keyword": "pattern"
+              }
+            }
+          ]
+        }
+      },
+      "ProblemInvalidCursor": {
+        "summary": "invalid_cursor (400)",
+        "dataValue": {
+          "type": "about:blank",
+          "title": "Bad Request",
+          "status": 400,
+          "code": "invalid_cursor",
+          "detail": "The cursor is not valid for this request.",
+          "request_id": "0b7d3f52-1a2e-4f6c-9d8b-7e6a5c4b3a21"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Problem",
+          "direction": "response",
+          "mutations": []
+        }
+      },
+      "ProblemUnauthenticated": {
+        "summary": "unauthenticated (401)",
+        "dataValue": {
+          "type": "about:blank",
+          "title": "Unauthorized",
+          "status": 401,
+          "code": "unauthenticated",
+          "request_id": "a3e1c0d9-8b7f-4e6d-9c5b-4a3f2e1d0c9b"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Problem",
+          "direction": "response",
+          "mutations": []
+        }
+      },
+      "ProblemPolicy": {
+        "summary": "policy (403): only for a resource whose existence the caller is already authorized to know",
+        "dataValue": {
+          "type": "about:blank",
+          "title": "Forbidden",
+          "status": 403,
+          "code": "policy",
+          "detail": "Your access to this resource does not permit this action.",
+          "request_id": "5d4c3b2a-1f0e-4d9c-8b7a-6f5e4d3c2b1a"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Problem",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "policy-as-404",
+              "class": "invalid",
+              "op": "set",
+              "path": "/status",
+              "value": 404,
+              "expect": {
+                "instancePath": "/status",
+                "keyword": "const"
+              }
+            }
+          ]
+        }
+      },
+      "ProblemNotFound": {
+        "summary": "not_found (404): also conceals resources the caller may not know about",
+        "dataValue": {
+          "type": "about:blank",
+          "title": "Not Found",
+          "status": 404,
+          "code": "not_found",
+          "request_id": "9e8d7c6b-5a4f-4e3d-8c2b-1a0f9e8d7c6b"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Problem",
+          "direction": "response",
+          "mutations": []
+        }
+      },
+      "ProblemConflict": {
+        "summary": "conflict (409)",
+        "dataValue": {
+          "type": "about:blank",
+          "title": "Conflict",
+          "status": 409,
+          "code": "conflict",
+          "detail": "The resource changed since it was read.",
+          "request_id": "1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Problem",
+          "direction": "response",
+          "mutations": []
+        }
+      },
+      "ProblemIdempotencyConflict": {
+        "summary": "idempotency_conflict (409)",
+        "dataValue": {
+          "type": "about:blank",
+          "title": "Conflict",
+          "status": 409,
+          "code": "idempotency_conflict",
+          "detail": "The idempotency key was already used with a different request.",
+          "request_id": "2d3e4f5a-6b7c-4d8e-9f0a-1b2c3d4e5f6a"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Problem",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "idempotency-conflict-as-422",
+              "class": "invalid",
+              "op": "set",
+              "path": "/status",
+              "value": 422,
+              "expect": {
+                "instancePath": "/status",
+                "keyword": "const"
+              }
+            }
+          ]
+        }
+      },
+      "ProblemQuota": {
+        "summary": "quota (429)",
+        "dataValue": {
+          "type": "about:blank",
+          "title": "Too Many Requests",
+          "status": 429,
+          "code": "quota",
+          "detail": "A usage quota for this account has been reached.",
+          "request_id": "3e4f5a6b-7c8d-4e9f-8a1b-2c3d4e5f6a7b"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Problem",
+          "direction": "response",
+          "mutations": []
+        }
+      },
+      "ProblemRateLimited": {
+        "summary": "rate_limited (429)",
+        "dataValue": {
+          "type": "about:blank",
+          "title": "Too Many Requests",
+          "status": 429,
+          "code": "rate_limited",
+          "request_id": "4f5a6b7c-8d9e-4f0a-9b2c-3d4e5f6a7b8c"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Problem",
+          "direction": "response",
+          "mutations": []
+        }
+      },
+      "ProblemInternal": {
+        "summary": "internal (500)",
+        "dataValue": {
+          "type": "about:blank",
+          "title": "Internal Server Error",
+          "status": 500,
+          "code": "internal",
+          "request_id": "5a6b7c8d-9e0f-4a1b-8c3d-4e5f6a7b8c9d"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Problem",
+          "direction": "response",
+          "mutations": []
+        }
+      },
+      "ProblemProviderFailure": {
+        "summary": "provider_failure (502): upstream bodies and credentials are never relayed",
+        "dataValue": {
+          "type": "about:blank",
+          "title": "Bad Gateway",
+          "status": 502,
+          "code": "provider_failure",
+          "detail": "The provider did not complete the request.",
+          "request_id": "6b7c8d9e-0f1a-4b2c-9d4e-5f6a7b8c9d0e"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Problem",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "provider-failure-as-503",
+              "class": "invalid",
+              "op": "set",
+              "path": "/status",
+              "value": 503,
+              "expect": {
+                "instancePath": "/status",
+                "keyword": "const"
+              }
+            }
+          ]
+        }
+      },
+      "ProblemUnavailable": {
+        "summary": "unavailable (503)",
+        "dataValue": {
+          "type": "about:blank",
+          "title": "Service Unavailable",
+          "status": 503,
+          "code": "unavailable",
+          "detail": "A required service is temporarily unavailable.",
+          "request_id": "7c8d9e0f-1a2b-4c3d-8e5f-6a7b8c9d0e1f"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Problem",
+          "direction": "response",
+          "mutations": []
+        }
+      },
+      "ProblemProvisioning": {
+        "summary": "provisioning (503): account or deployment not provisioned for this request",
+        "dataValue": {
+          "type": "about:blank",
+          "title": "Service Unavailable",
+          "status": 503,
+          "code": "provisioning",
+          "detail": "This account is not yet provisioned for the requested service.",
+          "request_id": "8d9e0f1a-2b3c-4d4e-9f6a-7b8c9d0e1f2a"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Problem",
+          "direction": "response",
+          "mutations": []
+        }
+      },
+      "ProblemTimeout": {
+        "summary": "timeout (504)",
+        "dataValue": {
+          "type": "about:blank",
+          "title": "Gateway Timeout",
+          "status": 504,
+          "code": "timeout",
+          "detail": "The operation did not finish in time; its outcome may still be unknown.",
+          "request_id": "9e0f1a2b-3c4d-4e5f-8a7b-8c9d0e1f2a3b"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Problem",
+          "direction": "response",
+          "mutations": []
+        }
+      },
+      "PageInfoMore": {
+        "summary": "A page followed by another page",
+        "dataValue": {
+          "next_cursor": "c3ludGhldGljLWN1cnNvcg"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/PageInfo",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "cursor-padded-base64",
+              "class": "invalid",
+              "op": "set",
+              "path": "/next_cursor",
+              "value": "c3ludGhldGljLWN1cnNvcg==",
+              "expect": {
+                "instancePath": "/next_cursor",
+                "keyword": "oneOf"
+              }
+            },
+            {
+              "name": "cursor-empty",
+              "class": "invalid",
+              "op": "set",
+              "path": "/next_cursor",
+              "value": "",
+              "expect": {
+                "instancePath": "/next_cursor",
+                "keyword": "oneOf"
+              }
+            }
+          ]
+        }
+      },
+      "PageInfoLast": {
+        "summary": "The final page",
+        "dataValue": {
+          "next_cursor": null
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/PageInfo",
+          "direction": "response",
+          "mutations": []
+        }
+      },
+      "RunEventItemNote": {
+        "summary": "One parsed SSE item carrying a run event of an illustrative, undefined type",
+        "dataValue": {
+          "id": "cnVuLWV2ZW50LWN1cnNvci00Mg",
+          "data": "{\"data\":{},\"occurred_at\":\"2026-11-17T09:00:01.000000Z\",\"run_id\":\"0f0e0d0c-0b0a-4908-8706-050403020100\",\"sequence\":\"42\",\"type\":\"example.note\",\"type_version\":1}"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/RunEventItem",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "data-not-json",
+              "class": "invalid",
+              "op": "set",
+              "path": "/data",
+              "value": "not json",
+              "expect": {
+                "content": "/data",
+                "decode": true
+              }
+            },
+            {
+              "name": "sequence-zero",
+              "class": "invalid",
+              "op": "set",
+              "path": "/data#/sequence",
+              "value": "0",
+              "expect": {
+                "content": "/data",
+                "instancePath": "/sequence",
+                "keyword": "pattern"
+              }
+            },
+            {
+              "name": "sequence-above-signed-64",
+              "class": "invalid",
+              "op": "set",
+              "path": "/data#/sequence",
+              "value": "9223372036854775808",
+              "expect": {
+                "content": "/data",
+                "instancePath": "/sequence",
+                "keyword": "pattern"
+              }
+            },
+            {
+              "name": "sequence-json-number",
+              "class": "invalid",
+              "op": "set",
+              "path": "/data#/sequence",
+              "value": 42,
+              "expect": {
+                "content": "/data",
+                "instancePath": "/sequence",
+                "keyword": "type"
+              }
+            },
+            {
+              "name": "run-id-missing",
+              "class": "invalid",
+              "op": "remove",
+              "path": "/data#/run_id",
+              "expect": {
+                "content": "/data",
+                "instancePath": "",
+                "keyword": "required"
+              }
+            },
+            {
+              "name": "retry-negative",
+              "class": "invalid",
+              "op": "set",
+              "path": "/retry",
+              "value": -1,
+              "expect": {
+                "instancePath": "/retry",
+                "keyword": "minimum"
+              }
+            },
+            {
+              "name": "sequence-signed-64-maximum",
+              "class": "valid",
+              "op": "set",
+              "path": "/data#/sequence",
+              "value": "9223372036854775807"
+            },
+            {
+              "name": "unrecognized-type",
+              "class": "compat",
+              "op": "set",
+              "path": "/data#/type",
+              "value": "example.added_in_a_later_minor"
+            },
+            {
+              "name": "unknown-envelope-field",
+              "class": "compat",
+              "op": "set",
+              "path": "/data#/x_future_envelope",
+              "value": {
+                "added_in": "1.9"
+              }
+            },
+            {
+              "name": "named-sse-event",
+              "class": "compat",
+              "op": "set",
+              "path": "/event",
+              "value": "example.named"
+            }
+          ]
+        }
+      },
+      "ApiVersionCurrent": {
+        "summary": "Response version header",
+        "dataValue": "1.0",
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/ApiVersion",
+          "direction": "value",
+          "mutations": [
+            {
+              "name": "newer-minor",
+              "class": "compat",
+              "op": "set",
+              "path": "",
+              "value": "1.12"
+            },
+            {
+              "name": "unsupported-major",
+              "class": "invalid",
+              "op": "set",
+              "path": "",
+              "value": "2.0",
+              "expect": {
+                "instancePath": "",
+                "keyword": "pattern"
+              }
+            },
+            {
+              "name": "major-only",
+              "class": "invalid",
+              "op": "set",
+              "path": "",
+              "value": "1",
+              "expect": {
+                "instancePath": "",
+                "keyword": "pattern"
+              }
+            },
+            {
+              "name": "leading-zero-minor",
+              "class": "invalid",
+              "op": "set",
+              "path": "",
+              "value": "1.01",
+              "expect": {
+                "instancePath": "",
+                "keyword": "pattern"
+              }
+            }
+          ]
+        }
+      },
+      "CounterZero": {
+        "summary": "Smallest counter or byte size",
+        "dataValue": "0",
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/NonNegativeDecimal",
+          "direction": "value",
+          "mutations": [
+            {
+              "name": "signed-64-maximum",
+              "class": "valid",
+              "op": "set",
+              "path": "",
+              "value": "9223372036854775807"
+            },
+            {
+              "name": "above-signed-64",
+              "class": "invalid",
+              "op": "set",
+              "path": "",
+              "value": "9223372036854775808",
+              "expect": {
+                "instancePath": "",
+                "keyword": "pattern"
+              }
+            },
+            {
+              "name": "twenty-digits",
+              "class": "invalid",
+              "op": "set",
+              "path": "",
+              "value": "10000000000000000000",
+              "expect": {
+                "instancePath": "",
+                "keyword": "maxLength"
+              }
+            },
+            {
+              "name": "leading-zero",
+              "class": "invalid",
+              "op": "set",
+              "path": "",
+              "value": "007",
+              "expect": {
+                "instancePath": "",
+                "keyword": "pattern"
+              }
+            },
+            {
+              "name": "negative",
+              "class": "invalid",
+              "op": "set",
+              "path": "",
+              "value": "-1",
+              "expect": {
+                "instancePath": "",
+                "keyword": "pattern"
+              }
+            },
+            {
+              "name": "exponent",
+              "class": "invalid",
+              "op": "set",
+              "path": "",
+              "value": "1e3",
+              "expect": {
+                "instancePath": "",
+                "keyword": "pattern"
+              }
+            },
+            {
+              "name": "json-number",
+              "class": "invalid",
+              "op": "set",
+              "path": "",
+              "value": 9007199254740993,
+              "expect": {
+                "instancePath": "",
+                "keyword": "type"
+              }
+            }
+          ]
+        }
+      },
+      "IdempotencyKeyTypical": {
+        "summary": "Visible ASCII idempotency key",
+        "dataValue": "retry-7f3a:create-run",
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/IdempotencyKey",
+          "direction": "value",
+          "mutations": [
+            {
+              "name": "maximum-length",
+              "class": "valid",
+              "op": "set",
+              "path": "",
+              "repeat": [
+                "k",
+                128
+              ]
+            },
+            {
+              "name": "too-long",
+              "class": "invalid",
+              "op": "set",
+              "path": "",
+              "repeat": [
+                "k",
+                129
+              ],
+              "expect": {
+                "instancePath": "",
+                "keyword": "maxLength"
+              }
+            },
+            {
+              "name": "empty",
+              "class": "invalid",
+              "op": "set",
+              "path": "",
+              "value": "",
+              "expect": {
+                "instancePath": "",
+                "keyword": "minLength"
+              }
+            },
+            {
+              "name": "space",
+              "class": "invalid",
+              "op": "set",
+              "path": "",
+              "value": "has space",
+              "expect": {
+                "instancePath": "",
+                "keyword": "pattern"
+              }
+            },
+            {
+              "name": "non-ascii",
+              "class": "invalid",
+              "op": "set",
+              "path": "",
+              "value": "clé",
+              "expect": {
+                "instancePath": "",
+                "keyword": "pattern"
+              }
+            }
+          ]
+        }
+      },
+      "TimestampCanonical": {
+        "summary": "Canonical UTC timestamp",
+        "dataValue": "2026-11-17T09:00:00.123456Z",
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Timestamp",
+          "direction": "value",
+          "mutations": [
+            {
+              "name": "offset-not-utc",
+              "class": "invalid",
+              "op": "set",
+              "path": "",
+              "value": "2026-11-17T09:00:00.123456+01:00",
+              "expect": {
+                "instancePath": "",
+                "keyword": "maxLength"
+              }
+            },
+            {
+              "name": "milliseconds",
+              "class": "invalid",
+              "op": "set",
+              "path": "",
+              "value": "2026-11-17T09:00:00.123Z",
+              "expect": {
+                "instancePath": "",
+                "keyword": "pattern"
+              }
+            },
+            {
+              "name": "month-thirteen",
+              "class": "invalid",
+              "op": "set",
+              "path": "",
+              "value": "2026-13-17T09:00:00.123456Z",
+              "expect": {
+                "instancePath": "",
+                "keyword": "format"
+              }
+            }
+          ]
+        }
+      },
+      "UuidCanonical": {
+        "summary": "Canonical lowercase UUID",
+        "dataValue": "0f0e0d0c-0b0a-4908-8706-050403020100",
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Uuid",
+          "direction": "value",
+          "mutations": [
+            {
+              "name": "braced",
+              "class": "invalid",
+              "op": "set",
+              "path": "",
+              "value": "{0f0e0d0c-0b0a-4908-8706-050403020100}",
+              "expect": {
+                "instancePath": "",
+                "keyword": "maxLength"
+              }
+            },
+            {
+              "name": "unhyphenated",
+              "class": "invalid",
+              "op": "set",
+              "path": "",
+              "value": "0f0e0d0c0b0a49088706050403020100",
+              "expect": {
+                "instancePath": "",
+                "keyword": "minLength"
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "class": "compat",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "RunEventItemNote--unrecognized-type",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "data": "{\"data\":{},\"occurred_at\":\"2026-11-17T09:00:01.000000Z\",\"run_id\":\"0f0e0d0c-0b0a-4908-8706-050403020100\",\"sequence\":\"42\",\"type\":\"example.added_in_a_later_minor\",\"type_version\":1}",
+    "id": "cnVuLWV2ZW50LWN1cnNvci00Mg"
+  },
+  "mutation": {
+    "name": "unrecognized-type",
+    "op": "set",
+    "path": "/data#/type",
+    "value": "example.added_in_a_later_minor"
+  },
+  "schema": "#/components/schemas/RunEventItem",
+  "source": "#/components/examples/RunEventItemNote"
+}

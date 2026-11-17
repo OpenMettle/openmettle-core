@@ -1,0 +1,25 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ProblemProviderFailure--auto-missing-code",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "detail": "The provider did not complete the request.",
+    "request_id": "6b7c8d9e-0f1a-4b2c-9d4e-5f6a7b8c9d0e",
+    "status": 502,
+    "title": "Bad Gateway",
+    "type": "about:blank"
+  },
+  "mutation": {
+    "name": "auto-missing-code",
+    "op": "remove",
+    "path": "/code"
+  },
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemProviderFailure"
+}
