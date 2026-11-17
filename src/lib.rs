@@ -7,6 +7,7 @@ pub mod migrate;
 pub mod provider_http;
 pub mod provider_keys;
 pub mod runs;
+pub mod sessions;
 pub mod storage;
 
 use axum::{Router, extract::State, http::StatusCode, routing::get};
@@ -155,3 +156,7 @@ async fn serve(config: Config) -> Result<(), &'static str> {
     .await
     .map_err(|_| "shutdown deadline exceeded")?
 }
+
+#[cfg(test)]
+#[path = "../tests/support/response_barrier.rs"]
+pub(crate) mod response_barrier;

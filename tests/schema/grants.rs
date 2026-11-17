@@ -631,7 +631,7 @@ async fn migration_five_failure_kill_timeout_and_concurrent_retry() {
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success(), "{}", stderr(&out));
     }
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8]);
     assert_eq!(
         count(&db, "SELECT count(*) FROM openmettle.grant_mapping_rules").await,
         0
@@ -659,7 +659,7 @@ async fn old_domain_snapshot(db: &TestDb) -> Vec<String> {
         "artifact_revisions",
     ] {
         let rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT t::text FROM openmettle.{table} t ORDER BY t::text"
+            "SELECT (to_jsonb(t) - 'session_generation' - 'session_issued')::text FROM openmettle.{table} t ORDER BY 1"
         )))
         .fetch_all(&mut c)
         .await
@@ -685,13 +685,18 @@ async fn populated_v5_upgrade_and_authentic_v5_binaries() {
 async fn populated_v6_upgrade_and_authentic_v6_binaries() {
     populated_upgrade("V6_BINARY_DIR", &[1, 2, 3, 4, 5, 6], true).await;
 }
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 and authentic V7_BINARY_DIR required"]
+async fn populated_v7_upgrade_and_authentic_v7_binaries() {
+    populated_upgrade("V7_BINARY_DIR", &[1, 2, 3, 4, 5, 6, 7], true).await;
+}
 // Synthetic protected-login rows written with the API role's version-6 column grants.
 async fn login_snapshot(db: &TestDb) -> Vec<String> {
     let mut c = db.admin().await;
     let mut result = Vec::new();
     for table in ["login_nonce_reservations", "login_transactions"] {
         let rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT t::text FROM openmettle.{table} t ORDER BY t::text"
+            "SELECT (to_jsonb(t) - 'session_generation' - 'session_issued')::text FROM openmettle.{table} t ORDER BY 1"
         )))
         .fetch_all(&mut c)
         .await
@@ -812,6 +817,14 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
         api.execute("INSERT INTO openmettle.login_nonce_reservations (key_id, nonce) VALUES ('upgrade-key', decode(repeat('01', 12), 'hex'))").await.unwrap();
         api.execute("INSERT INTO openmettle.login_transactions (id,binding,expires_ms,state_hash,nonce_hash,caller_hash,key_id,nonce,ciphertext) VALUES (repeat('a', 43), 'synthetic-binding'::bytea, 1, decode(repeat('02', 32), 'hex'), decode(repeat('03', 32), 'hex'), decode(repeat('04', 32), 'hex'), 'upgrade-key', decode(repeat('01', 12), 'hex'), decode(repeat('05', 59), 'hex'))").await.unwrap();
     }
+    if versions.contains(&7) {
+        owner.execute("INSERT INTO openmettle.login_providers(id,issuer,client_id) VALUES ('00000000-0000-0000-0000-000000000007','https://upgrade.example.test','synthetic'); INSERT INTO openmettle.login_provider_revisions(provider_id,revision) VALUES ('00000000-0000-0000-0000-000000000007','v1')").await.unwrap();
+    }
+    let authority_before: Vec<String> = if versions.contains(&7) {
+        sqlx::query_scalar("SELECT row(id,issuer,client_id,created_at)::text FROM openmettle.login_providers ORDER BY id").fetch_all(&mut owner).await.unwrap()
+    } else {
+        vec![]
+    };
     let login_before = if with_login {
         login_snapshot(&db).await
     } else {
@@ -831,7 +844,7 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
     migrate::apply(&db.settings(Duration::from_secs(10)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8]);
     assert_eq!(old_domain_snapshot(&db).await, before);
     if with_grants {
         assert_eq!(grant_snapshot(&db).await, grant_before);
@@ -839,9 +852,29 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
     if with_login {
         assert_eq!(login_snapshot(&db).await, login_before);
     }
+    if versions.contains(&7) {
+        let after: Vec<String> = sqlx::query_scalar("SELECT row(id,issuer,client_id,created_at)::text FROM openmettle.login_providers ORDER BY id").fetch_all(&mut owner).await.unwrap();
+        assert_eq!(after, authority_before);
+        assert_eq!(
+            count(
+                &db,
+                "SELECT count(*) FROM openmettle.users WHERE session_generation <> 0"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT count(*) FROM openmettle.login_transactions WHERE session_issued"
+            )
+            .await,
+            0
+        );
+    }
     // Migration 7 creates empty authority tables: no managed provider is active until the
     // operator records one, so an upgraded deployment fails closed for managed login.
-    if versions.len() < MIGRATIONS.len() {
+    if !versions.contains(&7) {
         assert_eq!(
             count(&db, "SELECT count(*) FROM openmettle.login_providers").await
                 + count(

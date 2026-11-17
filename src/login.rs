@@ -411,6 +411,7 @@ pub struct Callback<'a> {
 }
 /// Created only after acknowledged consumption commit. Owns the code and exact provider.
 pub struct ExchangePermit {
+    pub(crate) origin: Option<(String, i64)>,
     provider: Arc<Provider>,
     // Managed only: the durable authority epoch committed with this consumption.
     epoch: Option<i64>,
@@ -514,6 +515,7 @@ async fn consume_inner(
         return Err(Error::Protection);
     }
     let permit = ExchangePermit {
+        origin: Some((id.to_owned(), expiry)),
         provider: p,
         epoch,
         code: Secret(c.code.into()),
@@ -661,6 +663,7 @@ pub(crate) mod fixture;
 #[cfg(test)]
 pub(crate) fn fixture_permit(provider: Arc<Provider>, epoch: Option<i64>) -> ExchangePermit {
     ExchangePermit {
+        origin: None,
         provider,
         epoch,
         code: Secret("synthetic-code".into()),
@@ -696,6 +699,7 @@ mod tests {
     }
     fn permit() -> ExchangePermit {
         ExchangePermit {
+            origin: None,
             provider: provider(),
             epoch: None,
             code: Secret("code".into()),
@@ -797,6 +801,7 @@ mod tests {
         let code = fake.authorize(url.as_str(), "synthetic-state");
         let http = |request| std::future::ready(fake.exchange(request));
         let permit = ExchangePermit {
+            origin: None,
             provider: p,
             epoch: None,
             code: Secret(code),
@@ -825,6 +830,7 @@ mod tests {
                 p.callback = "https://app.example.test/wrong".into();
             }
             let permit = ExchangePermit {
+                origin: None,
                 provider: Arc::new(p),
                 epoch: None,
                 code: Secret(code),
@@ -906,6 +912,7 @@ mod tests {
             let mut p = Arc::try_unwrap(provider()).unwrap();
             p.token = token;
             ExchangePermit {
+                origin: None,
                 provider: Arc::new(p),
                 epoch: None,
                 code: Secret(fake.authorize(url.as_str(), "synthetic-state")),

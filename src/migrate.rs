@@ -60,6 +60,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "login provider authority",
         sql: include_str!("../migrations/0007_login_provider_authority.sql"),
     },
+    Source {
+        version: 8,
+        description: "local identity approval and sessions",
+        sql: include_str!("../migrations/0008_local_identity_sessions.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

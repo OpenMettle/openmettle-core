@@ -5,6 +5,10 @@ Refs #5; Refs #34. Independent review remains required. #5 remains open.
 Supersedes only ADR 0011's process-local registration-serial binding and its
 "identical re-registration clears keys" behaviour. Every other ADR 0011 rule stands.
 
+Migration 8 / [ADR 0013](0013-local-identity-sessions.md) adds constrained lock permission and
+separate session access generations. Use its owner revocation/retirement protocol once sessions
+are installed; the epoch allocation order and current-row checks below still apply.
+
 ## Problem
 
 ADR 0011 persisted a managed login binding that included a process-local registration

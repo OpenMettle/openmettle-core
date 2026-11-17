@@ -387,6 +387,13 @@ pub(crate) struct VerifiedAssertion {
 }
 impl VerifiedAssertion {
     pub(crate) fn release(self, now: SystemTime) -> Result<VerifiedIdentity, VerifyError> {
+        self.check(now)?;
+        Ok(self.identity)
+    }
+    pub(crate) fn identity(&self) -> &VerifiedIdentity {
+        &self.identity
+    }
+    pub(crate) fn check(&self, now: SystemTime) -> Result<(), VerifyError> {
         let now = utc(now)?;
         if now < self.checked_at {
             return Err(VerifyError::Clock);
@@ -401,7 +408,7 @@ impl VerifiedAssertion {
         {
             return Err(VerifyError::IssuedTooLongAgo);
         }
-        Ok(self.identity)
+        Ok(())
     }
 }
 

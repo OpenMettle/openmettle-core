@@ -568,6 +568,17 @@ impl ManagedProvider {
         assertion: auth::VerifiedAssertion,
         deadline: Instant,
     ) -> Result<VerifiedIdentity, Error> {
+        self.check_assertion(key_generation, &assertion, deadline)?;
+        assertion
+            .release(self.manager.now().wall)
+            .map_err(|_| Error::Verification)
+    }
+    fn check_assertion(
+        &self,
+        key_generation: u64,
+        assertion: &auth::VerifiedAssertion,
+        deadline: Instant,
+    ) -> Result<(), Error> {
         #[cfg(test)]
         self.before_release();
         let mut s = self.entry.state.lock().unwrap();
@@ -586,7 +597,7 @@ impl ManagedProvider {
         if Instant::now() >= deadline {
             return Err(Error::Timeout);
         }
-        assertion.release(now.wall).map_err(|_| Error::Verification)
+        assertion.check(now.wall).map_err(|_| Error::Verification)
     }
     pub async fn begin(
         &self,
@@ -656,12 +667,14 @@ impl ManagedProvider {
                 return Err(login::Error::Rejected);
             }
             // No await between active-config check and starting the one permitted token POST.
+            let origin = permit.origin.clone();
             let (token, nonce) = permit.request_token(&c.token).await?;
             let (key_generation, assertion) = self
                 .verify(&token, &nonce, policy)
                 .await
                 .map_err(|_| login::Error::Verification)?;
             Ok(ExchangedIdentity {
+                origin,
                 entry: self.entry.clone(),
                 generation: self.generation,
                 key_generation,
@@ -706,6 +719,52 @@ impl ManagedProvider {
         .await
         .map_err(|_| login::Error::Exchange)?
     }
+    /// Consume a managed online proof into a locally approved existing user's session.
+    /// Offline VerifiedIdentity values cannot reach this operation.
+    pub async fn issue_session(
+        &self,
+        connection: &mut sqlx::PgConnection,
+        exchanged: ExchangedIdentity,
+        policy: &crate::sessions::Policy,
+    ) -> Result<crate::sessions::Credential, crate::sessions::Error> {
+        use crate::sessions::{self, Error as SessionError};
+        if !Arc::ptr_eq(&self.entry, &exchanged.entry) || self.generation != exchanged.generation {
+            return Err(SessionError::Rejected);
+        }
+        let _admission = self.admission().map_err(|_| SessionError::Rejected)?;
+        let config = self.config().map_err(|_| SessionError::Rejected)?;
+        let (login, login_expiry) = exchanged.origin.as_ref().ok_or(SessionError::Rejected)?;
+        let identity = exchanged.assertion.identity();
+        let (provider, issuer, client) = config.identity.binding();
+        if identity.provider_config_id() != provider || identity.issuer() != issuer {
+            return Err(SessionError::Rejected);
+        }
+        sessions::issue(
+            connection,
+            sessions::Issuance {
+                provider,
+                issuer,
+                client,
+                revision: &config.revision,
+                subject: identity.subject(),
+                epoch: exchanged.epoch,
+                login,
+                login_expiry: *login_expiry,
+                binding: persisted(&config.binding, exchanged.epoch),
+                deadline: exchanged.deadline,
+            },
+            policy,
+            || {
+                self.check_assertion(
+                    exchanged.key_generation,
+                    &exchanged.assertion,
+                    exchanged.deadline,
+                )
+                .map_err(|_| SessionError::Rejected)
+            },
+        )
+        .await
+    }
     #[cfg(test)]
     async fn pause(&self, point: &'static str) {
         let barrier = self
@@ -730,9 +789,10 @@ impl ManagedProvider {
     }
 }
 
-/// Sealed managed exchange result. Not cloneable, no identity accessor; only `release`
-/// converts it, after the committed-authority and in-memory generation checks.
+/// Sealed managed exchange result. Not cloneable, no public identity accessor. `release`
+/// converts it after authority checks; `issue_session` consumes it under local approval.
 pub struct ExchangedIdentity {
+    origin: Option<(String, i64)>,
     entry: Arc<Entry>,
     generation: u64,
     key_generation: u64,

@@ -77,9 +77,28 @@ contract (relation, role, privilege) AS (
     SELECT relation, 'openmettle_api', 'SELECT' FROM (VALUES
         ('login_providers'), ('login_provider_revisions')
     ) AS authority(relation) WHERE $1 >= 7
+    UNION ALL
+    SELECT relation, 'openmettle_api', 'SELECT' FROM (VALUES
+        ('local_identity_approvals'), ('local_sessions')
+    ) AS sessions(relation) WHERE $1 >= 8
 ),
 column_contract (relation, attribute, role, privilege) AS (
     VALUES ('users', 'disabled_at', 'openmettle_api', 'UPDATE')
+    UNION ALL
+    SELECT relation, attribute, 'openmettle_api', privilege FROM (VALUES
+        ('login_providers','lock_guard','UPDATE'),
+        ('users','session_generation','UPDATE'),
+        ('login_transactions','session_issued','UPDATE'),
+        ('local_identity_approvals','lock_guard','UPDATE'),
+        ('local_sessions','revoked','UPDATE'),
+        ('local_sessions','id','INSERT'), ('local_sessions','secret_hash','INSERT'),
+        ('local_sessions','login_id','INSERT'), ('local_sessions','provider_id','INSERT'),
+        ('local_sessions','identity_id','INSERT'), ('local_sessions','approval_id','INSERT'),
+        ('local_sessions','user_id','INSERT'), ('local_sessions','issued_client','INSERT'), ('local_sessions','issued_epoch','INSERT'),
+        ('local_sessions','issued_revision','INSERT'), ('local_sessions','provider_generation','INSERT'),
+        ('local_sessions','approval_generation','INSERT'), ('local_sessions','user_generation','INSERT'),
+        ('local_sessions','created_ms','INSERT'), ('local_sessions','expires_ms','INSERT')
+    ) AS sessions(relation,attribute,privilege) WHERE $1 >= 8
     UNION ALL
     SELECT relation, attribute, 'openmettle_api', privilege FROM (VALUES
         ('login_nonce_reservations','key_id','INSERT'),
