@@ -114,7 +114,9 @@ process configuration.
   connection during the POST and returns a sealed `ExchangedIdentity`: not cloneable, Debug
   redacted, no identity accessor or conversion. It carries the exchange's original deadline.
 - **Release** (`ManagedProvider::release`) is the only conversion to `VerifiedIdentity`, on
-  the handle that exchanged. It refuses a connection already in a transaction, then opens a
+  the handle that exchanged. It refuses a connection already in a SQLx-managed transaction,
+  using the driver's transaction-depth guard. Manual transaction-control SQL is unsupported,
+  as in ADR 0004. It then opens a
   fresh root `READ COMMITTED, READ ONLY` transaction with 2-second lock and 3-second
   statement timeouts, all inside the original deadline. It reads authority once and
   requires the permit's epoch. It then repeats ADR 0011's in-memory check (registration

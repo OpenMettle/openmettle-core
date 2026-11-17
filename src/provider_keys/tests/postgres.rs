@@ -567,12 +567,16 @@ async fn release_owns_a_bounded_root_read_and_rechecks_time() {
     let provider = f.h.provider.clone();
     // A caller's open transaction/snapshot is never joined.
     let (_, exchanged) = f.exchanged(&provider).await;
-    f.api.execute("BEGIN").await.unwrap();
+    // Use SQLx's transaction API so its depth guard can observe the caller's transaction.
+    // Manual transaction-control SQL is unsupported (ADR 0004).
+    let mut outer = Connection::begin(&mut f.api).await.unwrap();
+    assert!(outer.is_in_transaction());
     assert_eq!(
-        provider.release(&mut f.api, exchanged).await.unwrap_err(),
+        provider.release(&mut outer, exchanged).await.unwrap_err(),
         login::Error::Rejected
     );
-    f.api.execute("ROLLBACK").await.unwrap();
+    assert!(outer.is_in_transaction());
+    outer.rollback().await.unwrap();
     // The original exchange deadline survives into release.
     let (_, exchanged) = f.exchanged(&provider).await;
     tokio::time::sleep(Duration::from_millis(1600)).await;
