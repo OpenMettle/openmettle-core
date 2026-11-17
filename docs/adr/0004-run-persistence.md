@@ -71,7 +71,7 @@ Public helpers borrow a `WriteTransaction`, which owns a root SQLx PostgreSQL tr
 Start it with `WriteTransaction::begin(&mut connection)`; nested construction is refused.
 Compose caller SQL through `connection()`, then call the helpers and finally `commit()` or
 `rollback()`. Raw connection access is for ordinary statements, not manual transaction control.
-Use READ COMMITTED and bounded connection/statement/lock deadlines.
+Before connection access, commit and helper entry, the owner verifies SQLx still reports an active transaction. Losing the root depth through a cancelled borrowed savepoint permanently invalidates the owner. Manual transaction-control SQL and deliberately leaked nested transactions remain unsupported. Use READ COMMITTED and bounded connection/statement/lock deadlines.
 
 Each helper takes the inner transaction out of its owner before opening a savepoint. It
 restores that transaction only after the helper succeeds and releases its savepoint, or after

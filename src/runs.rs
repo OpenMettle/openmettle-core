@@ -102,26 +102,32 @@ impl<'c> WriteTransaction<'c> {
             inner: Some(Connection::begin(connection).await?),
         })
     }
+    // SQLx can lose its root depth when a raw borrowed savepoint is cancelled. Never
+    // turn that state into a no-op successful commit or let a helper open a new root.
+    fn ensure_active(&mut self) -> Result<(), Error> {
+        if !self.inner.as_mut().is_some_and(|tx| tx.is_in_transaction()) {
+            self.inner.take();
+            return Err(Error::TransactionUnavailable);
+        }
+        Ok(())
+    }
+    fn take_active(&mut self) -> Result<Transaction<'c, Postgres>, Error> {
+        self.ensure_active()?;
+        self.inner.take().ok_or(Error::TransactionUnavailable)
+    }
     /// Compose SQL in the same transaction. Unavailable after cancellation/cleanup failure.
     pub fn connection(&mut self) -> Result<&mut PgConnection, Error> {
+        self.ensure_active()?;
         self.inner
             .as_deref_mut()
             .ok_or(Error::TransactionUnavailable)
     }
     pub async fn commit(mut self) -> Result<(), Error> {
-        self.inner
-            .take()
-            .ok_or(Error::TransactionUnavailable)?
-            .commit()
-            .await?;
+        self.take_active()?.commit().await?;
         Ok(())
     }
     pub async fn rollback(mut self) -> Result<(), Error> {
-        self.inner
-            .take()
-            .ok_or(Error::TransactionUnavailable)?
-            .rollback()
-            .await?;
+        self.take_active()?.rollback().await?;
         Ok(())
     }
 }
@@ -185,7 +191,7 @@ pub async fn create_run(tx: &mut WriteTransaction<'_>, r: &RunInput<'_>) -> Resu
         ],
     );
     let hash = digest(&id);
-    let mut outer = tx.inner.take().ok_or(Error::TransactionUnavailable)?;
+    let mut outer = tx.take_active()?;
     let mut sp = outer.begin().await?;
     let result = async {
         let inserted: Option<String> = sqlx::query_scalar("INSERT INTO openmettle.runs
@@ -294,7 +300,7 @@ pub async fn append_event(
         return Err(Error::Invalid);
     }
     let id = event_identity(scope, run, key, p);
-    let mut outer = tx.inner.take().ok_or(Error::TransactionUnavailable)?;
+    let mut outer = tx.take_active()?;
     let mut sp = outer.begin().await?;
     let result = async {
         lock_run(&mut sp, scope, run).await?;
@@ -337,7 +343,7 @@ pub async fn record_intent(tx: &mut WriteTransaction<'_>, r: &Intent<'_>) -> Res
             r.request.bytes,
         ],
     );
-    let mut outer = tx.inner.take().ok_or(Error::TransactionUnavailable)?;
+    let mut outer = tx.take_active()?;
     let mut sp = outer.begin().await?;
     let result = async {
         lock_run(&mut sp,r.scope,r.run).await?;
@@ -409,7 +415,7 @@ pub async fn record_observation(
             o.evidence.bytes,
         ],
     );
-    let mut outer = tx.inner.take().ok_or(Error::TransactionUnavailable)?;
+    let mut outer = tx.take_active()?;
     let mut sp = outer.begin().await?;
     let result = async {
         lock_run(&mut sp,o.scope,o.run).await?;

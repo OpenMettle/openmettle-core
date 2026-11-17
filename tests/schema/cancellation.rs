@@ -381,3 +381,65 @@ async fn pinned_sqlx_borrowed_savepoint_cancellation_reproduces_false_commit() {
     assert_eq!(missing, 0);
     cn.close().await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn cancelled_borrowed_savepoint_cannot_escape_owner() {
+    let db = TestDb::migrated().await;
+    let c = Context::new(&db).await;
+    let run = c.run(&db, "borrowed-cancellation").await;
+    // Test commit directly, then helper reuse directly; neither relies on connection() to
+    // detect the lost transaction first. Reuse the connection to prove queued rollback.
+    for reuse in [false, true] {
+        let mut barrier = ResponseBarrier::new(b"SAVEPOINT\0");
+        let options = role_options(&db.0, API)
+            .host("127.0.0.1")
+            .port(barrier.port)
+            .ssl_mode(sqlx::postgres::PgSslMode::Disable);
+        let mut cn = PgConnection::connect_with(&options).await.unwrap();
+        let mut tx = runs::WriteTransaction::begin(&mut cn).await.unwrap();
+        let previous = message(
+            tx.connection().unwrap(),
+            &c.scope,
+            &c.conversation,
+            Some(&c.message),
+        )
+        .await
+        .unwrap();
+        cancel_at_response(&mut barrier, sqlx::Acquire::begin(tx.connection().unwrap())).await;
+        if reuse {
+            assert!(matches!(
+                runs::append_event(&mut tx, &c.scope, &run, "escape", payload(b"x")).await,
+                Err(Error::TransactionUnavailable)
+            ));
+            assert!(matches!(
+                tx.connection(),
+                Err(Error::TransactionUnavailable)
+            ));
+        }
+        assert!(matches!(
+            tx.commit().await,
+            Err(Error::TransactionUnavailable)
+        ));
+        cn.ping().await.unwrap();
+        let missing: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM openmettle.messages WHERE id=$1::uuid")
+                .bind(previous)
+                .fetch_one(&mut cn)
+                .await
+                .unwrap();
+        assert_eq!(missing, 0);
+        let mut fresh = runs::WriteTransaction::begin(&mut cn).await.unwrap();
+        runs::append_event(
+            &mut fresh,
+            &c.scope,
+            &run,
+            if reuse { "fresh-reuse" } else { "fresh-commit" },
+            payload(b"fresh"),
+        )
+        .await
+        .unwrap();
+        fresh.commit().await.unwrap();
+        cn.close().await.unwrap();
+    }
+}
