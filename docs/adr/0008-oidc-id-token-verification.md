@@ -38,6 +38,11 @@ Deployment profiles can tighten them within the bounds above.
 
 ## Verification
 
+Before token verification, our configuration check requires every parsed RSA key to have
+an effective modulus of at least 2048 bits ([RFC 7518 §3.3](https://www.rfc-editor.org/rfc/rfc7518.html#section-3.3)).
+Leading zero bytes do not count toward strength. A missing, zero or too-small RSA modulus
+rejects the whole key set. Signature verification remains in the library.
+
 The library, using `IdTokenVerifier::new_public_client` with the explicit trusted issuer,
 client ID and JWKS, performs these checks:
 
@@ -64,7 +69,7 @@ this module therefore also enforces:
 - `iat` no more than the future skew ahead of `now`, and no older than the issue-time age;
 - the RFC 7519 `nbf`, if present, no later than `now` plus the future skew. A non-numeric `nbf`
   is malformed. No other claim is read;
-- a subject of 1–255 bytes, matching `user_identities.subject`. The issuer is already bounded
+- a NUL-free ASCII subject of 1–255 bytes, without trimming or normalization, matching `user_identities.subject`. The issuer is already bounded
   to the 2048 bytes `user_identities.issuer` allows.
 
 Email, names, groups and tenant claims are ignored. Nothing links or merges accounts.
@@ -177,3 +182,5 @@ except synthetic in-process tokens.
   V1-05.
 - The native broker proposal and the provider-outage freshness policy remain open owner
   decisions. They are deferred until an increment needs them.
+
+The minimum-strength check uses already-locked `base64` 0.22.1 (MIT OR Apache-2.0) as a direct production dependency to decode the library-parsed public modulus. It adds no lock package or feature; it replaces the previous dev-only declaration. Tests sign with ephemeral 512/1024-bit keys and reject their configuration, including zero padding, and retain a valid 2048-bit control. Signed subject tests reject NUL and non-ASCII values and preserve valid boundary values exactly.

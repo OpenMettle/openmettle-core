@@ -7,6 +7,7 @@
 //! discovery, key refresh, state/PKCE handling, account lookup or admission. A verified identity
 //! proves only that a trusted provider asserted this issuer/subject pair for this client and nonce;
 //! it is not authentication of a session, an admission decision or an access grant.
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, TimeDelta, Utc};
 use openidconnect::{
     AdditionalClaims, ClaimsVerificationError, ClientId, IdToken, IssuerUrl, Nonce,
@@ -199,6 +200,26 @@ impl TrustedProvider {
         if keys.keys().is_empty() || keys.keys().len() > MAX_JWKS_KEYS {
             return Err(ConfigError::Jwks);
         }
+        // Inspect the keys the verifier actually parsed, not a separate raw-JWKS view.
+        // CoreJsonWebKey exposes its RSA modulus through serialization only.
+        for key in keys.keys() {
+            let key = serde_json::to_value(key).map_err(|_| ConfigError::Jwks)?;
+            if key["kty"] == "RSA" {
+                let modulus = key["n"].as_str().ok_or(ConfigError::Jwks)?;
+                let bytes = URL_SAFE_NO_PAD
+                    .decode(modulus)
+                    .map_err(|_| ConfigError::Jwks)?;
+                let significant = bytes
+                    .iter()
+                    .position(|b| *b != 0)
+                    .ok_or(ConfigError::Jwks)?;
+                let bits =
+                    (bytes.len() - significant) * 8 - bytes[significant].leading_zeros() as usize;
+                if bits < 2048 {
+                    return Err(ConfigError::Jwks);
+                }
+            }
+        }
         Ok(Self {
             provider_config_id: provider_config_id.to_owned(),
             issuer,
@@ -262,7 +283,11 @@ impl TrustedProvider {
             }
         }
         let subject = claims.subject().as_str();
-        if subject.is_empty() || subject.len() > MAX_SUBJECT_BYTES {
+        if subject.is_empty()
+            || subject.len() > MAX_SUBJECT_BYTES
+            || !subject.is_ascii()
+            || subject.contains('\0')
+        {
             return Err(VerifyError::Subject);
         }
         Ok(VerifiedIdentity {

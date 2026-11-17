@@ -495,3 +495,92 @@ fn diagnostics_never_echo_token_or_identity_values() {
         .unwrap();
     assert!(!format!("{identity:?}").contains(MARK));
 }
+
+#[test]
+fn weak_rsa_moduli_are_rejected_even_with_zero_padding() {
+    for bits in [512, 1024] {
+        let private = rsa::RsaPrivateKey::new(&mut rand_core::OsRng, bits).unwrap();
+        let pem = private.to_pkcs1_pem(LineEnding::LF).unwrap();
+        let signing =
+            CoreRsaPrivateSigningKey::from_pem(&pem, Some(JsonWebKeyId::new("weak".into())))
+                .unwrap();
+        let token = sign_with(
+            claims(),
+            &signing,
+            CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256,
+        );
+        assert!(UnverifiedIdToken::new(&token).is_ok());
+        let mut keys =
+            serde_json::to_value(CoreJsonWebKeySet::new(vec![signing.as_verification_key()]))
+                .unwrap();
+        let original = URL_SAFE_NO_PAD
+            .decode(keys["keys"][0]["n"].as_str().unwrap())
+            .unwrap();
+        for padding in [0, 256] {
+            let mut modulus = vec![0; padding];
+            modulus.extend_from_slice(&original);
+            keys["keys"][0]["n"] = URL_SAFE_NO_PAD.encode(modulus).into();
+            assert_eq!(
+                TrustedProvider::new(
+                    PROVIDER,
+                    ISSUER,
+                    CLIENT,
+                    &serde_json::to_vec(&keys).unwrap()
+                )
+                .err(),
+                Some(ConfigError::Jwks)
+            );
+        }
+    }
+    // A real 2048-bit signature remains valid with a zero-prefixed public modulus.
+    let mut keys: serde_json::Value = serde_json::from_slice(&jwks(&["k1"])).unwrap();
+    let mut modulus = vec![0; 8];
+    modulus.extend(
+        URL_SAFE_NO_PAD
+            .decode(keys["keys"][0]["n"].as_str().unwrap())
+            .unwrap(),
+    );
+    keys["keys"][0]["n"] = URL_SAFE_NO_PAD.encode(modulus).into();
+    let trusted = TrustedProvider::new(
+        PROVIDER,
+        ISSUER,
+        CLIENT,
+        &serde_json::to_vec(&keys).unwrap(),
+    )
+    .unwrap();
+    assert!(verify_with(&trusted, &sign(claims(), "k1")).is_ok());
+    // Byte length alone must not accept a 2047-bit or all-zero modulus.
+    for leading in [0x7f, 0] {
+        let mut bytes = vec![0; 256];
+        bytes[0] = leading;
+        keys["keys"][0]["n"] = URL_SAFE_NO_PAD.encode(bytes).into();
+        assert_eq!(
+            TrustedProvider::new(
+                PROVIDER,
+                ISSUER,
+                CLIENT,
+                &serde_json::to_vec(&keys).unwrap()
+            )
+            .err(),
+            Some(ConfigError::Jwks)
+        );
+    }
+}
+
+#[test]
+fn subjects_must_be_ascii_and_nul_free_without_normalization() {
+    for subject in ["user\0suffix", "usér", "用户"] {
+        let token = sign(
+            claims().set_subject(SubjectIdentifier::new(subject.into())),
+            "k1",
+        );
+        assert_eq!(verify(&token).err(), Some(VerifyError::Subject));
+    }
+    for subject in ["x".into(), "s".repeat(255), " leading and trailing ".into()] {
+        let token = sign(
+            claims().set_subject(SubjectIdentifier::new(subject.clone())),
+            "k1",
+        );
+        assert_eq!(verify(&token).unwrap().subject(), subject);
+    }
+}
