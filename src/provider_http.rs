@@ -38,7 +38,8 @@ const MAX_REQUEST_HEADER_BYTES: usize = 1024;
 /// More answers than this fail the request instead of being truncated.
 pub const MAX_ADDRESSES: usize = 64;
 pub const MAX_PRIVATE_RANGES: usize = 32;
-const MAX_TRUST_BUNDLE_BYTES: usize = 1024 * 1024;
+/// Trust bundle ceiling, shared with the deployment loader's bounded file read.
+pub const MAX_TRUST_BUNDLE_BYTES: usize = 1024 * 1024;
 const MAX_TRUST_CERTIFICATES: usize = 256;
 const MAX_ENDPOINT_BYTES: usize = 2048;
 /// Process-wide limit on outstanding operating-system DNS lookups, including abandoned ones.

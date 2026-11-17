@@ -7,6 +7,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "auth_config_support/mod.rs"]
+mod auth_config_support;
+// The transport fixture's synthetic CA; its leaf certificates are not needed here.
+#[allow(dead_code)]
+#[path = "provider_http_support/ca.rs"]
+mod ca;
+
 struct Process(Child);
 impl Drop for Process {
     fn drop(&mut self) {
@@ -132,6 +139,145 @@ fn rejects_invalid_config_without_disclosing_values() {
         }
         assert_eq!(command(worker).output().unwrap().status.code(), Some(78));
     }
+}
+
+const USAGE: &str = "usage error: expected no arguments or --check-auth-config PATH\n";
+
+/// ADR 0015: the check needs no database setting and opens no listener.
+#[test]
+fn auth_config_check_succeeds_offline_without_serving_settings() {
+    let dir = auth_config_support::Dir::new();
+    let document = auth_config_support::document(&dir, &ca::Ca::new().pem());
+    let path = dir.write("auth.json", document.to_string().as_bytes());
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    for serving_settings in [false, true] {
+        let mut command = command(false);
+        if serving_settings {
+            // Serving with these would exit 78 (database URL) or 1 (occupied listener).
+            command
+                .env("OPENMETTLE_API_DATABASE_URL", "invalid://synthetic-secret")
+                .env(
+                    "OPENMETTLE_API_BIND",
+                    occupied.local_addr().unwrap().to_string(),
+                );
+        }
+        let output = command
+            .args(["--check-auth-config", &path])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "auth configuration valid (local files only)\n"
+        );
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
+fn auth_config_check_rejects_with_fixed_redacted_categories() {
+    let dir = auth_config_support::Dir::new();
+    let valid = auth_config_support::document(&dir, &ca::Ca::new().pem());
+    let short_key = dir.write("synthetic-secret-key", &[0xd3; 31]);
+    let mut cases = Vec::new();
+    let mut case = |pointer: &str, value: serde_json::Value, category: &'static str| {
+        let mut document = valid.clone();
+        match document.pointer_mut(pointer) {
+            Some(slot) => *slot = value,
+            None => document["synthetic-secret"] = value,
+        }
+        cases.push((document.to_string().into_bytes(), category));
+    };
+    case(
+        "/synthetic-secret",
+        "synthetic-secret".into(),
+        "configuration has an unknown field",
+    );
+    case(
+        "/version",
+        2.into(),
+        "configuration version is missing or unsupported",
+    );
+    case(
+        "/login/lifetime_seconds",
+        601.into(),
+        "login lifetime is out of range",
+    );
+    case(
+        "/login/keys/active/path",
+        short_key.into(),
+        "a login key is not a readable regular file of exactly 32 bytes",
+    );
+    case(
+        "/providers/0/issuer",
+        "http://synthetic-secret.example.test".into(),
+        "a provider identity is invalid",
+    );
+    case(
+        "/providers/0/token_endpoint",
+        "https://synthetic-secret/token".into(),
+        "a provider definition, endpoint, trust or address policy is invalid",
+    );
+    cases.push((
+        br#"{"synthetic-secret":"#.to_vec(),
+        "configuration is not valid JSON",
+    ));
+    for (bytes, category) in cases {
+        let path = dir.write("synthetic-secret.json", &bytes);
+        let output = command(false)
+            .args(["--check-auth-config", &path])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(78));
+        assert!(output.stdout.is_empty());
+        // The whole diagnostic is one fixed line: no path, value or parser text.
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            format!("auth configuration error: {category}\n")
+        );
+    }
+    let output = command(false)
+        .args(["--check-auth-config", &dir.path("synthetic-secret-absent")])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(78));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "auth configuration error: configuration is not a readable regular file within bounds\n"
+    );
+}
+
+#[test]
+fn malformed_check_invocation_is_refused_and_worker_is_unchanged() {
+    let dir = auth_config_support::Dir::new();
+    let document = auth_config_support::document(&dir, &ca::Ca::new().pem());
+    let path = dir.write("auth.json", document.to_string().as_bytes());
+    let joined = format!("--check-auth-config={path}");
+    for arguments in [
+        vec!["--check-auth-config"],
+        vec!["--check-auth-config", &path, "synthetic-secret"],
+        vec!["--check-auth-confg", &path],
+        vec![joined.as_str()],
+        vec![path.as_str()],
+        vec!["--help"],
+        vec![""],
+    ] {
+        // A fall-through to serving would report the missing database URL instead.
+        let output = command(false).args(&arguments).output().unwrap();
+        assert_eq!(output.status.code(), Some(78), "{arguments:?}");
+        assert!(output.stdout.is_empty());
+        assert_eq!(String::from_utf8(output.stderr).unwrap(), USAGE);
+    }
+    // The worker has no check mode and no auth settings: it reports its own configuration.
+    let output = command(true)
+        .args(["--check-auth-config", &path])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(78));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "configuration error: DATABASE_URL is required\n"
+    );
 }
 
 #[test]

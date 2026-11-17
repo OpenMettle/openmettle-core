@@ -70,13 +70,16 @@ impl<'de> Deserialize<'de> for Unique {
         d.deserialize_any(V)
     }
 }
+/// Duplicate-rejecting parse without a size cap: callers bound `bytes` first. A repeated member
+/// is the only `Category::Data` error this visitor can produce from JSON text.
+pub(crate) fn unique(bytes: &[u8]) -> Result<Value, serde_json::Error> {
+    serde_json::from_slice::<Unique>(bytes).map(|v| v.0)
+}
 pub(crate) fn json(bytes: &[u8]) -> Result<Value, Error> {
     if bytes.is_empty() || bytes.len() > MAX_JWKS_BYTES {
         return Err(Error::Document);
     }
-    serde_json::from_slice::<Unique>(bytes)
-        .map(|v| v.0)
-        .map_err(|_| Error::Document)
+    unique(bytes).map_err(|_| Error::Document)
 }
 #[derive(Deserialize)]
 struct Metadata {
