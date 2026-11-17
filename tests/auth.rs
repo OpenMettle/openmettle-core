@@ -584,3 +584,32 @@ fn subjects_must_be_ascii_and_nul_free_without_normalization() {
         assert_eq!(verify(&token).unwrap().subject(), subject);
     }
 }
+
+#[test]
+fn digest_nonce_uses_same_verification_and_bounds() {
+    use openmettle_core::auth::ExpectedNonceDigest;
+    let p = provider();
+    let expected = ExpectedNonceDigest::from_nonce(&nonce());
+    let token = UnverifiedIdToken::new(&sign(claims(), "k1")).unwrap();
+    assert!(
+        p.verify_digest(&token, &expected, &Policy::default(), now())
+            .is_ok()
+    );
+    assert_eq!(
+        p.verify_digest(
+            &token,
+            &ExpectedNonceDigest::new([0; 32]),
+            &Policy::default(),
+            now()
+        ),
+        Err(VerifyError::Nonce)
+    );
+    for value in ["x".repeat(513), "x".repeat(21), "x\0".repeat(22)] {
+        let c = claims().set_nonce(Some(Nonce::new(value)));
+        let token = UnverifiedIdToken::new(&sign(c, "k1")).unwrap();
+        assert_eq!(
+            p.verify_digest(&token, &expected, &Policy::default(), now()),
+            Err(VerifyError::Nonce)
+        );
+    }
+}

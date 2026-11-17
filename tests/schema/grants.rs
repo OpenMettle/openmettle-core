@@ -631,7 +631,7 @@ async fn migration_five_failure_kill_timeout_and_concurrent_retry() {
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success(), "{}", stderr(&out));
     }
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6]);
     assert_eq!(
         count(&db, "SELECT count(*) FROM openmettle.grant_mapping_rules").await,
         0
@@ -673,10 +673,18 @@ async fn old_domain_snapshot(db: &TestDb) -> Vec<String> {
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 and authentic V4_BINARY_DIR required"]
 async fn populated_v4_upgrade_and_authentic_v4_binaries() {
+    populated_upgrade("V4_BINARY_DIR", &[1, 2, 3, 4], false).await;
+}
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 and authentic V5_BINARY_DIR required"]
+async fn populated_v5_upgrade_and_authentic_v5_binaries() {
+    populated_upgrade("V5_BINARY_DIR", &[1, 2, 3, 4, 5], true).await;
+}
+async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool) {
     use openmettle_core::storage::{self as accounting, ReservationInput, Settlement};
     let db = TestDb::new().await;
     let old = std::path::PathBuf::from(
-        std::env::var("V4_BINARY_DIR").expect("build released d80e378 binaries first"),
+        std::env::var(binary_env).expect("build authentic released binaries first"),
     );
     let old_migrate = || {
         let template = migrate_command(&db.url(OWNER), &[]);
@@ -691,7 +699,7 @@ async fn populated_v4_upgrade_and_authentic_v4_binaries() {
     };
     let output = old_migrate();
     assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(db.history().await, [1, 2, 3, 4]);
+    assert_eq!(db.history().await, versions);
     let c = Context::new(&db).await;
     let run = c.run(&db, "before").await;
     let mut worker = connect(&db.0, WORKER).await;
@@ -768,6 +776,20 @@ async fn populated_v4_upgrade_and_authentic_v4_binaries() {
         }
         tx.commit().await.unwrap();
     }
+    if with_grants {
+        map(&db, &mapping(&c, RULE1, "upgrade-rule", 0))
+            .await
+            .unwrap();
+        let mut grant = input(&c, "upgrade-grant");
+        grant.assignment.mapping_rule = Some(RULE1);
+        grant.mapping_revision = Some(1);
+        change(&db, &grant).await.unwrap();
+    }
+    let grant_before = if with_grants {
+        grant_snapshot(&db).await
+    } else {
+        vec![]
+    };
     let before = old_domain_snapshot(&db).await;
     let history: Vec<String> =
         sqlx::query_scalar("SELECT t::text FROM openmettle._sqlx_migrations t ORDER BY version")
@@ -777,11 +799,15 @@ async fn populated_v4_upgrade_and_authentic_v4_binaries() {
     migrate::apply(&db.settings(Duration::from_secs(10)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6]);
     assert_eq!(old_domain_snapshot(&db).await, before);
+    if with_grants {
+        assert_eq!(grant_snapshot(&db).await, grant_before);
+    }
     let kept: Vec<String> = sqlx::query_scalar(
-        "SELECT t::text FROM openmettle._sqlx_migrations t WHERE version<=4 ORDER BY version",
+        "SELECT t::text FROM openmettle._sqlx_migrations t WHERE version<=$1 ORDER BY version",
     )
+    .bind(*versions.last().unwrap())
     .fetch_all(&mut db.admin().await)
     .await
     .unwrap();
@@ -897,4 +923,24 @@ fn migration_five_contract_hash() {
         format!("{:x}", Sha256::digest(MIGRATIONS[4].sql.as_bytes())),
         "3130bf356a92c08f08d9ec65e49bd4ae04c41dd82ebab2ee4e313427fa423680"
     );
+}
+
+async fn grant_snapshot(db: &TestDb) -> Vec<String> {
+    let mut result = Vec::new();
+    for table in [
+        "grant_mapping_rules",
+        "grant_mapping_revisions",
+        "grant_assignments",
+        "grant_changes",
+    ] {
+        let rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT t::text FROM openmettle.{table} t ORDER BY t::text"
+        )))
+        .fetch_all(&mut db.admin().await)
+        .await
+        .unwrap();
+        assert!(!rows.is_empty());
+        result.extend(rows);
+    }
+    result
 }

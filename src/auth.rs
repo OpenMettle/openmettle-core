@@ -18,11 +18,13 @@ use openidconnect::{
     },
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fmt,
     str::FromStr,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use subtle::ConstantTimeEq;
 
 /// Maximum accepted compact ID-token length in bytes.
 pub const MAX_ID_TOKEN_BYTES: usize = 16 * 1024;
@@ -237,6 +239,17 @@ impl TrustedProvider {
         policy: &Policy,
         now: SystemTime,
     ) -> Result<VerifiedIdentity, VerifyError> {
+        self.verify_digest(token, &ExpectedNonceDigest::from_nonce(nonce), policy, now)
+    }
+
+    /// Verify against a digest owned by the committed login transaction.
+    pub fn verify_digest(
+        &self,
+        token: &UnverifiedIdToken,
+        nonce: &ExpectedNonceDigest,
+        policy: &Policy,
+        now: SystemTime,
+    ) -> Result<VerifiedIdentity, VerifyError> {
         let now = utc(now)?;
         let parsed = IdToken::<
             TimeClaims,
@@ -253,7 +266,9 @@ impl TrustedProvider {
         )
         .set_allowed_algs([CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256])
         .set_time_fn(move || now);
-        let claims = parsed.into_claims(&verifier, &nonce.0).map_err(classify)?;
+        let claims = parsed
+            .into_claims(&verifier, |claim: Option<&Nonce>| nonce.check(claim))
+            .map_err(classify)?;
 
         // Checks on signature-verified claims that the library leaves to the relying party.
         if claims.audiences().len() != 1 {
@@ -295,6 +310,42 @@ impl TrustedProvider {
             issuer: self.issuer.as_str().to_owned(),
             subject: subject.to_owned(),
         })
+    }
+}
+
+/// SHA-256 of the exact authorization nonce. Not a substitute for transaction consumption.
+pub struct ExpectedNonceDigest([u8; 32]);
+impl fmt::Debug for ExpectedNonceDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ExpectedNonceDigest(..)")
+    }
+}
+impl ExpectedNonceDigest {
+    pub fn new(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+    pub fn from_nonce(nonce: &ExpectedNonce) -> Self {
+        Self(Sha256::digest(nonce.0.secret().as_bytes()).into())
+    }
+    fn check(&self, claim: Option<&Nonce>) -> Result<(), String> {
+        let value = claim.ok_or_else(|| "invalid nonce".to_owned())?.secret();
+        ExpectedNonce::new(value).map_err(|_| "invalid nonce".to_owned())?;
+        let actual: [u8; 32] = Sha256::digest(value.as_bytes()).into();
+        if bool::from(self.0.ct_eq(&actual)) {
+            Ok(())
+        } else {
+            Err("invalid nonce".to_owned())
+        }
+    }
+}
+
+impl TrustedProvider {
+    pub(crate) fn binding(&self) -> (&str, &str, &str) {
+        (
+            &self.provider_config_id,
+            self.issuer.as_str(),
+            self.client_id.as_str(),
+        )
     }
 }
 

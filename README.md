@@ -79,7 +79,23 @@ The internal evaluator in `src/capabilities.rs` keeps installation, supplied cal
 
 ## OIDC ID-token verification
 
-[ADR 0008](docs/adr/0008-oidc-id-token-verification.md) adds `src/auth.rs`, an offline verifier for the first V1-04 increment. It uses `openidconnect` to check untrusted ID-token bytes against an explicitly trusted provider (exact HTTPS issuer, client ID and JWKS), an expected nonce and an injected clock. Only RS256 tokens with a single audience pass. A valid token yields only the provider UUID, issuer and subject; failures are fixed categories that never echo token or claim values. There is no login route, discovery, network access, state/PKCE handling, session, admission or account creation, so no request is authenticated yet. `cargo test --test auth` runs the negative tests offline with in-memory keys.
+[ADR 0008](docs/adr/0008-oidc-id-token-verification.md) adds `src/auth.rs`, an offline verifier for the first V1-04 increment. It uses `openidconnect` to check untrusted ID-token bytes against an explicitly trusted provider (exact HTTPS issuer, client ID and JWKS), an expected nonce and an injected clock. Only RS256 tokens with a single audience pass. A valid token yields only the provider UUID, issuer and subject; failures are fixed categories that never echo token or claim values. The verifier itself has no route, discovery, network access, state/PKCE handling, session, admission or account creation, so it does not authenticate requests. `cargo test --test auth` runs the negative tests offline with in-memory keys.
+
+## Internal browser login transactions
+
+[ADR 0009](docs/adr/0009-protected-login-transactions.md) adds protected PKCE storage,
+separately committed AEAD nonce reservations and single-use callback consumption.
+An exchange permit owns the callback code and trusted configuration and reaches the
+library exchange only after commit acknowledgement. An injected fake transport exercises
+code/challenge/client/callback binding; there is no production HTTP adapter or login route.
+The nonce verifier accepts stored digests without weakening the existing token checks.
+
+Deployment key loading, browser cookies, native handoff, admission, account creation and
+application sessions remain unimplemented. Public exposure is blocked on bounded pruning
+and rate-limit policies. After database restore, invalidate pending login transactions and
+rotate the active login encryption key before any encryption; never resume restored logins.
+These are deployment requirements, not provided recovery commands. Lost/ambiguous logins
+restart rather than retrying single-use authorization codes.
 
 ## Schema migrations
 
@@ -107,7 +123,7 @@ Storage limits are durable deployment inputs that only `openmettle_owner` sets, 
 
 Connection budget: `api_replicas × API DB_MAX_CONNECTIONS + worker_replicas × worker DB_MAX_CONNECTIONS + 1 migrator + admin/backup headroom` must not exceed `max_connections − superuser_reserved_connections − reserved_connections`. Count surge replicas during a rolling update. For example, 2 × 4 + 2 × 4 + 1 + 3 = 20. Enforce each process's share with its login role's `CONNECTION LIMIT`. These figures are illustrative, not qualified sizing.
 
-The schema tests also require `OLD_BINARY_DIR` pointing to binaries built from release `18f52463c9d6bc12dda4bd1558e4597e067018f8` and `V3_BINARY_DIR` pointing to binaries built from release `2f1be947aa933177c2e407cd7290bf9909bd08ca`; CI builds those exact archives for compatibility checks. Set `V4_BINARY_DIR` to binaries built from `d80e37819f847072dfa272bdddcc1fbee6d622ef` for migration 5 compatibility; CI builds that archive too. Do not substitute the current binary with a truncated migration list.
+The schema tests also require `OLD_BINARY_DIR` pointing to binaries built from release `18f52463c9d6bc12dda4bd1558e4597e067018f8` and `V3_BINARY_DIR` pointing to binaries built from release `2f1be947aa933177c2e407cd7290bf9909bd08ca`; CI builds those exact archives for compatibility checks. Set `V4_BINARY_DIR` to binaries built from `d80e37819f847072dfa272bdddcc1fbee6d622ef` for migration 5 compatibility; CI builds that archive too. Set `V5_BINARY_DIR` to authentic binaries from `4a51242839e16e1d7b8ad3538887bf8e41081e6e` for migration 6 compatibility. Do not substitute the current binary with a truncated migration list.
 
 The schema tests need a superuser on an isolated, disposable PostgreSQL 18 service. They create synthetic `openmettle_*` cluster roles with a test-only password and one database per test. Never point them at a shared server.
 
