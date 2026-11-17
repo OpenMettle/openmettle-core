@@ -87,7 +87,8 @@ The internal evaluator in `src/capabilities.rs` keeps installation, supplied cal
 separately committed AEAD nonce reservations and single-use callback consumption.
 An exchange permit owns the callback code and trusted configuration and reaches the
 library exchange only after commit acknowledgement. An injected fake transport exercises
-code/challenge/client/callback binding; there is no production HTTP adapter or login route.
+code/challenge/client/callback binding. The production transport is described below; there
+is no login route.
 The nonce verifier accepts stored digests without weakening the existing token checks.
 
 Deployment key loading, browser cookies, native handoff, admission, account creation and
@@ -96,6 +97,25 @@ and rate-limit policies. After database restore, invalidate pending login transa
 rotate the active login encryption key before any encryption; never resume restored logins.
 These are deployment requirements, not provided recovery commands. Lost/ambiguous logins
 restart rather than retrying single-use authorization codes.
+
+## Provider token transport
+
+[ADR 0010](docs/adr/0010-provider-http-transport.md) adds `src/provider_http.rs`, the HTTPS
+transport for that exchange. It sends one token `POST` per TLS connection (hyper HTTP/1.1 and
+rustls with ring) to an exact configured `https` endpoint. That endpoint must use a DNS host
+name. Every DNS answer must pass an address policy before any connection: loopback,
+link-local, metadata, IPv6 transition forms and unallocated space are refused. Private
+addresses need an explicit per-provider CIDR allowlist. A configured CA bundle replaces the
+native roots.
+
+Responses are capped at 32 headers, 8 KiB of header bytes and 64 KiB of body. Ambiguous
+framing, compression and trailers are refused. The transport never follows redirects,
+retries, pools connections or reads proxy environment variables. Abandoned OS DNS lookups are
+the only work that can outlive a dropped request, limited to 8 process-wide slots.
+
+Deployments behind an egress proxy are unsupported. Network policy remains a deployment
+control. Discovery, JWKS refresh, configuration loading and routes are not implemented, and
+no real provider has been qualified.
 
 ## Schema migrations
 
