@@ -82,7 +82,7 @@ an earlier lock. Multi-row owner operations must use stable ascending IDs.
    before allocating epochs, so allocation order remains commit order among protocol writers.
 3. Resolve the existing exact identity. Lock its provider-specific approval FOR SHARE, then
    read current eligibility and revision in a new statement.
-4. Lock user FOR UPDATE. Read disablement and generation after waiting; require personal scope.
+4. Lock the user FOR NO KEY UPDATE (ADR 0021). Read disablement and generation after waiting; require personal scope.
    Count all retained session rows under this lock, including expired/revoked/undisclosed rows.
 5. Insert a new session and mark the originating login issued in the same transaction.
 6. Recheck primary database time after blocking writes and managed proof freshness before commit.

@@ -124,6 +124,7 @@ pub(crate) struct Subject<'a> {
     pub approval: &'a str,
     pub user: &'a str,
     pub epoch: i64,
+    pub membership_revision: i64,
     pub user_generation: i64,
     pub approval_generation: i64,
 }
@@ -138,10 +139,11 @@ pub(crate) async fn reconcile(
 ) -> Result<Option<i64>, Error> {
     let Some(enrollment) = sqlx::query(
         "SELECT rule_id::text,rule_revision,project_id::text,scope_id::text,max_age_seconds,
-                issued_ms,expires_ms,observation FROM openmettle.membership_observations
-         WHERE approval_id=$1::uuid FOR UPDATE",
+                issued_ms,expires_ms,(observation).state AS state,(observation).change_id::text AS change_id, floor_ms FROM openmettle.membership_observations
+         WHERE approval_id=$1::uuid AND enabled AND config_revision <= $2 FOR UPDATE",
     )
     .bind(subject.approval)
+    .bind(subject.membership_revision)
     .fetch_optional(tx.connection()?)
     .await?
     else {
@@ -182,13 +184,17 @@ pub(crate) async fn reconcile(
         observation = Failed;
     }
     let previous = enrollment.try_get::<Option<i64>, _>("issued_ms")?;
-    if previous.is_some_and(|v| issued < v) {
+    if enrollment
+        .try_get::<Option<i64>, _>("floor_ms")?
+        .is_some_and(|floor| issued <= floor)
+        || previous.is_some_and(|v| issued < v)
+    {
         return Ok(None);
     }
     if previous == Some(issued) {
         // One issue time cannot order two conflicting assertions. Require a newer time
         // to resolve that ambiguity. A replay can never extend the original expiry.
-        let prior = enrollment.try_get::<&str, _>("observation")?;
+        let prior = enrollment.try_get::<&str, _>("state")?;
         if prior == observation.label() && enrollment.try_get::<i64, _>("expires_ms")? <= expires {
             return Ok(None);
         }
@@ -201,6 +207,7 @@ pub(crate) async fn reconcile(
         observation = Ambiguous;
         expires = expires.min(enrollment.try_get("expires_ms")?);
     }
+    let mut change: Option<String> = enrollment.try_get("change_id")?;
     if matches!(observation, Present | Absent) {
         let assignment = Assignment {
             scope,
@@ -211,18 +218,22 @@ pub(crate) async fn reconcile(
             key: subject.approval,
             mapping_rule: Some(rule),
         };
-        apply_assignment(
+        if !apply_assignment(
             tx,
             assignment,
             project,
             revision,
             observation == Present,
             login,
+            &mut change,
         )
-        .await?;
+        .await?
+        {
+            observation = Failed;
+        }
     }
     sqlx::query(
-        "UPDATE openmettle.membership_observations SET issued_ms=$2,expires_ms=$3,observation=$4,
+        "UPDATE openmettle.membership_observations SET issued_ms=$2,expires_ms=$3,observation=ROW($4::text,$8::uuid)::openmettle.membership_evidence,
                  epoch=$5,approval_generation=$6,user_generation=$7 WHERE approval_id=$1::uuid",
     )
     .bind(subject.approval)
@@ -232,6 +243,7 @@ pub(crate) async fn reconcile(
     .bind(subject.epoch)
     .bind(subject.approval_generation)
     .bind(subject.user_generation)
+    .bind(change)
     .execute(tx.connection()?)
     .await?;
     Ok(matches!(observation, Present | Absent).then_some(expires))
@@ -245,9 +257,10 @@ async fn apply_assignment(
     revision: i64,
     present: bool,
     login: &str,
-) -> Result<(), Error> {
+    confirmed: &mut Option<String>,
+) -> Result<bool, Error> {
     let current = sqlx::query(
-        "SELECT a.last_revision,c.decision,c.cycle_id::text,c.mapping_revision
+        "SELECT c.id::text AS change_id,a.last_revision,c.decision,c.cycle_id::text,c.mapping_revision
              FROM openmettle.grant_assignments a JOIN openmettle.grant_changes c
                ON c.assignment_id=a.id AND c.revision=a.last_revision
              WHERE a.scope_id=$1::uuid AND a.project_id=$2::uuid AND a.grantee_user_id=$3::uuid
@@ -261,6 +274,14 @@ async fn apply_assignment(
     .bind(assignment.key)
     .fetch_optional(tx.connection()?)
     .await?;
+    let latest = current
+        .as_ref()
+        .map(|row| row.try_get::<&str, _>("change_id"))
+        .transpose()?;
+    if latest != confirmed.as_deref() {
+        // Independent v5 mutation. Never adopt this revision in a later login.
+        return Ok(false);
+    }
     let mut expected = 0;
     let mut active = false;
     if let Some(row) = current {
@@ -275,12 +296,14 @@ async fn apply_assignment(
                 mapping_revision: Some(row.try_get("mapping_revision")?),
                 decision: Decision::Revoke(Some(row.try_get("cycle_id")?)),
             };
-            expected = grants::change_grant(tx, &change).await?.revision;
+            let receipt = grants::change_grant(tx, &change).await?;
+            expected = receipt.revision;
+            *confirmed = Some(receipt.change);
             active = false;
         }
     }
     if present && !active {
-        grants::change_grant(
+        let receipt = grants::change_grant(
             tx,
             &ChangeInput {
                 assignment,
@@ -292,8 +315,9 @@ async fn apply_assignment(
             },
         )
         .await?;
+        *confirmed = Some(receipt.change);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Current mapped membership for one exact approval and project. Failure, expiry, rule
@@ -312,28 +336,27 @@ pub async fn current(
     }
     let query = sqlx::query_scalar::<_,String>(
         "SELECT CASE
-          WHEN NOT a.active OR a.expires_ms <= t.ms OR u.disabled_at IS NOT NULL
+          WHEN NOT m.enabled OR NOT a.active OR a.expires_ms <= t.ms OR u.disabled_at IS NOT NULL
             OR r.last_revision <> m.rule_revision OR NOT v.enabled
             OR v.binding_format <> 'openmettle.project-member' OR v.binding_version <> 1
             OR v.binding <> convert_to(m.project_id::text,'UTF8')
-            OR e.revision IS NULL THEN 'failed'
+            OR e.revision IS NULL OR h.id IS DISTINCT FROM (m.observation).change_id THEN 'failed'
           WHEN m.issued_ms IS NULL THEN 'missing'
           WHEN m.epoch IS DISTINCT FROM e.epoch
             OR m.approval_generation IS DISTINCT FROM a.access_generation
             OR m.user_generation IS DISTINCT FROM u.session_generation THEN 'failed'
           WHEN t.ms < m.issued_ms OR t.ms >= least(m.expires_ms, m.issued_ms + 1000::bigint*m.max_age_seconds) THEN 'stale'
-          WHEN m.observation='present' AND NOT EXISTS (
-            SELECT FROM openmettle.grant_assignments g JOIN openmettle.grant_changes h
-            ON h.assignment_id=g.id AND h.revision=g.last_revision
-            WHERE g.mapping_rule_id=r.id AND g.scope_id=m.scope_id AND g.project_id=m.project_id
-            AND g.assignment_key=a.id::text AND g.grantee_user_id=u.id
-            AND g.assignment_format='openmettle.project-member' AND g.assignment_version=1
-            AND h.decision='grant' AND h.mapping_revision=m.rule_revision) THEN 'failed'
-          ELSE coalesce(m.observation,'missing') END
+          WHEN (m.observation).state='present' AND
+               (h.decision <> 'grant' OR h.cycle_id IS DISTINCT FROM h.id OR h.mapping_revision <> m.rule_revision) THEN 'failed'
+          ELSE (m.observation).state END
          FROM openmettle.membership_observations m JOIN openmettle.local_identity_approvals a ON a.id=m.approval_id
          JOIN openmettle.user_identities i ON i.id=a.identity_id JOIN openmettle.users u ON u.id=i.user_id
          JOIN openmettle.grant_mapping_rules r ON r.id=m.rule_id AND r.provider_config_id=a.provider_id AND r.issuer=i.issuer
          JOIN openmettle.grant_mapping_revisions v ON v.rule_id=r.id AND v.revision=m.rule_revision
+         LEFT JOIN openmettle.grant_assignments g ON g.scope_id=m.scope_id AND g.project_id=m.project_id
+           AND g.grantee_user_id=u.id AND g.mapping_rule_id=r.id AND g.assignment_key=a.id::text
+           AND g.assignment_format='openmettle.project-member' AND g.assignment_version=1
+         LEFT JOIN openmettle.grant_changes h ON h.assignment_id=g.id AND h.revision=g.last_revision
          LEFT JOIN LATERAL (SELECT epoch,revision FROM openmettle.login_provider_revisions WHERE provider_id=a.provider_id
                             ORDER BY epoch DESC LIMIT 1) e ON true
          CROSS JOIN (SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint AS ms) t
@@ -385,7 +408,7 @@ mod tests {
             (json!({"groups":["team",false]}), Ambiguous, Missing),
             (json!({"groups":["team","team"]}), Ambiguous, Missing),
             (
-                json!({"groups":["team"],"hasgroups":true}),
+                json!({"groups":["team"],"roles":["team"],"hasgroups":true}),
                 Partial,
                 Partial,
             ),

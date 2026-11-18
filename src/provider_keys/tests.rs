@@ -144,7 +144,8 @@ impl Harness {
                     - Duration::from_secs(w.unsigned_abs()),
             }
         }));
-        let config = Self::endpoint_config(&server, &ca, "v1", authorization, callback);
+        let config =
+            Self::endpoint_config(&server, &ca, signing::ID, "v1", authorization, callback);
         script.lock().unwrap().metadata = metadata(&config);
         let provider = manager.register(config).unwrap();
         Self {
@@ -158,18 +159,26 @@ impl Harness {
         }
     }
     fn config(server: &tls::Server, ca: &tls::Ca, revision: &str) -> ProviderConfig {
-        Self::endpoint_config(server, ca, revision, signing::AUTH, signing::CALLBACK)
+        Self::endpoint_config(
+            server,
+            ca,
+            signing::ID,
+            revision,
+            signing::AUTH,
+            signing::CALLBACK,
+        )
     }
     fn endpoint_config(
         server: &tls::Server,
         ca: &tls::Ca,
+        provider_id: &str,
         revision: &str,
         authorization: &str,
         callback: &str,
     ) -> ProviderConfig {
         let base = format!("https://{}:{}", tls::HOST, server.port);
         let mut c = ProviderConfig::new(
-            ProviderIdentity::new(signing::ID, signing::ISSUER, signing::CLIENT).unwrap(),
+            ProviderIdentity::new(provider_id, signing::ISSUER, signing::CLIENT).unwrap(),
             login::ProviderDefinition {
                 revision,
                 authorization_endpoint: authorization,

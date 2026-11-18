@@ -522,8 +522,9 @@ The baseline is the complete accepted document exported from the [planning Page]
 
 ## Login-time project membership
 
-For an existing locally approved identity, an owner can enroll one project mapping in schema
-11. Managed session issuance then reconciles the signed group or app-role observation with
+After all participating login replicas, grant writers and membership readers are upgraded,
+an owner can enroll one rule revision and one project per exact identity approval in schema 11.
+Managed session issuance then reconciles the signed group or app-role observation with
 that rule's project assignment. The internal membership reader expires a confirmation at
 the configured age or token expiry, whichever comes first. A complete removal revokes the
 mapped assignment. Missing or partial evidence withholds a positive membership decision

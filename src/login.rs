@@ -511,6 +511,13 @@ async fn begin_inner(
     finish(tx, result).await
 }
 
+#[derive(Clone)]
+pub(crate) struct LoginOrigin {
+    pub login: String,
+    pub expiry: i64,
+    pub membership_revision: i64,
+}
+
 /// Parsed callback inputs, still untrusted. No Debug implementation.
 pub struct Callback<'a> {
     pub state: &'a str,
@@ -521,7 +528,7 @@ pub struct Callback<'a> {
 }
 /// Created only after acknowledged consumption commit. Owns the code and exact provider.
 pub struct ExchangePermit {
-    pub(crate) origin: Option<(String, i64)>,
+    pub(crate) origin: Option<LoginOrigin>,
     provider: Arc<Provider>,
     // Managed only: the durable authority epoch committed with this consumption.
     epoch: Option<i64>,
@@ -626,8 +633,14 @@ async fn consume_inner(
         {
             return Err(Error::Protection);
         }
+        // Owner edits serialize revision allocation and commit. This snapshot precedes
+        // the one permitted token POST, so the sealed proof cannot cross a later reset.
+        let membership_revision = if epoch.is_some() {
+            sqlx::query_scalar("SELECT coalesce(max(config_revision),0) FROM openmettle.membership_observations")
+                .fetch_one(tx.connection()?).await?
+        } else { 0 };
         let permit = ExchangePermit {
-            origin: Some((id.to_owned(), expiry)),
+            origin: Some(LoginOrigin {login:id.to_owned(),expiry,membership_revision}),
             provider: p,
             epoch,
             code: Secret(c.code.into()),

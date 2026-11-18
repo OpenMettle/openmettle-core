@@ -197,6 +197,7 @@ pub(crate) struct Issuance<'a> {
     pub epoch: i64,
     pub login: &'a str,
     pub login_expiry: i64,
+    pub membership_revision: i64,
     pub binding: Vec<u8>,
     pub deadline: Instant,
 }
@@ -230,7 +231,7 @@ pub(crate) async fn issue(
             .bind(input.provider).bind(&identity_id).fetch_optional(tx.connection()?).await?.ok_or(Error::Rejected)?;
         let a = sqlx::query("SELECT active,expires_ms,revision,access_generation FROM openmettle.local_identity_approvals WHERE id=$1::uuid")
             .bind(&approval).fetch_one(tx.connection()?).await?;
-        let u = sqlx::query("SELECT disabled_at IS NOT NULL AS disabled,session_generation FROM openmettle.users WHERE id=$1::uuid FOR UPDATE")
+        let u = sqlx::query("SELECT disabled_at IS NOT NULL AS disabled,session_generation FROM openmettle.users WHERE id=$1::uuid FOR NO KEY UPDATE")
             .bind(&user).fetch_one(tx.connection()?).await?;
         let timestamp = now(tx.connection()?).await?;
         let approval_expiry: i64 = a.try_get("expires_ms")?;
@@ -242,7 +243,7 @@ pub(crate) async fn issue(
             .bind(&user).fetch_one(tx.connection()?).await?;
         if count >= policy.retained_limit { return Err(Error::Capacity); }
         let membership_expiry = crate::membership::reconcile(&mut tx, crate::membership::Subject {
-            approval: &approval, user: &user, epoch,
+            approval: &approval, user: &user, epoch, membership_revision: input.membership_revision,
             approval_generation: a.try_get("access_generation")?,
             user_generation: u.try_get("session_generation")?,
         }, input.assertion, input.login).await?;
@@ -255,8 +256,15 @@ pub(crate) async fn issue(
             .bind(timestamp).bind(expiry).execute(tx.connection()?).await?;
         sqlx::query("UPDATE openmettle.login_transactions SET session_issued=true WHERE id=$1")
             .bind(input.login).execute(tx.connection()?).await?;
-        let final_time = now(tx.connection()?).await?;
-        if membership_expiry.is_some_and(|expiry| final_time >= expiry) || final_time < timestamp || final_time >= expiry || final_time >= approval_expiry || final_time >= input.login_expiry { return Err(Error::Rejected); }
+        let mut final_time = now(tx.connection()?).await?;
+        if membership_expiry.is_some_and(|expiry| final_time >= expiry) {
+            // Keep both the newer signed high-water and any completed removal. Only
+            // the mapped evidence expired while issuing this exact-approval session.
+            sqlx::query("UPDATE openmettle.membership_observations SET observation.state='stale' WHERE approval_id=$1::uuid")
+                .bind(&approval).execute(tx.connection()?).await?;
+            final_time = now(tx.connection()?).await?;
+        }
+        if final_time < timestamp || final_time >= expiry || final_time >= approval_expiry || final_time >= input.login_expiry { return Err(Error::Rejected); }
         check()?;
         Ok(credential)
         }.await;
