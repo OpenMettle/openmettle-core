@@ -757,7 +757,7 @@ impl ManagedProvider {
         .await
         .map_err(|_| login::Error::Exchange)?
     }
-    /// Consume a managed online proof into a locally approved existing user's session.
+    /// Consume a managed online proof for an approved identity or an invited new account.
     /// Offline VerifiedIdentity values cannot reach this operation.
     pub async fn issue_session(
         &self,

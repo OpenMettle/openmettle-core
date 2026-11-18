@@ -91,7 +91,7 @@ code/challenge/client/callback binding. The production transport is described be
 is no login route.
 The nonce verifier accepts stored digests without weakening the existing token checks.
 
-Native handoff and account creation remain unimplemented; the browser cookie handoff below is
+Native handoff remains unimplemented; the browser cookie handoff below is
 not mounted. Key files are read only by the offline check below. Internal local approval and sessions are described below. The outstanding-login
 cap below is not a rate limit. The unmounted login router below adds per-process request,
 rate and concurrency bounds; public exposure remains blocked on runtime enablement, ingress
@@ -142,8 +142,7 @@ expiring before cooldown ends blocks login until another refresh is allowed. Pro
 short cache lifetimes and clock skew can reduce availability; qualify policy values against
 actual provider behavior. The offline check below validates configuration files; the running API
 does not load them.
-The managed provider path itself provides no route, cookie or account creation. Its sealed
-proof now has the internal local-approval/session consumer described below. `cargo test --lib provider_keys --locked --offline` exercises isolated TLS,
+The managed provider returns a sealed proof to the internal session consumer described below. `cargo test --lib provider_keys --locked --offline` exercises isolated TLS,
 rotation, cancellation, capacity and freshness behavior without PostgreSQL.
 
 ## Login provider authority
@@ -175,8 +174,9 @@ container whose `psql` runs the operator scripts.
 ## Local identity approval and sessions
 
 [ADR 0013](docs/adr/0013-local-identity-sessions.md) adds internal sessions for already-existing
-exact issuer/subject identities with a personal scope and owner-recorded local approval. This
-is not invitation delivery or account provisioning. `ManagedProvider::issue_session` consumes
+exact issuer/subject identities with a personal scope and owner-recorded local approval.
+For a new home user, an operator can authorize first-account creation with a single-use
+[invitation bound to the exact provider, issuer and subject](docs/operator/home-invitations.md). `ManagedProvider::issue_session` consumes
 only its sealed online proof; an offline `VerifiedIdentity` cannot mint a session.
 
 Routine configuration/approval revisions preserve sessions. Explicit revoke, provider retirement,

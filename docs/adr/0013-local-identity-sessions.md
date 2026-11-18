@@ -3,6 +3,9 @@
 Status: owner choices and coordinator implementation contract accepted, 17 November 2026.
 Refs #5; Refs #34. Implementation and independent review/CI acceptance are separate.
 
+The subsequent [home invitation procedure](../operator/home-invitations.md) extends issuance
+for a new identity with an operator-authorized first account. The original increment follows.
+
 ## Boundary
 
 The owner selected exact existing OIDC identity approval first. This is **local identity

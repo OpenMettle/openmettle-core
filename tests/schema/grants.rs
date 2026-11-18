@@ -1047,6 +1047,8 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
             .unwrap();
     let refused = old_migrate();
     assert_eq!(refused.status.code(), Some(1));
+    // Membership (v11) and invitation (v12) privileges are outside every historical binary's
+    // contract, so each historical migrator stops at the boundary check.
     assert!(stderr(&refused).contains("boundary check refused"));
     let unchanged: Vec<String> =
         sqlx::query_scalar("SELECT t::text FROM openmettle._sqlx_migrations t ORDER BY version")

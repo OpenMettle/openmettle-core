@@ -759,6 +759,7 @@ mod admission;
 mod approval_change;
 mod browser;
 mod handoff;
+mod invitations;
 mod membership;
 mod pooled;
 #[path = "../../../tests/support/psql.rs"]

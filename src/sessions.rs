@@ -201,6 +201,36 @@ pub(crate) struct Issuance<'a> {
     pub binding: Vec<u8>,
     pub deadline: Instant,
 }
+// Only a missing identity can enter the first-account path. A missing or withdrawn
+// approval on an existing identity is always handled by the ordinary eligibility checks.
+async fn resolve_identity(
+    c: &mut PgConnection,
+    input: &Issuance<'_>,
+) -> Result<(String, String, Option<i64>), Error> {
+    let existing: Option<(String, String)> = sqlx::query_as(
+        "SELECT id::text, user_id::text FROM openmettle.user_identities
+         WHERE issuer=$1 AND subject=$2 AND issuer COLLATE \"C\"=$1 AND subject COLLATE \"C\"=$2",
+    )
+    .bind(input.issuer)
+    .bind(input.assertion.identity().subject())
+    .fetch_optional(&mut *c)
+    .await?;
+    if let Some((identity, user)) = existing {
+        return Ok((identity, user, None));
+    }
+    sqlx::query_as(
+        "SELECT identity_id, user_id, redeem_before_ms FROM
+         openmettle.redeem_home_invitation($1::uuid,$2,$3,$4,$5)",
+    )
+    .bind(input.provider)
+    .bind(input.issuer)
+    .bind(input.assertion.identity().subject())
+    .bind(input.login)
+    .bind(input.epoch)
+    .fetch_optional(c)
+    .await?
+    .ok_or(Error::Rejected)
+}
 pub(crate) async fn issue(
     c: &mut PgConnection,
     input: Issuance<'_>,
@@ -223,10 +253,7 @@ pub(crate) async fn issue(
         if epoch != input.epoch { return Err(Error::Rejected); }
         let provider_generation: i64 = sqlx::query_scalar("SELECT access_generation FROM openmettle.login_providers WHERE id=$1::uuid")
             .bind(input.provider).fetch_one(tx.connection()?).await?;
-        let identity = sqlx::query("SELECT id::text,user_id::text FROM openmettle.user_identities WHERE issuer=$1 AND subject=$2")
-            .bind(input.issuer).bind(input.assertion.identity().subject()).fetch_optional(tx.connection()?).await?.ok_or(Error::Rejected)?;
-        let identity_id: String = identity.try_get("id")?;
-        let user: String = identity.try_get("user_id")?;
+        let (identity_id, user, invitation_cutoff) = resolve_identity(tx.connection()?, &input).await?;
         let approval: String = sqlx::query_scalar("SELECT id::text FROM openmettle.local_identity_approvals WHERE provider_id=$1::uuid AND identity_id=$2::uuid FOR SHARE")
             .bind(input.provider).bind(&identity_id).fetch_optional(tx.connection()?).await?.ok_or(Error::Rejected)?;
         let a = sqlx::query("SELECT active,expires_ms,revision,access_generation FROM openmettle.local_identity_approvals WHERE id=$1::uuid")
@@ -264,7 +291,12 @@ pub(crate) async fn issue(
                 .bind(&approval).execute(tx.connection()?).await?;
             final_time = now(tx.connection()?).await?;
         }
-        if final_time < timestamp || final_time >= expiry || final_time >= approval_expiry || final_time >= input.login_expiry { return Err(Error::Rejected); }
+        if invitation_cutoff.is_some_and(|cutoff| final_time >= cutoff)
+            || final_time < timestamp || final_time >= expiry
+            || final_time >= approval_expiry || final_time >= input.login_expiry
+        {
+            return Err(Error::Rejected);
+        }
         check()?;
         Ok(credential)
         }.await;

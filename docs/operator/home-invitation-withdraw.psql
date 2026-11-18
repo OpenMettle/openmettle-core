@@ -1,0 +1,26 @@
+-- A stable invitation UUID names exactly one decision, even after a replacement is issued.
+\set ON_ERROR_STOP on
+\set VERBOSITY terse
+BEGIN ISOLATION LEVEL READ COMMITTED;
+SET LOCAL search_path = pg_catalog, pg_temp;
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '5s';
+SET LOCAL synchronous_commit = on;
+SELECT current_user = 'openmettle_owner' AND session_user = current_user
+       AND :'invitation' COLLATE "C" ~ pattern AND :'operator' COLLATE "C" ~ pattern AS valid
+  FROM (VALUES ('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')) AS uuid(pattern) \gset
+\set withdrew false
+\if :valid
+  WITH changed AS (UPDATE openmettle.home_invitations
+    SET withdrawn_by = :'operator'::uuid, withdrawn_at = clock_timestamp()
+    WHERE id = :'invitation'::uuid AND withdrawn_at IS NULL AND approval_id IS NULL
+    RETURNING 1)
+  SELECT count(*) = 1 AS withdrew FROM changed \gset
+\endif
+\if :withdrew
+  COMMIT;
+  \echo 'home invitation withdrawn'
+\else
+  ROLLBACK;
+  DO $$ BEGIN RAISE EXCEPTION 'home invitation withdrawal refused'; END $$;
+\endif

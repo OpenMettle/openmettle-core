@@ -32,6 +32,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "f73f2f41d56136d90deb49aac87ef835b96f50dea416871ec86cab61dd0b3c76",
         "91b95d8146362a47c78ebf96de7b9f2e81f625b99ac880ddb1f427c3f5652f57",
         "887728e24ebf829d4644b6f47937c37149862ab7a7d8069c278827141f9d7a84",
+        "e1743cc987929be425bfe623923b7b55681d332d3a8126f30875cd895cf08b39",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     for (migration, hash) in MIGRATIONS.iter().zip(expected) {
@@ -431,3 +432,6 @@ mod session_cleanup;
 
 #[path = "provider_recovery.rs"]
 mod provider_recovery;
+
+#[path = "home_invitations.rs"]
+mod home_invitations;
