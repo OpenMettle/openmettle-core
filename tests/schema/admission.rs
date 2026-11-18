@@ -435,3 +435,6 @@ async fn cleanup_script_removes_only_expired_unreferenced_gates() {
     }
     assert_eq!(counts(&db).await.0, reservations);
 }
+
+#[path = "session_cleanup.rs"]
+mod session_cleanup;

@@ -305,24 +305,20 @@ SELECT :observed_generation = :expected_generation AS expected \gset
 
 ## Bounded owner cleanup and restore
 
-The API has no DELETE privilege. Operators may execute one short cleanup transaction per batch,
-with lock_timeout 2s, statement_timeout 5s and synchronous_commit on. Supply `batch` explicitly;
-use 1–1000 rows. SQL clamps the supplied limit to 0–1000 as a safety bound (0 does no work).
-No schedule or retention duration is selected.
+The API has no DELETE privilege. Operators delete revoked sessions and sessions whose absolute
+expiry has passed on the primary clock with the exact script in the
+[session and login-gate cleanup procedure](../operator/session-cleanup.md). Each run is one
+short transaction of 1–1000 rows (`batch` is required and refused before use if invalid),
+with lock_timeout 2s, statement_timeout 5s, synchronous_commit on and `FOR UPDATE SKIP LOCKED`
+in ascending ID order. It deletes session rows only and prints only a row count. No schedule,
+default batch or retention duration is selected.
 
-```sql
-WITH candidates AS (
- SELECT id FROM openmettle.local_sessions
- WHERE revoked OR expires_ms <= floor(extract(epoch FROM clock_timestamp())*1000)::bigint
- ORDER BY id LIMIT LEAST(GREATEST(:batch,0),1000) FOR UPDATE SKIP LOCKED
-)
-DELETE FROM openmettle.local_sessions s USING candidates c WHERE s.id=c.id;
-```
-
-Commit this batch before selecting login rows. Then a separate bounded transaction can remove
-expired, consumed gates that no session references. For schema version 9 onward, use
-[ADR 0014's gate cleanup script](0014-login-admission.md#expired-gate-cleanup) instead; it
-also removes expired unconsumed gates and refuses invalid batches. The version-8 statement:
+Commit the session batch before selecting login rows. Then a separate bounded transaction can
+remove expired, consumed gates that no session references. For schema version 9 onward, run
+[ADR 0014's gate cleanup script](0014-login-admission.md#expired-gate-cleanup) as the
+procedure's second step; it also removes expired unconsumed gates and refuses invalid
+batches. The procedure describes failure between the two steps and idle batches. The
+version-8 gate statement:
 
 ```sql
 WITH candidates AS (
