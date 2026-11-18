@@ -227,6 +227,17 @@ struct Flow {
     api: PgConnection,
     owner: PgConnection,
 }
+impl Script {
+    fn authorize(&mut self, params: &HashMap<String, String>) {
+        self.challenge = Some(params["code_challenge"].clone());
+        self.token = signing::signed(
+            &params["nonce"],
+            signing::ISSUER,
+            signing::CLIENT,
+            1799999990,
+        );
+    }
+}
 impl Flow {
     async fn new() -> Self {
         Self::with(Harness::new().await).await
@@ -252,14 +263,7 @@ impl Flow {
     fn arm_url(&self, authorization_url: &str) {
         let url = openidconnect::url::Url::parse(authorization_url).unwrap();
         let params: HashMap<String, String> = url.query_pairs().into_owned().collect();
-        let mut s = self.h.script.lock().unwrap();
-        s.challenge = Some(params["code_challenge"].clone());
-        s.token = signing::signed(
-            &params["nonce"],
-            signing::ISSUER,
-            signing::CLIENT,
-            1799999990,
-        );
+        self.h.script.lock().unwrap().authorize(&params);
     }
     async fn consume(
         &mut self,
@@ -752,6 +756,7 @@ async fn operator_writers_serialize_in_commit_order() {
 }
 
 mod admission;
+mod browser;
 mod handoff;
 mod pooled;
 mod sessions;

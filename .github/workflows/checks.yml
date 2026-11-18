@@ -118,9 +118,19 @@ jobs:
       # Explicit module filter: runs only the managed-login PostgreSQL tests, never the
       # ignored provider_http proxy child fixture.
       - name: PostgreSQL managed login authority integration
-        run: cargo test --locked --offline --lib provider_keys::tests::postgres -- --ignored
+        run: |
+          cargo test --locked --offline --lib provider_keys::tests::postgres -- --ignored --skip provider_keys::tests::postgres::browser::
         env:
           TEST_DATABASE_URL: postgres://fixture:fixture@127.0.0.1:5432/fixture?sslmode=disable
+      - name: Chrome cross-site session qualification
+        timeout-minutes: 3
+        env:
+          TEST_DATABASE_URL: postgres://fixture:fixture@127.0.0.1:5432/fixture?sslmode=disable
+        run: |
+          python3 -m unittest discover -s tests/browser -v
+          case_name=provider_keys::tests::postgres::browser::cross_site_session_lifecycle
+          cargo test --locked --offline --lib "$case_name" -- --ignored --exact --list | grep -Fx "$case_name: test"
+          cargo test --locked --offline --lib "$case_name" -- --ignored --exact --nocapture
       - name: Save Cargo dependencies and build outputs
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5; MIT; resolved 2026-11-17

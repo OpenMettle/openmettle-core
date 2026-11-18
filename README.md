@@ -167,7 +167,7 @@ After restoring the database, append the current revision for every provider and
 ADR 0009 login key before reopening. Authority reads must use the primary, and acknowledged
 commits must survive failover; lagging standbys and asynchronous failover are unsupported.
 The database stores revisions, not full configuration: keep configuration identical across
-replicas for the same revision. `cargo test --locked --offline --lib provider_keys::tests::postgres -- --ignored`
+replicas for the same revision. `cargo test --locked --offline --lib provider_keys::tests::postgres -- --ignored --skip provider_keys::tests::postgres::browser::`
 runs the managed PostgreSQL tests against an isolated test database only.
 
 ## Local identity approval and sessions
@@ -328,7 +328,7 @@ no database. Connection churn and capacity under load are unmeasured.
 [ADR 0017](docs/adr/0017-browser-login-handoff.md) adds `src/browser_auth/handoff.rs`, an
 adapter that turns one browser request into one response over the service above. **It is
 not mounted**: no process constructs it, the API still serves `/healthz` and `/readyz` only
-and answers `404` for a callback path, and no browser has been qualified.
+and answers `404` for a callback path. The isolated CI browser fixture is described below.
 
 It takes three explicit settings with no defaults: the canonical HTTPS application origin,
 a landing path on that origin and one configured provider UUID. Auth settings version 2
@@ -356,7 +356,7 @@ admission slot until expiry. A callback already sent with its matching cookie ca
 finish. A new login replaces the browser's session cookie. The earlier session stays valid
 until expiry or revocation.
 
-Before any exposure these remain outstanding: browser qualification; trusted ingress
+Before exposure, remaining work includes broader browser qualification, trusted ingress
 routing for the application origin and redaction of request targets and cookies in
 telemetry; ingress transport limits; operated cleanup and retired-key reservation
 reclamation; and runtime enablement. The router below supplies per-process request, rate and
@@ -439,11 +439,32 @@ valid`. A browser applies `Set-Cookie` in response processing order. A logout de
 remove a new cookie set in another tab while that new session stays valid in the database.
 ADR 0019 describes these orderings and the per-process budget limits.
 
-Browser qualification, runtime enablement, ingress limits and telemetry redaction remain
+Cross-browser qualification, runtime enablement, ingress limits and telemetry redaction remain
 outstanding. `cargo test --locked --offline --lib provider_keys::tests::session_routes`
 runs the loopback tests. The PostgreSQL case
 `provider_keys::tests::postgres::handoff::issued_cookies_validate_and_logout_revokes_without_current_eligibility`
 runs only in isolated CI under the existing filter.
+
+### Single-browser CI qualification
+
+The Rust runtime job selects `provider_keys::tests::postgres::browser::cross_site_session_lifecycle`
+once against its isolated PostgreSQL 18 service. The ignored test requires runner-provided
+Google Chrome and NSS `certutil`. It prints the version reported by the running browser.
+Normal offline workspace tests leave this case ignored.
+
+The fixture serves the application at `app.relying.test` and the synthetic provider's
+authorization page at `issuer.example.test`, on ephemeral loopback ports with HTTPS.
+Chrome trusts the temporary CA in a private NSS database. A form on the issuer site
+first attempts a login that the router refuses. An application form then starts a login.
+Chrome commits the issuer document, follows its link back to the callback, and lands on
+the application. The fixture checks the browser's cross-site document GET, one PKCE-bound
+token POST, a successful same-origin session check, an acknowledged logout POST, and
+a refused check after Chrome removes the session cookie. PostgreSQL must contain one
+consumed login and its revoked session for the approved synthetic user.
+
+A passing run supplies evidence for the Chrome version in that run. Other engines,
+mobile and native handoff, real provider registrations, and deployed ingress remain
+qualification gaps for V1-04.
 
 ## Schema migrations
 
