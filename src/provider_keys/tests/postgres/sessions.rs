@@ -986,7 +986,7 @@ async fn cancellation_during_explicit_error_rollback_returns_no_success() {
 }
 
 /// Users, identities, scopes and grant assignments as JSON rows, compared as sets.
-async fn account_state(f: &mut Flow) -> BTreeSet<String> {
+pub(super) async fn account_state(f: &mut Flow) -> BTreeSet<String> {
     sqlx::query_scalar(
         "SELECT 'user ' || to_jsonb(t)::text FROM openmettle.users t
          UNION ALL SELECT 'identity ' || to_jsonb(t)::text FROM openmettle.user_identities t

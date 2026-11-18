@@ -5,7 +5,8 @@ first time. It creates the approval row that managed login requires (ADR 0013). 
 create a user, identity, personal scope, resource grant or session. It requires schema
 version 8 or later.
 
-Every later change uses [ADR 0013's approval change protocol](../adr/0013-local-identity-sessions.md#approval-edits-revocation-withdrawal-and-reapproval):
+Every later change uses the [local identity approval change procedure](identity-approval-change.md),
+which implements [ADR 0013's approval change protocol](../adr/0013-local-identity-sessions.md#approval-edits-revocation-withdrawal-and-reapproval):
 routine edits, expiry changes, revocation, withdrawal and reapproval. That includes an
 approval that is withdrawn or has expired. This procedure never updates an existing approval.
 
@@ -71,7 +72,7 @@ never printed.
 | `provider is missing, retired or has a different issuer` | No such provider, no current revision, retired, or the issuer differs. | Check the provider record and issuer. |
 | `no identity has exactly this issuer and subject` | No exact match. No similar value is tried. | Check the exact subject. Creating or linking identities is out of scope. |
 | `identity user is disabled or has no personal scope` | The user is not eligible. | Resolve it under its own procedure, then rerun. |
-| `an approval already exists for this provider and identity` | Created earlier, by someone else, or in a run whose result you did not see. | Inspect it. Use ADR 0013's change protocol for any change. |
+| `an approval already exists for this provider and identity` | Created earlier, by someone else, or in a run whose result you did not see. | Inspect it. Use the [change procedure](identity-approval-change.md) for any change. |
 | `expiry is not after the primary database clock` | `expires_ms` has passed. | Choose a future expiry and rerun. |
 
 A lock or statement timeout, lost connection or other SQL error also exits non-zero without
@@ -81,10 +82,12 @@ a success line.
 
 If the connection fails while the script waits for `COMMIT`, the approval might exist. Do not
 assume either result. Inspect the provider and identity with this read-only query, run with
-`psql -X -v provider=... -v issuer=... -v subject=... -f -`:
+`psql -X -v provider=... -v issuer=... -v subject=... -f -`. The same query finds an existing
+approval's `id`, `revision` and `access_generation` for the
+[change procedure](identity-approval-change.md):
 
 ```sql
-SELECT a.active, a.expires_ms,
+SELECT a.id, a.active, a.expires_ms,
        a.expires_ms > floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint AS unexpired,
        a.revision, a.access_generation, a.changed_by, a.change_reason, a.changed_at
   FROM openmettle.local_identity_approvals AS a
@@ -96,7 +99,8 @@ SELECT a.active, a.expires_ms,
   original transaction may still be finishing. You can retry with the same inputs.
 - If an active row matches the requested expiry, actor and reason at revision 1 and
   generation 0, the requested state exists. A concurrent request can produce the same state.
-- If any field differs, review the existing approval and use ADR 0013's change protocol.
+- If any field differs, review the existing approval and use the
+  [change procedure](identity-approval-change.md).
 
 Rerunning the script is also safe: it either creates the approval or refuses because one
 exists. It never replaces or extends an existing approval.

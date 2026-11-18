@@ -1,0 +1,124 @@
+-- ADR 0013: change one existing local identity approval (schema version 8+). Procedure,
+-- refusals and unknown-commit handling: docs/operator/identity-approval-change.md. Run against
+-- the primary as openmettle_owner with psql -X. Supply every variable; there are no defaults:
+--   approval             approval UUID, canonical lowercase form (see the runbook's inspection)
+--   expected_revision    the approval's current revision (1 to 2^63-1, plain decimal)
+--   expected_generation  its current access generation (0 to 2^63-1, plain decimal)
+--   action               routine | revoke | withdraw | restore
+--   expires_ms           Unix milliseconds; written by routine and restore, which require it
+--                        after the primary clock. revoke and withdraw keep the stored expiry.
+--   actor, reason        synthetic operator identifiers only (latest-change provenance, not audit)
+-- Updates only that approval row: revision +1 always; access generation +1 except for routine.
+-- Never creates approvals, changes provider/identity, sessions, users, scopes or grants.
+-- Prints one fixed line with the new counters after COMMIT and a fixed refusal reason otherwise;
+-- never input text. Operator values reach SQL only as quoted psql variables (:'name').
+\set ON_ERROR_STOP on
+-- Validate presence and domains before any table access or cast. Explicit character sets avoid
+-- locale-dependent ranges. Counters are compared as fixed-width text against the bigint maximum
+-- so no cast can overflow. Caller-supplied control variables are overwritten before use.
+\set valid false
+\if :{?approval}
+ \if :{?expected_revision}
+  \if :{?expected_generation}
+   \if :{?action}
+    \if :{?expires_ms}
+     \if :{?actor}
+      \if :{?reason}
+  SELECT :'approval' ~ '^[0123456789abcdef]{8}-[0123456789abcdef]{4}-[0123456789abcdef]{4}-[0123456789abcdef]{4}-[0123456789abcdef]{12}$'
+     AND :'expected_revision' ~ '^[123456789][0123456789]{0,18}$'
+     AND (octet_length(:'expected_revision') < 19
+          OR :'expected_revision' COLLATE "C" <= '9223372036854775807')
+     AND :'expected_generation' ~ '^(0|[123456789][0123456789]{0,18})$'
+     AND (octet_length(:'expected_generation') < 19
+          OR :'expected_generation' COLLATE "C" <= '9223372036854775807')
+     AND :'action' IN ('routine', 'revoke', 'withdraw', 'restore')
+     AND :'expires_ms' ~ '^[123456789][0123456789]{0,17}$'
+     AND octet_length(:'actor') BETWEEN 1 AND 128
+     AND octet_length(:'reason') BETWEEN 1 AND 512 AS valid \gset
+      \endif
+     \endif
+    \endif
+   \endif
+  \endif
+ \endif
+\endif
+\if :valid
+  BEGIN;
+  SET LOCAL lock_timeout = '2s';
+  SET LOCAL statement_timeout = '5s';
+  SET LOCAL synchronous_commit = on;
+  -- Exclusive row lock: issuance and validation hold FOR SHARE on this row, so a change waits
+  -- for them and they wait for it. Only this row is locked; provider and user are not touched.
+  SELECT count(*) AS approval_rows FROM (SELECT id FROM openmettle.local_identity_approvals
+   WHERE id = :'approval'::uuid FOR UPDATE) AS locked \gset
+  -- Fresh statement after any wait: current stored values and the primary clock. now() is
+  -- transaction-start time and cannot show expiry that passed during the wait.
+  SELECT :'approval_rows'::integer = 1 AND a.id IS NOT NULL AS found,
+         coalesce(a.revision = :'expected_revision'::bigint
+                  AND a.access_generation = :'expected_generation'::bigint, false) AS current,
+         -- Revision always advances; generation advances for every action except routine.
+         coalesce(a.revision < 9223372036854775807
+                  AND (:'action' = 'routine' OR a.access_generation < 9223372036854775807),
+                  false) AS bounded,
+         coalesce(CASE :'action'
+                    WHEN 'routine' THEN a.active AND a.expires_ms > c.ms
+                    WHEN 'restore' THEN NOT a.active OR a.expires_ms <= c.ms
+                    ELSE a.active END, false) AS applicable,
+         :'action' IN ('revoke', 'withdraw') OR :'expires_ms'::bigint > c.ms AS future
+    FROM (SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint AS ms) AS c
+    LEFT JOIN openmettle.local_identity_approvals AS a ON a.id = :'approval'::uuid \gset
+  \if :found
+    \if :current
+      \if :bounded
+        \if :applicable
+          \if :future
+            -- The expected counters are repeated so the write itself is a compare-and-set.
+            WITH changed AS (
+              UPDATE openmettle.local_identity_approvals
+                 SET revision = revision + 1,
+                     access_generation = access_generation
+                       + CASE WHEN :'action' = 'routine' THEN 0 ELSE 1 END,
+                     active = CASE :'action' WHEN 'withdraw' THEN false
+                                             WHEN 'restore' THEN true ELSE active END,
+                     expires_ms = CASE WHEN :'action' IN ('routine', 'restore')
+                                       THEN :'expires_ms'::bigint ELSE expires_ms END,
+                     changed_by = :'actor', change_reason = :'reason',
+                     changed_at = clock_timestamp()
+               WHERE id = :'approval'::uuid
+                 AND revision = :'expected_revision'::bigint
+                 AND access_generation = :'expected_generation'::bigint
+              RETURNING revision, access_generation
+            )
+            SELECT count(*) = 1 AS changed, max(revision) AS new_revision,
+                   max(access_generation) AS new_generation FROM changed \gset
+            \if :changed
+              COMMIT;
+              -- Reached only after the server acknowledged COMMIT. Counters are server values.
+              \echo 'approval change committed: revision' :new_revision 'access_generation' :new_generation
+            \else
+              ROLLBACK;
+              DO $refused$ BEGIN RAISE EXCEPTION 'approval change refused: expected revision or generation is not current; no changes committed'; END; $refused$;
+            \endif
+          \else
+            ROLLBACK;
+            DO $refused$ BEGIN RAISE EXCEPTION 'approval change refused: expiry is not after the primary database clock; no changes committed'; END; $refused$;
+          \endif
+        \else
+          ROLLBACK;
+          DO $refused$ BEGIN RAISE EXCEPTION 'approval change refused: action does not apply to the approval''s current state; no changes committed'; END; $refused$;
+        \endif
+      \else
+        ROLLBACK;
+        DO $refused$ BEGIN RAISE EXCEPTION 'approval change refused: revision or generation would overflow; no changes committed'; END; $refused$;
+      \endif
+    \else
+      ROLLBACK;
+      DO $refused$ BEGIN RAISE EXCEPTION 'approval change refused: expected revision or generation is not current; no changes committed'; END; $refused$;
+    \endif
+  \else
+    ROLLBACK;
+    DO $refused$ BEGIN RAISE EXCEPTION 'approval change refused: no approval has this ID; no changes committed'; END; $refused$;
+  \endif
+\else
+  DO $refused$ BEGIN RAISE EXCEPTION 'approval change refused: missing or invalid input; nothing changed'; END; $refused$;
+\endif

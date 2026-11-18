@@ -420,6 +420,8 @@ async fn cleanup_script_removes_only_expired_unreferenced_gates() {
     assert_eq!(counts(&db).await.0, reservations);
 }
 
+#[path = "approval_change.rs"]
+mod approval_change;
 #[path = "first_approval.rs"]
 mod first_approval;
 #[path = "session_cleanup.rs"]
