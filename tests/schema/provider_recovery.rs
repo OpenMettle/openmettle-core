@@ -37,6 +37,52 @@ fn variables<'a>(
 
 #[tokio::test]
 #[ignore = "isolated CI PostgreSQL 18 and POSTGRES_CONTAINER required"]
+async fn legacy_owner_restore_works_on_v9_and_refuses_on_v10() {
+    let adr = include_str!("../../docs/adr/0013-local-identity-sessions.md");
+    let section = adr
+        .split_once("### Provider revision, revocation, retirement and restoration\n")
+        .unwrap()
+        .1;
+    let script = section
+        .split_once("```sql\n")
+        .unwrap()
+        .1
+        .split_once("```")
+        .unwrap()
+        .0;
+    let db = TestDb::new().await;
+    let settings = db.settings(Duration::from_secs(10));
+    migrate::apply(&settings, &MIGRATIONS[..9]).await.unwrap();
+    retired(&db).await;
+    let run = |action, revision, epoch, generation| {
+        psql(
+            &db,
+            script,
+            &[
+                ("provider", PROVIDER),
+                ("actor", OPERATOR),
+                ("reason", "synthetic change"),
+                ("action", action),
+                ("revision", revision),
+                ("expected_epoch", epoch),
+                ("expected_generation", generation),
+            ],
+        )
+    };
+    let restored = run("restore", "v2", "3", "1");
+    assert!(restored.status.success(), "{}", stderr(&restored));
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+    let retired = run("retire", "", "4", "1");
+    assert!(retired.status.success(), "{}", stderr(&retired));
+    let before = everything(&db).await;
+    let refused = run("restore", "v2", "5", "2");
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("operator change refused; no changes committed"));
+    assert_eq!(everything(&db).await, before);
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 and POSTGRES_CONTAINER required"]
 async fn only_owner_can_recover_and_only_once_from_inspected_retirement() {
     let db = TestDb::migrated().await;
     retired(&db).await;

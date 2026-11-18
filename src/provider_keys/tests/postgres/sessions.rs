@@ -1115,7 +1115,10 @@ async fn first_approval_script_admits_existing_identity_to_its_personal_scope() 
 #[ignore = "isolated CI PostgreSQL 18 and POSTGRES_CONTAINER required"]
 async fn audited_provider_recovery_requires_a_new_successful_oidc_login() {
     const RESTORE: &str = include_str!("../../../../docs/operator/restore-login-provider.psql");
-    let mut f = Flow::new().await;
+    // The pre-retirement proof must outlive the external psql process for the epoch check.
+    let mut refresh = policy();
+    refresh.deadline = Duration::from_secs(30);
+    let mut f = Flow::with(Harness::with_policy(refresh).await).await;
     let p = f.h.provider.clone();
     let user = seed(&mut f, true, true).await;
     let accounts = account_state(&mut f).await;
@@ -1158,29 +1161,34 @@ async fn audited_provider_recovery_requires_a_new_successful_oidc_login() {
     assert_eq!(session_count(&mut f).await, 1);
     assert_eq!(account_state(&mut f).await, accounts);
 
-    assert!(
+    assert_eq!(
         local::validate(&mut f.api, old.expose(), &session_policy())
             .await
-            .is_err()
+            .unwrap_err(),
+        SessionError::Rejected
     );
     assert_eq!(
         f.consume(&p, &pending).await.unwrap_err(),
         login::Error::Rejected
     );
-    assert!(
+    assert_eq!(
         p.issue_session(&mut f.api, old_proof, &session_policy())
             .await
-            .is_err()
+            .unwrap_err(),
+        SessionError::Rejected
     );
     let start = f.begin(&p).await;
     f.arm(&start);
     let permit = f.consume(&p, &start).await.unwrap();
-    assert!(
+    let posts = super::pooled::posts(&f);
+    assert_eq!(
         permit
             .exchange_with_keys(&p, &auth::Policy::default())
             .await
-            .is_err()
+            .unwrap_err(),
+        login::Error::Exchange
     );
+    assert_eq!(super::pooled::posts(&f), posts + 1);
     assert_eq!(session_count(&mut f).await, 1);
 
     f.h.script.lock().unwrap().mode = "ok";
