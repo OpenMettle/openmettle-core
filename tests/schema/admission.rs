@@ -42,6 +42,13 @@ fn released_migrations_one_through_eight_are_unchanged_and_nine_is_pinned() {
 
 /// Runs an exact operator script with the service container's psql as openmettle_owner.
 fn psql(db: &TestDb, script: &str, variables: &[(&str, &str)]) -> Output {
+    psql_spawn(db, script, variables)
+        .wait_with_output()
+        .unwrap()
+}
+/// Starts the same psql run without waiting, for tests that hold a lock it must wait for.
+/// The server-side session reports application_name `psql`.
+fn psql_spawn(db: &TestDb, script: &str, variables: &[(&str, &str)]) -> Child {
     let container =
         std::env::var("POSTGRES_CONTAINER").expect("isolated CI PostgreSQL container ID required");
     let mut command = Command::new("docker");
@@ -77,7 +84,7 @@ fn psql(db: &TestDb, script: &str, variables: &[(&str, &str)]) -> Output {
         .unwrap()
         .write_all(script.as_bytes())
         .unwrap();
-    child.wait_with_output().unwrap()
+    child
 }
 async fn limit_row(db: &TestDb) -> (Option<i32>, String, String) {
     sqlx::query_as(
@@ -436,5 +443,7 @@ async fn cleanup_script_removes_only_expired_unreferenced_gates() {
     assert_eq!(counts(&db).await.0, reservations);
 }
 
+#[path = "first_approval.rs"]
+mod first_approval;
 #[path = "session_cleanup.rs"]
 mod session_cleanup;
