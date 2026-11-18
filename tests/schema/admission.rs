@@ -49,6 +49,16 @@ fn psql(db: &TestDb, script: &str, variables: &[(&str, &str)]) -> Output {
 /// Starts the same psql run without waiting, for tests that hold a lock it must wait for.
 /// The server-side session reports application_name `psql`.
 fn psql_spawn(db: &TestDb, script: &str, variables: &[(&str, &str)]) -> Child {
+    let mut child = psql_start(db, variables);
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    child
+}
+fn psql_start(db: &TestDb, variables: &[(&str, &str)]) -> Child {
     let container =
         std::env::var("POSTGRES_CONTAINER").expect("isolated CI PostgreSQL container ID required");
     let mut command = Command::new("docker");
@@ -71,20 +81,13 @@ fn psql_spawn(db: &TestDb, script: &str, variables: &[(&str, &str)]) -> Child {
     for (name, value) in variables {
         command.args(["-v", &format!("{name}={value}")]);
     }
-    let mut child = command
+    command
         .args(["-f", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
         .unwrap()
-        .write_all(script.as_bytes())
-        .unwrap();
-    child
 }
 async fn limit_row(db: &TestDb) -> (Option<i32>, String, String) {
     sqlx::query_as(

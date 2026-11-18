@@ -5,6 +5,7 @@
 //! `provider_keys::tests::postgres::sessions`, which seed approvals directly.
 use super::*;
 use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader};
 
 const SCRIPT: &str = include_str!("../../docs/operator/first-identity-approval.psql");
 const RUNBOOK: &str = include_str!("../../docs/operator/first-identity-approval.md");
@@ -195,19 +196,24 @@ fn refused(out: &Output, reason: &str) {
 /// Waits (bounded, polling) until the script's psql backend is blocked on a heavyweight lock
 /// in a statement that touches `relation`.
 async fn blocked(db: &TestDb, child: &mut Child, relation: &str) {
+    wait_for_psql(db, child, "Lock", &format!("openmettle.{relation}")).await;
+}
+
+async fn wait_for_psql(db: &TestDb, child: &mut Child, event_type: &str, query_fragment: &str) {
     let mut admin = db.admin().await;
     let deadline = Instant::now() + Duration::from_secs(10);
     while !sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT FROM pg_stat_activity WHERE datname = $1 AND application_name = 'psql'
-                         AND wait_event_type = 'Lock' AND strpos(query, $2) > 0)",
+                         AND wait_event_type = $2 AND strpos(query, $3) > 0)",
     )
     .bind(&db.0)
-    .bind(format!("openmettle.{relation}"))
+    .bind(event_type)
+    .bind(query_fragment)
     .fetch_one(&mut admin)
     .await
     .unwrap()
     {
-        assert!(Instant::now() < deadline, "script never waited on {relation}");
+        assert!(Instant::now() < deadline, "script never reached {query_fragment}");
         assert!(child.try_wait().unwrap().is_none(), "script exited before waiting");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -408,6 +414,58 @@ async fn refusals_commit_nothing_and_leave_eligibility_untouched() {
 
 #[tokio::test]
 #[ignore = "isolated CI PostgreSQL 18 and POSTGRES_CONTAINER required"]
+async fn provider_created_after_lock_lookup_requires_a_new_invocation() {
+    let db = TestDb::migrated().await;
+    seed(&db).await;
+    let new_provider = "00000000-0000-0000-0000-0000000000ff";
+    let vars = input(new_provider, ISSUER, SUBJECT, FUTURE);
+    let mut child = psql_start(&db, &borrowed(&vars));
+    let mut stdin = child.stdin.take().unwrap();
+    // Feed the exact file in two pieces. Observe the backend waiting for more input
+    // after the lock lookup has finished and before it can read current authority.
+    let lock_end = "FOR SHARE) AS locked \\gset\n";
+    let (first, rest) = SCRIPT.split_at(SCRIPT.find(lock_end).unwrap() + lock_end.len());
+    stdin.write_all(first.as_bytes()).unwrap();
+    wait_for_psql(&db, &mut child, "Client", " AS provider_rows FROM ").await;
+
+    let mut owner = connect(&db.0, OWNER).await;
+    let mut tx = owner.begin().await.unwrap();
+    sqlx::query("INSERT INTO openmettle.login_providers (id,issuer,client_id,changed_by,change_reason) VALUES ($1::uuid,$2,'synthetic','fixture-owner','synthetic creation')")
+        .bind(new_provider).bind(ISSUER).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO openmettle.login_provider_revisions (provider_id,revision) VALUES ($1::uuid,'v1')")
+        .bind(new_provider).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    stdin.write_all(rest.as_bytes()).unwrap();
+    drop(stdin);
+    refused(&child.wait_with_output().unwrap(), NO_PROVIDER);
+    assert_eq!(approval(&db, new_provider, 1).await, None);
+    succeeded(&approve(&db, &vars));
+    assert_eq!(approval(&db, new_provider, 1).await, created(1, FUTURE));
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 and POSTGRES_CONTAINER required"]
+async fn high_bit_subject_is_refused_on_sql_ascii() {
+    let db = TestDb::create(
+        "SELECT pg_advisory_lock_shared($1)",
+        "TEMPLATE template0 ENCODING 'SQL_ASCII' LOCALE_PROVIDER libc LC_COLLATE 'C' LC_CTYPE 'C'",
+    )
+    .await;
+    migrate::apply(&db.settings(Duration::from_secs(10)), MIGRATIONS)
+        .await
+        .unwrap();
+    seed(&db).await;
+    let subject = "Synthetic Subjéct";
+    sqlx::query("INSERT INTO openmettle.user_identities (id,user_id,issuer,subject) VALUES ($1::uuid,$2::uuid,$3,$4)")
+        .bind(identity(8)).bind(user(1)).bind(ISSUER).bind(subject)
+        .execute(&mut connect(&db.0, OWNER).await).await.unwrap();
+    refused(&approve(&db, &exact(subject, FUTURE)), INVALID);
+    assert_eq!(approval(&db, PROVIDER, 8).await, None);
+    succeeded(&approve(&db, &exact(SUBJECT, FUTURE)));
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 and POSTGRES_CONTAINER required"]
 async fn racing_first_approvals_cannot_replace_or_expand_an_approval() {
     let db = TestDb::migrated().await;
     seed(&db).await;
@@ -498,9 +556,19 @@ async fn provider_user_and_clock_are_rechecked_after_real_lock_waits() {
     // sampled after the wait, so nothing commits.
     holder.execute("BEGIN").await.unwrap();
     lock_user(1).execute(&mut holder).await.unwrap();
-    let expiry = db_ms(&mut holder).await + 1500;
-    let mut child = spawn(&db, &exact(SUBJECT, &expiry.to_string()));
+    // Start the window on the primary after psql connects. Report that timestamp on a
+    // fixture-only stderr line so the observer can use the identical cutoff.
+    let script = format!(
+        "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint + 1200 AS expires_ms \\gset\n\\warn :expires_ms\n{SCRIPT}"
+    );
+    let vars = without(exact(SUBJECT, FUTURE), "expires_ms");
+    let mut child = psql_spawn(&db, &script, &borrowed(&vars));
     blocked(&db, &mut child, "users").await;
+    let mut timestamp = String::new();
+    BufReader::new(child.stderr.as_mut().unwrap())
+        .read_line(&mut timestamp)
+        .unwrap();
+    let expiry: i64 = timestamp.trim_end().parse().unwrap();
     assert!(
         db_ms(&mut holder).await < expiry,
         "script must wait before expiry"

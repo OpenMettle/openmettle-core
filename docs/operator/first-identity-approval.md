@@ -29,7 +29,7 @@ Supply every variable. There are no defaults.
 | `provider` | Login provider UUID in canonical lowercase form. |
 | `issuer` | The provider's issuer, byte for byte. It must also be the identity's issuer. |
 | `subject` | The identity's subject, byte for byte: 1–255 ASCII bytes. Case and spaces are significant and never trimmed. |
-| `expires_ms` | Approval expiry in Unix milliseconds: a decimal integer of 1–18 digits without a leading zero, after the primary database clock when the script checks it. Sessions never outlive it. |
+| `expires_ms` | Approval expiry in Unix milliseconds. Supply 1–18 decimal digits without a leading zero. The expiry must still be in the future after the script's lock waits. Session issuance uses the approval expiry in effect at issuance. |
 | `actor`, `reason` | Operator identifier (1–128 bytes) and change reason (1–512 bytes). |
 
 `actor` and `reason` are latest-change provenance. A later change overwrites them, so they
@@ -53,12 +53,12 @@ On success it exits 0 and prints exactly `first approval committed`. The new app
 active, with revision 1 and access generation 0. No other row changes.
 
 The script runs one transaction with `lock_timeout` 2s, `statement_timeout` 5s and
-`synchronous_commit = on`. It takes shared locks in issuance order: provider row, then the
-new approval, then the user row. After each wait it rereads the provider's current revision
-and issuer, the user's disablement and personal scope, and the primary clock in new
-statements. An owner provider or user change therefore either commits before those reads
-or waits for this transaction. A concurrent creator for the same provider and identity is
-awaited: if it commits, this script inserts nothing.
+`synchronous_commit = on`. It locks the existing provider row for share and checks its
+current revision and issuer in a fresh statement. If the provider first appears after the
+lock attempt, rerun the command. It then inserts the approval and locks the existing user
+row for share. It checks the user's eligibility and the primary clock after those waits.
+If another operator creates the same approval concurrently, the script waits for that
+transaction. If the other transaction commits, this command refuses the duplicate.
 
 ## Refusals
 
@@ -92,10 +92,11 @@ SELECT a.active, a.expires_ms,
  WHERE a.provider_id = :'provider'::uuid AND i.issuer = :'issuer' AND i.subject = :'subject';
 ```
 
-- `(0 rows)`: nothing committed. Rerun the script.
-- One row with your actor, reason and expiry, revision 1 and generation 0: your run committed.
-- Any other row: someone else created or changed it. Review it and use ADR 0013's change
-  protocol for any change.
+- If the query returns zero rows, no approval was visible at the time of the read. The
+  original transaction may still be finishing. You can retry with the same inputs.
+- If an active row matches the requested expiry, actor and reason at revision 1 and
+  generation 0, the requested state exists. A concurrent request can produce the same state.
+- If any field differs, review the existing approval and use ADR 0013's change protocol.
 
 Rerunning the script is also safe: it either creates the approval or refuses because one
 exists. It never replaces or extends an existing approval.
@@ -112,7 +113,8 @@ The issuer and subject identify a person at the provider. Treat them as personal
   statement under the default `log_min_error_statement = error`. A running statement's text
   is visible in `pg_stat_activity` to roles allowed to see it. Issuer and subject appear only
   in the input check and in the reads of the provider and identity, none of which takes a row
-  lock. The statements that can wait on a lock carry UUIDs, expiry, actor and reason.
+  lock. DDL can make these reads wait for a relation lock while their text remains visible
+  to authorized observers. The deliberate row-lock waits use UUIDs, expiry, actor and reason.
 - Normal output is a fixed success line or a fixed refusal reason. PostgreSQL lock and
   timeout errors can name a relation or index, but not the supplied values.
 
@@ -123,7 +125,9 @@ through `cargo test --locked --offline --test schema -- --ignored`, which needs
 `TEST_DATABASE_URL` and `POSTGRES_CONTAINER`. The tests cover the created row, unchanged
 other tables, exact matching with case, space and apostrophe variants, every refusal reason,
 refusals of repeated and extended attempts, and real lock waits for concurrent creators,
-user disablement, provider revisions and expiry. They do not cover session issuance. The
+user disablement, provider revisions and expiry. The suite also checks a provider created
+between the lock attempt and the authority read, and high-bit subject bytes on SQL_ASCII.
+The operator tests do not exercise session issuance. The
 managed-session tests in `provider_keys::tests::postgres::sessions` show that an approval
 admits an identity; those tests insert approvals directly.
 

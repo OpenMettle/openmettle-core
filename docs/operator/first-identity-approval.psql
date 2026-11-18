@@ -24,7 +24,9 @@
   SELECT :'provider' ~ '^[0123456789abcdef]{8}-[0123456789abcdef]{4}-[0123456789abcdef]{4}-[0123456789abcdef]{4}-[0123456789abcdef]{12}$'
      AND octet_length(:'issuer') BETWEEN 1 AND 2048
      AND octet_length(:'subject') BETWEEN 1 AND 255
-     AND octet_length(convert_to(:'subject', 'UTF8')) = char_length(:'subject')
+     -- Each byte must be 00-7F even when the database uses SQL_ASCII.
+     AND encode(convert_to(:'subject', getdatabaseencoding()::name), 'hex')
+           COLLATE "C" ~ '^([0-7][0-9a-f])+$'
      AND :'expires_ms' ~ '^[123456789][0123456789]{0,17}$'
      AND octet_length(:'actor') BETWEEN 1 AND 128
      AND octet_length(:'reason') BETWEEN 1 AND 512 AS valid \gset
@@ -44,8 +46,9 @@
   SELECT count(*) AS provider_rows FROM (SELECT id FROM openmettle.login_providers
    WHERE id = :'provider'::uuid FOR SHARE) AS locked \gset
   -- Fresh statement after any wait: the current revision exists, is not retired, and the
-  -- provider's issuer is exactly the supplied issuer.
-  SELECT EXISTS (SELECT FROM openmettle.login_providers AS p
+  -- provider's issuer is exactly the supplied issuer. A newly visible provider is eligible
+  -- only on a later invocation that acquires its row lock.
+  SELECT :'provider_rows'::integer = 1 AND EXISTS (SELECT FROM openmettle.login_providers AS p
     JOIN LATERAL (SELECT revision FROM openmettle.login_provider_revisions
                    WHERE provider_id = p.id ORDER BY epoch DESC LIMIT 1) AS r ON true
    WHERE p.id = :'provider'::uuid AND r.revision IS NOT NULL
@@ -74,7 +77,7 @@
         -- waits until this transaction ends.
         SELECT count(*) AS user_rows FROM (SELECT id FROM openmettle.users
          WHERE id = :'identity_user'::uuid FOR SHARE) AS locked \gset
-        SELECT EXISTS (SELECT FROM openmettle.users AS u
+        SELECT :'user_rows'::integer = 1 AND EXISTS (SELECT FROM openmettle.users AS u
           JOIN openmettle.scopes AS s ON s.personal_user_id = u.id AND s.kind = 'personal'
          WHERE u.id = :'identity_user'::uuid AND u.disabled_at IS NULL) AS eligible \gset
         -- Primary clock sampled after every wait; now() is transaction-start time.
