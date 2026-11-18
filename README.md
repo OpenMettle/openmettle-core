@@ -168,7 +168,9 @@ ADR 0009 login key before reopening. Authority reads must use the primary, and a
 commits must survive failover; lagging standbys and asynchronous failover are unsupported.
 The database stores revisions, not full configuration: keep configuration identical across
 replicas for the same revision. `cargo test --locked --offline --lib provider_keys::tests::postgres -- --ignored --skip provider_keys::tests::postgres::browser::`
-runs the managed PostgreSQL tests against an isolated test database only.
+runs the managed PostgreSQL tests against an isolated test database only. The first-approval
+session test also needs `POSTGRES_CONTAINER`, the isolated CI service container whose `psql`
+runs the operator script.
 
 ## Local identity approval and sessions
 

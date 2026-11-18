@@ -1,8 +1,7 @@
 //! ADR 0013 first local identity approval: executes the exact operator script with the pinned
 //! service psql (isolated CI PostgreSQL 18 and POSTGRES_CONTAINER). These tests prove which rows
-//! the script creates, refuses and preserves under real lock waits. Whether an approved identity
-//! can then obtain or keep a session is proven separately by the managed-session tests in
-//! `provider_keys::tests::postgres::sessions`, which seed approvals directly.
+//! the script creates, refuses and preserves under real lock waits. Session issuance after the
+//! script is tested separately in `provider_keys::tests::postgres::sessions`.
 use super::*;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};

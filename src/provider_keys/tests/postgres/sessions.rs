@@ -2,6 +2,7 @@
 use super::*;
 use crate::response_barrier::{ResponseBarrier, cancel_at_response};
 use crate::sessions::{self as local, Error as SessionError};
+use std::{collections::BTreeSet, io::Write};
 
 pub(super) fn session_policy() -> local::Policy {
     local::Policy::new(Duration::from_secs(60), 16, Duration::from_secs(10)).unwrap()
@@ -982,4 +983,130 @@ async fn cancellation_during_explicit_error_rollback_returns_no_success() {
     .await
     .unwrap();
     assert_eq!(state, (true, 0));
+}
+
+/// Users, identities, scopes and grant assignments as JSON rows, compared as sets.
+async fn account_state(f: &mut Flow) -> BTreeSet<String> {
+    sqlx::query_scalar(
+        "SELECT 'user ' || to_jsonb(t)::text FROM openmettle.users t
+         UNION ALL SELECT 'identity ' || to_jsonb(t)::text FROM openmettle.user_identities t
+         UNION ALL SELECT 'scope ' || to_jsonb(t)::text FROM openmettle.scopes t
+         UNION ALL SELECT 'grant ' || to_jsonb(t)::text FROM openmettle.grant_assignments t",
+    )
+    .fetch_all(&mut f.owner)
+    .await
+    .unwrap()
+    .into_iter()
+    .collect()
+}
+
+// ADR 0013 first approval end to end: the unchanged operator script (run with the pinned service
+// psql, as in the schema suite) is the only approval writer, and managed login then admits the
+// existing identity into its existing user and personal scope.
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 and POSTGRES_CONTAINER required"]
+async fn first_approval_script_admits_existing_identity_to_its_personal_scope() {
+    const SCRIPT: &str = include_str!("../../../../docs/operator/first-identity-approval.psql");
+    let mut f = Flow::new().await;
+    // Existing enabled user, identity ('synthetic-subject' at the fixture issuer) and personal
+    // scope, without an approval.
+    let user = seed(&mut f, false, true).await;
+    let (identity, scope): (String, String) = sqlx::query_as(
+        "SELECT i.id::text, s.id::text FROM openmettle.user_identities i
+           JOIN openmettle.scopes s ON s.kind='personal' AND s.personal_user_id=i.user_id
+          WHERE i.user_id=$1::uuid",
+    )
+    .bind(&user)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    let accounts = account_state(&mut f).await;
+
+    let p = f.h.provider.clone();
+    let (_, proof) = f.exchanged(&p).await;
+    assert!(matches!(
+        p.issue_session(&mut f.api, proof, &session_policy()).await,
+        Err(SessionError::Rejected)
+    ));
+    assert_eq!(session_count(&mut f).await, 0);
+
+    // Explicit expiry ten minutes after the primary clock; synthetic actor and reason.
+    let expires_ms: i64 = sqlx::query_scalar(
+        "SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint+600000",
+    )
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    let expires = expires_ms.to_string();
+    let vars = [
+        ("provider", signing::ID),
+        ("issuer", signing::ISSUER),
+        ("subject", "synthetic-subject"),
+        ("expires_ms", expires.as_str()),
+        ("actor", "fixture-operator"),
+        ("reason", "synthetic first approval"),
+    ];
+    let mut child = psql::start(&f.db.name, OWNER, PASSWORD, &vars);
+    // Dropping stdin after the write ends psql's input.
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(SCRIPT.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    // The script never prints supplied values; stderr carries only fixed or SQL error text.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "first approval committed\n"
+    );
+    assert!(out.stderr.is_empty(), "{stderr}");
+    type Approval = (String, String, String, i64, i64, bool, i64, String, String);
+    let approvals: Vec<Approval> = sqlx::query_as(
+        "SELECT id::text, provider_id::text, identity_id::text, revision, access_generation,
+                active, expires_ms, changed_by, change_reason
+           FROM openmettle.local_identity_approvals",
+    )
+    .fetch_all(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(approvals.len(), 1);
+    let approval_id = approvals[0].0.clone();
+    assert_eq!(
+        approvals[0],
+        (
+            approval_id.clone(),
+            signing::ID.to_owned(),
+            identity.clone(),
+            1,
+            0,
+            true,
+            expires_ms,
+            "fixture-operator".into(),
+            "synthetic first approval".into()
+        )
+    );
+
+    // A fresh managed proof now issues a session for the original user and personal scope.
+    let credential = issue(&mut f).await;
+    let context = local::validate(&mut f.api, credential.expose(), &session_policy())
+        .await
+        .unwrap();
+    assert_eq!(context.user_id(), user);
+    assert_eq!(context.personal_scope_id(), scope);
+    let sessions: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT approval_id::text, provider_id::text, identity_id::text, user_id::text
+           FROM openmettle.local_sessions",
+    )
+    .fetch_all(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        sessions,
+        [(approval_id, signing::ID.to_owned(), identity, user)]
+    );
+    // Neither the script nor issuance created, linked or changed accounts, scopes or grants.
+    assert_eq!(account_state(&mut f).await, accounts);
 }
