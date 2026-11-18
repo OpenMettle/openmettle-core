@@ -48,10 +48,10 @@ FROM (VALUES ('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'))
      AND a.source_kind='mapped' AND a.target_kind='project'
      AND a.assignment_format='openmettle.project-member' AND a.assignment_version=1
    ORDER BY a.id FOR NO KEY UPDATE \g /dev/null
-  -- A request UUID records one withdrawal. Its receipts use this request key prefix.
+  -- A request UUID records one withdrawal, of any approval. Its receipts use this request key
+  -- prefix. Same match as unknown-commit recovery: any change with the prefix uses the UUID.
   SELECT NOT EXISTS (SELECT FROM openmettle.grant_changes
-                      WHERE actor_user_id=:'grantee'::uuid AND source_kind='mapped'
-                        AND starts_with(request_key, 'membership-withdraw/' || :'request' || '/'))
+                      WHERE starts_with(request_key, 'membership-withdraw/' || :'request' || '/'))
          AS unused \gset
 \else
   \set unused false

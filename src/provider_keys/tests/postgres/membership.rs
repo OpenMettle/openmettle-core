@@ -1235,6 +1235,65 @@ async fn withdrawal_revokes_only_mapped_grants_and_records_replayable_receipts()
 
 #[tokio::test]
 #[ignore = "isolated CI PostgreSQL 18 and POSTGRES_CONTAINER required"]
+async fn withdrawal_request_cannot_be_reused_for_another_approval() {
+    let mut f = Flow::new().await;
+    let e = enroll(&mut f).await;
+    e.submit(&mut f, 30, json!(["team"])).await;
+    let request = new_request(&mut f).await;
+    committed(&e.withdraw(&f, OWNER, &request), 1);
+    // Another user's approval with an active grant derived from the same rule. Its receipt
+    // would have another actor, so no unique key prevents a second use of the request.
+    let user: String =
+        sqlx::query_scalar("INSERT INTO openmettle.users DEFAULT VALUES RETURNING id::text")
+            .fetch_one(&mut f.owner)
+            .await
+            .unwrap();
+    let identity: String = sqlx::query_scalar("INSERT INTO openmettle.user_identities(user_id,issuer,subject) VALUES ($1::uuid,$2,'other-subject') RETURNING id::text")
+        .bind(&user).bind(signing::ISSUER).fetch_one(&mut f.owner).await.unwrap();
+    let approval: String = sqlx::query_scalar("INSERT INTO openmettle.local_identity_approvals(provider_id,identity_id,active,expires_ms,changed_by,change_reason) VALUES ($1::uuid,$2::uuid,true,floor(extract(epoch FROM clock_timestamp())*1000)::bigint+600000,'fixture-owner','synthetic approval') RETURNING id::text")
+        .bind(signing::ID).bind(&identity).fetch_one(&mut f.owner).await.unwrap();
+    let other = Enrollment {
+        now: e.now,
+        direct: direct_grant(&mut f, &user, &approval, &e.project, &e.scope).await,
+        user,
+        approval,
+        project: e.project.clone(),
+        scope: e.scope.clone(),
+    };
+    let mut tx = WriteTransaction::begin(&mut f.owner).await.unwrap();
+    let granted = grants::change_grant(
+        &mut tx,
+        &grants::ChangeInput {
+            assignment: other.assignment(),
+            actor: &other.user,
+            key: "synthetic-mapped",
+            expected_revision: 0,
+            mapping_revision: Some(1),
+            decision: grants::Decision::Grant,
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(other.head(&mut f).await, granted);
+    let stderr = refused(
+        &other.withdraw(&f, OWNER, &request),
+        &[&other.approval, &request, OPERATOR],
+    );
+    assert!(stderr.contains("membership withdrawal refused"), "{stderr}");
+    assert_eq!(other.head(&mut f).await, granted);
+    // The refusal was the reused request: a new one withdraws the same grant.
+    let fresh = new_request(&mut f).await;
+    committed(&other.withdraw(&f, OWNER, &fresh), 1);
+    assert_withdrawn(&granted, &other.head(&mut f).await);
+    assert_eq!(
+        head_of(&mut f, &other.direct.assignment).await,
+        other.direct
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 and POSTGRES_CONTAINER required"]
 async fn withdrawal_includes_grants_left_on_superseded_targets() {
     let mut f = Flow::new().await;
     let mut e = enroll(&mut f).await;
@@ -1277,7 +1336,10 @@ async fn withdrawal_includes_grants_left_on_superseded_targets() {
 #[tokio::test]
 #[ignore = "isolated CI PostgreSQL 18 and POSTGRES_CONTAINER required"]
 async fn held_proof_from_before_withdrawal_cannot_regrant() {
-    let mut f = Flow::new().await;
+    // The held proof's deadline must outlast the psql withdrawal run between exchange and use.
+    let mut refresh = policy();
+    refresh.deadline = Duration::from_secs(30);
+    let mut f = Flow::with(Harness::with_policy(refresh).await).await;
     let e = enroll(&mut f).await;
     e.submit(&mut f, 30, json!(["team"])).await;
     // Exchanged before the withdrawal, against the same enrollment revision.
@@ -1356,9 +1418,19 @@ async fn concurrent_issuance_waits_for_withdrawal_without_deadlock() {
     })
     .await
     .unwrap();
+    // The withdrawal has waited on the rule since before this point, under the script's 2 s
+    // lock_timeout. Issuance needs only its warmed pre-lock round trips to queue on the user
+    // row. Release as soon as it does; past 1.5 s fail here rather than as a withdrawal
+    // lock timeout or a 5 s observer timeout.
+    let rule_wait = tokio::time::Instant::now();
     assert!(blocked_by(&mut observer, operator_pid, writer_pid).await);
     let release = async {
-        sessions::waiting(&mut observer, reader_pid).await;
+        tokio::time::timeout_at(
+            rule_wait + Duration::from_millis(1500),
+            sessions::waiting(&mut observer, reader_pid),
+        )
+        .await
+        .expect("issuance did not queue behind the withdrawal within 1.5 s");
         assert!(blocked_by(&mut observer, reader_pid, operator_pid).await);
         writer.commit().await.unwrap();
     };
@@ -1463,7 +1535,7 @@ async fn invited_first_sign_in_skips_membership_until_its_approval_is_enrolled()
         .unwrap();
     let mut observer = sessions::statistics_observer(&f.db).await;
     let late = proof(&mut f, now - 5, json!({"groups":["team"]})).await;
-    f.owner.execute("UPDATE openmettle.home_invitations SET redeem_before_ms=floor(extract(epoch FROM clock_timestamp())*1000)::bigint+1000").await.unwrap();
+    super::invitations::cutoff_in(&mut f, super::invitations::CUTOFF_BUDGET_MS).await;
     let cutoff: Vec<String> =
         sqlx::query_scalar("SELECT to_jsonb(t)::text FROM openmettle.home_invitations t")
             .fetch_all(&mut f.owner)
@@ -1483,8 +1555,14 @@ async fn invited_first_sign_in_skips_membership_until_its_approval_is_enrolled()
     .execute(&mut *held)
     .await
     .unwrap();
+    let policy = session_policy();
+    let mut issuing = Box::pin(f.h.provider.issue_session(&mut f.api, late, &policy));
+    // An issuance refused before the insert (cutoff already passed) fails here at once.
+    tokio::select! {
+        result = &mut issuing => panic!("issuance ended before its session insert blocked: {:?}", result.err()),
+        () = sessions::waiting(&mut observer, pid) => {}
+    }
     let release = async {
-        sessions::waiting(&mut observer, pid).await;
         let waits: Vec<String> = sqlx::query_scalar(
             "SELECT coalesce(relation::regclass::text, locktype) FROM pg_locks
              WHERE pid=$1 AND NOT granted",
@@ -1497,11 +1575,7 @@ async fn invited_first_sign_in_skips_membership_until_its_approval_is_enrolled()
         held.execute("SELECT pg_sleep(GREATEST(0,redeem_before_ms/1000.0-extract(epoch FROM clock_timestamp()))) FROM openmettle.home_invitations").await.unwrap();
         held.commit().await.unwrap();
     };
-    let policy = session_policy();
-    let (result, ()) = tokio::join!(
-        f.h.provider.issue_session(&mut f.api, late, &policy),
-        release
-    );
+    let (result, ()) = tokio::join!(issuing, release);
     assert!(matches!(result, Err(crate::sessions::Error::Rejected)));
     // Nothing persists: no account, approval, session, grant, evidence or redemption.
     let mut expected = before.clone();

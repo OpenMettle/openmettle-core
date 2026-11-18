@@ -321,18 +321,23 @@ async fn first_session_blocked_at_insert_past_invitation_expiry_rolls_back_every
         .await
         .unwrap();
     let (_, proof) = f.exchanged(&p).await;
-    f.owner.execute("UPDATE openmettle.home_invitations SET redeem_before_ms=floor(extract(epoch FROM clock_timestamp())*1000)::bigint+1000").await.unwrap();
+    cutoff_in(&mut f, CUTOFF_BUDGET_MS).await;
     let mut held = f.owner.begin().await.unwrap();
     held.execute("LOCK TABLE openmettle.local_sessions IN SHARE MODE")
         .await
         .unwrap();
+    let policy = session_policy();
+    let mut issuing = Box::pin(p.issue_session(&mut f.api, proof, &policy));
+    // An issuance refused before the insert (cutoff already passed) fails here at once.
+    tokio::select! {
+        result = &mut issuing => panic!("issuance ended before its session insert blocked: {:?}", result.err()),
+        () = waiting(&mut observer, pid) => {}
+    }
     let release = async {
-        waiting(&mut observer, pid).await;
         held.execute("SELECT pg_sleep(GREATEST(0,redeem_before_ms/1000.0-extract(epoch FROM clock_timestamp()))) FROM openmettle.home_invitations").await.unwrap();
         held.commit().await.unwrap();
     };
-    let policy = session_policy();
-    let (result, ()) = tokio::join!(p.issue_session(&mut f.api, proof, &policy), release);
+    let (result, ()) = tokio::join!(issuing, release);
     assert!(matches!(result, Err(SessionError::Rejected)));
     empty(&mut f).await;
     refused(&mut f).await;
@@ -467,38 +472,115 @@ async fn ambiguous_first_session_commit_cannot_replay() {
     assert_eq!(n, 2);
 }
 
+/// Fixture-only triggers on the redemption's own write, with the production WHEN, so an
+/// owner edit of the invitation (approval_id stays NULL) never fires them. Each advances a
+/// sequence; nextval survives the rollback that follows, so the counters record which point
+/// the refused transaction reached. SECURITY DEFINER and owned by the fixture owner, so the
+/// role firing the trigger (API at COMMIT, the function owner inside the redemption) needs no
+/// sequence privilege.
+async fn redemption_fixture(f: &mut Flow, name: &str, deferred: bool, delay: bool) {
+    let sleep = if delay {
+        "PERFORM pg_sleep(GREATEST(0, NEW.redeem_before_ms / 1000.0
+             - extract(epoch FROM clock_timestamp())) + 0.05);"
+    } else {
+        ""
+    };
+    let timing = if deferred {
+        "CONSTRAINT TRIGGER"
+    } else {
+        "TRIGGER"
+    };
+    let deferral = if deferred {
+        "DEFERRABLE INITIALLY DEFERRED"
+    } else {
+        ""
+    };
+    for sql in [
+        format!("CREATE SEQUENCE openmettle.{name}"),
+        format!(
+            "CREATE FUNCTION openmettle.{name}() RETURNS trigger LANGUAGE plpgsql
+             SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+             BEGIN PERFORM nextval('openmettle.{name}'); {sleep} RETURN NULL; END $$"
+        ),
+        format!(
+            "CREATE {timing} {name} AFTER UPDATE ON openmettle.home_invitations {deferral}
+             FOR EACH ROW WHEN (OLD.approval_id IS NULL AND NEW.approval_id IS NOT NULL)
+             EXECUTE FUNCTION openmettle.{name}()"
+        ),
+    ] {
+        f.owner.execute(AssertSqlSafe(sql)).await.unwrap();
+    }
+}
+/// How many times the named fixture trigger fired, including in rolled-back transactions.
+async fn fired(f: &mut Flow, name: &str) -> i64 {
+    sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM openmettle.{name}"
+    )))
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap()
+}
+/// Time to pass the redemption time check, and the longest wait of a session insert held
+/// until the cutoff. Leaves 500 ms under the 2 s issuance lock_timeout for the release.
+pub(super) const CUTOFF_BUDGET_MS: i64 = 1500;
+/// Primary time plus the given budget. The fixture triggers ignore this owner write.
+pub(super) async fn cutoff_in(f: &mut Flow, budget_ms: i64) {
+    sqlx::query("UPDATE openmettle.home_invitations SET redeem_before_ms=floor(extract(epoch FROM clock_timestamp())*1000)::bigint+$1")
+        .bind(budget_ms)
+        .execute(&mut f.owner)
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 #[ignore = "isolated CI PostgreSQL 18 and POSTGRES_CONTAINER required"]
 async fn cutoff_passing_at_deferred_commit_is_a_definite_refusal() {
     let mut f = Flow::new().await;
     invite(&f);
-    // Fixture-only deferred trigger. Same event, earlier name: it fires first at COMMIT and
-    // sleeps past the cutoff, after the final pre-commit time check has already passed.
-    f.owner
-        .execute(
-            "CREATE FUNCTION openmettle.fixture_commit_delay() RETURNS trigger LANGUAGE plpgsql AS $$
-             BEGIN PERFORM pg_sleep(GREATEST(0, NEW.redeem_before_ms / 1000.0
-                 - extract(epoch FROM clock_timestamp())) + 0.05); RETURN NULL; END $$",
-        )
-        .await
-        .unwrap();
-    f.owner
-        .execute(
-            "CREATE CONSTRAINT TRIGGER a_fixture_commit_delay AFTER UPDATE ON openmettle.home_invitations
-             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION openmettle.fixture_commit_delay()",
-        )
-        .await
-        .unwrap();
+    // Deferred, and named before home_redemption_session: on the same queued event it fires
+    // first at COMMIT, records that COMMIT was reached and sleeps past the cutoff. Every
+    // pre-commit time check, in the redemption and in Rust, has already passed by then.
+    redemption_fixture(&mut f, "a_fixture_commit_delay", true, true).await;
     let p = f.h.provider.clone();
     let (_, proof) = f.exchanged(&p).await;
+    cutoff_in(&mut f, 1500).await;
     let started = std::time::Instant::now();
-    f.owner.execute("UPDATE openmettle.home_invitations SET redeem_before_ms=floor(extract(epoch FROM clock_timestamp())*1000)::bigint+1500").await.unwrap();
+    let result = p.issue_session(&mut f.api, proof, &session_policy()).await;
+    // Reached COMMIT exactly once; a pre-commit refusal never fires a deferred trigger.
+    assert_eq!(fired(&mut f, "a_fixture_commit_delay").await, 1);
+    // Only OMH01 from home_redemption_session maps to Rejected. Any other COMMIT failure,
+    // including that error unmapped, is Database.
+    assert_eq!(result.err(), Some(SessionError::Rejected));
+    // The cutoff passed during the COMMIT sleep, not before issuance started.
+    assert!(started.elapsed() >= Duration::from_millis(1400));
+    empty(&mut f).await;
+    // The connection was not discarded and remains usable for the next attempt. That
+    // attempt is refused inside the redemption, which writes nothing and fires nothing.
+    refused(&mut f).await;
+    assert_eq!(fired(&mut f, "a_fixture_commit_delay").await, 1);
+    assert!(withdraw(&f, ID).status.success());
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 and POSTGRES_CONTAINER required"]
+async fn cutoff_passing_after_redemption_is_refused_before_commit() {
+    let mut f = Flow::new().await;
+    invite(&f);
+    // Immediate: runs inside the redemption's own UPDATE, after its time check, and sleeps
+    // past the cutoff. Deferred: fires only if the transaction reaches COMMIT.
+    redemption_fixture(&mut f, "fixture_redeemed", false, true).await;
+    redemption_fixture(&mut f, "a_fixture_commit_reached", true, false).await;
+    let p = f.h.provider.clone();
+    let (_, proof) = f.exchanged(&p).await;
+    cutoff_in(&mut f, 1500).await;
     let result = p.issue_session(&mut f.api, proof, &session_policy()).await;
     assert_eq!(result.err(), Some(SessionError::Rejected));
-    // Only a transaction that reached COMMIT sleeps; a pre-commit refusal returns at once.
-    assert!(started.elapsed() >= Duration::from_millis(1500));
+    // The redemption passed its own time check and wrote the row, then the cutoff passed.
+    assert_eq!(fired(&mut f, "fixture_redeemed").await, 1);
+    // The Rust final check refused and rolled back. Without it the transaction would reach
+    // COMMIT and be refused there by home_redemption_session instead.
+    assert_eq!(fired(&mut f, "a_fixture_commit_reached").await, 0);
     empty(&mut f).await;
-    // The connection was not discarded and remains usable for the next attempt.
     refused(&mut f).await;
     assert!(withdraw(&f, ID).status.success());
 }

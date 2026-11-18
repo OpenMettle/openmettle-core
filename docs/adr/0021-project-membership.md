@@ -108,7 +108,9 @@ as `openmettle_owner` under the deployment's normal owner controls.
    each active head at its next revision with its exact cycle and original mapping revision.
    It commits only if at least one grant was revoked and no derived grant of the approval
    remains active. Otherwise it rolls back and prints a fixed refusal. Refusals cover another
-   role, invalid input, an unknown approval, a reused request and nothing to withdraw.
+   role, invalid input, an unknown approval, a reused request and nothing to withdraw. A
+   request is reused if any grant change, for any approval or user, has a request key
+   starting with `membership-withdraw/<request>/`.
 4. Each revoke is an ordinary immutable v5 change with an ADR 0006 request identity and
    digest. It records the grantee as actor and the request key
    `membership-withdraw/<request>/<operator>/<n>`, numbered per scope. The script does not
