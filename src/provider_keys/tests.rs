@@ -62,6 +62,7 @@ struct Script {
     keys: Vec<u8>,
     cache: String,
     metadata_cache: String,
+    date: std::time::SystemTime,
     mode: &'static str,
     token: String,
     // PKCE challenge from a real managed begin; None keeps the fixed fixture verifier.
@@ -92,6 +93,7 @@ impl Harness {
             keys: signing::jwks(),
             cache: "max-age=100".into(),
             metadata_cache: "max-age=100".into(),
+            date: signing::now(),
             mode: "ok",
             challenge: None,
             token: signing::signed(
@@ -124,7 +126,7 @@ impl Harness {
             }
             assert!(request.body.is_empty());
             let body=if discovery {serde_json::to_vec(&s.metadata).unwrap()}else{s.keys.clone()};
-            let bytes=tls::response(200,&[("content-type","application/json"),("cache-control",if discovery {&s.metadata_cache}else{&s.cache}),("date",&httpdate::fmt_http_date(signing::now()))],&body);
+            let bytes=tls::response(200,&[("content-type","application/json"),("cache-control",if discovery {&s.metadata_cache}else{&s.cache}),("date",&httpdate::fmt_http_date(s.date))],&body);
             if jwks && s.mode=="gate-jwks" {tls::Reply::Gate(s.gate.clone(),bytes)} else {tls::Reply::Bytes(bytes)}
         }).await;
         let manager = ProviderManager::new(policy);
@@ -142,7 +144,8 @@ impl Harness {
                     - Duration::from_secs(w.unsigned_abs()),
             }
         }));
-        let config = Self::endpoint_config(&server, &ca, "v1", authorization, callback);
+        let config =
+            Self::endpoint_config(&server, &ca, signing::ID, "v1", authorization, callback);
         script.lock().unwrap().metadata = metadata(&config);
         let provider = manager.register(config).unwrap();
         Self {
@@ -156,18 +159,26 @@ impl Harness {
         }
     }
     fn config(server: &tls::Server, ca: &tls::Ca, revision: &str) -> ProviderConfig {
-        Self::endpoint_config(server, ca, revision, signing::AUTH, signing::CALLBACK)
+        Self::endpoint_config(
+            server,
+            ca,
+            signing::ID,
+            revision,
+            signing::AUTH,
+            signing::CALLBACK,
+        )
     }
     fn endpoint_config(
         server: &tls::Server,
         ca: &tls::Ca,
+        provider_id: &str,
         revision: &str,
         authorization: &str,
         callback: &str,
     ) -> ProviderConfig {
         let base = format!("https://{}:{}", tls::HOST, server.port);
         let mut c = ProviderConfig::new(
-            ProviderIdentity::new(signing::ID, signing::ISSUER, signing::CLIENT).unwrap(),
+            ProviderIdentity::new(provider_id, signing::ISSUER, signing::CLIENT).unwrap(),
             login::ProviderDefinition {
                 revision,
                 authorization_endpoint: authorization,
@@ -265,6 +276,36 @@ async fn cold_start_and_one_post_with_unknown_key_refresh() {
     assert!(h.verify(false).await.is_err());
     assert_eq!(h.count(), 5);
     assert!(h.verify(true).await.is_ok());
+}
+#[tokio::test]
+async fn managed_exchange_preserves_signed_membership_and_never_resolves_overage() {
+    use crate::membership::Observation::{Partial, Present};
+    let h = Harness::new().await;
+    h.provider.preflight().await.unwrap();
+    for (claims, decision) in [
+        (json!({"groups":["team"]}), Present),
+        (
+            json!({"groups":["team"],"_claim_sources":{"src1":{"endpoint":"https://unused.example.test"}}}),
+            Partial,
+        ),
+    ] {
+        h.script.lock().unwrap().token =
+            signing::membership_token("synthetic-subject", &"n".repeat(43), 1799999990, claims);
+        let proof = h
+            .permit()
+            .exchange_with_keys(&h.provider, &auth::Policy::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            proof.assertion.membership.select("group", "groups", "team"),
+            decision
+        );
+        assert_eq!(
+            finish_in_memory(&h.provider, proof).unwrap().subject(),
+            "synthetic-subject"
+        );
+    }
+    assert_eq!(h.count(), 4); // Discovery, JWKS, and one token POST per permit.
 }
 #[tokio::test]
 async fn successful_replacements_retire_removed_and_noncacheable_keys() {
@@ -591,6 +632,30 @@ async fn identical_registration_is_noop_and_changes_or_restores_invalidate() {
 // Recompute the canonical binding after a test edits one input field directly.
 fn rebind(c: &mut ProviderConfig) {
     c.binding = c.canonical_binding();
+}
+// The invitation redemption function compares these exact bytes of the stored login binding
+// with the provider, issuer, client, current revision and epoch it is given.
+#[tokio::test]
+async fn stored_managed_binding_layout_matches_invitation_redemption() {
+    let h = Harness::new().await;
+    let c = Harness::config(&h.server, &h.ca, "v1");
+    let field = |b: &[u8]| [&(b.len() as u64).to_be_bytes()[..], b].concat();
+    let head = [
+        b"openmettle/login-provider/2\0".as_slice(),
+        &field(signing::ID.as_bytes()),
+        &field(signing::ISSUER.as_bytes()),
+        &field(signing::CLIENT.as_bytes()),
+        &field(b"v1"),
+    ]
+    .concat();
+    assert!(c.binding.starts_with(&head));
+    let expected = [
+        b"openmettle/managed-login/2\0".as_slice(),
+        &field(&c.binding),
+        &field(&42_i64.to_be_bytes()),
+    ]
+    .concat();
+    assert_eq!(persisted(&c.binding, 42), expected);
 }
 fn unknown(kid: &str) -> UnverifiedIdToken {
     let t = signing::signed(

@@ -1,0 +1,76 @@
+-- ADR 0021. Inputs and unknown-commit recovery are documented in that ADR.
+\set ON_ERROR_STOP on
+\set VERBOSITY terse
+BEGIN ISOLATION LEVEL READ COMMITTED;
+SET LOCAL search_path = pg_catalog, pg_temp;
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '5s';
+SET LOCAL synchronous_commit = on;
+
+SELECT current_user='openmettle_owner' AND session_user=current_user AND
+       :'approval' COLLATE "C" ~ pattern AND :'rule' COLLATE "C" ~ pattern AND
+       :'project' COLLATE "C" ~ pattern AND :'scope' COLLATE "C" ~ pattern AND
+       :'request' COLLATE "C" ~ pattern AND :'actor' COLLATE "C" ~ pattern AND
+       (:'baseline'='none' OR :'baseline' COLLATE "C" ~ pattern) AND
+       :'enabled' IN ('true','false') AS valid
+FROM (VALUES ('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')) AS uuid(pattern) \gset
+
+\if :valid
+  -- Only owner configuration writers take this table lock. Allocate receipt revisions
+  -- in commit order so a scalar callback watermark can never cross an invisible change.
+  LOCK TABLE openmettle.membership_configuration_changes IN EXCLUSIVE MODE;
+  SELECT id FROM openmettle.local_identity_approvals WHERE id=:'approval'::uuid FOR SHARE \g /dev/null
+  SELECT approval_id FROM openmettle.membership_observations WHERE approval_id=:'approval'::uuid FOR UPDATE \g /dev/null
+  SELECT id FROM openmettle.grant_mapping_rules WHERE id=:'rule'::uuid FOR NO KEY UPDATE \g /dev/null
+
+  WITH inspected AS (
+    SELECT a.id, r.id AS rule_id, v.revision, p.id AS project_id, p.scope_id,
+           coalesce(m.config_revision,0) AS previous, greatest(m.floor_ms,m.issued_ms) AS floor_ms,
+           h.id AS baseline
+    FROM openmettle.local_identity_approvals a
+    JOIN openmettle.user_identities i ON i.id=a.identity_id
+    JOIN openmettle.grant_mapping_rules r ON r.id=:'rule'::uuid
+         AND r.provider_config_id=a.provider_id AND r.issuer=i.issuer
+    JOIN openmettle.grant_mapping_revisions v ON v.rule_id=r.id AND v.revision::text=:'rule_revision'
+    JOIN openmettle.projects p ON p.id=:'project'::uuid AND p.scope_id=:'scope'::uuid
+    LEFT JOIN openmettle.membership_observations m ON m.approval_id=a.id
+    LEFT JOIN openmettle.grant_assignments g ON g.scope_id=p.scope_id AND g.project_id=p.id
+         AND g.grantee_user_id=i.user_id AND g.mapping_rule_id=r.id AND g.assignment_key=a.id::text
+         AND g.assignment_version=1 AND g.assignment_format='openmettle.project-member'
+    LEFT JOIN openmettle.grant_changes h ON h.assignment_id=g.id AND h.revision=g.last_revision
+    WHERE a.id=:'approval'::uuid AND coalesce(m.config_revision,0)::text=:'expected_revision'
+      AND coalesce(h.id::text,'none')=:'baseline'
+      AND v.binding_format='openmettle.project-member' AND v.binding_version=1
+      AND v.binding=convert_to(p.id::text,'UTF8')
+      AND (v.selector_kind,v.claim_name) IN (('group','groups'),('app_role','roles'))
+      AND (CASE WHEN :'enabled'::boolean THEN v.enabled AND v.revision=r.last_revision
+           ELSE m.rule_id=r.id AND m.rule_revision=v.revision AND m.project_id=p.id END)
+  ), receipt AS (
+    INSERT INTO openmettle.membership_configuration_changes
+      (request_id,approval_id,previous_revision,rule_id,rule_revision,project_id,scope_id,
+       max_age_seconds,enabled,baseline_change,floor_ms,actor,reason)
+    SELECT :'request'::uuid,id,previous,rule_id,revision,project_id,scope_id,
+           :'age'::integer,:'enabled'::boolean,baseline,floor_ms,:'actor'::uuid,:'reason' FROM inspected
+    RETURNING *
+  ), configured AS (
+    INSERT INTO openmettle.membership_observations
+      (approval_id,config_revision,enabled,floor_ms,rule_id,rule_revision,project_id,scope_id,max_age_seconds,observation)
+    SELECT approval_id,revision,enabled,floor_ms,rule_id,rule_revision,project_id,scope_id,max_age_seconds,
+           ROW('missing',baseline_change)::openmettle.membership_evidence FROM receipt
+    WHERE revision > (SELECT coalesce(max(config_revision),0) FROM openmettle.membership_observations)
+    ON CONFLICT (approval_id) DO UPDATE SET config_revision=excluded.config_revision,enabled=excluded.enabled,
+      floor_ms=excluded.floor_ms,rule_id=excluded.rule_id,rule_revision=excluded.rule_revision,
+      project_id=excluded.project_id,scope_id=excluded.scope_id,max_age_seconds=excluded.max_age_seconds,
+      observation=excluded.observation,issued_ms=NULL,expires_ms=NULL,epoch=NULL,approval_generation=NULL,user_generation=NULL
+    RETURNING config_revision
+  ) SELECT count(*)=1 AS changed FROM configured \gset
+\else
+  \set changed false
+\endif
+\if :changed
+  COMMIT;
+  \echo 'membership configuration committed'
+\else
+  ROLLBACK;
+  DO $$ BEGIN RAISE EXCEPTION 'membership configuration refused'; END $$;
+\endif

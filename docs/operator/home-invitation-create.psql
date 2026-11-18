@@ -1,0 +1,55 @@
+-- Run with psql -X -q on the primary. See home-invitations.md for the required inputs.
+\set ON_ERROR_STOP on
+\set VERBOSITY terse
+BEGIN ISOLATION LEVEL READ COMMITTED;
+SET LOCAL search_path = pg_catalog, pg_temp;
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '5s';
+SET LOCAL synchronous_commit = on;
+
+SELECT current_user = 'openmettle_owner' AND session_user = current_user
+       AND :'invitation' COLLATE "C" ~ pattern AND :'provider' COLLATE "C" ~ pattern
+       AND :'operator' COLLATE "C" ~ pattern
+       AND octet_length(:'issuer') BETWEEN 1 AND 2048
+       AND octet_length(:'subject') BETWEEN 1 AND 255
+       AND encode(convert_to(:'subject', getdatabaseencoding()::name), 'hex')
+             COLLATE "C" ~ '^([0-7][0-9a-f])+$'
+       AND :'redeem_before_ms' COLLATE "C" ~ '^[1-9][0-9]{0,17}$'
+       AND :'approval_until_ms' COLLATE "C" ~ '^[1-9][0-9]{0,17}$' AS valid
+  FROM (VALUES ('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')) AS uuid(pattern) \gset
+\set locked false
+\set inserted false
+\set future false
+\if :valid
+  SELECT count(*) = 1 AS locked FROM (SELECT id FROM openmettle.login_providers
+    WHERE id = :'provider'::uuid AND issuer COLLATE "C" = :'issuer'
+      AND access_generation::text = :'expected_generation' FOR SHARE) p \gset
+\endif
+\if :locked
+  -- Record the current epoch under the provider lock. A later retirement fences this decision.
+  WITH created AS (
+    INSERT INTO openmettle.home_invitations
+      (id, provider_id, provider_generation, provider_epoch, issuer, subject,
+       redeem_before_ms, approval_until_ms, created_by)
+    SELECT :'invitation'::uuid, :'provider'::uuid, :'expected_generation'::bigint, r.epoch,
+           :'issuer', :'subject', :'redeem_before_ms'::bigint, :'approval_until_ms'::bigint, :'operator'::uuid
+      FROM (SELECT epoch, revision FROM openmettle.login_provider_revisions
+             WHERE provider_id = :'provider'::uuid ORDER BY epoch DESC LIMIT 1) r
+     WHERE r.revision IS NOT NULL
+       AND :'approval_until_ms'::bigint >= :'redeem_before_ms'::bigint
+       AND NOT EXISTS (SELECT FROM openmettle.user_identities WHERE issuer = :'issuer' AND subject = :'subject')
+    ON CONFLICT DO NOTHING RETURNING 1
+  ) SELECT count(*) = 1 AS inserted FROM created \gset
+\endif
+\if :inserted
+  -- The unique-index insert can wait for a prior redemption. Use a fresh snapshot.
+  SELECT NOT EXISTS (SELECT FROM openmettle.user_identities WHERE issuer = :'issuer' AND subject = :'subject')
+     AND :'redeem_before_ms'::bigint > floor(extract(epoch FROM clock_timestamp()) * 1000) AS future \gset
+\endif
+\if :future
+  COMMIT;
+  \echo 'home invitation created'
+\else
+  ROLLBACK;
+  DO $$ BEGIN RAISE EXCEPTION 'home invitation creation refused'; END $$;
+\endif

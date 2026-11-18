@@ -757,7 +757,7 @@ impl ManagedProvider {
         .await
         .map_err(|_| login::Error::Exchange)?
     }
-    /// Consume a managed online proof into a locally approved existing user's session.
+    /// Consume a managed online proof for an approved identity or an invited new account.
     /// Offline VerifiedIdentity values cannot reach this operation.
     pub async fn issue_session(
         &self,
@@ -798,7 +798,7 @@ impl ManagedProvider {
     ) -> Result<crate::sessions::Credential, crate::sessions::Error> {
         use crate::sessions::{self, Error as SessionError};
         let config = self.config().map_err(|_| SessionError::Rejected)?;
-        let (login, login_expiry) = exchanged.origin.as_ref().ok_or(SessionError::Rejected)?;
+        let origin = exchanged.origin.as_ref().ok_or(SessionError::Rejected)?;
         let identity = exchanged.assertion.identity();
         let (provider, issuer, client) = config.identity.binding();
         if identity.provider_config_id() != provider || identity.issuer() != issuer {
@@ -811,10 +811,11 @@ impl ManagedProvider {
                 issuer,
                 client,
                 revision: &config.revision,
-                subject: identity.subject(),
+                assertion: &exchanged.assertion,
                 epoch: exchanged.epoch,
-                login,
-                login_expiry: *login_expiry,
+                login: &origin.login,
+                login_expiry: origin.expiry,
+                membership_revision: origin.membership_revision,
                 binding: persisted(&config.binding, exchanged.epoch),
                 deadline,
             },
@@ -857,7 +858,7 @@ impl ManagedProvider {
 /// Sealed managed exchange result. Not cloneable, no public identity accessor. `release`
 /// converts it after authority checks; `issue_session` consumes it under local approval.
 pub struct ExchangedIdentity {
-    origin: Option<(String, i64)>,
+    origin: Option<login::LoginOrigin>,
     entry: Arc<Entry>,
     generation: u64,
     key_generation: u64,

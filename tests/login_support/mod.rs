@@ -42,6 +42,8 @@ pub fn jwks() -> Vec<u8> {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Extra {
     nbf: i64,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 impl openidconnect::AdditionalClaims for Extra {}
 pub fn signed(nonce: &str, issuer: &str, audience: &str, nbf: i64) -> String {
@@ -54,13 +56,56 @@ pub fn signed_using(
     audience: &str,
     nbf: i64,
 ) -> String {
+    sign_claims(
+        signing_key,
+        "synthetic-subject",
+        nonce,
+        issuer,
+        audience,
+        1799999990,
+        Extra {
+            nbf,
+            extensions: Default::default(),
+        },
+    )
+}
+#[cfg(test)]
+#[allow(dead_code)] // shared fixture is also compiled by the schema integration crate
+pub fn membership_token(
+    subject: &str,
+    nonce: &str,
+    issued: i64,
+    claims: serde_json::Value,
+) -> String {
+    sign_claims(
+        key(),
+        subject,
+        nonce,
+        ISSUER,
+        CLIENT,
+        issued,
+        Extra {
+            nbf: issued,
+            extensions: claims.as_object().unwrap().clone(),
+        },
+    )
+}
+fn sign_claims(
+    signing_key: &CoreRsaPrivateSigningKey,
+    subject: &str,
+    nonce: &str,
+    issuer: &str,
+    audience: &str,
+    issued: i64,
+    extra: Extra,
+) -> String {
     let claims = IdTokenClaims::<Extra, CoreGenderClaim>::new(
         IssuerUrl::new(issuer.into()).unwrap(),
         vec![Audience::new(audience.into())],
-        chrono::DateTime::from_timestamp(1800000300, 0).unwrap(),
-        chrono::DateTime::from_timestamp(1799999990, 0).unwrap(),
-        StandardClaims::new(SubjectIdentifier::new("synthetic-subject".into())),
-        Extra { nbf },
+        chrono::DateTime::from_timestamp(issued + 310, 0).unwrap(),
+        chrono::DateTime::from_timestamp(issued, 0).unwrap(),
+        StandardClaims::new(SubjectIdentifier::new(subject.into())),
+        extra,
     )
     .set_nonce(Some(Nonce::new(nonce.into())));
     IdToken::<_, _, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm>::new(

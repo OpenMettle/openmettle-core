@@ -152,6 +152,11 @@ monotonic counters, transition order, exact replay and current mapping checks. A
 with counter UPDATE/INSERT privileges can bypass that protocol; this is not database-enforced
 permission evaluation or fencing. History rows cannot be mutated by either application role.
 
+For login-derived project membership, neither `recorded_active` nor `mapping_eligible`
+establishes current membership. V1-05 and queued-work consumers also need the current
+approval, signed observation, expiry and exact confirmed change described in
+[ADR 0021](0021-project-membership.md).
+
 ## Migration, compatibility and verification
 
 The new allowlist applies only after successful migration 5. The migrator keeps one dedicated

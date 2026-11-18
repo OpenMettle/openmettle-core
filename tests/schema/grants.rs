@@ -390,6 +390,25 @@ async fn sql_roles_scopes_null_checks_and_immutable_origin() {
     let direct = change(&db, &input(&c, "direct")).await.unwrap();
     let mut api = connect(&db.0, API).await;
     let mut worker = connect(&db.0, WORKER).await;
+    // Migration 11 revokes the default PUBLIC USAGE on the evidence type, and no runtime role
+    // is granted it. The owner keeps it as the type's owner.
+    let usage: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT role, has_type_privilege(role, 'openmettle.membership_evidence', 'USAGE')
+         FROM unnest(ARRAY['public','openmettle_api','openmettle_worker','openmettle_owner'])
+           WITH ORDINALITY AS r(role, ord) ORDER BY ord",
+    )
+    .fetch_all(&mut db.admin().await)
+    .await
+    .unwrap();
+    assert_eq!(
+        usage,
+        [
+            ("public".to_owned(), false),
+            ("openmettle_api".to_owned(), false),
+            ("openmettle_worker".to_owned(), false),
+            ("openmettle_owner".to_owned(), true),
+        ]
+    );
     for table in [
         "grant_mapping_rules",
         "grant_mapping_revisions",
@@ -631,7 +650,7 @@ async fn migration_five_failure_kill_timeout_and_concurrent_retry() {
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success(), "{}", stderr(&out));
     }
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
     assert_eq!(
         count(&db, "SELECT count(*) FROM openmettle.grant_mapping_rules").await,
         0
@@ -700,6 +719,123 @@ async fn populated_v8_upgrade_and_authentic_v8_binaries() {
 async fn populated_v9_upgrade_and_authentic_v9_binaries() {
     populated_upgrade("V9_BINARY_DIR", &[1, 2, 3, 4, 5, 6, 7, 8, 9], true).await;
 }
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 and authentic V10_BINARY_DIR required"]
+async fn populated_v10_upgrade_and_authentic_v10_binaries() {
+    populated_upgrade("V10_BINARY_DIR", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], true).await;
+}
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 and authentic V11_BINARY_DIR required"]
+async fn populated_v11_upgrade_and_authentic_v11_binaries() {
+    populated_upgrade("V11_BINARY_DIR", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], true).await;
+}
+const MEMBERSHIP_PROVIDER: &str = "00000000-0000-0000-0000-000000000007";
+const MEMBERSHIP_APPROVAL: &str = "00000000-0000-0000-0000-0000000000a8";
+// Version-11 membership state written through its own grants: the owner records a mapping rule
+// revision, an enrollment receipt and its missing observation (as the configuration script
+// does). The API records the enrollment-derived grant and confirms the observation, as
+// issuance reconciliation does.
+async fn populate_membership(db: &TestDb, c: &Context, project: &str, scope: &str) {
+    let rule = MappingInput {
+        rule: RULE2,
+        provider: MEMBERSHIP_PROVIDER,
+        issuer: "https://issuer.example.test",
+        actor: &c.actor,
+        key: "membership-rule",
+        expected_revision: 0,
+        enabled: true,
+        selector_kind: "group",
+        claim_name: "groups",
+        claim_value: "synthetic-team",
+        binding_format: "openmettle.project-member",
+        binding_version: 1,
+        binding: project.as_bytes(),
+    };
+    map(db, &rule).await.unwrap();
+    let mut owner = connect(&db.0, OWNER).await;
+    let revision: i64 = sqlx::query_scalar(
+        "INSERT INTO openmettle.membership_configuration_changes
+            (request_id,approval_id,previous_revision,rule_id,rule_revision,project_id,scope_id,
+             max_age_seconds,enabled,baseline_change,floor_ms,actor,reason)
+         VALUES (gen_random_uuid(),$1::uuid,0,$2::uuid,1,$3::uuid,$4::uuid,180,true,NULL,NULL,
+                 gen_random_uuid(),'upgrade fixture') RETURNING revision",
+    )
+    .bind(MEMBERSHIP_APPROVAL)
+    .bind(RULE2)
+    .bind(project)
+    .bind(scope)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.membership_observations
+            (approval_id,config_revision,enabled,floor_ms,rule_id,rule_revision,project_id,scope_id,
+             max_age_seconds,observation)
+         VALUES ($1::uuid,$2,true,NULL,$3::uuid,1,$4::uuid,$5::uuid,180,
+                 ROW('missing',NULL)::openmettle.membership_evidence)",
+    )
+    .bind(MEMBERSHIP_APPROVAL)
+    .bind(revision)
+    .bind(RULE2)
+    .bind(project)
+    .bind(scope)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    let grant = change(
+        db,
+        &ChangeInput {
+            assignment: Assignment {
+                scope,
+                target: Target::Project(project),
+                grantee: &c.actor,
+                format: "openmettle.project-member",
+                version: 1,
+                key: MEMBERSHIP_APPROVAL,
+                mapping_rule: Some(RULE2),
+            },
+            actor: &c.actor,
+            key: "membership-grant",
+            expected_revision: 0,
+            mapping_revision: Some(1),
+            decision: Decision::Grant,
+        },
+    )
+    .await
+    .unwrap();
+    let confirmed = sqlx::query(
+        "UPDATE openmettle.membership_observations SET issued_ms=1000,expires_ms=4102444800000,
+            observation=ROW('present',$2::uuid)::openmettle.membership_evidence,
+            epoch=(SELECT max(epoch) FROM openmettle.login_provider_revisions WHERE provider_id=$3::uuid),
+            approval_generation=0,user_generation=1
+         WHERE approval_id=$1::uuid",
+    )
+    .bind(MEMBERSHIP_APPROVAL)
+    .bind(&grant.change)
+    .bind(MEMBERSHIP_PROVIDER)
+    .execute(&mut connect(&db.0, API).await)
+    .await
+    .unwrap();
+    assert_eq!(confirmed.rows_affected(), 1);
+}
+async fn membership_snapshot(db: &TestDb) -> Vec<String> {
+    let mut c = db.admin().await;
+    let mut result = Vec::new();
+    for table in [
+        "membership_configuration_changes",
+        "membership_observations",
+    ] {
+        let rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT to_jsonb(t)::text FROM openmettle.{table} t ORDER BY 1"
+        )))
+        .fetch_all(&mut c)
+        .await
+        .unwrap();
+        result.push(table.into());
+        result.extend(rows);
+    }
+    result
+}
 // Synthetic protected-login rows written with the API role's version-6 column grants.
 async fn login_snapshot(db: &TestDb) -> Vec<String> {
     let mut c = db.admin().await;
@@ -761,7 +897,7 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
     tx.commit().await.unwrap();
     let mut api = connect(&db.0, API).await;
     sqlx::query("INSERT INTO openmettle.user_identities(user_id,issuer,subject) VALUES($1::uuid,'https://issuer.example.test','synthetic-subject')").bind(&c.actor).execute(&mut api).await.unwrap();
-    let (_, ps) = project(&mut api, &c.actor).await;
+    let (pid, ps) = project(&mut api, &c.actor).await;
     conversation(&mut api, &ps, "project", &c.actor)
         .await
         .unwrap();
@@ -834,6 +970,27 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
     } else if versions.contains(&7) {
         owner.execute("INSERT INTO openmettle.login_providers(id,issuer,client_id) VALUES ('00000000-0000-0000-0000-000000000007','https://upgrade.example.test','synthetic'); INSERT INTO openmettle.login_provider_revisions(provider_id,revision) VALUES ('00000000-0000-0000-0000-000000000007','v1')").await.unwrap();
     }
+    // Populate the v10-only domain before upgrading the authentic predecessor.
+    let recovery_before = if versions.contains(&10) {
+        let provider = "00000000-0000-0000-0000-000000000007";
+        let source: i64 = sqlx::query_scalar(
+            "SELECT epoch FROM openmettle.login_provider_revisions WHERE provider_id=$1::uuid",
+        )
+        .bind(provider)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        let retired: i64 = sqlx::query_scalar("INSERT INTO openmettle.login_provider_revisions(provider_id,revision) VALUES ($1::uuid,NULL) RETURNING epoch")
+            .bind(provider).fetch_one(&mut owner).await.unwrap();
+        let restored: i64 = sqlx::query_scalar("INSERT INTO openmettle.login_provider_revisions(provider_id,revision) VALUES ($1::uuid,'v1') RETURNING epoch")
+            .bind(provider).fetch_one(&mut owner).await.unwrap();
+        Some(sqlx::query_scalar::<_,String>("INSERT INTO openmettle.provider_recoveries AS r
+            (request_id,operator_id,provider_id,source_epoch,retired_epoch,restored_epoch,access_generation)
+            VALUES (gen_random_uuid(),gen_random_uuid(),$1::uuid,$2,$3,$4,0) RETURNING to_jsonb(r)::text")
+            .bind(provider).bind(source).bind(retired).bind(restored).fetch_one(&mut owner).await.unwrap())
+    } else {
+        None
+    };
     let session_tables = [
         "login_providers",
         "local_identity_approvals",
@@ -850,6 +1007,20 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
         api.execute("INSERT INTO openmettle.local_sessions(id,secret_hash,login_id,provider_id,identity_id,approval_id,user_id,issued_client,issued_epoch,issued_revision,provider_generation,approval_generation,user_generation,created_ms,expires_ms) SELECT repeat('s', 43),decode(repeat('0a', 32), 'hex'),repeat('b', 43),a.provider_id,a.identity_id,a.id,i.user_id,'synthetic',(SELECT max(epoch) FROM openmettle.login_provider_revisions),1,0,0,0,1,4102444800000 FROM openmettle.local_identity_approvals a JOIN openmettle.user_identities i ON i.id=a.identity_id").await.unwrap();
         api.execute("UPDATE openmettle.users SET session_generation=1 WHERE id IN (SELECT user_id FROM openmettle.user_identities WHERE subject='synthetic-subject')").await.unwrap();
     }
+    // Populate the v11-only domain (enrollment, rule, grant and observation) for the approval
+    // above before upgrading the authentic predecessor.
+    let membership_before = if versions.contains(&11) {
+        populate_membership(&db, &c, &pid, &ps).await;
+        let rows = membership_snapshot(&db).await;
+        assert_eq!(rows.len(), 4, "one receipt and one confirmed observation");
+        rows
+    } else {
+        // Migration 11 creates both tables empty.
+        vec![
+            "membership_configuration_changes".into(),
+            "membership_observations".into(),
+        ]
+    };
     let session_snapshot = async || {
         let mut c = db.admin().await;
         let mut rows: Vec<String> = sqlx::query_scalar(
@@ -905,10 +1076,18 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
             .fetch_all(&mut db.admin().await)
             .await
             .unwrap();
+    if versions.last() == Some(&9) {
+        migrate::apply(&db.settings(Duration::from_secs(10)), &MIGRATIONS[..10])
+            .await
+            .unwrap();
+        let refusal = old_migrate();
+        assert_eq!(refusal.status.code(), Some(1));
+        assert!(stderr(&refusal).contains("database has migration 10"));
+    }
     migrate::apply(&db.settings(Duration::from_secs(10)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
     assert_eq!(old_domain_snapshot(&db).await, before);
     if with_grants {
         assert_eq!(grant_snapshot(&db).await, grant_before);
@@ -925,8 +1104,48 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
             .unwrap();
     assert_eq!(admission, expected_admission);
     assert_eq!(
-        count(&db, "SELECT count(*) FROM openmettle.provider_recoveries").await,
+        sqlx::query_scalar::<_, String>(
+            "SELECT to_jsonb(r)::text FROM openmettle.provider_recoveries r"
+        )
+        .fetch_all(&mut owner)
+        .await
+        .unwrap(),
+        recovery_before.into_iter().collect::<Vec<_>>()
+    );
+    assert_eq!(membership_snapshot(&db).await, membership_before);
+    // Migration 12 creates the invitation table empty and widens no v11 role privilege.
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM openmettle.home_invitations").await,
         0
+    );
+    let roles: Vec<(String, bool, bool, bool, bool, bool)> = sqlx::query_as(
+        "SELECT role,
+            has_table_privilege(role,'openmettle.membership_observations','SELECT'),
+            has_table_privilege(role,'openmettle.membership_observations','INSERT,DELETE,TRUNCATE'),
+            has_table_privilege(role,'openmettle.membership_configuration_changes','SELECT,INSERT,UPDATE,DELETE'),
+            has_table_privilege(role,'openmettle.home_invitations','SELECT,INSERT,UPDATE,DELETE')
+              OR has_any_column_privilege(role,'openmettle.home_invitations','SELECT,INSERT,UPDATE'),
+            has_function_privilege(role,'openmettle.redeem_home_invitation(uuid,text,text,text,bigint)','EXECUTE')
+         FROM unnest(ARRAY['openmettle_api','openmettle_worker','public']) WITH ORDINALITY AS r(role, ord)
+         ORDER BY ord",
+    )
+    .fetch_all(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        roles,
+        [
+            ("openmettle_api".into(), true, false, false, false, true),
+            (
+                "openmettle_worker".into(),
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
+            ("public".into(), false, false, false, false, false),
+        ]
     );
     if with_sessions {
         assert_eq!(session_snapshot().await, sessions_before);
@@ -981,15 +1200,23 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
             .unwrap();
     let refused = old_migrate();
     assert_eq!(refused.status.code(), Some(1));
-    if versions.contains(&9) {
-        // Migration 10 adds no privileges, so v9 reaches the unknown-version check.
+    // Membership (v11) and invitation (v12) privileges are outside every historical binary's
+    // contract, so each historical migrator stops at the boundary check before the
+    // unknown-version check.
+    assert!(stderr(&refused).contains("boundary check refused"));
+    if versions.last() == Some(&11) {
+        // The v11 contract already admits every membership privilege. Only the v12
+        // redemption EXECUTE grant is outside it.
         assert!(
-            stderr(&refused).contains("database has migration 10"),
+            stderr(&refused).contains("openmettle_api has EXECUTE on function openmettle.redeem_home_invitation(uuid,text,text,text,bigint)"),
             "{}",
             stderr(&refused)
         );
-    } else {
-        assert!(stderr(&refused).contains("boundary check refused"));
+        assert!(
+            !stderr(&refused).contains("membership"),
+            "{}",
+            stderr(&refused)
+        );
     }
     let unchanged: Vec<String> =
         sqlx::query_scalar("SELECT t::text FROM openmettle._sqlx_migrations t ORDER BY version")

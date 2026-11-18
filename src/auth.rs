@@ -363,7 +363,16 @@ impl TrustedProvider {
         {
             return Err(VerifyError::Subject);
         }
+        // Inspect only the payload of the exact compact token that passed every check above.
+        // A duplicate anywhere makes membership ambiguous without changing exact-identity login.
+        let payload = token
+            .0
+            .split('.')
+            .nth(1)
+            .and_then(|v| URL_SAFE_NO_PAD.decode(v).ok())
+            .and_then(|bytes| crate::provider_keys::documents::unique(&bytes).ok());
         Ok(VerifiedAssertion {
+            membership: crate::membership::Evidence::from_signed_payload(payload),
             identity: VerifiedIdentity {
                 provider_config_id: self.provider_config_id.clone(),
                 issuer: self.issuer.as_str().to_owned(),
@@ -379,6 +388,7 @@ impl TrustedProvider {
 
 /// Signature-verified evidence kept private until the managed generation check.
 pub(crate) struct VerifiedAssertion {
+    pub(crate) membership: crate::membership::Evidence,
     identity: VerifiedIdentity,
     checked_at: DateTime<Utc>,
     expires: DateTime<Utc>,
@@ -386,6 +396,19 @@ pub(crate) struct VerifiedAssertion {
     max_age: TimeDelta,
 }
 impl VerifiedAssertion {
+    pub(crate) fn membership_window(&self, max_age_seconds: i32) -> (i64, i64) {
+        let issued = self.issued.timestamp_millis();
+        let age = self
+            .max_age
+            .num_milliseconds()
+            .min(i64::from(max_age_seconds) * 1000);
+        (
+            issued,
+            self.expires
+                .timestamp_millis()
+                .min(issued.saturating_add(age)),
+        )
+    }
     pub(crate) fn release(self, now: SystemTime) -> Result<VerifiedIdentity, VerifyError> {
         self.check(now)?;
         Ok(self.identity)

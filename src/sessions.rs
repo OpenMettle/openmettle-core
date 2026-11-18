@@ -166,12 +166,28 @@ async fn transaction(c: &mut PgConnection) -> Result<WriteTransaction<'_>, Error
     }
     Ok(tx)
 }
+// Deferred home-invitation cutoff (home_redemption_session). The server reported the error for COMMIT
+// and rolled the transaction back, so the refusal is definite.
+const INVITATION_CUTOFF: &str = "OMH01";
+// Only that known server refusal is Rejected. Connection loss, a lost acknowledgement and
+// every other commit failure stay Database: discard the uncertain connection.
+fn committed(result: Result<(), crate::runs::Error>) -> Result<(), Error> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(crate::runs::Error::Database(sqlx::Error::Database(e)))
+            if e.code().as_deref() == Some(INVITATION_CUTOFF) =>
+        {
+            Err(Error::Rejected)
+        }
+        Err(_) => Err(Error::Database),
+    }
+}
 // Returned errors must release locks before the caller gets its connection back. Drop
 // only queues SQLx rollback; cancellation/timeout remains an uncertain-discard boundary.
 async fn finish<T>(tx: WriteTransaction<'_>, result: Result<T, Error>) -> Result<T, Error> {
     match result {
         Ok(value) => {
-            tx.commit().await?;
+            committed(tx.commit().await)?;
             Ok(value)
         }
         Err(error) => {
@@ -180,7 +196,7 @@ async fn finish<T>(tx: WriteTransaction<'_>, result: Result<T, Error>) -> Result
         }
     }
 }
-async fn now(c: &mut PgConnection) -> Result<i64, Error> {
+pub(crate) async fn now(c: &mut PgConnection) -> Result<i64, Error> {
     Ok(
         sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
             .fetch_one(c)
@@ -193,12 +209,43 @@ pub(crate) struct Issuance<'a> {
     pub issuer: &'a str,
     pub client: &'a str,
     pub revision: &'a str,
-    pub subject: &'a str,
+    pub assertion: &'a crate::auth::VerifiedAssertion,
     pub epoch: i64,
     pub login: &'a str,
     pub login_expiry: i64,
+    pub membership_revision: i64,
     pub binding: Vec<u8>,
     pub deadline: Instant,
+}
+// Only a missing identity can enter the first-account path. A missing or withdrawn
+// approval on an existing identity is always handled by the ordinary eligibility checks.
+async fn resolve_identity(
+    c: &mut PgConnection,
+    input: &Issuance<'_>,
+) -> Result<(String, String, Option<i64>), Error> {
+    let existing: Option<(String, String)> = sqlx::query_as(
+        "SELECT id::text, user_id::text FROM openmettle.user_identities
+         WHERE issuer=$1 AND subject=$2 AND issuer COLLATE \"C\"=$1 AND subject COLLATE \"C\"=$2",
+    )
+    .bind(input.issuer)
+    .bind(input.assertion.identity().subject())
+    .fetch_optional(&mut *c)
+    .await?;
+    if let Some((identity, user)) = existing {
+        return Ok((identity, user, None));
+    }
+    sqlx::query_as(
+        "SELECT identity_id, user_id, redeem_before_ms FROM
+         openmettle.redeem_home_invitation($1::uuid,$2,$3,$4,$5)",
+    )
+    .bind(input.provider)
+    .bind(input.issuer)
+    .bind(input.assertion.identity().subject())
+    .bind(input.login)
+    .bind(input.epoch)
+    .fetch_optional(c)
+    .await?
+    .ok_or(Error::Rejected)
 }
 pub(crate) async fn issue(
     c: &mut PgConnection,
@@ -222,15 +269,12 @@ pub(crate) async fn issue(
         if epoch != input.epoch { return Err(Error::Rejected); }
         let provider_generation: i64 = sqlx::query_scalar("SELECT access_generation FROM openmettle.login_providers WHERE id=$1::uuid")
             .bind(input.provider).fetch_one(tx.connection()?).await?;
-        let identity = sqlx::query("SELECT id::text,user_id::text FROM openmettle.user_identities WHERE issuer=$1 AND subject=$2")
-            .bind(input.issuer).bind(input.subject).fetch_optional(tx.connection()?).await?.ok_or(Error::Rejected)?;
-        let identity_id: String = identity.try_get("id")?;
-        let user: String = identity.try_get("user_id")?;
+        let (identity_id, user, invitation_cutoff) = resolve_identity(tx.connection()?, &input).await?;
         let approval: String = sqlx::query_scalar("SELECT id::text FROM openmettle.local_identity_approvals WHERE provider_id=$1::uuid AND identity_id=$2::uuid FOR SHARE")
             .bind(input.provider).bind(&identity_id).fetch_optional(tx.connection()?).await?.ok_or(Error::Rejected)?;
         let a = sqlx::query("SELECT active,expires_ms,revision,access_generation FROM openmettle.local_identity_approvals WHERE id=$1::uuid")
             .bind(&approval).fetch_one(tx.connection()?).await?;
-        let u = sqlx::query("SELECT disabled_at IS NOT NULL AS disabled,session_generation FROM openmettle.users WHERE id=$1::uuid FOR UPDATE")
+        let u = sqlx::query("SELECT disabled_at IS NOT NULL AS disabled,session_generation FROM openmettle.users WHERE id=$1::uuid FOR NO KEY UPDATE")
             .bind(&user).fetch_one(tx.connection()?).await?;
         let timestamp = now(tx.connection()?).await?;
         let approval_expiry: i64 = a.try_get("expires_ms")?;
@@ -241,6 +285,11 @@ pub(crate) async fn issue(
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM openmettle.local_sessions WHERE user_id=$1::uuid")
             .bind(&user).fetch_one(tx.connection()?).await?;
         if count >= policy.retained_limit { return Err(Error::Capacity); }
+        let membership_expiry = crate::membership::reconcile(&mut tx, crate::membership::Subject {
+            approval: &approval, user: &user, epoch, membership_revision: input.membership_revision,
+            approval_generation: a.try_get("access_generation")?,
+            user_generation: u.try_get("session_generation")?,
+        }, input.assertion, input.login).await?;
         let expiry = timestamp.checked_add(policy.lifetime_ms).ok_or(Error::Configuration)?.min(approval_expiry);
         let (id, credential, hash) = create_with(|bytes| SystemRandom::new().fill(bytes).map_err(|_| Error::Random))?;
         sqlx::query("INSERT INTO openmettle.local_sessions (id,secret_hash,login_id,provider_id,identity_id,approval_id,user_id,issued_client,issued_epoch,issued_revision,provider_generation,approval_generation,user_generation,created_ms,expires_ms) VALUES ($1,$2,$3,$4::uuid,$5::uuid,$6::uuid,$7::uuid,$8,$9,$10,$11,$12,$13,$14,$15)")
@@ -250,8 +299,20 @@ pub(crate) async fn issue(
             .bind(timestamp).bind(expiry).execute(tx.connection()?).await?;
         sqlx::query("UPDATE openmettle.login_transactions SET session_issued=true WHERE id=$1")
             .bind(input.login).execute(tx.connection()?).await?;
-        let final_time = now(tx.connection()?).await?;
-        if final_time < timestamp || final_time >= expiry || final_time >= approval_expiry || final_time >= input.login_expiry { return Err(Error::Rejected); }
+        let mut final_time = now(tx.connection()?).await?;
+        if membership_expiry.is_some_and(|expiry| final_time >= expiry) {
+            // Keep both the newer signed high-water and any completed removal. Only
+            // the mapped evidence expired while issuing this exact-approval session.
+            sqlx::query("UPDATE openmettle.membership_observations SET observation.state='stale' WHERE approval_id=$1::uuid")
+                .bind(&approval).execute(tx.connection()?).await?;
+            final_time = now(tx.connection()?).await?;
+        }
+        if invitation_cutoff.is_some_and(|cutoff| final_time >= cutoff)
+            || final_time < timestamp || final_time >= expiry
+            || final_time >= approval_expiry || final_time >= input.login_expiry
+        {
+            return Err(Error::Rejected);
+        }
         check()?;
         Ok(credential)
         }.await;
@@ -418,6 +479,53 @@ mod tests {
             assert!(
                 Policy::new(Duration::from_secs(life), cap, Duration::from_millis(time)).is_err()
             );
+        }
+    }
+    #[derive(Debug)]
+    struct Server(&'static str);
+    impl fmt::Display for Server {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("synthetic server error")
+        }
+    }
+    impl std::error::Error for Server {}
+    impl sqlx::error::DatabaseError for Server {
+        fn message(&self) -> &str {
+            "synthetic server error"
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.0.into())
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+    #[test]
+    fn only_a_reported_invitation_cutoff_is_a_definite_commit_refusal() {
+        let server =
+            |code| crate::runs::Error::Database(sqlx::Error::Database(Box::new(Server(code))));
+        assert_eq!(committed(Ok(())), Ok(()));
+        assert_eq!(committed(Err(server("OMH01"))), Err(Error::Rejected));
+        // The detached-redemption gate, serialization failures and lost connections stay uncertain.
+        for code in ["P0001", "40001", "23514"] {
+            assert_eq!(committed(Err(server(code))), Err(Error::Database));
+        }
+        let lost = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        for error in [
+            crate::runs::Error::Database(sqlx::Error::Io(lost)),
+            crate::runs::Error::Database(sqlx::Error::PoolTimedOut),
+            crate::runs::Error::TransactionUnavailable,
+        ] {
+            assert_eq!(committed(Err(error)), Err(Error::Database));
         }
     }
 }

@@ -553,7 +553,7 @@ async fn migration_six_failure_rolls_back_reservations_and_retries() {
     migrate::apply(&db.settings(Duration::from_secs(5)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
 }
 
 #[tokio::test]
@@ -786,7 +786,7 @@ async fn migration_seven_is_atomic_and_gated_by_history() {
     migrate::apply(&db.settings(Duration::from_secs(5)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
     for table in AUTHORITY_TABLES {
         assert!(db.exists(table).await);
     }

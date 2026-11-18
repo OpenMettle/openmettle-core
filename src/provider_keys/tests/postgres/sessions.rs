@@ -222,7 +222,7 @@ async fn gate_binding_and_replay_survive_session_cleanup() {
     for absent in [false, true] {
         if absent {
             sqlx::query("DELETE FROM openmettle.login_transactions WHERE id=$1")
-                .bind(&origin.as_ref().unwrap().0)
+                .bind(&origin.as_ref().unwrap().login)
                 .execute(&mut f.owner)
                 .await
                 .unwrap();

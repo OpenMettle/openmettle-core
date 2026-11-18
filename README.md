@@ -91,7 +91,7 @@ code/challenge/client/callback binding. The production transport is described be
 is no login route.
 The nonce verifier accepts stored digests without weakening the existing token checks.
 
-Native handoff and account creation remain unimplemented; the browser cookie handoff below is
+Native handoff remains unimplemented; the browser cookie handoff below is
 not mounted. Key files are read only by the offline check below. Internal local approval and sessions are described below. The outstanding-login
 cap below is not a rate limit. The unmounted login router below adds per-process request,
 rate and concurrency bounds; public exposure remains blocked on runtime enablement, ingress
@@ -142,8 +142,7 @@ expiring before cooldown ends blocks login until another refresh is allowed. Pro
 short cache lifetimes and clock skew can reduce availability; qualify policy values against
 actual provider behavior. The offline check below validates configuration files; the running API
 does not load them.
-The managed provider path itself provides no route, cookie or account creation. Its sealed
-proof now has the internal local-approval/session consumer described below. `cargo test --lib provider_keys --locked --offline` exercises isolated TLS,
+The managed provider returns a sealed proof to the internal session consumer described below. `cargo test --lib provider_keys --locked --offline` exercises isolated TLS,
 rotation, cancellation, capacity and freshness behavior without PostgreSQL.
 
 ## Login provider authority
@@ -175,8 +174,9 @@ container whose `psql` runs the operator scripts.
 ## Local identity approval and sessions
 
 [ADR 0013](docs/adr/0013-local-identity-sessions.md) adds internal sessions for already-existing
-exact issuer/subject identities with a personal scope and owner-recorded local approval. This
-is not invitation delivery or account provisioning. `ManagedProvider::issue_session` consumes
+exact issuer/subject identities with a personal scope and owner-recorded local approval.
+For a new home user, an operator can authorize first-account creation with a single-use
+[invitation bound to the exact provider, issuer and subject](docs/operator/home-invitations.md). `ManagedProvider::issue_session` consumes
 only its sealed online proof; an offline `VerifiedIdentity` cannot mint a session.
 
 Routine configuration/approval revisions preserve sessions. Explicit revoke, provider retirement,
@@ -499,7 +499,7 @@ Storage limits are durable deployment inputs that only `openmettle_owner` sets, 
 
 Connection budget: `api_replicas × API DB_MAX_CONNECTIONS + worker_replicas × worker DB_MAX_CONNECTIONS + 1 migrator + admin/backup headroom` must not exceed `max_connections − superuser_reserved_connections − reserved_connections`. Count surge replicas during a rolling update. For example, 2 × 4 + 2 × 4 + 1 + 3 = 20. Enforce each process's share with its login role's `CONNECTION LIMIT`. These figures are illustrative, not qualified sizing.
 
-The schema tests also require `OLD_BINARY_DIR` pointing to binaries built from release `18f52463c9d6bc12dda4bd1558e4597e067018f8` and `V3_BINARY_DIR` pointing to binaries built from release `2f1be947aa933177c2e407cd7290bf9909bd08ca`; CI builds those exact archives for compatibility checks. Set `V4_BINARY_DIR` to binaries built from `d80e37819f847072dfa272bdddcc1fbee6d622ef` for migration 5 compatibility; CI builds that archive too. Set `V5_BINARY_DIR` to authentic binaries from `4a51242839e16e1d7b8ad3538887bf8e41081e6e` for migration 6 compatibility, and `V6_BINARY_DIR` to authentic binaries from `3978dff2864488bbdd9e748afd7116f39683f129` for migration 7 compatibility. `V7_BINARY_DIR` (`5ff1d2a8ed5e7424be006e78c16f0c30e784336d`) and `V8_BINARY_DIR` (`e55aff07527ad6452f8a0d49953b3fc2ffc51352`) cover migrations 8 and 9. Set `V9_BINARY_DIR` to binaries built from `940b8c2032d863e29fd04ad7c6357ad8cacc42fc` for migration 10. The ADR 0014 operator-script tests also need `POSTGRES_CONTAINER`, the isolated CI PostgreSQL service container whose `psql` runs them. Do not substitute the current binary with a truncated migration list.
+The schema tests also require `OLD_BINARY_DIR` pointing to binaries built from release `18f52463c9d6bc12dda4bd1558e4597e067018f8` and `V3_BINARY_DIR` pointing to binaries built from release `2f1be947aa933177c2e407cd7290bf9909bd08ca`; CI builds those exact archives for compatibility checks. Set `V4_BINARY_DIR` to binaries built from `d80e37819f847072dfa272bdddcc1fbee6d622ef` for migration 5 compatibility; CI builds that archive too. Set `V5_BINARY_DIR` to authentic binaries from `4a51242839e16e1d7b8ad3538887bf8e41081e6e` for migration 6 compatibility, and `V6_BINARY_DIR` to authentic binaries from `3978dff2864488bbdd9e748afd7116f39683f129` for migration 7 compatibility. `V7_BINARY_DIR` (`5ff1d2a8ed5e7424be006e78c16f0c30e784336d`) and `V8_BINARY_DIR` (`e55aff07527ad6452f8a0d49953b3fc2ffc51352`) cover migrations 8 and 9. Set `V9_BINARY_DIR` to binaries built from `940b8c2032d863e29fd04ad7c6357ad8cacc42fc` for migration 10. Set `V10_BINARY_DIR` to binaries built from `05dd18489242e545e3529b4e3750c74837b05638` for migration 11, and `V11_BINARY_DIR` to binaries built from `0ab3401714762f28a730eae4cd7c91052648dabd` for migration 12. The ADR 0014 operator-script tests also need `POSTGRES_CONTAINER`, the isolated CI PostgreSQL service container whose `psql` runs them. Do not substitute the current binary with a truncated migration list.
 
 The schema tests need a superuser on an isolated, disposable PostgreSQL 18 service. They create synthetic `openmettle_*` cluster roles with a test-only password and one database per test. Never point them at a shared server.
 
@@ -519,3 +519,14 @@ The app repository consumes core APIs. The deploy repository owns generic Helm p
 ## Baseline maintenance
 
 The baseline is the complete accepted document exported from the [planning Page](https://chatgpt.com/space/page_fef707d85d8c8191a14f162d6281307d). SOURCE-REFERENCES.md retains neutral aliases, source pins and paths for personal repository citations; the Page retains original URLs. The native workbook reference points back to that archive. These portability/privacy changes do not amend the accepted architecture. Record subsequent decisions in DECISIONS.md and link implementation tickets.
+
+## Login-time project membership
+
+After all participating login replicas, grant writers and membership readers are upgraded,
+an owner can enroll one rule revision and one project per exact identity approval in schema 11.
+Managed session issuance then reconciles the signed group or app-role observation with
+that rule's project assignment. The internal membership reader expires a confirmation at
+the configured age or token expiry, whichever comes first. A complete removal revokes the
+mapped assignment. Missing or partial evidence withholds a positive membership decision
+and preserves the grant history. See [ADR 0021](docs/adr/0021-project-membership.md) for
+the configuration, evidence profile and recovery boundaries.

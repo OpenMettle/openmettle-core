@@ -75,6 +75,16 @@ pub const MIGRATIONS: &[Source] = &[
         description: "audited provider recovery",
         sql: include_str!("../migrations/0010_provider_recoveries.sql"),
     },
+    Source {
+        version: 11,
+        description: "approved project membership observations",
+        sql: include_str!("../migrations/0011_membership_observations.sql"),
+    },
+    Source {
+        version: 12,
+        description: "home first-account invitations",
+        sql: include_str!("../migrations/0012_home_invitations.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.
