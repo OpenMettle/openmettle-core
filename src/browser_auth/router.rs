@@ -1,4 +1,4 @@
-//! Bounded Axum router for one [`LoginHandoff`] (ADR 0018).
+//! Bounded Axum router for one [`LoginHandoff`] (ADRs 0018 and 0019).
 //!
 //! **Not mounted.** No listener or running process constructs it: the API and worker still
 //! serve `/healthz` and `/readyz` only. [`router`] validates every setting first and then
@@ -8,13 +8,19 @@
 //! - the provider's registered callback path, dispatched to [`LoginHandoff::callback`] for
 //!   `GET` only. `HEAD` is refused like any other method and never reaches the handoff.
 //!
-//! Each request is decided in this order. Steps 1–4 do no provider, pool or database work.
+//! [`router_with_sessions`] adds two more explicit literal routes with their own budgets:
+//!
+//! - the session check path, dispatched to [`LoginHandoff::session`] for `GET` only;
+//! - the logout path, dispatched to [`LoginHandoff::logout`] for `POST` only.
+//!
+//! Each request on any route is decided in this order by one implementation. Steps 1–4 do no
+//! provider, pool or database work.
 //!
 //! 1. Method. A wrong method is `405` and spends nothing.
 //! 2. Request bounds on the head that HTTP parsing produced: target length, header count,
 //!    header bytes and an empty body. A refusal spends nothing and never polls the body.
-//! 3. One in-flight permit, shared by both routes. None free is `503` and spends no rate.
-//! 4. One unit of that route's rate budget. None left is `429`; the permit is released.
+//! 3. One in-flight permit, shared by every route. None free is `503` and spends no rate.
+//! 4. One unit of that route's own rate budget. None left is `429`; the permit is released.
 //! 5. The handoff, holding the permit until it returns or its future is dropped.
 //!
 //! The rate unit spent in step 4 is never refunded, whatever the handoff then decides.
@@ -76,14 +82,28 @@ pub struct Settings<'a> {
     pub in_flight: u32,
 }
 
-/// Fixed refusals of [`Settings`]. No variant carries a value.
+/// Explicit settings for the session routes of [`router_with_sessions`]. None has a default
+/// and none is taken from a request.
+#[derive(Clone, Copy, Debug)]
+pub struct SessionSettings<'a> {
+    /// Exact literal path of the session check `GET`.
+    pub session: &'a str,
+    /// Exact literal path of the logout form `POST`.
+    pub logout: &'a str,
+    /// Budget for session checks, separate from every other budget.
+    pub checks: Rate,
+    /// Budget for logouts, separate from every other budget.
+    pub logouts: Rate,
+}
+
+/// Fixed refusals of [`Settings`] and [`SessionSettings`]. No variant carries a value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsError {
     /// A path contains route syntax (`{`, `}`, `*` or `:`).
     Pattern,
     /// A path is not a plain literal path of the accepted shape.
     Path,
-    /// The two paths are equal, or one is an operational route.
+    /// Two paths are equal, or one is an operational route.
     Collision,
     /// A burst or interval is outside its range.
     Rate,
@@ -123,14 +143,16 @@ fn check_path(path: &str) -> Result<(), SettingsError> {
             .all(|segment| !matches!(segment, "" | "." | ".."));
     plain.then_some(()).ok_or(SettingsError::Path)
 }
-/// Both paths are valid and distinct, and neither is an operational route. Checked before a
+/// Every path is valid, no two are equal and none is an operational route. Checked before a
 /// route is added, so `Router::route` cannot panic on them.
-fn check_paths(initiation: &str, callback: &str) -> Result<(), SettingsError> {
-    check_path(initiation)?;
-    check_path(callback)?;
-    if initiation == callback || CORE_PATHS.contains(&initiation) || CORE_PATHS.contains(&callback)
-    {
-        return Err(SettingsError::Collision);
+fn check_paths(paths: &[&str]) -> Result<(), SettingsError> {
+    for path in paths {
+        check_path(path)?;
+    }
+    for (index, path) in paths.iter().enumerate() {
+        if CORE_PATHS.contains(path) || paths[index + 1..].contains(path) {
+            return Err(SettingsError::Collision);
+        }
     }
     Ok(())
 }
@@ -181,15 +203,44 @@ impl Budget {
 enum Route {
     Begin,
     Callback,
+    Session,
+    Logout,
+}
+impl Route {
+    /// The one accepted method, its `Allow` value and the route family's fixed lines.
+    fn profile(self) -> (Method, &'static str, &'static Lines) {
+        match self {
+            Self::Begin => (Method::POST, "POST", &LOGIN_LINES),
+            Self::Callback => (Method::GET, "GET", &LOGIN_LINES),
+            Self::Session => (Method::GET, "GET", &SESSION_LINES),
+            Self::Logout => (Method::POST, "POST", &SESSION_LINES),
+        }
+    }
 }
 
 /// Fixed lines through the handoff's builder: `no-store`, `no-referrer`, no cookie and no
-/// `Location`.
-const TARGET_REFUSED: &str = "login request target too long\n";
-const HEADERS_REFUSED: &str = "login request headers too large\n";
-const BODY_REFUSED: &str = "login request body not accepted\n";
-const RATE_REFUSED: &str = "login rate limit reached; try again later\n";
-const BUSY_REFUSED: &str = "login busy; try again later\n";
+/// `Location`. The login lines are unchanged from ADR 0018.
+struct Lines {
+    target: &'static str,
+    headers: &'static str,
+    body: &'static str,
+    busy: &'static str,
+    rate: &'static str,
+}
+const LOGIN_LINES: Lines = Lines {
+    target: "login request target too long\n",
+    headers: "login request headers too large\n",
+    body: "login request body not accepted\n",
+    busy: "login busy; try again later\n",
+    rate: "login rate limit reached; try again later\n",
+};
+const SESSION_LINES: Lines = Lines {
+    target: "session request target too long\n",
+    headers: "session request headers too large\n",
+    body: "session request body not accepted\n",
+    busy: "session busy; try again later\n",
+    rate: "session rate limit reached; try again later\n",
+};
 
 fn target_bytes(uri: &Uri) -> usize {
     uri.scheme_str()
@@ -220,63 +271,86 @@ fn empty_body(headers: &HeaderMap, body: &Body) -> bool {
 /// Bounds decided on what HTTP parsing already produced, before the handoff parses its query
 /// or cookies. They do not limit how much the server reads to parse a head. A refusal is a
 /// fixed status and line.
-fn bounds(request: &Parts, body: &Body) -> Result<(), (StatusCode, &'static str)> {
+fn bounds(request: &Parts, body: &Body, lines: &Lines) -> Result<(), (StatusCode, &'static str)> {
     if target_bytes(&request.uri) > MAX_TARGET_BYTES {
-        return Err((StatusCode::URI_TOO_LONG, TARGET_REFUSED));
+        return Err((StatusCode::URI_TOO_LONG, lines.target));
     }
     if request.headers.len() > MAX_HEADER_FIELDS
         || header_bytes(&request.headers) > MAX_HEADER_BYTES
     {
-        return Err((StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE, HEADERS_REFUSED));
+        return Err((StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE, lines.headers));
     }
     if !empty_body(&request.headers, body) {
-        return Err((StatusCode::PAYLOAD_TOO_LARGE, BODY_REFUSED));
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, lines.body));
     }
     Ok(())
 }
 
 /// State behind one router value and every clone of it. Constant size.
-struct Routes {
+struct Shared {
     handoff: LoginHandoff,
-    begin: Budget,
-    callback: Budget,
+    /// One cap across every route.
     in_flight: Semaphore,
 }
-impl Routes {
-    async fn dispatch(&self, route: Route, request: Request) -> Response<&'static str> {
+impl Shared {
+    /// The single route implementation. `budget` belongs to `route` alone.
+    async fn dispatch(
+        &self,
+        route: Route,
+        budget: &Budget,
+        request: Request,
+    ) -> Response<&'static str> {
         let (request, body) = request.into_parts();
-        let (method, allow, budget) = match route {
-            Route::Begin => (Method::POST, "POST", &self.begin),
-            Route::Callback => (Method::GET, "GET", &self.callback),
-        };
+        let (method, allow, lines) = route.profile();
         if request.method != method {
             return handoff::wrong_method(allow);
         }
         // Inspect body metadata only, then drop the body without polling it.
-        if let Err((status, line)) = bounds(&request, &body) {
+        if let Err((status, line)) = bounds(&request, &body, lines) {
             return handoff::respond(status, line);
         }
         drop(body);
         // `try_acquire` never waits. The permit is released when this future completes or is
         // dropped, including on client disconnect.
         let Ok(_permit) = self.in_flight.try_acquire() else {
-            return handoff::respond(StatusCode::SERVICE_UNAVAILABLE, BUSY_REFUSED);
+            return handoff::respond(StatusCode::SERVICE_UNAVAILABLE, lines.busy);
         };
         if !budget.admit(Instant::now()) {
-            return handoff::respond(StatusCode::TOO_MANY_REQUESTS, RATE_REFUSED);
+            return handoff::respond(StatusCode::TOO_MANY_REQUESTS, lines.rate);
         }
         match route {
             Route::Begin => self.handoff.initiate(&request).await,
             Route::Callback => self.handoff.callback(&request).await,
+            Route::Session => self.handoff.session(&request).await,
+            Route::Logout => self.handoff.logout(&request).await,
         }
     }
 }
 
-/// Validates `settings` against the handoff's registered callback, then builds the router.
-/// The original request path reaches the handoff unchanged: mount the result with
-/// `Router::merge`, never under a prefix with `Router::nest`. It has no fallback, so an
-/// unrouted path gets the host router's fallback.
+/// Validates `settings` against the handoff's registered callback, then builds the login
+/// router: the initiation and callback routes only. The original request path reaches the
+/// handoff unchanged: mount the result with `Router::merge`, never under a prefix with
+/// `Router::nest`. It has no fallback, so an unrouted path gets the host router's fallback.
 pub fn router(handoff: LoginHandoff, settings: Settings<'_>) -> Result<Router, SettingsError> {
+    build(handoff, settings, None)
+}
+
+/// [`router`] plus the session check and logout routes (ADR 0019). All four paths obey the
+/// same shape and collision rules, every route has its own budget and all four share the
+/// one in-flight cap. The same mounting rules apply.
+pub fn router_with_sessions(
+    handoff: LoginHandoff,
+    settings: Settings<'_>,
+    sessions: SessionSettings<'_>,
+) -> Result<Router, SettingsError> {
+    build(handoff, settings, Some(sessions))
+}
+
+fn build(
+    handoff: LoginHandoff,
+    settings: Settings<'_>,
+    sessions: Option<SessionSettings<'_>>,
+) -> Result<Router, SettingsError> {
     let Settings {
         initiation,
         begin,
@@ -284,28 +358,39 @@ pub fn router(handoff: LoginHandoff, settings: Settings<'_>) -> Result<Router, S
         in_flight,
     } = settings;
     let callback_path = handoff.callback_path().to_owned();
-    check_paths(initiation, &callback_path)?;
+    let mut routes = vec![(initiation, Route::Begin, begin)];
+    routes.push((&callback_path, Route::Callback, callback));
+    if let Some(sessions) = sessions {
+        routes.push((sessions.session, Route::Session, sessions.checks));
+        routes.push((sessions.logout, Route::Logout, sessions.logouts));
+    }
+    let paths: Vec<&str> = routes.iter().map(|(path, _, _)| *path).collect();
+    check_paths(&paths)?;
     let now = Instant::now();
-    let (begin, callback) = (Budget::new(begin, now)?, Budget::new(callback, now)?);
+    let mut budgets = Vec::with_capacity(routes.len());
+    for (path, route, rate) in routes {
+        budgets.push((path, route, Arc::new(Budget::new(rate, now)?)));
+    }
     if !(1..=MAX_IN_FLIGHT).contains(&in_flight) {
         return Err(SettingsError::InFlight);
     }
-    let routes = Arc::new(Routes {
+    let shared = Arc::new(Shared {
         handoff,
-        begin,
-        callback,
         in_flight: Semaphore::new(in_flight as usize),
     });
-    // `any`, not `get`: Axum also runs `get` handlers for HEAD.
-    let route = |route: Route| {
-        let routes = routes.clone();
-        any(
-            move |request: Request| async move { routes.dispatch(route, request).await.map(Body::from) },
-        )
-    };
-    Ok(Router::new()
-        .route(initiation, route(Route::Begin))
-        .route(&callback_path, route(Route::Callback)))
+    let mut router = Router::new();
+    for (path, route, budget) in budgets {
+        let shared = shared.clone();
+        // `any`, not `get`: Axum also runs `get` handlers for HEAD.
+        let handler = any(move |request: Request| async move {
+            shared
+                .dispatch(route, &budget, request)
+                .await
+                .map(Body::from)
+        });
+        router = router.route(path, handler);
+    }
+    Ok(router)
 }
 
 #[cfg(test)]
@@ -321,11 +406,11 @@ mod tests {
             ("/a-b.c_d~e", "/x/y/z"),
             ("/healthz/login", "/readyz2"),
         ] {
-            assert_eq!(check_paths(initiation, callback), Ok(()), "{initiation}");
+            assert_eq!(check_paths(&[initiation, callback]), Ok(()), "{initiation}");
         }
         let long = format!("/{}", "a".repeat(MAX_PATH_BYTES));
         let longest = &long[..MAX_PATH_BYTES];
-        assert_eq!(check_paths(longest, "/callback"), Ok(()));
+        assert_eq!(check_paths(&[longest, "/callback"]), Ok(()));
         for (path, error) in [
             ("/{id}", SettingsError::Pattern),
             ("/login/{*rest}", SettingsError::Pattern),
@@ -349,8 +434,8 @@ mod tests {
             (long.as_str(), SettingsError::Path),
         ] {
             // Either path; the callback comes from the provider configuration.
-            assert_eq!(check_paths(path, "/callback"), Err(error), "{path}");
-            assert_eq!(check_paths("/login", path), Err(error), "{path}");
+            assert_eq!(check_paths(&[path, "/callback"]), Err(error), "{path}");
+            assert_eq!(check_paths(&["/login", path]), Err(error), "{path}");
         }
         for (initiation, callback) in [
             ("/callback", "/callback"),
@@ -360,11 +445,38 @@ mod tests {
             ("/login", "/readyz"),
         ] {
             assert_eq!(
-                check_paths(initiation, callback),
+                check_paths(&[initiation, callback]),
                 Err(SettingsError::Collision),
                 "{initiation} {callback}"
             );
         }
+    }
+
+    /// Session paths join the same rules: every shape refusal applies in any position, and
+    /// any two equal paths or an operational path collide.
+    #[test]
+    fn session_paths_obey_the_same_rules() {
+        let four = |session, logout| check_paths(&["/login", "/callback", session, logout]);
+        assert_eq!(four("/session", "/logout"), Ok(()));
+        assert_eq!(four("/auth/session/", "/auth/logout"), Ok(()));
+        for (path, error) in [
+            ("/{id}", SettingsError::Pattern),
+            ("/session:x", SettingsError::Pattern),
+            ("", SettingsError::Path),
+            ("session", SettingsError::Path),
+            ("//session", SettingsError::Path),
+            ("/a/../session", SettingsError::Path),
+            ("/session?x", SettingsError::Path),
+            ("/s%65ssion", SettingsError::Path),
+            ("/login", SettingsError::Collision),
+            ("/callback", SettingsError::Collision),
+            ("/healthz", SettingsError::Collision),
+            ("/readyz", SettingsError::Collision),
+        ] {
+            assert_eq!(four(path, "/logout"), Err(error), "{path}");
+            assert_eq!(four("/session", path), Err(error), "{path}");
+        }
+        assert_eq!(four("/same", "/same"), Err(SettingsError::Collision));
     }
 
     #[test]

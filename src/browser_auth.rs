@@ -3,9 +3,9 @@
 //! It joins validated settings ([`AuthConfig`], ADR 0015) to the existing managed login and
 //! session operations and owns every pooled connection those operations use. The service
 //! itself has no cookie or request handling; [`handoff`] holds the unmounted browser
-//! adapter (ADR 0017) and [`router`] its unmounted bounded Axum router (ADR 0018). There is
-//! no mounted route, native handoff or runtime loader, and no running process constructs
-//! this service yet.
+//! adapter (ADR 0017) and [`router`] its unmounted bounded Axum router (ADRs 0018 and 0019).
+//! There is no mounted route, native handoff or runtime loader, and no running process
+//! constructs this service yet.
 pub mod handoff;
 pub mod router;
 use crate::{
