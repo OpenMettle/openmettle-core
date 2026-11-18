@@ -350,9 +350,14 @@ violations (violation) AS (
       AND NOT (g.kind = 'relation' AND g.schema_name = 'openmettle'
                AND (g.object_name::text, pg_get_userbyid(g.grantee)::text, g.privilege)
                    IN (SELECT relation, role, privilege FROM contract))
-      AND NOT (g.kind = 'function' AND $1 >= 12 AND g.privilege = 'EXECUTE'
+      -- Exactly one redemption signature per version: the code-less function exists only at
+      -- version 12, and from version 13 only the function that requires the invitation code.
+      AND NOT (g.kind = 'function' AND g.privilege = 'EXECUTE'
                AND g.grantee = (SELECT oid FROM pg_roles WHERE rolname = 'openmettle_api')
-               AND g.target = 'function openmettle.redeem_home_invitation(uuid,text,text,text,bigint)')
+               AND (($1 = 12 AND g.target
+                        = 'function openmettle.redeem_home_invitation(uuid,text,text,text,bigint)')
+                    OR ($1 >= 13 AND g.target
+                        = 'function openmettle.redeem_home_invitation(uuid,text,text,text,bigint,bytea)')))
       AND NOT (g.kind = 'column' AND g.schema_name = 'openmettle'
                AND (g.object_name::text, g.column_name::text,
                     pg_get_userbyid(g.grantee)::text, g.privilege)

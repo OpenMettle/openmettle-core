@@ -27,29 +27,45 @@ SELECT current_user = 'openmettle_owner' AND session_user = current_user
 \endif
 \if :locked
   -- Record the current epoch under the provider lock. A later retirement fences this decision.
-  WITH created AS (
+  -- The code is 16 bytes from two random UUIDs, generated once in the materialized CTE. The
+  -- row stores only its domain-separated hash. psql holds the display form in a variable, and
+  -- the code is never part of any statement text.
+  WITH code AS MATERIALIZED (
+    SELECT substring(sha256(uuid_send(gen_random_uuid()) || uuid_send(gen_random_uuid())) FROM 1 FOR 16) AS secret
+  ), created AS (
     INSERT INTO openmettle.home_invitations
       (id, provider_id, provider_generation, provider_epoch, issuer, subject,
-       redeem_before_ms, approval_until_ms, created_by)
+       redeem_before_ms, approval_until_ms, created_by, code_hash)
     SELECT :'invitation'::uuid, :'provider'::uuid, :'expected_generation'::bigint, r.epoch,
-           :'issuer', :'subject', :'redeem_before_ms'::bigint, :'approval_until_ms'::bigint, :'operator'::uuid
-      FROM (SELECT epoch, revision FROM openmettle.login_provider_revisions
+           :'issuer', :'subject', :'redeem_before_ms'::bigint, :'approval_until_ms'::bigint, :'operator'::uuid,
+           sha256(convert_to('openmettle/home-invitation-code/1', 'SQL_ASCII') || decode('00', 'hex') || code.secret)
+      FROM code, (SELECT epoch, revision FROM openmettle.login_provider_revisions
              WHERE provider_id = :'provider'::uuid ORDER BY epoch DESC LIMIT 1) r
      WHERE r.revision IS NOT NULL
        AND :'approval_until_ms'::bigint >= :'redeem_before_ms'::bigint
        AND NOT EXISTS (SELECT FROM openmettle.user_identities WHERE issuer = :'issuer' AND subject = :'subject')
     ON CONFLICT DO NOTHING RETURNING 1
-  ) SELECT count(*) = 1 AS inserted FROM created \gset
+  ) SELECT (SELECT count(*) = 1 FROM created) AS inserted,
+           'omh1-' || (SELECT string_agg(substring(encode(code.secret, 'hex') FROM i FOR 4), '-' ORDER BY i)
+                         FROM generate_series(1, 29, 4) AS i) AS code
+      FROM code \gset
 \endif
 \if :inserted
-  -- The unique-index insert can wait for a prior redemption. Use a fresh snapshot.
+  -- The unique-index insert can wait for a prior redemption. Use a fresh snapshot. The
+  -- redemption window ends in the future and at most seven days from now.
   SELECT NOT EXISTS (SELECT FROM openmettle.user_identities WHERE issuer = :'issuer' AND subject = :'subject')
-     AND :'redeem_before_ms'::bigint > floor(extract(epoch FROM clock_timestamp()) * 1000) AS future \gset
+     AND :'redeem_before_ms'::bigint > now_ms
+     AND :'redeem_before_ms'::bigint <= now_ms + 604800000 AS future
+    FROM (SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint AS now_ms) AS clock \gset
 \endif
 \if :future
   COMMIT;
+  -- Printed only after the commit is acknowledged, and only here. Keep the second line out of
+  -- tickets, logs and recordings (see home-invitations.md).
   \echo 'home invitation created'
+  \echo 'invitation code (shown once; deliver privately):' :code
 \else
   ROLLBACK;
   DO $$ BEGIN RAISE EXCEPTION 'home invitation creation refused'; END $$;
 \endif
+\unset code

@@ -32,7 +32,7 @@ jobs:
   rust:
     name: Rust runtime
     runs-on: ubuntu-24.04
-    # Ten authentic prior-release builds run serially (~70-90 s each). A cold run (cache key
+    # Eleven authentic prior-release builds run serially (~70-90 s each). A cold run (cache key
     # change) was projected at 20-24 min; keep headroom so a near-miss is not a wasted run.
     timeout-minutes: 35
     steps:
@@ -119,11 +119,18 @@ jobs:
           mkdir -p "$RUNNER_TEMP/openmettle-v11"
           git archive 0ab3401714762f28a730eae4cd7c91052648dabd | tar -x -C "$RUNNER_TEMP/openmettle-v11"
           cargo build --manifest-path "$RUNNER_TEMP/openmettle-v11/Cargo.toml" --locked --offline --bins
+      # Invitations (schema 12): the block A merge, the last release before invitation codes.
+      - name: Build authentic version-12 release for schema compatibility
+        run: |
+          mkdir -p "$RUNNER_TEMP/openmettle-v12"
+          git archive 4441b4236ad0dd1ea868d507bb10b50d9b0ddb6f | tar -x -C "$RUNNER_TEMP/openmettle-v12"
+          cargo build --manifest-path "$RUNNER_TEMP/openmettle-v12/Cargo.toml" --locked --offline --bins
       # POSTGRES_CONTAINER runs the exact ADR 0014 operator scripts with the pinned service psql.
       - name: PostgreSQL schema, migration and role integration
         run: cargo test --locked --offline --test schema -- --ignored
         env:
           POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          V12_BINARY_DIR: ${{ runner.temp }}/openmettle-v12/target/debug
           V11_BINARY_DIR: ${{ runner.temp }}/openmettle-v11/target/debug
           V10_BINARY_DIR: ${{ runner.temp }}/openmettle-v10/target/debug
           V9_BINARY_DIR: ${{ runner.temp }}/openmettle-v9/target/debug

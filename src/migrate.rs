@@ -85,6 +85,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "home first-account invitations",
         sql: include_str!("../migrations/0012_home_invitations.sql"),
     },
+    Source {
+        version: 13,
+        description: "home invitation codes",
+        sql: include_str!("../migrations/0013_home_invitation_codes.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

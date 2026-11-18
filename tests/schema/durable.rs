@@ -682,7 +682,10 @@ async fn killed_migration_three_preserves_version_two() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    assert_eq!(
+        db.history().await,
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    );
     db.wait_no_migration_session().await;
 }
 
@@ -727,7 +730,10 @@ async fn version_three_failure_timeout_concurrent_upgrade() {
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success(), "{}", stderr(&out));
     }
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    assert_eq!(
+        db.history().await,
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    );
     db.wait_no_migration_session().await;
 }
 

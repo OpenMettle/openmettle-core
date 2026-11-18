@@ -216,9 +216,13 @@ pub(crate) struct Issuance<'a> {
     pub membership_revision: i64,
     pub binding: Vec<u8>,
     pub deadline: Instant,
+    /// The invitation code presented when this login started, if any (ADR 0022).
+    pub invitation: Option<&'a crate::invitation::InvitationCode>,
 }
 // Only a missing identity can enter the first-account path. A missing or withdrawn
-// approval on an existing identity is always handled by the ordinary eligibility checks.
+// approval on an existing identity is always handled by the ordinary eligibility checks,
+// and a code presented for an existing identity is dropped here without being evaluated.
+// A missing identity without a code is refused without calling the redemption function.
 async fn resolve_identity(
     c: &mut PgConnection,
     input: &Issuance<'_>,
@@ -234,15 +238,17 @@ async fn resolve_identity(
     if let Some((identity, user)) = existing {
         return Ok((identity, user, None));
     }
+    let code = input.invitation.ok_or(Error::Rejected)?;
     sqlx::query_as(
         "SELECT identity_id, user_id, redeem_before_ms FROM
-         openmettle.redeem_home_invitation($1::uuid,$2,$3,$4,$5)",
+         openmettle.redeem_home_invitation($1::uuid,$2,$3,$4,$5,$6)",
     )
     .bind(input.provider)
     .bind(input.issuer)
     .bind(input.assertion.identity().subject())
     .bind(input.login)
     .bind(input.epoch)
+    .bind(code.bytes().as_slice())
     .fetch_optional(c)
     .await?
     .ok_or(Error::Rejected)

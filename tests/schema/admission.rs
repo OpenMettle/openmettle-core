@@ -33,6 +33,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "91b95d8146362a47c78ebf96de7b9f2e81f625b99ac880ddb1f427c3f5652f57",
         "887728e24ebf829d4644b6f47937c37149862ab7a7d8069c278827141f9d7a84",
         "b71bee740d4a71320f26f3392ce2be0962f599d8c032383cb14fc11bf32b1763",
+        "58312aca4b72100dd460f5cccfca9688154e83f4662268358834f75f8f49e7bd",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     for (migration, hash) in MIGRATIONS.iter().zip(expected) {
@@ -253,7 +254,10 @@ async fn migration_nine_rollback_and_version_gated_privileges() {
     migrate::apply(&db.settings(Duration::from_secs(5)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    assert_eq!(
+        db.history().await,
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    );
 }
 
 #[tokio::test]
