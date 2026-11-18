@@ -169,8 +169,8 @@ commits must survive failover; lagging standbys and asynchronous failover are un
 The database stores revisions, not full configuration: keep configuration identical across
 replicas for the same revision. `cargo test --locked --offline --lib provider_keys::tests::postgres -- --ignored --skip provider_keys::tests::postgres::browser::`
 runs the managed PostgreSQL tests against an isolated test database only. The first-approval
-session test also needs `POSTGRES_CONTAINER`, the isolated CI service container whose `psql`
-runs the operator script.
+and approval-change session tests also need `POSTGRES_CONTAINER`, the isolated CI service
+container whose `psql` runs the operator scripts.
 
 ## Local identity approval and sessions
 
@@ -182,7 +182,10 @@ only its sealed online proof; an offline `VerifiedIdentity` cannot mint a sessio
 Routine configuration/approval revisions preserve sessions. Explicit revoke, provider retirement,
 approval withdrawal and user disablement advance access generations; restoration never revives
 old sessions. Follow ADR 0013's updated owner write protocol, including the provider lock before
-epoch allocation. Validation and logout use the primary database without provider network access.
+epoch allocation. Owners create an approval with the
+[first local identity approval procedure](docs/operator/first-identity-approval.md) and change
+it with the [approval change procedure](docs/operator/identity-approval-change.md).
+Validation and logout use the primary database without provider network access.
 Session context does not grant resource access; V1-05 checks remain required before exposure.
 
 Credentials are random opaque values; only domain-separated digests are stored. Lifetime,

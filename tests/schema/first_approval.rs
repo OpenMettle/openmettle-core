@@ -90,7 +90,7 @@ async fn seed(db: &TestDb) {
 }
 
 /// Every row of every openmettle table as JSON text, compared as sets.
-async fn everything(db: &TestDb) -> BTreeMap<String, BTreeSet<String>> {
+pub(super) async fn everything(db: &TestDb) -> BTreeMap<String, BTreeSet<String>> {
     let mut owner = connect(&db.0, OWNER).await;
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT tablename::text FROM pg_tables WHERE schemaname = 'openmettle' ORDER BY 1",
@@ -198,7 +198,12 @@ async fn blocked(db: &TestDb, child: &mut Child, relation: &str) {
     wait_for_psql(db, child, "Lock", &format!("openmettle.{relation}")).await;
 }
 
-async fn wait_for_psql(db: &TestDb, child: &mut Child, event_type: &str, query_fragment: &str) {
+pub(super) async fn wait_for_psql(
+    db: &TestDb,
+    child: &mut Child,
+    event_type: &str,
+    query_fragment: &str,
+) {
     let mut admin = db.admin().await;
     let deadline = Instant::now() + Duration::from_secs(10);
     while !sqlx::query_scalar::<_, bool>(
@@ -217,7 +222,7 @@ async fn wait_for_psql(db: &TestDb, child: &mut Child, event_type: &str, query_f
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
-async fn db_ms(c: &mut PgConnection) -> i64 {
+pub(super) async fn db_ms(c: &mut PgConnection) -> i64 {
     sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
         .fetch_one(c)
         .await

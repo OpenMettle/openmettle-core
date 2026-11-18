@@ -231,43 +231,18 @@ Owner writes that bypass the protocol remain outside its concurrency guarantee.
 
 ### Approval edits, revocation, withdrawal and reapproval
 
-Supply `approval`, `expected_revision`, `expected_generation`, `actor`, `reason`, `action` and
-`expires_ms`. Use `routine` only for an active, unexpired approval; `revoke` to invalidate its
-sessions while retaining eligibility; `withdraw` to remove eligibility; or `restore` to
-reapprove an inactive or expired identity. `expires_ms` is used by routine edits and restoration;
-supply it explicitly even for other actions, which retain the stored expiry.
-
-```sql
-\set ON_ERROR_STOP on
-BEGIN;
-SET LOCAL lock_timeout = '2s';
-SET LOCAL statement_timeout = '5s';
-SET LOCAL synchronous_commit = on;
-SELECT revision AS observed_revision, access_generation AS observed_generation,
-       active AS was_active, expires_ms AS old_expiry
- FROM openmettle.local_identity_approvals WHERE id=:'approval'::uuid FOR UPDATE \gset
-SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint AS observed_ms \gset
-SELECT :observed_revision = :expected_revision AND :observed_generation = :expected_generation
- AND ((:'action'='routine' AND :'was_active'::boolean AND :old_expiry > :observed_ms
-                         AND :expires_ms > :observed_ms)
-   OR (:'action' IN ('revoke','withdraw') AND :'was_active'::boolean)
-   OR (:'action'='restore' AND (NOT :'was_active'::boolean OR :old_expiry <= :observed_ms)
-                          AND :expires_ms > :observed_ms)) AS expected \gset
-\if :expected
-  UPDATE openmettle.local_identity_approvals
-   SET revision=revision+1,
-       access_generation=access_generation + CASE WHEN :'action'='routine' THEN 0 ELSE 1 END,
-       active=CASE WHEN :'action'='withdraw' THEN false
-                   WHEN :'action'='restore' THEN true ELSE active END,
-       expires_ms=CASE WHEN :'action' IN ('routine','restore') THEN :expires_ms ELSE expires_ms END,
-       changed_by=:'actor', change_reason=:'reason', changed_at=clock_timestamp()
-   WHERE id=:'approval'::uuid;
-  COMMIT;
-\else
-  ROLLBACK;
-  DO $refused$ BEGIN RAISE EXCEPTION 'operator change refused; no changes committed'; END; $refused$;
-\endif
-```
+Use the exact script in the
+[local identity approval change procedure](../operator/identity-approval-change.md). It
+locks one existing approval by UUID, rechecks its expected revision and generation and the
+primary clock after the wait, and updates only that row with operator provenance. Find the
+UUID and counters with the first approval procedure's read-only inspection by exact
+provider, issuer and subject. Use `routine` only for an active, unexpired approval; `revoke`
+to invalidate its sessions while retaining eligibility; `withdraw` to remove eligibility; or
+`restore` to reapprove an inactive or expired identity. Every action advances the revision;
+all but `routine` advance the generation. `expires_ms` is required for every action but
+written only by `routine` and `restore`; the others retain the stored expiry. Malformed,
+stale, overflowing or inapplicable requests are refused with fixed text and commit nothing.
+This replaces the earlier inline block, which interpolated counters as SQL text.
 
 Restoration advances the generation again, including when the previous approval merely expired.
 It cannot revive sessions bound to that earlier approval. Never change provider/identity on an
