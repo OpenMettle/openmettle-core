@@ -456,8 +456,9 @@ The fixture serves the application at `app.relying.test` and the synthetic provi
 authorization page at `issuer.example.test`, on ephemeral loopback ports with HTTPS.
 Chrome trusts the temporary CA in a private NSS database. A form on the issuer site
 first attempts a login that the router refuses. An application form then starts a login.
-Chrome commits the issuer document, follows its link back to the callback, and lands on
-the application. The fixture checks the browser's cross-site document GET, one PKCE-bound
+Chrome commits the issuer document, follows its link back to the callback, and reaches
+the configured landing URL with no query or fragment. The fixture checks the browser's
+cross-site document GET, one PKCE-bound
 token POST, a successful same-origin session check, an acknowledged logout POST, and
 a refused check after Chrome removes the session cookie. PostgreSQL must contain one
 consumed login and its revoked session for the approved synthetic user.

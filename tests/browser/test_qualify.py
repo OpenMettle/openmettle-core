@@ -31,6 +31,17 @@ class PrivatePipeTests(unittest.TestCase):
             with self.assertRaisesRegex(Failure, "^browser command refused$"):
                 DevTools(client).call("Runtime.evaluate")
 
+    def test_packet_limit_applies_to_each_complete_message(self):
+        client, peer = socket.socketpair()
+        with client, peer:
+            browser = DevTools(client)
+            packet = b'{"id":1,"result":{}}'
+            browser.MAX_PACKET_BYTES = len(packet)
+            peer.sendall(packet + b'\0' + packet.replace(b':1,', b':2,') + b' \0')
+            self.assertEqual(browser.call("Browser.getVersion"), {})
+            with self.assertRaisesRegex(Failure, "^browser pipe packet oversized$"):
+                browser.call("Browser.getVersion")
+
     def test_page_exception_does_not_expose_exception_detail(self):
         client, peer = socket.socketpair()
         with client, peer:

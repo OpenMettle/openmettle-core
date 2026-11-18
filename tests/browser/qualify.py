@@ -21,6 +21,8 @@ class Navigating(Failure):
 
 
 class DevTools:
+    MAX_PACKET_BYTES = 1024 * 1024
+
     def __init__(self, connection):
         self.connection = connection
         self.pending = b""
@@ -34,12 +36,18 @@ class DevTools:
             message["sessionId"] = self.session
         self.connection.sendall(json.dumps(message).encode() + b"\0")
         while True:
-            while b"\0" not in self.pending:
+            end = self.pending.find(b"\0")
+            while end < 0:
+                if len(self.pending) > self.MAX_PACKET_BYTES:
+                    raise Failure("browser pipe packet oversized")
                 data = self.connection.recv(16384)
-                if not data or len(self.pending) > 1024 * 1024:
-                    raise Failure("browser pipe closed or oversized")
+                if not data:
+                    raise Failure("browser pipe closed")
                 self.pending += data
-            packet, self.pending = self.pending.split(b"\0", 1)
+                end = self.pending.find(b"\0")
+            if end > self.MAX_PACKET_BYTES:
+                raise Failure("browser pipe packet oversized")
+            packet, self.pending = self.pending[:end], self.pending[end + 1:]
             reply = json.loads(packet)
             if reply.get("id") == self.sequence:
                 if "error" in reply:
@@ -100,6 +108,8 @@ def journey(browser, app, issuer):
     page(issuer, "/authorize", "approve")
     browser.click("approve")
     page(app, "/app", "logout")
+    if browser.evaluate(f"location.href === {json.dumps(app + '/app')}") is not True:
+        raise Failure("unexpected landing URL")
     if browser.evaluate("fetch('/session').then(r => r.status)") != 204:
         raise Failure("issued session check")
     browser.click("logout")
