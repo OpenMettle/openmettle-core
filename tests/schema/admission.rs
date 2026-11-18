@@ -2,6 +2,7 @@
 //! PostgreSQL tests need an isolated CI PostgreSQL 18 service. The psql scripts run unchanged
 //! with the pinned service image's psql through `POSTGRES_CONTAINER`, as in the image checks.
 use super::*;
+use std::collections::BTreeSet;
 
 const LIMIT_SCRIPT: &str = include_str!("../../docs/operator/login-admission-limit.psql");
 const CLEANUP_SCRIPT: &str = include_str!("../../docs/operator/login-gate-cleanup.psql");
@@ -383,11 +384,14 @@ async fn cleanup_script_removes_only_expired_unreferenced_gates() {
         .fetch_one(&mut holder)
         .await
         .unwrap();
-    let remaining = async || -> Vec<String> {
-        sqlx::query_scalar("SELECT id FROM openmettle.login_transactions ORDER BY id")
+    // Compare gate membership independently of the database's collation.
+    let remaining = async || -> BTreeSet<String> {
+        sqlx::query_scalar::<_, String>("SELECT id FROM openmettle.login_transactions")
             .fetch_all(&mut connect(&db.0, OWNER).await)
             .await
             .unwrap()
+            .into_iter()
+            .collect()
     };
     let reservations = counts(&db).await.0;
     assert_eq!(reservations, 5);
@@ -406,19 +410,15 @@ async fn cleanup_script_removes_only_expired_unreferenced_gates() {
     );
     let out = cleanup("1000");
     assert!(out.status.success(), "{}", stderr(&out));
-    let mut kept = vec![id(&c), id(&d), id(&e)];
-    kept.sort();
     assert_eq!(
         remaining().await,
-        kept,
+        BTreeSet::from([id(&c), id(&d), id(&e)]),
         "live, referenced and locked gates remain"
     );
     holder.execute("ROLLBACK").await.unwrap();
     let out = cleanup("1000");
     assert!(out.status.success(), "{}", stderr(&out));
-    let mut kept = vec![id(&c), id(&d)];
-    kept.sort();
-    assert_eq!(remaining().await, kept);
+    assert_eq!(remaining().await, BTreeSet::from([id(&c), id(&d)]));
     assert_eq!(
         counts(&db).await.0,
         reservations,
