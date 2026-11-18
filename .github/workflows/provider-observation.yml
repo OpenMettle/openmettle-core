@@ -1,0 +1,75 @@
+name: Provider document observation
+# V1-04 (#5): one wire observation of a pinned stock OIDC provider's discovery and JWKS
+# documents. Not a login, not provider support, and not OpenMettle HTTPS transport evidence.
+# Runs only when the observer, its workflow or the production document request changes, or
+# on manual dispatch. The provider has no network beyond its own loopback.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/provider-observation.yml
+      - tests/provider_observation/**
+      - src/provider_http.rs
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  harness:
+    name: Observer tests (no provider)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6; resolved 2026-11-14
+        with:
+          persist-credentials: false
+      - name: Test transport, sanitization and verdicts offline
+        run: python3 -m unittest discover -s tests/provider_observation -v
+
+  observe:
+    name: Keycloak 26.8.2 discovery and JWKS headers (loopback HTTP)
+    needs: harness
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # Official quay.io index for Keycloak 26.8.2, active tag digest resolved 2026-11-18.
+      # Its linux/amd64 SLSA provenance names keycloak/keycloak e514445f9dcdabc5bdcf67cab56c1e49655de067.
+      PROVIDER_IMAGE: quay.io/keycloak/keycloak@sha256:c68e286cacd87b942ac1939a0a1481461109d6acd3a57dc496969a319a76bbf0
+      PROVIDER_CONTAINER: openmettle-provider-observation
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6; resolved 2026-11-14
+        with:
+          persist-credentials: false
+      - name: Pull pinned provider image by digest
+        run: |
+          docker pull "$PROVIDER_IMAGE"
+          version=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$PROVIDER_IMAGE")
+          test "$version" = 26.8.2
+      # Stock production mode (`start`). No admin account, client, realm import or proxy.
+      # `--network none` removes all egress; `--cache=local` because clustering cannot bind
+      # without a network. `--db=dev-file` makes the production default explicit.
+      - name: Start provider without a network
+        run: >-
+          docker run --detach --name "$PROVIDER_CONTAINER" --network none
+          --cap-drop ALL --security-opt no-new-privileges
+          "$PROVIDER_IMAGE"
+          start --db=dev-file --cache=local --http-enabled=true --hostname=http://127.0.0.1:8080
+      - name: Observe discovery and JWKS once each
+        run: >-
+          python3 tests/provider_observation/observe.py
+          --container "$PROVIDER_CONTAINER"
+          --report "$RUNNER_TEMP/provider-observation.json"
+      - name: Publish sanitized facts to the job summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/provider-observation.json" ]; then
+            { echo '```json'; cat "$RUNNER_TEMP/provider-observation.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # Container state only; provider logs are not published.
+          docker inspect --format 'provider state={{.State.Status}} exit={{.State.ExitCode}}' "$PROVIDER_CONTAINER" || true
+      - name: Remove provider container
+        if: always()
+        run: docker rm --force "$PROVIDER_CONTAINER" || true
