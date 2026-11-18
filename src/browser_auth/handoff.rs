@@ -9,8 +9,8 @@
 //!   configured application origin becomes a `303` to the provider with the caller cookie.
 //! - [`LoginHandoff::callback`]: a top-level `GET` on the exact registered callback path
 //!   becomes a `303` to the configured landing with the session cookie.
-//! - [`LoginHandoff::session`]: a `GET` with one well-formed session cookie that validates
-//!   becomes an empty `204`.
+//! - [`LoginHandoff::session`]: a same-origin `GET` with one valid session cookie becomes
+//!   an empty `204`.
 //! - [`LoginHandoff::logout`]: a form `POST` with the initiation `Origin` rule and one
 //!   well-formed session cookie becomes a `204` that deletes the session cookie, only after
 //!   the revocation commit is acknowledged.
@@ -98,6 +98,8 @@ enum Refusal {
     Unavailable,
     /// Logout `Origin` rule, the same rule as initiation.
     LogoutOrigin,
+    /// Session check without exactly one `Sec-Fetch-Site: same-origin` field.
+    SessionOrigin,
     /// The session cookie is absent, repeated or malformed, or its credential is unknown,
     /// revoked, expired or no longer eligible.
     SessionInvalid,
@@ -125,7 +127,8 @@ impl Refusal {
                 "login unavailable; restart login\n",
             ),
             Self::LogoutOrigin => (StatusCode::FORBIDDEN, "logout origin refused\n"),
-            Self::SessionInvalid => (StatusCode::UNAUTHORIZED, "session not valid\n"),
+            Self::SessionOrigin => (StatusCode::FORBIDDEN, "session origin refused\n"),
+            Self::SessionInvalid => (StatusCode::FORBIDDEN, "session not valid\n"),
             Self::SessionUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "session unavailable; try again later\n",
@@ -492,14 +495,20 @@ impl LoginHandoff {
         }
     }
 
-    /// Session check. The session cookie must occur exactly once before
-    /// [`BrowserAuth::validate`] is called once; its parser refuses a malformed credential
-    /// before any checkout. A valid session is an empty `204`: no identity, permission,
-    /// credential, cookie or `Location` is returned. The path, query and other cookies are not
-    /// read.
+    /// Session check. Require exactly one `Sec-Fetch-Site: same-origin` before reading the
+    /// session cookie. [`BrowserAuth::validate`] refuses a malformed credential before checkout.
+    /// A valid session gets an empty `204` with no identity, permission, credential, cookie
+    /// or redirect.
     pub async fn session(&self, request: &Parts) -> Response<&'static str> {
         if request.method != Method::GET {
             return wrong_method("GET");
+        }
+        let mut sites = request.headers.get_all("sec-fetch-site").iter();
+        if !matches!(
+            (sites.next(), sites.next()),
+            (Some(site), None) if site.as_bytes() == b"same-origin"
+        ) {
+            return Refusal::SessionOrigin.response();
         }
         let Some(credential) = session_credential(&request.headers) else {
             return Refusal::SessionInvalid.response();
@@ -630,7 +639,7 @@ mod tests {
         };
         assert_eq!(
             line(Error::Session(S::Rejected)),
-            (StatusCode::UNAUTHORIZED, "session not valid\n")
+            (StatusCode::FORBIDDEN, "session not valid\n")
         );
         for failure in [
             Error::Session(S::Configuration),

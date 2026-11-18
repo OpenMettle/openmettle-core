@@ -394,12 +394,11 @@ explicit, no defaults), so session polling cannot spend logout or login rate. Th
 cap is shared by all four. Requests pass the same method, bound, permit and rate steps
 before any service call.
 
-- **Session check** accepts `GET` only. The `__Host-openmettle-session` cookie must occur
-  exactly once across all `Cookie` fields. The session parser and `BrowserAuth::validate`
-  then decide. A valid session answers an empty `204` with no identity, cookie or redirect.
-  An absent, malformed, repeated, unknown, revoked, expired or ineligible credential answers
-  `401` (`session not valid`). Other service failures answer `503` (`session unavailable;
-  try again later`).
+- **Session check** accepts a `GET` with exactly one `Sec-Fetch-Site: same-origin` field.
+  The browser must supply this field before the check reads cookies. The check requires
+  exactly one `__Host-openmettle-session` cookie. A valid session gets an empty `204` with
+  no identity, cookie or redirect. An invalid credential gets `403 session not valid`.
+  Operational failures get `503`.
 - **Logout** accepts a form `POST` with an empty body and exactly one `Origin` equal to the
   application origin, by the same rule as initiation. Any other `Origin` is `403` before
   the cookie is read. `BrowserAuth::logout` then revokes by possession, with no eligibility
@@ -411,11 +410,10 @@ before any service call.
 
 Every response has `no-store` and `no-referrer`. Fixed lines carry no request, cookie or
 credential value. Repeated logout with the same credential is acknowledged again while the
-revoked row is retained. After cleanup removes the row, the credential receives `401`. A
-browser applies `Set-Cookie` in the order it processes responses. A logout deletion that arrives after a new
-session cookie from another tab removes the new cookie without revoking that session. ADR
-0019 describes these orderings, the `401` contract question and the per-process budget
-limits.
+revoked row is retained. After cleanup removes the row, logout returns `403 session not
+valid`. A browser applies `Set-Cookie` in response processing order. A logout deletion can
+remove a new cookie set in another tab while that new session stays valid in the database.
+ADR 0019 describes these orderings and the per-process budget limits.
 
 Browser qualification, runtime enablement, ingress limits and telemetry redaction remain
 outstanding. `cargo test --locked --offline --lib provider_keys::tests::session_routes`

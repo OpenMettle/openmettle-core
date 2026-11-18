@@ -281,7 +281,13 @@ async fn issued_cookies_validate_and_logout_revokes_without_current_eligibility(
     };
     let routes = router_with_sessions(handoff, limits(), sessions).unwrap();
     let address = serve(routes).await;
-    let check = |cookie: &str| head("GET", "/session", &[("cookie", cookie)]);
+    let check = |cookie: &str| {
+        head(
+            "GET",
+            "/session",
+            &[("sec-fetch-site", "same-origin"), ("cookie", cookie)],
+        )
+    };
     let logout = |origin: &str, cookie: &str| {
         head(
             "POST",
@@ -358,13 +364,13 @@ async fn issued_cookies_validate_and_logout_revokes_without_current_eligibility(
     assert!(revoked(&mut f, &credential).await);
     send(address, &check(&issued))
         .await
-        .refused(401, "session not valid\n");
+        .refused(403, "session not valid\n");
     assert!(auth.validate(&credential).await.is_err());
     // A repeated logout by the same retained credential is acknowledged again.
     deleted(&send(address, &logout(ORIGIN, &issued)).await);
     send(address, &check(&issued))
         .await
-        .refused(401, "session not valid\n");
+        .refused(403, "session not valid\n");
 
     // A second issued session loses eligibility. The check refuses it, and logout still
     // revokes it by possession alone.
@@ -379,7 +385,7 @@ async fn issued_cookies_validate_and_logout_revokes_without_current_eligibility(
         .unwrap();
     send(address, &check(&second_cookie))
         .await
-        .refused(401, "session not valid\n");
+        .refused(403, "session not valid\n");
     assert!(!revoked(&mut f, second.expose()).await);
     deleted(&send(address, &logout(ORIGIN, &second_cookie)).await);
     assert!(revoked(&mut f, second.expose()).await);
@@ -391,14 +397,14 @@ async fn issued_cookies_validate_and_logout_revokes_without_current_eligibility(
     for cookie in [&second_cookie, &issued] {
         send(address, &check(cookie))
             .await
-            .refused(401, "session not valid\n");
+            .refused(403, "session not valid\n");
     }
 
     // An unknown well-formed credential is refused without a deletion.
     let unknown = format!("{SESSION_COOKIE}={}.{}", "A".repeat(43), "A".repeat(43));
     send(address, &logout(ORIGIN, &unknown))
         .await
-        .refused(401, "session not valid\n");
+        .refused(403, "session not valid\n");
     assert_eq!(f.h.count(), requests);
     assert_eq!(posts(&f), 2);
 }

@@ -53,7 +53,8 @@ fn handoff(h: &Harness, pool: sqlx::PgPool) -> LoginHandoff {
 }
 /// A session check from the application, with the given `Cookie` fields.
 fn check(cookies: &[&str]) -> String {
-    let headers: Vec<_> = cookies.iter().map(|cookie| ("cookie", *cookie)).collect();
+    let mut headers = vec![("sec-fetch-site", "same-origin")];
+    headers.extend(cookies.iter().map(|cookie| ("cookie", *cookie)));
     head("GET", "/session", &headers)
 }
 /// A logout form `POST` with the given `Origin` fields and `Cookie` fields, empty body.
@@ -231,6 +232,31 @@ async fn routes_methods_bounds_and_cookies_are_decided_before_any_checkout() {
             );
         }
     }
+    // Only same-origin browser checks inspect the cookie. A rejected check never connects.
+    refused(
+        &send(address, &head("GET", "/session", &[])).await,
+        403,
+        "session origin refused\n",
+    );
+    for sites in [
+        &[][..],
+        &["same-site"][..],
+        &["cross-site"][..],
+        &["none"][..],
+        &["same-origin, same-origin"][..],
+        &["same-origin", "same-origin"][..],
+    ] {
+        let mut headers = vec![("cookie", cookie.as_str())];
+        headers.extend(sites.iter().map(|site| ("sec-fetch-site", *site)));
+        refused(
+            &send(address, &head("GET", "/session", &headers)).await,
+            403,
+            "session origin refused\n",
+        );
+    }
+    assert_eq!(h.count(), 0);
+    assert!(!attempted());
+
     // Missing, repeated, malformed and oversized session cookies, on both routes.
     let noncanonical = format!("{SESSION_COOKIE}={}.{}", "A".repeat(43), "B".repeat(43));
     let caller = format!("{LOGIN_COOKIE}={}", credential());
@@ -249,10 +275,10 @@ async fn routes_methods_bounds_and_cookies_are_decided_before_any_checkout() {
         &[noncanonical.as_str()][..],
         &[oversized.as_str()][..],
     ] {
-        refused(&send(address, &check(cookies)).await, 401, INVALID);
+        refused(&send(address, &check(cookies)).await, 403, INVALID);
         refused(
             &send(address, &logout(&[ORIGIN], cookies)).await,
-            401,
+            403,
             INVALID,
         );
     }
@@ -316,17 +342,8 @@ async fn logout_origin_is_exact_and_refused_before_the_cookie_or_database() {
     }
     assert_eq!(h.count(), 0);
     assert!(!attempted());
-    // The session check is a safe GET and reads no Origin: a cross-origin check still
-    // reaches validation and returns no cookie.
-    let headers = [
-        ("origin", "https://other.example.test"),
-        ("cookie", &cookie),
-    ];
-    refused(
-        &send(address, &head("GET", "/session", &headers)).await,
-        503,
-        UNAVAILABLE,
-    );
+    // The same-origin session GET uses Fetch Metadata and needs no Origin field.
+    refused(&send(address, &check(&[&cookie])).await, 503, UNAVAILABLE);
     assert!(attempted());
 }
 
@@ -346,7 +363,7 @@ async fn session_logout_and_login_budgets_are_independent_and_shared_by_clones()
     let (first, second) = (serve(routes.clone()).await, serve(routes).await);
     let cookie = session_cookie();
 
-    // Method, bound and cookie-free refusals before admission spend nothing.
+    // Method and bound refusals spend no rate.
     for _ in 0..5 {
         send(first, &head("HEAD", "/session", &[])).await;
         send(second, &head("GET", "/logout", &[])).await;
@@ -359,8 +376,8 @@ async fn session_logout_and_login_budgets_are_independent_and_shared_by_clones()
     }
     // Session polling spends only the check budget, across both clones. Refusals by the
     // handoff spend it too.
-    refused(&send(first, &check(&[])).await, 401, INVALID);
-    refused(&send(second, &check(&[])).await, 401, INVALID);
+    refused(&send(first, &check(&[])).await, 403, INVALID);
+    refused(&send(second, &check(&[])).await, 403, INVALID);
     for address in [first, second] {
         refused(&send(address, &check(&[])).await, 429, SESSION_RATE);
         refused(&send(address, &check(&[&cookie])).await, 429, SESSION_RATE);
@@ -371,7 +388,7 @@ async fn session_logout_and_login_budgets_are_independent_and_shared_by_clones()
         403,
         ORIGIN_REFUSED,
     );
-    refused(&send(second, &logout(&[ORIGIN], &[])).await, 401, INVALID);
+    refused(&send(second, &logout(&[ORIGIN], &[])).await, 403, INVALID);
     for address in [first, second] {
         let reply = send(address, &logout(&[ORIGIN], &[&cookie])).await;
         refused(&reply, 429, SESSION_RATE);

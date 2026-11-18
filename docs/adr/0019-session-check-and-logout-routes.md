@@ -63,13 +63,14 @@ Steps 1–4 do no provider, pool or database work. A unit spent in step 4 is nev
 
 ### Session check
 
-1. The `Cookie` fields total at most 16 KiB and contain `__Host-openmettle-session`
-   exactly once. This is the rule that finds the caller cookie, which is unchanged. Names
-   compare exactly. Missing, repeated or oversized cookies are refused here.
-2. `BrowserAuth::validate` is called once. Its session parser refuses a malformed credential
+1. Require exactly one `Sec-Fetch-Site: same-origin` field before reading cookies. Refuse
+   missing or repeated fields, other origins on the same site, cross-site requests and
+   address-bar navigation (`none`). [Fetch Metadata](https://www.w3.org/TR/fetch-metadata/#sec-fetch-site-header)
+2. Require exactly one `__Host-openmettle-session` cookie within the 16 KiB total cookie
+   field limit. Cookie names compare exactly, as for the login caller cookie.
+3. Call `BrowserAuth::validate` once. Its session parser refuses a malformed credential
    before requesting a pooled connection (ADR 0016).
-3. A valid session answers `204` with no body. The identity, personal scope and every other
-   value of the session context are dropped unread.
+4. Return an empty `204` for a valid session. Discard the identity and personal scope.
 
 The check reads no `Origin`, path, query or other cookie. It sets and deletes no cookie and
 never redirects.
@@ -103,7 +104,8 @@ Other sessions of the same user stay valid until they expire or are revoked.
 | Status | Fixed line | Cause |
 | --- | --- | --- |
 | `204` | (empty) | Valid session, or acknowledged logout |
-| `401` | `session not valid` | Session cookie absent, repeated or malformed, or credential unknown, revoked, expired or no longer eligible |
+| `403` | `session origin refused` | Session check Fetch Metadata rule |
+| `403` | `session not valid` | Session cookie absent, repeated or malformed, or credential unknown, revoked, expired or no longer eligible |
 | `403` | `logout origin refused` | Logout `Origin` rule |
 | `503` | `session unavailable; try again later` | Any other service category: database, timeout, configuration, capacity or randomness |
 | `405` | `method not allowed` (with `Allow`) | Wrong method |
@@ -119,18 +121,18 @@ has a `Location`, a retry time, a count or a request value. Only the acknowledge
 `204` has a `Set-Cookie`. The mapping from service errors is exhaustive, so a new category
 must be classified before the crate compiles. The login routes keep their ADR 0018 lines.
 
-`401` follows the `unauthenticated` status of the provisional `browserSession` scheme in
-ADR 0007. RFC 9110 §15.5.2 requires `WWW-Authenticate` on `401`, and cookie sessions have no
-registered scheme, so none is sent. Runtime enablement must settle this with the contract.
+These staged routes use `403` for cookie credential refusals. The versioned application
+API has its own unauthenticated response contract (ADR 0007). Any `401` response requires
+an applicable challenge. [RFC 9110, §15.5.2](https://www.rfc-editor.org/rfc/rfc9110.html#name-401-unauthorized)
 
 ### Repeated and concurrent responses
 
 - **Repeated logout.** Logout is idempotent while the revoked row is retained. A second logout
   with the same credential is acknowledged and deletes the cookie again. After operator
-  cleanup removes the row (ADR 0013), the same credential receives `401` and no deletion.
+  cleanup removes the row (ADR 0013), the same credential receives `403 session not valid`.
 - **Uncertain logout.** After a `503`, the revocation may or may not have committed and the
-  browser keeps its cookie. Retrying logout is safe. A later `401` from the session check
-  means the browser holds no valid session.
+  browser keeps its cookie. Retrying logout is safe. A later `session not valid` refusal
+  means that the presented credential failed validation.
 - **Deletion and a new session cookie.** A browser applies `Set-Cookie` in the order it
   processes responses, not the order requests were sent. If a login callback in another tab
   stores a new session cookie before a logout response arrives, the deletion removes the new
@@ -150,9 +152,9 @@ registered scheme, so none is sent. Runtime enablement must settle this with the
   spend it for everyone until it refills. Size it from measured polling, or poll less.
 - **Validation cost.** Each admitted check with a cookie takes a pooled connection and the
   SHARE locks of ADR 0013. Their throughput and latency are unmeasured.
-- **Same-site observers.** The check's `204` and `401` differ. A page on another host of the
-  same site can make a credentialed request and might infer sign-in state from load success.
-  No `Cross-Origin-Resource-Policy` is set. Use a dedicated application hostname (ADR 0017).
+- **Browser check profile.** Call the check from a page on the application origin. The
+  browser must send Fetch Metadata and ingress must preserve it. The session cookie still
+  has to validate. Use a dedicated application hostname as in ADR 0017.
 - **Origin depends on the browser.** The rule assumes a browser that sends `Origin` on form
   `POST`. A page with `Referrer-Policy: no-referrer` sends `Origin: null`, which is refused.
   Non-browser clients without `Origin` cannot log out through this route. No browser has
@@ -177,7 +179,10 @@ synthetic TLS provider and a database stand-in that never speaks PostgreSQL:
 - wrong methods, including `HEAD`, are `405`; path variants are `404`; target, header and
   body bounds use the session lines;
 - missing, repeated (in one field and across fields), misnamed, truncated, non-canonical,
-  caller-cookie-only and oversized cookies are `401` on both routes with no checkout;
+  caller-cookie-only and oversized cookies receive `403 session not valid` on both routes
+  with no checkout;
+- missing, repeated, same-site or cross-site Fetch Metadata on the session check is refused
+  before the cookie rule or any checkout;
 - every wrong logout `Origin` is `403` before the cookie rule, with no checkout. The check
   reads no `Origin`;
 - a well-formed cookie reaches the service, and the stand-in's failed checkout is a `503`
@@ -226,8 +231,8 @@ now shares its `Origin` check with logout, with identical behaviour.
 
 Still outstanding before any exposure: runtime enablement (settings source, construction and
 mounting in the API); trusted ingress routing, transport limits and telemetry redaction;
-browser qualification, including the `Origin` behaviour and concurrent cookie ordering above;
-the `401` contract question; operating values from measurement; operated cleanup and
+browser qualification, including Fetch Metadata, `Origin` and concurrent cookie ordering;
+operating values from measurement; operated cleanup and
 retired-key reservation reclamation. Native handoff, real-provider qualification,
 provisioning, resource authorization (V1-05), reconciliation and audited recovery also
 remain. #5 stays open.
