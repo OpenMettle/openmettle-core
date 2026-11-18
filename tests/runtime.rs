@@ -309,9 +309,16 @@ fn unavailable_database_keeps_liveness_and_bounded_readiness() {
                 .unwrap()
                 .starts_with("HTTP/1.1 404")
         );
-        // ADRs 0017 and 0018: neither the browser login handoff nor its router is mounted.
-        // The synthetic callback path and a form POST are unknown routes, no response sets a
-        // cookie or redirects, and the two operational routes still answer GET alone.
+        // A synthetic credential of the session parser's shape.
+        const SESSION: &str = concat!(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ".",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        );
+        // ADRs 0017–0019: neither the browser login handoff nor its router is mounted. The
+        // synthetic callback path, a form POST, a session check and a logout are unknown
+        // routes, no response sets or deletes a cookie or redirects, and the two operational
+        // routes still answer GET alone.
         for (method, path, status) in [
             (
                 "GET",
@@ -320,6 +327,8 @@ fn unavailable_database_keeps_liveness_and_bounded_readiness() {
             ),
             ("POST", "/callback", 404),
             ("POST", "/login", 404),
+            ("GET", "/session", 404),
+            ("POST", "/logout", 404),
             ("POST", "/", 404),
             ("POST", "/healthz", 405),
             ("POST", "/readyz", 405),
@@ -328,6 +337,7 @@ fn unavailable_database_keeps_liveness_and_bounded_readiness() {
             let request = format!(
                 "{method} {path} HTTP/1.1\r\nHost: localhost\r\n\
                  Origin: https://app.example.test\r\nContent-Length: 0\r\n\
+                 Cookie: __Host-openmettle-session={SESSION}\r\n\
                  Connection: close\r\n\r\n"
             );
             let response = send(&bind, &request).unwrap().to_ascii_lowercase();

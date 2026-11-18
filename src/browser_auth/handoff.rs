@@ -1,15 +1,22 @@
-//! Same-origin browser login handoff over [`BrowserAuth`] (ADR 0017).
+//! Same-origin browser login handoff over [`BrowserAuth`] (ADR 0017), with session checks and
+//! local logout (ADR 0019).
 //!
 //! **Not mounted.** No listener or running process constructs this adapter; the unmounted
-//! [`super::router`] composes it (ADR 0018). It turns one HTTP request head into one response:
+//! [`super::router`] composes it (ADRs 0018 and 0019). It turns one HTTP request head into one
+//! response:
 //!
 //! - [`LoginHandoff::initiate`]: a top-level form `POST` whose single `Origin` equals the
 //!   configured application origin becomes a `303` to the provider with the caller cookie.
 //! - [`LoginHandoff::callback`]: a top-level `GET` on the exact registered callback path
 //!   becomes a `303` to the configured landing with the session cookie.
+//! - [`LoginHandoff::session`]: a same-origin `GET` with one valid session cookie becomes
+//!   an empty `204`.
+//! - [`LoginHandoff::logout`]: a form `POST` with the initiation `Origin` rule and one
+//!   well-formed session cookie becomes a `204` that deletes the session cookie, only after
+//!   the revocation commit is acknowledged.
 //!
 //! Anything else is a fixed refusal. The adapter reads no request body, `Host`, forwarded
-//! header or return URL, logs nothing, and never deletes a cookie.
+//! header or return URL and logs nothing. Only an acknowledged logout deletes a cookie.
 use super::{BrowserAuth, Error};
 use crate::{login, sessions};
 use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode, header, request::Parts};
@@ -28,6 +35,10 @@ pub const MAX_QUERY_PARAMETERS: usize = 32;
 /// Total bytes of every `Cookie` field value on one request.
 pub const MAX_COOKIE_BYTES: usize = 16 * 1024;
 const COOKIE_ATTRIBUTES: &str = "Path=/; Secure; HttpOnly; SameSite=Lax";
+/// Deletes the session cookie: the same name and attributes, an empty value and `Max-Age=0`.
+/// It names no credential, so it is the same for every browser.
+const SESSION_DELETION: &str =
+    "__Host-openmettle-session=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Lax";
 
 /// Host-only (`__Host-`, no `Domain`) and gone with the login it names.
 fn caller_cookie(locator: &str, caller_secret: &str, login_seconds: u64) -> String {
@@ -85,6 +96,15 @@ enum Refusal {
     Binding,
     CompletionRejected,
     Unavailable,
+    /// Logout `Origin` rule, the same rule as initiation.
+    LogoutOrigin,
+    /// Session check without exactly one `Sec-Fetch-Site: same-origin` field.
+    SessionOrigin,
+    /// The session cookie is absent, repeated or malformed, or its credential is unknown,
+    /// revoked, expired or no longer eligible.
+    SessionInvalid,
+    /// Validation or logout failed or its outcome is uncertain.
+    SessionUnavailable,
 }
 impl Refusal {
     fn response(self) -> Response<&'static str> {
@@ -105,6 +125,13 @@ impl Refusal {
             Self::Unavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "login unavailable; restart login\n",
+            ),
+            Self::LogoutOrigin => (StatusCode::FORBIDDEN, "logout origin refused\n"),
+            Self::SessionOrigin => (StatusCode::FORBIDDEN, "session origin refused\n"),
+            Self::SessionInvalid => (StatusCode::FORBIDDEN, "session not valid\n"),
+            Self::SessionUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "session unavailable; try again later\n",
             ),
         };
         respond(status, line)
@@ -174,6 +201,38 @@ fn completion_refusal(error: Error) -> Refusal {
             Refusal::Unavailable
         }
     }
+}
+
+/// Validation and logout outcomes. Exhaustive, like [`completion_refusal`]. Only a credential
+/// the database refused is `SessionInvalid`; every other category, including the login
+/// categories these operations never return, is an operational failure.
+fn session_refusal(error: Error) -> Refusal {
+    use login::Error as L;
+    use sessions::Error as S;
+    match error {
+        Error::Session(S::Rejected) => Refusal::SessionInvalid,
+        Error::Session(S::Configuration | S::Capacity | S::Random | S::Database | S::Timeout)
+        | Error::Login(
+            L::Configuration
+            | L::Random
+            | L::Rejected
+            | L::Database
+            | L::Protection
+            | L::Exchange
+            | L::Verification
+            | L::Capacity
+            | L::Unconfigured,
+        ) => Refusal::SessionUnavailable,
+    }
+}
+/// `204` after an acknowledged revocation, with the one session-cookie deletion.
+fn logged_out() -> Response<&'static str> {
+    let mut response = respond(StatusCode::NO_CONTENT, "");
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_static(SESSION_DELETION),
+    );
+    response
 }
 
 /// `https://host[:port]` in the ASCII serialization browsers send, and nothing else.
@@ -260,9 +319,9 @@ fn authorization(query: &str) -> Option<Authorization> {
         issuer: issuer?,
     })
 }
-/// The caller cookie's value when it occurs exactly once across every `Cookie` field and
-/// those fields are within [`MAX_COOKIE_BYTES`].
-fn login_cookie(headers: &HeaderMap) -> Option<&str> {
+/// The value of cookie `name` when it occurs exactly once across every `Cookie` field and
+/// those fields are within [`MAX_COOKIE_BYTES`]. Names compare exactly.
+fn single_cookie<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
     let fields = || headers.get_all(header::COOKIE).iter();
     if fields().map(HeaderValue::len).sum::<usize>() > MAX_COOKIE_BYTES {
         return None;
@@ -272,7 +331,7 @@ fn login_cookie(headers: &HeaderMap) -> Option<&str> {
         for pair in field.as_bytes().split(|b| *b == b';') {
             let value = pair
                 .trim_ascii()
-                .strip_prefix(LOGIN_COOKIE.as_bytes())
+                .strip_prefix(name.as_bytes())
                 .and_then(|rest| rest.strip_prefix(b"="));
             if let Some(value) = value
                 && found.replace(value).is_some()
@@ -282,6 +341,15 @@ fn login_cookie(headers: &HeaderMap) -> Option<&str> {
         }
     }
     std::str::from_utf8(found?).ok()
+}
+/// The caller cookie, found by the rule above.
+fn login_cookie(headers: &HeaderMap) -> Option<&str> {
+    single_cookie(headers, LOGIN_COOKIE)
+}
+/// The session cookie's value, found by the same rule. [`BrowserAuth::validate`] and
+/// [`BrowserAuth::logout`] apply the session parser before requesting a pooled connection.
+fn session_credential(headers: &HeaderMap) -> Option<&str> {
+    single_cookie(headers, SESSION_COOKIE)
 }
 
 /// The handoff for one configured provider at one application origin.
@@ -347,6 +415,15 @@ impl LoginHandoff {
     pub(super) fn callback_path(&self) -> &str {
         &self.callback[self.origin.len()..]
     }
+    /// Exactly one field with exactly the configured bytes: `null`, a list, another scheme,
+    /// host or port and a repeated field all fail. Initiation and logout share this rule.
+    fn same_origin(&self, headers: &HeaderMap) -> bool {
+        let mut origins = headers.get_all(header::ORIGIN).iter();
+        matches!(
+            (origins.next(), origins.next()),
+            (Some(origin), None) if origin.as_bytes() == self.origin.as_bytes()
+        )
+    }
 
     /// Starts a login. Method and `Origin` are decided before the service is called; the
     /// path, query and body are not read. The `Location` is exactly the authorization URL
@@ -355,13 +432,7 @@ impl LoginHandoff {
         if request.method != Method::POST {
             return wrong_method("POST");
         }
-        // Exactly one field with exactly the configured bytes: `null`, a list, another
-        // scheme, host or port and a repeated field all fail here.
-        let mut origins = request.headers.get_all(header::ORIGIN).iter();
-        if !matches!(
-            (origins.next(), origins.next()),
-            (Some(origin), None) if origin.as_bytes() == self.origin.as_bytes()
-        ) {
+        if !self.same_origin(&request.headers) {
             return Refusal::Origin.response();
         }
         let Ok(started) = self.auth.begin(&self.provider).await else {
@@ -423,6 +494,54 @@ impl LoginHandoff {
             Err(error) => completion_refusal(error).response(),
         }
     }
+
+    /// Session check. Require exactly one `Sec-Fetch-Site: same-origin` before reading the
+    /// session cookie. [`BrowserAuth::validate`] refuses a malformed credential before checkout.
+    /// A valid session gets an empty `204` with no identity, permission, credential, cookie
+    /// or redirect.
+    pub async fn session(&self, request: &Parts) -> Response<&'static str> {
+        if request.method != Method::GET {
+            return wrong_method("GET");
+        }
+        let mut sites = request.headers.get_all("sec-fetch-site").iter();
+        if !matches!(
+            (sites.next(), sites.next()),
+            (Some(site), None) if site.as_bytes() == b"same-origin"
+        ) {
+            return Refusal::SessionOrigin.response();
+        }
+        let Some(credential) = session_credential(&request.headers) else {
+            return Refusal::SessionInvalid.response();
+        };
+        match self.auth.validate(credential).await {
+            // The context is dropped unread.
+            Ok(_) => respond(StatusCode::NO_CONTENT, ""),
+            Err(error) => session_refusal(error).response(),
+        }
+    }
+
+    /// Local logout of the presented session. The `Origin` rule is decided before any cookie
+    /// is read, and the single session cookie before [`BrowserAuth::logout`] is called once;
+    /// its parser refuses a malformed credential before any checkout. No eligibility check
+    /// precedes it: possession revokes an issued session after expiry, disablement or lost
+    /// approval. Only an acknowledged commit returns `204` with
+    /// the session-cookie deletion; every refusal or uncertain outcome deletes nothing.
+    /// Other sessions of the same user are not revoked, and the caller cookie is untouched.
+    pub async fn logout(&self, request: &Parts) -> Response<&'static str> {
+        if request.method != Method::POST {
+            return wrong_method("POST");
+        }
+        if !self.same_origin(&request.headers) {
+            return Refusal::LogoutOrigin.response();
+        }
+        let Some(credential) = session_credential(&request.headers) else {
+            return Refusal::SessionInvalid.response();
+        };
+        match self.auth.logout(credential).await {
+            Ok(()) => logged_out(),
+            Err(error) => session_refusal(error).response(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -482,6 +601,111 @@ mod tests {
         assert_eq!(broken.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(!broken.headers().contains_key(header::LOCATION));
         assert!(!broken.headers().contains_key(header::SET_COOKIE));
+    }
+
+    #[test]
+    fn logout_deletes_only_the_session_cookie_with_matching_attributes() {
+        assert_eq!(
+            SESSION_DELETION,
+            format!("{SESSION_COOKIE}=; Max-Age=0; {COOKIE_ATTRIBUTES}")
+        );
+        let response = logged_out();
+        assert_eq!(
+            (response.status(), *response.body()),
+            (StatusCode::NO_CONTENT, "")
+        );
+        let headers = response.headers();
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_eq!(headers[header::REFERRER_POLICY], "no-referrer");
+        assert!(!headers.contains_key(header::LOCATION));
+        assert!(!headers.contains_key(header::CONTENT_TYPE));
+        let cookies: Vec<_> = headers.get_all(header::SET_COOKIE).iter().collect();
+        assert_eq!(cookies, [SESSION_DELETION]);
+        assert_eq!(headers.len(), 3);
+    }
+
+    #[test]
+    fn session_errors_map_to_one_refusal_and_one_failure() {
+        use login::Error as L;
+        use sessions::Error as S;
+        let line = |error| {
+            let response = session_refusal(error).response();
+            let headers = response.headers();
+            assert!(!headers.contains_key(header::SET_COOKIE));
+            assert!(!headers.contains_key(header::LOCATION));
+            assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+            assert_eq!(headers[header::REFERRER_POLICY], "no-referrer");
+            (response.status(), *response.body())
+        };
+        assert_eq!(
+            line(Error::Session(S::Rejected)),
+            (StatusCode::FORBIDDEN, "session not valid\n")
+        );
+        for failure in [
+            Error::Session(S::Configuration),
+            Error::Session(S::Capacity),
+            Error::Session(S::Random),
+            Error::Session(S::Database),
+            Error::Session(S::Timeout),
+            Error::Login(L::Configuration),
+            Error::Login(L::Random),
+            Error::Login(L::Rejected),
+            Error::Login(L::Database),
+            Error::Login(L::Protection),
+            Error::Login(L::Exchange),
+            Error::Login(L::Verification),
+            Error::Login(L::Capacity),
+            Error::Login(L::Unconfigured),
+        ] {
+            assert_eq!(
+                line(failure),
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "session unavailable; try again later\n"
+                ),
+                "{failure:?}"
+            );
+        }
+    }
+
+    /// The session cookie is found by the caller-cookie rule, which still finds the caller
+    /// cookie. Credential shape is the session parser's decision, inside the service.
+    #[test]
+    fn session_credential_is_one_exactly_named_cookie() {
+        let valid = format!("{}.{}", "A".repeat(43), "A".repeat(43));
+        let headers = |fields: &[&str]| {
+            let mut headers = HeaderMap::new();
+            for field in fields {
+                headers.append(header::COOKIE, HeaderValue::from_str(field).unwrap());
+            }
+            headers
+        };
+        let session = format!("{SESSION_COOKIE}={valid}");
+        let caller = format!("{LOGIN_COOKIE}={valid}");
+        for fields in [
+            vec![session.as_str()],
+            vec!["theme=dark", session.as_str(), caller.as_str()],
+            vec![format!("a=1; {session}; b=2").as_str()],
+        ] {
+            let headers = headers(&fields);
+            assert_eq!(session_credential(&headers), Some(valid.as_str()));
+            if fields.len() == 3 {
+                assert_eq!(login_cookie(&headers), Some(valid.as_str()));
+            }
+        }
+        let oversized = format!("{session}; pad={}", "p".repeat(MAX_COOKIE_BYTES));
+        for fields in [
+            vec![],
+            vec!["theme=dark"],
+            vec![caller.as_str()],
+            vec![format!("{session}; {session}").as_str()],
+            vec![session.as_str(), session.as_str()],
+            vec![format!("{SESSION_COOKIE}2={valid}").as_str()],
+            vec![format!("__host-openmettle-session={valid}").as_str()],
+            vec![oversized.as_str()],
+        ] {
+            assert_eq!(session_credential(&headers(&fields)), None, "{fields:?}");
+        }
     }
 
     #[test]

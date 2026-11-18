@@ -1,6 +1,6 @@
 # OpenMettle core
 
-Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures, but no `/v1` route serves it. Internal managed login, an owner-configured outstanding-login cap, local identity approval and opaque-session primitives are implemented, with an offline check for mounted browser-auth settings that the running API does not load yet, an internal pooled browser-auth service that no process constructs yet, and an unmounted Axum router for the same-origin browser login handoff. No product API, upload service, request authentication, per-user authorization or GPU orchestration is exposed. Runtime qualification and deployment acceptance remain separate gates.
+Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures, but no `/v1` route serves it. Internal managed login, an owner-configured outstanding-login cap, local identity approval and opaque-session primitives are implemented, with an offline check for mounted browser-auth settings that the running API does not load yet, an internal pooled browser-auth service that no process constructs yet, and an unmounted Axum router for the same-origin browser login handoff, session check and local logout. No product API, upload service, request authentication, per-user authorization or GPU orchestration is exposed. Runtime qualification and deployment acceptance remain separate gates.
 
 ## Start here
 
@@ -336,10 +336,9 @@ until expiry or revocation.
 
 Before any exposure these remain outstanding: browser qualification; trusted ingress
 routing for the application origin and redaction of request targets and cookies in
-telemetry; session validation and logout handlers with CSRF protection for unsafe methods;
-ingress transport limits; operated cleanup and retired-key reservation reclamation; and
-runtime enablement. The router below supplies per-process request, rate and concurrency
-bounds. `cargo test --locked --offline --lib handoff` runs the tests that need no database;
+telemetry; ingress transport limits; operated cleanup and retired-key reservation
+reclamation; and runtime enablement. The router below supplies per-process request, rate and
+concurrency bounds, and the unmounted session check and logout routes. `cargo test --locked --offline --lib handoff` runs the tests that need no database;
 the end-to-end test runs only in isolated CI under the existing
 `provider_keys::tests::postgres` filter.
 
@@ -381,6 +380,46 @@ before exposure. `cargo test --locked --offline --lib browser_auth::router` and
 `cargo test --locked --offline --lib provider_keys::tests::router` run the local tests,
 which serve the router on loopback. The PostgreSQL handoff case also completes a login
 through the router, in isolated CI only.
+
+## Session check and logout routes
+
+[ADR 0019](docs/adr/0019-session-check-and-logout-routes.md) adds `router_with_sessions`,
+which builds the router above plus two explicit literal routes. **They are not mounted**: no
+process constructs the router, and the API and worker still answer `404` for every login
+and session path. `router` itself is unchanged and still builds only the login routes.
+
+The session and logout paths obey the same shape and collision rules as the login paths.
+All four must differ. Each route has its own rate budget (burst and refill interval,
+explicit, no defaults), so session polling cannot spend logout or login rate. The in-flight
+cap is shared by all four. Requests pass the same method, bound, permit and rate steps
+before any service call.
+
+- **Session check** accepts a `GET` with exactly one `Sec-Fetch-Site: same-origin` field.
+  The browser must supply this field before the check reads cookies. The check requires
+  exactly one `__Host-openmettle-session` cookie. A valid session gets an empty `204` with
+  no identity, cookie or redirect. An invalid credential gets `403 session not valid`.
+  Operational failures get `503`.
+- **Logout** accepts a form `POST` with an empty body and exactly one `Origin` equal to the
+  application origin, by the same rule as initiation. Any other `Origin` is `403` before
+  the cookie is read. `BrowserAuth::logout` then revokes by possession, with no eligibility
+  check, so an issued session can be ended after expiry, disablement or lost approval.
+  Only after the commit is acknowledged does the response become `204` with one deletion:
+  `__Host-openmettle-session=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Lax`.
+  Refusals and failures delete nothing. The caller cookie is left alone. Other sessions of
+  the same user are not revoked.
+
+Every response has `no-store` and `no-referrer`. Fixed lines carry no request, cookie or
+credential value. Repeated logout with the same credential is acknowledged again while the
+revoked row is retained. After cleanup removes the row, logout returns `403 session not
+valid`. A browser applies `Set-Cookie` in response processing order. A logout deletion can
+remove a new cookie set in another tab while that new session stays valid in the database.
+ADR 0019 describes these orderings and the per-process budget limits.
+
+Browser qualification, runtime enablement, ingress limits and telemetry redaction remain
+outstanding. `cargo test --locked --offline --lib provider_keys::tests::session_routes`
+runs the loopback tests. The PostgreSQL case
+`provider_keys::tests::postgres::handoff::issued_cookies_validate_and_logout_revokes_without_current_eligibility`
+runs only in isolated CI under the existing filter.
 
 ## Schema migrations
 

@@ -1,16 +1,17 @@
 //! The browser login handoff (ADR 0017) through the pooled service: one form POST to one
 //! session cookie, with the fixture TLS provider, called directly and then through the
-//! bounded router over loopback HTTP (ADR 0018). Isolated CI PostgreSQL 18 only.
+//! bounded router over loopback HTTP (ADR 0018), and the session check and logout routes
+//! over issued cookies (ADR 0019). Isolated CI PostgreSQL 18 only.
 use super::super::handoff::{
     BINDING_REFUSED, LOGIN_REFUSED, ORIGIN, RESPONSE_REFUSED, refused, request, settings,
 };
 use super::super::router::{head, limits, send, serve};
 use super::pooled::{one_slot, posts, service_over};
-use super::sessions::seed;
+use super::sessions::{issue, seed};
 use super::*;
 use crate::browser_auth::{
     handoff::{LOGIN_COOKIE, LoginHandoff, SESSION_COOKIE},
-    router::{Rate, Settings, router},
+    router::{Rate, SessionSettings, Settings, router, router_with_sessions},
 };
 use axum::http::{Response, StatusCode, header};
 
@@ -245,4 +246,165 @@ async fn form_post_becomes_one_session_cookie_and_stale_or_replayed_callbacks_se
         .await
         .unwrap();
     assert_eq!(sessions, 2);
+}
+
+/// `revoked` on the row named by the credential's public identifier.
+async fn revoked(f: &mut Flow, credential: &str) -> bool {
+    sqlx::query_scalar("SELECT revoked FROM openmettle.local_sessions WHERE id = $1")
+        .bind(credential.split_once('.').unwrap().0)
+        .fetch_one(&mut f.owner)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn issued_cookies_validate_and_logout_revokes_without_current_eligibility() {
+    use super::super::router::Reply;
+    const DELETION: &str =
+        "__Host-openmettle-session=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Lax";
+    let mut f = Flow::new().await;
+    seed(&mut f, true, true).await;
+    let pool = one_slot(f.db.options(API));
+    let auth = Arc::new(service_over(&f, &pool));
+    let handoff = LoginHandoff::new(auth.clone(), settings()).unwrap();
+    let hour = Duration::from_secs(3600);
+    let rate = |burst| Rate {
+        burst,
+        interval: hour,
+    };
+    let sessions = SessionSettings {
+        session: "/session",
+        logout: "/logout",
+        checks: rate(16),
+        logouts: rate(16),
+    };
+    let routes = router_with_sessions(handoff, limits(), sessions).unwrap();
+    let address = serve(routes).await;
+    let check = |cookie: &str| {
+        head(
+            "GET",
+            "/session",
+            &[("sec-fetch-site", "same-origin"), ("cookie", cookie)],
+        )
+    };
+    let logout = |origin: &str, cookie: &str| {
+        head(
+            "POST",
+            "/logout",
+            &[
+                ("origin", origin),
+                ("cookie", cookie),
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("content-length", "0"),
+            ],
+        )
+    };
+    let valid = |reply: &Reply| {
+        assert_eq!((reply.status, reply.body.as_str()), (204, ""));
+        assert_eq!(reply.one("cache-control"), "no-store");
+        assert_eq!(reply.one("referrer-policy"), "no-referrer");
+        assert!(reply.all("set-cookie").is_empty() && reply.all("location").is_empty());
+    };
+    let deleted = |reply: &Reply| {
+        assert_eq!((reply.status, reply.body.as_str()), (204, ""));
+        assert_eq!(reply.one("cache-control"), "no-store");
+        assert_eq!(reply.one("referrer-policy"), "no-referrer");
+        assert_eq!(reply.one("set-cookie"), DELETION);
+        assert!(reply.all("location").is_empty());
+    };
+
+    // A session cookie issued by a routed login.
+    let form = head(
+        "POST",
+        "/login",
+        &[("origin", ORIGIN), ("content-length", "0")],
+    );
+    let reply = send(address, &form).await;
+    assert_eq!(reply.status, 303);
+    let url = openidconnect::url::Url::parse(reply.one("location")).unwrap();
+    let parameters: HashMap<String, String> = url.query_pairs().into_owned().collect();
+    let caller = reply
+        .one("set-cookie")
+        .strip_suffix(&format!("; Max-Age=300{ATTRIBUTES}"))
+        .expect("caller cookie attributes")
+        .to_owned();
+    f.arm_url(url.as_str());
+    let target = format!(
+        "/callback?code=synthetic-code&state={}&iss=https%3A%2F%2Fissuer.example.test%2Frealm",
+        parameters["state"]
+    );
+    let reply = send(address, &head("GET", &target, &[("cookie", &caller)])).await;
+    assert_eq!(reply.status, 303);
+    let issued = reply
+        .one("set-cookie")
+        .strip_suffix(ATTRIBUTES)
+        .expect("session cookie attributes")
+        .to_owned();
+    let credential = issued
+        .strip_prefix(&format!("{SESSION_COOKIE}="))
+        .unwrap()
+        .to_owned();
+    assert_eq!(posts(&f), 1);
+    // Validation and logout never contact the provider.
+    let mut requests = f.h.count();
+
+    // The issued cookie validates, beside the caller cookie and other cookies.
+    let cookies = format!("theme=dark; {issued}; {caller}");
+    valid(&send(address, &check(&cookies)).await);
+    valid(&send(address, &check(&issued)).await);
+    // A wrong Origin is refused before the cookie or database: still valid, not revoked.
+    let reply = send(address, &logout("https://other.example.test", &issued)).await;
+    reply.refused(403, "logout origin refused\n");
+    assert!(!revoked(&mut f, &credential).await);
+    valid(&send(address, &check(&issued)).await);
+
+    // Logout is acknowledged before the one deletion. The caller cookie is not touched.
+    deleted(&send(address, &logout(ORIGIN, &cookies)).await);
+    assert!(revoked(&mut f, &credential).await);
+    send(address, &check(&issued))
+        .await
+        .refused(403, "session not valid\n");
+    assert!(auth.validate(&credential).await.is_err());
+    // A repeated logout by the same retained credential is acknowledged again.
+    deleted(&send(address, &logout(ORIGIN, &issued)).await);
+    send(address, &check(&issued))
+        .await
+        .refused(403, "session not valid\n");
+
+    // A second issued session loses eligibility. The check refuses it, and logout still
+    // revokes it by possession alone.
+    assert_eq!(f.h.count(), requests);
+    let second = issue(&mut f).await;
+    requests = f.h.count();
+    let second_cookie = format!("{SESSION_COOKIE}={}", second.expose());
+    valid(&send(address, &check(&second_cookie)).await);
+    f.owner
+        .execute("UPDATE openmettle.local_identity_approvals SET active=false,revision=revision+1,access_generation=access_generation+1")
+        .await
+        .unwrap();
+    send(address, &check(&second_cookie))
+        .await
+        .refused(403, "session not valid\n");
+    assert!(!revoked(&mut f, second.expose()).await);
+    deleted(&send(address, &logout(ORIGIN, &second_cookie)).await);
+    assert!(revoked(&mut f, second.expose()).await);
+    // Restored eligibility never revives either revoked session.
+    f.owner
+        .execute("UPDATE openmettle.local_identity_approvals SET active=true,revision=revision+1,access_generation=access_generation+1")
+        .await
+        .unwrap();
+    for cookie in [&second_cookie, &issued] {
+        send(address, &check(cookie))
+            .await
+            .refused(403, "session not valid\n");
+    }
+
+    // An unknown well-formed credential is refused without a deletion.
+    let unknown = format!("{SESSION_COOKIE}={}.{}", "A".repeat(43), "A".repeat(43));
+    send(address, &logout(ORIGIN, &unknown))
+        .await
+        .refused(403, "session not valid\n");
+    assert_eq!(f.h.count(), requests);
+    assert_eq!(posts(&f), 2);
 }
