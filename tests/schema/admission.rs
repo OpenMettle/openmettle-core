@@ -18,7 +18,7 @@ fn adr_embeds_the_exact_executed_operator_scripts() {
 }
 
 #[test]
-fn released_migrations_one_through_eight_are_unchanged_and_nine_is_pinned() {
+fn released_migration_sources_match_their_pinned_hashes() {
     use sha2::{Digest, Sha256};
     let expected = [
         "1672dd9259a2c9670fef4fac324af8a4fdf9b35fd9eabd421bd9f023571137bd",
@@ -30,6 +30,7 @@ fn released_migrations_one_through_eight_are_unchanged_and_nine_is_pinned() {
         "42e5ef4abffbbd6023f6e65a954a6f6ebedbdbcf46439f28f64e61260280842d",
         "9a77a03a838fa058ad3919ed8db5e483619755cc4a96959240202d6c35b3939a",
         "f73f2f41d56136d90deb49aac87ef835b96f50dea416871ec86cab61dd0b3c76",
+        "91b95d8146362a47c78ebf96de7b9f2e81f625b99ac880ddb1f427c3f5652f57",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     for (migration, hash) in MIGRATIONS.iter().zip(expected) {
@@ -250,7 +251,7 @@ async fn migration_nine_rollback_and_version_gated_privileges() {
     migrate::apply(&db.settings(Duration::from_secs(5)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 }
 
 #[tokio::test]
@@ -426,3 +427,6 @@ mod approval_change;
 mod first_approval;
 #[path = "session_cleanup.rs"]
 mod session_cleanup;
+
+#[path = "provider_recovery.rs"]
+mod provider_recovery;

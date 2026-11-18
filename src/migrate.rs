@@ -70,6 +70,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "login admission limit",
         sql: include_str!("../migrations/0009_login_admission.sql"),
     },
+    Source {
+        version: 10,
+        description: "audited provider recovery",
+        sql: include_str!("../migrations/0010_provider_recoveries.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

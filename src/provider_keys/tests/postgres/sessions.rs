@@ -1110,3 +1110,97 @@ async fn first_approval_script_admits_existing_identity_to_its_personal_scope() 
     // Neither the script nor issuance created, linked or changed accounts, scopes or grants.
     assert_eq!(account_state(&mut f).await, accounts);
 }
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 and POSTGRES_CONTAINER required"]
+async fn audited_provider_recovery_requires_a_new_successful_oidc_login() {
+    const RESTORE: &str = include_str!("../../../../docs/operator/restore-login-provider.psql");
+    let mut f = Flow::new().await;
+    let p = f.h.provider.clone();
+    let user = seed(&mut f, true, true).await;
+    let accounts = account_state(&mut f).await;
+    let old = issue(&mut f).await;
+    let pending = f.begin(&p).await;
+    let (_, old_proof) = f.exchanged(&p).await;
+    let retired = revoke_provider(&mut f.owner, None).await.to_string();
+    assert_eq!(
+        p.begin(&mut f.api, &keys(), Duration::from_secs(60))
+            .await
+            .unwrap_err(),
+        login::Error::Rejected
+    );
+
+    f.h.script.lock().unwrap().mode = "failure"; // Every provider request returns HTTP 503.
+    let before = f.h.count();
+    let vars = [
+        ("provider", signing::ID),
+        ("source_epoch", "1"),
+        ("retired_epoch", retired.as_str()),
+        ("expected_generation", "1"),
+        ("request", "00000000-0000-0000-0000-000000000012"),
+        ("operator", "00000000-0000-0000-0000-000000000011"),
+    ];
+    let mut child = psql::start(&f.db.name, OWNER, PASSWORD, &vars);
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(RESTORE.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"provider restoration committed\n");
+    assert_eq!(f.h.count(), before);
+    assert_eq!(session_count(&mut f).await, 1);
+    assert_eq!(account_state(&mut f).await, accounts);
+
+    assert!(
+        local::validate(&mut f.api, old.expose(), &session_policy())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        f.consume(&p, &pending).await.unwrap_err(),
+        login::Error::Rejected
+    );
+    assert!(
+        p.issue_session(&mut f.api, old_proof, &session_policy())
+            .await
+            .is_err()
+    );
+    let start = f.begin(&p).await;
+    f.arm(&start);
+    let permit = f.consume(&p, &start).await.unwrap();
+    assert!(
+        permit
+            .exchange_with_keys(&p, &auth::Policy::default())
+            .await
+            .is_err()
+    );
+    assert_eq!(session_count(&mut f).await, 1);
+
+    f.h.script.lock().unwrap().mode = "ok";
+    let fresh = issue(&mut f).await;
+    let context = local::validate(&mut f.api, fresh.expose(), &session_policy())
+        .await
+        .unwrap();
+    assert_eq!(context.user_id(), user);
+    // A valid exchange through the restored provider cannot substitute for current approval.
+    write(
+        &mut f,
+        "UPDATE openmettle.local_identity_approvals SET active=false,
+          revision=revision+1,access_generation=access_generation+1",
+    )
+    .await;
+    let (_, denied) = f.exchanged(&p).await;
+    assert!(matches!(
+        p.issue_session(&mut f.api, denied, &session_policy()).await,
+        Err(SessionError::Rejected)
+    ));
+    assert_eq!(session_count(&mut f).await, 2);
+    assert_eq!(account_state(&mut f).await, accounts);
+}

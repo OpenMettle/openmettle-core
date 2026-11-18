@@ -171,6 +171,8 @@ synchronous commit. Multi-row operations lock stable IDs in ascending order.
 
 ### Provider revision, revocation, retirement and restoration
 
+For schema 10 onward, use the [audited recovery procedure](../operator/restore-login-provider.md) to restore the last active revision of a retired provider. Its durable event and the restoration commit together. The inline restoration recipe below is for schemas 8 and 9.
+
 Supply `provider`, `expected_generation`, `expected_epoch`, `actor`, `reason`, `action` and
 `revision`. Use action `routine` to change an active configuration without signing users out;
 `revoke` to invalidate sessions and pending logins while keeping the provider active;

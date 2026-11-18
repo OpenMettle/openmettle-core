@@ -631,7 +631,7 @@ async fn migration_five_failure_kill_timeout_and_concurrent_retry() {
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success(), "{}", stderr(&out));
     }
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     assert_eq!(
         count(&db, "SELECT count(*) FROM openmettle.grant_mapping_rules").await,
         0
@@ -694,6 +694,11 @@ async fn populated_v7_upgrade_and_authentic_v7_binaries() {
 #[ignore = "isolated PostgreSQL 18 and authentic V8_BINARY_DIR required"]
 async fn populated_v8_upgrade_and_authentic_v8_binaries() {
     populated_upgrade("V8_BINARY_DIR", &[1, 2, 3, 4, 5, 6, 7, 8], true).await;
+}
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 and authentic V9_BINARY_DIR required"]
+async fn populated_v9_upgrade_and_authentic_v9_binaries() {
+    populated_upgrade("V9_BINARY_DIR", &[1, 2, 3, 4, 5, 6, 7, 8, 9], true).await;
 }
 // Synthetic protected-login rows written with the API role's version-6 column grants.
 async fn login_snapshot(db: &TestDb) -> Vec<String> {
@@ -888,6 +893,12 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
     } else {
         vec![]
     };
+    let expected_admission = if versions.contains(&9) {
+        owner.execute("UPDATE openmettle.login_admission SET outstanding_limit=37,changed_by='fixture-owner',change_reason='upgrade fixture',changed_at=clock_timestamp()").await.unwrap();
+        (Some(37), "fixture-owner".into())
+    } else {
+        (None, "migration-9".into())
+    };
     let before = old_domain_snapshot(&db).await;
     let history: Vec<String> =
         sqlx::query_scalar("SELECT t::text FROM openmettle._sqlx_migrations t ORDER BY version")
@@ -897,7 +908,7 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
     migrate::apply(&db.settings(Duration::from_secs(10)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     assert_eq!(old_domain_snapshot(&db).await, before);
     if with_grants {
         assert_eq!(grant_snapshot(&db).await, grant_before);
@@ -912,7 +923,11 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
             .fetch_one(&mut owner)
             .await
             .unwrap();
-    assert_eq!(admission, (None, "migration-9".into()));
+    assert_eq!(admission, expected_admission);
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM openmettle.provider_recoveries").await,
+        0
+    );
     if with_sessions {
         assert_eq!(session_snapshot().await, sessions_before);
     }
@@ -966,7 +981,16 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
             .unwrap();
     let refused = old_migrate();
     assert_eq!(refused.status.code(), Some(1));
-    assert!(stderr(&refused).contains("boundary check refused"));
+    if versions.contains(&9) {
+        // Migration 10 adds no privileges, so v9 reaches the unknown-version check.
+        assert!(
+            stderr(&refused).contains("database has migration 10"),
+            "{}",
+            stderr(&refused)
+        );
+    } else {
+        assert!(stderr(&refused).contains("boundary check refused"));
+    }
     let unchanged: Vec<String> =
         sqlx::query_scalar("SELECT t::text FROM openmettle._sqlx_migrations t ORDER BY version")
             .fetch_all(&mut db.admin().await)

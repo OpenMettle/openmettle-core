@@ -1,0 +1,62 @@
+-- Schema 10+. Connect directly as openmettle_owner on the primary with psql -X -q.
+-- Use only the inputs from restore-login-provider.md. Fail closed on missing variables.
+\set ON_ERROR_STOP on
+\set VERBOSITY terse
+BEGIN ISOLATION LEVEL READ COMMITTED;
+SET LOCAL search_path = pg_catalog, pg_temp;
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '5s';
+SET LOCAL synchronous_commit = on;
+
+-- Check canonical opaque identifiers before any UUID cast. The epoch and generation inputs
+-- are compared with server-rendered decimal values. Only matched values reach the bigint casts.
+SELECT current_user = 'openmettle_owner' AND session_user = current_user
+       AND :'provider' COLLATE "C" ~ pattern
+       AND :'request' COLLATE "C" ~ pattern
+       AND :'operator' COLLATE "C" ~ pattern AS valid
+  FROM (VALUES ('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')) AS uuid(pattern) \gset
+\if :valid
+  SELECT count(*) = 1 AS locked FROM (
+    SELECT id FROM openmettle.login_providers
+     WHERE id = :'provider'::uuid AND access_generation::text = :'expected_generation'
+     FOR UPDATE
+  ) AS provider_row \gset
+\else
+  \set locked false
+\endif
+
+\if :locked
+  -- Fresh snapshot after the stable provider lock. Copy only the last active revision,
+  -- and only if the operator inspected that exact revision and the current retirement.
+  SELECT EXISTS (
+    SELECT FROM
+      (SELECT epoch, revision FROM openmettle.login_provider_revisions
+        WHERE provider_id = :'provider'::uuid ORDER BY epoch DESC LIMIT 1) AS latest,
+      (SELECT epoch FROM openmettle.login_provider_revisions
+        WHERE provider_id = :'provider'::uuid AND revision IS NOT NULL ORDER BY epoch DESC LIMIT 1) AS source
+     WHERE latest.revision IS NULL AND latest.epoch::text = :'retired_epoch'
+       AND source.epoch::text = :'source_epoch'
+  ) AS eligible \gset
+\else
+  \set eligible false
+\endif
+
+\if :eligible
+  INSERT INTO openmettle.login_provider_revisions(provider_id, revision)
+    SELECT provider_id, revision FROM openmettle.login_provider_revisions
+     WHERE provider_id = :'provider'::uuid AND epoch = :'source_epoch'::bigint
+    RETURNING epoch AS restored_epoch \gset
+  UPDATE openmettle.login_providers SET changed_by = :'operator',
+         change_reason = 'restore last active revision', changed_at = clock_timestamp()
+   WHERE id = :'provider'::uuid;
+  -- The receipt constraint also rejects an allocator behind the inspected retirement.
+  INSERT INTO openmettle.provider_recoveries
+      (request_id, operator_id, provider_id, source_epoch, retired_epoch, restored_epoch, access_generation)
+    VALUES (:'request'::uuid, :'operator'::uuid, :'provider'::uuid, :'source_epoch'::bigint,
+            :'retired_epoch'::bigint, :'restored_epoch'::bigint, :'expected_generation'::bigint);
+  COMMIT;
+  \echo 'provider restoration committed'
+\else
+  ROLLBACK;
+  DO $$ BEGIN RAISE EXCEPTION 'provider restoration refused'; END $$;
+\endif
