@@ -390,6 +390,25 @@ async fn sql_roles_scopes_null_checks_and_immutable_origin() {
     let direct = change(&db, &input(&c, "direct")).await.unwrap();
     let mut api = connect(&db.0, API).await;
     let mut worker = connect(&db.0, WORKER).await;
+    // Migration 11 revokes the default PUBLIC USAGE on the evidence type, and no runtime role
+    // is granted it. The owner keeps it as the type's owner.
+    let usage: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT role, has_type_privilege(role, 'openmettle.membership_evidence', 'USAGE')
+         FROM unnest(ARRAY['public','openmettle_api','openmettle_worker','openmettle_owner'])
+           WITH ORDINALITY AS r(role, ord) ORDER BY ord",
+    )
+    .fetch_all(&mut db.admin().await)
+    .await
+    .unwrap();
+    assert_eq!(
+        usage,
+        [
+            ("public".to_owned(), false),
+            ("openmettle_api".to_owned(), false),
+            ("openmettle_worker".to_owned(), false),
+            ("openmettle_owner".to_owned(), true),
+        ]
+    );
     for table in [
         "grant_mapping_rules",
         "grant_mapping_revisions",

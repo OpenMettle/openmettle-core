@@ -57,8 +57,9 @@ revision sequence can bypass them.
    receipt, installs the new configuration and baseline, clears prior evidence and preserves
    the largest signed issue time recorded for that approval. Every reset, including tightening or relaxing an
    interval, requires a later callback and strictly newer signed issue time. A replacement
-   immediately withdraws confirmation on the old target. Its v5 history remains available
-   for inspection and explicit retirement.
+   immediately withdraws confirmation on the old target. It does not revoke the old
+   target's derived grant. Its v5 history remains available for inspection and for explicit
+   retirement with the withdrawal script below.
 4. On an uncertain outcome, reconnect as owner to the primary. In a new READ COMMITTED
    transaction acquire `LOCK TABLE openmettle.membership_configuration_changes IN EXCLUSIVE MODE`
    with the same bounded lock timeout, then select the receipt by `request_id` and end the
@@ -68,14 +69,71 @@ revision sequence can bypass them.
    before retrying with the same request and expected revision. A timeout or conflicting
    receipt requires investigation.
 
+### Withdraw enrollment-derived grants
+
+Use the [withdrawal script](../operator/withdraw-project-membership.psql) to revoke every
+still-active enrollment-derived grant of one approval. It selects `mapped` v5 assignments with
+target kind `project`, the approval's user as grantee, format `openmettle.project-member`,
+version 1 and the approval UUID text as assignment key, under any rule. This includes grants
+left on superseded targets. It never touches direct grants. Connect directly to the primary
+as `openmettle_owner` under the deployment's normal owner controls.
+
+1. Inspect the approval's derived assignments and their current heads.
+
+   ```sql
+   SELECT g.id, g.scope_id, g.project_id, g.mapping_rule_id, g.last_revision, h.decision, h.cycle_id
+     FROM openmettle.local_identity_approvals a
+     JOIN openmettle.user_identities i ON i.id = a.identity_id
+     JOIN openmettle.grant_assignments g ON g.grantee_user_id = i.user_id
+          AND g.assignment_key = a.id::text AND g.source_kind = 'mapped'
+          AND g.target_kind = 'project' AND g.assignment_format = 'openmettle.project-member'
+          AND g.assignment_version = 1
+     JOIN openmettle.grant_changes h ON h.assignment_id = g.id AND h.revision = g.last_revision
+    WHERE a.id = :'approval'::uuid ORDER BY g.id;
+   ```
+
+2. Choose a new request UUID and record it with a deployment-assigned opaque operator UUID,
+   the reason and the inspected rows in the deployment change record. Supply canonical
+   lowercase UUIDs. Run the script once.
+
+   ```sh
+   psql -X -q -v approval="$approval" -v request="$request" -v actor="$operator" \
+     -f docs/operator/withdraw-project-membership.psql
+   ```
+
+3. An acknowledged commit prints `membership withdrawal committed: N assignments`. The script
+   takes the owner receipt table lock, then the approval, user `FOR NO KEY UPDATE`, enrollment,
+   every owning rule in UUID order and every derived assignment in UUID order. That is issuance
+   order, so a concurrent issuance waits for the withdrawal. In a fresh statement it revokes
+   each active head at its next revision with its exact cycle and original mapping revision.
+   It commits only if at least one grant was revoked and no derived grant of the approval
+   remains active. Otherwise it rolls back and prints a fixed refusal. Refusals cover another
+   role, invalid input, an unknown approval, a reused request and nothing to withdraw.
+4. Each revoke is an ordinary immutable v5 change with an ADR 0006 request identity and
+   digest. It records the grantee as actor and the request key
+   `membership-withdraw/<request>/<operator>/<n>`, numbered per scope. The script does not
+   store the reason. Keep it in the change record.
+5. The enrollment is not modified. Its stored change no longer matches the withdrawn head,
+   so reconciliation stays fenced. No held or later proof can regrant, and `current` reports
+   `Failed` for that target. To re-enable, resynchronize through the configuration script
+   with the withdrawal revoke as `baseline` and a strictly newer signed proof.
+6. On an uncertain outcome, reconnect as owner to the primary. In a new READ COMMITTED
+   transaction acquire `LOCK TABLE openmettle.membership_configuration_changes IN EXCLUSIVE MODE`
+   with the same bounded lock timeout. Select the grant changes whose request key starts with
+   `membership-withdraw/<request>/`, then end the transaction. Matching receipts prove that
+   withdrawal committed. After a confirmed absence, re-inspect step 1 before retrying with the
+   same request. A conflicting receipt or a timeout requires investigation.
+
 ### Rollback and restore
 
 First quiesce membership-dependent admission, queued work and independent mapped writers.
 Drain in-flight issuance and consumers before switching versions. Suspend each enrolled
 approval with the script and verify the receipts. Before starting any older reader or writer,
-withdraw still-active enrollment-derived assignments through v5 CAS using their exact cycles,
-including assignments left on superseded targets. Verify the resulting revisions. Keep any
-consumer that lacks freshness and cycle checks disabled. Retain the v11 schema, receipts,
+run the withdrawal script for each enrolled approval. It withdraws still-active
+enrollment-derived assignments through v5 CAS using their exact cycles, including assignments
+left on superseded targets. A refusal because nothing is active is expected for an approval
+without derived grants. Re-run the step 1 inspection and verify the resulting revisions.
+Keep any consumer that lacks freshness and cycle checks disabled. Retain the v11 schema, receipts,
 high-water marks and grant history through binary rollback. After database restore, advance
 provider epochs using ADR 0013 before reopening login. To re-enable, upgrade all participants,
 resynchronize through the script and require a fresh eligible assertion for each approval.
@@ -99,6 +157,13 @@ is fresh and exceeds the preserved issue-time floor. Other approvals continue us
 An earlier issue time cannot replace a newer observation. Conflicting decisions at the same
 issue time yield ambiguity. A matching repeat can only shorten expiry.
 
+The verifier accepts an issue time up to its configured future skew ahead of its own clock.
+Issuance compares the signed issue time with the primary clock. A proof issued after the
+primary clock is `Stale` and records nothing: no evidence, no grant transition and no
+issue-time high-water. A clock-skewed provider therefore cannot block later correctly clocked
+proofs. This assumes the provider, verifier and primary clocks are synchronized. A provider
+clock running ahead yields no membership evidence for that skew.
+
 Issuance locks the consumed login, provider and approval, then the user with
 `FOR NO KEY UPDATE`, the enrollment and the rule. The user lock serializes capacity checks
 and conflicts with disablement while admitting the actor/grantee FK `KEY SHARE` locks of a
@@ -106,7 +171,9 @@ v5 writer already holding the rule. Both mapped writers take the rule before the
 Direct grants do not take the rule. Session validation takes shared provider, approval and
 user locks in the same order. Logout takes only its session row. Owner configuration writers
 serialize only with one another on the receipt table and take approval, enrollment and rule
-in issuance order. They do not modify users or assignments.
+in issuance order. They do not modify users or assignments. The owner withdrawal writer also
+takes the receipt table first, then approval, user, enrollment, rules and assignments in
+issuance order.
 
 Under the rule lock the reconciler compares its stored change UUID with the exact target's
 current immutable v5 change. The UUID identifies the assignment, revision and cycle. Any
@@ -116,6 +183,13 @@ one mapped grant. A fresh complete absence revokes its active cycle. Evidence al
 under the locks advances the issue-time fence without a grant transition. Missing, partial or
 ambiguous evidence withholds confirmation without recording a removal. Direct grants and
 other approvals retain independent origins.
+
+Reconciled grant changes name the grantee user as actor. ADR 0006 has no service account.
+Their provenance is `source_kind = 'mapped'`, the enrollment's rule and mapping revision, and
+the request key `membership-grant/<login>` or `membership-revoke/<login>`, which names the
+consumed login transaction. Operator withdrawals use the same actor and a
+`membership-withdraw/` request key. The actor is attribution only and is not proof of a user
+action.
 
 The newer observation and its issue-time fence commit with the identity session. If the
 membership deadline crosses during issuance, the identity session can still commit and a
@@ -140,9 +214,9 @@ alone. V1-05 and queued-work consumers must require current membership evidence 
 own server-authoritative permission checks. Treat a read error as a failed observation.
 
 Offline tests exercise signed claims and managed loopback TLS. The hosted PostgreSQL
-suite exercises real exchanges, independent v5 writes, configuration scripts, expiry,
-concurrent issuance, and independent provider approvals. The schema suite uses authentic
-v10 binaries at 05dd18489242e545e3529b4e3750c74837b05638 for populated upgrade and refusal
-checks. First-account provisioning through exact provider/issuer/subject invitations is
-approved and belongs to the separate provisioning increment. Periodic directory collection,
+suite exercises real exchanges, independent v5 writes, configuration and withdrawal
+scripts, expiry, concurrent issuance, and independent provider approvals. The schema suite
+uses authentic v10 binaries at 05dd18489242e545e3529b4e3750c74837b05638 for populated
+upgrade and refusal checks. First-account provisioning through exact provider/issuer/subject
+invitations is approved and belongs to the separate provisioning increment. Periodic directory collection,
 provider qualification, native handoff and resource authorization remain separate work.

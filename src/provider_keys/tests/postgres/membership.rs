@@ -9,6 +9,8 @@ use sessions::{seed, session_policy};
 use std::io::Write;
 
 const RULE: &str = "00000000-0000-0000-0000-00000000012a";
+/// Synthetic operator change-record reference; deliberately not an OpenMettle user.
+const OPERATOR: &str = "00000000-0000-0000-0000-0000000003aa";
 
 async fn proof(f: &mut Flow, issued: i64, claims: Value) -> ExchangedIdentity {
     proof_for(f, "synthetic-subject", issued, claims).await
@@ -106,6 +108,28 @@ impl Enrollment {
             ))
             .unwrap();
         child.wait_with_output().unwrap()
+    }
+    fn start_withdrawal(&self, f: &Flow, role: &str, request: &str) -> std::process::Child {
+        let vars = [
+            ("approval", self.approval.as_str()),
+            ("request", request),
+            ("actor", OPERATOR),
+        ];
+        let mut child = psql::start(&f.db.name, role, PASSWORD, &vars);
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(include_bytes!(
+                "../../../../docs/operator/withdraw-project-membership.psql"
+            ))
+            .unwrap();
+        child
+    }
+    fn withdraw(&self, f: &Flow, role: &str, request: &str) -> std::process::Output {
+        self.start_withdrawal(f, role, request)
+            .wait_with_output()
+            .unwrap()
     }
     async fn reset(&self, f: &mut Flow, config: Configuration<'_>) -> String {
         let request: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
@@ -1062,4 +1086,323 @@ async fn independent_aba_after_confirmation_invalidates_a_still_fresh_present_ro
         .unwrap();
     assert!(raw.recorded_active && raw.mapping_eligible);
     assert_eq!(e.observe(&mut f).await, Failed);
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 and POSTGRES_CONTAINER required"]
+async fn future_issue_time_records_no_evidence_and_cannot_block_a_correct_proof() {
+    let mut f = Flow::new().await;
+    let e = enroll(&mut f).await;
+    // Within the verifier's default 60 s future skew, but after the primary clock.
+    e.submit(&mut f, -30, json!(["team"])).await;
+    let stored: (Option<i64>, String) = sqlx::query_as(
+        "SELECT issued_ms,(observation).state FROM openmettle.membership_observations
+        WHERE approval_id=$1::uuid",
+    )
+    .bind(&e.approval)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(stored, (None, "missing".into()));
+    assert_eq!(e.observe(&mut f).await, Missing);
+    e.submit(&mut f, 1, json!(["team"])).await;
+    assert_eq!(e.observe(&mut f).await, Present);
+}
+
+async fn new_request(f: &mut Flow) -> String {
+    sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(&mut f.owner)
+        .await
+        .unwrap()
+}
+async fn head_of(f: &mut Flow, assignment: &str) -> grants::GrantReceipt {
+    let (change, revision, granted, cycle) = sqlx::query_as(
+        "SELECT h.id::text,h.revision,h.decision='grant',h.cycle_id::text
+        FROM openmettle.grant_assignments g JOIN openmettle.grant_changes h
+          ON h.assignment_id=g.id AND h.revision=g.last_revision WHERE g.id=$1::uuid",
+    )
+    .bind(assignment)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    grants::GrantReceipt {
+        change,
+        assignment: assignment.into(),
+        revision,
+        granted,
+        cycle,
+    }
+}
+fn committed(out: &std::process::Output, count: usize) {
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("membership withdrawal committed: {count} assignments")
+    );
+}
+// A refusal never commits, prints nothing to stdout and never echoes an input value.
+fn refused(out: &std::process::Output, inputs: &[&str]) -> String {
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    for input in inputs {
+        assert!(!stderr.contains(input), "{stderr}");
+    }
+    stderr
+}
+// Each withdrawal is an ordinary v5 revoke of the exact active cycle at the next revision.
+fn assert_withdrawn(before: &grants::GrantReceipt, after: &grants::GrantReceipt) {
+    assert!(before.granted && !after.granted);
+    assert_eq!(after.assignment, before.assignment);
+    assert_eq!(after.revision, before.revision + 1);
+    assert_eq!(after.cycle, before.cycle);
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 and POSTGRES_CONTAINER required"]
+async fn withdrawal_revokes_only_mapped_grants_and_records_replayable_receipts() {
+    let mut f = Flow::new().await;
+    let e = enroll(&mut f).await;
+    e.submit(&mut f, 30, json!(["team"])).await;
+    let granted = e.head(&mut f).await;
+    let request = new_request(&mut f).await;
+    committed(&e.withdraw(&f, OWNER, &request), 1);
+    let withdrawn = e.head(&mut f).await;
+    assert_withdrawn(&granted, &withdrawn);
+    // The direct grant shares grantee, target, format and key, and stays recorded active.
+    assert_eq!(head_of(&mut f, &e.direct.assignment).await, e.direct);
+    assert_eq!(e.observe(&mut f).await, Failed);
+    // The receipt names the request and operator reference, with the grantee as actor.
+    // Its ADR 0006 identity is exact: the library replays it instead of reporting a conflict.
+    let key = format!("membership-withdraw/{request}/{OPERATOR}/1");
+    let receipts: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT actor_user_id::text,request_key,source_kind FROM openmettle.grant_changes
+        WHERE starts_with(request_key,'membership-withdraw/')",
+    )
+    .fetch_all(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(receipts, [(e.user.clone(), key.clone(), "mapped".into())]);
+    let mut tx = WriteTransaction::begin(&mut f.api).await.unwrap();
+    let replay = grants::change_grant(
+        &mut tx,
+        &grants::ChangeInput {
+            assignment: e.assignment(),
+            actor: &e.user,
+            key: &key,
+            expected_revision: granted.revision,
+            mapping_revision: Some(1),
+            decision: grants::Decision::Revoke(granted.cycle.as_deref()),
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(replay, withdrawn);
+    // Explicit owner resynchronization adopts the withdrawal. A reused request is refused
+    // even with an active grant to withdraw. A new request withdraws it.
+    e.reset(
+        &mut f,
+        Configuration {
+            baseline: &withdrawn.change,
+            ..Default::default()
+        },
+    )
+    .await;
+    e.submit(&mut f, 29, json!(["team"])).await;
+    assert_eq!(e.observe(&mut f).await, Present);
+    let regranted = e.head(&mut f).await;
+    let stderr = refused(
+        &e.withdraw(&f, OWNER, &request),
+        &[&e.approval, &request, OPERATOR],
+    );
+    assert!(stderr.contains("membership withdrawal refused"), "{stderr}");
+    assert_eq!(e.head(&mut f).await, regranted);
+    let second = new_request(&mut f).await;
+    committed(&e.withdraw(&f, OWNER, &second), 1);
+    assert_withdrawn(&regranted, &e.head(&mut f).await);
+    // Nothing active remains: a further request is refused without changes.
+    let third = new_request(&mut f).await;
+    refused(
+        &e.withdraw(&f, OWNER, &third),
+        &[&e.approval, &third, OPERATOR],
+    );
+    assert_eq!(head_of(&mut f, &e.direct.assignment).await, e.direct);
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 and POSTGRES_CONTAINER required"]
+async fn withdrawal_includes_grants_left_on_superseded_targets() {
+    let mut f = Flow::new().await;
+    let mut e = enroll(&mut f).await;
+    e.submit(&mut f, 30, json!(["team"])).await;
+    let old = e.head(&mut f).await;
+    let (project, scope) = project(&mut f, &e.user).await;
+    let rule = "00000000-0000-0000-0000-0000000002aa";
+    record_rule(&mut f, rule, signing::ID, &e.user, &project).await;
+    e.project = project;
+    e.scope = scope;
+    e.reset(
+        &mut f,
+        Configuration {
+            rule,
+            ..Default::default()
+        },
+    )
+    .await;
+    e.submit(&mut f, 29, json!(["team"])).await;
+    assert_eq!(e.observe(&mut f).await, Present);
+    let assignment: String = sqlx::query_scalar(
+        "SELECT id::text FROM openmettle.grant_assignments WHERE mapping_rule_id=$1::uuid",
+    )
+    .bind(rule)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    let current = head_of(&mut f, &assignment).await;
+    // Replacement does not revoke. The superseded target's derived grant is still active.
+    assert_eq!(head_of(&mut f, &old.assignment).await, old);
+    let request = new_request(&mut f).await;
+    committed(&e.withdraw(&f, OWNER, &request), 2);
+    for before in [old, current] {
+        assert_withdrawn(&before, &head_of(&mut f, &before.assignment).await);
+    }
+    assert_eq!(head_of(&mut f, &e.direct.assignment).await, e.direct);
+    assert_eq!(e.observe(&mut f).await, Failed);
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 and POSTGRES_CONTAINER required"]
+async fn held_proof_from_before_withdrawal_cannot_regrant() {
+    let mut f = Flow::new().await;
+    let e = enroll(&mut f).await;
+    e.submit(&mut f, 30, json!(["team"])).await;
+    // Exchanged before the withdrawal, against the same enrollment revision.
+    let held = proof(&mut f, e.now - 20, json!({"groups":["team"]})).await;
+    let request = new_request(&mut f).await;
+    committed(&e.withdraw(&f, OWNER, &request), 1);
+    let withdrawn = e.head(&mut f).await;
+    f.h.provider
+        .issue_session(&mut f.api, held, &session_policy())
+        .await
+        .unwrap();
+    assert_eq!(e.head(&mut f).await, withdrawn);
+    assert_eq!(e.observe(&mut f).await, Failed);
+    // A fresh proof is fenced too until the owner resynchronizes.
+    e.submit(&mut f, 10, json!(["team"])).await;
+    assert_eq!(e.head(&mut f).await, withdrawn);
+    assert_eq!(e.observe(&mut f).await, Failed);
+}
+
+async fn blocked_by(observer: &mut PgConnection, waiter: i32, holder: i32) -> bool {
+    sqlx::query_scalar("SELECT $1=ANY(pg_blocking_pids($2))")
+        .bind(holder)
+        .bind(waiter)
+        .fetch_one(observer)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 and POSTGRES_CONTAINER required"]
+async fn concurrent_issuance_waits_for_withdrawal_without_deadlock() {
+    let mut refresh = policy();
+    refresh.deadline = Duration::from_secs(30);
+    let mut f = Flow::with(Harness::with_policy(refresh).await).await;
+    let e = enroll(&mut f).await;
+    e.submit(&mut f, 30, json!(["team"])).await;
+    let held = proof(&mut f, e.now - 20, json!({"groups":["team"]})).await;
+    // An independent mapped writer owns the rule. The withdrawal then waits on the rule
+    // while holding the user, which is where issuance must queue behind it.
+    let mut db = f.db.connect(API).await;
+    let mut writer = WriteTransaction::begin(&mut db).await.unwrap();
+    sqlx::query(
+        "SELECT id FROM openmettle.grant_mapping_rules WHERE id=$1::uuid FOR NO KEY UPDATE",
+    )
+    .bind(RULE)
+    .execute(writer.connection().unwrap())
+    .await
+    .unwrap();
+    let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(writer.connection().unwrap())
+        .await
+        .unwrap();
+    let reader_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut f.api)
+        .await
+        .unwrap();
+    let mut observer = sessions::statistics_observer(&f.db).await;
+    let request = new_request(&mut f).await;
+    let child = e.start_withdrawal(&f, OWNER, &request);
+    let withdrawal = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap());
+    let operator_pid: i32 = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let pid: Option<i32> = sqlx::query_scalar(
+                "SELECT pid FROM pg_stat_activity WHERE datname=$1 AND usename='openmettle_owner'
+                 AND application_name='psql' AND wait_event_type='Lock'",
+            )
+            .bind(&f.db.name)
+            .fetch_optional(&mut observer)
+            .await
+            .unwrap();
+            if let Some(pid) = pid {
+                break pid;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(blocked_by(&mut observer, operator_pid, writer_pid).await);
+    let release = async {
+        sessions::waiting(&mut observer, reader_pid).await;
+        assert!(blocked_by(&mut observer, reader_pid, operator_pid).await);
+        writer.commit().await.unwrap();
+    };
+    let policy = session_policy();
+    let (identity, ()) = tokio::join!(
+        f.h.provider.issue_session(&mut f.api, held, &policy),
+        release
+    );
+    identity.unwrap();
+    committed(&withdrawal.await.unwrap(), 1);
+    let withdrawn = e.head(&mut f).await;
+    assert!(!withdrawn.granted);
+    assert_eq!(e.observe(&mut f).await, Failed);
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 and POSTGRES_CONTAINER required"]
+async fn api_role_and_invalid_input_cannot_withdraw() {
+    let mut f = Flow::new().await;
+    let e = enroll(&mut f).await;
+    e.submit(&mut f, 30, json!(["team"])).await;
+    let granted = e.head(&mut f).await;
+    let request = new_request(&mut f).await;
+    refused(
+        &e.withdraw(&f, API, &request),
+        &[&e.approval, &request, OPERATOR],
+    );
+    // Non-canonical input is refused before any cast, without echoing it.
+    let upper = request.to_uppercase();
+    let stderr = refused(
+        &e.withdraw(&f, OWNER, &upper),
+        &[&e.approval, &upper, OPERATOR],
+    );
+    assert!(stderr.contains("membership withdrawal refused"), "{stderr}");
+    assert_eq!(e.head(&mut f).await, granted);
+    let receipts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM openmettle.grant_changes
+        WHERE starts_with(request_key,'membership-withdraw/')",
+    )
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(receipts, 0);
+    // Control: the same canonical request succeeds as the owner.
+    committed(&e.withdraw(&f, OWNER, &request), 1);
 }

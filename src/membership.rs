@@ -180,6 +180,12 @@ pub(crate) async fn reconcile(
         value: config.try_get("claim_value")?,
     };
     let (issued, mut expires, mut observation) = selector.observe(assertion, age, now_ms);
+    // The verifier tolerates bounded future skew against its own clock. A proof issued after
+    // the primary clock is Stale and never ordering evidence. Recording it would move the
+    // high-water mark ahead of every later correctly clocked proof.
+    if now_ms < issued {
+        return Ok(None);
+    }
     if !configured {
         observation = Failed;
     }

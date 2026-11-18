@@ -1,0 +1,128 @@
+-- ADR 0021. Withdraw every still-active enrollment-derived project-member grant for one
+-- approval, including grants left on superseded targets. Direct grants are never touched.
+-- Connect directly as openmettle_owner on the primary with psql -X -q. Inputs, inspection
+-- and unknown-commit recovery are documented in that ADR. Fail closed on missing variables.
+\set ON_ERROR_STOP on
+\set VERBOSITY terse
+BEGIN ISOLATION LEVEL READ COMMITTED;
+SET LOCAL search_path = pg_catalog, pg_temp;
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '5s';
+SET LOCAL synchronous_commit = on;
+
+-- Refuse any other login, including openmettle_api, and validate every identifier before
+-- any cast. Refusals print one fixed line and never echo input values.
+SELECT current_user='openmettle_owner' AND session_user=current_user AND
+       :'approval' COLLATE "C" ~ pattern AND :'request' COLLATE "C" ~ pattern AND
+       :'actor' COLLATE "C" ~ pattern AS valid
+FROM (VALUES ('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')) AS uuid(pattern) \gset
+
+\if :valid
+  -- Serialize with owner configuration writers first, then follow issuance order: approval,
+  -- user FOR NO KEY UPDATE, enrollment, rules, assignments. Issuance and this script
+  -- serialize on the user row. Neither holds a later lock while waiting for an earlier one.
+  LOCK TABLE openmettle.membership_configuration_changes IN EXCLUSIVE MODE;
+  SELECT id FROM openmettle.local_identity_approvals WHERE id=:'approval'::uuid FOR SHARE \g /dev/null
+  SELECT count(*)=1 AS found, coalesce(max(i.user_id::text),'') AS grantee
+    FROM openmettle.local_identity_approvals a JOIN openmettle.user_identities i ON i.id=a.identity_id
+   WHERE a.id=:'approval'::uuid \gset
+\else
+  \set found false
+\endif
+
+\if :found
+  SELECT id FROM openmettle.users WHERE id=:'grantee'::uuid FOR NO KEY UPDATE \g /dev/null
+  SELECT approval_id FROM openmettle.membership_observations WHERE approval_id=:'approval'::uuid FOR UPDATE \g /dev/null
+  -- Every rule that owns a derived assignment of this approval, current or superseded.
+  -- Mapped writers take the rule before the assignment. Only these locked rules are used below.
+  SELECT coalesce(string_agg(id::text, ',' ORDER BY id),'') AS rules FROM (
+    SELECT r.id FROM openmettle.grant_mapping_rules r
+     WHERE r.id IN (SELECT mapping_rule_id FROM openmettle.grant_assignments
+                     WHERE assignment_key=:'approval' AND grantee_user_id=:'grantee'::uuid
+                       AND source_kind='mapped' AND target_kind='project'
+                       AND assignment_format='openmettle.project-member' AND assignment_version=1)
+     ORDER BY r.id FOR NO KEY UPDATE) AS locked \gset
+  SELECT a.id FROM openmettle.grant_assignments a
+   WHERE a.mapping_rule_id = ANY (string_to_array(:'rules', ',')::uuid[])
+     AND a.assignment_key=:'approval' AND a.grantee_user_id=:'grantee'::uuid
+     AND a.source_kind='mapped' AND a.target_kind='project'
+     AND a.assignment_format='openmettle.project-member' AND a.assignment_version=1
+   ORDER BY a.id FOR NO KEY UPDATE \g /dev/null
+  -- A request UUID records one withdrawal. Its receipts use this request key prefix.
+  SELECT NOT EXISTS (SELECT FROM openmettle.grant_changes
+                      WHERE actor_user_id=:'grantee'::uuid AND source_kind='mapped'
+                        AND starts_with(request_key, 'membership-withdraw/' || :'request' || '/'))
+         AS unused \gset
+\else
+  \set unused false
+\endif
+
+\if :unused
+  -- Fresh statement after every lock: revoke each active head with its exact cycle and
+  -- revision (v5 CAS). Each revoke is an ordinary immutable v5 change. Its request identity
+  -- and digest follow ADR 0006 exactly, so grants::change_grant replays it unchanged.
+  WITH heads AS (
+    SELECT a.id AS assignment_id, a.scope_id, a.project_id, a.grantee_user_id, a.mapping_rule_id,
+           a.last_revision, h.cycle_id, h.mapping_revision,
+           row_number() OVER (PARTITION BY a.scope_id ORDER BY a.id) AS ordinal
+      FROM openmettle.grant_assignments a
+      JOIN openmettle.grant_changes h ON h.assignment_id=a.id AND h.revision=a.last_revision
+     WHERE a.mapping_rule_id = ANY (string_to_array(:'rules', ',')::uuid[])
+       AND a.assignment_key=:'approval' AND a.grantee_user_id=:'grantee'::uuid
+       AND a.source_kind='mapped' AND a.target_kind='project'
+       AND a.assignment_format='openmettle.project-member' AND a.assignment_version=1
+       AND h.decision='grant'
+  ), keyed AS (
+    -- The grantee is the recorded actor, as for reconciliation. The key names the request
+    -- and the operator reference. At most 97 bytes for fewer than 1000 assignments per scope.
+    SELECT heads.*, format('membership-withdraw/%s/%s/%s', :'request', :'actor', ordinal) AS request_key
+      FROM heads
+  ), identified AS (
+    SELECT keyed.*, (
+      SELECT convert_to('openmettle/grant-change/1','UTF8') || decode('00','hex')
+             || string_agg(int8send(octet_length(field)::bigint) || field, ''::bytea ORDER BY ord)
+        FROM unnest(ARRAY[
+          convert_to(scope_id::text,'UTF8'), convert_to('project','UTF8'),
+          convert_to(project_id::text,'UTF8'), convert_to(grantee_user_id::text,'UTF8'),
+          convert_to('openmettle.project-member','UTF8'), int4send(1),
+          convert_to(:'approval','UTF8'), convert_to(mapping_rule_id::text,'UTF8'),
+          int8send(mapping_revision), convert_to(grantee_user_id::text,'UTF8'),
+          convert_to(request_key,'UTF8'), int8send(last_revision),
+          convert_to('revoke','UTF8'), convert_to(cycle_id::text,'UTF8')
+        ]) WITH ORDINALITY AS fields(field, ord)
+    ) AS request_identity FROM keyed
+  ), recorded AS (
+    INSERT INTO openmettle.grant_changes
+      (scope_id,assignment_id,revision,source_kind,mapping_rule_id,mapping_revision,actor_user_id,
+       request_key,decision,cycle_id,request_identity,request_digest)
+    SELECT scope_id,assignment_id,last_revision+1,'mapped',mapping_rule_id,mapping_revision,
+           grantee_user_id,request_key,'revoke',cycle_id,request_identity,sha256(request_identity)
+      FROM identified
+    RETURNING assignment_id, revision
+  ), advanced AS (
+    UPDATE openmettle.grant_assignments a SET last_revision=r.revision FROM recorded r
+     WHERE a.id=r.assignment_id AND a.last_revision=r.revision-1
+    RETURNING a.id
+  ) SELECT (SELECT count(*) FROM advanced) AS withdrawn,
+           (SELECT count(*) FROM advanced)=(SELECT count(*) FROM recorded) AS consistent \gset
+  -- Commit only a complete withdrawal: something was revoked and no derived grant of this
+  -- approval remains active, including one created under a rule that was not locked.
+  SELECT :'consistent'::boolean AND :withdrawn > 0 AND NOT EXISTS (
+    SELECT FROM openmettle.grant_assignments a
+      JOIN openmettle.grant_changes h ON h.assignment_id=a.id AND h.revision=a.last_revision
+     WHERE a.assignment_key=:'approval' AND a.grantee_user_id=:'grantee'::uuid
+       AND a.source_kind='mapped' AND a.target_kind='project'
+       AND a.assignment_format='openmettle.project-member' AND a.assignment_version=1
+       AND h.decision='grant') AS changed \gset
+\else
+  \set changed false
+\endif
+
+\if :changed
+  COMMIT;
+  -- Reached only after the server acknowledged COMMIT. The count is a server value.
+  \echo 'membership withdrawal committed:' :withdrawn 'assignments'
+\else
+  ROLLBACK;
+  DO $$ BEGIN RAISE EXCEPTION 'membership withdrawal refused'; END $$;
+\endif
