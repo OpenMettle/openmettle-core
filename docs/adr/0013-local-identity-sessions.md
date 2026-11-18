@@ -272,8 +272,10 @@ SELECT :observed_revision = :expected_revision AND :observed_generation = :expec
 Restoration advances the generation again, including when the previous approval merely expired.
 It cannot revive sessions bound to that earlier approval. Never change provider/identity on an
 existing approval. Create a distinct approval only for an existing exact identity and compatible
-provider issuer, with explicit expiry and operator provenance. No API admission-write or user-
-provisioning helper is provided.
+provider issuer, with explicit expiry and operator provenance, using the exact script in the
+[first local identity approval procedure](../operator/first-identity-approval.md). It inserts
+only that row and refuses when any approval already exists for the pair. No API admission-write
+or user-provisioning helper is provided.
 
 ### User disablement and re-enable
 

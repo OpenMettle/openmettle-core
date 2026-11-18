@@ -1,0 +1,112 @@
+-- ADR 0013: create the first local identity approval for one existing exact OIDC identity
+-- (schema version 8+). Procedure, refusals and unknown-commit handling:
+-- docs/operator/first-identity-approval.md. Run against the primary as openmettle_owner with
+-- psql -X. Supply every variable; there are no defaults:
+--   provider    login provider UUID, canonical lowercase form
+--   issuer      that provider's exact issuer
+--   subject     the identity's exact subject (1-255 ASCII bytes; case and spaces are kept)
+--   expires_ms  approval expiry in Unix milliseconds, after the primary database clock
+--   actor, reason  synthetic operator identifiers only (latest-change provenance, not audit)
+-- Inserts exactly one approval row (revision 1, generation 0, active). Never creates or changes
+-- users, identities, scopes, grants, sessions or providers, and never updates an existing
+-- approval: changes, withdrawal and reapproval use ADR 0013's approval change protocol.
+-- Prints one fixed line on success and a fixed refusal reason otherwise; never input values.
+\set ON_ERROR_STOP on
+-- Validate presence and domains before any table access or cast. Explicit character sets
+-- avoid locale-dependent ranges. Caller-supplied control variables are overwritten.
+\set valid false
+\if :{?provider}
+ \if :{?issuer}
+  \if :{?subject}
+   \if :{?expires_ms}
+    \if :{?actor}
+     \if :{?reason}
+  SELECT :'provider' ~ '^[0123456789abcdef]{8}-[0123456789abcdef]{4}-[0123456789abcdef]{4}-[0123456789abcdef]{4}-[0123456789abcdef]{12}$'
+     AND octet_length(:'issuer') BETWEEN 1 AND 2048
+     AND octet_length(:'subject') BETWEEN 1 AND 255
+     -- Each byte must be 00-7F even when the database uses SQL_ASCII.
+     AND encode(convert_to(:'subject', getdatabaseencoding()::name), 'hex')
+           COLLATE "C" ~ '^([0-7][0-9a-f])+$'
+     AND :'expires_ms' ~ '^[123456789][0123456789]{0,17}$'
+     AND octet_length(:'actor') BETWEEN 1 AND 128
+     AND octet_length(:'reason') BETWEEN 1 AND 512 AS valid \gset
+     \endif
+    \endif
+   \endif
+  \endif
+ \endif
+\endif
+\if :valid
+  BEGIN;
+  SET LOCAL lock_timeout = '2s';
+  SET LOCAL statement_timeout = '5s';
+  SET LOCAL synchronous_commit = on;
+  -- Lock order follows issuance (provider -> approval -> user). The shared provider lock makes
+  -- an owner revision/retirement commit before the next read or wait until this one ends.
+  SELECT count(*) AS provider_rows FROM (SELECT id FROM openmettle.login_providers
+   WHERE id = :'provider'::uuid FOR SHARE) AS locked \gset
+  -- Fresh statement after any wait: the current revision exists, is not retired, and the
+  -- provider's issuer is exactly the supplied issuer. A newly visible provider is eligible
+  -- only on a later invocation that acquires its row lock.
+  SELECT :'provider_rows'::integer = 1 AND EXISTS (SELECT FROM openmettle.login_providers AS p
+    JOIN LATERAL (SELECT revision FROM openmettle.login_provider_revisions
+                   WHERE provider_id = p.id ORDER BY epoch DESC LIMIT 1) AS r ON true
+   WHERE p.id = :'provider'::uuid AND r.revision IS NOT NULL
+     AND p.issuer = :'issuer') AS provider_active \gset
+  \if :provider_active
+    -- Exact issuer/subject equality only: no case-folding, trimming or other lookup. Later
+    -- statements use the resolved UUIDs, so lock waits never carry the subject text.
+    SELECT count(*) = 1 AS identity_found, max(id::text) AS identity_id,
+           max(user_id::text) AS identity_user
+      FROM openmettle.user_identities WHERE issuer = :'issuer' AND subject = :'subject' \gset
+    \if :identity_found
+      -- A concurrent uncommitted insert for the same pair is awaited; if it commits, nothing
+      -- is inserted. An existing approval is never replaced, extended or restored.
+      WITH inserted AS (
+        INSERT INTO openmettle.local_identity_approvals
+            (provider_id, identity_id, revision, access_generation, active, expires_ms,
+             changed_by, change_reason)
+        VALUES (:'provider'::uuid, :'identity_id'::uuid, 1, 0, true, :'expires_ms'::bigint,
+                :'actor', :'reason')
+        ON CONFLICT (provider_id, identity_id) DO NOTHING
+        RETURNING 1
+      )
+      SELECT count(*) = 1 AS inserted FROM inserted \gset
+      \if :inserted
+        -- Shared user lock: an owner disable or re-enable commits before the next read or
+        -- waits until this transaction ends.
+        SELECT count(*) AS user_rows FROM (SELECT id FROM openmettle.users
+         WHERE id = :'identity_user'::uuid FOR SHARE) AS locked \gset
+        SELECT :'user_rows'::integer = 1 AND EXISTS (SELECT FROM openmettle.users AS u
+          JOIN openmettle.scopes AS s ON s.personal_user_id = u.id AND s.kind = 'personal'
+         WHERE u.id = :'identity_user'::uuid AND u.disabled_at IS NULL) AS eligible \gset
+        -- Primary clock sampled after every wait; now() is transaction-start time.
+        SELECT :'expires_ms'::bigint > floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
+            AS future \gset
+        \if :eligible
+          \if :future
+            COMMIT;
+            \echo 'first approval committed'
+          \else
+            ROLLBACK;
+            DO $refused$ BEGIN RAISE EXCEPTION 'first approval refused: expiry is not after the primary database clock; no changes committed'; END; $refused$;
+          \endif
+        \else
+          ROLLBACK;
+          DO $refused$ BEGIN RAISE EXCEPTION 'first approval refused: identity user is disabled or has no personal scope; no changes committed'; END; $refused$;
+        \endif
+      \else
+        ROLLBACK;
+        DO $refused$ BEGIN RAISE EXCEPTION 'first approval refused: an approval already exists for this provider and identity; no changes committed'; END; $refused$;
+      \endif
+    \else
+      ROLLBACK;
+      DO $refused$ BEGIN RAISE EXCEPTION 'first approval refused: no identity has exactly this issuer and subject; no changes committed'; END; $refused$;
+    \endif
+  \else
+    ROLLBACK;
+    DO $refused$ BEGIN RAISE EXCEPTION 'first approval refused: provider is missing, retired or has a different issuer; no changes committed'; END; $refused$;
+  \endif
+\else
+  DO $refused$ BEGIN RAISE EXCEPTION 'first approval refused: missing or invalid input; nothing changed'; END; $refused$;
+\endif

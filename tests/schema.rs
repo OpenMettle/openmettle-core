@@ -237,13 +237,13 @@ impl Drop for Restore {
 struct TestDb(String, #[allow(dead_code)] PgConnection);
 impl TestDb {
     async fn new() -> Self {
-        Self::create("SELECT pg_advisory_lock_shared($1)").await
+        Self::create("SELECT pg_advisory_lock_shared($1)", "").await
     }
     /// For tests that change cluster-wide role state; excludes all other test databases.
     async fn exclusive() -> Self {
-        Self::create("SELECT pg_advisory_lock($1)").await
+        Self::create("SELECT pg_advisory_lock($1)", "").await
     }
-    async fn create(lock: &'static str) -> Self {
+    async fn create(lock: &'static str, options: &'static str) -> Self {
         let mut admin = admin(None).await;
         ensure_roles(&mut admin).await;
         sqlx::query(lock)
@@ -262,7 +262,7 @@ impl TestDb {
         );
         admin
             .execute(AssertSqlSafe(format!(
-                "CREATE DATABASE {name} OWNER {OWNER}"
+                "CREATE DATABASE {name} OWNER {OWNER} {options}"
             )))
             .await
             .unwrap();
