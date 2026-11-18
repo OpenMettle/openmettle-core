@@ -1,13 +1,19 @@
-//! Offline loader for mounted browser-auth settings (ADR 0015).
+//! Offline loader for mounted browser-auth settings (ADRs 0015 and 0020).
 //!
 //! One strict, versioned JSON document and the files it names become validated in-memory state
-//! through the existing constructors. Loading performs no network, DNS, database or listener
-//! work. Settings and login secrets come from the deployment files. Native trust follows
-//! ADR 0010 and honors `SSL_CERT_FILE` and `SSL_CERT_DIR`. Success validates local inputs
-//! for this build. Provider reachability, durable authority (ADR 0012) and agreement between
-//! replicas require separate checks.
+//! through the existing constructors. Version 2 adds one browser-routing profile, judged by
+//! the same settings checks as the unmounted handoff and router. Loading performs no network,
+//! DNS, database or listener work, enters no async runtime and mounts nothing. Settings and
+//! login secrets come from the deployment files. Native trust follows ADR 0010 and honors
+//! `SSL_CERT_FILE` and `SSL_CERT_DIR`. Success validates local inputs for this build.
+//! Provider reachability, durable authority (ADR 0012) and agreement between replicas require
+//! separate checks.
 use crate::{
     auth::{self, ProviderIdentity},
+    browser_auth::{
+        handoff,
+        router::{self, Rate},
+    },
     login::{self, KeyRing},
     provider_http::{MAX_TRUST_BUNDLE_BYTES, Trust},
     provider_keys::{self, ManagedProvider, ProviderConfig, ProviderManager, RefreshPolicy},
@@ -23,8 +29,10 @@ use std::{
     time::Duration,
 };
 
-/// The only accepted document version.
+/// The original document: login, token, refresh, session and provider settings.
 pub const VERSION: u64 = 1;
+/// [`VERSION`] plus one required browser-routing profile (ADR 0020).
+pub const VERSION_2: u64 = 2;
 /// Maximum serialized document size, applied before parsing.
 pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 /// Exact length of each raw login key file.
@@ -63,6 +71,12 @@ pub enum Error {
     TrustBundleFile,
     /// Definition, endpoint, trust anchors or address policy refused by [`ProviderConfig`].
     Provider,
+    /// The browser profile's origin, landing, provider or that provider's callback, refused
+    /// by the handoff's own settings check with its fixed category.
+    BrowserHandoff(handoff::SettingsError),
+    /// The browser profile's paths, rate budgets or in-flight cap, refused by the router's
+    /// own settings check with its fixed category.
+    BrowserRouter(router::SettingsError),
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -86,6 +100,9 @@ impl fmt::Display for Error {
             Self::DuplicateProvider => "provider identifiers are not unique",
             Self::TrustBundleFile => "a trust bundle is not a readable regular file within bounds",
             Self::Provider => "a provider definition, endpoint, trust or address policy is invalid",
+            // The wrapped categories are fixed lines too; neither carries a value.
+            Self::BrowserHandoff(error) => return write!(f, "browser profile refused: {error}"),
+            Self::BrowserRouter(error) => return write!(f, "browser profile refused: {error}"),
         })
     }
 }
@@ -201,7 +218,106 @@ impl Provider {
     }
 }
 
-/// The complete version-1 shape, checked before any policy is evaluated or other file is read.
+/// The version-2 browser-routing profile (ADR 0020): one selected provider, the application
+/// origin and landing, three literal route paths, four rate budgets and one in-flight cap.
+/// The callback path is the selected provider's registered callback; nothing here supplies it.
+///
+/// Only [`load`] returns one, inside [`AuthConfig`], after the handoff's and router's own
+/// settings checks accepted it. It holds settings only: no route, listener or admission state.
+#[derive(Clone)]
+pub struct BrowserProfile {
+    provider_id: String,
+    origin: String,
+    landing_path: String,
+    initiation_path: String,
+    session_check_path: String,
+    logout_path: String,
+    initiation: Rate,
+    callback: Rate,
+    session_check: Rate,
+    logout: Rate,
+    max_in_flight: u32,
+}
+impl fmt::Debug for BrowserProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BrowserProfile(..)")
+    }
+}
+impl BrowserProfile {
+    /// Settings for `LoginHandoff::new`.
+    pub fn handoff(&self) -> handoff::Settings<'_> {
+        handoff::Settings {
+            origin: &self.origin,
+            landing: &self.landing_path,
+            provider: &self.provider_id,
+        }
+    }
+    /// Login-route settings for `router_with_sessions`.
+    pub fn router(&self) -> router::Settings<'_> {
+        router::Settings {
+            initiation: &self.initiation_path,
+            begin: self.initiation,
+            callback: self.callback,
+            in_flight: self.max_in_flight,
+        }
+    }
+    /// Session-route settings for `router_with_sessions`.
+    pub fn sessions(&self) -> router::SessionSettings<'_> {
+        router::SessionSettings {
+            session: &self.session_check_path,
+            logout: &self.logout_path,
+            checks: self.session_check,
+            logouts: self.logout,
+        }
+    }
+
+    /// Shape only. Integers too large for the router's types saturate, so the router's own
+    /// range check refuses them in its usual order; no bound is added here.
+    fn parse(value: Value) -> Result<Self, Error> {
+        let saturate = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
+        let rate = |value: Value| {
+            let mut rate = Object::new(value)?;
+            let parsed = Rate {
+                burst: saturate(rate.integer("burst")?),
+                interval: Duration::from_millis(rate.integer("interval_milliseconds")?),
+            };
+            rate.end()?;
+            Ok(parsed)
+        };
+        let mut browser = Object::new(value)?;
+        let mut paths = browser.object("paths")?;
+        let mut rates = browser.object("rates")?;
+        let parsed = Self {
+            provider_id: browser.string("provider_id")?,
+            origin: browser.string("origin")?,
+            landing_path: browser.string("landing_path")?,
+            initiation_path: paths.string("initiation")?,
+            session_check_path: paths.string("session_check")?,
+            logout_path: paths.string("logout")?,
+            initiation: rate(rates.take("initiation")?)?,
+            callback: rate(rates.take("callback")?)?,
+            session_check: rate(rates.take("session_check")?)?,
+            logout: rate(rates.take("logout")?)?,
+            max_in_flight: saturate(browser.integer("max_in_flight")?),
+        };
+        for object in [paths, rates, browser] {
+            object.end()?;
+        }
+        Ok(parsed)
+    }
+    /// The handoff's settings check against the registered providers (origin, landing,
+    /// selected provider and its exact callback), then the router's over all four paths,
+    /// the four budgets and the in-flight cap. Neither builds a service, route or task.
+    fn check(self, providers: &[ManagedProvider]) -> Result<Self, Error> {
+        let checked = handoff::check(providers, self.handoff()).map_err(Error::BrowserHandoff)?;
+        router::check(checked.callback_path(), self.router(), self.sessions())
+            .map_err(Error::BrowserRouter)?;
+        Ok(self)
+    }
+}
+
+/// The complete shape of either version, checked before any policy is evaluated or other file
+/// is read.
 struct Document {
     login_lifetime_seconds: u64,
     active_key: KeyFile,
@@ -218,6 +334,8 @@ struct Document {
     retained_per_user: u64,
     session_deadline_milliseconds: u64,
     providers: Vec<Provider>,
+    /// Required in version 2. Version 1 has no such member, so there it is an unknown field.
+    browser: Option<BrowserProfile>,
 }
 impl Document {
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
@@ -227,9 +345,10 @@ impl Document {
         })?;
         // Version first: another version's fields must not be reported as shape errors.
         let mut root = Object::new(value).map_err(|_| Error::Version)?;
-        if root.take("version").ok().and_then(|v| v.as_u64()) != Some(VERSION) {
-            return Err(Error::Version);
-        }
+        let version = match root.take("version").ok().and_then(|v| v.as_u64()) {
+            Some(version @ (VERSION | VERSION_2)) => version,
+            _ => return Err(Error::Version),
+        };
         let mut login = root.object("login")?;
         let mut keys = login.object("keys")?;
         let mut id_token = root.object("id_token")?;
@@ -259,6 +378,10 @@ impl Document {
                 .into_iter()
                 .map(Provider::parse)
                 .collect::<Result<_, _>>()?,
+            browser: match version {
+                VERSION_2 => Some(BrowserProfile::parse(root.take("browser")?)?),
+                _ => None,
+            },
         };
         for object in [keys, login, id_token, refresh, session, root] {
             object.end()?;
@@ -320,6 +443,7 @@ pub struct AuthConfig {
     session_policy: sessions::Policy,
     manager: ProviderManager,
     providers: Vec<ManagedProvider>,
+    browser: Option<BrowserProfile>,
 }
 impl fmt::Debug for AuthConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -345,6 +469,11 @@ impl AuthConfig {
     pub fn providers(&self) -> &[ManagedProvider] {
         &self.providers
     }
+    /// The validated browser-routing profile of a version-2 document; `None` for version 1.
+    /// Nothing consumes it yet: no process constructs or mounts the routes.
+    pub fn browser(&self) -> Option<&BrowserProfile> {
+        self.browser.as_ref()
+    }
     /// Test-only assembly from parts built with fixture trust. Production state comes from
     /// [`load`] alone.
     #[cfg(test)]
@@ -362,6 +491,7 @@ impl AuthConfig {
             session_policy,
             manager,
             providers,
+            browser: None,
         }
     }
 }
@@ -448,6 +578,11 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
         .map_err(|_| Error::Provider)?;
         providers.push(manager.register(config).map_err(|_| Error::Provider)?);
     }
+    // Last: the profile names a registered provider and is judged against its callback.
+    let browser = document
+        .browser
+        .map(|profile| profile.check(&providers))
+        .transpose()?;
     Ok(AuthConfig {
         keys,
         login_lifetime,
@@ -455,6 +590,7 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
         session_policy,
         manager,
         providers,
+        browser,
     })
 }
 

@@ -116,6 +116,12 @@ fn session_settled<T>(result: &Result<T, sessions::Error>) -> bool {
     }
 }
 
+/// Exact match against configured provider UUIDs. Nothing else selects a provider. The
+/// service and the handoff's settings check (also run offline, ADR 0020) share this lookup.
+fn configured<'a>(providers: &'a [ManagedProvider], id: &str) -> Option<&'a ManagedProvider> {
+    providers.iter().find(|provider| provider.id() == id)
+}
+
 /// Managed browser login and local sessions for the configured providers.
 ///
 /// Construct it once per process with the loaded settings and a handle to the API's
@@ -136,13 +142,8 @@ impl BrowserAuth {
     pub fn new(config: AuthConfig, pool: PgPool) -> Self {
         Self { config, pool }
     }
-    /// Exact match against configured provider UUIDs. Nothing else selects a provider.
     fn provider(&self, id: &str) -> Result<&ManagedProvider, login::Error> {
-        self.config
-            .providers()
-            .iter()
-            .find(|provider| provider.id() == id)
-            .ok_or(login::Error::Rejected)
+        configured(self.config.providers(), id).ok_or(login::Error::Rejected)
     }
 
     /// Starts a login for one configured provider. Deliver the result only to the

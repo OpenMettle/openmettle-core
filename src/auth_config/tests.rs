@@ -18,6 +18,12 @@ impl Fixture {
         let document = support::document(&dir, &Ca::new().pem());
         Self { dir, document }
     }
+    /// The same files with a version-2 document.
+    fn v2() -> Self {
+        let dir = Dir::new();
+        let document = support::document_v2(&dir, &Ca::new().pem());
+        Self { dir, document }
+    }
     fn load(&self) -> Result<AuthConfig, Error> {
         self.load_bytes(self.document.to_string().as_bytes())
     }
@@ -189,7 +195,7 @@ fn non_regular_relative_and_oversized_files_are_refused() {
     assert_eq!(fixture.with(pointer, json!(path)), Error::Provider);
 }
 
-/// Pointers to every object in the valid document.
+/// Pointers to every object in the valid version-1 document.
 const OBJECTS: [&str; 10] = [
     "",
     "/login",
@@ -202,12 +208,38 @@ const OBJECTS: [&str; 10] = [
     "/providers/0",
     "/providers/0/trust",
 ];
+/// The objects that version 2 adds.
+const BROWSER_OBJECTS: [&str; 7] = [
+    "/browser",
+    "/browser/paths",
+    "/browser/rates",
+    "/browser/rates/initiation",
+    "/browser/rates/callback",
+    "/browser/rates/session_check",
+    "/browser/rates/logout",
+];
 
 #[test]
 fn unknown_and_missing_fields_are_refused_in_every_object() {
+    // Every operational input of each shape is required: none has a default. Version 2 is
+    // version 1 plus 22 browser members, counting `browser` itself.
+    assert_eq!(missing_and_unknown(&Fixture::new(), &OBJECTS), 39);
+    let v2: Vec<&str> = OBJECTS.into_iter().chain(BROWSER_OBJECTS).collect();
+    assert_eq!(missing_and_unknown(&Fixture::v2(), &v2), 61);
+    // Native roots take no bundle path.
     let fixture = Fixture::new();
+    let mut native = fixture.document.clone();
+    native["providers"][0]["trust"]["roots"] = json!("native");
+    assert_eq!(
+        refusal(fixture.load_bytes(native.to_string().as_bytes())),
+        Error::UnknownField
+    );
+}
+/// Adds an unknown member to, and removes each member from, every object in turn. Returns
+/// the number of members removed.
+fn missing_and_unknown(fixture: &Fixture, objects: &[&str]) -> usize {
     let mut fields = 0;
-    for pointer in OBJECTS {
+    for &pointer in objects {
         let mut document = fixture.document.clone();
         let object = document
             .pointer_mut(pointer)
@@ -250,15 +282,7 @@ fn unknown_and_missing_fields_are_refused_in_every_object() {
             fields += 1;
         }
     }
-    // Every operational input in the version-1 shape is required: none has a default.
-    assert_eq!(fields, 39);
-    // Native roots take no bundle path.
-    let mut native = fixture.document.clone();
-    native["providers"][0]["trust"]["roots"] = json!("native");
-    assert_eq!(
-        refusal(fixture.load_bytes(native.to_string().as_bytes())),
-        Error::UnknownField
-    );
+    fields
 }
 
 #[test]
@@ -303,7 +327,8 @@ fn version_json_and_field_types_are_strict() {
     let fixture = Fixture::new();
     for version in [
         json!(0),
-        json!(2),
+        json!(3),
+        json!(u64::MAX),
         json!("1"),
         json!(1.0),
         json!(null),
@@ -313,7 +338,8 @@ fn version_json_and_field_types_are_strict() {
     }
     for (bytes, expected) in [
         // A later version is reported as such, not as unknown fields.
-        (&br#"{"version":2,"anything":true}"#[..], Error::Version),
+        (&br#"{"version":3,"anything":true}"#[..], Error::Version),
+        (br#"{"version":3,"browser":{}}"#, Error::Version),
         (b"{}", Error::Version),
         (b"[1]", Error::Version),
         (b"1", Error::Version),
@@ -661,4 +687,399 @@ fn refusals_carry_no_configuration_values() {
         assert!(!text.contains("synthetic"), "{text}");
         assert!(!text.contains('/'), "{text}");
     }
+    let v2 = Fixture::v2();
+    for (pointer, value) in [
+        ("/browser/provider_id", "synthetic-secret"),
+        ("/browser/origin", "https://synthetic-secret.example.test"),
+        ("/browser/origin", "http://synthetic-secret"),
+        ("/browser/landing_path", "/synthetic-secret?x"),
+        ("/browser/paths/initiation", "/synthetic-secret/{x}"),
+        ("/browser/paths/logout", "/synthetic-secret?x"),
+    ] {
+        let error = v2.with(pointer, json!(value));
+        let text = format!("{error} {error:?}");
+        assert!(text.starts_with("browser profile refused: "), "{text}");
+        assert!(!text.contains("synthetic"), "{text}");
+        assert!(!text.contains('/'), "{text}");
+    }
+}
+
+// Version 2: the browser-routing profile (ADR 0020).
+
+const PROVIDER: &str = "0b5c6f4e-2a1d-4c3b-9e8f-7a6b5c4d3e2f";
+const OTHER_PROVIDER: &str = "1c6d7a5f-3b2e-4d4c-8f9a-8b7c6d5e4f30";
+const RATES: [&str; 4] = [
+    "/browser/rates/initiation",
+    "/browser/rates/callback",
+    "/browser/rates/session_check",
+    "/browser/rates/logout",
+];
+const PATHS: [&str; 3] = [
+    "/browser/paths/initiation",
+    "/browser/paths/session_check",
+    "/browser/paths/logout",
+];
+fn handoff_refusal(error: handoff::SettingsError) -> Error {
+    Error::BrowserHandoff(error)
+}
+fn router_refusal(error: router::SettingsError) -> Error {
+    Error::BrowserRouter(error)
+}
+
+#[test]
+fn version_two_retains_the_checked_browser_profile() {
+    let fixture = Fixture::v2();
+    let config = fixture.load().unwrap();
+    // Loading is synchronous: no async runtime exists to enter.
+    assert!(tokio::runtime::Handle::try_current().is_err());
+    // The version-1 settings are unchanged by the profile beside them.
+    assert_eq!(config.providers().len(), 1);
+    assert_eq!(config.login_lifetime(), Duration::from_secs(300));
+    let profile = config.browser().expect("version 2 has a browser profile");
+    let handoff = profile.handoff();
+    assert_eq!(
+        (handoff.origin, handoff.landing, handoff.provider),
+        ("https://app.example.test", "/home", PROVIDER)
+    );
+    let rate = |burst, millis| Rate {
+        burst,
+        interval: Duration::from_millis(millis),
+    };
+    let routes = profile.router();
+    assert_eq!(routes.initiation, "/auth/login");
+    assert_eq!(
+        (routes.begin, routes.callback),
+        (rate(20, 500), rate(21, 501))
+    );
+    assert_eq!(routes.in_flight, 64);
+    let sessions = profile.sessions();
+    assert_eq!(
+        (sessions.session, sessions.logout),
+        ("/auth/session", "/auth/logout")
+    );
+    assert_eq!(
+        (sessions.checks, sessions.logouts),
+        (rate(120, 100), rate(22, 502))
+    );
+    // No origin, path or provider identifier when debug-printed.
+    assert_eq!(
+        format!("{config:?} {profile:?}"),
+        "AuthConfig(..) BrowserProfile(..)"
+    );
+
+    // Version 1 keeps its accepted shape and yields no profile.
+    assert!(Fixture::new().load().unwrap().browser().is_none());
+
+    // Inclusive router ceilings, the root landing and trailing slashes are accepted.
+    for (pointer, value) in [
+        ("/burst", 1),
+        ("/burst", u64::from(router::MAX_BURST)),
+        ("/interval_milliseconds", 1),
+        ("/interval_milliseconds", 3_600_000),
+    ] {
+        for rate in RATES {
+            let mut fixture = Fixture::v2();
+            fixture.set(&format!("{rate}{pointer}"), json!(value));
+            assert!(fixture.load().is_ok(), "{rate}{pointer} {value}");
+        }
+    }
+    for (pointer, value) in [
+        ("/browser/max_in_flight", json!(1)),
+        ("/browser/max_in_flight", json!(router::MAX_IN_FLIGHT)),
+        ("/browser/landing_path", json!("/")),
+        ("/browser/paths/initiation", json!("/auth/login/")),
+        ("/browser/paths/logout", json!("/")),
+    ] {
+        let mut fixture = Fixture::v2();
+        fixture.set(pointer, value);
+        assert!(fixture.load().is_ok(), "{pointer}");
+    }
+}
+
+#[test]
+fn version_decides_whether_the_browser_profile_is_allowed() {
+    let v1 = Fixture::new();
+    let v2 = Fixture::v2();
+    let browser = v2.document["browser"].clone();
+    // Version 1 does not accept the profile; version 2 requires it.
+    let mut document = v1.document.clone();
+    document["browser"] = browser.clone();
+    assert_eq!(
+        refusal(v1.load_bytes(document.to_string().as_bytes())),
+        Error::UnknownField
+    );
+    assert_eq!(v1.with("/version", json!(2)), Error::MissingField);
+    assert_eq!(v2.with("/version", json!(1)), Error::UnknownField);
+    let mut document = v2.document.clone();
+    document.as_object_mut().unwrap().remove("browser");
+    assert_eq!(
+        refusal(v2.load_bytes(document.to_string().as_bytes())),
+        Error::MissingField
+    );
+    // Shapes and types are strict at every depth of the profile.
+    for (pointer, value) in [
+        ("/browser", json!(null)),
+        ("/browser", json!([PROVIDER])),
+        ("/browser", json!("synthetic")),
+        ("/browser/paths", json!(["/auth/login", "/a", "/b"])),
+        ("/browser/rates", json!([])),
+        ("/browser/rates/callback", json!([21, 501])),
+        ("/browser/rates/logout", json!(null)),
+        ("/browser/provider_id", json!(1)),
+        ("/browser/origin", json!(null)),
+        ("/browser/landing_path", json!(["/home"])),
+        ("/browser/paths/session_check", json!({})),
+    ] {
+        assert_eq!(v2.with(pointer, value), Error::Field, "{pointer}");
+    }
+    for pointer in [
+        "/browser/max_in_flight",
+        "/browser/rates/initiation/burst",
+        "/browser/rates/session_check/interval_milliseconds",
+    ] {
+        for value in [
+            json!("64"),
+            json!(64.0),
+            json!(6.4e1),
+            json!(-1),
+            json!(null),
+            json!([64]),
+        ] {
+            assert_eq!(v2.with(pointer, value), Error::Field, "{pointer}");
+        }
+    }
+    // Repeated members in each new object, and in the profile itself.
+    let text = v2.document.to_string();
+    for member in [
+        r#""provider_id":"0b5c6f4e-2a1d-4c3b-9e8f-7a6b5c4d3e2f""#,
+        r#""max_in_flight":64"#,
+        r#""logout":"/auth/logout""#,
+        r#""burst":120"#,
+        r#""interval_milliseconds":502"#,
+        r#""paths":{"#,
+        r#""callback":{"#,
+    ] {
+        assert_eq!(text.matches(member).count(), 1, "{member}");
+        let repeated = if member.ends_with('{') {
+            text.replacen(member, &format!("{member}}},{member}"), 1)
+        } else {
+            text.replacen(member, &format!("{member},{member}"), 1)
+        };
+        assert_eq!(
+            refusal(v2.load_bytes(repeated.as_bytes())),
+            Error::DuplicateField,
+            "{member}"
+        );
+    }
+}
+
+#[test]
+fn browser_origin_landing_and_provider_use_the_handoff_rules() {
+    use handoff::SettingsError::{Callback, Landing, Origin, Provider};
+    let v2 = Fixture::v2();
+    for (pointer, value, error) in [
+        ("/browser/provider_id", OTHER_PROVIDER, Provider),
+        (
+            "/browser/provider_id",
+            "0B5C6F4E-2A1D-4C3B-9E8F-7A6B5C4D3E2F",
+            Provider,
+        ),
+        ("/browser/provider_id", "", Provider),
+        ("/browser/origin", "http://app.example.test", Origin),
+        ("/browser/origin", "https://app.example.test/", Origin),
+        ("/browser/origin", "https://APP.example.test", Origin),
+        ("/browser/origin", "https://app.example.test:443", Origin),
+        ("/browser/origin", "https://user@app.example.test", Origin),
+        ("/browser/origin", "app.example.test", Origin),
+        ("/browser/origin", "", Origin),
+        // Canonical, but the selected provider's callback is not on it.
+        ("/browser/origin", "https://other.example.test", Callback),
+        ("/browser/origin", "https://app.example.test:8443", Callback),
+        ("/browser/landing_path", "", Landing),
+        ("/browser/landing_path", "home", Landing),
+        ("/browser/landing_path", "//evil.example.test", Landing),
+        ("/browser/landing_path", "/a/../home", Landing),
+        ("/browser/landing_path", "/./home", Landing),
+        ("/browser/landing_path", "/home?next=x", Landing),
+        ("/browser/landing_path", "/home#x", Landing),
+        ("/browser/landing_path", "/h%6fme", Landing),
+        ("/browser/landing_path", "/h me", Landing),
+        ("/browser/landing_path", "/hömé", Landing),
+    ] {
+        assert_eq!(
+            v2.with(pointer, json!(value)),
+            handoff_refusal(error),
+            "{pointer} {value}"
+        );
+    }
+    // The profile selects one provider by exact UUID; only that provider's callback counts.
+    let mut fixture = Fixture::v2();
+    let mut other = fixture.document["providers"][0].clone();
+    other["id"] = json!(OTHER_PROVIDER);
+    other["callback"] = json!("https://other.example.test/return");
+    let first = fixture.document["providers"][0].clone();
+    fixture.set("/providers", json!([first, other]));
+    assert!(fixture.load().is_ok());
+    fixture.set("/browser/provider_id", json!(OTHER_PROVIDER));
+    assert_eq!(refusal(fixture.load()), handoff_refusal(Callback));
+    fixture.set("/browser/origin", json!("https://other.example.test"));
+    let config = fixture.load().unwrap();
+    assert_eq!(config.browser().unwrap().handoff().provider, OTHER_PROVIDER);
+    // The other provider's callback path is now the one the router checks against.
+    fixture.set("/browser/paths/logout", json!("/return"));
+    assert_eq!(
+        refusal(fixture.load()),
+        router_refusal(router::SettingsError::Collision)
+    );
+}
+
+#[test]
+fn browser_paths_and_admission_use_the_router_rules() {
+    use router::SettingsError::{Collision, InFlight, Path, Pattern, Rate as RateRange};
+    let v2 = Fixture::v2();
+    let long = format!("/{}", "a".repeat(router::MAX_PATH_BYTES));
+    for pointer in PATHS {
+        for (value, error) in [
+            ("/{id}", Pattern),
+            ("/auth/{*rest}", Pattern),
+            ("/auth:x", Pattern),
+            ("", Path),
+            ("auth", Path),
+            ("//auth", Path),
+            ("/a//b", Path),
+            ("/a/../b", Path),
+            ("/auth?x=1", Path),
+            ("/auth#x", Path),
+            ("/%61uth", Path),
+            (long.as_str(), Path),
+            // The selected provider's registered callback path, and the operational routes.
+            ("/callback", Collision),
+            ("/healthz", Collision),
+            ("/readyz", Collision),
+        ] {
+            assert_eq!(
+                v2.with(pointer, json!(value)),
+                router_refusal(error),
+                "{pointer} {value}"
+            );
+        }
+    }
+    for (first, second) in [(0, 1), (1, 2), (0, 2)] {
+        let mut fixture = Fixture::v2();
+        fixture.set(PATHS[first], json!("/same"));
+        fixture.set(PATHS[second], json!("/same"));
+        assert_eq!(refusal(fixture.load()), router_refusal(Collision));
+    }
+    // Every budget is independent and judged by the router's ranges. Values too large for
+    // the router's types still report the router's category.
+    for rate in RATES {
+        for (member, value) in [
+            ("burst", 0),
+            ("burst", u64::from(router::MAX_BURST) + 1),
+            ("burst", u64::from(u32::MAX) + 1),
+            ("burst", u64::MAX),
+            ("interval_milliseconds", 0),
+            ("interval_milliseconds", 3_600_001),
+            ("interval_milliseconds", u64::MAX),
+        ] {
+            assert_eq!(
+                v2.with(&format!("{rate}/{member}"), json!(value)),
+                router_refusal(RateRange),
+                "{rate}/{member} {value}"
+            );
+        }
+    }
+    for value in [
+        0,
+        u64::from(router::MAX_IN_FLIGHT) + 1,
+        u64::from(u32::MAX) + 1,
+        u64::MAX,
+    ] {
+        assert_eq!(
+            v2.with("/browser/max_in_flight", json!(value)),
+            router_refusal(InFlight),
+            "{value}"
+        );
+    }
+    // The handoff's settings are judged before the router's, and paths before budgets.
+    let mut fixture = Fixture::v2();
+    fixture.set("/browser/max_in_flight", json!(0));
+    fixture.set("/browser/rates/logout/burst", json!(0));
+    assert_eq!(refusal(fixture.load()), router_refusal(RateRange));
+    fixture.set("/browser/paths/logout", json!("/healthz"));
+    assert_eq!(refusal(fixture.load()), router_refusal(Collision));
+    fixture.set("/browser/landing_path", json!("home"));
+    assert_eq!(
+        refusal(fixture.load()),
+        handoff_refusal(handoff::SettingsError::Landing)
+    );
+    // Earlier version-1 refusals still come first.
+    fixture.set("/session/retained_per_user", json!(0));
+    assert_eq!(refusal(fixture.load()), Error::SessionPolicy);
+}
+
+/// One implementation: each profile the offline check accepts or refuses gets the same outcome
+/// from `LoginHandoff::new` and `router_with_sessions`, built over the same providers. The
+/// lazy pool is never used, so nothing connects.
+#[tokio::test]
+async fn offline_outcomes_match_the_handoff_and_router_constructors() {
+    use crate::browser_auth::{BrowserAuth, handoff::LoginHandoff, router::router_with_sessions};
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use std::sync::Arc;
+    let fixture = Fixture::v2();
+    let pool = PgPoolOptions::new().connect_lazy_with(
+        PgConnectOptions::new()
+            .host("127.0.0.1")
+            .port(9)
+            .username("fixture"),
+    );
+    let build_routes = |config, profile: &BrowserProfile| -> Result<(), Error> {
+        let auth = Arc::new(BrowserAuth::new(config, pool.clone()));
+        let handoff = LoginHandoff::new(auth, profile.handoff()).map_err(Error::BrowserHandoff)?;
+        router_with_sessions(handoff, profile.router(), profile.sessions())
+            .map(drop)
+            .map_err(Error::BrowserRouter)
+    };
+
+    // Compose the router from the profile the loader returned. Keep the checked
+    // settings while BrowserAuth takes ownership of the rest of the configuration.
+    let config = fixture.load().unwrap();
+    let profile = config.browser().unwrap().clone();
+    assert_eq!(build_routes(config, &profile), Ok(()));
+
+    let constructors = |document: &Value| -> Result<(), Error> {
+        let profile = BrowserProfile::parse(document["browser"].clone()).unwrap();
+        let mut v1 = document.clone();
+        v1["version"] = json!(1);
+        v1.as_object_mut().unwrap().remove("browser");
+        let config = fixture.load_bytes(v1.to_string().as_bytes()).unwrap();
+        build_routes(config, &profile)
+    };
+    let mut outcomes = HashSet::new();
+    for (pointer, value) in [
+        ("/browser/max_in_flight", json!(64)),
+        ("/browser/provider_id", json!(OTHER_PROVIDER)),
+        ("/browser/origin", json!("https://app.example.test/")),
+        ("/browser/origin", json!("https://other.example.test")),
+        ("/browser/landing_path", json!("/a/../b")),
+        ("/browser/paths/initiation", json!("/{id}")),
+        ("/browser/paths/session_check", json!("/a//b")),
+        ("/browser/paths/logout", json!("/callback")),
+        ("/browser/rates/callback/burst", json!(0)),
+        (
+            "/browser/rates/session_check/interval_milliseconds",
+            json!(3_600_001),
+        ),
+        ("/browser/max_in_flight", json!(4097)),
+    ] {
+        let mut document = fixture.document.clone();
+        *document.pointer_mut(pointer).unwrap() = value;
+        let offline = fixture
+            .load_bytes(document.to_string().as_bytes())
+            .map(drop);
+        assert_eq!(offline, constructors(&document), "{pointer}");
+        outcomes.insert(format!("{offline:?}"));
+    }
+    // Success and the nine handoff and router categories above were all reached.
+    assert_eq!(outcomes.len(), 10);
 }

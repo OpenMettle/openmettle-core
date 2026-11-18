@@ -238,9 +238,10 @@ Starting the API without arguments is unchanged and loads none of these files. T
 migrator never read them. Nothing consumes the settings at runtime yet, and there is no live
 reload.
 
-The check reads one version-1 JSON document and the files it names. Native trust also loads
-platform roots and honors `SSL_CERT_FILE` and `SSL_CERT_DIR` under ADR 0010. ADR 0015 gives
-the full document shape with synthetic values.
+The check reads one JSON document, version 1 or 2, and the files it names. Native trust also
+loads platform roots and honors `SSL_CERT_FILE` and `SSL_CERT_DIR` under ADR 0010. ADR 0015
+gives the version-1 shape with synthetic values. Version 2 adds one required browser-routing
+profile, described below.
 
 - Every setting is required, with its unit in the field name. There are no defaults, and no
   operational value is selected. Unknown, repeated, missing or mistyped fields are refused in
@@ -265,6 +266,23 @@ ADR 0012, and the ADR 0014 limit must be set. Keep the document, keys and bundle
 on every replica for a revision. Follow ADR 0015 for login-key rotation, provider revision
 changes and the unchanged restore requirements. `cargo test --locked --offline --lib auth_config`
 runs the loader tests without PostgreSQL or network access.
+
+### Browser-routing profile (version 2)
+
+[ADR 0020](docs/adr/0020-browser-routing-profile.md) defines version 2: every version-1
+member plus one required `browser` object. It selects one configured provider UUID and
+sets the canonical HTTPS application origin, the landing path, three literal paths
+(initiation, session check and logout), four rate budgets (initiation, callback, session
+check and logout, each a burst and `interval_milliseconds`) and one shared `max_in_flight`
+cap. The callback path comes from the selected provider's registered callback. Nothing has
+a default.
+
+The same checks as the unmounted handoff and router (ADRs 0017–0019) judge these values,
+without a database, async runtime, listener or provider request. A refusal is
+`auth configuration error: browser profile refused: ` followed by one fixed category. A
+version-1 document still passes unchanged and must not contain `browser`. **Nothing
+consumes the profile yet.** The API still serves `/healthz` and `/readyz` only, and the
+check cannot show that ingress, browsers or the provider registration agree with it.
 
 ## Pooled browser-auth service
 
@@ -309,8 +327,8 @@ not mounted**: no process constructs it, the API still serves `/healthz` and `/r
 and answers `404` for a callback path, and no browser has been qualified.
 
 It takes three explicit settings with no defaults: the canonical HTTPS application origin,
-a landing path on that origin and one configured provider UUID. They are not part of the
-auth settings document, which is unchanged. The issuer and the exact registered callback
+a landing path on that origin and one configured provider UUID. Auth settings version 2
+carries them and the offline check applies the adapter's own checks (ADR 0020). The issuer and the exact registered callback
 come from that provider. `Host`, forwarded headers, callback fields and return URLs never
 select an origin, provider, callback or destination.
 
@@ -356,7 +374,9 @@ built. Route syntax, escapes, dot or empty segments, a shared path and `/healthz
 
 Every other setting is explicit, with no defaults: a rate budget for initiations, a separate
 one for callbacks (burst and refill interval each) and one in-flight cap shared by both
-routes. The ranges in ADR 0018 are implementation ceilings, not operating values. Requests
+routes. The ranges in ADR 0018 are implementation ceilings, not operating values. Auth
+settings version 2 carries these settings, and the offline check runs the router's own
+validation (ADR 0020). Requests
 are decided in this order, and the first four steps do no provider, pool or database work:
 
 1. Method (`405`).

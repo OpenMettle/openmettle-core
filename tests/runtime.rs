@@ -147,14 +147,18 @@ fn rejects_invalid_config_without_disclosing_values() {
 
 const USAGE: &str = "usage error: expected no arguments or --check-auth-config PATH\n";
 
-/// ADR 0015: the check needs no database setting and opens no listener.
+/// ADRs 0015 and 0020: the check needs no database setting and opens no listener, for
+/// version 1 and for version 2 with its browser-routing profile.
 #[test]
 fn auth_config_check_succeeds_offline_without_serving_settings() {
+    assert_eq!(openmettle_core::auth_config::VERSION, 1);
     let dir = auth_config_support::Dir::new();
-    let document = auth_config_support::document(&dir, &ca::Ca::new().pem());
-    let path = dir.write("auth.json", document.to_string().as_bytes());
+    let bundle = ca::Ca::new().pem();
+    let v1 = auth_config_support::document(&dir, &bundle);
+    let v2 = auth_config_support::document_v2(&dir, &bundle);
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
-    for serving_settings in [false, true] {
+    for (document, serving_settings) in [(&v1, false), (&v1, true), (&v2, false), (&v2, true)] {
+        let path = dir.write("auth.json", document.to_string().as_bytes());
         let mut command = command(false);
         if serving_settings {
             // Serving with these would exit 78 (database URL) or 1 (occupied listener).
@@ -199,9 +203,11 @@ fn auth_config_check_rejects_with_fixed_redacted_categories() {
     );
     case(
         "/version",
-        2.into(),
+        3.into(),
         "configuration version is missing or unsupported",
     );
+    // Version 1 has no browser profile, and version 2 requires one.
+    case("/version", 2.into(), "configuration lacks a required field");
     case(
         "/login/lifetime_seconds",
         601.into(),
@@ -225,6 +231,50 @@ fn auth_config_check_rejects_with_fixed_redacted_categories() {
     cases.push((
         br#"{"synthetic-secret":"#.to_vec(),
         "configuration is not valid JSON",
+    ));
+    let v2 = auth_config_support::document_v2(&dir, &ca::Ca::new().pem());
+    let mut browser = valid.clone();
+    browser["browser"] = v2["browser"].clone();
+    cases.push((
+        browser.to_string().into_bytes(),
+        "configuration has an unknown field",
+    ));
+    for (pointer, value, category) in [
+        (
+            "/browser/provider_id",
+            "1c6d7a5f-3b2e-4d4c-8f9a-8b7c6d5e4f30",
+            "browser profile refused: provider is not configured",
+        ),
+        (
+            "/browser/origin",
+            "https://synthetic-secret.example.test",
+            "browser profile refused: registered callback is not a plain path on the application origin",
+        ),
+        (
+            "/browser/landing_path",
+            "/synthetic-secret?x",
+            "browser profile refused: landing is not a plain absolute path",
+        ),
+        (
+            "/browser/paths/logout",
+            "/callback",
+            "browser profile refused: login paths collide",
+        ),
+        (
+            "/browser/paths/initiation",
+            "/synthetic-secret/{x}",
+            "browser profile refused: login path contains route syntax",
+        ),
+    ] {
+        let mut document = v2.clone();
+        *document.pointer_mut(pointer).unwrap() = value.into();
+        cases.push((document.to_string().into_bytes(), category));
+    }
+    let mut document = v2.clone();
+    document["browser"]["rates"]["callback"]["burst"] = 0.into();
+    cases.push((
+        document.to_string().into_bytes(),
+        "browser profile refused: login rate is outside its allowed range",
     ));
     for (bytes, category) in cases {
         let path = dir.write("synthetic-secret.json", &bytes);

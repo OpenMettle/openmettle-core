@@ -86,3 +86,28 @@ pub fn document(dir: &Dir, bundle: &[u8]) -> Value {
         }]
     })
 }
+
+/// A valid version-2 document: [`document`] plus a browser profile for its provider, whose
+/// registered callback is `https://app.example.test/callback`. Every number is distinct.
+pub fn document_v2(dir: &Dir, bundle: &[u8]) -> Value {
+    let mut document = document(dir, bundle);
+    document["version"] = json!(2);
+    document["browser"] = json!({
+        "provider_id": "0b5c6f4e-2a1d-4c3b-9e8f-7a6b5c4d3e2f",
+        "origin": "https://app.example.test",
+        "landing_path": "/home",
+        "paths": {
+            "initiation": "/auth/login",
+            "session_check": "/auth/session",
+            "logout": "/auth/logout"
+        },
+        "rates": {
+            "initiation": {"burst": 20, "interval_milliseconds": 500},
+            "callback": {"burst": 21, "interval_milliseconds": 501},
+            "session_check": {"burst": 120, "interval_milliseconds": 100},
+            "logout": {"burst": 22, "interval_milliseconds": 502}
+        },
+        "max_in_flight": 64
+    });
+    document
+}

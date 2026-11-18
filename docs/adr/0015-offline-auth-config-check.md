@@ -42,6 +42,10 @@ Kubernetes qualification fixtures pass no arguments.
 
 ## Document
 
+> [ADR 0020](0020-browser-routing-profile.md) adds version 2: this shape plus one required
+> browser-routing profile. Version 1 below is unchanged and still accepted. Where this
+> record says the version must be `1`, read "must be `1` or `2`".
+
 One JSON shape, version 1. The values below are synthetic and illustrate the format only;
 no operational value is recommended or selected by this record.
 
@@ -193,7 +197,7 @@ or in `AuthConfig`'s `Debug`.
 | configuration is not a readable regular file within bounds | Missing, unreadable, non-regular or over 1 MiB |
 | configuration is not valid JSON | Syntax, encoding, trailing data or nesting depth |
 | configuration repeats a field | A repeated member name at any depth |
-| configuration version is missing or unsupported | Root is not an object, or `version` is not `1` |
+| configuration version is missing or unsupported | Root is not an object, or `version` is not `1` (or `2`, ADR 0020) |
 | configuration lacks a required field | Any absent member |
 | configuration has an unknown field | Any extra member |
 | a configuration field has the wrong type or keyword | Wrong JSON type, non-integer number, unknown `roots` |
