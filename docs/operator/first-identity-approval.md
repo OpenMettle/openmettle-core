@@ -127,9 +127,18 @@ other tables, exact matching with case, space and apostrophe variants, every ref
 refusals of repeated and extended attempts, and real lock waits for concurrent creators,
 user disablement, provider revisions and expiry. The suite also checks a provider created
 between the lock attempt and the authority read, and high-bit subject bytes on SQL_ASCII.
-The operator tests do not exercise session issuance. The
-managed-session tests in `provider_keys::tests::postgres::sessions` show that an approval
-admits an identity; those tests insert approvals directly.
+These operator tests do not exercise session issuance.
+
+`provider_keys::tests::postgres::sessions::first_approval_script_admits_existing_identity_to_its_personal_scope`
+is intended to cover the path from this script to a session. It seeds an enabled user,
+identity and personal scope without an approval. It checks that managed login is rejected
+and creates no session. It then runs the unchanged script with the same psql and checks the
+success line. A fresh managed login must then issue and validate a session for the original
+user and personal scope, which references the inserted approval. Users, identities, scopes
+and grant assignments must stay unchanged. CI selects it in the managed login step,
+`cargo test --locked --offline --lib provider_keys::tests::postgres -- --ignored --skip provider_keys::tests::postgres::browser::`,
+with `TEST_DATABASE_URL` and `POSTGRES_CONTAINER`. Check that job's result before relying on
+this test as evidence. The other managed-session tests insert approvals directly.
 
 Not provided: identity linking, account or scope provisioning, bulk approval, an API, a
 default expiry, or qualification against a real or restored database.

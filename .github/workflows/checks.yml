@@ -116,11 +116,13 @@ jobs:
           V6_BINARY_DIR: ${{ runner.temp }}/openmettle-v6/target/debug
           TEST_DATABASE_URL: postgres://fixture:fixture@127.0.0.1:5432/fixture?sslmode=disable
       # Explicit module filter: runs only the managed-login PostgreSQL tests, never the
-      # ignored provider_http proxy child fixture.
+      # ignored provider_http proxy child fixture. POSTGRES_CONTAINER runs the exact ADR 0013
+      # first-approval script with the pinned service psql.
       - name: PostgreSQL managed login authority integration
         run: |
           cargo test --locked --offline --lib provider_keys::tests::postgres -- --ignored --skip provider_keys::tests::postgres::browser::
         env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
           TEST_DATABASE_URL: postgres://fixture:fixture@127.0.0.1:5432/fixture?sslmode=disable
       - name: Chrome cross-site session qualification
         timeout-minutes: 3

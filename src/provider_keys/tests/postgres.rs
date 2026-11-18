@@ -759,4 +759,6 @@ mod admission;
 mod browser;
 mod handoff;
 mod pooled;
+#[path = "../../../tests/support/psql.rs"]
+mod psql;
 mod sessions;

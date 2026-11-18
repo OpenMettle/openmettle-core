@@ -3,6 +3,8 @@
 //! with the pinned service image's psql through `POSTGRES_CONTAINER`, as in the image checks.
 use super::*;
 use std::collections::BTreeSet;
+#[path = "../support/psql.rs"]
+mod psql_transport;
 
 const LIMIT_SCRIPT: &str = include_str!("../../docs/operator/login-admission-limit.psql");
 const CLEANUP_SCRIPT: &str = include_str!("../../docs/operator/login-gate-cleanup.psql");
@@ -59,35 +61,7 @@ fn psql_spawn(db: &TestDb, script: &str, variables: &[(&str, &str)]) -> Child {
     child
 }
 fn psql_start(db: &TestDb, variables: &[(&str, &str)]) -> Child {
-    let container =
-        std::env::var("POSTGRES_CONTAINER").expect("isolated CI PostgreSQL container ID required");
-    let mut command = Command::new("docker");
-    command.args([
-        "exec",
-        "-i",
-        "-e",
-        &format!("PGPASSWORD={PASSWORD}"),
-        &container,
-        "psql",
-        "-X",
-        "-q",
-        "-h",
-        "127.0.0.1",
-        "-U",
-        OWNER,
-        "-d",
-        &db.0,
-    ]);
-    for (name, value) in variables {
-        command.args(["-v", &format!("{name}={value}")]);
-    }
-    command
-        .args(["-f", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap()
+    psql_transport::start(&db.0, OWNER, PASSWORD, variables)
 }
 async fn limit_row(db: &TestDb) -> (Option<i32>, String, String) {
     sqlx::query_as(
