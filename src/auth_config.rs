@@ -30,8 +30,8 @@ use std::{
 };
 
 /// The original document: login, token, refresh, session and provider settings.
-pub const VERSION_1: u64 = 1;
-/// [`VERSION_1`] plus one required browser-routing profile (ADR 0020).
+pub const VERSION: u64 = 1;
+/// [`VERSION`] plus one required browser-routing profile (ADR 0020).
 pub const VERSION_2: u64 = 2;
 /// Maximum serialized document size, applied before parsing.
 pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
@@ -224,6 +224,7 @@ impl Provider {
 ///
 /// Only [`load`] returns one, inside [`AuthConfig`], after the handoff's and router's own
 /// settings checks accepted it. It holds settings only: no route, listener or admission state.
+#[derive(Clone)]
 pub struct BrowserProfile {
     provider_id: String,
     origin: String,
@@ -345,7 +346,7 @@ impl Document {
         // Version first: another version's fields must not be reported as shape errors.
         let mut root = Object::new(value).map_err(|_| Error::Version)?;
         let version = match root.take("version").ok().and_then(|v| v.as_u64()) {
-            Some(version @ (VERSION_1 | VERSION_2)) => version,
+            Some(version @ (VERSION | VERSION_2)) => version,
             _ => return Err(Error::Version),
         };
         let mut login = root.object("login")?;

@@ -151,6 +151,7 @@ const USAGE: &str = "usage error: expected no arguments or --check-auth-config P
 /// version 1 and for version 2 with its browser-routing profile.
 #[test]
 fn auth_config_check_succeeds_offline_without_serving_settings() {
+    assert_eq!(openmettle_core::auth_config::VERSION, 1);
     let dir = auth_config_support::Dir::new();
     let bundle = ca::Ca::new().pem();
     let v1 = auth_config_support::document(&dir, &bundle);

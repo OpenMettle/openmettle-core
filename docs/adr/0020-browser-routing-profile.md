@@ -126,11 +126,10 @@ refusals come first. No path, origin, UUID, URL or value appears in output, `Dis
 ### Validated state
 
 `AuthConfig::browser()` returns the `BrowserProfile` for version 2 and `None` for version 1.
-Its `Debug` output is `BrowserProfile(..)`. `handoff()`, `router()` and `sessions()` return
-the existing `handoff::Settings`, `router::Settings` and `router::SessionSettings`. A later
-startup increment can pass them to `LoginHandoff::new` and `router_with_sessions`, which
-repeat the same checks. The profile holds settings only: no budget state, permit, route or
-task.
+Its `Debug` output is `BrowserProfile(..)`. A caller can clone the profile before moving
+`AuthConfig` into `BrowserAuth`. `handoff()`, `router()` and `sessions()` return the settings
+for `LoginHandoff::new` and `router_with_sessions`. Both constructors repeat the checks.
+The profile holds settings only.
 
 ## What a successful check does not establish
 
@@ -149,9 +148,9 @@ All limits in ADR 0015 apply. In addition, the check does not show that:
 - Version-1 documents are accepted and refused exactly as before, and yield no profile.
 - **Behaviour change:** a document with `"version": 2` was refused as unsupported and is
   now judged as version 2. A version-1 body labelled `2` reports a missing field.
-- **API change:** the public constant `auth_config::VERSION` is replaced by `VERSION_1` and
-  `VERSION_2`. New public items: `BrowserProfile`, `AuthConfig::browser` and the
-  `Error::BrowserHandoff` and `Error::BrowserRouter` categories.
+- `auth_config::VERSION` still identifies version 1. `VERSION_2` identifies the new shape.
+  New public items include `BrowserProfile`, `AuthConfig::browser`, `Error::BrowserHandoff`
+  and `Error::BrowserRouter`.
 - No dependency, Cargo feature, lockfile, migration (1–9 unchanged), process argument, serve
   flag, environment variable, HTTP or OpenAPI contract, image, CI workflow or provenance
   change.
@@ -166,9 +165,9 @@ Local, without PostgreSQL, network or provider:
   repeated and mistyped members; provider, origin, callback and landing refusals; path,
   collision, budget and in-flight refusals at and beyond each bound, for every route;
   refusal order; and redaction.
-- The same filter's parity test builds `LoginHandoff::new` and `router_with_sessions` from
-  the same providers over a lazy pool that never connects. For success and each of the nine
-  categories, the loader and the constructors return the same outcome.
+- The same filter tests building a router from the profile returned by the v2 loader.
+  It also compares the loader and constructor outcomes for success and all nine settings
+  refusal categories. The lazy pool never connects.
 - `cargo test --locked --offline --test runtime` runs the built API binary with no
   `OPENMETTLE_*` or `PG*` variables. Versions 1 and 2 succeed while serving settings are
   unusable and the listener address is occupied. Refusals print one fixed line with exit 78.

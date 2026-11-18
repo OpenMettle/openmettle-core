@@ -1033,17 +1033,27 @@ async fn offline_outcomes_match_the_handoff_and_router_constructors() {
             .port(9)
             .username("fixture"),
     );
+    let build_routes = |config, profile: &BrowserProfile| -> Result<(), Error> {
+        let auth = Arc::new(BrowserAuth::new(config, pool.clone()));
+        let handoff = LoginHandoff::new(auth, profile.handoff()).map_err(Error::BrowserHandoff)?;
+        router_with_sessions(handoff, profile.router(), profile.sessions())
+            .map(drop)
+            .map_err(Error::BrowserRouter)
+    };
+
+    // Compose the router from the profile the loader returned. Keep the checked
+    // settings while BrowserAuth takes ownership of the rest of the configuration.
+    let config = fixture.load().unwrap();
+    let profile = config.browser().unwrap().clone();
+    assert_eq!(build_routes(config, &profile), Ok(()));
+
     let constructors = |document: &Value| -> Result<(), Error> {
         let profile = BrowserProfile::parse(document["browser"].clone()).unwrap();
         let mut v1 = document.clone();
         v1["version"] = json!(1);
         v1.as_object_mut().unwrap().remove("browser");
         let config = fixture.load_bytes(v1.to_string().as_bytes()).unwrap();
-        let auth = Arc::new(BrowserAuth::new(config, pool.clone()));
-        let handoff = LoginHandoff::new(auth, profile.handoff()).map_err(Error::BrowserHandoff)?;
-        router_with_sessions(handoff, profile.router(), profile.sessions())
-            .map(drop)
-            .map_err(Error::BrowserRouter)
+        build_routes(config, &profile)
     };
     let mut outcomes = HashSet::new();
     for (pointer, value) in [

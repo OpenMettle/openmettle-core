@@ -423,7 +423,7 @@ pub(crate) fn check(
 }
 
 impl LoginHandoff {
-    /// Validates the settings against the service's configuration with [`check`].
+    /// Validates the settings against the service's configuration using the offline checks.
     pub fn new(auth: Arc<BrowserAuth>, settings: Settings<'_>) -> Result<Self, SettingsError> {
         Ok(Self {
             settings: check(auth.config.providers(), settings)?,
