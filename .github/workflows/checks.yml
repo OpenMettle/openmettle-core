@@ -32,8 +32,9 @@ jobs:
   rust:
     name: Rust runtime
     runs-on: ubuntu-24.04
-    # Ten authentic prior-release builds run serially (~70-90 s each); keep headroom over the warm run.
-    timeout-minutes: 25
+    # Ten authentic prior-release builds run serially (~70-90 s each). A cold run (cache key
+    # change) was projected at 20-24 min; keep headroom so a near-miss is not a wasted run.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
