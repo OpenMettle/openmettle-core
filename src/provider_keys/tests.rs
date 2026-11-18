@@ -82,6 +82,9 @@ impl Harness {
         Self::with_policy(policy()).await
     }
     async fn with_policy(policy: RefreshPolicy) -> Self {
+        Self::with_endpoints(policy, signing::AUTH, signing::CALLBACK).await
+    }
+    async fn with_endpoints(policy: RefreshPolicy, authorization: &str, callback: &str) -> Self {
         let ca = tls::Ca::new();
         let script = Arc::new(Mutex::new(Script {
             gate: Arc::default(),
@@ -99,6 +102,7 @@ impl Harness {
             ),
         }));
         let data = script.clone();
+        let registered_callback = callback.to_owned();
         let server=tls::Server::start(ca.leaf(tls::HOST,false),move |request|{
             let s=data.lock().unwrap();
             let discovery=request.head.starts_with("GET /discovery ");let jwks=request.head.starts_with("GET /jwks ");
@@ -108,8 +112,13 @@ impl Harness {
             if !discovery && !jwks {
                 assert!(request.head.starts_with("POST /token "));
                 let params:HashMap<String,String>=openidconnect::url::form_urlencoded::parse(&request.body).into_owned().collect();
-                assert_eq!(params["code"],"synthetic-code");
-                match &s.challenge {Some(c)=>assert_eq!(&URL_SAFE_NO_PAD.encode(Sha256::digest(params["code_verifier"].as_bytes())),c),None=>assert_eq!(params["code_verifier"],"v".repeat(43))}assert_eq!(params["client_id"],signing::CLIENT);assert_eq!(params["redirect_uri"],signing::CALLBACK);
+                assert!(params["code"] == "synthetic-code", "authorization code mismatch");
+                let verifier = &params["code_verifier"];
+                match &s.challenge {
+                    Some(challenge) => assert!(URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())) == *challenge, "PKCE mismatch"),
+                    None => assert!(*verifier == "v".repeat(43), "fixture verifier mismatch"),
+                }
+                assert!(params["client_id"] == signing::CLIENT && params["redirect_uri"] == registered_callback, "client binding mismatch");
                 let bytes=tls::json(&serde_json::to_vec(&json!({"access_token":"synthetic-access","token_type":"Bearer","id_token":s.token})).unwrap());
                 return if s.mode=="gate-post" {tls::Reply::Gate(s.gate.clone(),bytes)} else {tls::Reply::Bytes(bytes)};
             }
@@ -133,7 +142,7 @@ impl Harness {
                     - Duration::from_secs(w.unsigned_abs()),
             }
         }));
-        let config = Self::config(&server, &ca, "v1");
+        let config = Self::endpoint_config(&server, &ca, "v1", authorization, callback);
         script.lock().unwrap().metadata = metadata(&config);
         let provider = manager.register(config).unwrap();
         Self {
@@ -147,14 +156,23 @@ impl Harness {
         }
     }
     fn config(server: &tls::Server, ca: &tls::Ca, revision: &str) -> ProviderConfig {
+        Self::endpoint_config(server, ca, revision, signing::AUTH, signing::CALLBACK)
+    }
+    fn endpoint_config(
+        server: &tls::Server,
+        ca: &tls::Ca,
+        revision: &str,
+        authorization: &str,
+        callback: &str,
+    ) -> ProviderConfig {
         let base = format!("https://{}:{}", tls::HOST, server.port);
         let mut c = ProviderConfig::new(
             ProviderIdentity::new(signing::ID, signing::ISSUER, signing::CLIENT).unwrap(),
             login::ProviderDefinition {
                 revision,
-                authorization_endpoint: signing::AUTH,
+                authorization_endpoint: authorization,
                 token_endpoint: &format!("{base}/token"),
-                callback: signing::CALLBACK,
+                callback,
                 destination: "home",
                 enabled: true,
             },

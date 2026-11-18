@@ -54,19 +54,22 @@ pub struct Server {
     /// Signalled when the client closes a stalled connection.
     pub closed: Arc<Notify>,
 }
+pub fn acceptor(identity: Identity) -> tokio_rustls::TlsAcceptor {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(identity.chain, identity.key)
+        .unwrap();
+    tokio_rustls::TlsAcceptor::from(Arc::new(config))
+}
 impl Server {
     pub async fn start(
         identity: Identity,
         script: impl Fn(&Received) -> Reply + Send + Sync + 'static,
     ) -> Self {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let config = rustls::ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(identity.chain, identity.key)
-            .unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let acceptor = acceptor(identity);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server = Self {
             port: listener.local_addr().unwrap().port(),
