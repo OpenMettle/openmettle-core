@@ -811,7 +811,7 @@ impl ManagedProvider {
                 issuer,
                 client,
                 revision: &config.revision,
-                subject: identity.subject(),
+                assertion: &exchanged.assertion,
                 epoch: exchanged.epoch,
                 login,
                 login_expiry: *login_expiry,

@@ -62,6 +62,7 @@ struct Script {
     keys: Vec<u8>,
     cache: String,
     metadata_cache: String,
+    date: std::time::SystemTime,
     mode: &'static str,
     token: String,
     // PKCE challenge from a real managed begin; None keeps the fixed fixture verifier.
@@ -92,6 +93,7 @@ impl Harness {
             keys: signing::jwks(),
             cache: "max-age=100".into(),
             metadata_cache: "max-age=100".into(),
+            date: signing::now(),
             mode: "ok",
             challenge: None,
             token: signing::signed(
@@ -124,7 +126,7 @@ impl Harness {
             }
             assert!(request.body.is_empty());
             let body=if discovery {serde_json::to_vec(&s.metadata).unwrap()}else{s.keys.clone()};
-            let bytes=tls::response(200,&[("content-type","application/json"),("cache-control",if discovery {&s.metadata_cache}else{&s.cache}),("date",&httpdate::fmt_http_date(signing::now()))],&body);
+            let bytes=tls::response(200,&[("content-type","application/json"),("cache-control",if discovery {&s.metadata_cache}else{&s.cache}),("date",&httpdate::fmt_http_date(s.date))],&body);
             if jwks && s.mode=="gate-jwks" {tls::Reply::Gate(s.gate.clone(),bytes)} else {tls::Reply::Bytes(bytes)}
         }).await;
         let manager = ProviderManager::new(policy);
@@ -265,6 +267,36 @@ async fn cold_start_and_one_post_with_unknown_key_refresh() {
     assert!(h.verify(false).await.is_err());
     assert_eq!(h.count(), 5);
     assert!(h.verify(true).await.is_ok());
+}
+#[tokio::test]
+async fn managed_exchange_preserves_signed_membership_and_never_resolves_overage() {
+    use crate::membership::Observation::{Partial, Present};
+    let h = Harness::new().await;
+    h.provider.preflight().await.unwrap();
+    for (claims, decision) in [
+        (json!({"groups":["team"]}), Present),
+        (
+            json!({"groups":["team"],"_claim_sources":{"src1":{"endpoint":"https://unused.example.test"}}}),
+            Partial,
+        ),
+    ] {
+        h.script.lock().unwrap().token =
+            signing::membership_token("synthetic-subject", &"n".repeat(43), 1799999990, claims);
+        let proof = h
+            .permit()
+            .exchange_with_keys(&h.provider, &auth::Policy::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            proof.assertion.membership.select("group", "groups", "team"),
+            decision
+        );
+        assert_eq!(
+            finish_in_memory(&h.provider, proof).unwrap().subject(),
+            "synthetic-subject"
+        );
+    }
+    assert_eq!(h.count(), 4); // Discovery, JWKS, and one token POST per permit.
 }
 #[tokio::test]
 async fn successful_replacements_retire_removed_and_noncacheable_keys() {

@@ -83,6 +83,8 @@ contract (relation, role, privilege) AS (
     ) AS sessions(relation) WHERE $1 >= 8
     UNION ALL
     SELECT 'login_admission', 'openmettle_api', 'SELECT' WHERE $1 >= 9
+    UNION ALL
+    SELECT 'membership_observations', 'openmettle_api', 'SELECT' WHERE $1 >= 11
 ),
 column_contract (relation, attribute, role, privilege) AS (
     VALUES ('users', 'disabled_at', 'openmettle_api', 'UPDATE')
@@ -101,6 +103,10 @@ column_contract (relation, attribute, role, privilege) AS (
         ('local_sessions','approval_generation','INSERT'), ('local_sessions','user_generation','INSERT'),
         ('local_sessions','created_ms','INSERT'), ('local_sessions','expires_ms','INSERT')
     ) AS sessions(relation,attribute,privilege) WHERE $1 >= 8
+    UNION ALL
+    SELECT 'membership_observations', attribute, 'openmettle_api', 'UPDATE'
+    FROM (VALUES ('issued_ms'),('expires_ms'),('observation'),('epoch'),('approval_generation'),('user_generation')) AS m(attribute)
+    WHERE $1 >= 11
     UNION ALL
     SELECT 'login_admission', 'lock_guard', 'openmettle_api', 'UPDATE' WHERE $1 >= 9
     UNION ALL

@@ -180,7 +180,7 @@ async fn finish<T>(tx: WriteTransaction<'_>, result: Result<T, Error>) -> Result
         }
     }
 }
-async fn now(c: &mut PgConnection) -> Result<i64, Error> {
+pub(crate) async fn now(c: &mut PgConnection) -> Result<i64, Error> {
     Ok(
         sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
             .fetch_one(c)
@@ -193,7 +193,7 @@ pub(crate) struct Issuance<'a> {
     pub issuer: &'a str,
     pub client: &'a str,
     pub revision: &'a str,
-    pub subject: &'a str,
+    pub assertion: &'a crate::auth::VerifiedAssertion,
     pub epoch: i64,
     pub login: &'a str,
     pub login_expiry: i64,
@@ -223,7 +223,7 @@ pub(crate) async fn issue(
         let provider_generation: i64 = sqlx::query_scalar("SELECT access_generation FROM openmettle.login_providers WHERE id=$1::uuid")
             .bind(input.provider).fetch_one(tx.connection()?).await?;
         let identity = sqlx::query("SELECT id::text,user_id::text FROM openmettle.user_identities WHERE issuer=$1 AND subject=$2")
-            .bind(input.issuer).bind(input.subject).fetch_optional(tx.connection()?).await?.ok_or(Error::Rejected)?;
+            .bind(input.issuer).bind(input.assertion.identity().subject()).fetch_optional(tx.connection()?).await?.ok_or(Error::Rejected)?;
         let identity_id: String = identity.try_get("id")?;
         let user: String = identity.try_get("user_id")?;
         let approval: String = sqlx::query_scalar("SELECT id::text FROM openmettle.local_identity_approvals WHERE provider_id=$1::uuid AND identity_id=$2::uuid FOR SHARE")
@@ -241,6 +241,11 @@ pub(crate) async fn issue(
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM openmettle.local_sessions WHERE user_id=$1::uuid")
             .bind(&user).fetch_one(tx.connection()?).await?;
         if count >= policy.retained_limit { return Err(Error::Capacity); }
+        let membership_expiry = crate::membership::reconcile(&mut tx, crate::membership::Subject {
+            approval: &approval, user: &user, epoch,
+            approval_generation: a.try_get("access_generation")?,
+            user_generation: u.try_get("session_generation")?,
+        }, input.assertion, input.login).await?;
         let expiry = timestamp.checked_add(policy.lifetime_ms).ok_or(Error::Configuration)?.min(approval_expiry);
         let (id, credential, hash) = create_with(|bytes| SystemRandom::new().fill(bytes).map_err(|_| Error::Random))?;
         sqlx::query("INSERT INTO openmettle.local_sessions (id,secret_hash,login_id,provider_id,identity_id,approval_id,user_id,issued_client,issued_epoch,issued_revision,provider_generation,approval_generation,user_generation,created_ms,expires_ms) VALUES ($1,$2,$3,$4::uuid,$5::uuid,$6::uuid,$7::uuid,$8,$9,$10,$11,$12,$13,$14,$15)")
@@ -251,7 +256,7 @@ pub(crate) async fn issue(
         sqlx::query("UPDATE openmettle.login_transactions SET session_issued=true WHERE id=$1")
             .bind(input.login).execute(tx.connection()?).await?;
         let final_time = now(tx.connection()?).await?;
-        if final_time < timestamp || final_time >= expiry || final_time >= approval_expiry || final_time >= input.login_expiry { return Err(Error::Rejected); }
+        if membership_expiry.is_some_and(|expiry| final_time >= expiry) || final_time < timestamp || final_time >= expiry || final_time >= approval_expiry || final_time >= input.login_expiry { return Err(Error::Rejected); }
         check()?;
         Ok(credential)
         }.await;
