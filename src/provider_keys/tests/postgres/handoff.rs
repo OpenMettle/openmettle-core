@@ -1,12 +1,17 @@
 //! The browser login handoff (ADR 0017) through the pooled service: one form POST to one
-//! session cookie, with the fixture TLS provider. Isolated CI PostgreSQL 18 only.
+//! session cookie, with the fixture TLS provider, called directly and then through the
+//! bounded router over loopback HTTP (ADR 0018). Isolated CI PostgreSQL 18 only.
 use super::super::handoff::{
     BINDING_REFUSED, LOGIN_REFUSED, ORIGIN, RESPONSE_REFUSED, refused, request, settings,
 };
+use super::super::router::{head, limits, send, serve};
 use super::pooled::{one_slot, posts, service_over};
 use super::sessions::seed;
 use super::*;
-use crate::browser_auth::handoff::{LOGIN_COOKIE, LoginHandoff, SESSION_COOKIE};
+use crate::browser_auth::{
+    handoff::{LOGIN_COOKIE, LoginHandoff, SESSION_COOKIE},
+    router::{Rate, Settings, router},
+};
 use axum::http::{Response, StatusCode, header};
 
 const ATTRIBUTES: &str = "; Path=/; Secure; HttpOnly; SameSite=Lax";
@@ -151,4 +156,93 @@ async fn form_post_becomes_one_session_cookie_and_stale_or_replayed_callbacks_se
         .await
         .unwrap();
     assert_eq!(sessions, 1);
+
+    // The same handoff through the bounded router and actual Axum dispatch over loopback
+    // HTTP. The budgets admit one initiation and two callbacks (the login and its replay),
+    // so the next request on each route is refused before any provider or database work.
+    let hour = Duration::from_secs(3600);
+    let bounded = Settings {
+        begin: Rate {
+            burst: 1,
+            interval: hour,
+        },
+        callback: Rate {
+            burst: 2,
+            interval: hour,
+        },
+        in_flight: 1,
+        ..limits()
+    };
+    let handoff = LoginHandoff::new(auth.clone(), settings()).unwrap();
+    let address = serve(router(handoff, bounded).unwrap()).await;
+    let form = head(
+        "POST",
+        "/login",
+        &[
+            ("origin", ORIGIN),
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("content-length", "0"),
+        ],
+    );
+    let redirect = |reply: &super::super::router::Reply| {
+        assert_eq!((reply.status, reply.body.as_str()), (303, ""));
+        assert_eq!(reply.one("cache-control"), "no-store");
+        assert_eq!(reply.one("referrer-policy"), "no-referrer");
+        (
+            reply.one("location").to_owned(),
+            reply.one("set-cookie").to_owned(),
+        )
+    };
+    let (authorization_url, set_cookie) = redirect(&send(address, &form).await);
+    let url = openidconnect::url::Url::parse(&authorization_url).unwrap();
+    let parameters: HashMap<String, String> = url.query_pairs().into_owned().collect();
+    assert_eq!(parameters["redirect_uri"], signing::CALLBACK);
+    let cookie = set_cookie
+        .strip_suffix(&format!("; Max-Age=300{ATTRIBUTES}"))
+        .expect("caller cookie attributes")
+        .to_owned();
+    let routed = Attempt {
+        authorization_url,
+        state: parameters["state"].clone(),
+        cookie,
+    };
+    assert!(routed.cookie.starts_with(&format!("{LOGIN_COOKIE}=")));
+    assert_eq!(f.rows().await, 3);
+    send(address, &form)
+        .await
+        .refused(429, "login rate limit reached; try again later\n");
+    assert_eq!(f.rows().await, 3);
+
+    f.arm_url(&routed.authorization_url);
+    let target = format!(
+        "/callback?code=synthetic-code&state={}&iss=https%3A%2F%2Fissuer.example.test%2Frealm",
+        routed.state
+    );
+    let navigation = head("GET", &target, &[("cookie", &routed.cookie)]);
+    let (landing, set_cookie) = redirect(&send(address, &navigation).await);
+    assert_eq!(landing, "https://app.example.test/app");
+    let routed_credential = set_cookie
+        .strip_prefix(&format!("{SESSION_COOKIE}="))
+        .and_then(|rest| rest.strip_suffix(ATTRIBUTES))
+        .expect("session cookie name and attributes");
+    assert_eq!(posts(&f), 2);
+    assert_eq!(
+        auth.validate(routed_credential).await.unwrap().user_id(),
+        user
+    );
+    assert!(consumed(&mut f, &routed).await);
+    // Replay through the router: the handoff's refusal, no token request, no cookie.
+    send(address, &navigation).await.refused(403, LOGIN_REFUSED);
+    // The callback budget is spent: refused before the handoff.
+    send(address, &navigation)
+        .await
+        .refused(429, "login rate limit reached; try again later\n");
+    assert_eq!(posts(&f), 2);
+    auth.validate(credential).await.unwrap();
+    auth.validate(routed_credential).await.unwrap();
+    let sessions: i64 = sqlx::query_scalar("SELECT count(*) FROM openmettle.local_sessions")
+        .fetch_one(&mut f.owner)
+        .await
+        .unwrap();
+    assert_eq!(sessions, 2);
 }

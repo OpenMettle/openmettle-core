@@ -1,6 +1,6 @@
 # OpenMettle core
 
-Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures, but no `/v1` route serves it. Internal managed login, an owner-configured outstanding-login cap, local identity approval and opaque-session primitives are implemented, with an offline check for mounted browser-auth settings that the running API does not load yet, an internal pooled browser-auth service that no process constructs yet, and an unmounted same-origin browser login handoff over it. No product API, upload service, request authentication, per-user authorization or GPU orchestration is exposed. Runtime qualification and deployment acceptance remain separate gates.
+Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures, but no `/v1` route serves it. Internal managed login, an owner-configured outstanding-login cap, local identity approval and opaque-session primitives are implemented, with an offline check for mounted browser-auth settings that the running API does not load yet, an internal pooled browser-auth service that no process constructs yet, and an unmounted Axum router for the same-origin browser login handoff. No product API, upload service, request authentication, per-user authorization or GPU orchestration is exposed. Runtime qualification and deployment acceptance remain separate gates.
 
 ## Start here
 
@@ -93,8 +93,9 @@ The nonce verifier accepts stored digests without weakening the existing token c
 
 Native handoff and account creation remain unimplemented; the browser cookie handoff below is
 not mounted. Key files are read only by the offline check below. Internal local approval and sessions are described below. The outstanding-login
-cap below is not a rate limit; public exposure remains blocked on request/rate/concurrency
-controls, operated cleanup and retired-key reservation reclamation. After database restore, invalidate pending login transactions and
+cap below is not a rate limit. The unmounted login router below adds per-process request,
+rate and concurrency bounds; public exposure remains blocked on runtime enablement, ingress
+transport limits, operated cleanup and retired-key reservation reclamation. After database restore, invalidate pending login transactions and
 rotate the active login encryption key before any encryption; never resume restored logins.
 These are deployment requirements, not provided recovery commands. Lost/ambiguous logins
 restart rather than retrying single-use authorization codes.
@@ -336,10 +337,50 @@ until expiry or revocation.
 Before any exposure these remain outstanding: browser qualification; trusted ingress
 routing for the application origin and redaction of request targets and cookies in
 telemetry; session validation and logout handlers with CSRF protection for unsafe methods;
-request, rate and concurrency controls; operated cleanup and retired-key reservation
-reclamation; and runtime enablement. `cargo test --locked --offline --lib handoff` runs the
-tests that need no database; the end-to-end test runs only in isolated CI under the existing
+ingress transport limits; operated cleanup and retired-key reservation reclamation; and
+runtime enablement. The router below supplies per-process request, rate and concurrency
+bounds. `cargo test --locked --offline --lib handoff` runs the tests that need no database;
+the end-to-end test runs only in isolated CI under the existing
 `provider_keys::tests::postgres` filter.
+
+## Bounded browser login router
+
+[ADR 0018](docs/adr/0018-bounded-login-router.md) adds `src/browser_auth/router.rs`, which
+builds an Axum router over the handoff above. **It is not mounted**: no process constructs
+it, and the API and worker still serve `/healthz` and `/readyz` only.
+
+It routes two exact literal paths: an explicit initiation path for the form `POST`, and the
+provider's registered callback path for `GET`. Both are validated before any route is
+built. Route syntax, escapes, dot or empty segments, a shared path and `/healthz` or
+`/readyz` are refused with fixed categories, never a panic. Any other method, including
+`HEAD`, is `405` and reaches no login work.
+
+Every other setting is explicit, with no defaults: a rate budget for initiations, a separate
+one for callbacks (burst and refill interval each) and one in-flight cap shared by both
+routes. The ranges in ADR 0018 are implementation ceilings, not operating values. Requests
+are decided in this order, and the first four steps do no provider, pool or database work:
+
+1. Method (`405`).
+2. Request bounds measured after HTTP parsing: a target of at most 33 792 bytes (`414`), at
+   most 64 header fields and 24 576 header bytes (`431`), and an empty body (`413`). The body
+   is judged from its metadata and never read, so a nonzero declared length or chunked body
+   is refused without waiting for it. The handoff's query and cookie ceilings still fit and still apply.
+3. An in-flight permit, without waiting (`503`, `login busy; try again later`).
+4. One unit of the route's rate budget (`429`). A unit is spent here, before the handoff
+   decides, and is never refunded. Earlier refusals spend nothing.
+5. The handoff, with the original request head. A dropped request releases its permit.
+
+These refusals are fixed lines with `no-store`, `no-referrer`, no cookie and no `Location`.
+Mount the router with `Router::merge`, never `Router::nest`, and keep ingress from
+rewriting the path.
+
+The bounds hold per router value and its clones in one process. They are not cluster-wide,
+fair between clients, durable across restarts or a limit on what the HTTP server reads
+while parsing a request head. Deployments still need ingress and server transport limits
+before exposure. `cargo test --locked --offline --lib browser_auth::router` and
+`cargo test --locked --offline --lib provider_keys::tests::router` run the local tests,
+which serve the router on loopback. The PostgreSQL handoff case also completes a login
+through the router, in isolated CI only.
 
 ## Schema migrations
 
