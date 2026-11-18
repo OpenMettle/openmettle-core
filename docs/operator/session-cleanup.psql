@@ -22,7 +22,7 @@
      WHERE s.revoked
         OR s.expires_ms <= floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
      ORDER BY s.id
-     LIMIT :batch
+     LIMIT (:'batch'::integer)
      FOR UPDATE OF s SKIP LOCKED
   ), deleted AS (
     DELETE FROM openmettle.local_sessions AS s USING candidates AS c

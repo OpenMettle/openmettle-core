@@ -1,14 +1,9 @@
 # Session and login-gate cleanup
 
-This procedure removes retained local session rows (ADR 0013) and then the login gates
-they referenced (ADR 0014). It runs two exact scripts, each in its own transaction, against
-the primary as `openmettle_owner` under deployment change control. Schema version 9 or later
-is required for the second script.
-
-This document and its scripts are the only supported cleanup procedure. There is no installed
-scheduler, default batch, retention period or audit archive. CI runs both scripts against
-synthetic data in an isolated PostgreSQL 18 service. That evidence does not approve running
-them against a real database.
+Use this procedure to free retained-session capacity and remove expired login gates.
+Connect to the primary database as `openmettle_owner` using your deployment’s approved
+connection settings. Session cleanup requires schema version 8 or later. Gate cleanup
+requires version 9 or later. Each script commits its own batch.
 
 ## What each script deletes
 
@@ -30,15 +25,14 @@ running the procedure.
 
 ## Run one cleanup pass
 
-Choose `batch` from 1 to 1000 for each invocation. The value bounds rows per transaction,
-not query cost, total run time or retained storage. Use `psql -X` so a `psqlrc` file cannot
-change the scripts' behaviour, and do not add `--single-transaction`. Supply the connection
-through your deployment's own credential handling; never put a password on the command line.
+From the repository root, set the shell variable `batch` to a decimal integer from 1 to
+1000. The commands require this value and ignore local `psqlrc` files. Run each in a
+fresh connection with the deployment's normal credential handling.
 
 1. Delete one batch of sessions:
 
    ```sh
-   psql -X -q -v batch=<1-1000> -f docs/operator/session-cleanup.psql
+   psql -X -q -v batch="${batch:?set batch to an integer from 1 to 1000}" -f docs/operator/session-cleanup.psql
    ```
 
    On success it exits 0 and prints one line:
@@ -47,7 +41,7 @@ through your deployment's own credential handling; never put a password on the c
 2. Only after step 1 exits 0, delete one batch of login gates in a separate transaction:
 
    ```sh
-   psql -X -q -v batch=<1-1000> -f docs/operator/login-gate-cleanup.psql
+   psql -X -q -v batch="${batch:?set batch to an integer from 1 to 1000}" -f docs/operator/login-gate-cleanup.psql
    ```
 
    It exits 0 and prints nothing on success.
@@ -63,14 +57,14 @@ skipped rather than awaited.
 
 | Situation | Result | Action |
 | --- | --- | --- |
-| Step 1 `batch` missing, empty, out of range, signed, zero-padded or not plain decimal | Exits non-zero with `session cleanup refused: batch must be 1-1000; nothing deleted`. No transaction starts. | Correct the value. |
+| Session script receives a missing, empty, out-of-range, signed, zero-padded or non-decimal `batch` | The script exits non-zero with `session cleanup refused: batch must be 1-1000; nothing deleted`. With the commands above, the shell reports a missing or empty variable before starting psql. | Correct the value. |
 | Step 2 `batch` invalid | Exits non-zero with nothing deleted. | Correct the value. |
 | Timeout or other SQL error in step 1 | Exits non-zero. The transaction rolls back and no session is deleted. | Investigate, then rerun step 1. |
 | Step 1 committed, then step 2 failed or was not run | The sessions are gone. Their gates remain with `session_issued` set. | Rerun step 2 later. Nothing else is needed. |
 | Step 2 run without step 1 | Only already unreferenced expired gates are removed. | None; it is safe. |
 | Connection lost while a script waits for `COMMIT` | The outcome is unknown; no success line is printed. | Rerun the same step. It selects whatever is eligible at that time. |
 | `<n>` equals `batch` | More eligible sessions may remain. | Run another batch. |
-| `<n>` is 0, or less than `batch` | No more rows were available to this batch. Locked rows may still be eligible. | Run a later batch. |
+| `<n>` is less than `batch`, including zero | The batch committed. Locked rows may still be eligible, and other sessions can expire later. | Resume at the next planned cleanup. |
 
 The interval between the steps is safe for replay. Issuance requires the original gate,
 consumed, without an issuance marker and before its original expiry. A retained gate with its

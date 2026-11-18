@@ -186,13 +186,12 @@ Session context does not grant resource access; V1-05 checks remain required bef
 Credentials are random opaque values; only domain-separated digests are stored. Lifetime,
 retained-row allowance and operation deadline are explicit bounded inputs with no deployment
 defaults. Issuance must finish before the originating login's existing expiry. A delayed commit
-can leave an undisclosed row but never returns a credential after failed final checks. Remove
-revoked and expired sessions, then the login gates they referenced, only with the
-[session and login-gate cleanup procedure](docs/operator/session-cleanup.md): two exact psql
-scripts in separate transactions, each an explicit 1–1000-row batch with `SKIP LOCKED`.
-Session cleanup deletes session rows only, so replay markers survive until the gate is
-removed. It never purges nonce reservations. No schedule, batch or retention value is
-selected, and CI evidence is not approval to run it against a real database.
+can leave an undisclosed row but never returns a credential after failed final checks.
+Operators can free retained-session capacity by deleting revoked or expired sessions, then
+remove expired login gates that no session references. Each step skips locked rows and commits a separate batch.
+The operator sets a limit of 1–1000 rows per batch. Session deletion
+preserves issuance markers and nonce reservations. See the
+[session and login-gate cleanup procedure](docs/operator/session-cleanup.md).
 
 There are no routes, native handoff, runtime loader, tenant/group qualification or reconciliation; the cookie handoff below is not mounted.
 Run the managed PostgreSQL tests only in isolated CI with the explicit module filter above;

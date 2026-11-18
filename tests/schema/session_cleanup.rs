@@ -75,9 +75,48 @@ async fn protected(db: &TestDb) -> Vec<BTreeSet<String>> {
 /// reservation) and one session per row. All values are synthetic and absolute.
 async fn seed(db: &TestDb, sessions: &[(&str, bool, i64, i64)]) {
     let mut owner = connect(&db.0, OWNER).await;
-    owner.execute(AssertSqlSafe(format!("INSERT INTO openmettle.login_providers(id,issuer,client_id,changed_by,change_reason) VALUES ('{PROVIDER}','https://cleanup.example.test','synthetic','fixture-owner','synthetic provider'); INSERT INTO openmettle.login_provider_revisions(provider_id,revision) VALUES ('{PROVIDER}','v1'); INSERT INTO openmettle.users(id) VALUES ('00000000-0000-0000-0000-0000000000a1'); INSERT INTO openmettle.user_identities(id,user_id,issuer,subject) VALUES ('00000000-0000-0000-0000-0000000000b1','00000000-0000-0000-0000-0000000000a1','https://cleanup.example.test','synthetic-subject'); INSERT INTO openmettle.local_identity_approvals(id,provider_id,identity_id,active,expires_ms,changed_by,change_reason) VALUES ('00000000-0000-0000-0000-0000000000c1','{PROVIDER}','00000000-0000-0000-0000-0000000000b1',true,{FUTURE},'fixture-owner','synthetic approval')"))).await.unwrap();
+    owner
+        .execute(AssertSqlSafe(format!(
+            "INSERT INTO openmettle.login_providers (id, issuer, client_id, changed_by, change_reason)
+                 VALUES ('{PROVIDER}', 'https://cleanup.example.test', 'synthetic', 'fixture-owner', 'synthetic provider');
+             INSERT INTO openmettle.login_provider_revisions (provider_id, revision)
+                 VALUES ('{PROVIDER}', 'v1');
+             INSERT INTO openmettle.users (id) VALUES ('00000000-0000-0000-0000-0000000000a1');
+             INSERT INTO openmettle.user_identities (id, user_id, issuer, subject)
+                 VALUES ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000a1',
+                         'https://cleanup.example.test', 'synthetic-subject');
+             INSERT INTO openmettle.local_identity_approvals
+                 (id, provider_id, identity_id, active, expires_ms, changed_by, change_reason)
+                 VALUES ('00000000-0000-0000-0000-0000000000c1', '{PROVIDER}', '00000000-0000-0000-0000-0000000000b1',
+                         true, {FUTURE}, 'fixture-owner', 'synthetic approval')"
+        )))
+        .await
+        .unwrap();
     for &(name, revoked, session_expiry, gate_expiry) in sessions {
-        sqlx::query("WITH r AS (INSERT INTO openmettle.login_nonce_reservations(key_id,nonce) VALUES ('fixture-v1',substring(sha256(convert_to($1,'UTF8')) FROM 1 FOR 12)) RETURNING key_id,nonce), g AS (INSERT INTO openmettle.login_transactions(id,binding,expires_ms,state_hash,nonce_hash,caller_hash,key_id,nonce,ciphertext,consumed,session_issued) SELECT $1,'\\x01'::bytea,$3,sha256(convert_to($1||':state','UTF8')),sha256(convert_to($1||':nonce','UTF8')),sha256(convert_to($1||':caller','UTF8')),key_id,nonce,NULL,true,true FROM r RETURNING id) INSERT INTO openmettle.local_sessions(id,secret_hash,login_id,provider_id,identity_id,approval_id,user_id,issued_client,issued_epoch,issued_revision,provider_generation,approval_generation,user_generation,created_ms,expires_ms,revoked) SELECT $2,sha256(convert_to($2,'UTF8')),g.id,$5::uuid,'00000000-0000-0000-0000-0000000000b1','00000000-0000-0000-0000-0000000000c1','00000000-0000-0000-0000-0000000000a1','synthetic',(SELECT max(epoch) FROM openmettle.login_provider_revisions),1,0,0,0,1,$4,$6 FROM g")
+        sqlx::query(
+            "WITH reservation AS (
+                 INSERT INTO openmettle.login_nonce_reservations (key_id, nonce)
+                 VALUES ('fixture-v1', substring(sha256(convert_to($1, 'UTF8')) FROM 1 FOR 12))
+                 RETURNING key_id, nonce
+             ), gate AS (
+                 INSERT INTO openmettle.login_transactions
+                     (id, binding, expires_ms, state_hash, nonce_hash, caller_hash,
+                      key_id, nonce, ciphertext, consumed, session_issued)
+                 SELECT $1, decode('01', 'hex'), $3, sha256(convert_to($1 || ':state', 'UTF8')),
+                        sha256(convert_to($1 || ':nonce', 'UTF8')), sha256(convert_to($1 || ':caller', 'UTF8')),
+                        key_id, nonce, NULL, true, true FROM reservation
+                 RETURNING id
+             )
+             INSERT INTO openmettle.local_sessions
+                 (id, secret_hash, login_id, provider_id, identity_id, approval_id, user_id,
+                  issued_client, issued_epoch, issued_revision, provider_generation, approval_generation,
+                  user_generation, created_ms, expires_ms, revoked)
+             SELECT $2, sha256(convert_to($2, 'UTF8')), gate.id, $5::uuid,
+                    '00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000c1',
+                    '00000000-0000-0000-0000-0000000000a1', 'synthetic',
+                    (SELECT epoch FROM openmettle.login_provider_revisions WHERE provider_id = $5::uuid),
+                    1, 0, 0, 0, 1, $4, $6 FROM gate",
+        )
             .bind(gate_id(name))
             .bind(session_id(name))
             .bind(gate_expiry)
