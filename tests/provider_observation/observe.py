@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+from urllib.request import parse_http_list
 
 # Must equal the production document request in src/provider_http.rs (checked by tests).
 ACCEPT = "application/json, application/jwk-set+json"
@@ -33,7 +34,7 @@ REQUEST_SECONDS = 20
 
 # Reads one HTTP/1.1 response from a socket opened by the provider image's own shell.
 # The request bytes arrive on stdin; the response is streamed to stdout unmodified.
-RELAY = "exec 3<>/dev/tcp/127.0.0.1/8080 || exit 97; cat <&3 & cat >&3; wait"
+RELAY = "exec 3<>/dev/tcp/127.0.0.1/8080 || exit 97; cat >&3 && exec cat <&3"
 
 MEDIA_TYPES = {"application/json", "application/jwk-set+json", "application/jwt"}
 CACHE_DIRECTIVES = {
@@ -64,8 +65,8 @@ class Failure(Exception):
 
 
 def request_bytes(path):
-    """Exactly Host and the production Accept header; no Connection, encoding or agent header."""
-    return f"GET {path} HTTP/1.1\r\nHost: {HOST}\r\nAccept: {ACCEPT}\r\n\r\n".encode("ascii")
+    """Use the production Accept value and request EOF after the single response."""
+    return f"GET {path} HTTP/1.1\r\nHost: {HOST}\r\nAccept: {ACCEPT}\r\nConnection: close\r\n\r\n".encode("ascii")
 
 
 class _Pipe:
@@ -80,29 +81,33 @@ class _Pipe:
 
 def exchange(argv, path, seconds=REQUEST_SECONDS):
     """Send one GET through `argv` and parse one bounded response. Redirects are never followed."""
-    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    watchdog = threading.Timer(seconds, proc.kill)
-    watchdog.start()
-    try:
+    deadline = time.monotonic() + seconds
+    with subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as proc:
+        watchdog = threading.Timer(seconds, proc.kill)
+        watchdog.start()
         try:
             proc.stdin.write(request_bytes(path))
             proc.stdin.close()
-        except OSError:
-            raise Failure("relay refused the request") from None
-        response = http.client.HTTPResponse(_Pipe(proc.stdout), method="GET")
-        try:
-            response.begin()
-            body = response.read(MAX_DOCUMENT_BYTES + 1)
+            with http.client.HTTPResponse(_Pipe(proc.stdout), method="GET") as response:
+                response.begin()
+                if response.length is None:
+                    body = response.read(MAX_DOCUMENT_BYTES + 1)
+                elif response.length <= MAX_DOCUMENT_BYTES:
+                    # read() enforces the declared length; read(limit) accepts an early EOF.
+                    body = response.read()
+                else:
+                    raise Failure("document exceeds the size limit")
+                if len(body) > MAX_DOCUMENT_BYTES:
+                    raise Failure("document exceeds the size limit")
+                if proc.wait() != 0 or time.monotonic() >= deadline:
+                    raise Failure("relay did not complete before the deadline")
+                return response.status, response.getheaders(), body
         except (http.client.HTTPException, OSError, ValueError):
             raise Failure("no complete HTTP response") from None
-        if len(body) > MAX_DOCUMENT_BYTES:
-            raise Failure("document exceeds the size limit")
-        return response.status, response.getheaders(), body
-    finally:
-        watchdog.cancel()
-        if proc.poll() is None:
+        finally:
+            watchdog.cancel()
             proc.kill()
-        proc.wait()
+            watchdog.join()
 
 
 def _values(headers, name):
@@ -111,7 +116,7 @@ def _values(headers, name):
 
 def _decimal(value):
     value = value.strip()
-    return int(value) if value.isdigit() and len(value) <= 10 else "non-numeric"
+    return int(value) if value.isascii() and value.isdecimal() and len(value) <= 10 else "non-numeric"
 
 
 def media_facts(values):
@@ -131,8 +136,8 @@ def media_facts(values):
 def cache_facts(values):
     directives, unknown, repeated = {}, 0, 0
     for header in values:
-        for item in header.split(","):
-            name, _, argument = item.strip().partition("=")
+        for item in parse_http_list(header):
+            name, separator, argument = item.strip().partition("=")
             name = name.strip().lower()
             if not name:
                 continue
@@ -142,7 +147,7 @@ def cache_facts(values):
             if name in directives:
                 repeated += 1
             argument = argument.strip()
-            if not argument:
+            if not separator:
                 directives[name] = True
             elif name in ("max-age", "s-maxage", "stale-if-error", "stale-while-revalidate"):
                 directives[name] = _decimal(argument.strip('"'))
@@ -180,7 +185,7 @@ def _reject_duplicates(pairs):
 def parse_document(body):
     try:
         value = json.loads(body.decode("utf-8"), object_pairs_hook=_reject_duplicates)
-    except (UnicodeDecodeError, ValueError):
+    except (ValueError, RecursionError):
         raise Failure("document is not JSON") from None
     if not isinstance(value, dict):
         raise Failure("document is not a JSON object")
@@ -229,7 +234,7 @@ def metadata_facts(document):
 def _count(values, known):
     counts = {}
     for value in values:
-        label = value if value in known else ("absent" if value is None else "other")
+        label = value if isinstance(value, str) and value in known else ("absent" if value is None else "other")
         counts[label] = counts.get(label, 0) + 1
     return dict(sorted(counts.items()))
 
@@ -265,7 +270,7 @@ def evaluate(discovery, jwks):
         failures.append("fixture: JWKS document unavailable")
     if d_meta is not None and not (d_meta["issuer_matches_fixed"] and d_meta["jwks_uri_matches_fixed"]):
         failures.append("fixture: discovery does not describe the fixed local realm")
-    if j_keys is not None and (j_keys["keys_shape"] != "array" or j_keys["private_members_present"]):
+    if j_keys is not None and (j_keys["keys_shape"] != "array" or j_keys["non_object_keys"] or j_keys["private_members_present"]):
         failures.append("fixture: JWKS is not a public key set")
     incompatibilities = []
     if d_meta is not None:
@@ -274,7 +279,7 @@ def evaluate(discovery, jwks):
             incompatibilities.append("discovery token_endpoint_auth_methods_supported omits none")
         else:
             failures.append("prediction not observed: discovery advertises no array without none")
-    if "no-store" in d_headers["cache_control"]["directives"]:
+    if d_headers["cache_control"]["directives"].get("no-store") is True:
         incompatibilities.append("discovery Cache-Control includes no-store")
     else:
         failures.append("prediction not observed: discovery Cache-Control lacks no-store")

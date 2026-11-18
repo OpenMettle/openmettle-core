@@ -16,21 +16,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  harness:
-    name: Observer tests (no provider)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6; resolved 2026-11-14
-        with:
-          persist-credentials: false
-      - name: Test transport, sanitization and verdicts offline
-        run: python3 -m unittest discover -s tests/provider_observation -v
-
   observe:
     name: Keycloak 26.8.2 discovery and JWKS headers (loopback HTTP)
-    needs: harness
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
@@ -43,6 +30,8 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6; resolved 2026-11-14
         with:
           persist-credentials: false
+      - name: Test transport, sanitization and verdicts offline
+        run: python3 -m unittest discover -s tests/provider_observation -v
       - name: Pull pinned provider image by digest
         run: |
           docker pull "$PROVIDER_IMAGE"
@@ -53,7 +42,7 @@ jobs:
       # without a network. `--db=dev-file` makes the production default explicit.
       - name: Start provider without a network
         run: >-
-          docker run --detach --name "$PROVIDER_CONTAINER" --network none
+          docker run --detach --name "$PROVIDER_CONTAINER" --network none --log-driver none
           --cap-drop ALL --security-opt no-new-privileges
           "$PROVIDER_IMAGE"
           start --db=dev-file --cache=local --http-enabled=true --hostname=http://127.0.0.1:8080
@@ -66,7 +55,7 @@ jobs:
         if: always()
         run: |
           if [ -f "$RUNNER_TEMP/provider-observation.json" ]; then
-            { echo '```json'; cat "$RUNNER_TEMP/provider-observation.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            { echo '```json'; cat "$RUNNER_TEMP/provider-observation.json"; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
           fi
           # Container state only; provider logs are not published.
           docker inspect --format 'provider state={{.State.Status}} exit={{.State.ExitCode}}' "$PROVIDER_CONTAINER" || true

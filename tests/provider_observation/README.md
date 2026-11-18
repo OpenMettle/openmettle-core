@@ -6,25 +6,25 @@ This harness records how a pinned stock OIDC provider serves its discovery and J
 
 The [workflow](../../.github/workflows/provider-observation.yml) runs on pull requests that change this directory, the workflow or `src/provider_http.rs`, and on manual dispatch. Other pull requests do not start it.
 
-1. `harness` runs the offline tests in `test_observe.py`. No provider runs in this job.
-2. `observe` pulls the official Keycloak 26.8.2 image by index digest and checks its version label. It starts the image in production mode (`start`) with `--network none`, so the provider has no network except its own loopback. No admin account, client, realm import, identity broker or proxy is configured. The stock `master` realm is observed.
-3. `observe.py` sends one request to each fixed path through the image's own shell (`bash` `/dev/tcp`) on `127.0.0.1:8080`:
+1. The job runs the offline tests in `test_observe.py`.
+2. On the same runner, it pulls the official Keycloak 26.8.2 image by index digest and checks its version label. It starts Keycloak in production mode (`start`) with `--network none`. The provider can use only its own loopback interface. The fixture uses the stock `master` realm.
+3. `observe.py` waits for discovery to return HTTP 200. It retains that first successful response and requests the key set once. Both paths are fixed on `127.0.0.1:8080` inside the provider container.
    - `/realms/master/.well-known/openid-configuration`
    - `/realms/master/protocol/openid-connect/certs`
 
-   Each request carries only `Host` and the production `Accept` header from `src/provider_http.rs`. A test fails if those headers diverge. Python's `http.client` parses the response. Redirects are never followed. The returned `jwks_uri` is compared with the fixed path but never requested.
+   Each request carries `Host`, the production `Accept` value from `src/provider_http.rs`, and `Connection: close` so the shell relay exits after one response. A test checks the `Accept` value against the Rust source. Python's `http.client` parses the response. The observer compares the returned `jwks_uri` with the configured address and follows no redirects.
 
 Three options differ from a bare `start`. `--http-enabled=true` with `--hostname=http://127.0.0.1:8080` gives a deterministic loopback HTTP origin. `--cache=local` is needed because the default clustered cache cannot bind without a network. `--db=dev-file` states the production default explicitly. None of these options sets response headers on the observed endpoints.
 
 ## What is reported
 
-The job summary contains a JSON report built only from integers, booleans, constants and allowlisted tokens. Raw documents, key material, key IDs, issuer strings and unrecognized header values are never written. A test injects canary values into every observed field and checks that none of them appears in the report. Provider logs are not published.
+The job log and summary contain the same JSON report. It contains only integers, booleans, constants and recognized tokens. The offline tests check that arbitrary provider values stay out of the report. The fixture disables Docker container logging.
 
 For each document the report covers:
 
 - the status code;
 - the `Content-Type` media type and charset;
-- whether `Date` is present and is an IMF-fixdate;
+- whether `Date` is present and matches the IMF-fixdate format;
 - whether `Age` is present, and its value if numeric;
 - `Cache-Control` directives;
 - whether `Content-Encoding` or `Location` is present.
@@ -47,7 +47,7 @@ The job also fails if either source prediction from the [#5 research](https://gi
 
 Each of these properties conflicts with a rule in `src/provider_keys/documents.rs`: `metadata` requires `none`, and `freshness` refuses `no-store`. A passing job therefore reports `observed-incompatibility`. It does not mean that sign-in works, that Keycloak is supported, or that these are the only conflicts.
 
-Content types, `Date`/`Age`, JWKS cache directives, PKCE and the `iss` parameter flag are recorded but not asserted. Upstream source alone does not settle their rendered values. Add assertions only after an owner has reviewed a hosted observation.
+The report also records content types, `Date`/`Age`, JWKS cache directives, PKCE and the `iss` parameter flag for comparison with a hosted run.
 
 ## Limits
 

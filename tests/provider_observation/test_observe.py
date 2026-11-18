@@ -103,11 +103,11 @@ class RequestTests(unittest.TestCase):
         found = re.findall(r"\.header\(header::ACCEPT, \"([^\"]+)\"\)", source)
         self.assertEqual(found, [observe.ACCEPT])
 
-    def test_request_carries_only_host_and_accept(self):
+    def test_request_carries_host_accept_and_connection_close(self):
         self.assertEqual(
             observe.request_bytes(observe.JWKS_PATH),
             b"GET /realms/master/protocol/openid-connect/certs HTTP/1.1\r\n"
-            b"Host: 127.0.0.1:8080\r\nAccept: application/json, application/jwk-set+json\r\n\r\n",
+            b"Host: 127.0.0.1:8080\r\nAccept: application/json, application/jwk-set+json\r\nConnection: close\r\n\r\n",
         )
 
     def test_document_paths_are_fixed_and_local(self):
@@ -138,6 +138,10 @@ class ExchangeTests(unittest.TestCase):
     def test_oversized_document_fails(self):
         with self.assertRaisesRegex(observe.Failure, "size limit"):
             self.run_one(response(200, KEYCLOAK_LIKE_HEADERS, b"x" * (observe.MAX_DOCUMENT_BYTES + 1)))
+
+    def test_short_response_fails_even_when_body_is_valid_json(self):
+        with self.assertRaisesRegex(observe.Failure, "no complete HTTP response"):
+            self.run_one(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n{}")
 
     def test_non_http_output_fails(self):
         with self.assertRaisesRegex(observe.Failure, "no complete HTTP response"):
@@ -217,6 +221,17 @@ class ObserveTests(unittest.TestCase):
         headers = [("Content-Type", "application/json"), ("Cache-Control", "max-age=300")]
         report = self.observe(response(200, headers, discovery()), response(200, headers, jwks()))
         self.assertEqual(report["outcome"]["failures"], ["prediction not observed: discovery Cache-Control lacks no-store"])
+
+    def test_quoted_extension_value_cannot_count_as_a_cache_directive(self):
+        headers = [("Cache-Control", 'extension="a, no-store, b"')]
+        report = self.observe(response(200, headers, discovery()), response(200, headers, jwks()))
+        self.assertEqual(report["outcome"]["classification"], "not-established")
+        self.assertNotIn("no-store", report["discovery"]["headers"]["cache_control"]["directives"])
+
+    def test_no_store_with_an_empty_argument_cannot_establish_the_prediction(self):
+        headers = [("Cache-Control", "no-store=")]
+        report = self.observe(response(200, headers, discovery()), response(200, headers, jwks()))
+        self.assertEqual(report["outcome"]["classification"], "not-established")
 
     def test_other_realm_is_a_fixture_failure(self):
         report = self.observe(response(200, KEYCLOAK_LIKE_HEADERS, discovery(jwks_uri="http://127.0.0.1:8080/realms/other/certs")),
