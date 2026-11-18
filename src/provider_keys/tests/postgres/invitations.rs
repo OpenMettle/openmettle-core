@@ -106,7 +106,7 @@ fn first_session_refused(err: sqlx::Error) {
         "{err:?}"
     );
 }
-fn invite(f: &Flow) {
+pub(super) fn invite(f: &Flow) {
     let out = create(f, ID, signing::ID, SUBJECT);
     assert!(
         out.status.success(),

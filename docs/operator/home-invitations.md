@@ -2,7 +2,7 @@
 
 An operator can approve first-account creation for one named OIDC principal. The person signs in with the configured provider. OpenMettle consumes the invitation when it issues the first local session. That transaction creates one user, the exact bound identity, a private personal scope and an ordinary provider-specific approval. It creates no resource grant, membership or administrator role.
 
-This private candidate uses provisional migration 11 on the v10 base. It becomes migration 12 when stacked on membership (v11). Native sign-in follows in a later block. An upgrade from the actual membership release binaries remains a pending qualification gate. The managed session consumer is internal and the browser routes remain unmounted.
+Invitations are migration 12, applied after project membership (migration 11). The schema suite upgrades a populated database migrated by the authentic membership (v11) binaries and checks that those binaries then refuse schema 12. An invitation-created approval can be enrolled in and withdrawn from [project membership](../adr/0021-project-membership.md) like any other approval. Its first sign-in creates no membership, because no enrollment can exist before the approval does. Native sign-in follows in a later block. The managed session consumer is internal and the browser routes remain unmounted.
 
 ## Identify the person and authorize the window
 

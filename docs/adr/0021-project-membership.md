@@ -217,6 +217,9 @@ Offline tests exercise signed claims and managed loopback TLS. The hosted Postgr
 suite exercises real exchanges, independent v5 writes, configuration and withdrawal
 scripts, expiry, concurrent issuance, and independent provider approvals. The schema suite
 uses authentic v10 binaries at 05dd18489242e545e3529b4e3750c74837b05638 for populated
-upgrade and refusal checks. First-account provisioning through exact provider/issuer/subject
-invitations is approved and belongs to the separate provisioning increment. Periodic directory collection,
+upgrade and refusal checks. First-account invitations follow as migration 12
+([home invitations](../operator/home-invitations.md)). Authentic v11 binaries at
+0ab3401714762f28a730eae4cd7c91052648dabd qualify the populated upgrade from this schema and
+refuse schema 12. An invited first sign-in has no enrollment and reconciles nothing. The
+owner can then enroll and withdraw its approval like any other. Periodic directory collection,
 provider qualification, native handoff and resource authorization remain separate work.

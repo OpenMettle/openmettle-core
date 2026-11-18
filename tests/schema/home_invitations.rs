@@ -1,8 +1,8 @@
 use super::*;
 
 const CREATE: &str = include_str!("../../docs/operator/home-invitation-create.psql");
-/// The invitation migration's version on this base. Becomes 12 when stacked on membership.
-const VERSION: i64 = 11;
+/// The invitation migration's version, stacked on membership (v11).
+const VERSION: i64 = 12;
 const PROVIDER: &str = "00000000-0000-0000-0000-0000000000c1";
 const INVITATION: &str = "00000000-0000-0000-0000-0000000000c2";
 const OPERATOR: &str = "00000000-0000-0000-0000-0000000000c3";
@@ -32,8 +32,8 @@ async fn function_contract(
     .unwrap()
 }
 
-// The candidate uses the real ten migrations on its private base. Release-binary
-// qualification follows the actual merged predecessor at integration.
+// Starts from the real eleven migrations, including membership. Authentic v11 release-binary
+// qualification with populated membership rows is populated_upgrade in grants.rs.
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn upgrade_preserves_state_and_only_allows_exact_redemption_signature() {

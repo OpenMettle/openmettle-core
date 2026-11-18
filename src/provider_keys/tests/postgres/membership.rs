@@ -200,9 +200,9 @@ async fn project(f: &mut Flow, user: &str) -> (String, String) {
     .await.unwrap()
 }
 
-async fn prepare(f: &mut Flow) -> Enrollment {
-    // Use primary time for signing and the synthetic TLS metadata Date in this test.
-    // All observed issue times are a few seconds in the past, with no sleeps.
+/// Use primary time for signing and the synthetic TLS metadata Date in this test. Proofs
+/// are issued a few seconds before this sample. Returns seconds.
+async fn primary_clock(f: &mut Flow) -> i64 {
     let now = crate::sessions::now(&mut f.api).await.unwrap() / 1000;
     let wall = std::time::UNIX_EPOCH + Duration::from_secs(now as u64);
     f.h.script.lock().unwrap().date = wall;
@@ -210,45 +210,30 @@ async fn prepare(f: &mut Flow) -> Enrollment {
         wall,
         mono: Instant::now(),
     }));
-    let user = seed(f, true, true).await;
-    let approval: String =
-        sqlx::query_scalar("SELECT id::text FROM openmettle.local_identity_approvals")
-            .fetch_one(&mut f.owner)
-            .await
-            .unwrap();
-    let (project, scope) = project(f, &user).await;
+    now
+}
+/// An independent direct grant sharing grantee, target, format and key with the derived one.
+async fn direct_grant(
+    f: &mut Flow,
+    user: &str,
+    approval: &str,
+    project: &str,
+    scope: &str,
+) -> grants::GrantReceipt {
     let mut tx = WriteTransaction::begin(&mut f.owner).await.unwrap();
-    let mapping = grants::MappingInput {
-        rule: RULE,
-        provider: signing::ID,
-        issuer: signing::ISSUER,
-        actor: &user,
-        key: "fixture-mapping",
-        expected_revision: 0,
-        enabled: true,
-        selector_kind: "group",
-        claim_name: "groups",
-        claim_value: "team",
-        binding_format: "openmettle.project-member",
-        binding_version: 1,
-        binding: project.as_bytes(),
-    };
-    grants::record_mapping_revision(&mut tx, &mapping)
-        .await
-        .unwrap();
     let direct = grants::change_grant(
         &mut tx,
         &grants::ChangeInput {
             assignment: grants::Assignment {
-                scope: &scope,
-                target: grants::Target::Project(&project),
-                grantee: &user,
+                scope,
+                target: grants::Target::Project(project),
+                grantee: user,
                 format: "openmettle.project-member",
                 version: 1,
-                key: &approval,
+                key: approval,
                 mapping_rule: None,
             },
-            actor: &user,
+            actor: user,
             key: "direct",
             expected_revision: 0,
             mapping_revision: None,
@@ -258,6 +243,20 @@ async fn prepare(f: &mut Flow) -> Enrollment {
     .await
     .unwrap();
     tx.commit().await.unwrap();
+    direct
+}
+
+async fn prepare(f: &mut Flow) -> Enrollment {
+    let now = primary_clock(f).await;
+    let user = seed(f, true, true).await;
+    let approval: String =
+        sqlx::query_scalar("SELECT id::text FROM openmettle.local_identity_approvals")
+            .fetch_one(&mut f.owner)
+            .await
+            .unwrap();
+    let (project, scope) = project(f, &user).await;
+    record_rule(f, RULE, signing::ID, &user, &project).await;
+    let direct = direct_grant(f, &user, &approval, &project, &scope).await;
     Enrollment {
         now,
         user,
@@ -1405,4 +1404,179 @@ async fn api_role_and_invalid_input_cannot_withdraw() {
     assert_eq!(receipts, 0);
     // Control: the same canonical request succeeds as the owner.
     committed(&e.withdraw(&f, OWNER, &request), 1);
+}
+
+/// Rows that an invited first sign-in or the membership writers can change. Login rows are
+/// excluded because each exchange consumes a new one.
+async fn durable_state(f: &mut Flow) -> Vec<String> {
+    let mut rows = Vec::new();
+    for table in [
+        "users",
+        "user_identities",
+        "scopes",
+        "local_identity_approvals",
+        "local_sessions",
+        "home_invitations",
+        "grant_mapping_rules",
+        "grant_assignments",
+        "grant_changes",
+        "membership_configuration_changes",
+        "membership_observations",
+    ] {
+        let table_rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT to_jsonb(t)::text FROM openmettle.{table} t ORDER BY 1"
+        )))
+        .fetch_all(&mut f.owner)
+        .await
+        .unwrap();
+        rows.push(table.to_owned());
+        rows.extend(table_rows);
+    }
+    rows
+}
+
+// An invited first sign-in can carry a matching group claim while a membership rule exists for
+// its provider. No enrollment can exist for an approval that the same transaction creates, so
+// issuance reconciles nothing and takes no membership lock. The owner can then enroll and
+// withdraw the invitation-created approval like any other.
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 and POSTGRES_CONTAINER required"]
+async fn invited_first_sign_in_skips_membership_until_its_approval_is_enrolled() {
+    let mut f = Flow::new().await;
+    let now = primary_clock(&mut f).await;
+    let admin: String =
+        sqlx::query_scalar("INSERT INTO openmettle.users DEFAULT VALUES RETURNING id::text")
+            .fetch_one(&mut f.owner)
+            .await
+            .unwrap();
+    let (project, scope) = project(&mut f, &admin).await;
+    record_rule(&mut f, RULE, signing::ID, &admin, &project).await;
+    super::invitations::invite(&f);
+    let before = durable_state(&mut f).await;
+
+    // Refusal after redemption and the membership step. The holder takes the locks that
+    // the configuration and withdrawal scripts take first, then blocks only the session
+    // insert until the invitation cutoff passes.
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut f.api)
+        .await
+        .unwrap();
+    let mut observer = sessions::statistics_observer(&f.db).await;
+    let late = proof(&mut f, now - 5, json!({"groups":["team"]})).await;
+    f.owner.execute("UPDATE openmettle.home_invitations SET redeem_before_ms=floor(extract(epoch FROM clock_timestamp())*1000)::bigint+1000").await.unwrap();
+    let cutoff: Vec<String> =
+        sqlx::query_scalar("SELECT to_jsonb(t)::text FROM openmettle.home_invitations t")
+            .fetch_all(&mut f.owner)
+            .await
+            .unwrap();
+    let mut held = f.owner.begin().await.unwrap();
+    held.execute(
+        "LOCK TABLE openmettle.membership_configuration_changes IN EXCLUSIVE MODE;
+         LOCK TABLE openmettle.local_sessions IN SHARE MODE",
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "SELECT id FROM openmettle.grant_mapping_rules WHERE id=$1::uuid FOR NO KEY UPDATE",
+    )
+    .bind(RULE)
+    .execute(&mut *held)
+    .await
+    .unwrap();
+    let release = async {
+        sessions::waiting(&mut observer, pid).await;
+        let waits: Vec<String> = sqlx::query_scalar(
+            "SELECT coalesce(relation::regclass::text, locktype) FROM pg_locks
+             WHERE pid=$1 AND NOT granted",
+        )
+        .bind(pid)
+        .fetch_all(&mut observer)
+        .await
+        .unwrap();
+        assert_eq!(waits, ["openmettle.local_sessions"]);
+        held.execute("SELECT pg_sleep(GREATEST(0,redeem_before_ms/1000.0-extract(epoch FROM clock_timestamp()))) FROM openmettle.home_invitations").await.unwrap();
+        held.commit().await.unwrap();
+    };
+    let policy = session_policy();
+    let (result, ()) = tokio::join!(
+        f.h.provider.issue_session(&mut f.api, late, &policy),
+        release
+    );
+    assert!(matches!(result, Err(crate::sessions::Error::Rejected)));
+    // Nothing persists: no account, approval, session, grant, evidence or redemption.
+    let mut expected = before.clone();
+    let invitations = expected
+        .iter()
+        .position(|row| row == "home_invitations")
+        .unwrap();
+    expected.splice(invitations + 1..invitations + 2, cutoff);
+    assert_eq!(durable_state(&mut f).await, expected);
+    f.owner.execute("UPDATE openmettle.home_invitations SET redeem_before_ms=floor(extract(epoch FROM clock_timestamp())*1000)::bigint+600000").await.unwrap();
+
+    // The invited first sign-in succeeds with the matching claim and records no membership.
+    let first = proof(&mut f, now - 4, json!({"groups":["team"]})).await;
+    let credential =
+        f.h.provider
+            .issue_session(&mut f.api, first, &policy)
+            .await
+            .unwrap();
+    let user = crate::sessions::validate(&mut f.api, credential.expose(), &policy)
+        .await
+        .unwrap()
+        .user_id()
+        .to_owned();
+    let approval: String = sqlx::query_scalar(
+        "SELECT approval_id::text FROM openmettle.home_invitations WHERE approval_id IS NOT NULL",
+    )
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    let membership: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM openmettle.membership_observations),
+                (SELECT count(*) FROM openmettle.membership_configuration_changes),
+                (SELECT count(*) FROM openmettle.grant_assignments)",
+    )
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(membership, (0, 0, 0));
+
+    // Withdrawal of an unenrolled invitation-created approval has nothing to revoke.
+    let e = Enrollment {
+        now,
+        direct: direct_grant(&mut f, &user, &approval, &project, &scope).await,
+        user,
+        approval,
+        project,
+        scope,
+    };
+    let unchanged = durable_state(&mut f).await;
+    let request = new_request(&mut f).await;
+    let stderr = refused(
+        &e.withdraw(&f, OWNER, &request),
+        &[&e.approval, &request, OPERATOR],
+    );
+    assert!(stderr.contains("membership withdrawal refused"), "{stderr}");
+    assert_eq!(durable_state(&mut f).await, unchanged);
+
+    // After owner enrollment the next sign-in follows the ordinary identity path and
+    // reconciles. The withdrawal script then revokes only the derived grant.
+    e.reset(&mut f, Configuration::default()).await;
+    assert_eq!(e.observe(&mut f).await, Missing);
+    e.submit(&mut f, 3, json!(["team"])).await;
+    assert_eq!(e.observe(&mut f).await, Present);
+    let granted = e.head(&mut f).await;
+    let request = new_request(&mut f).await;
+    committed(&e.withdraw(&f, OWNER, &request), 1);
+    assert_withdrawn(&granted, &e.head(&mut f).await);
+    assert_eq!(head_of(&mut f, &e.direct.assignment).await, e.direct);
+    assert_eq!(e.observe(&mut f).await, Failed);
+    let redeemed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM openmettle.home_invitations WHERE approval_id=$1::uuid",
+    )
+    .bind(&e.approval)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(redeemed, 1);
 }

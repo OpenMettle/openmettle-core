@@ -36,5 +36,5 @@ for attempt in first repeat; do
   echo "$attempt run: $output"
 done
 versions=$(psql openmettle -tA -c 'SELECT string_agg(version::text, $$,$$ ORDER BY version) FROM openmettle._sqlx_migrations WHERE success')
-test "$versions" = 1,2,3,4,5,6,7,8,9,10,11
+test "$versions" = 1,2,3,4,5,6,7,8,9,10,11,12
 echo 'Migrate image: non-root user, configuration exit 78, fresh install and idempotent rerun passed.'
