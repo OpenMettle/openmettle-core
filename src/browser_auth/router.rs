@@ -106,22 +106,21 @@ impl std::error::Error for SettingsError {}
 /// `/`, then segments of ASCII letters, digits and `- . _ ~`: no empty inner segment, dot
 /// segment, escape, query or fragment. A trailing `/` is allowed. Axum matches it literally.
 fn check_path(path: &str) -> Result<(), SettingsError> {
+    if path.len() > MAX_PATH_BYTES {
+        return Err(SettingsError::Path);
+    }
     if path.bytes().any(|b| b"{}*:".contains(&b)) {
         return Err(SettingsError::Pattern);
     }
     let Some(rest) = path.strip_prefix('/') else {
         return Err(SettingsError::Path);
     };
-    let segments: Vec<&str> = rest.split('/').collect();
-    let inner = &segments[..segments.len() - 1];
-    let plain = path.len() <= MAX_PATH_BYTES
+    let plain = rest
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"/-._~".contains(&b))
         && rest
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"/-._~".contains(&b))
-        && inner.iter().all(|segment| !segment.is_empty())
-        && segments
-            .iter()
-            .all(|segment| !matches!(*segment, "." | ".."));
+            .split_terminator('/')
+            .all(|segment| !matches!(segment, "" | "." | ".."));
     plain.then_some(()).ok_or(SettingsError::Path)
 }
 /// Both paths are valid and distinct, and neither is an operational route. Checked before a
@@ -246,9 +245,6 @@ struct Routes {
 impl Routes {
     async fn dispatch(&self, route: Route, request: Request) -> Response<&'static str> {
         let (request, body) = request.into_parts();
-        // The body is inspected through its metadata and dropped unpolled.
-        let bounded = bounds(&request, &body);
-        drop(body);
         let (method, allow, budget) = match route {
             Route::Begin => (Method::POST, "POST", &self.begin),
             Route::Callback => (Method::GET, "GET", &self.callback),
@@ -256,9 +252,11 @@ impl Routes {
         if request.method != method {
             return handoff::wrong_method(allow);
         }
-        if let Err((status, line)) = bounded {
+        // Inspect body metadata only, then drop the body without polling it.
+        if let Err((status, line)) = bounds(&request, &body) {
             return handoff::respond(status, line);
         }
+        drop(body);
         // `try_acquire` never waits. The permit is released when this future completes or is
         // dropped, including on client disconnect.
         let Ok(_permit) = self.in_flight.try_acquire() else {
@@ -336,7 +334,9 @@ mod tests {
             ("/login}", SettingsError::Pattern),
             ("", SettingsError::Path),
             ("login", SettingsError::Path),
+            ("//", SettingsError::Path),
             ("//login", SettingsError::Path),
+            ("/a//", SettingsError::Path),
             ("/a//b", SettingsError::Path),
             ("/./login", SettingsError::Path),
             ("/login/..", SettingsError::Path),

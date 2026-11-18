@@ -7,8 +7,8 @@ Refs #5; Refs #34. Independent review and CI acceptance are separate gates. #5 r
 
 ADR 0017 added `LoginHandoff`, which turns one request head into one response. Nothing
 routed requests to it, and ADRs 0009, 0014, 0016 and 0017 list request, rate and
-concurrency controls as exposure gates. Every admissible initiation spends a permanent
-nonce reservation and a login row. Every admissible callback can spend a token request.
+concurrency controls as exposure gates. A successful initiation records a permanent nonce
+reservation and a login row. A callback that passes consumption can spend a token request.
 Without a bound in front of the handoff, a client can ask for that work as fast as it can
 send requests.
 
@@ -87,9 +87,8 @@ still apply inside the handoff.
 
 The empty form and navigation profile is the only accepted body: no `Transfer-Encoding`,
 every `Content-Length` equal to `0`, and a parsed body whose exact size is zero. An HTML
-form with no fields sends that profile. A form with any field, a declared length or a
-chunked body is refused from the request metadata, without reading or waiting for body
-bytes.
+form with no fields sends that profile. A nonzero declared length or a chunked body is
+refused from the request metadata, without reading or waiting for body bytes.
 
 **What this measures.** The bounds run after the HTTP server has read and parsed the
 request head. They limit what reaches the handoff, not what the server reads to parse
@@ -149,18 +148,18 @@ host router's fallback.
 
 ## Limits
 
-- **Per router value, per process.** Budgets and the in-flight cap do not span replicas.
-  Total admission across a deployment is the per-process figure times the number of
-  replicas, including surge replicas. There is no cluster-wide limit.
+- **Per router value, per process.** Each independently constructed router has its own
+  budgets and in-flight cap. Aggregate capacity adds the limits of all router instances,
+  including instances in surge replicas.
 - **No per-client fairness.** One client can spend a whole budget and deny logins to
   everyone else on that replica until it refills. Per-client limits need trusted client
   identity at ingress. This router trusts no forwarded header.
 - **Not a parser or transport limit.** See [What this measures](#request-bounds). Slow or
   oversized heads, idle connections and connection floods are outside this router.
 - **Not durable or a storage bound.** Restarting a process refills its budgets. Each
-  admitted initiation still spends a permanent nonce reservation and a login row
-  (ADRs 0009 and 0014). The rate bounds how fast that happens on one replica, not how much
-  accumulates. Cleanup and retired-key reservation reclamation remain required.
+  successful initiation still records a permanent nonce reservation and a login row
+  (ADRs 0009 and 0014). The rate bounds how fast these records can accumulate on one
+  replica. Cleanup and retired-key reservation reclamation remain required.
 - **Rate is spent before the handoff decides.** A client with a stale or malformed callback
   spends callback budget that a valid callback could have used.
 - **The in-flight cap is independent of other caps.** It is checked before the provider
@@ -172,7 +171,7 @@ host router's fallback.
 ## Evidence
 
 Unit tests (`cargo test --locked --offline --lib browser_auth::router`) cover path
-validation for every category, rate and in-flight ranges, the target and header
+validation, rate ranges, the target and header
 measurements, the body metadata rule, and budget refill from injected `Instant` values:
 a full burst, no refill before an interval, one unit per interval, refusals spend nothing,
 idle refill stops at the burst and an earlier instant is not a refill.
@@ -181,10 +180,9 @@ Dispatch tests (`cargo test --locked --offline --lib provider_keys::tests::route
 the router with `axum::serve` on loopback and send raw HTTP/1.1 bytes. They use the
 synthetic TLS provider and a database stand-in that never speaks PostgreSQL:
 
-- invalid settings are refused through `router` without a panic or any provider or
-  database contact;
-- `HEAD`, `GET`, `PUT`, `DELETE`, `OPTIONS` and `PATCH` on the initiation route and every
-  method but `GET` on the callback route are `405`. Case, slash, escape and prefix variants
+- invalid paths, rate settings and in-flight caps are refused through `router` without a
+  panic or any provider or database contact;
+- wrong methods, including `HEAD` on both routes, receive `405`. Case, slash, escape and prefix variants
   of both paths and the operational paths are `404`, and none reaches the provider or the
   database;
 - one byte over the target, field and header-byte ceilings is refused. Declared, chunked

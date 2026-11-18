@@ -68,7 +68,7 @@ impl Reply {
     pub(super) fn one(&self, name: &str) -> &str {
         match self.all(name)[..] {
             [value] => value,
-            ref values => panic!("{name}: {values:?}"),
+            _ => panic!("expected exactly one {name} header"),
         }
     }
     /// A fixed refusal line: never stored, no referrer, no cookie and no redirect.

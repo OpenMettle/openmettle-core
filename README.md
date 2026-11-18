@@ -1,6 +1,6 @@
 # OpenMettle core
 
-Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures, but no `/v1` route serves it. Internal managed login, an owner-configured outstanding-login cap, local identity approval and opaque-session primitives are implemented, with an offline check for mounted browser-auth settings that the running API does not load yet, an internal pooled browser-auth service that no process constructs yet, and an unmounted same-origin browser login handoff over it with an unmounted bounded router. No product API, upload service, request authentication, per-user authorization or GPU orchestration is exposed. Runtime qualification and deployment acceptance remain separate gates.
+Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures, but no `/v1` route serves it. Internal managed login, an owner-configured outstanding-login cap, local identity approval and opaque-session primitives are implemented, with an offline check for mounted browser-auth settings that the running API does not load yet, an internal pooled browser-auth service that no process constructs yet, and an unmounted Axum router for the same-origin browser login handoff. No product API, upload service, request authentication, per-user authorization or GPU orchestration is exposed. Runtime qualification and deployment acceptance remain separate gates.
 
 ## Start here
 
@@ -363,8 +363,8 @@ are decided in this order, and the first four steps do no provider, pool or data
 1. Method (`405`).
 2. Request bounds measured after HTTP parsing: a target of at most 33 792 bytes (`414`), at
    most 64 header fields and 24 576 header bytes (`431`), and an empty body (`413`). The body
-   is judged from its metadata and never read, so a declared or chunked body is refused
-   without waiting for it. The handoff's query and cookie ceilings still fit and still apply.
+   is judged from its metadata and never read, so a nonzero declared length or chunked body
+   is refused without waiting for it. The handoff's query and cookie ceilings still fit and still apply.
 3. An in-flight permit, without waiting (`503`, `login busy; try again later`).
 4. One unit of the route's rate budget (`429`). A unit is spent here, before the handoff
    decides, and is never refunded. Earlier refusals spend nothing.
