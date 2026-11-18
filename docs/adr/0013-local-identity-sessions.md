@@ -171,6 +171,8 @@ synchronous commit. Multi-row operations lock stable IDs in ascending order.
 
 ### Provider revision, revocation, retirement and restoration
 
+For schema 10 onward, use the [audited recovery procedure](../operator/restore-login-provider.md) to restore a retired provider to its last active revision. The restoration and audit event commit together. The block below accepts the `restore` action only on schemas 8 and 9.
+
 Supply `provider`, `expected_generation`, `expected_epoch`, `actor`, `reason`, `action` and
 `revision`. Use action `routine` to change an active configuration without signing users out;
 `revoke` to invalidate sessions and pending logins while keeping the provider active;
@@ -189,10 +191,11 @@ SELECT access_generation AS observed_generation FROM openmettle.login_providers
 SELECT epoch AS observed_epoch, revision IS NULL AS retired
  FROM openmettle.login_provider_revisions
  WHERE provider_id=:'provider'::uuid ORDER BY epoch DESC LIMIT 1 \gset
-SELECT :observed_generation = :expected_generation
- AND :observed_epoch = :expected_epoch
+SELECT :'observed_generation' = :'expected_generation'
+ AND :'observed_epoch' = :'expected_epoch'
  AND ((:'action' IN ('routine','revoke','retire') AND NOT :'retired'::boolean)
-      OR (:'action' = 'restore' AND :'retired'::boolean)) AS expected \gset
+      OR (:'action' = 'restore' AND :'retired'::boolean AND
+          (SELECT max(version) FROM openmettle._sqlx_migrations WHERE success) IN (8, 9))) AS expected \gset
 \if :expected
   UPDATE openmettle.login_providers
    SET access_generation=access_generation +
@@ -203,7 +206,7 @@ SELECT :observed_generation = :expected_generation
    VALUES (:'provider'::uuid, CASE WHEN :'action'='retire' THEN NULL ELSE :'revision' END)
    RETURNING epoch AS new_epoch \gset
   SELECT NOT EXISTS (SELECT FROM openmettle.login_provider_revisions
-    WHERE provider_id=:'provider'::uuid AND epoch > :new_epoch) AS current \gset
+    WHERE provider_id=:'provider'::uuid AND epoch > :'new_epoch'::bigint) AS current \gset
   \if :current
     COMMIT;
   \else
