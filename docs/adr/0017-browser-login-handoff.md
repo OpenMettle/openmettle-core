@@ -23,9 +23,10 @@ fixed line.
 | `initiate` | A form `POST` whose single `Origin` is the application origin | `303` to the provider, with the caller cookie |
 | `callback` | A `GET` on the registered callback path carrying one authorization success response and the matching caller cookie | `303` to the landing, with the session cookie |
 
-**The adapter is not mounted.** No router, listener or running process constructs it. The
+**The adapter is not mounted.** No listener or running process constructs it. The
 API still serves `/healthz` and `/readyz` only, loads no auth settings and answers `404`
-for a callback path. Qualification in a browser is outstanding.
+for a callback path. Qualification in a browser is outstanding. [ADR 0018](0018-bounded-login-router.md)
+adds an unmounted bounded router over this adapter.
 
 ### Settings
 

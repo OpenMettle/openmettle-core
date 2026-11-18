@@ -1,7 +1,7 @@
 //! Same-origin browser login handoff over [`BrowserAuth`] (ADR 0017).
 //!
-//! **Not mounted.** No router, listener or running process constructs this adapter. It turns
-//! one HTTP request head into one response:
+//! **Not mounted.** No listener or running process constructs this adapter; the unmounted
+//! [`super::router`] composes it (ADR 0018). It turns one HTTP request head into one response:
 //!
 //! - [`LoginHandoff::initiate`]: a top-level form `POST` whose single `Origin` equals the
 //!   configured application origin becomes a `303` to the provider with the caller cookie.
@@ -110,8 +110,8 @@ impl Refusal {
         respond(status, line)
     }
 }
-/// Every handoff response: never stored, never a referrer source.
-fn respond(status: StatusCode, line: &'static str) -> Response<&'static str> {
+/// Every handoff response: never stored, never a referrer source. The router reuses it.
+pub(super) fn respond(status: StatusCode, line: &'static str) -> Response<&'static str> {
     let mut response = Response::new(line);
     *response.status_mut() = status;
     let headers = response.headers_mut();
@@ -128,7 +128,7 @@ fn respond(status: StatusCode, line: &'static str) -> Response<&'static str> {
     }
     response
 }
-fn wrong_method(allow: &'static str) -> Response<&'static str> {
+pub(super) fn wrong_method(allow: &'static str) -> Response<&'static str> {
     let mut response = respond(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n");
     response
         .headers_mut()
@@ -343,6 +343,11 @@ impl LoginHandoff {
         })
     }
 
+    /// The registered callback's path: everything after the application origin.
+    pub(super) fn callback_path(&self) -> &str {
+        &self.callback[self.origin.len()..]
+    }
+
     /// Starts a login. Method and `Origin` are decided before the service is called; the
     /// path, query and body are not read. The `Location` is exactly the authorization URL
     /// returned by [`BrowserAuth::begin`].
@@ -376,8 +381,7 @@ impl LoginHandoff {
     /// Only its acknowledged, freshly validated credential sets the session cookie; no
     /// refusal sets or deletes any cookie.
     pub async fn callback(&self, request: &Parts) -> Response<&'static str> {
-        let registered_path = &self.callback[self.origin.len()..];
-        if request.uri.path() != registered_path {
+        if request.uri.path() != self.callback_path() {
             return Refusal::Path.response();
         }
         if request.method != Method::GET {

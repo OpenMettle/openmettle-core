@@ -309,9 +309,9 @@ fn unavailable_database_keeps_liveness_and_bounded_readiness() {
                 .unwrap()
                 .starts_with("HTTP/1.1 404")
         );
-        // ADR 0017: the browser login handoff is not mounted. The synthetic callback path
-        // and a form POST are unknown routes, no response sets a cookie or redirects, and
-        // the two operational routes still answer GET alone.
+        // ADRs 0017 and 0018: neither the browser login handoff nor its router is mounted.
+        // The synthetic callback path and a form POST are unknown routes, no response sets a
+        // cookie or redirects, and the two operational routes still answer GET alone.
         for (method, path, status) in [
             (
                 "GET",
