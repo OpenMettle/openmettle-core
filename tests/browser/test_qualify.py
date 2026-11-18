@@ -1,9 +1,12 @@
 """Exercise the private pipe and failure reporting without starting Chrome."""
+import contextlib
+import io
 import json
 import socket
+import subprocess
 import unittest
 
-from qualify import DevTools, Failure
+from qualify import DevTools, Failure, Progress, journey, unexpected
 
 
 class PrivatePipeTests(unittest.TestCase):
@@ -48,3 +51,46 @@ class PrivatePipeTests(unittest.TestCase):
             peer.sendall(b'{"id":1,"result":{"exceptionDetails":{"text":"sensitive"}}}\0')
             with self.assertRaisesRegex(Failure, "^page action failed$"):
                 DevTools(client).evaluate("true")
+
+
+class UnexpectedErrorTests(unittest.TestCase):
+    def test_silent_browser_is_reported_by_the_phase_in_progress(self):
+        client, peer = socket.socketpair()
+        with client, peer:
+            client.settimeout(0.05)
+            progress = Progress()
+            progress.enter("browser start")
+            # The browser answers its version, then never answers again.
+            peer.sendall(b'{"id":1,"result":{"product":"Chrome/1.2.3.4"}}\0')
+            with self.assertRaises(TimeoutError) as raised, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                journey(DevTools(client), "https://app.test", "https://issuer.test",
+                        progress.enter)
+            self.assertEqual(unexpected(raised.exception, progress.phase),
+                             "timed out during browser target setup")
+
+    def test_browser_that_never_answers_is_a_start_timeout(self):
+        client, peer = socket.socketpair()
+        with client, peer:
+            client.settimeout(0.05)
+            progress = Progress()
+            progress.enter("browser start")
+            with self.assertRaises(TimeoutError) as raised:
+                journey(DevTools(client), "https://app.test", "https://issuer.test",
+                        progress.enter)
+            self.assertEqual(unexpected(raised.exception, progress.phase),
+                             "timed out during browser start")
+
+    def test_error_kinds_are_fixed_and_never_carry_error_text(self):
+        tool = ["certutil", "sensitive argument"]
+        for error, kind in [
+            (subprocess.TimeoutExpired(tool, 5, output=b"sensitive"), "timed out"),
+            (ConnectionResetError("sensitive"), "browser pipe lost"),
+            (BrokenPipeError("sensitive"), "browser pipe lost"),
+            (FileNotFoundError(2, "sensitive", "sensitive"), "required runner tool missing"),
+            (subprocess.CalledProcessError(1, tool, stderr=b"sensitive"), "runner tool refused"),
+            (KeyError("sensitive"), "browser harness failed"),
+        ]:
+            with self.subTest(kind=kind):
+                self.assertEqual(unexpected(error, "runner trust store"),
+                                 f"{kind} during runner trust store")
