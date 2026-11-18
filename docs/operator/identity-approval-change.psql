@@ -32,7 +32,9 @@
      AND (octet_length(:'expected_generation') < 19
           OR :'expected_generation' COLLATE "C" <= '9223372036854775807')
      AND :'action' IN ('routine', 'revoke', 'withdraw', 'restore')
-     AND :'expires_ms' ~ '^[123456789][0123456789]{0,17}$'
+     AND :'expires_ms' ~ '^[123456789][0123456789]{0,18}$'
+     AND (octet_length(:'expires_ms') < 19
+          OR :'expires_ms' COLLATE "C" <= '9223372036854775807')
      AND octet_length(:'actor') BETWEEN 1 AND 128
      AND octet_length(:'reason') BETWEEN 1 AND 512 AS valid \gset
       \endif

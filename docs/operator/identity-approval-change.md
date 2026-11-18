@@ -48,7 +48,7 @@ Supply every variable. There are no defaults.
 | `expected_revision` | The revision you inspected: plain decimal, 1 to 9223372036854775807. |
 | `expected_generation` | The access generation you inspected: plain decimal, 0 to 9223372036854775807. |
 | `action` | `routine`, `revoke`, `withdraw` or `restore`, in lowercase. |
-| `expires_ms` | Unix milliseconds, 1–18 decimal digits without a leading zero. `routine` and `restore` write it and require it to be after the primary clock. `revoke` and `withdraw` validate its format but keep the stored expiry; you can pass the current value. |
+| `expires_ms` | Unix milliseconds, 1 to 9223372036854775807 in plain decimal without a leading zero. For `routine` and `restore`, supply a future expiry. For `revoke` and `withdraw`, you can pass the current expiry. These actions preserve it. |
 | `actor`, `reason` | Operator identifier (1–128 bytes) and change reason (1–512 bytes). |
 
 `actor`, `reason` and the change time are latest-change provenance. The next change
@@ -94,7 +94,7 @@ never printed. Checks run in the order of this table.
 | `expiry is not after the primary database clock` | `routine` or `restore` with an `expires_ms` that has passed. | Choose a future expiry. |
 
 A lock or statement timeout, lost connection or other SQL error also exits non-zero without
-a success line. A lock timeout means another transaction held the row for more than 2s.
+a success line. A lock timeout means PostgreSQL could not acquire a required lock within 2s.
 
 ## Unknown outcome
 
@@ -102,13 +102,13 @@ If the connection fails while the script waits for `COMMIT`, the change might ha
 committed. Do not assume either result. Inspect the approval and compare its counters with
 the values you supplied:
 
-- `revision` equals `expected_revision` + 1, and the other fields match the request: the
-  change committed. Another operator could have produced the same state, so check `changed_by`
-  and `change_reason`.
-- `revision` and `access_generation` equal the expected values: nothing committed. You can
-  rerun the same command.
-- Anything else: another change committed. Review the current state before choosing a new
-  action.
+- If the revision advanced by one and the generation, active flag, expiry, actor and reason
+  match the requested action, the requested state is visible. An identical concurrent
+  command can produce the same result.
+- If both counters still equal the expected values, the query saw the previous state.
+  The original transaction might still be finishing. You can retry with the same counters.
+- If the row is missing or the values differ, review the current state before choosing a
+  new action.
 
 Retrying with the same expected counters is safe. A retry of a committed change refuses
 because its counters are no longer current; it never applies the action twice.
@@ -118,7 +118,7 @@ because its counters are no longer current; it never applies the action twice.
 The inspection query takes the issuer and subject, which identify a person at the provider.
 Treat them as personal data, as described in the
 [first approval procedure](first-identity-approval.md#sensitive-values). This script takes
-only the approval UUID, counters, expiry, actor and reason. Command-line `-v` values can
+the approval UUID, counters, action, expiry, actor and reason. Command-line `-v` values can
 appear in shell history and process listings. PostgreSQL can log statement text, which
 includes the quoted actor and reason.
 

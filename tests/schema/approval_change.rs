@@ -23,6 +23,7 @@ const PAST: &str = "2";
 const FUTURE: &str = "4102444800000";
 const LATER: &str = "4102444800001";
 const MAX: i64 = i64::MAX;
+const MAX_EXPIRY: &str = "9223372036854775807";
 
 const INVALID: &str = "approval change refused: missing or invalid input; nothing changed";
 const NOT_FOUND: &str = "approval change refused: no approval has this ID; no changes committed";
@@ -268,22 +269,22 @@ async fn each_action_writes_only_the_documented_values() {
         current
     };
 
-    // Active, unexpired approval through every action. revoke and withdraw ignore the
-    // supplied (past) expiry and keep the stored one.
+    // An existing approval can store the full positive bigint range. An operator can pass
+    // its current expiry to revoke, or another positive value to withdraw. Both preserve it.
     stored(
-        &run(step(1, (1, 0), "routine", LATER), 1, (2, 0)).await,
+        &run(step(1, (1, 0), "routine", MAX_EXPIRY), 1, (2, 0)).await,
         1,
         (2, 0),
         true,
-        LATER,
+        MAX_EXPIRY,
         odd,
     );
     stored(
-        &run(step(1, (2, 0), "revoke", PAST), 1, (3, 1)).await,
+        &run(step(1, (2, 0), "revoke", MAX_EXPIRY), 1, (3, 1)).await,
         1,
         (3, 1),
         true,
-        LATER,
+        MAX_EXPIRY,
         odd,
     );
     stored(
@@ -291,7 +292,7 @@ async fn each_action_writes_only_the_documented_values() {
         1,
         (4, 2),
         false,
-        LATER,
+        MAX_EXPIRY,
         odd,
     );
     stored(
@@ -400,7 +401,8 @@ async fn refusals_and_stale_retries_commit_nothing() {
         ("expires_ms", "-1".into()),
         ("expires_ms", "01".into()),
         ("expires_ms", "1.5".into()),
-        ("expires_ms", "1234567890123456789".into()),
+        ("expires_ms", "9223372036854775808".into()),
+        ("expires_ms", "10000000000000000000".into()),
         ("actor", "a".repeat(129)),
         ("reason", "r".repeat(513)),
     ] {
@@ -514,30 +516,31 @@ async fn competing_change_and_clock_are_rechecked_after_real_lock_waits() {
 
     // The approval expires during the wait. The clock is read after the lock, so routine
     // refuses, and restore then applies to the active-but-expired approval.
-    let expiry = db_ms(&mut holder).await + 2000;
-    sqlx::query(
-        "UPDATE openmettle.local_identity_approvals SET expires_ms = $2 WHERE id = $1::uuid",
-    )
-    .bind(approval(1))
-    .bind(expiry)
-    .execute(&mut holder)
-    .await
-    .unwrap();
     let settled = everything(&db).await;
+    let mut expected = row(&db, 1).await;
     holder.execute("BEGIN").await.unwrap();
     lock().execute(&mut holder).await.unwrap();
     let mut child = spawn(&db, &request(1, (3, 1), "routine", LATER));
     blocked(&db, &mut child).await;
-    assert!(
-        db_ms(&mut holder).await < expiry,
-        "script must wait before expiry"
-    );
-    while db_ms(&mut holder).await <= expiry {
+    // Put the cutoff strictly inside the observed wait. Container startup and the
+    // before-state snapshot have already finished, regardless of runner speed.
+    let expiry: i64 = sqlx::query_scalar(
+        "UPDATE openmettle.local_identity_approvals
+            SET expires_ms = floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint + 100
+          WHERE id = $1::uuid RETURNING expires_ms",
+    )
+    .bind(approval(1))
+    .fetch_one(&mut holder)
+    .await
+    .unwrap();
+    expected.5 = expiry;
+    while db_ms(&mut holder).await < expiry {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    holder.execute("ROLLBACK").await.unwrap();
+    holder.execute("COMMIT").await.unwrap();
     refused(&child.wait_with_output().unwrap(), INAPPLICABLE);
-    assert_eq!(everything(&db).await, settled);
+    only_changed(&settled, &everything(&db).await, 1);
+    assert_eq!(row(&db, 1).await, expected);
     committed(&change(&db, &request(1, (3, 1), "restore", LATER)), 4, 2);
     stored(&row(&db, 1).await, 1, (4, 2), true, LATER, REASON);
 
