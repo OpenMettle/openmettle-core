@@ -186,9 +186,12 @@ Session context does not grant resource access; V1-05 checks remain required bef
 Credentials are random opaque values; only domain-separated digests are stored. Lifetime,
 retained-row allowance and operation deadline are explicit bounded inputs with no deployment
 defaults. Issuance must finish before the originating login's existing expiry. A delayed commit
-can leave an undisclosed row but never returns a credential after failed final checks. Operator
-cleanup is bounded and preserves replay markers until the login gate becomes unusable. Never
-purge active-key nonce reservations as part of session cleanup.
+can leave an undisclosed row but never returns a credential after failed final checks.
+Operators can free retained-session capacity by deleting revoked or expired sessions, then
+remove expired login gates that no session references. Each step skips locked rows and commits a separate batch.
+The operator sets a limit of 1–1000 rows per batch. Session deletion
+preserves issuance markers and nonce reservations. See the
+[session and login-gate cleanup procedure](docs/operator/session-cleanup.md).
 
 There are no routes, native handoff, runtime loader, tenant/group qualification or reconciliation; the cookie handoff below is not mounted.
 Run the managed PostgreSQL tests only in isolated CI with the explicit module filter above;
@@ -214,9 +217,10 @@ Change the limit only with
 [`docs/operator/login-admission-limit.psql`](docs/operator/login-admission-limit.psql)
 (compare-and-set; lowering preserves existing rows). Remove expired, unreferenced login gates
 with [`docs/operator/login-gate-cleanup.psql`](docs/operator/login-gate-cleanup.psql)
-(batch 1–1000, `SKIP LOCKED`; never deletes nonce reservations). CI runs both scripts
-unchanged with the pinned PostgreSQL 18 `psql`. No limit, schedule or retention value is
-selected. Old version-8 replicas do not enforce the cap during a rolling upgrade.
+(batch 1–1000, `SKIP LOCKED`; never deletes nonce reservations), as the second step of the
+cleanup procedure above. CI runs these scripts unchanged with the pinned PostgreSQL 18
+`psql`. No limit, schedule or retention value is selected. Old version-8 replicas do not
+enforce the cap during a rolling upgrade.
 
 ## Offline browser-auth configuration check
 

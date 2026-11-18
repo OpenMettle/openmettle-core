@@ -191,6 +191,8 @@ SELECT :'batch' ~ '^[0-9]{1,4}$' AND :'batch'::integer BETWEEN 1 AND 1000 AS val
 ```
 
 Run ADR 0013's session cleanup first when session-referenced gates should become eligible.
+The [session and login-gate cleanup procedure](../operator/session-cleanup.md) runs both
+scripts in order as separate transactions.
 Deleting a gate makes every retained proof for it ineligible: consume and session issuance
 both require the original row, and issuance additionally requires a time before its original
 expiry. Cleanup never recreates gates, resets markers or deletes nonce reservations.

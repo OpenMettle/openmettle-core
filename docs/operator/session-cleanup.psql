@@ -1,0 +1,39 @@
+-- ADR 0013: delete one bounded batch of local sessions that are revoked or whose absolute
+-- expiry has passed on the primary clock (schema version 8+). Procedure and failure handling:
+-- docs/operator/session-cleanup.md. Run against the primary as openmettle_owner with psql -X.
+-- Supply batch (1-1000); there is no default. Deletes session rows only: never login gates,
+-- issuance markers, approvals, users, providers or nonce reservations. Locked rows are skipped
+-- for a later batch. Prints only a row count, never a session ID or digest.
+\set ON_ERROR_STOP on
+-- Validate the text before it is interpolated as SQL. Explicit character sets avoid
+-- locale-dependent ranges; no cast runs on unvalidated input.
+\if :{?batch}
+  SELECT :'batch' ~ '^(1000|[123456789][0123456789]{0,2})$' AS valid \gset
+\else
+  \set valid false
+\endif
+\if :valid
+  BEGIN;
+  SET LOCAL lock_timeout = '2s';
+  SET LOCAL statement_timeout = '5s';
+  SET LOCAL synchronous_commit = on;
+  WITH candidates AS (
+    SELECT s.id FROM openmettle.local_sessions AS s
+     WHERE s.revoked
+        OR s.expires_ms <= floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
+     ORDER BY s.id
+     LIMIT (:'batch'::integer)
+     FOR UPDATE OF s SKIP LOCKED
+  ), deleted AS (
+    DELETE FROM openmettle.local_sessions AS s USING candidates AS c
+     WHERE s.id = c.id
+       AND (s.revoked
+            OR s.expires_ms <= floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint)
+    RETURNING 1
+  )
+  SELECT count(*) AS deleted_sessions FROM deleted \gset
+  COMMIT;
+  \echo 'session cleanup committed:' :deleted_sessions 'session rows deleted'
+\else
+  DO $refused$ BEGIN RAISE EXCEPTION 'session cleanup refused: batch must be 1-1000; nothing deleted'; END; $refused$;
+\endif
