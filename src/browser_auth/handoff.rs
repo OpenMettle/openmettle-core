@@ -18,7 +18,7 @@
 //! Anything else is a fixed refusal. The adapter reads no request body, `Host`, forwarded
 //! header or return URL and logs nothing. Only an acknowledged logout deletes a cookie.
 use super::{BrowserAuth, Error};
-use crate::{login, sessions};
+use crate::{login, provider_keys::ManagedProvider, sessions};
 use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode, header, request::Parts};
 use openidconnect::url::Url;
 use std::{fmt, sync::Arc};
@@ -355,13 +355,7 @@ fn session_credential(headers: &HeaderMap) -> Option<&str> {
 /// The handoff for one configured provider at one application origin.
 pub struct LoginHandoff {
     auth: Arc<BrowserAuth>,
-    provider: String,
-    origin: String,
-    issuer: String,
-    /// The exact registered callback; its path is everything after the origin.
-    callback: String,
-    /// `origin` followed by the landing path.
-    landing: String,
+    settings: Checked,
     login_seconds: u64,
 }
 impl fmt::Debug for LoginHandoff {
@@ -369,43 +363,70 @@ impl fmt::Debug for LoginHandoff {
         f.write_str("LoginHandoff(..)")
     }
 }
+/// [`Settings`] that passed [`check`], with the provider's issuer and exact callback.
+pub(crate) struct Checked {
+    provider: String,
+    origin: String,
+    issuer: String,
+    /// The exact registered callback; its path is everything after the origin.
+    callback: String,
+    /// `origin` followed by the landing path.
+    landing: String,
+}
+impl Checked {
+    /// The registered callback's path: everything after the application origin.
+    pub(crate) fn callback_path(&self) -> &str {
+        &self.callback[self.origin.len()..]
+    }
+}
+
+/// Every settings check of [`LoginHandoff::new`], against the configured providers alone. It
+/// needs no service, pool, runtime or network, so the offline configuration check (ADR 0020)
+/// runs the same rules. The issuer and the exact callback come from the provider registered
+/// under that UUID, never from a request.
+pub(crate) fn check(
+    providers: &[ManagedProvider],
+    settings: Settings<'_>,
+) -> Result<Checked, SettingsError> {
+    let Settings {
+        origin,
+        landing,
+        provider,
+    } = settings;
+    if !canonical_origin(origin) {
+        return Err(SettingsError::Origin);
+    }
+    let landing_url = format!("{origin}{landing}");
+    if landing.starts_with("//")
+        || !landing
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/-._~".contains(&b))
+        || !plain_path(&landing_url, landing)
+    {
+        return Err(SettingsError::Landing);
+    }
+    let registered = super::configured(providers, provider).ok_or(SettingsError::Provider)?;
+    let callback = registered.callback().map_err(|_| SettingsError::Provider)?;
+    if !callback
+        .strip_prefix(origin)
+        .is_some_and(|path| plain_path(&callback, path))
+    {
+        return Err(SettingsError::Callback);
+    }
+    Ok(Checked {
+        provider: provider.to_owned(),
+        origin: origin.to_owned(),
+        issuer: registered.issuer().to_owned(),
+        callback,
+        landing: landing_url,
+    })
+}
+
 impl LoginHandoff {
-    /// Validates the settings against the service's configuration. The issuer and the exact
-    /// callback come from the provider registered under that UUID, never from a request.
+    /// Validates the settings against the service's configuration with [`check`].
     pub fn new(auth: Arc<BrowserAuth>, settings: Settings<'_>) -> Result<Self, SettingsError> {
-        let Settings {
-            origin,
-            landing,
-            provider,
-        } = settings;
-        if !canonical_origin(origin) {
-            return Err(SettingsError::Origin);
-        }
-        let landing_url = format!("{origin}{landing}");
-        if landing.starts_with("//")
-            || !landing
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"/-._~".contains(&b))
-            || !plain_path(&landing_url, landing)
-        {
-            return Err(SettingsError::Landing);
-        }
-        let registered = auth
-            .provider(provider)
-            .map_err(|_| SettingsError::Provider)?;
-        let callback = registered.callback().map_err(|_| SettingsError::Provider)?;
-        if !callback
-            .strip_prefix(origin)
-            .is_some_and(|path| plain_path(&callback, path))
-        {
-            return Err(SettingsError::Callback);
-        }
         Ok(Self {
-            provider: provider.to_owned(),
-            origin: origin.to_owned(),
-            issuer: registered.issuer().to_owned(),
-            callback,
-            landing: landing_url,
+            settings: check(auth.config.providers(), settings)?,
             login_seconds: auth.config.login_lifetime().as_secs(),
             auth,
         })
@@ -413,7 +434,7 @@ impl LoginHandoff {
 
     /// The registered callback's path: everything after the application origin.
     pub(super) fn callback_path(&self) -> &str {
-        &self.callback[self.origin.len()..]
+        self.settings.callback_path()
     }
     /// Exactly one field with exactly the configured bytes: `null`, a list, another scheme,
     /// host or port and a repeated field all fail. Initiation and logout share this rule.
@@ -421,7 +442,7 @@ impl LoginHandoff {
         let mut origins = headers.get_all(header::ORIGIN).iter();
         matches!(
             (origins.next(), origins.next()),
-            (Some(origin), None) if origin.as_bytes() == self.origin.as_bytes()
+            (Some(origin), None) if origin.as_bytes() == self.settings.origin.as_bytes()
         )
     }
 
@@ -435,7 +456,7 @@ impl LoginHandoff {
         if !self.same_origin(&request.headers) {
             return Refusal::Origin.response();
         }
-        let Ok(started) = self.auth.begin(&self.provider).await else {
+        let Ok(started) = self.auth.begin(&self.settings.provider).await else {
             return Refusal::Unavailable.response();
         };
         let Some((locator, _)) = started.state.expose().split_once('.') else {
@@ -470,7 +491,7 @@ impl LoginHandoff {
             && code.len() <= login::MAX_CODE_BYTES
             && code.bytes().all(|b| b.is_ascii_graphic());
         let locator = match token_pair(state) {
-            Some((locator, _)) if code_is_safe && *issuer == self.issuer => locator,
+            Some((locator, _)) if code_is_safe && *issuer == self.settings.issuer => locator,
             _ => return Refusal::Response.response(),
         };
         // The cookie names the login it belongs to, so a cookie from a later initiation
@@ -486,11 +507,13 @@ impl LoginHandoff {
             state,
             caller_binding,
             issuer,
-            callback: &self.callback,
+            callback: &self.settings.callback,
             code,
         };
-        match self.auth.complete(&self.provider, callback).await {
-            Ok(credential) => redirect(&self.landing, &session_cookie(credential.expose())),
+        match self.auth.complete(&self.settings.provider, callback).await {
+            Ok(credential) => {
+                redirect(&self.settings.landing, &session_cookie(credential.expose()))
+            }
             Err(error) => completion_refusal(error).response(),
         }
     }

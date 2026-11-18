@@ -346,20 +346,36 @@ pub fn router_with_sessions(
     build(handoff, settings, Some(sessions))
 }
 
-fn build(
-    handoff: LoginHandoff,
+/// Every [`router_with_sessions`] settings check, without a handoff or any route: path shape,
+/// collisions among the four paths and with the operational routes, each budget and the
+/// in-flight cap. `callback_path` is the selected provider's registered callback path. It
+/// needs no runtime, listener, pool or network, so the offline configuration check
+/// (ADR 0020) runs the same rules.
+pub(crate) fn check(
+    callback_path: &str,
     settings: Settings<'_>,
-    sessions: Option<SessionSettings<'_>>,
-) -> Result<Router, SettingsError> {
+    sessions: SessionSettings<'_>,
+) -> Result<(), SettingsError> {
+    plan(callback_path, settings, Some(sessions)).map(drop)
+}
+
+/// Validated routes with fresh budgets, in the order they are added, and the in-flight cap.
+type Plan<'a> = (Vec<(&'a str, Route, Arc<Budget>)>, u32);
+/// The single settings validation behind [`build`] and [`check`]. Paths first, then each
+/// budget in route order, then the in-flight cap.
+fn plan<'a>(
+    callback_path: &'a str,
+    settings: Settings<'a>,
+    sessions: Option<SessionSettings<'a>>,
+) -> Result<Plan<'a>, SettingsError> {
     let Settings {
         initiation,
         begin,
         callback,
         in_flight,
     } = settings;
-    let callback_path = handoff.callback_path().to_owned();
     let mut routes = vec![(initiation, Route::Begin, begin)];
-    routes.push((&callback_path, Route::Callback, callback));
+    routes.push((callback_path, Route::Callback, callback));
     if let Some(sessions) = sessions {
         routes.push((sessions.session, Route::Session, sessions.checks));
         routes.push((sessions.logout, Route::Logout, sessions.logouts));
@@ -374,6 +390,16 @@ fn build(
     if !(1..=MAX_IN_FLIGHT).contains(&in_flight) {
         return Err(SettingsError::InFlight);
     }
+    Ok((budgets, in_flight))
+}
+
+fn build(
+    handoff: LoginHandoff,
+    settings: Settings<'_>,
+    sessions: Option<SessionSettings<'_>>,
+) -> Result<Router, SettingsError> {
+    let callback_path = handoff.callback_path().to_owned();
+    let (budgets, in_flight) = plan(&callback_path, settings, sessions)?;
     let shared = Arc::new(Shared {
         handoff,
         in_flight: Semaphore::new(in_flight as usize),
