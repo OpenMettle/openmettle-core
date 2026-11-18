@@ -26,13 +26,16 @@ SELECT current_user = 'openmettle_owner' AND session_user = current_user
       AND access_generation::text = :'expected_generation' FOR SHARE) p \gset
 \endif
 \if :locked
+  -- Record the current epoch under the provider lock. A later retirement fences this decision.
   WITH created AS (
     INSERT INTO openmettle.home_invitations
-      (id, provider_id, provider_generation, issuer, subject, redeem_before_ms, approval_until_ms, created_by)
-    SELECT :'invitation'::uuid, :'provider'::uuid, :'expected_generation'::bigint,
+      (id, provider_id, provider_generation, provider_epoch, issuer, subject,
+       redeem_before_ms, approval_until_ms, created_by)
+    SELECT :'invitation'::uuid, :'provider'::uuid, :'expected_generation'::bigint, r.epoch,
            :'issuer', :'subject', :'redeem_before_ms'::bigint, :'approval_until_ms'::bigint, :'operator'::uuid
-     WHERE (SELECT revision FROM openmettle.login_provider_revisions
-             WHERE provider_id = :'provider'::uuid ORDER BY epoch DESC LIMIT 1) IS NOT NULL
+      FROM (SELECT epoch, revision FROM openmettle.login_provider_revisions
+             WHERE provider_id = :'provider'::uuid ORDER BY epoch DESC LIMIT 1) r
+     WHERE r.revision IS NOT NULL
        AND :'approval_until_ms'::bigint >= :'redeem_before_ms'::bigint
        AND NOT EXISTS (SELECT FROM openmettle.user_identities WHERE issuer = :'issuer' AND subject = :'subject')
     ON CONFLICT DO NOTHING RETURNING 1

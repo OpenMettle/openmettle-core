@@ -633,6 +633,30 @@ async fn identical_registration_is_noop_and_changes_or_restores_invalidate() {
 fn rebind(c: &mut ProviderConfig) {
     c.binding = c.canonical_binding();
 }
+// The invitation redemption function compares these exact bytes of the stored login binding
+// with the provider, issuer, client, current revision and epoch it is given.
+#[tokio::test]
+async fn stored_managed_binding_layout_matches_invitation_redemption() {
+    let h = Harness::new().await;
+    let c = Harness::config(&h.server, &h.ca, "v1");
+    let field = |b: &[u8]| [&(b.len() as u64).to_be_bytes()[..], b].concat();
+    let head = [
+        b"openmettle/login-provider/2\0".as_slice(),
+        &field(signing::ID.as_bytes()),
+        &field(signing::ISSUER.as_bytes()),
+        &field(signing::CLIENT.as_bytes()),
+        &field(b"v1"),
+    ]
+    .concat();
+    assert!(c.binding.starts_with(&head));
+    let expected = [
+        b"openmettle/managed-login/2\0".as_slice(),
+        &field(&c.binding),
+        &field(&42_i64.to_be_bytes()),
+    ]
+    .concat();
+    assert_eq!(persisted(&c.binding, 42), expected);
+}
 fn unknown(kid: &str) -> UnverifiedIdToken {
     let t = signing::signed(
         &"n".repeat(43),

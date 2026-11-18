@@ -166,12 +166,28 @@ async fn transaction(c: &mut PgConnection) -> Result<WriteTransaction<'_>, Error
     }
     Ok(tx)
 }
+// Deferred home-invitation cutoff (home_redemption_session). The server reported the error for COMMIT
+// and rolled the transaction back, so the refusal is definite.
+const INVITATION_CUTOFF: &str = "OMH01";
+// Only that known server refusal is Rejected. Connection loss, a lost acknowledgement and
+// every other commit failure stay Database: discard the uncertain connection.
+fn committed(result: Result<(), crate::runs::Error>) -> Result<(), Error> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(crate::runs::Error::Database(sqlx::Error::Database(e)))
+            if e.code().as_deref() == Some(INVITATION_CUTOFF) =>
+        {
+            Err(Error::Rejected)
+        }
+        Err(_) => Err(Error::Database),
+    }
+}
 // Returned errors must release locks before the caller gets its connection back. Drop
 // only queues SQLx rollback; cancellation/timeout remains an uncertain-discard boundary.
 async fn finish<T>(tx: WriteTransaction<'_>, result: Result<T, Error>) -> Result<T, Error> {
     match result {
         Ok(value) => {
-            tx.commit().await?;
+            committed(tx.commit().await)?;
             Ok(value)
         }
         Err(error) => {
@@ -463,6 +479,53 @@ mod tests {
             assert!(
                 Policy::new(Duration::from_secs(life), cap, Duration::from_millis(time)).is_err()
             );
+        }
+    }
+    #[derive(Debug)]
+    struct Server(&'static str);
+    impl fmt::Display for Server {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("synthetic server error")
+        }
+    }
+    impl std::error::Error for Server {}
+    impl sqlx::error::DatabaseError for Server {
+        fn message(&self) -> &str {
+            "synthetic server error"
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.0.into())
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+    #[test]
+    fn only_a_reported_invitation_cutoff_is_a_definite_commit_refusal() {
+        let server =
+            |code| crate::runs::Error::Database(sqlx::Error::Database(Box::new(Server(code))));
+        assert_eq!(committed(Ok(())), Ok(()));
+        assert_eq!(committed(Err(server("OMH01"))), Err(Error::Rejected));
+        // The detached-redemption gate, serialization failures and lost connections stay uncertain.
+        for code in ["P0001", "40001", "23514"] {
+            assert_eq!(committed(Err(server(code))), Err(Error::Database));
+        }
+        let lost = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        for error in [
+            crate::runs::Error::Database(sqlx::Error::Io(lost)),
+            crate::runs::Error::Database(sqlx::Error::PoolTimedOut),
+            crate::runs::Error::TransactionUnavailable,
+        ] {
+            assert_eq!(committed(Err(error)), Err(Error::Database));
         }
     }
 }
