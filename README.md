@@ -90,6 +90,8 @@ library exchange only after commit acknowledgement. An injected fake transport e
 code/challenge/client/callback binding. The production transport is described below; there
 is no login route.
 The nonce verifier accepts stored digests without weakening the existing token checks.
+From migration 13 the sealed value also carries an optional home invitation code, at one
+fixed length (ADR 0022). Logins sealed before that migration still complete.
 
 Native handoff remains unimplemented; the browser cookie handoff below is
 not mounted. Key files are read only by the offline check below. Internal local approval and sessions are described below. The outstanding-login
@@ -177,7 +179,9 @@ container whose `psql` runs the operator scripts.
 exact issuer/subject identities with a personal scope and owner-recorded local approval.
 For a new home user, an operator can authorize first-account creation with a single-use
 [invitation bound to the exact provider, issuer and subject](docs/operator/home-invitations.md).
-From schema 13, redeeming it also requires the one-time code that the create command prints. `ManagedProvider::issue_session` consumes
+From schema 13, redeeming it also requires the one-time code that the create command prints.
+The person enters it in the browser sign-in form, and the login seals it until redemption
+([ADR 0022](docs/adr/0022-home-invitation-codes.md)). `ManagedProvider::issue_session` consumes
 only its sealed online proof; an offline `VerifiedIdentity` cannot mint a session.
 
 Routine configuration/approval revisions preserve sessions. Explicit revoke, provider retirement,
@@ -347,7 +351,10 @@ select an origin, provider, callback or destination.
   origin. It answers `303` to the provider's authorization URL and sets
   `__Host-openmettle-login` (`Secure`, `HttpOnly`, `Path=/`, `SameSite=Lax`, `Max-Age` equal
   to the login lifetime). The page with the form must not use `Referrer-Policy: no-referrer`,
-  which makes browsers send `Origin: null`.
+  which makes browsers send `Origin: null`. The form may carry one optional field,
+  `invitation_code`, for a first sign-in (ADR 0022). Any other field or a malformed code is
+  `400` before any provider or database work. The response is the same with or without a
+  code.
 - **Callback** accepts a `GET` on the exact registered callback path. It refuses malformed
   escapes, repeated parameters, provider errors, an incomplete response, a missing or
   different `iss` and a missing, repeated or mismatched caller cookie before calling the
@@ -395,10 +402,14 @@ are decided in this order, and the first four steps do no provider, pool or data
    most 64 header fields and 24 576 header bytes (`431`), and an empty body (`413`). The body
    is judged from its metadata and never read, so a nonzero declared length or chunked body
    is refused without waiting for it. The handoff's query and cookie ceilings still fit and still apply.
+   The initiation route alone also admits one declared `application/x-www-form-urlencoded`
+   body of at most 256 bytes, for the invitation code field (ADR 0022).
 3. An in-flight permit, without waiting (`503`, `login busy; try again later`).
 4. One unit of the route's rate budget (`429`). A unit is spent here, before the handoff
    decides, and is never refunded. Earlier refusals spend nothing.
-5. The handoff, with the original request head. A dropped request releases its permit.
+5. The handoff, with the original request head. A dropped request releases its permit. A
+   declared initiation form is read first, under the permit: at most 256 bytes within 2
+   seconds, or `408`.
 
 These refusals are fixed lines with `no-store`, `no-referrer`, no cookie and no `Location`.
 Mount the router with `Router::merge`, never `Router::nest`, and keep ingress from

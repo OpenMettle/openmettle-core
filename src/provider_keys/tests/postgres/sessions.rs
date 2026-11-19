@@ -601,7 +601,7 @@ async fn original_login_expiry_is_checked_with_primary_clock_after_wait() {
     seed(&mut f, true, true).await;
     let p = f.h.provider.clone();
     let started = p
-        .begin(&mut f.api, &keys(), Duration::from_secs(1))
+        .begin(&mut f.api, &keys(), Duration::from_secs(1), None)
         .await
         .unwrap();
     f.arm(&started);
@@ -1127,7 +1127,7 @@ async fn audited_provider_recovery_requires_a_new_successful_oidc_login() {
     let (_, old_proof) = f.exchanged(&p).await;
     let retired = revoke_provider(&mut f.owner, None).await.to_string();
     assert_eq!(
-        p.begin(&mut f.api, &keys(), Duration::from_secs(60))
+        p.begin(&mut f.api, &keys(), Duration::from_secs(60), None)
             .await
             .unwrap_err(),
         login::Error::Rejected

@@ -65,7 +65,7 @@ async fn unconfigured_full_and_retired_prechecks_spend_no_reservation() {
     let refused = async |f: &mut Flow, expected: login::Error, why: &str| {
         let before = (reservations(&mut f.api).await, f.rows().await);
         let error = p
-            .begin(&mut f.api, &keys(), Duration::from_secs(60))
+            .begin(&mut f.api, &keys(), Duration::from_secs(60), None)
             .await
             .unwrap_err();
         assert_eq!(error, expected, "{why}");
@@ -113,12 +113,12 @@ async fn issued_and_expired_rows_free_capacity() {
     );
     admit(&mut f.owner, Some(2)).await;
     let short = p
-        .begin(&mut f.api, &keys(), Duration::from_secs(5))
+        .begin(&mut f.api, &keys(), Duration::from_secs(5), None)
         .await
         .unwrap();
     f.begin(&p).await;
     assert_eq!(
-        p.begin(&mut f.api, &keys(), Duration::from_secs(60))
+        p.begin(&mut f.api, &keys(), Duration::from_secs(60), None)
             .await
             .unwrap_err(),
         login::Error::Capacity
@@ -149,8 +149,8 @@ async fn last_slot_has_one_winner_and_loser_releases_admission_lock() {
     };
     let ring = keys();
     let (ra, rb, ()) = tokio::join!(
-        p.begin(&mut a, &ring, Duration::from_secs(60)),
-        p.begin(&mut b, &ring, Duration::from_secs(60)),
+        p.begin(&mut a, &ring, Duration::from_secs(60), None),
+        p.begin(&mut b, &ring, Duration::from_secs(60), None),
         control
     );
     let errors: Vec<_> = [&ra, &rb]
@@ -186,7 +186,10 @@ async fn waiting_begin_reads_limit_and_primary_clock_after_lock() {
         waiting(&mut observer, px).await;
         f.owner.execute("COMMIT").await.unwrap();
     };
-    let (result, ()) = tokio::join!(p.begin(&mut x, &ring, Duration::from_secs(60)), control);
+    let (result, ()) = tokio::join!(
+        p.begin(&mut x, &ring, Duration::from_secs(60), None),
+        control
+    );
     assert_eq!(result.unwrap_err(), login::Error::Capacity);
     // Same lowered limit, but the outstanding row expires during the wait: the clock is
     // sampled after the lock, so the expired row no longer counts.
@@ -197,7 +200,7 @@ async fn waiting_begin_reads_limit_and_primary_clock_after_lock() {
     let mut x = f.db.connect(API).await;
     let px = pid(&mut x).await;
     let short = p
-        .begin(&mut f.api, &keys(), Duration::from_secs(1))
+        .begin(&mut f.api, &keys(), Duration::from_secs(1), None)
         .await
         .unwrap();
     hold_limit(&mut f.owner, Some(Some(1))).await;
@@ -212,7 +215,10 @@ async fn waiting_begin_reads_limit_and_primary_clock_after_lock() {
         sleep_past_expiry(&mut f.owner, &short).await;
         f.owner.execute("COMMIT").await.unwrap();
     };
-    let (result, ()) = tokio::join!(p.begin(&mut x, &ring, Duration::from_secs(60)), control);
+    let (result, ()) = tokio::join!(
+        p.begin(&mut x, &ring, Duration::from_secs(60), None),
+        control
+    );
     result.unwrap();
     assert_eq!(outstanding(&mut f.api).await, 1);
 }
@@ -229,7 +235,7 @@ async fn returned_errors_release_admission_and_login_row_locks() {
         .unwrap();
     let mut x = f.db.connect(API).await;
     assert_eq!(
-        p.begin(&mut x, &keys(), Duration::from_secs(60))
+        p.begin(&mut x, &keys(), Duration::from_secs(60), None)
             .await
             .unwrap_err(),
         login::Error::Database
@@ -275,7 +281,7 @@ async fn cancellation_and_ambiguous_commit_admission() {
     let before = reservations(&mut f.api).await;
     hold_limit(&mut f.owner, None).await;
     {
-        let attempt = Box::pin(p.begin(&mut x, &ring, Duration::from_secs(60)));
+        let attempt = Box::pin(p.begin(&mut x, &ring, Duration::from_secs(60), None));
         tokio::select! {
             _ = attempt => panic!("begin finished while the singleton was held"),
             () = waiting(&mut observer, px) => {},
@@ -318,13 +324,15 @@ async fn cancellation_and_ambiguous_commit_admission() {
         let mut cn = PgConnection::connect_with(&options).await.unwrap();
         cancel_at_response(
             &mut barrier,
-            p.begin(&mut cn, &keys(), Duration::from_secs(60)),
+            p.begin(&mut cn, &keys(), Duration::from_secs(60), None),
         )
         .await;
         drop(cn);
         drop(barrier);
         assert_eq!(reservations(&mut f.api).await, 1);
-        let next = p.begin(&mut f.api, &keys(), Duration::from_secs(60)).await;
+        let next = p
+            .begin(&mut f.api, &keys(), Duration::from_secs(60), None)
+            .await;
         if committed {
             assert_eq!(next.unwrap_err(), login::Error::Capacity);
             assert_eq!(f.rows().await, 1);

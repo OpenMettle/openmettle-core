@@ -18,20 +18,25 @@
 //!
 //! 1. Method. A wrong method is `405` and spends nothing.
 //! 2. Request bounds on the head that HTTP parsing produced: target length, header count,
-//!    header bytes and an empty body. A refusal spends nothing and never polls the body.
+//!    header bytes and the body profile. Every route requires an empty body, except that an
+//!    initiation may declare one small form body (ADR 0022). A refusal spends nothing and
+//!    never polls the body.
 //! 3. One in-flight permit, shared by every route. None free is `503` and spends no rate.
 //! 4. One unit of that route's own rate budget. None left is `429`; the permit is released.
-//! 5. The handoff, holding the permit until it returns or its future is dropped.
+//! 5. The handoff, holding the permit until it returns or its future is dropped. A declared
+//!    initiation form is read first, under the permit: at most [`handoff::MAX_FORM_BYTES`]
+//!    within [`FORM_READ_TIMEOUT`], or `408`.
 //!
-//! The rate unit spent in step 4 is never refunded, whatever the handoff then decides.
+//! The rate unit spent in step 4 is never refunded, whatever the handoff then decides or
+//! however the form read ends.
 //! Admission state is per router value and shared by its clones. It is not keyed by client,
 //! trusts no forwarded header, never queues and spawns nothing.
 use super::handoff::{self, LoginHandoff};
 use axum::{
     Router,
-    body::{Body, HttpBody},
+    body::{Body, Bytes, HttpBody, to_bytes},
     extract::Request,
-    http::{HeaderMap, Method, Response, StatusCode, Uri, header, request::Parts},
+    http::{HeaderMap, HeaderName, Method, Response, StatusCode, Uri, header, request::Parts},
     routing::any,
 };
 use std::{
@@ -59,6 +64,11 @@ pub const MIN_INTERVAL: Duration = Duration::from_millis(1);
 pub const MAX_INTERVAL: Duration = Duration::from_secs(3600);
 /// Largest in-flight cap.
 pub const MAX_IN_FLIGHT: u32 = 4096;
+/// Longest wait for a declared initiation form body, counted while its permit is held.
+pub const FORM_READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// The only media type of an initiation form body, as an HTML form sends it.
+const FORM_MEDIA_TYPE: &str = "application/x-www-form-urlencoded";
+const FORM_NOT_RECEIVED: &str = "login request body not received\n";
 /// Operational routes in `crate::serve`. A login path never shadows them when merged.
 const CORE_PATHS: [&str; 2] = ["/healthz", "/readyz"];
 
@@ -268,10 +278,43 @@ fn empty_body(headers: &HeaderMap, body: &Body) -> bool {
             .all(|value| value.as_bytes() == b"0")
         && body.size_hint().exact() == Some(0)
 }
-/// Bounds decided on what HTTP parsing already produced, before the handoff parses its query
-/// or cookies. They do not limit how much the server reads to parse a head. A refusal is a
-/// fixed status and line.
-fn bounds(request: &Parts, body: &Body, lines: &Lines) -> Result<(), (StatusCode, &'static str)> {
+/// The initiation form profile (ADR 0022), decided from metadata alone. `Some(0)` is the
+/// empty profile above. Otherwise there is no `Transfer-Encoding`, exactly one `Content-Type`
+/// that is the form media type, and exactly one `Content-Length` of 1 to
+/// [`handoff::MAX_FORM_BYTES`] in plain decimal that the parsed body agrees with. `None`
+/// refuses, including a chunked body, whose length is not declared.
+fn form_body(headers: &HeaderMap, body: &Body) -> Option<usize> {
+    if empty_body(headers, body) {
+        return Some(0);
+    }
+    let single = |name: HeaderName| {
+        let mut values = headers.get_all(name).iter();
+        values.next().filter(|_| values.next().is_none())
+    };
+    let media_type = single(header::CONTENT_TYPE)?.as_bytes();
+    let length = single(header::CONTENT_LENGTH)?.as_bytes();
+    if headers.contains_key(header::TRANSFER_ENCODING)
+        || !media_type.eq_ignore_ascii_case(FORM_MEDIA_TYPE.as_bytes())
+        || length.len() > 3
+        || length.first() == Some(&b'0')
+        || !length.iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let length: usize = std::str::from_utf8(length).ok()?.parse().ok()?;
+    (length <= handoff::MAX_FORM_BYTES && body.size_hint().exact() == Some(length as u64))
+        .then_some(length)
+}
+/// Bounds decided on what HTTP parsing already produced, before the handoff parses its query,
+/// cookies or form. They do not limit how much the server reads to parse a head. A refusal is
+/// a fixed status and line. Success is the declared body length: zero, or the length of an
+/// initiation form that has not been read yet.
+fn bounds(
+    route: Route,
+    request: &Parts,
+    body: &Body,
+    lines: &Lines,
+) -> Result<usize, (StatusCode, &'static str)> {
     if target_bytes(&request.uri) > MAX_TARGET_BYTES {
         return Err((StatusCode::URI_TOO_LONG, lines.target));
     }
@@ -280,10 +323,13 @@ fn bounds(request: &Parts, body: &Body, lines: &Lines) -> Result<(), (StatusCode
     {
         return Err((StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE, lines.headers));
     }
-    if !empty_body(&request.headers, body) {
-        return Err((StatusCode::PAYLOAD_TOO_LARGE, lines.body));
-    }
-    Ok(())
+    let declared = match route {
+        Route::Begin => form_body(&request.headers, body),
+        Route::Callback | Route::Session | Route::Logout => {
+            empty_body(&request.headers, body).then_some(0)
+        }
+    };
+    declared.ok_or((StatusCode::PAYLOAD_TOO_LARGE, lines.body))
 }
 
 /// State behind one router value and every clone of it. Constant size.
@@ -305,11 +351,13 @@ impl Shared {
         if request.method != method {
             return handoff::wrong_method(allow);
         }
-        // Inspect body metadata only, then drop the body without polling it.
-        if let Err((status, line)) = bounds(&request, &body, lines) {
-            return handoff::respond(status, line);
-        }
-        drop(body);
+        // Inspect body metadata only. An empty body is dropped here without polling it. A
+        // declared initiation form is kept unread until the request is admitted.
+        let declared = match bounds(route, &request, &body, lines) {
+            Ok(declared) => declared,
+            Err((status, line)) => return handoff::respond(status, line),
+        };
+        let body = (declared > 0).then_some(body);
         // `try_acquire` never waits. The permit is released when this future completes or is
         // dropped, including on client disconnect.
         let Ok(_permit) = self.in_flight.try_acquire() else {
@@ -318,8 +366,19 @@ impl Shared {
         if !budget.admit(Instant::now()) {
             return handoff::respond(StatusCode::TOO_MANY_REQUESTS, lines.rate);
         }
+        // The declared length bounds the read, and the timeout bounds a client that stalls.
+        let form = match body {
+            None => Bytes::new(),
+            Some(body) => {
+                let read = to_bytes(body, handoff::MAX_FORM_BYTES);
+                match tokio::time::timeout(FORM_READ_TIMEOUT, read).await {
+                    Ok(Ok(form)) if form.len() == declared => form,
+                    _ => return handoff::respond(StatusCode::REQUEST_TIMEOUT, FORM_NOT_RECEIVED),
+                }
+            }
+        };
         match route {
-            Route::Begin => self.handoff.initiate(&request).await,
+            Route::Begin => self.handoff.initiate(&request, &form).await,
             Route::Callback => self.handoff.callback(&request).await,
             Route::Session => self.handoff.session(&request).await,
             Route::Logout => self.handoff.logout(&request).await,
@@ -594,5 +653,130 @@ mod tests {
         assert!(!empty(&[("content-length", "00")], Body::empty()));
         assert!(!empty(&[("transfer-encoding", "chunked")], Body::empty()));
         assert!(!empty(&[], Body::from("x")));
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        headers
+    }
+    const FORM: (&str, &str) = ("content-type", FORM_MEDIA_TYPE);
+
+    /// The initiation form profile, from metadata alone: nothing here polls a body.
+    #[test]
+    fn initiation_form_profile_is_one_declared_small_urlencoded_body() {
+        let form = |pairs: &[(&str, &str)], body: Body| form_body(&headers(pairs), &body);
+        let bytes = |length: usize| Body::from(vec![b'a'; length]);
+        // The empty profile is unchanged, with or without a media type.
+        assert_eq!(form(&[], Body::empty()), Some(0));
+        assert_eq!(
+            form(&[FORM, ("content-length", "0")], Body::empty()),
+            Some(0)
+        );
+        // One declared form body, up to the ceiling.
+        assert_eq!(form(&[FORM, ("content-length", "16")], bytes(16)), Some(16));
+        assert_eq!(form(&[FORM, ("content-length", "1")], bytes(1)), Some(1));
+        assert_eq!(handoff::MAX_FORM_BYTES, 256);
+        assert_eq!(
+            form(&[FORM, ("content-length", "256")], bytes(256)),
+            Some(256)
+        );
+        let mixed_case = ("content-type", "Application/X-WWW-Form-URLEncoded");
+        assert_eq!(
+            form(&[mixed_case, ("content-length", "16")], bytes(16)),
+            Some(16)
+        );
+
+        let length = ("content-length", "16");
+        let refused: [(&[(&str, &str)], Body); 17] = [
+            // One byte over the ceiling, and far over it.
+            (&[FORM, ("content-length", "257")], bytes(257)),
+            (&[FORM, ("content-length", "1000000000")], Body::empty()),
+            // No media type, another one, a parameter, a list and a repeated field.
+            (&[length], bytes(16)),
+            (&[("content-type", "text/plain"), length], bytes(16)),
+            (
+                &[("content-type", "multipart/form-data"), length],
+                bytes(16),
+            ),
+            (&[("content-type", "application/json"), length], bytes(16)),
+            (
+                &[
+                    (
+                        "content-type",
+                        "application/x-www-form-urlencoded; charset=UTF-8",
+                    ),
+                    length,
+                ],
+                bytes(16),
+            ),
+            (
+                &[
+                    (
+                        "content-type",
+                        "application/x-www-form-urlencoded, text/plain",
+                    ),
+                    length,
+                ],
+                bytes(16),
+            ),
+            (&[FORM, FORM, length], bytes(16)),
+            // No declared length, a repeated one, and lengths that are not plain decimal.
+            (&[FORM], bytes(16)),
+            (&[FORM, length, length], bytes(16)),
+            (&[FORM, ("content-length", "016")], bytes(16)),
+            (&[FORM, ("content-length", "+16")], bytes(16)),
+            (&[FORM, ("content-length", "16, 16")], bytes(16)),
+            // A chunked body, with or without a declared length.
+            (&[FORM, ("transfer-encoding", "chunked")], bytes(16)),
+            (&[FORM, length, ("transfer-encoding", "chunked")], bytes(16)),
+            // A parsed body that disagrees with the declared length.
+            (&[FORM, length], bytes(15)),
+        ];
+        for (index, (pairs, body)) in refused.into_iter().enumerate() {
+            assert_eq!(form(pairs, body), None, "case {index}: {pairs:?}");
+        }
+    }
+
+    /// Only the initiation route takes the form profile. The same request is refused on
+    /// every other route, where the body must still be empty.
+    #[test]
+    fn only_the_initiation_route_admits_a_form_body() {
+        let request = |pairs: &[(&str, &str)]| {
+            let mut request = Request::builder().method("POST").uri("/path");
+            for (name, value) in pairs {
+                request = request.header(*name, *value);
+            }
+            request.body(Body::empty()).unwrap().into_parts().0
+        };
+        let form = request(&[FORM, ("content-length", "16")]);
+        let body = || Body::from(vec![b'a'; 16]);
+        assert_eq!(bounds(Route::Begin, &form, &body(), &LOGIN_LINES), Ok(16));
+        for (route, lines) in [
+            (Route::Callback, &LOGIN_LINES),
+            (Route::Session, &SESSION_LINES),
+            (Route::Logout, &SESSION_LINES),
+        ] {
+            assert_eq!(
+                bounds(route, &form, &body(), lines),
+                Err((StatusCode::PAYLOAD_TOO_LARGE, lines.body))
+            );
+            // Control: the empty profile still passes there.
+            assert_eq!(bounds(route, &request(&[]), &Body::empty(), lines), Ok(0));
+        }
+        // A form the initiation route refuses is the same fixed refusal.
+        let chunked = request(&[FORM, ("transfer-encoding", "chunked")]);
+        assert_eq!(
+            bounds(Route::Begin, &chunked, &body(), &LOGIN_LINES),
+            Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "login request body not accepted\n"
+            ))
+        );
     }
 }

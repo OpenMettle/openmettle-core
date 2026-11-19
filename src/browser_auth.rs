@@ -10,6 +10,7 @@ pub mod handoff;
 pub mod router;
 use crate::{
     auth_config::AuthConfig,
+    invitation::InvitationCode,
     login,
     provider_keys::{ExchangedIdentity, ManagedProvider},
     sessions,
@@ -147,9 +148,14 @@ impl BrowserAuth {
     }
 
     /// Starts a login for one configured provider. Deliver the result only to the
-    /// initiating browser (ADR 0009).
-    pub async fn begin(&self, provider: &str) -> Result<login::Started, Error> {
-        Ok(self.start(self.provider(provider)?).await?)
+    /// initiating browser (ADR 0009). `invitation` is the code the person entered for a first
+    /// sign-in, if any. It is sealed with the login and never returned (ADR 0022).
+    pub async fn begin(
+        &self,
+        provider: &str,
+        invitation: Option<InvitationCode>,
+    ) -> Result<login::Started, Error> {
+        Ok(self.start(self.provider(provider)?, invitation).await?)
     }
     /// Completes a callback: committed single-use consumption, then exactly one token
     /// request, then session issuance from the sealed proof. No step is retried; after any
@@ -200,9 +206,12 @@ impl BrowserAuth {
     // Stages. Each takes the manager admission first, so waiters for a pooled connection
     // are bounded by the configured caller capacity, and creates its checkout inside the
     // future its deadline wraps.
+    // Every login start takes the optional invitation code, so a new start path (the native
+    // one, block C) must decide where the person enters it.
     pub(crate) async fn start(
         &self,
         provider: &ManagedProvider,
+        invitation: Option<InvitationCode>,
     ) -> Result<login::Started, login::Error> {
         let (_admission, deadline) = provider.login_phase()?;
         tokio::time::timeout_at(deadline, async {
@@ -215,6 +224,7 @@ impl BrowserAuth {
                 &login,
                 self.config.keys(),
                 self.config.login_lifetime(),
+                invitation.as_ref(),
             )
             .await;
             db.settle(login_settled(&result));

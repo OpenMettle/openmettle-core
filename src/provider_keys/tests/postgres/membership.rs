@@ -19,17 +19,17 @@ async fn proof_for(f: &mut Flow, subject: &str, issued: i64, claims: Value) -> E
     let p = f.h.provider.clone();
     exchange(f, &p, subject, issued, claims, &auth::Policy::default()).await
 }
-/// A proof for a first sign-in that presented the invitation `code`. No login start accepts
-/// a code yet, so the fixture attaches it to the proof itself.
+/// A proof for a first sign-in whose login start presented the invitation `code`.
 async fn invited_proof(
     f: &mut Flow,
     code: &crate::invitation::InvitationCode,
     issued: i64,
     claims: Value,
 ) -> ExchangedIdentity {
-    let mut proof = proof(f, issued, claims).await;
-    proof.invitation = Some(code.clone());
-    proof
+    let p = f.h.provider.clone();
+    let policy = auth::Policy::default();
+    let subject = "synthetic-subject";
+    exchange_with(f, &p, Some(code), subject, issued, claims, &policy).await
 }
 async fn exchange(
     f: &mut Flow,
@@ -39,7 +39,18 @@ async fn exchange(
     claims: Value,
     policy: &auth::Policy,
 ) -> ExchangedIdentity {
-    let started = f.begin(p).await;
+    exchange_with(f, p, None, subject, issued, claims, policy).await
+}
+async fn exchange_with(
+    f: &mut Flow,
+    p: &ManagedProvider,
+    code: Option<&crate::invitation::InvitationCode>,
+    subject: &str,
+    issued: i64,
+    claims: Value,
+    policy: &auth::Policy,
+) -> ExchangedIdentity {
+    let started = f.begin_with(p, code).await;
     f.arm(&started);
     let url = openidconnect::url::Url::parse(started.authorization_url.expose()).unwrap();
     let nonce = url.query_pairs().find(|(k, _)| k == "nonce").unwrap().1;

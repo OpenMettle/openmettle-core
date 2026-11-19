@@ -113,7 +113,7 @@ async fn one_slot_pool_completes_a_login_and_reuses_after_replay_denial() {
     let pool = one_slot(f.db.options(API));
     let auth = service_over(&f, &pool);
     let first = backend(&pool).await;
-    let started = auth.begin(signing::ID).await.unwrap();
+    let started = auth.begin(signing::ID, None).await.unwrap();
     f.arm(&started);
     let credential = auth
         .complete(signing::ID, callback(&started))
@@ -170,7 +170,7 @@ async fn blocked_provider_requests_hold_no_pooled_connection() {
         f.h.script.lock().unwrap().mode = "ok";
         gate.notify_one();
     };
-    let (started, ()) = tokio::join!(auth.begin(signing::ID), control);
+    let (started, ()) = tokio::join!(auth.begin(signing::ID, None), control);
     let started = started.unwrap();
     f.arm(&started);
     // The token request is held open after consumption committed. The consumption checkout
@@ -274,7 +274,7 @@ async fn cancellation_timeout_and_database_errors_replace_the_connection() {
         .await
         .unwrap();
     assert_eq!(
-        auth.begin(signing::ID).await.unwrap_err(),
+        auth.begin(signing::ID, None).await.unwrap_err(),
         Error::Login(login::Error::Database)
     );
     f.owner
@@ -315,7 +315,7 @@ async fn cancellation_timeout_and_database_errors_replace_the_connection() {
     assert!(!session_issued(&mut f, &started).await);
 
     // No capacity was lost: the single slot still serves a complete login.
-    let started = auth.begin(signing::ID).await.unwrap();
+    let started = auth.begin(signing::ID, None).await.unwrap();
     f.arm(&started);
     auth.complete(signing::ID, callback(&started))
         .await
@@ -413,7 +413,7 @@ async fn pool_waits_stay_inside_the_original_deadlines() {
     let requests = f.h.count();
     let began = Instant::now();
     assert_eq!(
-        auth.begin(signing::ID).await.unwrap_err(),
+        auth.begin(signing::ID, None).await.unwrap_err(),
         Error::Login(login::Error::Rejected)
     );
     let elapsed = began.elapsed();
@@ -439,7 +439,7 @@ async fn pool_waits_stay_inside_the_original_deadlines() {
     let auth = service_over(&f, &pool);
     let first = backend(&pool).await;
     let started = p
-        .begin(&mut f.api, &keys(), Duration::from_secs(1))
+        .begin(&mut f.api, &keys(), Duration::from_secs(1), None)
         .await
         .unwrap();
     f.arm(&started);
@@ -471,7 +471,7 @@ async fn pool_waits_stay_inside_the_original_deadlines() {
         f.h.manager.retire(&p).unwrap();
         drop(slot);
     };
-    let (result, ()) = tokio::join!(auth.begin(signing::ID), control);
+    let (result, ()) = tokio::join!(auth.begin(signing::ID, None), control);
     assert_eq!(result.unwrap_err(), Error::Login(login::Error::Rejected));
     assert_eq!((f.rows().await, reservations(&mut f).await), before);
     assert_eq!(backend(&pool).await, first);

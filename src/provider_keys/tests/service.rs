@@ -64,7 +64,7 @@ async fn provider_work_precedes_checkout_and_refusals_never_check_out() {
         code: "synthetic-code",
     };
     // Route handlers need Send futures.
-    assert_send(&auth.begin(signing::ID));
+    assert_send(&auth.begin(signing::ID, None));
     assert_send(&auth.complete(signing::ID, callback()));
     assert_send(&auth.validate("synthetic"));
     assert_send(&auth.logout("synthetic"));
@@ -72,7 +72,7 @@ async fn provider_work_precedes_checkout_and_refusals_never_check_out() {
     let unknown = "00000000-0000-4000-8000-000000000000";
     for id in [unknown, signing::ISSUER, ""] {
         assert_eq!(
-            auth.begin(id).await.unwrap_err(),
+            auth.begin(id, None).await.unwrap_err(),
             Error::Login(login::Error::Rejected)
         );
         assert!(matches!(
@@ -94,7 +94,7 @@ async fn provider_work_precedes_checkout_and_refusals_never_check_out() {
     // A failed preflight ends the phase before any checkout.
     h.script.lock().unwrap().mode = "failure";
     assert_eq!(
-        auth.begin(signing::ID).await.unwrap_err(),
+        auth.begin(signing::ID, None).await.unwrap_err(),
         Error::Login(login::Error::Rejected)
     );
     assert_eq!(h.count(), 1);
@@ -104,7 +104,7 @@ async fn provider_work_precedes_checkout_and_refusals_never_check_out() {
     h.script.lock().unwrap().mode = "ok";
     h.advance(2);
     assert_eq!(
-        auth.begin(signing::ID).await.unwrap_err(),
+        auth.begin(signing::ID, None).await.unwrap_err(),
         Error::Login(login::Error::Database)
     );
     assert_eq!(h.count(), 3);

@@ -3,6 +3,9 @@
 Status: coordinator-agreed V1-04 implementation contract, 17 November 2026.
 Refs #5; Refs #34. Independent review and CI acceptance are separate gates. #5 remains open.
 
+[ADR 0022](0022-home-invitation-codes.md) lets the initiation form carry one invitation code
+field. See [the amendment](#amendment-invitation-code-field-adr-0022) below.
+
 ## Problem
 
 ADR 0009 requires the caller secret to reach only the initiating browser in a Secure,
@@ -153,6 +156,48 @@ failures, so its text gives restart guidance for all of them. [ADR 0016](0016-po
 These follow RFC 9700 §§4.1–4.4: the exact registered callback and no caller-chosen
 destination, no referrer from the callback response, a single-use code that is never
 stored, and the issuer check against mix-up.
+
+### Amendment: invitation code field (ADR 0022)
+
+`initiate` now takes the request body beside the request head. The router has already
+bounded it ([ADR 0018](0018-bounded-login-router.md#amendment-initiation-form-body-adr-0022)):
+it is empty, or at most 256 bytes of `application/x-www-form-urlencoded`. This replaces the
+statement above that the body is not read. Initiation is decided in this order:
+
+1. The method is `POST`. Otherwise `405` with `Allow: POST`.
+2. The `Origin` rule, unchanged. Otherwise `403`.
+3. The form. An empty body means that no code was entered. Otherwise the body is exactly one
+   `invitation_code` field: one `name=value` pair with no `&` and no second `=`, each part
+   decoded strictly as in callback rule 4. An empty value also means no code. Any other
+   value must be a well-formed code: at most 64 ASCII bytes that, without spaces and `-` and
+   in lowercase, are 32 hexadecimal digits with or without the `omh1` prefix. Anything else
+   is `400`.
+4. `BrowserAuth::begin` for the configured provider, with the code if one was entered. Any
+   failure is `503`.
+5. `303`, as before.
+
+| Status | Fixed line | Cause |
+| --- | --- | --- |
+| `400` | `login request refused` | Initiation rule 3: an unknown, repeated or malformed field, or a malformed code |
+
+- `Origin` is decided before the form is parsed, so a page on another origin learns nothing
+  about the form rule.
+- The form refusal precedes any service call. It costs no provider request, pooled
+  connection, nonce reservation or login row.
+- Only syntax is checked here. Whether a code belongs to an invitation is decided at
+  redemption, inside session issuance. A well-formed wrong code, a correct code and no code
+  get the same `303` shape, and the code never appears in `Location`, a cookie or a body.
+- A sign-in refused for a missing or wrong code gets the existing `403`
+  `login refused. Start a new login.`, byte for byte the same as any other rejected
+  completion.
+- The code is held in a type with redacted `Debug` output and no `Display`.
+
+**Telemetry.** An access log, trace or proxy that records initiation request bodies would
+capture invitation codes. This joins request targets and cookies in the redaction required
+before mounting.
+
+Evidence is listed in ADR 0022. `callback`, `session` and `logout` are unchanged and read no
+body.
 
 ## Limits
 

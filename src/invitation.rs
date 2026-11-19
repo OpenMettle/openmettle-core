@@ -40,6 +40,10 @@ impl InvitationCode {
     pub(crate) fn bytes(&self) -> &[u8; 16] {
         &self.0
     }
+    /// The code recovered from a sealed login (ADR 0009).
+    pub(crate) fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
 }
 impl fmt::Debug for InvitationCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

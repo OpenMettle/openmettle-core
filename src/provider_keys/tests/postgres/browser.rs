@@ -49,8 +49,13 @@ fn serve(listener: TcpListener, host: &str, ca: &tls::Ca, routes: Router) {
     tokio::spawn(axum::serve(https, routes).into_future());
 }
 
-const LOGIN: &str =
-    r#"<form method="post" action="/login"><button id="login">Sign in</button></form>"#;
+// The form carries the invitation code field (ADR 0022), filled with a synthetic well-formed
+// code that no invitation has. The seeded identity already exists, so the code is ignored.
+// The journey shows that the body a real browser sends for this form passes the router's form
+// profile and the handoff's parser.
+const LOGIN: &str = r#"<form method="post" action="/login"><input name="invitation_code" value="omh1-0123-4567-89ab-cdef-fedc-ba98-7654-3210"><button id="login">Sign in</button></form>"#;
+/// `invitation_code=` and the 44-character display form, which needs no escaping.
+const LOGIN_FORM_BYTES: &str = "60";
 const LANDING: &str = r#"<form method="post" action="/logout"><button id="logout">Sign out</button></form>
 <script>
 document.forms[0].onsubmit = async event => {
@@ -66,6 +71,7 @@ document.forms[0].onsubmit = async event => {
 #[derive(Default)]
 struct Observations {
     wrong_form_refused: bool,
+    login_form_declared: bool,
     callback_navigation: bool,
     session_cookies: Vec<bool>,
 }
@@ -85,6 +91,20 @@ fn observe(routes: Router, wrong_origin: String, observed: Arc<Mutex<Observation
                 && headers
                     .get("sec-fetch-site")
                     .is_some_and(|v| v == "cross-site");
+            // The application's own form: one URL-encoded body of the field's exact length.
+            if req.uri().path() == "/login"
+                && req.method() == axum::http::Method::POST
+                && headers
+                    .get("sec-fetch-site")
+                    .is_some_and(|v| v == "same-origin")
+            {
+                observed.lock().unwrap().login_form_declared = headers
+                    .get(header::CONTENT_TYPE)
+                    .is_some_and(|v| v == "application/x-www-form-urlencoded")
+                    && headers
+                        .get(header::CONTENT_LENGTH)
+                        .is_some_and(|v| v == LOGIN_FORM_BYTES);
+            }
             if req.uri().path() == "/callback" {
                 observed.lock().unwrap().callback_navigation = req.method()
                     == axum::http::Method::GET
@@ -223,6 +243,10 @@ async fn cross_site_session_lifecycle() {
         assert!(
             observed.wrong_form_refused,
             "wrong-origin form POST refusal"
+        );
+        assert!(
+            observed.login_form_declared,
+            "application form POST with the invitation code field"
         );
         assert_eq!(observed.session_cookies, [true, false]);
     }
