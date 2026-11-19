@@ -4,6 +4,8 @@ Status: coordinator-agreed V1-04 implementation contract, 17 November 2026.
 Refs #5; Refs #34. Independent review remains required. #5 remains open.
 [ADR 0012](0012-login-provider-authority.md) replaces the process-generation login binding
 and makes identical re-registration a no-op; the rest of this record still applies.
+The [amendment of 19 November 2026](#amendment-19-nov-2026) replaces the token-endpoint
+authentication rule and the treatment of `no-store` and `no-cache` responses.
 
 ## Boundary
 
@@ -225,3 +227,134 @@ schema integration tests were not run locally; they remain CI gates, together wi
 and kind. The proxy child test is exercised by its parent and is not counted twice.
 Two generated provenance inventories were identical. Distribution readiness failed closed
 with the existing 433 blockers; no package or licence-review clearance changed.
+
+## Amendment, 19 Nov 2026
+
+The [owner decision of 19 November 2026](https://github.com/OpenMettle/openmettle-core/issues/5#issuecomment-7002907924)
+makes Keycloak the V1-04 real-provider target and approves two relaxations ("option B").
+Stock Keycloak 26.8.2 failed this profile before sign-in in the PR #72 observation. Its
+discovery omits `none` from `token_endpoint_auth_methods_supported` and sends
+`Cache-Control: no-cache, no-store, must-revalidate, no-transform`. Its JWKS sends
+`no-cache`. Neither response carries `Date` or `Age`.
+
+### Client authentication advertising
+
+Discovery no longer has to advertise `none`, and may omit the list. If present, the list must
+still be an array. The list describes the provider, not this client. The client remains a
+public PKCE client that sends no secret, and its binding still records `public-pkce`.
+PKCE `S256` and `authorization_response_iss_parameter_supported: true` remain required.
+There is still no fallback to confidential authentication, plain PKCE or callbacks without
+an issuer.
+
+### Responses that refuse caching
+
+A response whose `Cache-Control` contains `no-store` or `no-cache` without a value is
+reused for a short window that the operator sets. It is then fetched again.
+
+**Owner decision.** The first D1 rule served such a document only to the operations already
+running and fetched again at every start. Starts are preflight, login begin and callback
+consumption. That rule conflicts with the provider refresh cooldown: a callback, or another
+person's sign-in, arriving within the cooldown was refused, so Keycloak sign-in would mostly
+fail. The [owner decision of 19 November 2026](https://github.com/OpenMettle/openmettle-core/issues/5#issuecomment-7005252283)
+replaces that rule:
+
+- A document that refuses caching is reused for an operator-set window: 60 seconds by
+  default, 300 seconds at most.
+- The refresh cooldown and the unknown-`kid` refresh are unchanged.
+- **Accepted trade-off:** a key that the provider removes can stay trusted until the window
+  ends, at most 300 seconds after the fetch. This bound assumes the response is fresh from the
+  origin. An intermediary that serves an old copy with its original `Date` and no `Age` adds
+  its own staleness, because `Date` does not age the window (see Validation).
+
+The owner rejected three alternatives. Exempting these providers from cooldown would let
+outbound fetches grow with unauthenticated sign-in attempts. Adding cache headers at a reverse
+proxy was also rejected, as was keeping the D1 rule.
+
+**Validation.** Validation is unchanged:
+
+- Every directive is still validated first. A malformed, unknown or repeated directive fails
+  as before, wherever it appears. So do a repeated `Cache-Control`, `Date` or `Age` header,
+  an invalid `Age`, an invalid or future `Date`, and wall-clock rollback during the request.
+  A field-qualified `no-cache="…"` fails closed. Such failures make the provider unavailable.
+- `Date` is optional for these responses. When present it must be valid, but it does not age
+  the window. A refusal overrides any `max-age` in the same header.
+- Responses with `max-age` behave as before, and still require `Date`. Missing freshness,
+  `max-age=0` and expired responses still make the provider unavailable.
+
+**Lifetime.** The window counts from when the request was sent. Any `Age` the response
+carries is subtracted, and the configured maximum freshness caps the result. An `Age` that
+uses the whole window makes the document unusable. The snapshot expires at the earlier of
+its two documents' lifetimes, as before. A provider can therefore mix a `max-age` discovery
+with a refused JWKS. The snapshot stays in the existing process-local entry, and there are no
+storage or schema changes. Every start and continuation uses a cached snapshot until it
+expires, whether or not its documents refused caching.
+
+**Setting.** `provider_refresh.uncacheable_reuse_seconds` in the auth settings document
+([ADR 0015](0015-offline-auth-config-check.md)) is optional in versions 1 and 2:
+
+```json
+"provider_refresh": {
+  "freshness_seconds": 3600,
+  "cooldown_seconds": 60,
+  "uncacheable_reuse_seconds": 60,
+  "deadline_milliseconds": 5000,
+  "max_providers": 2,
+  "max_callers": 32,
+  "max_document_gets": 2
+}
+```
+
+| State | Rule | Reason |
+| --- | --- | --- |
+| Absent | 60 seconds, capped by `freshness_seconds` | Documents written before this member existed still load |
+| Present | 1–300 seconds | The owner's bounds |
+| Present | At least `cooldown_seconds` | Cooldown is set when a refresh starts, and the window counts from a request sent after that. A shorter window would expire while a refresh is still blocked, refusing every sign-in in between. A response `Age` can still shorten the window |
+| Present | At most `freshness_seconds` | Freshness is the operator's cap on how long any document is trusted. The window must not exceed it |
+
+A value outside these rules fails the offline check with "provider refresh policy is out of
+range". The cooldown rule applies only to an explicit value. A document without the member
+and with a cooldown above 60 seconds still loads. It then has the gap described above for
+such a provider, just as a `max-age` shorter than cooldown already does. Operators of a
+provider that refuses caching should therefore set the member. A cooldown above 300 seconds,
+or above `freshness_seconds`, leaves no valid explicit window.
+
+For such a provider:
+
+- **Key rotation.** A new key becomes usable at the next fetch: when the window ends, or
+  earlier through the unknown-`kid` refresh. As before, the replacement retires the old
+  generation. A removed key stays trusted until then, which is the accepted trade-off.
+- **Unknown `kid`.** The refresh rule is unchanged and shares the cooldown. Inside cooldown the
+  token fails without a fetch. After cooldown a refresh fetches both documents, and the
+  replacement starts a new window.
+- **Concurrent sign-ins.** Cooldown, admitted callers, GET slots, size limits and deadlines
+  are unchanged. Starts during a refresh share it, and later starts reuse its result until the
+  window ends. A begin and a callback inside one window share its fetch.
+- **Unreachable provider.** Within the window, operations continue on the held snapshot, as
+  for any cached document. After it ends, sign-in fails until a fetch succeeds, and a fetch is
+  attempted at most once per cooldown. There is no outage grace. Such a provider refreshes once
+  per window rather than at its `max-age`, so one transient fetch failure or leader timeout
+  refuses sign-ins for up to a full cooldown, and does so more often than for a cacheable
+  provider. An operation that straddles the end of a window is refused rather than refreshed
+  (for example at `confirm` or `check_assertion`). That is negligible at 60 seconds and
+  noticeable near the 1-second minimum.
+
+**Operational cost.** At most one discovery and one JWKS fetch per window, plus any
+unknown-`kid` refreshes, which cooldown already limits. That is one of each per minute at
+the default, per provider and process.
+
+Unchanged and still mandatory: PKCE S256, the exact registered callback, issuer and
+endpoint equality, the RFC 9207 issuer flag and callback `iss` check, HTTPS-only transport,
+document size and time bounds, and every key validation above.
+
+New public items: `RefreshPolicy::with_uncacheable_reuse`, `DEFAULT_UNCACHEABLE_REUSE` and
+`MAX_UNCACHEABLE_REUSE` in `provider_keys`. `RefreshPolicy::new` keeps its signature and
+selects the default window.
+
+Evidence for this amendment comes from in-process tests with synthetic TLS fixtures. They
+use Keycloak's exact header strings, a JWKS response without `Date`, and the same
+start/continuation sequence as sign-in. They cover reuse within the window and a fetch after
+it, a callback inside cooldown that needs no fetch, concurrent starts sharing one fetch,
+unknown-`kid` rotation, `max-age` lifetimes, the freshness cap, and the setting's bounds,
+default and cross-field rules in the loader. No PostgreSQL test was added because the cache
+is process-local. No real-provider sign-in, deployment or Keycloak support is claimed. That
+needs the separate hosted Keycloak qualification.

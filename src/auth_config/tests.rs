@@ -221,8 +221,9 @@ const BROWSER_OBJECTS: [&str; 7] = [
 
 #[test]
 fn unknown_and_missing_fields_are_refused_in_every_object() {
-    // Every operational input of each shape is required: none has a default. Version 2 is
-    // version 1 plus 22 browser members, counting `browser` itself.
+    // Every member of the fixture is required. The one optional member,
+    // `provider_refresh.uncacheable_reuse_seconds`, is absent from it and tested separately.
+    // Version 2 is version 1 plus 22 browser members, counting `browser` itself.
     assert_eq!(missing_and_unknown(&Fixture::new(), &OBJECTS), 39);
     let v2: Vec<&str> = OBJECTS.into_iter().chain(BROWSER_OBJECTS).collect();
     assert_eq!(missing_and_unknown(&Fixture::v2(), &v2), 61);
@@ -477,6 +478,98 @@ fn policies_are_judged_by_their_existing_constructors() {
             );
         }
     }
+}
+
+/// The optional reuse window for providers that refuse caching (ADR 0011 amendment, 19
+/// November 2026). The fixture's cooldown is 61 s and its freshness 3600 s.
+#[test]
+fn uncacheable_reuse_window_is_optional_bounded_and_consistent() {
+    let mut fixture = Fixture::new();
+    let load = |fixture: &Fixture, reuse: Option<Value>| {
+        let mut document = fixture.document.clone();
+        if let Some(value) = reuse {
+            document["provider_refresh"]["uncacheable_reuse_seconds"] = value;
+        }
+        fixture.load_bytes(document.to_string().as_bytes())
+    };
+    let expected = |freshness, reuse: Option<u64>| {
+        let policy = RefreshPolicy::new(
+            Duration::from_secs(freshness),
+            Duration::from_secs(61),
+            Duration::from_millis(5000),
+            2,
+            32,
+            3,
+        )
+        .unwrap();
+        let policy = match reuse {
+            Some(seconds) => policy
+                .with_uncacheable_reuse(Duration::from_secs(seconds))
+                .unwrap(),
+            None => policy,
+        };
+        format!("{policy:?}")
+    };
+    let loaded =
+        |result: Result<AuthConfig, Error>| format!("{:?}", result.unwrap().manager().policy());
+    // Absent: the 60 s default. It is not judged against the 61 s cooldown, so a document
+    // written before the member existed still loads.
+    assert!(expected(3600, None).contains("uncacheable_reuse: 60s"));
+    assert_eq!(loaded(load(&fixture, None)), expected(3600, None));
+    // Explicit: from the cooldown up to 300 s and the freshness cap.
+    for seconds in [61, 120, 300] {
+        assert_eq!(
+            loaded(load(&fixture, Some(json!(seconds)))),
+            expected(3600, Some(seconds))
+        );
+    }
+    for seconds in [0, 1, 60, 301, u64::MAX] {
+        assert_eq!(
+            refusal(load(&fixture, Some(json!(seconds)))),
+            Error::RefreshPolicy,
+            "{seconds}"
+        );
+    }
+    fixture.set("/provider_refresh/freshness_seconds", json!(120));
+    assert_eq!(
+        loaded(load(&fixture, Some(json!(120)))),
+        expected(120, Some(120))
+    );
+    assert_eq!(
+        refusal(load(&fixture, Some(json!(121)))),
+        Error::RefreshPolicy
+    );
+    // An absent window still loads under a freshness cap below the default.
+    fixture.set("/provider_refresh/freshness_seconds", json!(30));
+    assert_eq!(loaded(load(&fixture, None)), expected(30, None));
+    let fixture = Fixture::new();
+    for value in [
+        json!("61"),
+        json!(61.0),
+        json!(-1),
+        json!(null),
+        json!([61]),
+    ] {
+        assert_eq!(
+            refusal(load(&fixture, Some(value.clone()))),
+            Error::Field,
+            "{value}"
+        );
+    }
+    let text = fixture.document.to_string();
+    let member = r#""cooldown_seconds":61"#;
+    let repeated = text.replacen(
+        member,
+        &format!(r#"{member},"uncacheable_reuse_seconds":61,"uncacheable_reuse_seconds":61"#),
+        1,
+    );
+    assert_eq!(
+        refusal(fixture.load_bytes(repeated.as_bytes())),
+        Error::DuplicateField
+    );
+    // A version-2 document takes the same member.
+    let v2 = Fixture::v2();
+    assert_eq!(loaded(load(&v2, Some(json!(61)))), expected(3600, Some(61)));
 }
 
 #[test]
