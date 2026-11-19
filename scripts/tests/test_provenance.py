@@ -430,11 +430,13 @@ class RepositoryRegisterTests(unittest.TestCase):
                       boundary["review"]["evidence"])
         self.assertIn("https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7006023083",
                       boundary["review"]["evidence"])
-        # The second decision brings the SGLang fork source inside and keeps the Open WebUI fork outside.
+        self.assertIn("https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7006271314",
+                      boundary["review"]["evidence"])
+        # The third decision keeps both public forks outside the boundary, under their upstream licences.
         components = {comp["id"]: comp for comp in register["components"]}
-        self.assertEqual(components["sglang-curated-fork"]["distribution"], "included")
+        self.assertEqual(components["sglang-curated-fork"]["distribution"], "excluded")
         self.assertEqual(components["open-webui-fork"]["distribution"], "excluded")
-        self.assertNotEqual(register["review_groups"]["serving"]["status"], "excluded")
+        self.assertEqual(register["review_groups"]["serving"]["status"], "excluded")
         # Nothing may stay an undecided candidate, and every component carries a forward assessment.
         for comp in register["components"]:
             with self.subTest(component=comp["id"]):
