@@ -28,6 +28,16 @@ jobs:
         run: rustup toolchain install 1.100.0 --profile minimal
       - name: Resolve declared crate metadata from Cargo.lock
         run: cargo metadata --locked --format-version 1 > "$RUNNER_TEMP/cargo-metadata.json"
+      - name: Warn when Cargo policy records are stale (not a failure)
+        run: |
+          status=0
+          python3 scripts/provenance.py review-cargo --check \
+            --cargo-metadata "$RUNNER_TEMP/cargo-metadata.json" || status=$?
+          if [ "$status" -eq 1 ]; then
+            echo "::warning file=provenance/cargo-reviews.json::Cargo policy records are out of date. Run review-cargo and review the diff; affected packages block distribution readiness."
+          elif [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
       - name: Generate inventory twice and require identical output
         run: |
           for run in a b; do

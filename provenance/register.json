@@ -135,6 +135,39 @@
       }
     }
   },
+  "cargo_licence_policy": {
+    "scope": "Cargo packages are build inputs under the 19 Nov 2026 boundary: Cargo fetches them from their registries at build time, and no binary or image containing them is distributed. They become shipped content once the core images are published (V1-36), which needs a separate owner decision. Each crate's licence and notice files must then ship with the images.",
+    "allowed_licences": [
+      "0BSD",
+      "Apache-2.0",
+      "BSD-2-Clause",
+      "BSD-3-Clause",
+      "CC0-1.0",
+      "ISC",
+      "MIT",
+      "Unicode-3.0",
+      "Zlib"
+    ],
+    "notices": {
+      "status": "none-required",
+      "files": [],
+      "obligations": [
+        "When binaries or images containing these crates are distributed, ship each crate's licence and notice files with them."
+      ],
+      "justification": "Build inputs only under the 19 Nov 2026 boundary: the crates are not redistributed in source or binary form."
+    },
+    "review": {
+      "status": "pending",
+      "reviewer": null,
+      "date": null,
+      "evidence": [],
+      "notes": "Proposed by an agent on 19 November 2026 for owner approval. Approval adopts a licence-bookkeeping policy; it is not legal clearance. Records in cargo-reviews.json are generated against this list and block readiness until it is approved."
+    },
+    "tracking": [
+      "V1-42",
+      "V1-36"
+    ]
+  },
   "cargo_reviews": [
     {
       "name": "openmettle-core",

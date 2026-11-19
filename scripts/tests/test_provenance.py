@@ -403,6 +403,207 @@ class NegativeTests(FixtureCase):
         self.assertIn("**no**", (out_dir / "notice-obligations.md").read_text())
 
 
+class LicenceExpressionTests(unittest.TestCase):
+    ALLOWED = {"MIT", "Apache-2.0", "Unicode-3.0"}
+
+    def outcome(self, expression, licence_file=None):
+        return provenance.licence_outcome(expression, licence_file, self.ALLOWED)
+
+    def test_or_needs_one_allowed_branch_and_and_needs_all(self):
+        cases = {
+            "MIT": True,
+            "MIT OR GPL-3.0-only": True,
+            "GPL-3.0-only OR MIT": True,
+            "MIT AND GPL-3.0-only": False,
+            "MIT AND Apache-2.0": True,
+            "(MIT OR Apache-2.0) AND Unicode-3.0": True,
+            "(MIT OR GPL-3.0-only) AND (GPL-2.0-only OR LGPL-2.1-only)": False,
+            # AND binds tighter than OR.
+            "GPL-3.0-only AND MIT OR Apache-2.0": True,
+            "MIT OR Apache-2.0 AND GPL-3.0-only": True,
+            "GPL-3.0-only OR MIT AND GPL-2.0-only": False,
+            # A WITH term passes only if the whole term is allowed.
+            "Apache-2.0 WITH LLVM-exception": False,
+            "Apache-2.0 WITH LLVM-exception OR MIT": True,
+            "LicenseRef-Proprietary OR MIT": True,
+            "GPL-2.0+": False,
+        }
+        for expression, allowed in cases.items():
+            with self.subTest(expression=expression):
+                self.assertEqual(self.outcome(expression)[0], "allowed" if allowed else "blocked")
+
+    def test_blocked_outcomes_name_the_reason(self):
+        self.assertEqual(self.outcome("MIT AND GPL-3.0-only"),
+                         ("blocked", "licence 'MIT AND GPL-3.0-only' is outside the allow-list "
+                                     "(GPL-3.0-only not allowed)"))
+        self.assertIn("declares no SPDX licence expression", self.outcome(None)[1])
+        self.assertIn("names only the licence file 'COPYING'", self.outcome(None, "COPYING")[1])
+        self.assertIn("deprecated '/' separator", self.outcome("MIT/Apache-2.0")[1])
+
+    def test_invalid_expressions_are_blocked_not_guessed(self):
+        for expression in ("", " ", "mit or apache-2.0", "MIT or Apache-2.0", "MIT OR", "(MIT", "MIT)",
+                           "MIT AND OR Apache-2.0", "MIT, Apache-2.0", "MIT WITH", "OR MIT", "MIT Apache-2.0"):
+            with self.subTest(expression=expression):
+                outcome, reason = self.outcome(expression)
+                self.assertEqual(outcome, "blocked")
+                self.assertIn("not a valid SPDX expression", reason)
+
+
+class CargoPolicyTests(FixtureCase):
+    """Generated policy records replace the maintained review for fixture-dep."""
+
+    def setUp(self):
+        super().setUp()
+        reg = self.register()
+        reg["cargo_reviews"] = [r for r in reg["cargo_reviews"] if r["name"] != "fixture-dep"]
+        self.save(reg)
+        self.records_path = self.root / provenance.RECORDS_FILE
+
+    def review_cargo(self, *extra):
+        return run_cli("review-cargo", "--root", str(self.root), "--register", str(self.register_path),
+                       "--cargo-metadata", str(self.metadata_path), *extra)
+
+    def set_declared(self, licence, licence_file=None):
+        meta = json.loads(self.metadata_path.read_text())
+        meta["packages"][1] |= {"license": licence, "license_file": licence_file}
+        self.metadata_path.write_text(json.dumps(meta))
+
+    def records(self):
+        return json.loads(self.records_path.read_text())
+
+    def save_records(self, data):
+        self.records_path.write_text(json.dumps(data))
+
+    def test_generated_records_pass_under_an_approved_policy(self):
+        self.assert_blocked("cargo fixture-dep 1.2.3: no exact-version review record")
+        code, _, err = self.review_cargo()
+        self.assertEqual(code, 0, err)
+        packages = self.records()["packages"]
+        # The maintained workspace review is not duplicated as a generated record.
+        self.assertEqual([(p["name"], p["outcome"]) for p in packages], [("fixture-dep", "allowed")])
+        code, _, err = self.gate()
+        self.assertEqual(code, 0, err)
+
+    def test_generation_is_deterministic_and_check_detects_drift(self):
+        self.assertEqual(self.review_cargo("--check")[0], 1)
+        self.review_cargo()
+        first = self.records_path.read_bytes()
+        self.review_cargo()
+        self.assertEqual(self.records_path.read_bytes(), first)
+        self.assertEqual(self.review_cargo("--check")[0], 0)
+        self.set_declared("MIT")
+        self.assertEqual(self.review_cargo("--check")[0], 1)
+        self.assertEqual(self.records_path.read_bytes(), first, "--check must not write")
+
+    def test_review_cargo_requires_metadata(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            provenance.main(["review-cargo", "--root", str(self.root), "--register", str(self.register_path)])
+
+    def test_pending_policy_blocks_every_record(self):
+        self.review_cargo()
+        reg = self.register()
+        reg["cargo_licence_policy"]["review"] = {"status": "pending", "reviewer": None, "date": None,
+                                                 "evidence": [], "notes": "Awaiting owner approval."}
+        self.save(reg)
+        self.assert_blocked("cargo licence policy: owner approval pending (1 packages are reviewed against it)")
+
+    def test_pending_policy_notices_block(self):
+        self.review_cargo()
+        reg = self.register()
+        reg["cargo_licence_policy"]["notices"]["status"] = "pending"
+        self.save(reg)
+        self.assert_blocked("cargo licence policy: notice obligations pending")
+
+    def test_disallowed_missing_and_non_spdx_licences_stay_blocked(self):
+        cases = ((("GPL-3.0-only", None), "(GPL-3.0-only not allowed)"),
+                 (("MIT AND GPL-3.0-only", None), "(GPL-3.0-only not allowed)"),
+                 ((None, "LICENSE"), "declares no SPDX licence expression; it names only the licence file"),
+                 ((None, None), "declares no SPDX licence expression"),
+                 (("MIT/Apache-2.0", None), "deprecated '/' separator"))
+        for declared, fragment in cases:
+            with self.subTest(declared=declared):
+                self.set_declared(*declared)
+                self.assertEqual(self.review_cargo()[0], 0)
+                self.assertEqual(self.records()["packages"][0]["outcome"], "blocked")
+                self.assert_blocked(f"cargo fixture-dep 1.2.3: {'licence' if declared[0] else 'declares'}")
+                self.assert_blocked(fragment)
+
+    def test_hand_edited_outcome_blocks(self):
+        self.set_declared("GPL-3.0-only")
+        self.review_cargo()
+        data = self.records()
+        data["packages"][0] |= {"outcome": "allowed", "reason": None}
+        self.save_records(data)
+        code, _, err = self.gate()
+        self.assertEqual(code, 1)
+        self.assertIn("recorded outcome 'allowed' differs from the current policy result 'blocked'", err)
+        self.assertIn("(GPL-3.0-only not allowed)", err)
+
+    def test_policy_change_invalidates_records(self):
+        self.review_cargo()
+        reg = self.register()
+        reg["cargo_licence_policy"]["allowed_licences"] = ["MIT"]
+        self.save(reg)
+        self.assert_blocked("recorded outcome 'allowed' differs from the current policy result 'blocked'")
+
+    def test_declared_licence_change_invalidates_records(self):
+        self.review_cargo()
+        self.set_declared("MIT")
+        self.assert_blocked("declared licence 'MIT' differs from recorded 'Apache-2.0' (regenerate the records)")
+
+    def test_record_checksum_mismatch_blocks(self):
+        self.review_cargo()
+        data = self.records()
+        data["packages"][0]["checksum"] = "f" * 64
+        self.save_records(data)
+        self.assert_blocked("recorded checksum does not match Cargo.lock")
+
+    def test_stale_record_warns_and_new_package_blocks(self):
+        self.review_cargo()
+        lock = self.root / "Cargo.lock"
+        lock.write_text(lock.read_text().replace('version = "1.2.3"', 'version = "1.2.4"'))
+        code, _, err = self.gate(metadata=False)
+        self.assertEqual(code, 1)
+        self.assertIn("cargo fixture-dep 1.2.4: no exact-version review record", err)
+        self.assertIn("cargo policy record for fixture-dep 1.2.3 matches no Cargo.lock package (stale)", err)
+
+    def test_record_beside_a_maintained_review_is_invalid(self):
+        self.review_cargo()
+        self.save(json.loads((FIXTURE / "register.json").read_text()))
+        self.assert_invalid("must not also have a record: fixture-dep 1.2.3")
+
+    def test_malformed_records_are_invalid(self):
+        record = {"name": "fixture-dep", "version": "1.2.3", "source": None, "checksum": None,
+                  "declared_licence": "MIT", "declared_licence_file": None, "outcome": "allowed", "reason": None}
+        cases = ({"packages": {}}, {"packages": [None]}, [], {"packages": [record | {"outcome": "cleared"}]},
+                 {"packages": [record | {"outcome": []}]}, {"packages": [record | {"reason": "x"}]},
+                 {"packages": [record | {"outcome": "blocked"}]}, {"packages": [record, record]},
+                 {"packages": [record | {"declared_licence": " "}]})
+        for data in cases:
+            with self.subTest(data=data):
+                self.save_records(data)
+                self.assertEqual(self.gate()[0], 2)
+
+    def test_policy_must_be_a_list_of_single_identifiers(self):
+        cases = ((None, "cargo_licence_policy must be an object"),
+                 ({"allowed_licences": []}, "allowed_licences must not be empty"),
+                 ({"allowed_licences": ["MIT", "MIT"]}, "duplicates"),
+                 ({"allowed_licences": ["MIT OR Apache-2.0"]}, "must be one licence identifier"),
+                 ({"allowed_licences": ["MIT/Apache-2.0"]}, "is not a valid SPDX term"),
+                 ({"allowed_licences": [" "]}, "nonblank strings"),
+                 ({"scope": " "}, "'scope' must not be blank"))
+        base = self.register()
+        for change, fragment in cases:
+            with self.subTest(change=change):
+                reg = json.loads(json.dumps(base))
+                if change is None:
+                    del reg["cargo_licence_policy"]
+                else:
+                    reg["cargo_licence_policy"] |= change
+                self.save(reg)
+                self.assert_invalid(fragment)
+
+
 class RepositoryRegisterTests(unittest.TestCase):
     """The checked-in register must stay valid, and it must not claim readiness without evidence."""
 
@@ -442,6 +643,19 @@ class RepositoryRegisterTests(unittest.TestCase):
         lock = provenance.load_lock(REPO / "Cargo.lock")
         self.assertEqual([(p["name"], p["version"]) for p in report["cargo_packages"]],
                          [(p["name"], p["version"]) for p in lock])
+
+    def test_committed_policy_records_cover_the_lockfile_and_match_the_policy(self):
+        register = json.loads((REPO / "provenance" / "register.json").read_text())
+        records = provenance.load_records(REPO / "provenance" / provenance.RECORDS_FILE)
+        maintained = {(r["name"], r["version"], r["source"] or "") for r in register["cargo_reviews"]}
+        lock = {provenance._pkg_key(p): p for p in provenance.load_lock(REPO / "Cargo.lock")}
+        self.assertEqual({provenance._pkg_key(r) for r in records}, set(lock) - maintained)
+        allowed = set(register["cargo_licence_policy"]["allowed_licences"])
+        for record in records:
+            with self.subTest(package=record["name"], version=record["version"]):
+                self.assertEqual(record["checksum"], lock[provenance._pkg_key(record)]["checksum"])
+                self.assertEqual((record["outcome"], record["reason"]), provenance.licence_outcome(
+                    record["declared_licence"], record["declared_licence_file"], allowed))
 
 
 if __name__ == "__main__":

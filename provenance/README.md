@@ -6,8 +6,9 @@ This directory holds the V1-42 provenance register. Its tooling reports dependen
 
 | Path | Purpose |
 | --- | --- |
-| `provenance/register.json` | Maintained source: Rust package reviews, stack components, review-group dispositions and the distribution boundary |
-| `scripts/provenance.py` | Generates the inventory and runs the distribution-readiness gate (Python 3.11+ standard library) |
+| `provenance/register.json` | Maintained source: the distribution boundary, review-group dispositions, the Cargo licence policy, maintained Rust package reviews and stack components |
+| `provenance/cargo-reviews.json` | Generated, committed review records: one per Cargo.lock package without a maintained review, checked against the Cargo licence policy. Do not edit by hand |
+| `scripts/provenance.py` | Generates the policy records and the inventory, and runs the distribution-readiness gate (Python 3.11+ standard library) |
 | `scripts/tests/test_provenance.py` | Positive and negative gate tests that use the synthetic fixture in `scripts/tests/fixtures/provenance/` |
 | `.github/workflows/provenance.yml` | CI inventory artifact; the readiness gate runs on manual dispatch |
 
@@ -18,16 +19,18 @@ The generated inventory is a CI artifact and is not committed. A committed snaps
 ```sh
 python3 -m unittest discover -s scripts/tests -v
 cargo metadata --locked --format-version 1 > /tmp/cargo-metadata.json
+python3 scripts/provenance.py review-cargo --cargo-metadata /tmp/cargo-metadata.json
 python3 scripts/provenance.py inventory --cargo-metadata /tmp/cargo-metadata.json --output-dir /tmp/provenance
 python3 scripts/provenance.py check-distribution --cargo-metadata /tmp/cargo-metadata.json
 ```
 
-`--cargo-metadata` is optional for local runs without the pinned toolchain. When it is omitted, the gate reports declared crate licences as unverified. Exit codes:
+`review-cargo` rewrites `provenance/cargo-reviews.json`; review its diff before committing. `review-cargo --check` writes nothing and reports whether the committed records are current. CI runs it and emits a warning, not a failure, when they are stale. `--cargo-metadata` is required for `review-cargo` and optional for the other commands for local runs without the pinned toolchain. When it is omitted, the gate reports declared crate licences as unverified. Exit codes:
 
 | Command | 0 | 1 | 2 |
 | --- | --- | --- | --- |
-| `inventory` | Inventory written, even if blockers remain | — | Register, lockfile or metadata is invalid or inconsistent |
+| `inventory` | Inventory written, even if blockers remain | — | Register, records, lockfile or metadata is invalid or inconsistent |
 | `check-distribution` | No recorded blockers; owner release approval is still required | One or more blockers | As above |
+| `review-cargo` | Records written, or `--check` found them current | `--check` found stale records | As above |
 
 ## Inventory and clearance are separate
 
@@ -35,14 +38,30 @@ python3 scripts/provenance.py check-distribution --cargo-metadata /tmp/cargo-met
 - **Distribution readiness** fails until all of the following hold:
   - the distribution boundary has a nonblank description and a dated, attributed decision review with evidence;
   - every required review group (core, graphiti, database, sandbox, serving, media, application-fork) is either `reviewed` or `excluded`. Both need a nonblank summary and a dated, attributed decision review with evidence. An `excluded` group is outside the recorded boundary and also needs an `exclusion_reason`; it cannot contain an `included` or `candidate` component;
-  - every `Cargo.lock` package has a review at the exact name, version, source and checksum, and its licence matches the declared crate metadata;
+  - every `Cargo.lock` package has a maintained review or a generated policy record at the exact name, version, source and checksum, and its licence matches the declared crate metadata. A policy record also needs an `allowed` outcome under the current allow-list and an owner-approved Cargo licence policy;
   - every `included` component has a version, pin, origin, licence with evidence, recorded notices and a dated review, and no shipped component remains a `candidate`. An `excluded` or `not-distributed` component needs only its `exclusion_reason`; its missing facts do not block.
 
 Recorded notices require nonempty notice references and obligations. A `none-required` disposition requires an explicit justification and the component or crate review must still be complete before inclusion can pass. Evidence entries must be nonblank strings and review dates must be real calendar dates.
 
 Automatic discovery covers Cargo packages only. The component register is manually curated; the gate cannot detect an omitted image, asset or model. A release reviewer must reconcile the actual distribution against the register. A passing gate checks recorded evidence, not the truth or completeness of external evidence. Absolute Cargo licence-file paths are reduced to filenames in artifacts; the source package still owns the full notice.
 
-`Cargo.lock` is read on every run. A new or upgraded crate has no exact-version review, so it blocks readiness. This includes the V1-01 runtime dependencies once they land. A review for a version no longer in the lockfile produces a stale-review warning.
+`Cargo.lock` is read on every run. A new or upgraded crate has no exact-version review or record, so it blocks readiness until the records are regenerated and committed. A review or record for a version no longer in the lockfile produces a stale warning.
+
+## Cargo licence policy (proposed; owner approval required)
+
+`cargo_licence_policy` in `register.json` is an explicit allow-list of SPDX licence identifiers. **It is a proposed policy, not legal clearance.** Its review stays `pending` until the owner approves it, and while it is pending every package reviewed against it blocks readiness. The proposed list is:
+
+`0BSD`, `Apache-2.0`, `BSD-2-Clause`, `BSD-3-Clause`, `CC0-1.0`, `ISC`, `MIT`, `Unicode-3.0`, `Zlib`
+
+`review-cargo` reads each package's declared `license` field from `cargo metadata` and records its outcome:
+
+- an `OR` expression passes if any branch is allowed; an `AND` expression passes only if every part is allowed. `AND` binds tighter than `OR`, and parentheses group as in SPDX;
+- a `WITH` term passes only if the whole term, such as `Apache-2.0 WITH LLVM-exception`, is on the list. None are listed, so such a term needs another allowed `OR` branch;
+- these stay blockers, and the record names the reason: no declared licence (including packages that only name a licence file), an invalid SPDX expression (including Cargo's deprecated `/` separator and lower-case operators) and a licence outside the list. The tool does not reinterpret them.
+
+The gate re-checks every committed record against `Cargo.lock`, the declared metadata and the current allow-list. A hand-edited, stale or policy-changed record blocks. Packages with a maintained review in `cargo_reviews` (the first-party workspace package) get no generated record.
+
+The policy's `scope` records that Cargo packages are build inputs under the 19 November 2026 boundary: Cargo fetches them at build time and no binary or image containing them is distributed. Their notices are therefore `none-required` for now. They become shipped content once the core images are published (V1-36). That widening needs its own owner decision, and each crate's licence and notice files must then ship with the images.
 
 `cargo metadata --locked` stops Cargo from changing the lockfile. It does not prove that build artifacts are reproducible, and it does not review container images, OS packages or bundled assets.
 
@@ -68,7 +87,7 @@ Automatic discovery covers Cargo packages only. The component register is manual
 - **Outside the boundary.** The graphiti, database, sandbox, serving, media and application-fork groups are `excluded`. Every component in them is `excluded` or `not-distributed` with a reason, as are the Debian runtime base image and the CI and test tooling in the core group. Their licence reviews remain pending and are needed before the boundary widens to include them.
 - **Inside the boundary.** The core source (the `openmettle-core` workspace package), the retained repository-template starter and the vendored OpenAPI 3.2 schemas are `included`. Their notices are recorded. `LICENSE`, including its copyright line, is byte-identical to the template's LICENSE at the pinned revision. The vendored schemas keep their Apache-2.0 LICENSE and origin README. Their reviews and the core group disposition remain pending for the owner.
 - **Redistribution assessment.** Each component records one. Only components with recorded licence evidence are `redistributable` or `user-fetched`. Neo4j Community is recorded as GPLv3, so it is `redistributable` only with its corresponding source. Evidence for the Agent Sandbox controller, gVisor and HelixDB is unpinned and must be rechecked at the selected release.
-- **Rust packages.** No Cargo.lock package other than the workspace package has an exact-version review. Against the current lockfile (333 packages), the gate reports 336 blockers: 332 packages without a review record, the pending core group, and the pending reviews of the workspace package, the template starter and the OpenAPI schemas.
+- **Rust packages.** All 332 Cargo.lock packages other than the workspace package have generated policy records. 317 are `allowed` under the proposed allow-list. 15 stay blocked: 14 declare Cargo's deprecated `/` form (`MIT/Apache-2.0` or `Apache-2.0/MIT`), which is not an SPDX expression, and `borrow-or-share` 0.2.4 declares `MIT-0`, which is not on the list. Against the current lockfile (333 packages), the gate reports 20 blockers: those 15 packages, the pending policy approval, the pending core group, and the pending reviews of the workspace package, the template starter and the OpenAPI schemas.
 - **Observed read-only on 19 November 2026, for owner reconciliation.** The OpenMettle/sglang and OpenMettle/open-webui fork repositories are publicly visible, although the decision lists curated forks as not distributed. The openmettle-deploy repository is private, so the chart is not published yet. Track both through the publication tickets below.
 - **Carried forward.** The register keeps the read-only pins recorded on 16 November 2026: Graphiti 0.31.2 and the neo4j driver 6.4.1 (wheel hashes), the Neo4j Community 5.26.32 and PostgreSQL 18.6 image digests, the Text Embeddings Inference image digest and a locally built SGLang image digest (all at the `workstation-stack` revision cited in `SOURCE-REFERENCES.md`), plus the reviewed revisions of the forks and evidence repositories. It still lacks versions and pins for Agent Sandbox, sandboxd, gVisor, the Graphiti memory image, the SGLang release revision, the media services and all model weights. The runtime images do not yet include licence or notice files for the bundled crates or Debian packages; that matters once the images are published.
 - The `serving-fork` licence file names a personal copyright holder. Preserve required copyright and authorship notices. Removing private site configuration does not authorize deleting attribution; track packaging and notice preservation through the existing publication tickets.
