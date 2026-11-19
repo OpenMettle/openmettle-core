@@ -250,10 +250,12 @@ Local, without PostgreSQL:
     each answer within a second, failed readiness checks return within a second, and
     SIGTERM exits 0 within 2 s with `SHUTDOWN_TIMEOUT_MS=1000`. Before this change the
     pipe filled after a few hundred lines and the probes hung.
-- `tests/panic_hook.rs` (no libtest harness, because the hook is process-wide): the binary
-  re-executes itself, installs telemetry on its real stderr and panics with a canary in the
-  message, on the main thread in JSON and text and on a spawned thread. Stderr holds exactly
-  one `process.panicked` line and no canary, `panicked at` or source location.
+- `tests/panic_hook.rs`: the hook is process-wide, so the test re-executes its own binary,
+  filtered to that one test, as a child that installs telemetry on its real stderr and panics
+  with a canary in the message, on the test thread in JSON and text and on a spawned thread.
+  Stderr holds exactly one `process.panicked` line, and neither stream holds the canary,
+  `panicked at` or a source location. It is an ordinary test target, so the manifest declares
+  no extra target and the image build, which copies no tests, is unaffected.
 - `tests/schema.rs`, without PostgreSQL:
   - the migrator exits 78 for invalid `LOG_*` values with only the fixed line;
   - a connection deadline and a refused connection each report `migration.started` and
