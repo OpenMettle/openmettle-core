@@ -1274,3 +1274,207 @@ fn account_admin_cannot_run_in_anothers_scope() {
         RunContinuation::Invalidate(DenialReason::NotFound)
     );
 }
+
+#[test]
+fn project_role_of_returns_none_for_inactive_principals() {
+    let proj = project();
+    assert_eq!(proj.role_of(&user("own")), Some(ProjectRole::Owner));
+
+    let mut disabled = user("own");
+    disabled.account_active = false;
+    assert_eq!(proj.role_of(&disabled), None);
+
+    let mut unapproved = user("own");
+    unapproved.approval_active = false;
+    assert_eq!(proj.role_of(&unapproved), None);
+
+    let mut retired = user("own");
+    retired.provider_active = false;
+    assert_eq!(proj.role_of(&retired), None);
+}
+
+#[test]
+fn removed_or_stale_project_group_cuts_off_group_shares_even_for_direct_members() {
+    let mut alice = user("ed2");
+    alice.local_groups.insert("lg".into());
+    alice.oidc_groups.insert("og".into());
+
+    // LocalGroup removed from project.grants: Alice still has direct Editor on p1,
+    // but must lose access via the stale LocalGroup share row.
+    let mut proj_no_lg = project();
+    proj_no_lg
+        .grants
+        .retain(|g| g.grantee != Grantee::LocalGroup("lg".into()));
+    let r_lg = shared(
+        item(ResourceKind::Conversation, "ed", Scope::Project(proj_no_lg)),
+        Grantee::LocalGroup("lg".into()),
+        ResourceAccess::Write,
+    );
+    assert_eq!(authorize_resource(&alice, &r_lg, Action::Read), HIDDEN);
+    assert_eq!(authorize_resource(&alice, &r_lg, Action::Write), HIDDEN);
+
+    // Same for an Owner holding a direct grant: stale group share does not make item visible.
+    let mut own = user("own");
+    own.local_groups.insert("lg".into());
+    assert_eq!(
+        authorize_share(&own, &r_lg, ShareRecipient::Project),
+        HIDDEN
+    );
+    assert_eq!(authorize_revoke(&own, &r_lg), HIDDEN);
+
+    // LocalGroup grant recorded_active = false also cuts off access and new shares.
+    let mut proj_inactive_lg = project();
+    for g in &mut proj_inactive_lg.grants {
+        if g.grantee == Grantee::LocalGroup("lg".into()) {
+            g.recorded_active = false;
+        }
+    }
+    let r_inactive_lg = shared(
+        item(
+            ResourceKind::Conversation,
+            "ed",
+            Scope::Project(proj_inactive_lg.clone()),
+        ),
+        Grantee::LocalGroup("lg".into()),
+        ResourceAccess::Read,
+    );
+    assert_eq!(
+        authorize_resource(&alice, &r_inactive_lg, Action::Read),
+        HIDDEN
+    );
+    let own_item_inactive = item(
+        ResourceKind::Conversation,
+        "ed",
+        Scope::Project(proj_inactive_lg),
+    );
+    assert_eq!(
+        authorize_share(
+            &user("ed"),
+            &own_item_inactive,
+            ShareRecipient::LocalGroup("lg")
+        ),
+        refused(PolicyReason::GranteeNotMember)
+    );
+
+    // OidcGroup grant becoming Stale cuts off access and new shares even for direct members.
+    let mut proj_stale_og = project();
+    for g in &mut proj_stale_og.grants {
+        if g.grantee == Grantee::OidcGroup("og".into()) {
+            g.origin = Origin::Mapped(Observation::Stale);
+        }
+    }
+    let r_stale_og = shared(
+        item(
+            ResourceKind::Conversation,
+            "ed",
+            Scope::Project(proj_stale_og.clone()),
+        ),
+        Grantee::OidcGroup("og".into()),
+        ResourceAccess::Read,
+    );
+    assert_eq!(
+        authorize_resource(&alice, &r_stale_og, Action::Read),
+        HIDDEN
+    );
+    let own_item_stale = item(
+        ResourceKind::Conversation,
+        "ed",
+        Scope::Project(proj_stale_og),
+    );
+    assert_eq!(
+        authorize_share(
+            &user("ed"),
+            &own_item_stale,
+            ShareRecipient::OidcGroup("og")
+        ),
+        refused(PolicyReason::GranteeNotMember)
+    );
+}
+
+#[test]
+fn shared_personal_item_denies_non_owner_run_execute_and_forged_scope_owner() {
+    let conv = shared(
+        item(ResourceKind::Conversation, "own", personal("own")),
+        u("bob"),
+        ResourceAccess::Write,
+    );
+    // Bob can read and write the shared personal conversation, but cannot execute runs
+    // inside Alice's personal scope (accounting ownership remains with Alice).
+    assert_eq!(authorize_resource(&user("bob"), &conv, Action::Read), ALLOW);
+    assert_eq!(
+        authorize_resource(&user("bob"), &conv, Action::Write),
+        ALLOW
+    );
+    assert_eq!(
+        authorize_resource(&user("bob"), &conv, Action::RunExecute),
+        refused(PolicyReason::InsufficientAccess)
+    );
+    let r = RunAuthority {
+        scope: personal("own"),
+        target: Some(conv.clone()),
+        capabilities: vec![],
+        originating_session_active: true,
+    };
+    assert_eq!(
+        authorize_run_continuation(&user("bob"), &PlatformPolicy::default(), &r),
+        RunContinuation::Invalidate(DenialReason::NotFound)
+    );
+
+    // Forged personal scope with the same scope_id but different owner_user_id must not
+    // pass same_scope matching in authorize_run_continuation.
+    let forged_scope = Scope::Personal {
+        scope_id: "scope-bob".into(),
+        owner_user_id: "own".into(),
+    };
+    let forged_target = shared(
+        item(ResourceKind::Conversation, "own", forged_scope),
+        u("bob"),
+        ResourceAccess::Write,
+    );
+    let r_forged = RunAuthority {
+        scope: personal("bob"),
+        target: Some(forged_target),
+        capabilities: vec![],
+        originating_session_active: true,
+    };
+    assert_eq!(
+        authorize_run_continuation(&user("bob"), &PlatformPolicy::default(), &r_forged),
+        RunContinuation::Invalidate(DenialReason::NotFound)
+    );
+}
+
+#[test]
+fn owner_cannot_see_or_revoke_unshared_or_third_party_one_to_one_shares() {
+    let unshared = conversation("ed");
+    assert_eq!(authorize_revoke(&user("own"), &unshared), HIDDEN);
+
+    // Shared 1:1 between two other editors: still invisible to the project owner.
+    let peer_share = shared(conversation("ed"), u("ed2"), ResourceAccess::Write);
+    assert_eq!(
+        authorize_resource(&user("own"), &peer_share, Action::Read),
+        HIDDEN
+    );
+    assert_eq!(
+        authorize_share(&user("own"), &peer_share, ShareRecipient::Project),
+        HIDDEN
+    );
+    assert_eq!(authorize_revoke(&user("own"), &peer_share), HIDDEN);
+}
+
+#[test]
+fn run_continuation_handles_no_target_and_share_downgrade_to_read() {
+    let mut r = run();
+    r.target = None;
+    assert_eq!(
+        authorize_run_continuation(&runner(), &PlatformPolicy::default(), &r),
+        RunContinuation::Continue
+    );
+
+    // Target share downgraded from Write to Read must invalidate immediately.
+    let mut r_downgraded = run();
+    r_downgraded.target = Some(shared(conversation("own"), u("ed"), ResourceAccess::Read));
+    assert_eq!(
+        authorize_run_continuation(&runner(), &PlatformPolicy::default(), &r_downgraded),
+        RunContinuation::Invalidate(DenialReason::Policy(PolicyReason::InsufficientAccess))
+    );
+}

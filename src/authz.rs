@@ -303,7 +303,11 @@ pub struct Project {
 
 impl Project {
     /// Highest active role across direct, local-group and OIDC-mapped grants, if any.
+    /// Always returns `None` for an inactive principal.
     pub fn role_of(&self, principal: &Principal) -> Option<ProjectRole> {
+        if !principal.is_active() {
+            return None;
+        }
         self.grants
             .iter()
             .filter(|g| g.effective() && principal.matches(&g.grantee))
@@ -343,10 +347,20 @@ pub enum Scope {
     Project(Project),
 }
 
-fn scope_id(scope: &Scope) -> (&'static str, &str) {
-    match scope {
-        Scope::Personal { scope_id, .. } => ("personal", scope_id),
-        Scope::Project(project) => ("project", &project.id),
+fn same_scope(a: &Scope, b: &Scope) -> bool {
+    match (a, b) {
+        (
+            Scope::Personal {
+                scope_id: a_id,
+                owner_user_id: a_owner,
+            },
+            Scope::Personal {
+                scope_id: b_id,
+                owner_user_id: b_owner,
+            },
+        ) => a_id == b_id && a_owner == b_owner,
+        (Scope::Project(a), Scope::Project(b)) => a.id == b.id,
+        _ => false,
     }
 }
 
@@ -446,14 +460,19 @@ fn resource_access(principal: &Principal, resource: &Resource) -> Option<Resourc
     if !resource.kind.shareable() {
         return None;
     }
-    let in_project = matches!(resource.scope, Scope::Project(_));
     let access = resource
         .shares
         .iter()
         .filter(|s| s.effective())
-        .filter(|s| match s.grantee {
-            Grantee::Project => in_project,
-            ref g => principal.matches(g),
+        .filter(|s| match (&resource.scope, &s.grantee) {
+            (Scope::Project(_), Grantee::Project) => true,
+            (Scope::Personal { .. }, Grantee::Project) => false,
+            // Gate 2b: a group share inside a project is effective only while that group still
+            // holds active project membership, even if the caller has another direct project grant.
+            (Scope::Project(project), g @ (Grantee::LocalGroup(_) | Grantee::OidcGroup(_))) => {
+                project.group_is_member(g) && principal.matches(g)
+            }
+            (_, g) => principal.matches(g),
         })
         .map(|s| s.permission)
         .max()?;
@@ -470,7 +489,17 @@ pub fn authorize_resource(principal: &Principal, resource: &Resource, action: Ac
     };
     let required = match action {
         a if is_read(a) => ResourceAccess::Read,
-        Action::Write | Action::RunExecute => ResourceAccess::Write,
+        Action::Write => ResourceAccess::Write,
+        Action::RunExecute => {
+            // Runs charge the scope owner's accounting boundary, so a non-owner cannot execute
+            // runs inside another user's personal scope even with a Write share.
+            if matches!(resource.scope, Scope::Personal { .. })
+                && scope_role(principal, &resource.scope).is_none()
+            {
+                return policy(PolicyReason::InsufficientAccess);
+            }
+            ResourceAccess::Write
+        }
         _ => return policy(PolicyReason::NotApplicable),
     };
     if access < required {
@@ -492,9 +521,8 @@ fn manages_shares(principal: &Principal, resource: &Resource) -> Result<(), Deci
     }
     let role = scope_role(principal, &resource.scope);
     let creator = resource.creator_user_id == principal.user_id;
-    let project_owner =
-        matches!(resource.scope, Scope::Project(_)) && role == Some(ProjectRole::Owner);
-    if (creator && role >= Some(ProjectRole::Editor)) || project_owner {
+    let scope_owner = role == Some(ProjectRole::Owner);
+    if (creator && role >= Some(ProjectRole::Editor)) || scope_owner {
         Ok(())
     } else {
         Err(policy(PolicyReason::NotShareManager))
@@ -520,7 +548,14 @@ pub fn authorize_share(
         return denied;
     }
     match (&resource.scope, recipient) {
-        (_, ShareRecipient::User(grantee)) if grantee.user_id == resource.creator_user_id => {
+        (Scope::Personal { owner_user_id, .. }, ShareRecipient::User(grantee))
+            if grantee.user_id == resource.creator_user_id || grantee.user_id == *owner_user_id =>
+        {
+            policy(PolicyReason::InvalidGrantee)
+        }
+        (Scope::Project(_), ShareRecipient::User(grantee))
+            if grantee.user_id == resource.creator_user_id =>
+        {
             policy(PolicyReason::InvalidGrantee)
         }
         (Scope::Personal { .. }, ShareRecipient::Project) => policy(PolicyReason::InvalidGrantee),
@@ -710,7 +745,7 @@ pub fn authorize_run_continuation(
 ) -> RunContinuation {
     let mut decisions = vec![authorize_scope(owner, &run.scope, Action::RunExecute)];
     if let Some(target) = &run.target {
-        decisions.push(if scope_id(&target.scope) == scope_id(&run.scope) {
+        decisions.push(if same_scope(&target.scope, &run.scope) {
             authorize_resource(owner, target, Action::RunExecute)
         } else {
             Decision::Deny(NotFound)

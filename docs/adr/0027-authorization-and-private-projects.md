@@ -87,8 +87,10 @@ creator demoted to viewer keeps read access to their own items and loses edit an
 
 The project must keep at least one owner. `authorize_member_change` refuses removing or
 demoting the last **distinct user with an active direct `Owner` grant**. Group and mapped
-owners do not count, because they can lapse without an owner action. Transfer is: add the new
-direct owner, then step down.
+owners do not count, because they can lapse without an owner action. PR3 hydration filters
+disabled user accounts out of `Project.grants` (or counts enabled direct owners
+transactionally) so a disabled user cannot satisfy the last-owner invariant. Transfer is: add
+the new direct owner, then step down.
 
 ## Private by default
 
@@ -99,8 +101,9 @@ not shareable in V1-05: share rows on those kinds are ignored and new shares are
 Publishing memory into shared project memory is a separate future action.
 
 Personal-scope items belong to their scope owner. The owner can share them directly with a
-user or with a local or OIDC group. Sharing never changes accounting ownership. A
-project-wide share is invalid outside a project and grants nothing.
+user or with a local or OIDC group. Sharing never changes accounting ownership, and non-owners
+cannot execute runs (`RunExecute`) inside another user's personal scope even with a `Write`
+share. A project-wide share is invalid outside a project and grants nothing.
 
 ### Sharing inside a project
 
@@ -114,6 +117,8 @@ project-wide share is invalid outside a project and grants nothing.
 - On every access the caller's current membership is evaluated first. If it has lapsed
   through direct removal, local group removal or OIDC revocation or staleness, every item in
   that project is concealed, including the caller's own items, even if share rows remain.
+  Likewise, a group share inside a project is effective only while that group still holds
+  active project membership, even if the caller holds a separate direct grant on the project.
 - Revocation does not require the grantee to remain a member, so share managers can always
   retire stale rows.
 
@@ -147,7 +152,7 @@ Five guardrails apply:
    counts them on the primary under the lock that serializes admin changes and applies the
    change in the same transaction.
 3. **Append-only audit.** Every admin, membership, share and capability change records actor,
-   target, reason, request key and timestamp in an append-only table (PR2 schema, PR3 and PR5
+   target, reason, request key and timestamp in an append-only table (PR2 schema, PR3–PR5
    writers). Rows are never updated or deleted by the application roles.
 4. **Immediate revocation** follows from per-request primary hydration.
 5. **Content isolation** as above, covered by negative tests for every resource kind and
