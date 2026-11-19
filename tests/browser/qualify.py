@@ -263,8 +263,9 @@ def run(app, issuer, home, enter, link=None):
     db = home / ".local/share/pki/nssdb"
     db.mkdir(parents=True)
     certutil = ["certutil", "-d", f"sql:{db}"]
+    ca = sys.stdin.buffer.read()
     for args, data in [(["-N", "--empty-password"], b""),
-                       (["-A", "-a", "-t", "C,,", "-n", "fixture"], sys.stdin.buffer.read())]:
+                       (["-A", "-a", "-t", "C,,", "-n", "fixture"], ca)]:
         subprocess.run(certutil + args, input=data, env=env, check=True, timeout=5,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
