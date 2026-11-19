@@ -821,13 +821,14 @@ fn worker_ignores_auth_config_and_mounts_no_sign_in_route() {
 
 /// The API with a valid version-2 document and the given format; `debug`, so every request
 /// writes an event.
-fn start_mounted(bind: &str, url: &str, auth: &str, format: &str) -> Process {
+fn start_mounted(bind: &str, url: &str, auth: &str, format: &str, db_timeout_ms: &str) -> Process {
     start_logging(
         false,
         bind,
         url,
         &[
             ("AUTH_CONFIG", auth),
+            ("DB_TIMEOUT_MS", db_timeout_ms),
             ("LOG_LEVEL", "debug"),
             ("LOG_FORMAT", format),
         ],
@@ -1066,7 +1067,7 @@ fn api_mounts_browser_sign_in_routes_from_a_valid_auth_config() {
 
     for format in ["json", "text"] {
         let bind = address();
-        let mut process = start_mounted(&bind, &url, &auth, format);
+        let mut process = start_mounted(&bind, &url, &auth, format, "150");
         wait_status(&mut process, &bind, "/healthz", 200);
         // Loading and mounting dialled nothing: the lazy pool is still unconnected.
         assert!(database.accept().is_err());
@@ -1092,7 +1093,7 @@ fn api_mounts_browser_sign_in_routes_from_a_valid_auth_config() {
         let began = Instant::now();
         stop(&mut process, "-TERM");
         assert!(began.elapsed() < Duration::from_secs(2));
-        // The session check and the logout dialled the primary database, and only they did.
+        // Readiness, the session check and the logout dialled the primary database.
         assert!(std::iter::from_fn(|| database.accept().ok()).count() > 0);
         let (stdout, stderr) = drain(&mut process);
         assert!(stdout.is_empty(), "{stdout}");
@@ -1453,11 +1454,13 @@ impl MigratedDb {
             .execute("SELECT pg_advisory_lock_shared(720203)")
             .await
             .unwrap();
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .subsec_nanos();
-        let name = format!("om_runtime_{}_{nanos}", std::process::id());
+        let name = format!("om_runtime_{}_{seq}_{nanos}", std::process::id());
         admin
             .execute(AssertSqlSafe(format!(
                 "CREATE DATABASE {name} OWNER openmettle_owner"
@@ -1529,7 +1532,7 @@ async fn postgres_mounted_session_routes_use_the_primary_database() {
     let document = auth_config_support::document_v2(&dir, &ca::Ca::new().pem());
     let auth = dir.write("auth.json", document.to_string().as_bytes());
     let bind = address();
-    let mut api = start_mounted(&bind, &db.api_url(), &auth, "json");
+    let mut api = start_mounted(&bind, &db.api_url(), &auth, "json", "2000");
     wait_status(&mut api, &bind, "/readyz", 200);
 
     let session =

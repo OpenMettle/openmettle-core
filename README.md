@@ -69,6 +69,14 @@ The API, worker and migrator write structured events to stderr ([ADR 0024](docs/
 
 Values must match exactly; anything else exits 78 with `configuration error: invalid LOG_FORMAT` or `invalid LOG_LEVEL`.
 
+- **Default level.** `info` shows start, stop and failure events.
+- **Request events.** Each request gets a server-generated `request_id`, which is never taken from a client header. A request completion is logged at `debug`, or at `warn` for a 5xx response such as a failed readiness check.
+- **What is recorded.** Events carry fixed event names, the matched route template, the method, the status, durations, counts and failure classes. They never carry URLs, queries, headers, cookies, bodies, database settings or third-party library logs.
+- **Slow or unread stderr.** Events are queued (up to 1024 lines) for one writer thread, so a stalled log reader never blocks requests, readiness or shutdown. Lines that do not fit are dropped and counted, and a `telemetry.dropped` event with the count follows the next successful write. The stop, including the final flush, fits `SHUTDOWN_TIMEOUT_MS`: draining gets the deadline less a tenth (at most 250 ms), which is kept for the flush.
+- **Panics.** After telemetry starts, a panic writes one `process.panicked` event and never the panic message or location.
+- **Not covered.** Ingress and proxy access logs are outside these processes. Configure them separately before exposing login routes.
+- **No export yet.** Nothing is sent over the network; OTLP export is a later increment.
+
 ### Browser sign-in routes (off by default)
 
 [ADR 0025](docs/adr/0025-browser-auth-runtime-mounting.md) adds one API-only setting. The worker and migrator never read it.
@@ -90,14 +98,6 @@ A refusal exits 78 with one fixed stderr line and no listener:
 No line carries a path, value, URL, identifier or parser message. Run `--check-auth-config` in the same image and mounts first: it accepts version 1, which serving refuses. There is no live reload; restart the API to apply changed files. Request events for these routes carry the route's configured literal path, the method, the status and a server-generated request ID, and nothing from the request.
 
 **Setting this exposes sign-in to whatever can reach the API port.** The exposure gates of ADRs 0017–0020 are deployment work that this setting does not perform: TLS termination for the configured origin, ingress that preserves paths and does not log targets, cookies or bodies, the database authority and login limit (ADRs 0012 and 0014), operated cleanup, and measured budgets. Each replica keeps its own rate budgets.
-
-- **Default level.** `info` shows start, stop and failure events.
-- **Request events.** Each request gets a server-generated `request_id`, which is never taken from a client header. A request completion is logged at `debug`, or at `warn` for a 5xx response such as a failed readiness check.
-- **What is recorded.** Events carry fixed event names, the matched route template, the method, the status, durations, counts and failure classes. They never carry URLs, queries, headers, cookies, bodies, database settings or third-party library logs.
-- **Slow or unread stderr.** Events are queued (up to 1024 lines) for one writer thread, so a stalled log reader never blocks requests, readiness or shutdown. Lines that do not fit are dropped and counted, and a `telemetry.dropped` event with the count follows the next successful write. The stop, including the final flush, fits `SHUTDOWN_TIMEOUT_MS`: draining gets the deadline less a tenth (at most 250 ms), which is kept for the flush.
-- **Panics.** After telemetry starts, a panic writes one `process.panicked` event and never the panic message or location.
-- **Not covered.** Ingress and proxy access logs are outside these processes. Configure them separately before exposing login routes.
-- **No export yet.** Nothing is sent over the network; OTLP export is a later increment.
 
 Run the real PostgreSQL subprocess test against an isolated test database:
 
@@ -133,7 +133,7 @@ From migration 13 the sealed value also carries an optional home invitation code
 fixed length (ADR 0022). Logins sealed before that migration still complete.
 
 The native handoff below is not mounted; the browser cookie handoff below is
-mounted only when `OPENMETTLE_API_AUTH_CONFIG` is set (ADR 0025). Key files are read only by the offline check below. Internal local approval and sessions are described below. The outstanding-login
+mounted only when `OPENMETTLE_API_AUTH_CONFIG` is set (ADR 0025). Key files are read only by the offline check below and by `openmettle-api` at startup when `OPENMETTLE_API_AUTH_CONFIG` is set. Internal local approval and sessions are described below. The outstanding-login
 cap below is not a rate limit. The login router below adds per-process request,
 rate and concurrency bounds; public exposure remains blocked on ingress
 transport limits, operated cleanup and retired-key reservation reclamation. After database restore, invalidate pending login transactions and
