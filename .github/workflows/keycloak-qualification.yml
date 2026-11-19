@@ -1,0 +1,119 @@
+name: Keycloak sign-in qualification
+# V1-04 (#5): hosted CI browser sign-in qualification against pinned stock Keycloak 26.8.2
+# over HTTPS with a per-run test CA, PostgreSQL 18 and headless Chrome. Exercises the unmounted
+# browser auth stack (auth_config::load, BrowserAuth, LoginHandoff, router_with_sessions) and
+# operator approval/invitation scripts. Not a deployment template or production enablement.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  qualify:
+    name: Keycloak 26.8.2 browser sign-in (PostgreSQL + Chrome)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      # Official quay.io index for Keycloak 26.8.2, active tag digest resolved 2026-11-18.
+      # Same pinned digest as .github/workflows/provider-observation.yml.
+      PROVIDER_IMAGE: quay.io/keycloak/keycloak@sha256:c68e286cacd87b942ac1939a0a1481461109d6acd3a57dc496969a319a76bbf0
+      PROVIDER_CONTAINER: openmettle-keycloak-qualification
+      PROVIDER_NETWORK: openmettle-keycloak-qualification
+    services:
+      postgres:
+        image: postgres:18.1-bookworm@sha256:cc9f4143a8d2fa8cf3749d0cb4d26ecf2d53a77a2ac807e9ebd67ae22426221a
+        env:
+          POSTGRES_USER: fixture
+          POSTGRES_PASSWORD: fixture
+          POSTGRES_DB: fixture
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fixture -d fixture"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6; resolved 2026-11-14
+        with:
+          persist-credentials: false
+      - name: Test Keycloak fixture and browser harness offline
+        run: |
+          python3 -m unittest discover -s tests/keycloak -v
+          python3 -m unittest discover -s tests/browser -v
+      - name: Install pinned toolchain
+        run: rustup toolchain install 1.100.0 --profile minimal
+      # Read-only restore of main CI Cargo cache; never writes cache entries.
+      - name: Restore Cargo dependencies and build outputs
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5; MIT; resolved 2026-11-17
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+            ~/.cargo/git/db
+            target
+            !target/debug/incremental
+          key: cargo-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/**', '.github/workflows/checks.yml') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/**', '.github/workflows/checks.yml') }}-
+            cargo-v1-${{ runner.os }}-${{ runner.arch }}-
+      - name: Fetch locked Cargo dependencies
+        run: cargo fetch --locked
+      - name: Pull pinned Keycloak 26.8.2 image by digest
+        run: |
+          docker pull "$PROVIDER_IMAGE"
+          version=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$PROVIDER_IMAGE")
+          test "$version" = 26.8.2
+      - name: Prepare per-run test CA, realm import and synthetic accounts
+        run: python3 tests/keycloak/fixture.py prepare --directory "$RUNNER_TEMP/keycloak-qualification"
+      # Isolated internal bridge network (no container egress), HTTPS only, no container logs.
+      - name: Start pinned Keycloak 26.8.2 over HTTPS
+        run: |
+          docker network create --internal "$PROVIDER_NETWORK"
+          docker run --detach --name "$PROVIDER_CONTAINER" \
+            --network "$PROVIDER_NETWORK" \
+            --log-driver none \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --volume "$RUNNER_TEMP/keycloak-qualification/provider:/etc/keycloak-tls:ro" \
+            --volume "$RUNNER_TEMP/keycloak-qualification/import:/opt/keycloak/data/import:ro" \
+            "$PROVIDER_IMAGE" \
+            start \
+            --db=dev-file \
+            --cache=local \
+            --http-enabled=false \
+            --https-port=8443 \
+            --https-certificate-file=/etc/keycloak-tls/tls-certificate.pem \
+            --https-certificate-key-file=/etc/keycloak-tls/tls-key.pem \
+            --hostname=https://keycloak.provider.test:8443 \
+            --import-realm
+      - name: Configure auth settings, validate offline and wait for HTTPS discovery
+        run: |
+          address=$(docker inspect --format "{{with index .NetworkSettings.Networks \"$PROVIDER_NETWORK\"}}{{.IPAddress}}{{end}}" "$PROVIDER_CONTAINER")
+          test -n "$address"
+          printf '%s %s\n' "$address" keycloak.provider.test | sudo tee -a /etc/hosts >/dev/null
+          python3 tests/keycloak/fixture.py settings --directory "$RUNNER_TEMP/keycloak-qualification" --address "$address"
+          cargo run --locked --offline --bin openmettle-api -- --check-auth-config "$RUNNER_TEMP/keycloak-qualification/auth-settings.json"
+          python3 tests/keycloak/fixture.py wait --directory "$RUNNER_TEMP/keycloak-qualification"
+      - name: Run PostgreSQL + Chrome Keycloak sign-in qualification
+        timeout-minutes: 5
+        env:
+          KEYCLOAK_FIXTURE_DIR: ${{ runner.temp }}/keycloak-qualification
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          TEST_DATABASE_URL: postgres://fixture:fixture@127.0.0.1:5432/fixture?sslmode=disable
+        run: |
+          case_name=provider_keys::tests::postgres::browser::keycloak_browser_sign_in_qualification
+          cargo test --locked --offline --lib "$case_name" -- --ignored --exact --list | grep -Fx "$case_name: test"
+          cargo test --locked --offline --lib "$case_name" -- --ignored --exact --nocapture
+      - name: Remove provider container, network and private fixture directory
+        if: always()
+        run: |
+          # Container state only; provider logs and private fixture files are never published.
+          docker inspect --format 'provider state={{.State.Status}} exit={{.State.ExitCode}}' "$PROVIDER_CONTAINER" || true
+          docker rm --force "$PROVIDER_CONTAINER" || true
+          docker network rm "$PROVIDER_NETWORK" || true
+          rm -rf "$RUNNER_TEMP/keycloak-qualification"

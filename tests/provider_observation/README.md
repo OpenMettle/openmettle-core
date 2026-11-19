@@ -40,12 +40,14 @@ The job fails on any of these fixture errors:
 - the issuer or `jwks_uri` does not match the fixed realm;
 - the JWKS has no key array or contains private key members.
 
-The job also fails if either source prediction from the [#5 research](https://github.com/OpenMettle/openmettle-core/issues/5#issuecomment-6985077381) is not observed:
+The job classifies the observed discovery and JWKS documents against the current `src/provider_keys/documents.rs` rules, including the [ADR 0011 amendment of 19 November 2026](../../docs/adr/0011-managed-provider-keys.md#amendment-19-nov-2026):
 
-- discovery `token_endpoint_auth_methods_supported` must be an array without `none`;
-- discovery `Cache-Control` must include `no-store`.
+- **`compatible`**: both documents satisfy the metadata, key, media-type and explicit `max-age` + `Date` rules without requiring bounded uncacheable reuse.
+- **`compatible-with-bounded-uncacheable-reuse`**: both documents satisfy the amended ADR 0011 profile, and at least one document refuses caching (`no-store` or valueless `no-cache`), so operators must configure bounded reuse via `provider_refresh.uncacheable_reuse_seconds`. Stock Keycloak 26.8.2 falls in this class: discovery omits `none` from `token_endpoint_auth_methods_supported` and sends `Cache-Control: no-cache, no-store, must-revalidate, no-transform`, while JWKS sends `Cache-Control: no-cache`, both without `Date` or `Age`.
+- **`observed-incompatibility`** (job fails): an observed wire property conflicts with the current amended ADR 0011 profile (for example, missing `S256` or `authorization_response_iss_parameter_supported: true`, invalid `Cache-Control` directives, field-qualified `no-cache="..."`, or `max-age` without `Date`).
+- **`not-established`** (job fails): a fixture error prevented reading or validating the documents.
 
-Each of these properties conflicted with a rule in `src/provider_keys/documents.rs`: `metadata` required `none`, and `freshness` refused `no-store`. The [ADR 0011 amendment of 19 November 2026](../../docs/adr/0011-managed-provider-keys.md#amendment-19-nov-2026) accepts both. A passing job still reports `observed-incompatibility`: the label now records the provider behaviour observed against the earlier profile, not a conflict with the current one. It does not mean that sign-in works, that Keycloak is supported, or that no other conflicts exist.
+Raw header facts (`Cache-Control` directives, `Date`, `Age`, `Content-Type`) and metadata facts remain verbatim in the report. A passing observation still sets `login_attempted: false` and `provider_support_claimed: false`: end-to-end sign-in evidence lives in the separate hosted Keycloak qualification (`tests/keycloak/`).
 
 The report also records content types, `Date`/`Age`, JWKS cache directives, PKCE and the `iss` parameter flag for comparison with a hosted run.
 

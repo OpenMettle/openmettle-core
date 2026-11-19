@@ -193,45 +193,83 @@ class ObserveTests(unittest.TestCase):
                                         observe.request_bytes(observe.JWKS_PATH)])
         return report
 
-    def test_predicted_incompatibilities_are_reported(self):
-        report = self.observe(response(200, KEYCLOAK_LIKE_HEADERS, discovery()),
-                              response(200, KEYCLOAK_LIKE_HEADERS, jwks()))
+    def test_keycloak_headers_and_omitted_none_are_compatible_under_bounded_uncacheable_reuse(self):
+        discovery_headers = [
+            ("Cache-Control", "no-cache, no-store, must-revalidate, no-transform"),
+            ("Content-Type", "application/json; charset=UTF-8"),
+        ]
+        jwks_headers = [
+            ("Cache-Control", "no-cache"),
+            ("Content-Type", "application/json"),
+        ]
+        report = self.observe(response(200, discovery_headers, discovery()),
+                              response(200, jwks_headers, jwks()))
         outcome = report["outcome"]
         self.assertEqual(outcome["failures"], [])
-        self.assertEqual(outcome["classification"], "observed-incompatibility")
-        self.assertEqual(outcome["incompatibilities"], [
-            "discovery token_endpoint_auth_methods_supported omits none",
-            "discovery Cache-Control includes no-store",
+        self.assertEqual(outcome["incompatibilities"], [])
+        self.assertEqual(outcome["classification"], "compatible-with-bounded-uncacheable-reuse")
+        self.assertEqual(outcome["bounded_reuse_notes"], [
+            "discovery token_endpoint_auth_methods_supported omits none (accepted under ADR 0011 amendment)",
+            "discovery Cache-Control refuses caching (requires bounded provider_refresh.uncacheable_reuse_seconds)",
+            "jwks Cache-Control refuses caching (requires bounded provider_refresh.uncacheable_reuse_seconds)",
         ])
         self.assertFalse(outcome["login_attempted"])
         self.assertFalse(outcome["provider_support_claimed"])
+        self.assertEqual(report["discovery"]["headers"]["cache_control"]["directives"], {
+            "must-revalidate": True, "no-cache": True, "no-store": True, "no-transform": True,
+        })
+        self.assertEqual(report["jwks"]["headers"]["cache_control"]["directives"], {"no-cache": True})
         meta = report["discovery"]["metadata"]
         self.assertEqual(meta["code_challenge_methods_supported"], {"shape": "array", "known": ["S256", "plain"], "other": 0})
         self.assertIs(meta["authorization_response_iss_parameter_supported"], True)
         self.assertEqual(report["jwks"]["keys"]["rsa_rs256_signing_keys"], 1)
 
-    def test_advertised_none_falsifies_the_prediction(self):
+    def test_cacheable_provider_with_date_and_max_age_is_compatible(self):
+        headers = [
+            ("Content-Type", "application/json"),
+            ("Date", "Wed, 18 Nov 2026 12:00:00 GMT"),
+            ("Cache-Control", "max-age=300"),
+        ]
         methods = ["client_secret_basic", "none"]
-        report = self.observe(response(200, KEYCLOAK_LIKE_HEADERS, discovery(token_endpoint_auth_methods_supported=methods)),
-                              response(200, KEYCLOAK_LIKE_HEADERS, jwks()))
-        self.assertIn("prediction not observed: discovery advertises no array without none", report["outcome"]["failures"])
-        self.assertEqual(report["outcome"]["classification"], "not-established")
+        report = self.observe(response(200, headers, discovery(token_endpoint_auth_methods_supported=methods)),
+                              response(200, headers, jwks()))
+        outcome = report["outcome"]
+        self.assertEqual(outcome["failures"], [])
+        self.assertEqual(outcome["incompatibilities"], [])
+        self.assertEqual(outcome["bounded_reuse_notes"], [])
+        self.assertEqual(outcome["classification"], "compatible")
 
-    def test_cacheable_discovery_falsifies_the_prediction(self):
+    def test_max_age_without_date_is_incompatible(self):
         headers = [("Content-Type", "application/json"), ("Cache-Control", "max-age=300")]
         report = self.observe(response(200, headers, discovery()), response(200, headers, jwks()))
-        self.assertEqual(report["outcome"]["failures"], ["prediction not observed: discovery Cache-Control lacks no-store"])
+        self.assertEqual(report["outcome"]["classification"], "observed-incompatibility")
+        self.assertIn("discovery freshness headers are incompatible", report["outcome"]["incompatibilities"])
+        self.assertIn("jwks freshness headers are incompatible", report["outcome"]["incompatibilities"])
 
     def test_quoted_extension_value_cannot_count_as_a_cache_directive(self):
-        headers = [("Cache-Control", 'extension="a, no-store, b"')]
+        headers = [("Content-Type", "application/json"), ("Cache-Control", 'extension="a, no-store, b"')]
         report = self.observe(response(200, headers, discovery()), response(200, headers, jwks()))
-        self.assertEqual(report["outcome"]["classification"], "not-established")
+        self.assertEqual(report["outcome"]["classification"], "observed-incompatibility")
         self.assertNotIn("no-store", report["discovery"]["headers"]["cache_control"]["directives"])
 
-    def test_no_store_with_an_empty_argument_cannot_establish_the_prediction(self):
-        headers = [("Cache-Control", "no-store=")]
-        report = self.observe(response(200, headers, discovery()), response(200, headers, jwks()))
-        self.assertEqual(report["outcome"]["classification"], "not-established")
+    def test_no_store_or_no_cache_with_argument_is_incompatible(self):
+        for value in ("no-store=", 'no-cache="Set-Cookie"'):
+            headers = [("Content-Type", "application/json"), ("Cache-Control", value)]
+            with self.subTest(value=value):
+                report = self.observe(response(200, headers, discovery()), response(200, headers, jwks()))
+                self.assertEqual(report["outcome"]["classification"], "observed-incompatibility")
+
+    def test_missing_pkce_s256_or_rfc9207_iss_is_incompatible(self):
+        report = self.observe(
+            response(200, KEYCLOAK_LIKE_HEADERS, discovery(
+                code_challenge_methods_supported=["plain"],
+                authorization_response_iss_parameter_supported=False,
+            )),
+            response(200, KEYCLOAK_LIKE_HEADERS, jwks()),
+        )
+        self.assertEqual(report["outcome"]["classification"], "observed-incompatibility")
+        self.assertIn("discovery code_challenge_methods_supported lacks S256", report["outcome"]["incompatibilities"])
+        self.assertIn("discovery authorization_response_iss_parameter_supported is not true", report["outcome"]["incompatibilities"])
 
     def test_other_realm_is_a_fixture_failure(self):
         report = self.observe(response(200, KEYCLOAK_LIKE_HEADERS, discovery(jwks_uri="http://127.0.0.1:8080/realms/other/certs")),

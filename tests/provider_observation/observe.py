@@ -1,9 +1,10 @@
 """V1-04 wire observation of a pinned stock OIDC provider's discovery and JWKS documents.
 
 This is not a login test. It requests two fixed local document paths once each, records
-bounded allowlisted facts and asserts the incompatibilities that upstream source predicts.
-Raw documents, key material, identifiers and unrecognized header values never leave this
-process: every reported string is a constant or an allowlisted token.
+bounded allowlisted facts and classifies wire compatibility against the amended ADR 0011
+profile (including bounded reuse for documents that refuse caching). Raw documents, key
+material, identifiers and unrecognized header values never leave this process: every
+reported string is a constant or an allowlisted token.
 """
 import argparse
 import http.client
@@ -259,9 +260,50 @@ def jwks_facts(document):
     }
 
 
+VALUELESS_CACHE_DIRECTIVES = {
+    "no-store", "no-cache", "public", "private", "must-revalidate", "proxy-revalidate", "no-transform",
+}
+NUMERIC_CACHE_DIRECTIVES = {"max-age", "s-maxage", "stale-if-error", "stale-while-revalidate"}
+
+
+def _media_compatible(headers, allowed_media_types):
+    ct = headers["content_type"]
+    return ct.get("count") == 1 and ct.get("media_type") in allowed_media_types and ct.get("other_parameters") == 0
+
+
+def cache_mode(headers):
+    """Classify response caching headers against src/provider_keys/documents.rs (ADR 0011 amendment)."""
+    cc = headers["cache_control"]
+    date = headers["date"]
+    age = headers["age"]
+    if (headers["content_encoding_present"] or headers["location_present"]
+            or cc["count"] != 1 or cc["repeated_directives"] or cc["unknown_directives"]
+            or date["count"] > 1 or (date["count"] == 1 and not date["imf_fixdate"])
+            or age["count"] > 1 or (age["count"] == 1 and age["value"] is None)):
+        return "incompatible"
+    directives = cc["directives"]
+    if not directives:
+        return "incompatible"
+    for name, value in directives.items():
+        if name in VALUELESS_CACHE_DIRECTIVES:
+            if value is not True:
+                return "incompatible"
+        elif name in NUMERIC_CACHE_DIRECTIVES:
+            if not isinstance(value, int) or isinstance(value, bool):
+                return "incompatible"
+        else:
+            return "incompatible"
+    if directives.get("no-store") is True or directives.get("no-cache") is True:
+        return "bounded-uncacheable-reuse"
+    max_age = directives.get("max-age")
+    if isinstance(max_age, int) and not isinstance(max_age, bool) and max_age > 0 and date["count"] == 1:
+        return "cacheable-max-age"
+    return "incompatible"
+
+
 def evaluate(discovery, jwks):
-    """Fixture checks and source predictions. Each failure is a fixed phrase."""
-    failures = []
+    """Fixture checks and amended ADR 0011 wire-document compatibility. Every phrase is fixed."""
+    failures, incompatibilities, bounded_reuse_notes = [], [], []
     d_headers, d_meta = discovery["headers"], discovery.get("metadata")
     j_headers, j_keys = jwks["headers"], jwks.get("keys")
     if d_headers["status"] != 200 or d_meta is None:
@@ -272,18 +314,59 @@ def evaluate(discovery, jwks):
         failures.append("fixture: discovery does not describe the fixed local realm")
     if j_keys is not None and (j_keys["keys_shape"] != "array" or j_keys["non_object_keys"] or j_keys["private_members_present"]):
         failures.append("fixture: JWKS is not a public key set")
-    incompatibilities = []
-    if d_meta is not None:
-        methods = d_meta["token_endpoint_auth_methods_supported"]
-        if methods["shape"] == "array" and "none" not in methods["known"]:
-            incompatibilities.append("discovery token_endpoint_auth_methods_supported omits none")
-        else:
-            failures.append("prediction not observed: discovery advertises no array without none")
-    if d_headers["cache_control"]["directives"].get("no-store") is True:
-        incompatibilities.append("discovery Cache-Control includes no-store")
+    if failures:
+        return failures, incompatibilities, bounded_reuse_notes, "not-established"
+
+    if not _media_compatible(d_headers, {"application/json"}):
+        incompatibilities.append("discovery Content-Type is incompatible")
+    if not _media_compatible(j_headers, {"application/json", "application/jwk-set+json"}):
+        incompatibilities.append("jwks Content-Type is incompatible")
+
+    if not (d_meta["authorization_endpoint_matches_fixed"] and d_meta["token_endpoint_matches_fixed"]):
+        incompatibilities.append("discovery authorization or token endpoint does not match fixed realm")
+    if d_meta["response_types_supported_includes_code"] is not True:
+        incompatibilities.append("discovery response_types_supported lacks code")
+    if d_meta["subject_types_supported_includes_public"] is not True:
+        incompatibilities.append("discovery subject_types_supported lacks public")
+    if d_meta["id_token_signing_alg_values_supported_includes_RS256"] is not True:
+        incompatibilities.append("discovery id_token_signing_alg_values_supported lacks RS256")
+    if d_meta["grant_types_supported_includes_authorization_code"] not in (True, "absent"):
+        incompatibilities.append("discovery grant_types_supported lacks authorization_code")
+    if d_meta["response_modes_supported_includes_query"] not in (True, "absent"):
+        incompatibilities.append("discovery response_modes_supported lacks query")
+    pkce = d_meta["code_challenge_methods_supported"]
+    if pkce["shape"] != "array" or "S256" not in pkce["known"]:
+        incompatibilities.append("discovery code_challenge_methods_supported lacks S256")
+    if d_meta["authorization_response_iss_parameter_supported"] is not True:
+        incompatibilities.append("discovery authorization_response_iss_parameter_supported is not true")
+
+    methods = d_meta["token_endpoint_auth_methods_supported"]
+    if methods["shape"] == "invalid":
+        incompatibilities.append("discovery token_endpoint_auth_methods_supported is not an array")
+    elif methods["shape"] == "array" and "none" not in methods["known"]:
+        bounded_reuse_notes.append("discovery token_endpoint_auth_methods_supported omits none (accepted under ADR 0011 amendment)")
+
+    if j_keys["rsa_rs256_signing_keys"] < 1:
+        incompatibilities.append("jwks contains no RS256 RSA signing key")
+
+    d_cache = cache_mode(d_headers)
+    j_cache = cache_mode(j_headers)
+    if d_cache == "incompatible":
+        incompatibilities.append("discovery freshness headers are incompatible")
+    elif d_cache == "bounded-uncacheable-reuse":
+        bounded_reuse_notes.append("discovery Cache-Control refuses caching (requires bounded provider_refresh.uncacheable_reuse_seconds)")
+    if j_cache == "incompatible":
+        incompatibilities.append("jwks freshness headers are incompatible")
+    elif j_cache == "bounded-uncacheable-reuse":
+        bounded_reuse_notes.append("jwks Cache-Control refuses caching (requires bounded provider_refresh.uncacheable_reuse_seconds)")
+
+    if incompatibilities:
+        classification = "observed-incompatibility"
+    elif "bounded-uncacheable-reuse" in (d_cache, j_cache):
+        classification = "compatible-with-bounded-uncacheable-reuse"
     else:
-        failures.append("prediction not observed: discovery Cache-Control lacks no-store")
-    return failures, incompatibilities
+        classification = "compatible"
+    return failures, incompatibilities, bounded_reuse_notes, classification
 
 
 def observe(argv, deadline_seconds):
@@ -311,7 +394,7 @@ def observe(argv, deadline_seconds):
             jwks["keys"] = jwks_facts(parse_document(body))
         except Failure as error:
             jwks["error"] = str(error)
-    failures, incompatibilities = evaluate(discovery, jwks)
+    failures, incompatibilities, bounded_reuse_notes, classification = evaluate(discovery, jwks)
     return {
         "scope": "V1-04 provider document wire observation",
         "request": {"accept": ACCEPT, "redirects_followed": False, "returned_jwks_uri_followed": False},
@@ -320,8 +403,9 @@ def observe(argv, deadline_seconds):
         "discovery": discovery,
         "jwks": jwks,
         "outcome": {
-            "classification": "observed-incompatibility" if incompatibilities and not failures else "not-established",
+            "classification": classification,
             "incompatibilities": incompatibilities,
+            "bounded_reuse_notes": bounded_reuse_notes,
             "failures": failures,
             "login_attempted": False,
             "provider_support_claimed": False,
@@ -344,7 +428,7 @@ def main(argv=None):
             "login_attempted": False, "provider_support_claimed": False}}
     args.report.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(json.dumps(report["outcome"], indent=2, sort_keys=True))
-    return 1 if report["outcome"]["failures"] else 0
+    return 1 if (report["outcome"]["failures"] or report["outcome"].get("incompatibilities")) else 0
 
 
 if __name__ == "__main__":
