@@ -63,6 +63,8 @@ struct Script {
     cache: String,
     metadata_cache: String,
     date: std::time::SystemTime,
+    // False omits Date, as stock Keycloak 26.8.2 does (PR #72).
+    dated: bool,
     mode: &'static str,
     token: String,
     // PKCE challenge from a real managed begin; None keeps the fixed fixture verifier.
@@ -94,6 +96,7 @@ impl Harness {
             cache: "max-age=100".into(),
             metadata_cache: "max-age=100".into(),
             date: signing::now(),
+            dated: true,
             mode: "ok",
             challenge: None,
             token: signing::signed(
@@ -126,7 +129,10 @@ impl Harness {
             }
             assert!(request.body.is_empty());
             let body=if discovery {serde_json::to_vec(&s.metadata).unwrap()}else{s.keys.clone()};
-            let bytes=tls::response(200,&[("content-type","application/json"),("cache-control",if discovery {&s.metadata_cache}else{&s.cache}),("date",&httpdate::fmt_http_date(s.date))],&body);
+            let date=httpdate::fmt_http_date(s.date);
+            let mut headers=vec![("content-type","application/json"),("cache-control",if discovery {s.metadata_cache.as_str()}else{s.cache.as_str()})];
+            if s.dated {headers.push(("date",&date));}
+            let bytes=tls::response(200,&headers,&body);
             if jwks && s.mode=="gate-jwks" {tls::Reply::Gate(s.gate.clone(),bytes)} else {tls::Reply::Bytes(bytes)}
         }).await;
         let manager = ProviderManager::new(policy);
@@ -334,12 +340,13 @@ async fn managed_exchange_carries_the_sealed_invitation_code_to_the_proof() {
 }
 #[tokio::test]
 async fn successful_replacements_retire_removed_and_noncacheable_keys() {
-    for cache in [
-        "max-age=100",
-        "no-store",
-        "no-cache",
-        "max-age=0",
-        "max-age=bogus",
+    for (cache, usable) in [
+        ("max-age=100", true),
+        ("no-store", true),
+        ("no-cache", true),
+        ("max-age=0", false),
+        ("max-age=bogus", false),
+        ("no-cache, bogus", false),
     ] {
         let h = Harness::new().await;
         h.provider.preflight().await.unwrap();
@@ -351,7 +358,7 @@ async fn successful_replacements_retire_removed_and_noncacheable_keys() {
         }
         h.provider.refresh(None).await.unwrap();
         assert!(h.verify(false).await.is_err());
-        assert_eq!(h.verify(true).await.is_ok(), cache == "max-age=100");
+        assert_eq!(h.verify(true).await.is_ok(), usable, "{cache}");
         assert_eq!(h.count(), 4);
     }
     let h = Harness::new().await;
@@ -402,7 +409,6 @@ async fn metadata_defaults_profile_and_exact_destinations() {
         "response_types_supported",
         "subject_types_supported",
         "id_token_signing_alg_values_supported",
-        "token_endpoint_auth_methods_supported",
         "code_challenge_methods_supported",
         "authorization_response_iss_parameter_supported",
     ] {
@@ -413,10 +419,6 @@ async fn metadata_defaults_profile_and_exact_destinations() {
     for (name, value) in [
         ("grant_types_supported", json!(["implicit"])),
         ("response_modes_supported", json!(["fragment"])),
-        (
-            "token_endpoint_auth_methods_supported",
-            json!(["client_secret_basic"]),
-        ),
         ("code_challenge_methods_supported", json!(["plain"])),
         (
             "authorization_response_iss_parameter_supported",
@@ -759,6 +761,7 @@ async fn release_rechecks_generation_expiry_token_time_and_clock_rollback() {
                     known_kids: previous.known_kids.clone(),
                     expires: previous.expires,
                     generation: previous.generation + 1,
+                    reusable: previous.reusable,
                 }));
             }
             "keys-expire" => {
@@ -918,6 +921,7 @@ fn online_keys_reject_malformed_private_usage_and_strength() {
 }
 #[test]
 fn freshness_obeys_age_delay_caps_headers_and_directives() {
+    use documents::Freshness::Reusable;
     let now = signing::now();
     let response = |cache: &str, date: SystemTime, age: Option<&str>| {
         let mut r = openidconnect::http::Response::builder()
@@ -939,7 +943,7 @@ fn freshness_obeys_age_delay_caps_headers_and_directives() {
     };
     assert_eq!(
         fresh(&response("max-age=100", now, Some("3"))),
-        Some(Duration::from_secs(15))
+        Some(Reusable(Duration::from_secs(15)))
     );
     assert_eq!(
         fresh(&response(
@@ -947,7 +951,7 @@ fn freshness_obeys_age_delay_caps_headers_and_directives() {
             now - Duration::from_secs(7),
             Some("3")
         )),
-        Some(Duration::from_secs(13))
+        Some(Reusable(Duration::from_secs(13)))
     );
     for cc in [
         "max-age=0",
@@ -955,8 +959,6 @@ fn freshness_obeys_age_delay_caps_headers_and_directives() {
         "max-age=20, MAX-AGE=30",
         "max-age=-1",
         "max-age=18446744073709551616",
-        "max-age=20, no-store",
-        "max-age=20, no-cache",
         "max-age=20, unknown",
         "max-age=\"20",
         "max-age=20,",
@@ -1290,7 +1292,7 @@ async fn lost_metadata_qualification_retires_old_snapshot_without_key_fetch() {
                     .unwrap()
                     .remove("code_challenge_methods_supported");
             } else {
-                s.metadata_cache = "no-store".into();
+                s.metadata_cache = "no-store, unknown".into();
             }
         }
         assert_eq!(
@@ -1303,6 +1305,269 @@ async fn lost_metadata_qualification_retires_old_snapshot_without_key_fetch() {
         );
         assert!(h.provider.snapshot().is_err());
         assert_eq!(h.count(), 3);
+    }
+}
+/// ADR 0011 amendment: the token-endpoint authentication list is not required, in any form;
+/// S256 and every other capability check still are.
+#[tokio::test]
+async fn metadata_ignores_client_authentication_advertising_but_requires_s256() {
+    let h = Harness::new().await;
+    let c = h.provider.config().unwrap();
+    let check = |v: &Value| documents::metadata(&serde_json::to_vec(v).unwrap(), &c);
+    let mut keycloak = metadata(&c);
+    keycloak["token_endpoint_auth_methods_supported"] = json!([
+        "private_key_jwt",
+        "client_secret_basic",
+        "client_secret_post",
+        "tls_client_auth",
+        "client_secret_jwt"
+    ]);
+    keycloak["code_challenge_methods_supported"] = json!(["plain", "S256"]);
+    assert_eq!(check(&keycloak), Ok(()));
+    for methods in [json!(["client_secret_basic"]), json!([])] {
+        let mut v = metadata(&c);
+        v["token_endpoint_auth_methods_supported"] = methods;
+        assert_eq!(check(&v), Ok(()));
+    }
+    let mut v = metadata(&c);
+    v.as_object_mut()
+        .unwrap()
+        .remove("token_endpoint_auth_methods_supported");
+    assert_eq!(check(&v), Ok(()));
+    // The member stays typed: a non-array is still a malformed document.
+    v["token_endpoint_auth_methods_supported"] = json!("none");
+    assert_eq!(check(&v), Err(Error::Document));
+    for (name, value) in [
+        ("code_challenge_methods_supported", Some(json!(["plain"]))),
+        ("code_challenge_methods_supported", Some(json!([]))),
+        ("code_challenge_methods_supported", None),
+        ("authorization_response_iss_parameter_supported", None),
+        ("response_types_supported", Some(json!(["id_token"]))),
+    ] {
+        let mut v = keycloak.clone();
+        match value {
+            Some(value) => v[name] = value,
+            None => {
+                v.as_object_mut().unwrap().remove(name);
+            }
+        }
+        assert!(check(&v).is_err(), "{name}");
+    }
+    for name in ["issuer", "token_endpoint", "jwks_uri"] {
+        let mut v = keycloak.clone();
+        v[name] = "https://unconfigured.example.test/".into();
+        assert_eq!(check(&v), Err(Error::Mismatch), "{name}");
+    }
+}
+/// Refusal directives give a usable but non-reusable verdict, without Date or Age. A malformed
+/// header or directive still fails, whatever its position relative to the refusal.
+#[test]
+fn freshness_refusals_serve_one_operation_and_malformed_headers_still_fail() {
+    use documents::Freshness::{Operation, Reusable};
+    let now = signing::now();
+    let fresh = |cache: Option<&str>, date: Option<&str>, age: Option<&str>| {
+        let mut r = openidconnect::http::Response::builder();
+        for (name, value) in [("cache-control", cache), ("date", date), ("age", age)] {
+            if let Some(v) = value {
+                r = r.header(name, v);
+            }
+        }
+        documents::freshness(
+            &r.body(vec![]).unwrap(),
+            now - Duration::from_secs(2),
+            now,
+            Duration::from_secs(2),
+            Duration::from_secs(20),
+        )
+    };
+    let date = httpdate::fmt_http_date(now);
+    // Keycloak 26.8.2 discovery and JWKS as observed in PR #72: no Date and no Age.
+    for cc in [
+        "no-cache, no-store, must-revalidate, no-transform",
+        "no-cache",
+        "no-store",
+        "NO-STORE",
+        "no-transform, must-revalidate, no-store, no-cache",
+        "max-age=20, no-store",
+        "no-cache, max-age=20",
+        "public, no-cache",
+    ] {
+        assert_eq!(fresh(Some(cc), None, None), Some(Operation), "{cc}");
+        assert_eq!(
+            fresh(Some(cc), Some(&date), Some("3")),
+            Some(Operation),
+            "{cc}"
+        );
+    }
+    // max-age keeps its reusable lifetime and still needs Date.
+    assert_eq!(
+        fresh(Some("max-age=20"), Some(&date), None),
+        Some(Reusable(Duration::from_secs(18)))
+    );
+    assert_eq!(fresh(Some("max-age=20"), None, None), None);
+    for cc in [
+        "no-store, bogus",
+        "bogus, no-store",
+        "no-cache, no-cache",
+        "no-store, NO-STORE",
+        "no-store=1",
+        "no-cache=\"set-cookie\"",
+        "no-cache, max-age=x",
+        "no-cache, max-age",
+        "no-store,",
+        ",no-store",
+        "no-store, s-maxage=-1",
+        "no-store, public=1",
+    ] {
+        assert_eq!(fresh(Some(cc), None, None), None, "{cc}");
+    }
+    assert_eq!(fresh(None, None, None), None);
+    // When present, Date and Age must still be valid; future Date still fails.
+    let future = httpdate::fmt_http_date(now + Duration::from_secs(1));
+    assert_eq!(fresh(Some("no-store"), Some("yesterday"), None), None);
+    assert_eq!(fresh(Some("no-store"), Some(&future), None), None);
+    assert_eq!(fresh(Some("no-store"), None, Some("-1")), None);
+    // A repeated header fails even when both copies are identical and valid.
+    for (header, value) in [
+        ("date", date.as_str()),
+        ("age", "0"),
+        ("cache-control", "no-store"),
+    ] {
+        let r = openidconnect::http::Response::builder()
+            .header("cache-control", "no-store")
+            .header("date", &date)
+            .header("age", "0")
+            .header(header, value)
+            .body(vec![])
+            .unwrap();
+        assert_eq!(
+            documents::freshness(&r, now, now, Duration::ZERO, Duration::from_secs(20)),
+            None,
+            "duplicate {header}"
+        );
+    }
+    // Local wall-clock rollback during the request still fails.
+    let r = openidconnect::http::Response::builder()
+        .header("cache-control", "no-store")
+        .body(vec![])
+        .unwrap();
+    assert_eq!(
+        documents::freshness(
+            &r,
+            now + Duration::from_secs(1),
+            now,
+            Duration::ZERO,
+            Duration::from_secs(20)
+        ),
+        None
+    );
+}
+fn keycloak(h: &Harness) {
+    let mut s = h.script.lock().unwrap();
+    s.metadata_cache = "no-cache, no-store, must-revalidate, no-transform".into();
+    s.cache = "no-cache".into();
+    s.dated = false;
+    s.metadata["token_endpoint_auth_methods_supported"] = json!([
+        "private_key_jwt",
+        "client_secret_basic",
+        "client_secret_post"
+    ]);
+}
+/// A refused-caching snapshot serves the operations that were running when it arrived. Each
+/// later start fetches again, within cooldown; an outage is not bridged by the old snapshot.
+#[tokio::test]
+async fn refused_caching_is_fetched_per_operation_and_never_reused() {
+    let h = Harness::new().await;
+    keycloak(&h);
+    // Begin: fetch, then the in-operation checks after the database work.
+    let (_admission, deadline) = h.provider.login_phase().unwrap();
+    h.provider.fresh().await.unwrap();
+    assert_eq!(h.count(), 2);
+    assert!(!h.provider.snapshot().unwrap().reusable);
+    h.provider.login_provider(deadline).unwrap();
+    h.provider.confirm(deadline).unwrap();
+    // A second start inside cooldown does not reuse it: it is refused, without a fetch.
+    assert_eq!(h.provider.preflight().await, Err(Error::Cooldown));
+    assert!(matches!(
+        h.provider.fresh().await,
+        Err(login::Error::Rejected)
+    ));
+    assert_eq!(h.count(), 2);
+    // Callback after cooldown: consume fetches again; exchange and release continue it with
+    // that snapshot, so the only further request is the code POST.
+    h.advance(2);
+    h.provider.fresh().await.unwrap();
+    assert_eq!(h.count(), 4);
+    let generation = h.provider.snapshot().unwrap().generation;
+    let proof = h
+        .permit()
+        .exchange_with_keys(&h.provider, &auth::Policy::default())
+        .await
+        .unwrap();
+    assert_eq!(proof.key_generation, generation);
+    assert_eq!(h.count(), 5);
+    assert_eq!(
+        finish_in_memory(&h.provider, proof).unwrap().subject(),
+        "synthetic-subject"
+    );
+    // Key rotation: the next start retires the old set; the new key verifies.
+    h.advance(2);
+    h.script.lock().unwrap().keys = rotated();
+    h.provider.preflight().await.unwrap();
+    assert_eq!(h.count(), 7);
+    assert!(h.verify(false).await.is_err());
+    assert!(h.verify(true).await.is_ok());
+    assert_eq!(h.count(), 7);
+    // Unreachable provider at the next start: no grace from the held snapshot.
+    h.advance(2);
+    h.script.lock().unwrap().mode = "failure";
+    assert_eq!(h.provider.preflight().await, Err(Error::Fetch));
+    assert_eq!(h.count(), 8);
+    // It is still held for the operations it already serves, yet the start did not use it.
+    assert!(h.provider.snapshot().is_ok());
+    // The held snapshot ends one operation deadline after its fetch, even for continuations.
+    h.advance(3);
+    assert!(h.provider.snapshot().is_err());
+}
+/// A refusal on either document makes the snapshot non-reusable. Explicit max-age on both
+/// keeps today's reuse. A malformed refusal still makes the provider unavailable.
+#[tokio::test]
+async fn either_refusal_prevents_reuse_and_max_age_keeps_reuse() {
+    for (metadata_cache, cache, reusable) in [
+        ("max-age=100", "max-age=100", true),
+        ("no-store", "max-age=100", false),
+        ("max-age=100", "no-cache", false),
+    ] {
+        let h = Harness::new().await;
+        {
+            let mut s = h.script.lock().unwrap();
+            s.metadata_cache = metadata_cache.into();
+            s.cache = cache.into();
+        }
+        h.provider.preflight().await.unwrap();
+        assert_eq!(h.provider.snapshot().unwrap().reusable, reusable);
+        // Inside the max-age lifetime, a reusable snapshot needs no fetch.
+        h.advance(2);
+        h.provider.preflight().await.unwrap();
+        assert_eq!(
+            h.count(),
+            if reusable { 2 } else { 4 },
+            "{metadata_cache} {cache}"
+        );
+    }
+    for (metadata_cache, cache, count) in [
+        ("no-store, bogus", "no-cache", 1),
+        ("no-store", "no-cache, no-cache", 2),
+    ] {
+        let h = Harness::new().await;
+        {
+            let mut s = h.script.lock().unwrap();
+            s.metadata_cache = metadata_cache.into();
+            s.cache = cache.into();
+        }
+        assert_eq!(h.provider.preflight().await, Err(Error::Unavailable));
+        assert!(h.provider.snapshot().is_err());
+        assert_eq!(h.count(), count);
     }
 }
 #[test]

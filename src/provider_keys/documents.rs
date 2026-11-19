@@ -135,16 +135,16 @@ pub(super) fn metadata(bytes: &[u8], config: &ProviderConfig) -> Result<(), Erro
             .is_some_and(|v| !has(&v, "authorization_code"))
         || m.response_modes_supported
             .is_some_and(|v| !has(&v, "query"))
-        || m.token_endpoint_auth_methods_supported
-            .is_none_or(|v| !has(&v, "none"))
         || m.code_challenge_methods_supported
             .is_none_or(|v| !has(&v, "S256"))
         || m.authorization_response_iss_parameter_supported != Some(true)
     {
         return Err(Error::Mismatch);
     }
-    // Scopes advertising is recommended, not exhaustive or required.
-    let _ = m.scopes_supported;
+    // Scopes advertising is recommended, not exhaustive or required. Client authentication
+    // advertising describes the provider, not this client: the request stays a public PKCE
+    // client that sends no secret (ADR 0011 amendment, 19 November 2026).
+    let _ = (m.scopes_supported, m.token_endpoint_auth_methods_supported);
     Ok(())
 }
 pub(super) struct Keys {
@@ -342,14 +342,35 @@ pub(super) fn media(response: &HttpResponse, jwks: bool) -> Result<(), Error> {
     }
     Ok(())
 }
-// None means a valid representation cannot be reused. Callers must retire older keys.
+/// How a valid representation may serve sign-in operations. `freshness` returns None when it
+/// may serve none: malformed, duplicated or unknown caching headers, missing explicit
+/// lifetime, or an expired response. Callers must then retire older keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Freshness {
+    /// Remaining explicit lifetime, after age and delay, under the configured cap.
+    Reusable(Duration),
+    /// `no-store` or `no-cache`: only the operations in progress when it arrived may use it;
+    /// a later operation fetches again (ADR 0011 amendment, 19 November 2026).
+    Operation,
+}
+impl Freshness {
+    /// Lifetime from receipt, and whether a later operation may reuse the document. `hold`
+    /// bounds a refused document to the operations already running: one operation deadline,
+    /// never beyond the configured freshness cap.
+    pub(super) fn lifetime(self, hold: Duration) -> (Duration, bool) {
+        match self {
+            Self::Reusable(v) => (v, true),
+            Self::Operation => (hold, false),
+        }
+    }
+}
 pub(super) fn freshness(
     response: &HttpResponse,
     request: SystemTime,
     received: SystemTime,
     delay: Duration,
     cap: Duration,
-) -> Option<Duration> {
+) -> Option<Freshness> {
     let h = response.headers();
     for n in ["cache-control", "date", "age"] {
         if h.get_all(n).iter().count() > 1 {
@@ -359,8 +380,12 @@ pub(super) fn freshness(
     if received < request {
         return None;
     }
-    let date = httpdate::parse_http_date(h.get("date")?.to_str().ok()?).ok()?;
-    if date > received {
+    // Date is needed only to compute a reusable lifetime. When present it must be valid.
+    let date = match h.get("date") {
+        Some(v) => Some(httpdate::parse_http_date(v.to_str().ok()?).ok()?),
+        None => None,
+    };
+    if date.is_some_and(|d| d > received) {
         return None;
     }
     let decimal = |s: &str| -> Option<u64> {
@@ -375,7 +400,10 @@ pub(super) fn freshness(
         .map(|v| decimal(v.to_str().ok()?))
         .unwrap_or(Some(0))?;
     let mut max_age = None;
+    let mut refused = false;
     let mut seen = HashSet::new();
+    // Every directive is validated before any is acted on, so a refusal never hides a
+    // malformed or unknown directive.
     for directive in h.get("cache-control")?.to_str().ok()?.split(',') {
         let (name, value) = directive
             .trim()
@@ -388,7 +416,8 @@ pub(super) fn freshness(
             return None;
         }
         match name.as_str() {
-            "no-store" | "no-cache" => return None,
+            // Field-qualified no-cache has partial-reuse semantics; it fails closed below.
+            "no-store" | "no-cache" if value.is_none() => refused = true,
             "max-age" => {
                 let v = value?;
                 let v = if v.starts_with('"') {
@@ -407,8 +436,15 @@ pub(super) fn freshness(
             _ => return None,
         }
     }
+    if refused {
+        return Some(Freshness::Operation);
+    }
     let age = Duration::from_secs(age)
         .checked_add(delay)?
-        .max(received.duration_since(date).ok()?);
-    max_age?.min(cap).checked_sub(age).filter(|v| !v.is_zero())
+        .max(received.duration_since(date?).ok()?);
+    max_age?
+        .min(cap)
+        .checked_sub(age)
+        .filter(|v| !v.is_zero())
+        .map(Freshness::Reusable)
 }

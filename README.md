@@ -133,14 +133,19 @@ selects URLs. The existing offline APIs and POST-only transport remain available
 Managed exchange sends the authorization code once, then verifies the original ID token with
 fresh current keys. A bounded unknown-key refresh can reverify that token once. Valid
 replacements retire removed keys, and expired keys never receive outage grace. Both metadata
-and keys must remain fresh. The initial profile requires advertised public-client `none`,
-S256 and RFC 9207 support, and reusable responses with explicit max-age/Date. These are
-compatibility limits, not real-provider qualification. The maintained verifier supports RSA
+and keys must remain fresh. The profile requires S256 and RFC 9207 support. It does not
+require advertised token-endpoint authentication methods; the client stays public and sends
+no secret. Responses with explicit max-age and Date are reused until they expire. Responses
+with `no-store` or `no-cache` are fetched again at every preflight, begin and callback, within
+cooldown ([ADR 0011 amendment](docs/adr/0011-managed-provider-keys.md#amendment-19-nov-2026)).
+These are compatibility limits, not real-provider qualification. The maintained verifier supports RSA
 through 4096 bits; the online document parser's 8192-bit ceiling does not expand that support.
 
 Keep the manager alive across requests. Registering identical configuration is a no-op;
 a changed configuration or a retire/restore retains cooldown and invalidates keys. A document
-expiring before cooldown ends blocks login until another refresh is allowed. Provider Age,
+expiring before cooldown ends blocks login until another refresh is allowed. For a provider
+that refuses caching, begin and callback each need a refresh: a callback, or another person's
+sign-in, inside the cooldown interval is refused. Provider Age,
 short cache lifetimes and clock skew can reduce availability; qualify policy values against
 actual provider behavior. The offline check below validates configuration files; the running API
 does not load them.

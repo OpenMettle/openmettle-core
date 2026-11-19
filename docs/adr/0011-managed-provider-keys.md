@@ -4,6 +4,8 @@ Status: coordinator-agreed V1-04 implementation contract, 17 November 2026.
 Refs #5; Refs #34. Independent review remains required. #5 remains open.
 [ADR 0012](0012-login-provider-authority.md) replaces the process-generation login binding
 and makes identical re-registration a no-op; the rest of this record still applies.
+The [amendment of 19 November 2026](#amendment-19-nov-2026) replaces the token-endpoint
+authentication rule and the treatment of `no-store` and `no-cache` responses.
 
 ## Boundary
 
@@ -225,3 +227,81 @@ schema integration tests were not run locally; they remain CI gates, together wi
 and kind. The proxy child test is exercised by its parent and is not counted twice.
 Two generated provenance inventories were identical. Distribution readiness failed closed
 with the existing 433 blockers; no package or licence-review clearance changed.
+
+## Amendment, 19 Nov 2026
+
+The [owner decision of 19 November 2026](https://github.com/OpenMettle/openmettle-core/issues/5#issuecomment-7002907924)
+makes Keycloak the V1-04 real-provider target and approves two relaxations ("option B").
+Stock Keycloak 26.8.2 failed this profile before sign-in in the PR #72 observation. Its
+discovery omits `none` from `token_endpoint_auth_methods_supported` and sends
+`Cache-Control: no-cache, no-store, must-revalidate, no-transform`. Its JWKS sends
+`no-cache`. Neither response carries `Date` or `Age`.
+
+### Client authentication advertising
+
+Discovery no longer has to advertise `none`, and may omit the list. If present, the list must
+still be an array. The list describes the provider, not this client. The client remains a
+public PKCE client that sends no secret, and its binding still records `public-pkce`.
+PKCE `S256` and `authorization_response_iss_parameter_supported: true` remain required.
+There is still no fallback to confidential authentication, plain PKCE or callbacks without
+an issuer.
+
+### Responses that refuse caching
+
+A response whose `Cache-Control` contains `no-store` or `no-cache` without a value is
+usable, but not reusable:
+
+- Every directive is still validated first. A malformed, unknown or repeated directive fails
+  as before, wherever it appears. So do a repeated `Cache-Control`, `Date` or `Age` header,
+  an invalid `Age`, an invalid or future `Date`, and wall-clock rollback during the request.
+  A field-qualified `no-cache="…"` fails closed. Such failures make the provider unavailable.
+- `Date` is optional for these responses, because it is used only to compute a reusable
+  lifetime. A refusal overrides any `max-age` in the same header.
+- Responses with `max-age` behave as before, and still require `Date`. Missing freshness,
+  `max-age=0` and expired responses still make the provider unavailable.
+
+The snapshot is validated exactly as before. It is non-reusable when either document refused
+caching. Its monotonic limit is receipt plus the operation deadline, capped by the
+configured maximum freshness. It stays in the existing process-local entry. No storage or
+schema changes.
+
+An operation **start** never uses a non-reusable snapshot. Starts are preflight, login begin
+and callback consumption. A start joins a refresh already in flight or begins a refresh,
+subject to cooldown. The rest of an operation uses the current snapshot: the checks after
+the database work, the callback's exchange and ID-token verification, and release or
+session issuance. That snapshot was fetched by the operation's own start or later. A
+non-reusable document therefore serves only operations already running when it arrived.
+
+For such a provider:
+
+- **Key rotation.** Each start fetches the current key set. As before, the replacement retires
+  the old generation. If a later fetch replaces the generation that a callback verified with,
+  that callback fails at release or issuance. The person signs in again.
+- **Unknown `kid`.** The refresh rule is unchanged and shares the cooldown. The callback's
+  consumption fetched keys moments earlier, so this refresh normally falls inside cooldown
+  and exchange fails. If another operation has already replaced the generation, the token
+  is verified once more against the new keys.
+- **Concurrent sign-ins.** Cooldown, admitted callers, GET slots, size limits and deadlines
+  are unchanged. Starts that arrive during a refresh share it. A start after a completed
+  refresh but inside cooldown is refused and does not reuse the snapshot. Each process
+  admits at most one fetching start per provider per cooldown interval. Concurrent sign-ins
+  can therefore refuse each other. Begin and callback are separate starts, so a callback
+  succeeds only if it arrives at least one cooldown after the previous fetch. Use the
+  1-second minimum cooldown for such a provider. Even then, this suits low sign-in volume
+  only. The 60-second example in [ADR 0015](0015-offline-auth-config-check.md) would refuse
+  most callbacks.
+- **Unreachable provider.** The next start fails. The held snapshot serves only operations
+  already running and expires within one deadline. There is no outage grace.
+
+**Operational cost.** Each start fetches one discovery document and one JWKS. A completed
+browser sign-in has two starts, begin and callback, so it fetches two of each.
+
+Unchanged and still mandatory: PKCE S256, the exact registered callback, issuer and
+endpoint equality, the RFC 9207 issuer flag and callback `iss` check, HTTPS-only transport,
+document size and time bounds, and every key validation above.
+
+Evidence for this amendment comes from in-process tests with synthetic TLS fixtures. They
+use Keycloak's exact header strings, a JWKS response without `Date`, and the same
+start/continuation sequence as sign-in. No PostgreSQL test was added because the cache is
+process-local. No real-provider sign-in, deployment or Keycloak support is claimed. That
+needs the separate hosted Keycloak qualification.

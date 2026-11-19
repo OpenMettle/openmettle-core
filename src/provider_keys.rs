@@ -327,6 +327,8 @@ struct Snapshot {
     known_kids: Vec<String>,
     expires: Instant,
     generation: u64,
+    // False when either document refused caching: a new operation fetches again.
+    reusable: bool,
 }
 struct Flight {
     result: watch::Sender<Option<Result<(), Error>>>,
@@ -403,7 +405,7 @@ impl ManagedProvider {
     pub async fn preflight(&self) -> Result<(), Error> {
         let _admission = self.admission()?;
         let deadline = Instant::now() + self.manager.policy.deadline;
-        tokio::time::timeout_at(deadline, self.ensure())
+        tokio::time::timeout_at(deadline, self.ensure(true))
             .await
             .map_err(|_| Error::Timeout)??;
         if Instant::now() >= deadline {
@@ -411,8 +413,14 @@ impl ManagedProvider {
         }
         Ok(())
     }
-    async fn ensure(&self) -> Result<Arc<Snapshot>, Error> {
-        if let Ok(s) = self.snapshot() {
+    /// `start` begins an operation: preflight, login begin or callback consume. It never uses
+    /// a snapshot whose documents refused caching, so it shares only a flight in progress or
+    /// fetches again within cooldown. The callback's exchange and key verification continue
+    /// its consume, so they accept the snapshot that consume fetched or a later one.
+    async fn ensure(&self, start: bool) -> Result<Arc<Snapshot>, Error> {
+        if let Ok(s) = self.snapshot()
+            && (s.reusable || !start)
+        {
             return Ok(s);
         }
         self.refresh(None).await?;
@@ -462,7 +470,7 @@ impl ManagedProvider {
         &self,
         c: &ProviderConfig,
         jwks: bool,
-    ) -> Result<(openidconnect::HttpResponse, Option<Instant>), Error> {
+    ) -> Result<(openidconnect::HttpResponse, Option<(Instant, bool)>), Error> {
         self.config()?;
         let _slot = self
             .manager
@@ -490,7 +498,11 @@ impl ManagedProvider {
             delay,
             self.manager.policy.freshness,
         )
-        .and_then(|v| end.mono.checked_add(v));
+        .and_then(|f| {
+            let policy = self.manager.policy;
+            let (lifetime, reusable) = f.lifetime(policy.deadline.min(policy.freshness));
+            end.mono.checked_add(lifetime).map(|t| (t, reusable))
+        });
         Ok((response, fresh))
     }
     async fn fetch(&self, c: &ProviderConfig) -> Result<(), Error> {
@@ -519,12 +531,13 @@ impl ManagedProvider {
             .ok_or(Error::Configuration)?;
         // A valid replacement always retires old keys, even if it cannot be cached.
         s.snapshot = match metadata_expiry.zip(key_expiry) {
-            Some((m, k)) => Some(Arc::new(Snapshot {
+            Some(((m, metadata_reusable), (k, keys_reusable))) => Some(Arc::new(Snapshot {
                 trusted: c.identity.with_keys(keys.keys),
                 kids: keys.kids,
                 known_kids: keys.known_kids,
                 expires: m.min(k),
                 generation: s.key_generation,
+                reusable: metadata_reusable && keys_reusable,
             })),
             None => None,
         };
@@ -536,7 +549,7 @@ impl ManagedProvider {
         nonce: &ExpectedNonceDigest,
         policy: &auth::Policy,
     ) -> Result<(u64, auth::VerifiedAssertion), Error> {
-        let first = self.ensure().await?;
+        let first = self.ensure(false).await?;
         let header = token.header().map_err(|_| Error::Verification)?;
         let kid = match header.get("kid") {
             None => None,
@@ -626,7 +639,9 @@ impl ManagedProvider {
     }
     /// Managed preflight. It may fetch provider documents and needs no database connection.
     pub(crate) async fn fresh(&self) -> Result<(), login::Error> {
-        self.ensure().await.map_err(|_| login::Error::Rejected)?;
+        self.ensure(true)
+            .await
+            .map_err(|_| login::Error::Rejected)?;
         Ok(())
     }
     /// Active configuration with unexpired keys inside the phase deadline. No network or
@@ -699,7 +714,7 @@ impl ManagedProvider {
         let _admission = self.admission().map_err(|_| login::Error::Rejected)?;
         let deadline = Instant::now() + self.manager.policy.deadline;
         tokio::time::timeout_at(deadline, async {
-            self.ensure()
+            self.ensure(false)
                 .await
                 .map_err(|_| login::Error::Verification)?;
             let c = self.config().map_err(|_| login::Error::Rejected)?;
