@@ -685,6 +685,11 @@ pub async fn consume(
     .await
     .map_err(|_| Error::Database)?
 }
+/// The one syntax rule for a provider authorization code, shared by the callback parser and
+/// consumption: 1 to [`MAX_CODE_BYTES`] visible ASCII bytes.
+pub(crate) fn valid_authorization_code(code: &str) -> bool {
+    !code.is_empty() && code.len() <= MAX_CODE_BYTES && code.bytes().all(|b| b.is_ascii_graphic())
+}
 async fn consume_inner(
     connection: &mut PgConnection,
     p: Arc<Provider>,
@@ -694,9 +699,7 @@ async fn consume_inner(
     if !p.enabled
         || c.issuer != p.trusted.binding().1
         || c.callback != p.callback
-        || c.code.is_empty()
-        || c.code.len() > MAX_CODE_BYTES
-        || !c.code.bytes().all(|b| (0x21..0x7f).contains(&b))
+        || !valid_authorization_code(c.code)
         || c.state.len() != 87
         || c.caller_binding.len() != 43
     {

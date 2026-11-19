@@ -368,6 +368,8 @@ async fn confirmation_and_invalid_registrations_need_no_database_or_provider_req
         "https://example.test/a/../link",
         "https://example.test/link?",
         "https://user@example.test/link",
+        "https://app.example.test/healthz",
+        "https://app.example.test/readyz",
         CALLBACK,
     ] {
         assert!(
@@ -494,6 +496,40 @@ async fn native_http_refusals_do_not_checkout_or_exchange() {
     ));
     let address = serve(profile(auth).router(limits().begin).unwrap()).await;
     let mut input = redeem(&URL_SAFE_NO_PAD.encode([9; 32]));
+    // The six members are named. A positional array of the same values and an object that
+    // lacks any one member are refused.
+    let fields = [
+        "grant_type",
+        "iss",
+        "client_id",
+        "redirect_uri",
+        "code",
+        "code_verifier",
+    ];
+    let positional = Value::Array(fields.iter().map(|field| input[*field].clone()).collect());
+    assert_eq!(send(address, &post(&positional)).await.status, 403);
+    for field in fields {
+        let mut incomplete = input.clone();
+        incomplete.as_object_mut().unwrap().remove(field);
+        assert_eq!(send(address, &post(&incomplete)).await.status, 403);
+    }
+    // A provider code outside the one syntax rule is refused by the callback parser, with a
+    // well-formed cookie and state, before the service is called.
+    let locator = URL_SAFE_NO_PAD.encode([2; 32]);
+    let secret = URL_SAFE_NO_PAD.encode([3; 32]);
+    let cookie = format!("__Host-openmettle-native-login={locator}.{secret}.{secret}.{secret}");
+    for code in ["", "%20", "%C3%A9", &"x".repeat(login::MAX_CODE_BYTES + 1)] {
+        let callback = format!(
+            "/native/callback?iss={}&state={locator}.{secret}&code={code}",
+            signing::ISSUER
+        );
+        assert_eq!(
+            send(address, &head("GET", &callback, &[("cookie", &cookie)]))
+                .await
+                .status,
+            403
+        );
+    }
     for (name, value) in [
         ("iss", "https://foreign.example.test"),
         ("client_id", "another"),

@@ -36,8 +36,15 @@ unchanged.
 
 The constructor refuses a registration whose routes collide with each other, with the
 operational routes, or with the configured browser routes and landing path on the same
-origin. It refuses an app link that equals a provider callback or one of its own routes.
-There is no settings-document form yet: the registration is programmatic.
+origin. It also refuses an app link that is:
+
+- a provider callback or one of the native routes;
+- `/healthz` or `/readyz` on the deployment origin;
+- a browser route, the landing path, `/healthz` or `/readyz` on the configured browser
+  origin, whether or not the native deployment shares that origin.
+
+Choose a dedicated app-link path. There is no settings-document form yet: the registration
+is programmatic.
 
 Two digests are computed once. Both are SHA-256 over a domain-separated, length-prefixed
 encoding.
@@ -67,7 +74,9 @@ is a separate change (see Remaining).
    login locator, the caller binding and the app's challenge and state for the login
    lifetime.
 4. **Upstream callback.** The API checks the provider issuer and the cookie, consumes the
-   login, exchanges the provider code once and verifies the ID token. It issues a local
+   login, exchanges the provider code once and verifies the ID token. The callback parser
+   refuses a provider code that is not 1–4096 visible ASCII bytes, before the service is
+   called. The browser callback shares that parser and rule. It issues a local
    session only for an eligible identity with a personal scope, or for a first sign-in that
    redeems an invitation. It redirects to the app link with exactly `code`, the app's
    `state` and `iss`, the deployment issuer.
@@ -81,8 +90,9 @@ is a separate change (see Remaining).
    | `client_id`, `redirect_uri` | The exact registration |
    | `code`, `code_verifier` | The returned code and the app's verifier |
 
-   Success is `200` with `token_type` `Bearer` and the opaque `access_token`. Any other
-   member, a missing member, a wrong binding, a second use and an expired code are refused.
+   Send the six named members in one JSON object. Success is `200` with `token_type`
+   `Bearer` and the opaque `access_token`. A positional array, any other member, a missing
+   member, a wrong binding, a second use and an expired code are refused.
 
 `GET /auth/native/session` and `POST /auth/native/logout` take one
 `Authorization: Bearer` header and answer an empty `204`. The three back-channel routes
@@ -264,12 +274,18 @@ Local, without PostgreSQL:
 - `…::native::confirmed_start_takes_one_bounded_invitation_form_before_any_service_work`,
   through Axum dispatch: metadata refusals with no body sent, a stalled form, forms that
   reach the service with one reply, and a budget spent by admitted requests only.
-- `…::native::native_http_refusals_do_not_checkout_or_exchange`: back-channel refusals.
+- `…::native::native_http_refusals_do_not_checkout_or_exchange`: back-channel refusals,
+  including a positional token request, each missing member and a provider code outside
+  the syntax rule.
+- `auth_config::tests::native_app_links_cannot_target_configured_browser_routes`: app links
+  on the browser origin, from a shared and from a separate native origin.
 
 Reordering the form before `Origin`, treating a malformed form as no code, admitting the
 field in the query, naming the submit button, removing the read timeout, admitting every
 body profile, ignoring the attempt at exchange and changing either stored layout each make
-one of these tests fail. This was checked by mutation.
+one of these tests fail. So do admitting any provider code in the callback parser,
+admitting a positional token request, and dropping any one of the app-link checks. This
+was checked by mutation.
 
 PostgreSQL and Chrome, in CI only:
 
@@ -308,8 +324,8 @@ real provider, ingress, image, cluster, device or rollout was exercised.
 
 ## Remaining
 
-- Review corrections that follow this change: stricter callback and app-link validation,
-  and binding a delivered bearer's validation and logout to its stored audience.
+- A review correction that follows this change: binding a delivered bearer's validation
+  and logout to its stored audience.
 - A settings-document form for the native registration, and runtime construction.
 - Simulator qualification in the companion app project: the system browser, not an embedded
   web view; operating-system delivery of the link to the registered app; state and issuer

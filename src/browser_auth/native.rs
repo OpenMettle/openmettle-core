@@ -133,21 +133,26 @@ impl NativeAuth {
             .clone();
         let callback_url = exact_link(callback).ok_or(Error::Configuration)?;
         let redirect = exact_link(redirect).ok_or(Error::Configuration)?;
+        let redirect_origin = redirect.origin().ascii_serialization();
         let routes = [START, TOKEN, SESSION, LOGOUT, callback_url.path()];
         super::router::check_paths(&routes).map_err(|_| Error::Configuration)?;
-        if let Some(profile) = auth.config.browser()
-            && profile.handoff().origin == issuer
-        {
+        if let Some(profile) = auth.config.browser() {
+            let browser_origin = profile.handoff().origin;
             let settings = profile.router();
             let sessions = profile.sessions();
-            if [
+            let browser_paths = [
                 settings.initiation,
                 sessions.session,
                 sessions.logout,
                 profile.handoff().landing,
-            ]
-            .iter()
-            .any(|path| routes.contains(path))
+            ];
+            // The native routes never shadow a browser route on a shared origin, and the
+            // app link never lands on a browser or operational route of the browser origin,
+            // whichever origin the native deployment itself uses.
+            if (browser_origin == issuer && browser_paths.iter().any(|path| routes.contains(path)))
+                || (redirect_origin == browser_origin
+                    && (browser_paths.contains(&redirect.path())
+                        || super::router::CORE_PATHS.contains(&redirect.path())))
             {
                 return Err(Error::Configuration);
             }
@@ -165,8 +170,9 @@ impl NativeAuth {
         if !handoff::canonical_origin(issuer)
             || issuer.len() > 2048
             || callback_url.origin().ascii_serialization() != issuer
-            || (redirect.origin().ascii_serialization() == issuer
-                && routes.contains(&redirect.path()))
+            || (redirect_origin == issuer
+                && (routes.contains(&redirect.path())
+                    || super::router::CORE_PATHS.contains(&redirect.path())))
             || client.is_empty()
             || client.len() > 128
             || !client

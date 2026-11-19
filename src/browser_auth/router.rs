@@ -70,7 +70,7 @@ pub const FORM_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const FORM_MEDIA_TYPE: &str = "application/x-www-form-urlencoded";
 const FORM_NOT_RECEIVED: &str = "login request body not received\n";
 /// Operational routes in `crate::serve`. A login path never shadows them when merged.
-const CORE_PATHS: [&str; 2] = ["/healthz", "/readyz"];
+pub(super) const CORE_PATHS: [&str; 2] = ["/healthz", "/readyz"];
 
 /// One rate budget: at most `burst` admissions at once, refilled by one every `interval`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

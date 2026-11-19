@@ -152,6 +152,11 @@ impl NativeAuth {
             else {
                 return refused().map(Body::from);
             };
+            // Serde also accepts a positional array for a derived struct. This protocol
+            // requires the six named members of one JSON object.
+            if !bytes.trim_ascii_start().starts_with(b"{") {
+                return refused().map(Body::from);
+            }
             let Ok(input) = serde_json::from_slice::<TokenRequest>(&bytes) else {
                 return refused().map(Body::from);
             };

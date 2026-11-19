@@ -297,8 +297,9 @@ pub(super) struct Authorization {
     pub(super) issuer: String,
 }
 /// `None` unless the query is one well-formed success response: bounded before decoding, no
-/// decoded name twice (RFC 6749 §3.1), no error member, and `code`, `state` and `iss` present.
-/// Other well-formed parameters are ignored.
+/// decoded name twice (RFC 6749 §3.1), no error member, and `code`, `state` and `iss` present
+/// with a code that [`login::valid_authorization_code`] accepts. Other well-formed parameters
+/// are ignored.
 pub(super) fn authorization(query: &str) -> Option<Authorization> {
     if query.len() > MAX_QUERY_BYTES
         || query.bytes().filter(|b| *b == b'&').count() >= MAX_QUERY_PARAMETERS
@@ -325,7 +326,7 @@ pub(super) fn authorization(query: &str) -> Option<Authorization> {
         names.push(name);
     }
     Some(Authorization {
-        code: code?,
+        code: code.filter(|value| login::valid_authorization_code(value))?,
         state: state?,
         issuer: issuer?,
     })
@@ -526,11 +527,8 @@ impl LoginHandoff {
             state,
             issuer,
         } = &response;
-        let code_is_safe = !code.is_empty()
-            && code.len() <= login::MAX_CODE_BYTES
-            && code.bytes().all(|b| b.is_ascii_graphic());
         let locator = match token_pair(state) {
-            Some((locator, _)) if code_is_safe && *issuer == self.settings.issuer => locator,
+            Some((locator, _)) if *issuer == self.settings.issuer => locator,
             _ => return Refusal::Response.response(),
         };
         // The cookie names the login it belongs to, so a cookie from a later initiation
