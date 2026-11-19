@@ -47,9 +47,10 @@ handoff or the router (ADRs 0017–0019).
 The create command computes the code in a materialized CTE as the first 16 bytes of
 `sha256(uuid_send(gen_random_uuid()) || uuid_send(gen_random_uuid()))`. It needs no
 extension. In PostgreSQL 18, `gen_random_uuid()` (`src/backend/utils/adt/uuid.c`) fills the
-UUID from `pg_strong_random()` and raises an error if that fails, so each UUID contributes
-122 random bits. This is cited from the PostgreSQL source and was not re-fetched while
-writing this ADR. A reviewer should confirm it against the PostgreSQL 18 tree.
+UUID's 16 bytes from `pg_strong_random()` and raises "could not generate random values" if
+that fails, then sets the version and variant bits, so each UUID contributes 122 random
+bits. Review confirmed this in `REL_18_1` (`uuid.c:528-535`) and `REL_18_STABLE`
+(`uuid.c:545-552`).
 
 A plain domain-separated SHA-256 is enough for a 128-bit random value. There is no pepper,
 slow hash or constant-time comparison: the database compares hashes with `=`.
@@ -81,7 +82,8 @@ The initiation route (ADRs 0017 and 0018) accepts one of two bodies.
 | Form | Exactly one `Content-Type: application/x-www-form-urlencoded`, exactly one `Content-Length` of 1–256 in plain decimal, no `Transfer-Encoding` |
 
 The form holds exactly one field, `invitation_code`. An empty value means that no code was
-entered. The media type is compared without case and takes no parameter, so
+entered. Any other field gets the fixed `400`, so a page that submits this form must not
+name its submit control or add hidden fields such as a framework CSRF token. The media type is compared without case and takes no parameter, so
 `application/x-www-form-urlencoded; charset=UTF-8` is refused. An HTML form sends the bare
 media type. The 256-byte ceiling admits a 64-byte value with every byte percent-encoded.
 
@@ -296,6 +298,6 @@ real provider, ingress, image, cluster or rollout was exercised.
 ## Remaining
 
 Native sign-in (block C), the corrective migration that drops v1 acceptance, and the
-Flutter web field: an optional "invitation code" input submitted as a top-level form `POST`,
-never placed in a route, query, deep link or storage. Every exposure gate of ADRs 0017–0020
+Flutter web field: an optional "invitation code" input submitted as a top-level form `POST`
+whose only field is `invitation_code`, never placed in a route, query, deep link or storage. Every exposure gate of ADRs 0017–0020
 still applies. #5 stays open.

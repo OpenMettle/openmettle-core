@@ -1312,6 +1312,36 @@ mod tests {
         assert_eq!(other.open(&keys, iv, with).unwrap_err(), Error::Protection);
     }
 
+    /// A login sealed by the schema-12 release (c2c71f3) must still open after the upgrade.
+    /// These bytes are AES-256-GCM over 43 `v` bytes with key `[7; 32]`, IV `[9; 12]` and
+    /// c2c71f3's `aad()` for `envelope()`. They were computed outside this crate (Python
+    /// `cryptography`), so a change to the v1 labels or field order fails here, even though
+    /// sealing and opening would still agree with each other.
+    #[test]
+    fn a_login_sealed_by_the_schema_12_release_still_opens() {
+        const SEALED_BY_V12: [u8; 59] = [
+            0x51, 0xf3, 0xf2, 0xe2, 0xc8, 0x86, 0xb7, 0x17, 0xd6, 0x14, 0xbd, 0x4e, 0x90, 0x9c,
+            0xd5, 0xa9, 0xa2, 0xc6, 0x15, 0x85, 0x42, 0x98, 0x81, 0xb6, 0x19, 0xd8, 0x30, 0xd0,
+            0xa3, 0x02, 0x77, 0x0c, 0xa5, 0x93, 0x91, 0xb5, 0x94, 0x24, 0x5c, 0x66, 0x09, 0xc5,
+            0xd3, 0x92, 0x44, 0x92, 0x0b, 0x36, 0x2c, 0x4b, 0x47, 0x71, 0x73, 0x21, 0xa9, 0x0f,
+            0x74, 0x6f, 0x00,
+        ];
+        let keys = KeyRing::new(vec![("active".into(), [7; 32])]).unwrap();
+        let verifier = "v".repeat(43);
+        let (opened, invitation) = envelope()
+            .open(&keys, [9; 12], SEALED_BY_V12.to_vec())
+            .unwrap();
+        assert_eq!(opened.expose(), verifier);
+        assert!(invitation.is_none());
+        // The test-only v1 writer used by the upgrade fixtures produces the same bytes.
+        assert_eq!(
+            envelope()
+                .seal(Sealing::V1, &keys, [9; 12], &verifier, None)
+                .unwrap(),
+            SEALED_BY_V12
+        );
+    }
+
     #[test]
     fn secrets_carried_by_a_permit_stay_out_of_debug_output() {
         let mut permit = permit();
