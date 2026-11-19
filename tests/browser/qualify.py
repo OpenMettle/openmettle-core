@@ -107,11 +107,38 @@ class DevTools:
         self.evaluate(f"setTimeout(() => document.getElementById('{element}').click(), 0); true")
 
 
+START_ATTEMPTS = 2
+
+
+def start(launch, attempts=START_ATTEMPTS):
+    """Return the first browser that answers its version request, with its close action.
+
+    Runner Chrome occasionally never answers its first command. Only that start is retried:
+    a browser that stays silent, or whose pipe is lost before it answers, is closed and
+    `launch` is called again with the next attempt number, which selects a fresh profile.
+    Every other failure, and everything after the browser has answered, is never retried.
+    """
+    for attempt in range(1, attempts + 1):
+        browser, close = launch(attempt)
+        try:
+            version = browser.call("Browser.getVersion")["product"]
+        except (TimeoutError, ConnectionError):
+            close()
+            if attempt == attempts:
+                raise
+            print("Browser start retried", flush=True)
+            continue
+        except BaseException:
+            close()
+            raise
+        if not re.fullmatch(r"(HeadlessChrome|Chrome)/[0-9]+(?:\.[0-9]+){3}", version):
+            close()
+            raise Failure("unexpected browser version")
+        print(f"Browser runtime {version}", flush=True)
+        return browser, close
+
+
 def journey(browser, app, issuer, enter):
-    version = browser.call("Browser.getVersion")["product"]
-    if not re.fullmatch(r"(HeadlessChrome|Chrome)/[0-9]+(?:\.[0-9]+){3}", version):
-        raise Failure("unexpected browser version")
-    print(f"Browser runtime {version}", flush=True)
     enter("browser target setup")
     target = browser.call("Target.createTarget", url="about:blank")["targetId"]
     browser.session = browser.call("Target.attachToTarget", targetId=target, flatten=True)["sessionId"]
@@ -165,32 +192,45 @@ def run(app, issuer, home, enter):
         subprocess.run(certutil + args, input=data, env=env, check=True, timeout=5,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     rules = "MAP app.relying.test 127.0.0.1, MAP issuer.example.test 127.0.0.1, MAP * ~NOTFOUND"
-    # Chrome uses descriptors 3 and 4 for NUL-delimited commands and responses.
-    # Save stdin and stdout there, then disconnect normal browser logs from the pipe.
-    command = ["sh", "-c", 'exec 3<&0 4>&1 </dev/null >/dev/null; exec "$@"', "chrome-pipe",
-               "google-chrome", "--headless", "--remote-debugging-pipe", "--no-first-run",
-               "--disable-background-networking", "--no-proxy-server",
-               f"--host-resolver-rules={rules}", f"--user-data-dir={home / 'profile'}"]
-    parent, child = socket.socketpair()
-    enter("browser start")
-    with parent, child:
-        process = subprocess.Popen(command, env=env, stdin=child, stdout=child,
-                                   stderr=subprocess.DEVNULL, start_new_session=True)
-        child.close()
+
+    def launch(attempt):
+        # Chrome uses descriptors 3 and 4 for NUL-delimited commands and responses.
+        # Save stdin and stdout there, then disconnect normal browser logs from the pipe.
+        command = ["sh", "-c", 'exec 3<&0 4>&1 </dev/null >/dev/null; exec "$@"',
+                   "chrome-pipe", "google-chrome", "--headless", "--remote-debugging-pipe",
+                   "--no-first-run", "--disable-background-networking", "--no-proxy-server",
+                   f"--host-resolver-rules={rules}",
+                   f"--user-data-dir={home / f'profile-{attempt}'}"]
+        parent, child = socket.socketpair()
         try:
-            parent.settimeout(12)
-            journey(DevTools(parent), app, issuer, enter)
-            enter("browser shutdown")
-        finally:
-            # Closing the debugging pipe requests normal Chrome shutdown. On timeout
-            # the unreaped leader still reserves the group ID created by this harness.
+            with child:
+                process = subprocess.Popen(command, env=env, stdin=child, stdout=child,
+                                           stderr=subprocess.DEVNULL, start_new_session=True)
+        except BaseException:
             parent.close()
-            try:
-                process.wait(timeout=4)
-            except subprocess.TimeoutExpired:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=5)
+            raise
+        parent.settimeout(12)
+        return DevTools(parent), lambda: stop(parent, process)
+
+    enter("browser start")
+    browser, close = start(launch)
+    try:
+        journey(browser, app, issuer, enter)
+        enter("browser shutdown")
+    finally:
+        close()
+
+
+def stop(parent, process):
+    # Closing the debugging pipe requests normal Chrome shutdown. On timeout
+    # the unreaped leader still reserves the group ID created by this harness.
+    parent.close()
+    try:
+        process.wait(timeout=4)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=5)
 
 
 def interrupted(*_):
