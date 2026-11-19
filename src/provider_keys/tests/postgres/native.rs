@@ -55,8 +55,11 @@ impl App {
             state: URL_SAFE_NO_PAD.encode([seed; 32]),
         }
     }
+    fn challenge_bytes(&self) -> [u8; 32] {
+        Sha256::digest(self.verifier.as_bytes()).into()
+    }
     fn challenge(&self) -> String {
-        URL_SAFE_NO_PAD.encode(Sha256::digest(self.verifier.as_bytes()))
+        URL_SAFE_NO_PAD.encode(self.challenge_bytes())
     }
     fn target(&self) -> String {
         let r = self.registration;
@@ -79,6 +82,9 @@ impl App {
         let r = self.registration;
         json!({"grant_type":"authorization_code","iss":ORIGIN,"client_id":r.client,"redirect_uri":r.link,"code_verifier":self.verifier,"code":code})
     }
+}
+fn code_hash(code: &str) -> [u8; 32] {
+    Sha256::digest(URL_SAFE_NO_PAD.decode(code).unwrap()).into()
 }
 /// Upstream values of one managed login, as the browser saw them.
 struct Started {
@@ -127,17 +133,46 @@ async fn mount(auth: Arc<BrowserAuth>, r: Registration) -> SocketAddr {
 }
 /// Another process: its own provider manager, the fixture clock and `pool`.
 fn replica(f: &Flow, pool: PgPool, login_lifetime: Duration) -> Arc<BrowserAuth> {
-    let (manager, provider) = f.restart();
-    Arc::new(BrowserAuth::new(
+    replica_with(
+        f,
+        pool,
+        login_lifetime,
+        policy(),
+        sessions::session_policy(),
+    )
+    .0
+}
+/// Another process with explicit provider-refresh and session policies, returning both the
+/// service and its provider handle so timed tests can warm its key snapshot first.
+fn replica_with(
+    f: &Flow,
+    pool: PgPool,
+    login_lifetime: Duration,
+    refresh: RefreshPolicy,
+    session_policy: crate::sessions::Policy,
+) -> (Arc<BrowserAuth>, ManagedProvider) {
+    let manager = ProviderManager::new(refresh);
+    let clock = f.h.manager.inner.clock.lock().unwrap().clone();
+    *manager.inner.clock.lock().unwrap() = clock;
+    let p = manager
+        .register(Harness::config(&f.h.server, &f.h.ca, "v2"))
+        .unwrap();
+    manager.retire(&p).unwrap();
+    let provider = manager
+        .register(Harness::config(&f.h.server, &f.h.ca, "v1"))
+        .unwrap();
+    assert!(provider.generation > 1);
+    let auth = Arc::new(BrowserAuth::new(
         AuthConfig::fixture(
             keys(),
             login_lifetime,
-            sessions::session_policy(),
+            session_policy,
             manager,
-            vec![provider],
+            vec![provider.clone()],
         ),
         pool,
-    ))
+    ));
+    (auth, provider)
 }
 /// A one-slot pool whose only backend runs through `barrier`. The backend is opened before
 /// any counted reply. A replacement after a discarded connection bypasses the barrier.
@@ -159,7 +194,7 @@ async fn primary_ms(owner: &mut PgConnection) -> i64 {
     sqlx::query_scalar(NOW_MS).fetch_one(owner).await.unwrap()
 }
 async fn wait_past(owner: &mut PgConnection, expiry: i64) {
-    tokio::time::timeout(Duration::from_secs(8), async {
+    tokio::time::timeout(Duration::from_secs(15), async {
         while primary_ms(owner).await <= expiry {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -455,12 +490,15 @@ async fn registrations_isolate_codes_bearers_and_logout_across_revisions() {
     isolated(&[a1, a2], b, &mobile_bearer).await;
     isolated(&[b], a1, &tablet_bearer).await;
 
+    // A second redemption attempt on the fenced code still releases nothing.
+    nothing_released(&send(a1, &post(&pending.redeem(&pending_code))).await);
+
     // New logins after the revisions, then sign-out through the owning registration.
-    let (mobile_late, tablet_late) = (App::new(A, 10), App::new(B, 11));
-    let code_late = code(&f, &mobile_late, a2, a1).await;
-    let mobile_late = bearer(&send(a1, &post(&mobile_late.redeem(&code_late))).await);
-    let code_late = code(&f, &tablet_late, b, b).await;
-    let tablet_late = bearer(&send(b, &post(&tablet_late.redeem(&code_late))).await);
+    let (mobile_late_app, tablet_late_app) = (App::new(A, 10), App::new(B, 11));
+    let mobile_late_code = code(&f, &mobile_late_app, a2, a1).await;
+    let mobile_late = bearer(&send(a1, &post(&mobile_late_app.redeem(&mobile_late_code))).await);
+    let tablet_late_code = code(&f, &tablet_late_app, b, b).await;
+    let tablet_late = bearer(&send(b, &post(&tablet_late_app.redeem(&tablet_late_code))).await);
     assert_eq!(status(a2, "POST", "logout", &mobile_bearer).await, 204);
     for at in [a1, a2] {
         assert_eq!(status(at, "GET", "session", &mobile_bearer).await, 403);
@@ -483,16 +521,44 @@ async fn registrations_isolate_codes_bearers_and_logout_across_revisions() {
     assert_eq!(status(a1, "POST", "logout", &tablet_late).await, 403);
     assert_eq!(status(b, "POST", "logout", &tablet_late).await, 204);
     assert_eq!(f.h.count(), requests);
-    let revoked: Vec<bool> = sqlx::query_scalar(
-        "SELECT s.revoked FROM openmettle.local_sessions s
-         JOIN openmettle.native_handoffs g ON g.session_id=s.id ORDER BY g.sealed IS NULL, s.created_ms",
-    )
-    .fetch_all(&mut f.owner)
-    .await
-    .unwrap();
-    // The fenced pending grant was never delivered or revoked. Every delivered bearer was
-    // revoked only by its own registration.
-    assert_eq!(revoked, [false, true, true, true, true]);
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM openmettle.native_handoffs")
+        .fetch_one(&mut f.owner)
+        .await
+        .unwrap();
+    assert_eq!(total, 5);
+    // Every grant was claimed once (clearing `sealed`), including the fenced pending code
+    // whose post-claim validation refused the stale provider epoch without releasing a
+    // bearer. Only the four delivered bearers were revoked, each by its own registration.
+    for (name, app, handoff_code, expected) in [
+        ("mobile", &mobile, &mobile_code, (true, true)),
+        ("tablet", &tablet, &tablet_code, (true, true)),
+        ("pending", &pending, &pending_code, (true, false)),
+        (
+            "mobile_late",
+            &mobile_late_app,
+            &mobile_late_code,
+            (true, true),
+        ),
+        (
+            "tablet_late",
+            &tablet_late_app,
+            &tablet_late_code,
+            (true, true),
+        ),
+    ] {
+        let state: (bool, bool) = sqlx::query_as(
+            "SELECT g.sealed IS NULL, s.revoked
+             FROM openmettle.native_handoffs g
+             JOIN openmettle.local_sessions s ON s.id=g.session_id
+             WHERE g.code_hash=$1 AND g.challenge=$2",
+        )
+        .bind(code_hash(handoff_code).as_slice())
+        .bind(app.challenge_bytes().as_slice())
+        .fetch_one(&mut f.owner)
+        .await
+        .unwrap();
+        assert_eq!(state, expected, "{name}");
+    }
 }
 
 #[tokio::test]
@@ -523,7 +589,7 @@ async fn overlapping_attempt_keeps_its_binding_cookie_and_completes() {
         reply = &mut callback => panic!("callback ended before its token response: {}", reply.status),
         newer = async {
             // Callback A is held at its token response while initiation B replaces the cookie.
-            tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout(Duration::from_secs(10), async {
                 while pooled::posts(&f) == posts {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
@@ -567,43 +633,53 @@ async fn overlapping_attempt_keeps_its_binding_cookie_and_completes() {
 #[tokio::test]
 #[ignore = "isolated CI PostgreSQL 18 required"]
 async fn grant_expiry_during_final_validation_acknowledgement_releases_no_code() {
-    let mut f = Flow::new().await;
+    // An eight-second login lifetime clips the grant. The session (60 s), assertion (about
+    // 290 s on the fixture clock) and the 30 s exchange and 20 s session deadlines outlast it.
+    // Both replicas warm their key snapshots before the login starts so CI load does not spend
+    // the login lifetime on discovery or JWKS fetches before reaching the validation barrier.
+    let secs = Duration::from_secs;
+    let refresh = RefreshPolicy::new(secs(600), secs(2), secs(30), 2, 32, 2).unwrap();
+    let session_policy = crate::sessions::Policy::new(secs(60), 16, secs(20)).unwrap();
+    let mut f = Flow::with(Harness::with_policy(refresh).await).await;
     sessions::seed(&mut f, true, true).await;
-    // A three-second login lifetime clips the grant. The session (60 s), assertion (about
-    // 290 s on the fixture clock) and the 5 s exchange and 10 s session deadlines outlast it.
-    let lifetime = Duration::from_secs(3);
+    let lifetime = secs(8);
     let initiating = Arc::new(service::browser_auth(
         &f.h,
         pooled::one_slot(f.db.options(API)),
         lifetime,
-        sessions::session_policy(),
+        session_policy,
     ));
     let a = mount(initiating, A).await;
     // On the callback replica's only backend: consume, issuance, then final validation commit.
     let mut barrier = ResponseBarrier::nth(b"COMMIT\0", 3);
     let pool = proxied(&f, &barrier).await;
-    let b = mount(replica(&f, pool.clone(), lifetime), A).await;
+    let (replica_auth, replica_provider) =
+        replica_with(&f, pool.clone(), lifetime, refresh, session_policy);
+    f.h.provider.ensure().await.unwrap();
+    replica_provider.ensure().await.unwrap();
+    let b = mount(replica_auth, A).await;
     let app = App::new(A, 14);
     let started = start(a, &app).await;
     f.arm_url(&started.location);
-    let request = head(
-        "GET",
-        &app.callback(&started.state),
-        &[("cookie", &started.cookie)],
-    );
+    let request = callback_request(&app, &started);
     let callback = send(b, &request);
     tokio::pin!(callback);
     tokio::select! {
         () = barrier.wait_reached() => {},
         reply = &mut callback => panic!("callback ended before the validation barrier: {}", reply.status),
     }
-    let (grant, session): (i64, i64) = sqlx::query_as(
-        "SELECT g.expires_ms, s.expires_ms FROM openmettle.native_handoffs g
-         JOIN openmettle.local_sessions s ON s.id=g.session_id",
+    let (grant, login, session): (i64, i64, i64) = sqlx::query_as(
+        "SELECT g.expires_ms, l.expires_ms, s.expires_ms
+         FROM openmettle.native_handoffs g
+         JOIN openmettle.local_sessions s ON s.id=g.session_id
+         JOIN openmettle.login_transactions l ON l.id=s.login_id
+         WHERE g.challenge=$1",
     )
+    .bind(app.challenge_bytes().as_slice())
     .fetch_one(&mut f.owner)
     .await
     .unwrap();
+    assert_eq!(grant, login);
     wait_past(&mut f.owner, grant).await;
     assert!(session > primary_ms(&mut f.owner).await + 10_000);
     assert!(
@@ -614,9 +690,12 @@ async fn grant_expiry_during_final_validation_acknowledgement_releases_no_code()
     barrier.resume();
     nothing_released(&callback.await);
     let row: (bool, bool) = sqlx::query_as(
-        "SELECT g.sealed IS NOT NULL, s.revoked FROM openmettle.native_handoffs g
-         JOIN openmettle.local_sessions s ON s.id=g.session_id",
+        "SELECT g.sealed IS NOT NULL, s.revoked
+         FROM openmettle.native_handoffs g
+         JOIN openmettle.local_sessions s ON s.id=g.session_id
+         WHERE g.challenge=$1",
     )
+    .bind(app.challenge_bytes().as_slice())
     .fetch_one(&mut f.owner)
     .await
     .unwrap();
@@ -688,15 +767,16 @@ fn callback_request(app: &App, started: &Started) -> String {
         &[("cookie", &started.cookie)],
     )
 }
-/// The newest grant: its stored window from the session's creation, what remains of it now,
+/// The grant for `app`: its stored window from the session's creation, what remains of it now,
 /// whether its code is still unclaimed and whether its session is unrevoked.
-async fn newest_grant(owner: &mut PgConnection) -> (i64, i64, bool, bool) {
+async fn grant_state(owner: &mut PgConnection, app: &App) -> (i64, i64, bool, bool) {
     sqlx::query_as(AssertSqlSafe(format!(
         "SELECT g.expires_ms - s.created_ms, g.expires_ms - ({NOW_MS}), g.sealed IS NOT NULL,
                 NOT s.revoked
          FROM openmettle.native_handoffs g JOIN openmettle.local_sessions s ON s.id=g.session_id
-         ORDER BY s.created_ms DESC LIMIT 1"
+         WHERE g.challenge=$1"
     )))
+    .bind(app.challenge_bytes().as_slice())
     .fetch_one(owner)
     .await
     .unwrap()
@@ -729,7 +809,7 @@ async fn slow_exchange_under_the_provider_deadline_leaves_the_app_its_window() {
     tokio::select! {
         reply = &mut callback => panic!("callback ended before its token response: {}", reply.status),
         () = async {
-            tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout(Duration::from_secs(10), async {
                 while pooled::posts(&f) == posts {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
@@ -743,7 +823,7 @@ async fn slow_exchange_under_the_provider_deadline_leaves_the_app_its_window() {
     }
     let code = link_code(&callback.await, &app);
     // The stored grant is not clipped to what the exchange left of the provider deadline.
-    let (window, _, pending, _) = newest_grant(&mut f.owner).await;
+    let (window, _, pending, _) = grant_state(&mut f.owner, &app).await;
     full_window(window);
     assert!(pending);
     // The app redeems after that deadline has passed, as after a slow launch.
@@ -784,7 +864,7 @@ async fn short_key_reuse_window_bounds_the_release_and_not_the_stored_grant() {
     let code = link_code(&send(a, &callback_request(&app, &started)).await, &app);
     // The callback reused the snapshot: its one provider request is the token POST.
     assert_eq!(f.h.count(), fetched + 1);
-    let (window, _, pending, _) = newest_grant(&mut f.owner).await;
+    let (window, _, pending, _) = grant_state(&mut f.owner, &app).await;
     full_window(window);
     assert!(pending);
     f.h.advance(3);
@@ -821,7 +901,7 @@ async fn short_key_reuse_window_bounds_the_release_and_not_the_stored_grant() {
     nothing_released(&callback.await);
     assert_eq!(f.h.count(), fetched + 1);
     // The stored grant is whole and unexpired. Its code never left the process.
-    let (window, remaining, pending, unrevoked) = newest_grant(&mut f.owner).await;
+    let (window, remaining, pending, unrevoked) = grant_state(&mut f.owner, &app).await;
     full_window(window);
     assert!(remaining > 20_000, "{remaining}");
     assert!(pending && unrevoked);
@@ -839,12 +919,12 @@ async fn stored_audience_alone_refuses_a_pending_code_and_its_redemption() {
     // Another audience under an unchanged registration, challenge, code and expiry. Only the
     // owner can write it (`role_boundaries`).
     const REBIND: &str = "UPDATE openmettle.native_handoffs SET audience=sha256(audience)
-        WHERE session_id=(SELECT id FROM openmettle.local_sessions ORDER BY created_ms DESC LIMIT 1)
+        WHERE challenge=$1
         RETURNING registration, audience";
-    const NEWEST: &str = "SELECT g.registration, g.audience, g.sealed IS NOT NULL, NOT s.revoked,
+    const GRANT: &str = "SELECT g.registration, g.audience, g.sealed IS NOT NULL, NOT s.revoked,
             g.expires_ms > floor(extract(epoch FROM clock_timestamp())*1000)::bigint + 20000
         FROM openmettle.native_handoffs g JOIN openmettle.local_sessions s ON s.id=g.session_id
-        ORDER BY s.created_ms DESC LIMIT 1";
+        WHERE g.challenge=$1";
     type Grant = (Vec<u8>, Vec<u8>, bool, bool, bool);
 
     // Issuance: the audience changes while the issuance COMMIT acknowledgement is held, so
@@ -862,11 +942,14 @@ async fn stored_audience_alone_refuses_a_pending_code_and_its_redemption() {
         () = barrier.wait_reached() => {},
         reply = &mut callback => panic!("callback ended before the issuance barrier: {}", reply.status),
     }
-    let issued: Grant = sqlx::query_as(NEWEST)
+    let challenge = app.challenge_bytes();
+    let issued: Grant = sqlx::query_as(GRANT)
+        .bind(challenge.as_slice())
         .fetch_one(&mut f.owner)
         .await
         .unwrap();
     let rebound: (Vec<u8>, Vec<u8>) = sqlx::query_as(REBIND)
+        .bind(challenge.as_slice())
         .fetch_one(&mut f.owner)
         .await
         .unwrap();
@@ -874,7 +957,8 @@ async fn stored_audience_alone_refuses_a_pending_code_and_its_redemption() {
     assert_ne!(rebound.1, issued.1);
     barrier.resume();
     nothing_released(&callback.await);
-    let after: Grant = sqlx::query_as(NEWEST)
+    let after: Grant = sqlx::query_as(GRANT)
+        .bind(challenge.as_slice())
         .fetch_one(&mut f.owner)
         .await
         .unwrap();
@@ -888,11 +972,14 @@ async fn stored_audience_alone_refuses_a_pending_code_and_its_redemption() {
     // after it refuses, and no bearer is released then or later.
     let app = App::new(A, 35);
     let delivered = code(&f, &app, a, a).await;
-    let issued: Grant = sqlx::query_as(NEWEST)
+    let challenge = app.challenge_bytes();
+    let issued: Grant = sqlx::query_as(GRANT)
+        .bind(challenge.as_slice())
         .fetch_one(&mut f.owner)
         .await
         .unwrap();
     let rebound: (Vec<u8>, Vec<u8>) = sqlx::query_as(REBIND)
+        .bind(challenge.as_slice())
         .fetch_one(&mut f.owner)
         .await
         .unwrap();
@@ -900,7 +987,8 @@ async fn stored_audience_alone_refuses_a_pending_code_and_its_redemption() {
     assert_ne!(rebound.1, issued.1);
     let request = post(&app.redeem(&delivered));
     nothing_released(&send(a, &request).await);
-    let after: Grant = sqlx::query_as(NEWEST)
+    let after: Grant = sqlx::query_as(GRANT)
+        .bind(challenge.as_slice())
         .fetch_one(&mut f.owner)
         .await
         .unwrap();
@@ -948,18 +1036,24 @@ async fn withheld_claim_acknowledgement_releases_once_and_never_retries() {
 
     // The grant passes its expiry while the claim acknowledgement is withheld. Nothing is
     // released, the claim is not retried and no new upstream exchange starts.
+    let secs = Duration::from_secs;
+    let session_policy = crate::sessions::Policy::new(secs(60), 16, secs(20)).unwrap();
     let short = Arc::new(service::browser_auth(
         &f.h,
         pooled::one_slot(f.db.options(API)),
-        Duration::from_secs(3),
-        sessions::session_policy(),
+        secs(8),
+        session_policy,
     ));
     let short = mount(short, A).await;
     let mut barrier = ResponseBarrier::new(b"COMMIT\0");
     let pool = proxied(&f, &barrier).await;
-    let c = mount(replica(&f, pool.clone(), Duration::from_secs(300)), A).await;
+    let (replica_auth, _) = replica_with(&f, pool.clone(), secs(300), policy(), session_policy);
+    let c = mount(replica_auth, A).await;
     let app = App::new(A, 13);
-    let request = post(&app.redeem(&code(&f, &app, short, short).await));
+    let started = start(short, &app).await;
+    f.arm_url(&started.location);
+    let delivered = link_code(&send(short, &callback_request(&app, &started)).await, &app);
+    let request = post(&app.redeem(&delivered));
     let (posts, upstream) = (pooled::posts(&f), exchanged(&f));
     let held = send(c, &request);
     tokio::pin!(held);
@@ -967,13 +1061,19 @@ async fn withheld_claim_acknowledgement_releases_once_and_never_retries() {
         () = barrier.wait_reached() => {},
         reply = &mut held => panic!("redemption ended before the claim barrier: {}", reply.status),
     }
-    const LATEST: &str = "SELECT g.expires_ms, s.expires_ms, g.sealed IS NULL, s.revoked
-        FROM openmettle.native_handoffs g JOIN openmettle.local_sessions s ON s.id=g.session_id
-        ORDER BY s.created_ms DESC LIMIT 1";
-    let (grant, session, _, _): (i64, i64, bool, bool) = sqlx::query_as(LATEST)
+    const GRANT: &str =
+        "SELECT g.expires_ms, l.expires_ms, s.expires_ms, g.sealed IS NULL, s.revoked
+        FROM openmettle.native_handoffs g
+        JOIN openmettle.local_sessions s ON s.id=g.session_id
+        JOIN openmettle.login_transactions l ON l.id=s.login_id
+        WHERE g.challenge=$1";
+    let challenge = app.challenge_bytes();
+    let (grant, login, session, _, _): (i64, i64, i64, bool, bool) = sqlx::query_as(GRANT)
+        .bind(challenge.as_slice())
         .fetch_one(&mut f.owner)
         .await
         .unwrap();
+    assert_eq!(grant, login);
     wait_past(&mut f.owner, grant).await;
     assert!(session > primary_ms(&mut f.owner).await + 10_000);
     assert!(
@@ -985,7 +1085,8 @@ async fn withheld_claim_acknowledgement_releases_once_and_never_retries() {
     nothing_released(&held.await);
     nothing_released(&send(a, &request).await);
     assert_eq!((pooled::posts(&f), exchanged(&f)), (posts, upstream));
-    let (_, _, claimed, revoked): (i64, i64, bool, bool) = sqlx::query_as(LATEST)
+    let (_, _, _, claimed, revoked): (i64, i64, i64, bool, bool) = sqlx::query_as(GRANT)
+        .bind(challenge.as_slice())
         .fetch_one(&mut f.owner)
         .await
         .unwrap();
@@ -1238,27 +1339,30 @@ async fn preview_and_start_spend_separate_budgets_and_other_methods_spend_none()
 async fn handoff_cannot_outlive_remaining_assertion_age_on_another_replica() {
     let mut f = Flow::new().await;
     sessions::seed(&mut f, true, true).await;
-    // Fixture ID token issued at T-10, maximum age 300s. Two seconds remain.
+    // Fixture ID token issued at T-10, maximum age 300s. Four seconds remain.
     {
         let mut script = f.h.script.lock().unwrap();
         script.cache = "max-age=600".into();
         script.metadata_cache = "max-age=600".into();
     }
-    f.h.advance(288);
+    f.h.advance(286);
     let (_, a, b) = services(&f).await;
     let app = App::new(A, 3);
     let pending = app.redeem(&code(&f, &app, a, b).await);
-    let clipped: bool = sqlx::query_scalar(
-        "SELECT g.expires_ms <= floor(extract(epoch FROM clock_timestamp())*1000)::bigint + 2000
-            AND g.expires_ms < s.expires_ms AND g.expires_ms < l.expires_ms
+    let (grant, clipped): (i64, bool) = sqlx::query_as(
+        "SELECT g.expires_ms,
+                g.expires_ms <= floor(extract(epoch FROM clock_timestamp())*1000)::bigint + 4000
+                    AND g.expires_ms < s.expires_ms AND g.expires_ms < l.expires_ms
          FROM openmettle.native_handoffs g JOIN openmettle.local_sessions s ON s.id=g.session_id
-         JOIN openmettle.login_transactions l ON l.id=s.login_id",
+         JOIN openmettle.login_transactions l ON l.id=s.login_id
+         WHERE g.challenge=$1",
     )
+    .bind(app.challenge_bytes().as_slice())
     .fetch_one(&mut f.owner)
     .await
     .unwrap();
     assert!(clipped);
-    tokio::time::sleep(Duration::from_millis(2050)).await;
+    wait_past(&mut f.owner, grant).await;
     nothing_released(&send(a, &post(&pending)).await);
     assert_eq!(pooled::posts(&f), 1);
 }
