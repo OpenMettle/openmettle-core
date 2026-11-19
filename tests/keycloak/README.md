@@ -5,7 +5,7 @@ V1-04 ([#5](https://github.com/OpenMettle/openmettle-core/issues/5)) fixture for
 ## Scope and boundaries
 
 - **CI qualification only.** This fixture runs on a hosted GitHub Actions runner against an ephemeral PostgreSQL 18 service and a pinned Keycloak 26.8.2 container (`quay.io/keycloak/keycloak@sha256:c68e286cacd87b942ac1939a0a1481461109d6acd3a57dc496969a319a76bbf0`). It is not a deployment template, Helm package or owner configuration.
-- **Unmounted routes.** The qualification test loads the generated version-2 auth settings through `openmettle_core::auth_config::load` and serves `BrowserAuth` / `LoginHandoff` / `router_with_sessions` in-process on loopback HTTPS. The production `openmettle-api` binary still serves `/healthz` and `/readyz` only.
+- **Routes served by the test.** The qualification test loads the generated version-2 auth settings through `openmettle_core::auth_config::load` and serves `BrowserAuth` / `LoginHandoff` / `router_with_sessions` in-process on loopback HTTPS. The `openmettle-api` binary is not exercised: it mounts these routes only when `OPENMETTLE_API_AUTH_CONFIG` is set (ADR 0025) and serves `/healthz` and `/readyz` only by default.
 - **No weakening of TLS or production defaults.** Keycloak serves HTTPS only (`--http-enabled=false`) with a per-run certificate signed by a per-run test CA (`provider-ca.pem`). OpenMettle's `ProviderTransport` (via `trust.roots = "bundle"`) and `fixture.py` trust only `provider-ca.pem`; headless Chrome adds the run's test CAs as its only added trust in its private NSS database and blocks all other hosts via `--host-resolver-rules`.
 
 ## How the fixture works

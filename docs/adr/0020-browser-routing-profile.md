@@ -23,6 +23,10 @@ The arguments, success line, exit codes, file checks, 1 MiB document limit and e
 diagnostic categories are those of ADR 0015. Version 1 keeps its accepted shape and
 outcomes.
 
+> [ADR 0025](0025-browser-auth-runtime-mounting.md) adds the consumer: the API mounts the
+> profile's routes when `OPENMETTLE_API_AUTH_CONFIG` names the document. Without that
+> setting the paragraph below still holds.
+
 **Nothing consumes the profile yet.** The API without arguments and the worker run as
 before. They serve `/healthz` and `/readyz` only, load no auth file and answer `404` for
 every login and session path. There is no new serve flag, environment variable, live reload
@@ -177,6 +181,9 @@ Not claimed: no PostgreSQL, browser, real provider, ingress, image, cluster or r
 exercised.
 
 ## Remaining
+
+> [ADR 0025](0025-browser-auth-runtime-mounting.md) supplies runtime enablement, off by
+> default. The other items stand.
 
 Runtime enablement remains open: startup loading, constructing the service, handoff and
 router, and mounting. Deployment and browser qualification, ingress routing and telemetry

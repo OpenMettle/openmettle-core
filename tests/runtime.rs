@@ -618,6 +618,578 @@ fn malformed_check_invocation_is_refused_and_worker_is_unchanged() {
     );
 }
 
+/// A database address that accepts connections and never speaks PostgreSQL, with a canary
+/// password.
+fn unavailable_database() -> (TcpListener, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "postgres://fixture:CANARY-db-password@{}/fixture?sslmode=disable",
+        listener.local_addr().unwrap()
+    );
+    (listener, url)
+}
+/// One request on a new connection: the status line's code, the lowercase head and the body.
+fn exchange(address: &str, request: &str) -> (u16, String, String) {
+    let response = send(address, request).unwrap();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    let status = head["HTTP/1.1 ".len()..][..3].parse().unwrap();
+    (status, head.to_ascii_lowercase(), body.to_owned())
+}
+/// `extra` is further header lines, optionally followed by a blank line and a body.
+fn request(method: &str, target: &str, extra: &str) -> String {
+    let end = if extra.contains("\r\n\r\n") {
+        ""
+    } else {
+        "\r\n"
+    };
+    format!("{method} {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{extra}{end}")
+}
+/// A synthetic credential of the session parser's shape. No session has it.
+const SESSION: &str = concat!(
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    ".",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+);
+
+/// ADR 0025: a refused `OPENMETTLE_API_AUTH_CONFIG` exits 78 before any listener opens or
+/// any event is written, with one fixed line that carries no path, value or parser text.
+#[test]
+fn api_refuses_invalid_auth_config_with_a_fixed_redacted_line() {
+    let dir = auth_config_support::Dir::new();
+    let bundle = ca::Ca::new().pem();
+    let v1 = auth_config_support::document(&dir, &bundle);
+    let v2 = auth_config_support::document_v2(&dir, &bundle);
+    let write =
+        |name: &str, document: &serde_json::Value| dir.write(name, document.to_string().as_bytes());
+    let changed = |pointer: &str, value: serde_json::Value| {
+        let mut document = v2.clone();
+        *document.pointer_mut(pointer).unwrap() = value;
+        write("CANARY-auth.json", &document)
+    };
+    const SETTING: &str = "configuration error: invalid AUTH_CONFIG";
+    const ABSENT: &str =
+        "auth configuration error: configuration is not a readable regular file within bounds";
+    const COLLISION: &str =
+        "auth configuration error: browser profile refused: login paths collide";
+    let cases: Vec<(String, &str)> = vec![
+        (String::new(), SETTING),
+        ("CANARY-relative/auth.json".into(), SETTING),
+        ("./CANARY-auth.json".into(), SETTING),
+        (dir.path("CANARY-absent.json"), ABSENT),
+        // A directory is not a regular file.
+        (dir.path(""), ABSENT),
+        (
+            dir.write("CANARY-broken.json", br#"{"version": 2, "CANARY-member":"#),
+            "auth configuration error: configuration is not valid JSON",
+        ),
+        (
+            write("CANARY-v1.json", &v1),
+            "auth configuration error: serving requires a version 2 browser profile",
+        ),
+    ];
+    // Each of these files is rewritten by the next case, so each runs as it is written.
+    let short_key = dir.write("CANARY-short-key", b"CANARY-key-material-31-bytes-00");
+    let later: [(&str, serde_json::Value, &str); 7] = [
+        (
+            "/login/keys/active/path",
+            short_key.into(),
+            "auth configuration error: a login key is not a readable regular file of exactly 32 bytes",
+        ),
+        (
+            "/login/keys/active/path",
+            dir.path("CANARY-absent-key").into(),
+            "auth configuration error: a login key is not a readable regular file of exactly 32 bytes",
+        ),
+        ("/browser/paths/initiation", "/healthz".into(), COLLISION),
+        ("/browser/paths/session_check", "/readyz".into(), COLLISION),
+        ("/browser/paths/logout", "/healthz".into(), COLLISION),
+        // The callback path comes from the provider registration.
+        (
+            "/providers/0/callback",
+            "https://app.example.test/readyz".into(),
+            COLLISION,
+        ),
+        (
+            "/browser/origin",
+            "https://canary-origin.example.test".into(),
+            "auth configuration error: browser profile refused: registered callback is not a plain path on the application origin",
+        ),
+    ];
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let run = |path: &str, line: &str| {
+        let output = command(false)
+            .env("OPENMETTLE_API_DATABASE_URL", "postgres://localhost/test")
+            // Serving would exit 1 on this occupied address instead.
+            .env(
+                "OPENMETTLE_API_BIND",
+                occupied.local_addr().unwrap().to_string(),
+            )
+            .env("OPENMETTLE_API_LOG_LEVEL", "debug")
+            .env("OPENMETTLE_API_AUTH_CONFIG", path)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(78), "{line}");
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            format!("{line}\n")
+        );
+    };
+    for (path, line) in cases {
+        run(&path, line);
+    }
+    for (pointer, value, line) in later {
+        run(&changed(pointer, value), line);
+    }
+    // Earlier settings are still reported first, and a valid file does not excuse them.
+    let output = command(false)
+        .env("OPENMETTLE_API_DATABASE_URL", "invalid://CANARY")
+        .env("OPENMETTLE_API_AUTH_CONFIG", write("auth.json", &v2))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(78));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "configuration error: invalid DATABASE_URL scheme\n"
+    );
+}
+
+/// ADR 0025: the worker has no auth settings. Neither prefix's `AUTH_CONFIG`, valid or
+/// unusable, changes what it serves or writes.
+#[test]
+fn worker_ignores_auth_config_and_mounts_no_sign_in_route() {
+    let dir = auth_config_support::Dir::new();
+    let v2 = auth_config_support::document_v2(&dir, &ca::Ca::new().pem());
+    let valid = dir.write("auth.json", v2.to_string().as_bytes());
+    let (_database, url) = unavailable_database();
+    for path in [valid.as_str(), "", "CANARY-relative", "/CANARY-absent"] {
+        let bind = address();
+        // Both prefixes: the worker's own, and the API's in the same environment.
+        let mut process = Process(
+            command(true)
+                .env("OPENMETTLE_WORKER_BIND", &bind)
+                .env("OPENMETTLE_WORKER_DATABASE_URL", &url)
+                .env("OPENMETTLE_WORKER_DB_TIMEOUT_MS", "150")
+                .env("OPENMETTLE_WORKER_SHUTDOWN_TIMEOUT_MS", "1000")
+                .env("OPENMETTLE_WORKER_LOG_LEVEL", "debug")
+                .env("OPENMETTLE_WORKER_AUTH_CONFIG", path)
+                .env("OPENMETTLE_API_AUTH_CONFIG", path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        wait_status(&mut process, &bind, "/healthz", 200);
+        for (method, target) in [
+            ("POST", "/auth/login"),
+            ("GET", "/callback"),
+            ("GET", "/auth/session"),
+            ("POST", "/auth/logout"),
+        ] {
+            let extra = format!(
+                "Origin: https://app.example.test\r\nSec-Fetch-Site: same-origin\r\n\
+                 Content-Length: 0\r\nCookie: __Host-openmettle-session={SESSION}\r\n"
+            );
+            let (status, head, _) = exchange(&bind, &request(method, target, &extra));
+            assert_eq!(status, 404, "{method} {target}");
+            assert!(!head.contains("set-cookie") && !head.contains("location"));
+        }
+        stop(&mut process, "-TERM");
+        let (stdout, stderr) = drain(&mut process);
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(!stderr.contains("CANARY"), "{stderr}");
+        let events: Vec<serde_json::Value> = stderr
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events[0]["event"], "process.started", "{stderr}");
+        assert_eq!(events.last().unwrap()["event"], "process.stopped");
+        // Its lifecycle, health polling and four unknown routes; no sign-in route template.
+        let routes: Vec<&str> = events
+            .iter()
+            .filter_map(|event| event["http.route"].as_str())
+            .filter(|route| *route != "/healthz")
+            .collect();
+        assert_eq!(routes, ["unmatched"; 4], "{stderr}");
+        assert!(
+            events
+                .iter()
+                .all(|event| event["role"] == "worker" || event["http.route"].is_string())
+        );
+    }
+}
+
+/// The API with a valid version-2 document and the given format; `debug`, so every request
+/// writes an event.
+fn start_mounted(bind: &str, url: &str, auth: &str, format: &str, db_timeout_ms: &str) -> Process {
+    start_logging(
+        false,
+        bind,
+        url,
+        &[
+            ("AUTH_CONFIG", auth),
+            ("DB_TIMEOUT_MS", db_timeout_ms),
+            ("LOG_LEVEL", "debug"),
+            ("LOG_FORMAT", format),
+        ],
+    )
+}
+
+/// ADR 0025 through the real API binary, without PostgreSQL or a provider: a valid
+/// version-2 document mounts its four routes beside the probes, every refusal is the
+/// router's or handoff's fixed response, telemetry holds no planted value in either format,
+/// and SIGTERM still exits 0.
+#[test]
+fn api_mounts_browser_sign_in_routes_from_a_valid_auth_config() {
+    let dir = auth_config_support::Dir::new();
+    let document = auth_config_support::document_v2(&dir, &ca::Ca::new().pem());
+    // Textual login keys, so their bytes can be searched for.
+    dir.write("login-key-b", b"CANARY-login-key-active-00000000");
+    dir.write("login-key-a", b"CANARY-login-key-decrypt-0000000");
+    let auth = dir.write("CANARY-auth.json", document.to_string().as_bytes());
+    let (database, url) = unavailable_database();
+    database.set_nonblocking(true).unwrap();
+
+    let state = format!("{}.{}", "s".repeat(43), "t".repeat(43));
+    let login_cookie = format!(
+        "Cookie: __Host-openmettle-login={}.{}\r\n",
+        "u".repeat(43),
+        "v".repeat(43)
+    );
+    let bound = format!(
+        "/callback?code=CANARY-code&state={state}&iss=https%3A%2F%2Fissuer.example.test%2Frealm"
+    );
+    let session_cookie = format!("Cookie: __Host-openmettle-session={SESSION}\r\n");
+    let same_origin = "Sec-Fetch-Site: same-origin\r\n";
+    let origin = "Origin: https://app.example.test\r\nContent-Length: 0\r\n";
+    let form = "Origin: https://CANARY-origin.example.test\r\nContent-Length: 39\r\n\
+                Content-Type: application/x-www-form-urlencoded\r\n\r\n\
+                invitation_code=CANARY-invitation-00000";
+    // (method, target, extra head, status, body, route template, Allow)
+    type Case<'a> = (&'a str, &'a str, String, u16, &'a str, &'a str, &'a str);
+    let cases: Vec<Case> = vec![
+        (
+            "GET",
+            "/healthz",
+            "X-Request-Id: CANARY-id\r\n".into(),
+            200,
+            "ok\n",
+            "/healthz",
+            "",
+        ),
+        (
+            "GET",
+            "/readyz",
+            String::new(),
+            503,
+            "not ready\n",
+            "/readyz",
+            "",
+        ),
+        // Initiation: `POST` only, and the `Origin` rule before the form or any work.
+        (
+            "POST",
+            "/auth/login",
+            "Content-Length: 0\r\n".into(),
+            403,
+            "login origin refused\n",
+            "/auth/login",
+            "",
+        ),
+        (
+            "POST",
+            "/auth/login",
+            form.into(),
+            403,
+            "login origin refused\n",
+            "/auth/login",
+            "",
+        ),
+        (
+            "GET",
+            "/auth/login",
+            String::new(),
+            405,
+            "method not allowed\n",
+            "/auth/login",
+            "POST",
+        ),
+        // Callback: `GET` only; a malformed response, then a missing and a foreign binding.
+        (
+            "POST",
+            "/callback",
+            "Content-Length: 0\r\n".into(),
+            405,
+            "method not allowed\n",
+            "/callback",
+            "GET",
+        ),
+        (
+            "HEAD",
+            "/callback",
+            String::new(),
+            405,
+            "",
+            "/callback",
+            "GET",
+        ),
+        (
+            "GET",
+            "/callback?code=CANARY-code&state=CANARY-state&iss=CANARY-iss",
+            String::new(),
+            400,
+            "login response refused; restart login\n",
+            "/callback",
+            "",
+        ),
+        (
+            "GET",
+            &bound,
+            String::new(),
+            400,
+            "login browser binding missing or superseded; restart login\n",
+            "/callback",
+            "",
+        ),
+        (
+            "GET",
+            &bound,
+            login_cookie,
+            400,
+            "login browser binding missing or superseded; restart login\n",
+            "/callback",
+            "",
+        ),
+        // Session check: Fetch Metadata, then the cookie, then the primary pool.
+        (
+            "GET",
+            "/auth/session",
+            String::new(),
+            403,
+            "session origin refused\n",
+            "/auth/session",
+            "",
+        ),
+        (
+            "GET",
+            "/auth/session",
+            session_cookie.clone(),
+            403,
+            "session origin refused\n",
+            "/auth/session",
+            "",
+        ),
+        (
+            "GET",
+            "/auth/session",
+            same_origin.into(),
+            403,
+            "session not valid\n",
+            "/auth/session",
+            "",
+        ),
+        (
+            "GET",
+            "/auth/session",
+            format!("{same_origin}{session_cookie}"),
+            503,
+            "session unavailable; try again later\n",
+            "/auth/session",
+            "",
+        ),
+        // Logout: the initiation `Origin` rule, then the cookie, then the primary pool.
+        (
+            "POST",
+            "/auth/logout",
+            format!("Content-Length: 0\r\n{session_cookie}"),
+            403,
+            "logout origin refused\n",
+            "/auth/logout",
+            "",
+        ),
+        (
+            "POST",
+            "/auth/logout",
+            origin.into(),
+            403,
+            "session not valid\n",
+            "/auth/logout",
+            "",
+        ),
+        (
+            "POST",
+            "/auth/logout",
+            format!("{origin}{session_cookie}"),
+            503,
+            "session unavailable; try again later\n",
+            "/auth/logout",
+            "",
+        ),
+        // A body on a route that takes none is refused unread.
+        (
+            "POST",
+            "/auth/logout",
+            "Content-Length: 14\r\n\r\nCANARY-payload".into(),
+            413,
+            "session request body not accepted\n",
+            "/auth/logout",
+            "",
+        ),
+        // Paths the document does not name stay unknown.
+        (
+            "POST",
+            "/auth/CANARY-path",
+            "Content-Length: 0\r\n".into(),
+            404,
+            "",
+            "unmatched",
+            "",
+        ),
+        (
+            "POST",
+            "/login",
+            "Content-Length: 0\r\n".into(),
+            404,
+            "",
+            "unmatched",
+            "",
+        ),
+        (
+            "POST",
+            "/healthz",
+            "Content-Length: 0\r\n".into(),
+            405,
+            "",
+            "/healthz",
+            "GET,HEAD",
+        ),
+    ];
+
+    for format in ["json", "text"] {
+        let bind = address();
+        let mut process = start_mounted(&bind, &url, &auth, format, "150");
+        wait_status(&mut process, &bind, "/healthz", 200);
+        // Loading and mounting dialled nothing: the lazy pool is still unconnected.
+        assert!(database.accept().is_err());
+        for (method, target, extra, status, body, route, allow) in &cases {
+            let (got, head, text) = exchange(&bind, &request(method, target, extra));
+            assert_eq!((got, text.as_str()), (*status, *body), "{method} {target}");
+            assert!(!head.contains("set-cookie") && !head.contains("location"));
+            assert!(!head.contains("request-id") && !head.contains("canary"));
+            let sign_in = route.starts_with("/auth/") || *route == "/callback";
+            assert_eq!(head.contains("\r\ncache-control: no-store"), sign_in);
+            assert_eq!(head.contains("\r\nreferrer-policy: no-referrer"), sign_in);
+            if allow.is_empty() {
+                assert!(!head.contains("\r\nallow:"), "{method} {target}");
+            } else {
+                assert!(
+                    head.contains(&format!("\r\nallow: {}", allow.to_ascii_lowercase())),
+                    "{method} {target}: {head}"
+                );
+            }
+        }
+        // Liveness is unaffected, and the stop fits SHUTDOWN_TIMEOUT_MS (1000).
+        assert!(response(&bind, "/healthz").unwrap().ends_with("ok\n"));
+        let began = Instant::now();
+        stop(&mut process, "-TERM");
+        assert!(began.elapsed() < Duration::from_secs(2));
+        // Readiness, the session check and the logout dialled the primary database.
+        assert!(std::iter::from_fn(|| database.accept().ok()).count() > 0);
+        let (stdout, stderr) = drain(&mut process);
+        assert!(stdout.is_empty(), "{stdout}");
+        for canary in [
+            "CANARY",
+            "canary",
+            SESSION,
+            state.as_str(),
+            "uuuuuuuu",
+            "__Host-",
+            "issuer.example.test",
+            "app.example.test",
+            "invitation",
+            dir.path("").as_str(),
+        ] {
+            assert!(!stderr.contains(canary), "{canary}:\n{stderr}");
+        }
+        let lines: Vec<&str> = stderr.lines().collect();
+        if format == "text" {
+            // Health polling precedes the planted requests; the final probe follows them.
+            let planted = &lines[lines.len() - 3 - cases.len()..lines.len() - 3];
+            for (line, (_, _, _, status, _, route, _)) in planted.iter().zip(&cases) {
+                assert!(line.contains("event=\"http.request.completed\""), "{line}");
+                assert!(line.contains(&format!("http.route=\"{route}\"")), "{line}");
+                assert!(
+                    line.contains(&format!("http.response.status_code={status}")),
+                    "{line}"
+                );
+            }
+            continue;
+        }
+        let events: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        // The lifecycle is exactly the unmounted one.
+        assert_eq!(
+            events[0],
+            serde_json::json!({
+                "timestamp": events[0]["timestamp"],
+                "level": "INFO",
+                "event": "process.started",
+                "role": "api",
+            })
+        );
+        let names: Vec<&str> = events
+            .iter()
+            .map(|e| e["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names[names.len() - 2..],
+            ["process.stopping", "process.stopped"]
+        );
+        assert!(
+            names[1..names.len() - 2]
+                .iter()
+                .all(|name| *name == "http.request.completed")
+        );
+        let planted = &events[events.len() - 3 - cases.len()..events.len() - 3];
+        let mut ids = std::collections::HashSet::new();
+        for (event, (method, _, _, status, _, route, _)) in planted.iter().zip(&cases) {
+            assert_eq!(event["http.route"], *route);
+            assert_eq!(event["http.request.method"], *method);
+            assert_eq!(event["http.response.status_code"], *status);
+            assert_eq!(
+                event["level"],
+                if *status >= 500 { "WARN" } else { "DEBUG" }
+            );
+            // Only the allowlisted fields, with a fresh server-generated identifier.
+            let mut fields: Vec<&str> = event
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            fields.sort_unstable();
+            assert_eq!(
+                fields,
+                [
+                    "duration_us",
+                    "event",
+                    "http.request.method",
+                    "http.response.status_code",
+                    "http.route",
+                    "level",
+                    "request_id",
+                    "timestamp",
+                ]
+            );
+            let id = event["request_id"].as_str().unwrap();
+            assert_eq!(id.len(), 36, "{id}");
+            assert!(ids.insert(id.to_owned()), "repeated request identifier");
+        }
+    }
+}
+
 #[test]
 fn unavailable_database_keeps_liveness_and_bounded_readiness() {
     // Hold a TCP listener that never speaks PostgreSQL to exercise query/connect timeout.
@@ -643,16 +1215,10 @@ fn unavailable_database_keeps_liveness_and_bounded_readiness() {
                 .unwrap()
                 .starts_with("HTTP/1.1 404")
         );
-        // A synthetic credential of the session parser's shape.
-        const SESSION: &str = concat!(
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            ".",
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-        );
-        // ADRs 0017–0019: neither the browser login handoff nor its router is mounted. The
-        // synthetic callback path, a form POST, a session check and a logout are unknown
-        // routes, no response sets or deletes a cookie or redirects, and the two operational
-        // routes still answer GET alone.
+        // ADRs 0017–0019 and 0025: without `AUTH_CONFIG` neither the browser login handoff
+        // nor its router is mounted. The synthetic callback path, a form POST, a session
+        // check and a logout are unknown routes, no response sets or deletes a cookie or
+        // redirects, and the two operational routes still answer GET alone.
         for (method, path, status) in [
             (
                 "GET",
@@ -835,4 +1401,178 @@ async fn postgres_readiness_is_independent_of_optional_evaluation() {
             .starts_with("HTTP/1.1 404")
     );
     stop(&mut api, "-TERM");
+}
+
+/// Synthetic cluster roles shared with `tests/schema.rs`, which creates them the same way.
+const DATABASE_ROLES: [&str; 3] = ["openmettle_owner", "openmettle_api", "openmettle_worker"];
+/// Synthetic test-only credential for those roles; never a deployment value.
+const ROLE_PASSWORD: &str = "fixture-only-password";
+
+/// A fresh migrated database owned by `openmettle_owner`, dropped when the test ends. Its
+/// administrative connection holds the shared role-state lock, as every test database does.
+struct MigratedDb {
+    name: String,
+    _admin: sqlx::PgConnection,
+}
+impl MigratedDb {
+    fn admin_options() -> sqlx::postgres::PgConnectOptions {
+        std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL required")
+            .parse()
+            .expect("valid TEST_DATABASE_URL")
+    }
+    async fn new() -> Self {
+        use sqlx::{AssertSqlSafe, Connection, Executor};
+        let mut admin = sqlx::PgConnection::connect_with(&Self::admin_options())
+            .await
+            .unwrap();
+        admin
+            .execute("SELECT pg_advisory_lock(720202)")
+            .await
+            .unwrap();
+        for role in DATABASE_ROLES {
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS (SELECT FROM pg_roles WHERE rolname = $1)")
+                    .bind(role)
+                    .fetch_one(&mut admin)
+                    .await
+                    .unwrap();
+            if !exists {
+                admin
+                    .execute(AssertSqlSafe(format!(
+                        "CREATE ROLE {role} LOGIN PASSWORD '{ROLE_PASSWORD}'"
+                    )))
+                    .await
+                    .unwrap();
+            }
+        }
+        admin
+            .execute("SELECT pg_advisory_unlock(720202)")
+            .await
+            .unwrap();
+        admin
+            .execute("SELECT pg_advisory_lock_shared(720203)")
+            .await
+            .unwrap();
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let name = format!("om_runtime_{}_{seq}_{nanos}", std::process::id());
+        admin
+            .execute(AssertSqlSafe(format!(
+                "CREATE DATABASE {name} OWNER openmettle_owner"
+            )))
+            .await
+            .unwrap();
+        let db = Self {
+            name,
+            _admin: admin,
+        };
+        openmettle_core::migrate::apply(
+            &openmettle_core::migrate::Settings {
+                database: Self::admin_options()
+                    .database(&db.name)
+                    .username("openmettle_owner")
+                    .password(ROLE_PASSWORD),
+                connect_timeout: Duration::from_secs(5),
+                lock_timeout: Duration::from_secs(10),
+                statement_timeout: Duration::from_secs(30),
+            },
+            openmettle_core::migrate::MIGRATIONS,
+        )
+        .await
+        .unwrap();
+        db
+    }
+    /// The API's own role, never the owner's.
+    fn api_url(&self) -> String {
+        let admin = Self::admin_options();
+        format!(
+            "postgres://openmettle_api:{ROLE_PASSWORD}@{}:{}/{}?sslmode=disable",
+            admin.get_host(),
+            admin.get_port(),
+            self.name
+        )
+    }
+}
+impl Drop for MigratedDb {
+    fn drop(&mut self) {
+        let statement = format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", self.name);
+        let _ = thread::spawn(move || {
+            use sqlx::{AssertSqlSafe, Connection, Executor};
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let options = MigratedDb::admin_options();
+                    if let Ok(mut admin) = sqlx::PgConnection::connect_with(&options).await {
+                        let _ = admin.execute(AssertSqlSafe(statement)).await;
+                    }
+                })
+        })
+        .join();
+    }
+}
+
+/// ADR 0025 on PostgreSQL: the real API binary, as `openmettle_api` on a migrated database,
+/// with the sign-in routes mounted. Readiness stays a database query while the configured
+/// provider is a reserved name that cannot be reached, and the session routes are answered
+/// by the primary database: it refuses an unknown credential, where an unreachable database
+/// gives `503`. No provider is contacted; issued-session journeys are covered by the managed
+/// PostgreSQL router tests and the Keycloak qualification.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn postgres_mounted_session_routes_use_the_primary_database() {
+    let db = MigratedDb::new().await;
+    let dir = auth_config_support::Dir::new();
+    let document = auth_config_support::document_v2(&dir, &ca::Ca::new().pem());
+    let auth = dir.write("auth.json", document.to_string().as_bytes());
+    let bind = address();
+    let mut api = start_mounted(&bind, &db.api_url(), &auth, "json", "2000");
+    wait_status(&mut api, &bind, "/readyz", 200);
+
+    let session =
+        format!("Sec-Fetch-Site: same-origin\r\nCookie: __Host-openmettle-session={SESSION}\r\n");
+    let logout = format!(
+        "Origin: https://app.example.test\r\nContent-Length: 0\r\n\
+         Cookie: __Host-openmettle-session={SESSION}\r\n"
+    );
+    // Repeated, so a connection left unusable by one refusal would surface in the next.
+    for _ in 0..3 {
+        for (method, target, extra) in [
+            ("GET", "/auth/session", session.as_str()),
+            ("POST", "/auth/logout", logout.as_str()),
+        ] {
+            let (status, head, body) = exchange(&bind, &request(method, target, extra));
+            assert_eq!(
+                (status, body.as_str()),
+                (403, "session not valid\n"),
+                "{method} {target}"
+            );
+            assert!(head.contains("\r\ncache-control: no-store"));
+            assert!(!head.contains("set-cookie") && !head.contains("location"));
+        }
+        let (status, _, body) = exchange(&bind, &request("GET", "/readyz", ""));
+        assert_eq!((status, body.as_str()), (200, "ready\n"));
+    }
+    stop(&mut api, "-TERM");
+    let (stdout, stderr) = drain(&mut api);
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(!stderr.contains(SESSION) && !stderr.contains(ROLE_PASSWORD));
+    let events: Vec<serde_json::Value> = stderr
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    // Six refusals by the database, none of them a server error.
+    let refused = events
+        .iter()
+        .filter(|event| event["http.response.status_code"] == 403)
+        .count();
+    assert_eq!(refused, 6, "{stderr}");
+    assert!(events.iter().all(|event| event["level"] != "WARN"));
+    assert_eq!(events.last().unwrap()["event"], "process.stopped");
 }

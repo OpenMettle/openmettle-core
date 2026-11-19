@@ -1,6 +1,6 @@
 # OpenMettle core
 
-Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures, but no `/v1` route serves it. Internal managed login, an owner-configured outstanding-login cap, local identity approval and opaque-session primitives are implemented, with an offline check for mounted browser-auth settings that the running API does not load yet, an internal pooled browser-auth service that no process constructs yet, and an unmounted Axum router for the same-origin browser login handoff, session check and local logout. No product API, upload service, request authentication, per-user authorization or GPU orchestration is exposed. Runtime qualification and deployment acceptance remain separate gates.
+Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures, but no `/v1` route serves it. Internal managed login, an owner-configured outstanding-login cap, local identity approval and opaque-session primitives are implemented, with an offline check for mounted browser-auth settings, an internal pooled browser-auth service, and an Axum router for the same-origin browser login handoff, session check and local logout. The API loads those settings and mounts that router only when `OPENMETTLE_API_AUTH_CONFIG` is set; by default it does neither. No product API, upload service, request authentication, per-user authorization or GPU orchestration is exposed. Runtime qualification and deployment acceptance remain separate gates.
 
 ## Start here
 
@@ -77,6 +77,28 @@ Values must match exactly; anything else exits 78 with `configuration error: inv
 - **Not covered.** Ingress and proxy access logs are outside these processes. Configure them separately before exposing login routes.
 - **No export yet.** Nothing is sent over the network; OTLP export is a later increment.
 
+### Browser sign-in routes (off by default)
+
+[ADR 0025](docs/adr/0025-browser-auth-runtime-mounting.md) adds one API-only setting. The worker and migrator never read it.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `OPENMETTLE_API_AUTH_CONFIG` | unset | Unset: the API loads no auth file, serves `/healthz` and `/readyz` only and answers `404` on every sign-in path, as before. Set: the absolute path of a [version-2 auth settings document](#browser-routing-profile-version-2), loaded once at startup |
+
+When set, the API validates the document and the files it names with the same loader as `--check-auth-config`, before it installs telemetry or opens its listener. It then mounts the document's four routes beside the probes: the initiation `POST`, the provider's registered callback `GET`, the session check `GET` and the logout `POST`. They use the API's existing database pool. `/readyz` is still one database query and contacts no provider. Native sign-in is not mounted.
+
+A refusal exits 78 with one fixed stderr line and no listener:
+
+| Cause | Line |
+| --- | --- |
+| The value is empty or not an absolute path | `configuration error: invalid AUTH_CONFIG` |
+| The document or a file it names is refused | `auth configuration error: ` and the category `--check-auth-config` prints |
+| The document is version 1 | `auth configuration error: serving requires a version 2 browser profile` |
+
+No line carries a path, value, URL, identifier or parser message. Run `--check-auth-config` in the same image and mounts first: it accepts version 1, which serving refuses. There is no live reload; restart the API to apply changed files. Request events for these routes carry the route's configured literal path, the method, the status and a server-generated request ID, and nothing from the request.
+
+**Setting this exposes sign-in to whatever can reach the API port.** The exposure gates of ADRs 0017–0020 are deployment work that this setting does not perform: TLS termination for the configured origin, ingress that preserves paths and does not log targets, cookies or bodies, the database authority and login limit (ADRs 0012 and 0014), operated cleanup, and measured budgets. Each replica keeps its own rate budgets.
+
 Run the real PostgreSQL subprocess test against an isolated test database:
 
 ```sh
@@ -110,10 +132,10 @@ The nonce verifier accepts stored digests without weakening the existing token c
 From migration 13 the sealed value also carries an optional home invitation code, at one
 fixed length (ADR 0022). Logins sealed before that migration still complete.
 
-Native handoff remains unimplemented; the browser cookie handoff below is
-not mounted. Key files are read only by the offline check below. Internal local approval and sessions are described below. The outstanding-login
-cap below is not a rate limit. The unmounted login router below adds per-process request,
-rate and concurrency bounds; public exposure remains blocked on runtime enablement, ingress
+The native handoff below is not mounted; the browser cookie handoff below is
+mounted only when `OPENMETTLE_API_AUTH_CONFIG` is set (ADR 0025). Key files are read only by the offline check below and by `openmettle-api` at startup when `OPENMETTLE_API_AUTH_CONFIG` is set. Internal local approval and sessions are described below. The outstanding-login
+cap below is not a rate limit. The login router below adds per-process request,
+rate and concurrency bounds; public exposure remains blocked on ingress
 transport limits, operated cleanup and retired-key reservation reclamation. After database restore, invalidate pending login transactions and
 rotate the active login encryption key before any encryption; never resume restored logins.
 These are deployment requirements, not provided recovery commands. Lost/ambiguous logins
@@ -229,7 +251,7 @@ The operator sets a limit of 1–1000 rows per batch. Session deletion
 preserves issuance markers and nonce reservations. See the
 [session and login-gate cleanup procedure](docs/operator/session-cleanup.md).
 
-There are no routes, native handoff, runtime loader, tenant/group qualification or reconciliation; the cookie handoff below is not mounted.
+There is no tenant/group qualification or reconciliation; the cookie handoff below is mounted only on request (ADR 0025) and the native handoff is not mounted.
 Run the managed PostgreSQL tests only in isolated CI with the explicit module filter above;
 normal workspace tests leave them ignored. Migration 8 and authentic v7 compatibility are CI gates.
 
@@ -275,8 +297,9 @@ makes no DNS, provider or database request. Run it in the API image with the mou
 environment the API will use before installing changed settings.
 
 Starting the API without arguments is unchanged and loads none of these files. The worker and
-migrator never read them. Nothing consumes the settings at runtime yet, and there is no live
-reload.
+migrator never read them. The API serves from a version-2 document only when
+`OPENMETTLE_API_AUTH_CONFIG` names it ([ADR 0025](docs/adr/0025-browser-auth-runtime-mounting.md)).
+There is no live reload.
 
 The check reads one JSON document, version 1 or 2, and the files it names. Native trust also
 loads platform roots and honors `SSL_CERT_FILE` and `SSL_CERT_DIR` under ADR 0010. ADR 0015
@@ -320,12 +343,13 @@ check and logout, each a burst and `interval_milliseconds`) and one shared `max_
 cap. The callback path comes from the selected provider's registered callback. Nothing has
 a default.
 
-The same checks as the unmounted handoff and router (ADRs 0017–0019) judge these values,
+The same checks as the handoff and router (ADRs 0017–0019) judge these values,
 without a database, async runtime, listener or provider request. A refusal is
 `auth configuration error: browser profile refused: ` followed by one fixed category. A
-version-1 document still passes unchanged and must not contain `browser`. **Nothing
-consumes the profile yet.** The API still serves `/healthz` and `/readyz` only, and the
-check cannot show that ingress, browsers or the provider registration agree with it.
+version-1 document still passes unchanged and must not contain `browser`. The API mounts
+the profile's routes only when `OPENMETTLE_API_AUTH_CONFIG` names the document
+([ADR 0025](docs/adr/0025-browser-auth-runtime-mounting.md)); by default it serves
+`/healthz` and `/readyz` only. The check cannot show that ingress, browsers or the provider registration agree with it.
 
 ## Pooled browser-auth service
 
@@ -333,10 +357,9 @@ check cannot show that ingress, browsers or the provider registration agree with
 internal service built from the validated settings above and a handle to the API's existing
 primary pool. It starts a login for an exactly configured provider UUID, completes a
 callback (committed consumption, one token request, session issuance from the sealed proof)
-and validates or logs out local sessions. **No process constructs it**: the API, worker and
-migrator are unchanged, `/readyz` checks the database only, and there is no route, native
-handoff or rate policy. The service handles no request or cookie itself; the unmounted
-adapter below does.
+and validates or logs out local sessions. **No process constructs it by default**; the API
+does so only under ADR 0025. `/readyz` checks the database only. The service handles no
+request or cookie itself and has no rate policy; the adapter and router below do.
 
 The service holds a pooled connection only while database work runs, never during a
 provider document fetch or the token request. Waiting for a connection counts against the
@@ -366,8 +389,8 @@ no database. Connection churn and capacity under load are unmeasured.
 
 [ADR 0017](docs/adr/0017-browser-login-handoff.md) adds `src/browser_auth/handoff.rs`, an
 adapter that turns one browser request into one response over the service above. **It is
-not mounted**: no process constructs it, the API still serves `/healthz` and `/readyz` only
-and answers `404` for a callback path. The isolated CI browser fixture is described below.
+not mounted by default**: unless ADR 0025's setting is given, no process constructs it and
+the API serves `/healthz` and `/readyz` only and answers `404` for a callback path. The isolated CI browser fixture is described below.
 
 It takes three explicit settings with no defaults: the canonical HTTPS application origin,
 a landing path on that origin and one configured provider UUID. Auth settings version 2
@@ -409,8 +432,9 @@ the end-to-end test runs only in isolated CI under the existing
 ## Bounded browser login router
 
 [ADR 0018](docs/adr/0018-bounded-login-router.md) adds `src/browser_auth/router.rs`, which
-builds an Axum router over the handoff above. **It is not mounted**: no process constructs
-it, and the API and worker still serve `/healthz` and `/readyz` only.
+builds an Axum router over the handoff above. **It is not mounted by default**: the API
+mounts `router_with_sessions` only under ADR 0025, and otherwise the API and worker serve
+`/healthz` and `/readyz` only.
 
 It routes two exact literal paths: an explicit initiation path for the form `POST`, and the
 provider's registered callback path for `GET`. Both are validated before any route is
@@ -454,9 +478,9 @@ through the router, in isolated CI only.
 ## Session check and logout routes
 
 [ADR 0019](docs/adr/0019-session-check-and-logout-routes.md) adds `router_with_sessions`,
-which builds the router above plus two explicit literal routes. **They are not mounted**: no
-process constructs the router, and the API and worker still answer `404` for every login
-and session path. `router` itself is unchanged and still builds only the login routes.
+which builds the router above plus two explicit literal routes. **They are not mounted by
+default**: the API mounts this router only under ADR 0025, and otherwise the API and worker
+answer `404` for every login and session path. `router` itself is unchanged and still builds only the login routes.
 
 The session and logout paths obey the same shape and collision rules as the login paths.
 All four must differ. Each route has its own rate budget (burst and refill interval,
@@ -513,8 +537,8 @@ A passing run supplies evidence for the Chrome version in that run.
 
 ### Hosted Keycloak 26.8.2 CI qualification
 
-The dedicated workflow `.github/workflows/keycloak-qualification.yml` exercises the unmounted
-browser auth stack against a pinned stock Keycloak 26.8.2 container
+The dedicated workflow `.github/workflows/keycloak-qualification.yml` exercises the
+browser auth stack, served in-process by the test, against a pinned stock Keycloak 26.8.2 container
 (`quay.io/keycloak/keycloak@sha256:c68e286cacd87b942ac1939a0a1481461109d6acd3a57dc496969a319a76bbf0`)
 on an isolated `--internal` Docker bridge network (no container egress) alongside PostgreSQL 18
 and headless Chrome.
@@ -542,9 +566,8 @@ post-logout refusal (`403 session not valid`), PostgreSQL state, and that discov
 were fetched once over HTTPS and reused across begin, callback and the second sign-in inside the
 configured `uncacheable_reuse_seconds` window.
 
-This is CI qualification of pinned stock Keycloak 26.8.2 against the unmounted router, not owner
-deployment or production enablement: `openmettle-api` still serves `/healthz` and `/readyz`
-only. Other browser engines, mobile and native handoff, other OIDC providers, owner provider
+This is CI qualification of pinned stock Keycloak 26.8.2 against the router served in-process, not the
+`openmettle-api` binary, owner deployment or production enablement. Other browser engines, mobile and native handoff, other OIDC providers, owner provider
 registrations, and deployed ingress remain qualification gaps for V1-04.
 
 ## Native sign-in

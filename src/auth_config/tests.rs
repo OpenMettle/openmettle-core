@@ -4,8 +4,9 @@ use crate::provider_http::fixture::Ca;
 use serde_json::json;
 use std::{os::unix::fs::symlink, process::Command};
 
+// Shared with the mounting tests in `src/tests.rs`.
 #[path = "../../tests/auth_config_support/mod.rs"]
-mod support;
+pub(crate) mod support;
 use support::Dir;
 
 struct Fixture {
@@ -1219,4 +1220,35 @@ async fn offline_outcomes_match_the_handoff_and_router_constructors() {
     }
     // Success and the nine handoff and router categories above were all reached.
     assert_eq!(outcomes.len(), 10);
+}
+
+/// Serving (ADR 0025) takes the same loader and additionally requires the profile. Version 1
+/// stays valid for the offline check, and every loader refusal passes through unchanged.
+#[test]
+fn serving_load_requires_the_version_2_profile() {
+    let v2 = Fixture::v2();
+    let path = v2
+        .dir
+        .write("auth.json", v2.document.to_string().as_bytes());
+    let (config, profile) = load_browser(Path::new(&path)).unwrap();
+    assert_eq!(profile.handoff().origin, "https://app.example.test");
+    assert_eq!(
+        profile.router().initiation,
+        config.browser().unwrap().router().initiation
+    );
+
+    let v1 = Fixture::new();
+    let path = v1
+        .dir
+        .write("auth.json", v1.document.to_string().as_bytes());
+    assert!(load(Path::new(&path)).is_ok());
+    let refused = |path: &str| load_browser(Path::new(path)).map(drop);
+    assert_eq!(refused(&path), Err(Error::BrowserProfileRequired));
+    assert_eq!(
+        Error::BrowserProfileRequired.to_string(),
+        "serving requires a version 2 browser profile"
+    );
+    assert_eq!(refused("auth.json"), Err(Error::Path));
+    assert_eq!(refused(&v1.dir.path("absent")), Err(Error::ConfigFile));
+    assert_eq!(refused(&v1.dir.write("auth.json", b"{")), Err(Error::Json));
 }

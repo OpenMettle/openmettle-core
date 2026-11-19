@@ -41,6 +41,8 @@ Throughout, the following rules hold:
   exported and no telemetry socket is opened.
 - `src/telemetry.rs` is the only emitter, through typed constructors.
 - A request-ID middleware covers the served `/healthz` and `/readyz` routes and their fallback.
+  It also covers the browser sign-in routes when
+  [ADR 0025](0025-browser-auth-runtime-mounting.md) mounts them.
 - Lifecycle events for the API, worker and migrator.
 - `LOG_FORMAT` and `LOG_LEVEL` settings.
 - Non-blocking delivery to stderr, and a panic hook that writes one fixed event.
