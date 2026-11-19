@@ -358,3 +358,36 @@ unknown-`kid` rotation, `max-age` lifetimes, the freshness cap, and the setting'
 default and cross-field rules in the loader. No PostgreSQL test was added because the cache
 is process-local. No real-provider sign-in, deployment or Keycloak support is claimed. That
 needs the separate hosted Keycloak qualification.
+
+
+### Hosted Keycloak 26.8.2 CI qualification (V1-04 block D, increment D2)
+
+Increment D2 adds the hosted CI browser sign-in qualification against pinned stock Keycloak
+26.8.2 (`quay.io/keycloak/keycloak@sha256:c68e286cacd87b942ac1939a0a1481461109d6acd3a57dc496969a319a76bbf0`)
+in `.github/workflows/keycloak-qualification.yml`, `tests/keycloak/`, `tests/browser/keycloak.py`
+and `provider_keys::tests::postgres::browser::keycloak_browser_sign_in_qualification`.
+
+- **Transport and trust.** Keycloak runs with `--http-enabled=false` on an `--internal` Docker
+  bridge network (no egress) using a per-run server certificate signed by a per-run test CA
+  (`provider-ca.pem`). `fixture.py` writes a version-2 auth settings document validated offline
+  with `openmettle-api --check-auth-config`, selecting `trust.roots = "bundle"` against that
+  single CA and `private_cidrs` for the container's single IPv4 `/32`. Production TLS defaults,
+  egress policy and migrations are unchanged.
+- **Reuse window verification.** The qualification sets `cooldown_seconds: 60` and
+  `uncacheable_reuse_seconds: 300`, loading `AuthConfig` through `auth_config::load` and
+  exercising `BrowserAuth`, `LoginHandoff` and `router_with_sessions`. It verifies that discovery
+  and JWKS are fetched once over HTTPS at the first login initiation and reused without refetch
+  across the callback and a second full browser sign-in inside the same reuse window.
+- **Sign-in coverage.** Chrome completes two isolated journeys against Keycloak's public PKCE
+  `S256` client with exact redirect URI and RFC 9207 `iss`: an existing identity approved via
+  `docs/operator/first-identity-approval.psql` (ADR 0013) and a first-account home invitation
+  redemption with a one-time code created via `docs/operator/home-invitation-create.psql`
+  (ADR 0022), each followed by same-origin session check, logout and post-logout refusal.
+- **Provider observation alignment.** `tests/provider_observation/observe.py` now classifies
+  stock Keycloak 26.8.2's observed headers and omitted `none` as
+  `compatible-with-bounded-uncacheable-reuse` under this amendment while keeping all raw header
+  and metadata facts verbatim and failing on any wire conflict with the current profile.
+- **Boundaries.** This increment qualifies pinned stock Keycloak 26.8.2 in hosted CI only (live
+  CI pass requires pushing to GitHub Actions; Docker and PostgreSQL are not run locally). It is
+  not owner deployment evidence or general provider support, and the browser login router remains
+  unmounted in `openmettle-api`.

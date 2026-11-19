@@ -509,9 +509,43 @@ token POST, a successful same-origin session check, an acknowledged logout POST,
 a refused check after Chrome removes the session cookie. PostgreSQL must contain one
 consumed login and its revoked session for the approved synthetic user.
 
-A passing run supplies evidence for the Chrome version in that run. Other engines,
-mobile and native handoff, real provider registrations, and deployed ingress remain
-qualification gaps for V1-04.
+A passing run supplies evidence for the Chrome version in that run.
+
+### Hosted Keycloak 26.8.2 CI qualification
+
+The dedicated workflow `.github/workflows/keycloak-qualification.yml` exercises the unmounted
+browser auth stack against a pinned stock Keycloak 26.8.2 container
+(`quay.io/keycloak/keycloak@sha256:c68e286cacd87b942ac1939a0a1481461109d6acd3a57dc496969a319a76bbf0`)
+on an isolated `--internal` Docker bridge network (no container egress) alongside PostgreSQL 18
+and headless Chrome.
+
+`tests/keycloak/fixture.py` creates a per-run test CA and provider certificate for
+`keycloak.provider.test`, imports a synthetic realm with one public PKCE `S256` client, exact
+redirect URI, RFC 9207 `iss` enabled and two synthetic users with generated passwords written
+only to files, and writes a version-2 auth settings document with explicit
+`provider_refresh.uncacheable_reuse_seconds` (300 s, at least the 60 s cooldown) and
+`trust.roots = "bundle"` pointing solely at the per-run CA. After
+`openmettle-api --check-auth-config` validates the file offline and HTTPS discovery passes
+strictly against the test CA, the ignored test
+`provider_keys::tests::postgres::browser::keycloak_browser_sign_in_qualification` loads the
+settings via `auth_config::load`, serves `BrowserAuth` / `LoginHandoff` / `router_with_sessions`
+on loopback HTTPS, and drives two full Chrome journeys:
+
+1. An existing synthetic identity approved with `docs/operator/first-identity-approval.psql`
+   (ADR 0013).
+2. A first-account redemption using a single-use code created with
+   `docs/operator/home-invitation-create.psql` (ADR 0022).
+
+Both journeys assert PKCE `S256`, exact redirect URI, RFC 9207 `iss` on the cross-site callback,
+ID-token verification, session issuance, same-origin session check (`204`), logout (`204`),
+post-logout refusal (`403 session not valid`), PostgreSQL state, and that discovery and JWKS
+were fetched once over HTTPS and reused across begin, callback and the second sign-in inside the
+configured `uncacheable_reuse_seconds` window.
+
+This is CI qualification of pinned stock Keycloak 26.8.2 against the unmounted router, not owner
+deployment or production enablement: `openmettle-api` still serves `/healthz` and `/readyz`
+only. Other browser engines, mobile and native handoff, other OIDC providers, owner provider
+registrations, and deployed ingress remain qualification gaps for V1-04.
 
 ## Schema migrations
 

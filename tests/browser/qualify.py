@@ -91,8 +91,8 @@ class DevTools:
             raise Failure("page action failed")
         return result["result"].get("value")
 
-    def wait_for(self, expression, phase):
-        deadline = time.monotonic() + 12
+    def wait_for(self, expression, phase, seconds=12):
+        deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             try:
                 if self.evaluate(expression) is True:
@@ -138,16 +138,47 @@ def start(launch, attempts=START_ATTEMPTS):
         return browser, close
 
 
-def journey(browser, app, issuer, enter):
-    enter("browser target setup")
+def open_target(browser):
+    """Attach to one new blank page. Every later command addresses it."""
     target = browser.call("Target.createTarget", url="about:blank")["targetId"]
     browser.session = browser.call("Target.attachToTarget", targetId=target, flatten=True)["sessionId"]
 
+
+def committed(browser, origin, path, control, seconds=12):
+    """Wait for the complete document at `path` on `origin` that has the `control` element."""
+    browser.wait_for(
+        f"location.origin === {json.dumps(origin)} && location.pathname === '{path}' && "
+        f"document.readyState === 'complete' && !!document.getElementById('{control}')",
+        not_committed(path), seconds)
+
+
+def not_committed(path):
+    """The fixed phrase `committed` fails with for `path`."""
+    return f"document did not commit at {path}"
+
+
+def session_lifecycle(browser, app, enter):
+    """On the landing page: the exact landing URL, a valid session, logout, then a refused check."""
+    if browser.evaluate(f"location.href === {json.dumps(app + '/app')}") is not True:
+        raise Failure("unexpected landing URL")
+    enter("issued session check")
+    if browser.evaluate("fetch('/session').then(r => r.status)") != 204:
+        raise Failure("issued session check")
+    enter("logout")
+    browser.click("logout")
+    browser.wait_for("document.forms[0].dataset.status === '204'", "logout acknowledgement")
+    enter("signed-out session check")
+    if browser.evaluate("fetch('/session').then(async r => r.status === 403 && "
+                        "(await r.text()).trim() === 'session not valid')") is not True:
+        raise Failure("signed-out session check")
+
+
+def journey(browser, app, issuer, enter):
+    enter("browser target setup")
+    open_target(browser)
+
     def page(origin, path, control):
-        browser.wait_for(
-            f"location.origin === {json.dumps(origin)} && location.pathname === '{path}' && "
-            f"document.readyState === 'complete' && !!document.getElementById('{control}')",
-            f"document did not commit at {path}")
+        committed(browser, origin, path, control)
 
     enter("wrong-origin form")
     browser.call("Page.navigate", url=issuer + "/wrong")
@@ -166,23 +197,15 @@ def journey(browser, app, issuer, enter):
     enter("callback and landing")
     browser.click("approve")
     page(app, "/app", "logout")
-    if browser.evaluate(f"location.href === {json.dumps(app + '/app')}") is not True:
-        raise Failure("unexpected landing URL")
-    enter("issued session check")
-    if browser.evaluate("fetch('/session').then(r => r.status)") != 204:
-        raise Failure("issued session check")
-    enter("logout")
-    browser.click("logout")
-    browser.wait_for("document.forms[0].dataset.status === '204'", "logout acknowledgement")
-    enter("signed-out session check")
-    if browser.evaluate("fetch('/session').then(async r => r.status === 403 && "
-                        "(await r.text()).trim() === 'session not valid')") is not True:
-        raise Failure("signed-out session check")
+    session_lifecycle(browser, app, enter)
 
 
-def chrome(home, attempt):
+# The two fixture sites on loopback; every other name fails to resolve.
+RULES = "MAP app.relying.test 127.0.0.1, MAP issuer.example.test 127.0.0.1, MAP * ~NOTFOUND"
+
+
+def chrome(home, attempt, rules=RULES):
     """The Chrome command for one start attempt. Each attempt has its own profile."""
-    rules = "MAP app.relying.test 127.0.0.1, MAP issuer.example.test 127.0.0.1, MAP * ~NOTFOUND"
     # Chrome uses descriptors 3 and 4 for NUL-delimited commands and responses.
     # Save stdin and stdout there, then disconnect normal browser logs from the pipe.
     return ["sh", "-c", 'exec 3<&0 4>&1 </dev/null >/dev/null; exec "$@"', "chrome-pipe",
@@ -192,14 +215,22 @@ def chrome(home, attempt):
 
 
 def run(app, issuer, home, enter):
+    drive(lambda browser: journey(browser, app, issuer, enter),
+          [sys.stdin.buffer.read()], RULES, home, enter)
+
+
+def drive(journey, authorities, rules, home, enter):
+    """Start Chrome with `authorities` (one PEM certificate each) as its only added trust and
+    `rules` as its only name resolution, run `journey(browser)`, then stop Chrome."""
     enter("runner trust store")
     # Allowlist the child environment. Browser profile, NSS, cache, and crash files are private.
     env = {"HOME": str(home), "TMPDIR": str(home), "PATH": os.environ["PATH"]}
     db = home / ".local/share/pki/nssdb"
     db.mkdir(parents=True)
     certutil = ["certutil", "-d", f"sql:{db}"]
-    for args, data in [(["-N", "--empty-password"], b""),
-                       (["-A", "-a", "-t", "C,,", "-n", "fixture"], sys.stdin.buffer.read())]:
+    additions = [(["-A", "-a", "-t", "C,,", "-n", f"fixture-{index}"], authority)
+                 for index, authority in enumerate(authorities)]
+    for args, data in [(["-N", "--empty-password"], b"")] + additions:
         subprocess.run(certutil + args, input=data, env=env, check=True, timeout=5,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -207,7 +238,7 @@ def run(app, issuer, home, enter):
         parent, child = socket.socketpair()
         try:
             with child:
-                process = subprocess.Popen(chrome(home, attempt), env=env, stdin=child,
+                process = subprocess.Popen(chrome(home, attempt, rules), env=env, stdin=child,
                                            stdout=child,
                                            stderr=subprocess.DEVNULL, start_new_session=True)
         except BaseException:
@@ -219,7 +250,7 @@ def run(app, issuer, home, enter):
     enter("browser start")
     browser, close = start(launch)
     try:
-        journey(browser, app, issuer, enter)
+        journey(browser)
         enter("browser shutdown")
     finally:
         close()
@@ -241,15 +272,21 @@ def interrupted(*_):
     raise Failure("browser harness timed out or interrupted")
 
 
-if __name__ == "__main__":
+def execute(run, seconds):
+    """Call `run(home, enter)` with a private temporary home under one alarm. A failure exits
+    with one fixed line: its own phrase, or its kind and the phase in progress."""
     signal.signal(signal.SIGALRM, interrupted)
     signal.signal(signal.SIGTERM, interrupted)
-    signal.alarm(75)
+    signal.alarm(seconds)
     progress = Progress()
     try:
         with tempfile.TemporaryDirectory(prefix="om-browser-") as directory:
-            run(*sys.argv[1:], Path(directory), progress.enter)
+            run(Path(directory), progress.enter)
     except Failure as exc:
         sys.exit(str(exc))
     except Exception as exc:
         sys.exit(unexpected(exc, progress.phase))
+
+
+if __name__ == "__main__":
+    execute(lambda home, enter: run(*sys.argv[1:], home, enter), 75)
