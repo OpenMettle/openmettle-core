@@ -4,6 +4,7 @@ pub mod auth_config;
 pub mod browser_auth;
 pub mod capabilities;
 pub mod grants;
+pub mod invitation;
 pub mod login;
 pub mod membership;
 pub mod migrate;

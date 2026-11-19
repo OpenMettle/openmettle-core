@@ -1,20 +1,28 @@
 use super::*;
 
 const CREATE: &str = include_str!("../../docs/operator/home-invitation-create.psql");
-/// The invitation migration's version, stacked on membership (v11).
-const VERSION: i64 = 12;
+const WITHDRAW: &str = include_str!("../../docs/operator/home-invitation-withdraw.psql");
+/// Invitations are migration 12 and their one-time codes migration 13 (ADR 0022).
+const INVITATIONS: usize = 12;
 const PROVIDER: &str = "00000000-0000-0000-0000-0000000000c1";
 const INVITATION: &str = "00000000-0000-0000-0000-0000000000c2";
 const OPERATOR: &str = "00000000-0000-0000-0000-0000000000c3";
+const WITHDRAWN: &str = "00000000-0000-0000-0000-0000000000c4";
 const ISSUER: &str = "https://Invitation.example.test/Realm";
-/// Deterministic absolute cutoffs (2100-01-01), independent of the test clock.
+/// Deterministic absolute cutoffs (2100-01-01), independent of the test clock. The table
+/// accepts them; the create command caps its window at seven days.
 const FUTURE: &str = "4102444800000";
 const LATER: &str = "4102444800001";
 const SEARCH_PATH: &str = "search_path=pg_catalog, pg_temp";
+/// The redemption function of schema 12, without a code, and of schema 13, with one.
+const CODELESS: &str = "openmettle.redeem_home_invitation(uuid,text,text,text,bigint)";
+const CODED: &str = "openmettle.redeem_home_invitation(uuid,text,text,text,bigint,bytea)";
+const GATE: &str = "openmettle.check_home_redemption()";
+/// A ten-minute redemption window from primary time, set before the create command runs.
+const WINDOW: &str = "SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint + 600000 AS redeem_before_ms, floor(extract(epoch FROM clock_timestamp())*1000)::bigint + 900000 AS approval_until_ms \\gset\n";
 
-async fn function_contract(
-    owner: &mut PgConnection,
-) -> Vec<(String, String, bool, Vec<String>, Vec<String>)> {
+type Contract = (String, String, bool, Vec<String>, Vec<String>);
+async fn function_contract(owner: &mut PgConnection) -> Vec<Contract> {
     sqlx::query_as(
         "SELECT p.oid::regprocedure::text, pg_get_userbyid(p.proowner)::text, p.prosecdef,
                 coalesce(p.proconfig, '{}')::text[],
@@ -31,34 +39,8 @@ async fn function_contract(
     .await
     .unwrap()
 }
-
-// Starts from the real eleven migrations, including membership. Authentic v11 release-binary
-// qualification with populated membership rows is populated_upgrade in grants.rs.
-#[tokio::test]
-#[ignore = "isolated PostgreSQL 18 required"]
-async fn upgrade_preserves_state_and_only_allows_exact_redemption_signature() {
-    let db = TestDb::new().await;
-    let settings = db.settings(Duration::from_secs(5));
-    let before = usize::try_from(VERSION - 1).unwrap();
-    migrate::apply(&settings, &MIGRATIONS[..before])
-        .await
-        .unwrap();
-    let mut owner = connect(&db.0, OWNER).await;
-    owner
-        .execute("INSERT INTO openmettle.users DEFAULT VALUES")
-        .await
-        .unwrap();
-    let previous = first_approval::everything(&db).await;
-    migrate::apply(&settings, MIGRATIONS).await.unwrap();
-    assert_eq!(MIGRATIONS[before].version, VERSION);
-    let current = first_approval::everything(&db).await;
-    for (table, rows) in previous {
-        if table != "_sqlx_migrations" {
-            assert_eq!(rows, current[&table], "{table}");
-        }
-    }
-    assert!(current["home_invitations"].is_empty());
-    // Owner, security mode, pinned search path and the complete effective ACL.
+/// Owner, security mode, pinned search path and the complete effective ACL of both functions.
+fn contract(redemption: &str) -> Vec<Contract> {
     let owned = |name: &str, definer: bool, acl: &[&str]| {
         (
             name.to_owned(),
@@ -68,24 +50,85 @@ async fn upgrade_preserves_state_and_only_allows_exact_redemption_signature() {
             acl.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>(),
         )
     };
-    assert_eq!(
-        function_contract(&mut owner).await,
-        [
-            owned(
-                "openmettle.check_home_redemption()",
-                false,
-                &["openmettle_owner EXECUTE by openmettle_owner"],
-            ),
-            owned(
-                "openmettle.redeem_home_invitation(uuid,text,text,text,bigint)",
-                true,
-                &[
-                    "openmettle_api EXECUTE by openmettle_owner",
-                    "openmettle_owner EXECUTE by openmettle_owner",
-                ],
-            ),
-        ]
-    );
+    vec![
+        owned(
+            GATE,
+            false,
+            &["openmettle_owner EXECUTE by openmettle_owner"],
+        ),
+        owned(
+            redemption,
+            true,
+            &[
+                "openmettle_api EXECUTE by openmettle_owner",
+                "openmettle_owner EXECUTE by openmettle_owner",
+            ],
+        ),
+    ]
+}
+/// A migration run refused for exactly this one boundary violation.
+async fn refused_for(settings: &Settings, sources: &[Source], violation: &str) {
+    match migrate::apply(settings, sources).await {
+        Err(Failure::Refused(violations)) => assert_eq!(violations, [violation]),
+        other => panic!("expected the boundary check to refuse, got {other:?}"),
+    }
+}
+/// The other signature, owned by the owner and granted to the API role alone.
+async fn stub(owner: &mut PgConnection, signature: &str) {
+    for sql in [
+        format!("CREATE FUNCTION {signature} RETURNS int LANGUAGE sql AS 'SELECT 1'"),
+        format!("REVOKE ALL ON FUNCTION {signature} FROM PUBLIC"),
+        format!("GRANT EXECUTE ON FUNCTION {signature} TO openmettle_api"),
+    ] {
+        owner.execute(AssertSqlSafe(sql)).await.unwrap();
+    }
+}
+async fn provider(owner: &mut PgConnection) -> i64 {
+    sqlx::query("INSERT INTO openmettle.login_providers (id, issuer, client_id, changed_by, change_reason) VALUES ($1::uuid, $2, 'synthetic', 'fixture-owner', 'synthetic provider')")
+        .bind(PROVIDER).bind(ISSUER).execute(&mut *owner).await.unwrap();
+    sqlx::query_scalar("INSERT INTO openmettle.login_provider_revisions (provider_id, revision) VALUES ($1::uuid, 'v1') RETURNING epoch")
+        .bind(PROVIDER).fetch_one(owner).await.unwrap()
+}
+
+// Starts from the real eleven migrations, including membership. Authentic v11 and v12
+// release-binary qualification with populated rows is populated_upgrade in grants.rs.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn upgrades_preserve_state_and_allow_exactly_one_redemption_signature_per_version() {
+    let db = TestDb::new().await;
+    let settings = db.settings(Duration::from_secs(5));
+    let (v11, v12) = (&MIGRATIONS[..INVITATIONS - 1], &MIGRATIONS[..INVITATIONS]);
+    migrate::apply(&settings, v11).await.unwrap();
+    let mut owner = connect(&db.0, OWNER).await;
+    owner
+        .execute("INSERT INTO openmettle.users DEFAULT VALUES")
+        .await
+        .unwrap();
+    let previous = first_approval::everything(&db).await;
+
+    // Schema 12: only the code-less function, and the boundary check refuses the other one.
+    migrate::apply(&settings, v12).await.unwrap();
+    assert_eq!(function_contract(&mut owner).await, contract(CODELESS));
+    stub(&mut owner, CODED).await;
+    let violation = |signature: &str| format!("openmettle_api has EXECUTE on function {signature}");
+    refused_for(&settings, v12, &violation(CODED)).await;
+    owner
+        .execute(AssertSqlSafe(format!("DROP FUNCTION {CODED}")))
+        .await
+        .unwrap();
+    migrate::apply(&settings, v12).await.unwrap();
+
+    // Schema 13: the code-less function is gone and only the function with a code remains.
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+    assert_eq!(MIGRATIONS[INVITATIONS].version, 13);
+    let current = first_approval::everything(&db).await;
+    for (table, rows) in previous {
+        if table != "_sqlx_migrations" {
+            assert_eq!(rows, current[&table], "{table}");
+        }
+    }
+    assert!(current["home_invitations"].is_empty());
+    assert_eq!(function_contract(&mut owner).await, contract(CODED));
     let trigger: (bool, bool, bool, String) = sqlx::query_as(
         "SELECT tgconstraint <> 0, tgdeferrable, tginitdeferred, tgfoid::regprocedure::text
            FROM pg_trigger WHERE tgrelid = 'openmettle.home_invitations'::regclass
@@ -94,18 +137,10 @@ async fn upgrade_preserves_state_and_only_allows_exact_redemption_signature() {
     .fetch_one(&mut owner)
     .await
     .unwrap();
-    assert_eq!(
-        trigger,
-        (
-            true,
-            true,
-            true,
-            "openmettle.check_home_redemption()".into()
-        )
-    );
+    assert_eq!(trigger, (true, true, true, GATE.into()));
     for role in [API, WORKER, CAPPED, "public"] {
         let privileges: (bool,bool,bool,bool) = sqlx::query_as("SELECT
-            has_function_privilege($1, 'openmettle.redeem_home_invitation(uuid,text,text,text,bigint)', 'EXECUTE'),
+            has_function_privilege($1, 'openmettle.redeem_home_invitation(uuid,text,text,text,bigint,bytea)', 'EXECUTE'),
             has_function_privilege($1, 'openmettle.check_home_redemption()', 'EXECUTE'),
             has_table_privilege($1, 'openmettle.home_invitations', 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN')
             OR has_any_column_privilege($1,'openmettle.home_invitations','SELECT,INSERT,UPDATE,REFERENCES'),
@@ -117,38 +152,208 @@ async fn upgrade_preserves_state_and_only_allows_exact_redemption_signature() {
             "{role}"
         );
     }
+    // The API role can neither read the stored hash nor reach a code-less redemption.
+    let mut api = connect(&db.0, API).await;
+    expect_state(
+        &mut api,
+        "SELECT code_hash FROM openmettle.home_invitations",
+        "42501",
+    )
+    .await;
+    expect_state(
+        &mut api,
+        "SELECT * FROM openmettle.redeem_home_invitation('00000000-0000-0000-0000-0000000000c1'::uuid, 'i'::text, 's'::text, 'l'::text, 1::bigint)",
+        "42883",
+    )
+    .await;
     for (grant, revoke) in [
         (
-            "GRANT SELECT ON openmettle.home_invitations TO openmettle_api",
-            "REVOKE SELECT ON openmettle.home_invitations FROM openmettle_api",
+            "GRANT SELECT ON openmettle.home_invitations TO openmettle_api".to_owned(),
+            "REVOKE SELECT ON openmettle.home_invitations FROM openmettle_api".to_owned(),
         ),
         (
-            "GRANT EXECUTE ON FUNCTION openmettle.redeem_home_invitation(uuid,text,text,text,bigint) TO openmettle_worker",
-            "REVOKE EXECUTE ON FUNCTION openmettle.redeem_home_invitation(uuid,text,text,text,bigint) FROM openmettle_worker",
+            "GRANT SELECT (code_hash) ON openmettle.home_invitations TO openmettle_api".to_owned(),
+            "REVOKE SELECT (code_hash) ON openmettle.home_invitations FROM openmettle_api"
+                .to_owned(),
         ),
         (
-            "GRANT EXECUTE ON FUNCTION openmettle.check_home_redemption() TO PUBLIC",
-            "REVOKE EXECUTE ON FUNCTION openmettle.check_home_redemption() FROM PUBLIC",
+            format!("GRANT EXECUTE ON FUNCTION {CODED} TO openmettle_worker"),
+            format!("REVOKE EXECUTE ON FUNCTION {CODED} FROM openmettle_worker"),
+        ),
+        (
+            format!("GRANT EXECUTE ON FUNCTION {CODED} TO PUBLIC"),
+            format!("REVOKE EXECUTE ON FUNCTION {CODED} FROM PUBLIC"),
+        ),
+        (
+            format!("GRANT EXECUTE ON FUNCTION {GATE} TO PUBLIC"),
+            format!("REVOKE EXECUTE ON FUNCTION {GATE} FROM PUBLIC"),
         ),
     ] {
-        owner.execute(grant).await.unwrap();
-        assert!(matches!(
-            migrate::apply(&settings, MIGRATIONS).await,
-            Err(Failure::Refused(_))
-        ));
-        owner.execute(revoke).await.unwrap();
+        owner.execute(AssertSqlSafe(grant.clone())).await.unwrap();
+        assert!(
+            matches!(
+                migrate::apply(&settings, MIGRATIONS).await,
+                Err(Failure::Refused(_))
+            ),
+            "{grant}"
+        );
+        owner.execute(AssertSqlSafe(revoke)).await.unwrap();
     }
-    owner.execute("CREATE FUNCTION openmettle.redeem_home_invitation(uuid) RETURNS int LANGUAGE sql AS 'SELECT 1'").await.unwrap();
-    owner
-        .execute(
-            "GRANT EXECUTE ON FUNCTION openmettle.redeem_home_invitation(uuid) TO openmettle_api",
-        )
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+    // A code-less function granted to the API role again is the one violation reported.
+    stub(&mut owner, CODELESS).await;
+    refused_for(&settings, MIGRATIONS, &violation(CODELESS)).await;
+}
+
+// Schema 12 wrote invitations without a code. A pending one could never be redeemed on schema
+// 13, so the migration refuses and leaves schema 12 intact until the operator withdraws it.
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 and POSTGRES_CONTAINER required"]
+async fn pending_invitation_without_a_code_blocks_migration_13_until_withdrawn() {
+    let db = TestDb::new().await;
+    let settings = db.settings(Duration::from_secs(5));
+    migrate::apply(&settings, &MIGRATIONS[..INVITATIONS])
         .await
         .unwrap();
-    assert!(matches!(
-        migrate::apply(&settings, MIGRATIONS).await,
-        Err(Failure::Refused(_))
-    ));
+    let mut owner = connect(&db.0, OWNER).await;
+    let epoch = provider(&mut owner).await;
+    // One pending decision and one already withdrawn, as the schema-12 commands left them.
+    for (id, subject, withdrawn) in [
+        (INVITATION, "synthetic-pending", false),
+        (WITHDRAWN, "synthetic-withdrawn", true),
+    ] {
+        sqlx::query("INSERT INTO openmettle.home_invitations (id, provider_id, provider_generation, provider_epoch, issuer, subject, redeem_before_ms, approval_until_ms, created_by, withdrawn_by, withdrawn_at)
+            VALUES ($1::uuid, $2::uuid, 0, $3, $4, $5, $6, $7, $8::uuid,
+                    CASE WHEN $9 THEN $8::uuid END, CASE WHEN $9 THEN clock_timestamp() END)")
+            .bind(id).bind(PROVIDER).bind(epoch).bind(ISSUER).bind(subject)
+            .bind(FUTURE.parse::<i64>().unwrap()).bind(LATER.parse::<i64>().unwrap())
+            .bind(OPERATOR).bind(withdrawn).execute(&mut owner).await.unwrap();
+    }
+    let before = first_approval::everything(&db).await;
+
+    let failure = migrate::apply(&settings, MIGRATIONS).await.unwrap_err();
+    assert!(
+        matches!(
+            &failure,
+            Failure::Migrate(MigrateError::ExecuteMigration(_, 13))
+        ) && failure.to_string().contains("SQLSTATE 23514"),
+        "{failure}"
+    );
+    // Rolled back whole: history, every row, the code-less function and the table shape.
+    assert_eq!(db.history().await, (1..=12).collect::<Vec<i64>>());
+    assert_eq!(first_approval::everything(&db).await, before);
+    assert_eq!(function_contract(&mut owner).await, contract(CODELESS));
+    let hash_columns = "SELECT count(*) FROM pg_attribute WHERE attname = 'code_hash'
+        AND attrelid = 'openmettle.home_invitations'::regclass AND NOT attisdropped";
+    let columns: i64 = sqlx::query_scalar(hash_columns)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+    assert_eq!(columns, 0);
+    db.wait_no_migration_session().await;
+
+    // The documented precondition, with the unchanged withdrawal command.
+    let out = psql(
+        &db,
+        WITHDRAW,
+        &[("invitation", INVITATION), ("operator", OPERATOR)],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+    assert_eq!(db.history().await, (1..=13).collect::<Vec<i64>>());
+    assert_eq!(function_contract(&mut owner).await, contract(CODED));
+    // Both closed decisions survive, with no code and no way to become pending again.
+    let rows: Vec<(String, bool, bool)> = sqlx::query_as(
+        "SELECT id::text, withdrawn_at IS NOT NULL, code_hash IS NULL
+           FROM openmettle.home_invitations ORDER BY id",
+    )
+    .fetch_all(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        [
+            (INVITATION.into(), true, true),
+            (WITHDRAWN.into(), true, true)
+        ]
+    );
+    expect_state(
+        &mut owner,
+        "UPDATE openmettle.home_invitations SET withdrawn_by = NULL, withdrawn_at = NULL",
+        "23514",
+    )
+    .await;
+    // A new pending row needs a 32-byte hash.
+    for (hash, state) in [
+        ("NULL", Some("23514")),
+        ("decode(repeat('00', 31), 'hex')", Some("23514")),
+        ("decode(repeat('00', 33), 'hex')", Some("23514")),
+        ("decode(repeat('00', 32), 'hex')", None),
+    ] {
+        let mut tx = owner.begin().await.unwrap();
+        let result = tx.execute(AssertSqlSafe(format!(
+            "INSERT INTO openmettle.home_invitations (id, provider_id, provider_generation, provider_epoch, issuer, subject, redeem_before_ms, approval_until_ms, created_by, code_hash)
+             VALUES (gen_random_uuid(), '{PROVIDER}', 0, {epoch}, '{ISSUER}', 'synthetic-new', {FUTURE}, {LATER}, '{OPERATOR}', {hash})"
+        ))).await;
+        match state {
+            Some(state) => assert_eq!(sqlstate(result), state, "{hash}"),
+            None => drop(result.unwrap()),
+        }
+        tx.rollback().await.unwrap();
+    }
+}
+
+// Migration 13 admits the aes256gcm-v2 length beside v1 and nothing else. Schema 12 is the
+// control: the same 76-byte insert is refused there.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn ciphertext_check_accepts_only_the_sealed_lengths_of_each_schema() {
+    for (sources, accepted) in [
+        (&MIGRATIONS[..INVITATIONS], &[59][..]),
+        (MIGRATIONS, &[59, 76][..]),
+    ] {
+        let db = TestDb::new().await;
+        migrate::apply(&db.settings(Duration::from_secs(5)), sources)
+            .await
+            .unwrap();
+        let mut api = connect(&db.0, API).await;
+        for (n, length) in [0, 1, 58, 59, 60, 75, 76, 77, 4096].into_iter().enumerate() {
+            let mark = u8::try_from(n).unwrap();
+            sqlx::query(
+                "INSERT INTO openmettle.login_nonce_reservations (key_id, nonce) VALUES ('k', $1)",
+            )
+            .bind(vec![mark; 12])
+            .execute(&mut api)
+            .await
+            .unwrap();
+            let result = sqlx::query("INSERT INTO openmettle.login_transactions (id,binding,expires_ms,state_hash,nonce_hash,caller_hash,key_id,nonce,ciphertext) VALUES ($1,'b'::bytea,1,$2,$2,$2,'k',$3,$4)")
+                .bind(format!("{n:a>43}"))
+                .bind(vec![mark; 32])
+                .bind(vec![mark; 12])
+                .bind(vec![0u8; length])
+                .execute(&mut api)
+                .await;
+            if accepted.contains(&length) {
+                result.unwrap();
+            } else {
+                assert_eq!(sqlstate(result), "23514", "{length} bytes");
+            }
+        }
+        // Consumption still clears the ciphertext at either length.
+        expect_state(
+            &mut api,
+            "UPDATE openmettle.login_transactions SET consumed = true",
+            "23514",
+        )
+        .await;
+        let cleared = sqlx::query(
+            "UPDATE openmettle.login_transactions SET consumed = true, ciphertext = NULL",
+        )
+        .execute(&mut api)
+        .await
+        .unwrap();
+        assert_eq!(cleared.rows_affected(), accepted.len() as u64);
+    }
 }
 
 // The create command and the table constraint apply one byte predicate where the server does
@@ -165,10 +370,8 @@ async fn create_command_and_table_refuse_high_bit_subjects_on_sql_ascii() {
         .await
         .unwrap();
     let mut owner = connect(&db.0, OWNER).await;
-    sqlx::query("INSERT INTO openmettle.login_providers (id, issuer, client_id, changed_by, change_reason) VALUES ($1::uuid, $2, 'synthetic', 'fixture-owner', 'synthetic provider')")
-        .bind(PROVIDER).bind(ISSUER).execute(&mut owner).await.unwrap();
-    let epoch: i64 = sqlx::query_scalar("INSERT INTO openmettle.login_provider_revisions (provider_id, revision) VALUES ($1::uuid, 'v1') RETURNING epoch")
-        .bind(PROVIDER).fetch_one(&mut owner).await.unwrap();
+    let epoch = provider(&mut owner).await;
+    let script = format!("{WINDOW}{CREATE}");
     let vars = |subject: &'static str| {
         [
             ("invitation", INVITATION),
@@ -177,28 +380,20 @@ async fn create_command_and_table_refuse_high_bit_subjects_on_sql_ascii() {
             ("issuer", ISSUER),
             ("subject", subject),
             ("expected_generation", "0"),
-            ("redeem_before_ms", FUTURE),
-            ("approval_until_ms", LATER),
         ]
     };
     let high = "Synthetic Subjéct";
-    let out = psql(&db, CREATE, &vars(high));
-    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr(&out));
+    let out = psql(&db, &script, &vars(high));
+    // Standard output is never formatted into a message: it is where a code would appear.
+    let text = stderr(&out);
     assert!(!out.status.success());
-    assert!(out.stdout.is_empty());
+    assert!(out.stdout.is_empty(), "a refused command wrote to stdout");
     assert!(text.contains("home invitation creation refused"), "{text}");
-    for value in [
-        INVITATION,
-        OPERATOR,
-        PROVIDER,
-        ISSUER,
-        "Synthetic Subj",
-        FUTURE,
-    ] {
+    for value in [INVITATION, OPERATOR, PROVIDER, ISSUER, "Synthetic Subj"] {
         assert!(!text.contains(value), "output repeats an input value");
     }
     let insert = |subject: &'static str| {
-        sqlx::query("INSERT INTO openmettle.home_invitations (id, provider_id, provider_generation, provider_epoch, issuer, subject, redeem_before_ms, approval_until_ms, created_by) VALUES ($1::uuid, $2::uuid, 0, $3, $4, $5, $6, $7, $8::uuid)")
+        sqlx::query("INSERT INTO openmettle.home_invitations (id, provider_id, provider_generation, provider_epoch, issuer, subject, redeem_before_ms, approval_until_ms, created_by, code_hash) VALUES ($1::uuid, $2::uuid, 0, $3, $4, $5, $6, $7, $8::uuid, decode(repeat('00', 32), 'hex'))")
             .bind(INVITATION).bind(PROVIDER).bind(epoch).bind(ISSUER).bind(subject)
             .bind(FUTURE.parse::<i64>().unwrap()).bind(LATER.parse::<i64>().unwrap()).bind(OPERATOR)
     };
@@ -214,17 +409,27 @@ async fn create_command_and_table_refuse_high_bit_subjects_on_sql_ascii() {
     insert("Synthetic Subject").execute(&mut *tx).await.unwrap();
     tx.rollback().await.unwrap();
 
-    let out = psql(&db, CREATE, &vars("Synthetic Subject"));
+    let out = psql(&db, &script, &vars("Synthetic Subject"));
     assert!(out.status.success(), "{}", stderr(&out));
-    assert_eq!(out.stdout, b"home invitation created\n");
-    let row: (String, i64, Vec<u8>) = sqlx::query_as(
-        "SELECT id::text, provider_epoch, convert_to(subject, 'SQL_ASCII') FROM openmettle.home_invitations",
+    // Line 1, then the code line: `omh1-` and eight hyphenated groups of four digits.
+    let code = std::str::from_utf8(&out.stdout).ok().and_then(|text| {
+        text.strip_prefix(
+            "home invitation created\ninvitation code (shown once; deliver privately): omh1-",
+        )
+    });
+    assert!(
+        code.is_some_and(|code| code.len() == 40 && code.ends_with('\n')),
+        "create output is not the two documented lines"
+    );
+    let row: (String, i64, Vec<u8>, i32) = sqlx::query_as(
+        "SELECT id::text, provider_epoch, convert_to(subject, 'SQL_ASCII'), octet_length(code_hash)
+           FROM openmettle.home_invitations",
     )
     .fetch_one(&mut owner)
     .await
     .unwrap();
     assert_eq!(
         row,
-        (INVITATION.into(), epoch, b"Synthetic Subject".to_vec())
+        (INVITATION.into(), epoch, b"Synthetic Subject".to_vec(), 32)
     );
 }

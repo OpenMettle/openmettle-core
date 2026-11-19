@@ -713,6 +713,7 @@ impl ManagedProvider {
                 .map_err(|_| login::Error::Verification)?;
             Ok(ExchangedIdentity {
                 origin,
+                invitation: None,
                 entry: self.entry.clone(),
                 generation: self.generation,
                 key_generation,
@@ -818,6 +819,7 @@ impl ManagedProvider {
                 membership_revision: origin.membership_revision,
                 binding: persisted(&config.binding, exchanged.epoch),
                 deadline,
+                invitation: exchanged.invitation.as_ref(),
             },
             policy,
             || {
@@ -859,6 +861,9 @@ impl ManagedProvider {
 /// converts it after authority checks; `issue_session` consumes it under local approval.
 pub struct ExchangedIdentity {
     origin: Option<login::LoginOrigin>,
+    // The invitation code for first-account redemption (ADR 0022). No login start accepts a
+    // code yet, so this is always absent and a first sign-in is refused.
+    invitation: Option<crate::invitation::InvitationCode>,
     entry: Arc<Entry>,
     generation: u64,
     key_generation: u64,

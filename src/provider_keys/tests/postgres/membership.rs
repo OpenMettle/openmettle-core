@@ -19,6 +19,18 @@ async fn proof_for(f: &mut Flow, subject: &str, issued: i64, claims: Value) -> E
     let p = f.h.provider.clone();
     exchange(f, &p, subject, issued, claims, &auth::Policy::default()).await
 }
+/// A proof for a first sign-in that presented the invitation `code`. No login start accepts
+/// a code yet, so the fixture attaches it to the proof itself.
+async fn invited_proof(
+    f: &mut Flow,
+    code: &crate::invitation::InvitationCode,
+    issued: i64,
+    claims: Value,
+) -> ExchangedIdentity {
+    let mut proof = proof(f, issued, claims).await;
+    proof.invitation = Some(code.clone());
+    proof
+}
 async fn exchange(
     f: &mut Flow,
     p: &ManagedProvider,
@@ -1523,7 +1535,7 @@ async fn invited_first_sign_in_skips_membership_until_its_approval_is_enrolled()
             .unwrap();
     let (project, scope) = project(&mut f, &admin).await;
     record_rule(&mut f, RULE, signing::ID, &admin, &project).await;
-    super::invitations::invite(&f);
+    let code = super::invitations::invite(&f);
     let before = durable_state(&mut f).await;
 
     // Refusal after redemption and the membership step. The holder takes the locks that
@@ -1534,7 +1546,7 @@ async fn invited_first_sign_in_skips_membership_until_its_approval_is_enrolled()
         .await
         .unwrap();
     let mut observer = sessions::statistics_observer(&f.db).await;
-    let late = proof(&mut f, now - 5, json!({"groups":["team"]})).await;
+    let late = invited_proof(&mut f, &code, now - 5, json!({"groups":["team"]})).await;
     super::invitations::cutoff_in(&mut f, super::invitations::CUTOFF_BUDGET_MS).await;
     let cutoff: Vec<String> =
         sqlx::query_scalar("SELECT to_jsonb(t)::text FROM openmettle.home_invitations t")
@@ -1588,7 +1600,7 @@ async fn invited_first_sign_in_skips_membership_until_its_approval_is_enrolled()
     f.owner.execute("UPDATE openmettle.home_invitations SET redeem_before_ms=floor(extract(epoch FROM clock_timestamp())*1000)::bigint+600000").await.unwrap();
 
     // The invited first sign-in succeeds with the matching claim and records no membership.
-    let first = proof(&mut f, now - 4, json!({"groups":["team"]})).await;
+    let first = invited_proof(&mut f, &code, now - 4, json!({"groups":["team"]})).await;
     let credential =
         f.h.provider
             .issue_session(&mut f.api, first, &policy)

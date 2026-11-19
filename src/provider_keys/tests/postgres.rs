@@ -51,6 +51,10 @@ struct Db {
 }
 impl Db {
     async fn new() -> Self {
+        Self::at(migrate::MIGRATIONS).await
+    }
+    /// A fresh database holding only `sources`, for upgrade tests.
+    async fn at(sources: &[migrate::Source]) -> Self {
         let mut admin = PgConnection::connect_with(&admin_options()).await.unwrap();
         sqlx::query("SELECT pg_advisory_lock($1)")
             .bind(ROLE_LOCK)
@@ -103,18 +107,21 @@ impl Db {
             name,
             _admin: admin,
         };
+        db.upgrade(sources).await;
+        db
+    }
+    async fn upgrade(&self, sources: &[migrate::Source]) {
         migrate::apply(
             &migrate::Settings {
-                database: db.options(OWNER),
+                database: self.options(OWNER),
                 connect_timeout: Duration::from_secs(5),
                 lock_timeout: Duration::from_secs(10),
                 statement_timeout: Duration::from_secs(30),
             },
-            migrate::MIGRATIONS,
+            sources,
         )
         .await
         .unwrap();
-        db
     }
     fn options(&self, role: &str) -> PgConnectOptions {
         admin_options()
@@ -273,13 +280,23 @@ impl Flow {
         p.consume(&mut self.api, &keys(), callback(started)).await
     }
     async fn exchanged(&mut self, p: &ManagedProvider) -> (Started, ExchangedIdentity) {
+        self.exchanged_with(p, None).await
+    }
+    /// A sealed proof for a login that presented `code`. No login start accepts a code yet,
+    /// so the fixture attaches it to the proof itself.
+    async fn exchanged_with(
+        &mut self,
+        p: &ManagedProvider,
+        code: Option<&crate::invitation::InvitationCode>,
+    ) -> (Started, ExchangedIdentity) {
         let started = self.begin(p).await;
         self.arm(&started);
         let permit = self.consume(p, &started).await.unwrap();
-        let exchanged = permit
+        let mut exchanged = permit
             .exchange_with_keys(p, &auth::Policy::default())
             .await
             .unwrap();
+        exchanged.invitation = code.cloned();
         (started, exchanged)
     }
     async fn consumed(&mut self, started: &Started) -> bool {

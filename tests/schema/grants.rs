@@ -650,7 +650,10 @@ async fn migration_five_failure_kill_timeout_and_concurrent_retry() {
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success(), "{}", stderr(&out));
     }
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    assert_eq!(
+        db.history().await,
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    );
     assert_eq!(
         count(&db, "SELECT count(*) FROM openmettle.grant_mapping_rules").await,
         0
@@ -728,6 +731,74 @@ async fn populated_v10_upgrade_and_authentic_v10_binaries() {
 #[ignore = "isolated PostgreSQL 18 and authentic V11_BINARY_DIR required"]
 async fn populated_v11_upgrade_and_authentic_v11_binaries() {
     populated_upgrade("V11_BINARY_DIR", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], true).await;
+}
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 and authentic V12_BINARY_DIR required"]
+async fn populated_v12_upgrade_and_authentic_v12_binaries() {
+    populated_upgrade(
+        "V12_BINARY_DIR",
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        true,
+    )
+    .await;
+}
+// Version-12 invitations as its commands left them, without a code: one redeemed by the
+// fixture approval and login, one withdrawn in its window and one withdrawn after expiry.
+// A pending one would block migration 13 (see home_invitations.rs).
+async fn populate_invitations(db: &TestDb) {
+    let mut owner = connect(&db.0, OWNER).await;
+    for (id, subject, redeem_before_ms, redeemed) in [
+        (
+            "00000000-0000-0000-0000-0000000000b1",
+            "synthetic-redeemed",
+            4102444800000_i64,
+            true,
+        ),
+        (
+            "00000000-0000-0000-0000-0000000000b2",
+            "synthetic-withdrawn",
+            4102444800000,
+            false,
+        ),
+        (
+            "00000000-0000-0000-0000-0000000000b3",
+            "synthetic-expired",
+            1,
+            false,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO openmettle.home_invitations
+                (id,provider_id,provider_generation,provider_epoch,issuer,subject,redeem_before_ms,
+                 approval_until_ms,created_by,withdrawn_by,withdrawn_at,approval_id,redeemed_at,login_id)
+             SELECT $1::uuid,$2::uuid,0,max(epoch),'https://upgrade.example.test',$3,$4,4102444800001,
+                    gen_random_uuid(),
+                    CASE WHEN NOT $5 THEN gen_random_uuid() END,
+                    CASE WHEN NOT $5 THEN clock_timestamp() END,
+                    CASE WHEN $5 THEN $6::uuid END,
+                    CASE WHEN $5 THEN clock_timestamp() END,
+                    CASE WHEN $5 THEN repeat('b', 43) END
+               FROM openmettle.login_provider_revisions WHERE provider_id=$2::uuid",
+        )
+        .bind(id)
+        .bind(MEMBERSHIP_PROVIDER)
+        .bind(subject)
+        .bind(redeem_before_ms)
+        .bind(redeemed)
+        .bind(MEMBERSHIP_APPROVAL)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    }
+}
+// Every invitation column that schema 12 wrote. Migration 13 adds only code_hash.
+async fn invitation_snapshot(db: &TestDb) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT (to_jsonb(t) - 'code_hash')::text FROM openmettle.home_invitations t ORDER BY 1",
+    )
+    .fetch_all(&mut db.admin().await)
+    .await
+    .unwrap()
 }
 const MEMBERSHIP_PROVIDER: &str = "00000000-0000-0000-0000-000000000007";
 const MEMBERSHIP_APPROVAL: &str = "00000000-0000-0000-0000-0000000000a8";
@@ -1021,6 +1092,16 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
             "membership_observations".into(),
         ]
     };
+    // Populate the v12-only domain before upgrading the authentic predecessor.
+    let invitations_before = if versions.contains(&12) {
+        populate_invitations(&db).await;
+        let rows = invitation_snapshot(&db).await;
+        assert_eq!(rows.len(), 3, "redeemed, withdrawn and expired invitations");
+        rows
+    } else {
+        // Migration 12 creates the table empty.
+        vec![]
+    };
     let session_snapshot = async || {
         let mut c = db.admin().await;
         let mut rows: Vec<String> = sqlx::query_scalar(
@@ -1087,7 +1168,10 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
     migrate::apply(&db.settings(Duration::from_secs(10)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    assert_eq!(
+        db.history().await,
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    );
     assert_eq!(old_domain_snapshot(&db).await, before);
     if with_grants {
         assert_eq!(grant_snapshot(&db).await, grant_before);
@@ -1113,9 +1197,24 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
         recovery_before.into_iter().collect::<Vec<_>>()
     );
     assert_eq!(membership_snapshot(&db).await, membership_before);
-    // Migration 12 creates the invitation table empty and widens no v11 role privilege.
+    // Migration 13 keeps every closed invitation exactly as schema 12 wrote it and gives none a
+    // code. The code-less redemption function is gone, and no v11 role privilege is widened.
+    assert_eq!(invitation_snapshot(&db).await, invitations_before);
     assert_eq!(
-        count(&db, "SELECT count(*) FROM openmettle.home_invitations").await,
+        count(
+            &db,
+            "SELECT count(*) FROM openmettle.home_invitations WHERE code_hash IS NOT NULL"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM pg_proc WHERE proname = 'redeem_home_invitation'
+              AND pronamespace = 'openmettle'::regnamespace AND pronargs <> 6"
+        )
+        .await,
         0
     );
     let roles: Vec<(String, bool, bool, bool, bool, bool)> = sqlx::query_as(
@@ -1125,7 +1224,7 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
             has_table_privilege(role,'openmettle.membership_configuration_changes','SELECT,INSERT,UPDATE,DELETE'),
             has_table_privilege(role,'openmettle.home_invitations','SELECT,INSERT,UPDATE,DELETE')
               OR has_any_column_privilege(role,'openmettle.home_invitations','SELECT,INSERT,UPDATE'),
-            has_function_privilege(role,'openmettle.redeem_home_invitation(uuid,text,text,text,bigint)','EXECUTE')
+            has_function_privilege(role,'openmettle.redeem_home_invitation(uuid,text,text,text,bigint,bytea)','EXECUTE')
          FROM unnest(ARRAY['openmettle_api','openmettle_worker','public']) WITH ORDINALITY AS r(role, ord)
          ORDER BY ord",
     )
@@ -1200,15 +1299,16 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
             .unwrap();
     let refused = old_migrate();
     assert_eq!(refused.status.code(), Some(1));
-    // Membership (v11) and invitation (v12) privileges are outside every historical binary's
-    // contract, so each historical migrator stops at the boundary check before the
+    // Membership (v11) and invitation (v12, v13) privileges are outside every historical
+    // binary's contract, so each historical migrator stops at the boundary check before the
     // unknown-version check.
     assert!(stderr(&refused).contains("boundary check refused"));
-    if versions.last() == Some(&11) {
-        // The v11 contract already admits every membership privilege. Only the v12
-        // redemption EXECUTE grant is outside it.
+    if versions.last() >= Some(&11) {
+        // The v11 and v12 contracts already admit every membership privilege. Only the v13
+        // redemption EXECUTE grant is outside them: v11 knows no redemption function, and
+        // v12 admits only the code-less signature that migration 13 dropped.
         assert!(
-            stderr(&refused).contains("openmettle_api has EXECUTE on function openmettle.redeem_home_invitation(uuid,text,text,text,bigint)"),
+            stderr(&refused).contains("openmettle_api has EXECUTE on function openmettle.redeem_home_invitation(uuid,text,text,text,bigint,bytea)"),
             "{}",
             stderr(&refused)
         );
