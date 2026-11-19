@@ -63,6 +63,8 @@ struct Script {
     cache: String,
     metadata_cache: String,
     date: std::time::SystemTime,
+    // False omits Date, as stock Keycloak 26.8.2 does (PR #72).
+    dated: bool,
     mode: &'static str,
     token: String,
     // PKCE challenge from a real managed begin; None keeps the fixed fixture verifier.
@@ -94,6 +96,7 @@ impl Harness {
             cache: "max-age=100".into(),
             metadata_cache: "max-age=100".into(),
             date: signing::now(),
+            dated: true,
             mode: "ok",
             challenge: None,
             token: signing::signed(
@@ -126,7 +129,10 @@ impl Harness {
             }
             assert!(request.body.is_empty());
             let body=if discovery {serde_json::to_vec(&s.metadata).unwrap()}else{s.keys.clone()};
-            let bytes=tls::response(200,&[("content-type","application/json"),("cache-control",if discovery {&s.metadata_cache}else{&s.cache}),("date",&httpdate::fmt_http_date(s.date))],&body);
+            let date=httpdate::fmt_http_date(s.date);
+            let mut headers=vec![("content-type","application/json"),("cache-control",if discovery {s.metadata_cache.as_str()}else{s.cache.as_str()})];
+            if s.dated {headers.push(("date",&date));}
+            let bytes=tls::response(200,&headers,&body);
             if jwks && s.mode=="gate-jwks" {tls::Reply::Gate(s.gate.clone(),bytes)} else {tls::Reply::Bytes(bytes)}
         }).await;
         let manager = ProviderManager::new(policy);
@@ -334,12 +340,13 @@ async fn managed_exchange_carries_the_sealed_invitation_code_to_the_proof() {
 }
 #[tokio::test]
 async fn successful_replacements_retire_removed_and_noncacheable_keys() {
-    for cache in [
-        "max-age=100",
-        "no-store",
-        "no-cache",
-        "max-age=0",
-        "max-age=bogus",
+    for (cache, usable) in [
+        ("max-age=100", true),
+        ("no-store", true),
+        ("no-cache", true),
+        ("max-age=0", false),
+        ("max-age=bogus", false),
+        ("no-cache, bogus", false),
     ] {
         let h = Harness::new().await;
         h.provider.preflight().await.unwrap();
@@ -351,7 +358,7 @@ async fn successful_replacements_retire_removed_and_noncacheable_keys() {
         }
         h.provider.refresh(None).await.unwrap();
         assert!(h.verify(false).await.is_err());
-        assert_eq!(h.verify(true).await.is_ok(), cache == "max-age=100");
+        assert_eq!(h.verify(true).await.is_ok(), usable, "{cache}");
         assert_eq!(h.count(), 4);
     }
     let h = Harness::new().await;
@@ -402,7 +409,6 @@ async fn metadata_defaults_profile_and_exact_destinations() {
         "response_types_supported",
         "subject_types_supported",
         "id_token_signing_alg_values_supported",
-        "token_endpoint_auth_methods_supported",
         "code_challenge_methods_supported",
         "authorization_response_iss_parameter_supported",
     ] {
@@ -413,10 +419,6 @@ async fn metadata_defaults_profile_and_exact_destinations() {
     for (name, value) in [
         ("grant_types_supported", json!(["implicit"])),
         ("response_modes_supported", json!(["fragment"])),
-        (
-            "token_endpoint_auth_methods_supported",
-            json!(["client_secret_basic"]),
-        ),
         ("code_challenge_methods_supported", json!(["plain"])),
         (
             "authorization_response_iss_parameter_supported",
@@ -935,6 +937,7 @@ fn freshness_obeys_age_delay_caps_headers_and_directives() {
             now,
             Duration::from_secs(2),
             Duration::from_secs(20),
+            Duration::from_secs(60),
         )
     };
     assert_eq!(
@@ -955,8 +958,6 @@ fn freshness_obeys_age_delay_caps_headers_and_directives() {
         "max-age=20, MAX-AGE=30",
         "max-age=-1",
         "max-age=18446744073709551616",
-        "max-age=20, no-store",
-        "max-age=20, no-cache",
         "max-age=20, unknown",
         "max-age=\"20",
         "max-age=20,",
@@ -977,7 +978,8 @@ fn freshness_obeys_age_delay_caps_headers_and_directives() {
             now + Duration::from_secs(1),
             now,
             Duration::ZERO,
-            Duration::from_secs(20)
+            Duration::from_secs(20),
+            Duration::from_secs(60)
         ),
         None
     );
@@ -1290,7 +1292,7 @@ async fn lost_metadata_qualification_retires_old_snapshot_without_key_fetch() {
                     .unwrap()
                     .remove("code_challenge_methods_supported");
             } else {
-                s.metadata_cache = "no-store".into();
+                s.metadata_cache = "no-store, unknown".into();
             }
         }
         assert_eq!(
@@ -1303,6 +1305,430 @@ async fn lost_metadata_qualification_retires_old_snapshot_without_key_fetch() {
         );
         assert!(h.provider.snapshot().is_err());
         assert_eq!(h.count(), 3);
+    }
+}
+/// ADR 0011 amendment: the token-endpoint authentication list is not required, in any form;
+/// S256 and every other capability check still are.
+#[tokio::test]
+async fn metadata_ignores_client_authentication_advertising_but_requires_s256() {
+    let h = Harness::new().await;
+    let c = h.provider.config().unwrap();
+    let check = |v: &Value| documents::metadata(&serde_json::to_vec(v).unwrap(), &c);
+    let mut keycloak = metadata(&c);
+    keycloak["token_endpoint_auth_methods_supported"] = json!([
+        "private_key_jwt",
+        "client_secret_basic",
+        "client_secret_post",
+        "tls_client_auth",
+        "client_secret_jwt"
+    ]);
+    keycloak["code_challenge_methods_supported"] = json!(["plain", "S256"]);
+    assert_eq!(check(&keycloak), Ok(()));
+    for methods in [json!(["client_secret_basic"]), json!([])] {
+        let mut v = metadata(&c);
+        v["token_endpoint_auth_methods_supported"] = methods;
+        assert_eq!(check(&v), Ok(()));
+    }
+    let mut v = metadata(&c);
+    v.as_object_mut()
+        .unwrap()
+        .remove("token_endpoint_auth_methods_supported");
+    assert_eq!(check(&v), Ok(()));
+    // The member stays typed: a non-array is still a malformed document.
+    v["token_endpoint_auth_methods_supported"] = json!("none");
+    assert_eq!(check(&v), Err(Error::Document));
+    for (name, value) in [
+        ("code_challenge_methods_supported", Some(json!(["plain"]))),
+        ("code_challenge_methods_supported", Some(json!([]))),
+        ("code_challenge_methods_supported", None),
+        ("authorization_response_iss_parameter_supported", None),
+        ("response_types_supported", Some(json!(["id_token"]))),
+    ] {
+        let mut v = keycloak.clone();
+        match value {
+            Some(value) => v[name] = value,
+            None => {
+                v.as_object_mut().unwrap().remove(name);
+            }
+        }
+        assert!(check(&v).is_err(), "{name}");
+    }
+    for name in ["issuer", "token_endpoint", "jwks_uri"] {
+        let mut v = keycloak.clone();
+        v[name] = "https://unconfigured.example.test/".into();
+        assert_eq!(check(&v), Err(Error::Mismatch), "{name}");
+    }
+}
+/// Refusal directives give the operator's window from the request: Date never ages it, Age
+/// and request delay do, and maximum freshness caps it. A malformed header or directive still
+/// fails, whatever its position relative to the refusal.
+#[test]
+fn freshness_refusals_give_the_window_and_malformed_headers_still_fail() {
+    let now = signing::now();
+    let at = |cache: Option<&str>, date: Option<&str>, age: Option<&str>, window: u64| {
+        let mut r = openidconnect::http::Response::builder();
+        for (name, value) in [("cache-control", cache), ("date", date), ("age", age)] {
+            if let Some(v) = value {
+                r = r.header(name, v);
+            }
+        }
+        documents::freshness(
+            &r.body(vec![]).unwrap(),
+            now - Duration::from_secs(2),
+            now,
+            Duration::from_secs(2),
+            Duration::from_secs(20),
+            Duration::from_secs(window),
+        )
+    };
+    let fresh = |cache, date, age| at(cache, date, age, 10);
+    let secs = |v| Some(Duration::from_secs(v));
+    let date = httpdate::fmt_http_date(now);
+    let old = httpdate::fmt_http_date(now - Duration::from_secs(30));
+    // Keycloak 26.8.2 discovery and JWKS as observed in PR #72: no Date and no Age.
+    for cc in [
+        "no-cache, no-store, must-revalidate, no-transform",
+        "no-cache",
+        "no-store",
+        "NO-STORE",
+        "no-transform, must-revalidate, no-store, no-cache",
+        "max-age=20, no-store",
+        "no-cache, max-age=20",
+        "max-age=5, no-cache",
+        "public, no-cache",
+    ] {
+        // The 10 s window less the 2 s request delay.
+        assert_eq!(fresh(Some(cc), None, None), secs(8), "{cc}");
+        assert_eq!(fresh(Some(cc), Some(&old), Some("3")), secs(5), "{cc}");
+    }
+    assert_eq!(at(Some("no-store"), None, None, 30), secs(18));
+    assert_eq!(fresh(Some("no-store"), None, Some("7")), secs(1));
+    assert_eq!(fresh(Some("no-store"), None, Some("8")), None);
+    // max-age keeps its lifetime whatever the window, and still needs Date.
+    for window in [1, 10, 300] {
+        assert_eq!(at(Some("max-age=20"), Some(&date), None, window), secs(18));
+        assert_eq!(at(Some("max-age=20"), Some(&old), None, window), None);
+    }
+    assert_eq!(fresh(Some("max-age=20"), None, None), None);
+    for cc in [
+        "no-store, bogus",
+        "bogus, no-store",
+        "no-cache, no-cache",
+        "no-store, NO-STORE",
+        "no-store=1",
+        "no-cache=\"set-cookie\"",
+        "no-cache, max-age=x",
+        "no-cache, max-age",
+        "no-store,",
+        ",no-store",
+        "no-store, s-maxage=-1",
+        "no-store, public=1",
+    ] {
+        assert_eq!(fresh(Some(cc), None, None), None, "{cc}");
+    }
+    assert_eq!(fresh(None, None, None), None);
+    // When present, Date and Age must still be valid; future Date still fails.
+    let future = httpdate::fmt_http_date(now + Duration::from_secs(1));
+    assert_eq!(fresh(Some("no-store"), Some("yesterday"), None), None);
+    assert_eq!(fresh(Some("no-store"), Some(&future), None), None);
+    assert_eq!(fresh(Some("no-store"), None, Some("-1")), None);
+    // A repeated header fails even when both copies are identical and valid.
+    for (header, value) in [
+        ("date", date.as_str()),
+        ("age", "0"),
+        ("cache-control", "no-store"),
+    ] {
+        let r = openidconnect::http::Response::builder()
+            .header("cache-control", "no-store")
+            .header("date", &date)
+            .header("age", "0")
+            .header(header, value)
+            .body(vec![])
+            .unwrap();
+        assert_eq!(
+            documents::freshness(
+                &r,
+                now,
+                now,
+                Duration::ZERO,
+                Duration::from_secs(20),
+                Duration::from_secs(10)
+            ),
+            None,
+            "duplicate {header}"
+        );
+    }
+    // Local wall-clock rollback during the request still fails.
+    let r = openidconnect::http::Response::builder()
+        .header("cache-control", "no-store")
+        .body(vec![])
+        .unwrap();
+    assert_eq!(
+        documents::freshness(
+            &r,
+            now + Duration::from_secs(1),
+            now,
+            Duration::ZERO,
+            Duration::from_secs(20),
+            Duration::from_secs(10)
+        ),
+        None
+    );
+}
+fn keycloak(h: &Harness) {
+    let mut s = h.script.lock().unwrap();
+    s.metadata_cache = "no-cache, no-store, must-revalidate, no-transform".into();
+    s.cache = "no-cache".into();
+    s.dated = false;
+    s.metadata["token_endpoint_auth_methods_supported"] = json!([
+        "private_key_jwt",
+        "client_secret_basic",
+        "client_secret_post"
+    ]);
+}
+/// With Keycloak's headers, begin and a callback inside cooldown share one fetch. The snapshot
+/// is reused, even while the provider is unreachable, until the window ends; then it is
+/// fetched again and an outage gets no grace.
+#[tokio::test]
+async fn refused_caching_is_reused_for_the_window_then_fetched_again() {
+    let h = Harness::new().await;
+    keycloak(&h);
+    assert_eq!(
+        h.manager.policy().uncacheable_reuse,
+        DEFAULT_UNCACHEABLE_REUSE
+    );
+    // Begin: one discovery and one JWKS fetch, then the checks after the database work.
+    let (_admission, deadline) = h.provider.login_phase().unwrap();
+    h.provider.fresh().await.unwrap();
+    h.provider.login_provider(deadline).unwrap();
+    h.provider.confirm(deadline).unwrap();
+    assert_eq!(h.count(), 2);
+    // Callback 1 s later, inside the 2 s cooldown: consume, exchange and release reuse the
+    // snapshot, so the only further request is the code POST.
+    h.advance(1);
+    let (_admission, deadline) = h.provider.login_phase().unwrap();
+    h.provider.fresh().await.unwrap();
+    h.provider.login_provider(deadline).unwrap();
+    h.provider.confirm(deadline).unwrap();
+    let proof = h
+        .permit()
+        .exchange_with_keys(&h.provider, &auth::Policy::default())
+        .await
+        .unwrap();
+    assert_eq!(h.count(), 3);
+    assert_eq!(
+        finish_in_memory(&h.provider, proof).unwrap().subject(),
+        "synthetic-subject"
+    );
+    // The fixture clock adds no request delay, so the window ends exactly 60 s after fetch.
+    h.advance(58);
+    h.script.lock().unwrap().mode = "failure";
+    h.provider.preflight().await.unwrap();
+    assert!(h.verify(false).await.is_ok());
+    assert_eq!(h.count(), 3);
+    h.advance(1);
+    assert_eq!(h.provider.preflight().await, Err(Error::Fetch));
+    assert!(h.provider.snapshot().is_err());
+    assert!(h.verify(false).await.is_err());
+    assert_eq!(h.count(), 4);
+    h.script.lock().unwrap().mode = "ok";
+    h.advance(2);
+    h.provider.preflight().await.unwrap();
+    assert_eq!(h.count(), 6);
+}
+/// The documented gap: without an explicit window, the 60 s default is not checked against a
+/// longer cooldown. A provider that refuses caching is then refused from the end of each
+/// window until the cooldown ends, without a fetch, and recovers once a refresh is allowed.
+#[tokio::test]
+async fn default_window_shorter_than_cooldown_refuses_until_the_cooldown_ends() {
+    let h = Harness::with_policy(
+        RefreshPolicy::new(
+            Duration::from_secs(600),
+            Duration::from_secs(120),
+            Duration::from_secs(5),
+            2,
+            32,
+            2,
+        )
+        .unwrap(),
+    )
+    .await;
+    keycloak(&h);
+    assert_eq!(
+        h.manager.policy().uncacheable_reuse,
+        DEFAULT_UNCACHEABLE_REUSE
+    );
+    h.provider.preflight().await.unwrap();
+    assert_eq!(h.count(), 2);
+    // Inside the window the snapshot is reused.
+    h.advance(59);
+    h.provider.preflight().await.unwrap();
+    assert_eq!(h.count(), 2);
+    // The window has ended but the 120 s cooldown has not: refused, and nothing is fetched.
+    h.advance(1);
+    assert_eq!(h.provider.preflight().await, Err(Error::Cooldown));
+    assert!(h.provider.snapshot().is_err());
+    h.advance(59);
+    assert_eq!(h.provider.preflight().await, Err(Error::Cooldown));
+    assert_eq!(h.count(), 2);
+    // When the cooldown ends a refresh is allowed again and sign-in recovers.
+    h.advance(1);
+    h.provider.preflight().await.unwrap();
+    assert_eq!(h.count(), 4);
+}
+/// Rotation inside the window behaves as for cached documents. A removed key stays trusted
+/// (the accepted trade-off) and an unknown kid waits for cooldown; the unknown-kid refresh
+/// then retires the old key and starts a new window.
+#[tokio::test]
+async fn refused_caching_rotation_uses_the_unknown_key_refresh() {
+    let h = Harness::new().await;
+    keycloak(&h);
+    h.provider.preflight().await.unwrap();
+    h.script.lock().unwrap().keys = rotated();
+    assert_eq!(h.verify(true).await.err(), Some(Error::Cooldown));
+    assert!(h.verify(false).await.is_ok());
+    assert_eq!(h.count(), 2);
+    h.advance(2);
+    assert!(h.verify(true).await.is_ok());
+    assert_eq!(h.count(), 4);
+    assert!(h.verify(false).await.is_err());
+    // The replacement fetched at 2 s is reused until 62 s.
+    h.advance(59);
+    h.provider.preflight().await.unwrap();
+    assert_eq!(h.count(), 4);
+    h.advance(1);
+    h.provider.preflight().await.unwrap();
+    assert_eq!(h.count(), 6);
+}
+/// Concurrent starts share one fetch, and starts after it, inside cooldown, reuse its result
+/// instead of being refused.
+#[tokio::test]
+async fn concurrent_refused_caching_starts_share_one_fetch() {
+    let h = Harness::new().await;
+    keycloak(&h);
+    h.script.lock().unwrap().mode = "gate-jwks";
+    let mut starts = Vec::new();
+    for _ in 0..8 {
+        let p = h.provider.clone();
+        starts.push(tokio::spawn(async move { p.preflight().await }));
+    }
+    h.entered(2).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.manager.inner.callers.available_permits() != 24 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    h.script.lock().unwrap().gate.notify_one();
+    for start in starts {
+        assert_eq!(start.await.unwrap(), Ok(()));
+    }
+    h.script.lock().unwrap().mode = "ok";
+    h.advance(1);
+    for _ in 0..8 {
+        h.provider.preflight().await.unwrap();
+        h.provider.fresh().await.unwrap();
+    }
+    assert_eq!(h.count(), 2);
+}
+/// The snapshot lives until the earlier of its documents' lifetimes: explicit max-age as
+/// before, the window for a refusal, and maximum freshness over both. A malformed refusal
+/// still makes the provider unavailable.
+#[tokio::test]
+async fn max_age_keeps_its_lifetime_and_refusals_use_the_window() {
+    let refresh = |freshness| {
+        RefreshPolicy::new(
+            Duration::from_secs(freshness),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            2,
+            32,
+            2,
+        )
+        .unwrap()
+    };
+    let short = refresh(600)
+        .with_uncacheable_reuse(Duration::from_secs(10))
+        .unwrap();
+    let keycloak = "no-cache, no-store, must-revalidate, no-transform";
+    for (policy, metadata_cache, cache, lifetime) in [
+        (policy(), "max-age=100", "max-age=100", 100),
+        (policy(), "no-store", "max-age=100", 60),
+        (policy(), "max-age=100", "no-cache", 60),
+        (policy(), "max-age=30", "no-cache", 30),
+        (short, "max-age=100", "max-age=100", 100),
+        (short, keycloak, "no-cache", 10),
+        // The 60 s default stays under a shorter freshness cap.
+        (refresh(30), "no-store", "no-cache", 30),
+    ] {
+        let h = Harness::with_policy(policy).await;
+        {
+            let mut s = h.script.lock().unwrap();
+            s.metadata_cache = metadata_cache.into();
+            s.cache = cache.into();
+        }
+        h.provider.preflight().await.unwrap();
+        h.advance(lifetime - 1);
+        h.provider.preflight().await.unwrap();
+        assert_eq!(h.count(), 2, "{metadata_cache} {cache}");
+        h.advance(1);
+        h.script.lock().unwrap().date = signing::now() + Duration::from_secs(lifetime);
+        h.provider.preflight().await.unwrap();
+        assert_eq!(h.count(), 4, "{metadata_cache} {cache}");
+    }
+    for (metadata_cache, cache, count) in [
+        ("no-store, bogus", "no-cache", 1),
+        ("no-store", "no-cache, no-cache", 2),
+    ] {
+        let h = Harness::new().await;
+        {
+            let mut s = h.script.lock().unwrap();
+            s.metadata_cache = metadata_cache.into();
+            s.cache = cache.into();
+        }
+        assert_eq!(h.provider.preflight().await, Err(Error::Unavailable));
+        assert!(h.provider.snapshot().is_err());
+        assert_eq!(h.count(), count);
+    }
+}
+/// The window is 60 s unless set. An explicit window is 1–300 s, no shorter than cooldown
+/// and no longer than maximum freshness.
+#[test]
+fn uncacheable_reuse_window_is_bounded_by_cooldown_freshness_and_ceiling() {
+    let secs = Duration::from_secs;
+    let base = |freshness, cooldown| {
+        RefreshPolicy::new(secs(freshness), secs(cooldown), secs(5), 1, 1, 1).unwrap()
+    };
+    assert_eq!(base(600, 2).uncacheable_reuse, secs(60));
+    assert_eq!(MAX_UNCACHEABLE_REUSE, secs(300));
+    for (freshness, cooldown, reuse, accepted) in [
+        (600, 1, 1, true),
+        (600, 1, 0, false),
+        (600, 1, 300, true),
+        (600, 1, 301, false),
+        (600, 1, u64::MAX, false),
+        (600, 60, 60, true),
+        (600, 61, 60, false),
+        (120, 1, 120, true),
+        (120, 1, 121, false),
+        (1, 1, 1, true),
+        (1, 1, 2, false),
+        // A cooldown above the ceiling leaves no explicit window.
+        (3600, 300, 300, true),
+        (3600, 301, 301, false),
+    ] {
+        assert_eq!(
+            base(freshness, cooldown)
+                .with_uncacheable_reuse(secs(reuse))
+                .map(|p| p.uncacheable_reuse),
+            if accepted {
+                Ok(secs(reuse))
+            } else {
+                Err(Error::Configuration)
+            },
+            "{freshness} {cooldown} {reuse}"
+        );
     }
 }
 #[test]
