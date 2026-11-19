@@ -26,7 +26,8 @@ path = "src/bin/migrate.rs"
 unsafe_code = "forbid"
 
 [dependencies]
-axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
+# `matched-path` adds no crate; it lets telemetry record the route template, never the target.
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "matched-path", "tokio"] }
 tokio = { version = "=1.54.1", default-features = false, features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
 sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-native-roots"] }
 sqlx-core = { version = "=0.9.0", default-features = false }
@@ -54,6 +55,12 @@ httpdate = "=1.0.3"
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = { version = "=0.8.5", default-features = false }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
+
+# Process telemetry (ADR 0024): structured stderr logs behind a default-deny callsite guard.
+# tracing (MIT) was already locked through sqlx. tracing-subscriber (MIT) is new, with no
+# env-filter, ansi or tracing-log (`log` bridge). Origin: github.com/tokio-rs/tracing.
+tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["std", "registry", "fmt", "json"] }
 
 # Login protection: ring (Apache-2.0 AND ISC), subtle (BSD-3-Clause), already locked.
 # Origins: github.com/briansmith/ring; github.com/dalek-cryptography/subtle.

@@ -1,4 +1,5 @@
 //! One-shot schema migration process (ADR 0003). API and worker processes never call this.
+use crate::telemetry::{self, MigrationFailure, Process, Signal};
 use sqlx::{
     ConnectOptions, Connection, Executor, PgConnection, SqlSafeStr, postgres::PgConnectOptions,
 };
@@ -101,14 +102,14 @@ pub struct Settings {
 }
 
 impl Settings {
-    fn load() -> Result<Self, &'static str> {
-        Self::parse(
-            |key| match std::env::var(format!("OPENMETTLE_MIGRATE_{key}")) {
-                Ok(value) => Ok(Some(value)),
-                Err(std::env::VarError::NotPresent) => Ok(None),
-                Err(_) => Err("configuration must be UTF-8"),
-            },
-        )
+    /// Connection settings, then telemetry settings, under the same prefix.
+    fn load() -> Result<(Self, telemetry::Settings), &'static str> {
+        let get = |key: &str| match std::env::var(format!("OPENMETTLE_MIGRATE_{key}")) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(_) => Err("configuration must be UTF-8"),
+        };
+        Ok((Self::parse(get)?, telemetry::Settings::parse(get)?))
     }
 
     fn parse(
@@ -161,6 +162,21 @@ fn describe(error: &sqlx::Error) -> String {
         sqlx::Error::Io(_) => "I/O error".into(),
         sqlx::Error::Tls(_) => "TLS error".into(),
         _ => "protocol or driver error".into(),
+    }
+}
+
+impl Failure {
+    /// The telemetry class; the CLI line keeps the detail.
+    fn class(&self) -> MigrationFailure {
+        match self {
+            Self::Invalid(_) => MigrationFailure::Invalid,
+            Self::ConnectTimeout => MigrationFailure::ConnectTimeout,
+            Self::Connect(_) => MigrationFailure::Connect,
+            Self::Check(_) => MigrationFailure::Check,
+            Self::Refused(_) => MigrationFailure::Refused,
+            Self::Violated(_) => MigrationFailure::Violated,
+            Self::Migrate(_) => MigrationFailure::Migrate,
+        }
     }
 }
 
@@ -487,41 +503,63 @@ async fn migrate_within_boundaries(
 }
 
 /// Entry point for `openmettle-migrate`: 0 success, 78 invalid configuration, 1 failure.
+///
+/// The result lines are the command's operator output and are kept as they were: the stdout
+/// success line and the `migration error:` stderr line, whose detail names a category,
+/// version, SQLSTATE or role and object names (ADR 0003). Telemetry events add only the
+/// lifecycle and the failure class.
 pub async fn run() -> u8 {
-    let settings = match Settings::load() {
+    let (settings, telemetry_settings) = match Settings::load() {
         Ok(settings) => settings,
         Err(message) => {
             eprintln!("configuration error: {message}");
             return 78;
         }
     };
+    let telemetry = match telemetry::install(telemetry_settings, Process::Migrate) {
+        Ok(telemetry) => telemetry,
+        Err(unavailable) => {
+            eprintln!("runtime error: {}", unavailable.message());
+            return 1;
+        }
+    };
+    let code = migrate(&settings).await;
+    // Bounded: a stalled stderr loses the final lines, not the exit.
+    telemetry.flush(telemetry::FLUSH_LIMIT);
+    code
+}
+
+async fn migrate(settings: &Settings) -> u8 {
+    telemetry::migration_started();
     use tokio::signal::unix::{SignalKind, signal};
     let (Ok(mut terminate), Ok(mut interrupt)) = (
         signal(SignalKind::terminate()),
         signal(SignalKind::interrupt()),
     ) else {
-        eprintln!("runtime error: cannot register signal handlers");
+        telemetry::migration_failed(MigrationFailure::SignalRegistration);
         return 1;
     };
     // A signal drops the migration future and its connection; PostgreSQL rolls back the
     // open transaction and releases the session lock.
     tokio::select! {
-        result = apply(&settings, MIGRATIONS) => match result {
+        result = apply(settings, MIGRATIONS) => match result {
             Ok(()) => {
                 println!("schema is at migration {}", MIGRATIONS.len());
+                telemetry::migration_completed(MIGRATIONS.len());
                 0
             }
             Err(failure) => {
                 eprintln!("migration error: {failure}");
+                telemetry::migration_failed(failure.class());
                 1
             }
         },
         _ = terminate.recv() => {
-            eprintln!("migration interrupted");
+            telemetry::migration_interrupted(Signal::Terminate);
             1
         }
         _ = interrupt.recv() => {
-            eprintln!("migration interrupted");
+            telemetry::migration_interrupted(Signal::Interrupt);
             1
         }
     }
@@ -611,6 +649,37 @@ mod tests {
         assert!(migrator(&[source(2, "SELECT 1")]).is_err());
         assert!(migrator(&[source(1, "SELECT 1"), source(3, "SELECT 1")]).is_err());
         assert!(migrator(&[source(1, "SELECT 1; COMMIT")]).is_err());
+    }
+
+    /// Each failure keeps its own `error.type`, so swapping two classes fails here.
+    #[test]
+    fn failures_map_to_their_own_telemetry_class() {
+        let cases = [
+            (Failure::Invalid("x"), MigrationFailure::Invalid),
+            (Failure::ConnectTimeout, MigrationFailure::ConnectTimeout),
+            (
+                Failure::Connect(sqlx::Error::PoolTimedOut),
+                MigrationFailure::Connect,
+            ),
+            (
+                Failure::Check(sqlx::Error::PoolClosed),
+                MigrationFailure::Check,
+            ),
+            (Failure::Refused(vec![]), MigrationFailure::Refused),
+            (Failure::Violated(vec![]), MigrationFailure::Violated),
+            (
+                Failure::Migrate(MigrateError::VersionMissing(1)),
+                MigrationFailure::Migrate,
+            ),
+        ];
+        for (failure, class) in &cases {
+            assert_eq!(failure.class(), *class, "{failure:?}");
+        }
+        // Every class but signal registration, which precedes any `Failure`, is reachable.
+        let classes: std::collections::BTreeSet<_> =
+            cases.iter().map(|(_, c)| format!("{c:?}")).collect();
+        assert_eq!(classes.len(), cases.len());
+        assert!(!classes.contains("SignalRegistration"));
     }
 
     #[test]
