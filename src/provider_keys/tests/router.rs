@@ -5,10 +5,10 @@ use super::handoff::{BINDING_REFUSED, ORIGIN, settings};
 use super::*;
 use crate::{
     browser_auth::{
-        handoff::{LOGIN_COOKIE, LoginHandoff, MAX_COOKIE_BYTES, MAX_QUERY_BYTES},
+        handoff::{LOGIN_COOKIE, LoginHandoff, MAX_COOKIE_BYTES, MAX_FORM_BYTES, MAX_QUERY_BYTES},
         router::{
-            MAX_HEADER_BYTES, MAX_HEADER_FIELDS, MAX_TARGET_BYTES, Rate, Settings, SettingsError,
-            router,
+            FORM_READ_TIMEOUT, MAX_HEADER_BYTES, MAX_HEADER_FIELDS, MAX_TARGET_BYTES, Rate,
+            Settings, SettingsError, router,
         },
     },
     sessions,
@@ -23,6 +23,11 @@ const UNAVAILABLE: &str = "login unavailable; restart login\n";
 const RATE_REFUSED: &str = "login rate limit reached; try again later\n";
 const BUSY_REFUSED: &str = "login busy; try again later\n";
 const HOUR: Duration = Duration::from_secs(3600);
+const BODY_REFUSED: &str = "login request body not accepted\n";
+pub(super) const FORM_REFUSED: &str = "login request refused\n";
+pub(super) const FORM_TYPE: (&str, &str) = ("content-type", "application/x-www-form-urlencoded");
+/// A synthetic, well-formed invitation code in its display form. No invitation has it.
+pub(super) const CODE: &str = "omh1-0123-4567-89ab-cdef-fedc-ba98-7654-3210";
 
 /// Generous limits that no test reaches unless it sets its own.
 pub(super) fn limits() -> Settings<'static> {
@@ -148,6 +153,12 @@ fn form() -> String {
             ("content-length", "0"),
         ],
     )
+}
+/// A form `POST` from the application page that declares and carries `body`.
+pub(super) fn form_with(body: &str) -> String {
+    let length = body.len().to_string();
+    let headers = [("origin", ORIGIN), FORM_TYPE, ("content-length", &length)];
+    head("POST", "/login", &headers) + body
 }
 /// A well-formed callback with a matching caller cookie, as a top-level navigation.
 fn navigation(extra: &[(&str, &str)]) -> String {
@@ -491,5 +502,129 @@ async fn in_flight_cap_refuses_without_work_and_disconnect_releases_the_permit()
     send(first, &form()).await.refused(503, UNAVAILABLE);
     send(first, &form()).await.refused(429, RATE_REFUSED);
     assert_eq!(h.count(), 1);
+    assert!(!attempted());
+}
+
+/// The initiation form (ADR 0022): refused from metadata without reading or spending
+/// anything, otherwise read under the permit and the rate unit, and then decided by the
+/// handoff. The begin budget is exactly the number of requests below that are admitted.
+#[tokio::test]
+async fn initiation_form_is_bounded_by_metadata_then_read_under_admission() {
+    let (database, pool) = service::silent_database();
+    let attempted = || database.accept().is_ok();
+    let h = Harness::new().await;
+    let settings = Settings {
+        begin: Rate {
+            burst: 10,
+            interval: HOUR,
+        },
+        in_flight: 1,
+        ..limits()
+    };
+    let address = serve(router(handoff(&h, pool), settings).unwrap()).await;
+    let field = format!("invitation_code={CODE}");
+    let length = field.len().to_string();
+    let post = |extra: &[(&str, &str)]| {
+        let mut headers = vec![("origin", ORIGIN)];
+        headers.extend_from_slice(extra);
+        head("POST", "/login", &headers)
+    };
+
+    // Refused from the head alone. The same field in a body that is chunked, one byte over
+    // the ceiling, or not declared as exactly a URL-encoded form.
+    let chunked = format!("{:x}\r\n{field}\r\n0\r\n\r\n", field.len());
+    let over = "a".repeat(MAX_FORM_BYTES + 1);
+    let charset = "application/x-www-form-urlencoded; charset=UTF-8";
+    for request in [
+        post(&[FORM_TYPE, ("transfer-encoding", "chunked")]) + &chunked,
+        post(&[FORM_TYPE, ("content-length", "257")]) + &over,
+        post(&[("content-length", &length)]) + &field,
+        post(&[("content-type", "text/plain"), ("content-length", &length)]) + &field,
+        post(&[
+            ("content-type", "multipart/form-data"),
+            ("content-length", &length),
+        ]) + &field,
+        post(&[("content-type", charset), ("content-length", &length)]) + &field,
+        post(&[FORM_TYPE, FORM_TYPE, ("content-length", &length)]) + &field,
+        // No body byte is sent for these, so the reply shows that nothing waited for one.
+        post(&[FORM_TYPE, ("content-length", "257")]),
+        post(&[FORM_TYPE, ("transfer-encoding", "chunked")]),
+        // The callback route still takes no body, in the initiation profile or otherwise.
+        navigation(&[FORM_TYPE, ("content-length", &length)]) + &field,
+    ] {
+        send(address, &request).await.refused(413, BODY_REFUSED);
+    }
+
+    // Admitted and read. The handoff decides Origin before it parses the form, so a foreign
+    // page learns nothing about the form rule.
+    let foreign = form_with("x=1").replace(ORIGIN, "https://other.example.test");
+    send(address, &foreign)
+        .await
+        .refused(403, "login origin refused\n");
+    // With the application Origin, any malformed form is the one fixed refusal. The last
+    // body is exactly at the router's ceiling, which no valid form reaches.
+    let at_ceiling = format!("invitation_code={}", "+".repeat(MAX_FORM_BYTES - 16));
+    assert_eq!(at_ceiling.len(), MAX_FORM_BYTES);
+    for body in [
+        "x=1",
+        "invitation_code=not-a-code",
+        "invitation_code=%zz",
+        &format!("{field}&{field}"),
+        &at_ceiling,
+    ] {
+        send(address, &form_with(body))
+            .await
+            .refused(400, FORM_REFUSED);
+    }
+    assert_eq!(h.count(), 0);
+    assert!(!attempted());
+
+    // A declared body that stalls after five bytes. The request already holds the only
+    // permit, so every route is busy until the read gives up.
+    let unbound = navigation(&[]).replace(LOGIN_COOKIE, "theme");
+    let stalled = post(&[FORM_TYPE, ("content-length", &length)]) + &field[..5];
+    let begun = std::time::Instant::now();
+    let mut held = TcpStream::connect(address).await.unwrap();
+    held.write_all(stalled.as_bytes()).await.unwrap();
+    // An unbound callback is refused by the handoff at once when it is admitted. Repeat it
+    // until the stalled request is seen holding the permit.
+    tokio::time::timeout(Duration::from_millis(1500), async {
+        loop {
+            let reply = send(address, &unbound).await;
+            if reply.status == 503 {
+                break reply.refused(503, BUSY_REFUSED);
+            }
+            reply.refused(400, BINDING_REFUSED);
+        }
+    })
+    .await
+    .expect("the stalled form never held the in-flight permit");
+    let reply = tokio::time::timeout(Duration::from_secs(10), read_reply(&mut held, false))
+        .await
+        .expect("no reply to a stalled form body");
+    reply.refused(408, "login request body not received\n");
+    // The server began waiting after `begun` and its timer never fires early.
+    assert_eq!(FORM_READ_TIMEOUT, Duration::from_secs(2));
+    assert!(begun.elapsed() >= FORM_READ_TIMEOUT);
+    // The permit is free again.
+    send(address, &unbound).await.refused(400, BINDING_REFUSED);
+    assert_eq!(h.count(), 0);
+    assert!(!attempted());
+
+    // A complete form reaches the service: with a code, with an empty value and with no
+    // body. The response is the same each time.
+    for (index, request) in [form_with(&field), form_with("invitation_code="), form()]
+        .iter()
+        .enumerate()
+    {
+        send(address, request).await.refused(503, UNAVAILABLE);
+        assert!(attempted(), "request {index}");
+    }
+    assert_eq!(h.count(), 2);
+    // Ten requests were admitted: one foreign, five malformed, one stalled and three
+    // complete. Each spent one unit, and the metadata refusals spent none.
+    send(address, &form_with(&field))
+        .await
+        .refused(429, RATE_REFUSED);
     assert!(!attempted());
 }

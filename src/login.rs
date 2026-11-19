@@ -2,6 +2,7 @@
 use crate::auth::{
     ExpectedNonceDigest, Policy, TrustedProvider, UnverifiedIdToken, VerifiedIdentity,
 };
+use crate::invitation::InvitationCode;
 use crate::runs::{WriteTransaction, identity};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use openidconnect::{
@@ -22,7 +23,6 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 
-const FORMAT: &[u8] = b"aes256gcm-v1";
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MAX_CODE_BYTES: usize = 4096;
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -385,28 +385,136 @@ async fn reserve_random(connection: &mut PgConnection, key: &str) -> Result<[u8;
     }
     Err(Error::Protection)
 }
-fn aad(
-    id: &str,
-    binding: &[u8],
+const VERIFIER_BYTES: usize = 43;
+const TAG_BYTES: usize = 16;
+/// The two sealed formats, told apart by ciphertext length and bound by distinct
+/// authenticated data, so neither opens as the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sealing {
+    /// `aes256gcm-v1`: the PKCE verifier alone, 59 bytes. Opened for logins that started
+    /// before migration 13 and never written. Such a login carries no invitation code.
+    V1,
+    /// `aes256gcm-v2`: verifier, one flag byte and 16 code bytes that are zero when the
+    /// flag is zero. Always 76 bytes, so the length does not show whether a code was sent.
+    V2,
+}
+impl Sealing {
+    fn of(ciphertext: usize) -> Option<Self> {
+        [Self::V1, Self::V2]
+            .into_iter()
+            .find(|sealing| sealing.ciphertext() == ciphertext)
+    }
+    fn ciphertext(self) -> usize {
+        TAG_BYTES
+            + match self {
+                Self::V1 => VERIFIER_BYTES,
+                Self::V2 => VERIFIER_BYTES + 1 + 16,
+            }
+    }
+    /// The authenticated-data domain and the format label inside it.
+    fn labels(self) -> (&'static [u8], &'static [u8]) {
+        match self {
+            Self::V1 => (b"openmettle/login/1\0", b"aes256gcm-v1"),
+            Self::V2 => (b"openmettle/login/2\0", b"aes256gcm-v2"),
+        }
+    }
+}
+/// The row fields that authenticate one sealed login (ADR 0009).
+struct Envelope<'a> {
+    id: &'a str,
+    binding: &'a [u8],
     expiry: i64,
-    state: &[u8],
-    nonce: &[u8],
-    caller: &[u8],
-    key: &str,
-) -> Vec<u8> {
-    identity(
-        b"openmettle/login/1\0",
-        &[
-            FORMAT,
-            id.as_bytes(),
-            binding,
-            &expiry.to_be_bytes(),
-            state,
-            nonce,
-            caller,
-            key.as_bytes(),
-        ],
-    )
+    state: &'a [u8],
+    nonce: &'a [u8],
+    caller: &'a [u8],
+    key: &'a str,
+}
+impl Envelope<'_> {
+    fn aad(&self, sealing: Sealing) -> Vec<u8> {
+        let (domain, format) = sealing.labels();
+        identity(
+            domain,
+            &[
+                format,
+                self.id.as_bytes(),
+                self.binding,
+                &self.expiry.to_be_bytes(),
+                self.state,
+                self.nonce,
+                self.caller,
+                self.key.as_bytes(),
+            ],
+        )
+    }
+    /// Seals under the envelope's key. `iv` must be a committed reservation for that key.
+    fn seal(
+        &self,
+        sealing: Sealing,
+        keys: &KeyRing,
+        iv: [u8; 12],
+        verifier: &str,
+        invitation: Option<&InvitationCode>,
+    ) -> Result<Vec<u8>, Error> {
+        let mut sealed = verifier.as_bytes().to_vec();
+        match sealing {
+            // No code can be stored in this format.
+            Sealing::V1 if invitation.is_some() => return Err(Error::Protection),
+            Sealing::V1 => {}
+            Sealing::V2 => {
+                sealed.push(u8::from(invitation.is_some()));
+                sealed.extend_from_slice(invitation.map_or(&[0; 16], |code| code.bytes()));
+            }
+        }
+        keys.key(self.key)?
+            .seal_in_place_append_tag(
+                aead::Nonce::assume_unique_for_key(iv),
+                aead::Aad::from(&self.aad(sealing)),
+                &mut sealed,
+            )
+            .map_err(|_| Error::Protection)?;
+        Ok(sealed)
+    }
+    /// Opens either format. Any other length, a failed tag, a malformed verifier, an unknown
+    /// flag or code bytes without the flag are `Protection`.
+    fn open(
+        &self,
+        keys: &KeyRing,
+        iv: [u8; 12],
+        mut sealed: Vec<u8>,
+    ) -> Result<(Secret, Option<InvitationCode>), Error> {
+        let sealing = Sealing::of(sealed.len()).ok_or(Error::Protection)?;
+        let plain = keys
+            .key(self.key)?
+            .open_in_place(
+                aead::Nonce::assume_unique_for_key(iv),
+                aead::Aad::from(&self.aad(sealing)),
+                &mut sealed,
+            )
+            .map_err(|_| Error::Protection)?;
+        let (verifier, rest) = plain
+            .split_at_checked(VERIFIER_BYTES)
+            .ok_or(Error::Protection)?;
+        let verifier = std::str::from_utf8(verifier).map_err(|_| Error::Protection)?;
+        if !verifier
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+        {
+            return Err(Error::Protection);
+        }
+        let invitation = match (sealing, rest) {
+            (Sealing::V1, []) => None,
+            (Sealing::V2, [flag, code @ ..]) => {
+                let code: [u8; 16] = code.try_into().map_err(|_| Error::Protection)?;
+                match *flag {
+                    0 if code == [0; 16] => None,
+                    1 => Some(InvitationCode::from_bytes(code)),
+                    _ => return Err(Error::Protection),
+                }
+            }
+            _ => return Err(Error::Protection),
+        };
+        Ok((Secret(verifier.into()), invitation))
+    }
 }
 
 /// URL and caller secret must be delivered only to the initiating browser, after this operation.
@@ -418,21 +526,44 @@ pub struct Started {
     pub caller_binding: Secret,
 }
 
+/// `invitation` is the code the person entered when starting this login, if any. It is
+/// sealed with the PKCE verifier and reaches only the redemption function (ADR 0022).
 pub async fn begin(
     connection: &mut PgConnection,
     provider: &Provider,
     keys: &KeyRing,
     lifetime: Duration,
+    invitation: Option<&InvitationCode>,
 ) -> Result<Started, Error> {
-    tokio::time::timeout(DEADLINE, begin_inner(connection, provider, keys, lifetime))
+    let start = begin_inner(
+        connection,
+        provider,
+        keys,
+        lifetime,
+        invitation,
+        Sealing::V2,
+    );
+    tokio::time::timeout(DEADLINE, start)
         .await
         .map_err(|_| Error::Database)?
+}
+/// A login as the release before migration 13 sealed it, for upgrade tests.
+#[cfg(test)]
+pub(crate) async fn begin_v1(
+    connection: &mut PgConnection,
+    provider: &Provider,
+    keys: &KeyRing,
+    lifetime: Duration,
+) -> Result<Started, Error> {
+    begin_inner(connection, provider, keys, lifetime, None, Sealing::V1).await
 }
 async fn begin_inner(
     connection: &mut PgConnection,
     p: &Provider,
     keys: &KeyRing,
     lifetime: Duration,
+    invitation: Option<&InvitationCode>,
+    sealing: Sealing,
 ) -> Result<Started, Error> {
     if !p.enabled || !(MIN_LOGIN_LIFETIME..=MAX_LOGIN_LIFETIME).contains(&lifetime) {
         return Err(Error::Configuration);
@@ -460,23 +591,16 @@ async fn begin_inner(
         let (binding, _) = p.persisted_binding(tx.connection()?).await?;
         let (state_hash, nonce_hash, caller_hash) =
             (hash(&state.0), hash(&nonce.0), hash(&caller.0));
-        let context = aad(
-            &id.0,
-            &binding,
+        let envelope = Envelope {
+            id: &id.0,
+            binding: &binding,
             expiry,
-            &state_hash,
-            &nonce_hash,
-            &caller_hash,
+            state: &state_hash,
+            nonce: &nonce_hash,
+            caller: &caller_hash,
             key,
-        );
-        let mut encrypted = verifier.0.as_bytes().to_vec();
-        keys.key(key)?
-            .seal_in_place_append_tag(
-                aead::Nonce::assume_unique_for_key(iv),
-                aead::Aad::from(&context),
-                &mut encrypted,
-            )
-            .map_err(|_| Error::Protection)?;
+        };
+        let encrypted = envelope.seal(sealing, keys, iv, &verifier.0, invitation)?;
         sqlx::query("INSERT INTO openmettle.login_transactions (id,binding,expires_ms,state_hash,nonce_hash,caller_hash,key_id,nonce,ciphertext) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)")
             .bind(&id.0).bind(&binding).bind(expiry).bind(state_hash.as_slice()).bind(nonce_hash.as_slice())
             .bind(caller_hash.as_slice()).bind(key).bind(iv.as_slice()).bind(encrypted).execute(tx.connection()?).await?;
@@ -529,6 +653,8 @@ pub struct Callback<'a> {
 /// Created only after acknowledged consumption commit. Owns the code and exact provider.
 pub struct ExchangePermit {
     pub(crate) origin: Option<LoginOrigin>,
+    // The invitation code sealed with this login, for first-account redemption only.
+    pub(crate) invitation: Option<InvitationCode>,
     provider: Arc<Provider>,
     // Managed only: the durable authority epoch committed with this consumption.
     epoch: Option<i64>,
@@ -609,30 +735,20 @@ async fn consume_inner(
         }
         let key: String = row.try_get("key_id")?;
         let iv: Vec<u8> = row.try_get("nonce")?;
-        let mut encrypted: Vec<u8> = row
+        let encrypted: Vec<u8> = row
             .try_get::<Option<Vec<u8>>, _>("ciphertext")?
             .ok_or(Error::Protection)?;
-        if encrypted.len() != 59 {
-            return Err(Error::Protection);
-        }
-        let context = aad(id, &binding, expiry, &state, &nonce, &caller, &key);
+        let envelope = Envelope {
+            id,
+            binding: &binding,
+            expiry,
+            state: &state,
+            nonce: &nonce,
+            caller: &caller,
+            key: &key,
+        };
         let iv: [u8; 12] = iv.try_into().map_err(|_| Error::Protection)?;
-        let decrypt_key = keys.key(&key)?;
-        let plain = decrypt_key
-            .open_in_place(
-                aead::Nonce::assume_unique_for_key(iv),
-                aead::Aad::from(&context),
-                &mut encrypted,
-            )
-            .map_err(|_| Error::Protection)?;
-        let verifier = std::str::from_utf8(plain).map_err(|_| Error::Protection)?;
-        if verifier.len() != 43
-            || !verifier
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
-        {
-            return Err(Error::Protection);
-        }
+        let (verifier, invitation) = envelope.open(keys, iv, encrypted)?;
         // Owner edits serialize revision allocation and commit. This snapshot precedes
         // the one permitted token POST, so the sealed proof cannot cross a later reset.
         let membership_revision = if epoch.is_some() {
@@ -641,10 +757,11 @@ async fn consume_inner(
         } else { 0 };
         let permit = ExchangePermit {
             origin: Some(LoginOrigin {login:id.to_owned(),expiry,membership_revision}),
+            invitation,
             provider: p,
             epoch,
             code: Secret(c.code.into()),
-            verifier: Secret(verifier.into()),
+            verifier,
             nonce: ExpectedNonceDigest::new(nonce.try_into().map_err(|_| Error::Protection)?),
         };
         sqlx::query(
@@ -791,6 +908,7 @@ pub(crate) mod fixture;
 pub(crate) fn fixture_permit(provider: Arc<Provider>, epoch: Option<i64>) -> ExchangePermit {
     ExchangePermit {
         origin: None,
+        invitation: None,
         provider,
         epoch,
         code: Secret("synthetic-code".into()),
@@ -827,6 +945,7 @@ mod tests {
     fn permit() -> ExchangePermit {
         ExchangePermit {
             origin: None,
+            invitation: None,
             provider: provider(),
             epoch: None,
             code: Secret("code".into()),
@@ -929,6 +1048,7 @@ mod tests {
         let http = |request| std::future::ready(fake.exchange(request));
         let permit = ExchangePermit {
             origin: None,
+            invitation: None,
             provider: p,
             epoch: None,
             code: Secret(code),
@@ -958,6 +1078,7 @@ mod tests {
             }
             let permit = ExchangePermit {
                 origin: None,
+                invitation: None,
                 provider: Arc::new(p),
                 epoch: None,
                 code: Secret(code),
@@ -1040,6 +1161,7 @@ mod tests {
             p.token = token;
             ExchangePermit {
                 origin: None,
+                invitation: None,
                 provider: Arc::new(p),
                 epoch: None,
                 code: Secret(fake.authorize(url.as_str(), "synthetic-state")),
@@ -1093,23 +1215,132 @@ mod tests {
         assert!(https(fixture::AUTH));
     }
 
+    fn envelope() -> Envelope<'static> {
+        Envelope {
+            id: "id",
+            binding: b"binding",
+            expiry: 123,
+            state: &[1; 32],
+            nonce: &[2; 32],
+            caller: &[3; 32],
+            key: "active",
+        }
+    }
+    /// Any plaintext sealed validly under one format's authenticated data.
+    fn sealed_raw(sealing: Sealing, keys: &KeyRing, iv: [u8; 12], plain: &[u8]) -> Vec<u8> {
+        let mut sealed = plain.to_vec();
+        keys.key("active")
+            .unwrap()
+            .seal_in_place_append_tag(
+                aead::Nonce::assume_unique_for_key(iv),
+                aead::Aad::from(&envelope().aad(sealing)),
+                &mut sealed,
+            )
+            .unwrap();
+        sealed
+    }
+
+    #[test]
+    fn sealed_login_carries_an_optional_invitation_code_at_one_length() {
+        let keys = KeyRing::new(vec![("active".into(), [7; 32])]).unwrap();
+        let (envelope, iv) = (envelope(), [9; 12]);
+        let verifier = "v".repeat(43);
+        let code = InvitationCode::parse(&"5a".repeat(16)).unwrap();
+        let seal = |sealing, invitation| envelope.seal(sealing, &keys, iv, &verifier, invitation);
+        let with = seal(Sealing::V2, Some(&code)).unwrap();
+        let without = seal(Sealing::V2, None).unwrap();
+        // One length either way: a stored row does not show whether a code was sent.
+        assert_eq!((with.len(), without.len()), (76, 76));
+        let (opened, invitation) = envelope.open(&keys, iv, with.clone()).unwrap();
+        assert_eq!(opened.expose(), verifier);
+        assert_eq!(invitation.unwrap().bytes(), code.bytes());
+        let (opened, invitation) = envelope.open(&keys, iv, without.clone()).unwrap();
+        assert_eq!(opened.expose(), verifier);
+        assert!(invitation.is_none());
+
+        // The previous format still opens, as a login without a code. It cannot hold one.
+        let legacy = seal(Sealing::V1, None).unwrap();
+        assert_eq!(legacy.len(), 59);
+        let (opened, invitation) = envelope.open(&keys, iv, legacy.clone()).unwrap();
+        assert_eq!(opened.expose(), verifier);
+        assert!(invitation.is_none());
+        assert_eq!(
+            seal(Sealing::V1, Some(&code)).unwrap_err(),
+            Error::Protection
+        );
+
+        let refused = |sealed: Vec<u8>| {
+            assert_eq!(
+                envelope.open(&keys, iv, sealed).unwrap_err(),
+                Error::Protection
+            );
+        };
+        // Every byte of every ciphertext is authenticated, and no other length is opened.
+        for sealed in [&with, &without, &legacy] {
+            for index in 0..sealed.len() {
+                let mut tampered = sealed.clone();
+                tampered[index] ^= 1;
+                refused(tampered);
+            }
+            for length in [0, 16, 58, 60, 75, 77] {
+                let mut resized = sealed.clone();
+                resized.resize(length, 0);
+                refused(resized);
+            }
+        }
+        // Neither format opens as the other: the length selects the authenticated data, so
+        // a v2 plaintext sealed under the v1 domain, or the reverse, fails its tag.
+        let mut plain = verifier.clone().into_bytes();
+        refused(sealed_raw(Sealing::V2, &keys, iv, &plain));
+        plain.extend_from_slice(&[1; 17]);
+        refused(sealed_raw(Sealing::V1, &keys, iv, &plain));
+        // Control for the cases below: this helper's v2 output opens.
+        let opened = envelope.open(&keys, iv, sealed_raw(Sealing::V2, &keys, iv, &plain));
+        assert_eq!(opened.unwrap().1.unwrap().bytes(), &[1; 16]);
+        // Authentic but malformed contents: an unknown flag, code bytes without the flag
+        // and a verifier outside the base64url alphabet.
+        for (index, byte) in [(43, 2), (43, 0), (0, b'!')] {
+            let mut malformed = plain.clone();
+            malformed[index] = byte;
+            refused(sealed_raw(Sealing::V2, &keys, iv, &malformed));
+        }
+        // Another key ID or any other envelope field is not this login.
+        let other = Envelope {
+            expiry: 124,
+            ..self::envelope()
+        };
+        assert_eq!(other.open(&keys, iv, with).unwrap_err(), Error::Protection);
+    }
+
+    #[test]
+    fn secrets_carried_by_a_permit_stay_out_of_debug_output() {
+        let mut permit = permit();
+        permit.invitation = InvitationCode::parse(&"5a".repeat(16));
+        assert!(permit.invitation.is_some());
+        assert_eq!(format!("{permit:?}"), "ExchangePermit(..)");
+    }
+
     #[test]
     fn aead_binds_every_field_and_keys() {
         let keys = KeyRing::new(vec![("active".into(), [7; 32])]).unwrap();
-        let context = aad(
-            "id", b"binding", 123, &[1; 32], &[2; 32], &[3; 32], "active",
-        );
+        for sealing in [Sealing::V1, Sealing::V2] {
+            aead_binds(&keys, &envelope().aad(sealing));
+        }
+        // The two formats never share authenticated data.
+        assert_ne!(envelope().aad(Sealing::V1), envelope().aad(Sealing::V2));
+    }
+    fn aead_binds(keys: &KeyRing, context: &[u8]) {
         let key = keys.key("active").unwrap();
         let iv = random::<12>().unwrap();
         let mut cipher = b"secret verifier".to_vec();
         key.seal_in_place_append_tag(
             aead::Nonce::assume_unique_for_key(iv),
-            aead::Aad::from(&context),
+            aead::Aad::from(context),
             &mut cipher,
         )
         .unwrap();
         for index in 0..context.len() {
-            let mut wrong = context.clone();
+            let mut wrong = context.to_vec();
             wrong[index] ^= 1;
             assert!(
                 key.open_in_place(
@@ -1125,7 +1356,7 @@ mod tests {
         assert!(
             key.open_in_place(
                 aead::Nonce::assume_unique_for_key(iv),
-                aead::Aad::from(&context),
+                aead::Aad::from(context),
                 &mut bad
             )
             .is_err()
@@ -1138,7 +1369,7 @@ mod tests {
                 .unwrap()
                 .open_in_place(
                     aead::Nonce::assume_unique_for_key(iv),
-                    aead::Aad::from(&context),
+                    aead::Aad::from(context),
                     &mut cipher.clone()
                 )
                 .is_ok()
@@ -1149,7 +1380,7 @@ mod tests {
                 .unwrap()
                 .open_in_place(
                     aead::Nonce::assume_unique_for_key(iv),
-                    aead::Aad::from(&context),
+                    aead::Aad::from(context),
                     &mut cipher
                 )
                 .is_err()

@@ -81,6 +81,7 @@ async fn try_begin(db: &TestDb, lifetime: u64) -> Result<Started, Error> {
         &provider("v1", true),
         &keys(),
         Duration::from_secs(lifetime),
+        None,
     )
     .await
 }

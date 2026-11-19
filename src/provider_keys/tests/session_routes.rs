@@ -231,6 +231,18 @@ async fn routes_methods_bounds_and_cookies_are_decided_before_any_checkout() {
                 "session request body not accepted\n",
             );
         }
+        // The initiation form profile (ADR 0022) belongs to the initiation route alone.
+        let form = [
+            ("origin", ORIGIN),
+            ("cookie", &cookie),
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("content-length", "16"),
+        ];
+        refused(
+            &send(address, &(head(method, path, &form) + "invitation_code=")).await,
+            413,
+            "session request body not accepted\n",
+        );
     }
     // Only same-origin browser checks inspect the cookie. A rejected check never connects.
     refused(

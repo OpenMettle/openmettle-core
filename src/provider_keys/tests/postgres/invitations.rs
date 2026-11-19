@@ -206,7 +206,7 @@ async fn sign_in(f: &mut Flow, code: Option<&InvitationCode>) -> local::Credenti
         .unwrap()
 }
 /// Every invitation is still pending: not redeemed and not withdrawn.
-async fn pending(f: &mut Flow, expected: i64) {
+pub(super) async fn pending(f: &mut Flow, expected: i64) {
     let rows: (i64, i64) = sqlx::query_as(
         "SELECT count(*), count(*) FILTER (WHERE approval_id IS NULL AND withdrawn_at IS NULL
                 AND redeemed_at IS NULL AND login_id IS NULL)
@@ -217,7 +217,7 @@ async fn pending(f: &mut Flow, expected: i64) {
     .unwrap();
     assert_eq!(rows, (expected, expected));
 }
-async fn empty(f: &mut Flow) {
+pub(super) async fn empty(f: &mut Flow) {
     assert!(account_state(f).await.is_empty());
     let counts: (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
@@ -1211,13 +1211,34 @@ async fn login_started_on_schema_12_completes_after_the_upgrade() {
     let mut f = Flow { h, db, api, owner };
     let user = seed(&mut f, true, true).await;
     let p = f.h.provider.clone();
-    let started = f.begin(&p).await;
-    let sealed: i32 =
-        sqlx::query_scalar("SELECT octet_length(ciphertext) FROM openmettle.login_transactions")
-            .fetch_one(&mut f.owner)
+    // The current 76-byte format does not pass the schema-12 check: a current start is
+    // refused there and leaves no login. The fixture therefore seals this login exactly as
+    // the previous release did.
+    assert_eq!(
+        p.begin(&mut f.api, &keys(), Duration::from_secs(300), None)
             .await
-            .unwrap();
-    assert_eq!(sealed, 59);
+            .map(drop),
+        Err(login::Error::Database)
+    );
+    f.api = f.db.connect(API).await;
+    assert_eq!(f.rows().await, 0);
+    p.fresh().await.unwrap();
+    let previous = p
+        .login_provider(Instant::now() + Duration::from_secs(5))
+        .unwrap();
+    let started = login::begin_v1(&mut f.api, &previous, &keys(), Duration::from_secs(300))
+        .await
+        .unwrap();
+    let sealed = async |f: &mut Flow, started: &Started| -> i32 {
+        sqlx::query_scalar(
+            "SELECT octet_length(ciphertext) FROM openmettle.login_transactions WHERE id = $1",
+        )
+        .bind(locator(started))
+        .fetch_one(&mut f.owner)
+        .await
+        .unwrap()
+    };
+    assert_eq!(sealed(&mut f, &started).await, 59);
     f.db.upgrade(migrate::MIGRATIONS).await;
     f.arm(&started);
     let proof = f
@@ -1235,4 +1256,7 @@ async fn login_started_on_schema_12_completes_after_the_upgrade() {
         .await
         .unwrap();
     assert_eq!(context.user_id(), user);
+    // A login started after the upgrade is sealed in the current format.
+    let next = f.begin(&p).await;
+    assert_eq!(sealed(&mut f, &next).await, 76);
 }

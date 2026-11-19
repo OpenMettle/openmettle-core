@@ -7,6 +7,7 @@
 //!
 //! - [`LoginHandoff::initiate`]: a top-level form `POST` whose single `Origin` equals the
 //!   configured application origin becomes a `303` to the provider with the caller cookie.
+//!   Its form may carry one `invitation_code` field for a first sign-in (ADR 0022).
 //! - [`LoginHandoff::callback`]: a top-level `GET` on the exact registered callback path
 //!   becomes a `303` to the configured landing with the session cookie.
 //! - [`LoginHandoff::session`]: a same-origin `GET` with one valid session cookie becomes
@@ -15,10 +16,11 @@
 //!   well-formed session cookie becomes a `204` that deletes the session cookie, only after
 //!   the revocation commit is acknowledged.
 //!
-//! Anything else is a fixed refusal. The adapter reads no request body, `Host`, forwarded
-//! header or return URL and logs nothing. Only an acknowledged logout deletes a cookie.
+//! Anything else is a fixed refusal. The adapter reads no `Host`, forwarded header or return
+//! URL, no request body except the initiation form, and logs nothing. Only an acknowledged
+//! logout deletes a cookie.
 use super::{BrowserAuth, Error};
-use crate::{login, provider_keys::ManagedProvider, sessions};
+use crate::{invitation::InvitationCode, login, provider_keys::ManagedProvider, sessions};
 use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode, header, request::Parts};
 use openidconnect::url::Url;
 use std::{fmt, sync::Arc};
@@ -34,6 +36,11 @@ pub const MAX_QUERY_BYTES: usize = 32 * 1024;
 pub const MAX_QUERY_PARAMETERS: usize = 32;
 /// Total bytes of every `Cookie` field value on one request.
 pub const MAX_COOKIE_BYTES: usize = 16 * 1024;
+/// Bytes of the initiation form body. Room for the one field with a maximal code and every
+/// byte of it percent-encoded.
+pub const MAX_FORM_BYTES: usize = 256;
+/// The one field an initiation form may carry (ADR 0022).
+pub const INVITATION_FIELD: &str = "invitation_code";
 const COOKIE_ATTRIBUTES: &str = "Path=/; Secure; HttpOnly; SameSite=Lax";
 /// Deletes the session cookie: the same name and attributes, an empty value and `Max-Age=0`.
 /// It names no credential, so it is the same for every browser.
@@ -88,6 +95,8 @@ impl std::error::Error for SettingsError {}
 #[derive(Clone, Copy)]
 enum Refusal {
     Origin,
+    /// The initiation form has an unknown, repeated or malformed field, or a malformed code.
+    Form,
     Path,
     /// The authorization response is malformed, repeated, incomplete, from another issuer
     /// or a provider error.
@@ -110,6 +119,7 @@ impl Refusal {
     fn response(self) -> Response<&'static str> {
         let (status, line) = match self {
             Self::Origin => (StatusCode::FORBIDDEN, "login origin refused\n"),
+            Self::Form => (StatusCode::BAD_REQUEST, "login request refused\n"),
             Self::Path => (StatusCode::NOT_FOUND, "not found\n"),
             Self::Response => (
                 StatusCode::BAD_REQUEST,
@@ -319,6 +329,29 @@ fn authorization(query: &str) -> Option<Authorization> {
         issuer: issuer?,
     })
 }
+/// The invitation code in an initiation form. The outer `None` refuses the form. An empty
+/// body and an empty value both mean that no code was entered. Anything else must be exactly
+/// one `invitation_code` field whose strictly decoded value is a well-formed code. Syntax
+/// only: whether the code belongs to an invitation is decided at redemption, so a
+/// well-formed wrong code and no code get the same response here.
+fn invitation(form: &[u8]) -> Option<Option<InvitationCode>> {
+    if form.is_empty() {
+        return Some(None);
+    }
+    if form.len() > MAX_FORM_BYTES {
+        return None;
+    }
+    let (name, value) = std::str::from_utf8(form).ok()?.split_once('=')?;
+    // One field only: a second `=` or any `&` is another or a malformed field.
+    if value.contains(['=', '&']) || decode(name)? != INVITATION_FIELD {
+        return None;
+    }
+    let value = decode(value)?;
+    if value.is_empty() {
+        return Some(None);
+    }
+    InvitationCode::parse(&value).map(Some)
+}
 /// The value of cookie `name` when it occurs exactly once across every `Cookie` field and
 /// those fields are within [`MAX_COOKIE_BYTES`]. Names compare exactly.
 fn single_cookie<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
@@ -446,17 +479,22 @@ impl LoginHandoff {
         )
     }
 
-    /// Starts a login. Method and `Origin` are decided before the service is called; the
-    /// path, query and body are not read. The `Location` is exactly the authorization URL
-    /// returned by [`BrowserAuth::begin`].
-    pub async fn initiate(&self, request: &Parts) -> Response<&'static str> {
+    /// Starts a login. Method, `Origin` and then the form are decided before the service is
+    /// called; the path and query are not read. `form` is the request body, which the
+    /// caller has already bounded: empty, or one `invitation_code` field (ADR 0022). The
+    /// `Location` is exactly the authorization URL returned by [`BrowserAuth::begin`], and
+    /// the response is the same with or without a code.
+    pub async fn initiate(&self, request: &Parts, form: &[u8]) -> Response<&'static str> {
         if request.method != Method::POST {
             return wrong_method("POST");
         }
         if !self.same_origin(&request.headers) {
             return Refusal::Origin.response();
         }
-        let Ok(started) = self.auth.begin(&self.settings.provider).await else {
+        let Some(invitation) = invitation(form) else {
+            return Refusal::Form.response();
+        };
+        let Ok(started) = self.auth.begin(&self.settings.provider, invitation).await else {
             return Refusal::Unavailable.response();
         };
         let Some((locator, _)) = started.state.expose().split_once('.') else {
@@ -624,6 +662,121 @@ mod tests {
         assert_eq!(broken.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(!broken.headers().contains_key(header::LOCATION));
         assert!(!broken.headers().contains_key(header::SET_COOKIE));
+    }
+
+    const CODE: &str = "omh1-0123-4567-89ab-cdef-fedc-ba98-7654-3210";
+    const CODE_BYTES: [u8; 16] = [
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
+        0x10,
+    ];
+    fn percent_encoded(value: &str) -> String {
+        value.bytes().map(|b| format!("%{b:02X}")).collect()
+    }
+
+    #[test]
+    fn initiation_form_is_empty_or_exactly_one_invitation_code_field() {
+        // No code: an empty body, as a form without the field sends, or an empty value.
+        for form in ["", "invitation_code=", "%69nvitation_code="] {
+            assert!(matches!(invitation(form.as_bytes()), Some(None)), "{form}");
+        }
+        // One code, in every form a browser can send what the person typed or pasted.
+        let longest = format!(
+            "invitation_code={}",
+            percent_encoded(&format!("{CODE:<64}"))
+        );
+        assert!(longest.len() <= MAX_FORM_BYTES);
+        for form in [
+            format!("invitation_code={CODE}"),
+            format!("invitation_code={}", CODE.to_ascii_uppercase()),
+            format!("invitation_code={}", CODE.replace('-', "+")),
+            format!("invitation_code={}", CODE.replace('-', "%20")),
+            format!(
+                "invitation_code=+{}+",
+                &CODE.replace('-', "")["omh1".len()..]
+            ),
+            format!("invitation_code={}", percent_encoded(CODE)),
+            format!("{}={CODE}", percent_encoded(INVITATION_FIELD)),
+            longest,
+        ] {
+            let code = invitation(form.as_bytes())
+                .flatten()
+                .expect("accepted form");
+            assert_eq!(code.bytes(), &CODE_BYTES);
+        }
+    }
+
+    #[test]
+    fn initiation_form_with_any_other_content_is_refused() {
+        let hex = &CODE.replace('-', "")["omh1".len()..];
+        let oversized = format!("invitation_code={}", "+".repeat(MAX_FORM_BYTES));
+        let refused: Vec<Vec<u8>> = [
+            // Another field, alone, before or after the code, and the field twice.
+            "x=1".to_owned(),
+            format!("code={CODE}"),
+            format!("Invitation_Code={CODE}"),
+            format!("invitation_code2={CODE}"),
+            format!("x=1&invitation_code={CODE}"),
+            format!("invitation_code={CODE}&x=1"),
+            format!("invitation_code={CODE}&invitation_code={CODE}"),
+            "invitation_code=&invitation_code=".to_owned(),
+            // Not one `name=value` pair.
+            "invitation_code".to_owned(),
+            "=".to_owned(),
+            format!("={CODE}"),
+            format!("invitation_code={CODE}&"),
+            format!("&invitation_code={CODE}"),
+            format!("invitation_code=={CODE}"),
+            format!("invitation_code={CODE}="),
+            // Malformed escapes, and bytes a form never sends unescaped.
+            "invitation_code=%zz".to_owned(),
+            "invitation_code=%2".to_owned(),
+            "invitation_code=%".to_owned(),
+            format!("invitation_code={CODE}\r\n"),
+            format!("invitation_code={CODE} "),
+            format!("invitation_code={}", CODE.replace('-', " ")),
+            // A malformed code: wrong length, not hexadecimal, only separators, not ASCII,
+            // and more than 64 bytes once decoded.
+            format!("invitation_code={}", &hex[..31]),
+            format!("invitation_code={hex}0"),
+            format!("invitation_code={}g", &hex[..31]),
+            "invitation_code=+".to_owned(),
+            "invitation_code=-".to_owned(),
+            format!("invitation_code={}%C3%A9", &hex[..31]),
+            format!("invitation_code={CODE}{}", "+".repeat(65 - CODE.len())),
+            oversized,
+        ]
+        .into_iter()
+        .map(String::into_bytes)
+        // Bytes that are not UTF-8, raw and percent-encoded.
+        .chain([
+            b"invitation_code=\xff".to_vec(),
+            b"\xffinvitation_code=".to_vec(),
+        ])
+        .chain(["invitation_code=%FF".as_bytes().to_vec()])
+        .collect();
+        for form in &refused {
+            assert!(
+                invitation(form).is_none(),
+                "accepted {:?}",
+                String::from_utf8_lossy(form)
+            );
+        }
+        // Controls: each refusal above is one change away from an accepted form.
+        assert!(invitation(format!("invitation_code={CODE}").as_bytes()).is_some());
+        let padded = format!("invitation_code={CODE}{}", "+".repeat(64 - CODE.len()));
+        assert!(invitation(padded.as_bytes()).is_some());
+
+        // One fixed refusal, whatever was wrong, with no cookie and no redirect.
+        let response = Refusal::Form.response();
+        assert_eq!(
+            (response.status(), *response.body()),
+            (StatusCode::BAD_REQUEST, "login request refused\n")
+        );
+        let headers = response.headers();
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_eq!(headers[header::REFERRER_POLICY], "no-referrer");
+        assert!(!headers.contains_key(header::SET_COOKIE));
+        assert!(!headers.contains_key(header::LOCATION));
     }
 
     #[test]

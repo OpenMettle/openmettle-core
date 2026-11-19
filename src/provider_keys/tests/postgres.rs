@@ -259,7 +259,16 @@ impl Flow {
         Self { h, db, api, owner }
     }
     async fn begin(&mut self, p: &ManagedProvider) -> Started {
-        p.begin(&mut self.api, &keys(), Duration::from_secs(300))
+        self.begin_with(p, None).await
+    }
+    /// A login whose start presented `code`, sealed exactly as the browser start route
+    /// seals it (ADR 0022).
+    async fn begin_with(
+        &mut self,
+        p: &ManagedProvider,
+        code: Option<&crate::invitation::InvitationCode>,
+    ) -> Started {
+        p.begin(&mut self.api, &keys(), Duration::from_secs(300), code)
             .await
             .unwrap()
     }
@@ -282,21 +291,21 @@ impl Flow {
     async fn exchanged(&mut self, p: &ManagedProvider) -> (Started, ExchangedIdentity) {
         self.exchanged_with(p, None).await
     }
-    /// A sealed proof for a login that presented `code`. No login start accepts a code yet,
-    /// so the fixture attaches it to the proof itself.
+    /// A sealed proof for a login whose start presented `code`. The code reaches the proof
+    /// only through the sealed login row: begin seals it, consume opens it and the exchange
+    /// carries it. Nothing here attaches it to the proof.
     async fn exchanged_with(
         &mut self,
         p: &ManagedProvider,
         code: Option<&crate::invitation::InvitationCode>,
     ) -> (Started, ExchangedIdentity) {
-        let started = self.begin(p).await;
+        let started = self.begin_with(p, code).await;
         self.arm(&started);
         let permit = self.consume(p, &started).await.unwrap();
-        let mut exchanged = permit
+        let exchanged = permit
             .exchange_with_keys(p, &auth::Policy::default())
             .await
             .unwrap();
-        exchanged.invitation = code.cloned();
         (started, exchanged)
     }
     async fn consumed(&mut self, started: &Started) -> bool {
@@ -392,7 +401,7 @@ async fn begin_requires_committed_matching_authority() {
     let p = h.provider.clone();
     let refused = async |api: &mut PgConnection, why: &str| {
         assert_eq!(
-            p.begin(api, &keys(), Duration::from_secs(60))
+            p.begin(api, &keys(), Duration::from_secs(60), None)
                 .await
                 .unwrap_err(),
             login::Error::Rejected,
@@ -434,7 +443,7 @@ async fn begin_requires_committed_matching_authority() {
     owner.execute("ROLLBACK").await.unwrap();
     refused(&mut api, "rolled back").await;
     write(&mut owner, Some("v1")).await;
-    p.begin(&mut api, &keys(), Duration::from_secs(60))
+    p.begin(&mut api, &keys(), Duration::from_secs(60), None)
         .await
         .unwrap();
 }
@@ -493,7 +502,7 @@ async fn epoch_changes_and_simulated_restore_deny_pending_logins() {
     assert!(!f.consumed(&restored).await);
     // New logins after reopening work with the rotated key.
     let fresh = restarted
-        .begin(&mut f.api, &rotated, Duration::from_secs(60))
+        .begin(&mut f.api, &rotated, Duration::from_secs(60), None)
         .await
         .unwrap();
     f.arm(&fresh);
@@ -539,7 +548,7 @@ async fn release_linearizes_at_the_authority_read_snapshot() {
     assert_eq!(result.unwrap().subject(), "synthetic-subject");
     // The next authority read observes it.
     assert_eq!(
-        p.begin(&mut f.api, &keys(), Duration::from_secs(60))
+        p.begin(&mut f.api, &keys(), Duration::from_secs(60), None)
             .await
             .unwrap_err(),
         login::Error::Rejected
@@ -693,7 +702,7 @@ async fn operator_writers_serialize_in_commit_order() {
         assert!(waiting_epoch > held_epoch);
         let result = h
             .provider
-            .begin(&mut api, &keys(), Duration::from_secs(60))
+            .begin(&mut api, &keys(), Duration::from_secs(60), None)
             .await;
         assert_eq!(result.is_ok(), active);
     }
@@ -755,7 +764,7 @@ async fn operator_writers_serialize_in_commit_order() {
     assert!(!is_current(&mut first, behind).await);
     first.execute("ROLLBACK").await.unwrap();
     h.provider
-        .begin(&mut api, &keys(), Duration::from_secs(60))
+        .begin(&mut api, &keys(), Duration::from_secs(60), None)
         .await
         .unwrap();
     // Documented repair: advance the allocator past every row, then append normally.
@@ -766,7 +775,7 @@ async fn operator_writers_serialize_in_commit_order() {
     assert!(write(&mut first, None).await > 1000000);
     assert!(
         h.provider
-            .begin(&mut api, &keys(), Duration::from_secs(60))
+            .begin(&mut api, &keys(), Duration::from_secs(60), None)
             .await
             .is_err()
     );

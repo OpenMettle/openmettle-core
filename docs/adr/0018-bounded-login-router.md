@@ -3,6 +3,9 @@
 Status: proposed V1-04 implementation contract, 18 November 2026.
 Refs #5; Refs #34. Independent review and CI acceptance are separate gates. #5 remains open.
 
+[ADR 0022](0022-home-invitation-codes.md) lets the initiation route accept one small form
+body. See [the amendment](#amendment-initiation-form-body-adr-0022) below.
+
 ## Problem
 
 ADR 0017 added `LoginHandoff`, which turns one request head into one response. Nothing
@@ -138,6 +141,49 @@ These use the handoff's response builder: `Cache-Control: no-store`,
 retry time, a count or a request value. Every other response is the handoff's own (ADR
 0017). An unrouted path gets the host router's fallback. Standalone, that is Axum's empty
 `404`.
+
+### Amendment: initiation form body (ADR 0022)
+
+The initiation route accepts a second body profile, so that an HTML form can carry the
+invitation code field. This replaces "Empty only" in the bounds table and "The body is never
+polled" in the request order, for the initiation route alone. The callback, session and
+logout routes still require the empty profile.
+
+| Profile | Rule |
+| --- | --- |
+| Empty | Unchanged: no `Transfer-Encoding`, every `Content-Length` equal to `0`, parsed size zero |
+| Form | No `Transfer-Encoding`; exactly one `Content-Type` equal to `application/x-www-form-urlencoded`, compared without case and with no parameter; exactly one `Content-Length` of 1–256 in plain decimal; a parsed body whose exact size is that length |
+
+The profile is still decided in step 2 from request metadata. A body outside both profiles
+is `413` with the existing line. That includes a chunked body, a declared length over 256, a
+repeated `Content-Type` or `Content-Length` and any other media type. Nothing is read and
+nothing is spent.
+
+A declared form is kept unread through steps 3 and 4. Step 5 then reads it before calling
+the handoff, while the request holds its in-flight permit:
+
+- at most 256 bytes, the declared length;
+- within 2 seconds (`FORM_READ_TIMEOUT`), measured from the start of the read;
+- a body that does not arrive completely in that time, or whose size differs from the
+  declared length, is `408`. The handoff is not called.
+
+The rate unit spent in step 4 is not refunded, however the read ends.
+
+| Status | Fixed line | Cause |
+| --- | --- | --- |
+| `408` | `login request body not received` | A declared initiation form did not arrive within 2 seconds |
+
+The handoff's own `400` form refusal is described in
+[ADR 0017](0017-browser-login-handoff.md#amendment-invitation-code-field-adr-0022).
+
+**Limits added.** A stalled form holds one in-flight permit for up to 2 seconds. The cap
+bounds how many wait at once, and each has spent a rate unit. The 256-byte ceiling limits
+what the router reads, not what the HTTP server buffers while parsing. A request refused
+before its body is read leaves that body to the HTTP server, which may close the connection.
+
+New public item: `router::FORM_READ_TIMEOUT`. Evidence is listed in ADR 0022. Mutating the
+router to read the form before taking the permit, or to read it without the timeout, makes
+the dispatch test fail.
 
 ### Mounting rules
 

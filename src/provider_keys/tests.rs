@@ -265,6 +265,8 @@ async fn cold_start_and_one_post_with_unknown_key_refresh() {
         .await
         .unwrap();
     assert_eq!(format!("{exchanged:?}"), "ExchangedIdentity(..)");
+    // A login that sealed no invitation code yields a proof without one.
+    assert!(exchanged.invitation.is_none());
     let identity = finish_in_memory(&h.provider, exchanged).unwrap();
     assert_eq!(identity.subject(), "synthetic-subject");
     assert_eq!(h.count(), 5);
@@ -306,6 +308,29 @@ async fn managed_exchange_preserves_signed_membership_and_never_resolves_overage
         );
     }
     assert_eq!(h.count(), 4); // Discovery, JWKS, and one token POST per permit.
+}
+/// The invitation code sealed with a login travels from its permit to the sealed proof
+/// (ADR 0022). Neither value shows it in debug output.
+#[tokio::test]
+async fn managed_exchange_carries_the_sealed_invitation_code_to_the_proof() {
+    let h = Harness::new().await;
+    h.provider.preflight().await.unwrap();
+    h.script.lock().unwrap().token = signing::signed(
+        &"n".repeat(43),
+        signing::ISSUER,
+        signing::CLIENT,
+        1799999990,
+    );
+    let mut permit = h.permit();
+    permit.invitation = crate::invitation::InvitationCode::parse(&"5a".repeat(16));
+    assert_eq!(format!("{permit:?}"), "ExchangePermit(..)");
+    let proof = permit
+        .exchange_with_keys(&h.provider, &auth::Policy::default())
+        .await
+        .unwrap();
+    let carried = proof.invitation.as_ref().map(|code| *code.bytes());
+    assert_eq!(carried, Some([0x5a; 16]));
+    assert_eq!(format!("{proof:?}"), "ExchangedIdentity(..)");
 }
 #[tokio::test]
 async fn successful_replacements_retire_removed_and_noncacheable_keys() {

@@ -46,6 +46,7 @@ async fn begin(db: &TestDb, p: &Provider) -> Started {
         p,
         &keys(),
         Duration::from_secs(60),
+        None,
     )
     .await
     .unwrap()
@@ -174,7 +175,7 @@ async fn reservation_commit_uncertainty_and_consumption_cancellation() {
     let mut cn = PgConnection::connect_with(&options).await.unwrap();
     cancel_at_response(
         &mut barrier,
-        login::begin(&mut cn, &p, &keys(), Duration::from_secs(60)),
+        login::begin(&mut cn, &p, &keys(), Duration::from_secs(60), None),
     )
     .await;
     drop(cn);
@@ -227,6 +228,7 @@ async fn expiry_is_observed_after_waiting_for_row_lock() {
         &p,
         &keys(),
         Duration::from_secs(1),
+        None,
     )
     .await
     .unwrap();
@@ -319,6 +321,7 @@ async fn authenticated_row_tampering_cannot_consume_login() {
                     &p,
                     &KeyRing::new(vec![("test-v2".into(), [8; 32])]).unwrap(),
                     Duration::from_secs(60),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -577,7 +580,8 @@ async fn failed_begin_retains_reserved_nonce_without_partial_transaction() {
             &mut connect(&db.0, API).await,
             &p,
             &keys(),
-            Duration::from_secs(60)
+            Duration::from_secs(60),
+            None
         )
         .await
         .is_err()

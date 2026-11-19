@@ -161,12 +161,12 @@ async fn initiation_decides_method_and_origin_before_the_service() {
     let handoff = LoginHandoff::new(service(&h, pool), settings()).unwrap();
     let form = request("POST", "/login", &[("origin", ORIGIN)]);
     // Route handlers need Send futures.
-    service::assert_send(&handoff.initiate(&form));
+    service::assert_send(&handoff.initiate(&form, b""));
     service::assert_send(&handoff.callback(&form));
 
     for method in ["GET", "HEAD", "PUT", "DELETE", "OPTIONS"] {
         let response = handoff
-            .initiate(&request(method, "/login", &[("origin", ORIGIN)]))
+            .initiate(&request(method, "/login", &[("origin", ORIGIN)]), b"")
             .await;
         refused(
             &response,
@@ -196,7 +196,9 @@ async fn initiation_decides_method_and_origin_before_the_service() {
             ("referer", "https://app.example.test/"),
         ];
         headers.extend(origins.iter().map(|origin| ("origin", *origin)));
-        let response = handoff.initiate(&request("POST", "/login", &headers)).await;
+        let response = handoff
+            .initiate(&request("POST", "/login", &headers), b"")
+            .await;
         refused(&response, StatusCode::FORBIDDEN, "login origin refused\n");
     }
     assert_eq!(h.count(), 0);
@@ -204,10 +206,67 @@ async fn initiation_decides_method_and_origin_before_the_service() {
 
     // The admissible form POST is the one request that reaches the service: both provider
     // documents, then a checkout. The stand-in never answers, so nothing is delivered.
-    let response = handoff.initiate(&form).await;
+    let response = handoff.initiate(&form, b"").await;
     refused(&response, StatusCode::SERVICE_UNAVAILABLE, UNAVAILABLE);
     assert_eq!(h.count(), 2);
     assert!(attempted());
+}
+
+/// The initiation form (ADR 0022) is decided after `Origin` and before the service. A
+/// malformed form reaches neither the provider nor the database.
+#[tokio::test]
+async fn initiation_decides_the_form_after_origin_and_before_the_service() {
+    use super::router::{CODE, FORM_REFUSED};
+    let (database, pool) = service::silent_database();
+    let attempted = || database.accept().is_ok();
+    let h = Harness::new().await;
+    let handoff = LoginHandoff::new(service(&h, pool), settings()).unwrap();
+    let form = request("POST", "/login", &[("origin", ORIGIN)]);
+    let valid = format!("invitation_code={CODE}");
+    let malformed: [&[u8]; 7] = [
+        b"x=1",
+        b"invitation_code",
+        b"invitation_code=not-a-code",
+        b"invitation_code=0123",
+        b"invitation_code=%zz",
+        b"invitation_code=\xff",
+        &[valid.as_bytes(), b"&", valid.as_bytes()].concat(),
+    ];
+
+    // Method, then Origin, whatever the body holds: a foreign page gets the origin refusal
+    // for a valid and for a malformed form alike.
+    for body in malformed.into_iter().chain([valid.as_bytes()]) {
+        let response = handoff
+            .initiate(&request("GET", "/login", &[("origin", ORIGIN)]), body)
+            .await;
+        refused(
+            &response,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed\n",
+        );
+        for origins in [&[][..], &[("origin", "https://other.example.test")]] {
+            let response = handoff
+                .initiate(&request("POST", "/login", origins), body)
+                .await;
+            refused(&response, StatusCode::FORBIDDEN, "login origin refused\n");
+        }
+    }
+    // From the application origin, every malformed form is the one fixed refusal.
+    for body in malformed {
+        let response = handoff.initiate(&form, body).await;
+        refused(&response, StatusCode::BAD_REQUEST, FORM_REFUSED);
+    }
+    assert_eq!(h.count(), 0);
+    assert!(!attempted());
+
+    // A well-formed code is not checked against any invitation here. It reaches the service
+    // exactly as an empty value and an empty body do, with the same response.
+    for body in [valid.as_bytes(), b"invitation_code=", b""] {
+        let response = handoff.initiate(&form, body).await;
+        refused(&response, StatusCode::SERVICE_UNAVAILABLE, UNAVAILABLE);
+        assert!(attempted());
+    }
+    assert_eq!(h.count(), 2);
 }
 
 #[tokio::test]

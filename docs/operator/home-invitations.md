@@ -4,7 +4,7 @@ An operator can approve first-account creation for one named OIDC principal. The
 
 Invitations are migration 12, applied after project membership (migration 11). Invitation codes are migration 13. The schema suite upgrades populated databases migrated by the authentic membership (v11) and invitation (v12) binaries and checks that those binaries then refuse the newer schema. An invitation-created approval can be enrolled in and withdrawn from [project membership](../adr/0021-project-membership.md) like any other approval. Its first sign-in creates no membership, because no enrollment can exist before the approval does.
 
-The database requires the code from schema 13. No sign-in route accepts a code yet, so a first sign-in cannot complete until the browser start route carries it. Native sign-in follows in a later block. The managed session consumer is internal and the browser routes remain unmounted.
+The database requires the code from schema 13. The browser sign-in form carries it in one optional field, `invitation_code`, submitted with the form `POST` that starts the sign-in ([ADR 0022](../adr/0022-home-invitation-codes.md)). Native sign-in does not accept a code yet, so a first sign-in from a native app is refused until a later block adds it. The managed session consumer is internal and the browser routes remain unmounted.
 
 ## Before upgrading to schema 13
 
@@ -21,7 +21,7 @@ Migration 13 refuses to run while any invitation is pending. Schema 12 issued in
 3. Run the migration.
 4. Invite each person again with a new invitation UUID. Deliver the new code.
 
-Redeemed and withdrawn invitations are kept unchanged and have no code. During a rolling update, replicas from the previous release cannot redeem an invitation on schema 13, so first sign-ins are refused until every replica is updated. Sign-in for existing users continues.
+Redeemed and withdrawn invitations are kept unchanged and have no code. During a rolling update, replicas from the previous release cannot redeem an invitation on schema 13, so first sign-ins are refused until every replica is updated. Sign-in for existing users continues, with one exception: a previous-release replica cannot complete a sign-in that an updated replica started, and the person must start again. A sign-in started before the update completes on an updated replica.
 
 ## Identify the person and authorize the window
 
@@ -87,8 +87,11 @@ The code is 128 random bits, generated in the database inside the create transac
 - **Deliver it privately** to the invited person over a channel you trust for a password. Anyone who has the code and can sign in to the provider as the invited subject can create the account.
 - **Record only the first output line.** Keep the code line out of tickets, change records, chat, CI output, shell history and terminal recordings.
 - **Single use.** The code works only while the invitation is pending, before `redeem_before_ms`. It has no separate expiry. Redemption or withdrawal ends it.
+- **Entered when sign-in starts.** The person types or pastes the code into the sign-in form before they are sent to the provider. It is not asked for again afterwards.
 - **Entry is forgiving.** The person may type it in upper or lower case, with or without the `omh1-` prefix, hyphens and spaces.
+- **A mistyped code is caught in two places.** A code of the wrong length or with other characters is refused at once with `login request refused`, before the provider is contacted. A well-formed but wrong code is refused only after the provider sign-in, with the same `login refused. Start a new login.` message as any other refused sign-in. Neither message says whether an invitation exists.
 - **No lockout.** A wrong code refuses that sign-in and leaves the invitation pending. The person starts a new sign-in and enters the correct code.
+- **Ignored for existing accounts.** Once the account exists, a code entered at sign-in is ignored.
 
 To share the code as a QR image, encode the bare code text only. Generate the image locally and offline, for example `qrencode -t ANSIUTF8` reading the code from standard input in the same unrecorded terminal. Never encode a sign-in URL that contains the code, and never use an online QR generator: the code must not appear in URLs, `Referer` headers or another service's logs.
 
@@ -115,6 +118,8 @@ SELECT id, provider_id, provider_generation, provider_epoch, issuer, subject, cr
 
 ## Database trust boundary
 
+The code reaches the database by one path. The sign-in form submits it, the API seals it with the login's PKCE verifier (AES-256-GCM under the login key ring), and the callback opens it and passes it to the redemption function. Every stored login ciphertext has the same length, so a row does not show whether a code was entered, and the ciphertext is cleared when the login is consumed.
+
 Only the managed consumer accepts the sealed online proof. It locks the originating login and provider and checks the proof binding and authority before looking up the identity. An existing identity always follows ordinary approval checks, and a code presented with it is ignored. For an absent identity without a code, the consumer refuses without calling the database function. For an absent identity with a code, it calls the owner-defined redemption function. The API can execute this one function and has no table privilege on invitations. The function fixes its search path and uses schema-qualified tables.
 
 The function inserts fresh records only when all of these hold:
@@ -128,14 +133,23 @@ The function inserts fresh records only when all of these hold:
 
 A wrong code is handled exactly like a missing invitation: no invitation row is locked and nothing is written. A global issuer/subject uniqueness conflict rolls back the attempted creation. The caller cannot set the new account ID, choose the approval expiry, restore an approval or change invitation provenance.
 
-The database cannot verify an OIDC proof. It trusts the application to do so, as it does for ordinary session issuance. The API role already inserts login rows with their binding, marks them consumed and session-issued, and inserts session rows. A principal that can run arbitrary SQL as the API role can therefore fabricate everything the function checks except the code. Examples are a holder of the API's database credentials or of a SQL injection in the API. Without the code it cannot redeem an invitation: the API role cannot read `code_hash`, no function returns it, and the code-less function of schema 12 no longer exists. Guessing a 128-bit code is not feasible. The same principal can still issue sessions for any approved existing identity, which [#73](https://github.com/OpenMettle/openmettle-core/issues/73) tracks.
+The database cannot verify an OIDC proof. It trusts the application to do so, as it does for ordinary session issuance. The API role already inserts login rows with their binding, marks them consumed and session-issued, and inserts session rows. A principal that can run arbitrary SQL as the API role can therefore fabricate everything the function checks except the code. Examples are a holder of the API's database credentials or of a SQL injection in the API. Without the code it cannot redeem an invitation, so this boundary is closed for a principal limited to API-role SQL:
+
+- The API role cannot read `code_hash`, and no function returns it.
+- The code-less function of schema 12 no longer exists.
+- A code that a person has entered is stored only as ciphertext in the login row, under a key ring the database does not hold, and only until that login is consumed.
+- Guessing a 128-bit code is not feasible.
+
+The same principal can still issue sessions for any approved existing identity, which [#73](https://github.com/OpenMettle/openmettle-core/issues/73) tracks.
 
 These remain trusted with the code:
 
-- the invited person and the device they sign in from;
+- the invited person, their browser and the device they sign in from;
 - the channel that delivers the code;
 - the terminal and operator that ran the create command;
-- the API process, which holds the code in memory while it completes the sign-in;
+- the ingress or proxy that terminates TLS for the application. The code travels in the body of the sign-in form `POST`. Do not log request bodies for the sign-in start path, and treat any capture of them as secret;
+- the API process, which holds the code in memory while it starts and completes the sign-in;
+- anyone who holds both the login key ring and read access to the login table, for an unconsumed login's lifetime (at most 600 seconds);
 - the database owner and anyone who can read the database server's logs. The API passes the code to the redemption function as a bind parameter. A server that logs statements with their parameters records those bytes: `log_statement` or `log_min_duration_statement` unless `log_parameter_max_length` is `0`, and failed statements when `log_parameter_max_length_on_error` is not `0`. Disable parameter logging for the API role or treat those logs as secret.
 
 A leaked code alone creates no account. Redemption still needs a consumed login for the exact subject under the current provider epoch. Keep redemption windows short and withdraw invitations that are no longer needed.

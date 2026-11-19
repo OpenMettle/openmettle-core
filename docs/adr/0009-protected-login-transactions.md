@@ -3,6 +3,10 @@
 Status: coordinator-approved development contract, 17 November 2026. V1-04 core #5;
 sprint #34. Implementation and independent qualification are separate gates.
 
+[ADR 0022](0022-home-invitation-codes.md) adds a second sealed format that also carries an
+optional home invitation code. See [the amendment](#amendment-sealed-format-aes256gcm-v2-adr-0022)
+below. The original increment follows.
+
 ## Boundary
 
 `src/login.rs` provides executable internal browser login initiation, durable callback
@@ -105,6 +109,33 @@ ciphertext. Single-use consumption is enforced by the helper, not a database tri
 Secrets and permits redact Debug; errors are fixed enums. Memory zeroization, swap and
 core-dump protection are not claimed. URLs, callbacks, bodies and secret wrappers must
 not be logged by future callers or transports.
+
+### Amendment: sealed format `aes256gcm-v2` (ADR 0022)
+
+From migration 13, `begin` seals in a second format. It replaces the statements above that
+the verifier is the only encrypted value and that ciphertext is exactly 59 bytes.
+
+| Format | Authenticated-data domain | Plaintext | Ciphertext | Use |
+| --- | --- | --- | --- | --- |
+| `aes256gcm-v1` | `openmettle/login/1` | verifier (43) | 59 bytes | Opened only, for logins started before migration 13 |
+| `aes256gcm-v2` | `openmettle/login/2` | verifier (43) ‖ flag (1) ‖ invitation code (16) | 76 bytes | Written by every `begin` |
+
+- The flag is `1` when the person entered an invitation code and `0` otherwise. Without a
+  code the 16 code bytes are zero, so the length does not show whether a code was entered.
+- The authenticated data has the same fields in the same framing. The domain and the format
+  label differ, so a ciphertext of one format never opens as the other.
+- `consume` selects the format by ciphertext length. Any other length, a failed tag, a
+  malformed verifier, an unknown flag and code bytes without the flag are `Protection`.
+  There is still no negotiation and no plaintext fallback.
+- The database check admits 59 or 76 bytes. Consumption still clears the ciphertext.
+- The permit carries the opened code in memory, with the same redacted `Debug` output. Only
+  first-account redemption reads it.
+- Nonce reservation, key rotation and the restore rules are unchanged and apply to both
+  formats. A later migration removes 59-byte acceptance.
+
+The statement of what protection covers is unchanged. In addition, a holder of both the key
+ring and read access to `login_transactions` can read an unconsumed login's invitation code
+during the login lifetime.
 
 ## Consumption and failures
 

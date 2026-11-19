@@ -2,6 +2,7 @@
 pub(crate) mod documents;
 use crate::{
     auth::{self, ExpectedNonceDigest, ProviderIdentity, UnverifiedIdToken, VerifiedIdentity},
+    invitation::InvitationCode,
     login,
     provider_http::{ProviderDocuments, ProviderTransport, Trust},
 };
@@ -651,17 +652,19 @@ impl ManagedProvider {
         }
         Ok(())
     }
+    /// `invitation` is the code the person entered for a first sign-in, if any (ADR 0022).
     pub async fn begin(
         &self,
         connection: &mut sqlx::PgConnection,
         keys: &login::KeyRing,
         lifetime: Duration,
+        invitation: Option<&InvitationCode>,
     ) -> Result<login::Started, login::Error> {
         let (_admission, deadline) = self.login_phase()?;
         tokio::time::timeout_at(deadline, async {
             self.fresh().await?;
             let p = self.login_provider(deadline)?;
-            let started = login::begin(connection, &p, keys, lifetime).await?;
+            let started = login::begin(connection, &p, keys, lifetime, invitation).await?;
             self.confirm(deadline)?;
             Ok(started)
         })
@@ -690,7 +693,7 @@ impl ManagedProvider {
     /// `release` rechecks committed authority and in-memory generations.
     pub(crate) async fn exchange(
         &self,
-        permit: login::ExchangePermit,
+        mut permit: login::ExchangePermit,
         policy: &auth::Policy,
     ) -> Result<ExchangedIdentity, login::Error> {
         let _admission = self.admission().map_err(|_| login::Error::Rejected)?;
@@ -706,6 +709,7 @@ impl ManagedProvider {
             }
             // No await between active-config check and starting the one permitted token POST.
             let origin = permit.origin.clone();
+            let invitation = permit.invitation.take();
             let (token, nonce) = permit.request_token(&c.token).await?;
             let (key_generation, assertion) = self
                 .verify(&token, &nonce, policy)
@@ -713,7 +717,7 @@ impl ManagedProvider {
                 .map_err(|_| login::Error::Verification)?;
             Ok(ExchangedIdentity {
                 origin,
-                invitation: None,
+                invitation,
                 entry: self.entry.clone(),
                 generation: self.generation,
                 key_generation,
@@ -861,9 +865,9 @@ impl ManagedProvider {
 /// converts it after authority checks; `issue_session` consumes it under local approval.
 pub struct ExchangedIdentity {
     origin: Option<login::LoginOrigin>,
-    // The invitation code for first-account redemption (ADR 0022). No login start accepts a
-    // code yet, so this is always absent and a first sign-in is refused.
-    invitation: Option<crate::invitation::InvitationCode>,
+    // The invitation code sealed with the originating login, if the person entered one. It
+    // is passed only to first-account redemption (ADR 0022).
+    invitation: Option<InvitationCode>,
     entry: Arc<Entry>,
     generation: u64,
     key_generation: u64,
