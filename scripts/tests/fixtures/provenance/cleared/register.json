@@ -231,7 +231,11 @@
       },
       "tracking": [
         "FIXTURE"
-      ]
+      ],
+      "redistribution": {
+        "assessment": "redistributable",
+        "basis": "Synthetic recorded licence."
+      }
     },
     {
       "id": "fixture-excluded",
@@ -263,7 +267,11 @@
       "exclusion_reason": "Synthetic exclusion.",
       "tracking": [
         "FIXTURE"
-      ]
+      ],
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "Synthetic; no licence evidence."
+      }
     }
   ]
 }

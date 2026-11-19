@@ -1,12 +1,21 @@
 {
   "schema_version": 1,
   "distribution_boundary": {
-    "status": "undefined",
-    "description": "No accepted decision yet states which components an OpenMettle distribution ships (core binaries only, container images, Helm-referenced images, curated forks or model artifacts). Until the owner defines it, every candidate component blocks distribution readiness.",
+    "status": "defined",
+    "description": "Owner decision of 19 November 2026. Distributed: the source code in the public OpenMettle repositories and the Helm chart in openmettle-deploy. Not distributed yet: built container images (including the core api, worker and migrate images), re-hosted third-party images, curated forks and model weights. Third-party images are referenced only at their publishers' locations. Long-term direction: distribute everything needed to run OpenMettle, eventually as an Arch Linux distribution with everything preinstalled except components whose licences do not allow redistribution. Each widening of the boundary is a separate owner decision; publishing the core images (V1-36) is the likely next one.",
     "tracking": [
       "V1-42",
       "V1-36"
-    ]
+    ],
+    "review": {
+      "status": "reviewed",
+      "reviewer": "OpenMettle owner (GitHub Drgr33nSenior)",
+      "date": "2026-11-19",
+      "evidence": [
+        "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7005620131"
+      ],
+      "notes": "Recorded by an agent from the owner's decision comment. It defines distribution scope only; it is not a licence review or legal clearance."
+    }
   },
   "review_groups": {
     "core": {
@@ -18,52 +27,112 @@
       ]
     },
     "graphiti": {
-      "status": "pending",
+      "status": "excluded",
       "summary": "Graphiti library, its Python lock and the memory-service image, reviewed separately from the graph database.",
       "tracking": [
         "V1-23",
         "V1-42"
-      ]
+      ],
+      "exclusion_reason": "Not distributed under the 19 Nov 2026 boundary: graphiti-core and its Python dependencies would ship only inside the memory-service image, and built container images are not distributed.",
+      "review": {
+        "status": "reviewed",
+        "reviewer": "OpenMettle owner (GitHub Drgr33nSenior)",
+        "date": "2026-11-19",
+        "evidence": [
+          "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7005620131"
+        ],
+        "notes": "Disposition recorded by an agent from the owner's boundary decision. The group's licence review is still required before the boundary widens to include it."
+      }
     },
     "database": {
-      "status": "pending",
+      "status": "excluded",
       "summary": "PostgreSQL, Neo4j Community and experimental graph databases. Neo4j Community is recorded by the baseline as GPLv3 and needs its own corresponding-source review. HelixDB experimentation does not clear the stack.",
       "tracking": [
         "V1-02",
         "V1-23",
         "V1-37",
         "V1-42"
-      ]
+      ],
+      "exclusion_reason": "Not distributed under the 19 Nov 2026 boundary: the PostgreSQL and Neo4j Community images are third-party images referenced only at their publishers' locations, and HelixDB is an unadopted experiment.",
+      "review": {
+        "status": "reviewed",
+        "reviewer": "OpenMettle owner (GitHub Drgr33nSenior)",
+        "date": "2026-11-19",
+        "evidence": [
+          "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7005620131"
+        ],
+        "notes": "Disposition recorded by an agent from the owner's boundary decision. The group's licence review is still required before the boundary widens to include it."
+      }
     },
     "sandbox": {
-      "status": "pending",
+      "status": "excluded",
       "summary": "Agent Sandbox controller, sandboxd and gVisor. Versions are not pinned yet. The restrictive Open WebUI Terminals controller is excluded.",
       "tracking": [
         "V1-27",
         "V1-42"
-      ]
+      ],
+      "exclusion_reason": "Not distributed under the 19 Nov 2026 boundary: the Agent Sandbox controller, sandboxd and gVisor are third-party components referenced at their publishers' locations, and the Open WebUI Terminals controller and Open Terminal are excluded by the agreed sandbox direction.",
+      "review": {
+        "status": "reviewed",
+        "reviewer": "OpenMettle owner (GitHub Drgr33nSenior)",
+        "date": "2026-11-19",
+        "evidence": [
+          "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7005620131"
+        ],
+        "notes": "Disposition recorded by an agent from the owner's boundary decision. The group's licence review is still required before the boundary widens to include it."
+      }
     },
     "serving": {
-      "status": "pending",
+      "status": "excluded",
       "summary": "Curated SGLang fork, serving-fork evidence repository, serving images, embedding/reranking images and served model weights.",
       "tracking": [
         "V1-42"
-      ]
+      ],
+      "exclusion_reason": "Not distributed under the 19 Nov 2026 boundary: curated forks, built serving images and model weights are not distributed, and the Text Embeddings Inference image is referenced only at its publisher's location.",
+      "review": {
+        "status": "reviewed",
+        "reviewer": "OpenMettle owner (GitHub Drgr33nSenior)",
+        "date": "2026-11-19",
+        "evidence": [
+          "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7005620131"
+        ],
+        "notes": "Disposition recorded by an agent from the owner's boundary decision. The group's licence review is still required before the boundary widens to include it."
+      }
     },
     "media": {
-      "status": "pending",
+      "status": "excluded",
       "summary": "Image/video generation services, adapters and media model weights. No version, image or model pins are recorded in this repository.",
       "tracking": [
         "V1-21",
         "V1-42"
-      ]
+      ],
+      "exclusion_reason": "Not distributed under the 19 Nov 2026 boundary: the existing media services and adapters are not part of the openmettle-core source, and media model weights are not distributed.",
+      "review": {
+        "status": "reviewed",
+        "reviewer": "OpenMettle owner (GitHub Drgr33nSenior)",
+        "date": "2026-11-19",
+        "evidence": [
+          "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7005620131"
+        ],
+        "notes": "Disposition recorded by an agent from the owner's boundary decision. The group's licence review is still required before the boundary widens to include it."
+      }
     },
     "application-fork": {
-      "status": "pending",
+      "status": "excluded",
       "summary": "The Open WebUI fork is source evidence only and is not distributed. Translating its code into another language does not by itself make an independent implementation. The local coding agent (ACP) is a separate repository with its own licence and NOTICE.",
       "tracking": [
         "V1-42"
-      ]
+      ],
+      "exclusion_reason": "Nothing in this group is distributed from openmettle-core under the 19 Nov 2026 boundary: the Open WebUI fork is a curated fork kept as source evidence only, and openmettle-acp is distributed as source by its own public repository with its own LICENSE and NOTICE.",
+      "review": {
+        "status": "reviewed",
+        "reviewer": "OpenMettle owner (GitHub Drgr33nSenior)",
+        "date": "2026-11-19",
+        "evidence": [
+          "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7005620131"
+        ],
+        "notes": "Disposition recorded by an agent from the owner's boundary decision. The group's licence review is still required before the boundary widens to include it."
+      }
     }
   },
   "cargo_reviews": [
@@ -81,12 +150,12 @@
         ]
       },
       "notices": {
-        "status": "pending",
+        "status": "recorded",
         "files": [
           "LICENSE"
         ],
         "obligations": [
-          "Retain the MIT copyright and permission notice from LICENSE in source and binary distributions."
+          "Retain the MIT copyright notice 'Copyright (c) 2026 OpenMettle contributors' and the permission notice from LICENSE in source and binary distributions."
         ]
       },
       "review": {
@@ -94,7 +163,7 @@
         "reviewer": null,
         "date": null,
         "evidence": [],
-        "notes": "First-party workspace package. UPSTREAM.md records it as authored for OpenMettle with the MIT starter retained. An owner review of the final V1-01 sources is still required."
+        "notes": "First-party workspace package, distributed as public source under the 19 Nov 2026 boundary. UPSTREAM.md records it as authored for OpenMettle with the MIT starter retained. An owner review of the sources is still required."
       }
     }
   ],
@@ -109,7 +178,8 @@
       "pin": "git:eb327e329929a054fde30c75c2cfd7e862057040",
       "origin": "https://github.com/OpenMettle/repository-template",
       "source_evidence": [
-        "UPSTREAM.md"
+        "UPSTREAM.md",
+        "LICENSE is byte-identical to OpenMettle/repository-template LICENSE at eb327e329929a054fde30c75c2cfd7e862057040 (compared read-only on 2026-11-19)"
       ],
       "licence": {
         "expression": "MIT",
@@ -119,12 +189,12 @@
         ]
       },
       "notices": {
-        "status": "pending",
+        "status": "recorded",
         "files": [
           "LICENSE"
         ],
         "obligations": [
-          "Retain the MIT notice."
+          "Retain the MIT copyright notice 'Copyright (c) 2026 OpenMettle contributors' and the permission notice from LICENSE in all copies or substantial portions."
         ]
       },
       "review": {
@@ -132,11 +202,15 @@
         "reviewer": null,
         "date": null,
         "evidence": [],
-        "notes": "Licence is as recorded in UPSTREAM.md; awaiting owner review."
+        "notes": "Licence is as recorded in UPSTREAM.md. LICENSE is the retained starter licence, including its copyright line. Distributed as public openmettle-core source under the 19 Nov 2026 boundary; awaiting owner review."
       },
       "tracking": [
         "V1-42"
-      ]
+      ],
+      "redistribution": {
+        "assessment": "redistributable",
+        "basis": "MIT recorded from UPSTREAM.md and LICENSE; MIT permits redistribution with the copyright and permission notice."
+      }
     },
     {
       "id": "rust-toolchain",
@@ -169,7 +243,12 @@
       "tracking": [
         "V1-01",
         "V1-42"
-      ]
+      ],
+      "exclusion_reason": "CI or test tooling: never part of a distribution, and outside the 19 Nov 2026 boundary. Standard-library code linked into binaries ships with the core images once they are published (V1-36).",
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "No licence evidence is recorded in this register."
+      }
     },
     {
       "id": "rust-build-image",
@@ -201,14 +280,19 @@
       },
       "tracking": [
         "V1-01"
-      ]
+      ],
+      "exclusion_reason": "Build stage only: never part of a distribution, and outside the 19 Nov 2026 boundary.",
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "No licence evidence is recorded in this register."
+      }
     },
     {
       "id": "debian-runtime-image",
       "name": "Debian runtime base image",
       "kind": "container-image",
       "review_group": "core",
-      "distribution": "candidate",
+      "distribution": "excluded",
       "version": "bookworm-slim",
       "pin": "sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc",
       "origin": "docker.io/library/debian",
@@ -233,7 +317,12 @@
       },
       "tracking": [
         "V1-01"
-      ]
+      ],
+      "exclusion_reason": "Base layer of the built core api and worker images, which are not distributed under the 19 Nov 2026 boundary. It becomes shipped content when the core images are published (V1-36).",
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "No licence evidence is recorded in this register. Debian packages carry individual licences and no package inventory exists."
+      }
     },
     {
       "id": "postgresql-test-image",
@@ -265,14 +354,19 @@
       },
       "tracking": [
         "V1-01"
-      ]
+      ],
+      "exclusion_reason": "CI or test tooling: never part of a distribution, and outside the 19 Nov 2026 boundary.",
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "No licence evidence is recorded in this register. The runtime ADR names the PostgreSQL License for PostgreSQL itself, not for the image."
+      }
     },
     {
       "id": "graphiti-core",
       "name": "graphiti-core",
       "kind": "library",
       "review_group": "graphiti",
-      "distribution": "candidate",
+      "distribution": "excluded",
       "version": "0.31.2",
       "pin": "sha256:b26e1f350482266aec24beb1cd4c58d5e32ede1a897af8fa25b10800a16bbb8d",
       "origin": "https://pypi.org/project/graphiti-core/0.31.2/",
@@ -301,14 +395,19 @@
       },
       "tracking": [
         "V1-23"
-      ]
+      ],
+      "exclusion_reason": "Third-party Python library: it would ship only inside the memory-service image, which is not distributed under the 19 Nov 2026 boundary.",
+      "redistribution": {
+        "assessment": "redistributable",
+        "basis": "Apache-2.0 recorded from ARCHITECTURE-v1.md; Apache-2.0 permits redistribution with the licence, NOTICE attribution and modification notices retained. The transitive Python lock is unreviewed."
+      }
     },
     {
       "id": "neo4j-python-driver",
       "name": "neo4j (Python driver)",
       "kind": "library",
       "review_group": "graphiti",
-      "distribution": "candidate",
+      "distribution": "excluded",
       "version": "6.4.1",
       "pin": "sha256:f56a281c74355522fc2642df8919bec450115431531b8f3f6fe1cc17acb57a27",
       "origin": "https://pypi.org/project/neo4j/6.4.1/",
@@ -333,14 +432,19 @@
       },
       "tracking": [
         "V1-23"
-      ]
+      ],
+      "exclusion_reason": "Third-party Python library: it would ship only inside the memory-service image, which is not distributed under the 19 Nov 2026 boundary.",
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "No licence evidence is recorded in this register."
+      }
     },
     {
       "id": "graphiti-memory-image",
       "name": "Graphiti memory-service image",
       "kind": "container-image",
       "review_group": "graphiti",
-      "distribution": "candidate",
+      "distribution": "excluded",
       "version": null,
       "pin": null,
       "origin": null,
@@ -365,14 +469,19 @@
       },
       "tracking": [
         "V1-23"
-      ]
+      ],
+      "exclusion_reason": "Built container image: not distributed under the 19 Nov 2026 boundary.",
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "No licence evidence is recorded in this register."
+      }
     },
     {
       "id": "neo4j-community-image",
       "name": "Neo4j Community container image",
       "kind": "container-image",
       "review_group": "database",
-      "distribution": "candidate",
+      "distribution": "excluded",
       "version": "5.26.32-community",
       "pin": "sha256:42ef3ebfd671ebd01fdebb6dcbe80cf7b45eef2aa3d346ef4132f7ef31e67d2f",
       "origin": "docker.io/library/neo4j",
@@ -397,18 +506,23 @@
         "reviewer": null,
         "date": null,
         "evidence": [],
-        "notes": "The baseline records the GPLv3 licence. Whether OpenMettle redistributes this image or only references it depends on the undefined distribution boundary. The image's OS packages are not reviewed."
+        "notes": "The baseline records the GPLv3 licence. Under the 19 Nov 2026 boundary the image is referenced, not redistributed. Redistributing it later needs a corresponding-source compliance review. The image's OS packages are not reviewed."
       },
       "tracking": [
         "V1-23"
-      ]
+      ],
+      "exclusion_reason": "Third-party image: not distributed under the 19 Nov 2026 boundary; referenced only at its publisher's location.",
+      "redistribution": {
+        "assessment": "redistributable",
+        "basis": "GPL-3.0 recorded by ARCHITECTURE-v1.md for Neo4j Community. GPLv3 permits redistribution only with the corresponding source and licence; the image's OS packages are unreviewed."
+      }
     },
     {
       "id": "postgresql-image",
       "name": "PostgreSQL container image",
       "kind": "container-image",
       "review_group": "database",
-      "distribution": "candidate",
+      "distribution": "excluded",
       "version": "18.6-bookworm",
       "pin": "sha256:6b38fe68f2c02cafffbbce7496f76d110d8a947c039bd22c067e9a43c2250240",
       "origin": "docker.io/library/postgres",
@@ -434,7 +548,12 @@
       "tracking": [
         "V1-01",
         "V1-02"
-      ]
+      ],
+      "exclusion_reason": "Third-party image: not distributed under the 19 Nov 2026 boundary; referenced only at its publisher's location.",
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "No licence evidence is recorded in this register."
+      }
     },
     {
       "id": "helixdb",
@@ -468,14 +587,19 @@
       },
       "tracking": [
         "V1-37"
-      ]
+      ],
+      "exclusion_reason": "Experiment only (V1-37): not adopted, and outside the 19 Nov 2026 boundary.",
+      "redistribution": {
+        "assessment": "redistributable",
+        "basis": "Apache-2.0 recorded from ARCHITECTURE-v1.md for the unpinned project; recheck at any pinned version before adoption."
+      }
     },
     {
       "id": "agent-sandbox-controller",
       "name": "Kubernetes SIG Agent Sandbox controller",
       "kind": "service",
       "review_group": "sandbox",
-      "distribution": "candidate",
+      "distribution": "excluded",
       "version": null,
       "pin": null,
       "origin": "https://github.com/kubernetes-sigs/agent-sandbox",
@@ -502,14 +626,19 @@
       },
       "tracking": [
         "V1-27"
-      ]
+      ],
+      "exclusion_reason": "Third-party component: not distributed under the 19 Nov 2026 boundary; referenced only at its publisher's location.",
+      "redistribution": {
+        "assessment": "redistributable",
+        "basis": "Apache-2.0 recorded from ARCHITECTURE-v1.md for the unpinned project; recheck at the selected release and its bundled dependencies."
+      }
     },
     {
       "id": "sandboxd",
       "name": "sandboxd execution daemon",
       "kind": "service",
       "review_group": "sandbox",
-      "distribution": "candidate",
+      "distribution": "excluded",
       "version": null,
       "pin": null,
       "origin": "https://agent-sandbox.sigs.k8s.io/docs/api/runtime/",
@@ -534,14 +663,19 @@
       },
       "tracking": [
         "V1-27"
-      ]
+      ],
+      "exclusion_reason": "Third-party component: not distributed under the 19 Nov 2026 boundary; referenced only at its publisher's location.",
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "No licence evidence is recorded in this register."
+      }
     },
     {
       "id": "gvisor",
       "name": "gVisor (runsc)",
       "kind": "service",
       "review_group": "sandbox",
-      "distribution": "candidate",
+      "distribution": "excluded",
       "version": null,
       "pin": null,
       "origin": "https://github.com/google/gvisor",
@@ -564,11 +698,16 @@
         "reviewer": null,
         "date": null,
         "evidence": [],
-        "notes": "Operator-selected RuntimeClass. Whether OpenMettle ships it or requires the operator to install it is undecided."
+        "notes": "Operator-selected RuntimeClass; under the 19 Nov 2026 boundary OpenMettle does not ship it."
       },
       "tracking": [
         "V1-27"
-      ]
+      ],
+      "exclusion_reason": "Third-party runtime: not distributed under the 19 Nov 2026 boundary; the operator installs it as a RuntimeClass.",
+      "redistribution": {
+        "assessment": "redistributable",
+        "basis": "Apache-2.0 recorded from ARCHITECTURE-v1.md (the gVisor master LICENSE, unpinned); recheck at the selected release."
+      }
     },
     {
       "id": "open-webui-terminals",
@@ -604,7 +743,11 @@
       "exclusion_reason": "Agreed replacement direction (16 November 2026): the pinned licence restricts production use and redistribution.",
       "tracking": [
         "V1-27"
-      ]
+      ],
+      "redistribution": {
+        "assessment": "user-fetched",
+        "basis": "ARCHITECTURE-v1.md records that the pinned licence restricts production use and redistribution. It is being replaced, so it should not be fetched or shipped at all."
+      }
     },
     {
       "id": "open-terminal",
@@ -640,14 +783,18 @@
       "exclusion_reason": "The proposed replacement removes Open Terminal from the default server path.",
       "tracking": [
         "V1-27"
-      ]
+      ],
+      "redistribution": {
+        "assessment": "redistributable",
+        "basis": "MIT recorded from ARCHITECTURE-v1.md for the pinned revision; MIT permits redistribution with the copyright and permission notice. It is removed from the default server path."
+      }
     },
     {
       "id": "sglang-curated-fork",
       "name": "OpenMettle SGLang curated fork",
       "kind": "curated-fork",
       "review_group": "serving",
-      "distribution": "candidate",
+      "distribution": "excluded",
       "version": null,
       "pin": null,
       "origin": "https://github.com/OpenMettle/sglang",
@@ -676,14 +823,19 @@
       },
       "tracking": [
         "V1-42"
-      ]
+      ],
+      "exclusion_reason": "Curated fork: not distributed under the 19 Nov 2026 boundary.",
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "No licence evidence is recorded in this register. A LICENSE file was observed on an unreviewed branch, and LICENSES/ covers bundled third-party code."
+      }
     },
     {
       "id": "serving-fork-evidence",
       "name": "serving-fork evidence repository",
       "kind": "curated-fork",
       "review_group": "serving",
-      "distribution": "candidate",
+      "distribution": "excluded",
       "version": "8a53e9c2bf2837d4cd9296b18627067be98f27e8",
       "pin": "git:8a53e9c2bf2837d4cd9296b18627067be98f27e8",
       "origin": "serving-fork (SOURCE-REFERENCES.md alias)",
@@ -712,14 +864,19 @@
       },
       "tracking": [
         "V1-42"
-      ]
+      ],
+      "exclusion_reason": "Curated fork: not distributed under the 19 Nov 2026 boundary.",
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "No licence evidence is recorded in this register."
+      }
     },
     {
       "id": "sglang-serving-image",
       "name": "SGLang serving image",
       "kind": "container-image",
       "review_group": "serving",
-      "distribution": "candidate",
+      "distribution": "excluded",
       "version": null,
       "pin": "sha256:c9e4d0e0ea8818de29ccef4249119fc1c096d7a924b86c63567a6b9f9d5c3c8b",
       "origin": null,
@@ -744,14 +901,19 @@
       },
       "tracking": [
         "V1-42"
-      ]
+      ],
+      "exclusion_reason": "Built container image: not distributed under the 19 Nov 2026 boundary.",
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "No licence evidence is recorded in this register."
+      }
     },
     {
       "id": "text-embeddings-inference-image",
       "name": "Text Embeddings Inference CPU image",
       "kind": "container-image",
       "review_group": "serving",
-      "distribution": "candidate",
+      "distribution": "excluded",
       "version": "cpu-sha-da9a9ce",
       "pin": "sha256:50c39e698cda14212ea5bb0c17400ad3c72ee3432e03326a17dc8a096aeb9f33",
       "origin": "ghcr.io/huggingface/text-embeddings-inference",
@@ -776,14 +938,19 @@
       },
       "tracking": [
         "V1-42"
-      ]
+      ],
+      "exclusion_reason": "Third-party image: not distributed under the 19 Nov 2026 boundary; referenced only at its publisher's location.",
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "No licence evidence is recorded in this register."
+      }
     },
     {
       "id": "served-model-weights",
       "name": "Served chat, embedding and reranking model weights",
       "kind": "model",
       "review_group": "serving",
-      "distribution": "candidate",
+      "distribution": "excluded",
       "version": null,
       "pin": null,
       "origin": null,
@@ -802,18 +969,23 @@
         "reviewer": null,
         "date": null,
         "evidence": [],
-        "notes": "Model identities, revisions and licences are not recorded. Operator-downloaded weights may sit outside the distribution boundary, but that is undecided."
+        "notes": "Model identities, revisions and licences are not recorded. Model weights are outside the 19 Nov 2026 boundary."
       },
       "tracking": [
         "V1-42"
-      ]
+      ],
+      "exclusion_reason": "Model weights: not distributed under the 19 Nov 2026 boundary.",
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "No licence evidence is recorded in this register. Model identities and revisions are not recorded."
+      }
     },
     {
       "id": "media-generation-services",
       "name": "Image and video generation services and adapters",
       "kind": "service",
       "review_group": "media",
-      "distribution": "candidate",
+      "distribution": "excluded",
       "version": null,
       "pin": null,
       "origin": null,
@@ -838,14 +1010,19 @@
       },
       "tracking": [
         "V1-21"
-      ]
+      ],
+      "exclusion_reason": "Media services and adapters: not part of the openmettle-core source and not distributed under the 19 Nov 2026 boundary.",
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "No licence evidence is recorded in this register."
+      }
     },
     {
       "id": "media-model-weights",
       "name": "Image and video model weights",
       "kind": "model",
       "review_group": "media",
-      "distribution": "candidate",
+      "distribution": "excluded",
       "version": null,
       "pin": null,
       "origin": null,
@@ -868,7 +1045,12 @@
       },
       "tracking": [
         "V1-21"
-      ]
+      ],
+      "exclusion_reason": "Model weights: not distributed under the 19 Nov 2026 boundary.",
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "No licence evidence is recorded in this register. Model identities and revisions are not recorded."
+      }
     },
     {
       "id": "open-webui-fork",
@@ -905,14 +1087,18 @@
       "exclusion_reason": "REPOSITORIES.md: the fork is source evidence and current-stack work, not the replacement's source tree.",
       "tracking": [
         "V1-42"
-      ]
+      ],
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "ARCHITECTURE-v1.md records the Open WebUI License with a branding clause from v0.6.6; this register does not record whether its terms permit redistribution."
+      }
     },
     {
       "id": "openmettle-acp",
       "name": "OpenMettle ACP local coding agent",
       "kind": "code",
       "review_group": "application-fork",
-      "distribution": "candidate",
+      "distribution": "not-distributed",
       "version": "d411a4e2c9cba79d63f466fb8ca2afa0d1e1893c",
       "pin": "git:d411a4e2c9cba79d63f466fb8ca2afa0d1e1893c",
       "origin": "https://github.com/OpenMettle/openmettle-acp",
@@ -940,7 +1126,12 @@
       },
       "tracking": [
         "V1-42"
-      ]
+      ],
+      "exclusion_reason": "Separate public OpenMettle repository: it distributes its own source with its own LICENSE and NOTICE, outside openmettle-core. Its provenance belongs in that repository.",
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "No licence evidence is recorded in this register. A LICENSE with an MIT header was observed at the reviewed revision but is not recorded as reviewed evidence."
+      }
     },
     {
       "id": "kind-cli",
@@ -976,7 +1167,12 @@
       "tracking": [
         "V1-01",
         "V1-42"
-      ]
+      ],
+      "exclusion_reason": "CI or test tooling: never part of a distribution, and outside the 19 Nov 2026 boundary.",
+      "redistribution": {
+        "assessment": "redistributable",
+        "basis": "Apache-2.0 recorded from the kubernetes-sigs/kind v0.33.0 LICENSE; Apache-2.0 permits redistribution with the licence and NOTICE attribution retained."
+      }
     },
     {
       "id": "kubectl-cli",
@@ -1012,7 +1208,12 @@
       "tracking": [
         "V1-01",
         "V1-42"
-      ]
+      ],
+      "exclusion_reason": "CI or test tooling: never part of a distribution, and outside the 19 Nov 2026 boundary.",
+      "redistribution": {
+        "assessment": "redistributable",
+        "basis": "Apache-2.0 recorded from the kubernetes/kubernetes v1.37.0 LICENSE; Apache-2.0 permits redistribution with the licence and NOTICE attribution retained."
+      }
     },
     {
       "id": "kind-node-image",
@@ -1046,7 +1247,12 @@
       "tracking": [
         "V1-01",
         "V1-42"
-      ]
+      ],
+      "exclusion_reason": "CI or test tooling: never part of a distribution, and outside the 19 Nov 2026 boundary.",
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "No licence evidence is recorded in this register. The image bundles OS packages with individual licences."
+      }
     },
     {
       "id": "keycloak-observation-image",
@@ -1082,7 +1288,12 @@
       "tracking": [
         "V1-04",
         "V1-42"
-      ]
+      ],
+      "exclusion_reason": "CI or test tooling: never part of a distribution, and outside the 19 Nov 2026 boundary.",
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "No licence evidence is recorded in this register. The image bundles UBI packages with individual licences."
+      }
     },
     {
       "id": "github-actions-cache",
@@ -1117,14 +1328,19 @@
       },
       "tracking": [
         "V1-42"
-      ]
+      ],
+      "exclusion_reason": "CI or test tooling: never part of a distribution, and outside the 19 Nov 2026 boundary.",
+      "redistribution": {
+        "assessment": "redistributable",
+        "basis": "MIT recorded from the actions/cache LICENSE at the pinned commit; MIT permits redistribution with the copyright and permission notice."
+      }
     },
     {
       "id": "openapi-3.2-schemas",
       "name": "OpenAPI 3.2 official JSON Schemas (schema-base, schema, dialect, meta)",
       "kind": "asset",
       "review_group": "core",
-      "distribution": "candidate",
+      "distribution": "included",
       "version": "OAS 3.2 schema/schema-base 2026-11-12; dialect/meta 2026-02-26",
       "pin": "sha256: schema-base 8e432f0f148597960daa3aafa0c0030d8aae7538d32c217854a1e3aada595216, schema f1f7ee38d431a7bb1082e4df2288dbe1d4d3f49081b497af249c07b77737fb43, dialect 9375b7042aa0b01848403f0a9ebf12a3425e01a9e24337ce12624f10fea73833, meta f444d02ef7d36f30293983fad8118c823a3c70a49a8e5aa6f1afe21215e35417",
       "origin": "https://github.com/OAI/OpenAPI-Specification",
@@ -1139,12 +1355,14 @@
         ]
       },
       "notices": {
-        "status": "pending",
+        "status": "recorded",
         "files": [
-          "contracts/vendor/oas-3.2/LICENSE"
+          "contracts/vendor/oas-3.2/LICENSE",
+          "contracts/vendor/oas-3.2/README.md"
         ],
         "obligations": [
-          "Retain the Apache-2.0 licence with the vendored files in any source distribution; the files are unmodified and the upstream repository has no NOTICE file."
+          "Retain the Apache-2.0 licence with the vendored files in any source distribution. The files are unmodified and the upstream repository has no NOTICE file; mark any future modification.",
+          "Keep contracts/vendor/oas-3.2/README.md, which records each file's origin and SHA-256."
         ]
       },
       "review": {
@@ -1152,12 +1370,16 @@
         "reviewer": null,
         "date": null,
         "evidence": [],
-        "notes": "Contract-validation input for tests/contract.rs (ADR 0007). Not compiled into binaries or images; present in the source tree, so distribution depends on the undefined source-distribution boundary. Recorded by an agent; no review performed."
+        "notes": "Contract-validation input for tests/contract.rs (ADR 0007). Not compiled into binaries or images. It is distributed as part of the public openmettle-core source under the 19 Nov 2026 boundary. Recorded by an agent; awaiting owner review."
       },
       "tracking": [
         "V1-03",
         "V1-42"
-      ]
+      ],
+      "redistribution": {
+        "assessment": "redistributable",
+        "basis": "Apache-2.0 recorded from contracts/vendor/oas-3.2/LICENSE; Apache-2.0 permits redistribution with the licence retained. The upstream repository has no NOTICE file."
+      }
     }
   ]
 }

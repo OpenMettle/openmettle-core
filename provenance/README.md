@@ -1,6 +1,6 @@
 # Provenance and distribution readiness
 
-This directory holds the V1-42 provenance register. Its tooling reports dependencies and notice obligations, and refuses distribution while any fact is missing. **This is a partial V1-42 increment.** It covers the core repository and records stack components only as far as the existing evidence allows. It is not legal advice and does not clear any component for distribution.
+This directory holds the V1-42 provenance register. Its tooling reports dependencies and notice obligations, and refuses distribution while any fact is missing. **This is a partial V1-42 increment.** It covers the core repository and records stack components only as far as the existing evidence allows. It is licence bookkeeping, not legal advice, and it does not clear any component for distribution.
 
 ## Files
 
@@ -34,9 +34,9 @@ python3 scripts/provenance.py check-distribution --cargo-metadata /tmp/cargo-met
 - **Inventory success** means the register is valid, every `Cargo.lock` package is listed, and the output is reproducible. It says nothing about whether distribution is permitted.
 - **Distribution readiness** fails until all of the following hold:
   - the distribution boundary has a nonblank description and a dated, attributed decision review with evidence;
-  - every required review group (core, graphiti, database, sandbox, serving, media, application-fork) has a nonblank disposition and a dated, attributed decision review with evidence;
+  - every required review group (core, graphiti, database, sandbox, serving, media, application-fork) is either `reviewed` or `excluded`. Both need a nonblank summary and a dated, attributed decision review with evidence. An `excluded` group is outside the recorded boundary and also needs an `exclusion_reason`; it cannot contain an `included` or `candidate` component;
   - every `Cargo.lock` package has a review at the exact name, version, source and checksum, and its licence matches the declared crate metadata;
-  - every `included` component has a version, pin, origin, licence with evidence, recorded notices and a dated review, and no shipped component remains a `candidate`.
+  - every `included` component has a version, pin, origin, licence with evidence, recorded notices and a dated review, and no shipped component remains a `candidate`. An `excluded` or `not-distributed` component needs only its `exclusion_reason`; its missing facts do not block.
 
 Recorded notices require nonempty notice references and obligations. A `none-required` disposition requires an explicit justification and the component or crate review must still be complete before inclusion can pass. Evidence entries must be nonblank strings and review dates must be real calendar dates.
 
@@ -50,17 +50,27 @@ Automatic discovery covers Cargo packages only. The component register is manual
 
 - Record a licence expression only when there is source evidence for it, and cite that evidence. Otherwise use `null`. A licence recorded by the baseline is evidence; it is not a completed review.
 - `review.status: reviewed` needs a named reviewer, a date and evidence. Agents should leave entries `pending`; the owner or a designated reviewer records completed reviews.
-- Mark a component `excluded` only with an `exclusion_reason`. Use `blocked` for components whose licence is incompatible with the intended distribution.
+- Mark a component `excluded` (kept out of the distribution by decision) or `not-distributed` (tooling that is never shipped) only with an `exclusion_reason`. Use `blocked` for components whose licence is incompatible with the intended distribution.
+- Give every component a `redistribution` assessment with a `basis`. It looks ahead to a wider boundary and is not a distribution decision:
+  - `redistributable`: the register records a licence expression with evidence, and that licence permits redistribution under its conditions;
+  - `user-fetched`: recorded licence evidence restricts redistribution, so a user would fetch the component. It cannot be shipped;
+  - `undetermined`: everything else, including any component without recorded licence evidence.
 - Use the neutral source aliases from `SOURCE-REFERENCES.md`. Do not add personal repository coordinates, site domains, LAN addresses or storage paths.
 - A language translation of existing code is not automatically an independent implementation. Do not record translated Open WebUI code as first-party.
 
-## Current state (16 November 2026)
+## Current state (19 November 2026)
 
-- The distribution boundary is **undefined**. No accepted decision states whether a distribution contains only the core binaries or also container images, Helm-referenced images, curated forks or model artifacts. This needs an owner decision.
-- Every review group and component review is pending. Without crate metadata, the gate reports 99 blockers against the bootstrap lockfile (one workspace package). Against the V1-01 runtime lockfile in PR #35 (179 packages), it reports 277 blockers, 178 of them crates with no exact-version review.
-- The register records the PR #35 build, runtime and test images by digest. Once V1-01 merges, rerun the gate against the merged `Cargo.lock`, Dockerfile and crate metadata. The runtime images do not yet include licence or notice files for the bundled crates or Debian packages.
-- These pins are taken from read-only source evidence: Graphiti 0.31.2 and the neo4j driver 6.4.1 (wheel hashes), the Neo4j Community 5.26.32 and PostgreSQL 18.6 image digests, the Text Embeddings Inference image digest and a locally built SGLang image digest (all at the `workstation-stack` revision cited in `SOURCE-REFERENCES.md`), plus the reviewed revisions of the forks and evidence repositories.
-- These are missing: versions and pins for Agent Sandbox, sandboxd and gVisor; the Graphiti memory image; the SGLang release revision; the media services; and all model weights. Licences are also missing for several pinned components.
+- **Distribution boundary.** The owner defined it on 19 November 2026 ([decision](https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7005620131)):
+  - distributed: the source code in the public OpenMettle repositories and the Helm chart in openmettle-deploy;
+  - not distributed yet: built container images (including the core api, worker and migrate images), re-hosted third-party images, curated forks and model weights. Third-party images are referenced only at their publishers' locations.
+
+  The long-term direction is to distribute everything needed to run OpenMettle, eventually as an Arch Linux distribution with everything preinstalled except components whose licences do not allow redistribution. Each widening is a separate owner decision; publishing the core images (V1-36) is the likely next one. The register transcribes the boundary and the group dispositions from that comment. They are scope decisions, not licence reviews.
+- **Outside the boundary.** The graphiti, database, sandbox, serving, media and application-fork groups are `excluded`. Every component in them is `excluded` or `not-distributed` with a reason, as are the Debian runtime base image and the CI and test tooling in the core group. Their licence reviews remain pending and are needed before the boundary widens to include them.
+- **Inside the boundary.** The core source (the `openmettle-core` workspace package), the retained repository-template starter and the vendored OpenAPI 3.2 schemas are `included`. Their notices are recorded. `LICENSE`, including its copyright line, is byte-identical to the template's LICENSE at the pinned revision. The vendored schemas keep their Apache-2.0 LICENSE and origin README. Their reviews and the core group disposition remain pending for the owner.
+- **Redistribution assessment.** Each component records one. Only components with recorded licence evidence are `redistributable` or `user-fetched`. Neo4j Community is recorded as GPLv3, so it is `redistributable` only with its corresponding source. Evidence for the Agent Sandbox controller, gVisor and HelixDB is unpinned and must be rechecked at the selected release.
+- **Rust packages.** No Cargo.lock package other than the workspace package has an exact-version review. Against the current lockfile (333 packages), the gate reports 336 blockers: 332 packages without a review record, the pending core group, and the pending reviews of the workspace package, the template starter and the OpenAPI schemas.
+- **Observed read-only on 19 November 2026, for owner reconciliation.** The OpenMettle/sglang and OpenMettle/open-webui fork repositories are publicly visible, although the decision lists curated forks as not distributed. The openmettle-deploy repository is private, so the chart is not published yet. Track both through the publication tickets below.
+- **Carried forward.** The register keeps the read-only pins recorded on 16 November 2026: Graphiti 0.31.2 and the neo4j driver 6.4.1 (wheel hashes), the Neo4j Community 5.26.32 and PostgreSQL 18.6 image digests, the Text Embeddings Inference image digest and a locally built SGLang image digest (all at the `workstation-stack` revision cited in `SOURCE-REFERENCES.md`), plus the reviewed revisions of the forks and evidence repositories. It still lacks versions and pins for Agent Sandbox, sandboxd, gVisor, the Graphiti memory image, the SGLang release revision, the media services and all model weights. The runtime images do not yet include licence or notice files for the bundled crates or Debian packages; that matters once the images are published.
 - The `serving-fork` licence file names a personal copyright holder. Preserve required copyright and authorship notices. Removing private site configuration does not authorize deleting attribution; track packaging and notice preservation through the existing publication tickets.
 
 ## Related publication and scanner work

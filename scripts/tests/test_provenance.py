@@ -75,6 +75,33 @@ class PositiveTests(FixtureCase):
         self.assertEqual(code, 0, err)
         self.assertNotIn("fixture-excluded", err)
 
+    def test_excluded_group_needs_only_its_exclusion_record(self):
+        reg = self.register()
+        reg["components"] = [c for c in reg["components"] if c["review_group"] != "media"]
+        reg["review_groups"]["media"] |= {"status": "excluded", "exclusion_reason": "Synthetic boundary exclusion."}
+        self.save(reg)
+        code, _, err = self.gate()
+        self.assertEqual(code, 0, err)
+
+    def test_excluded_component_with_missing_facts_does_not_block(self):
+        reg = self.register()
+        excluded = reg["components"][1]
+        self.assertEqual(excluded["distribution"], "excluded")
+        self.assertIsNone(excluded["licence"]["expression"])
+        self.assertIsNone(excluded["pin"])
+        code, _, err = self.gate()
+        self.assertEqual(code, 0, err)
+
+    def test_redistribution_assessment_is_inventoried(self):
+        out_dir = self.root / "out"
+        code, _, err = run_cli("inventory", "--root", str(self.root), "--register", str(self.register_path),
+                               "--cargo-metadata", str(self.metadata_path), "--output-dir", str(out_dir))
+        self.assertEqual(code, 0, err)
+        report = json.loads((out_dir / "dependency-inventory.json").read_text())
+        self.assertEqual({c["id"]: c["redistribution"]["assessment"] for c in report["components"]},
+                         {"fixture-excluded": "undetermined", "fixture-image": "redistributable"})
+        self.assertIn("| redistributable |", (out_dir / "notice-obligations.md").read_text())
+
     def test_inventory_is_deterministic_and_complete(self):
         outputs = []
         for name in ("a", "b"):
@@ -272,6 +299,7 @@ class NegativeTests(FixtureCase):
     def test_licence_without_evidence_blocks(self):
         reg = self.register()
         reg["components"][0]["licence"]["evidence"] = []
+        reg["components"][0]["redistribution"]["assessment"] = "undetermined"
         self.save(reg)
         self.assert_blocked("component fixture-image: licence has no source evidence")
 
@@ -288,10 +316,74 @@ class NegativeTests(FixtureCase):
         self.assert_invalid("a reviewed entry needs a reviewer")
 
     def test_excluded_without_reason_is_invalid(self):
+        for distribution in ("excluded", "not-distributed"):
+            for reason in (None, " "):
+                with self.subTest(distribution=distribution, reason=reason):
+                    reg = json.loads((FIXTURE / "register.json").read_text())
+                    reg["components"][1]["distribution"] = distribution
+                    reg["components"][1]["exclusion_reason"] = reason
+                    self.save(reg)
+                    self.assert_invalid(f"{distribution} components need an exclusion_reason")
+
+    def test_excluded_group_needs_reason_and_decision_review(self):
+        cases = (("exclusion_reason", None, "exclusion_reason"),
+                 ("exclusion_reason", " ", "exclusion_reason"),
+                 ("review", None, "excluded disposition needs a completed decision review"),
+                 ("review", {"status": "pending", "evidence": [], "notes": "Pending."},
+                  "excluded disposition needs a completed decision review"))
+        for field, value, fragment in cases:
+            with self.subTest(field=field, value=value):
+                reg = json.loads((FIXTURE / "register.json").read_text())
+                reg["review_groups"]["media"] |= {"status": "excluded", "exclusion_reason": "Synthetic."}
+                reg["review_groups"]["media"][field] = value
+                self.save(reg)
+                self.assert_invalid(fragment)
+
+    def test_shipped_component_in_excluded_group_is_invalid(self):
+        for distribution in ("included", "candidate"):
+            with self.subTest(distribution=distribution):
+                reg = json.loads((FIXTURE / "register.json").read_text())
+                reg["review_groups"]["database"] |= {"status": "excluded", "exclusion_reason": "Synthetic."}
+                reg["components"][0]["distribution"] = distribution
+                self.save(reg)
+                self.assert_invalid("cannot belong to excluded group 'database'")
+
+    def test_in_boundary_component_with_missing_facts_still_blocks(self):
         reg = self.register()
-        del reg["components"][1]["exclusion_reason"]
+        reg["review_groups"]["sandbox"] |= {"status": "excluded", "exclusion_reason": "Synthetic."}
+        reg["components"][0]["notices"]["status"] = "pending"
+        reg["components"][0]["licence"] = {"expression": None, "evidence": []}
+        reg["components"][0]["redistribution"]["assessment"] = "undetermined"
         self.save(reg)
-        self.assert_invalid("excluded components need an exclusion_reason")
+        code, _, err = self.gate()
+        self.assertEqual(code, 1, err)
+        self.assertIn("component fixture-image: licence not recorded", err)
+        self.assertIn("component fixture-image: notice obligations pending", err)
+        self.assertNotIn("fixture-excluded", err)
+
+    def test_redistribution_assessment_is_required_and_evidence_bound(self):
+        cases = ((0, None, "redistribution.assessment must be one of"),
+                 (0, {"assessment": "allowed", "basis": "x"}, "redistribution.assessment must be one of"),
+                 (0, {"assessment": "undetermined", "basis": " "}, "'basis' must not be blank"),
+                 (1, {"assessment": "redistributable", "basis": "No licence recorded."},
+                  "'redistributable' needs a recorded licence expression with evidence"),
+                 (1, {"assessment": "user-fetched", "basis": "No evidence."},
+                  "'user-fetched' needs licence evidence"),
+                 (0, {"assessment": "user-fetched", "basis": "Synthetic restriction."},
+                  "user-fetched cannot be shipped"))
+        for index, value, fragment in cases:
+            with self.subTest(value=value):
+                reg = json.loads((FIXTURE / "register.json").read_text())
+                reg["components"][index]["redistribution"] = value
+                self.save(reg)
+                self.assert_invalid(fragment)
+
+    def test_redistributable_needs_evidence_not_just_an_expression(self):
+        reg = self.register()
+        reg["components"][1]["licence"] = {"expression": "MIT", "evidence": []}
+        reg["components"][1]["redistribution"] = {"assessment": "redistributable", "basis": "Unsourced."}
+        self.save(reg)
+        self.assert_invalid("'redistributable' needs a recorded licence expression with evidence")
 
     def test_unreadable_lock_is_invalid(self):
         (self.root / "Cargo.lock").write_text("not = [valid")
@@ -318,13 +410,29 @@ class RepositoryRegisterTests(unittest.TestCase):
         register = json.loads((REPO / "provenance" / "register.json").read_text())
         self.assertEqual(provenance.validate_register(register), [])
 
-    def test_repository_gate_fails_while_boundary_is_undefined(self):
+    def test_repository_gate_fails_while_any_review_is_pending(self):
         register = json.loads((REPO / "provenance" / "register.json").read_text())
-        if register["distribution_boundary"]["status"] != "undefined":
-            self.skipTest("distribution boundary has been defined")
+        pending = ([g for g in register["review_groups"].values() if g["status"] == "pending"]
+                   + [r for r in register["cargo_reviews"] if r["review"]["status"] == "pending"]
+                   + [c for c in register["components"]
+                      if c["distribution"] in provenance.SHIPPED and c["review"]["status"] == "pending"])
+        if not pending:
+            self.skipTest("no pending review is recorded")
         code, _, err = run_cli("check-distribution", "--root", str(REPO))
-        self.assertEqual(code, 1)
-        self.assertIn("distribution boundary: undefined", err)
+        self.assertEqual(code, 1, err)
+
+    def test_repository_register_records_the_19_nov_boundary(self):
+        register = json.loads((REPO / "provenance" / "register.json").read_text())
+        boundary = register["distribution_boundary"]
+        self.assertEqual(boundary["status"], "defined")
+        self.assertEqual(boundary["review"]["date"], "2026-11-19")
+        self.assertIn("https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7005620131",
+                      boundary["review"]["evidence"])
+        # Nothing may stay an undecided candidate, and every component carries a forward assessment.
+        for comp in register["components"]:
+            with self.subTest(component=comp["id"]):
+                self.assertNotEqual(comp["distribution"], "candidate")
+                self.assertIn(comp["redistribution"]["assessment"], provenance.REDISTRIBUTION)
 
     def test_every_lock_package_appears_in_inventory(self):
         with tempfile.TemporaryDirectory() as tmp:

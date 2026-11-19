@@ -23,6 +23,9 @@ REQUIRED_GROUPS = ("core", "graphiti", "database", "sandbox", "serving", "media"
 KINDS = {"code", "asset", "model", "curated-fork", "container-image", "library", "service", "tooling"}
 DISTRIBUTION = {"included", "candidate", "excluded", "not-distributed"}
 SHIPPED = {"included", "candidate"}
+GROUP_STATUS = {"pending", "reviewed", "excluded"}
+# Forward-looking assessment for a wider future boundary. It is not a distribution decision.
+REDISTRIBUTION = {"redistributable", "user-fetched", "undetermined"}
 REVIEW_STATUS = {"pending", "reviewed", "blocked"}
 NOTICE_STATUS = {"pending", "recorded", "none-required"}
 DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -180,13 +183,17 @@ def validate_register(register) -> list[str]:
         if name not in groups:
             errors.append(f"review_groups: required group '{name}' is missing")
     for name, group in groups.items():
-        if not isinstance(group, dict) or group.get("status") not in ("pending", "reviewed"):
-            errors.append(f"review_groups.{name}: status must be 'pending' or 'reviewed'")
-        elif group["status"] == "reviewed":
+        if not isinstance(group, dict) or group.get("status") not in GROUP_STATUS:
+            errors.append(f"review_groups.{name}: status must be one of {sorted(GROUP_STATUS)}")
+        elif group["status"] in ("reviewed", "excluded"):
             _need(group, "summary", f"review_groups.{name}", errors, str)
+            if group["status"] == "excluded":
+                # An excluded group is outside the recorded boundary; the reason and the decision
+                # review replace a licence review, so both must be present.
+                _need(group, "exclusion_reason", f"review_groups.{name}", errors, str)
             _validate_review(group.get("review"), f"review_groups.{name}", errors)
             if not isinstance(group.get("review"), dict) or group["review"].get("status") != "reviewed":
-                errors.append(f"review_groups.{name}: reviewed disposition needs a completed decision review")
+                errors.append(f"review_groups.{name}: {group['status']} disposition needs a completed decision review")
     seen = set()
     cargo_reviews = register.get("cargo_reviews")
     if not isinstance(cargo_reviews, list):
@@ -243,9 +250,32 @@ def validate_register(register) -> list[str]:
         _need(comp, "tracking", where, errors, list)
         _validate_licence_notices(comp, where, errors)
         _validate_review(comp.get("review"), where, errors)
-        if comp.get("distribution") == "excluded" and not _text(comp.get("exclusion_reason")):
-            errors.append(f"{where}: excluded components need an exclusion_reason")
+        _validate_redistribution(comp, where, errors)
+        if comp.get("distribution") in ("excluded", "not-distributed") and not _text(comp.get("exclusion_reason")):
+            errors.append(f"{where}: {comp['distribution']} components need an exclusion_reason")
+        group = groups.get(comp.get("review_group")) if isinstance(comp.get("review_group"), str) else None
+        if (isinstance(group, dict) and group.get("status") == "excluded"
+                and comp.get("distribution") in SHIPPED):
+            errors.append(f"{where}: a shipped component cannot belong to excluded group '{comp['review_group']}'")
     return errors
+
+
+def _validate_redistribution(comp, where, errors):
+    """The assessment may only go beyond 'undetermined' when the register holds licence evidence."""
+    assessment = comp.get("redistribution")
+    if (not isinstance(assessment, dict) or not isinstance(assessment.get("assessment"), str)
+            or assessment["assessment"] not in REDISTRIBUTION):
+        errors.append(f"{where}: redistribution.assessment must be one of {sorted(REDISTRIBUTION)}")
+        return
+    _need(assessment, "basis", f"{where}.redistribution", errors, str)
+    licence = comp.get("licence") if isinstance(comp.get("licence"), dict) else {}
+    evidence = licence.get("evidence") if isinstance(licence.get("evidence"), list) else []
+    if assessment["assessment"] == "redistributable" and not (_text(licence.get("expression")) and evidence):
+        errors.append(f"{where}: 'redistributable' needs a recorded licence expression with evidence")
+    if assessment["assessment"] == "user-fetched" and not evidence:
+        errors.append(f"{where}: 'user-fetched' needs licence evidence that restricts redistribution")
+    if assessment["assessment"] == "user-fetched" and comp.get("distribution") in SHIPPED:
+        errors.append(f"{where}: a component recorded as user-fetched cannot be shipped")
 
 
 def _readiness_blockers(entry, label, blockers):
@@ -269,7 +299,8 @@ def evaluate(register: dict, lock: list[dict], metadata: dict | None) -> dict:
     if register["distribution_boundary"]["status"] != "defined":
         blockers.append("distribution boundary: undefined (owner decision required)")
     for name in REQUIRED_GROUPS:
-        if register["review_groups"][name]["status"] != "reviewed":
+        # Excluded groups are outside the recorded boundary; validation already required their reason.
+        if register["review_groups"][name]["status"] not in ("reviewed", "excluded"):
             blockers.append(f"review group {name}: disposition pending")
     if metadata is None:
         blockers.append("cargo metadata: not supplied, so declared crate licences are unverified")
@@ -307,7 +338,8 @@ def evaluate(register: dict, lock: list[dict], metadata: dict | None) -> dict:
         components.append({k: comp[k] for k in ("id", "name", "kind", "review_group", "distribution",
                                                 "version", "pin", "origin", "licence", "notices")}
                           | {"review_status": comp["review"]["status"],
-                             "exclusion_reason": comp.get("exclusion_reason")})
+                             "exclusion_reason": comp.get("exclusion_reason"),
+                             "redistribution": comp["redistribution"]})
         if comp["distribution"] not in SHIPPED:
             continue
         label = f"component {comp['id']}"
@@ -340,7 +372,9 @@ def render_notices(report: dict, inputs: dict) -> str:
              "Generated by `scripts/provenance.py`. This is an inventory, not distribution clearance or legal advice.", "",
              f"- Distribution ready: **{'yes' if report['distribution_ready'] else 'no'}** "
              f"({len(report['blockers'])} blockers)",
-             f"- Distribution boundary: {report['distribution_boundary']['status']}"]
+             f"- Distribution boundary: {report['distribution_boundary']['status']}"
+             + (f" — {report['distribution_boundary']['description']}"
+                if report["distribution_boundary"]["status"] == "defined" else "")]
     lines += [f"- Input `{name}` sha256: `{digest}`" for name, digest in sorted(inputs.items())]
     lines += ["", "## Rust packages (from Cargo.lock)", "",
               "| Package | Version | Source | Declared licence | Reviewed licence | Review | Notice files | Obligations |",
@@ -351,12 +385,14 @@ def render_notices(report: dict, inputs: dict) -> str:
                           p["reviewed_licence"] or "unknown", p["review_status"],
                           ", ".join(notices["files"]) or "—", " ".join(notices["obligations"]) or "—"))
     lines += ["", "## Components", "",
-              "| Component | Group | Distribution | Version | Pin | Licence | Notices | Obligations | Review |",
-              "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+              "| Component | Group | Distribution | Version | Pin | Licence | Notices | Obligations | Review "
+              "| Later redistribution |",
+              "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for c in report["components"]:
         lines.append(_row(c["id"], c["review_group"], c["distribution"], c["version"] or "unknown",
                           c["pin"] or "unknown", c["licence"]["expression"] or "unknown", c["notices"]["status"],
-                          " ".join(c["notices"]["obligations"]) or "—", c["review_status"]))
+                          " ".join(c["notices"]["obligations"]) or "—", c["review_status"],
+                          c["redistribution"]["assessment"]))
     lines += ["", "## Blockers", ""] + [f"- {b}" for b in report["blockers"] or ["None."]]
     if report["warnings"]:
         lines += ["", "## Warnings", ""] + [f"- {w}" for w in report["warnings"]]
