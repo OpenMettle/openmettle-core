@@ -135,6 +135,15 @@ impl Object {
     fn integer(&mut self, name: &str) -> Result<u64, Error> {
         self.take(name)?.as_u64().ok_or(Error::Field)
     }
+    /// [`Self::integer`] for a member that may be absent. A present `null` is refused, so the
+    /// member has exactly two accepted shapes: absent, or a plain integer.
+    fn optional_integer(&mut self, name: &str) -> Result<Option<u64>, Error> {
+        if self.0.contains_key(name) {
+            self.integer(name).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
     fn array(&mut self, name: &str) -> Result<Vec<Value>, Error> {
         match self.take(name)? {
             Value::Array(values) => Ok(values),
@@ -326,6 +335,8 @@ struct Document {
     future_skew_seconds: u64,
     freshness_seconds: u64,
     cooldown_seconds: u64,
+    /// Optional; absent selects the 60-second default (ADR 0011 amendment, 19 November 2026).
+    uncacheable_reuse_seconds: Option<u64>,
     refresh_deadline_milliseconds: u64,
     max_providers: u64,
     max_callers: u64,
@@ -366,6 +377,7 @@ impl Document {
             future_skew_seconds: id_token.integer("future_skew_seconds")?,
             freshness_seconds: refresh.integer("freshness_seconds")?,
             cooldown_seconds: refresh.integer("cooldown_seconds")?,
+            uncacheable_reuse_seconds: refresh.optional_integer("uncacheable_reuse_seconds")?,
             refresh_deadline_milliseconds: refresh.integer("deadline_milliseconds")?,
             max_providers: refresh.integer("max_providers")?,
             max_callers: refresh.integer("max_callers")?,
@@ -511,7 +523,7 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
     .map_err(|_| Error::TokenPolicy)?;
     let count = |value: u64| usize::try_from(value).map_err(|_| Error::RefreshPolicy);
     let max_providers = count(document.max_providers)?;
-    let refresh_policy = RefreshPolicy::new(
+    let mut refresh_policy = RefreshPolicy::new(
         Duration::from_secs(document.freshness_seconds),
         Duration::from_secs(document.cooldown_seconds),
         Duration::from_millis(document.refresh_deadline_milliseconds),
@@ -520,6 +532,13 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
         count(document.max_document_gets)?,
     )
     .map_err(|_| Error::RefreshPolicy)?;
+    // Only an explicit window is checked against cooldown and freshness. The default applies
+    // under the freshness cap, so documents written before the member existed still load.
+    if let Some(seconds) = document.uncacheable_reuse_seconds {
+        refresh_policy = refresh_policy
+            .with_uncacheable_reuse(Duration::from_secs(seconds))
+            .map_err(|_| Error::RefreshPolicy)?;
+    }
     let session_policy = sessions::Policy::new(
         Duration::from_secs(document.session_lifetime_seconds),
         u32::try_from(document.retained_per_user).map_err(|_| Error::SessionPolicy)?,

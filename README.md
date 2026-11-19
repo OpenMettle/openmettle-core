@@ -136,16 +136,19 @@ replacements retire removed keys, and expired keys never receive outage grace. B
 and keys must remain fresh. The profile requires S256 and RFC 9207 support. It does not
 require advertised token-endpoint authentication methods; the client stays public and sends
 no secret. Responses with explicit max-age and Date are reused until they expire. Responses
-with `no-store` or `no-cache` are fetched again at every preflight, begin and callback, within
-cooldown ([ADR 0011 amendment](docs/adr/0011-managed-provider-keys.md#amendment-19-nov-2026)).
+with `no-store` or `no-cache` are reused for an operator-set window, 60 seconds by default and
+at most 300, then fetched again
+([ADR 0011 amendment](docs/adr/0011-managed-provider-keys.md#amendment-19-nov-2026)). A key
+the provider removes can therefore stay trusted until the window ends.
 These are compatibility limits, not real-provider qualification. The maintained verifier supports RSA
 through 4096 bits; the online document parser's 8192-bit ceiling does not expand that support.
 
 Keep the manager alive across requests. Registering identical configuration is a no-op;
 a changed configuration or a retire/restore retains cooldown and invalidates keys. A document
 expiring before cooldown ends blocks login until another refresh is allowed. For a provider
-that refuses caching, begin and callback each need a refresh: a callback, or another person's
-sign-in, inside the cooldown interval is refused. Provider Age,
+that refuses caching, set `provider_refresh.uncacheable_reuse_seconds` explicitly: the
+offline check then requires it to be at least the cooldown, so the documents do not expire
+while a refresh is still blocked unless the response carries `Age`. Provider Age,
 short cache lifetimes and clock skew can reduce availability; qualify policy values against
 actual provider behavior. The offline check below validates configuration files; the running API
 does not load them.
@@ -263,9 +266,12 @@ loads platform roots and honors `SSL_CERT_FILE` and `SSL_CERT_DIR` under ADR 001
 gives the version-1 shape with synthetic values. Version 2 adds one required browser-routing
 profile, described below.
 
-- Every setting is required, with its unit in the field name. There are no defaults, and no
-  operational value is selected. Unknown, repeated, missing or mistyped fields are refused in
-  every object.
+- Every setting is required, with its unit in the field name, except
+  `provider_refresh.uncacheable_reuse_seconds`. That one is optional: the reuse window for
+  provider documents that refuse caching, 60 seconds when absent. An explicit value must be
+  1–300 seconds, at least `cooldown_seconds` and at most `freshness_seconds`. No other
+  default or operational value is selected. Unknown, repeated, missing or mistyped fields are
+  refused in every object.
 - At least one provider, each with a unique canonical UUID, exact issuer and client, revision,
   HTTPS endpoints, callback, destination tag, private CIDRs and either native roots or one PEM
   bundle. The existing constructors (ADRs 0008–0013) judge every value.

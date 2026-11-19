@@ -54,7 +54,13 @@ impl fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
-/// Explicit deployment policy, with finite implementation ceilings and no operational defaults.
+/// Default reuse window for a document that refuses caching (owner decision, #5, 19 November
+/// 2026; ADR 0011 amendment).
+pub const DEFAULT_UNCACHEABLE_REUSE: Duration = Duration::from_secs(60);
+/// Largest reuse window an operator may set for a document that refuses caching.
+pub const MAX_UNCACHEABLE_REUSE: Duration = Duration::from_secs(300);
+/// Explicit deployment policy, with finite implementation ceilings. The only operational
+/// default is the reuse window for documents that refuse caching.
 #[derive(Clone, Copy, Debug)]
 pub struct RefreshPolicy {
     freshness: Duration,
@@ -63,8 +69,12 @@ pub struct RefreshPolicy {
     providers: usize,
     callers: usize,
     gets: usize,
+    // Reuse window for `no-store`/`no-cache` documents, from the request, under `freshness`.
+    uncacheable_reuse: Duration,
 }
 impl RefreshPolicy {
+    /// The reuse window starts at [`DEFAULT_UNCACHEABLE_REUSE`], capped by `freshness` when
+    /// the documents are fetched; [`Self::with_uncacheable_reuse`] sets it explicitly.
     pub fn new(
         freshness: Duration,
         cooldown: Duration,
@@ -89,6 +99,22 @@ impl RefreshPolicy {
             providers,
             callers,
             gets,
+            uncacheable_reuse: DEFAULT_UNCACHEABLE_REUSE,
+        })
+    }
+    /// An explicit reuse window for documents that refuse caching: 1 s to
+    /// [`MAX_UNCACHEABLE_REUSE`], no shorter than the cooldown and no longer than freshness.
+    /// A shorter window would leave the documents expired while cooldown still blocks the
+    /// refresh, refusing sign-ins in between. A longer one would trust keys past the
+    /// operator's freshness cap for every other document.
+    pub fn with_uncacheable_reuse(self, reuse: Duration) -> Result<Self, Error> {
+        // Cooldown is at least 1 s, so the lower bound also enforces the 1 s minimum.
+        if !(self.cooldown..=self.freshness.min(MAX_UNCACHEABLE_REUSE)).contains(&reuse) {
+            return Err(Error::Configuration);
+        }
+        Ok(Self {
+            uncacheable_reuse: reuse,
+            ..self
         })
     }
 }
@@ -245,6 +271,10 @@ impl ProviderManager {
             }),
         }
     }
+    #[cfg(test)]
+    pub(crate) fn policy(&self) -> RefreshPolicy {
+        self.inner.policy
+    }
     pub fn register(&self, config: ProviderConfig) -> Result<ManagedProvider, Error> {
         let mut entries = self.inner.entries.lock().unwrap();
         let id = config.identity.binding().0.to_owned();
@@ -327,8 +357,6 @@ struct Snapshot {
     known_kids: Vec<String>,
     expires: Instant,
     generation: u64,
-    // False when either document refused caching: a new operation fetches again.
-    reusable: bool,
 }
 struct Flight {
     result: watch::Sender<Option<Result<(), Error>>>,
@@ -405,7 +433,7 @@ impl ManagedProvider {
     pub async fn preflight(&self) -> Result<(), Error> {
         let _admission = self.admission()?;
         let deadline = Instant::now() + self.manager.policy.deadline;
-        tokio::time::timeout_at(deadline, self.ensure(true))
+        tokio::time::timeout_at(deadline, self.ensure())
             .await
             .map_err(|_| Error::Timeout)??;
         if Instant::now() >= deadline {
@@ -413,14 +441,8 @@ impl ManagedProvider {
         }
         Ok(())
     }
-    /// `start` begins an operation: preflight, login begin or callback consume. It never uses
-    /// a snapshot whose documents refused caching, so it shares only a flight in progress or
-    /// fetches again within cooldown. The callback's exchange and key verification continue
-    /// its consume, so they accept the snapshot that consume fetched or a later one.
-    async fn ensure(&self, start: bool) -> Result<Arc<Snapshot>, Error> {
-        if let Ok(s) = self.snapshot()
-            && (s.reusable || !start)
-        {
+    async fn ensure(&self) -> Result<Arc<Snapshot>, Error> {
+        if let Ok(s) = self.snapshot() {
             return Ok(s);
         }
         self.refresh(None).await?;
@@ -470,7 +492,7 @@ impl ManagedProvider {
         &self,
         c: &ProviderConfig,
         jwks: bool,
-    ) -> Result<(openidconnect::HttpResponse, Option<(Instant, bool)>), Error> {
+    ) -> Result<(openidconnect::HttpResponse, Option<Instant>), Error> {
         self.config()?;
         let _slot = self
             .manager
@@ -491,18 +513,16 @@ impl ManagedProvider {
             .mono
             .checked_duration_since(start.mono)
             .ok_or(Error::Unavailable)?;
+        let policy = self.manager.policy;
         let fresh = documents::freshness(
             &response,
             start.wall,
             end.wall,
             delay,
-            self.manager.policy.freshness,
+            policy.freshness,
+            policy.uncacheable_reuse,
         )
-        .and_then(|f| {
-            let policy = self.manager.policy;
-            let (lifetime, reusable) = f.lifetime(policy.deadline.min(policy.freshness));
-            end.mono.checked_add(lifetime).map(|t| (t, reusable))
-        });
+        .and_then(|v| end.mono.checked_add(v));
         Ok((response, fresh))
     }
     async fn fetch(&self, c: &ProviderConfig) -> Result<(), Error> {
@@ -531,13 +551,12 @@ impl ManagedProvider {
             .ok_or(Error::Configuration)?;
         // A valid replacement always retires old keys, even if it cannot be cached.
         s.snapshot = match metadata_expiry.zip(key_expiry) {
-            Some(((m, metadata_reusable), (k, keys_reusable))) => Some(Arc::new(Snapshot {
+            Some((m, k)) => Some(Arc::new(Snapshot {
                 trusted: c.identity.with_keys(keys.keys),
                 kids: keys.kids,
                 known_kids: keys.known_kids,
                 expires: m.min(k),
                 generation: s.key_generation,
-                reusable: metadata_reusable && keys_reusable,
             })),
             None => None,
         };
@@ -549,7 +568,7 @@ impl ManagedProvider {
         nonce: &ExpectedNonceDigest,
         policy: &auth::Policy,
     ) -> Result<(u64, auth::VerifiedAssertion), Error> {
-        let first = self.ensure(false).await?;
+        let first = self.ensure().await?;
         let header = token.header().map_err(|_| Error::Verification)?;
         let kid = match header.get("kid") {
             None => None,
@@ -639,9 +658,7 @@ impl ManagedProvider {
     }
     /// Managed preflight. It may fetch provider documents and needs no database connection.
     pub(crate) async fn fresh(&self) -> Result<(), login::Error> {
-        self.ensure(true)
-            .await
-            .map_err(|_| login::Error::Rejected)?;
+        self.ensure().await.map_err(|_| login::Error::Rejected)?;
         Ok(())
     }
     /// Active configuration with unexpired keys inside the phase deadline. No network or
@@ -714,7 +731,7 @@ impl ManagedProvider {
         let _admission = self.admission().map_err(|_| login::Error::Rejected)?;
         let deadline = Instant::now() + self.manager.policy.deadline;
         tokio::time::timeout_at(deadline, async {
-            self.ensure(false)
+            self.ensure()
                 .await
                 .map_err(|_| login::Error::Verification)?;
             let c = self.config().map_err(|_| login::Error::Rejected)?;

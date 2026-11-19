@@ -761,7 +761,6 @@ async fn release_rechecks_generation_expiry_token_time_and_clock_rollback() {
                     known_kids: previous.known_kids.clone(),
                     expires: previous.expires,
                     generation: previous.generation + 1,
-                    reusable: previous.reusable,
                 }));
             }
             "keys-expire" => {
@@ -921,7 +920,6 @@ fn online_keys_reject_malformed_private_usage_and_strength() {
 }
 #[test]
 fn freshness_obeys_age_delay_caps_headers_and_directives() {
-    use documents::Freshness::Reusable;
     let now = signing::now();
     let response = |cache: &str, date: SystemTime, age: Option<&str>| {
         let mut r = openidconnect::http::Response::builder()
@@ -939,11 +937,12 @@ fn freshness_obeys_age_delay_caps_headers_and_directives() {
             now,
             Duration::from_secs(2),
             Duration::from_secs(20),
+            Duration::from_secs(60),
         )
     };
     assert_eq!(
         fresh(&response("max-age=100", now, Some("3"))),
-        Some(Reusable(Duration::from_secs(15)))
+        Some(Duration::from_secs(15))
     );
     assert_eq!(
         fresh(&response(
@@ -951,7 +950,7 @@ fn freshness_obeys_age_delay_caps_headers_and_directives() {
             now - Duration::from_secs(7),
             Some("3")
         )),
-        Some(Reusable(Duration::from_secs(13)))
+        Some(Duration::from_secs(13))
     );
     for cc in [
         "max-age=0",
@@ -979,7 +978,8 @@ fn freshness_obeys_age_delay_caps_headers_and_directives() {
             now + Duration::from_secs(1),
             now,
             Duration::ZERO,
-            Duration::from_secs(20)
+            Duration::from_secs(20),
+            Duration::from_secs(60)
         ),
         None
     );
@@ -1359,13 +1359,13 @@ async fn metadata_ignores_client_authentication_advertising_but_requires_s256() 
         assert_eq!(check(&v), Err(Error::Mismatch), "{name}");
     }
 }
-/// Refusal directives give a usable but non-reusable verdict, without Date or Age. A malformed
-/// header or directive still fails, whatever its position relative to the refusal.
+/// Refusal directives give the operator's window from the request: Date never ages it, Age
+/// and request delay do, and maximum freshness caps it. A malformed header or directive still
+/// fails, whatever its position relative to the refusal.
 #[test]
-fn freshness_refusals_serve_one_operation_and_malformed_headers_still_fail() {
-    use documents::Freshness::{Operation, Reusable};
+fn freshness_refusals_give_the_window_and_malformed_headers_still_fail() {
     let now = signing::now();
-    let fresh = |cache: Option<&str>, date: Option<&str>, age: Option<&str>| {
+    let at = |cache: Option<&str>, date: Option<&str>, age: Option<&str>, window: u64| {
         let mut r = openidconnect::http::Response::builder();
         for (name, value) in [("cache-control", cache), ("date", date), ("age", age)] {
             if let Some(v) = value {
@@ -1378,9 +1378,13 @@ fn freshness_refusals_serve_one_operation_and_malformed_headers_still_fail() {
             now,
             Duration::from_secs(2),
             Duration::from_secs(20),
+            Duration::from_secs(window),
         )
     };
+    let fresh = |cache, date, age| at(cache, date, age, 10);
+    let secs = |v| Some(Duration::from_secs(v));
     let date = httpdate::fmt_http_date(now);
+    let old = httpdate::fmt_http_date(now - Duration::from_secs(30));
     // Keycloak 26.8.2 discovery and JWKS as observed in PR #72: no Date and no Age.
     for cc in [
         "no-cache, no-store, must-revalidate, no-transform",
@@ -1390,20 +1394,21 @@ fn freshness_refusals_serve_one_operation_and_malformed_headers_still_fail() {
         "no-transform, must-revalidate, no-store, no-cache",
         "max-age=20, no-store",
         "no-cache, max-age=20",
+        "max-age=5, no-cache",
         "public, no-cache",
     ] {
-        assert_eq!(fresh(Some(cc), None, None), Some(Operation), "{cc}");
-        assert_eq!(
-            fresh(Some(cc), Some(&date), Some("3")),
-            Some(Operation),
-            "{cc}"
-        );
+        // The 10 s window less the 2 s request delay.
+        assert_eq!(fresh(Some(cc), None, None), secs(8), "{cc}");
+        assert_eq!(fresh(Some(cc), Some(&old), Some("3")), secs(5), "{cc}");
     }
-    // max-age keeps its reusable lifetime and still needs Date.
-    assert_eq!(
-        fresh(Some("max-age=20"), Some(&date), None),
-        Some(Reusable(Duration::from_secs(18)))
-    );
+    assert_eq!(at(Some("no-store"), None, None, 30), secs(18));
+    assert_eq!(fresh(Some("no-store"), None, Some("7")), secs(1));
+    assert_eq!(fresh(Some("no-store"), None, Some("8")), None);
+    // max-age keeps its lifetime whatever the window, and still needs Date.
+    for window in [1, 10, 300] {
+        assert_eq!(at(Some("max-age=20"), Some(&date), None, window), secs(18));
+        assert_eq!(at(Some("max-age=20"), Some(&old), None, window), None);
+    }
     assert_eq!(fresh(Some("max-age=20"), None, None), None);
     for cc in [
         "no-store, bogus",
@@ -1441,7 +1446,14 @@ fn freshness_refusals_serve_one_operation_and_malformed_headers_still_fail() {
             .body(vec![])
             .unwrap();
         assert_eq!(
-            documents::freshness(&r, now, now, Duration::ZERO, Duration::from_secs(20)),
+            documents::freshness(
+                &r,
+                now,
+                now,
+                Duration::ZERO,
+                Duration::from_secs(20),
+                Duration::from_secs(10)
+            ),
             None,
             "duplicate {header}"
         );
@@ -1457,7 +1469,8 @@ fn freshness_refusals_serve_one_operation_and_malformed_headers_still_fail() {
             now + Duration::from_secs(1),
             now,
             Duration::ZERO,
-            Duration::from_secs(20)
+            Duration::from_secs(20),
+            Duration::from_secs(10)
         ),
         None
     );
@@ -1473,87 +1486,156 @@ fn keycloak(h: &Harness) {
         "client_secret_post"
     ]);
 }
-/// A refused-caching snapshot serves the operations that were running when it arrived. Each
-/// later start fetches again, within cooldown; an outage is not bridged by the old snapshot.
+/// With Keycloak's headers, begin and a callback inside cooldown share one fetch. The snapshot
+/// is reused, even while the provider is unreachable, until the window ends; then it is
+/// fetched again and an outage gets no grace.
 #[tokio::test]
-async fn refused_caching_is_fetched_per_operation_and_never_reused() {
+async fn refused_caching_is_reused_for_the_window_then_fetched_again() {
     let h = Harness::new().await;
     keycloak(&h);
-    // Begin: fetch, then the in-operation checks after the database work.
+    assert_eq!(
+        h.manager.policy().uncacheable_reuse,
+        DEFAULT_UNCACHEABLE_REUSE
+    );
+    // Begin: one discovery and one JWKS fetch, then the checks after the database work.
     let (_admission, deadline) = h.provider.login_phase().unwrap();
     h.provider.fresh().await.unwrap();
-    assert_eq!(h.count(), 2);
-    assert!(!h.provider.snapshot().unwrap().reusable);
     h.provider.login_provider(deadline).unwrap();
     h.provider.confirm(deadline).unwrap();
-    // A second start inside cooldown does not reuse it: it is refused, without a fetch.
-    assert_eq!(h.provider.preflight().await, Err(Error::Cooldown));
-    assert!(matches!(
-        h.provider.fresh().await,
-        Err(login::Error::Rejected)
-    ));
     assert_eq!(h.count(), 2);
-    // Callback after cooldown: consume fetches again; exchange and release continue it with
-    // that snapshot, so the only further request is the code POST.
-    h.advance(2);
+    // Callback 1 s later, inside the 2 s cooldown: consume, exchange and release reuse the
+    // snapshot, so the only further request is the code POST.
+    h.advance(1);
+    let (_admission, deadline) = h.provider.login_phase().unwrap();
     h.provider.fresh().await.unwrap();
-    assert_eq!(h.count(), 4);
-    let generation = h.provider.snapshot().unwrap().generation;
+    h.provider.login_provider(deadline).unwrap();
+    h.provider.confirm(deadline).unwrap();
     let proof = h
         .permit()
         .exchange_with_keys(&h.provider, &auth::Policy::default())
         .await
         .unwrap();
-    assert_eq!(proof.key_generation, generation);
-    assert_eq!(h.count(), 5);
+    assert_eq!(h.count(), 3);
     assert_eq!(
         finish_in_memory(&h.provider, proof).unwrap().subject(),
         "synthetic-subject"
     );
-    // Key rotation: the next start retires the old set; the new key verifies.
-    h.advance(2);
-    h.script.lock().unwrap().keys = rotated();
-    h.provider.preflight().await.unwrap();
-    assert_eq!(h.count(), 7);
-    assert!(h.verify(false).await.is_err());
-    assert!(h.verify(true).await.is_ok());
-    assert_eq!(h.count(), 7);
-    // Unreachable provider at the next start: no grace from the held snapshot.
-    h.advance(2);
+    // The fixture clock adds no request delay, so the window ends exactly 60 s after fetch.
+    h.advance(58);
     h.script.lock().unwrap().mode = "failure";
+    h.provider.preflight().await.unwrap();
+    assert!(h.verify(false).await.is_ok());
+    assert_eq!(h.count(), 3);
+    h.advance(1);
     assert_eq!(h.provider.preflight().await, Err(Error::Fetch));
-    assert_eq!(h.count(), 8);
-    // It is still held for the operations it already serves, yet the start did not use it.
-    assert!(h.provider.snapshot().is_ok());
-    // The held snapshot ends one operation deadline after its fetch, even for continuations.
-    h.advance(3);
     assert!(h.provider.snapshot().is_err());
+    assert!(h.verify(false).await.is_err());
+    assert_eq!(h.count(), 4);
+    h.script.lock().unwrap().mode = "ok";
+    h.advance(2);
+    h.provider.preflight().await.unwrap();
+    assert_eq!(h.count(), 6);
 }
-/// A refusal on either document makes the snapshot non-reusable. Explicit max-age on both
-/// keeps today's reuse. A malformed refusal still makes the provider unavailable.
+/// Rotation inside the window behaves as for cached documents. A removed key stays trusted
+/// (the accepted trade-off) and an unknown kid waits for cooldown; the unknown-kid refresh
+/// then retires the old key and starts a new window.
 #[tokio::test]
-async fn either_refusal_prevents_reuse_and_max_age_keeps_reuse() {
-    for (metadata_cache, cache, reusable) in [
-        ("max-age=100", "max-age=100", true),
-        ("no-store", "max-age=100", false),
-        ("max-age=100", "no-cache", false),
+async fn refused_caching_rotation_uses_the_unknown_key_refresh() {
+    let h = Harness::new().await;
+    keycloak(&h);
+    h.provider.preflight().await.unwrap();
+    h.script.lock().unwrap().keys = rotated();
+    assert_eq!(h.verify(true).await.err(), Some(Error::Cooldown));
+    assert!(h.verify(false).await.is_ok());
+    assert_eq!(h.count(), 2);
+    h.advance(2);
+    assert!(h.verify(true).await.is_ok());
+    assert_eq!(h.count(), 4);
+    assert!(h.verify(false).await.is_err());
+    // The replacement fetched at 2 s is reused until 62 s.
+    h.advance(59);
+    h.provider.preflight().await.unwrap();
+    assert_eq!(h.count(), 4);
+    h.advance(1);
+    h.provider.preflight().await.unwrap();
+    assert_eq!(h.count(), 6);
+}
+/// Concurrent starts share one fetch, and starts after it, inside cooldown, reuse its result
+/// instead of being refused.
+#[tokio::test]
+async fn concurrent_refused_caching_starts_share_one_fetch() {
+    let h = Harness::new().await;
+    keycloak(&h);
+    h.script.lock().unwrap().mode = "gate-jwks";
+    let mut starts = Vec::new();
+    for _ in 0..8 {
+        let p = h.provider.clone();
+        starts.push(tokio::spawn(async move { p.preflight().await }));
+    }
+    h.entered(2).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.manager.inner.callers.available_permits() != 24 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    h.script.lock().unwrap().gate.notify_one();
+    for start in starts {
+        assert_eq!(start.await.unwrap(), Ok(()));
+    }
+    h.script.lock().unwrap().mode = "ok";
+    h.advance(1);
+    for _ in 0..8 {
+        h.provider.preflight().await.unwrap();
+        h.provider.fresh().await.unwrap();
+    }
+    assert_eq!(h.count(), 2);
+}
+/// The snapshot lives until the earlier of its documents' lifetimes: explicit max-age as
+/// before, the window for a refusal, and maximum freshness over both. A malformed refusal
+/// still makes the provider unavailable.
+#[tokio::test]
+async fn max_age_keeps_its_lifetime_and_refusals_use_the_window() {
+    let refresh = |freshness| {
+        RefreshPolicy::new(
+            Duration::from_secs(freshness),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            2,
+            32,
+            2,
+        )
+        .unwrap()
+    };
+    let short = refresh(600)
+        .with_uncacheable_reuse(Duration::from_secs(10))
+        .unwrap();
+    let keycloak = "no-cache, no-store, must-revalidate, no-transform";
+    for (policy, metadata_cache, cache, lifetime) in [
+        (policy(), "max-age=100", "max-age=100", 100),
+        (policy(), "no-store", "max-age=100", 60),
+        (policy(), "max-age=100", "no-cache", 60),
+        (policy(), "max-age=30", "no-cache", 30),
+        (short, "max-age=100", "max-age=100", 100),
+        (short, keycloak, "no-cache", 10),
+        // The 60 s default stays under a shorter freshness cap.
+        (refresh(30), "no-store", "no-cache", 30),
     ] {
-        let h = Harness::new().await;
+        let h = Harness::with_policy(policy).await;
         {
             let mut s = h.script.lock().unwrap();
             s.metadata_cache = metadata_cache.into();
             s.cache = cache.into();
         }
         h.provider.preflight().await.unwrap();
-        assert_eq!(h.provider.snapshot().unwrap().reusable, reusable);
-        // Inside the max-age lifetime, a reusable snapshot needs no fetch.
-        h.advance(2);
+        h.advance(lifetime - 1);
         h.provider.preflight().await.unwrap();
-        assert_eq!(
-            h.count(),
-            if reusable { 2 } else { 4 },
-            "{metadata_cache} {cache}"
-        );
+        assert_eq!(h.count(), 2, "{metadata_cache} {cache}");
+        h.advance(1);
+        h.script.lock().unwrap().date = signing::now() + Duration::from_secs(lifetime);
+        h.provider.preflight().await.unwrap();
+        assert_eq!(h.count(), 4, "{metadata_cache} {cache}");
     }
     for (metadata_cache, cache, count) in [
         ("no-store, bogus", "no-cache", 1),
@@ -1568,6 +1650,45 @@ async fn either_refusal_prevents_reuse_and_max_age_keeps_reuse() {
         assert_eq!(h.provider.preflight().await, Err(Error::Unavailable));
         assert!(h.provider.snapshot().is_err());
         assert_eq!(h.count(), count);
+    }
+}
+/// The window is 60 s unless set. An explicit window is 1–300 s, no shorter than cooldown
+/// and no longer than maximum freshness.
+#[test]
+fn uncacheable_reuse_window_is_bounded_by_cooldown_freshness_and_ceiling() {
+    let secs = Duration::from_secs;
+    let base = |freshness, cooldown| {
+        RefreshPolicy::new(secs(freshness), secs(cooldown), secs(5), 1, 1, 1).unwrap()
+    };
+    assert_eq!(base(600, 2).uncacheable_reuse, secs(60));
+    assert_eq!(MAX_UNCACHEABLE_REUSE, secs(300));
+    for (freshness, cooldown, reuse, accepted) in [
+        (600, 1, 1, true),
+        (600, 1, 0, false),
+        (600, 1, 300, true),
+        (600, 1, 301, false),
+        (600, 1, u64::MAX, false),
+        (600, 60, 60, true),
+        (600, 61, 60, false),
+        (120, 1, 120, true),
+        (120, 1, 121, false),
+        (1, 1, 1, true),
+        (1, 1, 2, false),
+        // A cooldown above the ceiling leaves no explicit window.
+        (3600, 300, 300, true),
+        (3600, 301, 301, false),
+    ] {
+        assert_eq!(
+            base(freshness, cooldown)
+                .with_uncacheable_reuse(secs(reuse))
+                .map(|p| p.uncacheable_reuse),
+            if accepted {
+                Ok(secs(reuse))
+            } else {
+                Err(Error::Configuration)
+            },
+            "{freshness} {cooldown} {reuse}"
+        );
     }
 }
 #[test]

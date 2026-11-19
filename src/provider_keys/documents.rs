@@ -342,35 +342,20 @@ pub(super) fn media(response: &HttpResponse, jwks: bool) -> Result<(), Error> {
     }
     Ok(())
 }
-/// How a valid representation may serve sign-in operations. `freshness` returns None when it
-/// may serve none: malformed, duplicated or unknown caching headers, missing explicit
-/// lifetime, or an expired response. Callers must then retire older keys.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Freshness {
-    /// Remaining explicit lifetime, after age and delay, under the configured cap.
-    Reusable(Duration),
-    /// `no-store` or `no-cache`: only the operations in progress when it arrived may use it;
-    /// a later operation fetches again (ADR 0011 amendment, 19 November 2026).
-    Operation,
-}
-impl Freshness {
-    /// Lifetime from receipt, and whether a later operation may reuse the document. `hold`
-    /// bounds a refused document to the operations already running: one operation deadline,
-    /// never beyond the configured freshness cap.
-    pub(super) fn lifetime(self, hold: Duration) -> (Duration, bool) {
-        match self {
-            Self::Reusable(v) => (v, true),
-            Self::Operation => (hold, false),
-        }
-    }
-}
+/// Remaining reusable lifetime from receipt, under `cap`. An explicit `max-age` is aged by the
+/// larger of Date and Age plus delay. A valueless `no-store` or `no-cache` gives the
+/// operator's `uncacheable` window instead, counted from the request less any Age (ADR 0011
+/// amendment, 19 November 2026). None means a valid representation cannot be reused:
+/// malformed, duplicated or unknown caching headers, missing explicit lifetime, or an expired
+/// response. Callers must then retire older keys.
 pub(super) fn freshness(
     response: &HttpResponse,
     request: SystemTime,
     received: SystemTime,
     delay: Duration,
     cap: Duration,
-) -> Option<Freshness> {
+    uncacheable: Duration,
+) -> Option<Duration> {
     let h = response.headers();
     for n in ["cache-control", "date", "age"] {
         if h.get_all(n).iter().count() > 1 {
@@ -380,7 +365,7 @@ pub(super) fn freshness(
     if received < request {
         return None;
     }
-    // Date is needed only to compute a reusable lifetime. When present it must be valid.
+    // Date ages only an explicit max-age. When present it must be valid.
     let date = match h.get("date") {
         Some(v) => Some(httpdate::parse_http_date(v.to_str().ok()?).ok()?),
         None => None,
@@ -436,15 +421,12 @@ pub(super) fn freshness(
             _ => return None,
         }
     }
-    if refused {
-        return Some(Freshness::Operation);
-    }
-    let age = Duration::from_secs(age)
-        .checked_add(delay)?
-        .max(received.duration_since(date?).ok()?);
-    max_age?
-        .min(cap)
-        .checked_sub(age)
-        .filter(|v| !v.is_zero())
-        .map(Freshness::Reusable)
+    let age = Duration::from_secs(age).checked_add(delay)?;
+    // A refusal overrides any max-age in the same header.
+    let (lifetime, age) = if refused {
+        (uncacheable, age)
+    } else {
+        (max_age?, age.max(received.duration_since(date?).ok()?))
+    };
+    lifetime.min(cap).checked_sub(age).filter(|v| !v.is_zero())
 }
