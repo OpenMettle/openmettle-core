@@ -28,7 +28,9 @@ jobs:
         run: rustup toolchain install 1.100.0 --profile minimal
       - name: Resolve declared crate metadata from Cargo.lock
         run: cargo metadata --locked --format-version 1 > "$RUNNER_TEMP/cargo-metadata.json"
-      - name: Warn when Cargo policy records are stale (not a failure)
+      # Records that do not cover Cargo.lock already failed the unit tests above. This step compares
+      # them with real cargo metadata and warns on a declared-licence difference, which blocks readiness.
+      - name: Warn when Cargo policy records differ from cargo metadata (lockfile drift fails the unit tests)
         run: |
           status=0
           python3 scripts/provenance.py review-cargo --check \

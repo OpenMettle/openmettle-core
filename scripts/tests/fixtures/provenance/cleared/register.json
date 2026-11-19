@@ -3,6 +3,9 @@
   "distribution_boundary": {
     "status": "defined",
     "description": "Synthetic fixture boundary.",
+    "artefacts": [
+      "source"
+    ],
     "tracking": [
       "FIXTURE"
     ],

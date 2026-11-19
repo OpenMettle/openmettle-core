@@ -23,13 +23,19 @@ ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_VERSION = 1
 REQUIRED_GROUPS = ("core", "graphiti", "database", "sandbox", "serving", "media", "application-fork")
 KINDS = {"code", "asset", "model", "curated-fork", "container-image", "library", "service", "tooling"}
-DISTRIBUTION = {"included", "candidate", "excluded", "not-distributed"}
+# "reviewed-elsewhere": inside the boundary, but shipped and licence-reviewed by another OpenMettle
+# repository. This register covers openmettle-core's own source, so the core gate does not evaluate it.
+DISTRIBUTION = {"included", "candidate", "excluded", "not-distributed", "reviewed-elsewhere"}
 SHIPPED = {"included", "candidate"}
+IN_BOUNDARY = SHIPPED | {"reviewed-elsewhere"}
 GROUP_STATUS = {"pending", "reviewed", "excluded"}
 # Forward-looking assessment for a wider future boundary. It is not a distribution decision.
 REDISTRIBUTION = {"redistributable", "user-fetched", "undetermined"}
 REVIEW_STATUS = {"pending", "reviewed", "blocked"}
 NOTICE_STATUS = {"pending", "recorded", "none-required"}
+# What the boundary distributes. Shipping an image or binary makes bundled crates shipped content.
+ARTEFACTS = {"source", "helm-chart", "container-image", "binary"}
+BUILT_ARTEFACTS = {"container-image", "binary"}
 DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
@@ -248,7 +254,7 @@ def _terms(node) -> set[str]:
     return {value} if kind == "term" else set().union(*(_terms(child) for child in value))
 
 
-_SPDX_WORD = re.compile(r"\b(?:AND|OR|WITH)\b", re.IGNORECASE)
+_TOKEN_SPLIT = re.compile(r"[\s/]+")
 
 
 def normalise_cargo_slash(expression: str) -> str | None:
@@ -259,11 +265,13 @@ def normalise_cargo_slash(expression: str) -> str | None:
     Returns None when the expression has no '/'. Otherwise the expression must be a plain list
     of single licence identifiers, such as 'MIT/Apache-2.0', which becomes 'MIT OR Apache-2.0'.
     A '/' mixed with SPDX operators (in any case) or parentheses is refused as ambiguous: the
-    tool does not guess how '/' groups against AND, OR or WITH.
+    tool does not guess how '/' groups against AND, OR or WITH. An operator is a whole token
+    between whitespace or '/', so '-or-later' inside 'GPL-2.0-or-later' is not one.
     """
     if "/" not in expression:
         return None
-    if _SPDX_WORD.search(expression) or "(" in expression or ")" in expression:
+    if (any(token.upper() in _OPERATORS for token in _TOKEN_SPLIT.split(expression))
+            or "(" in expression or ")" in expression):
         raise LicenceSyntaxError("Cargo's deprecated '/' separator is mixed with SPDX operators or "
                                  "parentheses; refused as ambiguous")
     parts = [part.strip() for part in expression.split("/")]
@@ -332,6 +340,12 @@ def validate_register(register) -> list[str]:
         _validate_review(boundary.get("review"), "distribution_boundary", errors)
         if not isinstance(boundary.get("review"), dict) or boundary["review"].get("status") != "reviewed":
             errors.append("distribution_boundary: defined boundary needs a completed decision review")
+        artefacts = boundary.get("artefacts")
+        if (not isinstance(artefacts, list) or not artefacts
+                or any(not isinstance(a, str) or a not in ARTEFACTS for a in artefacts)
+                or len(set(artefacts)) != len(artefacts)):
+            errors.append(f"distribution_boundary: defined boundary needs 'artefacts', a nonempty list of "
+                          f"distinct values from {sorted(ARTEFACTS)}")
     groups = register.get("review_groups")
     if not isinstance(groups, dict):
         errors.append("register: review_groups must be an object")
@@ -413,8 +427,16 @@ def validate_register(register) -> list[str]:
             errors.append(f"{where}: {comp['distribution']} components need an exclusion_reason")
         group = groups.get(comp.get("review_group")) if isinstance(comp.get("review_group"), str) else None
         if (isinstance(group, dict) and group.get("status") == "excluded"
-                and comp.get("distribution") in SHIPPED):
-            errors.append(f"{where}: a shipped component cannot belong to excluded group '{comp['review_group']}'")
+                and comp.get("distribution") in IN_BOUNDARY):
+            errors.append(f"{where}: an in-boundary component cannot belong to excluded group '{comp['review_group']}'")
+        if comp.get("distribution") == "reviewed-elsewhere":
+            # The owner's group disposition is the only record here; the licence review lives in reviewed_in.
+            if not _text(comp.get("reviewed_in")):
+                errors.append(f"{where}: reviewed-elsewhere components need 'reviewed_in' naming the reviewing repository")
+            if comp.get("exclusion_reason") is not None:
+                errors.append(f"{where}: an in-boundary component cannot have an exclusion_reason")
+            if isinstance(group, dict) and group.get("status") != "reviewed":
+                errors.append(f"{where}: reviewed-elsewhere components need a group with a completed owner disposition")
     return errors
 
 
@@ -450,6 +472,17 @@ def _readiness_blockers(entry, label, blockers):
         blockers.append(f"{label}: review {status}")
 
 
+def _allow_list_blocker(entry, label, allowed, blockers):
+    """Maintained reviews and shipped components meet the same owner-approved allow-list as policy records.
+
+    There is no per-package exception: the owner has granted none.
+    """
+    if entry["licence"]["expression"]:
+        outcome, reason, _ = licence_outcome(entry["licence"]["expression"], None, allowed)
+        if outcome != "allowed":
+            blockers.append(f"{label}: {reason}")
+
+
 def evaluate(register: dict, lock: list[dict], metadata: dict | None, records: list[dict] = ()) -> dict:
     """Build the inventory and readiness blockers. The register must already be valid."""
     blockers: list[str] = []
@@ -482,6 +515,11 @@ def evaluate(register: dict, lock: list[dict], metadata: dict | None, records: l
                "review_status": review["review"]["status"] if review else "missing",
                "notices": review["notices"] if review else None, "slash_as_or": None}
         cargo.append(row)
+        if review is None and pkg["source"] is None:
+            # Path (workspace) packages are our own source: they need a maintained, owner-reviewed entry.
+            what = "a generated policy record is refused" if record is not None else "none is recorded"
+            blockers.append(f"{label}: path package needs a maintained review in cargo_reviews ({what})")
+            continue
         if review is None and record is not None:
             # Generated record: re-check it against Cargo.lock, the declared metadata and the
             # current policy, so a stale or hand-edited record cannot pass.
@@ -516,6 +554,7 @@ def evaluate(register: dict, lock: list[dict], metadata: dict | None, records: l
                             f"{review['licence']['expression']!r}")
         if declared and declared["license"] is None and declared["license_file"] is None:
             blockers.append(f"{label}: crate declares no licence")
+        _allow_list_blocker(review, label, allowed, blockers)
     for key in sorted(reviews):
         warnings.append(f"cargo review for {key[0]} {key[1]} matches no Cargo.lock package (stale)")
     for key in sorted(records):
@@ -527,6 +566,11 @@ def evaluate(register: dict, lock: list[dict], metadata: dict | None, records: l
                             f"({policy_packages} packages are reviewed against it)")
         if policy["notices"]["status"] == "pending":
             blockers.append("cargo licence policy: notice obligations pending")
+        built = sorted(BUILT_ARTEFACTS & set(register["distribution_boundary"].get("artefacts") or []))
+        if policy["notices"]["status"] == "none-required" and built:
+            # 'none-required' rests on crates being build inputs only; shipping images or binaries ends that.
+            blockers.append(f"cargo licence policy: notices are 'none-required' but the boundary distributes "
+                            f"{', '.join(built)}; record the crates' notice obligations")
 
     components = []
     for comp in sorted(register["components"], key=lambda c: c["id"]):
@@ -534,6 +578,7 @@ def evaluate(register: dict, lock: list[dict], metadata: dict | None, records: l
                                                 "version", "pin", "origin", "licence", "notices")}
                           | {"review_status": comp["review"]["status"],
                              "exclusion_reason": comp.get("exclusion_reason"),
+                             "reviewed_in": comp.get("reviewed_in"),
                              "redistribution": comp["redistribution"]})
         if comp["distribution"] not in SHIPPED:
             continue
@@ -544,6 +589,7 @@ def evaluate(register: dict, lock: list[dict], metadata: dict | None, records: l
             if not comp[field]:
                 blockers.append(f"{label}: {field} not recorded")
         _readiness_blockers(comp, label, blockers)
+        _allow_list_blocker(comp, label, allowed, blockers)
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -571,6 +617,9 @@ def render_notices(report: dict, inputs: dict) -> str:
              f"- Distribution boundary: {report['distribution_boundary']['status']}"
              + (f" — {report['distribution_boundary']['description']}"
                 if report["distribution_boundary"]["status"] == "defined" else "")]
+    if report["distribution_boundary"]["status"] == "defined":
+        lines.append(f"- Boundary artefacts: {', '.join(report['distribution_boundary']['artefacts'])}. "
+                     "This report covers openmettle-core only.")
     lines += [f"- Input `{name}` sha256: `{digest}`" for name, digest in sorted(inputs.items())]
     lines += ["", "## Rust packages (from Cargo.lock)", "",
               "| Package | Version | Source | Declared licence | Reviewed licence | Review | Notice files | Obligations |",
@@ -585,7 +634,8 @@ def render_notices(report: dict, inputs: dict) -> str:
               "| Later redistribution |",
               "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for c in report["components"]:
-        lines.append(_row(c["id"], c["review_group"], c["distribution"], c["version"] or "unknown",
+        distribution = c["distribution"] + (f" ({c['reviewed_in']})" if c["reviewed_in"] else "")
+        lines.append(_row(c["id"], c["review_group"], distribution, c["version"] or "unknown",
                           c["pin"] or "unknown", c["licence"]["expression"] or "unknown", c["notices"]["status"],
                           " ".join(c["notices"]["obligations"]) or "—", c["review_status"],
                           c["redistribution"]["assessment"]))
@@ -597,6 +647,8 @@ def render_notices(report: dict, inputs: dict) -> str:
 
 RECORDS_FILE = "cargo-reviews.json"
 RECORD_OUTCOMES = {"allowed", "blocked"}
+RECORD_KEYS = ("name", "version", "source", "checksum", "declared_licence", "declared_licence_file",
+               "outcome", "reason", "slash_as_or")
 RECORDS_HEADER = {
     "generated_by": "python3 scripts/provenance.py review-cargo --cargo-metadata <cargo metadata JSON>",
     "notice": ("Generated; do not edit. Each record pins a Cargo.lock package to its declared licence and the "
@@ -620,7 +672,12 @@ def load_records(path: Path) -> list[dict]:
     seen = set()
     for i, rec in enumerate(packages):
         where = f"{path.name} packages[{i}]"
-        if not isinstance(rec, dict) or not _text(rec.get("name")) or not _text(rec.get("version")):
+        if not isinstance(rec, dict):
+            raise InputError(f"{where}: must be an object")
+        missing = [field for field in RECORD_KEYS if field not in rec]
+        if missing:
+            raise InputError(f"{where}: missing {', '.join(repr(f) for f in missing)}; regenerate with review-cargo")
+        if not _text(rec["name"]) or not _text(rec["version"]):
             raise InputError(f"{where}: needs a name and version")
         for field in ("source", "checksum", "declared_licence", "declared_licence_file", "reason", "slash_as_or"):
             if rec.get(field) is not None and not _text(rec[field]):
@@ -636,13 +693,16 @@ def load_records(path: Path) -> list[dict]:
 
 
 def generate_records(register: dict, lock: list[dict], metadata: dict) -> list[dict]:
-    """One record per Cargo.lock package without a maintained review, in lockfile order."""
+    """One record per registry or git package without a maintained review, in lockfile order.
+
+    Path (workspace) packages never get a generated record: they need a maintained review.
+    """
     maintained = {(r["name"], r["version"], r["source"] or "") for r in register["cargo_reviews"]}
     allowed = set(register["cargo_licence_policy"]["allowed_licences"])
     records = []
     for pkg in lock:
         key = _pkg_key(pkg)
-        if key in maintained:
+        if key in maintained or pkg["source"] is None:
             continue
         declared = metadata[key]
         outcome, reason, slash_as_or = licence_outcome(declared["license"], declared["license_file"], allowed)
@@ -752,7 +812,10 @@ def main(argv=None) -> int:
         for blocker in report["blockers"]:
             print(f"  - {blocker}", file=sys.stderr)
         return 1
-    print("Distribution readiness: no blockers in the recorded inventory. Owner release approval is still required.")
+    artefacts = ", ".join(report["distribution_boundary"].get("artefacts") or [])
+    print(f"Distribution readiness: no blockers in the recorded inventory for openmettle-core only "
+          f"(boundary artefacts: {artefacts}). Other in-boundary repositories are reviewed in their own "
+          "repositories. Owner release approval is still required.")
     return 0
 
 
