@@ -681,6 +681,8 @@ async fn keycloak_browser_sign_in_qualification() {
     let db = Db::new().await;
     let mut owner = db.connect(OWNER).await;
     register_provider(&mut owner, &provider_id, &issuer, &client_id, &revision).await;
+    // Configure the ADR 0014 outstanding-login limit; fresh migrations start NULL (fail-closed).
+    admit(&mut owner, Some(64)).await;
 
     let approved_user = seed_unapproved_user(&mut owner, &issuer, &accounts.approved.subject).await;
     approve_identity_via_script(
