@@ -60,6 +60,21 @@ In another terminal, `curl --fail http://127.0.0.1:8080/healthz` returns `ok`. `
 
 The worker uses `OPENMETTLE_WORKER_DATABASE_URL` and port 8081. Every setting is independent: `BIND`, `DATABASE_URL`, `DB_MAX_CONNECTIONS`, `DB_TIMEOUT_MS` and `SHUTDOWN_TIMEOUT_MS` use the corresponding `OPENMETTLE_API_` or `OPENMETTLE_WORKER_` prefix. Defaults bind loopback; containers bind all interfaces unless overridden. Send SIGTERM or SIGINT to drain and stop. Invalid configuration exits 78; runtime failures or shutdown deadline expiry exit 1. Correct configuration and restart after these errors. Database failures affect readiness, not liveness.
 
+The API, worker and migrator write structured events to stderr ([ADR 0024](docs/adr/0024-process-telemetry-and-redaction.md)). The API and worker write nothing to stdout. The `configuration error:` line, the `--check-auth-config` output and the migrator's result lines keep their existing plain form. Two settings use the process's own prefix (`OPENMETTLE_API_`, `OPENMETTLE_WORKER_` or `OPENMETTLE_MIGRATE_`):
+
+| Setting | Default | Values |
+| --- | --- | --- |
+| `LOG_FORMAT` | `json` | `json` (one object per line) or `text` |
+| `LOG_LEVEL` | `info` | `error`, `warn`, `info` or `debug`. `trace` and filter directives are refused |
+
+Values must match exactly; anything else exits 78 with `configuration error: invalid LOG_FORMAT` or `invalid LOG_LEVEL`.
+
+- **Default level.** `info` shows start, stop and failure events.
+- **Request events.** Each request gets a server-generated `request_id`, which is never taken from a client header. A request completion is logged at `debug`, or at `warn` for a 5xx response such as a failed readiness check.
+- **What is recorded.** Events carry fixed event names, the matched route template, the method, the status, durations, counts and failure classes. They never carry URLs, queries, headers, cookies, bodies, database settings or third-party library logs.
+- **Not covered.** Ingress and proxy access logs are outside these processes. Configure them separately before exposing login routes.
+- **No export yet.** Nothing is sent over the network; OTLP export is a later increment.
+
 Run the real PostgreSQL subprocess test against an isolated test database:
 
 ```sh
@@ -498,7 +513,7 @@ CREATE ROLE openmettle_worker LOGIN PASSWORD :'worker_password' CONNECTION LIMIT
 CREATE DATABASE openmettle OWNER openmettle_owner;
 ```
 
-Then run the migrator with the owner's URL. It reads `OPENMETTLE_MIGRATE_DATABASE_URL` and optional `OPENMETTLE_MIGRATE_CONNECT_TIMEOUT_MS` (default 5000), `OPENMETTLE_MIGRATE_LOCK_TIMEOUT_MS` (default 15000) and `OPENMETTLE_MIGRATE_STATEMENT_TIMEOUT_MS` (default 300000). It exits 0 on success, 78 on invalid configuration and 1 on any other failure, including a lock wait past its deadline. Concurrent runs are serialized. A failed or interrupted run leaves no partial migration and can be retried immediately. A checksum mismatch or a database newer than the binary is refused. Do not delete history rows or rerun edited files; ship a corrective migration or restore a backup instead.
+Then run the migrator with the owner's URL. It reads `OPENMETTLE_MIGRATE_DATABASE_URL` and optional `OPENMETTLE_MIGRATE_CONNECT_TIMEOUT_MS` (default 5000), `OPENMETTLE_MIGRATE_LOCK_TIMEOUT_MS` (default 15000) and `OPENMETTLE_MIGRATE_STATEMENT_TIMEOUT_MS` (default 300000), plus `OPENMETTLE_MIGRATE_LOG_FORMAT` and `OPENMETTLE_MIGRATE_LOG_LEVEL` as described under Runtime. On success it prints `schema is at migration N` to stdout; a failure prints `migration error:` and a fixed description to stderr, beside a `migration.failed` event. It exits 0 on success, 78 on invalid configuration and 1 on any other failure, including a lock wait past its deadline. Concurrent runs are serialized. A failed or interrupted run leaves no partial migration and can be retried immediately. A checksum mismatch or a database newer than the binary is refused. Do not delete history rows or rerun edited files; ship a corrective migration or restore a backup instead.
 
 ```sh
 export OPENMETTLE_MIGRATE_DATABASE_URL='postgres://openmettle_owner:<password>@127.0.0.1:5432/openmettle?sslmode=disable'

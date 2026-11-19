@@ -462,6 +462,9 @@ fn migrate_rejects_invalid_config_without_disclosing_values() {
         ("CONNECT_TIMEOUT_MS", "synthetic-secret"),
         ("LOCK_TIMEOUT_MS", "0"),
         ("STATEMENT_TIMEOUT_MS", "3600001"),
+        // ADR 0024: telemetry settings share the prefix and the exit code.
+        ("LOG_FORMAT", "synthetic-secret"),
+        ("LOG_LEVEL", "trace"),
     ] {
         let output = migrate_command("postgres://localhost/test", &[(key, value)])
             .output()
