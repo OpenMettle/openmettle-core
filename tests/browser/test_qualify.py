@@ -2,11 +2,40 @@
 import contextlib
 import io
 import json
+from pathlib import Path
 import socket
 import subprocess
 import unittest
 
-from qualify import DevTools, Failure, Progress, journey, unexpected
+from qualify import DevTools, Failure, Progress, chrome, journey, start, unexpected
+
+VERSION = b'{"id":1,"result":{"product":"Chrome/1.2.3.4"}}\0'
+# The browser exits before answering, before or after reading the command.
+EXITED_UNREAD, EXITED_READ = "exited unread", "exited read"
+
+
+class Launches:
+    """Fake browser launches: each attempt answers with its scripted bytes, stays silent
+    (None) or exits before answering (EXITED_UNREAD, EXITED_READ)."""
+
+    def __init__(self, test, *replies):
+        self.replies, self.launched, self.closed = replies, [], []
+        self.test = test
+
+    def __call__(self, attempt):
+        client, peer = socket.socketpair()
+        self.test.addCleanup(client.close)
+        self.test.addCleanup(peer.close)
+        client.settimeout(0.05)
+        reply = self.replies[attempt - 1]
+        if reply == EXITED_UNREAD:
+            peer.close()  # the command write then fails with a broken pipe
+        elif reply == EXITED_READ:
+            peer.shutdown(socket.SHUT_WR)  # the command is accepted, then the pipe ends
+        elif reply:
+            peer.sendall(reply)
+        self.launched.append(attempt)
+        return DevTools(client), lambda: self.closed.append(attempt)
 
 
 class PrivatePipeTests(unittest.TestCase):
@@ -53,34 +82,80 @@ class PrivatePipeTests(unittest.TestCase):
                 DevTools(client).evaluate("true")
 
 
-class UnexpectedErrorTests(unittest.TestCase):
+class StartPhaseTests(unittest.TestCase):
     def test_silent_browser_is_reported_by_the_phase_in_progress(self):
-        client, peer = socket.socketpair()
-        with client, peer:
-            client.settimeout(0.05)
-            progress = Progress()
-            progress.enter("browser start")
-            # The browser answers its version, then never answers again.
-            peer.sendall(b'{"id":1,"result":{"product":"Chrome/1.2.3.4"}}\0')
-            with self.assertRaises(TimeoutError) as raised, \
-                    contextlib.redirect_stdout(io.StringIO()):
-                journey(DevTools(client), "https://app.test", "https://issuer.test",
-                        progress.enter)
-            self.assertEqual(unexpected(raised.exception, progress.phase),
-                             "timed out during browser target setup")
+        progress = Progress()
+        progress.enter("browser start")
+        # The browser answers its version, then never answers again.
+        with contextlib.redirect_stdout(io.StringIO()):
+            browser, _ = start(Launches(self, VERSION))
+        with self.assertRaises(TimeoutError) as raised:
+            journey(browser, "https://app.test", "https://issuer.test", progress.enter)
+        self.assertEqual(unexpected(raised.exception, progress.phase),
+                         "timed out during browser target setup")
 
     def test_browser_that_never_answers_is_a_start_timeout(self):
-        client, peer = socket.socketpair()
-        with client, peer:
-            client.settimeout(0.05)
-            progress = Progress()
-            progress.enter("browser start")
-            with self.assertRaises(TimeoutError) as raised:
-                journey(DevTools(client), "https://app.test", "https://issuer.test",
-                        progress.enter)
-            self.assertEqual(unexpected(raised.exception, progress.phase),
-                             "timed out during browser start")
+        progress = Progress()
+        progress.enter("browser start")
+        launches = Launches(self, None, None)
+        with self.assertRaises(TimeoutError) as raised, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            start(launches)
+        self.assertEqual(unexpected(raised.exception, progress.phase),
+                         "timed out during browser start")
+        # Both attempts were made, both browsers were closed, and only the first was retried.
+        self.assertEqual((launches.launched, launches.closed), ([1, 2], [1, 2]))
+        self.assertEqual(output.getvalue(), "Browser start retried\n")
 
+
+class StartRetryTests(unittest.TestCase):
+    def test_a_silent_start_is_retried_once(self):
+        launches = Launches(self, None, VERSION)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            browser, close = start(launches)
+        self.assertEqual((launches.launched, launches.closed), ([1, 2], [1]))
+        self.assertEqual(output.getvalue(),
+                         "Browser start retried\nBrowser runtime Chrome/1.2.3.4\n")
+        close()
+        self.assertEqual(launches.closed, [1, 2])
+
+    def test_a_browser_that_answers_is_not_relaunched(self):
+        launches = Launches(self, VERSION, VERSION)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            start(launches)
+        self.assertEqual((launches.launched, launches.closed), ([1], []))
+        self.assertNotIn("retried", output.getvalue())
+
+    def test_a_browser_that_exits_at_start_is_never_retried(self):
+        for reply, error in [(EXITED_UNREAD, ConnectionError), (EXITED_READ, Failure)]:
+            with self.subTest(reply=reply):
+                launches = Launches(self, reply, VERSION)
+                with self.assertRaises(error), contextlib.redirect_stdout(io.StringIO()):
+                    start(launches)
+                self.assertEqual((launches.launched, launches.closed), ([1], [1]))
+
+    def test_a_refused_or_unexpected_start_is_never_retried(self):
+        for reply, message in [
+            (b'{"id":1,"error":{"message":"sensitive"}}\0', "browser command refused"),
+            (b'{"id":1,"result":{"product":"Other/1"}}\0', "unexpected browser version"),
+        ]:
+            with self.subTest(message=message):
+                launches = Launches(self, reply, VERSION)
+                with self.assertRaisesRegex(Failure, f"^{message}$"), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    start(launches)
+                self.assertEqual((launches.launched, launches.closed), ([1], [1]))
+
+    def test_each_attempt_has_its_own_profile(self):
+        home = Path("/fixture-home")
+        first, second = chrome(home, 1), chrome(home, 2)
+        differing = [(a, b) for a, b in zip(first, second) if a != b]
+        self.assertEqual(len(first), len(second))
+        self.assertEqual(differing, [(f"--user-data-dir={home / 'profile-1'}",
+                                      f"--user-data-dir={home / 'profile-2'}")])
+
+
+class UnexpectedErrorTests(unittest.TestCase):
     def test_error_kinds_are_fixed_and_never_carry_error_text(self):
         tool = ["certutil", "sensitive argument"]
         for error, kind in [
