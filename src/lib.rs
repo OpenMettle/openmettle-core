@@ -38,6 +38,8 @@ struct Config {
     database_timeout: Duration,
     shutdown_timeout: Duration,
     telemetry: telemetry::Settings,
+    /// `OTLP_TRACES_ENDPOINT` and its companions (ADR 0026); `None` leaves export off.
+    otlp: Option<telemetry::otlp::Settings>,
     /// `OPENMETTLE_API_AUTH_CONFIG`: the browser sign-in settings document to mount
     /// (ADR 0025). Always `None` for the worker, which never reads the key.
     auth_config: Option<PathBuf>,
@@ -91,6 +93,7 @@ impl Config {
         let shutdown_timeout =
             Duration::from_millis(number("SHUTDOWN_TIMEOUT_MS", 5000, 60000)?.into());
         let telemetry = telemetry::Settings::parse(&get)?;
+        let otlp = telemetry::otlp::Settings::parse(&get)?;
         // Read last, and by the API alone. Unset serves the operational routes only. A set
         // value is never treated as unset: empty or relative is refused, as the loader would.
         let auth_config = match role {
@@ -110,6 +113,7 @@ impl Config {
             database_timeout,
             shutdown_timeout,
             telemetry,
+            otlp,
             auth_config,
         })
     }
@@ -165,6 +169,27 @@ async fn ready(State(state): State<Health>) -> (StatusCode, &'static str) {
     }
 }
 
+/// Runs a serving process on a two-worker Tokio runtime and returns its exit code. The
+/// runtime is then shut down without waiting for blocking tasks: an abandoned operating-system
+/// DNS lookup (ADRs 0010, 0026) cannot be cancelled and must not hold the exit after `run`
+/// has finished within `SHUTDOWN_TIMEOUT_MS`.
+pub fn run_blocking(role: Role) -> u8 {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            eprintln!("runtime error: async runtime could not start");
+            return 1;
+        }
+    };
+    let code = runtime.block_on(run(role));
+    runtime.shutdown_background();
+    code
+}
+
 pub async fn run(role: Role) -> u8 {
     let process = match role {
         Role::Api => Process::Api,
@@ -179,6 +204,15 @@ pub async fn run(role: Role) -> u8 {
             return 78;
         }
     };
+    // The OTLP CA file is read here, so a refusal is the same kind of fixed line (ADR 0026).
+    let export = match config.otlp.as_ref().map(telemetry::otlp::Destination::load) {
+        None => None,
+        Some(Ok(destination)) => Some(destination),
+        Some(Err(message)) => {
+            eprintln!("configuration error: {message}");
+            return 78;
+        }
+    };
     // The same holds for the browser sign-in settings: refused before telemetry is installed
     // or the listener opens, with the offline check's fixed category line (ADRs 0015, 0025).
     let pool = pool(&config);
@@ -189,7 +223,7 @@ pub async fn run(role: Role) -> u8 {
             return 78;
         }
     };
-    let telemetry = match telemetry::install(config.telemetry, process) {
+    let telemetry = match telemetry::install(config.telemetry, process, export) {
         Ok(telemetry) => telemetry,
         Err(unavailable) => {
             eprintln!("runtime error: {}", unavailable.message());
@@ -207,13 +241,14 @@ pub async fn run(role: Role) -> u8 {
             1
         }
     };
-    // Bounded: a stalled stderr loses the final lines, not the exit.
-    telemetry.flush(flush);
+    // Bounded: a stalled stderr or collector loses the final lines or spans, not the exit.
+    telemetry.stop(flush).await;
     code
 }
 
 /// Splits `SHUTDOWN_TIMEOUT_MS` so the whole stop fits it: the final telemetry flush gets a
-/// tenth, at most `telemetry::FLUSH_LIMIT`, and draining gets the rest.
+/// tenth, at most `telemetry::FLUSH_LIMIT`, and draining gets the rest. The flush slice also
+/// covers stopping a configured OTLP exporter.
 fn shutdown_budget(timeout: Duration) -> (Duration, Duration) {
     let flush = (timeout / 10).min(telemetry::FLUSH_LIMIT);
     (timeout - flush, flush)

@@ -13,6 +13,10 @@
 //!
 //! In production the sink is a bounded queue in front of one writer thread ([`sink`]), so a
 //! stalled stderr drops and counts lines instead of blocking the emitting thread.
+//!
+//! The stderr guard admits events only. When OTLP export is configured ([`otlp`], ADR 0026),
+//! a second layer behind [`SpanGuard`] admits spans only: this crate's request span, with
+//! [`SPAN_FIELDS`]. Third-party spans and every event stay invisible to it.
 use axum::{
     Router,
     extract::{MatchedPath, Request},
@@ -20,6 +24,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use opentelemetry_sdk::trace::SdkTracer;
 use std::time::{Duration, Instant};
 use tracing::{
     Level, Metadata, Subscriber,
@@ -33,6 +38,7 @@ use tracing_subscriber::{
     layer::{Context, Filter, SubscriberExt},
 };
 
+pub mod otlp;
 mod sink;
 
 /// The one target the guard admits. Every constructor names it explicitly.
@@ -52,6 +58,17 @@ pub const FIELDS: &[&str] = &[
     "error.type",
     "schema_version",
     "dropped_lines",
+    "dropped_spans",
+];
+
+/// The only field names [`SpanGuard`] admits: the request span's. `otel.kind` is consumed by
+/// the bridge as the span kind and is not exported as an attribute.
+pub const SPAN_FIELDS: &[&str] = &[
+    "otel.kind",
+    "request_id",
+    "http.route",
+    "http.request.method",
+    "http.response.status_code",
 ];
 
 /// Log line encoding, from `LOG_FORMAT`.
@@ -111,40 +128,83 @@ impl Settings {
     }
 }
 
-/// Default-deny callsite guard in front of the sink. Its decision depends only on static
-/// callsite metadata, so it is cached per callsite; `enabled` repeats it because another
-/// dispatcher's interest can make a callsite `sometimes`.
+/// Admits only callsites on [`TARGET`], at or below `max`, whose every field is in `fields`.
+fn allowed(metadata: &Metadata<'_>, max: Level, fields: &[&str]) -> bool {
+    metadata.target() == TARGET
+        && *metadata.level() <= max
+        && metadata.fields().iter().all(|f| fields.contains(&f.name()))
+}
+
+/// Default-deny callsite guard in front of the stderr sink: events only, with [`FIELDS`]. Its
+/// decision depends only on static callsite metadata, so it is cached per callsite; `enabled`
+/// repeats it because another dispatcher's interest can make a callsite `sometimes`.
 pub struct Guard {
     max: Level,
 }
 
 impl Guard {
     fn admits(&self, metadata: &Metadata<'_>) -> bool {
-        metadata.target() == TARGET
-            && *metadata.level() <= self.max
-            && metadata.fields().iter().all(|f| FIELDS.contains(&f.name()))
+        metadata.is_event() && allowed(metadata, self.max, FIELDS)
+    }
+    fn hint(&self) -> LevelFilter {
+        LevelFilter::from_level(self.max)
     }
 }
 
-impl<S> Filter<S> for Guard {
-    fn enabled(&self, metadata: &Metadata<'_>, _: &Context<'_, S>) -> bool {
-        self.admits(metadata)
+/// Default-deny callsite guard in front of the OTLP span layer: spans only, with
+/// [`SPAN_FIELDS`], at `info` or below whatever `LOG_LEVEL` is. Events, including every log
+/// event, never become span events.
+pub struct SpanGuard;
+
+impl SpanGuard {
+    fn admits(&self, metadata: &Metadata<'_>) -> bool {
+        metadata.is_span() && allowed(metadata, Level::INFO, SPAN_FIELDS)
     }
-    fn callsite_enabled(&self, metadata: &'static Metadata<'static>) -> Interest {
-        if self.admits(metadata) {
-            Interest::always()
-        } else {
-            Interest::never()
-        }
-    }
-    fn max_level_hint(&self) -> Option<LevelFilter> {
-        Some(LevelFilter::from_level(self.max))
+    fn hint(&self) -> LevelFilter {
+        LevelFilter::INFO
     }
 }
+
+/// Both guards decide from static callsite metadata alone.
+macro_rules! callsite_filter {
+    ($guard:ty) => {
+        impl<S> Filter<S> for $guard {
+            fn enabled(&self, metadata: &Metadata<'_>, _: &Context<'_, S>) -> bool {
+                self.admits(metadata)
+            }
+            fn callsite_enabled(&self, metadata: &'static Metadata<'static>) -> Interest {
+                if self.admits(metadata) {
+                    Interest::always()
+                } else {
+                    Interest::never()
+                }
+            }
+            fn max_level_hint(&self) -> Option<LevelFilter> {
+                Some(self.hint())
+            }
+        }
+    };
+}
+callsite_filter!(Guard);
+callsite_filter!(SpanGuard);
 
 /// The production subscriber stack over `writer`: one formatting layer behind [`Guard`].
 /// Production passes stderr; tests pass a capture.
 pub fn subscriber<W>(settings: Settings, writer: W) -> impl Subscriber + Send + Sync + 'static
+where
+    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
+    stack(settings, writer, None)
+}
+
+/// [`subscriber`], plus the OTLP span layer behind [`SpanGuard`] when `tracer` is given. The
+/// bridge records no source location, thread, target, level or busy/idle timing, maps no
+/// error field, and never activates an OpenTelemetry context.
+pub(crate) fn stack<W>(
+    settings: Settings,
+    writer: W,
+    tracer: Option<SdkTracer>,
+) -> Box<dyn Subscriber + Send + Sync + 'static>
 where
     W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
 {
@@ -162,7 +222,26 @@ where
     let guard = Guard {
         max: settings.verbosity.level(),
     };
-    Registry::default().with(layer.with_filter(guard))
+    let logs = Registry::default().with(layer.with_filter(guard));
+    // Two concrete stacks rather than an optional layer: an absent `Option` layer reports
+    // interest in every callsite, which would enable the request span with export off.
+    let Some(tracer) = tracer else {
+        return Box::new(logs);
+    };
+    let spans = tracing_opentelemetry::layer()
+        .with_tracer(tracer)
+        .with_location(false)
+        .with_threads(false)
+        .with_target(false)
+        .with_level(false)
+        .with_tracked_inactivity(false)
+        .with_context_activation(false)
+        .with_error_fields_to_exceptions(false)
+        .with_error_records_to_exceptions(false)
+        .with_error_events_to_exceptions(false)
+        .with_error_events_to_status(false)
+        .with_filter(SpanGuard);
+    Box::new(logs.with(spans))
 }
 
 /// Telemetry could not be installed; the process exits 1 with this fixed line.
@@ -187,24 +266,52 @@ impl Unavailable {
 /// The longest wait for queued lines at exit or after a panic, when stderr is not keeping up.
 pub const FLUSH_LIMIT: Duration = Duration::from_millis(250);
 
-/// The installed sink, kept by the process to flush before it exits.
-pub struct Installed(sink::Queue);
+/// The installed sink, and the OTLP exporter if one was configured, kept by the process to
+/// stop them before it exits.
+pub struct Installed {
+    queue: sink::Queue,
+    exporter: Option<otlp::Exporter>,
+}
 
 impl Installed {
     /// Waits at most `limit` for every line emitted so far to be written. Returns whether it
     /// was; exit never waits longer.
     pub fn flush(&self, limit: Duration) -> bool {
-        self.0.flush(limit)
+        self.queue.flush(limit)
+    }
+
+    /// Stops everything within `budget`. A configured exporter gets at most half of it to
+    /// send queued spans and is then cancelled, closing any connection; the stderr flush gets
+    /// the rest, before the same deadline. Without an exporter this is [`Self::flush`].
+    pub async fn stop(self, budget: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + budget;
+        if let Some(exporter) = self.exporter {
+            exporter.stop(deadline - budget / 2).await;
+        }
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        self.queue.flush(left)
     }
 }
 
 /// Installs the production stack for the rest of the process: the guarded formatter over a
 /// bounded queue to a stderr writer thread, and a panic hook that writes only
-/// `process.panicked` for `role`.
-pub fn install(settings: Settings, role: Process) -> Result<Installed, Unavailable> {
+/// `process.panicked` for `role`. With `export`, the OTLP exporter is started on the current
+/// Tokio runtime and its span layer joins the stack; without it nothing OTLP-related exists.
+pub fn install(
+    settings: Settings,
+    role: Process,
+    export: Option<otlp::Destination>,
+) -> Result<Installed, Unavailable> {
     let queue = sink::Queue::spawn(std::io::stderr(), sink::CAPACITY, settings)
         .map_err(|_| Unavailable::Writer)?;
-    tracing::subscriber::set_global_default(subscriber(settings, queue.clone()))
+    let (tracer, exporter) = match export {
+        Some(destination) => {
+            let (tracer, exporter) = otlp::start(destination, role);
+            (Some(tracer), Some(exporter))
+        }
+        None => (None, None),
+    };
+    tracing::subscriber::set_global_default(stack(settings, queue.clone(), tracer))
         .map_err(|_| Unavailable::AlreadyInstalled)?;
     let hook = queue.clone();
     // Replaces the default hook, which writes the payload and location. Unwinding or abort
@@ -213,7 +320,7 @@ pub fn install(settings: Settings, role: Process) -> Result<Installed, Unavailab
         process_panicked(role);
         hook.flush(FLUSH_LIMIT);
     }));
-    Ok(Installed(queue))
+    Ok(Installed { queue, exporter })
 }
 
 /// A server-generated UUIDv4 for one request. It is never read from a client header.
@@ -377,6 +484,10 @@ impl Route {
     fn as_str(&self) -> &str {
         self.0.as_ref().map_or("unmatched", MatchedPath::as_str)
     }
+    /// The liveness and readiness probes, which produce no span.
+    fn is_probe(&self) -> bool {
+        matches!(self.as_str(), "/healthz" | "/readyz")
+    }
 }
 
 /// Adds request-ID middleware to every route of `router` and to its fallback. Apply it after
@@ -386,7 +497,8 @@ pub fn observe<S: Clone + Send + Sync + 'static>(router: Router<S>) -> Router<S>
 }
 
 /// Assigns a fresh [`RequestId`] (also placed in request extensions for handlers) and records
-/// the route template, method, status and duration when the response head is ready.
+/// the route template, method, status and duration when the response head is ready. Every
+/// route except the probes also gets a request span, which only the OTLP layer can see.
 async fn request(mut request: Request, next: Next) -> Response {
     let started = Instant::now();
     let id = RequestId::generate();
@@ -395,15 +507,32 @@ async fn request(mut request: Request, next: Next) -> Response {
     }
     let route = Route(request.extensions().get::<MatchedPath>().cloned());
     let method = Method::of(request.method());
+    let span = (!route.is_probe()).then(|| request_span(id, &route, method));
     let response = next.run(request).await;
-    request_completed(
-        id,
-        &route,
-        method,
-        response.status().as_u16(),
-        started.elapsed(),
-    );
+    let status = response.status().as_u16();
+    if let Some(span) = &span {
+        // As i64: the bridge has no u64 visitor and would export the code as a string.
+        span.record("http.response.status_code", i64::from(status));
+    }
+    request_completed(id, &route, method, status, started.elapsed());
     response
+}
+
+/// A root server span, never entered and never parented: an inbound `traceparent` or
+/// `tracestate` is not read, so every request starts a new trace. It ends when dropped,
+/// after the response head is ready. Disabled, and almost free, unless OTLP is configured.
+fn request_span(id: Option<RequestId>, route: &Route, method: Method) -> tracing::Span {
+    let id: Option<DisplayValue<RequestId>> = id.map(display);
+    tracing::info_span!(
+        target: TARGET,
+        parent: None,
+        "http.server.request",
+        otel.kind = "server",
+        request_id = id,
+        http.route = route.as_str(),
+        http.request.method = method.as_str(),
+        http.response.status_code = tracing::field::Empty,
+    )
 }
 
 fn micros(elapsed: Duration) -> u64 {
@@ -482,6 +611,12 @@ pub fn process_panicked(role: Process) {
 /// or a write failed. `error`, so every configured level shows it.
 fn lines_dropped(count: u64) {
     tracing::error!(target: TARGET, event = "telemetry.dropped", dropped_lines = count);
+}
+
+/// The OTLP exporter dropped `count` spans since its last report, because the queue was full
+/// or a batch was not delivered. At most once per export cycle, to stderr only.
+fn spans_dropped(count: u64) {
+    tracing::error!(target: TARGET, event = "telemetry.dropped", dropped_spans = count);
 }
 
 /// A migration run is starting.

@@ -11,6 +11,28 @@ TOKEN = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{20,
 ACTION = re.compile(r"^\s*-?\s*uses:\s*([^\s#]+)", re.MULTILINE)
 SKIP_DIRS = {".git", "__pycache__", ".venv", "node_modules"}
 FORBIDDEN_NAMES = {".env", "id_rsa", "id_ed25519", "kubeconfig", "terraform.tfstate", "terraform.tfstate.backup"}
+# ADR 0026: OTLP export uses the ADR 0010 HTTP/1.1 core. None of these may enter Cargo.lock, as
+# a normal, build or dev dependency: HTTP/2 and gRPC stacks, other HTTP clients, the OTLP and
+# OTel HTTP exporters, async-trait, the `log` bridge and compression codecs.
+BANNED_CRATES = {
+    "h2",
+    "tonic",
+    "reqwest",
+    "hyper-rustls",
+    "opentelemetry-otlp",
+    "opentelemetry-http",
+    "async-trait",
+    "tracing-log",
+    "flate2",
+    "zstd",
+    "zstd-sys",
+}
+LOCK_NAME = re.compile(r'^name = "([^"]+)"$', re.MULTILINE)
+
+
+def banned_crates(lock_text):
+    """Banned package names present in Cargo.lock text, sorted."""
+    return sorted(set(LOCK_NAME.findall(lock_text)) & BANNED_CRATES)
 
 
 def tracked_files():
@@ -50,6 +72,10 @@ def check():
                 action = action.strip("\"'")
                 if not action.startswith("./") and not re.fullmatch(r"[\w.-]+/[\w./-]+@[0-9a-f]{40}", action):
                     errors.append(f"{relative}: external actions must be pinned to full commit SHAs")
+    lock = ROOT / "Cargo.lock"
+    if lock.is_file():
+        for name in banned_crates(lock.read_text(encoding="utf-8")):
+            errors.append(f"Cargo.lock: {name} is banned (ADR 0026)")
     for name in ("README.md", "LICENSE"):
         if not (ROOT / name).is_file():
             errors.append(f"{name}: required")

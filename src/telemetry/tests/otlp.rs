@@ -1,0 +1,876 @@
+//! OTLP/HTTP trace export (ADR 0026) against in-process collectors: a synthetic-CA TLS
+//! collector that decodes what it receives, one that accepts TCP and never reads, and scripted
+//! failures. No external network, cluster or PostgreSQL.
+use super::{Capture, exchange};
+use crate::{
+    auth_config::tests::support::Dir,
+    provider_http::fixture::{self, Ca, Reply, Server, loopback, response},
+    telemetry::{
+        Format, Method, Process, RequestId, Route, TARGET, Verbosity, observe,
+        otlp::{self, Destination, Exporter, Tuning},
+        request_span,
+    },
+};
+use axum::{Router, routing::get};
+use opentelemetry_proto::tonic::{
+    collector::trace::v1::ExportTraceServiceRequest,
+    common::v1::{AnyValue, KeyValue, any_value::Value},
+    trace::v1::{Span, span::SpanKind},
+};
+use prost::Message;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::SocketAddr,
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
+use tokio::io::AsyncReadExt;
+
+pub(crate) const COLLECTOR: &str = "collector.example.test";
+const CANARY: &str = "CANARY-otlp-5c1e";
+const TRACEPARENT_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+const TRACEPARENT_SPAN: &str = "00f067aa0ba902b7";
+
+/// Short cycles and deadlines so tests finish quickly; queue and batch bounds as in production.
+const FAST: Tuning = Tuning {
+    queue: otlp::QUEUE_CAPACITY,
+    batch: otlp::MAX_BATCH,
+    interval: Duration::from_millis(20),
+    deadline: Duration::from_secs(2),
+    request_body: otlp::MAX_REQUEST_BYTES,
+};
+
+fn settings(port: u16, ca_file: Option<&str>) -> otlp::Settings {
+    let endpoint = format!("https://{COLLECTOR}:{port}/v1/traces");
+    otlp::Settings::parse(|key| {
+        Ok(match key {
+            "OTLP_TRACES_ENDPOINT" => Some(endpoint.clone()),
+            "OTLP_CA_FILE" => ca_file.map(str::to_owned),
+            _ => None,
+        })
+    })
+    .unwrap()
+    .unwrap()
+}
+
+/// A destination for `port` trusting only `ca`, loaded through `OTLP_CA_FILE` as in
+/// production, resolving to loopback.
+fn destination(port: u16, ca: &Ca, tuning: Tuning) -> Destination {
+    let dir = Dir::new();
+    let path = dir.write("collector-ca.pem", &ca.pem());
+    Destination::load(&settings(port, Some(&path)))
+        .ok()
+        .unwrap()
+        .with_lookup(loopback)
+        .allow_loopback_fixture()
+        .with_tuning(tuning)
+}
+
+/// A TLS collector that records every request body and answers with `reply`.
+pub(crate) struct Collector {
+    pub(crate) server: Server,
+    pub(crate) ca: Ca,
+    bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl Collector {
+    pub(crate) async fn start(reply: impl Fn() -> Reply + Send + Sync + 'static) -> Self {
+        let ca = Ca::new();
+        let bodies: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let recorded = bodies.clone();
+        let server = Server::start(ca.leaf(COLLECTOR, false), move |received| {
+            recorded.lock().unwrap().push(received.body.clone());
+            reply()
+        })
+        .await;
+        Self { server, ca, bodies }
+    }
+    pub(crate) async fn accepting() -> Self {
+        Self::start(|| Reply::Bytes(response(200, &[], b""))).await
+    }
+    pub(crate) fn destination(&self) -> Destination {
+        destination(self.server.port, &self.ca, FAST)
+    }
+    pub(crate) fn bodies(&self) -> Vec<Vec<u8>> {
+        self.bodies.lock().unwrap().clone()
+    }
+    pub(crate) fn requests(&self) -> Vec<ExportTraceServiceRequest> {
+        let bodies = self.bodies().into_iter();
+        bodies
+            .map(|b| ExportTraceServiceRequest::decode(&b[..]).unwrap())
+            .collect()
+    }
+    /// Every exported span.
+    pub(crate) fn spans(&self) -> Vec<Span> {
+        let mut spans = Vec::new();
+        for request in self.requests() {
+            for resource in request.resource_spans {
+                for scope in resource.scope_spans {
+                    spans.extend(scope.spans);
+                }
+            }
+        }
+        spans
+    }
+    /// Fails if any canary's bytes appear in any request body.
+    pub(crate) fn assert_absent(&self, canaries: &[&[u8]]) {
+        for body in self.bodies() {
+            for canary in canaries {
+                assert!(
+                    !body.windows(canary.len()).any(|w| w == *canary),
+                    "canary {:?} was exported",
+                    String::from_utf8_lossy(canary)
+                );
+            }
+        }
+    }
+}
+
+/// Stops `exporter` with a generous deadline, so everything queued is sent.
+pub(crate) async fn finish(exporter: Exporter) {
+    exporter
+        .stop(tokio::time::Instant::now() + Duration::from_secs(10))
+        .await;
+}
+
+fn text(value: &Option<AnyValue>) -> Option<&str> {
+    match value.as_ref()?.value.as_ref()? {
+        Value::StringValue(s) => Some(s),
+        _ => None,
+    }
+}
+
+fn int(value: &Option<AnyValue>) -> Option<i64> {
+    match value.as_ref()?.value.as_ref()? {
+        Value::IntValue(i) => Some(*i),
+        _ => None,
+    }
+}
+
+fn attributes(list: &[KeyValue]) -> BTreeMap<&str, &Option<AnyValue>> {
+    list.iter().map(|kv| (kv.key.as_str(), &kv.value)).collect()
+}
+
+/// Total `dropped_spans` across `telemetry.dropped` events.
+fn dropped(capture: &Capture) -> u64 {
+    let events = capture.events("telemetry.dropped").into_iter();
+    events
+        .filter_map(|e| e.get("dropped_spans").and_then(|v| v.as_u64()))
+        .sum()
+}
+
+/// A lazy pool whose database address refuses connections, so readiness fails quickly.
+fn refusing_pool() -> sqlx::PgPool {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_millis(200))
+        .connect_lazy_with(
+            PgConnectOptions::new()
+                .host("127.0.0.1")
+                .port(port)
+                .username("fixture")
+                .password(CANARY)
+                .database("fixture")
+                .ssl_mode(PgSslMode::Disable),
+        )
+}
+
+/// Instrumentation a handler might trigger, none of which may be exported: third-party
+/// spans and events, a span on our target with an unlisted field, our own spans below `info`,
+/// and our own admitted events, which must not become span events.
+fn foreign_instrumentation() {
+    let query = tracing::info_span!(target: "sqlx::query", "query", db.statement = CANARY);
+    query.in_scope(|| tracing::info!(target: "hyper::proto", role = CANARY));
+    tracing::info_span!(target: "rustls::client", "handshake", request_id = CANARY).in_scope(|| {});
+    tracing::info_span!(target: TARGET, "leak", password = CANARY).in_scope(|| {});
+    tracing::debug_span!(target: TARGET, "verbose", request_id = CANARY).in_scope(|| {});
+    tracing::trace_span!(target: TARGET, "chatty", request_id = CANARY).in_scope(|| {});
+    tracing::error!(target: TARGET, event = "guard.span_event", role = "api");
+}
+
+/// The served health routes, a handler that triggers [`foreign_instrumentation`] and the
+/// fallback, observed as in `serve`.
+async fn serve_app() -> SocketAddr {
+    let health = crate::routes(crate::Health {
+        pool: refusing_pool(),
+        timeout: Duration::from_millis(200),
+    });
+    let handler = Router::new().route(
+        "/v1/thing",
+        get(|| async {
+            foreign_instrumentation();
+            "ok\n"
+        }),
+    );
+    let app = observe(health.merge(handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    address
+}
+
+fn get_request(target: &str) -> String {
+    format!(
+        "GET {target} HTTP/1.1\r\nhost: localhost\r\ntraceparent: 00-{TRACEPARENT_ID}-{TRACEPARENT_SPAN}-01\r\n\
+         tracestate: vendor={CANARY}\r\ncookie: session={CANARY}\r\nconnection: close\r\n\r\n"
+    )
+}
+
+/// The happy path through the production stack: one root server span per non-probe request
+/// with only the allowlisted attributes and `service.name`, sent as HTTP/1.1 protobuf over TLS
+/// with exactly the core's headers.
+#[tokio::test]
+async fn export_carries_only_allowlisted_root_request_spans_over_tls_http1() {
+    let collector = Collector::accepting().await;
+    let (tracer, exporter) = otlp::start(collector.destination(), Process::Api);
+    let (capture, _guard) = Capture::install_traced(Format::Json, Verbosity::Debug, tracer);
+    let address = serve_app().await;
+    let post = format!(
+        "POST /healthz HTTP/1.1\r\nhost: localhost\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{CANARY}",
+        CANARY.len()
+    );
+    let cases = [
+        (get_request("/healthz"), 200),
+        (get_request("/readyz"), 503),
+        (post, 405),
+        (get_request(&format!("/v1/thing?q={CANARY}")), 200),
+        (get_request(&format!("/{CANARY}/x")), 404),
+    ];
+    for (request, status) in &cases {
+        assert_eq!(exchange(address, request.as_bytes()).await, *status);
+    }
+    finish(exporter).await;
+
+    // Only the two non-probe requests produced spans; nothing else was exported.
+    let spans = collector.spans();
+    assert_eq!(spans.len(), 2, "{spans:#?}");
+    let mut routes = BTreeSet::new();
+    let mut traces = BTreeSet::new();
+    for span in &spans {
+        assert_eq!(span.name, "http.server.request");
+        assert_eq!(span.kind, SpanKind::Server as i32);
+        // Root spans: the inbound traceparent and tracestate were ignored.
+        assert!(span.parent_span_id.is_empty());
+        assert!(span.trace_state.is_empty());
+        assert_ne!(hex(&span.trace_id), TRACEPARENT_ID);
+        assert!(traces.insert(span.trace_id.clone()));
+        assert!(span.events.is_empty() && span.links.is_empty());
+        let attributes = attributes(&span.attributes);
+        let keys: BTreeSet<&str> = attributes.keys().copied().collect();
+        assert_eq!(
+            keys,
+            [
+                "request_id",
+                "http.route",
+                "http.request.method",
+                "http.response.status_code"
+            ]
+            .into()
+        );
+        assert!(super::is_v4(text(attributes["request_id"]).unwrap()));
+        assert_eq!(text(attributes["http.request.method"]), Some("GET"));
+        let route = text(attributes["http.route"]).unwrap();
+        let status = int(attributes["http.response.status_code"]).unwrap();
+        routes.insert((route.to_owned(), status));
+    }
+    assert_eq!(
+        routes,
+        [("/v1/thing".to_owned(), 200), ("unmatched".to_owned(), 404)].into()
+    );
+    for request in collector.requests() {
+        for resource in &request.resource_spans {
+            let attributes = &resource.resource.as_ref().unwrap().attributes;
+            assert_eq!(attributes.len(), 1);
+            assert_eq!(attributes[0].key, "service.name");
+            assert_eq!(text(&attributes[0].value), Some("openmettle-api"));
+            for scope in &resource.scope_spans {
+                assert_eq!(scope.scope.as_ref().unwrap().name, TARGET);
+            }
+        }
+    }
+    for head in collector.server.heads.lock().unwrap().iter() {
+        let mut lines = head.trim_end().split("\r\n");
+        assert_eq!(lines.next(), Some("POST /v1/traces HTTP/1.1"));
+        let headers: BTreeMap<String, String> = lines
+            .map(|l| {
+                let (k, v) = l.split_once(':').unwrap();
+                (k.to_ascii_lowercase(), v.trim().to_owned())
+            })
+            .collect();
+        let names: BTreeSet<&str> = headers.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            ["connection", "content-length", "content-type", "host"].into()
+        );
+        assert_eq!(headers["connection"], "close");
+        assert_eq!(headers["content-type"], "application/x-protobuf");
+        let port = collector.server.port;
+        assert_eq!(headers["host"], format!("{COLLECTOR}:{port}"));
+    }
+    collector.assert_absent(&[
+        CANARY.as_bytes(),
+        b"CANARY",
+        b"sqlx",
+        b"hyper",
+        b"rustls",
+        b"guard.span_event",
+        b"leak",
+        b"code.",
+        b"thread.",
+        TRACEPARENT_ID.as_bytes(),
+    ]);
+    // Stderr is unchanged by the span layer: one completion event per request and the
+    // handler's admitted event, no span context and no canary.
+    capture.assert_absent(&[CANARY.as_bytes(), b"http.server.request", b"spans"]);
+    assert_eq!(capture.events("http.request.completed").len(), cases.len());
+    assert_eq!(capture.events("guard.span_event").len(), 1);
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A collector that accepts TCP connections and never reads from them, keeping each socket.
+struct Stalled {
+    port: u16,
+    sockets: Arc<Mutex<Vec<tokio::net::TcpStream>>>,
+}
+
+impl Stalled {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let sockets: Arc<Mutex<Vec<tokio::net::TcpStream>>> = Arc::default();
+        let kept = sockets.clone();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                kept.lock().unwrap().push(socket);
+            }
+        });
+        Self { port, sockets }
+    }
+    fn connections(&self) -> usize {
+        self.sockets.lock().unwrap().len()
+    }
+}
+
+/// Polls `done` on this runtime until it holds, for at most ten seconds.
+async fn until(mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "condition not reached");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// A collector that never reads: emitting never waits, probes still answer promptly, every
+/// span is accounted for exactly in rate-limited `telemetry.dropped` events, and shutdown
+/// closes the stalled socket within its deadline.
+#[tokio::test]
+async fn a_stalled_collector_costs_spans_not_serving_or_shutdown() {
+    let collector = Stalled::start().await;
+    let ca = Ca::new();
+    let tuning = Tuning {
+        deadline: Duration::from_millis(200),
+        ..FAST
+    };
+    let (tracer, exporter) = otlp::start(destination(collector.port, &ca, tuning), Process::Api);
+    let (capture, _guard) = Capture::install_traced(Format::Json, Verbosity::Info, tracer);
+    let address = serve_app().await;
+
+    let began = Instant::now();
+    for _ in 0..10_000 {
+        drop(request_span(
+            RequestId::generate(),
+            &Route(None),
+            Method::Get,
+        ));
+    }
+    let emitting = began.elapsed();
+    assert!(emitting < Duration::from_secs(5), "{emitting:?}");
+
+    // While the exporter is held by the collector, the probes keep answering.
+    for _ in 0..20 {
+        let began = Instant::now();
+        assert_eq!(
+            exchange(address, get_request("/healthz").as_bytes()).await,
+            200
+        );
+        assert!(began.elapsed() < Duration::from_secs(1));
+    }
+    until(|| dropped(&capture) >= 10_000).await;
+    // The queue held 2048 of them: four full batches, each one connection and no retry.
+    assert_eq!(dropped(&capture), 10_000);
+    assert_eq!(
+        collector.connections(),
+        otlp::QUEUE_CAPACITY / otlp::MAX_BATCH
+    );
+    let reports = capture.events("telemetry.dropped");
+    assert_eq!(reports.len(), 4, "{}", capture.text());
+    for report in &reports {
+        let keys: BTreeSet<&str> = report.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["timestamp", "level", "event", "dropped_spans"].into()
+        );
+        assert_eq!(report["level"], "ERROR");
+    }
+
+    // One more span is queued, so the stop tries to send it to the stalled collector.
+    drop(request_span(
+        RequestId::generate(),
+        &Route(None),
+        Method::Get,
+    ));
+    until(|| collector.connections() == 4).await;
+    let began = Instant::now();
+    exporter
+        .stop(tokio::time::Instant::now() + Duration::from_millis(100))
+        .await;
+    let stopping = began.elapsed();
+    assert!(stopping < Duration::from_millis(500), "{stopping:?}");
+    // Cancelling the export dropped its connection: the collector sees end of stream.
+    until(|| collector.connections() == 5).await;
+    let mut last = collector.sockets.lock().unwrap().pop().unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut buf = [0; 1024];
+        while last.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+    })
+    .await;
+    assert!(closed.is_ok(), "the stalled export's socket stayed open");
+    capture.assert_absent(&[CANARY.as_bytes()]);
+}
+
+/// How one failure case is set up and what the collector should see.
+struct Case {
+    name: &'static str,
+    reply: fn(u16) -> Reply,
+    leaf: &'static str,
+    lookup: fn(&str, u16) -> std::io::Result<Vec<SocketAddr>>,
+    connections: usize,
+    requests: usize,
+    dropped: u64,
+}
+
+fn private_answer(_: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+    Ok(vec![SocketAddr::from(([10, 0, 0, 1], port))])
+}
+
+/// Each failure drops exactly its batch with one attempt and no retry, and serving continues.
+/// A redirect is never followed.
+#[tokio::test]
+async fn failed_exports_drop_their_batch_once_without_retry_or_redirect() {
+    let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    target.set_nonblocking(true).unwrap();
+    static REDIRECT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    let _ = REDIRECT.set(target.local_addr().unwrap().port());
+    let ok = |_: u16| Reply::Bytes(response(200, &[], b""));
+    let cases = [
+        Case {
+            name: "accepted",
+            reply: ok,
+            leaf: COLLECTOR,
+            lookup: loopback,
+            connections: 1,
+            requests: 1,
+            dropped: 0,
+        },
+        Case {
+            name: "redirect",
+            reply: |_| {
+                let location = format!("https://{COLLECTOR}:{}/v1/traces", REDIRECT.get().unwrap());
+                Reply::Bytes(response(307, &[("location", &location)], b""))
+            },
+            leaf: COLLECTOR,
+            lookup: loopback,
+            connections: 1,
+            requests: 1,
+            dropped: 3,
+        },
+        Case {
+            name: "server error",
+            reply: |_| Reply::Bytes(response(500, &[], b"")),
+            leaf: COLLECTOR,
+            lookup: loopback,
+            connections: 1,
+            requests: 1,
+            dropped: 3,
+        },
+        Case {
+            name: "throttled",
+            reply: |_| Reply::Bytes(response(429, &[("retry-after", "1")], b"")),
+            leaf: COLLECTOR,
+            lookup: loopback,
+            connections: 1,
+            requests: 1,
+            dropped: 3,
+        },
+        Case {
+            name: "oversized response",
+            reply: |_| {
+                let body = vec![b'x'; otlp::MAX_RESPONSE_BYTES + 1];
+                Reply::Bytes(response(200, &[], &body))
+            },
+            leaf: COLLECTOR,
+            lookup: loopback,
+            connections: 1,
+            requests: 1,
+            dropped: 3,
+        },
+        Case {
+            name: "certificate for another host",
+            reply: ok,
+            leaf: "other.example.test",
+            lookup: loopback,
+            connections: 1,
+            requests: 0,
+            dropped: 3,
+        },
+        Case {
+            name: "private address without an allowlisted range",
+            reply: ok,
+            leaf: COLLECTOR,
+            lookup: private_answer,
+            connections: 0,
+            requests: 0,
+            dropped: 3,
+        },
+    ];
+    let address = serve_app().await;
+    for case in cases {
+        let ca = Ca::new();
+        let reply = case.reply;
+        let server = Server::start(ca.leaf(case.leaf, false), move |_| reply(0)).await;
+        let destination = destination(server.port, &ca, FAST).with_lookup(case.lookup);
+        let (tracer, exporter) = otlp::start(destination, Process::Worker);
+        let (capture, guard) = Capture::install_traced(Format::Json, Verbosity::Info, tracer);
+        for _ in 0..3 {
+            drop(request_span(
+                RequestId::generate(),
+                &Route(None),
+                Method::Post,
+            ));
+        }
+        finish(exporter).await;
+        assert_eq!(
+            server.connections.load(Ordering::SeqCst),
+            case.connections,
+            "{}",
+            case.name
+        );
+        assert_eq!(
+            server.requests.load(Ordering::SeqCst),
+            case.requests,
+            "{}",
+            case.name
+        );
+        assert_eq!(dropped(&capture), case.dropped, "{}", case.name);
+        assert!(
+            capture.events("telemetry.dropped").len() <= 1,
+            "{}",
+            case.name
+        );
+        drop(guard);
+        assert_eq!(
+            exchange(address, get_request("/healthz").as_bytes()).await,
+            200
+        );
+    }
+    assert!(target.accept().is_err(), "the redirect was followed");
+}
+
+/// A batch whose encoding exceeds the request bound is dropped before any DNS work.
+#[tokio::test]
+async fn an_oversized_batch_is_dropped_before_resolution() {
+    let collector = Collector::accepting().await;
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let counted = lookups.clone();
+    let tuning = Tuning {
+        request_body: 64,
+        ..FAST
+    };
+    let destination =
+        destination(collector.server.port, &collector.ca, tuning).with_lookup(move |host, port| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            loopback(host, port)
+        });
+    let (tracer, exporter) = otlp::start(destination, Process::Api);
+    let (capture, _guard) = Capture::install_traced(Format::Json, Verbosity::Info, tracer);
+    for _ in 0..5 {
+        drop(request_span(
+            RequestId::generate(),
+            &Route(None),
+            Method::Get,
+        ));
+    }
+    finish(exporter).await;
+    assert_eq!(dropped(&capture), 5);
+    assert_eq!(lookups.load(Ordering::SeqCst), 0);
+    assert_eq!(collector.server.connections.load(Ordering::SeqCst), 0);
+}
+
+/// A gate that holds operating-system lookups until released.
+#[derive(Clone, Default)]
+struct Gate(Arc<(Mutex<bool>, Condvar)>);
+
+impl Gate {
+    fn wait(&self) {
+        let (open, changed) = &*self.0;
+        drop(changed.wait_while(open.lock().unwrap(), |o| !*o).unwrap());
+    }
+    fn release(&self) {
+        let (open, changed) = &*self.0;
+        *open.lock().unwrap() = true;
+        changed.notify_all();
+    }
+}
+
+/// The exporter's two DNS slots are its own: hung exporter lookups exhaust them without
+/// touching the provider transports' process-wide pool, which keeps resolving.
+#[tokio::test]
+async fn exporter_dns_slots_are_isolated_from_provider_transports() {
+    let gate = Gate::default();
+    let held = gate.clone();
+    let started = Arc::new(AtomicUsize::new(0));
+    let counted = started.clone();
+    let ca = Ca::new();
+    let tuning = Tuning {
+        batch: 1,
+        deadline: Duration::from_millis(150),
+        ..FAST
+    };
+    let destination = destination(1, &ca, tuning).with_lookup(move |host, port| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        held.wait();
+        loopback(host, port)
+    });
+    let slots = destination.slots.clone();
+    assert_eq!(slots.available_permits(), otlp::DNS_LOOKUP_SLOTS);
+    let (tracer, exporter) = otlp::start(destination, Process::Api);
+    let (capture, _guard) = Capture::install_traced(Format::Json, Verbosity::Info, tracer);
+    for _ in 0..3 {
+        drop(request_span(
+            RequestId::generate(),
+            &Route(None),
+            Method::Get,
+        ));
+    }
+    // Three single-span batches: two hung lookups hold both slots, the third times out
+    // waiting for one. All three batches are dropped.
+    until(|| dropped(&capture) == 3).await;
+    assert_eq!(slots.available_permits(), 0);
+    assert_eq!(started.load(Ordering::SeqCst), otlp::DNS_LOOKUP_SLOTS);
+
+    // A provider transport on the default process-wide pool still resolves and connects.
+    let provider = Server::start(fixture::Ca::leaf(&ca, fixture::HOST, false), |_| {
+        Reply::Bytes(fixture::json(b"{}"))
+    })
+    .await;
+    let transport = fixture::transport(provider.port, &ca);
+    let reply = openidconnect::AsyncHttpClient::call(
+        &transport,
+        fixture::token_request(&fixture::url(provider.port)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply.status(), 200);
+
+    gate.release();
+    until(|| slots.available_permits() == otlp::DNS_LOOKUP_SLOTS).await;
+    finish(exporter).await;
+}
+
+fn parse(pairs: &[(&str, &str)]) -> Result<Option<otlp::Settings>, &'static str> {
+    otlp::Settings::parse(|key| {
+        let found = pairs.iter().find(|(k, _)| *k == key);
+        Ok(found.map(|(_, v)| v.to_string()))
+    })
+}
+
+/// Unset is off; a set key is never ignored; only canonical HTTPS endpoints with a DNS host,
+/// absolute CA paths and explicit private ranges are accepted; errors name the key only.
+#[test]
+fn settings_accept_only_https_endpoints_absolute_ca_files_and_private_ranges() {
+    const ENDPOINT: &str = "https://alloy.monitoring.svc.cluster.local:4318/v1/traces";
+    assert!(parse(&[]).unwrap().is_none());
+    assert!(
+        parse(&[("OTLP_TRACES_ENDPOINT", ENDPOINT)])
+            .unwrap()
+            .is_some()
+    );
+    let full = parse(&[
+        ("OTLP_TRACES_ENDPOINT", ENDPOINT),
+        ("OTLP_CA_FILE", "/etc/openmettle/collector-ca.pem"),
+        ("OTLP_PRIVATE_RANGES", "10.43.0.0/16,fd00:10::/64"),
+    ]);
+    assert!(full.unwrap().is_some());
+    for (pairs, error) in [
+        (
+            &[("OTLP_CA_FILE", "/etc/ca.pem")][..],
+            "invalid OTLP_CA_FILE",
+        ),
+        (
+            &[("OTLP_PRIVATE_RANGES", "10.0.0.0/8")][..],
+            "invalid OTLP_PRIVATE_RANGES",
+        ),
+    ] {
+        assert_eq!(parse(pairs).err(), Some(error), "{pairs:?}");
+    }
+    for endpoint in [
+        "",
+        "http://alloy.monitoring.svc:4318/v1/traces",
+        "https://127.0.0.1:4318/v1/traces",
+        "https://[::1]:4318/v1/traces",
+        "https://localhost:4318/v1/traces",
+        "https://Alloy.monitoring.svc:4318/v1/traces",
+        "https://alloy.monitoring.svc:4318/v1/traces?x=1",
+        "https://user@alloy.monitoring.svc:4318/v1/traces",
+        "https://alloy.monitoring.svc:443/v1/traces",
+        "https://alloy.monitoring.svc:4318/v1/%74races",
+        "grpc://alloy.monitoring.svc:4317",
+        CANARY,
+    ] {
+        assert_eq!(
+            parse(&[("OTLP_TRACES_ENDPOINT", endpoint)]).err(),
+            Some("invalid OTLP_TRACES_ENDPOINT"),
+            "{endpoint:?}"
+        );
+    }
+    for ca in ["", "ca.pem", "./ca.pem", "~/ca.pem"] {
+        let pairs = [("OTLP_TRACES_ENDPOINT", ENDPOINT), ("OTLP_CA_FILE", ca)];
+        assert_eq!(parse(&pairs).err(), Some("invalid OTLP_CA_FILE"), "{ca:?}");
+    }
+    let too_many = (0..=crate::provider_http::MAX_PRIVATE_RANGES)
+        .map(|i| format!("10.{i}.0.0/16"))
+        .collect::<Vec<_>>()
+        .join(",");
+    for ranges in [
+        "",
+        ",",
+        "10.0.0.0/8,",
+        "10.0.0.1/8",
+        "8.8.8.0/24",
+        "127.0.0.0/8",
+        "0.0.0.0/0",
+        "10.0.0.0/8, 192.168.0.0/16",
+        "10.0.0.0/8,10.0.0.0/8",
+        too_many.as_str(),
+    ] {
+        let pairs = [
+            ("OTLP_TRACES_ENDPOINT", ENDPOINT),
+            ("OTLP_PRIVATE_RANGES", ranges),
+        ];
+        assert_eq!(
+            parse(&pairs).err(),
+            Some("invalid OTLP_PRIVATE_RANGES"),
+            "{ranges:?}"
+        );
+    }
+}
+
+/// Loading reads the CA file through the bounded reader: missing, oversized, non-PEM or a
+/// directory each refuse with the fixed line.
+#[test]
+fn loading_refuses_unusable_ca_files_with_a_fixed_line() {
+    let dir = Dir::new();
+    let ca = Ca::new();
+    let good = dir.write("ca.pem", &ca.pem());
+    assert!(Destination::load(&settings(4318, Some(&good))).is_ok());
+    let mut large = ca.pem();
+    large.resize(crate::provider_http::MAX_TRUST_BUNDLE_BYTES + 1, b'\n');
+    for path in [
+        dir.path("missing.pem"),
+        dir.write("large.pem", &large),
+        dir.write("text.pem", CANARY.as_bytes()),
+        dir.write("empty.pem", b""),
+        dir.path(""),
+    ] {
+        assert_eq!(
+            Destination::load(&settings(4318, Some(&path))).err(),
+            Some("invalid OTLP_CA_FILE"),
+            "{path}"
+        );
+    }
+}
+
+/// The serving processes read the three keys after their existing keys and before
+/// `AUTH_CONFIG`; the worker reads them too.
+#[test]
+fn serving_configuration_reads_otlp_keys_after_logging_and_before_auth_config() {
+    for role in [crate::Role::Api, crate::Role::Worker] {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let config = crate::Config::parse(role, |key| {
+            asked.borrow_mut().push(key.to_owned());
+            Ok(match key {
+                "DATABASE_URL" => Some("postgres://localhost/test".to_owned()),
+                "OTLP_TRACES_ENDPOINT" => {
+                    Some("https://alloy.monitoring.svc:4318/v1/traces".to_owned())
+                }
+                _ => None,
+            })
+        });
+        assert!(config.ok().unwrap().otlp.is_some());
+        let asked = asked.into_inner();
+        let position = |key: &str| asked.iter().position(|k| k == key);
+        let level = position("LOG_LEVEL").unwrap();
+        let endpoint = position("OTLP_TRACES_ENDPOINT").unwrap();
+        assert_eq!(
+            asked[endpoint..endpoint + 3],
+            [
+                "OTLP_TRACES_ENDPOINT",
+                "OTLP_CA_FILE",
+                "OTLP_PRIVATE_RANGES"
+            ]
+        );
+        assert!(level < endpoint);
+        match role {
+            crate::Role::Api => assert_eq!(position("AUTH_CONFIG"), Some(endpoint + 3)),
+            crate::Role::Worker => assert_eq!(position("AUTH_CONFIG"), None),
+        }
+        // A refused OTLP key precedes the AUTH_CONFIG check and follows LOG_* checks.
+        let refused = crate::Config::parse(role, |key| {
+            Ok(match key {
+                "DATABASE_URL" => Some("postgres://localhost/test".to_owned()),
+                "LOG_LEVEL" => Some("trace".to_owned()),
+                "OTLP_TRACES_ENDPOINT" => Some("http://x.example.test/".to_owned()),
+                _ => None,
+            })
+        });
+        assert_eq!(refused.err(), Some("invalid LOG_LEVEL"));
+        let refused = crate::Config::parse(role, |key| {
+            Ok(match key {
+                "DATABASE_URL" => Some("postgres://localhost/test".to_owned()),
+                "OTLP_TRACES_ENDPOINT" => Some("http://x.example.test/".to_owned()),
+                "AUTH_CONFIG" => Some("relative".to_owned()),
+                _ => None,
+            })
+        });
+        assert_eq!(refused.err(), Some("invalid OTLP_TRACES_ENDPOINT"));
+    }
+}
+
+/// Without a tracer the stack is today's: the stderr guard refuses our request span, so it
+/// neither prints nor adds span context to text lines. (With one global dispatcher, as in
+/// production, the callsite's interest is `never` and the span is disabled outright; test
+/// threads share callsite interest with other tests' dispatchers, so that is not asserted.)
+#[test]
+fn without_export_the_request_span_is_disabled() {
+    for format in [Format::Json, Format::Text] {
+        let (capture, _guard) = Capture::install(format, Verbosity::Debug);
+        let span = request_span(RequestId::generate(), &Route(None), Method::Get);
+
+        span.in_scope(|| tracing::warn!(target: TARGET, event = "inside", role = "api"));
+        let text = capture.text();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(!text.contains("http.server.request") && !text.contains("request_id"));
+    }
+}

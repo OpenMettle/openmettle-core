@@ -408,6 +408,11 @@ impl Document {
     }
 }
 
+/// [`read`] for another loader with its own fixed refusal: OTLP's CA file (ADR 0026).
+pub(crate) fn read_bounded(path: &Path, limit: usize) -> Option<Vec<u8>> {
+    read(path, limit, Error::TrustBundleFile).ok()
+}
+
 /// Reads one file named by an absolute path, at most `limit` bytes. Symbolic links are
 /// followed, so Kubernetes projected-volume entries work; what they resolve to must be a
 /// regular file. Type and length are checked before opening (a FIFO, device, socket or

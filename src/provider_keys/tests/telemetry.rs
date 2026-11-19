@@ -3,7 +3,9 @@
 //! with the served health routes, observed by the production request middleware and driven
 //! under the production subscriber stack, whose stderr is replaced by a capture. Synthetic
 //! canaries are planted in the database password, the login key, both cookies, the callback
-//! query, an invitation code, a run payload and other headers; none may reach the sink.
+//! query, an invitation code, a run payload and other headers; none may reach the sink. The
+//! OTLP span layer (ADR 0026) is installed too, exporting to an in-process TLS collector, and
+//! no canary may reach a span either.
 use super::handoff::{ORIGIN, settings};
 use super::router::{FORM_TYPE, head, limits, send, serve};
 use super::*;
@@ -16,8 +18,11 @@ use crate::{
     },
     sessions,
     telemetry::{
-        Format, Verbosity,
-        tests::{Capture, is_v4},
+        Format, Process, Verbosity, otlp,
+        tests::{
+            Capture, is_v4,
+            otlp::{Collector, finish},
+        },
     },
 };
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
@@ -217,7 +222,9 @@ async fn no_planted_canary_reaches_the_production_sink() {
 
     let h = Harness::new().await;
     for format in [Format::Json, Format::Text] {
-        let (capture, _guard) = Capture::install(format, Verbosity::Debug);
+        let collector = Collector::accepting().await;
+        let (tracer, exporter) = otlp::start(collector.destination(), Process::Api);
+        let (capture, _guard) = Capture::install_traced(format, Verbosity::Debug, tracer);
         let (database, pool, handoff) = handoff(&h);
         let login = router_with_sessions(handoff, limits(), sessions()).unwrap();
         let health = crate::routes(crate::Health {
@@ -255,5 +262,27 @@ async fn no_planted_canary_reaches_the_production_sink() {
             }
         }
         capture.assert_absent(&canaries);
+
+        // Positive control for export: one span per non-probe request, with its route.
+        finish(exporter).await;
+        let mut routes: Vec<String> = collector
+            .spans()
+            .iter()
+            .flat_map(|span| span.attributes.iter())
+            .filter(|kv| kv.key == "http.route")
+            .map(|kv| format!("{:?}", kv.value))
+            .collect();
+        routes.sort();
+        let mut expected: Vec<&str> = cases
+            .iter()
+            .map(|(_, _, route, _)| *route)
+            .filter(|route| !["/healthz", "/readyz"].contains(route))
+            .collect();
+        expected.sort();
+        assert_eq!(routes.len(), expected.len(), "{format:?}: {routes:?}");
+        for (route, expected) in routes.iter().zip(&expected) {
+            assert!(route.contains(&format!("{expected:?}")), "{route}");
+        }
+        collector.assert_absent(&canaries);
     }
 }

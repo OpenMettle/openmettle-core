@@ -202,6 +202,9 @@ owner-approved allow-list. Those records are licence bookkeeping, not clearance.
   (4750 ms of the 5000 ms default), so the final flush fits inside it.
 - **Spans.** No spans are emitted yet. Correlation within a request uses `request_id` on the
   completion event. Spans arrive with OTLP export in increment 2.
+  [ADR 0026](0026-otlp-trace-export.md) adds them, off by default, restricts this guard to
+  events, adds `dropped_spans` to the allowlist and clarifies the queue described under
+  Delivery (a bounded `VecDeque`, not a `sync_channel`).
 - **Route templates are server-defined but operator-configurable.** The login paths come
   from the browser-routing profile (ADR 0020). They are bounded literals, not client input.
 - **Missing request ID.** If the operating system's random source fails, the request is

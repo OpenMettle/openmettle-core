@@ -48,6 +48,18 @@ impl Capture {
         let guard = tracing::subscriber::set_default(subscriber(settings, capture.clone()));
         (capture, guard)
     }
+    /// [`Self::install`] with the OTLP span layer over `tracer` (ADR 0026).
+    pub(crate) fn install_traced(
+        format: Format,
+        verbosity: Verbosity,
+        tracer: opentelemetry_sdk::trace::SdkTracer,
+    ) -> (Self, tracing::subscriber::DefaultGuard) {
+        let capture = Self::default();
+        let settings = Settings { format, verbosity };
+        let guard =
+            tracing::subscriber::set_default(stack(settings, capture.clone(), Some(tracer)));
+        (capture, guard)
+    }
     pub(crate) fn bytes(&self) -> Vec<u8> {
         self.0.lock().unwrap().clone()
     }
@@ -774,3 +786,5 @@ async fn health_routes_record_the_template_method_status_and_a_server_id_only() 
     ]);
     capture.assert_absent(&planted);
 }
+
+pub(crate) mod otlp;

@@ -20,7 +20,7 @@ fn child(mode: &str) -> ! {
         format,
         verbosity: Verbosity::Error,
     };
-    let _telemetry = install(settings, Process::Worker).unwrap();
+    let _telemetry = install(settings, Process::Worker, None).unwrap();
     if mode == "thread" {
         // A panic on another thread: that thread ends, the process carries on and exits 3.
         let joined = std::thread::spawn(|| panic!("{CANARY} on a thread")).join();
