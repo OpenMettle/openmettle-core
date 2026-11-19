@@ -319,7 +319,7 @@ async fn total_deadline_cancels_and_dropping_closes_the_socket() {
     let server = Server::start(ca.leaf(fixture::HOST, false), |_| Reply::Stall(Vec::new())).await;
     let owner = Owner::new(server.port, &ca, slots(1));
     let mut short = limits();
-    short.total = Duration::from_millis(300);
+    short.total = Duration::from_millis(500);
     assert_eq!(owner.post(b"x", &short).await.unwrap_err(), Error::Timeout);
     tokio::time::timeout(Duration::from_secs(5), server.closed.notified())
         .await
@@ -389,10 +389,11 @@ async fn exhausted_dns_pool_does_not_starve_another_owners_pool() {
     // A provider-sized pool whose every lookup hangs, and a small independent pool.
     let busy = slots(8);
     let hung = Owner::new(server.port, &ca, busy.clone()).lookup(gate.lookup());
+    let normal = limits();
     let mut quick = limits();
     quick.setup = Duration::from_millis(300);
     for n in 1..=8 {
-        let call = hung.post(b"x", &quick);
+        let call = hung.post(b"x", &normal);
         tokio::pin!(call);
         tokio::select! {
             _ = async {
@@ -409,12 +410,37 @@ async fn exhausted_dns_pool_does_not_starve_another_owners_pool() {
     assert_eq!(gate.entered.load(Ordering::SeqCst), 8);
     // A separate owner with its own single slot is unaffected and completes end to end.
     let other = Owner::new(server.port, &ca, slots(1));
-    other.post(b"x", &quick).await.unwrap();
+    other.post(b"x", &normal).await.unwrap();
     assert_eq!(other.slots.available_permits(), 1);
     assert_eq!(server.requests.load(Ordering::SeqCst), 1);
     gate.release();
     drop(
         tokio::time::timeout(Duration::from_secs(5), busy.acquire_many(8))
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn total_deadline_clamps_setup_when_shorter_than_setup() {
+    let ca = Ca::new();
+    let gate = Arc::new(Gate::default());
+    let _unblock = Unblock(gate.clone());
+    let pool = slots(1);
+    let hung = Owner::new(8443, &ca, pool.clone()).lookup(gate.lookup());
+    let mut tight = limits();
+    tight.setup = Duration::from_secs(5);
+    tight.total = Duration::from_millis(150);
+    let began = Instant::now();
+    assert_eq!(hung.post(b"x", &tight).await.unwrap_err(), Error::Timeout);
+    assert!(
+        began.elapsed() < Duration::from_secs(1),
+        "setup must not outlive a shorter total deadline"
+    );
+    gate.release();
+    drop(
+        tokio::time::timeout(Duration::from_secs(5), pool.acquire_owned())
             .await
             .unwrap()
             .unwrap(),

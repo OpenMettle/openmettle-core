@@ -311,8 +311,10 @@ pub(crate) fn system_lookup(host: &str, port: u16) -> io::Result<Vec<SocketAddr>
         .collect())
 }
 
-/// Per-caller bounds. `setup` covers DNS queueing, lookup, TCP connect and TLS; `total` covers
-/// the whole request including setup. Response header limits are enforced by hyper's parser.
+/// Per-caller bounds. `setup` covers DNS queueing, lookup, TCP connect and TLS (clamped to
+/// `total`); `total` covers the whole request including setup. Response header limits are
+/// enforced by hyper's parser (`response_header_bytes` is additionally capped by
+/// `MAX_READ_BUFFER`, 8 KiB).
 #[derive(Clone, Copy)]
 pub(crate) struct Limits {
     pub(crate) request_body: usize,
@@ -349,7 +351,8 @@ impl Route<'_> {
         limits: &Limits,
     ) -> Result<HttpResponse, Error> {
         let start = Instant::now();
-        let setup = start + limits.setup;
+        let total = start + limits.total;
+        let setup = (start + limits.setup).min(total);
         if !(method == http::Method::POST || method == http::Method::GET && body.is_empty())
             || body.len() > limits.request_body
             || headers.keys_len() != headers.len()
@@ -385,12 +388,9 @@ impl Route<'_> {
         .await
         .map_err(|_| Error::Timeout)?
         .map_err(|_| Error::Tls)?;
-        tokio::time::timeout_at(
-            start + limits.total,
-            self.exchange(tls, method, headers, body, limits),
-        )
-        .await
-        .map_err(|_| Error::Timeout)?
+        tokio::time::timeout_at(total, self.exchange(tls, method, headers, body, limits))
+            .await
+            .map_err(|_| Error::Timeout)?
     }
 
     fn address_permitted(&self, ip: IpAddr) -> bool {
