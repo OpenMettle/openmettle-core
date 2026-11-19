@@ -129,11 +129,15 @@ pub async fn run(role: Role) -> u8 {
             return 78;
         }
     };
-    if telemetry::install(config.telemetry).is_err() {
-        eprintln!("runtime error: telemetry subscriber already installed");
-        return 1;
-    }
-    match serve(config, process).await {
+    let telemetry = match telemetry::install(config.telemetry, process) {
+        Ok(telemetry) => telemetry,
+        Err(unavailable) => {
+            eprintln!("runtime error: {}", unavailable.message());
+            return 1;
+        }
+    };
+    let (drain, flush) = shutdown_budget(config.shutdown_timeout);
+    let code = match serve(config, process, drain).await {
         Ok(()) => {
             telemetry::process_stopped(process);
             0
@@ -142,7 +146,17 @@ pub async fn run(role: Role) -> u8 {
             telemetry::process_failed(process, failure);
             1
         }
-    }
+    };
+    // Bounded: a stalled stderr loses the final lines, not the exit.
+    telemetry.flush(flush);
+    code
+}
+
+/// Splits `SHUTDOWN_TIMEOUT_MS` so the whole stop fits it: the final telemetry flush gets a
+/// tenth, at most `telemetry::FLUSH_LIMIT`, and draining gets the rest.
+fn shutdown_budget(timeout: Duration) -> (Duration, Duration) {
+    let flush = (timeout / 10).min(telemetry::FLUSH_LIMIT);
+    (timeout - flush, flush)
 }
 
 fn pool(config: &Config) -> PgPool {
@@ -152,7 +166,7 @@ fn pool(config: &Config) -> PgPool {
         .connect_lazy_with(config.database.clone())
 }
 
-async fn serve(config: Config, process: Process) -> Result<(), ProcessFailure> {
+async fn serve(config: Config, process: Process, drain: Duration) -> Result<(), ProcessFailure> {
     // Install signal handlers before opening the listener.
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|_| ProcessFailure::SignalRegistration)?;
@@ -180,7 +194,7 @@ async fn serve(config: Config, process: Process) -> Result<(), ProcessFailure> {
     };
     telemetry::process_stopping(process, signal);
     let _ = stop_tx.send(());
-    tokio::time::timeout(config.shutdown_timeout, async {
+    tokio::time::timeout(drain, async {
         server.await.map_err(|_| ProcessFailure::Shutdown)?;
         pool.close().await;
         Ok(())

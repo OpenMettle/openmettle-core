@@ -470,7 +470,10 @@ fn migrate_rejects_invalid_config_without_disclosing_values() {
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(78), "{key}");
-        assert!(!stderr(&output).contains("synthetic-secret"));
+        // One fixed line written before telemetry exists: no event, no value.
+        let text = stderr(&output);
+        assert!(text.starts_with("configuration error: ") && text.lines().count() == 1);
+        assert!(!text.contains("synthetic-secret"));
     }
     let output = binary("migrate").output().unwrap();
     assert_eq!(output.status.code(), Some(78));
@@ -493,6 +496,138 @@ fn migrate_connection_deadline_exits_one_without_disclosing_url() {
     let text = stderr(&output);
     assert!(text.contains("deadline"), "{text}");
     assert!(!text.contains("synthetic-secret") && !text.contains("fixture"));
+}
+
+/// The JSON telemetry lines on stderr, as (event, level, error.type or signal) triples, and
+/// the other lines as they are.
+fn split_events(text: &str) -> (Vec<(String, String, String)>, Vec<&str>) {
+    let mut events = Vec::new();
+    let mut others = Vec::new();
+    for line in text.lines() {
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(event) => {
+                assert_eq!(event["role"], "migrate", "{line}");
+                let detail = event.get("error.type").or(event.get("signal"));
+                events.push((
+                    event["event"].as_str().unwrap().to_owned(),
+                    event["level"].as_str().unwrap().to_owned(),
+                    detail.map_or(String::new(), |d| d.as_str().unwrap().to_owned()),
+                ));
+            }
+            Err(_) => others.push(line),
+        }
+    }
+    (events, others)
+}
+
+/// ADR 0024 through the binary: a failed run reports its `migrate::Failure` class beside the
+/// unchanged operator line, for a deadline and for a refused connection.
+#[test]
+fn migrate_failures_report_their_class_through_the_binary() {
+    let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+    let refused = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    for (address, class, line) in [
+        (
+            silent.local_addr().unwrap(),
+            "ConnectTimeout",
+            "migration error: database connection deadline exceeded",
+        ),
+        (
+            refused,
+            "Connect",
+            "migration error: database connection failed (I/O error)",
+        ),
+    ] {
+        let url = format!("postgres://fixture:synthetic-secret@{address}/fixture?sslmode=disable");
+        let output = migrate_command(&url, &[("CONNECT_TIMEOUT_MS", "300")])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        let text = stderr(&output);
+        assert!(!text.contains("synthetic-secret"), "{text}");
+        let (events, others) = split_events(&text);
+        assert_eq!(others, [line], "{text}");
+        let expected = [
+            ("migration.started", "INFO", ""),
+            ("migration.failed", "ERROR", class),
+        ];
+        let events: Vec<_> = events
+            .iter()
+            .map(|(e, l, d)| (e.as_str(), l.as_str(), d.as_str()))
+            .collect();
+        assert_eq!(events, expected, "{text}");
+    }
+}
+
+/// ADR 0024: an interrupted run exits 1 and says so at `LOG_LEVEL=error`, in both formats.
+#[test]
+fn interrupted_migrator_reports_at_error_level() {
+    for (format, signal_name, flag) in [("json", "SIGTERM", "-TERM"), ("text", "SIGINT", "-INT")] {
+        // A listener that never speaks PostgreSQL holds the run inside its connection attempt.
+        let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+        silent.set_nonblocking(true).unwrap();
+        let url = format!(
+            "postgres://fixture:synthetic-secret@{}/fixture?sslmode=disable",
+            silent.local_addr().unwrap()
+        );
+        let mut child = Process(
+            migrate_command(
+                &url,
+                &[
+                    ("CONNECT_TIMEOUT_MS", "60000"),
+                    ("LOG_LEVEL", "error"),
+                    ("LOG_FORMAT", format),
+                ],
+            )
+            .spawn()
+            .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let _connection = loop {
+            match silent.accept() {
+                Ok(connection) => break connection,
+                Err(_) => {
+                    assert!(Instant::now() < deadline, "migrator never connected");
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        signal(&child.0, flag);
+        let began = Instant::now();
+        let status = child.0.wait().unwrap();
+        assert!(began.elapsed() < Duration::from_secs(5));
+        assert_eq!(status.code(), Some(1));
+        let (mut stdout, mut text) = (String::new(), String::new());
+        let pipes = (child.0.stdout.take(), child.0.stderr.take());
+        pipes.0.unwrap().read_to_string(&mut stdout).unwrap();
+        pipes.1.unwrap().read_to_string(&mut text).unwrap();
+        assert!(stdout.is_empty());
+        assert!(!text.contains("synthetic-secret"), "{text}");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        if format == "json" {
+            let (events, _) = split_events(&text);
+            assert_eq!(
+                events,
+                [(
+                    "migration.interrupted".to_owned(),
+                    "ERROR".to_owned(),
+                    signal_name.to_owned()
+                )]
+            );
+        } else {
+            assert!(
+                lines[0].ends_with(&format!(
+                    " ERROR event=\"migration.interrupted\" role=\"migrate\" signal=\"{signal_name}\""
+                )),
+                "{text}"
+            );
+        }
+    }
 }
 
 // --- PostgreSQL tests ----------------------------------------------------------------------------

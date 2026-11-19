@@ -81,6 +81,16 @@ fn sessions() -> SessionSettings<'static> {
     }
 }
 
+/// What this discriminates: the request middleware recording a path, query, header, cookie
+/// or body instead of the route template, method and status; a client request ID being
+/// trusted; and the guard admitting third-party instrumentation (with the guard opened,
+/// sqlx's `.pgpass` notice reaches the sink and this fails). The positive control proves the
+/// sink is live.
+///
+/// What it does not: the login, callback, session, logout and invitation handlers emit no
+/// telemetry today, so the only paths from a canary to the sink are the middleware and
+/// foreign callsites. It says nothing about a future handler event that passes request-derived
+/// text through an allowlisted field; each new constructor needs its own canary case.
 #[tokio::test]
 async fn no_planted_canary_reaches_the_production_sink() {
     let locator = token("CANARYloginLocator");

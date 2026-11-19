@@ -72,6 +72,8 @@ Values must match exactly; anything else exits 78 with `configuration error: inv
 - **Default level.** `info` shows start, stop and failure events.
 - **Request events.** Each request gets a server-generated `request_id`, which is never taken from a client header. A request completion is logged at `debug`, or at `warn` for a 5xx response such as a failed readiness check.
 - **What is recorded.** Events carry fixed event names, the matched route template, the method, the status, durations, counts and failure classes. They never carry URLs, queries, headers, cookies, bodies, database settings or third-party library logs.
+- **Slow or unread stderr.** Events are queued (up to 1024 lines) for one writer thread, so a stalled log reader never blocks requests, readiness or shutdown. Lines that do not fit are dropped and counted, and a `telemetry.dropped` event with the count follows the next successful write. The stop, including the final flush, fits `SHUTDOWN_TIMEOUT_MS`: draining gets the deadline less a tenth (at most 250 ms), which is kept for the flush.
+- **Panics.** After telemetry starts, a panic writes one `process.panicked` event and never the panic message or location.
 - **Not covered.** Ingress and proxy access logs are outside these processes. Configure them separately before exposing login routes.
 - **No export yet.** Nothing is sent over the network; OTLP export is a later increment.
 

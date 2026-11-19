@@ -22,6 +22,11 @@ path = "src/bin/worker.rs"
 name = "openmettle-migrate"
 path = "src/bin/migrate.rs"
 
+# ADR 0024: the panic hook is process-wide, so its test re-executes itself without libtest.
+[[test]]
+name = "panic_hook"
+harness = false
+
 [lints.rust]
 unsafe_code = "forbid"
 

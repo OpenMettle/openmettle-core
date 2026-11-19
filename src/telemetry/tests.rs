@@ -282,6 +282,8 @@ fn every_constructor_passes_the_guard_with_its_fields() {
     migration_completed(13);
     migration_failed(MigrationFailure::Refused);
     migration_interrupted(Signal::Terminate);
+    process_panicked(Process::Migrate);
+    lines_dropped(3);
     let route = Route(None);
     let id = RequestId::generate();
     request_completed(id, &route, Method::Other, 404, Duration::from_micros(7));
@@ -312,7 +314,14 @@ fn every_constructor_passes_the_guard_with_its_fields() {
         ("migration.started", "INFO", with(&[])),
         ("migration.completed", "INFO", with(&["schema_version"])),
         ("migration.failed", "ERROR", with(&["error.type"])),
-        ("migration.interrupted", "WARN", with(&["signal"])),
+        // A run that exits 1 is visible at every level.
+        ("migration.interrupted", "ERROR", with(&["signal"])),
+        ("process.panicked", "ERROR", with(&[])),
+        (
+            "telemetry.dropped",
+            "ERROR",
+            ["timestamp", "level", "event", "dropped_lines"].into(),
+        ),
         ("http.request.completed", "DEBUG", request(&["request_id"])),
         // No ID is recorded rather than an invented one.
         ("http.request.completed", "WARN", request(&[])),
@@ -338,11 +347,197 @@ fn every_constructor_passes_the_guard_with_its_fields() {
     assert_eq!(field(5, "schema_version"), 13);
     assert_eq!(field(6, "error.type"), "Refused");
     assert_eq!(field(7, "role"), "migrate");
-    assert_eq!(field(8, "request_id"), id.unwrap().to_string().as_str());
-    assert_eq!(field(8, "http.route"), "unmatched");
-    assert_eq!(field(8, "http.request.method"), "_OTHER");
-    assert_eq!(field(8, "http.response.status_code"), 404);
-    assert_eq!(field(8, "duration_us"), 7);
+    assert_eq!(field(8, "role"), "migrate");
+    assert_eq!(field(9, "dropped_lines"), 3);
+    assert_eq!(field(10, "request_id"), id.unwrap().to_string().as_str());
+    assert_eq!(field(10, "http.route"), "unmatched");
+    assert_eq!(field(10, "http.request.method"), "_OTHER");
+    assert_eq!(field(10, "http.response.status_code"), 404);
+    assert_eq!(field(10, "duration_us"), 7);
+}
+
+/// The shutdown deadline covers draining and the final flush together.
+#[test]
+fn shutdown_budget_fits_the_flush_inside_the_deadline() {
+    for (timeout_ms, flush_ms) in [(1, 0.1), (1000, 100.0), (5000, 250.0), (60000, 250.0)] {
+        let timeout = Duration::from_millis(timeout_ms);
+        let (drain, flush) = crate::shutdown_budget(timeout);
+        assert_eq!(drain + flush, timeout);
+        assert_eq!(flush, Duration::from_secs_f64(flush_ms / 1000.0));
+    }
+}
+
+/// A stand-in for a stderr pipe whose reader stops reading. Each write announces itself and
+/// then waits until the gate opens, which may be never.
+#[derive(Clone, Default)]
+struct Stalled {
+    open: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    entered: Arc<std::sync::atomic::AtomicUsize>,
+    written: Capture,
+}
+
+impl Write for Stalled {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.entered
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (open, changed) = &*self.open;
+        let guard = open.lock().unwrap();
+        drop(changed.wait_while(guard, |open| !*open).unwrap());
+        self.written.make_writer().write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Stalled {
+    fn release(&self) {
+        let (open, changed) = &*self.open;
+        *open.lock().unwrap() = true;
+        changed.notify_all();
+    }
+    /// Waits until the writer thread is blocked inside its first write.
+    fn wait_entered(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "writer never wrote");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+fn offer(queue: &sink::Queue, line: &str) {
+    queue.make_writer().write_all(line.as_bytes()).unwrap();
+}
+
+const JSON_INFO: Settings = Settings {
+    format: Format::Json,
+    verbosity: Verbosity::Info,
+};
+
+/// ADR 0024 delivery: a writer that never returns costs lines, not the emitter's time, and
+/// the exit flush gives up at its limit.
+#[test]
+fn a_writer_that_never_returns_never_blocks_emitting_or_flushing() {
+    let stalled = Stalled::default();
+    let queue = sink::Queue::spawn(stalled.clone(), 8, JSON_INFO).unwrap();
+    offer(&queue, "first\n");
+    stalled.wait_entered();
+    // Emitting runs on its own thread so that a blocking regression fails here, not hangs.
+    let (done, finished) = std::sync::mpsc::channel();
+    let emitter = queue.clone();
+    std::thread::spawn(move || {
+        for i in 0..10_000 {
+            offer(&emitter, &format!("line {i}\n"));
+        }
+        // Ten thousand events through the production stack over the same queue.
+        let _default = tracing::subscriber::set_default(subscriber(JSON_INFO, emitter));
+        for _ in 0..10_000 {
+            process_started(Process::Api);
+        }
+        done.send(()).unwrap();
+    });
+    finished
+        .recv_timeout(Duration::from_secs(5))
+        .expect("emitting blocked on a stalled writer");
+    let began = Instant::now();
+    assert!(!queue.flush(Duration::from_millis(100)));
+    let waited = began.elapsed();
+    assert!(waited >= Duration::from_millis(100), "{waited:?}");
+    assert!(waited < Duration::from_secs(2), "{waited:?}");
+    assert!(stalled.written.bytes().is_empty());
+    // Let the thread finish so the test leaves nothing blocked.
+    stalled.release();
+    assert!(queue.flush(Duration::from_secs(10)));
+}
+
+/// Lines refused by a full queue are counted and reported once, after the next successful
+/// write, as a guarded `telemetry.dropped` event in the configured format.
+#[test]
+fn dropped_lines_are_counted_and_reported_after_the_next_write() {
+    for format in [Format::Json, Format::Text] {
+        let stalled = Stalled::default();
+        let settings = Settings {
+            format,
+            verbosity: Verbosity::Error,
+        };
+        let queue = sink::Queue::spawn(stalled.clone(), 4, settings).unwrap();
+        offer(&queue, "line 0\n");
+        // The writer holds line 0, so four more fill the queue and three are dropped.
+        stalled.wait_entered();
+        for i in 1..=7 {
+            offer(&queue, &format!("line {i}\n"));
+        }
+        assert!(!queue.flush(Duration::from_millis(10)));
+        stalled.release();
+        assert!(queue.flush(Duration::from_secs(10)));
+        let text = stalled.written.text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 6, "{text}");
+        assert_eq!(lines[0], "line 0");
+        assert_eq!(lines[2..], ["line 1", "line 2", "line 3", "line 4"]);
+        match format {
+            Format::Json => {
+                let report: Value = serde_json::from_str(lines[1]).unwrap();
+                let keys: BTreeSet<&str> = report
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                assert_eq!(
+                    keys,
+                    ["timestamp", "level", "event", "dropped_lines"].into()
+                );
+                assert_eq!(report["event"], "telemetry.dropped");
+                assert_eq!(report["level"], "ERROR");
+                assert_eq!(report["dropped_lines"], 3);
+            }
+            Format::Text => assert!(
+                lines[1].ends_with(" ERROR event=\"telemetry.dropped\" dropped_lines=3"),
+                "{text}"
+            ),
+        }
+        // The count was reset: further lines bring no second report.
+        offer(&queue, "line 8\n");
+        assert!(queue.flush(Duration::from_secs(10)));
+        assert_eq!(stalled.written.text().lines().count(), 7);
+    }
+}
+
+/// The guard runs on the emitting thread before a line is queued: refused events are neither
+/// queued nor counted as dropped.
+#[test]
+fn the_guard_applies_before_lines_are_queued() {
+    let out = Stalled::default();
+    out.release();
+    let queue = sink::Queue::spawn(out.clone(), 256, JSON_INFO).unwrap();
+    {
+        let _default = tracing::subscriber::set_default(subscriber(JSON_INFO, queue.clone()));
+        for _ in 0..100 {
+            emit_guarded();
+        }
+        tracing::debug!(target: TARGET, event = "below.level");
+    }
+    assert!(queue.flush(Duration::from_secs(10)));
+    let events: Vec<_> = out
+        .written
+        .json()
+        .iter()
+        .map(|l| l["event"].clone())
+        .collect();
+    assert_eq!(events.len(), 200);
+    assert!(
+        events
+            .iter()
+            .all(|e| *e == "guard.control" || *e == "guard.in_span")
+    );
+    out.written.assert_absent(&[
+        CANARY.as_bytes(),
+        b"guard.field",
+        b"below.level",
+        b"telemetry.dropped",
+    ]);
 }
 
 /// One HTTP/1.1 exchange on a new connection; returns the status code.

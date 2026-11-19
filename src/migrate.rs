@@ -1,5 +1,5 @@
 //! One-shot schema migration process (ADR 0003). API and worker processes never call this.
-use crate::telemetry::{self, MigrationFailure, Signal};
+use crate::telemetry::{self, MigrationFailure, Process, Signal};
 use sqlx::{
     ConnectOptions, Connection, Executor, PgConnection, SqlSafeStr, postgres::PgConnectOptions,
 };
@@ -516,10 +516,20 @@ pub async fn run() -> u8 {
             return 78;
         }
     };
-    if telemetry::install(telemetry_settings).is_err() {
-        eprintln!("runtime error: telemetry subscriber already installed");
-        return 1;
-    }
+    let telemetry = match telemetry::install(telemetry_settings, Process::Migrate) {
+        Ok(telemetry) => telemetry,
+        Err(unavailable) => {
+            eprintln!("runtime error: {}", unavailable.message());
+            return 1;
+        }
+    };
+    let code = migrate(&settings).await;
+    // Bounded: a stalled stderr loses the final lines, not the exit.
+    telemetry.flush(telemetry::FLUSH_LIMIT);
+    code
+}
+
+async fn migrate(settings: &Settings) -> u8 {
     telemetry::migration_started();
     use tokio::signal::unix::{SignalKind, signal};
     let (Ok(mut terminate), Ok(mut interrupt)) = (
@@ -532,7 +542,7 @@ pub async fn run() -> u8 {
     // A signal drops the migration future and its connection; PostgreSQL rolls back the
     // open transaction and releases the session lock.
     tokio::select! {
-        result = apply(&settings, MIGRATIONS) => match result {
+        result = apply(settings, MIGRATIONS) => match result {
             Ok(()) => {
                 println!("schema is at migration {}", MIGRATIONS.len());
                 telemetry::migration_completed(MIGRATIONS.len());
@@ -639,6 +649,37 @@ mod tests {
         assert!(migrator(&[source(2, "SELECT 1")]).is_err());
         assert!(migrator(&[source(1, "SELECT 1"), source(3, "SELECT 1")]).is_err());
         assert!(migrator(&[source(1, "SELECT 1; COMMIT")]).is_err());
+    }
+
+    /// Each failure keeps its own `error.type`, so swapping two classes fails here.
+    #[test]
+    fn failures_map_to_their_own_telemetry_class() {
+        let cases = [
+            (Failure::Invalid("x"), MigrationFailure::Invalid),
+            (Failure::ConnectTimeout, MigrationFailure::ConnectTimeout),
+            (
+                Failure::Connect(sqlx::Error::PoolTimedOut),
+                MigrationFailure::Connect,
+            ),
+            (
+                Failure::Check(sqlx::Error::PoolClosed),
+                MigrationFailure::Check,
+            ),
+            (Failure::Refused(vec![]), MigrationFailure::Refused),
+            (Failure::Violated(vec![]), MigrationFailure::Violated),
+            (
+                Failure::Migrate(MigrateError::VersionMissing(1)),
+                MigrationFailure::Migrate,
+            ),
+        ];
+        for (failure, class) in &cases {
+            assert_eq!(failure.class(), *class, "{failure:?}");
+        }
+        // Every class but signal registration, which precedes any `Failure`, is reachable.
+        let classes: std::collections::BTreeSet<_> =
+            cases.iter().map(|(_, c)| format!("{c:?}")).collect();
+        assert_eq!(classes.len(), cases.len());
+        assert!(!classes.contains("SignalRegistration"));
     }
 
     #[test]

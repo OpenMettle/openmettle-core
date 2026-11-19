@@ -315,6 +315,120 @@ fn serving_writes_redacted_lifecycle_and_request_events_to_stderr() {
     }
 }
 
+/// ADR 0024 through the worker binary at the defaults (JSON, `info`): exactly its lifecycle,
+/// with `role=worker`; health polling is `debug` and stays out.
+#[test]
+fn worker_writes_its_lifecycle_at_the_default_settings() {
+    let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "postgres://fixture:CANARY-db-password@{}/fixture?sslmode=disable",
+        unavailable.local_addr().unwrap()
+    );
+    let bind = address();
+    let mut process = start_logging(true, &bind, &url, &[]);
+    wait_status(&mut process, &bind, "/healthz", 200);
+    stop(&mut process, "-INT");
+    let (stdout, stderr) = drain(&mut process);
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(!stderr.contains("CANARY"), "{stderr}");
+    let events: Vec<serde_json::Value> = stderr
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let summary: Vec<(&str, &str, &str)> = events
+        .iter()
+        .map(|e| {
+            assert_eq!(e["role"], "worker", "{stderr}");
+            (
+                e["event"].as_str().unwrap(),
+                e["level"].as_str().unwrap(),
+                e.get("signal").map_or("", |s| s.as_str().unwrap()),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("process.started", "INFO", ""),
+            ("process.stopping", "INFO", "SIGINT"),
+            ("process.stopped", "INFO", ""),
+        ],
+        "{stderr}"
+    );
+}
+
+/// Sends `count` health checks over one keep-alive connection; each must answer within a
+/// second.
+fn probe_health(address: &str, count: usize) {
+    let mut stream = TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut response = Vec::new();
+    for i in 0..count {
+        stream
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        response.clear();
+        while !response.ends_with(b"\r\n\r\nok\n") {
+            let mut chunk = [0; 512];
+            let read = stream.read(&mut chunk);
+            let read = read.unwrap_or_else(|e| panic!("health check {i} did not answer: {e}"));
+            assert!(read > 0, "connection closed at health check {i}");
+            response.extend_from_slice(&chunk[..read]);
+        }
+        assert!(response.starts_with(b"HTTP/1.1 200"), "health check {i}");
+    }
+}
+
+/// ADR 0024 delivery and ARCHITECTURE-v1.md: an unread stderr pipe costs telemetry lines,
+/// not liveness, readiness or shutdown. At `debug` every probe writes a line; three thousand
+/// fill the pipe (64 KiB on Linux and macOS) and the queue (1024 lines) several times over.
+/// A synchronous write would block the Tokio workers and the probes would time out.
+#[test]
+fn unread_stderr_never_blocks_serving_or_shutdown() {
+    const PROBES: usize = 3000;
+    let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "postgres://fixture:CANARY-db-password@{}/fixture?sslmode=disable",
+        unavailable.local_addr().unwrap()
+    );
+    let bind = address();
+    // Nothing reads the process's stderr until it has exited.
+    let mut process = start_logging(false, &bind, &url, &[("LOG_LEVEL", "debug")]);
+    wait_status(&mut process, &bind, "/healthz", 200);
+    probe_health(&bind, PROBES);
+    // Readiness still fails promptly within its database deadline.
+    for _ in 0..3 {
+        let began = Instant::now();
+        assert!(
+            response(&bind, "/readyz")
+                .unwrap()
+                .starts_with("HTTP/1.1 503")
+        );
+        assert!(began.elapsed() < Duration::from_secs(1));
+    }
+    probe_health(&bind, 10);
+    // The whole stop fits SHUTDOWN_TIMEOUT_MS (1000), including the abandoned flush.
+    let began = Instant::now();
+    stop(&mut process, "-TERM");
+    assert!(
+        began.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        began.elapsed()
+    );
+    let (stdout, stderr) = drain(&mut process);
+    assert!(stdout.is_empty());
+    assert!(!stderr.contains("CANARY"));
+    // Whole JSON lines only, and far fewer than were emitted: the rest were dropped.
+    let lines: Vec<serde_json::Value> = stderr
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines[0]["event"], "process.started");
+    assert!(lines.len() < PROBES, "{}", lines.len());
+}
+
 const USAGE: &str = "usage error: expected no arguments or --check-auth-config PATH\n";
 
 /// ADRs 0015 and 0020: the check needs no database setting and opens no listener, for

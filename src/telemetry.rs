@@ -10,6 +10,9 @@
 //! instrumentation (sqlx, hyper, rustls and anything else using `tracing`) and formatted
 //! messages (a `message` field) never reach the output. No `log` bridge is installed, so
 //! crates that log through `log` are not collected either.
+//!
+//! In production the sink is a bounded queue in front of one writer thread ([`sink`]), so a
+//! stalled stderr drops and counts lines instead of blocking the emitting thread.
 use axum::{
     Router,
     extract::{MatchedPath, Request},
@@ -30,6 +33,8 @@ use tracing_subscriber::{
     layer::{Context, Filter, SubscriberExt},
 };
 
+mod sink;
+
 /// The one target the guard admits. Every constructor names it explicitly.
 pub const TARGET: &str = "openmettle_core::telemetry";
 
@@ -46,6 +51,7 @@ pub const FIELDS: &[&str] = &[
     "duration_us",
     "error.type",
     "schema_version",
+    "dropped_lines",
 ];
 
 /// Log line encoding, from `LOG_FORMAT`.
@@ -159,14 +165,55 @@ where
     Registry::default().with(layer.with_filter(guard))
 }
 
-/// Another global subscriber was already installed; this process cannot vouch for its sink.
+/// Telemetry could not be installed; the process exits 1 with this fixed line.
 #[derive(Debug)]
-pub struct AlreadyInstalled;
+pub enum Unavailable {
+    /// Another global subscriber was already installed; this process cannot vouch for its
+    /// sink.
+    AlreadyInstalled,
+    /// The stderr writer thread could not be started.
+    Writer,
+}
 
-/// Installs the production stack on stderr for the rest of the process.
-pub fn install(settings: Settings) -> Result<(), AlreadyInstalled> {
-    tracing::subscriber::set_global_default(subscriber(settings, std::io::stderr))
-        .map_err(|_| AlreadyInstalled)
+impl Unavailable {
+    pub fn message(&self) -> &'static str {
+        match self {
+            Self::AlreadyInstalled => "telemetry subscriber already installed",
+            Self::Writer => "telemetry writer could not start",
+        }
+    }
+}
+
+/// The longest wait for queued lines at exit or after a panic, when stderr is not keeping up.
+pub const FLUSH_LIMIT: Duration = Duration::from_millis(250);
+
+/// The installed sink, kept by the process to flush before it exits.
+pub struct Installed(sink::Queue);
+
+impl Installed {
+    /// Waits at most `limit` for every line emitted so far to be written. Returns whether it
+    /// was; exit never waits longer.
+    pub fn flush(&self, limit: Duration) -> bool {
+        self.0.flush(limit)
+    }
+}
+
+/// Installs the production stack for the rest of the process: the guarded formatter over a
+/// bounded queue to a stderr writer thread, and a panic hook that writes only
+/// `process.panicked` for `role`.
+pub fn install(settings: Settings, role: Process) -> Result<Installed, Unavailable> {
+    let queue = sink::Queue::spawn(std::io::stderr(), sink::CAPACITY, settings)
+        .map_err(|_| Unavailable::Writer)?;
+    tracing::subscriber::set_global_default(subscriber(settings, queue.clone()))
+        .map_err(|_| Unavailable::AlreadyInstalled)?;
+    let hook = queue.clone();
+    // Replaces the default hook, which writes the payload and location. Unwinding or abort
+    // then proceeds as without a hook.
+    std::panic::set_hook(Box::new(move |_| {
+        process_panicked(role);
+        hook.flush(FLUSH_LIMIT);
+    }));
+    Ok(Installed(queue))
 }
 
 /// A server-generated UUIDv4 for one request. It is never read from a client header.
@@ -426,6 +473,17 @@ pub fn process_failed(role: Process, failure: ProcessFailure) {
     );
 }
 
+/// A thread panicked. Nothing from the panic (payload, message or location) is recorded.
+pub fn process_panicked(role: Process) {
+    tracing::error!(target: TARGET, event = "process.panicked", role = role.as_str());
+}
+
+/// The stderr writer dropped `count` lines since its last report, because the queue was full
+/// or a write failed. `error`, so every configured level shows it.
+fn lines_dropped(count: u64) {
+    tracing::error!(target: TARGET, event = "telemetry.dropped", dropped_lines = count);
+}
+
 /// A migration run is starting.
 pub fn migration_started() {
     tracing::info!(
@@ -455,9 +513,10 @@ pub fn migration_failed(failure: MigrationFailure) {
     );
 }
 
-/// A signal ended the run; PostgreSQL rolls back the open transaction.
+/// A signal ended the run, which exits 1; PostgreSQL rolls back the open transaction.
+/// `error`, so a failed run is never silent at any configured level.
 pub fn migration_interrupted(signal: Signal) {
-    tracing::warn!(
+    tracing::error!(
         target: TARGET,
         event = "migration.interrupted",
         role = Process::Migrate.as_str(),
