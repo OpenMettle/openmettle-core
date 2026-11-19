@@ -540,6 +540,110 @@ fn the_guard_applies_before_lines_are_queued() {
     ]);
 }
 
+/// A writer that fails calls selected by a script, then records bytes written on success.
+#[derive(Clone)]
+struct Flaky {
+    outcomes: Arc<Mutex<std::collections::VecDeque<bool>>>,
+    written: Capture,
+}
+
+impl Flaky {
+    fn new(outcomes: impl IntoIterator<Item = bool>) -> Self {
+        Self {
+            outcomes: Arc::new(Mutex::new(outcomes.into_iter().collect())),
+            written: Capture::default(),
+        }
+    }
+}
+
+impl Write for Flaky {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let ok = self.outcomes.lock().unwrap().pop_front().unwrap_or(true);
+        if ok {
+            self.written.make_writer().write(bytes)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "broken pipe",
+            ))
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Failed stream writes are counted as dropped, and if writing the `telemetry.dropped` report
+/// itself fails the count is restored and reported after the next successful write.
+#[test]
+fn write_errors_and_failed_drop_reports_are_preserved_until_recovery() {
+    // Outcomes per write_all call:
+    // 1. line 0 -> Err (dropped = 1)
+    // 2. line 1 -> Err (dropped = 2)
+    // 3. line 2 -> Ok; drop report for 2 -> Err (restored to 2)
+    // 4. line 3 -> Ok; drop report for 2 -> Ok (reset to 0)
+    // 5. line 4 -> Ok (no further report)
+    let flaky = Flaky::new([false, false, true, false, true, true, true]);
+    let queue = sink::Queue::spawn(flaky.clone(), 16, JSON_INFO).unwrap();
+    for i in 0..=4 {
+        offer(&queue, &format!("line {i}\n"));
+    }
+    assert!(queue.flush(Duration::from_secs(10)));
+    let text = flaky.written.text();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 4, "{text}");
+    assert_eq!(lines[0], "line 2");
+    assert_eq!(lines[1], "line 3");
+    let report: Value = serde_json::from_str(lines[2]).unwrap();
+    assert_eq!(report["event"], "telemetry.dropped");
+    assert_eq!(report["level"], "ERROR");
+    assert_eq!(report["dropped_lines"], 2);
+    assert_eq!(lines[3], "line 4");
+}
+
+/// Under concurrent emitters, `flush` never returns `true` until the caller's own accepted
+/// line has been written to the underlying stream.
+#[test]
+fn flush_waits_for_accepted_lines_under_concurrent_emitters() {
+    let out = Capture::default();
+    let queue = sink::Queue::spawn(out.make_writer(), sink::CAPACITY, JSON_INFO).unwrap();
+    let rounds = 300usize;
+    let start = Arc::new(std::sync::Barrier::new(5));
+    let end = Arc::new(std::sync::Barrier::new(5));
+    let mut workers = Vec::new();
+    for w in 0..4 {
+        let q = queue.clone();
+        let start = start.clone();
+        let end = end.clone();
+        workers.push(std::thread::spawn(move || {
+            for round in 0..rounds {
+                start.wait();
+                for n in 0..8 {
+                    offer(&q, &format!("worker-{w}-{round}-{n}\n"));
+                }
+                end.wait();
+            }
+        }));
+    }
+    for round in 0..rounds {
+        start.wait();
+        let marker = format!("marker-{round}");
+        offer(&queue, &format!("{marker}\n"));
+        assert!(queue.flush(Duration::from_secs(10)));
+        assert!(
+            out.text().lines().any(|l| l == marker),
+            "flush returned before {marker} was written"
+        );
+        end.wait();
+        assert!(queue.flush(Duration::from_secs(10)));
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert!(queue.flush(Duration::from_secs(10)));
+    assert_eq!(out.text().lines().count(), rounds * (4 * 8 + 1));
+}
+
 /// One HTTP/1.1 exchange on a new connection; returns the status code.
 pub(crate) async fn exchange(address: SocketAddr, request: &[u8]) -> u16 {
     tokio::time::timeout(Duration::from_secs(10), async {

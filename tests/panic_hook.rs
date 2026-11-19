@@ -42,6 +42,7 @@ fn panic_writes_one_fixed_event_and_nothing_from_the_panic() {
         let output = Command::new(&exe)
             .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
             .env(CHILD, mode)
+            .env("RUST_BACKTRACE", "full")
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(code), "{mode}");

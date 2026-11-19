@@ -8,12 +8,9 @@
 //! telemetry lines, never request handling or shutdown.
 use super::{Settings, lines_dropped, subscriber};
 use std::{
+    collections::VecDeque,
     io::Write,
-    sync::{
-        Arc, Condvar, Mutex, PoisonError,
-        atomic::{AtomicU64, Ordering},
-        mpsc::{Receiver, SyncSender, sync_channel},
-    },
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     thread,
     time::{Duration, Instant},
 };
@@ -22,23 +19,50 @@ use tracing_subscriber::fmt::MakeWriter;
 /// Lines held while the writer is behind: a few hundred kilobytes at most.
 pub const CAPACITY: usize = 1024;
 
-#[derive(Default)]
-struct Progress {
-    /// Lines the queue accepted.
-    accepted: AtomicU64,
-    /// Lines refused by a full queue or a stopped writer, or not written, and not yet
-    /// reported.
-    dropped: AtomicU64,
+struct State {
+    lines: VecDeque<Vec<u8>>,
+    capacity: usize,
+    /// Lines accepted into `lines`. Enqueueing and incrementing this are atomic, so
+    /// `handled <= accepted` holds unconditionally and `flush` cannot return before every line
+    /// accepted ahead of it has been handled.
+    accepted: u64,
     /// Accepted lines the writer has finished with, whether written or not.
-    handled: Mutex<u64>,
-    changed: Condvar,
+    handled: u64,
+    /// Lines refused by a full queue or not written, and not yet reported.
+    dropped: u64,
+    /// True once every emitting [`Queue`] handle is gone.
+    closed: bool,
+}
+
+struct Shared {
+    state: Mutex<State>,
+    wake_writer: Condvar,
+    wake_flush: Condvar,
+}
+
+impl Shared {
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+struct EmitterGuard {
+    shared: Arc<Shared>,
+}
+
+impl Drop for EmitterGuard {
+    fn drop(&mut self) {
+        let mut state = self.shared.lock();
+        state.closed = true;
+        drop(state);
+        self.shared.wake_writer.notify_all();
+    }
 }
 
 /// The emitting side, used as the formatting layer's writer.
 #[derive(Clone)]
 pub struct Queue {
-    lines: SyncSender<Vec<u8>>,
-    progress: Arc<Progress>,
+    guard: Arc<EmitterGuard>,
 }
 
 impl Queue {
@@ -48,21 +72,37 @@ impl Queue {
     where
         W: Write + Send + 'static,
     {
-        let (lines, received) = sync_channel(capacity);
-        let progress = Arc::<Progress>::default();
-        let shared = progress.clone();
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State {
+                lines: VecDeque::with_capacity(capacity.min(CAPACITY)),
+                capacity,
+                accepted: 0,
+                handled: 0,
+                dropped: 0,
+                closed: false,
+            }),
+            wake_writer: Condvar::new(),
+            wake_flush: Condvar::new(),
+        });
+        let writer = shared.clone();
         thread::Builder::new()
             .name("telemetry-writer".into())
-            .spawn(move || write_lines(received, out, &shared, settings))?;
-        Ok(Self { lines, progress })
+            .spawn(move || write_lines(writer, out, settings))?;
+        Ok(Self {
+            guard: Arc::new(EmitterGuard { shared }),
+        })
     }
 
-    /// Never waits: a full queue or a stopped writer drops the line and counts it.
+    /// Never waits on I/O: a full queue drops the line and counts it.
     fn offer(&self, line: Vec<u8>) {
-        if self.lines.try_send(line).is_ok() {
-            self.progress.accepted.fetch_add(1, Ordering::SeqCst);
+        let mut state = self.guard.shared.lock();
+        if state.lines.len() < state.capacity {
+            state.lines.push_back(line);
+            state.accepted += 1;
+            drop(state);
+            self.guard.shared.wake_writer.notify_one();
         } else {
-            self.progress.dropped.fetch_add(1, Ordering::SeqCst);
+            state.dropped = state.dropped.saturating_add(1);
         }
     }
 
@@ -70,15 +110,17 @@ impl Queue {
     /// Returns whether it did.
     pub fn flush(&self, limit: Duration) -> bool {
         let deadline = Instant::now() + limit;
-        let target = self.progress.accepted.load(Ordering::SeqCst);
-        let handled = self.progress.handled.lock();
-        let mut handled = handled.unwrap_or_else(PoisonError::into_inner);
-        while *handled < target {
+        let mut state = self.guard.shared.lock();
+        let target = state.accepted;
+        while state.handled < target {
             let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                 return false;
             };
-            let waited = self.progress.changed.wait_timeout(handled, left);
-            handled = waited.unwrap_or_else(PoisonError::into_inner).0;
+            if left.is_zero() {
+                return false;
+            }
+            let waited = self.guard.shared.wake_flush.wait_timeout(state, left);
+            state = waited.unwrap_or_else(PoisonError::into_inner).0;
         }
         true
     }
@@ -144,13 +186,8 @@ fn write_all(out: &mut impl Write, bytes: &[u8]) -> bool {
 }
 
 /// The writer thread: the only code that waits on the real stream. It ends when every
-/// [`Queue`] is gone.
-fn write_lines<W: Write>(
-    received: Receiver<Vec<u8>>,
-    mut out: W,
-    progress: &Progress,
-    settings: Settings,
-) {
+/// [`Queue`] is gone and all queued lines have been drained.
+fn write_lines<W: Write>(shared: Arc<Shared>, mut out: W, settings: Settings) {
     // This thread's events go to a private stack over `report`, never back to the queue.
     let report = Report::default();
     let make = {
@@ -158,22 +195,45 @@ fn write_lines<W: Write>(
         move || report.clone()
     };
     let _private = tracing::subscriber::set_default(subscriber(settings, make));
-    for line in received {
+    loop {
+        let line = {
+            let mut state = shared.lock();
+            loop {
+                if let Some(line) = state.lines.pop_front() {
+                    break line;
+                }
+                if state.closed {
+                    return;
+                }
+                state = shared
+                    .wake_writer
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        };
         if write_all(&mut out, &line) {
-            let dropped = progress.dropped.swap(0, Ordering::SeqCst);
+            let dropped = {
+                let mut state = shared.lock();
+                let dropped = std::mem::take(&mut state.dropped);
+                if dropped == 0 {
+                    state.handled += 1;
+                }
+                dropped
+            };
             if dropped > 0 {
                 lines_dropped(dropped);
-                if !write_all(&mut out, &report.take()) {
-                    progress.dropped.fetch_add(dropped, Ordering::SeqCst);
+                let reported = write_all(&mut out, &report.take());
+                let mut state = shared.lock();
+                if !reported {
+                    state.dropped = state.dropped.saturating_add(dropped);
                 }
+                state.handled += 1;
             }
         } else {
-            progress.dropped.fetch_add(1, Ordering::SeqCst);
+            let mut state = shared.lock();
+            state.dropped = state.dropped.saturating_add(1);
+            state.handled += 1;
         }
-        *progress
-            .handled
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) += 1;
-        progress.changed.notify_all();
+        shared.wake_flush.notify_all();
     }
 }
