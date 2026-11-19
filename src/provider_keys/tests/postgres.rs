@@ -787,6 +787,7 @@ mod browser;
 mod handoff;
 mod invitations;
 mod membership;
+mod native;
 mod pooled;
 #[path = "../../../tests/support/psql.rs"]
 mod psql;

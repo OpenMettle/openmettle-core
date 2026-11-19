@@ -155,7 +155,7 @@ fn check_path(path: &str) -> Result<(), SettingsError> {
 }
 /// Every path is valid, no two are equal and none is an operational route. Checked before a
 /// route is added, so `Router::route` cannot panic on them.
-fn check_paths(paths: &[&str]) -> Result<(), SettingsError> {
+pub(super) fn check_paths(paths: &[&str]) -> Result<(), SettingsError> {
     for path in paths {
         check_path(path)?;
     }
@@ -169,14 +169,14 @@ fn check_paths(paths: &[&str]) -> Result<(), SettingsError> {
 
 /// A generic cell rate budget over monotonic time: one `Instant`, the earliest time at
 /// which the budget would be full again if nothing else were admitted.
-struct Budget {
+pub(super) struct Budget {
     interval: Duration,
     /// `interval × (burst − 1)`: how far that time may run ahead of now.
     tolerance: Duration,
     full_at: Mutex<Instant>,
 }
 impl Budget {
-    fn new(rate: Rate, now: Instant) -> Result<Self, SettingsError> {
+    pub(super) fn new(rate: Rate, now: Instant) -> Result<Self, SettingsError> {
         if !(1..=MAX_BURST).contains(&rate.burst)
             || !(MIN_INTERVAL..=MAX_INTERVAL).contains(&rate.interval)
         {
@@ -192,7 +192,7 @@ impl Budget {
         })
     }
     /// Spends one unit at `now`, or refuses and changes nothing.
-    fn admit(&self, now: Instant) -> bool {
+    pub(super) fn admit(&self, now: Instant) -> bool {
         // Only this arithmetic runs under the lock, so a poisoned value is still consistent.
         let mut full_at = self.full_at.lock().unwrap_or_else(PoisonError::into_inner);
         let from = (*full_at).max(now);
@@ -252,7 +252,7 @@ const SESSION_LINES: Lines = Lines {
     rate: "session rate limit reached; try again later\n",
 };
 
-fn target_bytes(uri: &Uri) -> usize {
+pub(super) fn target_bytes(uri: &Uri) -> usize {
     uri.scheme_str()
         .map_or(0, |scheme| scheme.len() + "://".len())
         + uri
@@ -262,7 +262,7 @@ fn target_bytes(uri: &Uri) -> usize {
             .path_and_query()
             .map_or(0, |target| target.as_str().len())
 }
-fn header_bytes(headers: &HeaderMap) -> usize {
+pub(super) fn header_bytes(headers: &HeaderMap) -> usize {
     headers
         .iter()
         .map(|(name, value)| name.as_str().len() + value.len())
@@ -270,7 +270,7 @@ fn header_bytes(headers: &HeaderMap) -> usize {
 }
 /// The empty form and navigation profile: no `Transfer-Encoding`, every `Content-Length` is
 /// `0`, and the parsed body is known to be empty. Decided from metadata alone.
-fn empty_body(headers: &HeaderMap, body: &Body) -> bool {
+pub(super) fn empty_body(headers: &HeaderMap, body: &Body) -> bool {
     !headers.contains_key(header::TRANSFER_ENCODING)
         && headers
             .get_all(header::CONTENT_LENGTH)
@@ -283,7 +283,7 @@ fn empty_body(headers: &HeaderMap, body: &Body) -> bool {
 /// that is the form media type, and exactly one `Content-Length` of 1 to
 /// [`handoff::MAX_FORM_BYTES`] in plain decimal that the parsed body agrees with. `None`
 /// refuses, including a chunked body, whose length is not declared.
-fn form_body(headers: &HeaderMap, body: &Body) -> Option<usize> {
+pub(super) fn form_body(headers: &HeaderMap, body: &Body) -> Option<usize> {
     if empty_body(headers, body) {
         return Some(0);
     }

@@ -5,6 +5,7 @@ use crate::{
     invitation::InvitationCode,
     login,
     provider_http::{ProviderDocuments, ProviderTransport, Trust},
+    sessions::native::Attempt,
 };
 use std::{
     collections::HashMap,
@@ -20,6 +21,9 @@ use tokio::{
 // Persisted managed binding: canonical configuration plus durable authority epoch (ADR 0012).
 // Process registration generations never enter stored bytes.
 const MANAGED_DOMAIN: &[u8] = b"openmettle/managed-login/2\0";
+// Persisted native binding (ADR 0023): the same configuration and epoch with the native
+// attempt digest between them, under its own domain. Migration 14 checks both layouts.
+const NATIVE_DOMAIN: &[u8] = b"openmettle/native-managed-login/1\0";
 const MAX_BINDING_BYTES: usize = 12 * 1024; // Existing migration 6 bytea constraint.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,20 +173,24 @@ impl ProviderConfig {
             ],
         )
     }
-    fn login(&self, snapshot: &Snapshot) -> Result<Arc<login::Provider>, Error> {
+    fn login(
+        &self,
+        snapshot: &Snapshot,
+        native: Option<&Attempt>,
+    ) -> Result<Arc<login::Provider>, Error> {
         let mut p = login::Provider::new(
             snapshot.trusted.clone(),
             login::ProviderDefinition {
                 revision: &self.revision,
                 authorization_endpoint: &self.authorization,
                 token_endpoint: &self.token_url,
-                callback: &self.callback,
+                callback: native.map_or(&self.callback, |n| &n.callback),
                 destination: &self.destination,
                 enabled: true,
             },
         )
         .map_err(|_| Error::Configuration)?;
-        p.set_managed(self.binding.clone());
+        p.set_managed(self.binding.clone(), native.map(|n| n.binding));
         Ok(Arc::new(p))
     }
 }
@@ -293,6 +301,7 @@ impl ProviderManager {
             manager: self.inner.clone(),
             entry,
             generation,
+            native: None,
         })
     }
     pub fn retire(&self, provider: &ManagedProvider) -> Result<(), Error> {
@@ -360,6 +369,7 @@ impl Drop for Leader {
 /// Generation-bound handle. Old handles cannot fetch, publish or release identity after replacement.
 #[derive(Clone)]
 pub struct ManagedProvider {
+    native: Option<Arc<Attempt>>,
     manager: Arc<Manager>,
     entry: Arc<Entry>,
     generation: u64,
@@ -370,6 +380,30 @@ impl fmt::Debug for ManagedProvider {
     }
 }
 impl ManagedProvider {
+    /// This provider for one native attempt. Its logins use the attempt's upstream callback
+    /// and store the native binding, so no other handle can consume or exchange them.
+    pub(crate) fn native_handle(&self, attempt: Attempt) -> Self {
+        Self {
+            native: Some(Arc::new(attempt)),
+            ..self.clone()
+        }
+    }
+    pub(crate) fn check_active(&self) -> Result<(), Error> {
+        self.active(&self.entry.state.lock().unwrap()).map(|_| ())
+    }
+    /// The canonical configuration binding, for a native registration digest. Refused when
+    /// the stored native binding built from it would exceed the login row's limit.
+    pub(crate) fn registration_binding(&self) -> Result<Vec<u8>, Error> {
+        let binding = self.config()?.binding.clone();
+        if persisted(&binding, Some(&[0; 32]), 0).len() > MAX_BINDING_BYTES {
+            return Err(Error::Configuration);
+        }
+        Ok(binding)
+    }
+    fn attempt(&self) -> Option<&[u8; 32]> {
+        self.native.as_ref().map(|n| &n.binding)
+    }
+
     fn active<'a>(&self, s: &'a State) -> Result<&'a Arc<ProviderConfig>, Error> {
         if s.generation != self.generation {
             return Err(Error::Retired);
@@ -581,7 +615,7 @@ impl ManagedProvider {
         key_generation: u64,
         assertion: &auth::VerifiedAssertion,
         deadline: Instant,
-    ) -> Result<(), Error> {
+    ) -> Result<Duration, Error> {
         #[cfg(test)]
         self.before_release();
         let mut s = self.entry.state.lock().unwrap();
@@ -591,16 +625,21 @@ impl ManagedProvider {
             return Err(Error::Unavailable);
         }
         s.last_wall = Some(now.wall);
-        if s.snapshot
+        let snapshot = s
+            .snapshot
             .as_ref()
-            .is_none_or(|v| v.generation != key_generation || now.mono >= v.expires)
-        {
-            return Err(Error::Unavailable);
-        }
+            .filter(|v| v.generation == key_generation && now.mono < v.expires)
+            .ok_or(Error::Unavailable)?;
         if Instant::now() >= deadline {
             return Err(Error::Timeout);
         }
-        assertion.check(now.wall).map_err(|_| Error::Verification)
+        assertion.check(now.wall).map_err(|_| Error::Verification)?;
+        let remaining = assertion
+            .remaining(now.wall)
+            .map_err(|_| Error::Verification)?;
+        Ok(remaining
+            .min(snapshot.expires - now.mono)
+            .min(deadline.saturating_duration_since(Instant::now())))
     }
     /// The configured provider UUID this handle was registered under.
     pub(crate) fn id(&self) -> &str {
@@ -641,7 +680,7 @@ impl ManagedProvider {
             return Err(login::Error::Rejected);
         }
         config
-            .login(&snapshot)
+            .login(&snapshot, self.native.as_deref())
             .map_err(|_| login::Error::Configuration)
     }
     /// After the database work: keys still fresh and the phase deadline unspent.
@@ -704,7 +743,9 @@ impl ManagedProvider {
                 .map_err(|_| login::Error::Verification)?;
             let c = self.config().map_err(|_| login::Error::Rejected)?;
             let epoch = permit.epoch().ok_or(login::Error::Rejected)?;
-            if permit.managed_config() != Some(c.binding.as_slice()) {
+            if permit.managed_config() != Some(c.binding.as_slice())
+                || permit.native_attempt() != self.attempt()
+            {
                 return Err(login::Error::Rejected);
             }
             // No await between active-config check and starting the one permitted token POST.
@@ -716,6 +757,7 @@ impl ManagedProvider {
                 .await
                 .map_err(|_| login::Error::Verification)?;
             Ok(ExchangedIdentity {
+                native_binding: self.attempt().copied(),
                 origin,
                 invitation,
                 entry: self.entry.clone(),
@@ -738,7 +780,10 @@ impl ManagedProvider {
         connection: &mut sqlx::PgConnection,
         exchanged: ExchangedIdentity,
     ) -> Result<VerifiedIdentity, login::Error> {
-        if !Arc::ptr_eq(&self.entry, &exchanged.entry) || self.generation != exchanged.generation {
+        if !Arc::ptr_eq(&self.entry, &exchanged.entry)
+            || self.generation != exchanged.generation
+            || self.attempt() != exchanged.native_binding.as_ref()
+        {
             return Err(login::Error::Rejected);
         }
         let _admission = self.admission().map_err(|_| login::Error::Rejected)?;
@@ -772,7 +817,8 @@ impl ManagedProvider {
     ) -> Result<crate::sessions::Credential, crate::sessions::Error> {
         let (_admission, deadline) = self.session_phase(&exchanged, policy)?;
         self.issue_admitted(connection, exchanged, policy, deadline)
-            .await
+            .await?
+            .browser()
     }
     /// Handle binding, manager admission and the issuance deadline: the proof's original
     /// exchange deadline, further limited by the session operation deadline from now. The
@@ -784,7 +830,10 @@ impl ManagedProvider {
         policy: &crate::sessions::Policy,
     ) -> Result<(OwnedSemaphorePermit, Instant), crate::sessions::Error> {
         use crate::sessions::Error as SessionError;
-        if !Arc::ptr_eq(&self.entry, &exchanged.entry) || self.generation != exchanged.generation {
+        if !Arc::ptr_eq(&self.entry, &exchanged.entry)
+            || self.generation != exchanged.generation
+            || self.attempt() != exchanged.native_binding.as_ref()
+        {
             return Err(SessionError::Rejected);
         }
         let admission = self.admission().map_err(|_| SessionError::Rejected)?;
@@ -800,7 +849,7 @@ impl ManagedProvider {
         exchanged: ExchangedIdentity,
         policy: &crate::sessions::Policy,
         deadline: Instant,
-    ) -> Result<crate::sessions::Credential, crate::sessions::Error> {
+    ) -> Result<crate::sessions::Delivery, crate::sessions::Error> {
         use crate::sessions::{self, Error as SessionError};
         let config = self.config().map_err(|_| SessionError::Rejected)?;
         let origin = exchanged.origin.as_ref().ok_or(SessionError::Rejected)?;
@@ -821,7 +870,8 @@ impl ManagedProvider {
                 login: &origin.login,
                 login_expiry: origin.expiry,
                 membership_revision: origin.membership_revision,
-                binding: persisted(&config.binding, exchanged.epoch),
+                binding: persisted(&config.binding, self.attempt(), exchanged.epoch),
+                native: self.native.as_deref(),
                 deadline,
                 invitation: exchanged.invitation.as_ref(),
             },
@@ -864,6 +914,8 @@ impl ManagedProvider {
 /// Sealed managed exchange result. Not cloneable, no public identity accessor. `release`
 /// converts it after authority checks; `issue_session` consumes it under local approval.
 pub struct ExchangedIdentity {
+    // The native attempt of the handle that exchanged this proof, if any (ADR 0023).
+    native_binding: Option<[u8; 32]>,
     origin: Option<login::LoginOrigin>,
     // The invitation code sealed with the originating login, if the person entered one. It
     // is passed only to first-account redemption (ADR 0022).
@@ -881,9 +933,15 @@ impl fmt::Debug for ExchangedIdentity {
     }
 }
 
-/// Stored managed transaction binding: canonical configuration bytes plus durable epoch.
-pub(crate) fn persisted(config: &[u8], epoch: i64) -> Vec<u8> {
-    crate::runs::identity(MANAGED_DOMAIN, &[config, &epoch.to_be_bytes()])
+/// Stored managed transaction binding: canonical configuration bytes plus durable epoch. A
+/// native login also carries its 32-byte attempt digest, under a separate domain, so neither
+/// layout reads as the other. `redeem_home_invitation` (migration 14) checks these exact bytes.
+pub(crate) fn persisted(config: &[u8], attempt: Option<&[u8; 32]>, epoch: i64) -> Vec<u8> {
+    let epoch = epoch.to_be_bytes();
+    match attempt {
+        None => crate::runs::identity(MANAGED_DOMAIN, &[config, &epoch]),
+        Some(attempt) => crate::runs::identity(NATIVE_DOMAIN, &[config, attempt, &epoch]),
+    }
 }
 
 // One statement: the latest committed revision row for this provider and its stable identity.

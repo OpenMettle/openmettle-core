@@ -58,6 +58,7 @@ fn nonce() -> ExpectedNonceDigest {
     ExpectedNonceDigest::new(Sha256::digest("n".repeat(43).as_bytes()).into())
 }
 struct Script {
+    native_callback: Option<String>,
     metadata: Value,
     keys: Vec<u8>,
     cache: String,
@@ -88,6 +89,7 @@ impl Harness {
     async fn with_endpoints(policy: RefreshPolicy, authorization: &str, callback: &str) -> Self {
         let ca = tls::Ca::new();
         let script = Arc::new(Mutex::new(Script {
+            native_callback: None,
             gate: Arc::default(),
             metadata: Value::Null,
             keys: signing::jwks(),
@@ -120,7 +122,7 @@ impl Harness {
                     Some(challenge) => assert!(URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())) == *challenge, "PKCE mismatch"),
                     None => assert!(*verifier == "v".repeat(43), "fixture verifier mismatch"),
                 }
-                assert!(params["client_id"] == signing::CLIENT && params["redirect_uri"] == registered_callback, "client binding mismatch");
+                assert!(params["client_id"] == signing::CLIENT && (params["redirect_uri"] == registered_callback || Some(&params["redirect_uri"]) == s.native_callback.as_ref()), "client binding mismatch");
                 let bytes=tls::json(&serde_json::to_vec(&json!({"access_token":"synthetic-access","token_type":"Bearer","id_token":s.token})).unwrap());
                 return if s.mode=="gate-post" {tls::Reply::Gate(s.gate.clone(),bytes)} else {tls::Reply::Bytes(bytes)};
             }
@@ -219,7 +221,7 @@ impl Harness {
     fn permit(&self) -> login::ExchangePermit {
         let c = self.provider.config().unwrap();
         let s = self.provider.snapshot().unwrap();
-        login::fixture_permit(c.login(&s).unwrap(), Some(1))
+        login::fixture_permit(c.login(&s, None).unwrap(), Some(1))
     }
 }
 async fn verify(p: &ManagedProvider, token: UnverifiedIdToken) -> Result<VerifiedIdentity, Error> {
@@ -680,7 +682,57 @@ async fn stored_managed_binding_layout_matches_invitation_redemption() {
         &field(&42_i64.to_be_bytes()),
     ]
     .concat();
-    assert_eq!(persisted(&c.binding, 42), expected);
+    assert_eq!(persisted(&c.binding, None, 42), expected);
+    // A native login (ADR 0023) stores the same configuration and epoch with its 32-byte
+    // attempt digest between them, under its own domain. Migration 14 reads these offsets.
+    let attempt = [0xa5; 32];
+    let native = [
+        b"openmettle/native-managed-login/1\0".as_slice(),
+        &field(&c.binding),
+        &field(&attempt),
+        &field(&42_i64.to_be_bytes()),
+    ]
+    .concat();
+    assert_eq!(persisted(&c.binding, Some(&attempt), 42), native);
+    assert_eq!(native.len(), 34 + 8 + c.binding.len() + 40 + 16);
+    assert_eq!(expected.len(), 27 + 8 + c.binding.len() + 16);
+}
+// A login belongs to the handle kind that started it: the browser handle, or the native
+// handle of one exact attempt. Any other handle refuses the permit before a token request.
+#[tokio::test]
+async fn permit_is_exchanged_only_by_the_handle_of_its_own_attempt() {
+    use crate::sessions::native::Attempt;
+    let h = Harness::new().await;
+    h.provider.preflight().await.unwrap();
+    let requests = h.count();
+    let attempt = |binding: u8| Attempt {
+        callback: signing::CALLBACK.into(),
+        binding: [binding; 32],
+        registration: [1; 32],
+        audience: [2; 32],
+        challenge: [3; 32],
+    };
+    let native = h.provider.native_handle(attempt(4));
+    let other = h.provider.native_handle(attempt(5));
+    let permit = |from: &ManagedProvider| {
+        let c = from.config().unwrap();
+        let s = from.snapshot().unwrap();
+        login::fixture_permit(c.login(&s, from.native.as_deref()).unwrap(), Some(1))
+    };
+    let policy = auth::Policy::default();
+    for (started, finishing) in [
+        (&h.provider, &native),
+        (&native, &h.provider),
+        (&native, &other),
+    ] {
+        let refused = permit(started).exchange_with_keys(finishing, &policy).await;
+        assert!(matches!(refused, Err(login::Error::Rejected)));
+    }
+    assert_eq!(h.count(), requests);
+    // Control: the handle of the same attempt reaches the provider's token endpoint.
+    let control = permit(&native).exchange_with_keys(&native, &policy).await;
+    assert!(!matches!(control, Err(login::Error::Rejected)));
+    assert!(h.count() > requests);
 }
 fn unknown(kid: &str) -> UnverifiedIdToken {
     let t = signing::signed(

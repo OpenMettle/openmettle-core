@@ -174,7 +174,7 @@ pub(super) fn wrong_method(allow: &'static str) -> Response<&'static str> {
 }
 /// `303` with one cookie. Both header values are marked sensitive: they stay out of `Debug`
 /// output, and an HTTP/2 encoder that honors the mark does not index them.
-fn redirect(location: &str, cookie: &str) -> Response<&'static str> {
+pub(super) fn redirect(location: &str, cookie: &str) -> Response<&'static str> {
     let sensitive = |value: &str| {
         let mut value = HeaderValue::from_str(value).ok()?;
         value.set_sensitive(true);
@@ -189,7 +189,7 @@ fn redirect(location: &str, cookie: &str) -> Response<&'static str> {
     response
 }
 // Exhaustive, so a new service category must be classified before the crate compiles.
-fn completion_refusal(error: Error) -> Refusal {
+pub(super) fn login_failure(error: Error) -> Response<&'static str> {
     use login::Error as L;
     use sessions::Error as S;
     match error {
@@ -211,9 +211,10 @@ fn completion_refusal(error: Error) -> Refusal {
             Refusal::Unavailable
         }
     }
+    .response()
 }
 
-/// Validation and logout outcomes. Exhaustive, like [`completion_refusal`]. Only a credential
+/// Validation and logout outcomes. Exhaustive, like [`login_failure`]. Only a credential
 /// the database refused is `SessionInvalid`; every other category, including the login
 /// categories these operations never return, is an operational failure.
 fn session_refusal(error: Error) -> Refusal {
@@ -246,7 +247,7 @@ fn logged_out() -> Response<&'static str> {
 }
 
 /// `https://host[:port]` in the ASCII serialization browsers send, and nothing else.
-fn canonical_origin(value: &str) -> bool {
+pub(super) fn canonical_origin(value: &str) -> bool {
     Url::parse(value)
         .is_ok_and(|url| url.scheme() == "https" && url.origin().ascii_serialization() == value)
 }
@@ -259,7 +260,7 @@ fn plain_path(url: &str, path: &str) -> bool {
         })
 }
 /// Two 43-character base64url tokens joined by a dot: `state` and the caller cookie value.
-fn token_pair(value: &str) -> Option<(&str, &str)> {
+pub(super) fn token_pair(value: &str) -> Option<(&str, &str)> {
     let (first, second) = value.split_once('.')?;
     let token = |part: &str| {
         part.len() == 43
@@ -271,7 +272,7 @@ fn token_pair(value: &str) -> Option<(&str, &str)> {
 }
 /// One strict `application/x-www-form-urlencoded` component: visible ASCII only, `+` is a
 /// space, every `%` starts two hexadecimal digits and the decoded bytes are UTF-8.
-fn decode(raw: &str) -> Option<String> {
+pub(super) fn decode(raw: &str) -> Option<String> {
     let mut decoded = Vec::with_capacity(raw.len());
     let mut bytes = raw.bytes();
     while let Some(byte) = bytes.next() {
@@ -290,15 +291,15 @@ fn decode(raw: &str) -> Option<String> {
 }
 
 /// A complete authorization success response, still untrusted.
-struct Authorization {
-    code: String,
-    state: String,
-    issuer: String,
+pub(super) struct Authorization {
+    pub(super) code: String,
+    pub(super) state: String,
+    pub(super) issuer: String,
 }
 /// `None` unless the query is one well-formed success response: bounded before decoding, no
 /// decoded name twice (RFC 6749 §3.1), no error member, and `code`, `state` and `iss` present.
 /// Other well-formed parameters are ignored.
-fn authorization(query: &str) -> Option<Authorization> {
+pub(super) fn authorization(query: &str) -> Option<Authorization> {
     if query.len() > MAX_QUERY_BYTES
         || query.bytes().filter(|b| *b == b'&').count() >= MAX_QUERY_PARAMETERS
     {
@@ -334,7 +335,7 @@ fn authorization(query: &str) -> Option<Authorization> {
 /// one `invitation_code` field whose strictly decoded value is a well-formed code. Syntax
 /// only: whether the code belongs to an invitation is decided at redemption, so a
 /// well-formed wrong code and no code get the same response here.
-fn invitation(form: &[u8]) -> Option<Option<InvitationCode>> {
+pub(super) fn invitation(form: &[u8]) -> Option<Option<InvitationCode>> {
     if form.is_empty() {
         return Some(None);
     }
@@ -354,7 +355,7 @@ fn invitation(form: &[u8]) -> Option<Option<InvitationCode>> {
 }
 /// The value of cookie `name` when it occurs exactly once across every `Cookie` field and
 /// those fields are within [`MAX_COOKIE_BYTES`]. Names compare exactly.
-fn single_cookie<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
+pub(super) fn single_cookie<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
     let fields = || headers.get_all(header::COOKIE).iter();
     if fields().map(HeaderValue::len).sum::<usize>() > MAX_COOKIE_BYTES {
         return None;
@@ -552,7 +553,7 @@ impl LoginHandoff {
             Ok(credential) => {
                 redirect(&self.settings.landing, &session_cookie(credential.expose()))
             }
-            Err(error) => completion_refusal(error).response(),
+            Err(error) => login_failure(error),
         }
     }
 
@@ -889,7 +890,7 @@ mod tests {
         use login::Error as L;
         use sessions::Error as S;
         let line = |error| {
-            let response = completion_refusal(error).response();
+            let response = login_failure(error);
             assert!(!response.headers().contains_key(header::SET_COOKIE));
             (response.status(), *response.body())
         };

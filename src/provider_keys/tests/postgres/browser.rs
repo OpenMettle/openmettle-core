@@ -192,48 +192,10 @@ async fn cross_site_session_lifecycle() {
     let script = f.h.script.clone();
     let provider = Router::new()
         .route("/wrong", get(|| async move { Html(wrong) }))
-        .route(
-            "/authorize",
-            get(move |RawQuery(query): RawQuery| async move {
-                let params: HashMap<_, _> = openidconnect::url::form_urlencoded::parse(
-                    query.as_deref().unwrap_or_default().as_bytes(),
-                )
-                .into_owned()
-                .collect();
-                assert!(
-                    params["redirect_uri"] == callback
-                        && params["client_id"] == signing::CLIENT
-                        && params["response_type"] == "code"
-                        && params["code_challenge_method"] == "S256",
-                    "authorization request binding"
-                );
-                script.lock().unwrap().authorize(&params);
-                let query = openidconnect::url::form_urlencoded::Serializer::new(String::new())
-                    .append_pair("code", "synthetic-code")
-                    .append_pair("state", &params["state"])
-                    .append_pair("iss", signing::ISSUER)
-                    .finish()
-                    .replace('&', "&amp;");
-                Html(format!(
-                    r#"<a id="approve" href="{callback}?{query}">Continue</a>"#
-                ))
-            }),
-        );
+        .merge(authorization_site(callback, script));
     serve(issuer_listener, ISSUER, &f.h.ca, provider);
 
-    let public_ca = f.h.ca.pem();
-    let status = tokio::task::spawn_blocking(move || {
-        let mut child = Command::new("python3")
-            .args(["tests/browser/qualify.py", &app, &issuer])
-            .stdin(Stdio::piped())
-            .spawn()
-            .expect("start browser harness");
-        child.stdin.take().unwrap().write_all(&public_ca).unwrap();
-        child.wait().expect("reap browser harness")
-    })
-    .await
-    .unwrap();
-    assert!(status.success(), "browser journey failed");
+    run_browser(app, issuer, None, f.h.ca.pem()).await;
     {
         let observed = observed.lock().unwrap();
         assert!(
@@ -257,4 +219,116 @@ async fn cross_site_session_lifecycle() {
          FROM openmettle.local_sessions s JOIN openmettle.login_transactions t ON t.id = s.login_id",
     ).bind(user).fetch_all(&mut f.owner).await.unwrap();
     assert_eq!(sessions, [true]);
+}
+
+async fn run_browser(app: String, issuer: String, link: Option<String>, public_ca: Vec<u8>) {
+    let status = tokio::task::spawn_blocking(move || {
+        let mut command = Command::new("python3");
+        command.args(["tests/browser/qualify.py", &app, &issuer]);
+        if let Some(link) = link {
+            command.arg(link);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("start browser harness");
+        child.stdin.take().unwrap().write_all(&public_ca).unwrap();
+        child.wait().expect("reap browser harness")
+    })
+    .await
+    .unwrap();
+    assert!(status.success(), "browser journey failed");
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 and sandboxed Chrome required"]
+async fn cross_site_native_code_delivery() {
+    use crate::browser_auth::native::NativeAuth;
+    let app_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let link_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let app = format!(
+        "https://{APP}:{}",
+        app_listener.local_addr().unwrap().port()
+    );
+    let issuer = format!(
+        "https://{ISSUER}:{}",
+        issuer_listener.local_addr().unwrap().port()
+    );
+    let link = format!(
+        "https://links.relying.test:{}/app-link",
+        link_listener.local_addr().unwrap().port()
+    );
+    let callback = format!("{app}/native/callback");
+    let h = Harness::with_endpoints(
+        policy(),
+        &format!("{issuer}/authorize"),
+        &format!("{app}/browser/callback"),
+    )
+    .await;
+    h.script.lock().unwrap().native_callback = Some(callback.clone());
+    let mut f = Flow::with(h).await;
+    sessions::seed(&mut f, true, true).await;
+    let pool = pooled::one_slot(f.db.options(API));
+    let service = Arc::new(pooled::service_over(&f, &pool));
+    let native = NativeAuth::new(
+        service,
+        signing::ID,
+        &app,
+        &callback,
+        "synthetic.mobile",
+        &link,
+        8,
+    )
+    .unwrap();
+    serve(
+        app_listener,
+        APP,
+        &f.h.ca,
+        native.router(super::super::router::limits().begin).unwrap(),
+    );
+
+    // Ordinary HTTPS destination in the harness. No mobile OS link association is involved.
+    serve(
+        link_listener,
+        "links.relying.test",
+        &f.h.ca,
+        Router::new().route("/app-link", get(|| async { "synthetic app link" })),
+    );
+    let routes = authorization_site(callback, f.h.script.clone());
+    serve(issuer_listener, ISSUER, &f.h.ca, routes);
+    run_browser(app, issuer, Some(link), f.h.ca.pem()).await;
+    assert_eq!(pooled::posts(&f), 1);
+    let result:(bool,bool)=sqlx::query_as("SELECT s.revoked, g.sealed IS NULL FROM openmettle.local_sessions s JOIN openmettle.native_handoffs g ON g.session_id=s.id").fetch_one(&mut f.owner).await.unwrap();
+    assert_eq!(result, (true, true));
+}
+
+fn authorization_site(callback: String, script: Arc<Mutex<Script>>) -> Router {
+    Router::new().route(
+        "/authorize",
+        get(move |RawQuery(query): RawQuery| async move {
+            let params: HashMap<_, _> = openidconnect::url::form_urlencoded::parse(
+                query.as_deref().unwrap_or_default().as_bytes(),
+            )
+            .into_owned()
+            .collect();
+            assert!(
+                params["redirect_uri"] == callback
+                    && params["client_id"] == signing::CLIENT
+                    && params["response_type"] == "code"
+                    && params["code_challenge_method"] == "S256",
+                "authorization request binding"
+            );
+            script.lock().unwrap().authorize(&params);
+            let query = openidconnect::url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("code", "synthetic-code")
+                .append_pair("state", &params["state"])
+                .append_pair("iss", signing::ISSUER)
+                .finish()
+                .replace('&', "&amp;");
+            Html(format!(
+                r#"<a id="approve" href="{callback}?{query}">Continue</a>"#
+            ))
+        }),
+    )
 }

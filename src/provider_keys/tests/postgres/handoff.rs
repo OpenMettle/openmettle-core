@@ -466,7 +466,7 @@ async fn routed_finish(f: &mut Flow, address: SocketAddr, start: &Routed) -> Rep
 }
 /// What an initiation reply shows apart from its random values: the status, the header
 /// names, the authorization parameter names and the lengths of the redirect and the cookie.
-fn start_shape(reply: &Reply) -> (u16, Vec<String>, Vec<String>, usize, usize) {
+pub(super) fn start_shape(reply: &Reply) -> (u16, Vec<String>, Vec<String>, usize, usize) {
     let names = |pairs: Vec<String>| {
         let mut names = pairs;
         names.sort();
@@ -487,7 +487,7 @@ fn start_shape(reply: &Reply) -> (u16, Vec<String>, Vec<String>, usize, usize) {
     )
 }
 /// Everything a client can observe in a reply except its `Date` field.
-fn observable(reply: &Reply) -> (u16, Vec<(String, String)>, String) {
+pub(super) fn observable(reply: &Reply) -> (u16, Vec<(String, String)>, String) {
     let headers = reply.headers.iter().filter(|(name, _)| name != "date");
     (reply.status, headers.cloned().collect(), reply.body.clone())
 }
@@ -503,7 +503,7 @@ fn signed_in(reply: &Reply) -> String {
         .to_owned()
 }
 /// `(consumed, ciphertext cleared, session issued)` of one login.
-async fn login_state(f: &mut Flow, login: &str) -> (bool, bool, bool) {
+pub(super) async fn login_state(f: &mut Flow, login: &str) -> (bool, bool, bool) {
     sqlx::query_as(
         "SELECT consumed, ciphertext IS NULL, session_issued
            FROM openmettle.login_transactions WHERE id = $1",
@@ -515,7 +515,7 @@ async fn login_state(f: &mut Flow, login: &str) -> (bool, bool, bool) {
 }
 /// The form field a person submits after typing `code` as the create command displays it.
 /// Test output never includes this value.
-fn entered(code: &[u8; 16]) -> String {
+pub(super) fn entered(code: &[u8; 16]) -> String {
     let hex: String = code.iter().map(|byte| format!("{byte:02x}")).collect();
     let groups: Vec<&str> = (0..8).map(|group| &hex[4 * group..4 * group + 4]).collect();
     format!("invitation_code=omh1-{}", groups.join("-"))

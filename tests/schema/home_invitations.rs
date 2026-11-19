@@ -118,7 +118,8 @@ async fn upgrades_preserve_state_and_allow_exactly_one_redemption_signature_per_
         .unwrap();
     migrate::apply(&settings, v12).await.unwrap();
 
-    // Schema 13: the code-less function is gone and only the function with a code remains.
+    // Schema 13 and later: the code-less function is gone and only the function with a
+    // code remains. Migration 14 replaces its body and keeps this contract (see below).
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
     assert_eq!(MIGRATIONS[INVITATIONS].version, 13);
     let current = first_approval::everything(&db).await;
@@ -205,6 +206,120 @@ async fn upgrades_preserve_state_and_allow_exactly_one_redemption_signature_per_
     refused_for(&settings, MIGRATIONS, &violation(CODELESS)).await;
 }
 
+// Migration 14 (ADR 0023) replaces the redemption function in place, so that a login started
+// by a native sign-in can redeem, and adds the native delivery table. The function keeps its
+// signature, owner, security mode, search path and complete ACL. The new table's grants are
+// outside the contract until version 14 is recorded, and then exactly the contract.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn migration_14_keeps_the_redemption_contract_and_gates_the_native_grants() {
+    const NATIVE: usize = 13;
+    const TABLE: &str = "openmettle.native_handoffs";
+    let db = TestDb::new().await;
+    let settings = db.settings(Duration::from_secs(5));
+    let v13 = &MIGRATIONS[..NATIVE];
+    migrate::apply(&settings, v13).await.unwrap();
+    let mut owner = connect(&db.0, OWNER).await;
+    assert_eq!(function_contract(&mut owner).await, contract(CODED));
+    let body = "SELECT position('openmettle/native-managed-login/1' IN prosrc) > 0,
+                       position('openmettle/managed-login/2' IN prosrc) > 0
+                  FROM pg_proc WHERE oid = 'openmettle.redeem_home_invitation(uuid,text,text,text,bigint,bytea)'::regprocedure";
+    let layouts: (bool, bool) = sqlx::query_as(body).fetch_one(&mut owner).await.unwrap();
+    assert_eq!(
+        layouts,
+        (false, true),
+        "schema 13 admits the managed layout only"
+    );
+
+    // A grant on the new relation before version 14 is recorded is the one violation.
+    owner
+        .execute(AssertSqlSafe(format!(
+            "CREATE TABLE {TABLE}(sealed bytea); GRANT SELECT ON {TABLE} TO openmettle_api"
+        )))
+        .await
+        .unwrap();
+    refused_for(
+        &settings,
+        v13,
+        &format!("openmettle_api has SELECT on {TABLE}"),
+    )
+    .await;
+    owner
+        .execute(AssertSqlSafe(format!("DROP TABLE {TABLE}")))
+        .await
+        .unwrap();
+
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+    assert_eq!(MIGRATIONS[NATIVE].version, 14);
+    assert_eq!(db.history().await, (1..=14).collect::<Vec<i64>>());
+    assert_eq!(function_contract(&mut owner).await, contract(CODED));
+    let layouts: (bool, bool) = sqlx::query_as(body).fetch_one(&mut owner).await.unwrap();
+    assert_eq!(layouts, (true, true), "schema 14 admits both layouts");
+
+    // The API role reads rows, inserts whole rows and clears one column. Nobody else, and
+    // nothing more: no other update, no delete and no table-wide write.
+    for role in [API, WORKER, CAPPED, "public"] {
+        let privileges: (bool, bool, bool, bool, bool) = sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT has_table_privilege($1, '{TABLE}', 'SELECT'),
+                (SELECT bool_and(has_column_privilege($1, '{TABLE}', a.attname::text, 'INSERT'))
+                   FROM pg_attribute a WHERE a.attrelid = '{TABLE}'::regclass
+                    AND a.attnum > 0 AND NOT a.attisdropped),
+                has_column_privilege($1, '{TABLE}', 'sealed', 'UPDATE'),
+                (SELECT bool_or(has_column_privilege($1, '{TABLE}', a.attname::text, 'UPDATE'))
+                   FROM pg_attribute a WHERE a.attrelid = '{TABLE}'::regclass
+                    AND a.attnum > 0 AND NOT a.attisdropped AND a.attname <> 'sealed'),
+                has_table_privilege($1, '{TABLE}', 'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN')"
+        )))
+        .bind(role)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        let api = role == API || role == CAPPED;
+        assert_eq!(privileges, (api, api, api, false, false), "{role}");
+    }
+    let columns: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT attname::text FROM pg_attribute WHERE attrelid = '{TABLE}'::regclass
+            AND attnum > 0 AND NOT attisdropped ORDER BY attnum"
+    )))
+    .fetch_all(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        columns,
+        [
+            "session_id",
+            "code_hash",
+            "registration",
+            "audience",
+            "challenge",
+            "sealed",
+            "expires_ms"
+        ]
+    );
+    for (grant, revoke, violation) in [
+        (
+            format!("GRANT UPDATE (expires_ms) ON {TABLE} TO openmettle_api"),
+            format!("REVOKE UPDATE (expires_ms) ON {TABLE} FROM openmettle_api"),
+            format!("openmettle_api has UPDATE on {TABLE}.expires_ms"),
+        ),
+        (
+            format!("GRANT DELETE ON {TABLE} TO openmettle_api"),
+            format!("REVOKE DELETE ON {TABLE} FROM openmettle_api"),
+            format!("openmettle_api has DELETE on {TABLE}"),
+        ),
+        (
+            format!("GRANT SELECT ON {TABLE} TO openmettle_worker"),
+            format!("REVOKE SELECT ON {TABLE} FROM openmettle_worker"),
+            format!("openmettle_worker has SELECT on {TABLE}"),
+        ),
+    ] {
+        owner.execute(AssertSqlSafe(grant)).await.unwrap();
+        refused_for(&settings, MIGRATIONS, &violation).await;
+        owner.execute(AssertSqlSafe(revoke)).await.unwrap();
+    }
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+}
+
 // Schema 12 wrote invitations without a code. A pending one could never be redeemed on schema
 // 13, so the migration refuses and leaves schema 12 intact until the operator withdraws it.
 #[tokio::test]
@@ -260,7 +375,7 @@ async fn pending_invitation_without_a_code_blocks_migration_13_until_withdrawn()
     );
     assert!(out.status.success(), "{}", stderr(&out));
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
-    assert_eq!(db.history().await, (1..=13).collect::<Vec<i64>>());
+    assert_eq!(db.history().await, (1..=14).collect::<Vec<i64>>());
     assert_eq!(function_contract(&mut owner).await, contract(CODED));
     // Both closed decisions survive, with no code and no way to become pending again.
     let rows: Vec<(String, bool, bool)> = sqlx::query_as(

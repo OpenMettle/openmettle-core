@@ -413,6 +413,15 @@ impl VerifiedAssertion {
         self.check(now)?;
         Ok(self.identity)
     }
+    pub(crate) fn remaining(&self, now: SystemTime) -> Result<Duration, VerifyError> {
+        let age_limit = self
+            .issued
+            .checked_add_signed(self.max_age)
+            .ok_or(VerifyError::Clock)?;
+        (self.expires.min(age_limit) - utc(now)?)
+            .to_std()
+            .map_err(|_| VerifyError::Expired)
+    }
     pub(crate) fn identity(&self) -> &VerifiedIdentity {
         &self.identity
     }

@@ -85,6 +85,8 @@ contract (relation, role, privilege) AS (
     SELECT 'login_admission', 'openmettle_api', 'SELECT' WHERE $1 >= 9
     UNION ALL
     SELECT 'membership_observations', 'openmettle_api', 'SELECT' WHERE $1 >= 11
+    UNION ALL
+    SELECT 'native_handoffs', 'openmettle_api', 'SELECT' WHERE $1 >= 14
 ),
 column_contract (relation, attribute, role, privilege) AS (
     VALUES ('users', 'disabled_at', 'openmettle_api', 'UPDATE')
@@ -109,6 +111,13 @@ column_contract (relation, attribute, role, privilege) AS (
     WHERE $1 >= 11
     UNION ALL
     SELECT 'login_admission', 'lock_guard', 'openmettle_api', 'UPDATE' WHERE $1 >= 9
+    UNION ALL
+    -- One native delivery row per session: written once, then only its envelope is cleared.
+    SELECT 'native_handoffs', attribute, 'openmettle_api', privilege FROM (VALUES
+        ('session_id','INSERT'), ('code_hash','INSERT'), ('registration','INSERT'),
+        ('audience','INSERT'), ('challenge','INSERT'), ('sealed','INSERT'),
+        ('expires_ms','INSERT'), ('sealed','UPDATE')
+    ) AS native(attribute, privilege) WHERE $1 >= 14
     UNION ALL
     SELECT relation, attribute, 'openmettle_api', privilege FROM (VALUES
         ('login_nonce_reservations','key_id','INSERT'),
@@ -352,6 +361,7 @@ violations (violation) AS (
                    IN (SELECT relation, role, privilege FROM contract))
       -- Exactly one redemption signature per version: the code-less function exists only at
       -- version 12, and from version 13 only the function that requires the invitation code.
+      -- Version 14 replaces that function's body and keeps its signature and grant.
       AND NOT (g.kind = 'function' AND g.privilege = 'EXECUTE'
                AND g.grantee = (SELECT oid FROM pg_roles WHERE rolname = 'openmettle_api')
                AND (($1 = 12 AND g.target

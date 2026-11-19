@@ -151,6 +151,8 @@ pub(crate) fn validate_definition(
 pub struct Provider {
     // Managed only: canonical full configuration binding before the durable authority epoch.
     managed: Option<Vec<u8>>,
+    // Managed native sign-in only: the attempt digest stored with that binding (ADR 0023).
+    native: Option<[u8; 32]>,
     trusted: TrustedProvider,
     revision: String,
     authorization: String,
@@ -177,6 +179,7 @@ impl Provider {
         }
         Ok(Self {
             managed: None,
+            native: None,
             trusted,
             revision: d.revision.into(),
             authorization: d.authorization_endpoint.into(),
@@ -186,8 +189,9 @@ impl Provider {
             enabled: d.enabled,
         })
     }
-    pub(crate) fn set_managed(&mut self, config_binding: Vec<u8>) {
+    pub(crate) fn set_managed(&mut self, config_binding: Vec<u8>, native: Option<[u8; 32]>) {
         self.managed = Some(config_binding);
+        self.native = native;
     }
     /// The stored transaction binding. Managed providers read the committed provider authority
     /// inside the caller's transaction (ADR 0012); offline providers keep the ADR 0009 binding.
@@ -201,7 +205,8 @@ impl Provider {
         let (id, issuer, client) = self.trusted.binding();
         let epoch =
             crate::provider_keys::authority(connection, id, issuer, client, &self.revision).await?;
-        Ok((crate::provider_keys::persisted(config, epoch), Some(epoch)))
+        let binding = crate::provider_keys::persisted(config, self.native.as_ref(), epoch);
+        Ok((binding, Some(epoch)))
     }
     fn binding(&self) -> Vec<u8> {
         let (id, issuer, client) = self.trusted.binding();
@@ -841,6 +846,9 @@ impl ExchangePermit {
     }
     pub(crate) fn managed_config(&self) -> Option<&[u8]> {
         self.provider.managed.as_deref()
+    }
+    pub(crate) fn native_attempt(&self) -> Option<&[u8; 32]> {
+        self.provider.native.as_ref()
     }
     pub(crate) fn epoch(&self) -> Option<i64> {
         self.epoch
