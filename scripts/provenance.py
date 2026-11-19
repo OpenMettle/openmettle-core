@@ -21,8 +21,11 @@ ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_VERSION = 1
 REQUIRED_GROUPS = ("core", "graphiti", "database", "sandbox", "serving", "media", "application-fork")
 KINDS = {"code", "asset", "model", "curated-fork", "container-image", "library", "service", "tooling"}
-DISTRIBUTION = {"included", "candidate", "excluded", "not-distributed"}
+# "reviewed-elsewhere": inside the boundary, but shipped and licence-reviewed by another OpenMettle
+# repository. This register covers openmettle-core's own source, so the core gate does not evaluate it.
+DISTRIBUTION = {"included", "candidate", "excluded", "not-distributed", "reviewed-elsewhere"}
 SHIPPED = {"included", "candidate"}
+IN_BOUNDARY = SHIPPED | {"reviewed-elsewhere"}
 GROUP_STATUS = {"pending", "reviewed", "excluded"}
 # Forward-looking assessment for a wider future boundary. It is not a distribution decision.
 REDISTRIBUTION = {"redistributable", "user-fetched", "undetermined"}
@@ -255,8 +258,16 @@ def validate_register(register) -> list[str]:
             errors.append(f"{where}: {comp['distribution']} components need an exclusion_reason")
         group = groups.get(comp.get("review_group")) if isinstance(comp.get("review_group"), str) else None
         if (isinstance(group, dict) and group.get("status") == "excluded"
-                and comp.get("distribution") in SHIPPED):
-            errors.append(f"{where}: a shipped component cannot belong to excluded group '{comp['review_group']}'")
+                and comp.get("distribution") in IN_BOUNDARY):
+            errors.append(f"{where}: an in-boundary component cannot belong to excluded group '{comp['review_group']}'")
+        if comp.get("distribution") == "reviewed-elsewhere":
+            # The owner's group disposition is the only record here; the licence review lives in reviewed_in.
+            if not _text(comp.get("reviewed_in")):
+                errors.append(f"{where}: reviewed-elsewhere components need 'reviewed_in' naming the reviewing repository")
+            if comp.get("exclusion_reason") is not None:
+                errors.append(f"{where}: an in-boundary component cannot have an exclusion_reason")
+            if isinstance(group, dict) and group.get("status") != "reviewed":
+                errors.append(f"{where}: reviewed-elsewhere components need a group with a completed owner disposition")
     return errors
 
 
@@ -339,6 +350,7 @@ def evaluate(register: dict, lock: list[dict], metadata: dict | None) -> dict:
                                                 "version", "pin", "origin", "licence", "notices")}
                           | {"review_status": comp["review"]["status"],
                              "exclusion_reason": comp.get("exclusion_reason"),
+                             "reviewed_in": comp.get("reviewed_in"),
                              "redistribution": comp["redistribution"]})
         if comp["distribution"] not in SHIPPED:
             continue
@@ -389,7 +401,8 @@ def render_notices(report: dict, inputs: dict) -> str:
               "| Later redistribution |",
               "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for c in report["components"]:
-        lines.append(_row(c["id"], c["review_group"], c["distribution"], c["version"] or "unknown",
+        distribution = c["distribution"] + (f" ({c['reviewed_in']})" if c["reviewed_in"] else "")
+        lines.append(_row(c["id"], c["review_group"], distribution, c["version"] or "unknown",
                           c["pin"] or "unknown", c["licence"]["expression"] or "unknown", c["notices"]["status"],
                           " ".join(c["notices"]["obligations"]) or "—", c["review_status"],
                           c["redistribution"]["assessment"]))
