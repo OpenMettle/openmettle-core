@@ -1,4 +1,5 @@
-"""Drive runner Chrome over its private DevTools pipe. Only fixed phase names reach stderr."""
+"""Drive runner Chrome over its private DevTools pipe. Only fixed phase names and fixed
+failure kinds reach stderr."""
 import contextlib
 import json
 import os
@@ -18,6 +19,31 @@ class Failure(Exception):
 
 class Navigating(Failure):
     """The renderer changed while a document predicate was in flight."""
+
+
+class Progress:
+    """The fixed phase in progress, for errors that carry no phase of their own."""
+
+    phase = "harness setup"
+
+    def enter(self, phase):
+        self.phase = phase
+
+
+def unexpected(error, phase):
+    """Describe a non-Failure error by its kind and phase only, never by its own text."""
+    if isinstance(error, (TimeoutError, socket.timeout, subprocess.TimeoutExpired)):
+        kind = "timed out"
+    elif isinstance(error, ConnectionError):
+        # Linux resets the pipe when Chrome exits with a command still unread.
+        kind = "browser pipe lost"
+    elif isinstance(error, FileNotFoundError):
+        kind = "required runner tool missing"
+    elif isinstance(error, subprocess.CalledProcessError):
+        kind = "runner tool refused"
+    else:
+        kind = "browser harness failed"
+    return f"{kind} during {phase}"
 
 
 class DevTools:
@@ -81,11 +107,12 @@ class DevTools:
         self.evaluate(f"setTimeout(() => document.getElementById('{element}').click(), 0); true")
 
 
-def journey(browser, app, issuer):
+def journey(browser, app, issuer, enter):
     version = browser.call("Browser.getVersion")["product"]
     if not re.fullmatch(r"(HeadlessChrome|Chrome)/[0-9]+(?:\.[0-9]+){3}", version):
         raise Failure("unexpected browser version")
     print(f"Browser runtime {version}", flush=True)
+    enter("browser target setup")
     target = browser.call("Target.createTarget", url="about:blank")["targetId"]
     browser.session = browser.call("Target.attachToTarget", targetId=target, flatten=True)["sessionId"]
 
@@ -95,6 +122,7 @@ def journey(browser, app, issuer):
             f"document.readyState === 'complete' && !!document.getElementById('{control}')",
             f"document did not commit at {path}")
 
+    enter("wrong-origin form")
     browser.call("Page.navigate", url=issuer + "/wrong")
     page(issuer, "/wrong", "wrong")
     browser.click("wrong")
@@ -102,24 +130,31 @@ def journey(browser, app, issuer):
                      "document.body?.innerText.trim() === 'login origin refused'",
                      "wrong-origin form denial")
 
+    enter("login page")
     browser.call("Page.navigate", url=app + "/")
     page(app, "/", "login")
+    enter("provider authorization")
     browser.click("login")
     page(issuer, "/authorize", "approve")
+    enter("callback and landing")
     browser.click("approve")
     page(app, "/app", "logout")
     if browser.evaluate(f"location.href === {json.dumps(app + '/app')}") is not True:
         raise Failure("unexpected landing URL")
+    enter("issued session check")
     if browser.evaluate("fetch('/session').then(r => r.status)") != 204:
         raise Failure("issued session check")
+    enter("logout")
     browser.click("logout")
     browser.wait_for("document.forms[0].dataset.status === '204'", "logout acknowledgement")
+    enter("signed-out session check")
     if browser.evaluate("fetch('/session').then(async r => r.status === 403 && "
                         "(await r.text()).trim() === 'session not valid')") is not True:
         raise Failure("signed-out session check")
 
 
-def run(app, issuer, home):
+def run(app, issuer, home, enter):
+    enter("runner trust store")
     # Allowlist the child environment. Browser profile, NSS, cache, and crash files are private.
     env = {"HOME": str(home), "TMPDIR": str(home), "PATH": os.environ["PATH"]}
     db = home / ".local/share/pki/nssdb"
@@ -137,13 +172,15 @@ def run(app, issuer, home):
                "--disable-background-networking", "--no-proxy-server",
                f"--host-resolver-rules={rules}", f"--user-data-dir={home / 'profile'}"]
     parent, child = socket.socketpair()
+    enter("browser start")
     with parent, child:
         process = subprocess.Popen(command, env=env, stdin=child, stdout=child,
                                    stderr=subprocess.DEVNULL, start_new_session=True)
         child.close()
         try:
             parent.settimeout(12)
-            journey(DevTools(parent), app, issuer)
+            journey(DevTools(parent), app, issuer, enter)
+            enter("browser shutdown")
         finally:
             # Closing the debugging pipe requests normal Chrome shutdown. On timeout
             # the unreaped leader still reserves the group ID created by this harness.
@@ -164,10 +201,11 @@ if __name__ == "__main__":
     signal.signal(signal.SIGALRM, interrupted)
     signal.signal(signal.SIGTERM, interrupted)
     signal.alarm(75)
+    progress = Progress()
     try:
         with tempfile.TemporaryDirectory(prefix="om-browser-") as directory:
-            run(*sys.argv[1:], Path(directory))
+            run(*sys.argv[1:], Path(directory), progress.enter)
     except Failure as exc:
         sys.exit(str(exc))
-    except Exception:
-        sys.exit("browser harness or required runner tool failed")
+    except Exception as exc:
+        sys.exit(unexpected(exc, progress.phase))
