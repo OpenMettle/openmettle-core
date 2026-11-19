@@ -262,7 +262,9 @@ replaces that rule:
   default, 300 seconds at most.
 - The refresh cooldown and the unknown-`kid` refresh are unchanged.
 - **Accepted trade-off:** a key that the provider removes can stay trusted until the window
-  ends, at most 300 seconds after the fetch.
+  ends, at most 300 seconds after the fetch. This bound assumes the response is fresh from the
+  origin. An intermediary that serves an old copy with its original `Date` and no `Age` adds
+  its own staleness, because `Date` does not age the window (see Validation).
 
 The owner rejected three alternatives. Exempting these providers from cooldown would let
 outbound fetches grow with unauthenticated sign-in attempts. Adding cache headers at a reverse
@@ -313,8 +315,8 @@ A value outside these rules fails the offline check with "provider refresh polic
 range". The cooldown rule applies only to an explicit value. A document without the member
 and with a cooldown above 60 seconds still loads. It then has the gap described above for
 such a provider, just as a `max-age` shorter than cooldown already does. Operators of a
-provider that refuses caching should therefore set the member. A cooldown above 300 seconds
-leaves no valid explicit window.
+provider that refuses caching should therefore set the member. A cooldown above 300 seconds,
+or above `freshness_seconds`, leaves no valid explicit window.
 
 For such a provider:
 
@@ -328,8 +330,13 @@ For such a provider:
   are unchanged. Starts during a refresh share it, and later starts reuse its result until the
   window ends. A begin and a callback inside one window share its fetch.
 - **Unreachable provider.** Within the window, operations continue on the held snapshot, as
-  for any cached document. After it ends, sign-in fails until a fetch succeeds. There is no
-  outage grace.
+  for any cached document. After it ends, sign-in fails until a fetch succeeds, and a fetch is
+  attempted at most once per cooldown. There is no outage grace. Such a provider refreshes once
+  per window rather than at its `max-age`, so one transient fetch failure or leader timeout
+  refuses sign-ins for up to a full cooldown, and does so more often than for a cacheable
+  provider. An operation that straddles the end of a window is refused rather than refreshed
+  (for example at `confirm` or `check_assertion`). That is negligible at 60 seconds and
+  noticeable near the 1-second minimum.
 
 **Operational cost.** At most one discovery and one JWKS fetch per window, plus any
 unknown-`kid` refreshes, which cooldown already limits. That is one of each per minute at

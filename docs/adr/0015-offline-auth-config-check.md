@@ -47,7 +47,9 @@ Kubernetes qualification fixtures pass no arguments.
 > record says the version must be `1`, read "must be `1` or `2`".
 
 One JSON shape, version 1. The values below are synthetic and illustrate the format only;
-no operational value is recommended or selected by this record.
+no operational value is recommended or selected by this record. The one exception is the
+default of the optional `provider_refresh.uncacheable_reuse_seconds` (60 seconds), set by
+the [ADR 0011 amendment](0011-managed-provider-keys.md#amendment-19-nov-2026).
 
 ```json
 {
@@ -244,7 +246,12 @@ The check validates local files against this build. It does not show that:
   `KeyRing` can compare only the keys in one ring;
 - another host would accept the same files. With `"roots": "native"` the result depends on
   the platform roots, including `SSL_CERT_FILE` and `SSL_CERT_DIR`, of the machine running
-  the check. Run it in the API image with the mounts and environment the API will use.
+  the check. Run it in the API image with the mounts and environment the API will use;
+- a provider that refuses caching can be used throughout. When
+  `provider_refresh.uncacheable_reuse_seconds` is absent, its 60-second default is not
+  checked against `cooldown_seconds`. With a longer cooldown, such a provider refuses
+  sign-ins from the end of each window until the cooldown ends. Set the member explicitly,
+  at or above the cooldown, for such providers (ADR 0011 amendment).
 
 ## Rotation and restore
 
@@ -269,6 +276,11 @@ admission limit, and rotate the active login key to a new identifier and new mat
 before reopening. Never resume restored logins.
 
 ## Compatibility
+
+> The 19 Nov 2026 amendment adds the optional `provider_refresh.uncacheable_reuse_seconds`
+> member to versions 1 and 2 without a version bump. A build from before that amendment
+> refuses a document carrying the member as an unknown field, not as an unsupported
+> version. Roll the new build out to every replica before adding the member.
 
 No dependency, Cargo feature, lockfile, migration (1–9 are unchanged), CI gate, image, HTTP
 contract or provenance-register change. New public items: the `auth_config` module,

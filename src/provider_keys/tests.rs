@@ -1536,6 +1536,46 @@ async fn refused_caching_is_reused_for_the_window_then_fetched_again() {
     h.provider.preflight().await.unwrap();
     assert_eq!(h.count(), 6);
 }
+/// The documented gap: without an explicit window, the 60 s default is not checked against a
+/// longer cooldown. A provider that refuses caching is then refused from the end of each
+/// window until the cooldown ends, without a fetch, and recovers once a refresh is allowed.
+#[tokio::test]
+async fn default_window_shorter_than_cooldown_refuses_until_the_cooldown_ends() {
+    let h = Harness::with_policy(
+        RefreshPolicy::new(
+            Duration::from_secs(600),
+            Duration::from_secs(120),
+            Duration::from_secs(5),
+            2,
+            32,
+            2,
+        )
+        .unwrap(),
+    )
+    .await;
+    keycloak(&h);
+    assert_eq!(
+        h.manager.policy().uncacheable_reuse,
+        DEFAULT_UNCACHEABLE_REUSE
+    );
+    h.provider.preflight().await.unwrap();
+    assert_eq!(h.count(), 2);
+    // Inside the window the snapshot is reused.
+    h.advance(59);
+    h.provider.preflight().await.unwrap();
+    assert_eq!(h.count(), 2);
+    // The window has ended but the 120 s cooldown has not: refused, and nothing is fetched.
+    h.advance(1);
+    assert_eq!(h.provider.preflight().await, Err(Error::Cooldown));
+    assert!(h.provider.snapshot().is_err());
+    h.advance(59);
+    assert_eq!(h.provider.preflight().await, Err(Error::Cooldown));
+    assert_eq!(h.count(), 2);
+    // When the cooldown ends a refresh is allowed again and sign-in recovers.
+    h.advance(1);
+    h.provider.preflight().await.unwrap();
+    assert_eq!(h.count(), 4);
+}
 /// Rotation inside the window behaves as for cached documents. A removed key stays trusted
 /// (the accepted trade-off) and an unknown kid waits for cooldown; the unknown-kid refresh
 /// then retires the old key and starts a new window.
