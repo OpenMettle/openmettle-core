@@ -156,7 +156,7 @@ fn settings_default_to_json_at_info_and_accept_only_the_listed_values() {
 }
 
 fn config(pairs: &[(&str, &str)]) -> Result<crate::Config, &'static str> {
-    crate::Config::parse(8080, |key| {
+    crate::Config::parse(crate::Role::Api, |key| {
         let found = pairs.iter().find(|(k, _)| *k == key);
         Ok(found.map(|(_, v)| v.to_string()))
     })
@@ -666,7 +666,7 @@ async fn health_routes_record_the_template_method_status_and_a_server_id_only() 
     let port = database.local_addr().unwrap().port();
     let password = "CANARY-db-password-41c2";
     let url = format!("postgres://fixture:{password}@127.0.0.1:{port}/fixture?sslmode=disable");
-    let config = crate::Config::parse(8080, |key| {
+    let config = crate::Config::parse(crate::Role::Api, |key| {
         Ok(match key {
             "DATABASE_URL" => Some(url.clone()),
             "DB_TIMEOUT_MS" => Some("200".into()),

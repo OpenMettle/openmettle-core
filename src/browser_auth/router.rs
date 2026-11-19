@@ -1,8 +1,9 @@
 //! Bounded Axum router for one [`LoginHandoff`] (ADRs 0018 and 0019).
 //!
-//! **Not mounted.** No listener or running process constructs it: the API and worker still
-//! serve `/healthz` and `/readyz` only. [`router`] validates every setting first and then
-//! returns an ordinary [`Router`] with exactly two literal routes:
+//! **Off by default.** The API mounts [`router_with_sessions`] only when
+//! `OPENMETTLE_API_AUTH_CONFIG` names a version-2 settings document (ADR 0025). Otherwise the
+//! API, like the worker always, serves `/healthz` and `/readyz` only. [`router`] validates
+//! every setting first and then returns an ordinary [`Router`] with exactly two literal routes:
 //!
 //! - the explicit initiation path, dispatched to [`LoginHandoff::initiate`] for `POST` only;
 //! - the provider's registered callback path, dispatched to [`LoginHandoff::callback`] for
@@ -69,7 +70,8 @@ pub const FORM_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// The only media type of an initiation form body, as an HTML form sends it.
 const FORM_MEDIA_TYPE: &str = "application/x-www-form-urlencoded";
 const FORM_NOT_RECEIVED: &str = "login request body not received\n";
-/// Operational routes in `crate::serve`. A login path never shadows them when merged.
+/// Operational routes in `crate::routes`. A login path never shadows them when `crate::app`
+/// merges the two routers.
 pub(super) const CORE_PATHS: [&str; 2] = ["/healthz", "/readyz"];
 
 /// One rate budget: at most `burst` admissions at once, refilled by one every `interval`.

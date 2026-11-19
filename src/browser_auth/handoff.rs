@@ -1,9 +1,9 @@
 //! Same-origin browser login handoff over [`BrowserAuth`] (ADR 0017), with session checks and
 //! local logout (ADR 0019).
 //!
-//! **Not mounted.** No listener or running process constructs this adapter; the unmounted
-//! [`super::router`] composes it (ADRs 0018 and 0019). It turns one HTTP request head into one
-//! response:
+//! **Off by default.** [`super::router`] composes this adapter (ADRs 0018 and 0019), and the
+//! API mounts that router only when `OPENMETTLE_API_AUTH_CONFIG` is set (ADR 0025). It turns
+//! one HTTP request head into one response:
 //!
 //! - [`LoginHandoff::initiate`]: a top-level form `POST` whose single `Origin` equals the
 //!   configured application origin becomes a `303` to the provider with the caller cookie.

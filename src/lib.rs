@@ -1,4 +1,5 @@
 //! Shared operational contract and persistence primitives; no domain APIs or worker queue yet.
+//! The API can also mount the browser sign-in routes, off by default (ADR 0025).
 pub mod auth;
 pub mod auth_config;
 pub mod browser_auth;
@@ -16,13 +17,15 @@ pub mod storage;
 pub mod telemetry;
 
 use axum::{Router, extract::State, http::StatusCode, routing::get};
+use browser_auth::{BrowserAuth, handoff::LoginHandoff, router::router_with_sessions};
 use sqlx::{
     ConnectOptions, PgPool,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use telemetry::{Process, ProcessFailure, Signal};
 
+#[derive(Clone, Copy)]
 pub enum Role {
     Api,
     Worker,
@@ -35,15 +38,18 @@ struct Config {
     database_timeout: Duration,
     shutdown_timeout: Duration,
     telemetry: telemetry::Settings,
+    /// `OPENMETTLE_API_AUTH_CONFIG`: the browser sign-in settings document to mount
+    /// (ADR 0025). Always `None` for the worker, which never reads the key.
+    auth_config: Option<PathBuf>,
 }
 
 impl Config {
     fn load(role: Role) -> Result<Self, &'static str> {
-        let (prefix, port) = match role {
-            Role::Api => ("OPENMETTLE_API", 8080),
-            Role::Worker => ("OPENMETTLE_WORKER", 8081),
+        let prefix = match role {
+            Role::Api => "OPENMETTLE_API",
+            Role::Worker => "OPENMETTLE_WORKER",
         };
-        Self::parse(port, |key| match std::env::var(format!("{prefix}_{key}")) {
+        Self::parse(role, |key| match std::env::var(format!("{prefix}_{key}")) {
             Ok(value) => Ok(Some(value)),
             Err(std::env::VarError::NotPresent) => Ok(None),
             Err(_) => Err("configuration must be UTF-8"),
@@ -51,9 +57,13 @@ impl Config {
     }
 
     fn parse(
-        port: u16,
+        role: Role,
         get: impl Fn(&str) -> Result<Option<String>, &'static str>,
     ) -> Result<Self, &'static str> {
+        let port = match role {
+            Role::Api => 8080,
+            Role::Worker => 8081,
+        };
         let bind = get("BIND")?
             .unwrap_or_else(|| format!("127.0.0.1:{port}"))
             .parse()
@@ -76,15 +86,31 @@ impl Config {
             }
             Ok(value)
         };
+        let connections = number("DB_MAX_CONNECTIONS", 4, 64)?;
+        let database_timeout = Duration::from_millis(number("DB_TIMEOUT_MS", 2000, 30000)?.into());
+        let shutdown_timeout =
+            Duration::from_millis(number("SHUTDOWN_TIMEOUT_MS", 5000, 60000)?.into());
+        let telemetry = telemetry::Settings::parse(&get)?;
+        // Read last, and by the API alone. Unset serves the operational routes only. A set
+        // value is never treated as unset: empty or relative is refused, as the loader would.
+        let auth_config = match role {
+            Role::Api => get("AUTH_CONFIG")?.map(PathBuf::from),
+            Role::Worker => None,
+        };
+        if auth_config
+            .as_deref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err("invalid AUTH_CONFIG");
+        }
         Ok(Self {
             bind,
             database,
-            connections: number("DB_MAX_CONNECTIONS", 4, 64)?,
-            database_timeout: Duration::from_millis(number("DB_TIMEOUT_MS", 2000, 30000)?.into()),
-            shutdown_timeout: Duration::from_millis(
-                number("SHUTDOWN_TIMEOUT_MS", 5000, 60000)?.into(),
-            ),
-            telemetry: telemetry::Settings::parse(&get)?,
+            connections,
+            database_timeout,
+            shutdown_timeout,
+            telemetry,
+            auth_config,
         })
     }
 }
@@ -95,6 +121,30 @@ fn routes(health: Health) -> Router {
         .route("/healthz", get(|| async { "ok\n" }))
         .route("/readyz", get(ready))
         .with_state(health)
+}
+
+/// Every route the process serves (ADR 0025): the operational routes, and for an API given
+/// `AUTH_CONFIG` the browser sign-in routes of that version-2 document, over the same primary
+/// pool (ADR 0016). Loading reads local files only; no provider, DNS name or database is
+/// contacted, and the lazy pool stays unconnected. Readiness is unchanged and database-only.
+///
+/// The settings check refused `/healthz` and `/readyz` as sign-in paths, and the two
+/// constructors repeat it, so the merge cannot shadow a probe or panic.
+fn app(config: &Config, pool: &PgPool) -> Result<Router, auth_config::Error> {
+    let operational = routes(Health {
+        pool: pool.clone(),
+        timeout: config.database_timeout,
+    });
+    let Some(path) = &config.auth_config else {
+        return Ok(operational);
+    };
+    let (settings, profile) = auth_config::load_browser(path)?;
+    let service = Arc::new(BrowserAuth::new(settings, pool.clone()));
+    let handoff = LoginHandoff::new(service, profile.handoff())
+        .map_err(auth_config::Error::BrowserHandoff)?;
+    let sign_in = router_with_sessions(handoff, profile.router(), profile.sessions())
+        .map_err(auth_config::Error::BrowserRouter)?;
+    Ok(operational.merge(sign_in))
 }
 
 #[derive(Clone)]
@@ -129,6 +179,16 @@ pub async fn run(role: Role) -> u8 {
             return 78;
         }
     };
+    // The same holds for the browser sign-in settings: refused before telemetry is installed
+    // or the listener opens, with the offline check's fixed category line (ADRs 0015, 0025).
+    let pool = pool(&config);
+    let app = match app(&config, &pool) {
+        Ok(app) => app,
+        Err(error) => {
+            eprintln!("auth configuration error: {error}");
+            return 78;
+        }
+    };
     let telemetry = match telemetry::install(config.telemetry, process) {
         Ok(telemetry) => telemetry,
         Err(unavailable) => {
@@ -137,7 +197,7 @@ pub async fn run(role: Role) -> u8 {
         }
     };
     let (drain, flush) = shutdown_budget(config.shutdown_timeout);
-    let code = match serve(config, process, drain).await {
+    let code = match serve(config.bind, app, pool, process, drain).await {
         Ok(()) => {
             telemetry::process_stopped(process);
             0
@@ -166,20 +226,23 @@ fn pool(config: &Config) -> PgPool {
         .connect_lazy_with(config.database.clone())
 }
 
-async fn serve(config: Config, process: Process, drain: Duration) -> Result<(), ProcessFailure> {
+async fn serve(
+    bind: SocketAddr,
+    app: Router,
+    pool: PgPool,
+    process: Process,
+    drain: Duration,
+) -> Result<(), ProcessFailure> {
     // Install signal handlers before opening the listener.
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|_| ProcessFailure::SignalRegistration)?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .map_err(|_| ProcessFailure::SignalRegistration)?;
-    let pool = pool(&config);
-    let listener = tokio::net::TcpListener::bind(config.bind)
+    let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|_| ProcessFailure::Bind)?;
-    let app = telemetry::observe(routes(Health {
-        pool: pool.clone(),
-        timeout: config.database_timeout,
-    }));
+    // After every route is added, so the sign-in routes are observed like the probes.
+    let app = telemetry::observe(app);
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let server = axum::serve(listener, app).with_graceful_shutdown(async {
         let _ = stop_rx.await;
@@ -206,3 +269,6 @@ async fn serve(config: Config, process: Process, drain: Duration) -> Result<(), 
 #[cfg(test)]
 #[path = "../tests/support/response_barrier.rs"]
 pub(crate) mod response_barrier;
+
+#[cfg(test)]
+mod tests;

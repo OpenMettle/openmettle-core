@@ -31,6 +31,10 @@ It reads no `OPENMETTLE_*` setting, needs no `DATABASE_URL`, opens no listener a
 DNS, HTTP or database request. Native trust follows ADR 0010, including `SSL_CERT_FILE`
 and `SSL_CERT_DIR`. The check never creates a file, changes a permission or generates a key.
 
+> [ADR 0025](0025-browser-auth-runtime-mounting.md) lets the API load a version-2 document
+> at startup when `OPENMETTLE_API_AUTH_CONFIG` is set. Without that setting the paragraph
+> below still holds.
+
 Starting the API without arguments is unchanged: it serves `/healthz` and `/readyz` and
 loads no auth file. **Nothing in the running API consumes these settings yet**, and there is
 no live reload. The worker and migrator have no check mode and read none of these files.

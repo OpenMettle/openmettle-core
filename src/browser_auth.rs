@@ -2,10 +2,11 @@
 //!
 //! It joins validated settings ([`AuthConfig`], ADR 0015) to the existing managed login and
 //! session operations and owns every pooled connection those operations use. The service
-//! itself has no cookie or request handling; [`handoff`] holds the unmounted browser
-//! adapter (ADR 0017) and [`router`] its unmounted bounded Axum router (ADRs 0018 and 0019).
-//! [`native`] provides the separate native code handoff. The running processes do not
-//! construct this service or either router.
+//! itself has no cookie or request handling; [`handoff`] holds the browser adapter
+//! (ADR 0017) and [`router`] its bounded Axum router (ADRs 0018 and 0019). The API constructs
+//! the service and mounts that router only when `OPENMETTLE_API_AUTH_CONFIG` names a
+//! version-2 settings document (ADR 0025); by default nothing constructs either.
+//! [`native`] provides the separate native code handoff, which no process mounts.
 pub mod handoff;
 pub mod native;
 pub mod router;

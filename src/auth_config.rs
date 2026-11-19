@@ -2,8 +2,10 @@
 //!
 //! One strict, versioned JSON document and the files it names become validated in-memory state
 //! through the existing constructors. Version 2 adds one browser-routing profile, judged by
-//! the same settings checks as the unmounted handoff and router. Loading performs no network,
-//! DNS, database or listener work, enters no async runtime and mounts nothing. Settings and
+//! the same settings checks as the handoff and router. Loading performs no network, DNS,
+//! database or listener work, enters no async runtime and mounts nothing. The API loads a
+//! version-2 document at startup through [`load_browser`] when `OPENMETTLE_API_AUTH_CONFIG`
+//! names one (ADR 0025). Settings and
 //! login secrets come from the deployment files. Native trust follows ADR 0010 and honors
 //! `SSL_CERT_FILE` and `SSL_CERT_DIR`. Success validates local inputs for this build.
 //! Provider reachability, durable authority (ADR 0012) and agreement between replicas require
@@ -77,6 +79,9 @@ pub enum Error {
     /// The browser profile's paths, rate budgets or in-flight cap, refused by the router's
     /// own settings check with its fixed category.
     BrowserRouter(router::SettingsError),
+    /// A valid version-1 document where serving needs the version-2 browser profile. Only
+    /// [`load_browser`] returns it; the offline check still accepts version 1.
+    BrowserProfileRequired,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -103,6 +108,7 @@ impl fmt::Display for Error {
             // The wrapped categories are fixed lines too; neither carries a value.
             Self::BrowserHandoff(error) => return write!(f, "browser profile refused: {error}"),
             Self::BrowserRouter(error) => return write!(f, "browser profile refused: {error}"),
+            Self::BrowserProfileRequired => "serving requires a version 2 browser profile",
         })
     }
 }
@@ -482,7 +488,7 @@ impl AuthConfig {
         &self.providers
     }
     /// The validated browser-routing profile of a version-2 document; `None` for version 1.
-    /// Nothing consumes it yet: no process constructs or mounts the routes.
+    /// The API mounts its routes only from [`load_browser`] (ADR 0025).
     pub fn browser(&self) -> Option<&BrowserProfile> {
         self.browser.as_ref()
     }
@@ -613,6 +619,18 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
     })
 }
 
+/// [`load`] for serving (ADR 0025): the settings and the browser-routing profile the API
+/// mounts. A version-1 document passes every version-1 check and is then refused, because it
+/// names no origin, route or budget to serve.
+pub fn load_browser(path: &Path) -> Result<(AuthConfig, BrowserProfile), Error> {
+    let config = load(path)?;
+    let profile = config
+        .browser
+        .clone()
+        .ok_or(Error::BrowserProfileRequired)?;
+    Ok((config, profile))
+}
+
 /// `openmettle-api` with arguments accepts exactly `--check-auth-config PATH`.
 /// Returns 0 after writing [`VALID`], 1 if that write fails, or 78 with a fixed diagnostic
 /// for invalid settings or arguments.
@@ -637,4 +655,4 @@ pub fn check_command(arguments: &[OsString]) -> u8 {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
