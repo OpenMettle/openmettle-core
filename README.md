@@ -1,6 +1,6 @@
 # OpenMettle core
 
-Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures, but no `/v1` route serves it. Internal managed login, an owner-configured outstanding-login cap, local identity approval and opaque-session primitives are implemented, with an offline check for mounted browser-auth settings that the running API does not load yet, an internal pooled browser-auth service that no process constructs yet, and unmounted Axum routers for the same-origin browser login handoff, session check and local logout, and for native sign-in with one-use code delivery. No product API, upload service, request authentication, per-user authorization or GPU orchestration is exposed. Runtime qualification and deployment acceptance remain separate gates.
+Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures, but no `/v1` route serves it. Internal managed login, an owner-configured outstanding-login cap, local identity approval and opaque-session primitives are implemented, with an offline check for mounted browser-auth settings that the running API does not load yet, an internal pooled browser-auth service that no process constructs yet, and an unmounted Axum router for the same-origin browser login handoff, session check and local logout. No product API, upload service, request authentication, per-user authorization or GPU orchestration is exposed. Runtime qualification and deployment acceptance remain separate gates.
 
 ## Start here
 
@@ -60,6 +60,23 @@ In another terminal, `curl --fail http://127.0.0.1:8080/healthz` returns `ok`. `
 
 The worker uses `OPENMETTLE_WORKER_DATABASE_URL` and port 8081. Every setting is independent: `BIND`, `DATABASE_URL`, `DB_MAX_CONNECTIONS`, `DB_TIMEOUT_MS` and `SHUTDOWN_TIMEOUT_MS` use the corresponding `OPENMETTLE_API_` or `OPENMETTLE_WORKER_` prefix. Defaults bind loopback; containers bind all interfaces unless overridden. Send SIGTERM or SIGINT to drain and stop. Invalid configuration exits 78; runtime failures or shutdown deadline expiry exit 1. Correct configuration and restart after these errors. Database failures affect readiness, not liveness.
 
+The API, worker and migrator write structured events to stderr ([ADR 0024](docs/adr/0024-process-telemetry-and-redaction.md)). The API and worker write nothing to stdout. The `configuration error:` line, the `--check-auth-config` output and the migrator's result lines keep their existing plain form. Two settings use the process's own prefix (`OPENMETTLE_API_`, `OPENMETTLE_WORKER_` or `OPENMETTLE_MIGRATE_`):
+
+| Setting | Default | Values |
+| --- | --- | --- |
+| `LOG_FORMAT` | `json` | `json` (one object per line) or `text` |
+| `LOG_LEVEL` | `info` | `error`, `warn`, `info` or `debug`. `trace` and filter directives are refused |
+
+Values must match exactly; anything else exits 78 with `configuration error: invalid LOG_FORMAT` or `invalid LOG_LEVEL`.
+
+- **Default level.** `info` shows start, stop and failure events.
+- **Request events.** Each request gets a server-generated `request_id`, which is never taken from a client header. A request completion is logged at `debug`, or at `warn` for a 5xx response such as a failed readiness check.
+- **What is recorded.** Events carry fixed event names, the matched route template, the method, the status, durations, counts and failure classes. They never carry URLs, queries, headers, cookies, bodies, database settings or third-party library logs.
+- **Slow or unread stderr.** Events are queued (up to 1024 lines) for one writer thread, so a stalled log reader never blocks requests, readiness or shutdown. Lines that do not fit are dropped and counted, and a `telemetry.dropped` event with the count follows the next successful write. The stop, including the final flush, fits `SHUTDOWN_TIMEOUT_MS`: draining gets the deadline less a tenth (at most 250 ms), which is kept for the flush.
+- **Panics.** After telemetry starts, a panic writes one `process.panicked` event and never the panic message or location.
+- **Not covered.** Ingress and proxy access logs are outside these processes. Configure them separately before exposing login routes.
+- **No export yet.** Nothing is sent over the network; OTLP export is a later increment.
+
 Run the real PostgreSQL subprocess test against an isolated test database:
 
 ```sh
@@ -93,7 +110,8 @@ The nonce verifier accepts stored digests without weakening the existing token c
 From migration 13 the sealed value also carries an optional home invitation code, at one
 fixed length (ADR 0022). Logins sealed before that migration still complete.
 
-The browser cookie handoff and the native handoff below are not mounted. Key files are read only by the offline check below. Internal local approval and sessions are described below. The outstanding-login
+Native handoff remains unimplemented; the browser cookie handoff below is
+not mounted. Key files are read only by the offline check below. Internal local approval and sessions are described below. The outstanding-login
 cap below is not a rate limit. The unmounted login router below adds per-process request,
 rate and concurrency bounds; public exposure remains blocked on runtime enablement, ingress
 transport limits, operated cleanup and retired-key reservation reclamation. After database restore, invalidate pending login transactions and
@@ -211,7 +229,7 @@ The operator sets a limit of 1–1000 rows per batch. Session deletion
 preserves issuance markers and nonce reservations. See the
 [session and login-gate cleanup procedure](docs/operator/session-cleanup.md).
 
-There are no mounted routes and no runtime loader or tenant/group qualification; the cookie and native handoffs below are not mounted.
+There are no routes, native handoff, runtime loader, tenant/group qualification or reconciliation; the cookie handoff below is not mounted.
 Run the managed PostgreSQL tests only in isolated CI with the explicit module filter above;
 normal workspace tests leave them ignored. Migration 8 and authentic v7 compatibility are CI gates.
 
@@ -316,8 +334,9 @@ internal service built from the validated settings above and a handle to the API
 primary pool. It starts a login for an exactly configured provider UUID, completes a
 callback (committed consumption, one token request, session issuance from the sealed proof)
 and validates or logs out local sessions. **No process constructs it**: the API, worker and
-migrator are unchanged and `/readyz` checks the database only. The service handles no
-request, cookie or rate policy itself; the unmounted adapters below do.
+migrator are unchanged, `/readyz` checks the database only, and there is no route, native
+handoff or rate policy. The service handles no request or cookie itself; the unmounted
+adapter below does.
 
 The service holds a pooled connection only while database work runs, never during a
 provider document fetch or the token request. Waiting for a connection counts against the
@@ -490,9 +509,43 @@ token POST, a successful same-origin session check, an acknowledged logout POST,
 a refused check after Chrome removes the session cookie. PostgreSQL must contain one
 consumed login and its revoked session for the approved synthetic user.
 
-A passing run supplies evidence for the Chrome version in that run. Other engines,
-mobile operating-system link handoff, real provider registrations, and deployed ingress
-remain qualification gaps for V1-04.
+A passing run supplies evidence for the Chrome version in that run.
+
+### Hosted Keycloak 26.8.2 CI qualification
+
+The dedicated workflow `.github/workflows/keycloak-qualification.yml` exercises the unmounted
+browser auth stack against a pinned stock Keycloak 26.8.2 container
+(`quay.io/keycloak/keycloak@sha256:c68e286cacd87b942ac1939a0a1481461109d6acd3a57dc496969a319a76bbf0`)
+on an isolated `--internal` Docker bridge network (no container egress) alongside PostgreSQL 18
+and headless Chrome.
+
+`tests/keycloak/fixture.py` creates a per-run test CA and provider certificate for
+`keycloak.provider.test`, imports a synthetic realm with one public PKCE `S256` client, exact
+redirect URI, RFC 9207 `iss` enabled and two synthetic users with generated passwords written
+only to files, and writes a version-2 auth settings document with explicit
+`provider_refresh.uncacheable_reuse_seconds` (300 s, at least the 60 s cooldown) and
+`trust.roots = "bundle"` pointing solely at the per-run CA. After
+`openmettle-api --check-auth-config` validates the file offline and HTTPS discovery passes
+strictly against the test CA, the ignored test
+`provider_keys::tests::postgres::browser::keycloak_browser_sign_in_qualification` loads the
+settings via `auth_config::load`, serves `BrowserAuth` / `LoginHandoff` / `router_with_sessions`
+on loopback HTTPS, and drives two full Chrome journeys:
+
+1. An existing synthetic identity approved with `docs/operator/first-identity-approval.psql`
+   (ADR 0013).
+2. A first-account redemption using a single-use code created with
+   `docs/operator/home-invitation-create.psql` (ADR 0022).
+
+Both journeys assert PKCE `S256`, exact redirect URI, RFC 9207 `iss` on the cross-site callback,
+ID-token verification, session issuance, same-origin session check (`204`), logout (`204`),
+post-logout refusal (`403 session not valid`), PostgreSQL state, and that discovery and JWKS
+were fetched once over HTTPS and reused across begin, callback and the second sign-in inside the
+configured `uncacheable_reuse_seconds` window.
+
+This is CI qualification of pinned stock Keycloak 26.8.2 against the unmounted router, not owner
+deployment or production enablement: `openmettle-api` still serves `/healthz` and `/readyz`
+only. Other browser engines, mobile and native handoff, other OIDC providers, owner provider
+registrations, and deployed ingress remain qualification gaps for V1-04.
 
 ## Native sign-in
 
@@ -525,7 +578,7 @@ CREATE ROLE openmettle_worker LOGIN PASSWORD :'worker_password' CONNECTION LIMIT
 CREATE DATABASE openmettle OWNER openmettle_owner;
 ```
 
-Then run the migrator with the owner's URL. It reads `OPENMETTLE_MIGRATE_DATABASE_URL` and optional `OPENMETTLE_MIGRATE_CONNECT_TIMEOUT_MS` (default 5000), `OPENMETTLE_MIGRATE_LOCK_TIMEOUT_MS` (default 15000) and `OPENMETTLE_MIGRATE_STATEMENT_TIMEOUT_MS` (default 300000). It exits 0 on success, 78 on invalid configuration and 1 on any other failure, including a lock wait past its deadline. Concurrent runs are serialized. A failed or interrupted run leaves no partial migration and can be retried immediately. A checksum mismatch or a database newer than the binary is refused. Do not delete history rows or rerun edited files; ship a corrective migration or restore a backup instead.
+Then run the migrator with the owner's URL. It reads `OPENMETTLE_MIGRATE_DATABASE_URL` and optional `OPENMETTLE_MIGRATE_CONNECT_TIMEOUT_MS` (default 5000), `OPENMETTLE_MIGRATE_LOCK_TIMEOUT_MS` (default 15000) and `OPENMETTLE_MIGRATE_STATEMENT_TIMEOUT_MS` (default 300000), plus `OPENMETTLE_MIGRATE_LOG_FORMAT` and `OPENMETTLE_MIGRATE_LOG_LEVEL` as described under Runtime. On success it prints `schema is at migration N` to stdout; a failure prints `migration error:` and a fixed description to stderr, beside a `migration.failed` event. It exits 0 on success, 78 on invalid configuration and 1 on any other failure, including a lock wait past its deadline. Concurrent runs are serialized. A failed or interrupted run leaves no partial migration and can be retried immediately. A checksum mismatch or a database newer than the binary is refused. Do not delete history rows or rerun edited files; ship a corrective migration or restore a backup instead.
 
 ```sh
 export OPENMETTLE_MIGRATE_DATABASE_URL='postgres://openmettle_owner:<password>@127.0.0.1:5432/openmettle?sslmode=disable'
@@ -538,7 +591,7 @@ Storage limits are durable deployment inputs that only `openmettle_owner` sets, 
 
 Connection budget: `api_replicas × API DB_MAX_CONNECTIONS + worker_replicas × worker DB_MAX_CONNECTIONS + 1 migrator + admin/backup headroom` must not exceed `max_connections − superuser_reserved_connections − reserved_connections`. Count surge replicas during a rolling update. For example, 2 × 4 + 2 × 4 + 1 + 3 = 20. Enforce each process's share with its login role's `CONNECTION LIMIT`. These figures are illustrative, not qualified sizing.
 
-The schema tests also require `OLD_BINARY_DIR` pointing to binaries built from release `18f52463c9d6bc12dda4bd1558e4597e067018f8` and `V3_BINARY_DIR` pointing to binaries built from release `2f1be947aa933177c2e407cd7290bf9909bd08ca`; CI builds those exact archives for compatibility checks. Set `V4_BINARY_DIR` to binaries built from `d80e37819f847072dfa272bdddcc1fbee6d622ef` for migration 5 compatibility; CI builds that archive too. Set `V5_BINARY_DIR` to authentic binaries from `4a51242839e16e1d7b8ad3538887bf8e41081e6e` for migration 6 compatibility, and `V6_BINARY_DIR` to authentic binaries from `3978dff2864488bbdd9e748afd7116f39683f129` for migration 7 compatibility. `V7_BINARY_DIR` (`5ff1d2a8ed5e7424be006e78c16f0c30e784336d`) and `V8_BINARY_DIR` (`e55aff07527ad6452f8a0d49953b3fc2ffc51352`) cover migrations 8 and 9. Set `V9_BINARY_DIR` to binaries built from `940b8c2032d863e29fd04ad7c6357ad8cacc42fc` for migration 10. Set `V10_BINARY_DIR` to binaries built from `05dd18489242e545e3529b4e3750c74837b05638` for migration 11, and `V11_BINARY_DIR` to binaries built from `0ab3401714762f28a730eae4cd7c91052648dabd` for migration 12. Set `V12_BINARY_DIR` to binaries built from `4441b4236ad0dd1ea868d507bb10b50d9b0ddb6f` for migration 13, and `V13_BINARY_DIR` to binaries built from `615dcffc93af18ab0db40a7a2fafc3c0752d4c77` for migration 14. The ADR 0014 operator-script tests also need `POSTGRES_CONTAINER`, the isolated CI PostgreSQL service container whose `psql` runs them. Do not substitute the current binary with a truncated migration list.
+The schema tests also require `OLD_BINARY_DIR` pointing to binaries built from release `18f52463c9d6bc12dda4bd1558e4597e067018f8` and `V3_BINARY_DIR` pointing to binaries built from release `2f1be947aa933177c2e407cd7290bf9909bd08ca`; CI builds those exact archives for compatibility checks. Set `V4_BINARY_DIR` to binaries built from `d80e37819f847072dfa272bdddcc1fbee6d622ef` for migration 5 compatibility; CI builds that archive too. Set `V5_BINARY_DIR` to authentic binaries from `4a51242839e16e1d7b8ad3538887bf8e41081e6e` for migration 6 compatibility, and `V6_BINARY_DIR` to authentic binaries from `3978dff2864488bbdd9e748afd7116f39683f129` for migration 7 compatibility. `V7_BINARY_DIR` (`5ff1d2a8ed5e7424be006e78c16f0c30e784336d`) and `V8_BINARY_DIR` (`e55aff07527ad6452f8a0d49953b3fc2ffc51352`) cover migrations 8 and 9. Set `V9_BINARY_DIR` to binaries built from `940b8c2032d863e29fd04ad7c6357ad8cacc42fc` for migration 10. Set `V10_BINARY_DIR` to binaries built from `05dd18489242e545e3529b4e3750c74837b05638` for migration 11, and `V11_BINARY_DIR` to binaries built from `0ab3401714762f28a730eae4cd7c91052648dabd` for migration 12. Set `V12_BINARY_DIR` to binaries built from `4441b4236ad0dd1ea868d507bb10b50d9b0ddb6f` for migration 13. The ADR 0014 operator-script tests also need `POSTGRES_CONTAINER`, the isolated CI PostgreSQL service container whose `psql` runs them. Do not substitute the current binary with a truncated migration list.
 
 The schema tests need a superuser on an isolated, disposable PostgreSQL 18 service. They create synthetic `openmettle_*` cluster roles with a test-only password and one database per test. Never point them at a shared server.
 

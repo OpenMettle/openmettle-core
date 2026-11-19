@@ -145,6 +145,290 @@ fn rejects_invalid_config_without_disclosing_values() {
     }
 }
 
+/// ADR 0024: telemetry settings are configuration. An invalid value exits 78 with one fixed
+/// line naming the key, before any listener opens or any event is written.
+#[test]
+fn rejects_invalid_telemetry_settings_with_a_fixed_line() {
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    for worker in [false, true] {
+        let prefix = if worker {
+            "OPENMETTLE_WORKER"
+        } else {
+            "OPENMETTLE_API"
+        };
+        for (key, value) in [
+            ("LOG_FORMAT", "synthetic-secret"),
+            ("LOG_FORMAT", "JSON"),
+            ("LOG_LEVEL", "trace"),
+            ("LOG_LEVEL", "info,synthetic-secret=debug"),
+        ] {
+            let output = command(worker)
+                .env(
+                    format!("{prefix}_DATABASE_URL"),
+                    "postgres://localhost/test",
+                )
+                // Serving would exit 1 on this occupied address instead.
+                .env(
+                    format!("{prefix}_BIND"),
+                    occupied.local_addr().unwrap().to_string(),
+                )
+                .env(format!("{prefix}_{key}"), value)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(78), "{key}={value}");
+            assert!(output.stdout.is_empty());
+            assert_eq!(
+                String::from_utf8(output.stderr).unwrap(),
+                format!("configuration error: invalid {key}\n")
+            );
+        }
+    }
+}
+
+/// Starts a process with piped stderr and the given telemetry settings.
+fn start_logging(worker: bool, address: &str, url: &str, settings: &[(&str, &str)]) -> Process {
+    let prefix = if worker {
+        "OPENMETTLE_WORKER"
+    } else {
+        "OPENMETTLE_API"
+    };
+    let mut command = command(worker);
+    command
+        .env(format!("{prefix}_BIND"), address)
+        .env(format!("{prefix}_DATABASE_URL"), url)
+        .env(format!("{prefix}_DB_TIMEOUT_MS"), "150")
+        .env(format!("{prefix}_SHUTDOWN_TIMEOUT_MS"), "1000");
+    for (key, value) in settings {
+        command.env(format!("{prefix}_{key}"), value);
+    }
+    Process(
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    )
+}
+fn drain(process: &mut Process) -> (String, String) {
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    process
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    process
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    (stdout, stderr)
+}
+
+/// ADR 0024 through the real binaries: lifecycle and request events on stderr only, in the
+/// selected format and level, with none of the planted canaries.
+#[test]
+fn serving_writes_redacted_lifecycle_and_request_events_to_stderr() {
+    let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "postgres://fixture:CANARY-db-password@{}/fixture?sslmode=disable",
+        unavailable.local_addr().unwrap()
+    );
+    let requests = [
+        "GET /healthz?code=CANARY-query&state=CANARY-state HTTP/1.1\r\nHost: localhost\r\n\
+         Cookie: __Host-openmettle-session=CANARY-cookie\r\nX-Request-Id: CANARY-id\r\n\
+         Connection: close\r\n\r\n",
+        "GET /readyz HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer CANARY-bearer\r\n\
+         Connection: close\r\n\r\n",
+        "POST /CANARY-path HTTP/1.1\r\nHost: localhost\r\nContent-Length: 14\r\n\
+         Connection: close\r\n\r\nCANARY-payload",
+    ];
+    // The API in JSON at debug sees everything; the worker in text at warn sees only the
+    // failed readiness check.
+    for (worker, settings) in [
+        (false, &[("LOG_LEVEL", "debug")][..]),
+        (true, &[("LOG_FORMAT", "text"), ("LOG_LEVEL", "warn")][..]),
+    ] {
+        let bind = address();
+        let mut process = start_logging(worker, &bind, &url, settings);
+        wait_status(&mut process, &bind, "/healthz", 200);
+        for request in requests {
+            send(&bind, request).unwrap();
+        }
+        stop(&mut process, "-TERM");
+        let (stdout, stderr) = drain(&mut process);
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(!stderr.contains("CANARY"), "{stderr}");
+        let lines: Vec<&str> = stderr.lines().collect();
+        if worker {
+            assert_eq!(lines.len(), 1, "{stderr}");
+            assert!(
+                lines[0].contains(" WARN event=\"http.request.completed\""),
+                "{stderr}"
+            );
+            assert!(lines[0].contains("http.route=\"/readyz\""), "{stderr}");
+            assert!(
+                lines[0].contains("http.response.status_code=503"),
+                "{stderr}"
+            );
+            continue;
+        }
+        let events: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let names: Vec<&str> = events
+            .iter()
+            .map(|e| e["event"].as_str().unwrap())
+            .collect();
+        // Health polling adds request events before the planted requests.
+        assert_eq!(names.first(), Some(&"process.started"), "{stderr}");
+        assert_eq!(
+            names[names.len() - 2..],
+            ["process.stopping", "process.stopped"]
+        );
+        assert_eq!(events[0]["role"], "api");
+        assert_eq!(events[names.len() - 2]["signal"], "SIGTERM");
+        let planted: Vec<_> = events[events.len() - 5..events.len() - 2]
+            .iter()
+            .map(|e| {
+                (
+                    e["http.route"].as_str().unwrap(),
+                    e["http.request.method"].as_str().unwrap(),
+                    e["http.response.status_code"].as_u64().unwrap(),
+                    e["level"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            planted,
+            [
+                ("/healthz", "GET", 200, "DEBUG"),
+                ("/readyz", "GET", 503, "WARN"),
+                ("unmatched", "POST", 404, "DEBUG"),
+            ]
+        );
+    }
+}
+
+/// ADR 0024 through the worker binary at the defaults (JSON, `info`): exactly its lifecycle,
+/// with `role=worker`; health polling is `debug` and stays out.
+#[test]
+fn worker_writes_its_lifecycle_at_the_default_settings() {
+    let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "postgres://fixture:CANARY-db-password@{}/fixture?sslmode=disable",
+        unavailable.local_addr().unwrap()
+    );
+    let bind = address();
+    let mut process = start_logging(true, &bind, &url, &[]);
+    wait_status(&mut process, &bind, "/healthz", 200);
+    stop(&mut process, "-INT");
+    let (stdout, stderr) = drain(&mut process);
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(!stderr.contains("CANARY"), "{stderr}");
+    let events: Vec<serde_json::Value> = stderr
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let summary: Vec<(&str, &str, &str)> = events
+        .iter()
+        .map(|e| {
+            assert_eq!(e["role"], "worker", "{stderr}");
+            (
+                e["event"].as_str().unwrap(),
+                e["level"].as_str().unwrap(),
+                e.get("signal").map_or("", |s| s.as_str().unwrap()),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("process.started", "INFO", ""),
+            ("process.stopping", "INFO", "SIGINT"),
+            ("process.stopped", "INFO", ""),
+        ],
+        "{stderr}"
+    );
+}
+
+/// Sends `count` health checks over one keep-alive connection; each must answer within a
+/// second.
+fn probe_health(address: &str, count: usize) {
+    let mut stream = TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut response = Vec::new();
+    for i in 0..count {
+        stream
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        response.clear();
+        while !response.ends_with(b"\r\n\r\nok\n") {
+            let mut chunk = [0; 512];
+            let read = stream.read(&mut chunk);
+            let read = read.unwrap_or_else(|e| panic!("health check {i} did not answer: {e}"));
+            assert!(read > 0, "connection closed at health check {i}");
+            response.extend_from_slice(&chunk[..read]);
+        }
+        assert!(response.starts_with(b"HTTP/1.1 200"), "health check {i}");
+    }
+}
+
+/// ADR 0024 delivery and ARCHITECTURE-v1.md: an unread stderr pipe costs telemetry lines,
+/// not liveness, readiness or shutdown. At `debug` every probe writes a line; three thousand
+/// fill the pipe (64 KiB on Linux and macOS) and the queue (1024 lines) several times over.
+/// A synchronous write would block the Tokio workers and the probes would time out.
+#[test]
+fn unread_stderr_never_blocks_serving_or_shutdown() {
+    const PROBES: usize = 3000;
+    let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "postgres://fixture:CANARY-db-password@{}/fixture?sslmode=disable",
+        unavailable.local_addr().unwrap()
+    );
+    let bind = address();
+    // Nothing reads the process's stderr until it has exited.
+    let mut process = start_logging(false, &bind, &url, &[("LOG_LEVEL", "debug")]);
+    wait_status(&mut process, &bind, "/healthz", 200);
+    probe_health(&bind, PROBES);
+    // Readiness still fails promptly within its database deadline.
+    for _ in 0..3 {
+        let began = Instant::now();
+        assert!(
+            response(&bind, "/readyz")
+                .unwrap()
+                .starts_with("HTTP/1.1 503")
+        );
+        assert!(began.elapsed() < Duration::from_secs(1));
+    }
+    probe_health(&bind, 10);
+    // The whole stop fits SHUTDOWN_TIMEOUT_MS (1000), including the abandoned flush.
+    let began = Instant::now();
+    stop(&mut process, "-TERM");
+    assert!(
+        began.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        began.elapsed()
+    );
+    let (stdout, stderr) = drain(&mut process);
+    assert!(stdout.is_empty());
+    assert!(!stderr.contains("CANARY"));
+    // Whole JSON lines only, and far fewer than were emitted: the rest were dropped.
+    let lines: Vec<serde_json::Value> = stderr
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines[0]["event"], "process.started");
+    assert!(lines.len() < PROBES, "{}", lines.len());
+}
+
 const USAGE: &str = "usage error: expected no arguments or --check-auth-config PATH\n";
 
 /// ADRs 0015 and 0020: the check needs no database setting and opens no listener, for
@@ -413,6 +697,14 @@ fn occupied_listener_exits_with_runtime_error() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
+    // One JSON event names the failure class; nothing goes to stdout.
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let event: serde_json::Value = serde_json::from_str(stderr.trim_end()).unwrap();
+    assert_eq!(event["event"], "process.failed");
+    assert_eq!(event["level"], "ERROR");
+    assert_eq!(event["role"], "api");
+    assert_eq!(event["error.type"], "Bind");
 }
 
 #[test]

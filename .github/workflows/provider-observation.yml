@@ -9,6 +9,7 @@ on:
       - .github/workflows/provider-observation.yml
       - tests/provider_observation/**
       - src/provider_http.rs
+      - src/provider_keys/documents.rs
   workflow_dispatch:
 permissions:
   contents: read

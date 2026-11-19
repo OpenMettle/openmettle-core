@@ -13,6 +13,7 @@ pub mod provider_keys;
 pub mod runs;
 pub mod sessions;
 pub mod storage;
+pub mod telemetry;
 
 use axum::{Router, extract::State, http::StatusCode, routing::get};
 use sqlx::{
@@ -20,6 +21,7 @@ use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 use std::{net::SocketAddr, time::Duration};
+use telemetry::{Process, ProcessFailure, Signal};
 
 pub enum Role {
     Api,
@@ -32,6 +34,7 @@ struct Config {
     connections: u32,
     database_timeout: Duration,
     shutdown_timeout: Duration,
+    telemetry: telemetry::Settings,
 }
 
 impl Config {
@@ -81,8 +84,17 @@ impl Config {
             shutdown_timeout: Duration::from_millis(
                 number("SHUTDOWN_TIMEOUT_MS", 5000, 60000)?.into(),
             ),
+            telemetry: telemetry::Settings::parse(&get)?,
         })
     }
+}
+
+/// Served operational routes; `telemetry::observe` adds request IDs when serving.
+fn routes(health: Health) -> Router {
+    Router::new()
+        .route("/healthz", get(|| async { "ok\n" }))
+        .route("/readyz", get(ready))
+        .with_state(health)
 }
 
 #[derive(Clone)]
@@ -104,6 +116,12 @@ async fn ready(State(state): State<Health>) -> (StatusCode, &'static str) {
 }
 
 pub async fn run(role: Role) -> u8 {
+    let process = match role {
+        Role::Api => Process::Api,
+        Role::Worker => Process::Worker,
+    };
+    // Configuration errors precede telemetry, whose own settings may be the invalid ones:
+    // they stay one fixed stderr line that names a key or category, never a value.
     let config = match Config::load(role) {
         Ok(config) => config,
         Err(message) => {
@@ -111,54 +129,78 @@ pub async fn run(role: Role) -> u8 {
             return 78;
         }
     };
-    match serve(config).await {
-        Ok(()) => 0,
-        Err(message) => {
-            eprintln!("runtime error: {message}");
+    let telemetry = match telemetry::install(config.telemetry, process) {
+        Ok(telemetry) => telemetry,
+        Err(unavailable) => {
+            eprintln!("runtime error: {}", unavailable.message());
+            return 1;
+        }
+    };
+    let (drain, flush) = shutdown_budget(config.shutdown_timeout);
+    let code = match serve(config, process, drain).await {
+        Ok(()) => {
+            telemetry::process_stopped(process);
+            0
+        }
+        Err(failure) => {
+            telemetry::process_failed(process, failure);
             1
         }
-    }
+    };
+    // Bounded: a stalled stderr loses the final lines, not the exit.
+    telemetry.flush(flush);
+    code
 }
 
-async fn serve(config: Config) -> Result<(), &'static str> {
-    // Install signal handlers before opening the listener.
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(|_| "cannot register SIGTERM")?;
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .map_err(|_| "cannot register SIGINT")?;
-    let pool = PgPoolOptions::new()
+/// Splits `SHUTDOWN_TIMEOUT_MS` so the whole stop fits it: the final telemetry flush gets a
+/// tenth, at most `telemetry::FLUSH_LIMIT`, and draining gets the rest.
+fn shutdown_budget(timeout: Duration) -> (Duration, Duration) {
+    let flush = (timeout / 10).min(telemetry::FLUSH_LIMIT);
+    (timeout - flush, flush)
+}
+
+fn pool(config: &Config) -> PgPool {
+    PgPoolOptions::new()
         .max_connections(config.connections)
         .acquire_timeout(config.database_timeout)
-        .connect_lazy_with(config.database);
+        .connect_lazy_with(config.database.clone())
+}
+
+async fn serve(config: Config, process: Process, drain: Duration) -> Result<(), ProcessFailure> {
+    // Install signal handlers before opening the listener.
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|_| ProcessFailure::SignalRegistration)?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .map_err(|_| ProcessFailure::SignalRegistration)?;
+    let pool = pool(&config);
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
-        .map_err(|_| "cannot bind listener")?;
-    let app = Router::new()
-        .route("/healthz", get(|| async { "ok\n" }))
-        .route("/readyz", get(ready))
-        .with_state(Health {
-            pool: pool.clone(),
-            timeout: config.database_timeout,
-        });
+        .map_err(|_| ProcessFailure::Bind)?;
+    let app = telemetry::observe(routes(Health {
+        pool: pool.clone(),
+        timeout: config.database_timeout,
+    }));
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let server = axum::serve(listener, app).with_graceful_shutdown(async {
         let _ = stop_rx.await;
     });
     let server = std::future::IntoFuture::into_future(server);
     tokio::pin!(server);
-    tokio::select! {
-        result = &mut server => return result.map_err(|_| "HTTP server failed"),
-        _ = terminate.recv() => {},
-        _ = interrupt.recv() => {},
-    }
+    telemetry::process_started(process);
+    let signal = tokio::select! {
+        result = &mut server => return result.map_err(|_| ProcessFailure::Server),
+        _ = terminate.recv() => Signal::Terminate,
+        _ = interrupt.recv() => Signal::Interrupt,
+    };
+    telemetry::process_stopping(process, signal);
     let _ = stop_tx.send(());
-    tokio::time::timeout(config.shutdown_timeout, async {
-        server.await.map_err(|_| "HTTP shutdown failed")?;
+    tokio::time::timeout(drain, async {
+        server.await.map_err(|_| ProcessFailure::Shutdown)?;
         pool.close().await;
         Ok(())
     })
     .await
-    .map_err(|_| "shutdown deadline exceeded")?
+    .map_err(|_| ProcessFailure::ShutdownDeadline)?
 }
 
 #[cfg(test)]
