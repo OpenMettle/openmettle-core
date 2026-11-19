@@ -2,7 +2,7 @@
   "schema_version": 1,
   "distribution_boundary": {
     "status": "defined",
-    "description": "Owner decisions of 19 November 2026. Distributed: the source code in the public OpenMettle repositories, including the source of the OpenMettle/sglang curated fork, and the Helm chart in openmettle-deploy. Not distributed yet: built container images (including the core api, worker and migrate images and any image built from the SGLang fork), re-hosted third-party images, other curated forks (the OpenMettle/open-webui fork is reference material only) and model weights. Third-party images are referenced only at their publishers' locations. Long-term direction: distribute everything needed to run OpenMettle, eventually as an Arch Linux distribution with everything preinstalled except components whose licences do not allow redistribution. Each widening of the boundary is a separate owner decision; publishing the core images (V1-36) is the likely next one.",
+    "description": "Owner decisions of 19 November 2026. Distributed: the source code in the public OpenMettle repositories that are not forks, and the Helm chart in openmettle-deploy. Not distributed yet: built container images (including the core api, worker and migrate images), re-hosted third-party images, curated forks and model weights. The public forks OpenMettle/sglang and OpenMettle/open-webui stay outside the boundary as public forks under their upstream licences: the SGLang fork comes inside, with a full audit, when serving packaging (V1-20) ships it; the Open WebUI fork is reference material for the product OpenMettle replaces and stays public. Third-party images are referenced only at their publishers' locations. Long-term direction: distribute everything needed to run OpenMettle, eventually as an Arch Linux distribution with everything preinstalled except components whose licences do not allow redistribution. Each widening of the boundary is a separate owner decision; publishing the core images (V1-36) is the likely next one.",
     "tracking": [
       "V1-42",
       "V1-36"
@@ -13,9 +13,10 @@
       "date": "2026-11-19",
       "evidence": [
         "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7005620131",
-        "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7006023083"
+        "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7006023083",
+        "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7006271314"
       ],
-      "notes": "Recorded by an agent from the owner's decision comments. The second brings the OpenMettle/sglang fork source inside the boundary and keeps the OpenMettle/open-webui fork outside it. It defines distribution scope only; it is not a licence review or legal clearance."
+      "notes": "Recorded by an agent from the owner's decision comments. The third supersedes the second's fork item: both public forks stay outside the boundary for now. It defines distribution scope only; it is not a licence review or legal clearance."
     }
   },
   "review_groups": {
@@ -93,11 +94,22 @@
       }
     },
     "serving": {
-      "status": "pending",
-      "summary": "Curated SGLang fork, serving-fork evidence repository, serving images, embedding/reranking images and served model weights. The first 19 Nov 2026 decision excluded the whole group; the owner's second decision of the same day brings the OpenMettle/sglang fork source inside the boundary, so the group needs a licence-review disposition. Its other components stay outside the boundary, each with its own exclusion reason.",
+      "status": "excluded",
+      "summary": "Curated SGLang fork, serving-fork evidence repository, serving images, embedding/reranking images and served model weights.",
       "tracking": [
         "V1-42"
-      ]
+      ],
+      "exclusion_reason": "Not distributed under the 19 Nov 2026 boundary: the OpenMettle/sglang fork stays a public fork under its upstream Apache-2.0 licence until serving packaging (V1-20) brings it inside with a full audit; built serving images and model weights are not distributed, and the Text Embeddings Inference image is referenced only at its publisher's location.",
+      "review": {
+        "status": "reviewed",
+        "reviewer": "OpenMettle owner (GitHub Drgr33nSenior)",
+        "date": "2026-11-19",
+        "evidence": [
+          "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7005620131",
+          "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7006271314"
+        ],
+        "notes": "Disposition recorded by an agent from the owner's boundary decisions. The group's licence review is still required before the boundary widens to include it."
+      }
     },
     "media": {
       "status": "excluded",
@@ -119,20 +131,20 @@
     },
     "application-fork": {
       "status": "excluded",
-      "summary": "The Open WebUI fork is reference material only and is not distributed. Translating its code into another language does not by itself make an independent implementation. The local coding agent (ACP) is a separate repository with its own licence and NOTICE.",
+      "summary": "The Open WebUI fork is reference material for the product OpenMettle replaces and is not distributed. Translating its code into another language does not by itself make an independent implementation. The local coding agent (ACP) is a separate repository with its own licence and NOTICE.",
       "tracking": [
         "V1-42"
       ],
-      "exclusion_reason": "Nothing in this group is distributed from openmettle-core under the 19 Nov 2026 boundary: the Open WebUI fork is reference material only because its licence adds a branding clause, and openmettle-acp is distributed as source by its own public repository with its own LICENSE and NOTICE.",
+      "exclusion_reason": "Nothing in this group is distributed from openmettle-core under the 19 Nov 2026 boundary: the Open WebUI fork is a public reference fork under its upstream licence, which adds a branding clause, and openmettle-acp is distributed as source by its own public repository with its own LICENSE and NOTICE.",
       "review": {
         "status": "reviewed",
         "reviewer": "OpenMettle owner (GitHub Drgr33nSenior)",
         "date": "2026-11-19",
         "evidence": [
           "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7005620131",
-          "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7006023083"
+          "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7006271314"
         ],
-        "notes": "Disposition recorded by an agent from the owner's boundary decision and confirmed by the owner's second decision, which keeps the Open WebUI fork outside the boundary. The group's licence review is still required before the boundary widens to include it."
+        "notes": "Disposition recorded by an agent from the owner's boundary decisions; the third keeps the Open WebUI fork public as reference material. The group's licence review is still required before the boundary widens to include it."
       }
     }
   },
@@ -834,7 +846,7 @@
       "name": "OpenMettle SGLang curated fork",
       "kind": "curated-fork",
       "review_group": "serving",
-      "distribution": "included",
+      "distribution": "excluded",
       "version": null,
       "pin": null,
       "origin": "https://github.com/OpenMettle/sglang",
@@ -842,14 +854,13 @@
         "GitHub repository API, read-only on 2026-11-19: OpenMettle/sglang is a public GitHub fork of sgl-project/sglang with default branch openmettle/rdna4.",
         "openmettle/rdna4 head 2e9dc033cfc7886371dc71ef632848ae7a63fa52 on 2026-11-19, unchanged since the 16 November observation; 34 commits ahead of upstream main at merge base fcb3274646e43c16d70fd83806ebb3a5134d5e81. The branch moves; this is not a selected release revision.",
         "OPENMETTLE-NOTICES.md at that head records the imported serving patches and the retained upstream and third-party notices.",
-        "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7006023083"
+        "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7006271314"
       ],
       "licence": {
         "expression": "Apache-2.0",
         "evidence": [
           "OpenMettle/sglang LICENSE at openmettle/rdna4 2e9dc033cfc7886371dc71ef632848ae7a63fa52 (Apache License 2.0 text, Git blob 9c422689c8f5c317c7c65153b1209349ec57007e)",
-          "GitHub license API for OpenMettle/sglang reports Apache-2.0 (read-only, 2026-11-19)",
-          "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7006023083"
+          "GitHub license API for OpenMettle/sglang reports Apache-2.0 (read-only, 2026-11-19)"
         ]
       },
       "notices": {
@@ -871,7 +882,7 @@
         "reviewer": null,
         "date": null,
         "evidence": [],
-        "notes": "Source is inside the boundary by owner decision; the owner has not recorded a review of the fork. Before it clears: select and pin a release revision, and audit the bundled third-party code (3rdparty/ and the sgl-router, sgl-model-gateway and rust/ sub-projects) for further notices. OPENMETTLE-NOTICES.md states it is not a complete dependency audit. Images built from the fork and served model weights stay outside the boundary."
+        "notes": "Public fork under its upstream licence, outside the boundary by owner decision. Before it comes inside with serving packaging (V1-20): select and pin a release revision, and audit the bundled third-party code (3rdparty/ and the sgl-router, sgl-model-gateway and rust/ sub-projects) for further notices. OPENMETTLE-NOTICES.md states it is not a complete dependency audit."
       },
       "tracking": [
         "V1-42"
@@ -879,7 +890,8 @@
       "redistribution": {
         "assessment": "redistributable",
         "basis": "Apache-2.0 recorded from the fork's root LICENSE and the GitHub license API; Apache-2.0 permits redistribution with the licence, NOTICE attribution and modification notices retained. Derived portions also carry MIT notices in LICENSES/; bundled third-party code under 3rdparty/ is not yet audited."
-      }
+      },
+      "exclusion_reason": "Public fork under its upstream Apache-2.0 licence, outside the 19 Nov 2026 boundary by owner decision until serving packaging (V1-20) brings it inside with a full audit. Images built from it and served model weights are not distributed."
     },
     {
       "id": "serving-fork-evidence",
@@ -1115,7 +1127,7 @@
       "source_evidence": [
         "ARCHITECTURE-v1.md source table",
         "REPOSITORIES.md",
-        "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7006023083"
+        "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7006271314"
       ],
       "licence": {
         "expression": null,
@@ -1136,7 +1148,7 @@
         "evidence": [],
         "notes": "Source and requirements evidence only. Do not copy or translate its implementation into OpenMettle repositories. Observed read-only on 2026-11-19 as a public GitHub fork of open-webui/open-webui; the GitHub license API reports NOASSERTION."
       },
-      "exclusion_reason": "Reference material only, outside the 19 Nov 2026 boundary by owner decision because its licence adds a branding clause. Publicly visible pending owner action; not distributed. The owner will make the GitHub fork private, which is an owner action outside this repository.",
+      "exclusion_reason": "Reference material for the product OpenMettle replaces, outside the 19 Nov 2026 boundary by owner decision; its licence adds a branding clause. The public GitHub fork stays public under its upstream licence and is not part of the OpenMettle distribution. Nothing from it is copied or translated into OpenMettle.",
       "tracking": [
         "V1-42"
       ],
