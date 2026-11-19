@@ -210,6 +210,11 @@ current provider epoch.
 
 ## Native sign-in (block C)
 
+**Adopted.** [ADR 0023](0023-native-sign-in.md) and migration 14 implement the three points
+below: the native start takes the optional code, the system-browser confirmation form
+carries it under the body rules of browser initiation, and the redemption function also
+admits the native binding layout. The text below is the contract as this change set it.
+
 Native start is not implemented here. Block C must adopt this contract:
 
 - `BrowserAuth::start`, `ManagedProvider::begin` and `login::begin` take
@@ -297,7 +302,8 @@ real provider, ingress, image, cluster or rollout was exercised.
 
 ## Remaining
 
-Native sign-in (block C), the corrective migration that drops v1 acceptance, and the
+Block C adopted the code for native sign-in ([ADR 0023](0023-native-sign-in.md)). Still
+open: the corrective migration that drops v1 acceptance, and the
 Flutter web field: an optional "invitation code" input submitted as a top-level form `POST`
 whose only field is `invitation_code`, never placed in a route, query, deep link or storage. Every exposure gate of ADRs 0017–0020
 still applies. #5 stays open.

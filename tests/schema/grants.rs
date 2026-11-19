@@ -652,7 +652,7 @@ async fn migration_five_failure_kill_timeout_and_concurrent_retry() {
     }
     assert_eq!(
         db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     );
     assert_eq!(
         count(&db, "SELECT count(*) FROM openmettle.grant_mapping_rules").await,
@@ -742,6 +742,16 @@ async fn populated_v12_upgrade_and_authentic_v12_binaries() {
     )
     .await;
 }
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 and authentic V13_BINARY_DIR required"]
+async fn populated_v13_upgrade_and_authentic_v13_binaries() {
+    populated_upgrade(
+        "V13_BINARY_DIR",
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+        true,
+    )
+    .await;
+}
 // Version-12 invitations as its commands left them, without a code: one redeemed by the
 // fixture approval and login, one withdrawn in its window and one withdrawn after expiry.
 // A pending one would block migration 13 (see home_invitations.rs).
@@ -791,10 +801,23 @@ async fn populate_invitations(db: &TestDb) {
         .unwrap();
     }
 }
-// Every invitation column that schema 12 wrote. Migration 13 adds only code_hash.
+// Every invitation column that schema 12 wrote. Migration 13 adds only code_hash. The filter
+// reads code_hash through the row's JSON, so the snapshot also works on a schema-12 database,
+// where the column does not exist yet.
 async fn invitation_snapshot(db: &TestDb) -> Vec<String> {
     sqlx::query_scalar(
-        "SELECT (to_jsonb(t) - 'code_hash')::text FROM openmettle.home_invitations t ORDER BY 1",
+        "SELECT (to_jsonb(t) - 'code_hash')::text FROM openmettle.home_invitations t
+          WHERE to_jsonb(t) ->> 'code_hash' IS NULL ORDER BY 1",
+    )
+    .fetch_all(&mut db.admin().await)
+    .await
+    .unwrap()
+}
+// Every invitation that holds a code hash, complete. Only schema 13 and later write one.
+async fn coded_invitations(db: &TestDb) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT to_jsonb(t)::text FROM openmettle.home_invitations t
+          WHERE code_hash IS NOT NULL ORDER BY 1",
     )
     .fetch_all(&mut db.admin().await)
     .await
@@ -1102,6 +1125,28 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
         // Migration 12 creates the table empty.
         vec![]
     };
+    // Populate the v13-only domain: a pending invitation, which schema 13 requires to hold
+    // its code hash. Migration 14 replaces the redemption function and must leave it pending.
+    let coded_before = if versions.contains(&13) {
+        sqlx::query(
+            "INSERT INTO openmettle.home_invitations
+                (id,provider_id,provider_generation,provider_epoch,issuer,subject,redeem_before_ms,
+                 approval_until_ms,created_by,code_hash)
+             SELECT '00000000-0000-0000-0000-0000000000b4',$1::uuid,0,max(epoch),
+                    'https://upgrade.example.test','synthetic-pending',4102444800000,4102444800001,
+                    gen_random_uuid(),decode(repeat('5c',32),'hex')
+               FROM openmettle.login_provider_revisions WHERE provider_id=$1::uuid",
+        )
+        .bind(MEMBERSHIP_PROVIDER)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+        let rows = coded_invitations(&db).await;
+        assert_eq!(rows.len(), 1, "one pending invitation with a code hash");
+        rows
+    } else {
+        vec![]
+    };
     let session_snapshot = async || {
         let mut c = db.admin().await;
         let mut rows: Vec<String> = sqlx::query_scalar(
@@ -1170,7 +1215,7 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
         .unwrap();
     assert_eq!(
         db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     );
     assert_eq!(old_domain_snapshot(&db).await, before);
     if with_grants {
@@ -1199,15 +1244,9 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
     assert_eq!(membership_snapshot(&db).await, membership_before);
     // Migration 13 keeps every closed invitation exactly as schema 12 wrote it and gives none a
     // code. The code-less redemption function is gone, and no v11 role privilege is widened.
+    // Migration 14 changes no invitation row: a pending schema-13 invitation keeps its hash.
     assert_eq!(invitation_snapshot(&db).await, invitations_before);
-    assert_eq!(
-        count(
-            &db,
-            "SELECT count(*) FROM openmettle.home_invitations WHERE code_hash IS NOT NULL"
-        )
-        .await,
-        0
-    );
+    assert_eq!(coded_invitations(&db).await, coded_before);
     assert_eq!(
         count(
             &db,
@@ -1299,11 +1338,24 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
             .unwrap();
     let refused = old_migrate();
     assert_eq!(refused.status.code(), Some(1));
-    // Membership (v11) and invitation (v12, v13) privileges are outside every historical
-    // binary's contract, so each historical migrator stops at the boundary check before the
-    // unknown-version check.
+    // Membership (v11), invitation (v12, v13) and native delivery (v14) privileges are outside
+    // every historical binary's contract, so each historical migrator stops at the boundary
+    // check before the unknown-version check.
     assert!(stderr(&refused).contains("boundary check refused"));
-    if versions.last() >= Some(&11) {
+    if versions.last() == Some(&13) {
+        // The v13 contract admits the redemption grant, which migration 14 keeps. Only the
+        // native delivery table's grants are outside it.
+        for violation in [
+            "openmettle_api has SELECT on openmettle.native_handoffs",
+            "openmettle_api has UPDATE on openmettle.native_handoffs.sealed",
+            "openmettle_api has INSERT on openmettle.native_handoffs.audience",
+        ] {
+            assert!(stderr(&refused).contains(violation), "{}", stderr(&refused));
+        }
+        for admitted in ["redeem_home_invitation", "membership"] {
+            assert!(!stderr(&refused).contains(admitted), "{}", stderr(&refused));
+        }
+    } else if versions.last() >= Some(&11) {
         // The v11 and v12 contracts already admit every membership privilege. Only the v13
         // redemption EXECUTE grant is outside them: v11 knows no redemption function, and
         // v12 admits only the code-less signature that migration 13 dropped.

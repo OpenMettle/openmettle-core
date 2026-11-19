@@ -32,7 +32,7 @@ jobs:
   rust:
     name: Rust runtime
     runs-on: ubuntu-24.04
-    # Eleven authentic prior-release builds run serially (~70-90 s each). A cold run (cache key
+    # Twelve authentic prior-release builds run serially (~70-90 s each). A cold run (cache key
     # change) was projected at 20-24 min; keep headroom so a near-miss is not a wasted run.
     timeout-minutes: 35
     steps:
@@ -125,11 +125,18 @@ jobs:
           mkdir -p "$RUNNER_TEMP/openmettle-v12"
           git archive 4441b4236ad0dd1ea868d507bb10b50d9b0ddb6f | tar -x -C "$RUNNER_TEMP/openmettle-v12"
           cargo build --manifest-path "$RUNNER_TEMP/openmettle-v12/Cargo.toml" --locked --offline --bins
+      # Invitation codes (schema 13): the block B merge, the last release before native sign-in.
+      - name: Build authentic version-13 release for schema compatibility
+        run: |
+          mkdir -p "$RUNNER_TEMP/openmettle-v13"
+          git archive 615dcffc93af18ab0db40a7a2fafc3c0752d4c77 | tar -x -C "$RUNNER_TEMP/openmettle-v13"
+          cargo build --manifest-path "$RUNNER_TEMP/openmettle-v13/Cargo.toml" --locked --offline --bins
       # POSTGRES_CONTAINER runs the exact ADR 0014 operator scripts with the pinned service psql.
       - name: PostgreSQL schema, migration and role integration
         run: cargo test --locked --offline --test schema -- --ignored
         env:
           POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          V13_BINARY_DIR: ${{ runner.temp }}/openmettle-v13/target/debug
           V12_BINARY_DIR: ${{ runner.temp }}/openmettle-v12/target/debug
           V11_BINARY_DIR: ${{ runner.temp }}/openmettle-v11/target/debug
           V10_BINARY_DIR: ${{ runner.temp }}/openmettle-v10/target/debug
@@ -151,13 +158,17 @@ jobs:
         env:
           POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
           TEST_DATABASE_URL: postgres://fixture:fixture@127.0.0.1:5432/fixture?sslmode=disable
+      # Two journeys, each bounded by the harness's own 75-second alarm.
       - name: Chrome cross-site session qualification
-        timeout-minutes: 3
+        timeout-minutes: 5
         env:
           TEST_DATABASE_URL: postgres://fixture:fixture@127.0.0.1:5432/fixture?sslmode=disable
         run: |
           python3 -m unittest discover -s tests/browser -v
           case_name=provider_keys::tests::postgres::browser::cross_site_session_lifecycle
+          cargo test --locked --offline --lib "$case_name" -- --ignored --exact --list | grep -Fx "$case_name: test"
+          cargo test --locked --offline --lib "$case_name" -- --ignored --exact --nocapture
+          case_name=provider_keys::tests::postgres::browser::cross_site_native_code_delivery
           cargo test --locked --offline --lib "$case_name" -- --ignored --exact --list | grep -Fx "$case_name: test"
           cargo test --locked --offline --lib "$case_name" -- --ignored --exact --nocapture
       - name: Save Cargo dependencies and build outputs

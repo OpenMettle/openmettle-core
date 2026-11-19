@@ -172,24 +172,32 @@ pub(super) fn wrong_method(allow: &'static str) -> Response<&'static str> {
         .insert(header::ALLOW, HeaderValue::from_static(allow));
     response
 }
-/// `303` with one cookie. Both header values are marked sensitive: they stay out of `Debug`
-/// output, and an HTTP/2 encoder that honors the mark does not index them.
-fn redirect(location: &str, cookie: &str) -> Response<&'static str> {
+/// `303` with at most one cookie. Both header values are marked sensitive: they stay out of
+/// `Debug` output, and an HTTP/2 encoder that honors the mark does not index them. Without a
+/// cookie the response neither sets nor deletes one (the native app link, ADR 0023).
+pub(super) fn redirect(location: &str, cookie: Option<&str>) -> Response<&'static str> {
     let sensitive = |value: &str| {
         let mut value = HeaderValue::from_str(value).ok()?;
         value.set_sensitive(true);
         Some(value)
     };
-    let (Some(location), Some(cookie)) = (sensitive(location), sensitive(cookie)) else {
+    let Some(location) = sensitive(location) else {
         return Refusal::Unavailable.response();
+    };
+    let cookie = match cookie.map(sensitive) {
+        Some(None) => return Refusal::Unavailable.response(),
+        Some(cookie) => cookie,
+        None => None,
     };
     let mut response = respond(StatusCode::SEE_OTHER, "");
     response.headers_mut().insert(header::LOCATION, location);
-    response.headers_mut().insert(header::SET_COOKIE, cookie);
+    if let Some(cookie) = cookie {
+        response.headers_mut().insert(header::SET_COOKIE, cookie);
+    }
     response
 }
 // Exhaustive, so a new service category must be classified before the crate compiles.
-fn completion_refusal(error: Error) -> Refusal {
+pub(super) fn login_failure(error: Error) -> Response<&'static str> {
     use login::Error as L;
     use sessions::Error as S;
     match error {
@@ -211,9 +219,10 @@ fn completion_refusal(error: Error) -> Refusal {
             Refusal::Unavailable
         }
     }
+    .response()
 }
 
-/// Validation and logout outcomes. Exhaustive, like [`completion_refusal`]. Only a credential
+/// Validation and logout outcomes. Exhaustive, like [`login_failure`]. Only a credential
 /// the database refused is `SessionInvalid`; every other category, including the login
 /// categories these operations never return, is an operational failure.
 fn session_refusal(error: Error) -> Refusal {
@@ -246,7 +255,7 @@ fn logged_out() -> Response<&'static str> {
 }
 
 /// `https://host[:port]` in the ASCII serialization browsers send, and nothing else.
-fn canonical_origin(value: &str) -> bool {
+pub(super) fn canonical_origin(value: &str) -> bool {
     Url::parse(value)
         .is_ok_and(|url| url.scheme() == "https" && url.origin().ascii_serialization() == value)
 }
@@ -259,7 +268,7 @@ fn plain_path(url: &str, path: &str) -> bool {
         })
 }
 /// Two 43-character base64url tokens joined by a dot: `state` and the caller cookie value.
-fn token_pair(value: &str) -> Option<(&str, &str)> {
+pub(super) fn token_pair(value: &str) -> Option<(&str, &str)> {
     let (first, second) = value.split_once('.')?;
     let token = |part: &str| {
         part.len() == 43
@@ -271,7 +280,7 @@ fn token_pair(value: &str) -> Option<(&str, &str)> {
 }
 /// One strict `application/x-www-form-urlencoded` component: visible ASCII only, `+` is a
 /// space, every `%` starts two hexadecimal digits and the decoded bytes are UTF-8.
-fn decode(raw: &str) -> Option<String> {
+pub(super) fn decode(raw: &str) -> Option<String> {
     let mut decoded = Vec::with_capacity(raw.len());
     let mut bytes = raw.bytes();
     while let Some(byte) = bytes.next() {
@@ -290,15 +299,16 @@ fn decode(raw: &str) -> Option<String> {
 }
 
 /// A complete authorization success response, still untrusted.
-struct Authorization {
-    code: String,
-    state: String,
-    issuer: String,
+pub(super) struct Authorization {
+    pub(super) code: String,
+    pub(super) state: String,
+    pub(super) issuer: String,
 }
 /// `None` unless the query is one well-formed success response: bounded before decoding, no
-/// decoded name twice (RFC 6749 §3.1), no error member, and `code`, `state` and `iss` present.
-/// Other well-formed parameters are ignored.
-fn authorization(query: &str) -> Option<Authorization> {
+/// decoded name twice (RFC 6749 §3.1), no error member, and `code`, `state` and `iss` present
+/// with a code that [`login::valid_authorization_code`] accepts. Other well-formed parameters
+/// are ignored.
+pub(super) fn authorization(query: &str) -> Option<Authorization> {
     if query.len() > MAX_QUERY_BYTES
         || query.bytes().filter(|b| *b == b'&').count() >= MAX_QUERY_PARAMETERS
     {
@@ -324,7 +334,7 @@ fn authorization(query: &str) -> Option<Authorization> {
         names.push(name);
     }
     Some(Authorization {
-        code: code?,
+        code: code.filter(|value| login::valid_authorization_code(value))?,
         state: state?,
         issuer: issuer?,
     })
@@ -334,7 +344,7 @@ fn authorization(query: &str) -> Option<Authorization> {
 /// one `invitation_code` field whose strictly decoded value is a well-formed code. Syntax
 /// only: whether the code belongs to an invitation is decided at redemption, so a
 /// well-formed wrong code and no code get the same response here.
-fn invitation(form: &[u8]) -> Option<Option<InvitationCode>> {
+pub(super) fn invitation(form: &[u8]) -> Option<Option<InvitationCode>> {
     if form.is_empty() {
         return Some(None);
     }
@@ -354,7 +364,7 @@ fn invitation(form: &[u8]) -> Option<Option<InvitationCode>> {
 }
 /// The value of cookie `name` when it occurs exactly once across every `Cookie` field and
 /// those fields are within [`MAX_COOKIE_BYTES`]. Names compare exactly.
-fn single_cookie<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
+pub(super) fn single_cookie<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
     let fields = || headers.get_all(header::COOKIE).iter();
     if fields().map(HeaderValue::len).sum::<usize>() > MAX_COOKIE_BYTES {
         return None;
@@ -502,7 +512,11 @@ impl LoginHandoff {
         };
         redirect(
             started.authorization_url.expose(),
-            &caller_cookie(locator, started.caller_binding.expose(), self.login_seconds),
+            Some(&caller_cookie(
+                locator,
+                started.caller_binding.expose(),
+                self.login_seconds,
+            )),
         )
     }
 
@@ -525,11 +539,8 @@ impl LoginHandoff {
             state,
             issuer,
         } = &response;
-        let code_is_safe = !code.is_empty()
-            && code.len() <= login::MAX_CODE_BYTES
-            && code.bytes().all(|b| b.is_ascii_graphic());
         let locator = match token_pair(state) {
-            Some((locator, _)) if code_is_safe && *issuer == self.settings.issuer => locator,
+            Some((locator, _)) if *issuer == self.settings.issuer => locator,
             _ => return Refusal::Response.response(),
         };
         // The cookie names the login it belongs to, so a cookie from a later initiation
@@ -549,10 +560,11 @@ impl LoginHandoff {
             code,
         };
         match self.auth.complete(&self.settings.provider, callback).await {
-            Ok(credential) => {
-                redirect(&self.settings.landing, &session_cookie(credential.expose()))
-            }
-            Err(error) => completion_refusal(error).response(),
+            Ok(credential) => redirect(
+                &self.settings.landing,
+                Some(&session_cookie(credential.expose())),
+            ),
+            Err(error) => login_failure(error),
         }
     }
 
@@ -633,7 +645,7 @@ mod tests {
                 ),
             ),
         ] {
-            let response = redirect(location, &cookie);
+            let response = redirect(location, Some(&cookie));
             assert_eq!(
                 (response.status(), *response.body()),
                 (StatusCode::SEE_OTHER, "")
@@ -657,11 +669,28 @@ mod tests {
                 assert!(!debug.contains(secret));
             }
         }
+        // The native app-link redirect sets and deletes no cookie and keeps the other headers.
+        let link = format!("https://links.example.test/app?code={credential}");
+        let response = redirect(&link, None);
+        let headers = response.headers();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(!headers.contains_key(header::SET_COOKIE));
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_eq!(headers[header::REFERRER_POLICY], "no-referrer");
+        assert_eq!(headers.len(), 3);
+        assert_eq!(headers[header::LOCATION], link.as_str());
+        assert!(headers[header::LOCATION].is_sensitive());
+        assert!(!format!("{response:?}").contains(&credential));
         // A value that cannot be a header never becomes a partial redirect.
-        let broken = redirect("https://app.example.test/app", "name=line\nbreak");
-        assert_eq!(broken.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(!broken.headers().contains_key(header::LOCATION));
-        assert!(!broken.headers().contains_key(header::SET_COOKIE));
+        for broken in [
+            redirect("https://app.example.test/app", Some("name=line\nbreak")),
+            redirect("https://links.example.test/a\nb", Some("name=value")),
+            redirect("https://links.example.test/a\nb", None),
+        ] {
+            assert_eq!(broken.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!broken.headers().contains_key(header::LOCATION));
+            assert!(!broken.headers().contains_key(header::SET_COOKIE));
+        }
     }
 
     const CODE: &str = "omh1-0123-4567-89ab-cdef-fedc-ba98-7654-3210";
@@ -889,7 +918,7 @@ mod tests {
         use login::Error as L;
         use sessions::Error as S;
         let line = |error| {
-            let response = completion_refusal(error).response();
+            let response = login_failure(error);
             assert!(!response.headers().contains_key(header::SET_COOKIE));
             (response.status(), *response.body())
         };

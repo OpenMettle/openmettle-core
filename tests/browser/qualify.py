@@ -1,16 +1,22 @@
 """Drive runner Chrome over its private DevTools pipe. Only fixed phase names and fixed
 failure kinds reach stderr."""
+import base64
 import contextlib
+import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 
 class Failure(Exception):
@@ -173,12 +179,16 @@ def session_lifecycle(browser, app, enter):
         raise Failure("signed-out session check")
 
 
-def journey(browser, app, issuer, enter):
+def journey(browser, app, issuer, enter, link=None, ca=None):
     enter("browser target setup")
     open_target(browser)
 
     def page(origin, path, control):
         committed(browser, origin, path, control)
+
+    if link:
+        native_journey(browser, app, issuer, enter, link, ca, page)
+        return
 
     enter("wrong-origin form")
     browser.call("Page.navigate", url=issuer + "/wrong")
@@ -200,8 +210,65 @@ def journey(browser, app, issuer, enter):
     session_lifecycle(browser, app, enter)
 
 
+def native_journey(browser, app, issuer, enter, link, ca, page):
+    enter("native confirmation page")
+    verifier = secrets.token_urlsafe(32)
+    state = secrets.token_urlsafe(32)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    query = urlencode(dict(client_id="synthetic.mobile", redirect_uri=link, response_type="code",
+                           code_challenge=challenge, code_challenge_method="S256", state=state))
+    browser.call("Page.navigate", url=f"{app}/auth/native/authorize?{query}")
+    page(app, "/auth/native/authorize", "confirm")
+    enter("provider authorization")
+    # The form posts its one invitation_code field, left empty: no code was entered.
+    browser.click("confirm")
+    page(issuer, "/authorize", "approve")
+    enter("native app link")
+    browser.click("approve")
+    browser.wait_for(f"location.origin + location.pathname === {json.dumps(link)} && "
+                     "document.body?.innerText.trim() === 'synthetic app link'", "native HTTPS link")
+    params = parse_qs(browser.evaluate("location.search.slice(1)"), strict_parsing=True)
+    if (set(params) != {"iss", "code", "state"} or params["iss"] != [app] or
+            params["state"] != [state] or len(params["code"]) != 1 or len(params["code"][0]) != 43):
+        raise Failure("native callback binding")
+
+    # Independent HTTPS client, empty cookie jar, one trusted ephemeral CA and loopback resolution.
+    target = urlsplit(app)
+    trust = ssl.create_default_context(cadata=ca.decode("ascii"))
+
+    def backchannel(method, path, body=None, headers=None):
+        conn = http.client.HTTPSConnection(target.hostname, target.port, context=trust, timeout=4)
+        conn._create_connection = lambda *_: socket.create_connection(("127.0.0.1", target.port), 4)
+        try:
+            conn.request(method, "/auth/native/" + path, body, headers or {})
+            reply = conn.getresponse()
+            if reply.getheader("Cache-Control") != "no-store" or reply.getheader("Set-Cookie"):
+                raise Failure("native response headers")
+            return reply.status, reply.read(4096)
+        finally:
+            conn.close()
+
+    enter("native code redemption")
+    payload = json.dumps(dict(grant_type="authorization_code", iss=app, client_id="synthetic.mobile",
+                              redirect_uri=link, code=params["code"][0], code_verifier=verifier))
+    status, body = backchannel("POST", "token", payload, {"Content-Type": "application/json"})
+    if status != 200:
+        raise Failure("native HTTPS redemption")
+    token = json.loads(body)
+    if set(token) != {"token_type", "access_token"} or token["token_type"] != "Bearer":
+        raise Failure("native token response")
+    enter("native session lifecycle")
+    headers = {"Authorization": "Bearer " + token["access_token"]}
+    for method, path, expected in [("GET", "session", 204), ("POST", "logout", 204), ("GET", "session", 403)]:
+        if backchannel(method, path, headers=headers)[0] != expected:
+            raise Failure("native HTTPS session lifecycle")
+
+
+
 # The two fixture sites on loopback; every other name fails to resolve.
 RULES = "MAP app.relying.test 127.0.0.1, MAP issuer.example.test 127.0.0.1, MAP * ~NOTFOUND"
+NATIVE_RULES = ("MAP app.relying.test 127.0.0.1, MAP issuer.example.test 127.0.0.1, "
+                "MAP links.relying.test 127.0.0.1, MAP * ~NOTFOUND")
 
 
 def chrome(home, attempt, rules=RULES):
@@ -214,9 +281,10 @@ def chrome(home, attempt, rules=RULES):
             f"--host-resolver-rules={rules}", f"--user-data-dir={home / f'profile-{attempt}'}"]
 
 
-def run(app, issuer, home, enter):
-    drive(lambda browser: journey(browser, app, issuer, enter),
-          [sys.stdin.buffer.read()], RULES, home, enter)
+def run(app, issuer, home, enter, link=None):
+    ca = sys.stdin.buffer.read()
+    drive(lambda browser: journey(browser, app, issuer, enter, link, ca),
+          [ca], NATIVE_RULES if link else RULES, home, enter)
 
 
 def drive(journey, authorities, rules, home, enter):
@@ -289,4 +357,4 @@ def execute(run, seconds):
 
 
 if __name__ == "__main__":
-    execute(lambda home, enter: run(*sys.argv[1:], home, enter), 75)
+    execute(lambda home, enter: run(sys.argv[1], sys.argv[2], home, enter, *sys.argv[3:]), 75)

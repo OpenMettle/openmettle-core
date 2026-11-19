@@ -2,9 +2,9 @@
 
 An operator can approve first-account creation for one named OIDC principal. The create command prints a one-time invitation code, which the operator delivers to that person privately. The person signs in with the configured provider and presents the code. OpenMettle consumes the invitation when it issues the first local session. That transaction creates one user, the exact bound identity, a private personal scope and an ordinary provider-specific approval. It creates no resource grant, membership or administrator role.
 
-Invitations are migration 12, applied after project membership (migration 11). Invitation codes are migration 13. The schema suite upgrades populated databases migrated by the authentic membership (v11) and invitation (v12) binaries and checks that those binaries then refuse the newer schema. An invitation-created approval can be enrolled in and withdrawn from [project membership](../adr/0021-project-membership.md) like any other approval. Its first sign-in creates no membership, because no enrollment can exist before the approval does.
+Invitations are migration 12, applied after project membership (migration 11). Invitation codes are migration 13. Migration 14 lets a login started by a native sign-in redeem, and changes no invitation. The schema suite upgrades populated databases migrated by the authentic membership (v11), invitation (v12) and invitation-code (v13) binaries and checks that those binaries then refuse the newer schema. An invitation-created approval can be enrolled in and withdrawn from [project membership](../adr/0021-project-membership.md) like any other approval. Its first sign-in creates no membership, because no enrollment can exist before the approval does.
 
-The database requires the code from schema 13. The browser sign-in form carries it in one optional field, `invitation_code`, submitted with the form `POST` that starts the sign-in ([ADR 0022](../adr/0022-home-invitation-codes.md)). Native sign-in does not accept a code yet, so a first sign-in from a native app is refused until a later block adds it. The managed session consumer is internal and the browser routes remain unmounted.
+The database requires the code from schema 13. The browser sign-in form carries it in one optional field, `invitation_code`, submitted with the form `POST` that starts the sign-in ([ADR 0022](../adr/0022-home-invitation-codes.md)). From schema 14, native sign-in carries the same field on its system-browser confirmation page, so a first sign-in from a native app redeems under the same rules ([ADR 0023](../adr/0023-native-sign-in.md)). The app itself never handles the code. The managed session consumer is internal, and the browser and native routes remain unmounted.
 
 ## Before upgrading to schema 13
 
@@ -22,6 +22,8 @@ Migration 13 refuses to run while any invitation is pending. Schema 12 issued in
 4. Invite each person again with a new invitation UUID. Deliver the new code.
 
 Redeemed and withdrawn invitations are kept unchanged and have no code. During a rolling update, replicas from the previous release cannot redeem an invitation on schema 13, so first sign-ins are refused until every replica is updated. Sign-in for existing users continues, with one exception: a previous-release replica cannot complete a sign-in that an updated replica started, and the person must start again. A sign-in started before the update completes on an updated replica.
+
+Migration 14 has no precondition and changes no invitation. A previous-release replica on schema 14 still redeems an invitation for a browser sign-in. It has no native routes.
 
 ## Identify the person and authorize the window
 
@@ -87,9 +89,9 @@ The code is 128 random bits, generated in the database inside the create transac
 - **Deliver it privately** to the invited person over a channel you trust for a password. Anyone who has the code and can sign in to the provider as the invited subject can create the account.
 - **Record only the first output line.** Keep the code line out of tickets, change records, chat, CI output, shell history and terminal recordings.
 - **Single use.** The code works only while the invitation is pending, before `redeem_before_ms`. It has no separate expiry. Redemption or withdrawal ends it.
-- **Entered when sign-in starts.** The person types or pastes the code into the sign-in form before they are sent to the provider. It is not asked for again afterwards.
+- **Entered when sign-in starts.** The person types or pastes the code into the sign-in form before they are sent to the provider. It is not asked for again afterwards. In a native app, that form is the confirmation page the system browser shows before the provider. The app never asks for the code.
 - **Entry is forgiving.** The person may type it in upper or lower case, with or without the `omh1-` prefix, hyphens and spaces.
-- **A mistyped code is caught in two places.** A code of the wrong length or with other characters is refused at once with `login request refused`, before the provider is contacted. A well-formed but wrong code is refused only after the provider sign-in, with the same `login refused. Start a new login.` message as any other refused sign-in. Neither message says whether an invitation exists.
+- **A mistyped code is caught in two places.** A code of the wrong length or with other characters is refused at once with `login request refused`, before the provider is contacted. A well-formed but wrong code is refused only after the provider sign-in, with the same `login refused. Start a new login.` message as any other refused sign-in. Neither message says whether an invitation exists. The native confirmation page answers `native sign-in request refused` and `native sign-in refused` in the same two places.
 - **No lockout.** A wrong code refuses that sign-in and leaves the invitation pending. The person starts a new sign-in and enters the correct code.
 - **Ignored for existing accounts.** Once the account exists, a code entered at sign-in is ignored.
 

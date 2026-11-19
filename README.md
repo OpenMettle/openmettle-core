@@ -547,6 +547,24 @@ deployment or production enablement: `openmettle-api` still serves `/healthz` an
 only. Other browser engines, mobile and native handoff, other OIDC providers, owner provider
 registrations, and deployed ingress remain qualification gaps for V1-04.
 
+## Native sign-in
+
+[ADR 0023](docs/adr/0023-native-sign-in.md) adds `src/browser_auth/native.rs`, an unmounted
+router that brokers sign-in for a native app through the same provider registration, with
+its own upstream callback. **No process constructs it.** The app opens the system browser
+at the deployment, where the person confirms the sign-in and, for a first sign-in, enters
+their [invitation code](docs/operator/home-invitations.md). The app never handles that
+code. After the provider sign-in the API redirects to the app's registered HTTPS link with
+a one-use code. The app exchanges that code and its own PKCE verifier over a back channel
+for an opaque bearer. A browser-cookie session and a native bearer have separate digest
+domains, so neither validates as the other. Each bearer validates and signs out only
+through the native registration that delivered it.
+
+Migration 14 adds the delivery table and lets a login that a native sign-in started redeem
+a home invitation under the same rules as a browser login, including the code. The ADR
+gives the protocol, limits, evidence and the gates that remain before exposure, including
+device link ownership and the companion app's simulator qualification.
+
 ## Schema migrations
 
 Read [ADR 0003](docs/adr/0003-schema-migrations.md) for the migration, role and ownership contract and [ADR 0004](docs/adr/0004-run-persistence.md) for run/event/operation persistence, limits and replay semantics, [ADR 0005](docs/adr/0005-artifact-storage-accounting.md) for artifact revisions, storage reservations and byte accounting, and [ADR 0006](docs/adr/0006-grant-persistence.md) for grant provenance, replay and revocation persistence. PostgreSQL 18 is the only qualified major version. Migrations in `migrations/` are embedded in the `openmettle-migrate` binary, forward-only and transactional; released migrations are never edited. Run the migrate image once per release, before rolling out new API and worker versions. Each release's migrations must remain compatible with the previous API and worker.

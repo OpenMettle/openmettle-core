@@ -57,6 +57,11 @@ fn token(new: bool) -> UnverifiedIdToken {
 fn nonce() -> ExpectedNonceDigest {
     ExpectedNonceDigest::new(Sha256::digest("n".repeat(43).as_bytes()).into())
 }
+/// One armed upstream authorization: its exact `redirect_uri` and the ID token for its nonce.
+struct Authorization {
+    callback: String,
+    token: String,
+}
 struct Script {
     metadata: Value,
     keys: Vec<u8>,
@@ -67,8 +72,11 @@ struct Script {
     dated: bool,
     mode: &'static str,
     token: String,
-    // PKCE challenge from a real managed begin; None keeps the fixed fixture verifier.
-    challenge: Option<String>,
+    // Armed authorizations by upstream PKCE challenge. Empty keeps the fixed fixture verifier,
+    // the registered callback and `token`.
+    authorizations: HashMap<String, Authorization>,
+    // Upstream challenges whose token POST was accepted, in arrival order.
+    exchanged: Vec<String>,
     gate: Arc<tokio::sync::Notify>,
 }
 struct Harness {
@@ -98,7 +106,8 @@ impl Harness {
             date: signing::now(),
             dated: true,
             mode: "ok",
-            challenge: None,
+            authorizations: HashMap::new(),
+            exchanged: Vec::new(),
             token: signing::signed(
                 &"n".repeat(43),
                 signing::ISSUER,
@@ -109,7 +118,7 @@ impl Harness {
         let data = script.clone();
         let registered_callback = callback.to_owned();
         let server=tls::Server::start(ca.leaf(tls::HOST,false),move |request|{
-            let s=data.lock().unwrap();
+            let mut s=data.lock().unwrap();
             let discovery=request.head.starts_with("GET /discovery ");let jwks=request.head.starts_with("GET /jwks ");
             if s.mode=="stall" || s.mode=="post-stall" && !discovery && !jwks {return tls::Reply::Stall(vec![]);}
             if s.mode=="redirect" {return tls::Reply::Bytes(tls::response(302,&[("location","https://unconfigured.example.test/jwks")],b""));}
@@ -118,13 +127,23 @@ impl Harness {
                 assert!(request.head.starts_with("POST /token "));
                 let params:HashMap<String,String>=openidconnect::url::form_urlencoded::parse(&request.body).into_owned().collect();
                 assert!(params["code"] == "synthetic-code", "authorization code mismatch");
+                assert!(params["client_id"] == signing::CLIENT, "client binding mismatch");
                 let verifier = &params["code_verifier"];
-                match &s.challenge {
-                    Some(challenge) => assert!(URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())) == *challenge, "PKCE mismatch"),
-                    None => assert!(*verifier == "v".repeat(43), "fixture verifier mismatch"),
-                }
-                assert!(params["client_id"] == signing::CLIENT && params["redirect_uri"] == registered_callback, "client binding mismatch");
-                let bytes=tls::json(&serde_json::to_vec(&json!({"access_token":"synthetic-access","token_type":"Bearer","id_token":s.token})).unwrap());
+                // The verifier selects exactly one armed authorization. Its recorded callback is
+                // the only accepted redirect_uri; another configured callback is refused.
+                let token = if s.authorizations.is_empty() {
+                    assert!(*verifier == "v".repeat(43), "fixture verifier mismatch");
+                    assert!(params["redirect_uri"] == registered_callback, "callback binding mismatch");
+                    s.token.clone()
+                } else {
+                    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+                    let armed = s.authorizations.get(&challenge).expect("PKCE mismatch");
+                    assert!(params["redirect_uri"] == armed.callback, "callback binding mismatch");
+                    let token = armed.token.clone();
+                    s.exchanged.push(challenge);
+                    token
+                };
+                let bytes=tls::json(&serde_json::to_vec(&json!({"access_token":"synthetic-access","token_type":"Bearer","id_token":token})).unwrap());
                 return if s.mode=="gate-post" {tls::Reply::Gate(s.gate.clone(),bytes)} else {tls::Reply::Bytes(bytes)};
             }
             assert!(request.body.is_empty());
@@ -225,7 +244,7 @@ impl Harness {
     fn permit(&self) -> login::ExchangePermit {
         let c = self.provider.config().unwrap();
         let s = self.provider.snapshot().unwrap();
-        login::fixture_permit(c.login(&s).unwrap(), Some(1))
+        login::fixture_permit(c.login(&s, None).unwrap(), Some(1))
     }
 }
 async fn verify(p: &ManagedProvider, token: UnverifiedIdToken) -> Result<VerifiedIdentity, Error> {
@@ -682,7 +701,57 @@ async fn stored_managed_binding_layout_matches_invitation_redemption() {
         &field(&42_i64.to_be_bytes()),
     ]
     .concat();
-    assert_eq!(persisted(&c.binding, 42), expected);
+    assert_eq!(persisted(&c.binding, None, 42), expected);
+    // A native login (ADR 0023) stores the same configuration and epoch with its 32-byte
+    // attempt digest between them, under its own domain. Migration 14 reads these offsets.
+    let attempt = [0xa5; 32];
+    let native = [
+        b"openmettle/native-managed-login/1\0".as_slice(),
+        &field(&c.binding),
+        &field(&attempt),
+        &field(&42_i64.to_be_bytes()),
+    ]
+    .concat();
+    assert_eq!(persisted(&c.binding, Some(&attempt), 42), native);
+    assert_eq!(native.len(), 34 + 8 + c.binding.len() + 40 + 16);
+    assert_eq!(expected.len(), 27 + 8 + c.binding.len() + 16);
+}
+// A login belongs to the handle kind that started it: the browser handle, or the native
+// handle of one exact attempt. Any other handle refuses the permit before a token request.
+#[tokio::test]
+async fn permit_is_exchanged_only_by_the_handle_of_its_own_attempt() {
+    use crate::sessions::native::Attempt;
+    let h = Harness::new().await;
+    h.provider.preflight().await.unwrap();
+    let requests = h.count();
+    let attempt = |binding: u8| Attempt {
+        callback: signing::CALLBACK.into(),
+        binding: [binding; 32],
+        registration: [1; 32],
+        audience: [2; 32],
+        challenge: [3; 32],
+    };
+    let native = h.provider.native_handle(attempt(4));
+    let other = h.provider.native_handle(attempt(5));
+    let permit = |from: &ManagedProvider| {
+        let c = from.config().unwrap();
+        let s = from.snapshot().unwrap();
+        login::fixture_permit(c.login(&s, from.native.as_deref()).unwrap(), Some(1))
+    };
+    let policy = auth::Policy::default();
+    for (started, finishing) in [
+        (&h.provider, &native),
+        (&native, &h.provider),
+        (&native, &other),
+    ] {
+        let refused = permit(started).exchange_with_keys(finishing, &policy).await;
+        assert!(matches!(refused, Err(login::Error::Rejected)));
+    }
+    assert_eq!(h.count(), requests);
+    // Control: the handle of the same attempt reaches the provider's token endpoint.
+    let control = permit(&native).exchange_with_keys(&native, &policy).await;
+    assert!(!matches!(control, Err(login::Error::Rejected)));
+    assert!(h.count() > requests);
 }
 fn unknown(kid: &str) -> UnverifiedIdToken {
     let t = signing::signed(
@@ -1691,6 +1760,44 @@ async fn max_age_keeps_its_lifetime_and_refusals_use_the_window() {
         assert!(h.provider.snapshot().is_err());
         assert_eq!(h.count(), count);
     }
+}
+/// ADR 0023: the assertion's remaining age is reported apart from the process budget. A key
+/// snapshot near the end of its reuse window, or a nearly spent operation deadline, shortens
+/// the process budget only.
+#[tokio::test]
+async fn proof_budget_reports_assertion_age_apart_from_key_freshness_and_the_deadline() {
+    let reuse = policy()
+        .with_uncacheable_reuse(Duration::from_secs(10))
+        .unwrap();
+    let h = Harness::with_policy(reuse).await;
+    {
+        let mut s = h.script.lock().unwrap();
+        s.metadata_cache = "no-store".into();
+        s.cache = "no-store".into();
+    }
+    let p = &h.provider;
+    let (generation, assertion) = p
+        .verify(&token(false), &nonce(), &auth::Policy::default())
+        .await
+        .unwrap();
+    let secs = Duration::from_secs;
+    let far = Instant::now() + secs(3600);
+    // The fixture token was issued at T-10 with a maximum age of 300 s.
+    let budget = p.check_assertion(generation, &assertion, far).unwrap();
+    assert_eq!((budget.assertion, budget.process), (secs(290), secs(10)));
+    h.advance(8);
+    let budget = p.check_assertion(generation, &assertion, far).unwrap();
+    assert_eq!((budget.assertion, budget.process), (secs(282), secs(2)));
+    let near = Instant::now() + Duration::from_millis(500);
+    let budget = p.check_assertion(generation, &assertion, near).unwrap();
+    assert_eq!(budget.assertion, secs(282));
+    assert!(budget.process <= Duration::from_millis(500));
+    // Spent key freshness and a spent deadline still refuse the in-process check itself.
+    let spent = p.check_assertion(generation, &assertion, Instant::now());
+    assert_eq!(spent.unwrap_err(), Error::Timeout);
+    h.advance(2);
+    let stale = p.check_assertion(generation, &assertion, far);
+    assert_eq!(stale.unwrap_err(), Error::Unavailable);
 }
 /// The window is 60 s unless set. An explicit window is 1–300 s, no shorter than cooldown
 /// and no longer than maximum freshness.

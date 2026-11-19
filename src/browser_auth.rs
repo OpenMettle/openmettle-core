@@ -4,9 +4,10 @@
 //! session operations and owns every pooled connection those operations use. The service
 //! itself has no cookie or request handling; [`handoff`] holds the unmounted browser
 //! adapter (ADR 0017) and [`router`] its unmounted bounded Axum router (ADRs 0018 and 0019).
-//! There is no mounted route, native handoff or runtime loader, and no running process
-//! constructs this service yet.
+//! [`native`] provides the separate native code handoff. The running processes do not
+//! construct this service or either router.
 pub mod handoff;
+pub mod native;
 pub mod router;
 use crate::{
     auth_config::AuthConfig,
@@ -259,6 +260,13 @@ impl BrowserAuth {
         provider: &ManagedProvider,
         exchanged: ExchangedIdentity,
     ) -> Result<sessions::Credential, sessions::Error> {
+        self.issue_delivery(provider, exchanged).await?.browser()
+    }
+    pub(crate) async fn issue_delivery(
+        &self,
+        provider: &ManagedProvider,
+        exchanged: ExchangedIdentity,
+    ) -> Result<sessions::Delivery, sessions::Error> {
         let policy = self.config.session_policy();
         // Fixed before the wait: pool pressure never opens a new window for the proof.
         let (_admission, deadline) = provider.session_phase(&exchanged, policy)?;

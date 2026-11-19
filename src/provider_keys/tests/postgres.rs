@@ -236,13 +236,18 @@ struct Flow {
 }
 impl Script {
     fn authorize(&mut self, params: &HashMap<String, String>) {
-        self.challenge = Some(params["code_challenge"].clone());
-        self.token = signing::signed(
+        let token = signing::signed(
             &params["nonce"],
             signing::ISSUER,
             signing::CLIENT,
             1799999990,
         );
+        let armed = Authorization {
+            callback: params["redirect_uri"].clone(),
+            token,
+        };
+        self.authorizations
+            .insert(params["code_challenge"].clone(), armed);
     }
 }
 impl Flow {
@@ -280,6 +285,19 @@ impl Flow {
         let url = openidconnect::url::Url::parse(authorization_url).unwrap();
         let params: HashMap<String, String> = url.query_pairs().into_owned().collect();
         self.h.script.lock().unwrap().authorize(&params);
+    }
+    /// Replaces the ID token that the fixture provider issues for an armed login.
+    fn rearm(&self, started: &Started, token: String) {
+        let url = openidconnect::url::Url::parse(started.authorization_url.expose()).unwrap();
+        let challenge = url
+            .query_pairs()
+            .find(|(name, _)| name == "code_challenge")
+            .expect("code_challenge parameter")
+            .1
+            .into_owned();
+        let mut script = self.h.script.lock().unwrap();
+        let armed = script.authorizations.get_mut(&challenge);
+        armed.expect("the login is armed").token = token;
     }
     async fn consume(
         &mut self,
@@ -787,6 +805,7 @@ mod browser;
 mod handoff;
 mod invitations;
 mod membership;
+mod native;
 mod pooled;
 #[path = "../../../tests/support/psql.rs"]
 mod psql;

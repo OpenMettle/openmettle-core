@@ -11,7 +11,7 @@ use std::{io::Write, process::Output};
 const CREATE: &str = include_str!("../../../../docs/operator/home-invitation-create.psql");
 const WITHDRAW: &str = include_str!("../../../../docs/operator/home-invitation-withdraw.psql");
 const ID: &str = "00000000-0000-0000-0000-000000000111";
-const OTHER: &str = "00000000-0000-0000-0000-000000000112";
+pub(super) const OTHER: &str = "00000000-0000-0000-0000-000000000112";
 const OPERATOR: &str = "00000000-0000-0000-0000-000000000113";
 const FRESH: &str = "00000000-0000-0000-0000-000000000114";
 const SUBJECT: &str = "synthetic-subject";
@@ -44,7 +44,7 @@ fn run(
     drop(stdin);
     child.wait_with_output().unwrap()
 }
-fn create(f: &Flow, id: &str, provider: &str, subject: &str) -> Output {
+pub(super) fn create(f: &Flow, id: &str, provider: &str, subject: &str) -> Output {
     command(
         f,
         OWNER,
@@ -122,7 +122,7 @@ async fn redeem_raw(
         .await
         .unwrap()
 }
-async fn redeem_direct(
+pub(super) async fn redeem_direct(
     c: &mut PgConnection,
     provider: &str,
     login: &str,
@@ -140,7 +140,7 @@ fn first_session_refused(err: sqlx::Error) {
 }
 /// The code from a successful create: exactly the two documented lines, the second in the
 /// display form. No assertion here formats stdout, so a failure never prints a code.
-fn created(out: &Output) -> InvitationCode {
+pub(super) fn created(out: &Output) -> InvitationCode {
     assert!(
         out.status.success(),
         "{}",
@@ -904,7 +904,7 @@ async fn fabricated_login(f: &mut Flow) -> (String, i64) {
     .fetch_one(&mut f.api)
     .await
     .unwrap();
-    let binding = persisted(&f.h.provider.config().unwrap().binding, epoch);
+    let binding = persisted(&f.h.provider.config().unwrap().binding, None, epoch);
     let login = "f".repeat(43);
     f.api
         .execute(

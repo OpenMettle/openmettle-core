@@ -1111,6 +1111,50 @@ fn browser_paths_and_admission_use_the_router_rules() {
     assert_eq!(refusal(fixture.load()), Error::SessionPolicy);
 }
 
+/// A native app link (ADR 0023) never lands on a configured browser route, the landing path
+/// or an operational route of the browser origin, whether or not the native deployment
+/// shares that origin. The lazy pool is never used, so nothing connects.
+#[tokio::test]
+async fn native_app_links_cannot_target_configured_browser_routes() {
+    use crate::browser_auth::{BrowserAuth, native::NativeAuth};
+    use std::sync::Arc;
+    let config = Fixture::v2().load().unwrap();
+    let provider = config.browser().unwrap().handoff().provider.to_owned();
+    let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy_with(
+        sqlx::postgres::PgConnectOptions::new()
+            .host("127.0.0.1")
+            .port(9),
+    );
+    let auth = Arc::new(BrowserAuth::new(config, pool));
+    for origin in ["https://app.example.test", "https://broker.example.test"] {
+        let register = |link: &str| {
+            NativeAuth::new(
+                auth.clone(),
+                &provider,
+                origin,
+                &format!("{origin}/native/callback"),
+                "synthetic.mobile",
+                link,
+                8,
+            )
+        };
+        for path in [
+            "/auth/login",
+            "/auth/session",
+            "/auth/logout",
+            "/home",
+            "/healthz",
+            "/readyz",
+        ] {
+            let link = format!("https://app.example.test{path}");
+            assert!(register(&link).is_err(), "{origin} {path}");
+        }
+        // Controls: another path on the browser origin, and a browser path on another origin.
+        assert!(register("https://app.example.test/app-link").is_ok());
+        assert!(register("https://links.example.test/auth/session").is_ok());
+    }
+}
+
 /// One implementation: each profile the offline check accepts or refuses gets the same outcome
 /// from `LoginHandoff::new` and `router_with_sessions`, built over the same providers. The
 /// lazy pool is never used, so nothing connects.
