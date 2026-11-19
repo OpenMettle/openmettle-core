@@ -18,6 +18,14 @@ exposes no HTTP/1 header byte limit. Each of these would need to be disabled or 
 around. A per-request hyper connection supplies exact parser bounds and a connection
 driven by the caller.
 
+The address policy, endpoint and trust parsing, TLS configuration, DNS resolution, connection
+and response framing live in the crate-internal `provider_http::transport` core (V1-29). It
+takes caller-owned limits and a caller-owned DNS slot pool, accepts only `GET` with an empty
+body or `POST`, and allows only `Accept` and `Content-Type` caller headers. `ProviderTransport`
+keeps its stricter admission, its limits and the process-wide pool described below. Another
+configured client, such as an OTLP exporter, supplies its own pool and cannot consume
+provider DNS slots.
+
 Not implemented: discovery, JWKS fetch or refresh, configuration loading, routes, cookies,
 sessions, admission, confidential clients, HTTP/2, proxies and real-provider qualification.
 
