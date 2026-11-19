@@ -181,6 +181,7 @@ def parse_licence(expression: str):
 
     Precedence follows SPDX: WITH binds tightest, then AND, then OR. Operators must be upper case.
     Anything else, including Cargo's deprecated "/" separator, is a syntax error (fail closed).
+    licence_outcome rewrites a legacy Cargo "/" list with normalise_cargo_slash before calling this.
     """
     tokens, pos = [], 0
     while pos < len(expression):
@@ -247,19 +248,49 @@ def _terms(node) -> set[str]:
     return {value} if kind == "term" else set().union(*(_terms(child) for child in value))
 
 
-def licence_outcome(expression: str | None, licence_file: str | None, allowed: set[str]) -> tuple[str, str | None]:
-    """Check a declared licence against the allow-list: an OR passes if any branch passes; an AND needs all parts."""
+_SPDX_WORD = re.compile(r"\b(?:AND|OR|WITH)\b", re.IGNORECASE)
+
+
+def normalise_cargo_slash(expression: str) -> str | None:
+    """Read Cargo's deprecated '/' licence separator as OR (owner decision, 19 Nov 2026).
+
+    Applies to the Cargo `license` field only, before SPDX evaluation. SPDX identifiers and
+    expressions cannot contain '/', so a valid SPDX expression never reaches the rewrite.
+    Returns None when the expression has no '/'. Otherwise the expression must be a plain list
+    of single licence identifiers, such as 'MIT/Apache-2.0', which becomes 'MIT OR Apache-2.0'.
+    A '/' mixed with SPDX operators (in any case) or parentheses is refused as ambiguous: the
+    tool does not guess how '/' groups against AND, OR or WITH.
+    """
+    if "/" not in expression:
+        return None
+    if _SPDX_WORD.search(expression) or "(" in expression or ")" in expression:
+        raise LicenceSyntaxError("Cargo's deprecated '/' separator is mixed with SPDX operators or "
+                                 "parentheses; refused as ambiguous")
+    parts = [part.strip() for part in expression.split("/")]
+    if any(not _LICENCE_TERM.fullmatch(part) for part in parts):
+        raise LicenceSyntaxError("Cargo's deprecated '/' separator must separate single licence identifiers")
+    return " OR ".join(parts)
+
+
+def licence_outcome(expression: str | None, licence_file: str | None,
+                    allowed: set[str]) -> tuple[str, str | None, str | None]:
+    """Check a Cargo package's declared licence against the allow-list.
+
+    An OR passes if any branch passes; an AND needs all parts. Returns (outcome, reason, slash_as_or),
+    where slash_as_or is the SPDX expression evaluated in place of a legacy '/' form, or None.
+    """
     if expression is None:
         detail = f"; it names only the licence file {licence_file!r}" if licence_file else ""
-        return "blocked", f"declares no SPDX licence expression{detail}"
+        return "blocked", f"declares no SPDX licence expression{detail}", None
     try:
-        node = parse_licence(expression)
+        slash_as_or = normalise_cargo_slash(expression)
+        node = parse_licence(slash_as_or or expression)
     except LicenceSyntaxError as exc:
-        return "blocked", f"licence {expression!r} is not a valid SPDX expression: {exc}"
+        return "blocked", f"licence {expression!r} is not a valid SPDX expression: {exc}", None
     if _allowed(node, allowed):
-        return "allowed", None
+        return "allowed", None, slash_as_or
     outside = ", ".join(sorted(_terms(node) - allowed))
-    return "blocked", f"licence {expression!r} is outside the allow-list ({outside} not allowed)"
+    return "blocked", f"licence {expression!r} is outside the allow-list ({outside} not allowed)", slash_as_or
 
 
 def _validate_policy(policy, errors):
@@ -449,15 +480,16 @@ def evaluate(register: dict, lock: list[dict], metadata: dict | None, records: l
                "repository": declared["repository"] if declared else None,
                "reviewed_licence": review["licence"]["expression"] if review else None,
                "review_status": review["review"]["status"] if review else "missing",
-               "notices": review["notices"] if review else None}
+               "notices": review["notices"] if review else None, "slash_as_or": None}
         cargo.append(row)
         if review is None and record is not None:
             # Generated record: re-check it against Cargo.lock, the declared metadata and the
             # current policy, so a stale or hand-edited record cannot pass.
             policy_packages += 1
-            outcome, reason = licence_outcome(record["declared_licence"], record["declared_licence_file"], allowed)
+            outcome, reason, slash_as_or = licence_outcome(record["declared_licence"],
+                                                           record["declared_licence_file"], allowed)
             row |= {"reviewed_licence": record["declared_licence"], "review_status": f"policy-{outcome}",
-                    "notices": policy["notices"]}
+                    "notices": policy["notices"], "slash_as_or": slash_as_or}
             if record["checksum"] != pkg["checksum"]:
                 blockers.append(f"{label}: recorded checksum does not match Cargo.lock")
             if declared and (declared["license"], declared["license_file"]) != (
@@ -467,6 +499,9 @@ def evaluate(register: dict, lock: list[dict], metadata: dict | None, records: l
             if (record["outcome"], record["reason"]) != (outcome, reason):
                 blockers.append(f"{label}: recorded outcome {record['outcome']!r} differs from the current "
                                 f"policy result {outcome!r} (regenerate the records)")
+            if record.get("slash_as_or") != slash_as_or:
+                blockers.append(f"{label}: recorded slash_as_or {record.get('slash_as_or')!r} differs from the "
+                                f"current reading {slash_as_or!r} (regenerate the records)")
             if outcome != "allowed":
                 blockers.append(f"{label}: {reason}")
             continue
@@ -565,7 +600,9 @@ RECORD_OUTCOMES = {"allowed", "blocked"}
 RECORDS_HEADER = {
     "generated_by": "python3 scripts/provenance.py review-cargo --cargo-metadata <cargo metadata JSON>",
     "notice": ("Generated; do not edit. Each record pins a Cargo.lock package to its declared licence and the "
-               "outcome against cargo_licence_policy in register.json. Reviewed against policy; not legal clearance."),
+               "outcome against cargo_licence_policy in register.json. slash_as_or is set when the declared "
+               "licence uses Cargo's deprecated '/' separator: it is the SPDX expression evaluated instead, with '/' "
+               "read as OR. Reviewed against policy; not legal clearance."),
 }
 
 
@@ -585,7 +622,7 @@ def load_records(path: Path) -> list[dict]:
         where = f"{path.name} packages[{i}]"
         if not isinstance(rec, dict) or not _text(rec.get("name")) or not _text(rec.get("version")):
             raise InputError(f"{where}: needs a name and version")
-        for field in ("source", "checksum", "declared_licence", "declared_licence_file", "reason"):
+        for field in ("source", "checksum", "declared_licence", "declared_licence_file", "reason", "slash_as_or"):
             if rec.get(field) is not None and not _text(rec[field]):
                 raise InputError(f"{where}: '{field}' must be a nonblank string or null")
         if (not isinstance(rec.get("outcome"), str) or rec["outcome"] not in RECORD_OUTCOMES
@@ -608,10 +645,11 @@ def generate_records(register: dict, lock: list[dict], metadata: dict) -> list[d
         if key in maintained:
             continue
         declared = metadata[key]
-        outcome, reason = licence_outcome(declared["license"], declared["license_file"], allowed)
+        outcome, reason, slash_as_or = licence_outcome(declared["license"], declared["license_file"], allowed)
         records.append({"name": pkg["name"], "version": pkg["version"], "source": pkg["source"],
                         "checksum": pkg["checksum"], "declared_licence": declared["license"],
-                        "declared_licence_file": declared["license_file"], "outcome": outcome, "reason": reason})
+                        "declared_licence_file": declared["license_file"], "outcome": outcome, "reason": reason,
+                        "slash_as_or": slash_as_or})
     return records
 
 

@@ -143,9 +143,9 @@
       "Apache-2.0",
       "BSD-2-Clause",
       "BSD-3-Clause",
-      "CC0-1.0",
       "ISC",
       "MIT",
+      "MIT-0",
       "Unicode-3.0",
       "Zlib"
     ],
@@ -158,11 +158,13 @@
       "justification": "Build inputs only under the 19 Nov 2026 boundary: the crates are not redistributed in source or binary form."
     },
     "review": {
-      "status": "pending",
-      "reviewer": null,
-      "date": null,
-      "evidence": [],
-      "notes": "Proposed by an agent on 19 November 2026 for owner approval. Approval adopts a licence-bookkeeping policy; it is not legal clearance. Records in cargo-reviews.json are generated against this list and block readiness until it is approved."
+      "status": "reviewed",
+      "reviewer": "OpenMettle owner (GitHub Drgr33nSenior)",
+      "date": "2026-11-19",
+      "evidence": [
+        "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7006023083"
+      ],
+      "notes": "Proposed by an agent on 19 November 2026 and approved by the owner the same day, with CC0-1.0 dropped and MIT-0 added; an agent transcribed the approval from the owner's decision comment. The same decision reads Cargo's deprecated '/' licence separator as OR (for example, 'MIT/Apache-2.0' as 'MIT OR Apache-2.0'); review-cargo records each package where that rule applied. Approval adopts a licence-bookkeeping policy; packages are reviewed against policy, which is not legal clearance."
     },
     "tracking": [
       "V1-42",
@@ -414,7 +416,7 @@
       "licence": {
         "expression": "Apache-2.0",
         "evidence": [
-          "ARCHITECTURE-v1.md 'Graphiti licence check \u2014 16 November 2026'"
+          "ARCHITECTURE-v1.md 'Graphiti licence check — 16 November 2026'"
         ]
       },
       "notices": {
@@ -603,12 +605,12 @@
       "pin": null,
       "origin": "https://github.com/HelixDB/helix-db",
       "source_evidence": [
-        "ARCHITECTURE-v1.md 'Rust alternatives reviewed \u2014 16 November 2026'"
+        "ARCHITECTURE-v1.md 'Rust alternatives reviewed — 16 November 2026'"
       ],
       "licence": {
         "expression": "Apache-2.0",
         "evidence": [
-          "ARCHITECTURE-v1.md 'Rust alternatives reviewed \u2014 16 November 2026' (unpinned)"
+          "ARCHITECTURE-v1.md 'Rust alternatives reviewed — 16 November 2026' (unpinned)"
         ]
       },
       "notices": {

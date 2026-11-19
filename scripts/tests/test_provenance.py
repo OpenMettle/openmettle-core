@@ -435,18 +435,71 @@ class LicenceExpressionTests(unittest.TestCase):
     def test_blocked_outcomes_name_the_reason(self):
         self.assertEqual(self.outcome("MIT AND GPL-3.0-only"),
                          ("blocked", "licence 'MIT AND GPL-3.0-only' is outside the allow-list "
-                                     "(GPL-3.0-only not allowed)"))
+                                     "(GPL-3.0-only not allowed)", None))
         self.assertIn("declares no SPDX licence expression", self.outcome(None)[1])
         self.assertIn("names only the licence file 'COPYING'", self.outcome(None, "COPYING")[1])
-        self.assertIn("deprecated '/' separator", self.outcome("MIT/Apache-2.0")[1])
 
     def test_invalid_expressions_are_blocked_not_guessed(self):
         for expression in ("", " ", "mit or apache-2.0", "MIT or Apache-2.0", "MIT OR", "(MIT", "MIT)",
                            "MIT AND OR Apache-2.0", "MIT, Apache-2.0", "MIT WITH", "OR MIT", "MIT Apache-2.0"):
             with self.subTest(expression=expression):
-                outcome, reason = self.outcome(expression)
+                outcome, reason, slash_as_or = self.outcome(expression)
                 self.assertEqual(outcome, "blocked")
                 self.assertIn("not a valid SPDX expression", reason)
+                self.assertIsNone(slash_as_or)
+
+    def test_cargo_slash_list_is_read_as_or(self):
+        cases = {
+            "MIT/Apache-2.0": ("allowed", "MIT OR Apache-2.0"),
+            "Apache-2.0/MIT": ("allowed", "Apache-2.0 OR MIT"),
+            "MIT / Apache-2.0": ("allowed", "MIT OR Apache-2.0"),
+            "MIT/Apache-2.0/Unicode-3.0": ("allowed", "MIT OR Apache-2.0 OR Unicode-3.0"),
+            # Read as OR, so one allowed branch is enough and none blocks.
+            "GPL-3.0-only/MIT": ("allowed", "GPL-3.0-only OR MIT"),
+            "GPL-3.0-only/LGPL-2.1-only": ("blocked", "GPL-3.0-only OR LGPL-2.1-only"),
+        }
+        for expression, (outcome, slash_as_or) in cases.items():
+            with self.subTest(expression=expression):
+                result = self.outcome(expression)
+                self.assertEqual((result[0], result[2]), (outcome, slash_as_or))
+        # The reason quotes the declared form, not the rewritten one.
+        self.assertIn("licence 'GPL-3.0-only/LGPL-2.1-only' is outside the allow-list",
+                      self.outcome("GPL-3.0-only/LGPL-2.1-only")[1])
+
+    def test_slash_mixed_with_spdx_operators_is_refused_as_ambiguous(self):
+        # How '/' would group against AND, OR or WITH is not defined, so none of these is guessed,
+        # even where both readings would pass.
+        for expression in ("MIT/Apache-2.0 OR Unicode-3.0", "MIT OR Apache-2.0/Unicode-3.0",
+                           "MIT/Apache-2.0 AND Unicode-3.0", "MIT AND Apache-2.0/Unicode-3.0",
+                           "GPL-3.0-only AND MIT/Apache-2.0", "Apache-2.0 WITH LLVM-exception/MIT",
+                           "(MIT/Apache-2.0)", "(MIT OR Apache-2.0)/Unicode-3.0",
+                           "MIT/Apache-2.0 or Unicode-3.0", "MIT/Apache-2.0 and Unicode-3.0"):
+            with self.subTest(expression=expression):
+                outcome, reason, slash_as_or = self.outcome(expression)
+                self.assertEqual(outcome, "blocked")
+                self.assertIn("not a valid SPDX expression", reason)
+                self.assertIn("refused as ambiguous", reason)
+                self.assertIsNone(slash_as_or)
+
+    def test_malformed_slash_lists_are_refused(self):
+        for expression in ("MIT/", "/MIT", "MIT//Apache-2.0", "/", "MIT Apache-2.0/Unicode-3.0",
+                           "MIT/Apache-2.0, Unicode-3.0"):
+            with self.subTest(expression=expression):
+                outcome, reason, slash_as_or = self.outcome(expression)
+                self.assertEqual(outcome, "blocked")
+                self.assertIn("must separate single licence identifiers", reason)
+                self.assertIsNone(slash_as_or)
+
+    def test_spdx_expressions_are_never_rewritten(self):
+        # SPDX identifiers cannot contain '/', so the strict parser still rejects it and valid
+        # expressions reach SPDX evaluation unchanged.
+        with self.assertRaisesRegex(provenance.LicenceSyntaxError, "deprecated '/' separator"):
+            provenance.parse_licence("MIT/Apache-2.0")
+        for expression in ("MIT", "MIT OR Apache-2.0", "(MIT OR Apache-2.0) AND Unicode-3.0",
+                           "Apache-2.0 WITH LLVM-exception OR MIT", "LicenseRef-Proprietary OR MIT"):
+            with self.subTest(expression=expression):
+                self.assertIsNone(provenance.normalise_cargo_slash(expression))
+                self.assertIsNone(self.outcome(expression)[2])
 
 
 class CargoPolicyTests(FixtureCase):
@@ -519,7 +572,8 @@ class CargoPolicyTests(FixtureCase):
                  (("MIT AND GPL-3.0-only", None), "(GPL-3.0-only not allowed)"),
                  ((None, "LICENSE"), "declares no SPDX licence expression; it names only the licence file"),
                  ((None, None), "declares no SPDX licence expression"),
-                 (("MIT/Apache-2.0", None), "deprecated '/' separator"))
+                 (("MIT/Apache-2.0 AND GPL-3.0-only", None), "refused as ambiguous"),
+                 (("GPL-3.0-only/LGPL-2.1-only", None), "(GPL-3.0-only, LGPL-2.1-only not allowed)"))
         for declared, fragment in cases:
             with self.subTest(declared=declared):
                 self.set_declared(*declared)
@@ -527,6 +581,28 @@ class CargoPolicyTests(FixtureCase):
                 self.assertEqual(self.records()["packages"][0]["outcome"], "blocked")
                 self.assert_blocked(f"cargo fixture-dep 1.2.3: {'licence' if declared[0] else 'declares'}")
                 self.assert_blocked(fragment)
+
+    def test_slash_record_notes_the_or_reading_and_passes(self):
+        self.set_declared("MIT/Apache-2.0")
+        self.assertEqual(self.review_cargo()[0], 0)
+        record = self.records()["packages"][0]
+        self.assertEqual((record["declared_licence"], record["slash_as_or"], record["outcome"]),
+                         ("MIT/Apache-2.0", "MIT OR Apache-2.0", "allowed"))
+        code, _, err = self.gate()
+        self.assertEqual(code, 0, err)
+        self.set_declared("Apache-2.0")
+        self.review_cargo()
+        self.assertIsNone(self.records()["packages"][0]["slash_as_or"])
+
+    def test_hand_edited_slash_reading_blocks(self):
+        for declared, edited in (("MIT/Apache-2.0", None), ("Apache-2.0", "Apache-2.0 OR MIT")):
+            with self.subTest(declared=declared):
+                self.set_declared(declared)
+                self.review_cargo()
+                data = self.records()
+                data["packages"][0]["slash_as_or"] = edited
+                self.save_records(data)
+                self.assert_blocked(f"recorded slash_as_or {edited!r} differs from the current reading")
 
     def test_hand_edited_outcome_blocks(self):
         self.set_declared("GPL-3.0-only")
@@ -578,7 +654,8 @@ class CargoPolicyTests(FixtureCase):
         cases = ({"packages": {}}, {"packages": [None]}, [], {"packages": [record | {"outcome": "cleared"}]},
                  {"packages": [record | {"outcome": []}]}, {"packages": [record | {"reason": "x"}]},
                  {"packages": [record | {"outcome": "blocked"}]}, {"packages": [record, record]},
-                 {"packages": [record | {"declared_licence": " "}]})
+                 {"packages": [record | {"declared_licence": " "}]},
+                 {"packages": [record | {"slash_as_or": " "}]})
         for data in cases:
             with self.subTest(data=data):
                 self.save_records(data)
@@ -661,8 +738,9 @@ class RepositoryRegisterTests(unittest.TestCase):
         for record in records:
             with self.subTest(package=record["name"], version=record["version"]):
                 self.assertEqual(record["checksum"], lock[provenance._pkg_key(record)]["checksum"])
-                self.assertEqual((record["outcome"], record["reason"]), provenance.licence_outcome(
-                    record["declared_licence"], record["declared_licence_file"], allowed))
+                self.assertEqual((record["outcome"], record["reason"], record["slash_as_or"]),
+                                 provenance.licence_outcome(record["declared_licence"],
+                                                            record["declared_licence_file"], allowed))
 
 
 if __name__ == "__main__":
