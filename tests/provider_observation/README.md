@@ -45,7 +45,7 @@ The job also fails if either source prediction from the [#5 research](https://gi
 - discovery `token_endpoint_auth_methods_supported` must be an array without `none`;
 - discovery `Cache-Control` must include `no-store`.
 
-Each of these properties conflicts with a rule in `src/provider_keys/documents.rs`: `metadata` requires `none`, and `freshness` refuses `no-store`. A passing job therefore reports `observed-incompatibility`. It does not mean that sign-in works, that Keycloak is supported, or that these are the only conflicts.
+Each of these properties conflicted with a rule in `src/provider_keys/documents.rs`: `metadata` required `none`, and `freshness` refused `no-store`. The [ADR 0011 amendment of 19 November 2026](../../docs/adr/0011-managed-provider-keys.md#amendment-19-nov-2026) accepts both. A passing job still reports `observed-incompatibility`: the label now records the provider behaviour observed against the earlier profile, not a conflict with the current one. It does not mean that sign-in works, that Keycloak is supported, or that no other conflicts exist.
 
 The report also records content types, `Date`/`Age`, JWKS cache directives, PKCE and the `iss` parameter flag for comparison with a hosted run.
 

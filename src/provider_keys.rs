@@ -54,7 +54,13 @@ impl fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
-/// Explicit deployment policy, with finite implementation ceilings and no operational defaults.
+/// Default reuse window for a document that refuses caching (owner decision, #5, 19 November
+/// 2026; ADR 0011 amendment).
+pub const DEFAULT_UNCACHEABLE_REUSE: Duration = Duration::from_secs(60);
+/// Largest reuse window an operator may set for a document that refuses caching.
+pub const MAX_UNCACHEABLE_REUSE: Duration = Duration::from_secs(300);
+/// Explicit deployment policy, with finite implementation ceilings. The only operational
+/// default is the reuse window for documents that refuse caching.
 #[derive(Clone, Copy, Debug)]
 pub struct RefreshPolicy {
     freshness: Duration,
@@ -63,8 +69,12 @@ pub struct RefreshPolicy {
     providers: usize,
     callers: usize,
     gets: usize,
+    // Reuse window for `no-store`/`no-cache` documents, from the request, under `freshness`.
+    uncacheable_reuse: Duration,
 }
 impl RefreshPolicy {
+    /// The reuse window starts at [`DEFAULT_UNCACHEABLE_REUSE`], capped by `freshness` when
+    /// the documents are fetched; [`Self::with_uncacheable_reuse`] sets it explicitly.
     pub fn new(
         freshness: Duration,
         cooldown: Duration,
@@ -89,6 +99,22 @@ impl RefreshPolicy {
             providers,
             callers,
             gets,
+            uncacheable_reuse: DEFAULT_UNCACHEABLE_REUSE,
+        })
+    }
+    /// An explicit reuse window for documents that refuse caching: 1 s to
+    /// [`MAX_UNCACHEABLE_REUSE`], no shorter than the cooldown and no longer than freshness.
+    /// A shorter window would leave the documents expired while cooldown still blocks the
+    /// refresh, refusing sign-ins in between. A longer one would trust keys past the
+    /// operator's freshness cap for every other document.
+    pub fn with_uncacheable_reuse(self, reuse: Duration) -> Result<Self, Error> {
+        // Cooldown is at least 1 s, so the lower bound also enforces the 1 s minimum.
+        if !(self.cooldown..=self.freshness.min(MAX_UNCACHEABLE_REUSE)).contains(&reuse) {
+            return Err(Error::Configuration);
+        }
+        Ok(Self {
+            uncacheable_reuse: reuse,
+            ..self
         })
     }
 }
@@ -244,6 +270,10 @@ impl ProviderManager {
                 clock: Mutex::new(None),
             }),
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn policy(&self) -> RefreshPolicy {
+        self.inner.policy
     }
     pub fn register(&self, config: ProviderConfig) -> Result<ManagedProvider, Error> {
         let mut entries = self.inner.entries.lock().unwrap();
@@ -483,12 +513,14 @@ impl ManagedProvider {
             .mono
             .checked_duration_since(start.mono)
             .ok_or(Error::Unavailable)?;
+        let policy = self.manager.policy;
         let fresh = documents::freshness(
             &response,
             start.wall,
             end.wall,
             delay,
-            self.manager.policy.freshness,
+            policy.freshness,
+            policy.uncacheable_reuse,
         )
         .and_then(|v| end.mono.checked_add(v));
         Ok((response, fresh))

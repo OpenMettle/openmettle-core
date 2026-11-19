@@ -47,7 +47,9 @@ Kubernetes qualification fixtures pass no arguments.
 > record says the version must be `1`, read "must be `1` or `2`".
 
 One JSON shape, version 1. The values below are synthetic and illustrate the format only;
-no operational value is recommended or selected by this record.
+no operational value is recommended or selected by this record. The one exception is the
+default of the optional `provider_refresh.uncacheable_reuse_seconds` (60 seconds), set by
+the [ADR 0011 amendment](0011-managed-provider-keys.md#amendment-19-nov-2026).
 
 ```json
 {
@@ -94,8 +96,11 @@ no operational value is recommended or selected by this record.
 }
 ```
 
-Every field is required and none has a default. Units are part of the field name. The loader
-adds no bound of its own to these values; each is judged by the existing constructor:
+Every field above is required and none has a default. Units are part of the field name.
+The [ADR 0011 amendment of 19 November 2026](0011-managed-provider-keys.md#amendment-19-nov-2026)
+adds one optional member, `provider_refresh.uncacheable_reuse_seconds`, in both versions; it
+is the only exception. The loader adds no bound of its own to these values; each is judged by
+the existing constructor:
 
 | Field | Constructor | Existing implementation bounds |
 | --- | --- | --- |
@@ -104,6 +109,7 @@ adds no bound of its own to these values; each is judged by the existing constru
 | `id_token.future_skew_seconds` | `auth::Policy::new` | 0–300 and below the age |
 | `provider_refresh.freshness_seconds` | `RefreshPolicy::new` | 1–86 400 |
 | `provider_refresh.cooldown_seconds` | `RefreshPolicy::new` | 1–3600 |
+| `provider_refresh.uncacheable_reuse_seconds` (optional) | `RefreshPolicy::with_uncacheable_reuse` | Absent: 60, capped by freshness. Present: 1–300, at least `cooldown_seconds`, at most `freshness_seconds` |
 | `provider_refresh.deadline_milliseconds` | `RefreshPolicy::new` | 10–60 000 |
 | `provider_refresh.max_providers` | `RefreshPolicy::new` | 1–64 |
 | `provider_refresh.max_callers` | `RefreshPolicy::new` | 1–1024 |
@@ -134,9 +140,9 @@ database authority change (ADR 0012).
   parser that ADR 0011 already applies to provider documents.
 - `version` is checked first, so a later version is reported as unsupported, not as unknown
   fields.
-- Every object refuses unknown and missing members. Objects are JSON objects only, and
-  integers are plain non-negative JSON integers: fractions, exponents, strings and `null`
-  are refused.
+- Every object refuses unknown and missing members; the optional reuse window may be absent.
+  Objects are JSON objects only, and integers are plain non-negative JSON integers:
+  fractions, exponents, strings and `null` are refused, including for the optional member.
 
 Derived Serde structs are deliberately not used for this document. With `serde_json` they
 also accept a positional array in place of an object and `null` for optional fields, which
@@ -203,7 +209,7 @@ or in `AuthConfig`'s `Debug`.
 | a configuration field has the wrong type or keyword | Wrong JSON type, non-integer number, unknown `roots` |
 | login lifetime is out of range | ADR 0009 bounds |
 | ID-token age or skew is out of range | `auth::Policy::new` |
-| provider refresh policy is out of range | `RefreshPolicy::new` |
+| provider refresh policy is out of range | `RefreshPolicy::new`, or an explicit reuse window outside its range |
 | session policy is out of range | `sessions::Policy::new` |
 | a login key is not a readable regular file of exactly 32 bytes | Key file checks above |
 | login key count, identifiers or material are not acceptable | More than three decrypt-only keys, or `KeyRing::new` |
@@ -240,7 +246,12 @@ The check validates local files against this build. It does not show that:
   `KeyRing` can compare only the keys in one ring;
 - another host would accept the same files. With `"roots": "native"` the result depends on
   the platform roots, including `SSL_CERT_FILE` and `SSL_CERT_DIR`, of the machine running
-  the check. Run it in the API image with the mounts and environment the API will use.
+  the check. Run it in the API image with the mounts and environment the API will use;
+- a provider that refuses caching can be used throughout. When
+  `provider_refresh.uncacheable_reuse_seconds` is absent, its 60-second default is not
+  checked against `cooldown_seconds`. With a longer cooldown, such a provider refuses
+  sign-ins from the end of each window until the cooldown ends. Set the member explicitly,
+  at or above the cooldown, for such providers (ADR 0011 amendment).
 
 ## Rotation and restore
 
@@ -265,6 +276,11 @@ admission limit, and rotate the active login key to a new identifier and new mat
 before reopening. Never resume restored logins.
 
 ## Compatibility
+
+> The 19 Nov 2026 amendment adds the optional `provider_refresh.uncacheable_reuse_seconds`
+> member to versions 1 and 2 without a version bump. A build from before that amendment
+> refuses a document carrying the member as an unknown field, not as an unsupported
+> version. Roll the new build out to every replica before adding the member.
 
 No dependency, Cargo feature, lockfile, migration (1–9 are unchanged), CI gate, image, HTTP
 contract or provenance-register change. New public items: the `auth_config` module,
