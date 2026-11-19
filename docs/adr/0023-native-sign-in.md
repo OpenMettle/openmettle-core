@@ -52,10 +52,13 @@ encoding.
 | Digest | Inputs | Stored in | Used for |
 | --- | --- | --- | --- |
 | Registration (`openmettle/native-login/1`) | Provider configuration binding, deployment issuer, upstream callback, client ID, app link | `native_handoffs.registration` | Fences a pending code to the exact configuration that issued it |
-| Session audience (`openmettle/native-session-audience/1`) | Deployment issuer, client ID, app link, provider UUID and issuer | `native_handoffs.audience` | Names the downstream registration a delivered bearer belongs to |
+| Session audience (`openmettle/native-session-audience/1`) | Deployment issuer, client ID, app link, provider UUID and issuer | `native_handoffs.audience` | Binds a delivered bearer's validation and logout to the registration that delivered it |
 
-This change stores the audience with every delivery. Enforcement on validation and logout
-is a separate change (see Remaining).
+The two digests change at different times. A router built from any other provider
+configuration, including a routine revision, endpoint or transport-trust change, has
+another registration digest, and a new provider epoch also fences a pending code. The
+audience changes only with the deployment issuer, client ID, app link or provider UUID.
+Replicas built from the same inputs share both.
 
 ### Sign-in
 
@@ -79,7 +82,10 @@ is a separate change (see Remaining).
    called. The browser callback shares that parser and rule. It issues a local
    session only for an eligible identity with a personal scope, or for a first sign-in that
    redeems an invitation. It redirects to the app link with exactly `code`, the app's
-   `state` and `iss`, the deployment issuer.
+   `state` and `iss`, the deployment issuer. The callback sets and deletes no cookie,
+   whatever its outcome. The login cookie stays until the login lifetime ends or a later
+   start replaces it, so a completed or replayed callback cannot erase the binding of a
+   newer overlapping attempt.
 5. **Redemption.** The app checks the link, state and issuer against its attempt, then
    sends `POST /auth/native/token` with `Content-Type: application/json`:
 
@@ -128,10 +134,11 @@ browser, on the confirmation page, and nowhere else.
 
 Requests to the confirmed start are decided in this order:
 
-1. Head bounds (`403`).
+1. Head bounds, then the method (`403`). Each route accepts only its own methods, and any
+   other method is refused here, before a slot is taken or a unit is spent.
 2. The body profile, from metadata alone (`413` `native sign-in request body not
    accepted`). Nothing is read and nothing is spent.
-3. A request slot (`503`), then one unit of the route's budget (`429`).
+3. A request slot (`503`), then one unit of the budget of this route and method (`429`).
 4. The declared form is read: at most 256 bytes within 2 seconds, or `408`
    `native sign-in request body not received`.
 5. The query, the method and `Origin` (`403`), then the form (`400`
@@ -204,11 +211,22 @@ A code lives for at most 30 seconds, clipped to the login expiry, the session ex
 remaining proof budget (token expiry, maximum token age and signing-key freshness) and the
 operation deadline.
 
+The callback releases a code only before a conservative monotonic deadline. Issuance fixes
+the remaining proof budget on the monotonic clock before its first await. It pairs each
+primary-clock read with a monotonic sample taken before the query is sent, and discards one
+millisecond for the floored result. The release deadline is the earliest of the stored
+grant expiry converted through either sample and the proof budget. The code is held in a
+value that yields it only through that check, and the callback makes the check immediately
+before it writes the redirect. A late acknowledgement, a lock wait, a rollback or a
+wall-clock change can therefore only shorten the grant. A late callback answers the fixed
+`403` with no code, cookie or redirect.
+
 Redemption matches the code digest, the S256 challenge and the registration, locks the row
-and clears the ciphertext under synchronous commit. A second transaction then rechecks
-session eligibility, the grant expiry and that the issuing provider epoch is still the
-current one. Concurrent redeemers receive at most one bearer. After an uncertain commit the
-app starts a new sign-in.
+and clears the ciphertext under synchronous commit. It converts the remaining grant time
+from its own sample in the same way. A second transaction then rechecks session
+eligibility, the grant expiry, the audience and that the issuing provider epoch is still
+the current one. Concurrent redeemers receive at most one bearer. After an uncertain commit
+the app starts a new sign-in.
 
 ### Bearer
 
@@ -216,7 +234,27 @@ A native bearer has the same shape as the session cookie value, and its secret d
 separate domain (`openmettle/native-session-secret/1`). A browser session therefore never
 validates as a bearer, and a bearer never validates as a cookie. Validation and logout also
 require a delivered row for the session, so an unredeemed session has no usable credential.
-Logout needs only possession: it records local revocation whatever the current eligibility.
+
+**A bearer works only through the registration that delivered it.** Validation and logout
+compare the row's audience with the serving registration's audience, in the same
+transaction as the session check. Another native registration on the same database refuses
+the bearer with `403` and revokes nothing.
+
+A pending code and a delivered session follow different rules:
+
+| | Fenced by | Kept across |
+| --- | --- | --- |
+| Pending code | The registration digest and the issuing provider epoch, so every configuration change | Nothing |
+| Delivered session | Its audience, and the ADR 0013 rules: explicit revocation, retirement, withdrawal and disablement | Routine provider revisions, approval edits, and key or trust maintenance |
+
+Changing the deployment issuer, client ID, app link or provider UUID creates a new
+audience. Bearers of the old audience can then be neither validated nor signed out through
+the new registration. They end at expiry, or when the owner revokes or cleans up their
+sessions.
+
+Logout needs possession of the bearer and the matching audience, and nothing else. It
+records local revocation whatever the current user, approval or provider eligibility, and
+makes no provider request.
 
 ## Limits
 
@@ -225,13 +263,17 @@ Logout needs only possession: it records local revocation whatever the current e
 | Upstream login | The configured login lifetime of 1–600 seconds and the outstanding-login cap (ADR 0014) |
 | Handoff code | At most 30 seconds, clipped as described above |
 | Local session | The existing session policy (ADR 0013). Retained sessions per user include both channels and undelivered sessions |
-| HTTP | 1–1024 requests in flight per native router. One rate budget per route at the supplied rate. The token body allows 8192 bytes and 2 seconds. The authorization query allows 4096 bytes. Request heads use the browser router's limits |
+| HTTP | 1–1024 requests in flight per native router. One rate budget per route and accepted method at the supplied rate, so the confirmation `GET` and the confirmed `POST` on `/auth/native/authorize` spend separately. The token body allows 8192 bytes and 2 seconds. The authorization query allows 4096 bytes. Request heads use the browser router's limits |
 | Database | The existing primary pool and session operation deadline |
 
 - **Not mounted.** The routes exist as library code only.
 - **A stalled form holds a request slot for up to 2 seconds**, as in ADR 0022.
 - **The login cookie has one slot.** A later start replaces the cookie of an earlier
-  attempt in the same browser, and a completed callback deletes it (see Remaining).
+  attempt in the same browser. An earlier attempt whose callback the browser has not yet
+  sent can then no longer complete. No callback deletes the cookie: it expires with the
+  login lifetime.
+- **An old audience cannot sign out.** After a change to the issuer, client ID, app link or
+  provider UUID, the bearers of the old audience last until expiry or owner cleanup.
 - **Expired undelivered rows** count toward retained-session capacity until the owner's
   session cleanup removes them (ADR 0013).
 - **No refresh credential.** The app signs in again when the session expires.
@@ -279,13 +321,23 @@ Local, without PostgreSQL:
   the syntax rule.
 - `auth_config::tests::native_app_links_cannot_target_configured_browser_routes`: app links
   on the browser origin, from a shared and from a separate native origin.
+- `…::native::preview_and_start_spend_separate_budgets_and_other_methods_spend_none`: with a
+  burst of one, the confirmation `GET` and the confirmed `POST` are both admitted and each
+  is then limited; an unsupported method on every route is refused without spending a unit
+  or taking a request slot.
+- `browser_auth::handoff::tests::redirects_carry_one_protected_cookie_and_stay_out_of_debug_output`:
+  a redirect without a cookie carries no `Set-Cookie` and keeps the protected `Location`.
+- `sessions::native::tests`: the monotonic conversion discards one millisecond and never
+  extends a spent remainder, and a code is not released at or after its deadline.
 
 Reordering the form before `Origin`, treating a malformed form as no code, admitting the
 field in the query, naming the submit button, removing the read timeout, admitting every
 body profile, ignoring the attempt at exchange and changing either stored layout each make
 one of these tests fail. So do admitting any provider code in the callback parser,
-admitting a positional token request, and dropping any one of the app-link checks. This
-was checked by mutation.
+admitting a positional token request, and dropping any one of the app-link checks. So do
+sharing one budget between the methods of a route, letting an unsupported method reach a
+budget, adding a cookie to the cookie-less redirect, keeping the discarded millisecond and
+releasing a code at its deadline. This was checked by mutation.
 
 PostgreSQL and Chrome, in CI only:
 
@@ -305,14 +357,34 @@ PostgreSQL and Chrome, in CI only:
   `grant_expiry_withdrawal_disablement_and_retirement_prevent_delivery` and
   `handoff_cannot_outlive_remaining_assertion_age_on_another_replica`: delivery, races,
   wrong bindings, expiry and authority changes.
+- `…::native::registrations_isolate_codes_bearers_and_logout_across_revisions`: two
+  registrations on one database. Neither redeems the other's code, validates the other's
+  bearer or signs it out, before and after routine provider and approval revisions, for a
+  disabled user and for a retired provider. A refused foreign logout leaves the bearer
+  valid.
+- `…::native::overlapping_attempt_keeps_its_binding_cookie_and_completes`: an older callback
+  held at its token response completes after a newer start replaced the cookie. It changes
+  no cookie, and the newer attempt completes with its own.
+- `…::native::grant_expiry_during_final_validation_acknowledgement_releases_no_code`,
+  `pending_grant_expiry_alone_refuses_while_session_is_unexpired` and
+  `withheld_claim_acknowledgement_releases_once_and_never_retries`: a grant that expires
+  while a commit acknowledgement is withheld releases no code and no bearer, although its
+  session is unexpired.
+- The synthetic provider accepts a token request only with the callback and PKCE challenge
+  recorded for that authorization, so a login finished through another registration's
+  callback fails at the provider as well.
 - Schema suite: `migration_14_keeps_the_redemption_contract_and_gates_the_native_grants`,
   and a populated upgrade from the authentic schema-13 release, which then refuses the
   newer schema for the native grants alone.
 - Chrome: `cross_site_native_code_delivery` submits the confirmation form with its field
-  left empty and redeems the code from an independent HTTPS client.
+  left empty and redeems the code from an independent HTTPS client. It records booleans
+  only: no `Referer` or `Cookie` reaches the provider authorization page or the app link,
+  the callback carries one binding cookie and changes no cookie, no browser session cookie
+  is issued, and the back-channel requests carry no `Referer` or `Cookie`.
 
-Not claimed: the PostgreSQL and Chrome cases were compiled and listed locally, not run. No
-real provider, ingress, image, cluster, device or rollout was exercised.
+Not claimed: the PostgreSQL and Chrome cases were compiled and listed locally, not run, and
+so were not checked by mutation. No real provider, ingress, image, cluster, device or
+rollout was exercised.
 
 ## Compatibility
 
@@ -324,8 +396,6 @@ real provider, ingress, image, cluster, device or rollout was exercised.
 
 ## Remaining
 
-- A review correction that follows this change: binding a delivered bearer's validation
-  and logout to its stored audience.
 - A settings-document form for the native registration, and runtime construction.
 - Simulator qualification in the companion app project: the system browser, not an embedded
   web view; operating-system delivery of the link to the registered app; state and issuer

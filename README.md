@@ -493,7 +493,8 @@ their [invitation code](docs/operator/home-invitations.md). The app never handle
 code. After the provider sign-in the API redirects to the app's registered HTTPS link with
 a one-use code. The app exchanges that code and its own PKCE verifier over a back channel
 for an opaque bearer. A browser-cookie session and a native bearer have separate digest
-domains, so neither validates as the other.
+domains, so neither validates as the other. Each bearer validates and signs out only
+through the native registration that delivered it.
 
 Migration 14 adds the delivery table and lets a login that a native sign-in started redeem
 a home invitation under the same rules as a browser login, including the code. The ADR

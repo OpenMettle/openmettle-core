@@ -28,27 +28,34 @@ fn single(request: &Parts, name: header::HeaderName) -> Option<&str> {
 }
 
 impl NativeAuth {
-    /// Build one router per process. Each route has its own bucket at the supplied rate.
+    /// Build one router per process. Each route and accepted method has its own bucket at the
+    /// supplied rate, so the authorization preview `GET` and the starting `POST` spend
+    /// separately. Any other method is refused before it takes a slot or spends a unit.
     pub fn router(self, rate: Rate) -> Result<Router, Error> {
         let bodies = Arc::new(Semaphore::new(self.operations.available_permits()));
         let auth = Arc::new(self);
         let mut router = Router::new();
-        for path in [
-            START,
-            &auth.callback[auth.issuer.len()..],
-            TOKEN,
-            SESSION,
-            LOGOUT,
+        let callback = auth.callback[auth.issuer.len()..].to_owned();
+        for (path, methods) in [
+            (START, &[Method::GET, Method::POST][..]),
+            (&callback, &[Method::GET]),
+            (TOKEN, &[Method::POST]),
+            (SESSION, &[Method::GET]),
+            (LOGOUT, &[Method::POST]),
         ] {
-            let budget =
-                Arc::new(Budget::new(rate, Instant::now()).map_err(|_| Error::Configuration)?);
+            let mut budgets = Vec::with_capacity(methods.len());
+            for method in methods {
+                let budget = Budget::new(rate, Instant::now()).map_err(|_| Error::Configuration)?;
+                budgets.push((method.clone(), budget));
+            }
+            let budgets = Arc::new(budgets);
             let auth = auth.clone();
             let bodies = bodies.clone();
             router = router.route(
                 path,
                 any(move |request: Request| {
                     let auth = auth.clone();
-                    let budget = budget.clone();
+                    let budgets = budgets.clone();
                     let bodies = bodies.clone();
                     async move {
                         let (parts, body) = request.into_parts();
@@ -58,6 +65,11 @@ impl NativeAuth {
                         {
                             return refused().map(Body::from);
                         }
+                        let Some((_, budget)) =
+                            budgets.iter().find(|(method, _)| *method == parts.method)
+                        else {
+                            return refused().map(Body::from);
+                        };
                         // The confirmed start follows the browser initiation body rules
                         // (ADR 0022). Its profile is decided from metadata alone, before a
                         // slot is taken or a unit is spent, and nothing is read here.

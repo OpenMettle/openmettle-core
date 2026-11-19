@@ -240,6 +240,108 @@ async fn run_browser(app: String, issuer: String, link: Option<String>, public_c
     assert!(status.success(), "browser journey failed");
 }
 
+/// Redacted facts from the native journey. Only booleans are kept, never a header value.
+#[derive(Default)]
+struct NativeObservations {
+    provider_reached: bool,
+    link_reached: bool,
+    /// A Referer reached the provider authorization or app-link endpoint.
+    third_party_referer: bool,
+    /// A Cookie reached the provider authorization or app-link endpoint.
+    third_party_cookie: bool,
+    /// The callback carried exactly one temporary native binding cookie.
+    callback_binding: bool,
+    callback_redirect: bool,
+    /// The callback response set or deleted any cookie.
+    callback_set_cookie: bool,
+    /// Any app response set the browser session cookie.
+    session_cookie_issued: bool,
+    /// A Referer or Cookie reached the token, session or logout endpoint.
+    backchannel_ambient: bool,
+    /// The confirmation form was one URL-encoded body holding its empty field alone.
+    confirmation_form: bool,
+}
+
+fn observe_native(
+    routes: Router,
+    callback: &'static str,
+    observed: Arc<Mutex<NativeObservations>>,
+) -> Router {
+    routes.layer(from_fn(move |req: Request, next: Next| {
+        let observed = observed.clone();
+        async move {
+            let path = req.uri().path().to_owned();
+            let headers = req.headers();
+            let ambient =
+                headers.contains_key(header::REFERER) || headers.contains_key(header::COOKIE);
+            // `invitation_code=` is 16 bytes: the page's one field, left empty.
+            let form = req.method() == axum::http::Method::POST
+                && headers
+                    .get(header::CONTENT_TYPE)
+                    .is_some_and(|v| v == "application/x-www-form-urlencoded")
+                && headers
+                    .get(header::CONTENT_LENGTH)
+                    .is_some_and(|v| v == "16");
+            let bindings = headers
+                .get_all(header::COOKIE)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .flat_map(|v| v.split(';'))
+                .filter(|v| v.trim().starts_with("__Host-openmettle-native-login="))
+                .count();
+            let response = next.run(req).await;
+            let set_cookies = response.headers().get_all(header::SET_COOKIE);
+            let session = set_cookies.iter().any(|v| {
+                v.as_bytes()
+                    .starts_with(format!("{SESSION_COOKIE}=").as_bytes())
+            });
+            let mut o = observed.lock().unwrap();
+            o.session_cookie_issued |= session;
+            if path == "/auth/native/authorize" && form {
+                o.confirmation_form = response.status() == axum::http::StatusCode::SEE_OTHER;
+            }
+            if path == callback {
+                o.callback_binding = bindings == 1;
+                o.callback_redirect = response.status() == axum::http::StatusCode::SEE_OTHER;
+                o.callback_set_cookie = set_cookies.iter().next().is_some();
+            }
+            if [
+                "/auth/native/token",
+                "/auth/native/session",
+                "/auth/native/logout",
+            ]
+            .contains(&path.as_str())
+            {
+                o.backchannel_ambient |= ambient;
+            }
+            response
+        }
+    }))
+}
+// The provider authorization page and the app link see neither Referer nor Cookie.
+fn observe_site(
+    routes: Router,
+    endpoint: &'static str,
+    observed: Arc<Mutex<NativeObservations>>,
+) -> Router {
+    routes.layer(from_fn(move |req: Request, next: Next| {
+        let observed = observed.clone();
+        async move {
+            if req.uri().path() == endpoint {
+                let headers = req.headers();
+                let mut o = observed.lock().unwrap();
+                match endpoint {
+                    "/authorize" => o.provider_reached = true,
+                    _ => o.link_reached = true,
+                }
+                o.third_party_referer |= headers.contains_key(header::REFERER);
+                o.third_party_cookie |= headers.contains_key(header::COOKIE);
+            }
+            next.run(req).await
+        }
+    }))
+}
+
 #[tokio::test]
 #[ignore = "isolated CI PostgreSQL 18 and sandboxed Chrome required"]
 async fn cross_site_native_code_delivery() {
@@ -266,7 +368,6 @@ async fn cross_site_native_code_delivery() {
         &format!("{app}/browser/callback"),
     )
     .await;
-    h.script.lock().unwrap().native_callback = Some(callback.clone());
     let mut f = Flow::with(h).await;
     sessions::seed(&mut f, true, true).await;
     let pool = pooled::one_slot(f.db.options(API));
@@ -281,23 +382,30 @@ async fn cross_site_native_code_delivery() {
         8,
     )
     .unwrap();
-    serve(
-        app_listener,
-        APP,
-        &f.h.ca,
-        native.router(super::super::router::limits().begin).unwrap(),
-    );
+    let observed = Arc::new(Mutex::new(NativeObservations::default()));
+    let routes = native.router(super::super::router::limits().begin).unwrap();
+    let routes = observe_native(routes, "/native/callback", observed.clone());
+    serve(app_listener, APP, &f.h.ca, routes);
 
     // Ordinary HTTPS destination in the harness. No mobile OS link association is involved.
-    serve(
-        link_listener,
-        "links.relying.test",
-        &f.h.ca,
-        Router::new().route("/app-link", get(|| async { "synthetic app link" })),
-    );
+    let routes = Router::new().route("/app-link", get(|| async { "synthetic app link" }));
+    let routes = observe_site(routes, "/app-link", observed.clone());
+    serve(link_listener, "links.relying.test", &f.h.ca, routes);
     let routes = authorization_site(callback, f.h.script.clone());
+    let routes = observe_site(routes, "/authorize", observed.clone());
     serve(issuer_listener, ISSUER, &f.h.ca, routes);
     run_browser(app, issuer, Some(link), f.h.ca.pem()).await;
+    {
+        let o = observed.lock().unwrap();
+        assert!(o.provider_reached && o.link_reached, "observed endpoints");
+        assert!(!o.third_party_referer, "Referer at provider or app link");
+        assert!(!o.third_party_cookie, "Cookie at provider or app link");
+        assert!(o.callback_binding && o.callback_redirect, "native callback");
+        assert!(!o.callback_set_cookie, "native callback cookie change");
+        assert!(!o.session_cookie_issued, "browser session cookie");
+        assert!(o.confirmation_form, "confirmation form POST");
+        assert!(!o.backchannel_ambient, "ambient back-channel credentials");
+    }
     assert_eq!(pooled::posts(&f), 1);
     let result:(bool,bool)=sqlx::query_as("SELECT s.revoked, g.sealed IS NULL FROM openmettle.local_sessions s JOIN openmettle.native_handoffs g ON g.session_id=s.id").fetch_one(&mut f.owner).await.unwrap();
     assert_eq!(result, (true, true));

@@ -37,8 +37,8 @@ fn hash(fields: &[&[u8]]) -> [u8; 32] {
 /// Downstream session audience, separate from the pending-code registration. It names the
 /// deployment issuer, native client, exact app link and the provider UUID and issuer. It
 /// omits the provider configuration binding and upstream callback, so routine upstream
-/// epoch and trust maintenance leave it unchanged. Replicas with the same inputs share it.
-/// Version 1 of a domain-separated, length-prefixed SHA-256 digest.
+/// epoch and trust maintenance keep delivered sessions (ADR 0013). Replicas with the same
+/// inputs share it. Version 1 of a domain-separated, length-prefixed SHA-256 digest.
 fn audience(provider: &ManagedProvider, issuer: &str, client: &str, redirect: &Url) -> [u8; 32] {
     Sha256::digest(crate::runs::identity(
         b"openmettle/native-session-audience/1\0",
@@ -312,7 +312,7 @@ impl NativeAuth {
             started.caller_binding.expose(),
             self.auth.config.login_lifetime().as_secs()
         );
-        handoff::redirect(started.authorization_url.expose(), &cookie)
+        handoff::redirect(started.authorization_url.expose(), Some(&cookie))
     }
     pub async fn callback(&self, request: &Parts) -> Response<&'static str> {
         if request.method != Method::GET
@@ -366,20 +366,23 @@ impl NativeAuth {
             Ok(proof) => proof,
             Err(error) => return handoff::login_failure(error.into()),
         };
-        let code = match self.auth.issue_delivery(&provider, proof).await {
-            Ok(sessions::Delivery::NativeCode(code)) => code,
+        let pending = match self.auth.issue_delivery(&provider, proof).await {
+            Ok(sessions::Delivery::NativeCode(pending)) => pending,
             Ok(sessions::Delivery::Browser(_)) => return refused(),
             Err(error) => return session_failure(error),
+        };
+        // Last monotonic check of the grant deadline. Nothing below awaits.
+        let Some(code) = pending.release() else {
+            return refused();
         };
         let mut link = self.redirect.clone();
         link.query_pairs_mut()
             .append_pair("code", &code)
             .append_pair("state", state)
             .append_pair("iss", &self.issuer);
-        handoff::redirect(
-            link.as_str(),
-            "__Host-openmettle-native-login=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Lax",
-        )
+        // No Set-Cookie. Deleting the single temporary cookie here could erase the binding
+        // of a newer overlapping attempt. It expires with the login lifetime.
+        handoff::redirect(link.as_str(), None)
     }
 
     pub async fn redeem(&self, request: Redemption<'_>) -> Result<Credential, Error> {
@@ -401,7 +404,14 @@ impl NativeAuth {
         tokio::time::timeout(policy.deadline(), async {
             self.provider.check_active().map_err(|_| Error::Rejected)?;
             let mut db = Checkout::acquire(&self.auth.pool).await?;
-            let result = native::redeem(db.lend(), &code, &self.registration, &challenge).await;
+            let result = native::redeem(
+                db.lend(),
+                &code,
+                &self.registration,
+                &self.audience,
+                &challenge,
+            )
+            .await;
             db.settle(session_settled(&result));
             let bearer = result?;
             self.provider.check_active().map_err(|_| Error::Rejected)?;
@@ -416,8 +426,12 @@ impl NativeAuth {
         let _slot = self.operations.try_acquire().map_err(|_| Error::Capacity)?;
         tokio::time::timeout(self.auth.config.session_policy().deadline(), async {
             let mut db = Checkout::acquire(&self.auth.pool).await?;
-            let result =
-                sessions::validate_inner(db.lend(), bearer, Validation::NativeBearer).await;
+            let result = sessions::validate_inner(
+                db.lend(),
+                bearer,
+                Validation::NativeBearer(self.audience),
+            )
+            .await;
             db.settle(session_settled(&result));
             result
         })
@@ -430,7 +444,9 @@ impl NativeAuth {
         let policy = self.auth.config.session_policy();
         tokio::time::timeout(policy.deadline(), async {
             let mut db = Checkout::acquire(&self.auth.pool).await?;
-            let result = sessions::logout_channel(db.lend(), bearer, policy, Channel::Native).await;
+            let result =
+                sessions::logout_channel(db.lend(), bearer, policy, Channel::Native(self.audience))
+                    .await;
             db.settle(session_settled(&result));
             result
         })

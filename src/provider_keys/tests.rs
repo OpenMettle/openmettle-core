@@ -57,8 +57,12 @@ fn token(new: bool) -> UnverifiedIdToken {
 fn nonce() -> ExpectedNonceDigest {
     ExpectedNonceDigest::new(Sha256::digest("n".repeat(43).as_bytes()).into())
 }
+/// One armed upstream authorization: its exact `redirect_uri` and the ID token for its nonce.
+struct Authorization {
+    callback: String,
+    token: String,
+}
 struct Script {
-    native_callback: Option<String>,
     metadata: Value,
     keys: Vec<u8>,
     cache: String,
@@ -66,8 +70,11 @@ struct Script {
     date: std::time::SystemTime,
     mode: &'static str,
     token: String,
-    // PKCE challenge from a real managed begin; None keeps the fixed fixture verifier.
-    challenge: Option<String>,
+    // Armed authorizations by upstream PKCE challenge. Empty keeps the fixed fixture verifier,
+    // the registered callback and `token`.
+    authorizations: HashMap<String, Authorization>,
+    // Upstream challenges whose token POST was accepted, in arrival order.
+    exchanged: Vec<String>,
     gate: Arc<tokio::sync::Notify>,
 }
 struct Harness {
@@ -89,7 +96,6 @@ impl Harness {
     async fn with_endpoints(policy: RefreshPolicy, authorization: &str, callback: &str) -> Self {
         let ca = tls::Ca::new();
         let script = Arc::new(Mutex::new(Script {
-            native_callback: None,
             gate: Arc::default(),
             metadata: Value::Null,
             keys: signing::jwks(),
@@ -97,7 +103,8 @@ impl Harness {
             metadata_cache: "max-age=100".into(),
             date: signing::now(),
             mode: "ok",
-            challenge: None,
+            authorizations: HashMap::new(),
+            exchanged: Vec::new(),
             token: signing::signed(
                 &"n".repeat(43),
                 signing::ISSUER,
@@ -108,7 +115,7 @@ impl Harness {
         let data = script.clone();
         let registered_callback = callback.to_owned();
         let server=tls::Server::start(ca.leaf(tls::HOST,false),move |request|{
-            let s=data.lock().unwrap();
+            let mut s=data.lock().unwrap();
             let discovery=request.head.starts_with("GET /discovery ");let jwks=request.head.starts_with("GET /jwks ");
             if s.mode=="stall" || s.mode=="post-stall" && !discovery && !jwks {return tls::Reply::Stall(vec![]);}
             if s.mode=="redirect" {return tls::Reply::Bytes(tls::response(302,&[("location","https://unconfigured.example.test/jwks")],b""));}
@@ -117,13 +124,23 @@ impl Harness {
                 assert!(request.head.starts_with("POST /token "));
                 let params:HashMap<String,String>=openidconnect::url::form_urlencoded::parse(&request.body).into_owned().collect();
                 assert!(params["code"] == "synthetic-code", "authorization code mismatch");
+                assert!(params["client_id"] == signing::CLIENT, "client binding mismatch");
                 let verifier = &params["code_verifier"];
-                match &s.challenge {
-                    Some(challenge) => assert!(URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())) == *challenge, "PKCE mismatch"),
-                    None => assert!(*verifier == "v".repeat(43), "fixture verifier mismatch"),
-                }
-                assert!(params["client_id"] == signing::CLIENT && (params["redirect_uri"] == registered_callback || Some(&params["redirect_uri"]) == s.native_callback.as_ref()), "client binding mismatch");
-                let bytes=tls::json(&serde_json::to_vec(&json!({"access_token":"synthetic-access","token_type":"Bearer","id_token":s.token})).unwrap());
+                // The verifier selects exactly one armed authorization. Its recorded callback is
+                // the only accepted redirect_uri; another configured callback is refused.
+                let token = if s.authorizations.is_empty() {
+                    assert!(*verifier == "v".repeat(43), "fixture verifier mismatch");
+                    assert!(params["redirect_uri"] == registered_callback, "callback binding mismatch");
+                    s.token.clone()
+                } else {
+                    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+                    let armed = s.authorizations.get(&challenge).expect("PKCE mismatch");
+                    assert!(params["redirect_uri"] == armed.callback, "callback binding mismatch");
+                    let token = armed.token.clone();
+                    s.exchanged.push(challenge);
+                    token
+                };
+                let bytes=tls::json(&serde_json::to_vec(&json!({"access_token":"synthetic-access","token_type":"Bearer","id_token":token})).unwrap());
                 return if s.mode=="gate-post" {tls::Reply::Gate(s.gate.clone(),bytes)} else {tls::Reply::Bytes(bytes)};
             }
             assert!(request.body.is_empty());

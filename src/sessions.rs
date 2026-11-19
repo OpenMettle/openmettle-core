@@ -98,23 +98,27 @@ impl fmt::Debug for Context {
         f.write_str("SessionContext(..)")
     }
 }
+/// Native variants carry the session audience of the serving registration (ADR 0023). The
+/// bearer's stored audience must equal it in the same transaction as validation or logout.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Channel {
     Browser,
-    Native,
+    Native([u8; 32]),
 }
 #[derive(Clone, Copy)]
 pub(crate) enum Validation {
     Browser,
-    NativePending,
-    NativeExchange,
-    NativeBearer,
+    NativePending([u8; 32]),
+    NativeExchange([u8; 32]),
+    NativeBearer([u8; 32]),
 }
 impl Validation {
     fn channel(self) -> Channel {
         match self {
             Self::Browser => Channel::Browser,
-            _ => Channel::Native,
+            Self::NativePending(audience)
+            | Self::NativeExchange(audience)
+            | Self::NativeBearer(audience) => Channel::Native(audience),
         }
     }
 }
@@ -122,7 +126,7 @@ fn digest(channel: Channel, id: &str, secret: &[u8; 32]) -> [u8; 32] {
     Sha256::digest(crate::runs::identity(
         match channel {
             Channel::Browser => b"openmettle/session-secret/1\0",
-            Channel::Native => b"openmettle/native-session-secret/1\0",
+            Channel::Native(_) => b"openmettle/native-session-secret/1\0",
         },
         &[id.as_bytes(), secret],
     ))
@@ -281,7 +285,7 @@ async fn resolve_identity(
 }
 pub(crate) enum Delivery {
     Browser(Credential),
-    NativeCode(String),
+    NativeCode(native::Release),
 }
 impl Delivery {
     pub(crate) fn browser(self) -> Result<Credential, Error> {
@@ -298,16 +302,19 @@ pub(crate) async fn issue(
     policy: &Policy,
     check: impl Fn() -> Result<Duration, Error>,
 ) -> Result<Delivery, Error> {
-    let validation = if input.native.is_some() {
-        Validation::NativePending
+    let validation = if let Some(native) = input.native {
+        Validation::NativePending(native.audience)
     } else {
         Validation::Browser
     };
     let deadline = input.deadline.min(Instant::now() + policy.deadline);
     tokio::time::timeout_at(deadline, async {
-        check()?;
+        // The proof budget becomes a monotonic bound before the first await. Later wall-clock
+        // changes cannot extend it, and each later check() can only shorten what remains.
+        let started = Instant::now();
+        let proof_deadline = (started + check()?).min(deadline);
         let mut tx = transaction(c).await?;
-        let result: Result<(Credential, Option<String>), Error> = async {
+        let result: Result<(Credential, Option<native::Release>), Error> = async {
         let gate = sqlx::query("SELECT binding,expires_ms,consumed,session_issued FROM openmettle.login_transactions WHERE id=$1 FOR UPDATE")
             .bind(input.login).fetch_optional(tx.connection()?).await?.ok_or(Error::Rejected)?;
         if !gate.try_get::<bool,_>("consumed")? || gate.try_get::<bool,_>("session_issued")?
@@ -326,6 +333,8 @@ pub(crate) async fn issue(
             .bind(&approval).fetch_one(tx.connection()?).await?;
         let u = sqlx::query("SELECT disabled_at IS NOT NULL AS disabled,session_generation FROM openmettle.users WHERE id=$1::uuid FOR NO KEY UPDATE")
             .bind(&user).fetch_one(tx.connection()?).await?;
+        // Each monotonic sample is taken before its primary clock query is sent.
+        let issued_at = Instant::now();
         let timestamp = now(tx.connection()?).await?;
         let approval_expiry: i64 = a.try_get("expires_ms")?;
         if !a.try_get::<bool,_>("active")? || u.try_get::<bool,_>("disabled")?
@@ -349,12 +358,14 @@ pub(crate) async fn issue(
             .bind(timestamp).bind(expiry).execute(tx.connection()?).await?;
         sqlx::query("UPDATE openmettle.login_transactions SET session_issued=true WHERE id=$1")
             .bind(input.login).execute(tx.connection()?).await?;
+        let mut final_at = Instant::now();
         let mut final_time = now(tx.connection()?).await?;
         if membership_expiry.is_some_and(|expiry| final_time >= expiry) {
             // Keep both the newer signed high-water and any completed removal. Only
             // the mapped evidence expired while issuing this exact-approval session.
             sqlx::query("UPDATE openmettle.membership_observations SET observation.state='stale' WHERE approval_id=$1::uuid")
                 .bind(&approval).execute(tx.connection()?).await?;
+            final_at = Instant::now();
             final_time = now(tx.connection()?).await?;
         }
         if invitation_cutoff.is_some_and(|cutoff| final_time >= cutoff)
@@ -365,11 +376,17 @@ pub(crate) async fn issue(
         }
         let remaining = check()?;
         let code = if let Some(native) = input.native {
-            // The grant ends with the login, the session, the proof and this operation.
-            let budget = remaining.min(native::MAX_LIFETIME).min(deadline.saturating_duration_since(Instant::now()));
+            // The grant ends with the login, the session, the proof and this operation. The
+            // stored expiry is primary milliseconds. The release deadline converts it to the
+            // monotonic clock from both paired samples, so a lock wait, a rollback or
+            // wall-clock skew after a sample cannot extend it.
+            let budget = remaining.min(native::MAX_LIFETIME).min(proof_deadline.saturating_duration_since(Instant::now()));
             let until = input.login_expiry.min(expiry).min(final_time.saturating_add(budget.as_millis() as i64));
             if until <= final_time { return Err(Error::Rejected); }
-            let code = native.store(tx.connection()?, &id, &credential, until).await?;
+            let release_by = native::primary_deadline(issued_at, until - timestamp)
+                .min(native::primary_deadline(final_at, until - final_time))
+                .min(proof_deadline);
+            let code = native.store(tx.connection()?, &id, &credential, until, release_by).await?;
             check()?;
             Some(code)
         } else { None };
@@ -382,7 +399,12 @@ pub(crate) async fn issue(
         validate_inner(c, credential.expose(), validation).await?;
         check()?;
         if Instant::now() >= deadline { return Err(Error::Timeout); }
-        Ok(match code { Some(code) => Delivery::NativeCode(code), None => Delivery::Browser(credential) })
+        match code {
+            // The caller rechecks the same deadline when it releases the code.
+            Some(code) if code.live() => Ok(Delivery::NativeCode(code)),
+            Some(_) => Err(Error::Rejected),
+            None => Ok(Delivery::Browser(credential)),
+        }
     }).await.map_err(|_| Error::Timeout)?
 }
 
@@ -444,18 +466,20 @@ pub(crate) async fn validate_inner(
         .bind(id).bind(hash.as_slice()).bind(timestamp).fetch_optional(tx.connection()?).await?.ok_or(Error::Rejected)?;
     match validation {
         Validation::Browser => {}
-        Validation::NativeBearer => {
-            sqlx::query("SELECT session_id FROM openmettle.native_handoffs WHERE session_id=$1 AND sealed IS NULL")
-                .bind(id).fetch_optional(tx.connection()?).await?.ok_or(Error::Rejected)?;
+        Validation::NativeBearer(audience) => {
+            // A delivered bearer is usable only through its own audience. Routine upstream
+            // changes keep the audience, and another registration never matches it.
+            sqlx::query("SELECT session_id FROM openmettle.native_handoffs WHERE session_id=$1 AND audience=$2 AND sealed IS NULL")
+                .bind(id).bind(audience.as_slice()).fetch_optional(tx.connection()?).await?.ok_or(Error::Rejected)?;
         }
-        Validation::NativePending | Validation::NativeExchange => {
+        Validation::NativePending(audience) | Validation::NativeExchange(audience) => {
             // Pending grants require the original provider epoch, including across replicas.
             // The first observation precedes code delivery, the second follows the claim commit.
             sqlx::query("SELECT g.session_id FROM openmettle.native_handoffs g
                          JOIN openmettle.local_sessions s ON s.id=g.session_id
-                         WHERE s.id=$1 AND (g.sealed IS NULL)=$2 AND g.expires_ms > $3
+                         WHERE s.id=$1 AND (g.sealed IS NULL)=$2 AND g.expires_ms > $3 AND g.audience=$4
                          AND s.issued_epoch=(SELECT max(epoch) FROM openmettle.login_provider_revisions WHERE provider_id=s.provider_id)")
-                .bind(id).bind(matches!(validation, Validation::NativeExchange)).bind(timestamp)
+                .bind(id).bind(matches!(validation, Validation::NativeExchange(_))).bind(timestamp).bind(audience.as_slice())
                 .fetch_optional(tx.connection()?).await?.ok_or(Error::Rejected)?;
         }
     }
@@ -490,9 +514,10 @@ pub(crate) async fn logout_channel(
             if !matches(stored.as_deref(), &hash) {
                 return Err(Error::Rejected);
             }
-            if channel == Channel::Native {
-                sqlx::query("SELECT session_id FROM openmettle.native_handoffs WHERE session_id=$1 AND sealed IS NULL")
-                    .bind(id).fetch_optional(tx.connection()?).await?.ok_or(Error::Rejected)?;
+            // Possession and the serving audience. Current eligibility is not required.
+            if let Channel::Native(audience) = channel {
+                sqlx::query("SELECT session_id FROM openmettle.native_handoffs WHERE session_id=$1 AND audience=$2 AND sealed IS NULL")
+                    .bind(id).bind(audience.as_slice()).fetch_optional(tx.connection()?).await?.ok_or(Error::Rejected)?;
             }
             sqlx::query("UPDATE openmettle.local_sessions SET revoked=true WHERE id=$1")
                 .bind(id)
@@ -545,7 +570,7 @@ mod tests {
             parse(Channel::Browser, value.expose()).unwrap(),
             (id.as_str(), hash)
         );
-        let (_, native_digest) = parse(Channel::Native, value.expose()).unwrap();
+        let (_, native_digest) = parse(Channel::Native([0; 32]), value.expose()).unwrap();
         assert!(!matches(Some(&hash), &native_digest));
         assert!(matches(Some(&hash), &hash));
         assert!(!matches(None, &[0; 32]));

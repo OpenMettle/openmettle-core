@@ -172,20 +172,28 @@ pub(super) fn wrong_method(allow: &'static str) -> Response<&'static str> {
         .insert(header::ALLOW, HeaderValue::from_static(allow));
     response
 }
-/// `303` with one cookie. Both header values are marked sensitive: they stay out of `Debug`
-/// output, and an HTTP/2 encoder that honors the mark does not index them.
-pub(super) fn redirect(location: &str, cookie: &str) -> Response<&'static str> {
+/// `303` with at most one cookie. Both header values are marked sensitive: they stay out of
+/// `Debug` output, and an HTTP/2 encoder that honors the mark does not index them. Without a
+/// cookie the response neither sets nor deletes one (the native app link, ADR 0023).
+pub(super) fn redirect(location: &str, cookie: Option<&str>) -> Response<&'static str> {
     let sensitive = |value: &str| {
         let mut value = HeaderValue::from_str(value).ok()?;
         value.set_sensitive(true);
         Some(value)
     };
-    let (Some(location), Some(cookie)) = (sensitive(location), sensitive(cookie)) else {
+    let Some(location) = sensitive(location) else {
         return Refusal::Unavailable.response();
+    };
+    let cookie = match cookie.map(sensitive) {
+        Some(None) => return Refusal::Unavailable.response(),
+        Some(cookie) => cookie,
+        None => None,
     };
     let mut response = respond(StatusCode::SEE_OTHER, "");
     response.headers_mut().insert(header::LOCATION, location);
-    response.headers_mut().insert(header::SET_COOKIE, cookie);
+    if let Some(cookie) = cookie {
+        response.headers_mut().insert(header::SET_COOKIE, cookie);
+    }
     response
 }
 // Exhaustive, so a new service category must be classified before the crate compiles.
@@ -504,7 +512,11 @@ impl LoginHandoff {
         };
         redirect(
             started.authorization_url.expose(),
-            &caller_cookie(locator, started.caller_binding.expose(), self.login_seconds),
+            Some(&caller_cookie(
+                locator,
+                started.caller_binding.expose(),
+                self.login_seconds,
+            )),
         )
     }
 
@@ -548,9 +560,10 @@ impl LoginHandoff {
             code,
         };
         match self.auth.complete(&self.settings.provider, callback).await {
-            Ok(credential) => {
-                redirect(&self.settings.landing, &session_cookie(credential.expose()))
-            }
+            Ok(credential) => redirect(
+                &self.settings.landing,
+                Some(&session_cookie(credential.expose())),
+            ),
             Err(error) => login_failure(error),
         }
     }
@@ -632,7 +645,7 @@ mod tests {
                 ),
             ),
         ] {
-            let response = redirect(location, &cookie);
+            let response = redirect(location, Some(&cookie));
             assert_eq!(
                 (response.status(), *response.body()),
                 (StatusCode::SEE_OTHER, "")
@@ -656,11 +669,28 @@ mod tests {
                 assert!(!debug.contains(secret));
             }
         }
+        // The native app-link redirect sets and deletes no cookie and keeps the other headers.
+        let link = format!("https://links.example.test/app?code={credential}");
+        let response = redirect(&link, None);
+        let headers = response.headers();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(!headers.contains_key(header::SET_COOKIE));
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_eq!(headers[header::REFERRER_POLICY], "no-referrer");
+        assert_eq!(headers.len(), 3);
+        assert_eq!(headers[header::LOCATION], link.as_str());
+        assert!(headers[header::LOCATION].is_sensitive());
+        assert!(!format!("{response:?}").contains(&credential));
         // A value that cannot be a header never becomes a partial redirect.
-        let broken = redirect("https://app.example.test/app", "name=line\nbreak");
-        assert_eq!(broken.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(!broken.headers().contains_key(header::LOCATION));
-        assert!(!broken.headers().contains_key(header::SET_COOKIE));
+        for broken in [
+            redirect("https://app.example.test/app", Some("name=line\nbreak")),
+            redirect("https://links.example.test/a\nb", Some("name=value")),
+            redirect("https://links.example.test/a\nb", None),
+        ] {
+            assert_eq!(broken.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!broken.headers().contains_key(header::LOCATION));
+            assert!(!broken.headers().contains_key(header::SET_COOKIE));
+        }
     }
 
     const CODE: &str = "omh1-0123-4567-89ab-cdef-fedc-ba98-7654-3210";

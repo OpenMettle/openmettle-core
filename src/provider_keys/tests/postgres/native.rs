@@ -7,9 +7,11 @@ use super::super::{
 use super::*;
 use crate::{
     auth_config::AuthConfig,
-    browser_auth::{BrowserAuth, native::NativeAuth, router::Rate},
+    browser_auth::{BrowserAuth, handoff::SESSION_COOKIE, native::NativeAuth, router::Rate},
+    response_barrier::ResponseBarrier,
 };
 use openidconnect::url::Url;
+use sqlx::PgPool;
 use std::net::SocketAddr;
 
 const CALLBACK: &str = "https://app.example.test/native/callback";
@@ -17,6 +19,75 @@ const LINK: &str = "https://links.example.test/app";
 const CLIENT: &str = "synthetic.mobile";
 const VERIFIER: &str = "0123456789abcdefghijklmnopqrstuvwxyz-._~ABCDEFGHIJK";
 const REFUSED: &str = "native sign-in refused\n";
+const NOW_MS: &str = "SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint";
+
+/// One downstream native registration on the shared deployment issuer.
+#[derive(Clone, Copy)]
+struct Registration {
+    client: &'static str,
+    link: &'static str,
+    callback: &'static str,
+}
+const A: Registration = Registration {
+    client: CLIENT,
+    link: LINK,
+    callback: CALLBACK,
+};
+// A second app on the same deployment, provider and primary database. Its upstream callback
+// is separately registered with the synthetic provider.
+const B: Registration = Registration {
+    client: "synthetic.tablet",
+    link: "https://links.example.test/tablet",
+    callback: "https://app.example.test/native/tablet/callback",
+};
+
+/// The app's own attempt values. They never reach the provider.
+struct App {
+    registration: Registration,
+    verifier: String,
+    state: String,
+}
+impl App {
+    fn new(registration: Registration, seed: u8) -> Self {
+        Self {
+            registration,
+            verifier: format!("{VERIFIER}{seed:03}"),
+            state: URL_SAFE_NO_PAD.encode([seed; 32]),
+        }
+    }
+    fn challenge(&self) -> String {
+        URL_SAFE_NO_PAD.encode(Sha256::digest(self.verifier.as_bytes()))
+    }
+    fn target(&self) -> String {
+        let r = self.registration;
+        format!(
+            "/auth/native/authorize?response_type=code&client_id={}&redirect_uri={}&code_challenge_method=S256&state={}&code_challenge={}",
+            r.client,
+            r.link,
+            self.state,
+            self.challenge()
+        )
+    }
+    fn callback(&self, upstream_state: &str) -> String {
+        format!(
+            "{}?iss={}&state={upstream_state}&code=synthetic-code",
+            &self.registration.callback[ORIGIN.len()..],
+            signing::ISSUER
+        )
+    }
+    fn redeem(&self, code: &str) -> Value {
+        let r = self.registration;
+        json!({"grant_type":"authorization_code","iss":ORIGIN,"client_id":r.client,"redirect_uri":r.link,"code_verifier":self.verifier,"code":code})
+    }
+}
+/// Upstream values of one managed login, as the browser saw them.
+struct Started {
+    location: String,
+    cookie: String,
+    state: String,
+    challenge: String,
+}
+
 const FORM_REFUSED: &str = "native sign-in request refused\n";
 const BODY_REFUSED: &str = "native sign-in request body not accepted\n";
 const BODY_NOT_RECEIVED: &str = "native sign-in request body not received\n";
@@ -45,15 +116,62 @@ async fn role_boundaries(f: &mut Flow) {
         denied(f.api.execute(sql).await.unwrap_err());
     }
 }
-fn profile(auth: Arc<BrowserAuth>) -> NativeAuth {
-    NativeAuth::new(auth, signing::ID, ORIGIN, CALLBACK, CLIENT, LINK, 8).unwrap()
+fn native(auth: Arc<BrowserAuth>, r: Registration) -> NativeAuth {
+    NativeAuth::new(auth, signing::ID, ORIGIN, r.callback, r.client, r.link, 8).unwrap()
 }
-fn form(verifier: &str) -> String {
-    let state = URL_SAFE_NO_PAD.encode([3; 32]);
-    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-    format!(
-        "/auth/native/authorize?response_type=code&client_id={CLIENT}&redirect_uri={LINK}&code_challenge_method=S256&state={state}&code_challenge={challenge}"
-    )
+fn profile(auth: Arc<BrowserAuth>) -> NativeAuth {
+    native(auth, A)
+}
+async fn mount(auth: Arc<BrowserAuth>, r: Registration) -> SocketAddr {
+    serve(native(auth, r).router(limits().begin).unwrap()).await
+}
+/// Another process: its own provider manager, the fixture clock and `pool`.
+fn replica(f: &Flow, pool: PgPool, login_lifetime: Duration) -> Arc<BrowserAuth> {
+    let (manager, provider) = f.restart();
+    Arc::new(BrowserAuth::new(
+        AuthConfig::fixture(
+            keys(),
+            login_lifetime,
+            sessions::session_policy(),
+            manager,
+            vec![provider],
+        ),
+        pool,
+    ))
+}
+/// A one-slot pool whose only backend runs through `barrier`. The backend is opened before
+/// any counted reply. A replacement after a discarded connection bypasses the barrier.
+async fn proxied(f: &Flow, barrier: &ResponseBarrier) -> PgPool {
+    let pool = pooled::one_slot(
+        f.db.options(API)
+            .host("127.0.0.1")
+            .port(barrier.port)
+            .ssl_mode(sqlx::postgres::PgSslMode::Disable),
+    );
+    sqlx::query("SELECT 1").execute(&pool).await.unwrap();
+    pool.set_connect_options(f.db.options(API));
+    pool
+}
+fn exchanged(f: &Flow) -> Vec<String> {
+    f.h.script.lock().unwrap().exchanged.clone()
+}
+async fn primary_ms(owner: &mut PgConnection) -> i64 {
+    sqlx::query_scalar(NOW_MS).fetch_one(owner).await.unwrap()
+}
+async fn wait_past(owner: &mut PgConnection, expiry: i64) {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while primary_ms(owner).await <= expiry {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("primary clock did not pass the grant expiry");
+}
+/// No code, bearer, redirect or cookie of any kind.
+fn nothing_released(reply: &Reply) {
+    assert_eq!((reply.status, reply.body.as_str()), (403, REFUSED));
+    assert!(reply.all("set-cookie").is_empty());
+    assert!(reply.all("location").is_empty());
 }
 /// The confirmed `POST` from a page on `origin`. A non-empty `body` is declared and carried
 /// as the confirmation form.
@@ -65,105 +183,106 @@ fn confirm(target: &str, origin: &str, body: &str) -> String {
     let headers = [("origin", origin), FORM_TYPE, ("content-length", &length)];
     head("POST", target, &headers) + body
 }
-async fn start(address: SocketAddr) -> (String, String) {
-    let (_, location, cookie) = start_with(address, "").await;
-    (location, cookie)
+async fn start(address: SocketAddr, app: &App) -> Started {
+    start_with(address, app, "").await.1
 }
-/// One confirmed start whose form is `body`: the reply, the provider URL and the cookie pair.
-async fn start_with(address: SocketAddr, body: &str) -> (Reply, String, String) {
-    let target = form(VERIFIER);
-    let response = send(address, &confirm(&target, ORIGIN, body)).await;
+/// One confirmed start whose form is `body`: the reply and the upstream values in it.
+async fn start_with(address: SocketAddr, app: &App, body: &str) -> (Reply, Started) {
+    let response = send(address, &confirm(&app.target(), ORIGIN, body)).await;
     assert_eq!(response.status, 303);
-    let location = response.one("location");
-    let params: HashMap<_, _> = Url::parse(location)
-        .unwrap()
-        .query_pairs()
-        .into_owned()
-        .collect();
-    assert_eq!(params["redirect_uri"], CALLBACK);
-    assert_ne!(
-        params["code_challenge"],
-        URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes()))
-    );
-    let cookie = response
-        .one("set-cookie")
-        .split(';')
-        .next()
-        .unwrap()
-        .to_owned();
-    assert!(!location.contains(cookie.split('.').nth(1).unwrap()));
-    let location = location.to_owned();
-    (response, location, cookie)
-}
-/// The provider approves and the system browser follows the upstream callback.
-async fn finish(f: &Flow, address: SocketAddr, location: &str, cookie: &str) -> Reply {
-    f.arm_url(location);
-    let state = Url::parse(location)
-        .unwrap()
-        .query_pairs()
-        .find(|(name, _)| name == "state")
-        .expect("state parameter")
-        .1
-        .into_owned();
-    let target = format!(
-        "/native/callback?iss={}&state={state}&code=synthetic-code",
-        signing::ISSUER
-    );
-    send(address, &head("GET", &target, &[("cookie", cookie)])).await
-}
-/// The handoff code in a completed callback: the app link with exactly its three parameters.
-fn delivered(reply: &Reply) -> String {
-    assert_eq!(reply.status, 303);
-    let url = Url::parse(reply.one("location")).unwrap();
-    assert!(url.as_str().starts_with(&format!("{LINK}?")));
-    assert_eq!(url.query_pairs().count(), 3);
-    let params: HashMap<_, _> = url.query_pairs().into_owned().collect();
-    assert_eq!(params["state"], URL_SAFE_NO_PAD.encode([3; 32]));
-    assert_eq!(params["iss"], ORIGIN);
-    assert_eq!(params["code"].len(), 43);
-    params["code"].clone()
-}
-async fn complete(
-    f: &Flow,
-    start_at: SocketAddr,
-    finish_at: SocketAddr,
-) -> super::super::router::Reply {
-    let (location, cookie) = start(start_at).await;
-    f.arm_url(&location);
+    let location = response.one("location").to_owned();
     let params: HashMap<_, _> = Url::parse(&location)
         .unwrap()
         .query_pairs()
         .into_owned()
         .collect();
-    let target = format!(
-        "/native/callback?iss={}&state={}&code=synthetic-code",
-        signing::ISSUER,
-        params["state"]
+    assert_eq!(params["redirect_uri"], app.registration.callback);
+    assert_eq!(params["code_challenge_method"], "S256");
+    // Upstream state and PKCE are fresh per login and independent of the app's values.
+    assert_ne!(params["code_challenge"], app.challenge());
+    assert_ne!(params["state"], app.state);
+    let (cookie, attributes) = response.one("set-cookie").split_once(';').unwrap();
+    assert!(attributes.starts_with(" Max-Age="));
+    assert!(attributes.ends_with("; Path=/; Secure; HttpOnly; SameSite=Lax"));
+    let value = cookie
+        .strip_prefix("__Host-openmettle-native-login=")
+        .unwrap();
+    let parts: Vec<&str> = value.split('.').collect();
+    let (locator, _) = params["state"].split_once('.').unwrap();
+    assert_eq!(
+        (parts.len(), parts[0], parts[2], parts[3]),
+        (4, locator, app.challenge().as_str(), app.state.as_str())
     );
+    assert!(!location.contains(parts[1]));
+    let started = Started {
+        cookie: cookie.to_owned(),
+        state: params["state"].clone(),
+        challenge: params["code_challenge"].clone(),
+        location,
+    };
+    (response, started)
+}
+async fn complete(f: &Flow, app: &App, start_at: SocketAddr, finish_at: SocketAddr) -> Reply {
+    let started = start(start_at, app).await;
+    f.arm_url(&started.location);
+    let upstream = exchanged(f);
+    let target = app.callback(&started.state);
     let send_callback = |cookie: &str| head("GET", &target, &[("cookie", cookie)]);
     let wrong_issuer = target.replace(signing::ISSUER, "https://other.example.test");
-    assert_eq!(
-        send(
+    nothing_released(
+        &send(
             finish_at,
-            &head("GET", &wrong_issuer, &[("cookie", &cookie)])
+            &head("GET", &wrong_issuer, &[("cookie", &started.cookie)]),
         )
-        .await
-        .status,
-        403
+        .await,
+    );
+    // The app's own state is not the upstream state.
+    nothing_released(
+        &send(
+            finish_at,
+            &send_callback(&started.cookie).replace(&started.state, &app.state),
+        )
+        .await,
     );
     // Attempt substitution changes the managed login's authenticated transaction binding.
-    let (prefix, _) = cookie.rsplit_once('.').unwrap();
+    let (prefix, _) = started.cookie.rsplit_once('.').unwrap();
     let tampered = format!("{prefix}.{}", URL_SAFE_NO_PAD.encode([4; 32]));
     assert_eq!(send(finish_at, &send_callback(&tampered)).await.status, 403);
-    let reply = send(finish_at, &send_callback(&cookie)).await;
-    assert_eq!(send(start_at, &send_callback(&cookie)).await.status, 403);
+    assert_eq!(exchanged(f), upstream);
+    let reply = send(finish_at, &send_callback(&started.cookie)).await;
+    let replay = send(start_at, &send_callback(&started.cookie)).await;
+    assert_eq!(replay.status, 403);
+    assert!(replay.all("set-cookie").is_empty() && replay.all("location").is_empty());
+    // The callback never sets or deletes a cookie, whatever its outcome.
+    assert!(reply.all("set-cookie").is_empty());
+    let after = exchanged(f);
+    if reply.status == 303 {
+        // One token POST, bound to this login's upstream challenge and exact callback.
+        assert_eq!(after[..upstream.len()], upstream[..]);
+        assert_eq!(after[upstream.len()..], [started.challenge]);
+    } else {
+        assert!(after.len() <= upstream.len() + 1);
+    }
     reply
 }
-async fn code(f: &Flow, start_at: SocketAddr, finish_at: SocketAddr) -> String {
-    delivered(&complete(f, start_at, finish_at).await)
+/// The app-link redirect: exactly code, the app's state and the deployment issuer.
+fn link_code(reply: &Reply, app: &App) -> String {
+    assert_eq!(reply.status, 303);
+    assert!(reply.all("set-cookie").is_empty());
+    let url = Url::parse(reply.one("location")).unwrap();
+    assert!(
+        url.as_str()
+            .starts_with(&format!("{}?", app.registration.link))
+    );
+    assert_eq!(url.query_pairs().count(), 3);
+    let params: HashMap<_, _> = url.query_pairs().into_owned().collect();
+    assert_eq!(params["state"], app.state);
+    assert_eq!(params["iss"], ORIGIN);
+    assert_eq!(params["code"].len(), 43);
+    params["code"].clone()
 }
-fn redeem(code: &str) -> Value {
-    json!({"grant_type":"authorization_code","iss":ORIGIN,"client_id":CLIENT,"redirect_uri":LINK,"code_verifier":VERIFIER,"code":code})
+async fn code(f: &Flow, app: &App, start_at: SocketAddr, finish_at: SocketAddr) -> String {
+    link_code(&complete(f, app, start_at, finish_at).await, app)
 }
 fn post(input: &Value) -> String {
     // Native serializers can escape slashes in JSON URL strings.
@@ -177,25 +296,47 @@ fn post(input: &Value) -> String {
         ],
     ) + &body
 }
+fn bearer(reply: &Reply) -> String {
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.one("cache-control"), "no-store");
+    assert!(reply.all("set-cookie").is_empty());
+    let json: Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(json.as_object().unwrap().len(), 2);
+    assert_eq!(json["token_type"], "Bearer");
+    json["access_token"].as_str().unwrap().to_owned()
+}
+async fn status(address: SocketAddr, method: &str, route: &str, bearer: &str) -> u16 {
+    let target = format!("/auth/native/{route}");
+    let authorization = format!("Bearer {bearer}");
+    send(
+        address,
+        &head(method, &target, &[("authorization", &authorization)]),
+    )
+    .await
+    .status
+}
+/// Valid through each listed replica of its own registration. Refused for validation and
+/// logout through `foreign`, and that refused logout leaves it valid.
+async fn isolated(own: &[SocketAddr], foreign: SocketAddr, bearer: &str) {
+    assert_eq!(status(foreign, "GET", "session", bearer).await, 403);
+    assert_eq!(status(foreign, "POST", "logout", bearer).await, 403);
+    for at in own {
+        assert_eq!(status(*at, "GET", "session", bearer).await, 204);
+    }
+}
 async fn services(f: &Flow) -> (Arc<BrowserAuth>, SocketAddr, SocketAddr) {
-    f.h.script.lock().unwrap().native_callback = Some(CALLBACK.into());
     let pool = pooled::one_slot(f.db.options(API));
     let auth = Arc::new(pooled::service_over(f, &pool));
-    let (manager, provider) = f.restart();
-    let replica = Arc::new(BrowserAuth::new(
-        AuthConfig::fixture(
-            keys(),
-            Duration::from_secs(300),
-            sessions::session_policy(),
-            manager,
-            vec![provider],
-        ),
+    let replica = replica(
+        f,
         pooled::one_slot(f.db.options(API)),
-    ));
-    let a = serve(profile(auth.clone()).router(limits().begin).unwrap()).await;
-    let b = serve(profile(replica).router(limits().begin).unwrap()).await;
+        Duration::from_secs(300),
+    );
+    let a = mount(auth.clone(), A).await;
+    let b = mount(replica, A).await;
     (auth, a, b)
 }
+
 #[tokio::test]
 #[ignore = "isolated CI PostgreSQL 18 required"]
 async fn two_replicas_deliver_once_with_exact_pkce_registration_and_channel() {
@@ -203,7 +344,16 @@ async fn two_replicas_deliver_once_with_exact_pkce_registration_and_channel() {
     role_boundaries(&mut f).await;
     sessions::seed(&mut f, true, true).await;
     let (auth, a, b) = services(&f).await;
-    let request = redeem(&code(&f, a, b).await);
+    let app = App::new(A, 3);
+    let request = app.redeem(&code(&f, &app, a, b).await);
+    // The downstream verifier never reaches the provider.
+    assert!(
+        !f.h.script
+            .lock()
+            .unwrap()
+            .authorizations
+            .contains_key(&app.challenge())
+    );
     for (field, value) in [
         ("client_id", "other"),
         ("redirect_uri", "https://other.example.test/app"),
@@ -212,39 +362,26 @@ async fn two_replicas_deliver_once_with_exact_pkce_registration_and_channel() {
     ] {
         let mut wrong = request.clone();
         wrong[field] = value.into();
-        assert_eq!(send(a, &post(&wrong)).await.status, 403);
+        nothing_released(&send(a, &post(&wrong)).await);
     }
     let req = post(&request);
     let (one, two) = tokio::join!(send(a, &req), send(b, &req));
-    let ok = match (one.status, two.status) {
-        (200, 403) => one,
-        (403, 200) => two,
+    // Exactly one cross-replica claimant receives the bearer. The other gets no cookie,
+    // redirect or token.
+    let (ok, lost) = match (one.status, two.status) {
+        (200, 403) => (one, two),
+        (403, 200) => (two, one),
         _ => panic!("exactly one redemption must win"),
     };
-    assert_eq!(ok.one("cache-control"), "no-store");
-    assert!(ok.all("set-cookie").is_empty());
-    let json: Value = serde_json::from_str(&ok.body).unwrap();
-    assert_eq!(json.as_object().unwrap().len(), 2);
-    let bearer = json["access_token"].as_str().unwrap();
-    assert_eq!(send(b, &req).await.status, 403);
-    assert!(auth.validate(bearer).await.is_err());
-    assert!(auth.logout(bearer).await.is_err());
+    nothing_released(&lost);
+    let bearer = bearer(&ok);
+    nothing_released(&send(b, &req).await);
+    assert!(auth.validate(&bearer).await.is_err());
+    assert!(auth.logout(&bearer).await.is_err());
     let browser = sessions::issue(&mut f).await;
     for (route, method) in [("session", "GET"), ("logout", "POST")] {
         let target = format!("/auth/native/{route}");
-        assert_eq!(
-            send(
-                a,
-                &head(
-                    method,
-                    &target,
-                    &[("authorization", &format!("Bearer {}", browser.expose()))]
-                )
-            )
-            .await
-            .status,
-            403
-        );
+        assert_eq!(status(a, method, route, browser.expose()).await, 403);
         assert_eq!(
             send(
                 a,
@@ -258,33 +395,9 @@ async fn two_replicas_deliver_once_with_exact_pkce_registration_and_channel() {
             .status,
             403
         );
-        assert_eq!(
-            send(
-                a,
-                &head(
-                    method,
-                    &target,
-                    &[("authorization", &format!("Bearer {bearer}"))]
-                )
-            )
-            .await
-            .status,
-            204
-        );
+        assert_eq!(status(a, method, route, &bearer).await, 204);
     }
-    assert_eq!(
-        send(
-            b,
-            &head(
-                "GET",
-                "/auth/native/session",
-                &[("authorization", &format!("Bearer {bearer}"))]
-            )
-        )
-        .await
-        .status,
-        403
-    );
+    assert_eq!(status(b, "GET", "session", &bearer).await, 403);
     auth.validate(browser.expose()).await.unwrap();
     let empty: bool = sqlx::query_scalar("SELECT sealed IS NULL FROM openmettle.native_handoffs")
         .fetch_one(&mut f.owner)
@@ -295,17 +408,376 @@ async fn two_replicas_deliver_once_with_exact_pkce_registration_and_channel() {
 
 #[tokio::test]
 #[ignore = "isolated CI PostgreSQL 18 required"]
+async fn registrations_isolate_codes_bearers_and_logout_across_revisions() {
+    let mut f = Flow::new().await;
+    let user = sessions::seed(&mut f, true, true).await;
+    let (auth, a1, a2) = services(&f).await;
+    let b = mount(auth, B).await;
+    let (mobile, tablet) = (App::new(A, 7), App::new(B, 8));
+    let mobile_code = code(&f, &mobile, a1, a2).await;
+    let tablet_code = code(&f, &tablet, b, b).await;
+    // Replicas of one registration store one audience. Registrations differ in both values.
+    let distinct: (i64, i64) = sqlx::query_as(
+        "SELECT count(DISTINCT audience), count(DISTINCT registration) FROM openmettle.native_handoffs",
+    )
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(distinct, (2, 2));
+    // Neither registration redeems the other's code: with the code's own registration fields,
+    // or with the serving registration's fields and the original verifier.
+    for (owner, code, serving, at) in [
+        (&mobile, &mobile_code, &tablet, b),
+        (&tablet, &tablet_code, &mobile, a1),
+    ] {
+        nothing_released(&send(at, &post(&owner.redeem(code))).await);
+        let mut substituted = serving.redeem(code);
+        substituted["code_verifier"] = owner.verifier.clone().into();
+        nothing_released(&send(at, &post(&substituted)).await);
+    }
+    let mobile_bearer = bearer(&send(a2, &post(&mobile.redeem(&mobile_code))).await);
+    let tablet_bearer = bearer(&send(b, &post(&tablet.redeem(&tablet_code))).await);
+    isolated(&[a1, a2], b, &mobile_bearer).await;
+    isolated(&[b], a1, &tablet_bearer).await;
+    isolated(&[b], a2, &tablet_bearer).await;
+
+    // Routine provider and approval revisions fence a pending code but keep delivered sessions
+    // in their own audience only.
+    let pending = App::new(A, 9);
+    let pending_code = code(&f, &pending, a1, a2).await;
+    write(&mut f.owner, Some("v2")).await;
+    f.owner
+        .execute("UPDATE openmettle.local_identity_approvals SET revision=revision+1,change_reason='routine extension',expires_ms=expires_ms+1000")
+        .await
+        .unwrap();
+    write(&mut f.owner, Some("v1")).await;
+    nothing_released(&send(a1, &post(&pending.redeem(&pending_code))).await);
+    isolated(&[a1, a2], b, &mobile_bearer).await;
+    isolated(&[b], a1, &tablet_bearer).await;
+
+    // New logins after the revisions, then sign-out through the owning registration.
+    let (mobile_late, tablet_late) = (App::new(A, 10), App::new(B, 11));
+    let code_late = code(&f, &mobile_late, a2, a1).await;
+    let mobile_late = bearer(&send(a1, &post(&mobile_late.redeem(&code_late))).await);
+    let code_late = code(&f, &tablet_late, b, b).await;
+    let tablet_late = bearer(&send(b, &post(&tablet_late.redeem(&code_late))).await);
+    assert_eq!(status(a2, "POST", "logout", &mobile_bearer).await, 204);
+    for at in [a1, a2] {
+        assert_eq!(status(at, "GET", "session", &mobile_bearer).await, 403);
+    }
+    assert_eq!(status(b, "GET", "session", &tablet_bearer).await, 204);
+    assert_eq!(status(b, "POST", "logout", &tablet_bearer).await, 204);
+    assert_eq!(status(b, "GET", "session", &tablet_bearer).await, 403);
+
+    // Owner sign-out still works for a disabled user, and for a retired, unreachable provider.
+    // A foreign registration still cannot sign either bearer out.
+    crate::sessions::disable_user(&mut f.api, &user, 0, &sessions::session_policy())
+        .await
+        .unwrap();
+    assert_eq!(status(a1, "GET", "session", &mobile_late).await, 403);
+    assert_eq!(status(b, "POST", "logout", &mobile_late).await, 403);
+    assert_eq!(status(a1, "POST", "logout", &mobile_late).await, 204);
+    write(&mut f.owner, None).await;
+    f.h.script.lock().unwrap().mode = "failure";
+    let requests = f.h.count();
+    assert_eq!(status(a1, "POST", "logout", &tablet_late).await, 403);
+    assert_eq!(status(b, "POST", "logout", &tablet_late).await, 204);
+    assert_eq!(f.h.count(), requests);
+    let revoked: Vec<bool> = sqlx::query_scalar(
+        "SELECT s.revoked FROM openmettle.local_sessions s
+         JOIN openmettle.native_handoffs g ON g.session_id=s.id ORDER BY g.sealed IS NULL, s.created_ms",
+    )
+    .fetch_all(&mut f.owner)
+    .await
+    .unwrap();
+    // The fenced pending grant was never delivered or revoked. Every delivered bearer was
+    // revoked only by its own registration.
+    assert_eq!(revoked, [false, true, true, true, true]);
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn overlapping_attempt_keeps_its_binding_cookie_and_completes() {
+    let mut f = Flow::new().await;
+    sessions::seed(&mut f, true, true).await;
+    let (_, a, b) = services(&f).await;
+    let (first, second) = (App::new(A, 5), App::new(A, 6));
+    let older = start(a, &first).await;
+    f.arm_url(&older.location);
+    let posts = pooled::posts(&f);
+    let gate = f.h.script.lock().unwrap().gate.clone();
+    f.h.script.lock().unwrap().mode = "gate-post";
+    // An unrelated browser session credential travels with the callback. It must stay untouched.
+    let cookies = format!(
+        "{}; {SESSION_COOKIE}=synthetic-browser-session",
+        older.cookie
+    );
+    let request = head(
+        "GET",
+        &first.callback(&older.state),
+        &[("cookie", &cookies)],
+    );
+    let callback = send(b, &request);
+    tokio::pin!(callback);
+    let newer = tokio::select! {
+        reply = &mut callback => panic!("callback ended before its token response: {}", reply.status),
+        newer = async {
+            // Callback A is held at its token response while initiation B replaces the cookie.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while pooled::posts(&f) == posts {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("token POST not received");
+            let newer = start(a, &second).await;
+            f.arm_url(&newer.location);
+            f.h.script.lock().unwrap().mode = "ok";
+            gate.notify_one();
+            newer
+        } => newer,
+    };
+    let older_code = link_code(&callback.await, &first);
+    // Replays of A, with its own cookie and with the newer cookie the browser now holds,
+    // release nothing and set or delete no cookie.
+    for cookie in [cookies.as_str(), newer.cookie.as_str()] {
+        let replay = send(
+            b,
+            &head("GET", &first.callback(&older.state), &[("cookie", cookie)]),
+        )
+        .await;
+        assert_eq!(replay.status, 403);
+        assert!(replay.all("set-cookie").is_empty() && replay.all("location").is_empty());
+    }
+    let reply = send(
+        a,
+        &head(
+            "GET",
+            &second.callback(&newer.state),
+            &[("cookie", &newer.cookie)],
+        ),
+    )
+    .await;
+    let newer_code = link_code(&reply, &second);
+    bearer(&send(a, &post(&first.redeem(&older_code))).await);
+    bearer(&send(b, &post(&second.redeem(&newer_code))).await);
+    assert_eq!(exchanged(&f), [older.challenge, newer.challenge]);
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn grant_expiry_during_final_validation_acknowledgement_releases_no_code() {
+    let mut f = Flow::new().await;
+    sessions::seed(&mut f, true, true).await;
+    // A three-second login lifetime clips the grant. The session (60 s), assertion (about
+    // 290 s on the fixture clock) and the 5 s exchange and 10 s session deadlines outlast it.
+    let lifetime = Duration::from_secs(3);
+    let initiating = Arc::new(service::browser_auth(
+        &f.h,
+        pooled::one_slot(f.db.options(API)),
+        lifetime,
+        sessions::session_policy(),
+    ));
+    let a = mount(initiating, A).await;
+    // On the callback replica's only backend: consume, issuance, then final validation commit.
+    let mut barrier = ResponseBarrier::nth(b"COMMIT\0", 3);
+    let pool = proxied(&f, &barrier).await;
+    let b = mount(replica(&f, pool.clone(), lifetime), A).await;
+    let app = App::new(A, 14);
+    let started = start(a, &app).await;
+    f.arm_url(&started.location);
+    let request = head(
+        "GET",
+        &app.callback(&started.state),
+        &[("cookie", &started.cookie)],
+    );
+    let callback = send(b, &request);
+    tokio::pin!(callback);
+    tokio::select! {
+        () = barrier.wait_reached() => {},
+        reply = &mut callback => panic!("callback ended before the validation barrier: {}", reply.status),
+    }
+    let (grant, session): (i64, i64) = sqlx::query_as(
+        "SELECT g.expires_ms, s.expires_ms FROM openmettle.native_handoffs g
+         JOIN openmettle.local_sessions s ON s.id=g.session_id",
+    )
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    wait_past(&mut f.owner, grant).await;
+    assert!(session > primary_ms(&mut f.owner).await + 10_000);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut callback)
+            .await
+            .is_err()
+    );
+    barrier.resume();
+    nothing_released(&callback.await);
+    let row: (bool, bool) = sqlx::query_as(
+        "SELECT g.sealed IS NOT NULL, s.revoked FROM openmettle.native_handoffs g
+         JOIN openmettle.local_sessions s ON s.id=g.session_id",
+    )
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(row, (true, false));
+    assert_eq!(exchanged(&f), [started.challenge]);
+    pool.close().await;
+    drop(barrier);
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn pending_grant_expiry_alone_refuses_while_session_is_unexpired() {
+    let mut f = Flow::new().await;
+    sessions::seed(&mut f, true, true).await;
+    let (_, a, _) = services(&f).await;
+    // Issuance: only the grant expires while the issuance COMMIT acknowledgement is held.
+    let mut barrier = ResponseBarrier::nth(b"COMMIT\0", 2);
+    let pool = proxied(&f, &barrier).await;
+    let b = mount(replica(&f, pool.clone(), Duration::from_secs(300)), A).await;
+    let app = App::new(A, 15);
+    let started = start(a, &app).await;
+    f.arm_url(&started.location);
+    let request = head(
+        "GET",
+        &app.callback(&started.state),
+        &[("cookie", &started.cookie)],
+    );
+    let callback = send(b, &request);
+    tokio::pin!(callback);
+    tokio::select! {
+        () = barrier.wait_reached() => {},
+        reply = &mut callback => panic!("callback ended before the issuance barrier: {}", reply.status),
+    }
+    f.owner
+        .execute(AssertSqlSafe(format!(
+            "UPDATE openmettle.native_handoffs SET expires_ms=({NOW_MS})"
+        )))
+        .await
+        .unwrap();
+    barrier.resume();
+    nothing_released(&callback.await);
+    pool.close().await;
+    drop(barrier);
+    // Redemption: a delivered code whose grant alone has expired.
+    let app = App::new(A, 16);
+    let code = code(&f, &app, a, a).await;
+    f.owner
+        .execute(AssertSqlSafe(format!(
+            "UPDATE openmettle.native_handoffs SET expires_ms=({NOW_MS})"
+        )))
+        .await
+        .unwrap();
+    nothing_released(&send(a, &post(&app.redeem(&code))).await);
+    let rows: Vec<(bool, bool, bool)> = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT g.sealed IS NOT NULL, NOT s.revoked, s.expires_ms > ({NOW_MS})
+         FROM openmettle.native_handoffs g JOIN openmettle.local_sessions s ON s.id=g.session_id"
+    )))
+    .fetch_all(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(rows, [(true, true, true); 2]);
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn withheld_claim_acknowledgement_releases_once_and_never_retries() {
+    let mut f = Flow::new().await;
+    sessions::seed(&mut f, true, true).await;
+    let (_, a, _) = services(&f).await;
+    // The claim commits on replica C, whose acknowledgement is withheld. A concurrent claimant
+    // on A receives nothing. C then delivers the bearer once.
+    let mut barrier = ResponseBarrier::new(b"COMMIT\0");
+    let pool = proxied(&f, &barrier).await;
+    let c = mount(replica(&f, pool.clone(), Duration::from_secs(300)), A).await;
+    let app = App::new(A, 12);
+    let request = post(&app.redeem(&code(&f, &app, a, a).await));
+    let held = send(c, &request);
+    tokio::pin!(held);
+    tokio::select! {
+        () = barrier.wait_reached() => {},
+        reply = &mut held => panic!("redemption ended before the claim barrier: {}", reply.status),
+    }
+    let claimed: bool = sqlx::query_scalar("SELECT sealed IS NULL FROM openmettle.native_handoffs")
+        .fetch_one(&mut f.owner)
+        .await
+        .unwrap();
+    assert!(claimed);
+    nothing_released(&send(a, &request).await);
+    barrier.resume();
+    let token = bearer(&held.await);
+    assert_eq!(status(a, "GET", "session", &token).await, 204);
+    nothing_released(&send(a, &request).await);
+    pool.close().await;
+    drop(barrier);
+
+    // The grant passes its expiry while the claim acknowledgement is withheld. Nothing is
+    // released, the claim is not retried and no new upstream exchange starts.
+    let short = Arc::new(service::browser_auth(
+        &f.h,
+        pooled::one_slot(f.db.options(API)),
+        Duration::from_secs(3),
+        sessions::session_policy(),
+    ));
+    let short = mount(short, A).await;
+    let mut barrier = ResponseBarrier::new(b"COMMIT\0");
+    let pool = proxied(&f, &barrier).await;
+    let c = mount(replica(&f, pool.clone(), Duration::from_secs(300)), A).await;
+    let app = App::new(A, 13);
+    let request = post(&app.redeem(&code(&f, &app, short, short).await));
+    let (posts, upstream) = (pooled::posts(&f), exchanged(&f));
+    let held = send(c, &request);
+    tokio::pin!(held);
+    tokio::select! {
+        () = barrier.wait_reached() => {},
+        reply = &mut held => panic!("redemption ended before the claim barrier: {}", reply.status),
+    }
+    const LATEST: &str = "SELECT g.expires_ms, s.expires_ms, g.sealed IS NULL, s.revoked
+        FROM openmettle.native_handoffs g JOIN openmettle.local_sessions s ON s.id=g.session_id
+        ORDER BY s.created_ms DESC LIMIT 1";
+    let (grant, session, _, _): (i64, i64, bool, bool) = sqlx::query_as(LATEST)
+        .fetch_one(&mut f.owner)
+        .await
+        .unwrap();
+    wait_past(&mut f.owner, grant).await;
+    assert!(session > primary_ms(&mut f.owner).await + 10_000);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut held)
+            .await
+            .is_err()
+    );
+    barrier.resume();
+    nothing_released(&held.await);
+    nothing_released(&send(a, &request).await);
+    assert_eq!((pooled::posts(&f), exchanged(&f)), (posts, upstream));
+    let (_, _, claimed, revoked): (i64, i64, bool, bool) = sqlx::query_as(LATEST)
+        .fetch_one(&mut f.owner)
+        .await
+        .unwrap();
+    assert_eq!((claimed, revoked), (true, false));
+    pool.close().await;
+    drop(barrier);
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
 async fn grant_expiry_withdrawal_disablement_and_retirement_prevent_delivery() {
     let mut f = Flow::new().await;
     let (_, a, b) = services(&f).await;
-    assert_eq!(complete(&f, a, b).await.status, 403);
+    assert_eq!(complete(&f, &App::new(A, 3), a, b).await.status, 403);
     let user = sessions::seed(&mut f, true, true).await;
-    for event in ["expiry", "withdraw", "disable", "retire"] {
-        let delivered = post(&redeem(&code(&f, a, b).await));
-        let ok = send(a, &delivered).await;
-        assert_eq!(ok.status, 200);
-        let token: Value = serde_json::from_str(&ok.body).unwrap();
-        let pending = post(&redeem(&code(&f, b, a).await));
+    for (seed, event) in [
+        (20, "expiry"),
+        (22, "withdraw"),
+        (24, "disable"),
+        (26, "retire"),
+    ] {
+        let delivered = App::new(A, seed);
+        let delivered = post(&delivered.redeem(&code(&f, &delivered, a, b).await));
+        let token = bearer(&send(a, &delivered).await);
+        let pending = App::new(A, seed + 1);
+        let pending = post(&pending.redeem(&code(&f, &pending, b, a).await));
         match event {
             "expiry" => {
                 f.owner.execute("UPDATE openmettle.native_handoffs SET expires_ms=1 WHERE sealed IS NOT NULL").await.unwrap();
@@ -332,23 +804,8 @@ async fn grant_expiry_withdrawal_disablement_and_retirement_prevent_delivery() {
                 write(&mut f.owner, Some("v1")).await;
             }
         }
-        assert_eq!(send(a, &pending).await.status, 403);
-        assert_eq!(
-            send(
-                b,
-                &head(
-                    "GET",
-                    "/auth/native/session",
-                    &[(
-                        "authorization",
-                        &format!("Bearer {}", token["access_token"].as_str().unwrap())
-                    )]
-                )
-            )
-            .await
-            .status,
-            403
-        );
+        nothing_released(&send(a, &pending).await);
+        assert_eq!(status(b, "GET", "session", &token).await, 403);
     }
 }
 
@@ -362,6 +819,7 @@ async fn confirmation_and_invalid_registrations_need_no_database_or_provider_req
         Duration::from_secs(60),
         sessions::session_policy(),
     ));
+    // Production app links are HTTPS only. A private scheme is never accepted here.
     for link in [
         "synthetic-app:/callback",
         "http://example.test/link",
@@ -389,7 +847,7 @@ async fn confirmation_and_invalid_registrations_need_no_database_or_provider_req
         .is_err()
     );
     let native = profile(auth);
-    let target = form(VERIFIER);
+    let target = App::new(A, 3).target();
     let response = native.authorize(&request("GET", &target, &[]), &[]).await;
     assert_eq!(response.status(), 200);
     assert_eq!(response.headers()["referrer-policy"], "same-origin");
@@ -456,6 +914,92 @@ async fn confirmation_and_invalid_registrations_need_no_database_or_provider_req
 }
 
 #[tokio::test]
+async fn preview_and_start_spend_separate_budgets_and_other_methods_spend_none() {
+    let h = Harness::new().await;
+    let (_listener, pool) = service::silent_database();
+    let auth = Arc::new(service::browser_auth(
+        &h,
+        pool,
+        Duration::from_secs(60),
+        sessions::session_policy(),
+    ));
+    let one = Rate {
+        burst: 1,
+        interval: Duration::from_secs(3600),
+    };
+    let address = serve(profile(auth.clone()).router(one).unwrap()).await;
+    let target = App::new(A, 3).target();
+    let callback = &CALLBACK[ORIGIN.len()..];
+    let routes: [(&str, &[&str]); 5] = [
+        (&target, &["GET", "POST"]),
+        (callback, &["GET"]),
+        ("/auth/native/token", &["POST"]),
+        ("/auth/native/session", &["GET"]),
+        ("/auth/native/logout", &["POST"]),
+    ];
+    // Unsupported methods are refused first, and spend no unit of any budget.
+    for (path, allowed) in routes {
+        for method in ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"] {
+            if !allowed.contains(&method) {
+                let reply = send(address, &head(method, path, &[])).await;
+                assert_eq!((reply.status, reply.body.as_str()), (403, REFUSED));
+            }
+        }
+    }
+    // With burst 1, the confirmation preview and its POST are both admitted. The silent
+    // database then refuses the started login.
+    assert_eq!(send(address, &head("GET", &target, &[])).await.status, 200);
+    let started = send(address, &head("POST", &target, &[("origin", ORIGIN)])).await;
+    assert_eq!(started.status, 503);
+    let limited = |reply: Reply| {
+        assert_eq!(
+            (reply.status, reply.body.as_str()),
+            (429, "native request rate exceeded\n")
+        );
+    };
+    limited(send(address, &head("GET", &target, &[])).await);
+    limited(send(address, &head("POST", &target, &[("origin", ORIGIN)])).await);
+    for (path, method) in [
+        (callback, "GET"),
+        ("/auth/native/token", "POST"),
+        ("/auth/native/session", "GET"),
+        ("/auth/native/logout", "POST"),
+    ] {
+        assert_eq!(send(address, &head(method, path, &[])).await.status, 403);
+        limited(send(address, &head(method, path, &[])).await);
+    }
+
+    // An unsupported method takes no request slot. One slot is held by a token body that
+    // never arrives, so a supported request is busy while an unsupported one is refused.
+    let native = NativeAuth::new(auth, signing::ID, ORIGIN, CALLBACK, CLIENT, LINK, 1).unwrap();
+    let address = serve(native.router(limits().begin).unwrap()).await;
+    let stalled = head(
+        "POST",
+        "/auth/native/token",
+        &[
+            ("content-type", "application/json"),
+            ("content-length", "64"),
+        ],
+    );
+    let stalled = tokio::spawn(async move { send(address, &stalled).await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while send(address, &head("GET", "/auth/native/session", &[]))
+            .await
+            .status
+            != 503
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("body slot was not taken");
+    let reply = send(address, &head("PUT", "/auth/native/session", &[])).await;
+    assert_eq!((reply.status, reply.body.as_str()), (403, REFUSED));
+    assert_eq!(stalled.await.unwrap().status, 403);
+    assert_eq!(h.count(), 2);
+}
+
+#[tokio::test]
 #[ignore = "isolated CI PostgreSQL 18 required"]
 async fn handoff_cannot_outlive_remaining_assertion_age_on_another_replica() {
     let mut f = Flow::new().await;
@@ -468,7 +1012,8 @@ async fn handoff_cannot_outlive_remaining_assertion_age_on_another_replica() {
     }
     f.h.advance(288);
     let (_, a, b) = services(&f).await;
-    let pending = redeem(&code(&f, a, b).await);
+    let app = App::new(A, 3);
+    let pending = app.redeem(&code(&f, &app, a, b).await);
     let clipped: bool = sqlx::query_scalar(
         "SELECT g.expires_ms <= floor(extract(epoch FROM clock_timestamp())*1000)::bigint + 2000
             AND g.expires_ms < s.expires_ms AND g.expires_ms < l.expires_ms
@@ -480,7 +1025,7 @@ async fn handoff_cannot_outlive_remaining_assertion_age_on_another_replica() {
     .unwrap();
     assert!(clipped);
     tokio::time::sleep(Duration::from_millis(2050)).await;
-    assert_eq!(send(a, &post(&pending)).await.status, 403);
+    nothing_released(&send(a, &post(&pending)).await);
     assert_eq!(pooled::posts(&f), 1);
 }
 
@@ -495,9 +1040,8 @@ async fn native_http_refusals_do_not_checkout_or_exchange() {
         sessions::session_policy(),
     ));
     let address = serve(profile(auth).router(limits().begin).unwrap()).await;
-    let mut input = redeem(&URL_SAFE_NO_PAD.encode([9; 32]));
-    // The six members are named. A positional array of the same values and an object that
-    // lacks any one member are refused.
+    let app = App::new(A, 3);
+    let mut input = app.redeem(&URL_SAFE_NO_PAD.encode([9; 32]));
     let fields = [
         "grant_type",
         "iss",
@@ -506,6 +1050,8 @@ async fn native_http_refusals_do_not_checkout_or_exchange() {
         "code",
         "code_verifier",
     ];
+    // The six members are named. A positional array of the same values and an object that
+    // lacks any one member are refused.
     let positional = Value::Array(fields.iter().map(|field| input[*field].clone()).collect());
     assert_eq!(send(address, &post(&positional)).await.status, 403);
     for field in fields {
@@ -584,7 +1130,7 @@ async fn confirmed_start_takes_one_bounded_invitation_form_before_any_service_wo
         interval: Duration::from_secs(3600),
     };
     let address = serve(profile(auth).router(rate).unwrap()).await;
-    let target = form(VERIFIER);
+    let target = App::new(A, 3).target();
     let coded = format!("invitation_code={CODE}");
     let declared = |headers: &[(&str, &str)]| {
         let mut all = vec![("origin", ORIGIN)];
@@ -673,45 +1219,56 @@ async fn confirmed_start_takes_one_bounded_invitation_form_before_any_service_wo
 
 /// One complete native sign-in whose confirmation form is `body`.
 struct SignIn {
+    app: App,
     /// The login's public locator.
     login: String,
     start: Reply,
     callback: Reply,
 }
-async fn sign_in(f: &mut Flow, address: SocketAddr, body: &str) -> SignIn {
-    let (start, location, cookie) = start_with(address, body).await;
-    let login = cookie
-        .split_once('=')
-        .and_then(|(_, value)| value.split('.').next())
-        .expect("cookie locator")
-        .to_owned();
-    // The stored login is sealed at one length whatever the form carried, and it carries
-    // the native binding layout that migration 14 admits.
-    let stored: (i32, bool) = sqlx::query_as(
+/// `(ciphertext bytes, native binding layout)` of a stored login.
+async fn stored_login(f: &mut Flow, login: &str) -> (i32, bool) {
+    sqlx::query_as(
         "SELECT octet_length(ciphertext),
                 substring(binding FROM 1 FOR 34)
                     = convert_to('openmettle/native-managed-login/1', 'SQL_ASCII') || '\\x00'::bytea
            FROM openmettle.login_transactions WHERE id = $1",
     )
-    .bind(&login)
+    .bind(login)
     .fetch_one(&mut f.owner)
     .await
-    .unwrap();
-    assert_eq!(stored, (76, true));
-    let callback = finish(f, address, &location, &cookie).await;
+    .unwrap()
+}
+async fn sign_in(f: &mut Flow, address: SocketAddr, seed: u8, body: &str) -> SignIn {
+    let app = App::new(A, seed);
+    let (start, started) = start_with(address, &app, body).await;
+    let login = started.state.split_once('.').unwrap().0.to_owned();
+    // The stored login is sealed at one length whatever the form carried, and it carries
+    // the native binding layout that migration 14 admits.
+    assert_eq!(stored_login(f, &login).await, (76, true));
+    f.arm_url(&started.location);
+    let request = head(
+        "GET",
+        &app.callback(&started.state),
+        &[("cookie", &started.cookie)],
+    );
+    let callback = send(address, &request).await;
     SignIn {
+        app,
         login,
         start,
         callback,
     }
 }
 /// Redeems a delivered code and validates the bearer through `native`: the signed-in user.
-async fn delivered_user(native: &NativeAuth, address: SocketAddr, reply: &Reply) -> String {
-    let token = send(address, &post(&redeem(&delivered(reply)))).await;
-    assert_eq!(token.status, 200);
-    let token: Value = serde_json::from_str(&token.body).unwrap();
-    let bearer = token["access_token"].as_str().expect("bearer");
-    let context = native.validate(bearer).await.unwrap();
+async fn delivered_user(
+    native: &NativeAuth,
+    address: SocketAddr,
+    app: &App,
+    reply: &Reply,
+) -> String {
+    let code = link_code(reply, app);
+    let token = bearer(&send(address, &post(&app.redeem(&code))).await);
+    let context = native.validate(&token).await.unwrap();
     context.user_id().to_owned()
 }
 /// `(pending, redeemed by this login)` over every invitation.
@@ -745,7 +1302,7 @@ async fn first_native_sign_in_needs_the_invitation_code_entered_in_the_confirmat
 
     // Nobody is invited. A person who enters a well-formed code completes the provider
     // sign-in and is refused at the callback. This is the reference refusal.
-    let uninvited = sign_in(&mut f, a, &format!("invitation_code={CODE}")).await;
+    let uninvited = sign_in(&mut f, a, 30, &format!("invitation_code={CODE}")).await;
     uninvited.callback.refused(403, REFUSED);
     assert_eq!(
         login_state(&mut f, &uninvited.login).await,
@@ -768,31 +1325,28 @@ async fn first_native_sign_in_needs_the_invitation_code_entered_in_the_confirmat
     // code and a code no invitation has. Each sign-in starts like any other, is refused with
     // exactly the reply an uninvited person gets, spends its login and leaves both
     // invitations pending.
-    for (attempt, body) in [
-        "",
-        "invitation_code=",
-        wrong.as_str(),
-        another.as_str(),
-        unassigned.as_str(),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let refused = sign_in(&mut f, a, body).await;
+    for (seed, body) in [
+        (31, ""),
+        (32, "invitation_code="),
+        (33, wrong.as_str()),
+        (34, another.as_str()),
+        (35, unassigned.as_str()),
+    ] {
+        let refused = sign_in(&mut f, a, seed, body).await;
         assert_eq!(
             start_shape(&refused.start),
             start_shape(&uninvited.start),
-            "{attempt}"
+            "{seed}"
         );
         assert_eq!(
             observable(&refused.callback),
             observable(&uninvited.callback),
-            "{attempt}"
+            "{seed}"
         );
         assert_eq!(
             login_state(&mut f, &refused.login).await,
             (true, true, false),
-            "{attempt}"
+            "{seed}"
         );
         empty(&mut f).await;
         pending(&mut f, 2).await;
@@ -803,7 +1357,7 @@ async fn first_native_sign_in_needs_the_invitation_code_entered_in_the_confirmat
     // A malformed code and a code in the query are refused at the start: no login row and
     // no provider request.
     let (rows, requests) = (f.rows().await, f.h.count());
-    let target = form(VERIFIER);
+    let target = App::new(A, 39).target();
     for body in ["invitation_code=omh1-0123", "code=0123"] {
         send(a, &confirm(&target, ORIGIN, body))
             .await
@@ -818,13 +1372,11 @@ async fn first_native_sign_in_needs_the_invitation_code_entered_in_the_confirmat
 
     // A new sign-in with the correct code, typed as displayed, creates the account. The
     // callback finishes on the other replica.
-    let (start, location, cookie) = start_with(a, &correct).await;
+    let app = App::new(A, 40);
+    let (start, started) = start_with(a, &app, &correct).await;
     assert_eq!(start_shape(&start), start_shape(&uninvited.start));
-    let login = cookie
-        .split_once('=')
-        .and_then(|(_, value)| value.split('.').next())
-        .expect("cookie locator")
-        .to_owned();
+    let login = started.state.split_once('.').unwrap().0.to_owned();
+    assert_eq!(stored_login(&mut f, &login).await, (76, true));
     // The stored login holds the code only inside its ciphertext.
     let visible: bool = sqlx::query_scalar(
         "SELECT position(encode($1, 'hex') IN to_jsonb(t)::text) > 0
@@ -839,7 +1391,13 @@ async fn first_native_sign_in_needs_the_invitation_code_entered_in_the_confirmat
         !visible,
         "the login row shows the code outside its ciphertext"
     );
-    let reply = finish(&f, b, &location, &cookie).await;
+    f.arm_url(&started.location);
+    let request = head(
+        "GET",
+        &app.callback(&started.state),
+        &[("cookie", &started.cookie)],
+    );
+    let reply = send(b, &request).await;
     // The app link carries the handoff code, the app state and the issuer, and nothing of
     // the invitation code.
     let hex: String = code.bytes().iter().map(|b| format!("{b:02x}")).collect();
@@ -847,7 +1405,7 @@ async fn first_native_sign_in_needs_the_invitation_code_entered_in_the_confirmat
         !reply.one("location").contains(&hex),
         "the app link repeats the invitation code"
     );
-    let user = delivered_user(&native, b, &reply).await;
+    let user = delivered_user(&native, b, &app, &reply).await;
     assert_eq!(login_state(&mut f, &login).await, (true, true, true));
     let accounts = sessions::account_state(&mut f).await;
     assert_eq!(accounts.len(), 3); // one user, one identity, one private scope
@@ -856,15 +1414,17 @@ async fn first_native_sign_in_needs_the_invitation_code_entered_in_the_confirmat
     // The identity now exists, so a code is ignored: the spent code, a wrong code, the other
     // pending invitation's code and no code all sign in to that one account through its
     // ordinary approval. The other invitation stays pending.
-    for (attempt, body) in [correct.as_str(), wrong.as_str(), another.as_str(), ""]
-        .into_iter()
-        .enumerate()
-    {
-        let again = sign_in(&mut f, a, body).await;
+    for (seed, body) in [
+        (41, correct.as_str()),
+        (42, wrong.as_str()),
+        (43, another.as_str()),
+        (44, ""),
+    ] {
+        let again = sign_in(&mut f, a, seed, body).await;
         assert_eq!(
-            delivered_user(&native, a, &again.callback).await,
+            delivered_user(&native, a, &again.app, &again.callback).await,
             user,
-            "{attempt}"
+            "{seed}"
         );
     }
     assert_eq!(sessions::account_state(&mut f).await, accounts);
@@ -875,7 +1435,7 @@ async fn first_native_sign_in_needs_the_invitation_code_entered_in_the_confirmat
         .await
         .unwrap();
     let disabled = sessions::account_state(&mut f).await;
-    let refused = sign_in(&mut f, a, &correct).await;
+    let refused = sign_in(&mut f, a, 45, &correct).await;
     assert_eq!(
         observable(&refused.callback),
         observable(&uninvited.callback)

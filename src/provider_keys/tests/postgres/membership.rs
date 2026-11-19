@@ -54,7 +54,10 @@ async fn exchange_with(
     f.arm(&started);
     let url = openidconnect::url::Url::parse(started.authorization_url.expose()).unwrap();
     let nonce = url.query_pairs().find(|(k, _)| k == "nonce").unwrap().1;
-    f.h.script.lock().unwrap().token = signing::membership_token(subject, &nonce, issued, claims);
+    f.rearm(
+        &started,
+        signing::membership_token(subject, &nonce, issued, claims),
+    );
     f.consume(p, &started)
         .await
         .unwrap()
