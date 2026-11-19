@@ -113,16 +113,16 @@ START_ATTEMPTS = 2
 def start(launch, attempts=START_ATTEMPTS):
     """Return the first browser that answers its version request, with its close action.
 
-    Runner Chrome occasionally never answers its first command. Only that start is retried:
-    a browser that stays silent, or whose pipe is lost before it answers, is closed and
-    `launch` is called again with the next attempt number, which selects a fresh profile.
-    Every other failure, and everything after the browser has answered, is never retried.
+    Runner Chrome occasionally never answers its first command. Only that silent start is
+    retried: the browser is closed and `launch` is called again with the next attempt
+    number, which selects a fresh profile. A browser that exits or loses its pipe, every
+    other failure, and everything after the browser has answered are never retried.
     """
     for attempt in range(1, attempts + 1):
         browser, close = launch(attempt)
         try:
             version = browser.call("Browser.getVersion")["product"]
-        except (TimeoutError, ConnectionError):
+        except TimeoutError:
             close()
             if attempt == attempts:
                 raise
@@ -180,6 +180,17 @@ def journey(browser, app, issuer, enter):
         raise Failure("signed-out session check")
 
 
+def chrome(home, attempt):
+    """The Chrome command for one start attempt. Each attempt has its own profile."""
+    rules = "MAP app.relying.test 127.0.0.1, MAP issuer.example.test 127.0.0.1, MAP * ~NOTFOUND"
+    # Chrome uses descriptors 3 and 4 for NUL-delimited commands and responses.
+    # Save stdin and stdout there, then disconnect normal browser logs from the pipe.
+    return ["sh", "-c", 'exec 3<&0 4>&1 </dev/null >/dev/null; exec "$@"', "chrome-pipe",
+            "google-chrome", "--headless", "--remote-debugging-pipe", "--no-first-run",
+            "--disable-background-networking", "--no-proxy-server",
+            f"--host-resolver-rules={rules}", f"--user-data-dir={home / f'profile-{attempt}'}"]
+
+
 def run(app, issuer, home, enter):
     enter("runner trust store")
     # Allowlist the child environment. Browser profile, NSS, cache, and crash files are private.
@@ -191,20 +202,13 @@ def run(app, issuer, home, enter):
                        (["-A", "-a", "-t", "C,,", "-n", "fixture"], sys.stdin.buffer.read())]:
         subprocess.run(certutil + args, input=data, env=env, check=True, timeout=5,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    rules = "MAP app.relying.test 127.0.0.1, MAP issuer.example.test 127.0.0.1, MAP * ~NOTFOUND"
 
     def launch(attempt):
-        # Chrome uses descriptors 3 and 4 for NUL-delimited commands and responses.
-        # Save stdin and stdout there, then disconnect normal browser logs from the pipe.
-        command = ["sh", "-c", 'exec 3<&0 4>&1 </dev/null >/dev/null; exec "$@"',
-                   "chrome-pipe", "google-chrome", "--headless", "--remote-debugging-pipe",
-                   "--no-first-run", "--disable-background-networking", "--no-proxy-server",
-                   f"--host-resolver-rules={rules}",
-                   f"--user-data-dir={home / f'profile-{attempt}'}"]
         parent, child = socket.socketpair()
         try:
             with child:
-                process = subprocess.Popen(command, env=env, stdin=child, stdout=child,
+                process = subprocess.Popen(chrome(home, attempt), env=env, stdin=child,
+                                           stdout=child,
                                            stderr=subprocess.DEVNULL, start_new_session=True)
         except BaseException:
             parent.close()
