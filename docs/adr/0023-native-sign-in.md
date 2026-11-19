@@ -57,8 +57,8 @@ encoding.
 The two digests change at different times. A router built from any other provider
 configuration, including a routine revision, endpoint or transport-trust change, has
 another registration digest, and a new provider epoch also fences a pending code. The
-audience changes only with the deployment issuer, client ID, app link or provider UUID.
-Replicas built from the same inputs share both.
+audience changes only with the deployment issuer, client ID, app link, provider UUID or
+provider issuer. Replicas built from the same inputs share both.
 
 ### Sign-in
 
@@ -207,19 +207,72 @@ code is 32 random bytes. AES-256-GCM seals the bearer under that code as a singl
 with the session locator as associated data. The database stores the code's SHA-256 and the
 ciphertext, so a database snapshot alone does not reveal the bearer.
 
-A code lives for at most 30 seconds, clipped to the login expiry, the session expiry, the
-remaining proof budget (token expiry, maximum token age and signing-key freshness) and the
-operation deadline.
+#### Stored grant lifetime
 
-The callback releases a code only before a conservative monotonic deadline. Issuance fixes
-the remaining proof budget on the monotonic clock before its first await. It pairs each
-primary-clock read with a monotonic sample taken before the query is sent, and discards one
-millisecond for the floored result. The release deadline is the earliest of the stored
-grant expiry converted through either sample and the proof budget. The code is held in a
-value that yields it only through that check, and the callback makes the check immediately
-before it writes the redirect. A late acknowledgement, a lock wait, a rollback or a
-wall-clock change can therefore only shorten the grant. A late callback answers the fixed
-`403` with no code, cookie or redirect.
+The stored expiry is what the app redeems against, on any replica. It is the earliest of
+four terms and nothing else:
+
+| Term | Reason |
+| --- | --- |
+| 30 seconds after the final primary-clock read of the issuing transaction | The delivery window |
+| The login expiry | The sign-in attempt has ended |
+| The session expiry | Nothing remains to deliver |
+| The remaining age of the ID token: its expiry and its maximum age | A bearer is never first delivered on a proof that is no longer acceptable |
+
+With ordinary login and session lifetimes the app has the full 30 seconds for the redirect,
+the operating system's link delivery, its own launch and the token request. A sign-in that
+completes within 30 seconds of its login expiry, or on an ID token within 30 seconds of its
+age limit, has a correspondingly shorter window.
+
+Three bounds of the issuing process are deliberately **not** terms of the stored grant:
+
+- the freshness of its signing-key snapshot (ADR 0011), including the reuse window for
+  documents that refuse caching;
+- the provider HTTP deadline of 10 ms–60 s, which starts before the token request;
+- the session operation deadline (ADRs 0013 and 0016).
+
+They must not bound redemption, for these reasons:
+
+- **They belong to one process, not to the grant.** Redemption makes no provider request
+  and uses no signing key. It can run on another replica, which has its own snapshot and
+  deadlines and cannot evaluate the issuing replica's.
+- **They were satisfied when it mattered.** The ID token was verified, and the session
+  committed, while all three held. The code delivers that already-issued session. A browser
+  session from the same proof is not bounded by them after issuance either (ADR 0013).
+- **What must end a pending code is decided from the database at redemption:** the
+  registration, the issuing provider epoch, session eligibility and the stored expiry (see
+  Bearer). A configuration or trust change that should end pending codes is a provider
+  revision or retirement, which fences them. Routine key rotation at the provider ends no
+  session that is already issued, and so no pending code.
+- **Clipping to them made the window unreachable.** With a 5-second provider deadline and
+  1.5 seconds spent in the exchange and issuance, the app had about 3.5 seconds. With the
+  default 60-second reuse window, a snapshot has under 5 seconds left for 5 seconds in
+  every 60.
+
+#### Release from the issuing process
+
+The issuing process releases a code only before a conservative monotonic deadline. That
+deadline is the earliest of:
+
+- the stored expiry, converted to the monotonic clock through each of the two paired
+  samples below;
+- the process's proof budget: the ID token's remaining age, key freshness, the provider
+  HTTP deadline and the session operation deadline.
+
+Issuance fixes the proof budget, and separately the ID token's remaining age, on the
+monotonic clock before its first await. It pairs each primary-clock read with a monotonic
+sample taken before the query is sent, and discards one millisecond for the floored
+result. A late acknowledgement, a lock wait, a rollback or a wall-clock change can
+therefore only shorten either lifetime.
+
+The code is held in a value that yields it only through the deadline check. The callback
+makes that check immediately before it writes the redirect, and it is the authoritative
+one. Issuance also refuses a code whose deadline has passed when it returns. That earlier
+refusal is defence in depth: every case it refuses, the callback's check refuses too. A
+late callback answers the fixed `403` with no code, cookie or redirect.
+
+A code that misses the release deadline never leaves the process. Its stored grant remains
+until its own expiry and cannot be redeemed, because nothing else holds the code.
 
 Redemption matches the code digest, the S256 challenge and the registration, locks the row
 and clears the ciphertext under synchronous commit. It converts the remaining grant time
@@ -247,8 +300,8 @@ A pending code and a delivered session follow different rules:
 | Pending code | The registration digest and the issuing provider epoch, so every configuration change | Nothing |
 | Delivered session | Its audience, and the ADR 0013 rules: explicit revocation, retirement, withdrawal and disablement | Routine provider revisions, approval edits, and key or trust maintenance |
 
-Changing the deployment issuer, client ID, app link or provider UUID creates a new
-audience. Bearers of the old audience can then be neither validated nor signed out through
+Changing the deployment issuer, client ID, app link, provider UUID or provider issuer
+creates a new audience. Bearers of the old audience can then be neither validated nor signed out through
 the new registration. They end at expiry, or when the owner revokes or cleans up their
 sessions.
 
@@ -261,7 +314,7 @@ makes no provider request.
 | Budget | Value |
 | --- | --- |
 | Upstream login | The configured login lifetime of 1–600 seconds and the outstanding-login cap (ADR 0014) |
-| Handoff code | At most 30 seconds, clipped as described above |
+| Handoff code | At most 30 seconds, clipped only by the login expiry, the session expiry and the ID token's remaining age (Stored grant lifetime) |
 | Local session | The existing session policy (ADR 0013). Retained sessions per user include both channels and undelivered sessions |
 | HTTP | 1–1024 requests in flight per native router. One rate budget per route and accepted method at the supplied rate, so the confirmation `GET` and the confirmed `POST` on `/auth/native/authorize` spend separately. The token body allows 8192 bytes and 2 seconds. The authorization query allows 4096 bytes. Request heads use the browser router's limits |
 | Database | The existing primary pool and session operation deadline |
@@ -272,8 +325,11 @@ makes no provider request.
   attempt in the same browser. An earlier attempt whose callback the browser has not yet
   sent can then no longer complete. No callback deletes the cookie: it expires with the
   login lifetime.
-- **An old audience cannot sign out.** After a change to the issuer, client ID, app link or
-  provider UUID, the bearers of the old audience last until expiry or owner cleanup.
+- **An old audience cannot sign out.** After a change to the deployment issuer, client ID,
+  app link, provider UUID or provider issuer, the bearers of the old audience last until
+  expiry or owner cleanup.
+- **An unreleased code leaves its row.** A code that misses the release deadline is never
+  delivered. Its session and grant rows stay, unredeemable, until expiry and cleanup.
 - **Expired undelivered rows** count toward retained-session capacity until the owner's
   session cleanup removes them (ADR 0013).
 - **No refresh credential.** The app signs in again when the session expires.
@@ -329,6 +385,17 @@ Local, without PostgreSQL:
   a redirect without a cookie carries no `Set-Cookie` and keeps the protected `Location`.
 - `sessions::native::tests`: the monotonic conversion discards one millisecond and never
   extends a spent remainder, and a code is not released at or after its deadline.
+- `sessions::native::tests::stored_grant_has_exactly_four_clips_and_the_process_deadline_is_not_one`:
+  the stored expiry is 30 seconds with 3.5 seconds, one second and nothing left of the
+  process budget; each of the four terms clips alone; a spent grant stores nothing.
+- `…::release_deadline_takes_the_earlier_sample_and_never_passes_the_process_deadline`: the
+  release deadline follows whichever sample is earlier and stops at the process budget
+  while the stored grant keeps 30 seconds.
+- `…::issuance_refuses_a_code_that_is_past_its_release_deadline`: issuance's own refusal,
+  apart from the callback's check.
+- `provider_keys::tests::proof_budget_reports_assertion_age_apart_from_key_freshness_and_the_deadline`:
+  with two seconds of a ten-second reuse window left, or half a second of the deadline,
+  the ID token's remaining age is reported unchanged and only the process budget shrinks.
 
 Reordering the form before `Origin`, treating a malformed form as no code, admitting the
 field in the query, naming the submit button, removing the read timeout, admitting every
@@ -337,7 +404,10 @@ one of these tests fail. So do admitting any provider code in the callback parse
 admitting a positional token request, and dropping any one of the app-link checks. So do
 sharing one budget between the methods of a route, letting an unsupported method reach a
 budget, adding a cookie to the cookie-less redirect, keeping the discarded millisecond and
-releasing a code at its deadline. This was checked by mutation.
+releasing a code at its deadline. So do clipping the stored expiry to the process budget,
+dropping the process budget from the release deadline, reporting the process budget as the
+ID token's age, and removing either issuance's refusal or the callback's check of a late
+code. This was checked by mutation.
 
 PostgreSQL and Chrome, in CI only:
 
@@ -370,6 +440,18 @@ PostgreSQL and Chrome, in CI only:
   `withheld_claim_acknowledgement_releases_once_and_never_retries`: a grant that expires
   while a commit acknowledgement is withheld releases no code and no bearer, although its
   session is unexpired.
+- `…::native::slow_exchange_under_the_provider_deadline_leaves_the_app_its_window`: the
+  token response takes 1.5 seconds of a 5-second provider deadline. The stored grant is
+  the full 30 seconds, and the app redeems after the provider deadline has passed.
+- `…::native::short_key_reuse_window_bounds_the_release_and_not_the_stored_grant`: with two
+  seconds of a ten-second reuse window left, the stored grant is the full 30 seconds and
+  is redeemed after the snapshot has expired. When the final validation's acknowledgement
+  is withheld past those two seconds, the callback releases nothing, although every later
+  proof check passes and the stored grant is whole.
+- `…::native::stored_audience_alone_refuses_a_pending_code_and_its_redemption`: the owner
+  changes a grant's stored audience and nothing else. Issuance's final validation then
+  releases no code, and a delivered code's redemption claims the grant and releases no
+  bearer. The same steps without the change succeed.
 - The synthetic provider accepts a token request only with the callback and PKCE challenge
   recorded for that authorization, so a login finished through another registration's
   callback fails at the provider as well.

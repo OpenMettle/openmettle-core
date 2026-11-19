@@ -647,7 +647,7 @@ impl ManagedProvider {
         key_generation: u64,
         assertion: &auth::VerifiedAssertion,
         deadline: Instant,
-    ) -> Result<Duration, Error> {
+    ) -> Result<crate::sessions::ProofBudget, Error> {
         #[cfg(test)]
         self.before_release();
         let mut s = self.entry.state.lock().unwrap();
@@ -669,9 +669,14 @@ impl ManagedProvider {
         let remaining = assertion
             .remaining(now.wall)
             .map_err(|_| Error::Verification)?;
-        Ok(remaining
-            .min(snapshot.expires - now.mono)
-            .min(deadline.saturating_duration_since(Instant::now())))
+        // The assertion's own age is reported apart from this process's key freshness and
+        // operation deadline, which never bound a stored native grant (ADR 0023).
+        Ok(crate::sessions::ProofBudget {
+            assertion: remaining,
+            process: remaining
+                .min(snapshot.expires - now.mono)
+                .min(deadline.saturating_duration_since(Instant::now())),
+        })
     }
     /// The configured provider UUID this handle was registered under.
     pub(crate) fn id(&self) -> &str {

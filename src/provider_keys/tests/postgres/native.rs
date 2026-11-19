@@ -680,6 +680,240 @@ async fn pending_grant_expiry_alone_refuses_while_session_is_unexpired() {
     assert_eq!(rows, [(true, true, true); 2]);
 }
 
+/// One callback request of `app`'s attempt, as the browser sends it.
+fn callback_request(app: &App, started: &Started) -> String {
+    head(
+        "GET",
+        &app.callback(&started.state),
+        &[("cookie", &started.cookie)],
+    )
+}
+/// The newest grant: its stored window from the session's creation, what remains of it now,
+/// whether its code is still unclaimed and whether its session is unrevoked.
+async fn newest_grant(owner: &mut PgConnection) -> (i64, i64, bool, bool) {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT g.expires_ms - s.created_ms, g.expires_ms - ({NOW_MS}), g.sealed IS NOT NULL,
+                NOT s.revoked
+         FROM openmettle.native_handoffs g JOIN openmettle.local_sessions s ON s.id=g.session_id
+         ORDER BY s.created_ms DESC LIMIT 1"
+    )))
+    .fetch_one(owner)
+    .await
+    .unwrap()
+}
+/// The full 30 s from the final clock read of issuance, which follows the session's creation
+/// inside one transaction.
+fn full_window(window: i64) {
+    assert!((30_000..40_000).contains(&window), "{window}");
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn slow_exchange_under_the_provider_deadline_leaves_the_app_its_window() {
+    let mut f = Flow::new().await;
+    sessions::seed(&mut f, true, true).await;
+    let (_, a, b) = services(&f).await;
+    let app = App::new(A, 30);
+    let started = start(a, &app).await;
+    f.arm_url(&started.location);
+    // The provider answers the token request after 1.5 s of the 5 s provider deadline.
+    let provider_deadline = policy().deadline;
+    assert_eq!(provider_deadline, Duration::from_secs(5));
+    let posts = pooled::posts(&f);
+    let gate = f.h.script.lock().unwrap().gate.clone();
+    f.h.script.lock().unwrap().mode = "gate-post";
+    let sent = Instant::now();
+    let request = callback_request(&app, &started);
+    let callback = send(b, &request);
+    tokio::pin!(callback);
+    tokio::select! {
+        reply = &mut callback => panic!("callback ended before its token response: {}", reply.status),
+        () = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while pooled::posts(&f) == posts {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("token POST not received");
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            f.h.script.lock().unwrap().mode = "ok";
+            gate.notify_one();
+        } => {},
+    }
+    let code = link_code(&callback.await, &app);
+    // The stored grant is not clipped to what the exchange left of the provider deadline.
+    let (window, _, pending, _) = newest_grant(&mut f.owner).await;
+    full_window(window);
+    assert!(pending);
+    // The app redeems after that deadline has passed, as after a slow launch.
+    tokio::time::sleep_until(sent + provider_deadline + Duration::from_millis(500)).await;
+    let token = bearer(&send(a, &post(&app.redeem(&code))).await);
+    assert_eq!(status(b, "GET", "session", &token).await, 204);
+    assert_eq!(exchanged(&f), [started.challenge]);
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn short_key_reuse_window_bounds_the_release_and_not_the_stored_grant() {
+    // The provider documents refuse caching, so a key snapshot lives for the ten-second
+    // reuse window. A 30 s provider deadline keeps the operation deadlines out of the way.
+    let secs = Duration::from_secs;
+    let refresh = RefreshPolicy::new(secs(600), secs(2), secs(30), 2, 32, 2)
+        .unwrap()
+        .with_uncacheable_reuse(secs(10))
+        .unwrap();
+    let mut f = Flow::with(Harness::with_policy(refresh).await).await;
+    {
+        let mut script = f.h.script.lock().unwrap();
+        script.cache = "no-store".into();
+        script.metadata_cache = "no-store".into();
+    }
+    sessions::seed(&mut f, true, true).await;
+    // Both services use the harness manager, and so one key snapshot on the fixture clock.
+    let pool = pooled::one_slot(f.db.options(API));
+    let a = mount(Arc::new(pooled::service_over(&f, &pool)), A).await;
+
+    // Stored grant: issued with two seconds of key freshness left, and redeemed after the
+    // snapshot has expired.
+    let app = App::new(A, 32);
+    let started = start(a, &app).await;
+    f.arm_url(&started.location);
+    let fetched = f.h.count();
+    f.h.advance(8);
+    let code = link_code(&send(a, &callback_request(&app, &started)).await, &app);
+    // The callback reused the snapshot: its one provider request is the token POST.
+    assert_eq!(f.h.count(), fetched + 1);
+    let (window, _, pending, _) = newest_grant(&mut f.owner).await;
+    full_window(window);
+    assert!(pending);
+    f.h.advance(3);
+    let token = bearer(&send(a, &post(&app.redeem(&code))).await);
+    assert_eq!(status(a, "GET", "session", &token).await, 204);
+    assert_eq!(f.h.count(), fetched + 1);
+
+    // Release: the same two seconds bound the issuing process. The final validation's
+    // acknowledgement is withheld past them on the callback service's only backend, after
+    // the consume and issuance commits. The fixture clock stands still, so every later
+    // proof check passes and only the code's release deadline refuses.
+    let mut barrier = ResponseBarrier::nth(b"COMMIT\0", 3);
+    let held_pool = proxied(&f, &barrier).await;
+    let b = mount(Arc::new(pooled::service_over(&f, &held_pool)), A).await;
+    let app = App::new(A, 33);
+    let started = start(a, &app).await;
+    f.arm_url(&started.location);
+    let fetched = f.h.count();
+    f.h.advance(8);
+    let request = callback_request(&app, &started);
+    let callback = send(b, &request);
+    tokio::pin!(callback);
+    tokio::select! {
+        () = barrier.wait_reached() => {},
+        reply = &mut callback => panic!("callback ended before the validation barrier: {}", reply.status),
+    }
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut callback)
+            .await
+            .is_err()
+    );
+    barrier.resume();
+    nothing_released(&callback.await);
+    assert_eq!(f.h.count(), fetched + 1);
+    // The stored grant is whole and unexpired. Its code never left the process.
+    let (window, remaining, pending, unrevoked) = newest_grant(&mut f.owner).await;
+    full_window(window);
+    assert!(remaining > 20_000, "{remaining}");
+    assert!(pending && unrevoked);
+    assert_eq!(exchanged(&f).len(), 2);
+    held_pool.close().await;
+    drop(barrier);
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn stored_audience_alone_refuses_a_pending_code_and_its_redemption() {
+    let mut f = Flow::new().await;
+    sessions::seed(&mut f, true, true).await;
+    let (_, a, _) = services(&f).await;
+    // Another audience under an unchanged registration, challenge, code and expiry. Only the
+    // owner can write it (`role_boundaries`).
+    const REBIND: &str = "UPDATE openmettle.native_handoffs SET audience=sha256(audience)
+        WHERE session_id=(SELECT id FROM openmettle.local_sessions ORDER BY created_ms DESC LIMIT 1)
+        RETURNING registration, audience";
+    const NEWEST: &str = "SELECT g.registration, g.audience, g.sealed IS NOT NULL, NOT s.revoked,
+            g.expires_ms > floor(extract(epoch FROM clock_timestamp())*1000)::bigint + 20000
+        FROM openmettle.native_handoffs g JOIN openmettle.local_sessions s ON s.id=g.session_id
+        ORDER BY s.created_ms DESC LIMIT 1";
+    type Grant = (Vec<u8>, Vec<u8>, bool, bool, bool);
+
+    // Issuance: the audience changes while the issuance COMMIT acknowledgement is held, so
+    // the final validation meets a grant that differs in its audience only.
+    let mut barrier = ResponseBarrier::nth(b"COMMIT\0", 2);
+    let pool = proxied(&f, &barrier).await;
+    let b = mount(replica(&f, pool.clone(), Duration::from_secs(300)), A).await;
+    let app = App::new(A, 34);
+    let started = start(a, &app).await;
+    f.arm_url(&started.location);
+    let request = callback_request(&app, &started);
+    let callback = send(b, &request);
+    tokio::pin!(callback);
+    tokio::select! {
+        () = barrier.wait_reached() => {},
+        reply = &mut callback => panic!("callback ended before the issuance barrier: {}", reply.status),
+    }
+    let issued: Grant = sqlx::query_as(NEWEST)
+        .fetch_one(&mut f.owner)
+        .await
+        .unwrap();
+    let rebound: (Vec<u8>, Vec<u8>) = sqlx::query_as(REBIND)
+        .fetch_one(&mut f.owner)
+        .await
+        .unwrap();
+    assert_eq!(rebound.0, issued.0);
+    assert_ne!(rebound.1, issued.1);
+    barrier.resume();
+    nothing_released(&callback.await);
+    let after: Grant = sqlx::query_as(NEWEST)
+        .fetch_one(&mut f.owner)
+        .await
+        .unwrap();
+    // Unclaimed, unrevoked and unexpired, with the registration it was issued under.
+    assert_eq!(after, (issued.0, rebound.1, true, true, true));
+    pool.close().await;
+    drop(barrier);
+
+    // Redemption: a delivered code whose grant differs in its audience only. The claim
+    // matches the code, the challenge and the registration and commits. The validation
+    // after it refuses, and no bearer is released then or later.
+    let app = App::new(A, 35);
+    let delivered = code(&f, &app, a, a).await;
+    let issued: Grant = sqlx::query_as(NEWEST)
+        .fetch_one(&mut f.owner)
+        .await
+        .unwrap();
+    let rebound: (Vec<u8>, Vec<u8>) = sqlx::query_as(REBIND)
+        .fetch_one(&mut f.owner)
+        .await
+        .unwrap();
+    assert_eq!(rebound.0, issued.0);
+    assert_ne!(rebound.1, issued.1);
+    let request = post(&app.redeem(&delivered));
+    nothing_released(&send(a, &request).await);
+    let after: Grant = sqlx::query_as(NEWEST)
+        .fetch_one(&mut f.owner)
+        .await
+        .unwrap();
+    assert_eq!(after, (issued.0, rebound.1, false, true, true));
+    nothing_released(&send(a, &request).await);
+
+    // Control: the same steps without the change deliver and redeem.
+    let app = App::new(A, 36);
+    let delivered = code(&f, &app, a, a).await;
+    let token = bearer(&send(a, &post(&app.redeem(&delivered))).await);
+    assert_eq!(status(a, "GET", "session", &token).await, 204);
+}
+
 #[tokio::test]
 #[ignore = "isolated CI PostgreSQL 18 required"]
 async fn withheld_claim_acknowledgement_releases_once_and_never_retries() {

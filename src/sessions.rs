@@ -232,6 +232,16 @@ pub(crate) async fn now(c: &mut PgConnection) -> Result<i64, Error> {
             .await?,
     )
 }
+/// What remains of a managed proof at one in-memory check (ADR 0023).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProofBudget {
+    /// Until the ID token expires or passes its maximum age. This alone bounds a stored
+    /// native grant, which the app redeems on any replica.
+    pub(crate) assertion: Duration,
+    /// Until the checking process must stop acting on the proof: `assertion`, the freshness
+    /// of its key snapshot and its exchange deadline. It bounds in-process work only.
+    pub(crate) process: Duration,
+}
 // Only the managed proof consumer constructs this input. No public mint/identity bypass.
 pub(crate) struct Issuance<'a> {
     pub provider: &'a str,
@@ -288,6 +298,17 @@ pub(crate) enum Delivery {
     NativeCode(native::Release),
 }
 impl Delivery {
+    /// The last step of issuance. A native code whose release deadline has already passed,
+    /// for example during the final validation, is refused here. That refusal is defence in
+    /// depth: `native::Release::release` repeats the check when the code leaves the process,
+    /// and nothing else yields the code.
+    fn settled(credential: Credential, code: Option<native::Release>) -> Result<Self, Error> {
+        match code {
+            Some(code) if code.live() => Ok(Self::NativeCode(code)),
+            Some(_) => Err(Error::Rejected),
+            None => Ok(Self::Browser(credential)),
+        }
+    }
     pub(crate) fn browser(self) -> Result<Credential, Error> {
         match self {
             Self::Browser(credential) => Ok(credential),
@@ -300,7 +321,7 @@ pub(crate) async fn issue(
     c: &mut PgConnection,
     input: Issuance<'_>,
     policy: &Policy,
-    check: impl Fn() -> Result<Duration, Error>,
+    check: impl Fn() -> Result<ProofBudget, Error>,
 ) -> Result<Delivery, Error> {
     let validation = if let Some(native) = input.native {
         Validation::NativePending(native.audience)
@@ -309,10 +330,14 @@ pub(crate) async fn issue(
     };
     let deadline = input.deadline.min(Instant::now() + policy.deadline);
     tokio::time::timeout_at(deadline, async {
-        // The proof budget becomes a monotonic bound before the first await. Later wall-clock
-        // changes cannot extend it, and each later check() can only shorten what remains.
+        // Both proof budgets become monotonic bounds before the first await. Later wall-clock
+        // changes cannot extend them, and each later check() can only shorten what remains.
+        // `proof_deadline` bounds this process. `assertion_deadline` also bounds a stored
+        // native grant. It is None only for a remainder too large to represent.
         let started = Instant::now();
-        let proof_deadline = (started + check()?).min(deadline);
+        let proof = check()?;
+        let proof_deadline = (started + proof.process).min(deadline);
+        let assertion_deadline = started.checked_add(proof.assertion);
         let mut tx = transaction(c).await?;
         let result: Result<(Credential, Option<native::Release>), Error> = async {
         let gate = sqlx::query("SELECT binding,expires_ms,consumed,session_issued FROM openmettle.login_transactions WHERE id=$1 FOR UPDATE")
@@ -376,17 +401,18 @@ pub(crate) async fn issue(
         }
         let remaining = check()?;
         let code = if let Some(native) = input.native {
-            // The grant ends with the login, the session, the proof and this operation. The
-            // stored expiry is primary milliseconds. The release deadline converts it to the
-            // monotonic clock from both paired samples, so a lock wait, a rollback or
-            // wall-clock skew after a sample cannot extend it.
-            let budget = remaining.min(native::MAX_LIFETIME).min(proof_deadline.saturating_duration_since(Instant::now()));
-            let until = input.login_expiry.min(expiry).min(final_time.saturating_add(budget.as_millis() as i64));
-            if until <= final_time { return Err(Error::Rejected); }
-            let release_by = native::primary_deadline(issued_at, until - timestamp)
-                .min(native::primary_deadline(final_at, until - final_time))
-                .min(proof_deadline);
-            let code = native.store(tx.connection()?, &id, &credential, until, release_by).await?;
+            // The stored grant ends with the login, the session and the assertion's age, and
+            // never with `proof_deadline`: that bounds only the release from this process
+            // (`native::window`, ADR 0023).
+            let assertion = assertion_deadline.map_or(remaining.assertion, |at| {
+                remaining.assertion.min(at.saturating_duration_since(Instant::now()))
+            });
+            let window = native::window(
+                native::Sample { at: issued_at, ms: timestamp },
+                native::Sample { at: final_at, ms: final_time },
+                input.login_expiry, expiry, assertion, proof_deadline,
+            ).ok_or(Error::Rejected)?;
+            let code = native.store(tx.connection()?, &id, &credential, window.until, window.release_by).await?;
             check()?;
             Some(code)
         } else { None };
@@ -399,12 +425,7 @@ pub(crate) async fn issue(
         validate_inner(c, credential.expose(), validation).await?;
         check()?;
         if Instant::now() >= deadline { return Err(Error::Timeout); }
-        match code {
-            // The caller rechecks the same deadline when it releases the code.
-            Some(code) if code.live() => Ok(Delivery::NativeCode(code)),
-            Some(_) => Err(Error::Rejected),
-            None => Ok(Delivery::Browser(credential)),
-        }
+        Delivery::settled(credential, code)
     }).await.map_err(|_| Error::Timeout)?
 }
 

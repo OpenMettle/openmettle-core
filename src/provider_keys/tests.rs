@@ -1761,6 +1761,44 @@ async fn max_age_keeps_its_lifetime_and_refusals_use_the_window() {
         assert_eq!(h.count(), count);
     }
 }
+/// ADR 0023: the assertion's remaining age is reported apart from the process budget. A key
+/// snapshot near the end of its reuse window, or a nearly spent operation deadline, shortens
+/// the process budget only.
+#[tokio::test]
+async fn proof_budget_reports_assertion_age_apart_from_key_freshness_and_the_deadline() {
+    let reuse = policy()
+        .with_uncacheable_reuse(Duration::from_secs(10))
+        .unwrap();
+    let h = Harness::with_policy(reuse).await;
+    {
+        let mut s = h.script.lock().unwrap();
+        s.metadata_cache = "no-store".into();
+        s.cache = "no-store".into();
+    }
+    let p = &h.provider;
+    let (generation, assertion) = p
+        .verify(&token(false), &nonce(), &auth::Policy::default())
+        .await
+        .unwrap();
+    let secs = Duration::from_secs;
+    let far = Instant::now() + secs(3600);
+    // The fixture token was issued at T-10 with a maximum age of 300 s.
+    let budget = p.check_assertion(generation, &assertion, far).unwrap();
+    assert_eq!((budget.assertion, budget.process), (secs(290), secs(10)));
+    h.advance(8);
+    let budget = p.check_assertion(generation, &assertion, far).unwrap();
+    assert_eq!((budget.assertion, budget.process), (secs(282), secs(2)));
+    let near = Instant::now() + Duration::from_millis(500);
+    let budget = p.check_assertion(generation, &assertion, near).unwrap();
+    assert_eq!(budget.assertion, secs(282));
+    assert!(budget.process <= Duration::from_millis(500));
+    // Spent key freshness and a spent deadline still refuse the in-process check itself.
+    let spent = p.check_assertion(generation, &assertion, Instant::now());
+    assert_eq!(spent.unwrap_err(), Error::Timeout);
+    h.advance(2);
+    let stale = p.check_assertion(generation, &assertion, far);
+    assert_eq!(stale.unwrap_err(), Error::Unavailable);
+}
 /// The window is 60 s unless set. An explicit window is 1–300 s, no shorter than cooldown
 /// and no longer than maximum freshness.
 #[test]
