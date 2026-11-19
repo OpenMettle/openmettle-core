@@ -521,7 +521,7 @@ pub async fn run() -> u8 {
             return 78;
         }
     };
-    let telemetry = match telemetry::install(telemetry_settings, Process::Migrate) {
+    let telemetry = match telemetry::install(telemetry_settings, Process::Migrate, None) {
         Ok(telemetry) => telemetry,
         Err(unavailable) => {
             eprintln!("runtime error: {}", unavailable.message());

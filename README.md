@@ -75,7 +75,24 @@ Values must match exactly; anything else exits 78 with `configuration error: inv
 - **Slow or unread stderr.** Events are queued (up to 1024 lines) for one writer thread, so a stalled log reader never blocks requests, readiness or shutdown. Lines that do not fit are dropped and counted, and a `telemetry.dropped` event with the count follows the next successful write. The stop, including the final flush, fits `SHUTDOWN_TIMEOUT_MS`: draining gets the deadline less a tenth (at most 250 ms), which is kept for the flush.
 - **Panics.** After telemetry starts, a panic writes one `process.panicked` event and never the panic message or location.
 - **Not covered.** Ingress and proxy access logs are outside these processes. Configure them separately before exposing login routes.
-- **No export yet.** Nothing is sent over the network; OTLP export is a later increment.
+- **No export by default.** Nothing is sent over the network unless the OTLP trace setting below is given.
+
+### OTLP trace export (off by default)
+
+[ADR 0026](docs/adr/0026-otlp-trace-export.md) adds three settings for the API and the worker, under their own prefix. The migrator never reads them. Ambient `OTEL_*` variables (`OTEL_EXPORTER_OTLP_*`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_TRACES_SAMPLER*`, `OTEL_SPAN_*_LIMIT`) and proxy variables have no effect.
+
+| Setting | Default | Values |
+| --- | --- | --- |
+| `OTLP_TRACES_ENDPOINT` | unset (export off) | A canonical `https://` URL with a DNS host, for example `https://alloy.monitoring.svc.cluster.local:4318/v1/traces`. No `http://`, IP literal, user information, query, fragment or percent-encoding |
+| `OTLP_CA_FILE` | platform roots | Absolute path to a PEM CA bundle (1 to 256 certificates, at most 1 MiB) that replaces the platform roots, for example the cluster CA |
+| `OTLP_PRIVATE_RANGES` | none | Comma-separated canonical CIDRs inside 10/8, 172.16/12, 192.168/16, 100.64/10 or fc00::/7 (at most 32). A collector address in a private range is refused unless a listed range contains it |
+
+Unset, no exporter, task, DNS slot or socket exists and the process behaves exactly as before. `OTLP_CA_FILE` or `OTLP_PRIVATE_RANGES` without an endpoint is refused rather than ignored. An invalid value exits 78 with one fixed line, `configuration error: invalid OTLP_TRACES_ENDPOINT`, `invalid OTLP_CA_FILE` or `invalid OTLP_PRIVATE_RANGES`, which never includes the value, path or file contents; `configuration error: OTLP trust roots unavailable` means no CA file was given and the platform roots could not be loaded.
+
+- **What is exported.** One root server span, `http.server.request`, per request other than `/healthz` and `/readyz`, with only `request_id`, `http.route`, `http.request.method` and `http.response.status_code`, and the resource attribute `service.name` (`openmettle-api` or `openmettle-worker`). No third-party span, log event, URL, header, cookie, body or source location is exported. An inbound `traceparent` or `tracestate` is ignored, so each request starts its own trace.
+- **Transport.** OTLP/HTTP protobuf (`POST`, `Content-Type: application/x-protobuf`) over the same bounded HTTP/1.1 TLS core as the provider transport ([ADR 0010](docs/adr/0010-provider-http-transport.md)): one request per connection, no compression, retry, redirect, proxy or authentication header, and its own two DNS lookup slots.
+- **Bounds.** Up to 2048 ended spans are queued; batches of up to 512 are sent at least every 5 s; each export has 3 s, a 1 MiB request and a 64 KiB response. A full queue, a non-2xx response (including 3xx and 429), a timeout or any DNS, address or TLS failure drops the spans, and a `telemetry.dropped` event with `dropped_spans` goes to stderr at most once per export cycle.
+- **Shutdown.** The exporter gets at most half of the final flush slice (at most 125 ms) to send queued spans and is then cancelled, closing its connection; the stderr flush gets the rest. A stalled collector cannot extend the stop beyond `SHUTDOWN_TIMEOUT_MS`, and the runtime does not wait for an abandoned DNS lookup at exit.
 
 ### Browser sign-in routes (off by default)
 

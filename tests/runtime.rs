@@ -315,6 +315,293 @@ fn serving_writes_redacted_lifecycle_and_request_events_to_stderr() {
     }
 }
 
+/// Ambient OpenTelemetry SDK variables the binaries must ignore (ADR 0026). The canaries
+/// would show up in stderr or on the wire if any were read.
+const AMBIENT_OTEL: [(&str, &str); 9] = [
+    ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
+    (
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "authorization=Bearer CANARY-otel-header",
+    ),
+    (
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        "x-api-key=CANARY-otel-traces-header",
+    ),
+    ("OTEL_TRACES_EXPORTER", "otlp"),
+    ("OTEL_TRACES_SAMPLER", "always_on"),
+    ("OTEL_SERVICE_NAME", "CANARY-otel-service"),
+    (
+        "OTEL_RESOURCE_ATTRIBUTES",
+        "deployment.secret=CANARY-otel-resource",
+    ),
+    ("OTEL_SDK_DISABLED", "false"),
+    ("OTEL_LOG_LEVEL", "debug"),
+];
+
+/// A listener counting nothing but whether anyone connected.
+fn untouched() -> (TcpListener, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    (listener, address)
+}
+fn assert_untouched(listener: &TcpListener) {
+    match listener.accept() {
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock),
+        Ok(_) => panic!("a connection was made"),
+    }
+}
+
+/// ADR 0026: export is off unless `OTLP_TRACES_ENDPOINT` is set under the process prefix.
+/// Ambient `OTEL_EXPORTER_OTLP_*` variables pointing at a local listener, header canaries and
+/// proxy variables change nothing: no connection, and stderr holds exactly the lifecycle.
+#[test]
+fn otlp_export_is_off_by_default_despite_ambient_otel_variables() {
+    let (database, url) = unavailable_database();
+    let (collector, collector_address) = untouched();
+    let (proxy, proxy_address) = untouched();
+    for worker in [false, true] {
+        let bind = address();
+        let prefix = if worker {
+            "OPENMETTLE_WORKER"
+        } else {
+            "OPENMETTLE_API"
+        };
+        let mut command = command(worker);
+        command
+            .env(format!("{prefix}_BIND"), &bind)
+            .env(format!("{prefix}_DATABASE_URL"), &url)
+            .env(format!("{prefix}_DB_TIMEOUT_MS"), "150")
+            .env(format!("{prefix}_SHUTDOWN_TIMEOUT_MS"), "1000")
+            .envs(AMBIENT_OTEL)
+            .env(
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                format!("http://{collector_address}"),
+            )
+            .env(
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                format!("http://{collector_address}/v1/traces"),
+            )
+            .env("HTTPS_PROXY", format!("http://{proxy_address}"))
+            .env("ALL_PROXY", format!("http://{proxy_address}"));
+        let mut process = Process(
+            command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        wait_status(&mut process, &bind, "/healthz", 200);
+        for target in ["/v1/runs", "/CANARY-path"] {
+            let _ = response(&bind, target);
+        }
+        stop(&mut process, "-TERM");
+        let (stdout, stderr) = drain(&mut process);
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(!stderr.contains("CANARY"), "{stderr}");
+        let names: Vec<String> = stderr
+            .lines()
+            .map(|line| {
+                let event: serde_json::Value = serde_json::from_str(line).unwrap();
+                event["event"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["process.started", "process.stopping", "process.stopped"],
+            "{stderr}"
+        );
+    }
+    assert_untouched(&collector);
+    assert_untouched(&proxy);
+    drop(database);
+}
+
+/// ADR 0026: an invalid `OTLP_*` value exits 78 with one fixed line naming the key, before
+/// any listener opens, file contents are echoed or any event is written.
+#[test]
+fn rejects_invalid_otlp_settings_with_a_fixed_line() {
+    const ENDPOINT: &str = "https://collector.example.test:4318/v1/traces";
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let dir = auth_config_support::Dir::new();
+    let not_pem = dir.write("CANARY-ca.pem", b"CANARY-not-a-certificate\n");
+    let missing = dir.path("CANARY-missing.pem");
+    let cases: Vec<(Vec<(&str, &str)>, &str)> = vec![
+        (
+            vec![(
+                "OTLP_TRACES_ENDPOINT",
+                "http://collector.example.test:4318/v1/traces",
+            )],
+            "OTLP_TRACES_ENDPOINT",
+        ),
+        (
+            vec![("OTLP_TRACES_ENDPOINT", "https://127.0.0.1:4318/v1/traces")],
+            "OTLP_TRACES_ENDPOINT",
+        ),
+        (
+            vec![(
+                "OTLP_TRACES_ENDPOINT",
+                "https://collector.example.test:4318/v1/traces?token=CANARY-query",
+            )],
+            "OTLP_TRACES_ENDPOINT",
+        ),
+        (
+            vec![("OTLP_TRACES_ENDPOINT", "CANARY-endpoint")],
+            "OTLP_TRACES_ENDPOINT",
+        ),
+        (
+            vec![
+                ("OTLP_TRACES_ENDPOINT", ENDPOINT),
+                ("OTLP_CA_FILE", "CANARY/ca.pem"),
+            ],
+            "OTLP_CA_FILE",
+        ),
+        (
+            vec![
+                ("OTLP_TRACES_ENDPOINT", ENDPOINT),
+                ("OTLP_CA_FILE", &missing),
+            ],
+            "OTLP_CA_FILE",
+        ),
+        (
+            vec![
+                ("OTLP_TRACES_ENDPOINT", ENDPOINT),
+                ("OTLP_CA_FILE", &not_pem),
+            ],
+            "OTLP_CA_FILE",
+        ),
+        (vec![("OTLP_CA_FILE", &not_pem)], "OTLP_CA_FILE"),
+        (
+            vec![
+                ("OTLP_TRACES_ENDPOINT", ENDPOINT),
+                ("OTLP_PRIVATE_RANGES", "10.0.0.1/8"),
+            ],
+            "OTLP_PRIVATE_RANGES",
+        ),
+        (
+            vec![
+                ("OTLP_TRACES_ENDPOINT", ENDPOINT),
+                ("OTLP_PRIVATE_RANGES", "8.8.8.0/24"),
+            ],
+            "OTLP_PRIVATE_RANGES",
+        ),
+        (
+            vec![("OTLP_PRIVATE_RANGES", "10.0.0.0/8")],
+            "OTLP_PRIVATE_RANGES",
+        ),
+    ];
+    for worker in [false, true] {
+        let prefix = if worker {
+            "OPENMETTLE_WORKER"
+        } else {
+            "OPENMETTLE_API"
+        };
+        for (pairs, key) in &cases {
+            let mut command = command(worker);
+            command
+                .env(
+                    format!("{prefix}_DATABASE_URL"),
+                    "postgres://localhost/test",
+                )
+                .env(
+                    format!("{prefix}_BIND"),
+                    occupied.local_addr().unwrap().to_string(),
+                )
+                .envs(AMBIENT_OTEL);
+            for (name, value) in pairs {
+                command.env(format!("{prefix}_{name}"), value);
+            }
+            let output = command.output().unwrap();
+            assert_eq!(output.status.code(), Some(78), "{pairs:?}");
+            assert!(output.stdout.is_empty());
+            assert_eq!(
+                String::from_utf8(output.stderr).unwrap(),
+                format!("configuration error: invalid {key}\n"),
+                "{pairs:?}"
+            );
+        }
+    }
+}
+
+/// ADR 0026 through the API binary with export configured: proxy variables are not used, a
+/// collector that cannot be reached costs nothing visible to serving, and SIGTERM still exits
+/// 0 within the shutdown deadline. The `.localhost` name resolves locally to loopback, which
+/// the address policy refuses, or not at all; either way no socket reaches anything.
+#[test]
+fn configured_export_ignores_proxies_and_keeps_shutdown_bounded() {
+    let (database, url) = unavailable_database();
+    let (proxy, proxy_address) = untouched();
+    let dir = auth_config_support::Dir::new();
+    let ca = dir.write("collector-ca.pem", &ca::Ca::new().pem());
+    let bind = address();
+    let proxy_url = format!("http://{proxy_address}");
+    let mut command = command(false);
+    command
+        .env("OPENMETTLE_API_BIND", &bind)
+        .env("OPENMETTLE_API_DATABASE_URL", &url)
+        .env("OPENMETTLE_API_DB_TIMEOUT_MS", "150")
+        .env("OPENMETTLE_API_SHUTDOWN_TIMEOUT_MS", "1000")
+        .env(
+            "OPENMETTLE_API_OTLP_TRACES_ENDPOINT",
+            "https://collector.localhost:4318/v1/traces",
+        )
+        .env("OPENMETTLE_API_OTLP_CA_FILE", &ca)
+        .envs(AMBIENT_OTEL);
+    for name in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        command.env(name, &proxy_url);
+    }
+    command.env("NO_PROXY", "").env("no_proxy", "");
+    let mut process = Process(
+        command
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    wait_status(&mut process, &bind, "/healthz", 200);
+    for _ in 0..20 {
+        let reply = response(&bind, "/v1/runs").unwrap();
+        assert!(reply.starts_with("HTTP/1.1 404"), "{reply}");
+    }
+    let began = Instant::now();
+    stop(&mut process, "-TERM");
+    let stopping = began.elapsed();
+    assert!(stopping < Duration::from_secs(2), "{stopping:?}");
+    let mut stderr = String::new();
+    process
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(!stderr.contains("CANARY"), "{stderr}");
+    let names: Vec<String> = stderr
+        .lines()
+        .map(|line| {
+            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+            event["event"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    assert_eq!(names.first().map(String::as_str), Some("process.started"));
+    assert!(names.iter().any(|n| n == "process.stopped"), "{stderr}");
+    assert!(
+        names
+            .iter()
+            .all(|n| n.starts_with("process.") || n == "telemetry.dropped"),
+        "{stderr}"
+    );
+    assert_untouched(&proxy);
+    drop(database);
+}
+
 /// ADR 0024 through the worker binary at the defaults (JSON, `info`): exactly its lifecycle,
 /// with `role=worker`; health polling is `debug` and stays out.
 #[test]

@@ -62,6 +62,18 @@ tokio-rustls = { version = "=0.26.6", default-features = false, features = ["rin
 tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["std", "registry", "fmt", "json"] }
 
+# OTLP/HTTP protobuf trace export (ADR 0026), off by default. Only the API types, the SDK span
+# model, the generated protobuf messages and the tracing bridge: no opentelemetry-otlp,
+# opentelemetry-http, tonic, h2, reqwest, compression, async runtime integration or log bridge.
+# Spans travel over the ADR 0010 transport core. Origin: github.com/open-telemetry/opentelemetry-rust
+# (Apache-2.0) and github.com/tokio-rs/tracing-opentelemetry (MIT).
+opentelemetry = { version = "=0.33.1", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "=0.33.1", default-features = false, features = ["trace"] }
+opentelemetry-proto = { version = "=0.33.1", default-features = false, features = ["gen-tonic-messages", "trace"] }
+tracing-opentelemetry = { version = "=0.34.0", default-features = false }
+# `Message::encode_to_vec` for the generated request; already locked through opentelemetry-proto.
+prost = { version = "=0.14.6", default-features = false }
+
 # Login protection: ring (Apache-2.0 AND ISC), subtle (BSD-3-Clause), already locked.
 # Origins: github.com/briansmith/ring; github.com/dalek-cryptography/subtle.
 [dependencies.ring]
