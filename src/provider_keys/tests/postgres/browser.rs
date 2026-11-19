@@ -292,6 +292,7 @@ struct KeycloakObserverConfig {
     authorization_endpoint: String,
     client_id: String,
     callback_url: String,
+    landing_url: String,
     issuer: String,
     provider: ManagedProvider,
 }
@@ -418,7 +419,7 @@ fn observe_keycloak(
                 let response_ok = status == axum::http::StatusCode::SEE_OTHER
                     && resp_headers
                         .get(header::LOCATION)
-                        .is_some_and(|v| v == "/app")
+                        .is_some_and(|v| v == expected.landing_url.as_str())
                     && sets_cookie(resp_headers, SESSION_COOKIE);
                 let (key_gen, _, _) = provider_cache_state(&expected.provider);
                 let mut obs = observed.lock().unwrap();
@@ -530,8 +531,7 @@ async fn approve_identity_via_script(
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "first approval committed
-"
+        "first approval committed\n"
     );
     assert!(out.stderr.is_empty(), "first approval stderr: {stderr}");
 }
@@ -572,7 +572,10 @@ fn create_home_invitation_via_script(
     // Never format stdout into an assertion message: it carries the one-time code.
     let stdout = String::from_utf8(out.stdout).expect("utf-8 invitation output");
     let mut lines = stdout.lines();
-    assert_eq!(lines.next(), Some("home invitation created"));
+    assert!(
+        lines.next() == Some("home invitation created"),
+        "unexpected invitation output header"
+    );
     let code = lines
         .next()
         .and_then(|line| line.strip_prefix(CODE_PREFIX))
@@ -714,10 +717,12 @@ async fn keycloak_browser_sign_in_qualification() {
     .unwrap();
 
     let observed = Arc::new(Mutex::new(KeycloakObservations::default()));
+    let landing_url = format!("{app_origin}{}", browser_profile.handoff().landing);
     let observer_config = Arc::new(KeycloakObserverConfig {
         authorization_endpoint,
         client_id,
         callback_url,
+        landing_url,
         issuer: issuer.clone(),
         provider: provider.clone(),
     });

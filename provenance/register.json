@@ -450,7 +450,7 @@
       "licence": {
         "expression": "Apache-2.0",
         "evidence": [
-          "ARCHITECTURE-v1.md 'Graphiti licence check \u2014 16 November 2026'"
+          "ARCHITECTURE-v1.md 'Graphiti licence check — 16 November 2026'"
         ]
       },
       "notices": {
@@ -639,12 +639,12 @@
       "pin": null,
       "origin": "https://github.com/HelixDB/helix-db",
       "source_evidence": [
-        "ARCHITECTURE-v1.md 'Rust alternatives reviewed \u2014 16 November 2026'"
+        "ARCHITECTURE-v1.md 'Rust alternatives reviewed — 16 November 2026'"
       ],
       "licence": {
         "expression": "Apache-2.0",
         "evidence": [
-          "ARCHITECTURE-v1.md 'Rust alternatives reviewed \u2014 16 November 2026' (unpinned)"
+          "ARCHITECTURE-v1.md 'Rust alternatives reviewed — 16 November 2026' (unpinned)"
         ]
       },
       "notices": {
