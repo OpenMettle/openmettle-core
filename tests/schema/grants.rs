@@ -801,11 +801,13 @@ async fn populate_invitations(db: &TestDb) {
         .unwrap();
     }
 }
-// Every invitation column that schema 12 wrote. Migration 13 adds only code_hash.
+// Every invitation column that schema 12 wrote. Migration 13 adds only code_hash. The filter
+// reads code_hash through the row's JSON, so the snapshot also works on a schema-12 database,
+// where the column does not exist yet.
 async fn invitation_snapshot(db: &TestDb) -> Vec<String> {
     sqlx::query_scalar(
         "SELECT (to_jsonb(t) - 'code_hash')::text FROM openmettle.home_invitations t
-          WHERE code_hash IS NULL ORDER BY 1",
+          WHERE to_jsonb(t) ->> 'code_hash' IS NULL ORDER BY 1",
     )
     .fetch_all(&mut db.admin().await)
     .await
