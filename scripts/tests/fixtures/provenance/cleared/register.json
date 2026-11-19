@@ -3,6 +3,9 @@
   "distribution_boundary": {
     "status": "defined",
     "description": "Synthetic fixture boundary.",
+    "artefacts": [
+      "source"
+    ],
     "tracking": [
       "FIXTURE"
     ],
@@ -129,6 +132,31 @@
         "notes": "Synthetic scope and disposition reviewed."
       }
     }
+  },
+  "cargo_licence_policy": {
+    "scope": "Synthetic fixture policy.",
+    "allowed_licences": [
+      "Apache-2.0",
+      "MIT"
+    ],
+    "notices": {
+      "status": "none-required",
+      "files": [],
+      "obligations": [],
+      "justification": "Synthetic build inputs."
+    },
+    "review": {
+      "status": "reviewed",
+      "reviewer": "fixture-reviewer",
+      "date": "2026-11-16",
+      "evidence": [
+        "synthetic decision record"
+      ],
+      "notes": "Synthetic policy approval."
+    },
+    "tracking": [
+      "FIXTURE"
+    ]
   },
   "cargo_reviews": [
     {

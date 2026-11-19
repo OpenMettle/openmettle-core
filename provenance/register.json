@@ -3,6 +3,10 @@
   "distribution_boundary": {
     "status": "defined",
     "description": "Owner decisions of 19 November 2026. Distributed: the source code in the public OpenMettle repositories that are not forks, and the Helm chart in openmettle-deploy. Explicit exception: OpenMettle/openmettle-serving, a public non-fork repository of experimental ROCm/SGLang serving and benchmarking work, stays outside the boundary until serving packaging (V1-20) audits the serving stack, the same treatment as the SGLang fork. OpenMettle/openmettle-acp, a public non-fork repository with its own LICENSE and NOTICE, is inside the boundary. This register's gate covers openmettle-core's own source only; every other in-boundary repository is reviewed in its own repository. Not distributed yet: built container images (including the core api, worker and migrate images), re-hosted third-party images, curated forks and model weights. The public forks OpenMettle/sglang and OpenMettle/open-webui stay outside the boundary as public forks under their upstream licences: the SGLang fork comes inside, with a full audit, when serving packaging (V1-20) ships it; the Open WebUI fork is reference material for the product OpenMettle replaces and stays public. Third-party images are referenced only at their publishers' locations. Long-term direction: distribute everything needed to run OpenMettle, eventually as an Arch Linux distribution with everything preinstalled except components whose licences do not allow redistribution. Each widening of the boundary is a separate owner decision; publishing the core images (V1-36) is the likely next one.",
+    "artefacts": [
+      "source",
+      "helm-chart"
+    ],
     "tracking": [
       "V1-42",
       "V1-36"
@@ -165,6 +169,41 @@
         "notes": "Disposition recorded by an agent from the owner's decision comment: openmettle-acp is inside the boundary and its licence review lives in its own repository. This register's gate covers openmettle-core's own source only. This is a scope disposition, not a licence review."
       }
     }
+  },
+  "cargo_licence_policy": {
+    "scope": "Cargo packages are build inputs under the 19 Nov 2026 boundary: Cargo fetches them from their registries at build time, and no binary or image containing them is distributed. They become shipped content once the core images are published (V1-36), which needs a separate owner decision. Each crate's licence and notice files must then ship with the images.",
+    "allowed_licences": [
+      "0BSD",
+      "Apache-2.0",
+      "BSD-2-Clause",
+      "BSD-3-Clause",
+      "ISC",
+      "MIT",
+      "MIT-0",
+      "Unicode-3.0",
+      "Zlib"
+    ],
+    "notices": {
+      "status": "none-required",
+      "files": [],
+      "obligations": [
+        "When binaries or images containing these crates are distributed, ship each crate's licence and notice files with them."
+      ],
+      "justification": "Build inputs only under the 19 Nov 2026 boundary: the crates are not redistributed in source or binary form."
+    },
+    "review": {
+      "status": "reviewed",
+      "reviewer": "OpenMettle owner (GitHub Drgr33nSenior)",
+      "date": "2026-11-19",
+      "evidence": [
+        "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7006023083"
+      ],
+      "notes": "Proposed by an agent on 19 November 2026 and approved by the owner the same day, with CC0-1.0 dropped and MIT-0 added; an agent transcribed the approval from the owner's decision comment. The same decision reads Cargo's deprecated '/' licence separator as OR (for example, 'MIT/Apache-2.0' as 'MIT OR Apache-2.0'); review-cargo records each package where that rule applied. Approval adopts a licence-bookkeeping policy; packages are reviewed against policy, which is not legal clearance."
+    },
+    "tracking": [
+      "V1-42",
+      "V1-36"
+    ]
   },
   "cargo_reviews": [
     {
