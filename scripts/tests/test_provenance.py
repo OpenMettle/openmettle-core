@@ -16,6 +16,7 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parents[1]
 REPO = SCRIPTS.parent
 FIXTURE = SCRIPTS / "tests" / "fixtures" / "provenance" / "cleared"
+OPENMETTLE_SERVING_DECISION = "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7008299248"
 sys.path.insert(0, str(SCRIPTS))
 
 import provenance  # noqa: E402
@@ -71,9 +72,21 @@ class PositiveTests(FixtureCase):
         self.assertIn("Owner release approval is still required", out)
 
     def test_excluded_blocked_component_does_not_block(self):
-        code, _, err = self.gate()
-        self.assertEqual(code, 0, err)
-        self.assertNotIn("fixture-excluded", err)
+        # Block the fully reviewed fixture-image, then move it outside the boundary.
+        reg = self.register()
+        image = reg["components"][0]
+        image["review"] = {"status": "blocked", "reviewer": None, "date": None, "evidence": [],
+                           "notes": "Synthetic incompatible licence."}
+        self.save(reg)
+        self.assert_blocked("component fixture-image: review blocked")
+        for distribution in ("excluded", "not-distributed"):
+            with self.subTest(distribution=distribution):
+                image["distribution"] = distribution
+                image["exclusion_reason"] = "Synthetic exclusion."
+                self.save(reg)
+                code, _, err = self.gate()
+                self.assertEqual(code, 0, err)
+                self.assertNotIn("fixture-image", err)
 
     def test_excluded_group_needs_only_its_exclusion_record(self):
         reg = self.register()
@@ -84,13 +97,43 @@ class PositiveTests(FixtureCase):
         self.assertEqual(code, 0, err)
 
     def test_excluded_component_with_missing_facts_does_not_block(self):
+        # Strip every readiness fact from the fully reviewed fixture-image; in the boundary it blocks.
         reg = self.register()
-        excluded = reg["components"][1]
-        self.assertEqual(excluded["distribution"], "excluded")
-        self.assertIsNone(excluded["licence"]["expression"])
-        self.assertIsNone(excluded["pin"])
+        image = reg["components"][0]
+        image |= {"version": None, "pin": None, "origin": None, "licence": {"expression": None, "evidence": []},
+                  "notices": {"status": "pending", "files": [], "obligations": []},
+                  "review": {"status": "pending", "reviewer": None, "date": None, "evidence": [], "notes": "Pending."},
+                  "redistribution": {"assessment": "undetermined", "basis": "Synthetic; no licence evidence."}}
+        self.save(reg)
+        code, _, err = self.gate()
+        self.assertEqual(code, 1, err)
+        for fragment in ("version not recorded", "pin not recorded", "origin not recorded",
+                         "licence not recorded", "notice obligations pending", "review pending"):
+            self.assertIn(f"component fixture-image: {fragment}", err)
+        image |= {"distribution": "excluded", "exclusion_reason": "Synthetic exclusion."}
+        self.save(reg)
         code, _, err = self.gate()
         self.assertEqual(code, 0, err)
+        self.assertNotIn("fixture-image", err)
+
+    def test_reviewed_elsewhere_component_is_not_gated_here(self):
+        reg = self.register()
+        image = reg["components"][0]
+        image |= {"distribution": "reviewed-elsewhere", "reviewed_in": "example/other-repository",
+                  "version": None, "pin": None, "licence": {"expression": None, "evidence": []},
+                  "notices": {"status": "pending", "files": [], "obligations": []},
+                  "review": {"status": "pending", "reviewer": None, "date": None, "evidence": [], "notes": "Pending."},
+                  "redistribution": {"assessment": "undetermined", "basis": "Synthetic; no licence evidence."}}
+        self.save(reg)
+        code, _, err = self.gate()
+        self.assertEqual(code, 0, err)
+        out_dir = self.root / "out"
+        code, _, err = run_cli("inventory", "--root", str(self.root), "--register", str(self.register_path),
+                               "--cargo-metadata", str(self.metadata_path), "--output-dir", str(out_dir))
+        self.assertEqual(code, 0, err)
+        report = json.loads((out_dir / "dependency-inventory.json").read_text())
+        self.assertEqual(report["components"][1]["reviewed_in"], "example/other-repository")
+        self.assertIn("reviewed-elsewhere (example/other-repository)", (out_dir / "notice-obligations.md").read_text())
 
     def test_redistribution_assessment_is_inventoried(self):
         out_dir = self.root / "out"
@@ -360,6 +403,23 @@ class NegativeTests(FixtureCase):
         self.assertIn("component fixture-image: licence not recorded", err)
         self.assertIn("component fixture-image: notice obligations pending", err)
         self.assertNotIn("fixture-excluded", err)
+
+    def test_reviewed_elsewhere_needs_repository_and_owner_disposition(self):
+        cases = (({"reviewed_in": None}, None, "need 'reviewed_in'"),
+                 ({"reviewed_in": " "}, None, "need 'reviewed_in'"),
+                 ({"exclusion_reason": "Synthetic."}, None, "cannot have an exclusion_reason"),
+                 ({}, {"status": "excluded", "exclusion_reason": "Synthetic."},
+                  "in-boundary component cannot belong to excluded group 'database'"),
+                 ({}, {"status": "pending"}, "need a group with a completed owner disposition"))
+        for change, group, fragment in cases:
+            with self.subTest(change=change, group=group):
+                reg = json.loads((FIXTURE / "register.json").read_text())
+                reg["components"][0] |= {"distribution": "reviewed-elsewhere",
+                                         "reviewed_in": "example/other-repository"} | change
+                if group:
+                    reg["review_groups"]["database"] |= group
+                self.save(reg)
+                self.assert_invalid(fragment)
 
     def test_redistribution_assessment_is_required_and_evidence_bound(self):
         cases = ((0, None, "redistribution.assessment must be one of"),
@@ -715,11 +775,55 @@ class RepositoryRegisterTests(unittest.TestCase):
         self.assertEqual(components["sglang-curated-fork"]["distribution"], "excluded")
         self.assertEqual(components["open-webui-fork"]["distribution"], "excluded")
         self.assertEqual(register["review_groups"]["serving"]["status"], "excluded")
+        self.assertIn(OPENMETTLE_SERVING_DECISION, boundary["review"]["evidence"])
+        self.assertIn("Explicit exception: OpenMettle/openmettle-serving", boundary["description"])
+        self.assertIn("openmettle-core's own source only", boundary["description"])
         # Nothing may stay an undecided candidate, and every component carries a forward assessment.
         for comp in register["components"]:
             with self.subTest(component=comp["id"]):
                 self.assertNotEqual(comp["distribution"], "candidate")
                 self.assertIn(comp["redistribution"]["assessment"], provenance.REDISTRIBUTION)
+
+    def test_in_boundary_core_sources_stay_included(self):
+        register = json.loads((REPO / "provenance" / "register.json").read_text())
+        components = {comp["id"]: comp for comp in register["components"]}
+        for cid in ("repository-template", "openapi-3.2-schemas"):
+            with self.subTest(component=cid):
+                self.assertEqual(components[cid]["distribution"], "included")
+                self.assertEqual(components[cid]["review"]["status"], "reviewed")
+                self.assertEqual(components[cid]["review_group"], "core")
+        workspace = [r for r in register["cargo_reviews"] if r["name"] == "openmettle-core" and r["source"] is None]
+        self.assertEqual(len(workspace), 1)
+        self.assertEqual(workspace[0]["licence"]["expression"], "MIT")
+        self.assertEqual(workspace[0]["review"]["status"], "reviewed")
+        self.assertEqual(register["review_groups"]["core"]["status"], "reviewed")
+
+    def test_openmettle_acp_is_in_boundary_and_reviewed_in_its_own_repository(self):
+        register = json.loads((REPO / "provenance" / "register.json").read_text())
+        acp = {comp["id"]: comp for comp in register["components"]}["openmettle-acp"]
+        self.assertEqual(acp["distribution"], "reviewed-elsewhere")
+        self.assertEqual(acp["reviewed_in"], "OpenMettle/openmettle-acp")
+        self.assertNotIn("exclusion_reason", acp)
+        group = register["review_groups"][acp["review_group"]]
+        self.assertEqual(group["status"], "reviewed")
+        self.assertIn(OPENMETTLE_SERVING_DECISION, group["review"]["evidence"])
+
+    def test_openmettle_serving_is_the_explicit_exception(self):
+        register = json.loads((REPO / "provenance" / "register.json").read_text())
+        serving = {comp["id"]: comp for comp in register["components"]}["serving-fork-evidence"]
+        self.assertEqual(serving["distribution"], "excluded")
+        self.assertEqual(register["review_groups"][serving["review_group"]]["status"], "excluded")
+        self.assertIn(OPENMETTLE_SERVING_DECISION, serving["exclusion_reason"])
+        self.assertIn("OpenMettle/openmettle-serving", serving["exclusion_reason"])
+        self.assertNotIn("second decision", serving["exclusion_reason"])
+        self.assertIn(OPENMETTLE_SERVING_DECISION, register["review_groups"]["serving"]["review"]["evidence"])
+
+    def test_unpinned_or_unreviewed_licences_are_undetermined(self):
+        register = json.loads((REPO / "provenance" / "register.json").read_text())
+        components = {comp["id"]: comp for comp in register["components"]}
+        for cid in ("neo4j-community-image", "agent-sandbox-controller", "gvisor", "helixdb"):
+            with self.subTest(component=cid):
+                self.assertEqual(components[cid]["redistribution"]["assessment"], "undetermined")
 
     def test_every_lock_package_appears_in_inventory(self):
         with tempfile.TemporaryDirectory() as tmp:
