@@ -145,6 +145,176 @@ fn rejects_invalid_config_without_disclosing_values() {
     }
 }
 
+/// ADR 0024: telemetry settings are configuration. An invalid value exits 78 with one fixed
+/// line naming the key, before any listener opens or any event is written.
+#[test]
+fn rejects_invalid_telemetry_settings_with_a_fixed_line() {
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    for worker in [false, true] {
+        let prefix = if worker {
+            "OPENMETTLE_WORKER"
+        } else {
+            "OPENMETTLE_API"
+        };
+        for (key, value) in [
+            ("LOG_FORMAT", "synthetic-secret"),
+            ("LOG_FORMAT", "JSON"),
+            ("LOG_LEVEL", "trace"),
+            ("LOG_LEVEL", "info,synthetic-secret=debug"),
+        ] {
+            let output = command(worker)
+                .env(
+                    format!("{prefix}_DATABASE_URL"),
+                    "postgres://localhost/test",
+                )
+                // Serving would exit 1 on this occupied address instead.
+                .env(
+                    format!("{prefix}_BIND"),
+                    occupied.local_addr().unwrap().to_string(),
+                )
+                .env(format!("{prefix}_{key}"), value)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(78), "{key}={value}");
+            assert!(output.stdout.is_empty());
+            assert_eq!(
+                String::from_utf8(output.stderr).unwrap(),
+                format!("configuration error: invalid {key}\n")
+            );
+        }
+    }
+}
+
+/// Starts a process with piped stderr and the given telemetry settings.
+fn start_logging(worker: bool, address: &str, url: &str, settings: &[(&str, &str)]) -> Process {
+    let prefix = if worker {
+        "OPENMETTLE_WORKER"
+    } else {
+        "OPENMETTLE_API"
+    };
+    let mut command = command(worker);
+    command
+        .env(format!("{prefix}_BIND"), address)
+        .env(format!("{prefix}_DATABASE_URL"), url)
+        .env(format!("{prefix}_DB_TIMEOUT_MS"), "150")
+        .env(format!("{prefix}_SHUTDOWN_TIMEOUT_MS"), "1000");
+    for (key, value) in settings {
+        command.env(format!("{prefix}_{key}"), value);
+    }
+    Process(
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    )
+}
+fn drain(process: &mut Process) -> (String, String) {
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    process
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    process
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    (stdout, stderr)
+}
+
+/// ADR 0024 through the real binaries: lifecycle and request events on stderr only, in the
+/// selected format and level, with none of the planted canaries.
+#[test]
+fn serving_writes_redacted_lifecycle_and_request_events_to_stderr() {
+    let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "postgres://fixture:CANARY-db-password@{}/fixture?sslmode=disable",
+        unavailable.local_addr().unwrap()
+    );
+    let requests = [
+        "GET /healthz?code=CANARY-query&state=CANARY-state HTTP/1.1\r\nHost: localhost\r\n\
+         Cookie: __Host-openmettle-session=CANARY-cookie\r\nX-Request-Id: CANARY-id\r\n\
+         Connection: close\r\n\r\n",
+        "GET /readyz HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer CANARY-bearer\r\n\
+         Connection: close\r\n\r\n",
+        "POST /CANARY-path HTTP/1.1\r\nHost: localhost\r\nContent-Length: 14\r\n\
+         Connection: close\r\n\r\nCANARY-payload",
+    ];
+    // The API in JSON at debug sees everything; the worker in text at warn sees only the
+    // failed readiness check.
+    for (worker, settings) in [
+        (false, &[("LOG_LEVEL", "debug")][..]),
+        (true, &[("LOG_FORMAT", "text"), ("LOG_LEVEL", "warn")][..]),
+    ] {
+        let bind = address();
+        let mut process = start_logging(worker, &bind, &url, settings);
+        wait_status(&mut process, &bind, "/healthz", 200);
+        for request in requests {
+            send(&bind, request).unwrap();
+        }
+        stop(&mut process, "-TERM");
+        let (stdout, stderr) = drain(&mut process);
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(!stderr.contains("CANARY"), "{stderr}");
+        let lines: Vec<&str> = stderr.lines().collect();
+        if worker {
+            assert_eq!(lines.len(), 1, "{stderr}");
+            assert!(
+                lines[0].contains(" WARN event=\"http.request.completed\""),
+                "{stderr}"
+            );
+            assert!(lines[0].contains("http.route=\"/readyz\""), "{stderr}");
+            assert!(
+                lines[0].contains("http.response.status_code=503"),
+                "{stderr}"
+            );
+            continue;
+        }
+        let events: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let names: Vec<&str> = events
+            .iter()
+            .map(|e| e["event"].as_str().unwrap())
+            .collect();
+        // Health polling adds request events before the planted requests.
+        assert_eq!(names.first(), Some(&"process.started"), "{stderr}");
+        assert_eq!(
+            names[names.len() - 2..],
+            ["process.stopping", "process.stopped"]
+        );
+        assert_eq!(events[0]["role"], "api");
+        assert_eq!(events[names.len() - 2]["signal"], "SIGTERM");
+        let planted: Vec<_> = events[events.len() - 5..events.len() - 2]
+            .iter()
+            .map(|e| {
+                (
+                    e["http.route"].as_str().unwrap(),
+                    e["http.request.method"].as_str().unwrap(),
+                    e["http.response.status_code"].as_u64().unwrap(),
+                    e["level"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            planted,
+            [
+                ("/healthz", "GET", 200, "DEBUG"),
+                ("/readyz", "GET", 503, "WARN"),
+                ("unmatched", "POST", 404, "DEBUG"),
+            ]
+        );
+    }
+}
+
 const USAGE: &str = "usage error: expected no arguments or --check-auth-config PATH\n";
 
 /// ADRs 0015 and 0020: the check needs no database setting and opens no listener, for
@@ -413,6 +583,14 @@ fn occupied_listener_exits_with_runtime_error() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
+    // One JSON event names the failure class; nothing goes to stdout.
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let event: serde_json::Value = serde_json::from_str(stderr.trim_end()).unwrap();
+    assert_eq!(event["event"], "process.failed");
+    assert_eq!(event["level"], "ERROR");
+    assert_eq!(event["role"], "api");
+    assert_eq!(event["error.type"], "Bind");
 }
 
 #[test]

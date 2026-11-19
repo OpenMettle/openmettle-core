@@ -1415,3 +1415,4 @@ mod postgres;
 mod router;
 mod service;
 mod session_routes;
+mod telemetry;
