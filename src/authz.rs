@@ -762,6 +762,7 @@ pub fn authorize_run_continuation(
 }
 
 pub mod projects;
+pub mod runs;
 pub mod store;
 
 #[cfg(test)]
