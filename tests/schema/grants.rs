@@ -1092,6 +1092,7 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
                     size_bytes: 10,
                     content_digest: &[0; 32],
                     media_type: "text/plain",
+                    display_name: None,
                 },
             )
             .await
@@ -1488,6 +1489,8 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
             "openmettle.grant_assignments.grantee_local_group_id",
             "openmettle.grant_assignments.grantee_oidc_group_id",
             "openmettle.projects.lock_guard",
+            // Migration 17 (ADR 0031).
+            "openmettle.artifact_revisions.display_name",
         ];
         let worker_reads = [
             "openmettle_worker has SELECT on openmettle.membership_observations",

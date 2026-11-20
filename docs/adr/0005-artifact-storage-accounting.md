@@ -6,6 +6,10 @@ does not complete #3: grants remain outstanding. It enables no product API, uplo
 quota policy, retention job or filesystem work. Follow ADR 0003 for migration and role
 provisioning and ADR 0004 for transaction composition. Migrations 1–3 are unchanged.
 
+> [ADR 0031](0031-filesystem-artifact-storage-and-streaming-multipart.md) adds the filesystem
+> payloads named by reservation UUID, and migration 17 adds an optional revision `display_name`
+> that `settle` stores and compares on replay.
+
 ## Scope
 
 Migration 4 adds five tables:

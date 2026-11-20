@@ -1135,6 +1135,72 @@ fn api_refuses_invalid_auth_config_with_a_fixed_redacted_line() {
     );
 }
 
+/// ADR 0031: a refused `ARTIFACTS_DIR` exits 78 before any listener opens, with one fixed
+/// line that carries no path. A usable directory gains `staging` and `revisions` and serves.
+#[test]
+fn artifacts_dir_is_validated_before_serving_with_a_fixed_line() {
+    let dir = auth_config_support::Dir::new();
+    let file = dir.write("CANARY-file", b"x");
+    let target = dir.path("CANARY-target");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, dir.path("CANARY-link")).unwrap();
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    for worker in [false, true] {
+        let prefix = if worker {
+            "OPENMETTLE_WORKER"
+        } else {
+            "OPENMETTLE_API"
+        };
+        for path in [
+            String::new(),
+            "CANARY-relative".into(),
+            dir.path("CANARY-absent"),
+            file.clone(),
+            dir.path("CANARY-link"),
+        ] {
+            let output = command(worker)
+                .env(
+                    format!("{prefix}_DATABASE_URL"),
+                    "postgres://localhost/test",
+                )
+                // Serving would exit 1 on this occupied address instead.
+                .env(
+                    format!("{prefix}_BIND"),
+                    occupied.local_addr().unwrap().to_string(),
+                )
+                .env(format!("{prefix}_ARTIFACTS_DIR"), &path)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(78), "{path:?}");
+            assert!(output.stdout.is_empty());
+            assert_eq!(
+                String::from_utf8(output.stderr).unwrap(),
+                "configuration error: invalid ARTIFACTS_DIR\n"
+            );
+        }
+        let root = dir.path(if worker { "worker" } else { "api" });
+        std::fs::create_dir(&root).unwrap();
+        let (_database, url) = unavailable_database();
+        let bind = address();
+        let mut process = Process(
+            command(worker)
+                .env(format!("{prefix}_BIND"), &bind)
+                .env(format!("{prefix}_DATABASE_URL"), &url)
+                .env(format!("{prefix}_DB_TIMEOUT_MS"), "150")
+                .env(format!("{prefix}_SHUTDOWN_TIMEOUT_MS"), "1000")
+                .env(format!("{prefix}_ARTIFACTS_DIR"), &root)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        wait_status(&mut process, &bind, "/healthz", 200);
+        for sub in ["staging", "revisions"] {
+            assert!(std::path::Path::new(&root).join(sub).is_dir());
+        }
+    }
+}
+
 /// ADR 0025: the worker has no auth settings. Neither prefix's `AUTH_CONFIG`, valid or
 /// unusable, changes what it serves or writes.
 #[test]

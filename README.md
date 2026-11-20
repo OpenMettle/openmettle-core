@@ -96,6 +96,20 @@ Unset, no exporter, task, DNS slot or socket exists and the process behaves exac
 - **Bounds.** Up to 2048 ended spans are queued; trace batches of up to 512 and cumulative metric snapshots are sent at least every 5 s; each export has 3 s, a 1 MiB request and a 64 KiB response. A full queue, a non-2xx response (including 3xx and 429), a timeout or any DNS, address or TLS failure drops the batch/cycle, and a `telemetry.dropped` event with `dropped_spans` or `dropped_metric_exports` goes to stderr at most once per export cycle.
 - **Shutdown.** The exporter gets at most half of the final flush slice (at most 125 ms) to send queued spans and a final metrics snapshot and is then cancelled, closing its connection; the stderr flush gets the rest. A stalled collector cannot extend the stop beyond `SHUTDOWN_TIMEOUT_MS`, and the runtime does not wait for an abandoned DNS lookup at exit.
 
+### Artifact storage directory (off by default)
+
+[ADR 0031](docs/adr/0031-filesystem-artifact-storage-and-streaming-multipart.md) adds one setting for the API and the worker, under their own prefix. The migrator never reads it. The storage engine and multipart parser exist as library code (`src/artifact_fs.rs`, `src/multipart.rs`); no route uses them yet.
+
+| Setting | Default | Values |
+| --- | --- | --- |
+| `ARTIFACTS_DIR` | unset (artifact file I/O disabled) | Absolute path to an existing directory whose leaf is not a symbolic link, typically the mount point of a persistent volume |
+
+Unset, the process opens no directory and starts exactly as before. Set, it creates `staging/` and `revisions/` (mode 0700) inside the directory if they are absent, before telemetry or the listener starts. Any refusal (empty, relative, missing, a file, a symbolic-link leaf, or a subdirectory that cannot be created or is not a real directory) exits 78 with exactly `configuration error: invalid ARTIFACTS_DIR`, never the path.
+
+- **Layout.** `staging/<reservation_id>` holds an upload in progress (mode 0600, created exclusively); `revisions/<reservation_id>` holds a published payload. The name is always the server-generated reservation UUID, never a client file name, which is kept only as the revision's display name.
+- **Durability.** A payload is `fsync`ed, renamed into `revisions/` and the directory `fsync`ed before the database records the revision. Refused, truncated or cancelled uploads leave no staging file, and their reservation is released, or released later by `artifact_fs::reconcile_expired`. `artifact_fs::purge_due` deletes expired retained payloads before confirming the purge. Nothing schedules either helper yet.
+- **Topology.** Every API and worker replica that writes or purges payloads must see the same directory. Use a `ReadWriteOnce` volume with all those pods on one node, or a `ReadWriteMany` storage class qualified for POSIX `rename`, exclusive creation and `fsync`. Back up PostgreSQL and the volume together.
+
 ### Browser sign-in routes (off by default)
 
 [ADR 0025](docs/adr/0025-browser-auth-runtime-mounting.md) adds one API-only setting. The worker and migrator never read it.

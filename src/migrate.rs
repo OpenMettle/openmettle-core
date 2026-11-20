@@ -106,6 +106,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "group and project grantees",
         sql: include_str!("../migrations/0016_grant_group_grantees.sql"),
     },
+    Source {
+        version: 17,
+        description: "artifact revision display name",
+        sql: include_str!("../migrations/0017_artifact_revision_display_name.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

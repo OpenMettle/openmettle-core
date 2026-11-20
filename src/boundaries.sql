@@ -198,6 +198,11 @@ column_contract (relation, attribute, role, privilege) AS (
         ('projects','lock_guard','UPDATE')
     ) AS grantees(relation, attribute, privilege) WHERE $1 >= 16
     UNION ALL
+    -- V1-15 (ADR 0031): the optional display name `settle` writes with each revision.
+    SELECT 'artifact_revisions', 'display_name', role, 'INSERT'
+    FROM (VALUES ('openmettle_api'), ('openmettle_worker')) AS r(role)
+    WHERE $1 >= 17
+    UNION ALL
     SELECT relation, attribute, 'openmettle_api', privilege FROM (VALUES
         ('login_nonce_reservations','key_id','INSERT'),
         ('login_nonce_reservations','nonce','INSERT'),

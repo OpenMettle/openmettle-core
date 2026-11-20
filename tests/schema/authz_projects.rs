@@ -1728,3 +1728,91 @@ async fn inactive_principals_receive_inactive_not_existence_and_settings_edge_ca
         );
     }
 }
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn create_in_scope_needs_an_editor_and_a_live_project() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let editor = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let viewer = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let outsider = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let p = create(&db, &alice, "create").await;
+    applied(set_role(&db, &alice, "e", &p, &user(&editor), ProjectRole::Editor).await);
+    applied(set_role(&db, &alice, "v", &p, &user(&viewer), ProjectRole::Viewer).await);
+    let scope = scope_of(&db, &p).await;
+    let personal = |account: &Account| {
+        let user = account.user.clone();
+        let db = &db;
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT id::text FROM openmettle.scopes WHERE personal_user_id = $1::uuid",
+            )
+            .bind(user)
+            .fetch_one(&mut connect(&db.0, OWNER).await)
+            .await
+            .unwrap()
+        }
+    };
+    let create_in = async |account: &Account, scope: &str| {
+        let principal = principal(&db, account).await;
+        projects::authorize_create_in_scope(&mut api(&db).await, &principal, scope, NOW).await
+    };
+    let alice_personal = personal(&alice).await;
+    assert!(create_in(&alice, &alice_personal).await.is_ok());
+    assert_eq!(
+        denied(create_in(&editor, &alice_personal).await),
+        DenialReason::NotFound
+    );
+    let missing = sqlx::query_scalar::<_, String>("SELECT gen_random_uuid()::text")
+        .fetch_one(&mut api(&db).await)
+        .await
+        .unwrap();
+    assert_eq!(
+        denied(create_in(&alice, &missing).await),
+        DenialReason::NotFound
+    );
+
+    let live = async || {
+        assert!(create_in(&alice, &scope).await.is_ok());
+        assert!(create_in(&editor, &scope).await.is_ok());
+        assert_eq!(
+            denied(create_in(&viewer, &scope).await),
+            policy(PolicyReason::InsufficientRole)
+        );
+        assert_eq!(
+            denied(create_in(&outsider, &scope).await),
+            DenialReason::NotFound
+        );
+    };
+    live().await;
+    // Archived: refused after authorization, so an outsider still learns nothing.
+    let mut c = api(&db).await;
+    applied(projects::archive_project(&mut c, &ctx(&alice, "archive"), &p).await);
+    for member in [&alice, &editor] {
+        assert_eq!(
+            conflict(create_in(member, &scope).await),
+            "project is archived"
+        );
+    }
+    assert_eq!(
+        denied(create_in(&viewer, &scope).await),
+        policy(PolicyReason::InsufficientRole)
+    );
+    assert_eq!(
+        denied(create_in(&outsider, &scope).await),
+        DenialReason::NotFound
+    );
+    applied(projects::restore_project(&mut c, &ctx(&alice, "restore"), &p).await);
+    live().await;
+    // Deleted: concealed from everyone, including its owner.
+    applied(projects::delete_project(&mut c, &ctx(&alice, "delete"), &p).await);
+    for account in [&alice, &editor, &viewer, &outsider] {
+        assert_eq!(
+            denied(create_in(account, &scope).await),
+            DenialReason::NotFound
+        );
+    }
+}

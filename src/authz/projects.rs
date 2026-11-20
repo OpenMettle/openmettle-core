@@ -1110,6 +1110,54 @@ pub async fn read_project(
     }
 }
 
+/// Decide whether `principal`, hydrated by the caller for this request, may create a
+/// conversation or artifact in `scope_id` ([`Action::CreateInScope`]). A personal scope admits
+/// its owner only; a project scope needs at least the editor role. A missing scope, or a
+/// deleted or invisible project, is concealed. An archived project is refused with
+/// [`ARCHIVED`] once the caller is authorized. `openmettle_api` only.
+pub async fn authorize_create_in_scope(
+    c: &mut PgConnection,
+    principal: &Principal,
+    scope_id: &str,
+    now_ms: i64,
+) -> Result<(), StoreError> {
+    active(principal)?;
+    uuid(scope_id, "scope_id")?;
+    let owner: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT personal_user_id::text, project_id::text FROM openmettle.scopes
+          WHERE id = $1::uuid",
+    )
+    .bind(scope_id)
+    .fetch_optional(&mut *c)
+    .await?;
+    let (scope, archived) = match owner {
+        Some((Some(owner_user_id), None)) => (
+            Scope::Personal {
+                scope_id: scope_id.to_owned(),
+                owner_user_id,
+            },
+            false,
+        ),
+        Some((None, Some(project_id))) => match load_project_settings(c, &project_id).await? {
+            Some(settings) if !settings.deleted => (
+                Scope::Project(project_in(c, &project_id, scope_id, now_ms).await?),
+                settings.archived,
+            ),
+            _ => return Err(CONCEALED),
+        },
+        _ => return Err(CONCEALED),
+    };
+    check(super::authorize_scope(
+        principal,
+        &scope,
+        Action::CreateInScope,
+    ))?;
+    if archived {
+        return Err(ARCHIVED);
+    }
+    Ok(())
+}
+
 /// Read one conversation or artifact for `principal` with [`super::authorize_resource`]. An
 /// item in a deleted project is concealed. In an archived project the item stays readable, its
 /// effective access is `Read` and shares can still be revoked. `openmettle_api` only.
