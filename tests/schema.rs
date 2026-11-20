@@ -448,17 +448,33 @@ async fn message(
     .await
 }
 
+/// Rows written before an upgrade, unchanged by it. Columns that later migrations add are
+/// excluded from the comparison; the nullable migration-19 `runs` columns must stay unset.
 async fn snapshot(connection: &mut PgConnection, tables: &[&str]) -> Vec<String> {
+    const V19_RUN_COLUMNS: [&str; 5] = [
+        "actor_approval_id",
+        "round_limit",
+        "queue_expires_at",
+        "claim_token",
+        "claimed_at",
+    ];
     let mut rows = Vec::new();
     for table in tables {
-        let mut table_rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT (to_jsonb(t) - 'session_generation' - 'lock_guard')::text FROM openmettle.{table} t ORDER BY id"
+        // Absent keys (before migration 19, or other tables) and JSON nulls are both unset.
+        let table_rows: Vec<(String, bool)> = sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT (to_jsonb(t) - 'session_generation' - 'lock_guard' - $1::text[])::text,
+                    NOT (jsonb_strip_nulls(to_jsonb(t)) ?| $1::text[])
+             FROM openmettle.{table} t ORDER BY id"
         )))
+        .bind(V19_RUN_COLUMNS)
         .fetch_all(&mut *connection)
         .await
         .unwrap();
         rows.push(format!("{table}: {}", table_rows.len()));
-        rows.append(&mut table_rows);
+        for (row, v19_unset) in table_rows {
+            assert!(v19_unset, "{table} row sets a migration-19 column: {row}");
+            rows.push(row);
+        }
     }
     rows
 }

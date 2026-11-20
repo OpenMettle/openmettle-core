@@ -672,7 +672,7 @@ async fn admission_racing_archive_delete_or_disable_never_leaves_a_live_run() {
         // Deterministic order: an uncommitted admission holds the project row (or the runner's
         // user row); the revocation waits for it, then cancels the run it admitted.
         let runner = account(&mut owner, PROVIDER, true, FUTURE).await;
-        let (project, scope) = new_project(&db, &alice, &format!("{path}-held")).await;
+        let (project, scope) = new_project(&db, &alice, &format!("{path}-held-project")).await;
         editor(&db, &alice, &project, &runner).await;
         let r = request(&db, &scope, "project", &runner, "held").await;
         let mut c = api(&db).await;
@@ -691,7 +691,8 @@ async fn admission_racing_archive_delete_or_disable_never_leaves_a_live_run() {
             panic!("expected an admission");
         };
         let mut revoker = api(&db).await;
-        let key = format!("{path}-held");
+        // Distinct from the creation key: an audited request_key is unique per actor.
+        let key = format!("{path}-held-revoke");
         let revoking = revoke(
             &mut revoker,
             path,
