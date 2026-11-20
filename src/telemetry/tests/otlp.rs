@@ -832,8 +832,8 @@ fn loading_refuses_unusable_ca_files_with_a_fixed_line() {
     }
 }
 
-/// The serving processes read the three keys after their existing keys and before
-/// `AUTH_CONFIG`; the worker reads them too.
+/// The serving processes read the OTLP keys after their existing keys and before
+/// `ARTIFACTS_DIR` and `AUTH_CONFIG`; the worker reads them too.
 #[test]
 fn serving_configuration_reads_otlp_keys_after_logging_and_before_auth_config() {
     for role in [crate::Role::Api, crate::Role::Worker] {
@@ -863,8 +863,10 @@ fn serving_configuration_reads_otlp_keys_after_logging_and_before_auth_config() 
             ]
         );
         assert!(level < endpoint);
+        // ADR 0031: both processes read `ARTIFACTS_DIR` next.
+        assert_eq!(position("ARTIFACTS_DIR"), Some(endpoint + 4));
         match role {
-            crate::Role::Api => assert_eq!(position("AUTH_CONFIG"), Some(endpoint + 4)),
+            crate::Role::Api => assert_eq!(position("AUTH_CONFIG"), Some(endpoint + 5)),
             crate::Role::Worker => assert_eq!(position("AUTH_CONFIG"), None),
         }
         // A refused OTLP key precedes the AUTH_CONFIG check and follows LOG_* checks.

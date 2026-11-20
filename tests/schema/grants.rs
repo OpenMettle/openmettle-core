@@ -678,7 +678,7 @@ async fn old_domain_snapshot(db: &TestDb) -> Vec<String> {
         "artifact_revisions",
     ] {
         let rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT (to_jsonb(t) - 'session_generation' - 'session_issued' - 'lock_guard')::text FROM openmettle.{table} t ORDER BY 1"
+            "SELECT (to_jsonb(t) - 'session_generation' - 'session_issued' - 'lock_guard' - 'display_name')::text FROM openmettle.{table} t ORDER BY 1"
         )))
         .fetch_all(&mut c)
         .await
@@ -1092,6 +1092,7 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
                     size_bytes: 10,
                     content_digest: &[0; 32],
                     media_type: "text/plain",
+                    display_name: None,
                 },
             )
             .await
@@ -1447,6 +1448,14 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
         .unwrap();
     assert_eq!(db.history().await, all_versions());
     assert_eq!(old_domain_snapshot(&db).await, before);
+    // Migration 17 names no existing revision; the snapshot omits only that new column.
+    let named: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM openmettle.artifact_revisions WHERE display_name IS NOT NULL",
+    )
+    .fetch_one(&mut db.admin().await)
+    .await
+    .unwrap();
+    assert_eq!(named, 0);
     if with_grants {
         assert_eq!(grant_snapshot(&db).await, grant_before);
     }
@@ -1488,6 +1497,8 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
             "openmettle.grant_assignments.grantee_local_group_id",
             "openmettle.grant_assignments.grantee_oidc_group_id",
             "openmettle.projects.lock_guard",
+            // Migration 17 (ADR 0031).
+            "openmettle.artifact_revisions.display_name",
         ];
         let worker_reads = [
             "openmettle_worker has SELECT on openmettle.membership_observations",

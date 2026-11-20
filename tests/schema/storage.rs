@@ -16,14 +16,19 @@ fn code(error: &Error) -> String {
 }
 
 /// Owner-only configuration, as an operator would apply it.
-async fn configure(db: &TestDb, budget: Option<i64>, personal: Option<i64>, project: Option<i64>) {
+pub(super) async fn configure(
+    db: &TestDb,
+    budget: Option<i64>,
+    personal: Option<i64>,
+    project: Option<i64>,
+) {
     let mut owner = connect(&db.0, OWNER).await;
     sqlx::query("UPDATE openmettle.storage_instance SET instance_budget_bytes=$1,personal_limit_bytes=$2,project_limit_bytes=$3")
         .bind(budget).bind(personal).bind(project).execute(&mut owner).await.unwrap();
 }
 
 /// Counters must equal the totals recomputed from reservation and revision rows.
-async fn assert_totals(db: &TestDb) {
+pub(super) async fn assert_totals(db: &TestDb) {
     let mut admin = db.admin().await;
     let rows: Vec<(String, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
         "SELECT s.id::text,
@@ -53,12 +58,12 @@ async fn assert_totals(db: &TestDb) {
     assert_eq!(instance, sums, "instance counters drifted");
 }
 
-async fn account(db: &TestDb, scope: &str) -> (i64, i64, i64) {
+pub(super) async fn account(db: &TestDb, scope: &str) -> (i64, i64, i64) {
     sqlx::query_as("SELECT active_bytes,retained_bytes,reserved_bytes FROM openmettle.storage_accounts WHERE scope_id=$1::uuid")
         .bind(scope).fetch_one(&mut db.admin().await).await.unwrap()
 }
 
-async fn new_uuid(db: &TestDb) -> String {
+pub(super) async fn new_uuid(db: &TestDb) -> String {
     sqlx::query_scalar("SELECT gen_random_uuid()::text")
         .fetch_one(&mut db.admin().await)
         .await
@@ -114,6 +119,7 @@ async fn settle(
             size_bytes: size,
             content_digest: &digest,
             media_type: media,
+            display_name: None,
         },
     )
     .await;
@@ -842,6 +848,7 @@ async fn cancellation_and_unknown_commit_never_double_charge() {
             size_bytes: 10,
             content_digest: &digest,
             media_type: "text/plain",
+            display_name: None,
         };
         match which {
             0 => {

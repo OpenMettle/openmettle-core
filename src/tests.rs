@@ -76,6 +76,32 @@ fn worker_never_reads_auth_config() {
     assert_eq!(worker_keys, api_keys);
 }
 
+/// ADR 0031: both processes read their own optional `ARTIFACTS_DIR`; a set value must be an
+/// absolute path, and the refusal names the key alone.
+#[test]
+fn artifacts_dir_is_optional_and_must_be_an_absolute_path() {
+    for role in [Role::Api, Role::Worker] {
+        assert_eq!(parse(role, &[URL]).ok().unwrap().artifacts_dir, None);
+        let config = parse(
+            role,
+            &[URL, ("ARTIFACTS_DIR", "/var/lib/openmettle/artifacts")],
+        );
+        assert_eq!(
+            config.ok().unwrap().artifacts_dir.as_deref(),
+            Some(std::path::Path::new("/var/lib/openmettle/artifacts"))
+        );
+        for value in ["", " ", "artifacts", "./artifacts", "../artifacts", "~/a"] {
+            let refused = parse(role, &[URL, ("ARTIFACTS_DIR", value)]);
+            assert_eq!(refused.err(), Some("invalid ARTIFACTS_DIR"), "{value:?}");
+        }
+        let refused = parse(
+            role,
+            &[URL, ("LOG_LEVEL", "trace"), ("ARTIFACTS_DIR", "relative")],
+        );
+        assert_eq!(refused.err(), Some("invalid LOG_LEVEL"));
+    }
+}
+
 /// A serving configuration over a database address that accepts and never answers.
 fn config(database: &TcpListener, auth: Option<&str>) -> Config {
     let url = format!(

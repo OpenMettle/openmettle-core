@@ -898,6 +898,8 @@ async fn concurrent_observations_have_one_revision_winner() {
     );
 }
 
+#[path = "artifact_fs.rs"]
+mod artifact_fs;
 #[path = "cancellation.rs"]
 mod cancellation;
 #[path = "storage.rs"]

@@ -3,6 +3,7 @@
 //! authenticated `/v1` project, conversation and artifact routes (ADRs 0025, 0029 and 0027
 //! PR4b), all off by default: without `OPENMETTLE_API_AUTH_CONFIG` it serves `/healthz` and
 //! `/readyz` only.
+pub mod artifact_fs;
 pub mod auth;
 pub mod auth_config;
 pub mod authz;
@@ -13,6 +14,7 @@ pub mod invitation;
 pub mod login;
 pub mod membership;
 pub mod migrate;
+pub mod multipart;
 pub mod provider_http;
 pub mod provider_keys;
 pub mod runs;
@@ -51,6 +53,10 @@ struct Config {
     /// document to mount (ADRs 0025 and 0029). Always `None` for the worker, which never
     /// reads the key.
     auth_config: Option<PathBuf>,
+    /// `ARTIFACTS_DIR` (ADR 0031): the artifact payload directory, validated with
+    /// [`artifact_fs::Store::open`] before telemetry starts. `None` leaves artifact file I/O
+    /// disabled.
+    artifacts_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -102,6 +108,14 @@ impl Config {
             Duration::from_millis(number("SHUTDOWN_TIMEOUT_MS", 5000, 60000)?.into());
         let telemetry = telemetry::Settings::parse(&get)?;
         let otlp = telemetry::otlp::Settings::parse(&get)?;
+        // Both processes; a set value is never treated as unset.
+        let artifacts_dir = get("ARTIFACTS_DIR")?.map(PathBuf::from);
+        if artifacts_dir
+            .as_deref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err("invalid ARTIFACTS_DIR");
+        }
         // Read last, and by the API alone. Unset serves the operational routes only. A set
         // value is never treated as unset: empty or relative is refused, as the loader would.
         let auth_config = match role {
@@ -123,6 +137,7 @@ impl Config {
             telemetry,
             otlp,
             auth_config,
+            artifacts_dir,
         })
     }
 }
@@ -256,6 +271,13 @@ pub async fn run(role: Role) -> u8 {
             return 78;
         }
     };
+    // The artifacts directory must exist as a real directory with usable subdirectories.
+    if let Some(dir) = &config.artifacts_dir
+        && artifact_fs::Store::open(dir).is_err()
+    {
+        eprintln!("configuration error: invalid ARTIFACTS_DIR");
+        return 78;
+    }
     // The same holds for the browser sign-in settings: refused before telemetry is installed
     // or the listener opens, with the offline check's fixed category line (ADRs 0015, 0025).
     let pool = pool(&config);

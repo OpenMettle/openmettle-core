@@ -232,12 +232,21 @@ pub struct Settlement<'a> {
     pub size_bytes: i64,
     pub content_digest: &'a [u8],
     pub media_type: &'a str,
+    /// Optional client-supplied file name, display metadata only (ADR 0031). Never a path.
+    pub display_name: Option<&'a str>,
+}
+
+/// A display name is 1 to 255 characters without control characters or surrounding white
+/// space; at least as strict as migration 17, which checks only ASCII classes.
+pub fn valid_display_name(name: &str) -> bool {
+    let count = name.chars().count();
+    (1..=255).contains(&count) && !name.chars().any(char::is_control) && name.trim() == name
 }
 
 /// Settle a reservation into exactly one revision: charge the actual size and release the
 /// unused remainder. Creates the artifact (owned by the reservation actor) on first use. An
-/// exact replay returns the same revision; different metadata or a released reservation
-/// conflicts.
+/// exact replay returns the same revision; different metadata (including the display name) or
+/// a released reservation conflicts.
 pub async fn settle(tx: &mut WriteTransaction<'_>, s: &Settlement<'_>) -> Result<String, Error> {
     record(StorageOperation::Settle, settle_inner(tx, s).await)
 }
@@ -245,7 +254,11 @@ pub async fn settle(tx: &mut WriteTransaction<'_>, s: &Settlement<'_>) -> Result
 async fn settle_inner(tx: &mut WriteTransaction<'_>, s: &Settlement<'_>) -> Result<String, Error> {
     uuid(s.scope)?;
     uuid(s.reservation)?;
-    if s.size_bytes < 0 || s.content_digest.len() != 32 || !bounded(s.media_type, 255) {
+    if s.size_bytes < 0
+        || s.content_digest.len() != 32
+        || !bounded(s.media_type, 255)
+        || s.display_name.is_some_and(|name| !valid_display_name(name))
+    {
         return Err(Error::Invalid);
     }
     let mut outer = tx.take_active()?;
@@ -261,13 +274,14 @@ async fn settle_inner(tx: &mut WriteTransaction<'_>, s: &Settlement<'_>) -> Resu
             ReservationState::Released => return Err(Error::Conflict),
             ReservationState::Settled => {
                 let rev = sqlx::query("SELECT id::text,artifact_id::text,size_bytes,content_digest,media_type,
-                     created_by_user_id::text FROM openmettle.artifact_revisions
+                     display_name,created_by_user_id::text FROM openmettle.artifact_revisions
                      WHERE scope_id=$1::uuid AND reservation_id=$2::uuid")
                     .bind(s.scope).bind(s.reservation).fetch_one(&mut *sp).await?;
                 if rev.get::<String, _>("artifact_id") != artifact
                     || rev.get::<i64, _>("size_bytes") != s.size_bytes
                     || rev.get::<Vec<u8>, _>("content_digest") != s.content_digest
                     || rev.get::<String, _>("media_type") != s.media_type
+                    || rev.get::<Option<String>, _>("display_name").as_deref() != s.display_name
                     || rev.get::<String, _>("created_by_user_id") != actor
                 {
                     return Err(Error::Conflict);
@@ -290,11 +304,25 @@ async fn settle_inner(tx: &mut WriteTransaction<'_>, s: &Settlement<'_>) -> Resu
         let number: i64 = sqlx::query_scalar("UPDATE openmettle.artifacts SET last_revision=last_revision+1
              WHERE id=$1::uuid RETURNING last_revision")
             .bind(&artifact).fetch_one(&mut *sp).await?;
-        let revision: String = sqlx::query_scalar("INSERT INTO openmettle.artifact_revisions
-             (scope_id,artifact_id,revision,reservation_id,size_bytes,content_digest,media_type,created_by_user_id)
-             VALUES ($1::uuid,$2::uuid,$3,$4::uuid,$5,$6,$7,$8::uuid) RETURNING id::text")
+        // Name `display_name` only when set, so an unnamed settle also runs on schemas 4-16.
+        let sql = if s.display_name.is_some() {
+            "INSERT INTO openmettle.artifact_revisions
+             (scope_id,artifact_id,revision,reservation_id,size_bytes,content_digest,media_type,
+              created_by_user_id,display_name)
+             VALUES ($1::uuid,$2::uuid,$3,$4::uuid,$5,$6,$7,$8::uuid,$9) RETURNING id::text"
+        } else {
+            "INSERT INTO openmettle.artifact_revisions
+             (scope_id,artifact_id,revision,reservation_id,size_bytes,content_digest,media_type,
+              created_by_user_id)
+             VALUES ($1::uuid,$2::uuid,$3,$4::uuid,$5,$6,$7,$8::uuid) RETURNING id::text"
+        };
+        let mut insert = sqlx::query_scalar(sql)
             .bind(s.scope).bind(&artifact).bind(number).bind(s.reservation).bind(s.size_bytes)
-            .bind(s.content_digest).bind(s.media_type).bind(&actor).fetch_one(&mut *sp).await?;
+            .bind(s.content_digest).bind(s.media_type).bind(&actor);
+        if let Some(name) = s.display_name {
+            insert = insert.bind(name);
+        }
+        let revision: String = insert.fetch_one(&mut *sp).await?;
         sqlx::query("UPDATE openmettle.storage_reservations SET state='settled',settled_bytes=$3,closed_at=now()
              WHERE scope_id=$1::uuid AND id=$2::uuid")
             .bind(s.scope).bind(s.reservation).bind(s.size_bytes).execute(&mut *sp).await?;
