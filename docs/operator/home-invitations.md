@@ -142,7 +142,7 @@ The database cannot verify an OIDC proof. It trusts the application to do so, as
 - A code that a person has entered is stored only as ciphertext in the login row, under a key ring the database does not hold, and only until that login is consumed.
 - Guessing a 128-bit code is not feasible.
 
-The same principal can still issue sessions for any approved existing identity, which [#73](https://github.com/OpenMettle/openmettle-core/issues/73) tracks.
+The same principal can still issue sessions for any approved existing identity, which [#73](https://github.com/OpenMettle/openmettle-core/issues/73) tracks. [ADR 0030](../adr/0030-session-issuance-database-boundary.md) (proposed, not yet implemented) closes that path by moving issuance and the redemption function's `EXECUTE` to a separate `openmettle_issuance` role. From then on, the parameter-logging advice below applies to that role instead of the API role.
 
 These remain trusted with the code:
 
