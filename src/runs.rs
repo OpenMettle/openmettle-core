@@ -72,19 +72,15 @@ impl Payload<'_> {
 pub(crate) fn bounded(s: &str, max: usize) -> bool {
     !s.is_empty() && s.len() <= max && !s.contains('\0')
 }
-pub(crate) fn uuid(s: &str) -> Result<(), Error> {
-    if s.len() != 36
-        || !s.bytes().enumerate().all(|(i, b)| {
-            if [8, 13, 18, 23].contains(&i) {
-                b == b'-'
-            } else {
-                b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
-            }
+pub(crate) fn is_canonical_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => matches!(b, b'0'..=b'9' | b'a'..=b'f'),
         })
-    {
-        return Err(Error::Invalid);
-    }
-    Ok(())
+}
+pub(crate) fn uuid(s: &str) -> Result<(), Error> {
+    is_canonical_uuid(s).then_some(()).ok_or(Error::Invalid)
 }
 /// Domain is a fixed ASCII constant, then each field is u64 big-endian length + bytes.
 /// Numeric fields are fixed-width big-endian bytes inside that envelope.
@@ -116,6 +112,34 @@ impl<'c> WriteTransaction<'c> {
         Ok(Self {
             inner: Some(Connection::begin(connection).await?),
         })
+    }
+    /// Start a bounded `READ COMMITTED` root transaction with 2 s lock and 3 s statement limits.
+    pub(crate) async fn begin_bounded(
+        connection: &'c mut PgConnection,
+        read_only: bool,
+    ) -> Result<Self, Error> {
+        let mut tx = Self::begin(connection).await?;
+        let setup: &[&'static str] = if read_only {
+            &[
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY",
+                "SET LOCAL lock_timeout = '2s'",
+                "SET LOCAL statement_timeout = '3s'",
+            ]
+        } else {
+            &[
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+                "SET LOCAL synchronous_commit = on",
+                "SET LOCAL lock_timeout = '2s'",
+                "SET LOCAL statement_timeout = '3s'",
+            ]
+        };
+        for &sql in setup {
+            if let Err(error) = sqlx::query(sql).execute(tx.connection()?).await {
+                tx.rollback().await?;
+                return Err(error.into());
+            }
+        }
+        Ok(tx)
     }
     // SQLx can lose its root depth when a raw borrowed savepoint is cancelled. Never
     // turn that state into a no-op successful commit or let a helper open a new root.

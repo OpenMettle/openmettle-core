@@ -136,11 +136,7 @@ impl Settings {
     /// issuance credential is refused first: the migrator never reads it (ADR 0030).
     fn load() -> Result<(Self, telemetry::Settings), &'static str> {
         crate::refuse_issuance_url()?;
-        let get = |key: &str| match std::env::var(format!("OPENMETTLE_MIGRATE_{key}")) {
-            Ok(value) => Ok(Some(value)),
-            Err(std::env::VarError::NotPresent) => Ok(None),
-            Err(_) => Err("configuration must be UTF-8"),
-        };
+        let get = |key: &str| crate::env_var("OPENMETTLE_MIGRATE", key);
         Ok((Self::parse(get)?, telemetry::Settings::parse(get)?))
     }
 
@@ -148,21 +144,10 @@ impl Settings {
         get: impl Fn(&str) -> Result<Option<String>, &'static str>,
     ) -> Result<Self, &'static str> {
         let url = get("DATABASE_URL")?.ok_or("DATABASE_URL is required")?;
-        if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
-            return Err("invalid DATABASE_URL scheme");
-        }
-        let database = url
-            .parse::<PgConnectOptions>()
-            .map_err(|_| "invalid DATABASE_URL")?;
-        let millis = |key, default, max| -> Result<Duration, &'static str> {
-            let value: u64 = match get(key)? {
-                Some(value) => value.parse().map_err(|_| "invalid numeric configuration")?,
-                None => default,
-            };
-            if value == 0 || value > max {
-                return Err("configuration outside allowed range");
-            }
-            Ok(Duration::from_millis(value))
+        let database =
+            crate::database_url(&url, "invalid DATABASE_URL scheme", "invalid DATABASE_URL")?;
+        let millis = |key, default: u64, max| {
+            crate::bounded_positive(get(key)?, default, max).map(Duration::from_millis)
         };
         Ok(Self {
             database,

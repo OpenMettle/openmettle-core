@@ -7,6 +7,7 @@
 use crate::{
     capabilities::{Authorization, Caller},
     membership::Observation,
+    runs::is_canonical_uuid,
 };
 use std::collections::BTreeSet;
 
@@ -231,7 +232,7 @@ impl GrantVocabulary {
         }
         let permission = match (format, key) {
             // ADR 0021 stores the approval UUID as the key; it never names a role.
-            (PROJECT_MEMBER, key) if canonical_uuid(key) => {
+            (PROJECT_MEMBER, key) if is_canonical_uuid(key) => {
                 GrantPermission::ProjectRole(ProjectRole::Viewer)
             }
             (PROJECT_ROLE, "viewer") => GrantPermission::ProjectRole(ProjectRole::Viewer),
@@ -243,14 +244,6 @@ impl GrantVocabulary {
         };
         Ok(permission)
     }
-}
-
-fn canonical_uuid(s: &str) -> bool {
-    s.len() == 36
-        && s.bytes().enumerate().all(|(i, b)| match i {
-            8 | 13 | 18 | 23 => b == b'-',
-            _ => matches!(b, b'0'..=b'9' | b'a'..=b'f'),
-        })
 }
 
 /// Grant recipients. Local and OIDC groups are separate namespaces.

@@ -74,9 +74,37 @@ pub(crate) fn refuse_issuance_url() -> Result<(), &'static str> {
     }
 }
 
+/// Reads `{prefix}_{key}` from the process environment, refusing non-UTF-8 values.
+pub(crate) fn env_var(prefix: &str, key: &str) -> Result<Option<String>, &'static str> {
+    match std::env::var(format!("{prefix}_{key}")) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(_) => Err("configuration must be UTF-8"),
+    }
+}
+
+/// Parses an optional positive integer in `1..=max` with fixed, value-free refusals.
+pub(crate) fn bounded_positive<T>(
+    raw: Option<String>,
+    default: T,
+    max: T,
+) -> Result<T, &'static str>
+where
+    T: std::str::FromStr + PartialOrd + Default,
+{
+    let value = match raw {
+        Some(value) => value.parse().map_err(|_| "invalid numeric configuration")?,
+        None => default,
+    };
+    if value <= T::default() || value > max {
+        return Err("configuration outside allowed range");
+    }
+    Ok(value)
+}
+
 /// A `postgres://` or `postgresql://` URL, parsed with statement logging off (ADR 0002).
 /// The refusals name the key alone, never the value.
-fn database_url(
+pub(crate) fn database_url(
     url: &str,
     scheme: &'static str,
     invalid: &'static str,
@@ -99,11 +127,7 @@ impl Config {
                 "OPENMETTLE_WORKER"
             }
         };
-        Self::parse(role, |key| match std::env::var(format!("{prefix}_{key}")) {
-            Ok(value) => Ok(Some(value)),
-            Err(std::env::VarError::NotPresent) => Ok(None),
-            Err(_) => Err("configuration must be UTF-8"),
-        })
+        Self::parse(role, |key| env_var(prefix, key))
     }
 
     fn parse(
@@ -120,16 +144,7 @@ impl Config {
             .map_err(|_| "invalid BIND")?;
         let url = get("DATABASE_URL")?.ok_or("DATABASE_URL is required")?;
         let database = database_url(&url, "invalid DATABASE_URL scheme", "invalid DATABASE_URL")?;
-        let number = |key, default, max| -> Result<u32, &'static str> {
-            let value = match get(key)? {
-                Some(value) => value.parse().map_err(|_| "invalid numeric configuration")?,
-                None => default,
-            };
-            if value == 0 || value > max {
-                return Err("configuration outside allowed range");
-            }
-            Ok(value)
-        };
+        let number = |key, default: u32, max| bounded_positive(get(key)?, default, max);
         let connections = number("DB_MAX_CONNECTIONS", 4, 64)?;
         let database_timeout = Duration::from_millis(number("DB_TIMEOUT_MS", 2000, 30000)?.into());
         let shutdown_timeout =

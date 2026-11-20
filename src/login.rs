@@ -133,13 +133,10 @@ pub struct ProviderDefinition<'a> {
     pub destination: &'a str,
     pub enabled: bool,
 }
-pub(crate) fn validate_definition(
-    identity: &crate::auth::ProviderIdentity,
-    d: &ProviderDefinition<'_>,
-) -> Result<(), Error> {
+pub(crate) fn validate_definition(issuer: &str, d: &ProviderDefinition<'_>) -> Result<(), Error> {
     if !name(d.revision)
         || !name(d.destination)
-        || !https(identity.binding().1)
+        || !https(issuer)
         || !https(d.authorization_endpoint)
         || !https(d.token_endpoint)
         || !https(d.callback)
@@ -168,15 +165,7 @@ impl fmt::Debug for Provider {
 }
 impl Provider {
     pub fn new(trusted: TrustedProvider, d: ProviderDefinition<'_>) -> Result<Self, Error> {
-        if !name(d.revision)
-            || !name(d.destination)
-            || !https(trusted.binding().1)
-            || !https(d.authorization_endpoint)
-            || !https(d.token_endpoint)
-            || !https(d.callback)
-        {
-            return Err(Error::Configuration);
-        }
+        validate_definition(trusted.binding().1, &d)?;
         Ok(Self {
             managed: None,
             native: None,
@@ -273,28 +262,7 @@ async fn open(
     connection: &mut PgConnection,
     read_only: bool,
 ) -> Result<WriteTransaction<'_>, Error> {
-    let mut tx = WriteTransaction::begin(connection).await?;
-    let setup: Result<(), Error> = async {
-        for sql in [
-            "SET LOCAL synchronous_commit = on",
-            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-            "SET LOCAL lock_timeout = '2s'",
-            "SET LOCAL statement_timeout = '3s'",
-        ] {
-            sqlx::query(sql).execute(tx.connection()?).await?;
-        }
-        if read_only {
-            sqlx::query("SET TRANSACTION READ ONLY")
-                .execute(tx.connection()?)
-                .await?;
-        }
-        Ok(())
-    }
-    .await;
-    match setup {
-        Ok(()) => Ok(tx),
-        Err(error) => finish(tx, Err(error)).await,
-    }
+    Ok(WriteTransaction::begin_bounded(connection, read_only).await?)
 }
 // Every ordinary returned error awaits ROLLBACK, so an idle caller connection never keeps
 // row or admission locks (dropping a SQLx transaction only queues the rollback). The original

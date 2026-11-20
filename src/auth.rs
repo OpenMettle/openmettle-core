@@ -7,6 +7,7 @@
 //! discovery, key refresh, state/PKCE handling, account lookup or admission. A verified identity
 //! proves only that a trusted provider asserted this issuer/subject pair for this client and nonce;
 //! it is not authentication of a session, an admission decision or an access grant.
+use crate::runs::is_canonical_uuid;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, TimeDelta, Utc};
 use openidconnect::{
@@ -171,7 +172,7 @@ impl fmt::Debug for ProviderIdentity {
 }
 impl ProviderIdentity {
     pub fn new(id: &str, issuer: &str, client: &str) -> Result<Self, ConfigError> {
-        if !canonical_uuid(id) {
+        if !is_canonical_uuid(id) {
             return Err(ConfigError::ProviderConfigId);
         }
         let issuer = trusted_issuer(issuer).ok_or(ConfigError::Issuer)?;
@@ -232,7 +233,7 @@ impl TrustedProvider {
         client_id: &str,
         jwks: &[u8],
     ) -> Result<Self, ConfigError> {
-        if !canonical_uuid(provider_config_id) {
+        if !is_canonical_uuid(provider_config_id) {
             return Err(ConfigError::ProviderConfigId);
         }
         let issuer = trusted_issuer(issuer).ok_or(ConfigError::Issuer)?;
@@ -608,14 +609,6 @@ fn trusted_issuer(issuer: &str) -> Option<IssuerUrl> {
         && url.fragment().is_none()
         && !issuer.contains(['?', '#']);
     exact.then_some(parsed)
-}
-
-fn canonical_uuid(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(i, b)| match i {
-            8 | 13 | 18 | 23 => b == b'-',
-            _ => b.is_ascii_digit() || (b'a'..=b'f').contains(&b),
-        })
 }
 
 fn utc(now: SystemTime) -> Result<DateTime<Utc>, VerifyError> {

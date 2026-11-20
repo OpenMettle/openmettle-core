@@ -51,6 +51,7 @@ const BUCKET_SLOTS: usize = DURATION_BUCKETS.len() + 1;
 
 /// Closed HTTP route bucket for metrics. Keeps cardinality fixed even as new routes land and
 /// guarantees no raw path segment or parameter can enter a metric label.
+#[repr(usize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouteClass {
     Healthz,
@@ -90,18 +91,12 @@ impl RouteClass {
     }
 
     const fn index(self) -> usize {
-        match self {
-            Self::Healthz => 0,
-            Self::Readyz => 1,
-            Self::Auth => 2,
-            Self::V1 => 3,
-            Self::Other => 4,
-            Self::Unmatched => 5,
-        }
+        self as usize
     }
 }
 
 /// Closed HTTP status class for metrics.
+#[repr(usize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusClass {
     S2xx,
@@ -130,17 +125,12 @@ impl StatusClass {
     }
 
     const fn index(self) -> usize {
-        match self {
-            Self::S2xx => 0,
-            Self::S3xx => 1,
-            Self::S4xx => 2,
-            Self::S5xx => 3,
-            Self::Other => 4,
-        }
+        self as usize
     }
 }
 
 /// Closed outcome set for database readiness checks (`/readyz`).
+#[repr(usize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadinessOutcome {
     Ok,
@@ -157,15 +147,12 @@ impl ReadinessOutcome {
     }
 
     const fn index(self) -> usize {
-        match self {
-            Self::Ok => 0,
-            Self::Timeout => 1,
-            Self::Error => 2,
-        }
+        self as usize
     }
 }
 
 /// Closed outbound provider HTTP operation set (ADR 0010 / 0011).
+#[repr(usize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderOperation {
     Discovery,
@@ -182,15 +169,12 @@ impl ProviderOperation {
     }
 
     const fn index(self) -> usize {
-        match self {
-            Self::Discovery => 0,
-            Self::Jwks => 1,
-            Self::Token => 2,
-        }
+        self as usize
     }
 }
 
 /// Closed outcome set for outbound provider HTTP calls.
+#[repr(usize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderOutcome {
     Ok,
@@ -224,18 +208,12 @@ impl ProviderOutcome {
     }
 
     const fn index(self) -> usize {
-        match self {
-            Self::Ok => 0,
-            Self::HttpError => 1,
-            Self::Timeout => 2,
-            Self::Transport => 3,
-            Self::Refused => 4,
-            Self::BodyLimit => 5,
-        }
+        self as usize
     }
 }
 
 /// Closed artifact storage accounting operation set (ADR 0005).
+#[repr(usize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StorageOperation {
     Reserve,
@@ -272,19 +250,12 @@ impl StorageOperation {
     }
 
     const fn index(self) -> usize {
-        match self {
-            Self::Reserve => 0,
-            Self::Settle => 1,
-            Self::Release => 2,
-            Self::Retain => 3,
-            Self::Restore => 4,
-            Self::BeginPurge => 5,
-            Self::ConfirmPurge => 6,
-        }
+        self as usize
     }
 }
 
 /// Closed artifact storage accounting outcome set.
+#[repr(usize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StorageOutcome {
     Ok,
@@ -318,18 +289,12 @@ impl StorageOutcome {
     }
 
     const fn index(self) -> usize {
-        match self {
-            Self::Ok => 0,
-            Self::QuotaRefused => 1,
-            Self::Conflict => 2,
-            Self::NotFound => 3,
-            Self::Invalid => 4,
-            Self::Error => 5,
-        }
+        self as usize
     }
 }
 
 /// Closed signal kind for telemetry self-drop accounting.
+#[repr(usize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DroppedSignal {
     LogLines,
@@ -346,11 +311,7 @@ impl DroppedSignal {
     }
 
     const fn index(self) -> usize {
-        match self {
-            Self::LogLines => 0,
-            Self::TraceSpans => 1,
-            Self::MetricExports => 2,
-        }
+        self as usize
     }
 }
 

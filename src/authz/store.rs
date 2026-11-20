@@ -272,19 +272,7 @@ fn unique(error: sqlx::Error, constraint: &str, conflict: &'static str) -> Store
 
 /// One bounded READ COMMITTED transaction, shared by the writers and the run recheck.
 pub(super) async fn begin(c: &mut PgConnection) -> Result<WriteTransaction<'_>, StoreError> {
-    let mut tx = WriteTransaction::begin(c).await?;
-    for sql in [
-        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-        "SET LOCAL synchronous_commit = on",
-        "SET LOCAL lock_timeout = '2s'",
-        "SET LOCAL statement_timeout = '3s'",
-    ] {
-        if let Err(error) = sqlx::query(sql).execute(tx.connection()?).await {
-            tx.rollback().await?;
-            return Err(error.into());
-        }
-    }
-    Ok(tx)
+    Ok(WriteTransaction::begin_bounded(c, false).await?)
 }
 
 /// Run `body` in one READ COMMITTED write transaction: commit on success, roll back otherwise.
