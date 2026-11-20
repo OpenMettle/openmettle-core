@@ -396,7 +396,7 @@ creation (V1-07, V1-10), SSE (V1-12) and artifact upload (V1-15) remain with the
 - **Sessions.** A request presents exactly one channel: the `__Host-openmettle-session` cookie
   (found by the handoff's single-cookie rule) or one `Authorization: Bearer` native credential,
   accepted only when a native profile is mounted. Both, neither, a repeated field, another
-  scheme or a malformed bearer is `401` before any database work. The cookie channel binds the
+  scheme or a malformed cookie or bearer is `401` before any database work. The cookie channel binds the
   configured browser origin as ADR 0019 does for logout: an unsafe method needs exactly one
   `Origin` with those bytes, and a safe method that sends `Origin` must send that one. A missing,
   `null`, repeated or foreign `Origin` is `401`, not `403`, so `policy` still implies the caller

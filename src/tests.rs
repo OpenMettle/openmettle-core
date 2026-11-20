@@ -619,6 +619,22 @@ async fn v1_routes_refuse_before_the_database_under_observation() {
             "unauthenticated",
             "/v1/capabilities",
         ),
+        (
+            "POST",
+            "/v1/projects",
+            "authorization: Bearer CANARY-bearer\r\n".into(),
+            401,
+            "unauthenticated",
+            "/v1/projects",
+        ),
+        (
+            "POST",
+            "/v1/projects",
+            format!("cookie: __Host-openmettle-session=CANARY-cookie\r\n{origin}"),
+            401,
+            "unauthenticated",
+            "/v1/projects",
+        ),
         // The cookie channel's Origin binding (CSRF): required on writes, checked on reads.
         (
             "POST",
@@ -815,6 +831,7 @@ async fn v1_routes_refuse_before_the_database_under_observation() {
             "{head}"
         );
         if *method == "HEAD" {
+            assert!(head.contains("content-length: 0"), "{head}");
             assert!(body.is_empty());
             ids.push(None);
             continue;

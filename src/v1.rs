@@ -705,15 +705,21 @@ fn routes() -> [(&'static str, Vec<(Method, Op)>); 13] {
 
 impl Api {
     async fn serve(&self, operations: &[(Method, Op)], request: Request) -> Response {
+        let head = request.method() == Method::HEAD;
         // Inserted by `telemetry::observe`, so the problem names the logged request.
         let id = request
             .extensions()
             .get::<RequestId>()
             .copied()
             .or_else(RequestId::generate);
-        self.handle(operations, request)
+        let mut response = self
+            .handle(operations, request)
             .await
-            .unwrap_or_else(|problem| problem.response(id))
+            .unwrap_or_else(|problem| problem.response(id));
+        if head {
+            *response.body_mut() = Body::empty();
+        }
+        response
     }
 
     async fn handle(
@@ -772,11 +778,16 @@ impl Api {
         match (cookie, authorization.next(), authorization.next()) {
             (true, None, _) if self.same_origin(parts) => {
                 handoff::single_cookie(headers, handoff::SESSION_COOKIE)
+                    .filter(|c| sessions::well_formed(c).is_ok())
                     .map(Session::Browser)
                     .ok_or(UNAUTHENTICATED)
             }
             (false, Some(value), None) => {
-                let bearer = value.to_str().ok().and_then(|v| v.strip_prefix("Bearer "));
+                let bearer = value
+                    .to_str()
+                    .ok()
+                    .and_then(|v| v.strip_prefix("Bearer "))
+                    .filter(|c| sessions::well_formed(c).is_ok());
                 match (self.native.as_deref(), bearer) {
                     (Some(native), Some(bearer)) => Ok(Session::Native(native, bearer)),
                     _ => Err(UNAUTHENTICATED),

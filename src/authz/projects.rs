@@ -625,22 +625,40 @@ async fn project_write(
 
 /// A deleted project stays concealed from every write. The one exception is the exact replay
 /// of the delete that recorded it, by an actor still allowed to delete it, which answers
-/// `Replayed`. Any other request key is concealed, and the audit row `record` inserts for it
-/// is rolled back with the transaction.
+/// `Replayed` without writing. Any other request key is concealed.
 async fn deleted_replay(
     c: &mut PgConnection,
     ctx: &AuditContext<'_>,
     change: &Change,
     decision: Decision,
 ) -> Result<WriteOutcome, StoreError> {
+    let Some(project_id) = change.target_id.as_deref() else {
+        return Err(CONCEALED);
+    };
     if change.action != DELETE || !decision.is_allowed() {
         return Err(CONCEALED);
     }
-    match record(c, ctx, change).await {
-        Ok(replayed @ WriteOutcome::Replayed { .. }) => Ok(replayed),
-        Ok(WriteOutcome::Applied { .. }) | Err(StoreError::Conflict(_)) => Err(CONCEALED),
-        Err(error) => Err(error),
-    }
+    let target_id: Option<String> = sqlx::query_scalar(
+        "SELECT target_id
+           FROM openmettle.authorization_audit
+          WHERE actor_user_id = $1::uuid
+            AND request_key = $2
+            AND action = $3
+            AND target_kind = $4
+            AND target_id = $5
+            AND details = $6::jsonb",
+    )
+    .bind(ctx.actor_user_id)
+    .bind(ctx.request_key)
+    .bind(change.action)
+    .bind(change.target_kind)
+    .bind(project_id)
+    .bind(change.details.to_string())
+    .fetch_optional(&mut *c)
+    .await?;
+    target_id
+        .map(|target_id| WriteOutcome::Replayed { target_id })
+        .ok_or(CONCEALED)
 }
 
 fn project_change(action: &'static str, project_id: &str, details: Value) -> Change {
