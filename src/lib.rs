@@ -2,6 +2,7 @@
 //! The API can also mount the browser sign-in routes, off by default (ADR 0025).
 pub mod auth;
 pub mod auth_config;
+pub mod authz;
 pub mod browser_auth;
 pub mod capabilities;
 pub mod grants;

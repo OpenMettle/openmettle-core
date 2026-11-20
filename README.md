@@ -662,3 +662,13 @@ the configured age or token expiry, whichever comes first. A complete removal re
 mapped assignment. Missing or partial evidence withholds a positive membership decision
 and preserves the grant history. See [ADR 0021](docs/adr/0021-project-membership.md) for
 the configuration, evidence profile and recovery boundaries.
+
+## Authorization policy
+
+[ADR 0027](docs/adr/0027-authorization-and-private-projects.md) adds `src/authz.rs`, a pure
+policy evaluator for V1-05: strict grant vocabulary, `Owner`/`Editor`/`Viewer` project roles,
+private-by-default conversations, artifacts and memory, sharing that requires active project
+membership, platform and user capability denies, last-owner and last-admin refusals and an
+execution-time run recheck. `account_admin` never grants content access. Nothing calls it
+yet: it adds no migration, route or enforcement, and inputs must be hydrated from the primary
+database by later increments.
