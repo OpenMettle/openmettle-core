@@ -1,0 +1,70 @@
+name: Telemetry qualification
+# V1-29 Increment 4 (#26, ADR 0028): validates deterministic Prometheus alert rules with
+# promtool and qualifies OTLP/HTTPS trace+metrics ingestion, contract label conformance,
+# redaction, and collector-outage resilience against pinned Grafana Alloy and Prometheus
+# on an ephemeral kind cluster classified dev. Test fixtures only; nothing is published.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  harness:
+    name: Telemetry harness tests and promtool alert checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # Multi-arch Docker Hub index digest for prom/prometheus v3.5.0, resolved 2026-11-20.
+      PROMETHEUS_IMAGE: docker.io/prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6; resolved 2026-11-14
+        with:
+          persist-credentials: false
+      - name: Test telemetry qualification guards, TLS, fixtures and validators offline
+        run: python3 -m unittest discover -s tests/telemetry_kind -v
+      - name: Validate and unit-test v1 Prometheus alert rules with pinned promtool
+        run: |
+          docker pull "$PROMETHEUS_IMAGE"
+          docker run --rm --network none --read-only --user 65534:65534 \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --entrypoint /bin/promtool \
+            --volume "$PWD/contracts/telemetry:/work:ro" \
+            "$PROMETHEUS_IMAGE" check rules /work/alerts-v1.yaml
+          docker run --rm --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges \
+            --entrypoint /bin/promtool \
+            --volume "$PWD/contracts/telemetry:/work:ro" \
+            "$PROMETHEUS_IMAGE" test rules /work/alerts-v1-test.yaml
+
+  kind:
+    name: Telemetry contract on ephemeral kind (Alloy + Prometheus)
+    needs: harness
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6; resolved 2026-11-14
+        with:
+          persist-credentials: false
+      - name: Install pinned kind and kubectl (SHA-256 verified)
+        run: bash tests/kubernetes/install-tools.sh "$RUNNER_TEMP/k8s-tools"
+      - name: Qualify telemetry contract v1 and collector-outage resilience
+        env:
+          OPENMETTLE_K8S_QUALIFICATION: isolated-dev
+          OPENMETTLE_K8S_DOCKER_CONTEXT: default
+        run: >-
+          python3 tests/telemetry_kind/qualify.py
+          --tools-dir "$RUNNER_TEMP/k8s-tools"
+          --report "$RUNNER_TEMP/telemetry-qualification.json"
+      - name: Publish observed results to the job summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/telemetry-qualification.json" ]; then
+            { echo '```json'; cat "$RUNNER_TEMP/telemetry-qualification.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi

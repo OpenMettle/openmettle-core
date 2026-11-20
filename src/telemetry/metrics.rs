@@ -850,17 +850,19 @@ impl Metrics {
         push_counter(&mut metrics, &DESCRIPTORS[6], storage_points);
 
         // 7: openmettle.telemetry.dropped
-        let mut drop_points = Vec::new();
+        // Always emit all 3 closed drop-signal series (including 0) from process startup so
+        // Prometheus records the zero baseline before any first outage; otherwise `increase()`
+        // treats the first non-zero sample after a collector outage as a series appearance with
+        // zero increase. These 3 streams are already counted in `max_series: 3`.
+        let mut drop_points = Vec::with_capacity(DroppedSignal::ALL.len());
         for &signal in DroppedSignal::ALL {
             let value = self.telemetry_dropped[signal.index()].load(Ordering::Relaxed);
-            if value > 0 {
-                drop_points.push(counter_point(
-                    start,
-                    now,
-                    value,
-                    &[("signal", signal.as_str())],
-                ));
-            }
+            drop_points.push(counter_point(
+                start,
+                now,
+                value,
+                &[("signal", signal.as_str())],
+            ));
         }
         push_counter(&mut metrics, &DESCRIPTORS[7], drop_points);
 
