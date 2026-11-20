@@ -1875,3 +1875,6 @@ mod durable;
 
 #[path = "schema/sessions.rs"]
 mod sessions;
+
+#[path = "schema/authz_store.rs"]
+mod authz_store;

@@ -221,6 +221,39 @@ Group grantees on ADR 0006 assignments (`grant_assignments.grantee_user_id` is `
 are not part of this migration; sharing with or granting project roles to a group needs a
 later additive migration before PR3/PR4 writes them.
 
+### PR3: Hydration and administration store
+
+`src/authz/store.rs` reads and writes the migration 15 tables through the existing bounded
+roles. It adds no migration, route or dependency.
+
+- **Hydration.** `hydrate_api_principal` and `hydrate_worker_principal` share one query path
+  and read the primary on every call; nothing is cached. The principal is `None` for an
+  unknown user or one without a personal scope. `approval_active` and `provider_active` use
+  the session-validation rules of ADR 0013 for the exact approval, which must belong to one
+  of the user's identities. Local groups are active memberships of enabled groups. An OIDC
+  group is the claim value of a `group` selector whose ADR 0021 evidence is `present` at
+  `now_ms`, using the same SQL predicate as `membership::current`. The worker variant never
+  selects `account_admins` and reports `account_admin = false`.
+  `load_platform_capabilities` returns the platform denies for either role.
+- **Writes** run only as `openmettle_api`, each in one READ COMMITTED transaction:
+  1. Account-administrator changes and user disable or enable first lock
+     `account_admin_lock`, matching `docs/operator/grant-account-admin.psql`.
+  2. The actor is re-hydrated inside the transaction and must pass `require` and
+     `authorize_admin`.
+  3. The `authorization_audit` row is inserted next with `ON CONFLICT DO NOTHING` on
+     `(actor_user_id, request_key)`. A recorded key with the same action, target and details
+     returns `Replayed` without writing. A different change returns `Conflict`.
+  4. The target is checked and the change applied. Removing an enabled administrator is
+     re-decided with the enabled count taken under the lock (`LastAccountAdmin`).
+- A change that would not alter the current state returns `Conflict` and writes no audit
+  row. Rows are never deleted. Every update advances `revision` and records
+  `updated_at = clock_timestamp()` and the actor. Disabling a user also advances
+  `session_generation`, so re-enabling never revives an earlier session or membership
+  observation.
+- Audit `details` hold only request identifiers: a group `name`, or the member or capability
+  `user_id`. Capability changes use target kind `capability` with the capability name as the
+  target.
+
 ## Verification
 
 `src/authz/tests.rs` covers vocabulary acceptance and rejection, the role matrix,
@@ -230,3 +263,8 @@ personal sharing, last-owner and last-admin invariants, capability denies and op
 mapping and run continuation. They are unit tests of the pure policy. They do not prove
 hydration, persistence, transactional counting or route enforcement, which PR2–PR5 must test
 against PostgreSQL and HTTP.
+
+For PR3, `tests/schema/authz_store.rs` runs against PostgreSQL 18 as the bounded roles. It
+covers hydration for both roles, OIDC evidence states, every write with its audit row,
+replays, request-key conflicts, refusals and the last-administrator race under
+`account_admin_lock`. Route enforcement remains PR4.
