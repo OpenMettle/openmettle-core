@@ -50,6 +50,7 @@ fn service(h: &Harness, pool: sqlx::PgPool) -> Arc<BrowserAuth> {
     let policy = sessions::Policy::new(Duration::from_secs(60), 16, Duration::from_secs(5));
     Arc::new(service::browser_auth(
         h,
+        pool.clone(),
         pool,
         Duration::from_secs(300),
         policy.unwrap(),

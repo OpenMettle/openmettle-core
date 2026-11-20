@@ -21,6 +21,8 @@ use std::{
 
 const OWNER: &str = "openmettle_owner";
 const API: &str = "openmettle_api";
+/// Session issuance (ADR 0030); required from migration 18.
+const ISSUANCE: &str = "openmettle_issuance";
 const WORKER: &str = "openmettle_worker";
 const CAPPED: &str = "openmettle_fixture_capped";
 /// Synthetic test-only credential for disposable fixture roles; never a deployment value.
@@ -178,7 +180,7 @@ async fn ensure_roles(admin: &mut PgConnection) {
         .execute("SELECT pg_advisory_lock(720202)")
         .await
         .unwrap();
-    for role in [OWNER, API, WORKER, CAPPED] {
+    for role in [OWNER, API, ISSUANCE, WORKER, CAPPED] {
         let exists: bool =
             sqlx::query_scalar("SELECT EXISTS (SELECT FROM pg_roles WHERE rolname = $1)")
                 .bind(role)
@@ -495,6 +497,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "b4203f2bf76cf54ec21882c40a41a312233c9be37a4631949f28e566b32dd118",
         "425c1d0aa9d3cf7d1910cab8f2ec55d3a5c8de24a169c181b5febeedc84f7c91",
         "6b2363d7267c088f75999b697fee05f74f88ee4a572be688558b03e9fe27d35c",
+        "26a9aff24fdead77748763b8e73ecf834faddfcfa5b0c3b70eebc5dd624000db",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
@@ -530,6 +533,24 @@ fn migrate_rejects_invalid_config_without_disclosing_values() {
     }
     let output = binary("migrate").output().unwrap();
     assert_eq!(output.status.code(), Some(78));
+    // ADR 0030: the API's issuance credential is refused while present, whatever its value,
+    // before any other setting is read and without echoing it.
+    use std::os::unix::ffi::OsStrExt;
+    for value in [
+        std::ffi::OsStr::new("postgres://openmettle_issuance:synthetic-secret@host/db"),
+        std::ffi::OsStr::new(""),
+        std::ffi::OsStr::from_bytes(b"synthetic-secret-\xff"),
+    ] {
+        let output = migrate_command("invalid://synthetic-secret", &[])
+            .env("OPENMETTLE_API_ISSUANCE_DATABASE_URL", value)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(78), "{value:?}");
+        assert_eq!(
+            stderr(&output),
+            "configuration error: OPENMETTLE_API_ISSUANCE_DATABASE_URL is refused outside the API\n"
+        );
+    }
 }
 
 #[test]
@@ -1273,7 +1294,7 @@ async fn unsafe_role_memberships_and_attributes_are_refused() {
         ),
         (
             &["GRANT openmettle_worker TO openmettle_fixture_capped"],
-            "role openmettle_fixture_capped has both API and worker privileges",
+            "role openmettle_fixture_capped reaches more than one of openmettle_api, openmettle_issuance and openmettle_worker",
         ),
         (
             &["GRANT openmettle_owner TO openmettle_fixture_capped"],
@@ -1528,11 +1549,13 @@ async fn application_roles_are_bounded() {
                 privilege == "SELECT"
             }
             (WORKER, "messages") => matches!(privilege, "SELECT" | "INSERT"),
+            // ADR 0030: issuance reads identities and scopes; its writes are column grants.
+            (ISSUANCE, "users" | "user_identities" | "scopes") => privilege == "SELECT",
             _ => false,
         }
     };
     let mut admin = db.admin().await;
-    for role in [API, WORKER] {
+    for role in [API, ISSUANCE, WORKER] {
         for table in tables {
             for privilege in privileges {
                 let granted: bool = sqlx::query_scalar("SELECT has_table_privilege($1, $2, $3)")
@@ -1592,8 +1615,8 @@ async fn application_roles_are_bounded() {
     .unwrap();
     assert_eq!(public, (false, false));
 
-    // Actual denied operations for both application roles.
-    for role in [API, WORKER] {
+    // Actual denied operations for every application role.
+    for role in [API, ISSUANCE, WORKER] {
         let mut connection = connect(&db.0, role).await;
         for sql in [
             "CREATE TABLE openmettle.intruder (id int)",
@@ -1877,6 +1900,9 @@ mod durable;
 
 #[path = "schema/sessions.rs"]
 mod sessions;
+
+#[path = "schema/issuance.rs"]
+mod issuance;
 
 #[path = "schema/authz_store.rs"]
 mod authz_store;

@@ -5,7 +5,7 @@ Refs #5; Refs #34. Implementation and independent review/CI acceptance are separ
 
 The subsequent [home invitation procedure](../operator/home-invitations.md) extends issuance
 for a new identity with an operator-authorized first account.
-[ADR 0030](0030-session-issuance-database-boundary.md) (proposed, migration 18) moves session
+[ADR 0030](0030-session-issuance-database-boundary.md) (migration 18) moves session
 insertion, the issuance marker and membership-evidence updates from `openmettle_api` to a
 separate `openmettle_issuance` role, so arbitrary API-role SQL can no longer issue a session.
 The privileges below are the migration 8 contract. The original increment follows.

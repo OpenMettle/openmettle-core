@@ -12,6 +12,8 @@ use sqlx::{AssertSqlSafe, Connection, Executor, PgConnection, postgres::PgConnec
 
 const OWNER: &str = "openmettle_owner";
 const API: &str = "openmettle_api";
+/// Session issuance (ADR 0030): the only role that can insert a session.
+const ISSUANCE: &str = "openmettle_issuance";
 const WORKER: &str = "openmettle_worker";
 /// Synthetic test-only credential shared with the schema suite; never a deployment value.
 const PASSWORD: &str = "fixture-only-password";
@@ -61,7 +63,7 @@ impl Db {
             .execute(&mut admin)
             .await
             .unwrap();
-        for role in [OWNER, API, WORKER] {
+        for role in [OWNER, API, ISSUANCE, WORKER] {
             let exists: bool =
                 sqlx::query_scalar("SELECT EXISTS (SELECT FROM pg_roles WHERE rolname = $1)")
                     .bind(role)
@@ -232,6 +234,8 @@ struct Flow {
     h: Harness,
     db: Db,
     api: PgConnection,
+    /// The issuance connection; `api` is the primary that validates (ADR 0030).
+    issuance: PgConnection,
     owner: PgConnection,
 }
 impl Script {
@@ -257,11 +261,18 @@ impl Flow {
     async fn with(h: Harness) -> Self {
         let db = Db::new().await;
         let api = db.connect(API).await;
+        let issuance = db.connect(ISSUANCE).await;
         let mut owner = db.connect(OWNER).await;
         add_provider(&mut owner, signing::ISSUER, signing::CLIENT, "v1").await;
         // Every Flow test starts logins; admission-specific tests lower or clear this.
         admit(&mut owner, Some(64)).await;
-        Self { h, db, api, owner }
+        Self {
+            h,
+            db,
+            api,
+            issuance,
+            owner,
+        }
     }
     async fn begin(&mut self, p: &ManagedProvider) -> Started {
         self.begin_with(p, None).await

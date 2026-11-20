@@ -889,7 +889,8 @@ async fn keycloak_browser_sign_in_qualification() {
         .await
         .expect("bind application loopback listener");
     let pool = pooled::one_slot(db.options(API));
-    let service = Arc::new(BrowserAuth::new(config, pool));
+    let issuance = pooled::one_slot(db.options(ISSUANCE));
+    let service = Arc::new(BrowserAuth::new(config, pool, issuance));
     let handoff = LoginHandoff::new(service, browser_profile.handoff()).unwrap();
     let routes = router_with_sessions(
         handoff,

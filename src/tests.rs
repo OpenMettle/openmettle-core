@@ -26,7 +26,14 @@ fn auth_config_is_optional_and_must_be_an_absolute_path() {
     assert_eq!(parse(Role::Api, &[URL]).ok().unwrap().auth_config, None);
     let config = parse(
         Role::Api,
-        &[URL, ("AUTH_CONFIG", "/etc/openmettle/auth.json")],
+        &[
+            URL,
+            ("AUTH_CONFIG", "/etc/openmettle/auth.json"),
+            (
+                "ISSUANCE_DATABASE_URL",
+                "postgres://openmettle_issuance@localhost/test",
+            ),
+        ],
     );
     assert_eq!(
         config.ok().unwrap().auth_config.as_deref(),
@@ -76,6 +83,100 @@ fn worker_never_reads_auth_config() {
     assert_eq!(worker_keys, api_keys);
 }
 
+/// ADR 0030: the API reads its issuance settings after `AUTH_CONFIG` and exactly beside it,
+/// under a resolved user other than the primary's. The worker never asks for them.
+#[test]
+fn issuance_settings_accompany_auth_config_on_the_api_alone() {
+    const AUTH: (&str, &str) = ("AUTH_CONFIG", "/etc/openmettle/auth.json");
+    const ISSUANCE: (&str, &str) = (
+        "ISSUANCE_DATABASE_URL",
+        "postgres://openmettle_issuance@localhost/test",
+    );
+    let api = |pairs: &[(&str, &str)]| parse(Role::Api, pairs).map(|config| config.issuance);
+    let (options, connections) = api(&[URL, AUTH, ISSUANCE]).ok().unwrap().unwrap();
+    assert_eq!(options.get_username(), "openmettle_issuance");
+    assert_eq!(connections, 2);
+    let config = api(&[URL, AUTH, ISSUANCE, ("ISSUANCE_DB_MAX_CONNECTIONS", "64")]);
+    assert_eq!(config.ok().unwrap().unwrap().1, 64);
+    assert!(api(&[URL]).ok().unwrap().is_none());
+    for (pairs, refusal) in [
+        (
+            &[URL, AUTH][..],
+            "ISSUANCE_DATABASE_URL is required with AUTH_CONFIG",
+        ),
+        (
+            &[URL, ISSUANCE],
+            "ISSUANCE_DATABASE_URL requires AUTH_CONFIG",
+        ),
+        (
+            &[URL, ("ISSUANCE_DB_MAX_CONNECTIONS", "2")],
+            "ISSUANCE_DB_MAX_CONNECTIONS requires ISSUANCE_DATABASE_URL",
+        ),
+        (
+            &[
+                (
+                    "DATABASE_URL",
+                    "postgres://openmettle_issuance@localhost/other",
+                ),
+                AUTH,
+                ISSUANCE,
+            ],
+            "ISSUANCE_DATABASE_URL must use a different user",
+        ),
+        (
+            &[
+                URL,
+                AUTH,
+                ("ISSUANCE_DATABASE_URL", "postgres://localhost/other"),
+            ],
+            "ISSUANCE_DATABASE_URL must use a different user",
+        ),
+        (
+            &[
+                URL,
+                AUTH,
+                ("ISSUANCE_DATABASE_URL", "mysql://u@localhost/test"),
+            ],
+            "invalid ISSUANCE_DATABASE_URL scheme",
+        ),
+        (
+            &[URL, AUTH, ISSUANCE, ("ISSUANCE_DB_MAX_CONNECTIONS", "65")],
+            "configuration outside allowed range",
+        ),
+        // An invalid `AUTH_CONFIG` is still reported first.
+        (
+            &[URL, ("AUTH_CONFIG", "relative"), ISSUANCE],
+            "invalid AUTH_CONFIG",
+        ),
+    ] {
+        assert_eq!(api(pairs).err(), Some(refusal), "{pairs:?}");
+    }
+    // Asked for after `AUTH_CONFIG`, and never by the worker, whatever the API is given.
+    let keys = |role| {
+        let asked = RefCell::new(Vec::new());
+        let config = Config::parse(role, |key| {
+            asked.borrow_mut().push(key.to_owned());
+            Ok([URL, AUTH, ISSUANCE]
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string()))
+        });
+        assert!(config.is_ok());
+        asked.into_inner()
+    };
+    let api_keys = keys(Role::Api);
+    let worker_keys = keys(Role::Worker);
+    assert_eq!(
+        api_keys[worker_keys.len()..],
+        [
+            "AUTH_CONFIG",
+            "ISSUANCE_DATABASE_URL",
+            "ISSUANCE_DB_MAX_CONNECTIONS"
+        ]
+    );
+    assert_eq!(api_keys[..worker_keys.len()], worker_keys);
+}
+
 /// ADR 0031: both processes read their own optional `ARTIFACTS_DIR`; a set value must be an
 /// absolute path, and the refusal names the key alone.
 #[test]
@@ -102,14 +203,18 @@ fn artifacts_dir_is_optional_and_must_be_an_absolute_path() {
     }
 }
 
-/// A serving configuration over a database address that accepts and never answers.
+/// A serving configuration over a database address that accepts and never answers. With
+/// `auth`, the issuance pool (ADR 0030) uses the same address under its own user.
 fn config(database: &TcpListener, auth: Option<&str>) -> Config {
-    let url = format!(
-        "postgres://fixture:CANARY-db-password@{}/fixture?sslmode=disable",
-        database.local_addr().unwrap()
+    let address = database.local_addr().unwrap();
+    let url = format!("postgres://fixture:CANARY-db-password@{address}/fixture?sslmode=disable");
+    let issuance = format!(
+        "postgres://fixture-issuance:CANARY-issuance-password@{address}/fixture?sslmode=disable"
     );
     let mut pairs = vec![("DATABASE_URL", url.as_str()), ("DB_TIMEOUT_MS", "200")];
-    pairs.extend(auth.map(|path| ("AUTH_CONFIG", path)));
+    if let Some(path) = auth {
+        pairs.extend([("AUTH_CONFIG", path), ("ISSUANCE_DATABASE_URL", &issuance)]);
+    }
     parse(Role::Api, &pairs).ok().unwrap()
 }
 

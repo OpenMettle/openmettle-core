@@ -193,7 +193,8 @@ async fn refused(f: &mut Flow, code: Option<&InvitationCode>) {
     let p = f.h.provider.clone();
     let (_, proof) = f.exchanged_with(&p, code).await;
     assert!(matches!(
-        p.issue_session(&mut f.api, proof, &session_policy()).await,
+        p.issue_session(&mut f.issuance, &mut f.api, proof, &session_policy())
+            .await,
         Err(SessionError::Rejected)
     ));
 }
@@ -201,7 +202,7 @@ async fn refused(f: &mut Flow, code: Option<&InvitationCode>) {
 async fn sign_in(f: &mut Flow, code: Option<&InvitationCode>) -> local::Credential {
     let p = f.h.provider.clone();
     let (_, proof) = f.exchanged_with(&p, code).await;
-    p.issue_session(&mut f.api, proof, &session_policy())
+    p.issue_session(&mut f.issuance, &mut f.api, proof, &session_policy())
         .await
         .unwrap()
 }
@@ -284,10 +285,11 @@ async fn competing_first_proofs_consume_once_then_ordinary_approval_governs() {
     let code = invite(&f);
     empty(&mut f).await;
     let p = f.h.provider.clone();
-    let mut second = f.db.connect(API).await;
+    let mut second = f.db.connect(ISSUANCE).await;
+    let mut second_api = f.db.connect(API).await;
     let mut observer = statistics_observer(&f.db).await;
     let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut f.api)
+        .fetch_one(&mut f.issuance)
         .await
         .unwrap();
     let other_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
@@ -307,8 +309,8 @@ async fn competing_first_proofs_consume_once_then_ordinary_approval_governs() {
     };
     let policy = session_policy();
     let (a, b, ()) = tokio::join!(
-        p.issue_session(&mut f.api, a, &policy),
-        p.issue_session(&mut second, b, &policy),
+        p.issue_session(&mut f.issuance, &mut f.api, a, &policy),
+        p.issue_session(&mut second, &mut second_api, b, &policy),
         release
     );
     let first = match (a, b) {
@@ -355,7 +357,7 @@ async fn competing_first_proofs_consume_once_then_ordinary_approval_governs() {
     create_refused(&f, OTHER, signing::ID, SUBJECT);
     // The code is spent. A new consumed login cannot redeem it again through the function.
     let (replay, proof) = f.exchanged(&p).await;
-    let mut tx = f.api.begin().await.unwrap();
+    let mut tx = f.issuance.begin().await.unwrap();
     assert_eq!(
         redeem_direct(&mut tx, signing::ID, &locator(&replay), proof.epoch, &code).await,
         None
@@ -415,7 +417,8 @@ async fn stale_invitation_cannot_adopt_an_existing_identity_or_survive_revocatio
         .unwrap();
     f.owner.execute("COMMIT").await.unwrap();
     assert!(matches!(
-        p.issue_session(&mut f.api, stale, &session_policy()).await,
+        p.issue_session(&mut f.issuance, &mut f.api, stale, &session_policy())
+            .await,
         Err(SessionError::Rejected)
     ));
     refused(&mut f, Some(&code)).await;
@@ -430,7 +433,7 @@ async fn first_session_blocked_at_insert_past_invitation_expiry_rolls_back_every
     let p = f.h.provider.clone();
     let mut observer = statistics_observer(&f.db).await;
     let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut f.api)
+        .fetch_one(&mut f.issuance)
         .await
         .unwrap();
     let (_, proof) = f.exchanged_with(&p, Some(&code)).await;
@@ -440,7 +443,7 @@ async fn first_session_blocked_at_insert_past_invitation_expiry_rolls_back_every
         .await
         .unwrap();
     let policy = session_policy();
-    let mut issuing = Box::pin(p.issue_session(&mut f.api, proof, &policy));
+    let mut issuing = Box::pin(p.issue_session(&mut f.issuance, &mut f.api, proof, &policy));
     // An issuance refused before the insert (cutoff already passed) fails here at once.
     tokio::select! {
         result = &mut issuing => panic!("issuance ended before its session insert blocked: {:?}", result.err()),
@@ -465,7 +468,7 @@ async fn detached_redemption_without_a_session_cannot_commit() {
     let p = f.h.provider.clone();
     let (started, proof) = f.exchanged_with(&p, Some(&code)).await;
     let login = locator(&started);
-    let mut tx = f.api.begin().await.unwrap();
+    let mut tx = f.issuance.begin().await.unwrap();
     let row = redeem_direct(&mut tx, signing::ID, &login, proof.epoch, &code)
         .await
         .unwrap();
@@ -479,7 +482,7 @@ async fn detached_redemption_without_a_session_cannot_commit() {
     first_session_refused(tx.commit().await.unwrap_err());
     empty(&mut f).await;
     // The server rolled back; the same proof still redeems through the managed path.
-    p.issue_session(&mut f.api, proof, &session_policy())
+    p.issue_session(&mut f.issuance, &mut f.api, proof, &session_policy())
         .await
         .unwrap();
 }
@@ -493,7 +496,7 @@ async fn detached_redemption_without_the_issued_marker_cannot_commit() {
     let (started, proof) = f.exchanged(&p).await;
     let login = locator(&started);
     for marker in [false, true] {
-        let mut tx = f.api.begin().await.unwrap();
+        let mut tx = f.issuance.begin().await.unwrap();
         let (identity, user, _) = redeem_direct(&mut tx, signing::ID, &login, proof.epoch, &code)
             .await
             .unwrap();
@@ -516,8 +519,9 @@ async fn detached_redemption_without_the_issued_marker_cannot_commit() {
             empty(&mut f).await;
             continue;
         }
-        // Documented trust limit: API SQL that holds the code and writes both rows satisfies
-        // the gate. The database cannot tell that no OIDC proof was verified.
+        // Documented trust limit: issuance-role SQL that holds the code and writes both rows
+        // satisfies the gate. The database cannot tell that no OIDC proof was verified.
+        // API-role SQL can write neither row nor call the function (ADR 0030).
         sqlx::query("UPDATE openmettle.login_transactions SET session_issued=true WHERE id=$1")
             .bind(&login)
             .execute(&mut *tx)
@@ -547,14 +551,14 @@ async fn ambiguous_first_session_commit_cannot_replay() {
     // Lose acknowledgement after the server commits. No credential escapes cancellation.
     let mut barrier = ResponseBarrier::new(b"COMMIT\0");
     let options =
-        f.db.options(API)
+        f.db.options(ISSUANCE)
             .host("127.0.0.1")
             .port(barrier.port)
             .ssl_mode(sqlx::postgres::PgSslMode::Disable);
     let mut cn = PgConnection::connect_with(&options).await.unwrap();
     cancel_at_response(
         &mut barrier,
-        p.issue_session(&mut cn, proof, &session_policy()),
+        p.issue_session(&mut cn, &mut f.api, proof, &session_policy()),
     )
     .await;
     cn.close().await.unwrap();
@@ -572,7 +576,7 @@ async fn ambiguous_first_session_commit_cannot_replay() {
     let (_, mut duplicate) = f.exchanged_with(&p, Some(&code)).await;
     duplicate.origin = original;
     assert!(matches!(
-        p.issue_session(&mut f.api, duplicate, &session_policy())
+        p.issue_session(&mut f.issuance, &mut f.api, duplicate, &session_policy())
             .await,
         Err(SessionError::Rejected)
     ));
@@ -658,7 +662,9 @@ async fn cutoff_passing_at_deferred_commit_is_a_definite_refusal() {
     let (_, proof) = f.exchanged_with(&p, Some(&code)).await;
     cutoff_in(&mut f, 1500).await;
     let started = std::time::Instant::now();
-    let result = p.issue_session(&mut f.api, proof, &session_policy()).await;
+    let result = p
+        .issue_session(&mut f.issuance, &mut f.api, proof, &session_policy())
+        .await;
     // Reached COMMIT exactly once; a pre-commit refusal never fires a deferred trigger.
     assert_eq!(fired(&mut f, "a_fixture_commit_delay").await, 1);
     // Only OMH01 from home_redemption_session maps to Rejected. Any other COMMIT failure,
@@ -686,7 +692,9 @@ async fn cutoff_passing_after_redemption_is_refused_before_commit() {
     let p = f.h.provider.clone();
     let (_, proof) = f.exchanged_with(&p, Some(&code)).await;
     cutoff_in(&mut f, 1500).await;
-    let result = p.issue_session(&mut f.api, proof, &session_policy()).await;
+    let result = p
+        .issue_session(&mut f.issuance, &mut f.api, proof, &session_policy())
+        .await;
     assert_eq!(result.err(), Some(SessionError::Rejected));
     // The redemption passed its own time check and wrote the row, then the cutoff passed.
     assert_eq!(fired(&mut f, "fixture_redeemed").await, 1);
@@ -709,7 +717,7 @@ async fn redemption_requires_the_login_binding_of_the_supplied_provider_and_epoc
     // Routine revision: same configuration, new current epoch. The login stays bound to the old.
     let current = write(&mut f.owner, Some("v1")).await;
     let (fresh, _) = f.exchanged(&p).await;
-    let mut tx = f.api.begin().await.unwrap();
+    let mut tx = f.issuance.begin().await.unwrap();
     assert_eq!(
         redeem_direct(&mut tx, signing::ID, &stale, current, &code).await,
         None
@@ -745,7 +753,7 @@ async fn redemption_requires_the_login_binding_of_the_supplied_provider_and_epoc
     assert!(withdraw(&f, ID).status.success());
     // The other provider's own invitation and code: only the login binding differs.
     let code = created(&create(&f, OPERATOR, OTHER, SUBJECT));
-    let mut tx = f.api.begin().await.unwrap();
+    let mut tx = f.issuance.begin().await.unwrap();
     assert_eq!(
         redeem_direct(&mut tx, OTHER, &locator(&fresh), other, &code).await,
         None
@@ -855,7 +863,7 @@ async fn identity_insert_racing_redemption_cannot_transfer_ownership() {
     let p = f.h.provider.clone();
     let (_, proof) = f.exchanged_with(&p, Some(&code)).await;
     let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut f.api)
+        .fetch_one(&mut f.issuance)
         .await
         .unwrap();
     let mut observer = statistics_observer(&f.db).await;
@@ -880,7 +888,10 @@ async fn identity_insert_racing_redemption_cannot_transfer_ownership() {
         held.commit().await.unwrap();
     };
     let policy = session_policy();
-    let (result, ()) = tokio::join!(p.issue_session(&mut f.api, proof, &policy), release);
+    let (result, ()) = tokio::join!(
+        p.issue_session(&mut f.issuance, &mut f.api, proof, &policy),
+        release
+    );
     assert!(matches!(result, Err(SessionError::Rejected)));
     let accounts = account_state(&mut f).await;
     assert_eq!(accounts.len(), 2);
@@ -936,8 +947,10 @@ async fn fabricated_login(f: &mut Flow) -> (String, i64) {
     (login, epoch)
 }
 
-// ADR 0022 trust boundary. A principal limited to openmettle_api SQL can write every row the
-// redemption function checks, but it cannot read or derive the code.
+// ADR 0022 and ADR 0030 trust boundaries, layered. A principal limited to openmettle_api SQL
+// can fabricate the consumed login the redemption function checks, but it can neither read
+// the code nor call the function. A principal limited to openmettle_issuance SQL can call it,
+// but cannot read or derive the code.
 #[tokio::test]
 #[ignore = "isolated CI PostgreSQL 18 and POSTGRES_CONTAINER required"]
 async fn api_sql_without_the_code_cannot_redeem_a_pending_invitation() {
@@ -946,25 +959,39 @@ async fn api_sql_without_the_code_cannot_redeem_a_pending_invitation() {
     let other = created(&create(&f, OTHER, signing::ID, "other-subject"));
     let (login, epoch) = fabricated_login(&mut f).await;
 
-    // Neither the stored hash nor the code-less function is reachable.
+    // Neither the stored hash nor either redemption function is reachable as the API role:
+    // the code-less one is gone, and the coded one moved to the issuance role (ADR 0030).
     let state = |result: Result<(), sqlx::Error>| match result {
         Err(sqlx::Error::Database(e)) => e.code().map(|code| code.into_owned()),
         _ => None,
     };
-    let unreadable = sqlx::query("SELECT code_hash FROM openmettle.home_invitations")
-        .fetch_all(&mut f.api)
-        .await;
-    assert_eq!(state(unreadable.map(drop)).as_deref(), Some("42501"));
-    let codeless =
-        sqlx::query("SELECT * FROM openmettle.redeem_home_invitation($1::uuid,$2,$3,$4,$5)")
+    for c in [&mut f.api, &mut f.issuance] {
+        let unreadable = sqlx::query("SELECT code_hash FROM openmettle.home_invitations")
+            .fetch_all(&mut *c)
+            .await;
+        assert_eq!(state(unreadable.map(drop)).as_deref(), Some("42501"));
+        let codeless =
+            sqlx::query("SELECT * FROM openmettle.redeem_home_invitation($1::uuid,$2,$3,$4,$5)")
+                .bind(signing::ID)
+                .bind(signing::ISSUER)
+                .bind(SUBJECT)
+                .bind(&login)
+                .bind(epoch)
+                .fetch_all(&mut *c)
+                .await;
+        assert_eq!(state(codeless.map(drop)).as_deref(), Some("42883"));
+    }
+    let coded =
+        sqlx::query("SELECT * FROM openmettle.redeem_home_invitation($1::uuid,$2,$3,$4,$5,$6)")
             .bind(signing::ID)
             .bind(signing::ISSUER)
             .bind(SUBJECT)
             .bind(&login)
             .bind(epoch)
+            .bind(code.bytes().as_slice())
             .fetch_all(&mut f.api)
             .await;
-    assert_eq!(state(codeless.map(drop)).as_deref(), Some("42883"));
+    assert_eq!(state(coded.map(drop)).as_deref(), Some("42501"));
 
     let mut near = *code.bytes();
     near[15] ^= 1;
@@ -983,7 +1010,7 @@ async fn api_sql_without_the_code_cannot_redeem_a_pending_invitation() {
         ("the stored hash", Some(code_hash(&code))),
     ];
     for (guess, value) in &guesses {
-        let mut tx = f.api.begin().await.unwrap();
+        let mut tx = f.issuance.begin().await.unwrap();
         let row = redeem_raw(
             &mut tx,
             signing::ID,
@@ -1002,7 +1029,7 @@ async fn api_sql_without_the_code_cannot_redeem_a_pending_invitation() {
 
     // Control: the same fabricated login redeems once the code is supplied. Every refusal
     // above was therefore caused by the code alone.
-    let mut tx = f.api.begin().await.unwrap();
+    let mut tx = f.issuance.begin().await.unwrap();
     assert!(
         redeem_direct(&mut tx, signing::ID, &login, epoch, &code)
             .await
@@ -1028,7 +1055,7 @@ async fn the_correct_code_cannot_redeem_a_closed_or_fenced_invitation() {
         let p = f.h.provider.clone();
         // Control: before the change, a consumed login and this code redeem.
         let (started, proof) = f.exchanged(&p).await;
-        let mut tx = f.api.begin().await.unwrap();
+        let mut tx = f.issuance.begin().await.unwrap();
         assert!(
             redeem_direct(&mut tx, signing::ID, &locator(&started), proof.epoch, &code)
                 .await
@@ -1057,7 +1084,7 @@ async fn the_correct_code_cannot_redeem_a_closed_or_fenced_invitation() {
         }
         // A new consumed login under the current epoch, with the correct code.
         let (started, proof) = f.exchanged(&p).await;
-        let mut tx = f.api.begin().await.unwrap();
+        let mut tx = f.issuance.begin().await.unwrap();
         assert_eq!(
             redeem_direct(&mut tx, signing::ID, &locator(&started), proof.epoch, &code).await,
             None,
@@ -1205,10 +1232,19 @@ async fn login_started_on_schema_12_completes_after_the_upgrade() {
     let h = Harness::new().await;
     let db = Db::at(&migrate::MIGRATIONS[..12]).await;
     let api = db.connect(API).await;
+    // Schema 12 grants the issuance role nothing, not even CONNECT. This placeholder is
+    // replaced once migration 18 has run.
+    let issuance = db.connect(API).await;
     let mut owner = db.connect(OWNER).await;
     add_provider(&mut owner, signing::ISSUER, signing::CLIENT, "v1").await;
     admit(&mut owner, Some(64)).await;
-    let mut f = Flow { h, db, api, owner };
+    let mut f = Flow {
+        h,
+        db,
+        api,
+        issuance,
+        owner,
+    };
     let user = seed(&mut f, true, true).await;
     let p = f.h.provider.clone();
     // The current 76-byte format does not pass the schema-12 check: a current start is
@@ -1240,6 +1276,7 @@ async fn login_started_on_schema_12_completes_after_the_upgrade() {
     };
     assert_eq!(sealed(&mut f, &started).await, 59);
     f.db.upgrade(migrate::MIGRATIONS).await;
+    f.issuance = f.db.connect(ISSUANCE).await;
     f.arm(&started);
     let proof = f
         .consume(&p, &started)
@@ -1249,7 +1286,7 @@ async fn login_started_on_schema_12_completes_after_the_upgrade() {
         .await
         .unwrap();
     let credential = p
-        .issue_session(&mut f.api, proof, &session_policy())
+        .issue_session(&mut f.issuance, &mut f.api, proof, &session_policy())
         .await
         .unwrap();
     let context = local::validate(&mut f.api, credential.expose(), &session_policy())

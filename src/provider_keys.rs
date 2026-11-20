@@ -845,15 +845,21 @@ impl ManagedProvider {
         .map_err(|_| login::Error::Exchange)?
     }
     /// Consume a managed online proof for an approved identity or an invited new account.
-    /// Offline VerifiedIdentity values cannot reach this operation.
+    /// Offline VerifiedIdentity values cannot reach this operation. Issuance commits on
+    /// `issuance`, an `openmettle_issuance` connection; the credential is released only after
+    /// a fresh validation on `primary`, an `openmettle_api` connection (ADR 0030).
     pub async fn issue_session(
         &self,
-        connection: &mut sqlx::PgConnection,
+        issuance: &mut sqlx::PgConnection,
+        primary: &mut sqlx::PgConnection,
         exchanged: ExchangedIdentity,
         policy: &crate::sessions::Policy,
     ) -> Result<crate::sessions::Credential, crate::sessions::Error> {
         let (_admission, deadline) = self.session_phase(&exchanged, policy)?;
-        self.issue_admitted(connection, exchanged, policy, deadline)
+        let issued = self
+            .issue_admitted(issuance, &exchanged, policy, deadline)
+            .await?;
+        self.release_issued(primary, &exchanged, issued)
             .await?
             .browser()
     }
@@ -877,16 +883,17 @@ impl ManagedProvider {
         let deadline = exchanged.deadline.min(Instant::now() + policy.deadline());
         Ok((admission, deadline))
     }
-    /// Issuance under a held `session_phase` admission. `deadline` bounds the transaction
-    /// and the postcommit validation; the proof keeps its own original deadline in every
-    /// in-memory check.
+    /// Issuance under a held `session_phase` admission, on an issuance connection.
+    /// `deadline` bounds the transaction and, through the result, the postcommit
+    /// validation of [`Self::release_issued`]; the proof keeps its own original deadline in
+    /// every in-memory check.
     pub(crate) async fn issue_admitted(
         &self,
         connection: &mut sqlx::PgConnection,
-        exchanged: ExchangedIdentity,
+        exchanged: &ExchangedIdentity,
         policy: &crate::sessions::Policy,
         deadline: Instant,
-    ) -> Result<crate::sessions::Delivery, crate::sessions::Error> {
+    ) -> Result<crate::sessions::Issued, crate::sessions::Error> {
         use crate::sessions::{self, Error as SessionError};
         let config = self.config().map_err(|_| SessionError::Rejected)?;
         let origin = exchanged.origin.as_ref().ok_or(SessionError::Rejected)?;
@@ -913,16 +920,32 @@ impl ManagedProvider {
                 invitation: exchanged.invitation.as_ref(),
             },
             policy,
-            || {
-                self.check_assertion(
-                    exchanged.key_generation,
-                    &exchanged.assertion,
-                    exchanged.deadline,
-                )
-                .map_err(|_| SessionError::Rejected)
-            },
+            || self.proof_budget(exchanged),
         )
         .await
+    }
+    /// The postcommit validation that gates a committed issuance, on a primary connection
+    /// acquired after the issuance connection was settled (ADR 0030).
+    pub(crate) async fn release_issued(
+        &self,
+        primary: &mut sqlx::PgConnection,
+        exchanged: &ExchangedIdentity,
+        issued: crate::sessions::Issued,
+    ) -> Result<crate::sessions::Delivery, crate::sessions::Error> {
+        issued
+            .release(primary, || self.proof_budget(exchanged))
+            .await
+    }
+    fn proof_budget(
+        &self,
+        exchanged: &ExchangedIdentity,
+    ) -> Result<crate::sessions::ProofBudget, crate::sessions::Error> {
+        self.check_assertion(
+            exchanged.key_generation,
+            &exchanged.assertion,
+            exchanged.deadline,
+        )
+        .map_err(|_| crate::sessions::Error::Rejected)
     }
     #[cfg(test)]
     async fn pause(&self, point: &'static str) {

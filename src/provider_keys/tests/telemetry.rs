@@ -68,7 +68,7 @@ fn handoff(h: &Harness) -> (std::net::TcpListener, sqlx::PgPool, LoginHandoff) {
         },
         vec![h.provider.clone()],
     );
-    let auth = BrowserAuth::new(config, pool.clone());
+    let auth = BrowserAuth::new(config, pool.clone(), pool.clone());
     let handoff = LoginHandoff::new(Arc::new(auth), settings()).unwrap();
     (database, pool, handoff)
 }

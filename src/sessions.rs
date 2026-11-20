@@ -330,12 +330,51 @@ impl Delivery {
     }
 }
 
+/// A committed session whose credential has not been released. Only [`Issued::release`]
+/// yields it, after a fresh validation on the primary; dropping this releases nothing.
+pub(crate) struct Issued {
+    credential: Credential,
+    code: Option<native::Release>,
+    validation: Validation,
+    deadline: Instant,
+}
+impl fmt::Debug for Issued {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Issued(..)")
+    }
+}
+impl Issued {
+    /// The acknowledgement can be delayed past revocation or local expiry. A new primary
+    /// transaction observes that; the issued row/marker may remain without a credential.
+    /// `c` is an `openmettle_api` connection, never the issuance one: the issuance role
+    /// cannot run validation (ADR 0030). The issuance deadline still bounds this step.
+    pub(crate) async fn release(
+        self,
+        c: &mut PgConnection,
+        check: impl Fn() -> Result<ProofBudget, Error>,
+    ) -> Result<Delivery, Error> {
+        let deadline = self.deadline;
+        tokio::time::timeout_at(deadline, async move {
+            validate_inner(c, self.credential.expose(), self.validation).await?;
+            check()?;
+            if Instant::now() >= deadline {
+                return Err(Error::Timeout);
+            }
+            Delivery::settled(self.credential, self.code)
+        })
+        .await
+        .map_err(|_| Error::Timeout)?
+    }
+}
+
+/// The issuance transaction on `c`, an `openmettle_issuance` connection (ADR 0030). It ends
+/// committed or rolled back; the caller settles `c` before releasing the result.
 pub(crate) async fn issue(
     c: &mut PgConnection,
     input: Issuance<'_>,
     policy: &Policy,
     check: impl Fn() -> Result<ProofBudget, Error>,
-) -> Result<Delivery, Error> {
+) -> Result<Issued, Error> {
     let validation = if let Some(native) = input.native {
         Validation::NativePending(native.audience)
     } else {
@@ -433,12 +472,7 @@ pub(crate) async fn issue(
         }.await;
         let (credential, code) = finish(tx, result).await?;
         check()?;
-        // The acknowledgement can be delayed past revocation or local expiry. A new primary
-        // transaction observes that; the issued row/marker may remain without a credential.
-        validate_inner(c, credential.expose(), validation).await?;
-        check()?;
-        if Instant::now() >= deadline { return Err(Error::Timeout); }
-        Delivery::settled(credential, code)
+        Ok(Issued { credential, code, validation, deadline })
     }).await.map_err(|_| Error::Timeout)?
 }
 

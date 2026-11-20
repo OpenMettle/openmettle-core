@@ -190,7 +190,7 @@ impl Enrollment {
     async fn submit(&self, f: &mut Flow, age: i64, groups: Value) {
         let p = f.h.provider.clone();
         let token = proof(f, self.now - age, json!({"groups":groups})).await;
-        p.issue_session(&mut f.api, token, &session_policy())
+        p.issue_session(&mut f.issuance, &mut f.api, token, &session_policy())
             .await
             .unwrap();
     }
@@ -345,7 +345,7 @@ async fn approved_project_mapping_orders_real_assertions_and_preserves_direct_gr
     ] {
         let exchanged = proof(&mut f, now - age, claims).await;
         let credential = p
-            .issue_session(&mut f.api, exchanged, &session_policy())
+            .issue_session(&mut f.issuance, &mut f.api, exchanged, &session_policy())
             .await
             .unwrap();
         let ctx = crate::sessions::validate(&mut f.api, credential.expose(), &session_policy())
@@ -382,7 +382,7 @@ async fn approved_project_mapping_orders_real_assertions_and_preserves_direct_gr
     )
     .await;
     assert!(
-        p.issue_session(&mut f.api, collision, &session_policy())
+        p.issue_session(&mut f.issuance, &mut f.api, collision, &session_policy())
             .await
             .is_err()
     );
@@ -392,15 +392,17 @@ async fn approved_project_mapping_orders_real_assertions_and_preserves_direct_gr
             .unwrap(),
         Present
     );
-    // Two different committed login gates and two API connections race the same approval.
-    // The removal is newer than the positive proof irrespective of row-lock acquisition order.
+    // Two different committed login gates and two issuance connections race the same
+    // approval. The removal is newer than the positive proof irrespective of row-lock
+    // acquisition order.
     let positive = proof(&mut f, now - 21, json!({"groups":["team"]})).await;
     let removal = proof(&mut f, now - 20, json!({"groups":[]})).await;
     let policy = session_policy();
-    let mut second = f.db.connect(API).await;
+    let mut second = f.db.connect(ISSUANCE).await;
+    let mut second_api = f.db.connect(API).await;
     let (first, second_result) = tokio::join!(
-        p.issue_session(&mut f.api, removal, &policy),
-        p.issue_session(&mut second, positive, &policy)
+        p.issue_session(&mut f.issuance, &mut f.api, removal, &policy),
+        p.issue_session(&mut second, &mut second_api, positive, &policy)
     );
     first.unwrap();
     second_result.unwrap();
@@ -419,7 +421,7 @@ async fn approved_project_mapping_orders_real_assertions_and_preserves_direct_gr
     .unwrap();
     assert_eq!(remaining, 4);
     let confirmation = proof(&mut f, now - 19, json!({"groups":["team"]})).await;
-    p.issue_session(&mut f.api, confirmation, &policy)
+    p.issue_session(&mut f.issuance, &mut f.api, confirmation, &policy)
         .await
         .unwrap();
 
@@ -434,7 +436,11 @@ async fn approved_project_mapping_orders_real_assertions_and_preserves_direct_gr
     // a proof exchanged before it. A later fresh login can use the new epoch.
     let held = proof(&mut f, now - 2, json!({"groups":["team"]})).await;
     write(&mut f.owner, Some("v1")).await;
-    assert!(p.issue_session(&mut f.api, held, &policy).await.is_err());
+    assert!(
+        p.issue_session(&mut f.issuance, &mut f.api, held, &policy)
+            .await
+            .is_err()
+    );
     assert_eq!(
         current(&mut f.api, &approval, &project, &policy)
             .await
@@ -444,7 +450,7 @@ async fn approved_project_mapping_orders_real_assertions_and_preserves_direct_gr
     let exchanged = proof(&mut f, now - 1, json!({"groups":["team"]})).await;
     f.owner.execute("UPDATE openmettle.users SET disabled_at=clock_timestamp(),session_generation=session_generation+1").await.unwrap();
     assert!(
-        p.issue_session(&mut f.api, exchanged, &session_policy())
+        p.issue_session(&mut f.issuance, &mut f.api, exchanged, &session_policy())
             .await
             .is_err()
     );
@@ -478,7 +484,7 @@ async fn failed_issuance_rolls_back_grant_and_fence_and_rule_change_invalidates_
         .unwrap();
     let exchanged = proof(&mut f, now - 3, json!({"groups":["team"]})).await;
     assert!(
-        p.issue_session(&mut f.api, exchanged, &policy)
+        p.issue_session(&mut f.issuance, &mut f.api, exchanged, &policy)
             .await
             .is_err()
     );
@@ -501,7 +507,7 @@ async fn failed_issuance_rolls_back_grant_and_fence_and_rule_change_invalidates_
         .await
         .unwrap();
     let exchanged = proof(&mut f, now - 3, json!({"groups":["team"]})).await;
-    p.issue_session(&mut f.api, exchanged, &policy)
+    p.issue_session(&mut f.issuance, &mut f.api, exchanged, &policy)
         .await
         .unwrap();
     assert_eq!(
@@ -541,7 +547,7 @@ async fn failed_issuance_rolls_back_grant_and_fence_and_rule_change_invalidates_
         Failed
     );
     let exchanged = proof(&mut f, now - 2, json!({"roles":["new-team"]})).await;
-    p.issue_session(&mut f.api, exchanged, &policy)
+    p.issue_session(&mut f.issuance, &mut f.api, exchanged, &policy)
         .await
         .unwrap();
     assert_eq!(
@@ -579,7 +585,7 @@ async fn v5_withdrawal_and_aba_require_owner_resync_and_post_reset_exchange() {
         .await
         .unwrap();
     let reader_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut f.api)
+        .fetch_one(&mut f.issuance)
         .await
         .unwrap();
     let mut observer = sessions::statistics_observer(&f.db).await;
@@ -610,7 +616,8 @@ async fn v5_withdrawal_and_aba_require_owner_resync_and_post_reset_exchange() {
     };
     let policy = session_policy();
     let (identity, revoke) = tokio::join!(
-        f.h.provider.issue_session(&mut f.api, held, &policy),
+        f.h.provider
+            .issue_session(&mut f.issuance, &mut f.api, held, &policy),
         withdraw
     );
     identity.unwrap();
@@ -649,7 +656,7 @@ async fn v5_withdrawal_and_aba_require_owner_resync_and_post_reset_exchange() {
         )
         .await;
     f.h.provider
-        .issue_session(&mut f.api, held, &policy)
+        .issue_session(&mut f.issuance, &mut f.api, held, &policy)
         .await
         .unwrap();
     assert_eq!(e.observe(&mut f).await, Missing);
@@ -804,7 +811,7 @@ async fn independent_generations_and_same_iat_shorter_expiry() {
         &short,
     )
     .await;
-    p.issue_session(&mut f.api, token, &session_policy())
+    p.issue_session(&mut f.issuance, &mut f.api, token, &session_policy())
         .await
         .unwrap();
     e.submit(&mut f, 30, json!(["team"])).await;
@@ -855,7 +862,7 @@ async fn membership_expiry_while_issuing_commits_removal_and_valid_identity_sess
     // Connection setup and the owner operation precede the short window.
     let mut barrier = ResponseBarrier::nth(b"UPDATE 1\0", 2);
     let options =
-        f.db.options(API)
+        f.db.options(ISSUANCE)
             .host("127.0.0.1")
             .port(barrier.port)
             .ssl_mode(sqlx::postgres::PgSslMode::Disable);
@@ -870,7 +877,7 @@ async fn membership_expiry_while_issuing_commits_removal_and_valid_identity_sess
     // UPDATE assignment, then UPDATE observation. Hold that second acknowledgement
     // before the final authentication and approval checks. Sample the actual DB clock.
     let credential = {
-        let issuance = p.issue_session(&mut cn, token, &policy);
+        let issuance = p.issue_session(&mut cn, &mut f.api, token, &policy);
         tokio::pin!(issuance);
         tokio::select! {
             ()=barrier.wait_reached()=>{},
@@ -958,7 +965,7 @@ async fn replacement_pins_the_new_rule_scope_and_assignment_and_fences_return_to
     )
     .await;
     f.h.provider
-        .issue_session(&mut f.api, pending, &session_policy())
+        .issue_session(&mut f.issuance, &mut f.api, pending, &session_policy())
         .await
         .unwrap();
     assert_eq!(e.observe(&mut f).await, Missing);
@@ -1053,7 +1060,7 @@ async fn two_provider_specific_approvals_for_one_identity_reconcile_independentl
     )
     .await;
     second
-        .issue_session(&mut f.api, token, &session_policy())
+        .issue_session(&mut f.issuance, &mut f.api, token, &session_policy())
         .await
         .unwrap();
     assert_eq!(e.observe(&mut f).await, Present);
@@ -1380,7 +1387,7 @@ async fn held_proof_from_before_withdrawal_cannot_regrant() {
     committed(&e.withdraw(&f, OWNER, &request), 1);
     let withdrawn = e.head(&mut f).await;
     f.h.provider
-        .issue_session(&mut f.api, held, &session_policy())
+        .issue_session(&mut f.issuance, &mut f.api, held, &session_policy())
         .await
         .unwrap();
     assert_eq!(e.head(&mut f).await, withdrawn);
@@ -1425,7 +1432,7 @@ async fn concurrent_issuance_waits_for_withdrawal_without_deadlock() {
         .await
         .unwrap();
     let reader_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut f.api)
+        .fetch_one(&mut f.issuance)
         .await
         .unwrap();
     let mut observer = sessions::statistics_observer(&f.db).await;
@@ -1468,7 +1475,8 @@ async fn concurrent_issuance_waits_for_withdrawal_without_deadlock() {
     };
     let policy = session_policy();
     let (identity, ()) = tokio::join!(
-        f.h.provider.issue_session(&mut f.api, held, &policy),
+        f.h.provider
+            .issue_session(&mut f.issuance, &mut f.api, held, &policy),
         release
     );
     identity.unwrap();
@@ -1562,7 +1570,7 @@ async fn invited_first_sign_in_skips_membership_until_its_approval_is_enrolled()
     // the configuration and withdrawal scripts take first, then blocks only the session
     // insert until the invitation cutoff passes.
     let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut f.api)
+        .fetch_one(&mut f.issuance)
         .await
         .unwrap();
     let mut observer = sessions::statistics_observer(&f.db).await;
@@ -1588,7 +1596,11 @@ async fn invited_first_sign_in_skips_membership_until_its_approval_is_enrolled()
     .await
     .unwrap();
     let policy = session_policy();
-    let mut issuing = Box::pin(f.h.provider.issue_session(&mut f.api, late, &policy));
+    let mut issuing =
+        Box::pin(
+            f.h.provider
+                .issue_session(&mut f.issuance, &mut f.api, late, &policy),
+        );
     // An issuance refused before the insert (cutoff already passed) fails here at once.
     tokio::select! {
         result = &mut issuing => panic!("issuance ended before its session insert blocked: {:?}", result.err()),
@@ -1623,7 +1635,7 @@ async fn invited_first_sign_in_skips_membership_until_its_approval_is_enrolled()
     let first = invited_proof(&mut f, &code, now - 4, json!({"groups":["team"]})).await;
     let credential =
         f.h.provider
-            .issue_session(&mut f.api, first, &policy)
+            .issue_session(&mut f.issuance, &mut f.api, first, &policy)
             .await
             .unwrap();
     let user = crate::sessions::validate(&mut f.api, credential.expose(), &policy)

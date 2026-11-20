@@ -182,6 +182,235 @@ fn rejects_invalid_telemetry_settings_with_a_fixed_line() {
     }
 }
 
+/// ADR 0030: the API's issuance pool settings. Each refusal exits 78 with one fixed line that
+/// names the key or category, never a value, before any listener opens. The worker never reads
+/// the settings and refuses to start while the API's issuance URL is present.
+#[test]
+fn issuance_settings_are_refused_with_a_fixed_line() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let bind = occupied.local_addr().unwrap().to_string();
+    // An absolute path: parsing accepts it, and a document is never read before a refusal.
+    let auth = Some("/CANARY-absent/auth.json");
+    let issuance = "postgres://openmettle_issuance:CANARY-issuance@localhost/test";
+    let primary = "postgres://openmettle_api:CANARY-api@localhost/test";
+    let max = "OPENMETTLE_API_ISSUANCE_DB_MAX_CONNECTIONS";
+    type Case<'a> = (
+        Option<&'a str>,
+        &'a str,
+        &'a [(&'a str, &'a OsStr)],
+        &'a [(&'a str, &'a str)],
+        &'a str,
+    );
+    let url = |value: &'static str| ("OPENMETTLE_API_ISSUANCE_DATABASE_URL", OsStr::new(value));
+    let cases: &[Case] = &[
+        (
+            auth,
+            primary,
+            &[],
+            &[],
+            "ISSUANCE_DATABASE_URL is required with AUTH_CONFIG",
+        ),
+        (
+            None,
+            primary,
+            &[url(issuance)],
+            &[],
+            "ISSUANCE_DATABASE_URL requires AUTH_CONFIG",
+        ),
+        (
+            None,
+            primary,
+            &[url("")],
+            &[],
+            "ISSUANCE_DATABASE_URL requires AUTH_CONFIG",
+        ),
+        (
+            None,
+            primary,
+            &[],
+            &[(max, "2")],
+            "ISSUANCE_DB_MAX_CONNECTIONS requires ISSUANCE_DATABASE_URL",
+        ),
+        (
+            auth,
+            primary,
+            &[url("")],
+            &[],
+            "invalid ISSUANCE_DATABASE_URL scheme",
+        ),
+        (
+            auth,
+            primary,
+            &[url("mysql://openmettle_issuance:CANARY@localhost/test")],
+            &[],
+            "invalid ISSUANCE_DATABASE_URL scheme",
+        ),
+        (
+            auth,
+            primary,
+            &[url("postgres://openmettle_issuance:CANARY@[::1/test")],
+            &[],
+            "invalid ISSUANCE_DATABASE_URL",
+        ),
+        (
+            auth,
+            primary,
+            &[(
+                "OPENMETTLE_API_ISSUANCE_DATABASE_URL",
+                OsStr::from_bytes(b"postgres://CANARY-\xff"),
+            )],
+            &[],
+            "configuration must be UTF-8",
+        ),
+        // The two pools must not collapse into one role: the same explicit user, the same user
+        // through the `user` parameter, or both from libpq defaults.
+        (
+            auth,
+            primary,
+            &[url(
+                "postgres://openmettle_api:CANARY-other@localhost/other",
+            )],
+            &[],
+            "ISSUANCE_DATABASE_URL must use a different user",
+        ),
+        (
+            auth,
+            primary,
+            &[url(
+                "postgres://localhost/test?user=openmettle_api&password=CANARY",
+            )],
+            &[],
+            "ISSUANCE_DATABASE_URL must use a different user",
+        ),
+        (
+            auth,
+            "postgres://localhost/test",
+            &[url("postgres://localhost/other")],
+            &[],
+            "ISSUANCE_DATABASE_URL must use a different user",
+        ),
+        (
+            auth,
+            primary,
+            &[url(issuance)],
+            &[(max, "0")],
+            "configuration outside allowed range",
+        ),
+        (
+            auth,
+            primary,
+            &[url(issuance)],
+            &[(max, "65")],
+            "configuration outside allowed range",
+        ),
+        (
+            auth,
+            primary,
+            &[url(issuance)],
+            &[(max, "CANARY")],
+            "invalid numeric configuration",
+        ),
+    ];
+    for (auth, database, issuance, extra, line) in cases {
+        let mut command = command(false);
+        command
+            .env("OPENMETTLE_API_BIND", &bind)
+            .env("OPENMETTLE_API_DATABASE_URL", database);
+        if let Some(path) = auth {
+            command.env("OPENMETTLE_API_AUTH_CONFIG", path);
+        }
+        command
+            .envs(issuance.iter().copied())
+            .envs(extra.iter().copied());
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(78), "{line}");
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            format!("configuration error: {line}\n")
+        );
+    }
+    // A user filled from `PGUSER` counts as that user, on either URL.
+    for (database, issuance) in [
+        (
+            "postgres://localhost/test",
+            "postgres://openmettle_api@localhost/other",
+        ),
+        (primary, "postgres://localhost/other"),
+    ] {
+        let output = command(false)
+            .env("PGUSER", "openmettle_api")
+            .env("OPENMETTLE_API_BIND", &bind)
+            .env("OPENMETTLE_API_DATABASE_URL", database)
+            .env("OPENMETTLE_API_AUTH_CONFIG", "/CANARY-absent/auth.json")
+            .env("OPENMETTLE_API_ISSUANCE_DATABASE_URL", issuance)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(78), "{database} {issuance}");
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "configuration error: ISSUANCE_DATABASE_URL must use a different user\n"
+        );
+    }
+    // Accepted settings reach the document loader, which reports the absent file instead.
+    for max in [None, Some("1"), Some("64")] {
+        let mut command = command(false);
+        command
+            .env("OPENMETTLE_API_BIND", &bind)
+            .env("OPENMETTLE_API_DATABASE_URL", primary)
+            .env("OPENMETTLE_API_AUTH_CONFIG", "/CANARY-absent/auth.json")
+            .env("OPENMETTLE_API_ISSUANCE_DATABASE_URL", issuance);
+        if let Some(max) = max {
+            command.env("OPENMETTLE_API_ISSUANCE_DB_MAX_CONNECTIONS", max);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(78), "{max:?}");
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "auth configuration error: configuration is not a readable regular file within bounds\n"
+        );
+    }
+    // The worker refuses the API's issuance URL whatever its value, and reads no issuance
+    // setting under its own prefix.
+    for value in [
+        OsStr::new(issuance),
+        OsStr::new(""),
+        OsStr::from_bytes(b"CANARY-\xff"),
+    ] {
+        let output = command(true)
+            .env("OPENMETTLE_WORKER_BIND", &bind)
+            .env(
+                "OPENMETTLE_WORKER_DATABASE_URL",
+                "postgres://localhost/test",
+            )
+            .env("OPENMETTLE_API_ISSUANCE_DATABASE_URL", value)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(78), "{value:?}");
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "configuration error: OPENMETTLE_API_ISSUANCE_DATABASE_URL is refused outside the API\n"
+        );
+    }
+    // Under its own prefix, unread: the occupied listener is the first failure.
+    let output = command(true)
+        .env("OPENMETTLE_WORKER_BIND", &bind)
+        .env(
+            "OPENMETTLE_WORKER_DATABASE_URL",
+            "postgres://localhost/test",
+        )
+        .env(
+            "OPENMETTLE_WORKER_ISSUANCE_DATABASE_URL",
+            "invalid://CANARY",
+        )
+        .env("OPENMETTLE_WORKER_ISSUANCE_DB_MAX_CONNECTIONS", "CANARY")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("CANARY"));
+}
+
 /// Starts a process with piped stderr and the given telemetry settings.
 fn start_logging(worker: bool, address: &str, url: &str, settings: &[(&str, &str)]) -> Process {
     let prefix = if worker {
@@ -990,6 +1219,13 @@ fn unavailable_database() -> (TcpListener, String) {
     );
     (listener, url)
 }
+/// The issuance pool's URL (ADR 0030) on the same unanswered address, under its own user.
+fn unavailable_issuance(database: &TcpListener) -> String {
+    format!(
+        "postgres://fixture-issuance:CANARY-issuance-password@{}/fixture?sslmode=disable",
+        database.local_addr().unwrap()
+    )
+}
 /// One request on a new connection: the status line's code, the lowercase head and the body.
 fn exchange(address: &str, request: &str) -> (u16, String, String) {
     let response = send(address, request).unwrap();
@@ -1088,6 +1324,10 @@ fn api_refuses_invalid_auth_config_with_a_fixed_redacted_line() {
             )
             .env("OPENMETTLE_API_LOG_LEVEL", "debug")
             .env("OPENMETTLE_API_AUTH_CONFIG", path)
+            .env(
+                "OPENMETTLE_API_ISSUANCE_DATABASE_URL",
+                "postgres://fixture-issuance@localhost/test",
+            )
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(78), "{line}");
@@ -1271,15 +1511,23 @@ fn worker_ignores_auth_config_and_mounts_no_sign_in_route() {
     }
 }
 
-/// The API with a valid version-2 document and the given format; `debug`, so every request
-/// writes an event.
-fn start_mounted(bind: &str, url: &str, auth: &str, format: &str, db_timeout_ms: &str) -> Process {
+/// The API with a valid version-2 document, its issuance pool and the given format; `debug`,
+/// so every request writes an event.
+fn start_mounted(
+    bind: &str,
+    url: &str,
+    issuance: &str,
+    auth: &str,
+    format: &str,
+    db_timeout_ms: &str,
+) -> Process {
     start_logging(
         false,
         bind,
         url,
         &[
             ("AUTH_CONFIG", auth),
+            ("ISSUANCE_DATABASE_URL", issuance),
             ("DB_TIMEOUT_MS", db_timeout_ms),
             ("LOG_LEVEL", "debug"),
             ("LOG_FORMAT", format),
@@ -1519,7 +1767,14 @@ fn api_mounts_browser_sign_in_routes_from_a_valid_auth_config() {
 
     for format in ["json", "text"] {
         let bind = address();
-        let mut process = start_mounted(&bind, &url, &auth, format, "150");
+        let mut process = start_mounted(
+            &bind,
+            &url,
+            &unavailable_issuance(&database),
+            &auth,
+            format,
+            "150",
+        );
         wait_status(&mut process, &bind, "/healthz", 200);
         // Loading and mounting dialled nothing: the lazy pool is still unconnected.
         assert!(database.accept().is_err());
@@ -1734,7 +1989,14 @@ fn api_mounts_native_sign_in_routes_beside_the_browser_routes() {
         ),
     ];
     let bind = address();
-    let mut process = start_mounted(&bind, &url, &auth, "json", "150");
+    let mut process = start_mounted(
+        &bind,
+        &url,
+        &unavailable_issuance(&database),
+        &auth,
+        "json",
+        "150",
+    );
     wait_status(&mut process, &bind, "/healthz", 200);
     assert!(database.accept().is_err());
     for (index, (method, target, extra, status, body, _)) in cases.iter().enumerate() {
@@ -1998,7 +2260,12 @@ async fn postgres_readiness_is_independent_of_optional_evaluation() {
 }
 
 /// Synthetic cluster roles shared with `tests/schema.rs`, which creates them the same way.
-const DATABASE_ROLES: [&str; 3] = ["openmettle_owner", "openmettle_api", "openmettle_worker"];
+const DATABASE_ROLES: [&str; 4] = [
+    "openmettle_owner",
+    "openmettle_api",
+    "openmettle_issuance",
+    "openmettle_worker",
+];
 /// Synthetic test-only credential for those roles; never a deployment value.
 const ROLE_PASSWORD: &str = "fixture-only-password";
 
@@ -2081,11 +2348,11 @@ impl MigratedDb {
         .unwrap();
         db
     }
-    /// The API's own role, never the owner's.
-    fn api_url(&self) -> String {
+    /// An application role's URL, never the owner's.
+    fn url(&self, role: &str) -> String {
         let admin = Self::admin_options();
         format!(
-            "postgres://openmettle_api:{ROLE_PASSWORD}@{}:{}/{}?sslmode=disable",
+            "postgres://{role}:{ROLE_PASSWORD}@{}:{}/{}?sslmode=disable",
             admin.get_host(),
             admin.get_port(),
             self.name
@@ -2116,8 +2383,10 @@ impl Drop for MigratedDb {
 /// with the sign-in routes mounted. Readiness stays a database query while the configured
 /// provider is a reserved name that cannot be reached, and the session routes are answered
 /// by the primary database: it refuses an unknown credential, where an unreachable database
-/// gives `503`. No provider is contacted; issued-session journeys are covered by the managed
-/// PostgreSQL router tests and the Keycloak qualification.
+/// gives `503`. The issuance pool (ADR 0030) points at an address that never answers, and
+/// neither readiness nor a session route ever dials it. No provider is contacted;
+/// issued-session journeys are covered by the managed PostgreSQL router tests and the Keycloak
+/// qualification.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
 async fn postgres_mounted_session_routes_use_the_primary_database() {
@@ -2127,7 +2396,16 @@ async fn postgres_mounted_session_routes_use_the_primary_database() {
     let document = auth_config_support::document_v2_native(&dir, &ca::Ca::new().pem());
     let auth = dir.write("auth.json", document.to_string().as_bytes());
     let bind = address();
-    let mut api = start_mounted(&bind, &db.api_url(), &auth, "json", "2000");
+    let (issuance, _) = unavailable_database();
+    issuance.set_nonblocking(true).unwrap();
+    let mut api = start_mounted(
+        &bind,
+        &db.url("openmettle_api"),
+        &unavailable_issuance(&issuance),
+        &auth,
+        "json",
+        "2000",
+    );
     wait_status(&mut api, &bind, "/readyz", 200);
 
     let session =
@@ -2171,6 +2449,7 @@ async fn postgres_mounted_session_routes_use_the_primary_database() {
         let (status, _, body) = exchange(&bind, &request("GET", "/readyz", ""));
         assert_eq!((status, body.as_str()), (200, "ready\n"));
     }
+    assert!(issuance.accept().is_err(), "the issuance pool was dialled");
     stop(&mut api, "-TERM");
     let (stdout, stderr) = drain(&mut api);
     assert!(stdout.is_empty(), "{stdout}");

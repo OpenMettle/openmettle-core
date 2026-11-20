@@ -1,6 +1,7 @@
-//! The pooled browser-auth service (ADR 0016) on a one-slot pool: connection ownership across
-//! provider requests, reuse after acknowledged outcomes and replacement after uncertain ones.
-//! Isolated CI PostgreSQL 18 only. The fixture administrator observes pool backends and
+//! The pooled browser-auth service (ADR 0016) on one-slot primary and issuance pools (ADR 0030):
+//! connection ownership across provider requests and between the pools, reuse after
+//! acknowledged outcomes and replacement after uncertain ones. Isolated CI PostgreSQL 18 only.
+//! The fixture administrator observes pool backends and
 //! terminates one identified fixture backend to exercise connection loss.
 use super::sessions::{issue, seed, session_policy, statistics_observer, waiting};
 use super::*;
@@ -19,10 +20,15 @@ pub(super) fn one_slot(options: PgConnectOptions) -> PgPool {
         .acquire_timeout(Duration::from_secs(20))
         .connect_lazy_with(options)
 }
+/// The service over `pool` and a fresh one-slot issuance pool.
 pub(super) fn service_over(f: &Flow, pool: &PgPool) -> BrowserAuth {
+    service_with(f, pool, &one_slot(f.db.options(ISSUANCE)))
+}
+pub(super) fn service_with(f: &Flow, pool: &PgPool, issuance: &PgPool) -> BrowserAuth {
     service::browser_auth(
         &f.h,
         pool.clone(),
+        issuance.clone(),
         Duration::from_secs(300),
         session_policy(),
     )
@@ -111,8 +117,10 @@ async fn one_slot_pool_completes_a_login_and_reuses_after_replay_denial() {
     let mut f = Flow::new().await;
     let user = seed(&mut f, true, true).await;
     let pool = one_slot(f.db.options(API));
-    let auth = service_over(&f, &pool);
+    let issuance = one_slot(f.db.options(ISSUANCE));
+    let auth = service_with(&f, &pool, &issuance);
     let first = backend(&pool).await;
+    let issuing = backend(&issuance).await;
     let started = auth.begin(signing::ID, None).await.unwrap();
     f.arm(&started);
     let credential = auth
@@ -120,6 +128,9 @@ async fn one_slot_pool_completes_a_login_and_reuses_after_replay_denial() {
         .await
         .unwrap();
     assert_eq!(posts(&f), 1);
+    // Each pool kept its backend: issuance and the final validation each returned theirs.
+    assert_eq!(backend(&issuance).await, issuing);
+    pool_state(&issuance, 1, 1).await;
     let context = auth.validate(credential.expose()).await.unwrap();
     assert_eq!(context.user_id(), user);
     // Replay is refused under the login row lock, after an awaited rollback, with no POST.
@@ -151,6 +162,8 @@ async fn one_slot_pool_completes_a_login_and_reuses_after_replay_denial() {
     assert_eq!(f.h.count(), requests);
     assert_eq!(backend(&pool).await, first);
     pool_state(&pool, 1, 1).await;
+    // Validation and logout never use the issuance pool.
+    assert_eq!(backend(&issuance).await, issuing);
 }
 
 #[tokio::test]
@@ -159,7 +172,8 @@ async fn blocked_provider_requests_hold_no_pooled_connection() {
     let mut f = Flow::new().await;
     seed(&mut f, true, true).await;
     let pool = one_slot(f.db.options(API));
-    let auth = service_over(&f, &pool);
+    let issuance = one_slot(f.db.options(ISSUANCE));
+    let auth = service_with(&f, &pool, &issuance);
     let gate = f.h.script.lock().unwrap().gate.clone();
     // Cold start: the key document request is held open during preflight. The pool has not
     // been asked for a connection, so unrelated work gets its only slot.
@@ -174,12 +188,14 @@ async fn blocked_provider_requests_hold_no_pooled_connection() {
     let started = started.unwrap();
     f.arm(&started);
     // The token request is held open after consumption committed. The consumption checkout
-    // has already gone back, so unrelated work again gets the only slot.
+    // has already gone back, and issuance has not asked for one, so unrelated work again gets
+    // the only slot of each pool.
     f.h.script.lock().unwrap().mode = "gate-post";
     let control = async {
         f.h.entered(3).await;
         assert!(f.consumed(&started).await);
         backend(&pool).await;
+        backend(&issuance).await;
         gate.notify_one();
     };
     let (credential, ()) = tokio::join!(auth.complete(signing::ID, callback(&started)), control);
@@ -187,6 +203,7 @@ async fn blocked_provider_requests_hold_no_pooled_connection() {
     auth.validate(credential.unwrap().expose()).await.unwrap();
     assert_eq!(posts(&f), 1);
     pool_state(&pool, 1, 1).await;
+    pool_state(&issuance, 1, 1).await;
 }
 
 #[tokio::test]
@@ -196,12 +213,14 @@ async fn cancellation_timeout_and_database_errors_replace_the_connection() {
     seed(&mut f, true, true).await;
     let p = f.h.provider.clone();
     let pool = one_slot(f.db.options(API));
-    let auth = service_over(&f, &pool);
+    let issuance = one_slot(f.db.options(ISSUANCE));
+    let auth = service_with(&f, &pool, &issuance);
     let mut observer = statistics_observer(&f.db).await;
+    let primary = backend(&pool).await;
 
     // 1. Cancellation. Issuance holds the login row lock and waits for the user row.
     let (started, proof) = f.exchanged(&p).await;
-    let cancelled = backend(&pool).await;
+    let cancelled = backend(&issuance).await;
     let mut held = f.owner.begin().await.unwrap();
     held.execute("SELECT id FROM openmettle.users FOR UPDATE")
         .await
@@ -213,9 +232,11 @@ async fn cancellation_timeout_and_database_errors_replace_the_connection() {
             () = waiting(&mut observer, cancelled.0) => {},
         }
     }
-    // A different backend can use the slot after SQLx closes the cancelled checkout.
-    let replacement = backend(&pool).await;
-    assert_ne!(replacement, cancelled);
+    // A different backend can use the slot after SQLx closes the cancelled checkout. The
+    // primary pool was never asked for a connection.
+    let reissued = backend(&issuance).await;
+    assert_ne!(reissued, cancelled);
+    assert_eq!(backend(&pool).await, primary);
     // Keep the blocker held while checking that the cancelled backend exits and releases
     // its login row lock.
     gone(&mut observer, &cancelled).await;
@@ -233,14 +254,12 @@ async fn cancellation_timeout_and_database_errors_replace_the_connection() {
     let brief = service::browser_auth(
         &f.h,
         pool.clone(),
+        issuance.clone(),
         Duration::from_secs(300),
         local::Policy::new(Duration::from_secs(60), 16, Duration::from_secs(1)).unwrap(),
     );
     let timed_out = backend(&pool).await;
-    assert_eq!(
-        timed_out, replacement,
-        "an ordinary query keeps the backend"
-    );
+    assert_eq!(timed_out, primary, "an ordinary query keeps the backend");
     let mut held = f.owner.begin().await.unwrap();
     held.execute("SELECT id FROM openmettle.local_identity_approvals FOR UPDATE")
         .await
@@ -286,22 +305,24 @@ async fn cancellation_timeout_and_database_errors_replace_the_connection() {
     gone(&mut observer, &replacement).await;
     unlocked(&mut f.owner, &["login_admission", "login_transactions"]).await;
 
-    // 4. Lost connection. The backend is terminated while issuance waits, so the statement
-    // and the ROLLBACK that follows both fail: the cleanup-failure case of ADR 0014.
+    // 4. Lost connection. The issuance backend is terminated while issuance waits, so the
+    // statement and the ROLLBACK that follows both fail: the cleanup-failure case of ADR 0014.
     let (started, proof) = f.exchanged(&p).await;
+    let issuing = backend(&issuance).await;
+    assert_eq!(issuing, reissued);
     let mut held = f.owner.begin().await.unwrap();
     held.execute("SELECT id FROM openmettle.users FOR UPDATE")
         .await
         .unwrap();
     let control = async {
-        waiting(&mut observer, after_error.0).await;
+        waiting(&mut observer, issuing.0).await;
         let signalled: Option<bool> = sqlx::query_scalar(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
              WHERE pid = $1 AND backend_start::text = $2 AND datname = current_database()
                AND wait_event_type = 'Lock'",
         )
-        .bind(after_error.0)
-        .bind(&after_error.1)
+        .bind(issuing.0)
+        .bind(&issuing.1)
         .fetch_optional(&mut observer)
         .await
         .unwrap();
@@ -310,18 +331,20 @@ async fn cancellation_timeout_and_database_errors_replace_the_connection() {
     let (result, ()) = tokio::join!(auth.issue(&p, proof), control);
     assert_eq!(result.unwrap_err(), SessionError::Database);
     held.rollback().await.unwrap();
-    let after_loss = backend(&pool).await;
-    assert_ne!(after_loss, after_error);
+    let after_loss = backend(&issuance).await;
+    assert_ne!(after_loss, issuing);
     assert!(!session_issued(&mut f, &started).await);
 
-    // No capacity was lost: the single slot still serves a complete login.
+    // No capacity was lost: each single slot still serves a complete login.
     let started = auth.begin(signing::ID, None).await.unwrap();
     f.arm(&started);
     auth.complete(signing::ID, callback(&started))
         .await
         .unwrap();
-    assert_eq!(backend(&pool).await, after_loss);
+    assert_eq!(backend(&pool).await, after_error);
+    assert_eq!(backend(&issuance).await, after_loss);
     pool_state(&pool, 1, 1).await;
+    pool_state(&issuance, 1, 1).await;
 }
 
 #[tokio::test]
@@ -332,18 +355,25 @@ async fn withheld_commit_acknowledgement_returns_nothing_and_is_never_retried() 
         seed(&mut f, true, true).await;
         let p = f.h.provider.clone();
         let mut barrier = ResponseBarrier::new(b"COMMIT\0");
-        // The proxy carries exactly one connection: the pool's first. Replacements connect
-        // directly, as a new connection would in a deployment.
+        // The proxy carries exactly one connection: the first of the pool that commits this
+        // stage, the primary for consumption and the issuance pool for issuance. Replacements
+        // connect directly, as a new connection would in a deployment.
+        let role = if stage == "consume" { API } else { ISSUANCE };
         let pool = one_slot(
-            f.db.options(API)
+            f.db.options(role)
                 .host("127.0.0.1")
                 .port(barrier.port)
                 .ssl_mode(sqlx::postgres::PgSslMode::Disable),
         );
-        let auth = service_over(&f, &pool);
+        let other = one_slot(f.db.options(if stage == "consume" { ISSUANCE } else { API }));
+        let auth = if stage == "consume" {
+            service_with(&f, &pool, &other)
+        } else {
+            service_with(&f, &other, &pool)
+        };
         let proxied = backend(&pool).await;
         pool_state(&pool, 1, 1).await;
-        pool.set_connect_options(f.db.options(API));
+        pool.set_connect_options(f.db.options(role));
         let started = if stage == "consume" {
             let started = f.begin(&p).await;
             f.arm(&started);
@@ -395,12 +425,15 @@ async fn pool_waits_stay_inside_the_original_deadlines() {
     seed(&mut f, true, true).await;
     let p = f.h.provider.clone();
     let pool = one_slot(f.db.options(API));
-    let auth = service_over(&f, &pool);
+    let issuance = one_slot(f.db.options(ISSUANCE));
+    let auth = service_with(&f, &pool, &issuance);
     let first = backend(&pool).await;
+    let issuing = backend(&issuance).await;
     let (started, proof) = f.exchanged(&p).await;
     let original = proof.deadline;
     let before = (f.rows().await, reservations(&mut f).await);
     let slot = pool.acquire().await.unwrap();
+    let issuance_slot = issuance.acquire().await.unwrap();
     // Issuance waits only until the proof's original exchange deadline. The session
     // operation deadline (10 s) would allow far longer if the wait opened a new window.
     assert_eq!(
@@ -423,12 +456,15 @@ async fn pool_waits_stay_inside_the_original_deadlines() {
     );
     assert_eq!(f.h.count(), requests);
     drop(slot);
+    drop(issuance_slot);
     pool_state(&pool, 1, 1).await;
+    pool_state(&issuance, 1, 1).await;
     assert_eq!(sessions(&mut f).await, 0);
     assert!(!session_issued(&mut f, &started).await);
     assert_eq!((f.rows().await, reservations(&mut f).await), before);
-    // Neither attempt was ever lent the connection, so nothing was discarded.
+    // Neither attempt was ever lent a connection, so nothing was discarded.
     assert_eq!(backend(&pool).await, first);
+    assert_eq!(backend(&issuance).await, issuing);
 
     // 2. The slot frees inside the deadline but after the login's original expiry: the
     // primary clock refuses issuance.
@@ -436,7 +472,8 @@ async fn pool_waits_stay_inside_the_original_deadlines() {
     seed(&mut f, true, true).await;
     let p = f.h.provider.clone();
     let pool = one_slot(f.db.options(API));
-    let auth = service_over(&f, &pool);
+    let issuance = one_slot(f.db.options(ISSUANCE));
+    let auth = service_with(&f, &pool, &issuance);
     let first = backend(&pool).await;
     let started = p
         .begin(&mut f.api, &keys(), Duration::from_secs(1), None)
@@ -448,7 +485,7 @@ async fn pool_waits_stay_inside_the_original_deadlines() {
         .exchange_with_keys(&p, &auth::Policy::default())
         .await
         .unwrap();
-    let slot = pool.acquire().await.unwrap();
+    let slot = issuance.acquire().await.unwrap();
     let control = async {
         sqlx::query("SELECT pg_sleep(GREATEST(0, (expires_ms - floor(extract(epoch FROM clock_timestamp())*1000))/1000.0 + 0.02)) FROM openmettle.login_transactions WHERE id=$1")
             .bind(locator(&started))
@@ -476,4 +513,51 @@ async fn pool_waits_stay_inside_the_original_deadlines() {
     assert_eq!((f.rows().await, reservations(&mut f).await), before);
     assert_eq!(backend(&pool).await, first);
     pool_state(&pool, 1, 1).await;
+}
+
+/// ADR 0030: issuance commits on the issuance pool and settles that checkout before the final
+/// validation asks the primary pool, so a callback never holds a connection of each pool. With
+/// the primary's only slot held, issuance still commits and returns its slot for reuse; the
+/// validation then waits for the primary only until the proof's original deadline, and no
+/// credential is released.
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn issuance_returns_its_connection_before_the_primary_validation() {
+    let mut brief = policy();
+    brief.deadline = Duration::from_millis(1500);
+    let mut f = Flow::with(Harness::with_policy(brief).await).await;
+    seed(&mut f, true, true).await;
+    let p = f.h.provider.clone();
+    let pool = one_slot(f.db.options(API));
+    let issuance = one_slot(f.db.options(ISSUANCE));
+    let auth = service_with(&f, &pool, &issuance);
+    let first = backend(&pool).await;
+    let issuing = backend(&issuance).await;
+    let (started, proof) = f.exchanged(&p).await;
+    let original = proof.deadline;
+    let slot = pool.acquire().await.unwrap();
+    let control = async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !session_issued(&mut f, &started).await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("issuance must commit without a primary connection");
+        // The validation is now waiting for the primary; the issuance slot is idle again and
+        // keeps its backend.
+        pool_state(&issuance, 1, 1).await;
+        assert_eq!(backend(&issuance).await, issuing);
+    };
+    let (result, ()) = tokio::join!(auth.issue(&p, proof), control);
+    assert_eq!(result.unwrap_err(), SessionError::Timeout);
+    let now = Instant::now();
+    assert!(now >= original && now < original + Duration::from_secs(3));
+    drop(slot);
+    // The issued row and marker remain without a credential (ADR 0013); the held primary slot
+    // was never lent, so it keeps its backend.
+    assert_eq!(sessions(&mut f).await, 1);
+    assert!(session_issued(&mut f, &started).await);
+    pool_state(&pool, 1, 1).await;
+    assert_eq!(backend(&pool).await, first);
 }

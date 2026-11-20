@@ -9,10 +9,12 @@ use crate::{
 };
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 
-/// The service over this harness's manager and fixture provider. Test trust only.
+/// The service over this harness's manager and fixture provider. Test trust only. Tests
+/// that never reach issuance pass the same lazy pool as `issuance`.
 pub(super) fn browser_auth(
     h: &Harness,
     pool: sqlx::PgPool,
+    issuance: sqlx::PgPool,
     login_lifetime: Duration,
     session_policy: sessions::Policy,
 ) -> BrowserAuth {
@@ -27,6 +29,7 @@ pub(super) fn browser_auth(
             vec![h.provider.clone()],
         ),
         pool,
+        issuance,
     )
 }
 pub(super) fn assert_send<T: Send>(_: &T) {}
@@ -55,7 +58,13 @@ async fn provider_work_precedes_checkout_and_refusals_never_check_out() {
     let attempted = || database.accept().is_ok();
     let h = Harness::new().await;
     let policy = sessions::Policy::new(Duration::from_secs(60), 16, Duration::from_secs(5));
-    let auth = browser_auth(&h, pool, Duration::from_secs(300), policy.unwrap());
+    let auth = browser_auth(
+        &h,
+        pool.clone(),
+        pool,
+        Duration::from_secs(300),
+        policy.unwrap(),
+    );
     let callback = || login::Callback {
         state: "synthetic-state",
         caller_binding: "synthetic-binding",

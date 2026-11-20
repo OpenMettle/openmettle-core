@@ -122,7 +122,7 @@ SELECT id, provider_id, provider_generation, provider_epoch, issuer, subject, cr
 
 The code reaches the database by one path. The sign-in form submits it, the API seals it with the login's PKCE verifier (AES-256-GCM under the login key ring), and the callback opens it and passes it to the redemption function. Every stored login ciphertext has the same length, so a row does not show whether a code was entered, and the ciphertext is cleared when the login is consumed.
 
-Only the managed consumer accepts the sealed online proof. It locks the originating login and provider and checks the proof binding and authority before looking up the identity. An existing identity always follows ordinary approval checks, and a code presented with it is ignored. For an absent identity without a code, the consumer refuses and writes nothing; the database function would also refuse a missing code. For an absent identity with a code, it calls the owner-defined redemption function. The API can execute this one function and has no table privilege on invitations. The function fixes its search path and uses schema-qualified tables.
+Only the managed consumer accepts the sealed online proof. It locks the originating login and provider and checks the proof binding and authority before looking up the identity. An existing identity always follows ordinary approval checks, and a code presented with it is ignored. For an absent identity without a code, the consumer refuses and writes nothing; the database function would also refuse a missing code. For an absent identity with a code, it calls the owner-defined redemption function. From schema 18 the API calls it on its issuance connection, as `openmettle_issuance`, the only role that can execute it ([ADR 0030](../adr/0030-session-issuance-database-boundary.md)); before schema 18 the API role executed it. Neither role has a table privilege on invitations. The function fixes its search path and uses schema-qualified tables.
 
 The function inserts fresh records only when all of these hold:
 
@@ -135,14 +135,18 @@ The function inserts fresh records only when all of these hold:
 
 A wrong code is handled exactly like a missing invitation: no invitation row is locked and nothing is written. A global issuer/subject uniqueness conflict rolls back the attempted creation. The caller cannot set the new account ID, choose the approval expiry, restore an approval or change invitation provenance.
 
-The database cannot verify an OIDC proof. It trusts the application to do so, as it does for ordinary session issuance. The API role already inserts login rows with their binding, marks them consumed and session-issued, and inserts session rows. A principal that can run arbitrary SQL as the API role can therefore fabricate everything the function checks except the code. Examples are a holder of the API's database credentials or of a SQL injection in the API. Without the code it cannot redeem an invitation, so this boundary is closed for a principal limited to API-role SQL:
+The database cannot verify an OIDC proof. It trusts the application to do so, as it does for ordinary session issuance. Two layers keep a principal limited to SQL as one application role from creating an account.
 
-- The API role cannot read `code_hash`, and no function returns it.
+From schema 18, a principal limited to SQL as `openmettle_api`, for example a holder of the API's primary database credentials or of a SQL injection in an API query, can still insert and consume login rows, but it cannot execute the redemption function, insert a session row or mark a login session-issued. It can therefore neither redeem an invitation nor issue a session for an approved existing identity ([ADR 0030](../adr/0030-session-issuance-database-boundary.md), [#73](https://github.com/OpenMettle/openmettle-core/issues/73)).
+
+The `openmettle_issuance` role holds those writes and the function's `EXECUTE`. A principal that can run arbitrary SQL as that role, or as the API role before schema 18, can fabricate everything the function checks except the code. Without the code it cannot redeem an invitation:
+
+- Neither role can read `code_hash`, and no function returns it.
 - The code-less function of schema 12 no longer exists.
 - A code that a person has entered is stored only as ciphertext in the login row, under a key ring the database does not hold, and only until that login is consumed.
 - Guessing a 128-bit code is not feasible.
 
-The same principal can still issue sessions for any approved existing identity, which [#73](https://github.com/OpenMettle/openmettle-core/issues/73) tracks. [ADR 0030](../adr/0030-session-issuance-database-boundary.md) (proposed, not yet implemented) closes that path by moving issuance and the redemption function's `EXECUTE` to a separate `openmettle_issuance` role. From then on, the parameter-logging advice below applies to that role instead of the API role.
+Such an issuance-role principal can still issue sessions for any approved existing identity, by design. Protect the issuance credential like the API's and mount it into the API container only. Sessions issued before the upgrade to schema 18 cannot be told apart from forged ones; [ADR 0030](../adr/0030-session-issuance-database-boundary.md#upgrade) gives the optional revocation step.
 
 These remain trusted with the code:
 
@@ -152,7 +156,7 @@ These remain trusted with the code:
 - the ingress or proxy that terminates TLS for the application. The code travels in the body of the sign-in form `POST`. Do not log request bodies for the sign-in start path, and treat any capture of them as secret;
 - the API process, which holds the code in memory while it starts and completes the sign-in;
 - anyone who holds both the login key ring and read access to the login table, for an unconsumed login's lifetime (at most 600 seconds);
-- the database owner and anyone who can read the database server's logs. The API passes the code to the redemption function as a bind parameter. A server that logs statements with their parameters records those bytes: `log_statement` or `log_min_duration_statement` unless `log_parameter_max_length` is `0`, and failed statements when `log_parameter_max_length_on_error` is not `0`. Disable parameter logging for the API role or treat those logs as secret.
+- the database owner and anyone who can read the database server's logs. The API passes the code to the redemption function as a bind parameter, as `openmettle_issuance` from schema 18 and as `openmettle_api` before. A server that logs statements with their parameters records those bytes: `log_statement` or `log_min_duration_statement` unless `log_parameter_max_length` is `0`, and failed statements when `log_parameter_max_length_on_error` is not `0`. Disable parameter logging for that role or treat those logs as secret.
 
 A leaked code alone creates no account. Redemption still needs a consumed login for the exact subject under the current provider epoch. Keep redemption windows short and withdraw invitations that are no longer needed.
 

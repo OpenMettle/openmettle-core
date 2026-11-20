@@ -1136,7 +1136,7 @@ async fn native_app_links_cannot_target_configured_browser_routes() {
             .host("127.0.0.1")
             .port(9),
     );
-    let auth = Arc::new(BrowserAuth::new(config, pool));
+    let auth = Arc::new(BrowserAuth::new(config, pool.clone(), pool));
     for origin in ["https://app.example.test", "https://broker.example.test"] {
         let register = |link: &str| {
             NativeAuth::new(
@@ -1182,7 +1182,7 @@ async fn offline_outcomes_match_the_handoff_and_router_constructors() {
             .username("fixture"),
     );
     let build_routes = |config, profile: &BrowserProfile| -> Result<(), Error> {
-        let auth = Arc::new(BrowserAuth::new(config, pool.clone()));
+        let auth = Arc::new(BrowserAuth::new(config, pool.clone(), pool.clone()));
         let handoff = LoginHandoff::new(auth, profile.handoff()).map_err(Error::BrowserHandoff)?;
         router_with_sessions(handoff, profile.router(), profile.sessions())
             .map(drop)
@@ -1831,7 +1831,7 @@ async fn offline_native_outcomes_match_the_native_constructors() {
         let mut without = document.clone();
         without.as_object_mut().unwrap().remove("native");
         let config = fixture.load_bytes(without.to_string().as_bytes()).unwrap();
-        let auth = Arc::new(BrowserAuth::new(config, pool.clone()));
+        let auth = Arc::new(BrowserAuth::new(config, pool.clone(), pool.clone()));
         let checked = NativeAuth::checked(auth.clone(), profile.settings(), profile.rate());
         assert_eq!(
             checked.as_ref().map(drop).map_err(|e| *e),
