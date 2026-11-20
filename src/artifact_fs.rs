@@ -422,6 +422,7 @@ where
     // `reconcile_expired`. A reservation no longer `reserved` keeps no staging file; `settle`
     // then replays or conflicts.
     let settled = committed::<_, Error>(pool, async |tx| {
+        let mut published = false;
         if let Some(staged) = staged {
             let state: String = sqlx::query_scalar(
                 "SELECT state FROM openmettle.storage_reservations
@@ -433,23 +434,31 @@ where
             .await?;
             if state == "reserved" {
                 staged.publish().await?;
+                published = true;
             }
         }
-        Ok(storage::settle(tx, &settlement).await?)
+        Ok((storage::settle(tx, &settlement).await?, published))
     })
     .await;
-    let revision = match settled {
-        Ok(revision) => revision,
+    let (revision, published) = match settled {
+        Ok(settled) => settled,
         // Only publication fails with `Io`: both paths are gone, so the release is safe.
         Err(Error::Io) => return Err(abort(pool, upload.scope, &id, Error::Io).await),
         Err(error) => return Err(error),
     };
-    if !fresh {
+    // A replay, or a request whose reservation another request settled, must find that
+    // revision's payload: a regular file (not a symlink) of exactly the settled size.
+    if !published {
         let (_, path) = store.paths(&id)?;
-        let len = blocking(move || fs::symlink_metadata(path).map(|m| m.len()))
+        let size = sink.size;
+        let present =
+            blocking(move || {
+                Ok(fs::symlink_metadata(path)
+                    .is_ok_and(|m| m.file_type().is_file() && m.len() == size))
+            })
             .await
-            .map_err(|_| Error::Missing)?;
-        if len != sink.size {
+            .unwrap_or(false);
+        if !present {
             return Err(Error::Missing);
         }
     }

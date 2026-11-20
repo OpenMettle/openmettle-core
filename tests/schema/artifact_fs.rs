@@ -463,7 +463,7 @@ async fn ingest_publishes_once_and_replays_exactly() {
     }
     // A changed byte ceiling is another request under the same key.
     assert!(matches!(
-        f.upload("a", &doc, 999, "b", chunked(&retry, 64), true)
+        f.upload("a", &doc, 999, "second-boundary", chunked(&retry, 64), true)
             .await,
         Err(artifact_fs::Error::Storage(Error::Conflict))
     ));
@@ -478,10 +478,36 @@ async fn ingest_publishes_once_and_replays_exactly() {
     )
     .unwrap();
     assert!(matches!(
-        f.upload("a", &doc, 1000, "b", chunked(&retry, 64), true)
-            .await,
+        f.upload(
+            "a",
+            &doc,
+            1000,
+            "second-boundary",
+            chunked(&retry, 64),
+            true
+        )
+        .await,
         Err(artifact_fs::Error::Missing)
     ));
+    // A symlink to a payload of the right size is not the settled payload either.
+    std::os::unix::fs::symlink(
+        f.root.join("moved"),
+        f.root.join("revisions").join(&stored.reservation),
+    )
+    .unwrap();
+    assert!(matches!(
+        f.upload(
+            "a",
+            &doc,
+            1000,
+            "second-boundary",
+            chunked(&retry, 64),
+            true
+        )
+        .await,
+        Err(artifact_fs::Error::Missing)
+    ));
+    fs::remove_file(f.root.join("revisions").join(&stored.reservation)).unwrap();
     fs::rename(
         f.root.join("moved"),
         f.root.join("revisions").join(&stored.reservation),

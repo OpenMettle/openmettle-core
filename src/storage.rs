@@ -304,13 +304,25 @@ async fn settle_inner(tx: &mut WriteTransaction<'_>, s: &Settlement<'_>) -> Resu
         let number: i64 = sqlx::query_scalar("UPDATE openmettle.artifacts SET last_revision=last_revision+1
              WHERE id=$1::uuid RETURNING last_revision")
             .bind(&artifact).fetch_one(&mut *sp).await?;
-        let revision: String = sqlx::query_scalar("INSERT INTO openmettle.artifact_revisions
-             (scope_id,artifact_id,revision,reservation_id,size_bytes,content_digest,media_type,display_name,
+        // Name `display_name` only when set, so an unnamed settle also runs on schemas 4-16.
+        let sql = if s.display_name.is_some() {
+            "INSERT INTO openmettle.artifact_revisions
+             (scope_id,artifact_id,revision,reservation_id,size_bytes,content_digest,media_type,
+              created_by_user_id,display_name)
+             VALUES ($1::uuid,$2::uuid,$3,$4::uuid,$5,$6,$7,$8::uuid,$9) RETURNING id::text"
+        } else {
+            "INSERT INTO openmettle.artifact_revisions
+             (scope_id,artifact_id,revision,reservation_id,size_bytes,content_digest,media_type,
               created_by_user_id)
-             VALUES ($1::uuid,$2::uuid,$3,$4::uuid,$5,$6,$7,$8,$9::uuid) RETURNING id::text")
+             VALUES ($1::uuid,$2::uuid,$3,$4::uuid,$5,$6,$7,$8::uuid) RETURNING id::text"
+        };
+        let mut insert = sqlx::query_scalar(sql)
             .bind(s.scope).bind(&artifact).bind(number).bind(s.reservation).bind(s.size_bytes)
-            .bind(s.content_digest).bind(s.media_type).bind(s.display_name).bind(&actor)
-            .fetch_one(&mut *sp).await?;
+            .bind(s.content_digest).bind(s.media_type).bind(&actor);
+        if let Some(name) = s.display_name {
+            insert = insert.bind(name);
+        }
+        let revision: String = insert.fetch_one(&mut *sp).await?;
         sqlx::query("UPDATE openmettle.storage_reservations SET state='settled',settled_bytes=$3,closed_at=now()
              WHERE scope_id=$1::uuid AND id=$2::uuid")
             .bind(s.scope).bind(s.reservation).bind(s.size_bytes).execute(&mut *sp).await?;
