@@ -2,7 +2,7 @@
 //! (isolated CI PostgreSQL 18 and POSTGRES_CONTAINER). These tests prove which approval values
 //! each action writes, which requests refuse without changes, and what the script observes after
 //! real lock waits. Session effects are tested in `provider_keys::tests::postgres::approval_change`.
-use super::first_approval::{db_ms, everything, wait_for_psql};
+use super::first_approval::{db_ms, everything, refused, wait_for_psql};
 use super::*;
 use std::collections::BTreeMap;
 
@@ -178,11 +178,6 @@ fn committed(out: &Output, revision: i64, generation: i64) {
         format!("approval change committed: revision {revision} access_generation {generation}\n")
     );
     assert!(out.stderr.is_empty(), "{}", stderr(out));
-}
-fn refused(out: &Output, reason: &str) {
-    assert!(!out.status.success());
-    assert!(out.stdout.is_empty());
-    assert!(stderr(out).contains(reason), "{}", stderr(out));
 }
 async fn blocked(db: &TestDb, child: &mut Child) {
     wait_for_psql(db, child, "Lock", "openmettle.local_identity_approvals").await;

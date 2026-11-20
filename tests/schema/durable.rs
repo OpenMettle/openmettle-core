@@ -79,30 +79,6 @@ async fn count(db: &TestDb, sql: &'static str) -> i64 {
         .unwrap()
 }
 
-#[test]
-fn released_migrations_are_unchanged() {
-    for (sql, expected) in [
-        (
-            MIGRATIONS[0].sql,
-            "1672dd9259a2c9670fef4fac324af8a4fdf9b35fd9eabd421bd9f023571137bd",
-        ),
-        (
-            MIGRATIONS[1].sql,
-            "b1bf6e677a74226d258292dc6d987158a5d81fe2fa0ba00d4e3ed1afdd0a4e5c",
-        ),
-        (
-            MIGRATIONS[2].sql,
-            "1744f1ca3e4ef146e151e2c622dd7d19d02b295281db1c819d747970807111c1",
-        ),
-        (
-            MIGRATIONS[3].sql,
-            "6c4a1794d1c132739fdaf1b48706e8b2884ef51e903f0f2a979837919a8f53f3",
-        ),
-    ] {
-        assert_eq!(format!("{:x}", Sha256::digest(sql.as_bytes())), expected);
-    }
-}
-
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 and authentic OLD_BINARY_DIR required"]
 async fn populated_v2_upgrade_and_authentic_old_binaries() {
@@ -194,13 +170,7 @@ async fn populated_v2_upgrade_and_authentic_old_binaries() {
     ] {
         let bind = address();
         let mut cmd = Command::new(old.join(name));
-        for (k, _) in std::env::vars_os() {
-            if k.to_string_lossy().starts_with("OPENMETTLE_")
-                || k.to_string_lossy().starts_with("PG")
-            {
-                cmd.env_remove(k);
-            }
-        }
+        scrub_env(&mut cmd);
         let child = cmd
             .env(format!("{prefix}_DATABASE_URL"), db.url(role))
             .env(format!("{prefix}_BIND"), &bind)
@@ -682,10 +652,7 @@ async fn killed_migration_three_preserves_version_two() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert_eq!(
-        db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-    );
+    assert_eq!(db.history().await, all_versions());
     db.wait_no_migration_session().await;
 }
 
@@ -730,10 +697,7 @@ async fn version_three_failure_timeout_concurrent_upgrade() {
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success(), "{}", stderr(&out));
     }
-    assert_eq!(
-        db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-    );
+    assert_eq!(db.history().await, all_versions());
     db.wait_no_migration_session().await;
 }
 

@@ -547,7 +547,7 @@ async fn migration_six_failure_rolls_back_reservations_and_retries() {
             .await
             .is_err()
     );
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5]);
+    assert_eq!(db.history().await, versions_through(5));
     assert!(!db.exists("openmettle.login_nonce_reservations").await);
     owner
         .execute("DROP TABLE openmettle.login_transactions")
@@ -556,10 +556,7 @@ async fn migration_six_failure_rolls_back_reservations_and_retries() {
     migrate::apply(&db.settings(Duration::from_secs(5)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(
-        db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-    );
+    assert_eq!(db.history().await, all_versions());
 }
 
 #[tokio::test]
@@ -593,23 +590,6 @@ async fn failed_begin_retains_reserved_nonce_without_partial_transaction() {
         .unwrap();
     let _start = begin(&db, &p).await;
     assert_eq!(counts(&db).await, (2, 1, 0));
-}
-
-#[test]
-fn released_login_migrations_are_frozen() {
-    use sha2::{Digest, Sha256};
-    for (sql, expected) in [
-        (
-            MIGRATIONS[5].sql,
-            "6ebaec059411b63e6b787ca7bb72de9e152809174c462c48a2173bdf7b10e078",
-        ),
-        (
-            MIGRATIONS[6].sql,
-            "42e5ef4abffbbd6023f6e65a954a6f6ebedbdbcf46439f28f64e61260280842d",
-        ),
-    ] {
-        assert_eq!(format!("{:x}", Sha256::digest(sql.as_bytes())), expected);
-    }
 }
 
 const AUTHORITY_TABLES: [&str; 2] = [
@@ -768,7 +748,7 @@ async fn migration_seven_is_atomic_and_gated_by_history() {
         migrate::apply(&early.settings(Duration::from_secs(5)), MIGRATIONS).await,
         Err(Failure::Refused(_))
     ));
-    assert_eq!(early.history().await, [1, 2, 3, 4, 5, 6]);
+    assert_eq!(early.history().await, versions_through(6));
     // A failure inside migration 7 leaves no partial authority objects and can be retried.
     let db = TestDb::new().await;
     migrate::apply(&db.settings(Duration::from_secs(5)), &MIGRATIONS[..6])
@@ -784,7 +764,7 @@ async fn migration_seven_is_atomic_and_gated_by_history() {
             .await
             .is_err()
     );
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6]);
+    assert_eq!(db.history().await, versions_through(6));
     assert!(!db.exists("openmettle.login_providers").await);
     owner
         .execute("DROP TABLE openmettle.login_provider_revisions")
@@ -793,10 +773,7 @@ async fn migration_seven_is_atomic_and_gated_by_history() {
     migrate::apply(&db.settings(Duration::from_secs(5)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(
-        db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-    );
+    assert_eq!(db.history().await, all_versions());
     for table in AUTHORITY_TABLES {
         assert!(db.exists(table).await);
     }

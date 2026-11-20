@@ -7,6 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "support/env.rs"]
+mod env_support;
+use env_support::scrub_env;
 #[path = "auth_config_support/mod.rs"]
 mod auth_config_support;
 // The transport fixture's synthetic CA; its leaf certificates are not needed here.
@@ -34,13 +37,7 @@ fn command(worker: bool) -> Command {
     } else {
         env!("CARGO_BIN_EXE_openmettle-api")
     });
-    // Do not inherit deployment configuration or libpq defaults.
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("OPENMETTLE_") || name.starts_with("PG") {
-            command.env_remove(key);
-        }
-    }
+    scrub_env(&mut command);
     command
 }
 fn start(worker: bool, address: &str, url: &str) -> Process {

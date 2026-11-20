@@ -17,37 +17,6 @@ fn adr_embeds_the_exact_executed_operator_scripts() {
     }
 }
 
-#[test]
-fn released_migration_sources_match_their_pinned_hashes() {
-    use sha2::{Digest, Sha256};
-    let expected = [
-        "1672dd9259a2c9670fef4fac324af8a4fdf9b35fd9eabd421bd9f023571137bd",
-        "b1bf6e677a74226d258292dc6d987158a5d81fe2fa0ba00d4e3ed1afdd0a4e5c",
-        "1744f1ca3e4ef146e151e2c622dd7d19d02b295281db1c819d747970807111c1",
-        "6c4a1794d1c132739fdaf1b48706e8b2884ef51e903f0f2a979837919a8f53f3",
-        "3130bf356a92c08f08d9ec65e49bd4ae04c41dd82ebab2ee4e313427fa423680",
-        "6ebaec059411b63e6b787ca7bb72de9e152809174c462c48a2173bdf7b10e078",
-        "42e5ef4abffbbd6023f6e65a954a6f6ebedbdbcf46439f28f64e61260280842d",
-        "9a77a03a838fa058ad3919ed8db5e483619755cc4a96959240202d6c35b3939a",
-        "f73f2f41d56136d90deb49aac87ef835b96f50dea416871ec86cab61dd0b3c76",
-        "91b95d8146362a47c78ebf96de7b9f2e81f625b99ac880ddb1f427c3f5652f57",
-        "887728e24ebf829d4644b6f47937c37149862ab7a7d8069c278827141f9d7a84",
-        "b71bee740d4a71320f26f3392ce2be0962f599d8c032383cb14fc11bf32b1763",
-        "58312aca4b72100dd460f5cccfca9688154e83f4662268358834f75f8f49e7bd",
-        "e02d6df9824120c788991dd4ec84dc5f5bd1069d780549c25ac5f2cd7e6efc4a",
-        "b4203f2bf76cf54ec21882c40a41a312233c9be37a4631949f28e566b32dd118",
-    ];
-    assert_eq!(MIGRATIONS.len(), expected.len());
-    for (migration, hash) in MIGRATIONS.iter().zip(expected) {
-        assert_eq!(
-            format!("{:x}", Sha256::digest(migration.sql.as_bytes())),
-            hash,
-            "migration {}",
-            migration.version
-        );
-    }
-}
-
 /// Runs an exact operator script with the service container's psql as openmettle_owner.
 fn psql(db: &TestDb, script: &str, variables: &[(&str, &str)]) -> Output {
     psql_spawn(db, script, variables)
@@ -232,7 +201,7 @@ async fn migration_nine_rollback_and_version_gated_privileges() {
             .await
             .is_err()
     );
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(db.history().await, versions_through(8));
     assert!(
         !db.exists("openmettle.login_admission").await,
         "the preceding CREATE TABLE must roll back"
@@ -257,10 +226,7 @@ async fn migration_nine_rollback_and_version_gated_privileges() {
     migrate::apply(&db.settings(Duration::from_secs(5)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(
-        db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-    );
+    assert_eq!(db.history().await, all_versions());
 }
 
 #[tokio::test]

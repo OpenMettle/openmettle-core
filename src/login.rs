@@ -101,12 +101,12 @@ fn hash(value: &str) -> [u8; 32] {
 fn equal(left: &[u8], right: &[u8]) -> bool {
     left.len() == 32 && right.len() == 32 && bool::from(left.ct_eq(right))
 }
+/// ASCII alphanumeric, `_` or `-`: the URL-safe base64 alphabet (RFC 4648 section 5).
+pub(crate) fn url_safe_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"_-".contains(&b)
+}
 fn name(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+    !value.is_empty() && value.len() <= 64 && value.bytes().all(url_safe_byte)
 }
 fn https(value: &str) -> bool {
     if value.len() > 2048 || value.bytes().any(|b| b <= 32 || b >= 127) {
@@ -500,10 +500,7 @@ impl Envelope<'_> {
             .split_at_checked(VERIFIER_BYTES)
             .ok_or(Error::Protection)?;
         let verifier = std::str::from_utf8(verifier).map_err(|_| Error::Protection)?;
-        if !verifier
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
-        {
+        if !verifier.bytes().all(url_safe_byte) {
             return Err(Error::Protection);
         }
         let invitation = match (sealing, rest) {
@@ -708,10 +705,7 @@ async fn consume_inner(
     let (id, state_secret) = c.state.split_once('.').ok_or(Error::Rejected)?;
     if id.len() != 43
         || state_secret.len() != 43
-        || !id
-            .bytes()
-            .chain(state_secret.bytes())
-            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+        || !id.bytes().chain(state_secret.bytes()).all(url_safe_byte)
     {
         return Err(Error::Rejected);
     }

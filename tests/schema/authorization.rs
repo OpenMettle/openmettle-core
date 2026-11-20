@@ -172,14 +172,6 @@ async fn exec(
     query.execute(connection).await.map(|r| r.rows_affected())
 }
 
-/// A migration run refused for exactly this one boundary violation.
-async fn refused_with(settings: &Settings, sources: &[Source], violation: &str) {
-    match migrate::apply(settings, sources).await {
-        Err(Failure::Refused(violations)) => assert_eq!(violations, [violation]),
-        other => panic!("expected the boundary check to refuse, got {other:?}"),
-    }
-}
-
 #[test]
 fn migration_15_is_registered_and_the_admin_script_is_canonical() {
     let latest = MIGRATIONS.last().unwrap();
@@ -233,7 +225,7 @@ fn migration_15_is_registered_and_the_admin_script_is_canonical() {
 #[ignore = "isolated CI PostgreSQL 18 required"]
 async fn migration_15_grants_exactly_the_contract() {
     let db = TestDb::migrated().await;
-    assert_eq!(db.history().await, (1..=15).collect::<Vec<i64>>());
+    assert_eq!(db.history().await, all_versions());
     let mut admin = db.admin().await;
     let privileges = [
         "SELECT",
@@ -457,7 +449,7 @@ async fn migration_15_grants_exactly_the_contract() {
         early_owner.execute(revoke).await.unwrap();
     }
     migrate::apply(&early_settings, MIGRATIONS).await.unwrap();
-    assert_eq!(early.history().await, (1..=15).collect::<Vec<i64>>());
+    assert_eq!(early.history().await, all_versions());
 }
 
 #[tokio::test]
@@ -1099,7 +1091,7 @@ async fn populated_v14_upgrade_keeps_rows_and_adds_empty_authorization_state() {
     let db = TestDb::new().await;
     let settings = db.settings(Duration::from_secs(10));
     migrate::apply(&settings, &MIGRATIONS[..14]).await.unwrap();
-    assert_eq!(db.history().await, (1..=14).collect::<Vec<i64>>());
+    assert_eq!(db.history().await, versions_through(14));
     // Version-14 rows written through the version-14 grants: account, identity, approval,
     // personal scope, conversation, branch, run and project.
     let c = Context::new(&db).await;
@@ -1159,7 +1151,7 @@ async fn populated_v14_upgrade_keeps_rows_and_adds_empty_authorization_state() {
 
     let output = migrate_command(&db.url(OWNER), &[]).output().unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert_eq!(db.history().await, (1..=15).collect::<Vec<i64>>());
+    assert_eq!(db.history().await, all_versions());
     let after = everything(&db).await;
     // Every pre-existing row is unchanged; history only gains version 15.
     for (table, rows) in &before {
@@ -1221,7 +1213,7 @@ async fn populated_v14_upgrade_keeps_rows_and_adds_empty_authorization_state() {
     // Rerunning the migrator changes nothing.
     let rerun = migrate_command(&db.url(OWNER), &[]).output().unwrap();
     assert_eq!(rerun.status.code(), Some(0), "{}", stderr(&rerun));
-    assert_eq!(db.history().await, (1..=15).collect::<Vec<i64>>());
+    assert_eq!(db.history().await, all_versions());
 }
 
 // --- exact operator script -----------------------------------------------------------------

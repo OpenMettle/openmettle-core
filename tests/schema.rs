@@ -1,6 +1,9 @@
 //! Migration, ownership and role-boundary tests. Ignored tests need TEST_DATABASE_URL for an
 //! isolated, disposable PostgreSQL 18 service with a superuser fixture account. They create
 //! synthetic cluster roles (`openmettle_*`, test-only password) and one database per test.
+#[path = "support/env.rs"]
+mod env_support;
+use env_support::scrub_env;
 use openmettle_core::migrate::{self, Failure, MIGRATIONS, Settings, Source};
 use sqlx::{AssertSqlSafe, Connection, Executor, PgConnection, Row, postgres::PgConnectOptions};
 use sqlx_core::migrate::{Migrate, MigrateError};
@@ -39,12 +42,7 @@ fn binary(name: &str) -> Command {
         "api" => env!("CARGO_BIN_EXE_openmettle-api"),
         _ => env!("CARGO_BIN_EXE_openmettle-worker"),
     });
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("OPENMETTLE_") || name.starts_with("PG") {
-            command.env_remove(key);
-        }
-    }
+    scrub_env(&mut command);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     command
 }
@@ -126,6 +124,16 @@ fn signal(child: &Child, signal: &str) {
 }
 
 // --- database fixture -------------------------------------------------------------------------
+
+/// Every embedded migration version, in order: the expected history after a full apply.
+fn all_versions() -> Vec<i64> {
+    MIGRATIONS.iter().map(|m| m.version).collect()
+}
+
+/// The expected history after applying migrations 1 through `last`.
+fn versions_through(last: i64) -> Vec<i64> {
+    (1..=last).collect()
+}
 
 fn admin_options() -> PgConnectOptions {
     std::env::var("TEST_DATABASE_URL")
@@ -453,7 +461,50 @@ async fn snapshot(connection: &mut PgConnection, tables: &[&str]) -> Vec<String>
     rows
 }
 
+/// A migration run refused for exactly this one boundary violation.
+async fn refused_with(settings: &Settings, sources: &[Source], violation: &str) {
+    match migrate::apply(settings, sources).await {
+        Err(Failure::Refused(violations)) => assert_eq!(violations, [violation]),
+        other => panic!("expected the boundary check to refuse, got {other:?}"),
+    }
+}
+
 // --- tests without PostgreSQL ------------------------------------------------------------------
+
+/// The single pin for every released migration: any edit to a shipped migration must fail here.
+#[test]
+fn released_migration_sources_match_their_pinned_hashes() {
+    use sha2::{Digest, Sha256};
+    migrate::migrator(MIGRATIONS)
+        .expect("all embedded migrations must pass the transactional scanner");
+    let expected = [
+        "1672dd9259a2c9670fef4fac324af8a4fdf9b35fd9eabd421bd9f023571137bd",
+        "b1bf6e677a74226d258292dc6d987158a5d81fe2fa0ba00d4e3ed1afdd0a4e5c",
+        "1744f1ca3e4ef146e151e2c622dd7d19d02b295281db1c819d747970807111c1",
+        "6c4a1794d1c132739fdaf1b48706e8b2884ef51e903f0f2a979837919a8f53f3",
+        "3130bf356a92c08f08d9ec65e49bd4ae04c41dd82ebab2ee4e313427fa423680",
+        "6ebaec059411b63e6b787ca7bb72de9e152809174c462c48a2173bdf7b10e078",
+        "42e5ef4abffbbd6023f6e65a954a6f6ebedbdbcf46439f28f64e61260280842d",
+        "9a77a03a838fa058ad3919ed8db5e483619755cc4a96959240202d6c35b3939a",
+        "f73f2f41d56136d90deb49aac87ef835b96f50dea416871ec86cab61dd0b3c76",
+        "91b95d8146362a47c78ebf96de7b9f2e81f625b99ac880ddb1f427c3f5652f57",
+        "887728e24ebf829d4644b6f47937c37149862ab7a7d8069c278827141f9d7a84",
+        "b71bee740d4a71320f26f3392ce2be0962f599d8c032383cb14fc11bf32b1763",
+        "58312aca4b72100dd460f5cccfca9688154e83f4662268358834f75f8f49e7bd",
+        "e02d6df9824120c788991dd4ec84dc5f5bd1069d780549c25ac5f2cd7e6efc4a",
+        "b4203f2bf76cf54ec21882c40a41a312233c9be37a4631949f28e566b32dd118",
+    ];
+    assert_eq!(MIGRATIONS.len(), expected.len());
+    assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
+    for (migration, hash) in MIGRATIONS.iter().zip(expected) {
+        assert_eq!(
+            format!("{:x}", Sha256::digest(migration.sql.as_bytes())),
+            hash,
+            "migration {}",
+            migration.version
+        );
+    }
+}
 
 #[test]
 fn migrate_rejects_invalid_config_without_disclosing_values() {
@@ -638,10 +689,7 @@ async fn fresh_install_is_idempotent_and_owned() {
     let db = TestDb::new().await;
     let output = migrate_command(&db.url(OWNER), &[]).output().unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert_eq!(
-        db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-    );
+    assert_eq!(db.history().await, all_versions());
 
     let mut admin = db.admin().await;
     let recorded: Vec<Vec<u8>> =
@@ -724,10 +772,7 @@ async fn populated_upgrade_preserves_identity_and_ownership() {
 
     let output = migrate_command(&db.url(OWNER), &[]).output().unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert_eq!(
-        db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-    );
+    assert_eq!(db.history().await, all_versions());
 
     let mut api = connect(&db.0, API).await;
     assert_eq!(snapshot(&mut api, &tables).await, before);
@@ -812,10 +857,7 @@ async fn held_lock_times_out_and_is_released_for_retry() {
         .output()
         .unwrap();
     assert_eq!(retry.status.code(), Some(0), "{}", stderr(&retry));
-    assert_eq!(
-        db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-    );
+    assert_eq!(db.history().await, all_versions());
 }
 
 #[tokio::test]
@@ -955,10 +997,7 @@ async fn killed_migrator_holding_the_lock_mid_migration_rolls_back() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert_eq!(
-        db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-    );
+    assert_eq!(db.history().await, all_versions());
 }
 
 /// Custom sets start with the real migration 1 so the post-migration boundary check sees the
@@ -1169,10 +1208,7 @@ async fn wrong_login_is_refused_before_bootstrap_and_owner_retry_succeeds() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert_eq!(
-        db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-    );
+    assert_eq!(db.history().await, all_versions());
 
     // Later runs check identity as well.
     let mut wrong = db.settings(Duration::from_secs(1));
@@ -1436,34 +1472,15 @@ async fn unsafe_privileges_defaults_and_ownership_are_refused() {
         admin.execute(AssertSqlSafe(revoke.clone())).await.unwrap();
     }
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
-    assert_eq!(
-        db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-    );
+    assert_eq!(db.history().await, all_versions());
 
     // A migration that grants beyond the contract is reported after it commits.
-    let overgrant = [
-        MIGRATIONS[0],
-        MIGRATIONS[1],
-        MIGRATIONS[2],
-        MIGRATIONS[3],
-        MIGRATIONS[4],
-        MIGRATIONS[5],
-        MIGRATIONS[6],
-        MIGRATIONS[7],
-        MIGRATIONS[8],
-        MIGRATIONS[9],
-        MIGRATIONS[10],
-        MIGRATIONS[11],
-        MIGRATIONS[12],
-        MIGRATIONS[13],
-        MIGRATIONS[14],
-        Source {
-            version: 16,
-            description: "over-grant",
-            sql: "GRANT DELETE ON openmettle.messages TO openmettle_worker",
-        },
-    ];
+    let mut overgrant = MIGRATIONS.to_vec();
+    overgrant.push(Source {
+        version: MIGRATIONS.last().unwrap().version + 1,
+        description: "over-grant",
+        sql: "GRANT DELETE ON openmettle.messages TO openmettle_worker",
+    });
     let failure = migrate::apply(&settings, &overgrant).await.unwrap_err();
     assert!(
         matches!(failure, Failure::Violated(_))
@@ -1850,10 +1867,7 @@ async fn runtime_readiness_with_bounded_roles_never_migrates() {
         let status = process.0.wait().unwrap();
         assert!(status.success(), "worker={worker}");
     }
-    assert_eq!(
-        db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-    );
+    assert_eq!(db.history().await, all_versions());
 }
 
 #[path = "schema/durable.rs"]

@@ -36,5 +36,11 @@ for attempt in first repeat; do
   echo "$attempt run: $output"
 done
 versions=$(psql openmettle -tA -c 'SELECT string_agg(version::text, $$,$$ ORDER BY version) FROM openmettle._sqlx_migrations WHERE success')
-test "$versions" = 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+# Expected history: every NNNN_*.sql source, as integers in order. Fails closed if none match.
+expected=$(for file in "$(dirname "$0")"/../migrations/[0-9][0-9][0-9][0-9]_*.sql; do
+  name=${file##*/}
+  echo $((10#${name%%_*}))
+done | sort -n | paste -sd, -)
+test -n "$expected"
+test "$versions" = "$expected"
 echo 'Migrate image: non-root user, configuration exit 78, fresh install and idempotent rerun passed.'

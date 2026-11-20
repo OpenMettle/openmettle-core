@@ -68,69 +68,31 @@ jobs:
         run: cargo test --locked --offline --test runtime -- --ignored
         env:
           TEST_DATABASE_URL: postgres://fixture:fixture@127.0.0.1:5432/fixture?sslmode=disable
-      - name: Build authentic previous release for schema compatibility
+      # One authentic prior release per schema version, built into $RUNNER_TEMP/openmettle-vN.
+      - name: Build authentic prior releases for schema compatibility
         run: |
-          mkdir -p "$RUNNER_TEMP/openmettle-v2"
-          git archive 18f52463c9d6bc12dda4bd1558e4597e067018f8 | tar -x -C "$RUNNER_TEMP/openmettle-v2"
-          cargo build --manifest-path "$RUNNER_TEMP/openmettle-v2/Cargo.toml" --locked --offline --bins
-      - name: Build authentic version-3 release for schema compatibility
-        run: |
-          mkdir -p "$RUNNER_TEMP/openmettle-v3"
-          git archive 2f1be947aa933177c2e407cd7290bf9909bd08ca | tar -x -C "$RUNNER_TEMP/openmettle-v3"
-          cargo build --manifest-path "$RUNNER_TEMP/openmettle-v3/Cargo.toml" --locked --offline --bins
-      - name: Build authentic version-4 release for schema compatibility
-        run: |
-          mkdir -p "$RUNNER_TEMP/openmettle-v4"
-          git archive d80e37819f847072dfa272bdddcc1fbee6d622ef | tar -x -C "$RUNNER_TEMP/openmettle-v4"
-          cargo build --manifest-path "$RUNNER_TEMP/openmettle-v4/Cargo.toml" --locked --offline --bins
-      - name: Build authentic version-5 release for schema compatibility
-        run: |
-          mkdir -p "$RUNNER_TEMP/openmettle-v5"
-          git archive 4a51242839e16e1d7b8ad3538887bf8e41081e6e | tar -x -C "$RUNNER_TEMP/openmettle-v5"
-          cargo build --manifest-path "$RUNNER_TEMP/openmettle-v5/Cargo.toml" --locked --offline --bins
-      - name: Build authentic version-6 release for schema compatibility
-        run: |
-          mkdir -p "$RUNNER_TEMP/openmettle-v6"
-          git archive 3978dff2864488bbdd9e748afd7116f39683f129 | tar -x -C "$RUNNER_TEMP/openmettle-v6"
-          cargo build --manifest-path "$RUNNER_TEMP/openmettle-v6/Cargo.toml" --locked --offline --bins
-      - name: Build authentic version-7 release for schema compatibility
-        run: |
-          mkdir -p "$RUNNER_TEMP/openmettle-v7"
-          git archive 5ff1d2a8ed5e7424be006e78c16f0c30e784336d | tar -x -C "$RUNNER_TEMP/openmettle-v7"
-          cargo build --manifest-path "$RUNNER_TEMP/openmettle-v7/Cargo.toml" --locked --offline --bins
-      - name: Build authentic version-8 release for schema compatibility
-        run: |
-          mkdir -p "$RUNNER_TEMP/openmettle-v8"
-          git archive e55aff07527ad6452f8a0d49953b3fc2ffc51352 | tar -x -C "$RUNNER_TEMP/openmettle-v8"
-          cargo build --manifest-path "$RUNNER_TEMP/openmettle-v8/Cargo.toml" --locked --offline --bins
-      - name: Build authentic version-9 release for schema compatibility
-        run: |
-          mkdir -p "$RUNNER_TEMP/openmettle-v9"
-          git archive 940b8c2032d863e29fd04ad7c6357ad8cacc42fc | tar -x -C "$RUNNER_TEMP/openmettle-v9"
-          cargo build --manifest-path "$RUNNER_TEMP/openmettle-v9/Cargo.toml" --locked --offline --bins
-      - name: Build authentic version-10 release for schema compatibility
-        run: |
-          mkdir -p "$RUNNER_TEMP/openmettle-v10"
-          git archive 05dd18489242e545e3529b4e3750c74837b05638 | tar -x -C "$RUNNER_TEMP/openmettle-v10"
-          cargo build --manifest-path "$RUNNER_TEMP/openmettle-v10/Cargo.toml" --locked --offline --bins
-      # Membership (schema 11) final commit. It stays reachable only through a merge commit.
-      - name: Build authentic version-11 release for schema compatibility
-        run: |
-          mkdir -p "$RUNNER_TEMP/openmettle-v11"
-          git archive 0ab3401714762f28a730eae4cd7c91052648dabd | tar -x -C "$RUNNER_TEMP/openmettle-v11"
-          cargo build --manifest-path "$RUNNER_TEMP/openmettle-v11/Cargo.toml" --locked --offline --bins
-      # Invitations (schema 12): the block A merge, the last release before invitation codes.
-      - name: Build authentic version-12 release for schema compatibility
-        run: |
-          mkdir -p "$RUNNER_TEMP/openmettle-v12"
-          git archive 4441b4236ad0dd1ea868d507bb10b50d9b0ddb6f | tar -x -C "$RUNNER_TEMP/openmettle-v12"
-          cargo build --manifest-path "$RUNNER_TEMP/openmettle-v12/Cargo.toml" --locked --offline --bins
-      # Invitation codes (schema 13): the block B merge, the last release before native sign-in.
-      - name: Build authentic version-13 release for schema compatibility
-        run: |
-          mkdir -p "$RUNNER_TEMP/openmettle-v13"
-          git archive 615dcffc93af18ab0db40a7a2fafc3c0752d4c77 | tar -x -C "$RUNNER_TEMP/openmettle-v13"
-          cargo build --manifest-path "$RUNNER_TEMP/openmettle-v13/Cargo.toml" --locked --offline --bins
+          while read -r version sha; do
+            case "$version" in ''|'#'*) continue ;; esac
+            mkdir -p "$RUNNER_TEMP/openmettle-v$version"
+            git archive "$sha" | tar -x -C "$RUNNER_TEMP/openmettle-v$version"
+            cargo build --manifest-path "$RUNNER_TEMP/openmettle-v$version/Cargo.toml" --locked --offline --bins
+          done <<'RELEASES'
+            2 18f52463c9d6bc12dda4bd1558e4597e067018f8
+            3 2f1be947aa933177c2e407cd7290bf9909bd08ca
+            4 d80e37819f847072dfa272bdddcc1fbee6d622ef
+            5 4a51242839e16e1d7b8ad3538887bf8e41081e6e
+            6 3978dff2864488bbdd9e748afd7116f39683f129
+            7 5ff1d2a8ed5e7424be006e78c16f0c30e784336d
+            8 e55aff07527ad6452f8a0d49953b3fc2ffc51352
+            9 940b8c2032d863e29fd04ad7c6357ad8cacc42fc
+            10 05dd18489242e545e3529b4e3750c74837b05638
+            # Membership (schema 11) final commit. It stays reachable only through a merge commit.
+            11 0ab3401714762f28a730eae4cd7c91052648dabd
+            # Invitations (schema 12): the block A merge, the last release before invitation codes.
+            12 4441b4236ad0dd1ea868d507bb10b50d9b0ddb6f
+            # Invitation codes (schema 13): the block B merge, the last release before native sign-in.
+            13 615dcffc93af18ab0db40a7a2fafc3c0752d4c77
+          RELEASES
       # POSTGRES_CONTAINER runs the exact ADR 0014 operator scripts with the pinned service psql.
       - name: PostgreSQL schema, migration and role integration
         run: cargo test --locked --offline --test schema -- --ignored

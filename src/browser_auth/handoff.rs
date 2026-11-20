@@ -19,7 +19,7 @@
 //! Anything else is a fixed refusal. The adapter reads no `Host`, forwarded header or return
 //! URL, no request body except the initiation form, and logs nothing. Only an acknowledged
 //! logout deletes a cookie.
-use super::{BrowserAuth, Error};
+use super::{BrowserAuth, Error, path_byte};
 use crate::{invitation::InvitationCode, login, provider_keys::ManagedProvider, sessions};
 use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode, header, request::Parts};
 use openidconnect::url::Url;
@@ -270,12 +270,7 @@ fn plain_path(url: &str, path: &str) -> bool {
 /// Two 43-character base64url tokens joined by a dot: `state` and the caller cookie value.
 pub(super) fn token_pair(value: &str) -> Option<(&str, &str)> {
     let (first, second) = value.split_once('.')?;
-    let token = |part: &str| {
-        part.len() == 43
-            && part
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
-    };
+    let token = |part: &str| part.len() == 43 && part.bytes().all(login::url_safe_byte);
     (token(first) && token(second)).then_some((first, second))
 }
 /// One strict `application/x-www-form-urlencoded` component: visible ASCII only, `+` is a
@@ -441,9 +436,7 @@ pub(crate) fn check(
     }
     let landing_url = format!("{origin}{landing}");
     if landing.starts_with("//")
-        || !landing
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"/-._~".contains(&b))
+        || !landing.bytes().all(path_byte)
         || !plain_path(&landing_url, landing)
     {
         return Err(SettingsError::Landing);

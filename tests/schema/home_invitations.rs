@@ -66,13 +66,6 @@ fn contract(redemption: &str) -> Vec<Contract> {
         ),
     ]
 }
-/// A migration run refused for exactly this one boundary violation.
-async fn refused_for(settings: &Settings, sources: &[Source], violation: &str) {
-    match migrate::apply(settings, sources).await {
-        Err(Failure::Refused(violations)) => assert_eq!(violations, [violation]),
-        other => panic!("expected the boundary check to refuse, got {other:?}"),
-    }
-}
 /// The other signature, owned by the owner and granted to the API role alone.
 async fn stub(owner: &mut PgConnection, signature: &str) {
     for sql in [
@@ -111,7 +104,7 @@ async fn upgrades_preserve_state_and_allow_exactly_one_redemption_signature_per_
     assert_eq!(function_contract(&mut owner).await, contract(CODELESS));
     stub(&mut owner, CODED).await;
     let violation = |signature: &str| format!("openmettle_api has EXECUTE on function {signature}");
-    refused_for(&settings, v12, &violation(CODED)).await;
+    refused_with(&settings, v12, &violation(CODED)).await;
     owner
         .execute(AssertSqlSafe(format!("DROP FUNCTION {CODED}")))
         .await
@@ -203,7 +196,7 @@ async fn upgrades_preserve_state_and_allow_exactly_one_redemption_signature_per_
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
     // A code-less function granted to the API role again is the one violation reported.
     stub(&mut owner, CODELESS).await;
-    refused_for(&settings, MIGRATIONS, &violation(CODELESS)).await;
+    refused_with(&settings, MIGRATIONS, &violation(CODELESS)).await;
 }
 
 // Migration 14 (ADR 0023) replaces the redemption function in place, so that a login started
@@ -238,7 +231,7 @@ async fn migration_14_keeps_the_redemption_contract_and_gates_the_native_grants(
         )))
         .await
         .unwrap();
-    refused_for(
+    refused_with(
         &settings,
         v13,
         &format!("openmettle_api has SELECT on {TABLE}"),
@@ -251,7 +244,7 @@ async fn migration_14_keeps_the_redemption_contract_and_gates_the_native_grants(
 
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
     assert_eq!(MIGRATIONS[NATIVE].version, 14);
-    assert_eq!(db.history().await, (1..=15).collect::<Vec<i64>>());
+    assert_eq!(db.history().await, all_versions());
     assert_eq!(function_contract(&mut owner).await, contract(CODED));
     let layouts: (bool, bool) = sqlx::query_as(body).fetch_one(&mut owner).await.unwrap();
     assert_eq!(layouts, (true, true), "schema 14 admits both layouts");
@@ -314,7 +307,7 @@ async fn migration_14_keeps_the_redemption_contract_and_gates_the_native_grants(
         ),
     ] {
         owner.execute(AssertSqlSafe(grant)).await.unwrap();
-        refused_for(&settings, MIGRATIONS, &violation).await;
+        refused_with(&settings, MIGRATIONS, &violation).await;
         owner.execute(AssertSqlSafe(revoke)).await.unwrap();
     }
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
@@ -355,7 +348,7 @@ async fn pending_invitation_without_a_code_blocks_migration_13_until_withdrawn()
         "{failure}"
     );
     // Rolled back whole: history, every row, the code-less function and the table shape.
-    assert_eq!(db.history().await, (1..=12).collect::<Vec<i64>>());
+    assert_eq!(db.history().await, versions_through(12));
     assert_eq!(first_approval::everything(&db).await, before);
     assert_eq!(function_contract(&mut owner).await, contract(CODELESS));
     let hash_columns = "SELECT count(*) FROM pg_attribute WHERE attname = 'code_hash'
@@ -375,7 +368,7 @@ async fn pending_invitation_without_a_code_blocks_migration_13_until_withdrawn()
     );
     assert!(out.status.success(), "{}", stderr(&out));
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
-    assert_eq!(db.history().await, (1..=15).collect::<Vec<i64>>());
+    assert_eq!(db.history().await, all_versions());
     assert_eq!(function_contract(&mut owner).await, contract(CODED));
     // Both closed decisions survive, with no code and no way to become pending again.
     let rows: Vec<(String, bool, bool)> = sqlx::query_as(

@@ -3,7 +3,10 @@
 //! canonical contract and its generated fixtures; no /v1 route is implemented.
 #[path = "contract/consumer.rs"]
 mod consumer;
+#[path = "support/env.rs"]
+mod env_support;
 
+use env_support::scrub_env;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -841,12 +844,7 @@ fn api_does_not_serve_contract_routes() {
         .to_string();
     let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_openmettle-api"));
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("OPENMETTLE_") || name.starts_with("PG") {
-            command.env_remove(key);
-        }
-    }
+    scrub_env(&mut command);
     let mut child = command
         .env("OPENMETTLE_API_BIND", &bind)
         .env(
