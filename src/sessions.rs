@@ -84,6 +84,8 @@ impl fmt::Debug for Credential {
 pub struct Context {
     user: String,
     personal_scope: String,
+    approval: String,
+    observed_ms: i64,
 }
 impl Context {
     pub fn user_id(&self) -> &str {
@@ -91,6 +93,17 @@ impl Context {
     }
     pub fn personal_scope_id(&self) -> &str {
         &self.personal_scope
+    }
+    /// The approval the session was issued under, verified active and unexpired under its
+    /// `FOR SHARE` lock in the validating transaction (ADR 0029). Pass it with
+    /// [`Self::observed_ms`] to `authz::store::hydrate_api_principal`.
+    pub fn approval_id(&self) -> &str {
+        &self.approval
+    }
+    /// The primary database's clock, in Unix milliseconds, at which eligibility was observed
+    /// (ADR 0029). It lies in the session's `[created_ms, expires_ms)` window.
+    pub fn observed_ms(&self) -> i64 {
+        self.observed_ms
     }
 }
 impl fmt::Debug for Context {
@@ -483,7 +496,7 @@ pub(crate) async fn validate_inner(
         .await?
         .ok_or(Error::Rejected)?;
     let timestamp = now(tx.connection()?).await?;
-    let current = sqlx::query("SELECT s.user_id::text,sc.id::text AS scope_id FROM openmettle.local_sessions s JOIN openmettle.login_providers p ON p.id=s.provider_id JOIN LATERAL (SELECT revision FROM openmettle.login_provider_revisions WHERE provider_id=p.id ORDER BY epoch DESC LIMIT 1) r ON true JOIN openmettle.local_identity_approvals a ON a.id=s.approval_id JOIN openmettle.user_identities i ON i.id=s.identity_id JOIN openmettle.users u ON u.id=s.user_id JOIN openmettle.scopes sc ON sc.personal_user_id=u.id AND sc.kind='personal' WHERE s.id=$1 AND s.secret_hash=$2 AND NOT s.revoked AND s.created_ms <= $3 AND s.expires_ms > $3 AND r.revision IS NOT NULL AND NOT EXISTS (SELECT FROM openmettle.login_provider_revisions retired WHERE retired.provider_id=p.id AND retired.epoch>s.issued_epoch AND retired.revision IS NULL) AND p.issuer=i.issuer AND p.client_id=s.issued_client AND i.user_id=u.id AND a.provider_id=p.id AND a.identity_id=i.id AND a.active AND a.expires_ms > $3 AND u.disabled_at IS NULL AND s.provider_generation=p.access_generation AND s.approval_generation=a.access_generation AND s.user_generation=u.session_generation")
+    let current = sqlx::query("SELECT s.user_id::text,s.approval_id::text AS approval_id,sc.id::text AS scope_id FROM openmettle.local_sessions s JOIN openmettle.login_providers p ON p.id=s.provider_id JOIN LATERAL (SELECT revision FROM openmettle.login_provider_revisions WHERE provider_id=p.id ORDER BY epoch DESC LIMIT 1) r ON true JOIN openmettle.local_identity_approvals a ON a.id=s.approval_id JOIN openmettle.user_identities i ON i.id=s.identity_id JOIN openmettle.users u ON u.id=s.user_id JOIN openmettle.scopes sc ON sc.personal_user_id=u.id AND sc.kind='personal' WHERE s.id=$1 AND s.secret_hash=$2 AND NOT s.revoked AND s.created_ms <= $3 AND s.expires_ms > $3 AND r.revision IS NOT NULL AND NOT EXISTS (SELECT FROM openmettle.login_provider_revisions retired WHERE retired.provider_id=p.id AND retired.epoch>s.issued_epoch AND retired.revision IS NULL) AND p.issuer=i.issuer AND p.client_id=s.issued_client AND i.user_id=u.id AND a.provider_id=p.id AND a.identity_id=i.id AND a.active AND a.expires_ms > $3 AND u.disabled_at IS NULL AND s.provider_generation=p.access_generation AND s.approval_generation=a.access_generation AND s.user_generation=u.session_generation")
         .bind(id).bind(hash.as_slice()).bind(timestamp).fetch_optional(tx.connection()?).await?.ok_or(Error::Rejected)?;
     match validation {
         Validation::Browser => {}
@@ -507,6 +520,8 @@ pub(crate) async fn validate_inner(
     let context = Context {
         user: current.try_get("user_id")?,
         personal_scope: current.try_get("scope_id")?,
+        approval: current.try_get("approval_id")?,
+        observed_ms: timestamp,
     };
     Ok(context)
     }.await;

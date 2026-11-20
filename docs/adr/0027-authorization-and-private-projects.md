@@ -1,8 +1,9 @@
 # 0027 — Central authorization policy and private-by-default projects
 
-Status: proposed V1-05 increment 1 of 5, 19 November 2026. Agent-authored; implements the
-owner decisions recorded on #6 the same day. Owner approval of this record, independent
-review and CI acceptance are separate gates. Refs #6. #6 remains open.
+Status: proposed V1-05 increments 1–3, 4a and 5; PR4b routes remain. 19 November 2026.
+Agent-authored; implements the owner decisions recorded on #6 the same day. Owner approval
+of this record, independent review and CI acceptance are separate gates. Refs #6. #6
+remains open.
 
 ## Problem
 

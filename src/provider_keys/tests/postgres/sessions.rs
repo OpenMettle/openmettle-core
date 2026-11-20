@@ -37,6 +37,47 @@ pub(super) async fn issue(f: &mut Flow) -> local::Credential {
         .await
         .unwrap()
 }
+/// ADR 0029: a validated context names the session's own approval and a primary-clock
+/// instant inside the session's window, and passes directly to API principal hydration.
+pub(super) async fn assert_authorization_context(
+    f: &mut Flow,
+    context: &local::Context,
+    credential: &str,
+) {
+    let id = credential.split_once('.').unwrap().0;
+    let (approval, user, created, expires): (String, String, i64, i64) = sqlx::query_as(
+        "SELECT approval_id::text,user_id::text,created_ms,expires_ms
+           FROM openmettle.local_sessions WHERE id=$1",
+    )
+    .bind(id)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(context.approval_id(), approval);
+    assert_eq!(context.user_id(), user);
+    let observed = context.observed_ms();
+    assert!(observed > 0 && created <= observed && observed < expires);
+    let now: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint")
+            .fetch_one(&mut f.owner)
+            .await
+            .unwrap();
+    assert!(observed <= now);
+    let principal = crate::authz::store::hydrate_api_principal(
+        &mut f.api,
+        context.user_id(),
+        context.approval_id(),
+        observed,
+    )
+    .await
+    .unwrap()
+    .expect("the validated session hydrates an API principal");
+    assert_eq!(principal.user_id, context.user_id());
+    assert_eq!(principal.personal_scope_id, context.personal_scope_id());
+    assert!(principal.account_active && principal.approval_active && principal.provider_active);
+    // Still redacted: no identifier when debug-printed.
+    assert_eq!(format!("{context:?}"), "SessionContext(..)");
+}
 // Caller holds the stable provider row FOR UPDATE in this transaction. Generation and
 // a fresh epoch commit together, including explicit revoke with an unchanged revision.
 async fn revoke_locked(owner: &mut PgConnection, revision: Option<&str>) -> i64 {
@@ -106,6 +147,13 @@ async fn routine_changes_preserve_sessions_and_explicit_revocations_do_not_reviv
         .await
         .unwrap();
     assert_eq!(context.user_id(), user);
+    assert_authorization_context(&mut f, &context, credential.expose()).await;
+    // A later validation observes the same approval at a later or equal primary instant.
+    let again = local::validate(&mut f.api, credential.expose(), &session_policy())
+        .await
+        .unwrap();
+    assert_eq!(again.approval_id(), context.approval_id());
+    assert!(again.observed_ms() >= context.observed_ms());
     // Routine provider revision and approval revision retain access generations.
     open_write(&mut f.owner, Some("v2")).await;
     f.owner.execute("COMMIT").await.unwrap();

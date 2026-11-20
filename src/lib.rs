@@ -1,5 +1,6 @@
 //! Shared operational contract and persistence primitives; no domain APIs or worker queue yet.
-//! The API can also mount the browser sign-in routes, off by default (ADR 0025).
+//! The API can also mount the browser sign-in routes, and beside them the native sign-in
+//! routes, off by default (ADRs 0025 and 0029).
 pub mod auth;
 pub mod auth_config;
 pub mod authz;
@@ -18,7 +19,9 @@ pub mod storage;
 pub mod telemetry;
 
 use axum::{Router, extract::State, http::StatusCode, routing::get};
-use browser_auth::{BrowserAuth, handoff::LoginHandoff, router::router_with_sessions};
+use browser_auth::{
+    BrowserAuth, handoff::LoginHandoff, native::NativeAuth, router::router_with_sessions,
+};
 use sqlx::{
     ConnectOptions, PgPool,
     postgres::{PgConnectOptions, PgPoolOptions},
@@ -41,8 +44,9 @@ struct Config {
     telemetry: telemetry::Settings,
     /// `OTLP_TRACES_ENDPOINT` and its companions (ADR 0026); `None` leaves export off.
     otlp: Option<telemetry::otlp::Settings>,
-    /// `OPENMETTLE_API_AUTH_CONFIG`: the browser sign-in settings document to mount
-    /// (ADR 0025). Always `None` for the worker, which never reads the key.
+    /// `OPENMETTLE_API_AUTH_CONFIG`: the browser, and optionally native, sign-in settings
+    /// document to mount (ADRs 0025 and 0029). Always `None` for the worker, which never
+    /// reads the key.
     auth_config: Option<PathBuf>,
 }
 
@@ -130,11 +134,13 @@ fn routes(health: Health) -> Router {
 
 /// Every route the process serves (ADR 0025): the operational routes, and for an API given
 /// `AUTH_CONFIG` the browser sign-in routes of that version-2 document, over the same primary
-/// pool (ADR 0016). Loading reads local files only; no provider, DNS name or database is
-/// contacted, and the lazy pool stays unconnected. Readiness is unchanged and database-only.
+/// pool (ADR 0016). A `native` profile in it adds the five native routes over the same
+/// service, so one provider manager and one pool serve both (ADR 0029). Loading reads local
+/// files only; no provider, DNS name or database is contacted, and the lazy pool stays
+/// unconnected. Readiness is unchanged and database-only.
 ///
-/// The settings check refused `/healthz` and `/readyz` as sign-in paths, and the two
-/// constructors repeat it, so the merge cannot shadow a probe or panic.
+/// The settings checks refused `/healthz` and `/readyz` and every browser path as native
+/// paths, and the constructors repeat them, so no merge can shadow a route or panic.
 fn app(config: &Config, pool: &PgPool) -> Result<Router, auth_config::Error> {
     let operational = routes(Health {
         pool: pool.clone(),
@@ -144,12 +150,23 @@ fn app(config: &Config, pool: &PgPool) -> Result<Router, auth_config::Error> {
         return Ok(operational);
     };
     let (settings, profile) = auth_config::load_browser(path)?;
+    let native = settings.native().cloned();
     let service = Arc::new(BrowserAuth::new(settings, pool.clone()));
-    let handoff = LoginHandoff::new(service, profile.handoff())
+    let handoff = LoginHandoff::new(service.clone(), profile.handoff())
         .map_err(auth_config::Error::BrowserHandoff)?;
     let sign_in = router_with_sessions(handoff, profile.router(), profile.sessions())
         .map_err(auth_config::Error::BrowserRouter)?;
-    Ok(operational.merge(sign_in))
+    let mut app = operational.merge(sign_in);
+    if let Some(native) = native {
+        let auth = NativeAuth::checked(service, native.settings(), native.rate())
+            .map_err(auth_config::Error::Native)?;
+        // The rate was accepted just above; a refusal here is that check's category.
+        let routes = Arc::new(auth)
+            .router_shared(native.rate())
+            .map_err(|_| auth_config::Error::Native(browser_auth::native::SettingsError::Rate))?;
+        app = app.merge(routes);
+    }
+    Ok(app)
 }
 
 #[derive(Clone)]

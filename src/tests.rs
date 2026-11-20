@@ -138,6 +138,10 @@ async fn unset_auth_config_serves_the_operational_routes_only() {
         ("GET", "/callback"),
         ("GET", "/auth/session"),
         ("POST", "/auth/logout"),
+        ("GET", "/auth/native/authorize"),
+        ("POST", "/auth/native/token"),
+        ("GET", "/auth/native/session"),
+        ("POST", "/auth/native/logout"),
     ] {
         let (status, head, _) = send(address, method, path, "content-length: 0\r\n").await;
         assert_eq!(status, 404, "{method} {path}");
@@ -214,7 +218,7 @@ async fn version_2_settings_mount_the_sign_in_routes_under_observation() {
     let form = "origin: https://other.example.test\r\ncontent-length: 39\r\n\
                 content-type: application/x-www-form-urlencoded\r\n\r\n\
                 invitation_code=CANARY-invitation-00000";
-    let cases: [(&str, &str, &str, u16, &str, &str); 12] = [
+    let cases: [(&str, &str, &str, u16, &str, &str); 13] = [
         (
             "GET",
             "/healthz",
@@ -298,6 +302,8 @@ async fn version_2_settings_mount_the_sign_in_routes_under_observation() {
             "/auth/logout",
         ),
         ("GET", "/auth/CANARY-path", "", 404, "", "unmatched"),
+        // Without a native profile, no native route is mounted (ADR 0029).
+        ("GET", "/auth/native/session", "", 404, "", "unmatched"),
     ];
     for (method, target, extra, status, line, route) in cases {
         let (got, head, body) = send(address, method, target, extra).await;
@@ -332,4 +338,186 @@ async fn version_2_settings_mount_the_sign_in_routes_under_observation() {
         b"issuer.example.test",
         dir.path("").as_bytes(),
     ]);
+}
+
+/// ADR 0029: a version-2 document with a native profile mounts the five native routes beside
+/// the browser routes and the probes, under the same observation. Previews and refusals are
+/// decided before any pool or provider work, and no planted value reaches telemetry.
+#[tokio::test]
+async fn native_profile_mounts_the_native_routes_beside_the_browser_routes() {
+    let database = TcpListener::bind("127.0.0.1:0").unwrap();
+    let dir = Dir::new();
+    let document = support::document_v2_native(&dir, &Ca::new().pem());
+    dir.write("login-key-b", b"CANARY-login-key-32-bytes-000000");
+    let path = dir.write("auth.json", document.to_string().as_bytes());
+    let config = config(&database, Some(&path));
+    let (capture, _guard) = Capture::install(Format::Json, Verbosity::Debug);
+    let address = serve_observed(app(&config, &pool(&config)).unwrap()).await;
+
+    let preview = format!(
+        "/auth/native/authorize?client_id=openmettle-desktop\
+         &redirect_uri=https%3A%2F%2Fapp.example.test%2Fnative%2Fcomplete&response_type=code\
+         &state={}&code_challenge_method=S256&code_challenge={}",
+        "s".repeat(43),
+        "c".repeat(43)
+    );
+    let foreign = preview.replace("openmettle-desktop", "CANARY-client");
+    let token = "content-type: application/json\r\ncontent-length: 30\r\n\r\n\
+                 {\"code\":\"CANARY-code-0000000\"}";
+    let bearer = "authorization: Bearer CANARY-bearer\r\n";
+    let cases: [(&str, &str, &str, u16, &str); 11] = [
+        ("GET", "/healthz", "", 200, "/healthz"),
+        ("GET", &preview, "", 200, "/auth/native/authorize"),
+        ("GET", &foreign, "", 403, "/auth/native/authorize"),
+        (
+            "GET",
+            "/auth/native/callback?code=CANARY-code&state=CANARY-state",
+            "",
+            403,
+            "/auth/native/callback",
+        ),
+        (
+            "POST",
+            "/auth/native/token",
+            token,
+            403,
+            "/auth/native/token",
+        ),
+        (
+            "GET",
+            "/auth/native/session",
+            "",
+            403,
+            "/auth/native/session",
+        ),
+        (
+            "GET",
+            "/auth/native/session",
+            bearer,
+            403,
+            "/auth/native/session",
+        ),
+        (
+            "POST",
+            "/auth/native/logout",
+            "content-length: 0\r\n",
+            403,
+            "/auth/native/logout",
+        ),
+        (
+            "DELETE",
+            "/auth/native/session",
+            "",
+            403,
+            "/auth/native/session",
+        ),
+        // The browser routes are still mounted beside them.
+        (
+            "POST",
+            "/auth/login",
+            "content-length: 0\r\n",
+            403,
+            "/auth/login",
+        ),
+        ("GET", "/auth/native/CANARY-path", "", 404, "unmatched"),
+    ];
+    for (method, target, extra, status, route) in cases {
+        let (got, head, body) = send(address, method, target, extra).await;
+        assert_eq!(got, status, "{method} {target}");
+        assert!(!head.contains("set-cookie") && !head.contains("location"));
+        assert!(!head.contains("request-id"), "{head}");
+        match (status, route) {
+            (200, "/auth/native/authorize") => {
+                assert!(body.contains("<form method=post>"), "{body}");
+                assert!(head.contains("cache-control: no-store"), "{head}");
+            }
+            (403, r) if r.starts_with("/auth/native/") => {
+                assert_eq!(body, "native sign-in refused\n", "{method} {target}");
+                assert!(head.contains("cache-control: no-store"), "{head}");
+            }
+            _ => {}
+        }
+    }
+    // Nothing above reached the primary pool.
+    database.set_nonblocking(true).unwrap();
+    assert!(database.accept().is_err());
+
+    let events = capture.events("http.request.completed");
+    assert_eq!(capture.json().len(), cases.len());
+    assert_eq!(events.len(), cases.len());
+    for (event, (method, _, _, status, route)) in events.iter().zip(&cases) {
+        assert_eq!(event["http.route"], *route);
+        assert_eq!(event["http.request.method"], *method);
+        assert_eq!(event["http.response.status_code"], *status);
+        assert!(is_v4(event["request_id"].as_str().unwrap()));
+        if route.starts_with("/auth/") {
+            assert_eq!(
+                telemetry::metrics::RouteClass::of(route),
+                telemetry::metrics::RouteClass::Auth
+            );
+        }
+    }
+    capture.assert_absent(&[
+        b"CANARY",
+        b"openmettle-desktop",
+        b"native/complete",
+        b"sssssssss",
+        b"ccccccccc",
+        b"0b5c6f4e",
+        b"app.example.test",
+        b"issuer.example.test",
+        dir.path("").as_bytes(),
+    ]);
+}
+
+/// A refused native profile builds no router, with the offline check's fixed category.
+#[tokio::test]
+async fn refused_native_profile_mounts_nothing() {
+    let database = TcpListener::bind("127.0.0.1:0").unwrap();
+    let dir = Dir::new();
+    let bundle = Ca::new().pem();
+    for (pointer, value, error) in [
+        (
+            "/native/callback",
+            "https://app.example.test/healthz",
+            browser_auth::native::SettingsError::Collision,
+        ),
+        (
+            "/native/redirect_uri",
+            "https://app.example.test/auth/session",
+            browser_auth::native::SettingsError::Collision,
+        ),
+        (
+            "/native/provider_id",
+            "1c6d7a5f-3b2e-4d4c-8f9a-8b7c6d5e4f30",
+            browser_auth::native::SettingsError::Provider,
+        ),
+    ] {
+        let mut document = support::document_v2_native(&dir, &bundle);
+        *document.pointer_mut(pointer).unwrap() = value.into();
+        let path = dir.write("auth.json", document.to_string().as_bytes());
+        let config = config(&database, Some(&path));
+        assert_eq!(
+            app(&config, &pool(&config)).err(),
+            Some(auth_config::Error::Native(error))
+        );
+    }
+    // A native route on another origin that repeats a browser route is refused, not left to
+    // panic in `Router::merge`, which matches paths without the host.
+    for path in ["/auth/login", "/callback", "/auth/session"] {
+        let mut document = support::document_v2_native(&dir, &bundle);
+        document["native"]["issuer"] = "https://broker.example.test".into();
+        document["native"]["callback"] = format!("https://broker.example.test{path}").into();
+        let file = dir.write("auth.json", document.to_string().as_bytes());
+        let config = config(&database, Some(&file));
+        assert_eq!(
+            app(&config, &pool(&config)).err(),
+            Some(auth_config::Error::Native(
+                browser_auth::native::SettingsError::Collision
+            )),
+            "{path}"
+        );
+    }
+    database.set_nonblocking(true).unwrap();
+    assert!(database.accept().is_err());
 }

@@ -35,6 +35,9 @@ before any route is served.
 - **Native sign-in is not mounted.** ADR 0023 leaves its settings-document form and runtime
   construction to a separate increment. Nothing in this change constructs `NativeAuth`.
 
+> [ADR 0029](0029-native-sign-in-mounting-and-session-context.md) mounts native sign-in beside these routes when the same
+> document has the optional `native` member, over the same service and pool.
+
 There is no serve flag, live reload or second pool. Changed files take effect at the next
 start. `--check-auth-config PATH` is unchanged for both versions (ADRs 0015 and 0020).
 
@@ -187,6 +190,9 @@ router by the managed PostgreSQL tests (ADRs 0017–0019) and the Keycloak quali
 both of which serve the router in-process rather than through `openmettle-api`.
 
 ## Remaining
+
+> [ADR 0029](0029-native-sign-in-mounting-and-session-context.md) supplies the native settings-document form, runtime construction
+> and mounting. The other items stand.
 
 For V1-04: deployment and ingress qualification of the mounted routes (TLS for the origin,
 path preservation, access-log redaction, transport limits); running the Keycloak browser

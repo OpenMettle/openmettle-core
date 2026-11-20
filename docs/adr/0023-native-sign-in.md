@@ -22,6 +22,9 @@ PKCE verifier.
 worker still serve `/healthz` and `/readyz` only. The browser handoff and its routes are
 unchanged.
 
+> [ADR 0029](0029-native-sign-in-mounting-and-session-context.md) adds the settings-document form (`native` in version 2), one
+> offline settings check and runtime mounting beside the browser routes, off by default.
+
 ### Registration
 
 `NativeAuth::new` takes the pooled service, an active provider UUID, and:
@@ -477,6 +480,9 @@ rollout was exercised.
   OpenAPI contract and the process contract.
 
 ## Remaining
+
+> [ADR 0029](0029-native-sign-in-mounting-and-session-context.md) supplies the settings-document form and runtime construction.
+> The other items stand.
 
 - A settings-document form for the native registration, and runtime construction.
 - Simulator qualification in the companion app project: the system browser, not an embedded
