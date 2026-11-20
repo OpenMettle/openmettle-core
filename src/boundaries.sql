@@ -112,6 +112,9 @@ contract (relation, role, privilege) AS (
         ('local_group_memberships'), ('platform_capability_denies'),
         ('user_capability_denies'), ('user_capability_grants')
     ) AS recheck(relation) WHERE $1 >= 15
+    UNION ALL
+    -- V1-10 (ADR 0032): the claim's dispatch lock row.
+    SELECT 'run_dispatch_lock', 'openmettle_worker', 'SELECT' WHERE $1 >= 19
 ),
 column_contract (relation, attribute, role, privilege) AS (
     VALUES ('users', 'disabled_at', 'openmettle_api', 'UPDATE')
@@ -231,6 +234,17 @@ column_contract (relation, attribute, role, privilege) AS (
     WHERE $1 >= r.since
     UNION ALL
     SELECT 'projects', 'lock_guard', 'openmettle_api', 'UPDATE' WHERE $1 >= 16
+    UNION ALL
+    -- V1-10 (ADR 0032): admission decisions are inserted once with the run by the API; only
+    -- the worker records a claim and locks the dispatch row.
+    SELECT * FROM (VALUES
+        ('runs', 'actor_approval_id', 'openmettle_api', 'INSERT'),
+        ('runs', 'round_limit', 'openmettle_api', 'INSERT'),
+        ('runs', 'queue_expires_at', 'openmettle_api', 'INSERT'),
+        ('runs', 'claim_token', 'openmettle_worker', 'UPDATE'),
+        ('runs', 'claimed_at', 'openmettle_worker', 'UPDATE'),
+        ('run_dispatch_lock', 'lock_guard', 'openmettle_worker', 'UPDATE')
+    ) AS queue(relation, attribute, role, privilege) WHERE $1 >= 19
     UNION ALL
     -- V1-15 (ADR 0031): the optional display name `settle` writes with each revision.
     SELECT 'artifact_revisions', 'display_name', role, 'INSERT'

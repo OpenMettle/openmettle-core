@@ -1153,9 +1153,9 @@ async fn populated_v14_upgrade_keeps_rows_and_adds_empty_authorization_state() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(db.history().await, all_versions());
     let after = everything(&db).await;
-    // Every pre-existing row is unchanged; history gains version 15 and later. Migration 16
-    // adds only columns whose values on every earlier row are fixed defaults.
-    let without_v16 = |rows: &BTreeSet<String>| -> BTreeSet<String> {
+    // Every pre-existing row is unchanged; history gains version 15 and later. Migrations 16,
+    // 18 and 19 add only columns whose values on every earlier row are fixed defaults.
+    let without_later = |rows: &BTreeSet<String>| -> BTreeSet<String> {
         rows.iter()
             .map(|row| {
                 let mut row: serde_json::Value = serde_json::from_str(row).unwrap();
@@ -1165,6 +1165,11 @@ async fn populated_v14_upgrade_keeps_rows_and_adds_empty_authorization_state() {
                     ("grantee_kind", serde_json::json!("user")),
                     ("grantee_local_group_id", serde_json::Value::Null),
                     ("grantee_oidc_group_id", serde_json::Value::Null),
+                    ("actor_approval_id", serde_json::Value::Null),
+                    ("round_limit", serde_json::Value::Null),
+                    ("queue_expires_at", serde_json::Value::Null),
+                    ("claim_token", serde_json::Value::Null),
+                    ("claimed_at", serde_json::Value::Null),
                 ] {
                     if let Some(found) = object.remove(column) {
                         assert_eq!(found, value, "{column}");
@@ -1179,22 +1184,28 @@ async fn populated_v14_upgrade_keeps_rows_and_adds_empty_authorization_state() {
             assert!(rows.is_subset(&after[table]));
             assert_eq!(after[table].len(), rows.len() + MIGRATIONS.len() - 14);
         } else {
-            assert_eq!(without_v16(&after[table]), without_v16(rows), "{table}");
+            assert_eq!(without_later(&after[table]), without_later(rows), "{table}");
         }
     }
-    // The new tables start empty, apart from the single administrator lock row.
+    // The new tables, including migration 19's dispatch lock, start empty apart from their
+    // single lock rows.
     let added: BTreeSet<&str> = after
         .keys()
         .filter(|t| !before.contains_key(*t))
         .map(String::as_str)
         .collect();
-    assert_eq!(added, NEW_TABLES.into_iter().collect());
-    for table in NEW_TABLES {
-        let expected: BTreeSet<String> = if table == "account_admin_lock" {
-            ["{\"id\": true, \"lock_guard\": false}".to_owned()].into()
-        } else {
-            BTreeSet::new()
-        };
+    let expected_added: BTreeSet<&str> = NEW_TABLES
+        .into_iter()
+        .chain(["run_dispatch_lock"])
+        .collect();
+    assert_eq!(added, expected_added);
+    for table in expected_added {
+        let expected: BTreeSet<String> =
+            if matches!(table, "account_admin_lock" | "run_dispatch_lock") {
+                ["{\"id\": true, \"lock_guard\": false}".to_owned()].into()
+            } else {
+                BTreeSet::new()
+            };
         assert_eq!(after[table], expected, "{table}");
     }
     // A pre-15 project has no settings row and stays valid; its owner can add one later.

@@ -182,9 +182,8 @@ pub struct RunInput<'a> {
     pub input: &'a [u8],
     pub config: &'a [u8],
 }
-/// Insert or recover the same run. Initial event is deterministic and empty; callers may
-/// compose messages/reservations before calling. Rejected outer work must be rolled back.
-pub async fn create_run(tx: &mut WriteTransaction<'_>, r: &RunInput<'_>) -> Result<String, Error> {
+/// The ADR 0004 run identity; also validates the input.
+pub(crate) fn run_identity(r: &RunInput<'_>) -> Result<Vec<u8>, Error> {
     for id in [r.scope, r.actor, r.conversation, r.branch, r.message] {
         uuid(id)?;
     }
@@ -195,7 +194,7 @@ pub async fn create_run(tx: &mut WriteTransaction<'_>, r: &RunInput<'_>) -> Resu
     {
         return Err(Error::Invalid);
     }
-    let id = identity(
+    Ok(identity(
         b"openmettle/run/1\0",
         &[
             r.scope.as_bytes(),
@@ -209,21 +208,59 @@ pub async fn create_run(tx: &mut WriteTransaction<'_>, r: &RunInput<'_>) -> Resu
             r.input,
             r.config,
         ],
-    );
+    ))
+}
+
+/// Server admission decisions (ADR 0032), written by the same `INSERT` as the run. They are
+/// outside `request_identity`, so a replay never compares them.
+pub(crate) struct AdmissionColumns<'a> {
+    pub approval: &'a str,
+    pub round_limit: i32,
+    pub queue_timeout_ms: i64,
+}
+
+/// Insert or recover the same run. Initial event is deterministic and empty; callers may
+/// compose messages/reservations before calling. Rejected outer work must be rolled back.
+/// The run's admission columns stay `NULL`: it is never claimed and expiry fails it.
+pub async fn create_run(tx: &mut WriteTransaction<'_>, r: &RunInput<'_>) -> Result<String, Error> {
+    insert_run(tx, r, None).await.map(|(run, _)| run)
+}
+
+/// [`create_run`], optionally with admission columns. Returns the run and whether this call
+/// inserted it; an existing identical run is returned with `false`.
+pub(crate) async fn insert_run(
+    tx: &mut WriteTransaction<'_>,
+    r: &RunInput<'_>,
+    admission: Option<&AdmissionColumns<'_>>,
+) -> Result<(String, bool), Error> {
+    let id = run_identity(r)?;
     let hash = digest(&id);
+    // A bare insert names only the pre-19 columns, so it also works on an older schema.
+    let sql = if admission.is_some() {
+        "INSERT INTO openmettle.runs
+             (scope_id,actor_user_id,conversation_id,branch_id,input_message_id,idempotency_key,snapshot_format,snapshot_version,input_snapshot,config_snapshot,request_identity,request_digest,actor_approval_id,round_limit,queue_expires_at)
+             VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6,$7,$8,$9,$10,$11,$12,$13::uuid,$14,clock_timestamp() + $15::bigint * interval '1 millisecond') ON CONFLICT
+             (scope_id,actor_user_id,idempotency_key) DO NOTHING RETURNING id::text"
+    } else {
+        "INSERT INTO openmettle.runs
+             (scope_id,actor_user_id,conversation_id,branch_id,input_message_id,idempotency_key,snapshot_format,snapshot_version,input_snapshot,config_snapshot,request_identity,request_digest)
+             VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT
+             (scope_id,actor_user_id,idempotency_key) DO NOTHING RETURNING id::text"
+    };
     let mut outer = tx.take_active()?;
     let mut sp = outer.begin().await?;
     let result = async {
-        let inserted: Option<String> = sqlx::query_scalar("INSERT INTO openmettle.runs
-             (scope_id,actor_user_id,conversation_id,branch_id,input_message_id,idempotency_key,snapshot_format,snapshot_version,input_snapshot,config_snapshot,request_identity,request_digest)
-             VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT
-             (scope_id,actor_user_id,idempotency_key) DO NOTHING RETURNING id::text")
-            .bind(r.scope).bind(r.actor).bind(r.conversation).bind(r.branch).bind(r.message).bind(r.key).bind(r.format).bind(r.version).bind(r.input).bind(r.config).bind(&id).bind(&hash).fetch_optional(&mut *sp).await?;
+        let mut insert = sqlx::query_scalar(sql)
+            .bind(r.scope).bind(r.actor).bind(r.conversation).bind(r.branch).bind(r.message).bind(r.key).bind(r.format).bind(r.version).bind(r.input).bind(r.config).bind(&id).bind(&hash);
+        if let Some(a) = admission {
+            insert = insert.bind(a.approval).bind(a.round_limit).bind(a.queue_timeout_ms);
+        }
+        let inserted: Option<String> = insert.fetch_optional(&mut *sp).await?;
         if let Some(run) = inserted {
             let payload = Payload { format: "openmettle.run-created", version: 1, bytes: b"" };
             let event_id = event_identity(r.scope, &run, "run-created", payload);
             append_locked(&mut sp, r.scope, &run, "run-created", &event_id, payload).await?;
-            Ok(run)
+            Ok((run, true))
         } else {
             let row = sqlx::query("SELECT id::text, request_identity, request_digest, conversation_id::text, branch_id::text,
              input_message_id::text, snapshot_format, snapshot_version, input_snapshot, config_snapshot FROM
@@ -233,7 +270,7 @@ pub async fn create_run(tx: &mut WriteTransaction<'_>, r: &RunInput<'_>) -> Resu
                 || row.get::<String,_>("conversation_id") != r.conversation || row.get::<String,_>("branch_id") != r.branch
                 || row.get::<String,_>("input_message_id") != r.message || row.get::<String,_>("snapshot_format") != r.format
                 || row.get::<i32,_>("snapshot_version") != r.version || row.get::<Vec<u8>,_>("input_snapshot") != r.input || row.get::<Vec<u8>,_>("config_snapshot") != r.config { return Err(Error::Conflict); }
-            Ok(row.get("id"))
+            Ok((row.get("id"), false))
         }
     }.await;
     let result = finish(sp, result).await?;
@@ -252,7 +289,7 @@ pub(crate) async fn lock_run(
     exists.ok_or(Error::NotFound).map(|_| ())
 }
 async fn existing_event(
-    tx: &mut Transaction<'_, Postgres>,
+    c: &mut PgConnection,
     scope: &str,
     run: &str,
     key: &str,
@@ -261,7 +298,7 @@ async fn existing_event(
 ) -> Result<Option<i64>, Error> {
     let row = sqlx::query("SELECT sequence,identity,digest,format,format_version,payload FROM openmettle.run_events WHERE
              scope_id=$1::uuid AND run_id=$2::uuid AND append_key=$3")
-        .bind(scope).bind(run).bind(key).fetch_optional(&mut **tx).await?;
+        .bind(scope).bind(run).bind(key).fetch_optional(&mut *c).await?;
     match row {
         None => Ok(None),
         Some(row) => {
@@ -278,24 +315,36 @@ async fn existing_event(
     }
 }
 async fn append_locked(
-    tx: &mut Transaction<'_, Postgres>,
+    c: &mut PgConnection,
     scope: &str,
     run: &str,
     key: &str,
     id: &[u8],
     p: Payload<'_>,
 ) -> Result<i64, Error> {
-    if let Some(seq) = existing_event(tx, scope, run, key, id, p).await? {
+    if let Some(seq) = existing_event(c, scope, run, key, id, p).await? {
         return Ok(seq);
     }
     let seq: i64 = sqlx::query_scalar("UPDATE openmettle.runs SET last_event_sequence=last_event_sequence+1 WHERE scope_id=$1::uuid AND
              id=$2::uuid RETURNING last_event_sequence")
-        .bind(scope).bind(run).fetch_one(&mut **tx).await?;
+        .bind(scope).bind(run).fetch_one(&mut *c).await?;
     sqlx::query("INSERT INTO openmettle.run_events
              (scope_id,run_id,sequence,append_key,format,format_version,payload,identity,digest) VALUES
              ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9)")
-        .bind(scope).bind(run).bind(seq).bind(key).bind(p.format).bind(p.version).bind(p.bytes).bind(id).bind(digest(id)).execute(&mut **tx).await?;
+        .bind(scope).bind(run).bind(seq).bind(key).bind(p.format).bind(p.version).bind(p.bytes).bind(id).bind(digest(id)).execute(&mut *c).await?;
     Ok(seq)
+}
+/// Append to a run whose row the caller's transaction already holds `FOR NO KEY UPDATE`
+/// (ADR 0032 claim and terminal events). No savepoint: an error aborts the caller's work.
+pub(crate) async fn append_to_locked_run(
+    c: &mut PgConnection,
+    scope: &str,
+    run: &str,
+    key: &str,
+    p: Payload<'_>,
+) -> Result<i64, Error> {
+    let id = event_identity(scope, run, key, p);
+    append_locked(c, scope, run, key, &id, p).await
 }
 fn event_identity(scope: &str, run: &str, key: &str, p: Payload<'_>) -> Vec<u8> {
     identity(

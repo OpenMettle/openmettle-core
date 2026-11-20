@@ -448,17 +448,33 @@ async fn message(
     .await
 }
 
+/// Rows written before an upgrade, unchanged by it. Columns that later migrations add are
+/// excluded from the comparison; the nullable migration-19 `runs` columns must stay unset.
 async fn snapshot(connection: &mut PgConnection, tables: &[&str]) -> Vec<String> {
+    const V19_RUN_COLUMNS: [&str; 5] = [
+        "actor_approval_id",
+        "round_limit",
+        "queue_expires_at",
+        "claim_token",
+        "claimed_at",
+    ];
     let mut rows = Vec::new();
     for table in tables {
-        let mut table_rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT (to_jsonb(t) - 'session_generation' - 'lock_guard')::text FROM openmettle.{table} t ORDER BY id"
+        // Absent keys (before migration 19, or other tables) and JSON nulls are both unset.
+        let table_rows: Vec<(String, bool)> = sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT (to_jsonb(t) - 'session_generation' - 'lock_guard' - $1::text[])::text,
+                    NOT (jsonb_strip_nulls(to_jsonb(t)) ?| $1::text[])
+             FROM openmettle.{table} t ORDER BY id"
         )))
+        .bind(V19_RUN_COLUMNS)
         .fetch_all(&mut *connection)
         .await
         .unwrap();
         rows.push(format!("{table}: {}", table_rows.len()));
-        rows.append(&mut table_rows);
+        for (row, v19_unset) in table_rows {
+            assert!(v19_unset, "{table} row sets a migration-19 column: {row}");
+            rows.push(row);
+        }
     }
     rows
 }
@@ -498,6 +514,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "425c1d0aa9d3cf7d1910cab8f2ec55d3a5c8de24a169c181b5febeedc84f7c91",
         "6b2363d7267c088f75999b697fee05f74f88ee4a572be688558b03e9fe27d35c",
         "26a9aff24fdead77748763b8e73ecf834faddfcfa5b0c3b70eebc5dd624000db",
+        "93686928e8f33f08c340f6dbe6348727a1f9abb4c44c0e68061d10578d181e59",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
@@ -1915,6 +1932,9 @@ mod authz_runs;
 
 #[path = "schema/authz_http.rs"]
 mod authz_http;
+
+#[path = "schema/run_admission.rs"]
+mod run_admission;
 
 // Fixtures of the mounted-API tests in `authz_http`: synthetic auth settings, the transport
 // fixture's synthetic CA (its leaf certificates are not needed) and the independent contract
