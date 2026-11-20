@@ -150,7 +150,8 @@ impl ProviderConfig {
         trust: Trust<'_>,
         private_ranges: &[&str],
     ) -> Result<Self, Error> {
-        login::validate_definition(&identity, &definition).map_err(|_| Error::Configuration)?;
+        login::validate_definition(identity.binding().1, &definition)
+            .map_err(|_| Error::Configuration)?;
         if !definition.enabled {
             return Err(Error::Configuration);
         }
@@ -1042,18 +1043,12 @@ async fn read_authority(
     connection: &mut sqlx::PgConnection,
     c: &ProviderConfig,
 ) -> Result<i64, login::Error> {
-    use sqlx::Connection;
-    if connection.is_in_transaction() {
-        return Err(login::Error::Rejected);
-    }
-    let mut tx = crate::runs::WriteTransaction::begin(connection).await?;
-    for statement in [
-        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY",
-        "SET LOCAL lock_timeout = '2s'",
-        "SET LOCAL statement_timeout = '3s'",
-    ] {
-        sqlx::query(statement).execute(tx.connection()?).await?;
-    }
+    let mut tx = crate::runs::WriteTransaction::begin_bounded(connection, true)
+        .await
+        .map_err(|error| match error {
+            crate::runs::Error::Invalid => login::Error::Rejected,
+            other => other.into(),
+        })?;
     let (id, issuer, client) = c.identity.binding();
     let epoch = authority(tx.connection()?, id, issuer, client, &c.revision).await;
     match epoch {

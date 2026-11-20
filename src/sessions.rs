@@ -157,27 +157,32 @@ fn create_with(
     let credential = Credential(format!("{id}.{}", URL_SAFE_NO_PAD.encode(secret)));
     Ok((id, credential, hash))
 }
-fn parse(channel: Channel, value: &str) -> Result<(&str, [u8; 32]), Error> {
+fn parse_parts(value: &str) -> Result<(&str, [u8; 32]), Error> {
     if value.len() != 87 {
         return Err(Error::Rejected);
     }
     let (id, secret) = value.split_once('.').ok_or(Error::Rejected)?;
-    for part in [id, secret] {
-        let bytes = URL_SAFE_NO_PAD.decode(part).map_err(|_| Error::Rejected)?;
-        if bytes.len() != 32 || URL_SAFE_NO_PAD.encode(&bytes) != part {
+    let decode = |part: &str| -> Result<[u8; 32], Error> {
+        let bytes: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(part)
+            .map_err(|_| Error::Rejected)?
+            .try_into()
+            .map_err(|_| Error::Rejected)?;
+        if URL_SAFE_NO_PAD.encode(bytes) != part {
             return Err(Error::Rejected);
         }
-    }
-    let secret: [u8; 32] = URL_SAFE_NO_PAD
-        .decode(secret)
-        .map_err(|_| Error::Rejected)?
-        .try_into()
-        .map_err(|_| Error::Rejected)?;
+        Ok(bytes)
+    };
+    decode(id)?;
+    Ok((id, decode(secret)?))
+}
+fn parse(channel: Channel, value: &str) -> Result<(&str, [u8; 32]), Error> {
+    let (id, secret) = parse_parts(value)?;
     Ok((id, digest(channel, id, &secret)))
 }
 /// Shape check alone, so a malformed credential never costs a pooled connection (ADR 0016).
 pub(crate) fn well_formed(value: &str) -> Result<(), Error> {
-    parse(Channel::Browser, value).map(|_| ())
+    parse_parts(value).map(|_| ())
 }
 fn matches(stored: Option<&[u8]>, supplied: &[u8; 32]) -> bool {
     let expected: [u8; 32] = stored.and_then(|v| v.try_into().ok()).unwrap_or([0; 32]);
@@ -185,28 +190,12 @@ fn matches(stored: Option<&[u8]>, supplied: &[u8; 32]) -> bool {
     stored.is_some_and(|v| v.len() == 32) & equal
 }
 async fn transaction(c: &mut PgConnection) -> Result<WriteTransaction<'_>, Error> {
-    use sqlx::Connection;
-    if c.is_in_transaction() {
-        return Err(Error::Rejected);
-    }
-    let mut tx = WriteTransaction::begin(c).await?;
-    let setup: Result<(), Error> = async {
-        for sql in [
-            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-            "SET LOCAL synchronous_commit = on",
-            "SET LOCAL lock_timeout = '2s'",
-            "SET LOCAL statement_timeout = '3s'",
-        ] {
-            sqlx::query(sql).execute(tx.connection()?).await?;
-        }
-        Ok(())
-    }
-    .await;
-    if let Err(error) = setup {
-        tx.rollback().await?;
-        return Err(error);
-    }
-    Ok(tx)
+    WriteTransaction::begin_bounded(c, false)
+        .await
+        .map_err(|error| match error {
+            crate::runs::Error::Invalid => Error::Rejected,
+            other => other.into(),
+        })
 }
 // Deferred home-invitation cutoff (home_redemption_session). The server reported the error for COMMIT
 // and rolled the transaction back, so the refusal is definite.

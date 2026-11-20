@@ -439,6 +439,7 @@ impl MigrationFailure {
 }
 
 /// A closed request-method set; anything else is `_OTHER`.
+#[repr(usize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
     Get,
@@ -482,16 +483,7 @@ impl Method {
         Self::NAMES[self.index()]
     }
     pub(crate) const fn index(self) -> usize {
-        match self {
-            Self::Get => 0,
-            Self::Head => 1,
-            Self::Post => 2,
-            Self::Put => 3,
-            Self::Delete => 4,
-            Self::Patch => 5,
-            Self::Options => 6,
-            Self::Other => 7,
-        }
+        self as usize
     }
 }
 
