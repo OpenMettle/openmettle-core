@@ -186,7 +186,7 @@ fn succeeded(out: &Output) {
     assert_eq!(String::from_utf8_lossy(&out.stdout), COMMITTED);
     assert!(out.stderr.is_empty(), "{}", stderr(out));
 }
-fn refused(out: &Output, reason: &str) {
+pub(super) fn refused(out: &Output, reason: &str) {
     assert!(!out.status.success());
     assert!(out.stdout.is_empty());
     assert!(stderr(out).contains(reason), "{}", stderr(out));

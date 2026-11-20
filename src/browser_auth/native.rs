@@ -2,7 +2,7 @@
 //! The person confirms the sign-in in the system browser, where a first sign-in also enters
 //! its invitation code (ADR 0022). The app never handles that code.
 mod routes;
-use super::{BrowserAuth, Checkout, handoff, session_settled};
+use super::{BrowserAuth, Checkout, handoff, path_byte, session_settled};
 use crate::sessions::native::{self, Attempt};
 use crate::{
     provider_keys::ManagedProvider,
@@ -89,10 +89,7 @@ fn exact_link(value: &str) -> Option<Url> {
         && value == format!("{}{}", url.origin().ascii_serialization(), url.path())
         && url.path().len() > 1
         && !url.path().starts_with("//")
-        && url
-            .path()
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"/-._~".contains(&b)))
+        && url.path().bytes().all(path_byte))
     .then_some(url)
 }
 fn refused() -> Response<&'static str> {

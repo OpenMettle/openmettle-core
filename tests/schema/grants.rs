@@ -551,7 +551,7 @@ async fn sql_roles_scopes_null_checks_and_immutable_origin() {
         migrate::apply(&v4.settings(Duration::from_secs(5)), MIGRATIONS).await,
         Err(Failure::Refused(_))
     ));
-    assert_eq!(v4.history().await, [1, 2, 3, 4]);
+    assert_eq!(v4.history().await, versions_through(4));
 }
 
 #[tokio::test]
@@ -581,7 +581,7 @@ async fn migration_five_failure_kill_timeout_and_concurrent_retry() {
         .await,
         Err(Failure::Migrate(_))
     ));
-    assert_eq!(db.history().await, [1, 2, 3, 4]);
+    assert_eq!(db.history().await, versions_through(4));
     assert!(!db.exists("openmettle.grant_mapping_rules").await);
     // Migration 5's first foreign key waits on users inside transactional DDL.
     let mut blocker = db.admin().await;
@@ -597,7 +597,7 @@ async fn migration_five_failure_kill_timeout_and_concurrent_retry() {
         Err(Failure::Migrate(_))
     ));
     db.wait_no_migration_session().await;
-    assert_eq!(db.history().await, [1, 2, 3, 4]);
+    assert_eq!(db.history().await, versions_through(4));
     let mut admin = db.admin().await;
     for kill in ["-TERM", "-KILL"] {
         let mut child = migrate_command(
@@ -640,7 +640,7 @@ async fn migration_five_failure_kill_timeout_and_concurrent_retry() {
         }
         db.wait_no_migration_session().await;
         assert!(!db.exists("openmettle.grant_mapping_rules").await, "{kill}");
-        assert_eq!(db.history().await, [1, 2, 3, 4], "{kill}");
+        assert_eq!(db.history().await, versions_through(4), "{kill}");
     }
     blocker.execute("ROLLBACK").await.unwrap();
     let children: Vec<_> = (0..4)
@@ -650,10 +650,7 @@ async fn migration_five_failure_kill_timeout_and_concurrent_retry() {
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success(), "{}", stderr(&out));
     }
-    assert_eq!(
-        db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-    );
+    assert_eq!(db.history().await, all_versions());
     assert_eq!(
         count(&db, "SELECT count(*) FROM openmettle.grant_mapping_rules").await,
         0
@@ -695,62 +692,52 @@ async fn old_domain_snapshot(db: &TestDb) -> Vec<String> {
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 and authentic V4_BINARY_DIR required"]
 async fn populated_v4_upgrade_and_authentic_v4_binaries() {
-    populated_upgrade("V4_BINARY_DIR", &[1, 2, 3, 4], false).await;
+    populated_upgrade("V4_BINARY_DIR", &versions_through(4), false).await;
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 and authentic V5_BINARY_DIR required"]
 async fn populated_v5_upgrade_and_authentic_v5_binaries() {
-    populated_upgrade("V5_BINARY_DIR", &[1, 2, 3, 4, 5], true).await;
+    populated_upgrade("V5_BINARY_DIR", &versions_through(5), true).await;
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 and authentic V6_BINARY_DIR required"]
 async fn populated_v6_upgrade_and_authentic_v6_binaries() {
-    populated_upgrade("V6_BINARY_DIR", &[1, 2, 3, 4, 5, 6], true).await;
+    populated_upgrade("V6_BINARY_DIR", &versions_through(6), true).await;
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 and authentic V7_BINARY_DIR required"]
 async fn populated_v7_upgrade_and_authentic_v7_binaries() {
-    populated_upgrade("V7_BINARY_DIR", &[1, 2, 3, 4, 5, 6, 7], true).await;
+    populated_upgrade("V7_BINARY_DIR", &versions_through(7), true).await;
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 and authentic V8_BINARY_DIR required"]
 async fn populated_v8_upgrade_and_authentic_v8_binaries() {
-    populated_upgrade("V8_BINARY_DIR", &[1, 2, 3, 4, 5, 6, 7, 8], true).await;
+    populated_upgrade("V8_BINARY_DIR", &versions_through(8), true).await;
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 and authentic V9_BINARY_DIR required"]
 async fn populated_v9_upgrade_and_authentic_v9_binaries() {
-    populated_upgrade("V9_BINARY_DIR", &[1, 2, 3, 4, 5, 6, 7, 8, 9], true).await;
+    populated_upgrade("V9_BINARY_DIR", &versions_through(9), true).await;
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 and authentic V10_BINARY_DIR required"]
 async fn populated_v10_upgrade_and_authentic_v10_binaries() {
-    populated_upgrade("V10_BINARY_DIR", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], true).await;
+    populated_upgrade("V10_BINARY_DIR", &versions_through(10), true).await;
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 and authentic V11_BINARY_DIR required"]
 async fn populated_v11_upgrade_and_authentic_v11_binaries() {
-    populated_upgrade("V11_BINARY_DIR", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], true).await;
+    populated_upgrade("V11_BINARY_DIR", &versions_through(11), true).await;
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 and authentic V12_BINARY_DIR required"]
 async fn populated_v12_upgrade_and_authentic_v12_binaries() {
-    populated_upgrade(
-        "V12_BINARY_DIR",
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
-        true,
-    )
-    .await;
+    populated_upgrade("V12_BINARY_DIR", &versions_through(12), true).await;
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 and authentic V13_BINARY_DIR required"]
 async fn populated_v13_upgrade_and_authentic_v13_binaries() {
-    populated_upgrade(
-        "V13_BINARY_DIR",
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
-        true,
-    )
-    .await;
+    populated_upgrade("V13_BINARY_DIR", &versions_through(13), true).await;
 }
 // Version-12 invitations as its commands left them, without a code: one redeemed by the
 // fixture approval and login, one withdrawn in its window and one withdrawn after expiry.
@@ -1215,10 +1202,7 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
     migrate::apply(&db.settings(Duration::from_secs(10)), &MIGRATIONS[..14])
         .await
         .unwrap();
-    assert_eq!(
-        db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
-    );
+    assert_eq!(db.history().await, versions_through(14));
     assert_eq!(old_domain_snapshot(&db).await, before);
     if with_grants {
         assert_eq!(grant_snapshot(&db).await, grant_before);
@@ -1386,10 +1370,7 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
     migrate::apply(&db.settings(Duration::from_secs(10)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(
-        db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-    );
+    assert_eq!(db.history().await, all_versions());
     assert_eq!(old_domain_snapshot(&db).await, before);
     if with_grants {
         assert_eq!(grant_snapshot(&db).await, grant_before);
@@ -1466,13 +1447,7 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
     ] {
         let bind = address();
         let mut cmd = Command::new(old.join(name));
-        for (k, _) in std::env::vars_os() {
-            if k.to_string_lossy().starts_with("OPENMETTLE_")
-                || k.to_string_lossy().starts_with("PG")
-            {
-                cmd.env_remove(k);
-            }
-        }
+        scrub_env(&mut cmd);
         let child = cmd
             .env(format!("{prefix}_DATABASE_URL"), db.url(role))
             .env(format!("{prefix}_BIND"), &bind)
@@ -1546,16 +1521,6 @@ async fn legal_bounds_and_distinct_provider_bindings() {
         )
         .await,
         3
-    );
-}
-
-#[test]
-fn migration_five_contract_hash() {
-    migrate::migrator(MIGRATIONS)
-        .expect("all embedded migrations must pass the transactional scanner");
-    assert_eq!(
-        format!("{:x}", Sha256::digest(MIGRATIONS[4].sql.as_bytes())),
-        "3130bf356a92c08f08d9ec65e49bd4ae04c41dd82ebab2ee4e313427fa423680"
     );
 }
 

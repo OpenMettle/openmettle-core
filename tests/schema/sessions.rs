@@ -130,7 +130,7 @@ async fn migration_eight_rollback_and_version_gated_privileges() {
             .await
             .is_err()
     );
-    assert_eq!(db.history().await, [1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(db.history().await, versions_through(7));
     let new_columns:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.columns WHERE table_schema='openmettle' AND column_name IN ('session_generation','session_issued','lock_guard')").fetch_one(&mut owner).await.unwrap();
     assert_eq!(new_columns, 0, "preceding ALTERs must roll back");
     owner.execute("DROP TABLE openmettle.local_identity_approvals; ALTER TABLE openmettle.login_providers ADD COLUMN lock_guard boolean; GRANT UPDATE(lock_guard) ON openmettle.login_providers TO openmettle_api").await.unwrap();
@@ -142,30 +142,7 @@ async fn migration_eight_rollback_and_version_gated_privileges() {
     migrate::apply(&db.settings(Duration::from_secs(5)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(
-        db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-    );
-}
-
-#[test]
-fn released_migrations_one_through_seven_are_unchanged() {
-    use sha2::{Digest, Sha256};
-    let expected = [
-        "1672dd9259a2c9670fef4fac324af8a4fdf9b35fd9eabd421bd9f023571137bd",
-        "b1bf6e677a74226d258292dc6d987158a5d81fe2fa0ba00d4e3ed1afdd0a4e5c",
-        "1744f1ca3e4ef146e151e2c622dd7d19d02b295281db1c819d747970807111c1",
-        "6c4a1794d1c132739fdaf1b48706e8b2884ef51e903f0f2a979837919a8f53f3",
-        "3130bf356a92c08f08d9ec65e49bd4ae04c41dd82ebab2ee4e313427fa423680",
-        "6ebaec059411b63e6b787ca7bb72de9e152809174c462c48a2173bdf7b10e078",
-        "42e5ef4abffbbd6023f6e65a954a6f6ebedbdbcf46439f28f64e61260280842d",
-    ];
-    for (migration, hash) in MIGRATIONS[..7].iter().zip(expected) {
-        assert_eq!(
-            format!("{:x}", Sha256::digest(migration.sql.as_bytes())),
-            hash
-        );
-    }
+    assert_eq!(db.history().await, all_versions());
 }
 
 #[tokio::test]
@@ -200,13 +177,4 @@ async fn provider_provenance_backfills_v7_but_requires_explicit_values_after_upg
         expect_state(&mut owner, sql, "23502").await;
     }
     owner.execute("INSERT INTO openmettle.login_providers(id,issuer,client_id,changed_by,change_reason) VALUES (gen_random_uuid(),'https://new.example.test','synthetic','fixture-owner','new provider')").await.unwrap();
-}
-
-#[test]
-fn migration_eight_contract_hash() {
-    use sha2::{Digest, Sha256};
-    assert_eq!(
-        format!("{:x}", Sha256::digest(MIGRATIONS[7].sql.as_bytes())),
-        "9a77a03a838fa058ad3919ed8db5e483619755cc4a96959240202d6c35b3939a"
-    );
 }

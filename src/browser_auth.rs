@@ -119,6 +119,11 @@ fn session_settled<T>(result: &Result<T, sessions::Error>) -> bool {
     }
 }
 
+/// One byte of a plain URL path: RFC 3986 unreserved characters and `/`.
+fn path_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"/-._~".contains(&b)
+}
+
 /// Exact match against configured provider UUIDs. Nothing else selects a provider. The
 /// service and the handoff's settings check (also run offline, ADR 0020) share this lookup.
 fn configured<'a>(providers: &'a [ManagedProvider], id: &str) -> Option<&'a ManagedProvider> {

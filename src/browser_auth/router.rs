@@ -33,6 +33,7 @@
 //! Admission state is per router value and shared by its clones. It is not keyed by client,
 //! trusts no forwarded header, never queues and spawns nothing.
 use super::handoff::{self, LoginHandoff};
+use super::path_byte;
 use axum::{
     Router,
     body::{Body, Bytes, HttpBody, to_bytes},
@@ -147,9 +148,7 @@ fn check_path(path: &str) -> Result<(), SettingsError> {
     let Some(rest) = path.strip_prefix('/') else {
         return Err(SettingsError::Path);
     };
-    let plain = rest
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b"/-._~".contains(&b))
+    let plain = rest.bytes().all(path_byte)
         && rest
             .split_terminator('/')
             .all(|segment| !matches!(segment, "" | "." | ".."));

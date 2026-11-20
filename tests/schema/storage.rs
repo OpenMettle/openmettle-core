@@ -1001,10 +1001,7 @@ async fn migration_four_failure_kill_timeout_and_concurrent_retry() {
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success(), "{}", stderr(&out));
     }
-    assert_eq!(
-        db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-    );
+    assert_eq!(db.history().await, all_versions());
     let singleton: (i64, Option<i64>) = sqlx::query_as(
         "SELECT count(*), max(instance_budget_bytes) FROM openmettle.storage_instance",
     )
@@ -1098,10 +1095,7 @@ async fn populated_v3_upgrade_and_authentic_v3_binaries() {
     migrate::apply(&db.settings(Duration::from_secs(10)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(
-        db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-    );
+    assert_eq!(db.history().await, all_versions());
     let after = (
         snapshot(&mut api, &tables).await,
         sqlx::query_scalar::<_, String>(events)
@@ -1147,13 +1141,7 @@ async fn populated_v3_upgrade_and_authentic_v3_binaries() {
     ] {
         let bind = address();
         let mut cmd = Command::new(old.join(name));
-        for (k, _) in std::env::vars_os() {
-            if k.to_string_lossy().starts_with("OPENMETTLE_")
-                || k.to_string_lossy().starts_with("PG")
-            {
-                cmd.env_remove(k);
-            }
-        }
+        scrub_env(&mut cmd);
         let child = cmd
             .env(format!("{prefix}_DATABASE_URL"), db.url(role))
             .env(format!("{prefix}_BIND"), &bind)
