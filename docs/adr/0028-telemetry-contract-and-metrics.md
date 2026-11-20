@@ -1,0 +1,97 @@
+# 0028 — Telemetry contract v1 and bounded operational metrics
+
+Status: proposed V1-29 increment 3 of 4, 20 November 2026. Agent-authored; implements the
+V1-29 increment plan recorded on #26. Owner approval of this record, independent review and
+CI acceptance are separate gates. Refs #26; Refs #34. #26 remains open.
+
+## Problem
+
+[ADR 0024](0024-process-telemetry-and-redaction.md) delivered structured stderr logging behind
+a default-deny callsite guard, and [ADR 0026](0026-otlp-trace-export.md) added opt-in
+OTLP/HTTP protobuf trace export over the ADR 0010 transport core. Neither yet provides a
+machine-checked versioned telemetry contract beside the API contract, bounded-cardinality
+aggregate metrics independent of sampled traces, or deterministic Prometheus alert rules for
+the base signals already present in `openmettle-core`.
+
+## Decision
+
+### Versioned telemetry contract
+
+`contracts/telemetry/v1.json` is the canonical telemetry contract for `openmettle-core`,
+versioned independently at `1.0.0` with pinned OpenTelemetry semantic conventions (`1.37.0`).
+It records:
+
+- Privacy and transport policy: inbound `traceparent` ignored, logs on stderr, HTTPS HTTP/1.1
+  protobuf OTLP export, retention ceiling defaults (traces 72 h, logs 7 d, metrics 14 d;
+  operator-confirmed per jurisdiction), disallowed metric label substrings, and fields excluded
+  from all telemetry.
+- The exact stderr log field allowlist (`telemetry::FIELDS`) and event catalog.
+- The exact trace span field allowlist (`telemetry::SPAN_FIELDS`) and span limits.
+- Every v1 metric: OTel name, Prometheus normalized name, instrument kind (`counter` or
+  `histogram`), unit, explicit histogram bucket bounds, closed label enum values, and exact
+  per-metric and total series ceilings.
+- Reserved future signal namespaces (`openmettle.runs.queue.age`,
+  `openmettle.runs.cancellations`, `openmettle.capacity.grants`,
+  `openmettle.storage.quota.drift`, `openmettle.backup.runs`), owned by V1-10, V1-11, V1-17,
+  V1-18 and V1-30 respectively.
+
+### Statically bounded metrics registry
+
+`src/telemetry/metrics.rs` provides a fixed-size, wait-free `Metrics` registry backed solely
+by pre-allocated `AtomicU64` counters and fixed-bucket histograms (`DURATION_BUCKETS`).
+
+- Every metric label is a closed Rust enum (`Method`, `RouteClass`, `StatusClass`,
+  `ReadinessOutcome`, `ProviderOperation`, `ProviderOutcome`, `StorageOperation`,
+  `StorageOutcome`, `DroppedSignal`). No `String`, raw path, user ID, scope ID, run ID, or
+  request ID can be supplied as a metric label.
+- Total worst-case series count across all 8 v1 metrics is fixed at compile time (`312` series
+  maximum across HTTP requests/duration, DB readiness checks/duration, provider HTTP
+  requests/duration, storage operations, and telemetry self-drops).
+- Histogram snapshots derive `count` from the sum of loaded bucket counts so the OTLP
+  invariant `count == sum(bucket_counts)` holds even under concurrent writers.
+
+### Opt-in OTLP/HTTP protobuf metrics export
+
+`telemetry::otlp::Settings::parse` reads four keys in order under the process prefix:
+`OTLP_TRACES_ENDPOINT`, `OTLP_METRICS_ENDPOINT`, `OTLP_CA_FILE`, `OTLP_PRIVATE_RANGES`.
+
+- Both endpoints default to unset (export off). When neither endpoint is set, `OTLP_CA_FILE`
+  and `OTLP_PRIVATE_RANGES` are refused just as in ADR 0026.
+- Either or both endpoints may be configured independently. Both share the loaded CA trust
+  bundle, private CIDR allowlist, and the 2-slot exporter DNS semaphore.
+- When `OTLP_METRICS_ENDPOINT` is set, one Tokio task periodically snapshots non-zero
+  cumulative metrics, encodes `ExportMetricsServiceRequest` via `opentelemetry-proto`
+  (`metrics` feature enabled with zero new crates in `Cargo.lock`), and POSTs with
+  `Content-Type: application/x-protobuf` over the ADR 0010 `Route`.
+- Failures (non-2xx, timeout, DNS/TLS/transport error, or oversized body) drop the export
+  cycle without retry, increment `openmettle.telemetry.dropped{signal="metric_exports"}`, and
+  emit one `telemetry.dropped` event with `dropped_metric_exports` to stderr.
+- On shutdown, trace and metrics export tasks drain concurrently within the existing half-slice
+  of `shutdown_budget` and are aborted on deadline expiry.
+
+### Deterministic alert rules
+
+`contracts/telemetry/alerts-v1.yaml` defines Prometheus alert rules strictly over the v1
+metrics emitted today: `OpenMettleApiHighServerErrorRatio`,
+`OpenMettleDatabaseReadinessFailing`, `OpenMettleTelemetryDropsDetected`, and
+`OpenMettleProviderTransportFailures`. Live Prometheus/Alloy `promtool` and collector-outage
+qualification remain V1-29 increment 4 (`kind` qualification).
+
+## Dependencies
+
+Enabling `metrics` on `opentelemetry-proto = "=0.33.1"` activates only crates already locked
+in `Cargo.lock` (`futures-channel`, `futures-executor`, `futures-util`, `thiserror`). No new
+package enters `Cargo.lock`, and the ADR 0026 banned-crate guard in
+`scripts/check_repository.py` remains unchanged.
+
+## Verification
+
+- `tests/telemetry_contract.rs` verifies 1:1 bijective equality between
+  `contracts/telemetry/v1.json` and compiled Rust constants (`FIELDS`, `SPAN_FIELDS`,
+  `metrics::DESCRIPTORS`, bucket bounds, closed label values, and series ceilings), verifies
+  zero disallowed/ID label names, and checks that every metric and label referenced in
+  `contracts/telemetry/alerts-v1.yaml` is declared in `contracts/telemetry/v1.json`.
+- `src/telemetry/tests/otlp.rs` exercises `OTLP_METRICS_ENDPOINT` configuration parsing,
+  end-to-end HTTPS OTLP/HTTP protobuf metrics export against an in-process synthetic-CA
+  collector, protobuf decoding of `ExportMetricsServiceRequest`, and stalled/failing collector
+  drop reporting within bounded shutdown.

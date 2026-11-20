@@ -1,0 +1,60 @@
+# Deterministic Prometheus alert rules for OpenMettle telemetry contract v1 (ADR 0028).
+# Every metric and label referenced here is defined in contracts/telemetry/v1.json.
+# No user, scope, run, or request identifier may appear in alert expressions or labels.
+groups:
+  - name: openmettle-core-v1
+    interval: 30s
+    rules:
+      - alert: OpenMettleApiHighServerErrorRatio
+        expr: |
+          (
+            sum(rate(openmettle_http_server_requests_total{http_response_status_class="5xx"}[5m]))
+            /
+            clamp_min(sum(rate(openmettle_http_server_requests_total[5m])), 1e-9)
+          ) > 0.05
+          and
+          sum(increase(openmettle_http_server_requests_total{http_response_status_class="5xx"}[5m])) >= 5
+        for: 5m
+        labels:
+          severity: warning
+          service: openmettle-api
+          signal_contract: v1
+        annotations:
+          summary: "OpenMettle HTTP 5xx error ratio exceeded 5%"
+          description: "More than 5% of completed HTTP requests returned 5xx over the last 5 minutes."
+
+      - alert: OpenMettleDatabaseReadinessFailing
+        expr: |
+          sum by (outcome) (increase(openmettle_db_readiness_checks_total{outcome!="ok"}[5m])) >= 3
+        for: 2m
+        labels:
+          severity: critical
+          service: openmettle-core
+          signal_contract: v1
+        annotations:
+          summary: "OpenMettle database readiness checks are failing"
+          description: "Readiness probe /readyz recorded repeated non-ok database checks."
+
+      - alert: OpenMettleTelemetryDropsDetected
+        expr: |
+          sum by (signal) (increase(openmettle_telemetry_dropped_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: openmettle-core
+          signal_contract: v1
+        annotations:
+          summary: "OpenMettle telemetry drops detected"
+          description: "The bounded stderr sink or OTLP exporter dropped telemetry items due to queue saturation or collector unavailability."
+
+      - alert: OpenMettleProviderTransportFailures
+        expr: |
+          sum by (operation, outcome) (increase(openmettle_provider_http_requests_total{outcome!="ok"}[5m])) >= 3
+        for: 5m
+        labels:
+          severity: warning
+          service: openmettle-api
+          signal_contract: v1
+        annotations:
+          summary: "OpenMettle identity provider transport failures"
+          description: "Repeated outbound OIDC provider HTTP requests failed over the ADR 0010 transport."

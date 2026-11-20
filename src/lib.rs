@@ -159,15 +159,31 @@ struct Health {
 }
 
 async fn ready(State(state): State<Health>) -> (StatusCode, &'static str) {
-    match tokio::time::timeout(
+    let started = std::time::Instant::now();
+    let (status, body, outcome) = match tokio::time::timeout(
         state.timeout,
         sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(&state.pool),
     )
     .await
     {
-        Ok(Ok(1)) => (StatusCode::OK, "ready\n"),
-        _ => (StatusCode::SERVICE_UNAVAILABLE, "not ready\n"),
-    }
+        Ok(Ok(1)) => (
+            StatusCode::OK,
+            "ready\n",
+            telemetry::metrics::ReadinessOutcome::Ok,
+        ),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not ready\n",
+            telemetry::metrics::ReadinessOutcome::Timeout,
+        ),
+        Ok(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not ready\n",
+            telemetry::metrics::ReadinessOutcome::Error,
+        ),
+    };
+    telemetry::metrics::global().record_db_readiness(outcome, started.elapsed());
+    (status, body)
 }
 
 /// Runs a serving process on a two-worker Tokio runtime and returns its exit code. The

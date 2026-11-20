@@ -69,7 +69,7 @@ tracing-subscriber = { version = "=0.3.23", default-features = false, features =
 # (Apache-2.0) and github.com/tokio-rs/tracing-opentelemetry (MIT).
 opentelemetry = { version = "=0.33.1", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "=0.33.1", default-features = false, features = ["trace"] }
-opentelemetry-proto = { version = "=0.33.1", default-features = false, features = ["gen-tonic-messages", "trace"] }
+opentelemetry-proto = { version = "=0.33.1", default-features = false, features = ["gen-tonic-messages", "trace", "metrics"] }
 tracing-opentelemetry = { version = "=0.34.0", default-features = false }
 # `Message::encode_to_vec` for the generated request; already locked through opentelemetry-proto.
 prost = { version = "=0.14.6", default-features = false }
