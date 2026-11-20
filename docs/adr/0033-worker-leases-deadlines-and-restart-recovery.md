@@ -198,18 +198,22 @@ claimed row is ever without a lease.
 
 ```sql
 UPDATE openmettle.runs
-   SET lease_expires_at = least(clock_timestamp() + $3 * interval '1 millisecond',
-                                execution_expires_at)
+   SET lease_expires_at = greatest(lease_expires_at,
+                                   least(clock_timestamp() + $3 * interval '1 millisecond',
+                                         execution_expires_at))
  WHERE scope_id = $1::uuid AND id = $2::uuid
 RETURNING state, cancel_reason, <lease ms>, <execution ms>
 ```
 
-Renewal never extends past `execution_expires_at`, never shortens a lease, and never revives a
-lapsed one: after `Expired`, only recovery takes the run, under a new token. Renewal is also how
-a holder learns of a cancellation, within `L/3`.
+Renewal never extends past `execution_expires_at`, never shortens a lease (the `greatest`), and
+never revives a lapsed one: after `Expired`, only recovery takes the run, under a new token.
+Renewal is also how a holder learns of a cancellation, within `L/3`.
 
-`release_lease(c, &Lease)` sets `lease_expires_at = clock_timestamp()` after a `Hold` fence. A
-draining worker uses it so another worker can re-claim at once instead of after `L`.
+`release_lease(c, &Lease)` sets `lease_expires_at = least(clock_timestamp(),
+execution_expires_at)` after a `Hold` fence. `clock_timestamp()` advances between the fence and
+the `UPDATE`, so when renewal has capped the lease at `execution_expires_at`, a bare
+`clock_timestamp()` could pass that deadline and fail `runs_lease_check` (`23514`). A draining
+worker uses it so another worker can re-claim at once instead of after `L`.
 
 **Only the worker renews.** The API has no `UPDATE` on `lease_expires_at` or
 `execution_expires_at`. No client request, SSE heartbeat, reconnect or event append extends a
@@ -231,19 +235,23 @@ UPDATE openmettle.runs
        cancel_reason = coalesce(cancel_reason, $3)
  WHERE scope_id = $1::uuid AND id = $2::uuid
    AND state NOT IN ('succeeded', 'failed', 'cancelled', 'interrupted')
-RETURNING new.state, old.cancel_reason IS NULL
+   AND (state IN ('queued', 'waiting') OR cancel_reason IS NULL)
+RETURNING state
 ```
 
-`RETURNING old.…` is PostgreSQL 18, the only qualified major version (ADR 0003). The bulk forms
-keep their ordered `MATERIALIZED` lock and return `(scope_id, id, new.state, old.cancel_reason
-IS NULL)`.
+The last predicate skips executing rows that already carry a reason, so a repeat `cancel_run`
+and a bulk revocation over already-`cancelling` or `reconciling` runs update no row. Every
+executing row this statement updates therefore had no reason before it. The bulk forms keep
+their ordered `MATERIALIZED` lock and return `(scope_id, id, state)`. When no row updates,
+`cancel_run` classifies the row it has already locked and read, as `src/authz/runs.rs` does
+today: `Requested { state }`, `Terminal { state }`, or not found.
 
 - `queued` or `waiting` becomes `cancelled` with its terminal event, as before. A waiting run
   holds no worker and no unresolved operation (a precondition V1-13 must keep), so nothing can be
   in flight.
-- `running` becomes `cancelling`; `reconciling` stays `reconciling`. If this statement set the
-  reason, it appends `openmettle.run-cancel-requested` v1 `{"reason":"<reason>"}` under the
-  append key `cancel-requested`. The holder settles the run.
+- `running` becomes `cancelling`; `reconciling` stays `reconciling`. For each such row it
+  updates (each had no reason), it appends `openmettle.run-cancel-requested` v1
+  `{"reason":"<reason>"}` under the append key `cancel-requested`. The holder settles the run.
 - `cancel_run` returns `CancelOutcome::{Cancelled, Requested { state }, Terminal { state }}`;
   `Requested` replaces `Executing` and is idempotent: a repeat writes nothing and appends nothing.
   V1-07 maps `Requested` to `202`.
@@ -293,7 +301,7 @@ execution time remaining, the first matching rule decides:
 | 3 | `reconciling`, `Stopped`, `n > 0` | `interrupted` | `openmettle.run-interrupted` v1 `{"unresolved":n}` |
 | 4 | `reconciling`, `Stopped`, `n = 0`, `r` set | `cancelled` | `openmettle.run-cancelled` v1 `{"reason":"<r>"}` |
 | 5 | `reconciling`, `Stopped`, `n = 0` | `interrupted` | `openmettle.run-interrupted` v1 `{"unresolved":0}` |
-| 6 | `n > 0`, `E > L` | `reconciling` (not terminal) | None |
+| 6 | `n > 0`, `E > L` | `reconciling` (not terminal) | None; instead `openmettle.run-reconciling` v1 `{"unresolved":n}` under `run-reconciling` |
 | 7 | `n > 0`, `E ≤ L` | `interrupted` | `openmettle.run-interrupted` v1 `{"unresolved":n}` |
 | 8 | `n = 0`, `r` set | `cancelled` | `openmettle.run-cancelled` v1 `{"reason":"<r>"}` |
 | 9 | `Failed(reason)`, `n = 0` | `failed` | `openmettle.run-failed` v1 `{"reason":"step_failed"}` or `{"reason":"round_limit"}` |
@@ -303,6 +311,11 @@ execution time remaining, the first matching rule decides:
 Payloads are exact bytes with no white space; `n` is a decimal integer. Every terminal result
 sets `wait_reason = NULL` and appends its event in the same transaction. The unique
 `(run_id, append_key)` keeps one terminal event per run whichever path writes it.
+
+Rule 6 is the only non-terminal state change. It applies only from `running` or `cancelling`,
+because rules 3 to 5 take every `reconciling` row first, so a run enters `reconciling` at most
+once and `run-reconciling` is appended at most once, in the same transaction. Every `runs.state`
+change in this ADR thus writes exactly one event with it.
 
 - **Succeeded wins over a late cancellation.** If all work finished, reporting `cancelled` would
   be false; cancellation is not rollback.
@@ -357,7 +370,7 @@ UPDATE openmettle.runs r
        wait_reason = NULL
   FROM due LEFT JOIN unresolved u ON u.run_id = due.id
  WHERE r.id = due.id
-RETURNING r.scope_id::text, r.id::text, new.state, r.cancel_reason, coalesce(u.n, 0)
+RETURNING r.scope_id::text, r.id::text, r.state, r.cancel_reason, coalesce(u.n, 0)
 ```
 
 The `CASE` is the settlement table with `Stopped` and no time left (rules 3, 4, 5, 7, 8, 10).
@@ -384,11 +397,14 @@ UPDATE openmettle.runs r
 RETURNING <ClaimedRun columns>, r.state, r.cancel_reason
 ```
 
-It appends `openmettle.run-claimed` under `claim:<new token>` and returns
+It appends `openmettle.run-reclaimed` v1 `{}` under `reclaim:<new token>` and returns
 `Reclaimed { run: ClaimedRun, state: ExecState, cancel: Option<CancelReason> }`. The state and
 `execution_expires_at` are unchanged, so the run keeps its executing slot and its deadline; no
 executing count changes and no dispatch lock is taken. A run with a lapsed lease and at most one
 lease of execution left is not re-claimed; `settle_expired` takes it once the deadline passes.
+`openmettle.run-claimed` stays reserved for the initial `queued` → `running` dispatch, which
+ADR 0034 maps to `run.started`; `run-reclaimed` is internal and hidden on `/v1`, so a restart or
+takeover, including of a `cancelling` or `reconciling` run, emits no second `run.started`.
 
 The re-claimer then decides from durable state only:
 
@@ -585,7 +601,9 @@ PR2 tests use the disposable PostgreSQL fixture and backdate lease and deadline 
 owner rather than waiting:
 
 - **Duplicate claims.** Concurrent `claim_next` and `reclaim_next` callers never hold one run
-  twice; each claim has a distinct token and exactly one `claim:<token>` event.
+  twice; each claim has a distinct token and exactly one event: `openmettle.run-claimed` under
+  `claim:<token>` for `claim_next`, `openmettle.run-reclaimed` under `reclaim:<token>` for
+  `reclaim_next`. A re-claimed run never gains a second `run-claimed` event.
 - **Stale worker.** A claims; its lease lapses; B re-claims and settles `succeeded`. A's later
   intent, observation, renewal and `settle` each return `StaleClaim` and change nothing; the run
   has one terminal event. Without B, A gets `Expired` and cannot renew.
@@ -596,15 +614,16 @@ owner rather than waiting:
   `Requested` with no write; renewal reports it; `settle(Stopped)` gives `cancelled`
   `{"reason":"requested"}`. `waiting` and `queued` → `cancelled`. Cancel racing
   `settle(Succeeded)` produces exactly one terminal state. Archive and disable move `running` to
-  `cancelling` with `{"reason":"revoked"}`.
+  `cancelling` with `{"reason":"revoked"}`; repeating either over `cancelling` or
+  `reconciling` runs updates no row and appends nothing.
 - **Swallowed cancellation and orphan work.** After a cancellation, a `Step` write is
   `Stopping`; after settlement or lapse, every write is refused; an observation for an in-flight
   effect is still accepted while `cancelling`.
 - **No blind replay.** A `non_repeatable` or `lookup` operation in `intent` or `outcome_unknown`
-  makes `Succeeded` fail, `Stopped` give `reconciling`, and `settle_expired` give
-  `{"unresolved":1}`; the operation row is unchanged and no intent is added. Replay-safe
-  operations alone let a re-claimed `running` run resume, and `record_intent` with the same key
-  returns the same operation.
+  makes `Succeeded` fail, `Stopped` give `reconciling` with one `run-reconciling` event, and
+  `settle_expired` give `{"unresolved":1}`; the operation row is unchanged and no intent is
+  added. Replay-safe operations alone let a re-claimed `running` run resume, and `record_intent`
+  with the same key returns the same operation.
 - **Deadlines.** `settle_expired` fails a lapsed run with no operations as `deadline_exceeded`
   and settles a populated version 19 claim. API reads, cancellation and event appends never move
   `lease_expires_at`; API `UPDATE` of either lease column is refused (42501).
