@@ -111,6 +111,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "artifact revision display name",
         sql: include_str!("../migrations/0017_artifact_revision_display_name.sql"),
     },
+    Source {
+        version: 18,
+        description: "session issuance role",
+        sql: include_str!("../migrations/0018_session_issuance_role.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.
@@ -122,8 +127,10 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// Connection settings, then telemetry settings, under the same prefix.
+    /// Connection settings, then telemetry settings, under the same prefix. The API's
+    /// issuance credential is refused first: the migrator never reads it (ADR 0030).
     fn load() -> Result<(Self, telemetry::Settings), &'static str> {
+        crate::refuse_issuance_url()?;
         let get = |key: &str| match std::env::var(format!("OPENMETTLE_MIGRATE_{key}")) {
             Ok(value) => Ok(Some(value)),
             Err(std::env::VarError::NotPresent) => Ok(None),

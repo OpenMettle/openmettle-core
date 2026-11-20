@@ -40,7 +40,9 @@ async fn function_contract(owner: &mut PgConnection) -> Vec<Contract> {
     .unwrap()
 }
 /// Owner, security mode, pinned search path and the complete effective ACL of both functions.
-fn contract(redemption: &str) -> Vec<Contract> {
+/// `caller` holds the redemption grant: the API role until version 18, then the issuance role
+/// (ADR 0030).
+fn contract(redemption: &str, caller: &str) -> Vec<Contract> {
     let owned = |name: &str, definer: bool, acl: &[&str]| {
         (
             name.to_owned(),
@@ -60,7 +62,7 @@ fn contract(redemption: &str) -> Vec<Contract> {
             redemption,
             true,
             &[
-                "openmettle_api EXECUTE by openmettle_owner",
+                &format!("{caller} EXECUTE by openmettle_owner"),
                 "openmettle_owner EXECUTE by openmettle_owner",
             ],
         ),
@@ -101,7 +103,7 @@ async fn upgrades_preserve_state_and_allow_exactly_one_redemption_signature_per_
 
     // Schema 12: only the code-less function, and the boundary check refuses the other one.
     migrate::apply(&settings, v12).await.unwrap();
-    assert_eq!(function_contract(&mut owner).await, contract(CODELESS));
+    assert_eq!(function_contract(&mut owner).await, contract(CODELESS, API));
     stub(&mut owner, CODED).await;
     let violation = |signature: &str| format!("openmettle_api has EXECUTE on function {signature}");
     refused_with(&settings, v12, &violation(CODED)).await;
@@ -116,13 +118,33 @@ async fn upgrades_preserve_state_and_allow_exactly_one_redemption_signature_per_
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
     assert_eq!(MIGRATIONS[INVITATIONS].version, 13);
     let current = first_approval::everything(&db).await;
+    // Migration 18 adds only the inert users.lock_guard, false on every earlier row.
+    let without_guard = |rows: &BTreeSet<String>| -> BTreeSet<String> {
+        rows.iter()
+            .map(|row| {
+                let mut row: serde_json::Value = serde_json::from_str(row).unwrap();
+                let object = row.as_object_mut().unwrap();
+                if let Some(guard) = object.remove("lock_guard") {
+                    assert_eq!(guard, serde_json::json!(false));
+                }
+                row.to_string()
+            })
+            .collect()
+    };
     for (table, rows) in previous {
         if table != "_sqlx_migrations" {
-            assert_eq!(rows, current[&table], "{table}");
+            assert_eq!(
+                without_guard(&rows),
+                without_guard(&current[&table]),
+                "{table}"
+            );
         }
     }
     assert!(current["home_invitations"].is_empty());
-    assert_eq!(function_contract(&mut owner).await, contract(CODED));
+    assert_eq!(
+        function_contract(&mut owner).await,
+        contract(CODED, ISSUANCE)
+    );
     let trigger: (bool, bool, bool, String) = sqlx::query_as(
         "SELECT tgconstraint <> 0, tgdeferrable, tginitdeferred, tgfoid::regprocedure::text
            FROM pg_trigger WHERE tgrelid = 'openmettle.home_invitations'::regclass
@@ -132,7 +154,7 @@ async fn upgrades_preserve_state_and_allow_exactly_one_redemption_signature_per_
     .await
     .unwrap();
     assert_eq!(trigger, (true, true, true, GATE.into()));
-    for role in [API, WORKER, CAPPED, "public"] {
+    for role in [API, ISSUANCE, WORKER, CAPPED, "public"] {
         let privileges: (bool,bool,bool,bool) = sqlx::query_as("SELECT
             has_function_privilege($1, 'openmettle.redeem_home_invitation(uuid,text,text,text,bigint,bytea)', 'EXECUTE'),
             has_function_privilege($1, 'openmettle.check_home_redemption()', 'EXECUTE'),
@@ -140,14 +162,21 @@ async fn upgrades_preserve_state_and_allow_exactly_one_redemption_signature_per_
             OR has_any_column_privilege($1,'openmettle.home_invitations','SELECT,INSERT,UPDATE,REFERENCES'),
             has_any_column_privilege($1, 'openmettle.local_identity_approvals', 'INSERT')")
             .bind(role).fetch_one(&mut owner).await.unwrap();
+        // From version 18 only the issuance role redeems (ADR 0030).
         assert_eq!(
             privileges,
-            (role == API || role == CAPPED, false, false, false),
+            (role == ISSUANCE, false, false, false),
             "{role}"
         );
     }
-    // The API role can neither read the stored hash nor reach a code-less redemption.
+    // The API role can neither read the stored hash nor reach either redemption function.
     let mut api = connect(&db.0, API).await;
+    expect_state(
+        &mut api,
+        "SELECT * FROM openmettle.redeem_home_invitation('00000000-0000-0000-0000-0000000000c1'::uuid, 'i'::text, 's'::text, 'l'::text, 1::bigint, '\\x00'::bytea)",
+        "42501",
+    )
+    .await;
     expect_state(
         &mut api,
         "SELECT code_hash FROM openmettle.home_invitations",
@@ -173,6 +202,10 @@ async fn upgrades_preserve_state_and_allow_exactly_one_redemption_signature_per_
         (
             format!("GRANT EXECUTE ON FUNCTION {CODED} TO openmettle_worker"),
             format!("REVOKE EXECUTE ON FUNCTION {CODED} FROM openmettle_worker"),
+        ),
+        (
+            format!("GRANT EXECUTE ON FUNCTION {CODED} TO openmettle_api"),
+            format!("REVOKE EXECUTE ON FUNCTION {CODED} FROM openmettle_api"),
         ),
         (
             format!("GRANT EXECUTE ON FUNCTION {CODED} TO PUBLIC"),
@@ -213,7 +246,7 @@ async fn migration_14_keeps_the_redemption_contract_and_gates_the_native_grants(
     let v13 = &MIGRATIONS[..NATIVE];
     migrate::apply(&settings, v13).await.unwrap();
     let mut owner = connect(&db.0, OWNER).await;
-    assert_eq!(function_contract(&mut owner).await, contract(CODED));
+    assert_eq!(function_contract(&mut owner).await, contract(CODED, API));
     let body = "SELECT position('openmettle/native-managed-login/1' IN prosrc) > 0,
                        position('openmettle/managed-login/2' IN prosrc) > 0
                   FROM pg_proc WHERE oid = 'openmettle.redeem_home_invitation(uuid,text,text,text,bigint,bytea)'::regprocedure";
@@ -245,13 +278,17 @@ async fn migration_14_keeps_the_redemption_contract_and_gates_the_native_grants(
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
     assert_eq!(MIGRATIONS[NATIVE].version, 14);
     assert_eq!(db.history().await, all_versions());
-    assert_eq!(function_contract(&mut owner).await, contract(CODED));
+    assert_eq!(
+        function_contract(&mut owner).await,
+        contract(CODED, ISSUANCE)
+    );
     let layouts: (bool, bool) = sqlx::query_as(body).fetch_one(&mut owner).await.unwrap();
     assert_eq!(layouts, (true, true), "schema 14 admits both layouts");
 
-    // The API role reads rows, inserts whole rows and clears one column. Nobody else, and
-    // nothing more: no other update, no delete and no table-wide write.
-    for role in [API, WORKER, CAPPED, "public"] {
+    // The API role reads rows and clears one column; from version 18 only the issuance role
+    // inserts whole rows (ADR 0030). Nobody else, and nothing more: no other update, no delete
+    // and no table-wide write.
+    for role in [API, ISSUANCE, WORKER, CAPPED, "public"] {
         let privileges: (bool, bool, bool, bool, bool) = sqlx::query_as(AssertSqlSafe(format!(
             "SELECT has_table_privilege($1, '{TABLE}', 'SELECT'),
                 (SELECT bool_and(has_column_privilege($1, '{TABLE}', a.attname::text, 'INSERT'))
@@ -268,7 +305,11 @@ async fn migration_14_keeps_the_redemption_contract_and_gates_the_native_grants(
         .await
         .unwrap();
         let api = role == API || role == CAPPED;
-        assert_eq!(privileges, (api, api, api, false, false), "{role}");
+        assert_eq!(
+            privileges,
+            (api, role == ISSUANCE, api, false, false),
+            "{role}"
+        );
     }
     let columns: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
         "SELECT attname::text FROM pg_attribute WHERE attrelid = '{TABLE}'::regclass
@@ -350,7 +391,7 @@ async fn pending_invitation_without_a_code_blocks_migration_13_until_withdrawn()
     // Rolled back whole: history, every row, the code-less function and the table shape.
     assert_eq!(db.history().await, versions_through(12));
     assert_eq!(first_approval::everything(&db).await, before);
-    assert_eq!(function_contract(&mut owner).await, contract(CODELESS));
+    assert_eq!(function_contract(&mut owner).await, contract(CODELESS, API));
     let hash_columns = "SELECT count(*) FROM pg_attribute WHERE attname = 'code_hash'
         AND attrelid = 'openmettle.home_invitations'::regclass AND NOT attisdropped";
     let columns: i64 = sqlx::query_scalar(hash_columns)
@@ -369,7 +410,10 @@ async fn pending_invitation_without_a_code_blocks_migration_13_until_withdrawn()
     assert!(out.status.success(), "{}", stderr(&out));
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
     assert_eq!(db.history().await, all_versions());
-    assert_eq!(function_contract(&mut owner).await, contract(CODED));
+    assert_eq!(
+        function_contract(&mut owner).await,
+        contract(CODED, ISSUANCE)
+    );
     // Both closed decisions survive, with no code and no way to become pending again.
     let rows: Vec<(String, bool, bool)> = sqlx::query_as(
         "SELECT id::text, withdrawn_at IS NOT NULL, code_hash IS NULL

@@ -1120,12 +1120,13 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
         api.execute("INSERT INTO openmettle.login_nonce_reservations (key_id, nonce) VALUES ('upgrade-key', decode(repeat('01', 12), 'hex'))").await.unwrap();
         api.execute("INSERT INTO openmettle.login_transactions (id,binding,expires_ms,state_hash,nonce_hash,caller_hash,key_id,nonce,ciphertext) VALUES (repeat('a', 43), 'synthetic-binding'::bytea, 1, decode(repeat('02', 32), 'hex'), decode(repeat('03', 32), 'hex'), decode(repeat('04', 32), 'hex'), 'upgrade-key', decode(repeat('01', 12), 'hex'), decode(repeat('05', 59), 'hex'))").await.unwrap();
     }
-    // Version 8 removed the provider provenance defaults; its writers must supply them.
+    // Version 8 removed the provider provenance defaults; its writers must supply them. The
+    // provider issues the fixture identity, so the retained session below validates.
     let with_sessions = versions.contains(&8);
     if with_sessions {
-        owner.execute("INSERT INTO openmettle.login_providers(id,issuer,client_id,changed_by,change_reason) VALUES ('00000000-0000-0000-0000-000000000007','https://upgrade.example.test','synthetic','fixture-owner','synthetic provider'); INSERT INTO openmettle.login_provider_revisions(provider_id,revision) VALUES ('00000000-0000-0000-0000-000000000007','v1')").await.unwrap();
+        owner.execute("INSERT INTO openmettle.login_providers(id,issuer,client_id,changed_by,change_reason) VALUES ('00000000-0000-0000-0000-000000000007','https://issuer.example.test','synthetic','fixture-owner','synthetic provider'); INSERT INTO openmettle.login_provider_revisions(provider_id,revision) VALUES ('00000000-0000-0000-0000-000000000007','v1')").await.unwrap();
     } else if versions.contains(&7) {
-        owner.execute("INSERT INTO openmettle.login_providers(id,issuer,client_id) VALUES ('00000000-0000-0000-0000-000000000007','https://upgrade.example.test','synthetic'); INSERT INTO openmettle.login_provider_revisions(provider_id,revision) VALUES ('00000000-0000-0000-0000-000000000007','v1')").await.unwrap();
+        owner.execute("INSERT INTO openmettle.login_providers(id,issuer,client_id) VALUES ('00000000-0000-0000-0000-000000000007','https://issuer.example.test','synthetic'); INSERT INTO openmettle.login_provider_revisions(provider_id,revision) VALUES ('00000000-0000-0000-0000-000000000007','v1')").await.unwrap();
     }
     // Populate the v10-only domain before upgrading the authentic predecessor.
     let recovery_before = if versions.contains(&10) {
@@ -1155,13 +1156,15 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
     ];
     if with_sessions {
         // An owner approval, an issued gate and its retained session, written through the
-        // version-8 owner and API grants, plus an advanced user session generation.
+        // version-8 owner and API grants, plus an advanced user session generation. The
+        // session's digest is the ADR 0013 browser digest of SESSION_SECRET (`sessions::digest`),
+        // and it records the advanced generation, so it is valid before and after upgrading.
         owner.execute("INSERT INTO openmettle.local_identity_approvals(id,provider_id,identity_id,active,expires_ms,changed_by,change_reason) SELECT '00000000-0000-0000-0000-0000000000a8','00000000-0000-0000-0000-000000000007',id,true,4102444800000,'fixture-owner','synthetic approval' FROM openmettle.user_identities WHERE subject='synthetic-subject'").await.unwrap();
         let mut api = connect(&db.0, API).await;
         api.execute("INSERT INTO openmettle.login_nonce_reservations (key_id, nonce) VALUES ('upgrade-key', decode(repeat('06', 12), 'hex'))").await.unwrap();
         api.execute("INSERT INTO openmettle.login_transactions (id,binding,expires_ms,state_hash,nonce_hash,caller_hash,key_id,nonce,ciphertext) VALUES (repeat('b', 43), 'synthetic-binding'::bytea, 4102444800000, decode(repeat('07', 32), 'hex'), decode(repeat('08', 32), 'hex'), decode(repeat('09', 32), 'hex'), 'upgrade-key', decode(repeat('06', 12), 'hex'), decode(repeat('05', 59), 'hex'))").await.unwrap();
         api.execute("UPDATE openmettle.login_transactions SET consumed=true,ciphertext=NULL,session_issued=true WHERE id=repeat('b', 43)").await.unwrap();
-        api.execute("INSERT INTO openmettle.local_sessions(id,secret_hash,login_id,provider_id,identity_id,approval_id,user_id,issued_client,issued_epoch,issued_revision,provider_generation,approval_generation,user_generation,created_ms,expires_ms) SELECT repeat('s', 43),decode(repeat('0a', 32), 'hex'),repeat('b', 43),a.provider_id,a.identity_id,a.id,i.user_id,'synthetic',(SELECT max(epoch) FROM openmettle.login_provider_revisions),1,0,0,0,1,4102444800000 FROM openmettle.local_identity_approvals a JOIN openmettle.user_identities i ON i.id=a.identity_id").await.unwrap();
+        api.execute("INSERT INTO openmettle.local_sessions(id,secret_hash,login_id,provider_id,identity_id,approval_id,user_id,issued_client,issued_epoch,issued_revision,provider_generation,approval_generation,user_generation,created_ms,expires_ms) SELECT repeat('s', 43),sha256(convert_to('openmettle/session-secret/1','UTF8') || decode('00','hex') || int8send(43) || convert_to(repeat('s', 43),'UTF8') || int8send(32) || decode(repeat('0a', 32), 'hex')),repeat('b', 43),a.provider_id,a.identity_id,a.id,i.user_id,'synthetic',(SELECT max(epoch) FROM openmettle.login_provider_revisions),1,0,0,1,1,4102444800000 FROM openmettle.local_identity_approvals a JOIN openmettle.user_identities i ON i.id=a.identity_id").await.unwrap();
         api.execute("UPDATE openmettle.users SET session_generation=1 WHERE id IN (SELECT user_id FROM openmettle.user_identities WHERE subject='synthetic-subject')").await.unwrap();
     }
     // Populate the v11-only domain (enrollment, rule, grant and observation) for the approval
@@ -1464,6 +1467,20 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
     }
     assert_eq!(membership_snapshot(&db).await, membership_before);
     assert_eq!(invitation_snapshot(&db).await, invitations_before);
+    if with_sessions {
+        // Migration 18 (ADR 0030) keeps every session row, and the one issued before the
+        // upgrade still validates as the API role. Its secret is 32 bytes of 0x0a.
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use openmettle_core::sessions;
+        assert_eq!(session_snapshot().await, sessions_before);
+        let credential = format!("{}.{}", "s".repeat(43), URL_SAFE_NO_PAD.encode([0x0a; 32]));
+        let policy =
+            sessions::Policy::new(Duration::from_secs(60), 16, Duration::from_secs(10)).unwrap();
+        let context = sessions::validate(&mut connect(&db.0, API).await, &credential, &policy)
+            .await
+            .unwrap();
+        assert_eq!(context.user_id(), c.actor);
+    }
     let full: Vec<String> =
         sqlx::query_scalar("SELECT t::text FROM openmettle._sqlx_migrations t ORDER BY version")
             .fetch_all(&mut db.admin().await)
@@ -1624,9 +1641,10 @@ async fn grant_snapshot(db: &TestDb) -> Vec<String> {
         "grant_changes",
     ] {
         // Migration 16 only adds grantee columns: 'user' and NULLs on every earlier row.
+        // Migration 18 only adds the inert rule lock guard: false on every row.
         let rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
             "SELECT (to_jsonb(t) - 'grantee_kind' - 'grantee_local_group_id'
-                     - 'grantee_oidc_group_id')::text FROM openmettle.{table} t ORDER BY 1"
+                     - 'grantee_oidc_group_id' - 'lock_guard')::text FROM openmettle.{table} t ORDER BY 1"
         )))
         .fetch_all(&mut db.admin().await)
         .await

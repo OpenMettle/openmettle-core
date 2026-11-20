@@ -3,12 +3,15 @@
 -- $1: the highest successfully applied migration version (0 before migration 1). Migration 1
 -- revokes the PUBLIC database/public-schema defaults, which are tolerated only before that.
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
--- Principals are openmettle_api, openmettle_worker, every role that is directly or indirectly
--- a member of either (for example their login roles), and PUBLIC. They may hold only the
--- privileges in `contract`, CONNECT on the database and USAGE on schema openmettle.
+-- Principals are openmettle_api, openmettle_issuance, openmettle_worker, every role that is
+-- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
+-- They may hold only the privileges in `contract`, CONNECT on the database and USAGE on schema
+-- openmettle. openmettle_issuance (ADR 0030) is required from version 18; before that an
+-- existing one has an empty contract, and version 18 moves the session issuance writes to it.
 WITH RECURSIVE
 privilege_roles AS (
-    SELECT oid FROM pg_roles WHERE rolname IN ('openmettle_api', 'openmettle_worker')
+    SELECT oid FROM pg_roles
+    WHERE rolname IN ('openmettle_api', 'openmettle_issuance', 'openmettle_worker')
 ),
 owner_role AS (
     SELECT oid FROM pg_roles WHERE rolname = 'openmettle_owner'
@@ -82,6 +85,14 @@ contract (relation, role, privilege) AS (
         ('local_identity_approvals'), ('local_sessions')
     ) AS sessions(relation) WHERE $1 >= 8
     UNION ALL
+    -- ADR 0030: the reads of the session issuance transaction.
+    SELECT relation, 'openmettle_issuance', 'SELECT' FROM (VALUES
+        ('login_transactions'), ('login_providers'), ('login_provider_revisions'),
+        ('user_identities'), ('users'), ('scopes'), ('local_identity_approvals'),
+        ('local_sessions'), ('membership_observations'), ('grant_mapping_rules'),
+        ('grant_mapping_revisions'), ('grant_assignments'), ('grant_changes')
+    ) AS issuance(relation) WHERE $1 >= 18
+    UNION ALL
     SELECT 'login_admission', 'openmettle_api', 'SELECT' WHERE $1 >= 9
     UNION ALL
     SELECT 'membership_observations', 'openmettle_api', 'SELECT' WHERE $1 >= 11
@@ -105,33 +116,54 @@ contract (relation, role, privilege) AS (
 column_contract (relation, attribute, role, privilege) AS (
     VALUES ('users', 'disabled_at', 'openmettle_api', 'UPDATE')
     UNION ALL
-    SELECT relation, attribute, 'openmettle_api', privilege FROM (VALUES
+    SELECT relation, attribute, role, privilege FROM (VALUES
         ('login_providers','lock_guard','UPDATE'),
+        ('local_identity_approvals','lock_guard','UPDATE')
+    ) AS locks(relation,attribute,privilege),
+    (VALUES ('openmettle_api', 8), ('openmettle_issuance', 18)) AS r(role, since)
+    WHERE $1 >= r.since
+    UNION ALL
+    SELECT relation, attribute, 'openmettle_api', privilege FROM (VALUES
         ('users','session_generation','UPDATE'),
-        ('login_transactions','session_issued','UPDATE'),
-        ('local_identity_approvals','lock_guard','UPDATE'),
-        ('local_sessions','revoked','UPDATE'),
-        ('local_sessions','id','INSERT'), ('local_sessions','secret_hash','INSERT'),
-        ('local_sessions','login_id','INSERT'), ('local_sessions','provider_id','INSERT'),
-        ('local_sessions','identity_id','INSERT'), ('local_sessions','approval_id','INSERT'),
-        ('local_sessions','user_id','INSERT'), ('local_sessions','issued_client','INSERT'), ('local_sessions','issued_epoch','INSERT'),
-        ('local_sessions','issued_revision','INSERT'), ('local_sessions','provider_generation','INSERT'),
-        ('local_sessions','approval_generation','INSERT'), ('local_sessions','user_generation','INSERT'),
-        ('local_sessions','created_ms','INSERT'), ('local_sessions','expires_ms','INSERT')
+        ('local_sessions','revoked','UPDATE')
     ) AS sessions(relation,attribute,privilege) WHERE $1 >= 8
     UNION ALL
-    SELECT 'membership_observations', attribute, 'openmettle_api', 'UPDATE'
-    FROM (VALUES ('issued_ms'),('expires_ms'),('observation'),('epoch'),('approval_generation'),('user_generation')) AS m(attribute)
-    WHERE $1 >= 11
+    -- Writes only session issuance performs: the API's before version 18, then only the
+    -- issuance role's (ADR 0030). Native delivery rows are written once by issuance.
+    SELECT relation, attribute,
+           CASE WHEN $1 < 18 THEN 'openmettle_api' ELSE 'openmettle_issuance' END, privilege
+    FROM (VALUES
+        ('login_transactions','session_issued','UPDATE', 8),
+        ('local_sessions','id','INSERT', 8), ('local_sessions','secret_hash','INSERT', 8),
+        ('local_sessions','login_id','INSERT', 8), ('local_sessions','provider_id','INSERT', 8),
+        ('local_sessions','identity_id','INSERT', 8), ('local_sessions','approval_id','INSERT', 8),
+        ('local_sessions','user_id','INSERT', 8), ('local_sessions','issued_client','INSERT', 8),
+        ('local_sessions','issued_epoch','INSERT', 8), ('local_sessions','issued_revision','INSERT', 8),
+        ('local_sessions','provider_generation','INSERT', 8),
+        ('local_sessions','approval_generation','INSERT', 8),
+        ('local_sessions','user_generation','INSERT', 8),
+        ('local_sessions','created_ms','INSERT', 8), ('local_sessions','expires_ms','INSERT', 8),
+        ('membership_observations','issued_ms','UPDATE', 11),
+        ('membership_observations','expires_ms','UPDATE', 11),
+        ('membership_observations','observation','UPDATE', 11),
+        ('membership_observations','epoch','UPDATE', 11),
+        ('membership_observations','approval_generation','UPDATE', 11),
+        ('membership_observations','user_generation','UPDATE', 11),
+        ('native_handoffs','session_id','INSERT', 14), ('native_handoffs','code_hash','INSERT', 14),
+        ('native_handoffs','registration','INSERT', 14), ('native_handoffs','audience','INSERT', 14),
+        ('native_handoffs','challenge','INSERT', 14), ('native_handoffs','sealed','INSERT', 14),
+        ('native_handoffs','expires_ms','INSERT', 14)
+    ) AS issuance(relation,attribute,privilege,since) WHERE $1 >= since
+    UNION ALL
+    -- Migration 18's inert guards for the issuance role's row locks.
+    SELECT relation, 'lock_guard', 'openmettle_issuance', 'UPDATE' FROM (VALUES
+        ('users'), ('grant_mapping_rules')
+    ) AS guards(relation) WHERE $1 >= 18
     UNION ALL
     SELECT 'login_admission', 'lock_guard', 'openmettle_api', 'UPDATE' WHERE $1 >= 9
     UNION ALL
-    -- One native delivery row per session: written once, then only its envelope is cleared.
-    SELECT 'native_handoffs', attribute, 'openmettle_api', privilege FROM (VALUES
-        ('session_id','INSERT'), ('code_hash','INSERT'), ('registration','INSERT'),
-        ('audience','INSERT'), ('challenge','INSERT'), ('sealed','INSERT'),
-        ('expires_ms','INSERT'), ('sealed','UPDATE')
-    ) AS native(attribute, privilege) WHERE $1 >= 14
+    -- A native delivery row's envelope is cleared once by the token exchange.
+    SELECT 'native_handoffs', 'sealed', 'openmettle_api', 'UPDATE' WHERE $1 >= 14
     UNION ALL
     -- V1-05: inserts never name generated IDs, times, revisions or audit operator actors;
     -- updates never change an ownership or key column.
@@ -190,13 +222,15 @@ column_contract (relation, attribute, role, privilege) AS (
          (VALUES ('openmettle_api'), ('openmettle_worker')) AS r(role)
     WHERE $1 >= 15
     UNION ALL
-    -- V1-05 PR4a: group and project-wide grantees, and the inert project row lock.
-    SELECT relation, attribute, 'openmettle_api', privilege FROM (VALUES
-        ('grant_assignments','grantee_kind','INSERT'),
-        ('grant_assignments','grantee_local_group_id','INSERT'),
-        ('grant_assignments','grantee_oidc_group_id','INSERT'),
-        ('projects','lock_guard','UPDATE')
-    ) AS grantees(relation, attribute, privilege) WHERE $1 >= 16
+    -- V1-05 PR4a: group and project-wide grantees, and the inert project row lock. The
+    -- issuance role's mapped grant writer names the grantee columns from version 18.
+    SELECT 'grant_assignments', attribute, role, 'INSERT' FROM (VALUES
+        ('grantee_kind'), ('grantee_local_group_id'), ('grantee_oidc_group_id')
+    ) AS grantees(attribute),
+    (VALUES ('openmettle_api', 16), ('openmettle_issuance', 18)) AS r(role, since)
+    WHERE $1 >= r.since
+    UNION ALL
+    SELECT 'projects', 'lock_guard', 'openmettle_api', 'UPDATE' WHERE $1 >= 16
     UNION ALL
     -- V1-15 (ADR 0031): the optional display name `settle` writes with each revision.
     SELECT 'artifact_revisions', 'display_name', role, 'INSERT'
@@ -319,34 +353,41 @@ column_contract (relation, attribute, role, privilege) AS (
         ('grant_mapping_revisions', 'binding_version', 'openmettle_api', 'INSERT'),
         ('grant_mapping_revisions', 'binding', 'openmettle_api', 'INSERT'),
         ('grant_mapping_revisions', 'request_identity', 'openmettle_api', 'INSERT'),
-        ('grant_mapping_revisions', 'request_digest', 'openmettle_api', 'INSERT'),
-        ('grant_assignments', 'scope_id', 'openmettle_api', 'INSERT'),
-        ('grant_assignments', 'target_kind', 'openmettle_api', 'INSERT'),
-        ('grant_assignments', 'project_id', 'openmettle_api', 'INSERT'),
-        ('grant_assignments', 'conversation_id', 'openmettle_api', 'INSERT'),
-        ('grant_assignments', 'artifact_id', 'openmettle_api', 'INSERT'),
-        ('grant_assignments', 'grantee_user_id', 'openmettle_api', 'INSERT'),
-        ('grant_assignments', 'assignment_format', 'openmettle_api', 'INSERT'),
-        ('grant_assignments', 'assignment_version', 'openmettle_api', 'INSERT'),
-        ('grant_assignments', 'assignment_key', 'openmettle_api', 'INSERT'),
-        ('grant_assignments', 'source_kind', 'openmettle_api', 'INSERT'),
-        ('grant_assignments', 'mapping_rule_id', 'openmettle_api', 'INSERT'),
-        ('grant_assignments', 'created_by_user_id', 'openmettle_api', 'INSERT'),
-        ('grant_assignments', 'last_revision', 'openmettle_api', 'UPDATE'),
-        ('grant_changes', 'id', 'openmettle_api', 'INSERT'),
-        ('grant_changes', 'scope_id', 'openmettle_api', 'INSERT'),
-        ('grant_changes', 'assignment_id', 'openmettle_api', 'INSERT'),
-        ('grant_changes', 'revision', 'openmettle_api', 'INSERT'),
-        ('grant_changes', 'source_kind', 'openmettle_api', 'INSERT'),
-        ('grant_changes', 'mapping_rule_id', 'openmettle_api', 'INSERT'),
-        ('grant_changes', 'mapping_revision', 'openmettle_api', 'INSERT'),
-        ('grant_changes', 'actor_user_id', 'openmettle_api', 'INSERT'),
-        ('grant_changes', 'request_key', 'openmettle_api', 'INSERT'),
-        ('grant_changes', 'decision', 'openmettle_api', 'INSERT'),
-        ('grant_changes', 'cycle_id', 'openmettle_api', 'INSERT'),
-        ('grant_changes', 'request_identity', 'openmettle_api', 'INSERT'),
-        ('grant_changes', 'request_digest', 'openmettle_api', 'INSERT')
-    ) AS grants(relation, attribute, role, privilege) WHERE $1 >= 5
+        ('grant_mapping_revisions', 'request_digest', 'openmettle_api', 'INSERT')
+    ) AS rules(relation, attribute, role, privilege) WHERE $1 >= 5
+    UNION ALL
+    -- The grant writer (grants::change_grant). From version 18 the issuance role runs its
+    -- mapped-membership path inside session issuance (ADR 0030).
+    SELECT relation, attribute, role, privilege FROM (VALUES
+        ('grant_assignments', 'scope_id', 'INSERT'),
+        ('grant_assignments', 'target_kind', 'INSERT'),
+        ('grant_assignments', 'project_id', 'INSERT'),
+        ('grant_assignments', 'conversation_id', 'INSERT'),
+        ('grant_assignments', 'artifact_id', 'INSERT'),
+        ('grant_assignments', 'grantee_user_id', 'INSERT'),
+        ('grant_assignments', 'assignment_format', 'INSERT'),
+        ('grant_assignments', 'assignment_version', 'INSERT'),
+        ('grant_assignments', 'assignment_key', 'INSERT'),
+        ('grant_assignments', 'source_kind', 'INSERT'),
+        ('grant_assignments', 'mapping_rule_id', 'INSERT'),
+        ('grant_assignments', 'created_by_user_id', 'INSERT'),
+        ('grant_assignments', 'last_revision', 'UPDATE'),
+        ('grant_changes', 'id', 'INSERT'),
+        ('grant_changes', 'scope_id', 'INSERT'),
+        ('grant_changes', 'assignment_id', 'INSERT'),
+        ('grant_changes', 'revision', 'INSERT'),
+        ('grant_changes', 'source_kind', 'INSERT'),
+        ('grant_changes', 'mapping_rule_id', 'INSERT'),
+        ('grant_changes', 'mapping_revision', 'INSERT'),
+        ('grant_changes', 'actor_user_id', 'INSERT'),
+        ('grant_changes', 'request_key', 'INSERT'),
+        ('grant_changes', 'decision', 'INSERT'),
+        ('grant_changes', 'cycle_id', 'INSERT'),
+        ('grant_changes', 'request_identity', 'INSERT'),
+        ('grant_changes', 'request_digest', 'INSERT')
+    ) AS writer(relation, attribute, privilege),
+    (VALUES ('openmettle_api', 5), ('openmettle_issuance', 18)) AS r(role, since)
+    WHERE $1 >= r.since
 ),
 user_schemas AS (
     SELECT oid, nspname, nspowner, nspacl FROM pg_namespace
@@ -398,8 +439,9 @@ violations (violation) AS (
     WHERE datname = current_database() AND pg_get_userbyid(datdba) <> 'openmettle_owner'
     UNION ALL
     SELECT format('role %s is missing', r)
-    FROM unnest(ARRAY['openmettle_owner', 'openmettle_api', 'openmettle_worker']) AS r
-    WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = r)
+    FROM unnest(ARRAY['openmettle_owner', 'openmettle_api', 'openmettle_worker',
+                      CASE WHEN $1 >= 18 THEN 'openmettle_issuance' END]) AS r
+    WHERE r IS NOT NULL AND NOT EXISTS (SELECT FROM pg_roles WHERE rolname = r)
     UNION ALL
     -- Role attributes of the owner and every application principal.
     SELECT format('role %s must not be superuser or hold CREATEROLE, CREATEDB, REPLICATION '
@@ -422,7 +464,9 @@ violations (violation) AS (
       AND m.member NOT IN (SELECT oid FROM privilege_roles)
       AND m.roleid NOT IN (SELECT oid FROM application)
     UNION ALL
-    SELECT format('role %s has both API and worker privileges', pg_get_userbyid(oid))
+    -- Disjoint login roles: each reaches at most one application role.
+    SELECT format('role %s reaches more than one of openmettle_api, openmettle_issuance and '
+                  'openmettle_worker', pg_get_userbyid(oid))
     FROM application
     GROUP BY oid
     HAVING count(DISTINCT base) > 1
@@ -445,9 +489,12 @@ violations (violation) AS (
                    IN (SELECT relation, role, privilege FROM contract))
       -- Exactly one redemption signature per version: the code-less function exists only at
       -- version 12, and from version 13 only the function that requires the invitation code.
-      -- Version 14 replaces that function's body and keeps its signature and grant.
+      -- Version 14 replaces that function's body and keeps its signature and grant. Version 18
+      -- moves the grant from openmettle_api to openmettle_issuance (ADR 0030).
       AND NOT (g.kind = 'function' AND g.privilege = 'EXECUTE'
-               AND g.grantee = (SELECT oid FROM pg_roles WHERE rolname = 'openmettle_api')
+               AND g.grantee = (SELECT oid FROM pg_roles WHERE rolname
+                                = CASE WHEN $1 < 18 THEN 'openmettle_api'
+                                       ELSE 'openmettle_issuance' END)
                AND (($1 = 12 AND g.target
                         = 'function openmettle.redeem_home_invitation(uuid,text,text,text,bigint)')
                     OR ($1 >= 13 AND g.target

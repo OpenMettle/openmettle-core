@@ -112,19 +112,26 @@ Unset, the process opens no directory and starts exactly as before. Set, it crea
 
 ### Browser sign-in routes (off by default)
 
-[ADR 0025](docs/adr/0025-browser-auth-runtime-mounting.md) adds one API-only setting. The worker and migrator never read it.
+[ADR 0025](docs/adr/0025-browser-auth-runtime-mounting.md) adds one API-only setting, and [ADR 0030](docs/adr/0030-session-issuance-database-boundary.md) the session issuance pool that sign-in requires. The worker and migrator never read them.
 
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `OPENMETTLE_API_AUTH_CONFIG` | unset | Unset: the API loads no auth file, serves `/healthz` and `/readyz` only and answers `404` on every sign-in and `/v1` path, as before. Set: the absolute path of a [version-2 auth settings document](#browser-routing-profile-version-2), loaded once at startup; the [`/v1` routes](#authenticated-application-routes) are mounted with it |
+| `OPENMETTLE_API_ISSUANCE_DATABASE_URL` | unset | Required with `AUTH_CONFIG` and refused without it. The URL of a login role of `openmettle_issuance` (see [Schema migrations](#schema-migrations)) on the same primary, with the same scheme, TLS and redaction rules as `DATABASE_URL`. Its resolved user, including one filled from `PGUSER` or the operating-system user, must differ from the `DATABASE_URL` user. Never logged |
+| `OPENMETTLE_API_ISSUANCE_DB_MAX_CONNECTIONS` | `2` | Size of the issuance pool, 1–64. Refused when the issuance URL is unset |
 
-When set, the API validates the document and the files it names with the same loader as `--check-auth-config`, before it installs telemetry or opens its listener. It then mounts the document's four routes beside the probes: the initiation `POST`, the provider's registered callback `GET`, the session check `GET` and the logout `POST`. They use the API's existing database pool. `/readyz` is still one database query and contacts no provider. If the document also has the optional [native profile](#native-sign-in-profile-version-2), the API mounts the five native sign-in routes beside them over the same service and pool ([ADR 0029](docs/adr/0029-native-sign-in-mounting-and-session-context.md)); otherwise every `/auth/native/` path is `404`.
+When set, the API validates the document and the files it names with the same loader as `--check-auth-config`, before it installs telemetry or opens its listener. It then mounts the document's four routes beside the probes: the initiation `POST`, the provider's registered callback `GET`, the session check `GET` and the logout `POST`. They use the API's existing database pool, except that session issuance runs on a separate lazy issuance pool whose connections wait at most `DB_TIMEOUT_MS`. `/readyz` is still one query on the primary pool and contacts no provider; an unusable issuance pool refuses sign-in completion only. If the document also has the optional [native profile](#native-sign-in-profile-version-2), the API mounts the five native sign-in routes beside them over the same service and pool ([ADR 0029](docs/adr/0029-native-sign-in-mounting-and-session-context.md)); otherwise every `/auth/native/` path is `404`.
 
 A refusal exits 78 with one fixed stderr line and no listener:
 
 | Cause | Line |
 | --- | --- |
 | The value is empty or not an absolute path | `configuration error: invalid AUTH_CONFIG` |
+| `AUTH_CONFIG` without an issuance URL, or the reverse | `configuration error: ISSUANCE_DATABASE_URL is required with AUTH_CONFIG`, or `… requires AUTH_CONFIG` |
+| The issuance URL has another scheme, does not parse or is not UTF-8 | `configuration error: invalid ISSUANCE_DATABASE_URL scheme`, `… invalid ISSUANCE_DATABASE_URL` or `… configuration must be UTF-8` |
+| The issuance URL resolves to the `DATABASE_URL` user | `configuration error: ISSUANCE_DATABASE_URL must use a different user` |
+| `ISSUANCE_DB_MAX_CONNECTIONS` without the URL, or outside 1–64 | `configuration error: ISSUANCE_DB_MAX_CONNECTIONS requires ISSUANCE_DATABASE_URL`, or the numeric categories |
+| `OPENMETTLE_API_ISSUANCE_DATABASE_URL` is present, with any value, in the worker's or migrator's environment | `configuration error: OPENMETTLE_API_ISSUANCE_DATABASE_URL is refused outside the API` |
 | The document or a file it names is refused | `auth configuration error: ` and the category `--check-auth-config` prints |
 | The document is version 1 | `auth configuration error: serving requires a version 2 browser profile` |
 | The native profile is refused | `auth configuration error: native profile refused: ` and a fixed category |
@@ -276,7 +283,13 @@ For a new home user, an operator can authorize first-account creation with a sin
 From schema 13, redeeming it also requires the one-time code that the create command prints.
 The person enters it in the browser sign-in form, and the login seals it until redemption
 ([ADR 0022](docs/adr/0022-home-invitation-codes.md)). `ManagedProvider::issue_session` consumes
-only its sealed online proof; an offline `VerifiedIdentity` cannot mint a session.
+only its sealed online proof; an offline `VerifiedIdentity` cannot mint a session. From schema
+18 only the `openmettle_issuance` role can insert a session, mark a login issued, record
+membership evidence, create a native handoff or redeem an invitation
+([ADR 0030](docs/adr/0030-session-issuance-database-boundary.md)), so SQL limited to
+`openmettle_api` can no longer forge a session. Issuance commits on an issuance connection, and
+the credential is released only after a fresh validation on a primary `openmettle_api`
+connection.
 
 Routine configuration/approval revisions preserve sessions. Explicit revoke, provider retirement,
 approval withdrawal and user disablement advance access generations; restoration never revives
@@ -421,15 +434,18 @@ check, after the browser profile. The native paths and the app link must not col
 ## Pooled browser-auth service
 
 [ADR 0016](docs/adr/0016-pooled-browser-auth-service.md) adds `src/browser_auth.rs`, one
-internal service built from the validated settings above and a handle to the API's existing
-primary pool. It starts a login for an exactly configured provider UUID, completes a
+internal service built from the validated settings above, a handle to the API's existing
+primary pool and, from [ADR 0030](docs/adr/0030-session-issuance-database-boundary.md), one to
+its issuance pool. It starts a login for an exactly configured provider UUID, completes a
 callback (committed consumption, one token request, session issuance from the sealed proof)
 and validates or logs out local sessions. **No process constructs it by default**; the API
 does so only under ADR 0025. `/readyz` checks the database only. The service handles no
 request or cookie itself and has no rate policy; the adapter and router below do.
 
 The service holds a pooled connection only while database work runs, never during a
-provider document fetch or the token request. Waiting for a connection counts against the
+provider document fetch or the token request, and never one from each pool at once: a
+callback consumes on the primary, exchanges with neither, issues on the issuance pool and
+returns that connection before the final validation asks the primary for one. Waiting for a connection counts against the
 existing deadlines and never extends the login's expiry or the proof's original deadline.
 Validation and logout contact no provider.
 
@@ -658,16 +674,19 @@ device link ownership and the companion app's simulator qualification.
 
 ## Schema migrations
 
-Read [ADR 0003](docs/adr/0003-schema-migrations.md) for the migration, role and ownership contract and [ADR 0004](docs/adr/0004-run-persistence.md) for run/event/operation persistence, limits and replay semantics, [ADR 0005](docs/adr/0005-artifact-storage-accounting.md) for artifact revisions, storage reservations and byte accounting, and [ADR 0006](docs/adr/0006-grant-persistence.md) for grant provenance, replay and revocation persistence. PostgreSQL 18 is the only qualified major version. Migrations in `migrations/` are embedded in the `openmettle-migrate` binary, forward-only and transactional; released migrations are never edited. Run the migrate image once per release, before rolling out new API and worker versions. Each release's migrations must remain compatible with the previous API and worker.
+Read [ADR 0003](docs/adr/0003-schema-migrations.md) for the migration, role and ownership contract and [ADR 0004](docs/adr/0004-run-persistence.md) for run/event/operation persistence, limits and replay semantics, [ADR 0005](docs/adr/0005-artifact-storage-accounting.md) for artifact revisions, storage reservations and byte accounting, and [ADR 0006](docs/adr/0006-grant-persistence.md) for grant provenance, replay and revocation persistence. PostgreSQL 18 is the only qualified major version. Migrations in `migrations/` are embedded in the `openmettle-migrate` binary, forward-only and transactional; released migrations are never edited. Run the migrate image once per release, before rolling out new API and worker versions. Each release's migrations must remain compatible with the previous API and worker, with one deliberate exception: on schema 18 the previous API's sign-in completion and first-account redemption fail closed, because it issues as `openmettle_api` ([ADR 0030](docs/adr/0030-session-issuance-database-boundary.md#upgrade)).
 
-Provision the roles and one dedicated database before the first migration, using deployment-managed secrets for passwords. Before creating anything, and on every later run, the migrator checks the provisioning and exits 1 with nothing changed if it is unsafe. Log in as `openmettle_owner`, which must own the database. Do not make any of these roles superuser or give them CREATEROLE, CREATEDB, REPLICATION or BYPASSRLS. Keep `openmettle_owner`, `openmettle_api` and `openmettle_worker` out of every other role, including predefined roles such as `pg_read_all_data` and `pg_write_all_data`; this applies to `SET ROLE`-only memberships too. Separate login roles may be members of exactly one of `openmettle_api` or `openmettle_worker` and of nothing else. Do not grant those roles, their logins or `PUBLIC` any database, schema or table privilege yourself, and do not set default privileges for `openmettle_owner`; the migrations grant exactly what [ADR 0003](docs/adr/0003-schema-migrations.md) lists. The error names each violation to fix. Role names are cluster-global: installations sharing a PostgreSQL cluster would share these roles and so each other's database access, which this increment does not isolate. A superuser runs, for example (psql variables):
+Provision the roles and one dedicated database before the first migration, using deployment-managed secrets for passwords. Before creating anything, and on every later run, the migrator checks the provisioning and exits 1 with nothing changed if it is unsafe. Log in as `openmettle_owner`, which must own the database. Do not make any of these roles superuser or give them CREATEROLE, CREATEDB, REPLICATION or BYPASSRLS. Keep `openmettle_owner`, `openmettle_api`, `openmettle_issuance` and `openmettle_worker` out of every other role, including predefined roles such as `pg_read_all_data` and `pg_write_all_data`; this applies to `SET ROLE`-only memberships too. Separate login roles may be members of exactly one of `openmettle_api`, `openmettle_issuance` or `openmettle_worker` and of nothing else. Do not grant those roles, their logins or `PUBLIC` any database, schema or table privilege yourself, and do not set default privileges for `openmettle_owner`; the migrations grant exactly what [ADR 0003](docs/adr/0003-schema-migrations.md) lists. The error names each violation to fix. Role names are cluster-global: installations sharing a PostgreSQL cluster would share these roles and so each other's database access, which this increment does not isolate. A superuser runs, for example (psql variables):
 
 ```sql
 CREATE ROLE openmettle_owner LOGIN PASSWORD :'owner_password';
 CREATE ROLE openmettle_api LOGIN PASSWORD :'api_password' CONNECTION LIMIT 8;
+CREATE ROLE openmettle_issuance LOGIN PASSWORD :'issuance_password' CONNECTION LIMIT 4;
 CREATE ROLE openmettle_worker LOGIN PASSWORD :'worker_password' CONNECTION LIMIT 8;
 CREATE DATABASE openmettle OWNER openmettle_owner;
 ```
+
+`openmettle_issuance` is required from migration 18 ([ADR 0030](docs/adr/0030-session-issuance-database-boundary.md)). On an existing installation, create it before migrating; while it is missing, migration 18 refuses, rolls back and leaves the previous schema. Migration 18 keeps every session, and existing sessions stay valid. Where `openmettle_api` SQL may have been exposed, revoke every pre-upgrade session after migration 18 commits and before the new release serves sign-ins, with the statement in [ADR 0030](docs/adr/0030-session-issuance-database-boundary.md#upgrade) run as `openmettle_owner` on the primary. Each person then signs in again.
 
 Then run the migrator with the owner's URL. It reads `OPENMETTLE_MIGRATE_DATABASE_URL` and optional `OPENMETTLE_MIGRATE_CONNECT_TIMEOUT_MS` (default 5000), `OPENMETTLE_MIGRATE_LOCK_TIMEOUT_MS` (default 15000) and `OPENMETTLE_MIGRATE_STATEMENT_TIMEOUT_MS` (default 300000), plus `OPENMETTLE_MIGRATE_LOG_FORMAT` and `OPENMETTLE_MIGRATE_LOG_LEVEL` as described under Runtime. On success it prints `schema is at migration N` to stdout; a failure prints `migration error:` and a fixed description to stderr, beside a `migration.failed` event. It exits 0 on success, 78 on invalid configuration and 1 on any other failure, including a lock wait past its deadline. Concurrent runs are serialized. A failed or interrupted run leaves no partial migration and can be retried immediately. A checksum mismatch or a database newer than the binary is refused. Do not delete history rows or rerun edited files; ship a corrective migration or restore a backup instead.
 
@@ -676,11 +695,11 @@ export OPENMETTLE_MIGRATE_DATABASE_URL='postgres://openmettle_owner:<password>@1
 cargo run --locked --bin openmettle-migrate
 ```
 
-Give the API `openmettle_api` credentials and the worker `openmettle_worker` credentials, never the owner's. These roles bound each process, not each user: both can read every scope's rows. Per-user authorization (V1-05) is required before any product endpoint uses this data.
+Give the API `openmettle_api` credentials and, when sign-in is mounted, `openmettle_issuance` credentials as its issuance URL; give the worker `openmettle_worker` credentials. Never give a process the owner's, and never mount the issuance credential into the worker or migrator. These roles bound each process, not each user: both can read every scope's rows. Per-user authorization (V1-05) is required before any product endpoint uses this data.
 
 Storage limits are durable deployment inputs that only `openmettle_owner` sets, in the single `openmettle.storage_instance` row: `instance_budget_bytes` (the logical ceiling left after operational headroom, not measured disk capacity), `personal_limit_bytes` and `project_limit_bytes`. Migrations install them as NULL, which refuses every new storage reservation until the deployment configures them; see [ADR 0005](docs/adr/0005-artifact-storage-accounting.md#limits). Lowering a limit preserves existing data and reservations and refuses only new reservations.
 
-Connection budget: `api_replicas × API DB_MAX_CONNECTIONS + worker_replicas × worker DB_MAX_CONNECTIONS + 1 migrator + admin/backup headroom` must not exceed `max_connections − superuser_reserved_connections − reserved_connections`. Count surge replicas during a rolling update. For example, 2 × 4 + 2 × 4 + 1 + 3 = 20. Enforce each process's share with its login role's `CONNECTION LIMIT`. These figures are illustrative, not qualified sizing.
+Connection budget: `api_replicas × (API DB_MAX_CONNECTIONS + ISSUANCE_DB_MAX_CONNECTIONS) + worker_replicas × worker DB_MAX_CONNECTIONS + 1 migrator + admin/backup headroom` must not exceed `max_connections − superuser_reserved_connections − reserved_connections`. Count surge replicas during a rolling update. For example, 2 × (4 + 2) + 2 × 4 + 1 + 3 = 24. Enforce each process's share with its login role's `CONNECTION LIMIT`. These figures are illustrative, not qualified sizing.
 
 The schema tests also require `OLD_BINARY_DIR` pointing to binaries built from release `18f52463c9d6bc12dda4bd1558e4597e067018f8` and `V3_BINARY_DIR` pointing to binaries built from release `2f1be947aa933177c2e407cd7290bf9909bd08ca`; CI builds those exact archives for compatibility checks. Set `V4_BINARY_DIR` to binaries built from `d80e37819f847072dfa272bdddcc1fbee6d622ef` for migration 5 compatibility; CI builds that archive too. Set `V5_BINARY_DIR` to authentic binaries from `4a51242839e16e1d7b8ad3538887bf8e41081e6e` for migration 6 compatibility, and `V6_BINARY_DIR` to authentic binaries from `3978dff2864488bbdd9e748afd7116f39683f129` for migration 7 compatibility. `V7_BINARY_DIR` (`5ff1d2a8ed5e7424be006e78c16f0c30e784336d`) and `V8_BINARY_DIR` (`e55aff07527ad6452f8a0d49953b3fc2ffc51352`) cover migrations 8 and 9. Set `V9_BINARY_DIR` to binaries built from `940b8c2032d863e29fd04ad7c6357ad8cacc42fc` for migration 10. Set `V10_BINARY_DIR` to binaries built from `05dd18489242e545e3529b4e3750c74837b05638` for migration 11, and `V11_BINARY_DIR` to binaries built from `0ab3401714762f28a730eae4cd7c91052648dabd` for migration 12. Set `V12_BINARY_DIR` to binaries built from `4441b4236ad0dd1ea868d507bb10b50d9b0ddb6f` for migration 13. The ADR 0014 operator-script tests also need `POSTGRES_CONTAINER`, the isolated CI PostgreSQL service container whose `psql` runs them. Do not substitute the current binary with a truncated migration list.
 

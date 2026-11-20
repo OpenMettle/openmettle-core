@@ -98,7 +98,8 @@ const FORM_REFUSED: &str = "native sign-in request refused\n";
 const BODY_REFUSED: &str = "native sign-in request body not accepted\n";
 const BODY_NOT_RECEIVED: &str = "native sign-in request body not received\n";
 /// Migration 14's role boundary as the roles meet it: the worker reads nothing, and the API
-/// role can neither extend a grant, rebind it nor remove it.
+/// role can neither extend a grant, rebind it nor remove it. From migration 18 it cannot
+/// create one either: only the issuance role inserts grants (ADR 0030).
 async fn role_boundaries(f: &mut Flow) {
     let mut worker = f.db.connect(WORKER).await;
     let denied = |err: sqlx::Error| {
@@ -118,6 +119,10 @@ async fn role_boundaries(f: &mut Flow) {
         "UPDATE openmettle.native_handoffs SET challenge=code_hash",
         "UPDATE openmettle.native_handoffs SET audience=registration",
         "DELETE FROM openmettle.native_handoffs",
+        "INSERT INTO openmettle.native_handoffs
+             (session_id, code_hash, registration, audience, challenge, sealed, expires_ms)
+         SELECT session_id, code_hash, registration, audience, challenge, sealed, expires_ms
+           FROM openmettle.native_handoffs",
     ] {
         denied(f.api.execute(sql).await.unwrap_err());
     }
@@ -131,11 +136,12 @@ fn profile(auth: Arc<BrowserAuth>) -> NativeAuth {
 async fn mount(auth: Arc<BrowserAuth>, r: Registration) -> SocketAddr {
     serve(native(auth, r).router(limits().begin).unwrap()).await
 }
-/// Another process: its own provider manager, the fixture clock and `pool`.
-fn replica(f: &Flow, pool: PgPool, login_lifetime: Duration) -> Arc<BrowserAuth> {
+/// Another process: its own provider manager, the fixture clock, `pool` and `issuance`.
+fn replica(f: &Flow, pool: PgPool, issuance: PgPool, login_lifetime: Duration) -> Arc<BrowserAuth> {
     replica_with(
         f,
         pool,
+        issuance,
         login_lifetime,
         policy(),
         sessions::session_policy(),
@@ -147,6 +153,7 @@ fn replica(f: &Flow, pool: PgPool, login_lifetime: Duration) -> Arc<BrowserAuth>
 fn replica_with(
     f: &Flow,
     pool: PgPool,
+    issuance: PgPool,
     login_lifetime: Duration,
     refresh: RefreshPolicy,
     session_policy: crate::sessions::Policy,
@@ -171,21 +178,26 @@ fn replica_with(
             vec![provider.clone()],
         ),
         pool,
+        issuance,
     ));
     (auth, provider)
 }
-/// A one-slot pool whose only backend runs through `barrier`. The backend is opened before
-/// any counted reply. A replacement after a discarded connection bypasses the barrier.
-async fn proxied(f: &Flow, barrier: &ResponseBarrier) -> PgPool {
+/// A one-slot pool of `role` whose only backend runs through `barrier`. The backend is opened
+/// before any counted reply. A replacement after a discarded connection bypasses the barrier.
+async fn proxied(f: &Flow, role: &str, barrier: &ResponseBarrier) -> PgPool {
     let pool = pooled::one_slot(
-        f.db.options(API)
+        f.db.options(role)
             .host("127.0.0.1")
             .port(barrier.port)
             .ssl_mode(sqlx::postgres::PgSslMode::Disable),
     );
     sqlx::query("SELECT 1").execute(&pool).await.unwrap();
-    pool.set_connect_options(f.db.options(API));
+    pool.set_connect_options(f.db.options(role));
     pool
+}
+/// A fresh one-slot pool of `role`.
+fn direct(f: &Flow, role: &str) -> PgPool {
+    pooled::one_slot(f.db.options(role))
 }
 fn exchanged(f: &Flow) -> Vec<String> {
     f.h.script.lock().unwrap().exchanged.clone()
@@ -364,7 +376,8 @@ async fn services(f: &Flow) -> (Arc<BrowserAuth>, SocketAddr, SocketAddr) {
     let auth = Arc::new(pooled::service_over(f, &pool));
     let replica = replica(
         f,
-        pooled::one_slot(f.db.options(API)),
+        direct(f, API),
+        direct(f, ISSUANCE),
         Duration::from_secs(300),
     );
     let a = mount(auth.clone(), A).await;
@@ -652,16 +665,24 @@ async fn grant_expiry_during_final_validation_acknowledgement_releases_no_code()
     let lifetime = secs(8);
     let initiating = Arc::new(service::browser_auth(
         &f.h,
-        pooled::one_slot(f.db.options(API)),
+        direct(&f, API),
+        direct(&f, ISSUANCE),
         lifetime,
         session_policy,
     ));
     let a = mount(initiating, A).await;
-    // On the callback replica's only backend: consume, issuance, then final validation commit.
-    let mut barrier = ResponseBarrier::nth(b"COMMIT\0", 3);
-    let pool = proxied(&f, &barrier).await;
-    let (replica_auth, replica_provider) =
-        replica_with(&f, pool.clone(), lifetime, refresh, session_policy);
+    // On the callback replica's only primary backend: the consume commit, then the final
+    // validation commit. Issuance commits on the replica's issuance pool between them.
+    let mut barrier = ResponseBarrier::nth(b"COMMIT\0", 2);
+    let pool = proxied(&f, API, &barrier).await;
+    let (replica_auth, replica_provider) = replica_with(
+        &f,
+        pool.clone(),
+        direct(&f, ISSUANCE),
+        lifetime,
+        refresh,
+        session_policy,
+    );
     f.h.provider.ensure().await.unwrap();
     replica_provider.ensure().await.unwrap();
     let b = mount(replica_auth, A).await;
@@ -718,10 +739,15 @@ async fn pending_grant_expiry_alone_refuses_while_session_is_unexpired() {
     let mut f = Flow::new().await;
     sessions::seed(&mut f, true, true).await;
     let (_, a, _) = services(&f).await;
-    // Issuance: only the grant expires while the issuance COMMIT acknowledgement is held.
-    let mut barrier = ResponseBarrier::nth(b"COMMIT\0", 2);
-    let pool = proxied(&f, &barrier).await;
-    let b = mount(replica(&f, pool.clone(), Duration::from_secs(300)), A).await;
+    // Issuance: only the grant expires while the issuance COMMIT acknowledgement is held on
+    // the replica's only issuance backend.
+    let mut barrier = ResponseBarrier::new(b"COMMIT\0");
+    let pool = proxied(&f, ISSUANCE, &barrier).await;
+    let b = mount(
+        replica(&f, direct(&f, API), pool.clone(), Duration::from_secs(300)),
+        A,
+    )
+    .await;
     let app = App::new(A, 15);
     let started = start(a, &app).await;
     f.arm_url(&started.location);
@@ -880,11 +906,12 @@ async fn short_key_reuse_window_bounds_the_release_and_not_the_stored_grant() {
     assert_eq!(f.h.count(), fetched + 1);
 
     // Release: the same two seconds bound the issuing process. The final validation's
-    // acknowledgement is withheld past them on the callback service's only backend, after
-    // the consume and issuance commits. The fixture clock stands still, so every later
-    // proof check passes and only the code's release deadline refuses.
-    let mut barrier = ResponseBarrier::nth(b"COMMIT\0", 3);
-    let held_pool = proxied(&f, &barrier).await;
+    // acknowledgement is withheld past them on the callback service's only primary backend,
+    // after the consume commit there and the issuance commit on its issuance pool. The
+    // fixture clock stands still, so every later proof check passes and only the code's
+    // release deadline refuses.
+    let mut barrier = ResponseBarrier::nth(b"COMMIT\0", 2);
+    let held_pool = proxied(&f, API, &barrier).await;
     let b = mount(Arc::new(pooled::service_over(&f, &held_pool)), A).await;
     let app = App::new(A, 33);
     let started = start(a, &app).await;
@@ -936,9 +963,13 @@ async fn stored_audience_alone_refuses_a_pending_code_and_its_redemption() {
 
     // Issuance: the audience changes while the issuance COMMIT acknowledgement is held, so
     // the final validation meets a grant that differs in its audience only.
-    let mut barrier = ResponseBarrier::nth(b"COMMIT\0", 2);
-    let pool = proxied(&f, &barrier).await;
-    let b = mount(replica(&f, pool.clone(), Duration::from_secs(300)), A).await;
+    let mut barrier = ResponseBarrier::new(b"COMMIT\0");
+    let pool = proxied(&f, ISSUANCE, &barrier).await;
+    let b = mount(
+        replica(&f, direct(&f, API), pool.clone(), Duration::from_secs(300)),
+        A,
+    )
+    .await;
     let app = App::new(A, 34);
     let started = start(a, &app).await;
     f.arm_url(&started.location);
@@ -1018,8 +1049,17 @@ async fn withheld_claim_acknowledgement_releases_once_and_never_retries() {
     // The claim commits on replica C, whose acknowledgement is withheld. A concurrent claimant
     // on A receives nothing. C then delivers the bearer once.
     let mut barrier = ResponseBarrier::new(b"COMMIT\0");
-    let pool = proxied(&f, &barrier).await;
-    let c = mount(replica(&f, pool.clone(), Duration::from_secs(300)), A).await;
+    let pool = proxied(&f, API, &barrier).await;
+    let c = mount(
+        replica(
+            &f,
+            pool.clone(),
+            direct(&f, ISSUANCE),
+            Duration::from_secs(300),
+        ),
+        A,
+    )
+    .await;
     let app = App::new(A, 12);
     let request = post(&app.redeem(&code(&f, &app, a, a).await));
     let held = send(c, &request);
@@ -1047,14 +1087,22 @@ async fn withheld_claim_acknowledgement_releases_once_and_never_retries() {
     let session_policy = crate::sessions::Policy::new(secs(60), 16, secs(20)).unwrap();
     let short = Arc::new(service::browser_auth(
         &f.h,
-        pooled::one_slot(f.db.options(API)),
+        direct(&f, API),
+        direct(&f, ISSUANCE),
         secs(8),
         session_policy,
     ));
     let short = mount(short, A).await;
     let mut barrier = ResponseBarrier::new(b"COMMIT\0");
-    let pool = proxied(&f, &barrier).await;
-    let (replica_auth, _) = replica_with(&f, pool.clone(), secs(300), policy(), session_policy);
+    let pool = proxied(&f, API, &barrier).await;
+    let (replica_auth, _) = replica_with(
+        &f,
+        pool.clone(),
+        direct(&f, ISSUANCE),
+        secs(300),
+        policy(),
+        session_policy,
+    );
     let c = mount(replica_auth, A).await;
     let app = App::new(A, 13);
     let started = start(short, &app).await;
@@ -1157,6 +1205,7 @@ async fn confirmation_and_invalid_registrations_need_no_database_or_provider_req
     let (listener, pool) = service::silent_database();
     let auth = Arc::new(service::browser_auth(
         &h,
+        pool.clone(),
         pool,
         Duration::from_secs(60),
         sessions::session_policy(),
@@ -1261,6 +1310,7 @@ async fn preview_and_start_spend_separate_budgets_and_other_methods_spend_none()
     let (_listener, pool) = service::silent_database();
     let auth = Arc::new(service::browser_auth(
         &h,
+        pool.clone(),
         pool,
         Duration::from_secs(60),
         sessions::session_policy(),
@@ -1380,6 +1430,7 @@ async fn native_http_refusals_do_not_checkout_or_exchange() {
     let (listener, pool) = service::silent_database();
     let auth = Arc::new(service::browser_auth(
         &h,
+        pool.clone(),
         pool,
         Duration::from_secs(60),
         sessions::session_policy(),
@@ -1465,6 +1516,7 @@ async fn confirmed_start_takes_one_bounded_invitation_form_before_any_service_wo
     let attempted = || listener.accept().is_ok();
     let auth = Arc::new(service::browser_auth(
         &h,
+        pool.clone(),
         pool,
         Duration::from_secs(60),
         sessions::session_policy(),
@@ -1916,7 +1968,7 @@ async fn redemption_admits_exactly_the_managed_and_native_binding_layouts() {
     ];
     for (mark, (case, binding, admitted)) in cases.iter().enumerate() {
         let login = consumed_login(&mut f, b'a' + mark as u8, binding).await;
-        let mut tx = f.api.begin().await.unwrap();
+        let mut tx = f.issuance.begin().await.unwrap();
         let row = redeem_direct(&mut tx, signing::ID, &login, epoch, &code).await;
         assert_eq!(row.is_some(), *admitted, "{case}");
         // An admitted redemption is discarded: this test decides the binding check alone.

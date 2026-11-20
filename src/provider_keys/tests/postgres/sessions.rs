@@ -33,7 +33,7 @@ pub(super) async fn seed(f: &mut Flow, approved: bool, scope: bool) -> String {
 pub(super) async fn issue(f: &mut Flow) -> local::Credential {
     let p = f.h.provider.clone();
     let (_, proof) = f.exchanged(&p).await;
-    p.issue_session(&mut f.api, proof, &session_policy())
+    p.issue_session(&mut f.issuance, &mut f.api, proof, &session_policy())
         .await
         .unwrap()
 }
@@ -238,7 +238,8 @@ async fn unknown_unapproved_disabled_and_missing_scope_never_provision() {
         let p = f.h.provider.clone();
         let (_, proof) = f.exchanged(&p).await;
         assert!(matches!(
-            p.issue_session(&mut f.api, proof, &session_policy()).await,
+            p.issue_session(&mut f.issuance, &mut f.api, proof, &session_policy())
+                .await,
             Err(SessionError::Rejected)
         ));
         let after=sqlx::query_as::<_,(i64,i64,i64,i64)>("SELECT (SELECT count(*) FROM openmettle.users),(SELECT count(*) FROM openmettle.user_identities),(SELECT count(*) FROM openmettle.scopes),(SELECT count(*) FROM openmettle.grant_assignments)").fetch_one(&mut f.owner).await.unwrap();
@@ -256,7 +257,7 @@ async fn gate_binding_and_replay_survive_session_cleanup() {
     let (_, proof) = f.exchanged(&p).await;
     let origin = proof.origin.clone();
     let credential = p
-        .issue_session(&mut f.api, proof, &session_policy())
+        .issue_session(&mut f.issuance, &mut f.api, proof, &session_policy())
         .await
         .unwrap();
     local::logout(&mut f.api, credential.expose(), &session_policy())
@@ -279,7 +280,7 @@ async fn gate_binding_and_replay_survive_session_cleanup() {
         // Synthetic duplicate only inside cfg(test); production proof is sealed/non-cloneable.
         duplicate.origin = origin.clone();
         assert!(matches!(
-            p.issue_session(&mut f.api, duplicate, &session_policy())
+            p.issue_session(&mut f.issuance, &mut f.api, duplicate, &session_policy())
                 .await,
             Err(SessionError::Rejected)
         ));
@@ -304,7 +305,7 @@ async fn gate_binding_and_replay_survive_session_cleanup() {
             .await
             .unwrap();
         assert!(
-            p.issue_session(&mut f.api, proof, &session_policy())
+            p.issue_session(&mut f.issuance, &mut f.api, proof, &session_policy())
                 .await
                 .is_err()
         );
@@ -319,11 +320,12 @@ async fn retained_cap_serializes_and_sqlx_caller_transaction_is_preserved() {
     let p = f.h.provider.clone();
     let (_, a) = f.exchanged(&p).await;
     let (_, b) = f.exchanged(&p).await;
-    let mut second = f.db.connect(API).await;
+    let mut second = f.db.connect(ISSUANCE).await;
+    let mut second_api = f.db.connect(API).await;
     let policy = local::Policy::new(Duration::from_secs(60), 1, Duration::from_secs(10)).unwrap();
     let (a, b) = tokio::join!(
-        p.issue_session(&mut f.api, a, &policy),
-        p.issue_session(&mut second, b, &policy)
+        p.issue_session(&mut f.issuance, &mut f.api, a, &policy),
+        p.issue_session(&mut second, &mut second_api, b, &policy)
     );
     assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
     let credential = match (a, b) {
@@ -336,15 +338,17 @@ async fn retained_cap_serializes_and_sqlx_caller_transaction_is_preserved() {
     let (_, proof) = f.exchanged(&p).await;
     assert!(
         matches!(
-            p.issue_session(&mut f.api, proof, &policy).await,
+            p.issue_session(&mut f.issuance, &mut f.api, proof, &policy)
+                .await,
             Err(SessionError::Capacity)
         ),
         "revoked retained rows still count"
     );
     let (_, proof) = f.exchanged(&p).await;
-    let mut outer = f.api.begin().await.unwrap();
+    let mut outer = f.issuance.begin().await.unwrap();
     assert!(matches!(
-        p.issue_session(&mut outer, proof, &policy).await,
+        p.issue_session(&mut outer, &mut f.api, proof, &policy)
+            .await,
         Err(SessionError::Rejected)
     ));
     assert!(outer.is_in_transaction());
@@ -364,14 +368,14 @@ async fn precommit_cancellation_and_unknown_commit_release_no_credential() {
         let (started, proof) = f.exchanged(&p).await;
         let mut barrier = ResponseBarrier::new(command);
         let options =
-            f.db.options(API)
+            f.db.options(ISSUANCE)
                 .host("127.0.0.1")
                 .port(barrier.port)
                 .ssl_mode(sqlx::postgres::PgSslMode::Disable);
         let mut cn = PgConnection::connect_with(&options).await.unwrap();
         cancel_at_response(
             &mut barrier,
-            p.issue_session(&mut cn, proof, &session_policy()),
+            p.issue_session(&mut cn, &mut f.api, proof, &session_policy()),
         )
         .await;
         cn.close().await.unwrap();
@@ -401,14 +405,17 @@ async fn postcommit_ack_delay_rechecks_proof_and_database() {
         let deadline = proof.deadline;
         let mut barrier = ResponseBarrier::new(b"COMMIT\0");
         let options =
-            f.db.options(API)
+            f.db.options(ISSUANCE)
                 .host("127.0.0.1")
                 .port(barrier.port)
                 .ssl_mode(sqlx::postgres::PgSslMode::Disable);
         let mut cn = PgConnection::connect_with(&options).await.unwrap();
+        // The final validation runs on its own primary connection, so the controls below
+        // keep `f.owner` and the fixture clock to themselves.
+        let mut primary = f.db.connect(API).await;
         let result = {
             let policy = session_policy();
-            let issuance = p.issue_session(&mut cn, proof, &policy);
+            let issuance = p.issue_session(&mut cn, &mut primary, proof, &policy);
             tokio::pin!(issuance);
             tokio::select! {
                 () = barrier.wait_reached() => {},
@@ -460,7 +467,7 @@ async fn approval_writer_first_waits_and_reads_new_state_or_rollback() {
             .await
             .unwrap();
         let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-            .fetch_one(&mut f.api)
+            .fetch_one(&mut f.issuance)
             .await
             .unwrap();
         let mut observer = statistics_observer(&f.db).await;
@@ -486,7 +493,10 @@ async fn approval_writer_first_waits_and_reads_new_state_or_rollback() {
             }
         };
         let policy = session_policy();
-        let (result, ()) = tokio::join!(p.issue_session(&mut f.api, proof, &policy), control);
+        let (result, ()) = tokio::join!(
+            p.issue_session(&mut f.issuance, &mut f.api, proof, &policy),
+            control
+        );
         assert_eq!(
             result.is_ok(),
             matches!(action, "routine" | "rollback"),
@@ -504,11 +514,12 @@ async fn issuance_first_blocks_revocation_until_transaction_finishes() {
     let (_, proof) = f.exchanged(&p).await;
     let mut barrier = ResponseBarrier::new(b"INSERT 0 1\0");
     let options =
-        f.db.options(API)
+        f.db.options(ISSUANCE)
             .host("127.0.0.1")
             .port(barrier.port)
             .ssl_mode(sqlx::postgres::PgSslMode::Disable);
     let mut cn = PgConnection::connect_with(&options).await.unwrap();
+    let mut primary = f.db.connect(API).await;
     let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut f.owner)
         .await
@@ -525,7 +536,10 @@ async fn issuance_first_blocks_revocation_until_transaction_finishes() {
         result.unwrap();
     };
     let policy = session_policy();
-    let (result, ()) = tokio::join!(p.issue_session(&mut cn, proof, &policy), revoke);
+    let (result, ()) = tokio::join!(
+        p.issue_session(&mut cn, &mut primary, proof, &policy),
+        revoke
+    );
     // Depending on postcommit ordering, issuance can report denial or return a credential
     // whose later validation is denied. No validity-through-return promise is made.
     if let Ok(c) = result {
@@ -608,7 +622,7 @@ async fn authority_and_disablement_are_rechecked_after_real_lock_waits() {
         };
         sqlx::query(lock).execute(&mut *held).await.unwrap();
         let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-            .fetch_one(&mut f.api)
+            .fetch_one(&mut f.issuance)
             .await
             .unwrap();
         let mut observer = statistics_observer(&f.db).await;
@@ -637,7 +651,10 @@ async fn authority_and_disablement_are_rechecked_after_real_lock_waits() {
             }
         };
         let policy = session_policy();
-        let (result, ()) = tokio::join!(p.issue_session(&mut f.api, proof, &policy), control);
+        let (result, ()) = tokio::join!(
+            p.issue_session(&mut f.issuance, &mut f.api, proof, &policy),
+            control
+        );
         assert_eq!(result.is_ok(), action == "provider-rollback", "{action}");
     }
 }
@@ -664,7 +681,7 @@ async fn original_login_expiry_is_checked_with_primary_clock_after_wait() {
         .await
         .unwrap();
     let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut f.api)
+        .fetch_one(&mut f.issuance)
         .await
         .unwrap();
     let mut observer = statistics_observer(&f.db).await;
@@ -675,7 +692,10 @@ async fn original_login_expiry_is_checked_with_primary_clock_after_wait() {
         held.commit().await.unwrap();
     };
     let policy = session_policy();
-    let (result, ()) = tokio::join!(p.issue_session(&mut f.api, proof, &policy), control);
+    let (result, ()) = tokio::join!(
+        p.issue_session(&mut f.issuance, &mut f.api, proof, &policy),
+        control
+    );
     assert!(result.is_err());
     assert_eq!(session_count(&mut f).await, 0);
 }
@@ -724,7 +744,10 @@ async fn validation_uses_primary_session_expiry_after_wait() {
     let p = f.h.provider.clone();
     let (_, proof) = f.exchanged(&p).await;
     let policy = local::Policy::new(Duration::from_secs(1), 16, Duration::from_secs(10)).unwrap();
-    let c = p.issue_session(&mut f.api, proof, &policy).await.unwrap();
+    let c = p
+        .issue_session(&mut f.issuance, &mut f.api, proof, &policy)
+        .await
+        .unwrap();
     let mut held = f.owner.begin().await.unwrap();
     sqlx::query("SELECT id FROM openmettle.users FOR UPDATE")
         .execute(&mut *held)
@@ -755,11 +778,12 @@ async fn issuance_first_blocks_provider_and_user_writers() {
         let (_, proof) = f.exchanged(&p).await;
         let mut barrier = ResponseBarrier::new(b"INSERT 0 1\0");
         let options =
-            f.db.options(API)
+            f.db.options(ISSUANCE)
                 .host("127.0.0.1")
                 .port(barrier.port)
                 .ssl_mode(sqlx::postgres::PgSslMode::Disable);
         let mut cn = PgConnection::connect_with(&options).await.unwrap();
+        let mut primary = f.db.connect(API).await;
         let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
             .fetch_one(&mut f.owner)
             .await
@@ -781,7 +805,10 @@ async fn issuance_first_blocks_provider_and_user_writers() {
             let ((), ()) = tokio::join!(update, release);
         };
         let policy = session_policy();
-        let (result, ()) = tokio::join!(p.issue_session(&mut cn, proof, &policy), revoke);
+        let (result, ()) = tokio::join!(
+            p.issue_session(&mut cn, &mut primary, proof, &policy),
+            revoke
+        );
         if let Ok(c) = result {
             assert!(
                 local::validate(&mut f.api, c.expose(), &policy)
@@ -810,7 +837,7 @@ async fn proof_expiry_after_user_wait_rolls_back_session_and_marker() {
         .await
         .unwrap();
     let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut f.api)
+        .fetch_one(&mut f.issuance)
         .await
         .unwrap();
     let mut observer = statistics_observer(&f.db).await;
@@ -820,7 +847,10 @@ async fn proof_expiry_after_user_wait_rolls_back_session_and_marker() {
         held.commit().await.unwrap();
     };
     let policy = session_policy();
-    let (result, ()) = tokio::join!(p.issue_session(&mut f.api, proof, &policy), control);
+    let (result, ()) = tokio::join!(
+        p.issue_session(&mut f.issuance, &mut f.api, proof, &policy),
+        control
+    );
     assert!(result.is_err());
     assert_eq!(session_count(&mut f).await, 0);
     let issued: bool =
@@ -852,7 +882,9 @@ async fn returned_errors_release_locks_while_rejected_connection_stays_idle() {
                 let (_, proof) = f.exchanged(&p).await;
                 let cap = local::Policy::new(Duration::from_secs(60), 1, Duration::from_secs(10))
                     .unwrap();
-                p.issue_session(&mut f.api, proof, &cap).await.map(|_| ())
+                p.issue_session(&mut f.issuance, &mut f.api, proof, &cap)
+                    .await
+                    .map(|_| ())
             }
             "logout" => {
                 // A different canonical secret with the real lookup ID reaches the row lock.
@@ -912,7 +944,8 @@ async fn explicit_provider_revoke_fences_exchanged_proof_even_with_same_revision
     let previous_epoch = proof.epoch;
     assert!(revoke_provider(&mut f.owner, Some("v1")).await > previous_epoch);
     assert!(matches!(
-        p.issue_session(&mut f.api, proof, &session_policy()).await,
+        p.issue_session(&mut f.issuance, &mut f.api, proof, &session_policy())
+            .await,
         Err(SessionError::Rejected)
     ));
     assert_eq!(session_count(&mut f).await, 0);
@@ -1073,7 +1106,8 @@ async fn first_approval_script_admits_existing_identity_to_its_personal_scope() 
     let p = f.h.provider.clone();
     let (_, proof) = f.exchanged(&p).await;
     assert!(matches!(
-        p.issue_session(&mut f.api, proof, &session_policy()).await,
+        p.issue_session(&mut f.issuance, &mut f.api, proof, &session_policy())
+            .await,
         Err(SessionError::Rejected)
     ));
     assert_eq!(session_count(&mut f).await, 0);
@@ -1220,7 +1254,7 @@ async fn audited_provider_recovery_requires_a_new_successful_oidc_login() {
         login::Error::Rejected
     );
     assert_eq!(
-        p.issue_session(&mut f.api, old_proof, &session_policy())
+        p.issue_session(&mut f.issuance, &mut f.api, old_proof, &session_policy())
             .await
             .unwrap_err(),
         SessionError::Rejected
@@ -1254,7 +1288,8 @@ async fn audited_provider_recovery_requires_a_new_successful_oidc_login() {
     .await;
     let (_, denied) = f.exchanged(&p).await;
     assert!(matches!(
-        p.issue_session(&mut f.api, denied, &session_policy()).await,
+        p.issue_session(&mut f.issuance, &mut f.api, denied, &session_policy())
+            .await,
         Err(SessionError::Rejected)
     ));
     assert_eq!(session_count(&mut f).await, 2);

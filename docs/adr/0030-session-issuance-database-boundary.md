@@ -1,8 +1,9 @@
 # 0030 — Session issuance database boundary
 
 Status: proposed AUTHSEC-01 design, 20 November 2026. Agent-authored; owner approval,
-independent review and CI acceptance are separate gates. Refs #73; Refs #5. Migration 18 and
-the runtime change follow in a separate change. #73 remains open.
+independent review and CI acceptance are separate gates. Refs #73; Refs #5. Core PR2
+implements migration 18, the boundary audit, the issuance pool and its settings (see
+[Remaining](#remaining)). #73 remains open.
 
 ## Problem
 
@@ -154,7 +155,8 @@ and `native::Attempt::store`. Its inputs come from the sealed exchanged proof.
   role.
 - The issuance pool is lazy, uses `DB_TIMEOUT_MS` for acquisition and disables statement
   logging, like the primary pool. Readiness stays one primary query; an unusable issuance
-  pool refuses sign-ins only.
+  pool refuses sign-ins only. On SIGTERM or SIGINT both pools close concurrently within the
+  same drain deadline.
 - The worker and the migrator never read the setting, and exit 78 if
   `OPENMETTLE_API_ISSUANCE_DATABASE_URL` is present in their environment.
 - `openmettle-deploy` adds a `database.issuance` Secret reference mounted into the API
@@ -227,8 +229,8 @@ API-role SQL can also still reset login consumption (ADR 0009).
 
 ## Compatibility
 
-- **Migrations.** Migration 18 (not in this change): role precondition, two inert guards,
-  the grant move and the boundary contract. Migrations 1–17 are unchanged.
+- **Migrations.** Migration 18: role precondition, two inert guards, the grant move and the
+  boundary contract. Migrations 1–17 are unchanged.
 - **Configuration.** Two new API settings. Behaviour change: an API with `AUTH_CONFIG` and
   no issuance URL exits 78.
 - **Deployment.** A new role, Secret and connection share.
@@ -237,7 +239,8 @@ API-role SQL can also still reset login consumption (ADR 0009).
 
 ## Evidence required for acceptance
 
-Not yet implemented. PR2 must show, on CI PostgreSQL 18:
+PR2 adds the tests below; they are accepted only once they pass on CI PostgreSQL 18. PR2 must
+show:
 
 - each step of the forgery path above, run as `openmettle_api`, is refused with
   `insufficient_privilege`, and `redeem_home_invitation` is not executable by it;
@@ -250,7 +253,24 @@ Not yet implemented. PR2 must show, on CI PostgreSQL 18:
   passing;
 - the configuration refusals above, offline.
 
+Where PR2 provides it:
+
+- forgery refusals and the issuance role's exact ACL: `tests/schema/issuance.rs`
+  (`api_sql_cannot_issue_and_the_issuance_role_holds_exactly_its_writes`), with the layered
+  invitation case in `src/provider_keys/tests/postgres/invitations.rs`;
+- boundary audit and migration 18 refusals: `tests/schema/issuance.rs`, and the generalised
+  disjoint-role message in `tests/schema.rs`;
+- populated upgrades from the authentic v4–v13 binaries, where the retained pre-upgrade
+  session validates after migration 18: `tests/schema/grants.rs` (`populated_upgrade`);
+- sign-ins through two pools: every `provider_keys::tests::postgres` flow issues on an
+  `openmettle_issuance` connection and validates on an `openmettle_api` one, and
+  `pooled.rs` shows the issuance checkout returned before the primary is requested;
+- configuration refusals: `tests/runtime.rs`
+  (`issuance_settings_are_refused_with_a_fixed_line`), `tests/schema.rs` (migrator) and
+  `src/tests.rs`.
+
 ## Remaining
 
-PR2: migration 18, `boundaries.sql`, the issuance pool and settings, tests, README and
-operator guides. `openmettle-deploy`: the Secret and budget. #73 stays open until both land.
+Core PR2 is implemented: migration 18, `boundaries.sql`, the issuance pool and settings,
+tests, README and operator guides. `openmettle-deploy` still needs the Secret and the
+connection budget. #73 stays open until both land and the owner accepts.

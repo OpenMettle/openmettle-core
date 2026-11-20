@@ -48,7 +48,13 @@ fn sessions_at(checks: u32, logouts: u32) -> SessionSettings<'static> {
 }
 fn handoff(h: &Harness, pool: sqlx::PgPool) -> LoginHandoff {
     let policy = sessions::Policy::new(Duration::from_secs(60), 16, Duration::from_secs(5));
-    let auth = service::browser_auth(h, pool, Duration::from_secs(300), policy.unwrap());
+    let auth = service::browser_auth(
+        h,
+        pool.clone(),
+        pool,
+        Duration::from_secs(300),
+        policy.unwrap(),
+    );
     LoginHandoff::new(Arc::new(auth), settings()).unwrap()
 }
 /// A session check from the application, with the given `Cookie` fields.

@@ -1036,7 +1036,14 @@ impl Api {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         if let Some(path) = auth {
-            command.env("OPENMETTLE_API_AUTH_CONFIG", path);
+            // ADR 0030: sign-in needs the issuance pool, under its own user; never contacted.
+            command.env("OPENMETTLE_API_AUTH_CONFIG", path).env(
+                "OPENMETTLE_API_ISSUANCE_DATABASE_URL",
+                format!(
+                    "postgres://fixture-issuance@{}/fixture?sslmode=disable",
+                    unavailable.local_addr().unwrap()
+                ),
+            );
         }
         let mut api = Self(command.spawn().unwrap(), bind);
         let deadline = Instant::now() + Duration::from_secs(15);

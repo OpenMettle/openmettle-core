@@ -326,13 +326,15 @@ async fn cleanup_script_removes_only_expired_unreferenced_gates() {
         .bind(&user).fetch_one(&mut api).await.unwrap();
     let approval: String = sqlx::query_scalar("INSERT INTO openmettle.local_identity_approvals(provider_id,identity_id,active,expires_ms,changed_by,change_reason) VALUES ('00000000-0000-0000-0000-000000000014',$1::uuid,true,4102444800000,'fixture-owner','synthetic approval') RETURNING id::text")
         .bind(&identity).fetch_one(&mut owner).await.unwrap();
+    // Only the issuance role marks a login issued and inserts its session (ADR 0030).
+    let mut issuance = connect(&db.0, ISSUANCE).await;
     sqlx::query("UPDATE openmettle.login_transactions SET session_issued=true WHERE id=$1")
         .bind(id(&d))
-        .execute(&mut api)
+        .execute(&mut issuance)
         .await
         .unwrap();
     sqlx::query("INSERT INTO openmettle.local_sessions(id,secret_hash,login_id,provider_id,identity_id,approval_id,user_id,issued_client,issued_epoch,issued_revision,provider_generation,approval_generation,user_generation,created_ms,expires_ms) VALUES (repeat('s',43),decode(repeat('0a',32),'hex'),$1,'00000000-0000-0000-0000-000000000014',$2::uuid,$3::uuid,$4::uuid,'synthetic',(SELECT max(epoch) FROM openmettle.login_provider_revisions),1,0,0,0,1,4102444800000)")
-        .bind(id(&d)).bind(&identity).bind(&approval).bind(&user).execute(&mut api).await.unwrap();
+        .bind(id(&d)).bind(&identity).bind(&approval).bind(&user).execute(&mut issuance).await.unwrap();
     // Wait on the primary clock until every short gate has expired.
     api.execute("SELECT pg_sleep(GREATEST(0, (max(expires_ms) - floor(extract(epoch FROM clock_timestamp())*1000))/1000.0 + 0.02)) FROM openmettle.login_transactions WHERE expires_ms < floor(extract(epoch FROM clock_timestamp())*1000) + 10000")
         .await

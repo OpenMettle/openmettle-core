@@ -1,4 +1,5 @@
-//! Internal managed browser-auth service over the API's primary PostgreSQL pool (ADR 0016).
+//! Internal managed browser-auth service over the API's primary PostgreSQL pool (ADR 0016)
+//! and its separate session issuance pool (ADR 0030).
 //!
 //! It joins validated settings ([`AuthConfig`], ADR 0015) to the existing managed login and
 //! session operations and owns every pooled connection those operations use. The service
@@ -134,12 +135,14 @@ fn configured<'a>(providers: &'a [ManagedProvider], id: &str) -> Option<&'a Mana
 
 /// Managed browser login and local sessions for the configured providers.
 ///
-/// Construct it once per process with the loaded settings and a handle to the API's
-/// existing primary pool. It opens no pool of its own and holds a pooled connection only
-/// while database work runs: never across a provider document fetch or the token request.
+/// Construct it once per process with the loaded settings, a handle to the API's existing
+/// primary pool and one to its issuance pool. It opens no pool of its own and holds a pooled
+/// connection only while database work runs: never across a provider document fetch or the
+/// token request, and never one from each pool at once.
 pub struct BrowserAuth {
     config: AuthConfig,
     pool: PgPool,
+    issuance: PgPool,
 }
 impl fmt::Debug for BrowserAuth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -147,10 +150,17 @@ impl fmt::Debug for BrowserAuth {
     }
 }
 impl BrowserAuth {
-    /// `pool` must connect to the primary (ADR 0012). The settings keep their single
+    /// `pool` must connect to the primary (ADR 0012) as `openmettle_api`, and `issuance` to
+    /// the same primary as a login role of `openmettle_issuance` (ADR 0030). The issuance
+    /// pool runs only session issuance; everything else, including the validation that
+    /// releases a new credential, uses `pool`. The settings keep their single
     /// process-lifetime provider manager (ADR 0011).
-    pub fn new(config: AuthConfig, pool: PgPool) -> Self {
-        Self { config, pool }
+    pub fn new(config: AuthConfig, pool: PgPool, issuance: PgPool) -> Self {
+        Self {
+            config,
+            pool,
+            issuance,
+        }
     }
     fn provider(&self, id: &str) -> Result<&ManagedProvider, login::Error> {
         configured(self.config.providers(), id).ok_or(login::Error::Rejected)
@@ -279,10 +289,16 @@ impl BrowserAuth {
         // Fixed before the wait: pool pressure never opens a new window for the proof.
         let (_admission, deadline) = provider.session_phase(&exchanged, policy)?;
         tokio::time::timeout_at(deadline, async {
-            let mut db = Checkout::acquire(&self.pool).await?;
+            // The issuance checkout is settled, and so returned or closed, before the primary
+            // checkout is requested: no phase waits on one pool while holding the other.
+            let mut db = Checkout::acquire(&self.issuance).await?;
             let result = provider
-                .issue_admitted(db.lend(), exchanged, policy, deadline)
+                .issue_admitted(db.lend(), &exchanged, policy, deadline)
                 .await;
+            db.settle(session_settled(&result));
+            let issued = result?;
+            let mut db = Checkout::acquire(&self.pool).await?;
+            let result = provider.release_issued(db.lend(), &exchanged, issued).await;
             db.settle(session_settled(&result));
             result
         })

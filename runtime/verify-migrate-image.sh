@@ -23,6 +23,7 @@ test "$status" = 78
 psql fixture <<SQL
 CREATE ROLE openmettle_owner LOGIN PASSWORD '$password';
 CREATE ROLE openmettle_api LOGIN PASSWORD '$password';
+CREATE ROLE openmettle_issuance LOGIN PASSWORD '$password';
 CREATE ROLE openmettle_worker LOGIN PASSWORD '$password';
 CREATE DATABASE openmettle OWNER openmettle_owner;
 SQL

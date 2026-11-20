@@ -53,17 +53,51 @@ struct Config {
     /// document to mount (ADRs 0025 and 0029). Always `None` for the worker, which never
     /// reads the key.
     auth_config: Option<PathBuf>,
+    /// `ISSUANCE_DATABASE_URL` and `ISSUANCE_DB_MAX_CONNECTIONS` (ADR 0030): the session
+    /// issuance pool's connection and size. Set exactly when `auth_config` is.
+    issuance: Option<(PgConnectOptions, u32)>,
     /// `ARTIFACTS_DIR` (ADR 0031): the artifact payload directory, validated with
     /// [`artifact_fs::Store::open`] before telemetry starts. `None` leaves artifact file I/O
     /// disabled.
     artifacts_dir: Option<PathBuf>,
 }
 
+/// ADR 0030: the API's issuance credential, mounted into the API container only.
+pub(crate) const ISSUANCE_URL: &str = "OPENMETTLE_API_ISSUANCE_DATABASE_URL";
+
+/// The worker and the migrator never read [`ISSUANCE_URL`] and refuse to start while it is
+/// present, whatever its value, so a misplaced Secret is noticed instead of ignored.
+pub(crate) fn refuse_issuance_url() -> Result<(), &'static str> {
+    match std::env::var_os(ISSUANCE_URL) {
+        Some(_) => Err("OPENMETTLE_API_ISSUANCE_DATABASE_URL is refused outside the API"),
+        None => Ok(()),
+    }
+}
+
+/// A `postgres://` or `postgresql://` URL, parsed with statement logging off (ADR 0002).
+/// The refusals name the key alone, never the value.
+fn database_url(
+    url: &str,
+    scheme: &'static str,
+    invalid: &'static str,
+) -> Result<PgConnectOptions, &'static str> {
+    if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
+        return Err(scheme);
+    }
+    Ok(url
+        .parse::<PgConnectOptions>()
+        .map_err(|_| invalid)?
+        .disable_statement_logging())
+}
+
 impl Config {
     fn load(role: Role) -> Result<Self, &'static str> {
         let prefix = match role {
             Role::Api => "OPENMETTLE_API",
-            Role::Worker => "OPENMETTLE_WORKER",
+            Role::Worker => {
+                refuse_issuance_url()?;
+                "OPENMETTLE_WORKER"
+            }
         };
         Self::parse(role, |key| match std::env::var(format!("{prefix}_{key}")) {
             Ok(value) => Ok(Some(value)),
@@ -85,13 +119,7 @@ impl Config {
             .parse()
             .map_err(|_| "invalid BIND")?;
         let url = get("DATABASE_URL")?.ok_or("DATABASE_URL is required")?;
-        if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
-            return Err("invalid DATABASE_URL scheme");
-        }
-        let database = url
-            .parse::<PgConnectOptions>()
-            .map_err(|_| "invalid DATABASE_URL")?
-            .disable_statement_logging();
+        let database = database_url(&url, "invalid DATABASE_URL scheme", "invalid DATABASE_URL")?;
         let number = |key, default, max| -> Result<u32, &'static str> {
             let value = match get(key)? {
                 Some(value) => value.parse().map_err(|_| "invalid numeric configuration")?,
@@ -128,6 +156,35 @@ impl Config {
         {
             return Err("invalid AUTH_CONFIG");
         }
+        // ADR 0030: the API's issuance pool exists exactly when sign-in is mounted, under a
+        // different resolved user than the primary pool, including users filled from `PG*`
+        // defaults. Read after `AUTH_CONFIG`, and by the API alone.
+        let issuance = match role {
+            Role::Worker => None,
+            Role::Api => match (get("ISSUANCE_DATABASE_URL")?, &auth_config) {
+                (Some(_), None) => return Err("ISSUANCE_DATABASE_URL requires AUTH_CONFIG"),
+                (None, Some(_)) => {
+                    return Err("ISSUANCE_DATABASE_URL is required with AUTH_CONFIG");
+                }
+                (None, None) => match get("ISSUANCE_DB_MAX_CONNECTIONS")? {
+                    Some(_) => {
+                        return Err("ISSUANCE_DB_MAX_CONNECTIONS requires ISSUANCE_DATABASE_URL");
+                    }
+                    None => None,
+                },
+                (Some(url), Some(_)) => {
+                    let issuance = database_url(
+                        &url,
+                        "invalid ISSUANCE_DATABASE_URL scheme",
+                        "invalid ISSUANCE_DATABASE_URL",
+                    )?;
+                    if issuance.get_username() == database.get_username() {
+                        return Err("ISSUANCE_DATABASE_URL must use a different user");
+                    }
+                    Some((issuance, number("ISSUANCE_DB_MAX_CONNECTIONS", 2, 64)?))
+                }
+            },
+        };
         Ok(Self {
             bind,
             database,
@@ -137,6 +194,7 @@ impl Config {
             telemetry,
             otlp,
             auth_config,
+            issuance,
             artifacts_dir,
         })
     }
@@ -152,26 +210,31 @@ fn routes(health: Health) -> Router {
 
 /// Every route the process serves (ADR 0025): the operational routes, and for an API given
 /// `AUTH_CONFIG` the browser sign-in routes of that version-2 document, over the same primary
-/// pool (ADR 0016). A `native` profile in it adds the five native routes over the same
+/// pool (ADR 0016) and a lazy issuance pool for session issuance alone (ADR 0030). A `native` profile in it adds the five native routes over the same
 /// service, so one provider manager and one pool serve both (ADR 0029). The authenticated
 /// `/v1` routes are mounted beside them and accept a session from either channel (ADR 0027
 /// PR4b). Loading reads local files only; no provider, DNS name or database is contacted, and
-/// the lazy pool stays unconnected. Readiness is unchanged and database-only.
+/// the lazy pools stay unconnected. Readiness is unchanged and checks the primary pool only:
+/// an unusable issuance pool refuses sign-in completion alone.
 ///
 /// The settings checks refused `/healthz`, `/readyz` and every `/v1` path as browser and
 /// native paths, and every browser path as a native path, and the constructors repeat them,
-/// so no merge can shadow a route or panic.
-fn app(config: &Config, pool: &PgPool) -> Result<Router, auth_config::Error> {
+/// so no merge can shadow a route or panic. The issuance pool, when built, is returned beside
+/// the router so `serve` can close it within the drain deadline.
+fn app(config: &Config, pool: &PgPool) -> Result<(Router, Option<PgPool>), auth_config::Error> {
     let operational = routes(Health {
         pool: pool.clone(),
         timeout: config.database_timeout,
     });
-    let Some(path) = &config.auth_config else {
-        return Ok(operational);
+    // `Config::parse` sets both or neither.
+    let (Some(path), Some((issuance, connections))) = (&config.auth_config, &config.issuance)
+    else {
+        return Ok((operational, None));
     };
     let (settings, profile) = auth_config::load_browser(path)?;
     let native = settings.native().cloned();
-    let service = Arc::new(BrowserAuth::new(settings, pool.clone()));
+    let issuance = lazy_pool(issuance, *connections, config.database_timeout);
+    let service = Arc::new(BrowserAuth::new(settings, pool.clone(), issuance.clone()));
     let handoff = LoginHandoff::new(service.clone(), profile.handoff())
         .map_err(auth_config::Error::BrowserHandoff)?;
     let sign_in = router_with_sessions(handoff, profile.router(), profile.sessions())
@@ -190,7 +253,10 @@ fn app(config: &Config, pool: &PgPool) -> Result<Router, auth_config::Error> {
         bearer = Some(auth);
     }
     let origin = profile.handoff().origin;
-    Ok(app.merge(v1::router(service, bearer, origin, pool.clone())))
+    Ok((
+        app.merge(v1::router(service, bearer, origin, pool.clone())),
+        Some(issuance),
+    ))
 }
 
 #[derive(Clone)]
@@ -281,8 +347,8 @@ pub async fn run(role: Role) -> u8 {
     // The same holds for the browser sign-in settings: refused before telemetry is installed
     // or the listener opens, with the offline check's fixed category line (ADRs 0015, 0025).
     let pool = pool(&config);
-    let app = match app(&config, &pool) {
-        Ok(app) => app,
+    let (app, issuance) = match app(&config, &pool) {
+        Ok(built) => built,
         Err(error) => {
             eprintln!("auth configuration error: {error}");
             return 78;
@@ -296,7 +362,7 @@ pub async fn run(role: Role) -> u8 {
         }
     };
     let (drain, flush) = shutdown_budget(config.shutdown_timeout);
-    let code = match serve(config.bind, app, pool, process, drain).await {
+    let code = match serve(config.bind, app, pool, issuance, process, drain).await {
         Ok(()) => {
             telemetry::process_stopped(process);
             0
@@ -320,16 +386,26 @@ fn shutdown_budget(timeout: Duration) -> (Duration, Duration) {
 }
 
 fn pool(config: &Config) -> PgPool {
+    lazy_pool(
+        &config.database,
+        config.connections,
+        config.database_timeout,
+    )
+}
+
+/// Connects on first use; acquisition waits at most `DB_TIMEOUT_MS`.
+fn lazy_pool(options: &PgConnectOptions, connections: u32, timeout: Duration) -> PgPool {
     PgPoolOptions::new()
-        .max_connections(config.connections)
-        .acquire_timeout(config.database_timeout)
-        .connect_lazy_with(config.database.clone())
+        .max_connections(connections)
+        .acquire_timeout(timeout)
+        .connect_lazy_with(options.clone())
 }
 
 async fn serve(
     bind: SocketAddr,
     app: Router,
     pool: PgPool,
+    issuance: Option<PgPool>,
     process: Process,
     drain: Duration,
 ) -> Result<(), ProcessFailure> {
@@ -359,7 +435,13 @@ async fn serve(
     let _ = stop_tx.send(());
     tokio::time::timeout(drain, async {
         server.await.map_err(|_| ProcessFailure::Shutdown)?;
-        pool.close().await;
+        // Both pools close within the deadline, so idle connections end cleanly before the
+        // runtime is shut down.
+        if let Some(issuance) = &issuance {
+            tokio::join!(pool.close(), issuance.close());
+        } else {
+            pool.close().await;
+        }
         Ok(())
     })
     .await

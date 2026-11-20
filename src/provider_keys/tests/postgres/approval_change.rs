@@ -83,7 +83,8 @@ async fn issuance_refused(f: &mut Flow) {
     let p = f.h.provider.clone();
     let (_, proof) = f.exchanged(&p).await;
     assert!(matches!(
-        p.issue_session(&mut f.api, proof, &session_policy()).await,
+        p.issue_session(&mut f.issuance, &mut f.api, proof, &session_policy())
+            .await,
         Err(SessionError::Rejected)
     ));
 }

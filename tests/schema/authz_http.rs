@@ -47,7 +47,8 @@ enum As<'a> {
     Native(&'a str),
 }
 
-/// The API binary with `AUTH_CONFIG`, connected as `openmettle_api`. Killed on drop.
+/// The API binary with `AUTH_CONFIG`, connected as `openmettle_api` and, for session
+/// issuance, as `openmettle_issuance` (ADR 0030). Killed on drop.
 struct Api {
     _process: Process,
     _dir: auth_config_support::Dir,
@@ -65,6 +66,7 @@ impl Api {
             .env("OPENMETTLE_API_DATABASE_URL", db.url(API))
             .env("OPENMETTLE_API_DB_TIMEOUT_MS", "2000")
             .env("OPENMETTLE_API_AUTH_CONFIG", &auth)
+            .env("OPENMETTLE_API_ISSUANCE_DATABASE_URL", db.url(ISSUANCE))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
