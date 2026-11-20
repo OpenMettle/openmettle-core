@@ -1,0 +1,157 @@
+# Deterministic promtool unit tests for OpenMettle telemetry contract v1 alert rules (ADR 0028).
+# Executed in CI via `promtool test rules` inside the pinned prom/prometheus v3.5.0 image.
+rule_files:
+  - alerts-v1.yaml
+
+evaluation_interval: 30s
+
+tests:
+  # --- OpenMettleApiHighServerErrorRatio -------------------------------------------------
+  - name: api_high_server_error_ratio_fires_above_threshold
+    interval: 30s
+    input_series:
+      - series: 'openmettle_http_server_requests_total{job="openmettle-api",instance="a",http_request_method="GET",openmettle_route_class="v1",http_response_status_class="2xx"}'
+        values: '0+9x30'
+      - series: 'openmettle_http_server_requests_total{job="openmettle-api",instance="a",http_request_method="GET",openmettle_route_class="v1",http_response_status_class="5xx"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: OpenMettleApiHighServerErrorRatio
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: openmettle-api
+              signal_contract: v1
+            exp_annotations:
+              summary: "OpenMettle API HTTP 5xx error ratio exceeded 5%"
+              description: "More than 5% of non-probe API HTTP requests returned 5xx over the last 5 minutes."
+
+  - name: api_high_server_error_ratio_ignores_probes_and_worker
+    interval: 30s
+    input_series:
+      - series: 'openmettle_http_server_requests_total{job="openmettle-api",instance="a",http_request_method="GET",openmettle_route_class="readyz",http_response_status_class="5xx"}'
+        values: '0+5x30'
+      - series: 'openmettle_http_server_requests_total{job="openmettle-api",instance="a",http_request_method="GET",openmettle_route_class="healthz",http_response_status_class="5xx"}'
+        values: '0+5x30'
+      - series: 'openmettle_http_server_requests_total{job="openmettle-worker",instance="b",http_request_method="GET",openmettle_route_class="v1",http_response_status_class="5xx"}'
+        values: '0+5x30'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: OpenMettleApiHighServerErrorRatio
+        exp_alerts: []
+
+  - name: api_high_server_error_ratio_silent_below_ratio_ceiling
+    interval: 30s
+    input_series:
+      - series: 'openmettle_http_server_requests_total{job="openmettle-api",instance="a",http_request_method="GET",openmettle_route_class="v1",http_response_status_class="2xx"}'
+        values: '0+96x30'
+      - series: 'openmettle_http_server_requests_total{job="openmettle-api",instance="a",http_request_method="GET",openmettle_route_class="v1",http_response_status_class="5xx"}'
+        values: '0+4x30'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: OpenMettleApiHighServerErrorRatio
+        exp_alerts: []
+
+  - name: api_high_server_error_ratio_silent_below_minimum_volume
+    interval: 30s
+    input_series:
+      - series: 'openmettle_http_server_requests_total{job="openmettle-api",instance="a",http_request_method="GET",openmettle_route_class="v1",http_response_status_class="2xx"}'
+        values: '0+1x30'
+      - series: 'openmettle_http_server_requests_total{job="openmettle-api",instance="a",http_request_method="GET",openmettle_route_class="v1",http_response_status_class="5xx"}'
+        values: '0+0.2x30'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: OpenMettleApiHighServerErrorRatio
+        exp_alerts: []
+
+  # --- OpenMettleDatabaseReadinessFailing ------------------------------------------------
+  - name: database_readiness_failing_fires_on_non_ok_outcomes
+    interval: 30s
+    input_series:
+      - series: 'openmettle_db_readiness_checks_total{job="openmettle-api",instance="a",outcome="timeout"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: OpenMettleDatabaseReadinessFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: openmettle-core
+              signal_contract: v1
+              outcome: timeout
+            exp_annotations:
+              summary: "OpenMettle database readiness checks are failing"
+              description: "Readiness probe /readyz recorded repeated non-ok database checks."
+
+  - name: database_readiness_failing_silent_on_ok_or_below_threshold
+    interval: 30s
+    input_series:
+      - series: 'openmettle_db_readiness_checks_total{job="openmettle-api",instance="a",outcome="ok"}'
+        values: '0+5x30'
+      - series: 'openmettle_db_readiness_checks_total{job="openmettle-api",instance="a",outcome="error"}'
+        values: '0+0.1x30'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: OpenMettleDatabaseReadinessFailing
+        exp_alerts: []
+
+  # --- OpenMettleTelemetryDropsDetected --------------------------------------------------
+  - name: telemetry_drops_detected_fires_on_drop_increase
+    interval: 30s
+    input_series:
+      - series: 'openmettle_telemetry_dropped_total{job="openmettle-api",instance="a",signal="metric_exports"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: OpenMettleTelemetryDropsDetected
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: openmettle-core
+              signal_contract: v1
+              signal: metric_exports
+            exp_annotations:
+              summary: "OpenMettle telemetry drops detected"
+              description: "The bounded stderr sink or OTLP exporter dropped telemetry items due to queue saturation or collector unavailability."
+
+  - name: telemetry_drops_detected_silent_when_counter_is_flat
+    interval: 30s
+    input_series:
+      - series: 'openmettle_telemetry_dropped_total{job="openmettle-api",instance="a",signal="log_lines"}'
+        values: '5+0x30'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: OpenMettleTelemetryDropsDetected
+        exp_alerts: []
+
+  # --- OpenMettleProviderTransportFailures -----------------------------------------------
+  - name: provider_transport_failures_fires_on_repeated_errors
+    interval: 30s
+    input_series:
+      - series: 'openmettle_provider_http_requests_total{job="openmettle-api",instance="a",operation="jwks",outcome="timeout"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: OpenMettleProviderTransportFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: openmettle-api
+              signal_contract: v1
+              operation: jwks
+              outcome: timeout
+            exp_annotations:
+              summary: "OpenMettle identity provider transport failures"
+              description: "Repeated outbound OIDC provider HTTP requests failed over the ADR 0010 transport."
+
+  - name: provider_transport_failures_silent_on_ok_or_below_threshold
+    interval: 30s
+    input_series:
+      - series: 'openmettle_provider_http_requests_total{job="openmettle-api",instance="a",operation="discovery",outcome="ok"}'
+        values: '0+10x30'
+      - series: 'openmettle_provider_http_requests_total{job="openmettle-api",instance="a",operation="token",outcome="transport"}'
+        values: '0+0.1x30'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: OpenMettleProviderTransportFailures
+        exp_alerts: []

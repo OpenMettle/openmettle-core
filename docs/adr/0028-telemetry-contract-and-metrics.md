@@ -1,8 +1,8 @@
 # 0028 — Telemetry contract v1 and bounded operational metrics
 
-Status: proposed V1-29 increment 3 of 4, 20 November 2026. Agent-authored; implements the
+Status: proposed V1-29 increments 3–4 of 4, 20 November 2026. Agent-authored; implements the
 V1-29 increment plan recorded on #26. Owner approval of this record, independent review and
-CI acceptance are separate gates. Refs #26; Refs #34. #26 remains open.
+CI acceptance are separate gates. Refs #26; Refs #34. #26 remains open until owner acceptance.
 
 ## Problem
 
@@ -84,9 +84,10 @@ by pre-allocated `AtomicU64` counters and fixed-bucket histograms (`DURATION_BUC
 `contracts/telemetry/alerts-v1.yaml` defines Prometheus alert rules strictly over the v1
 metrics emitted today: `OpenMettleApiHighServerErrorRatio` (scoped to `job="openmettle-api"`
 and excluding `healthz`/`readyz` probes), `OpenMettleDatabaseReadinessFailing`,
-`OpenMettleTelemetryDropsDetected`, and `OpenMettleProviderTransportFailures`. Live
-Prometheus/Alloy `promtool` and collector-outage qualification remain V1-29 increment 4
-(`kind` qualification).
+`OpenMettleTelemetryDropsDetected`, and `OpenMettleProviderTransportFailures`.
+`contracts/telemetry/alerts-v1-test.yaml` supplies deterministic positive and negative
+`promtool test rules` cases for all four alerts, executed alongside `promtool check rules`
+in CI via the pinned Prometheus image.
 
 ## Dependencies
 
@@ -112,3 +113,13 @@ package enters `Cargo.lock`, and the ADR 0026 banned-crate guard in
 - `src/telemetry/tests.rs` verifies that `metric_exports_dropped` and `spans_dropped` pass
   the allowlist guard and that retried stderr drop-report writes never double-count
   `openmettle.telemetry.dropped{signal="log_lines"}`.
+- `.github/workflows/telemetry-qualification.yml` and `tests/telemetry_kind/qualify.py`
+  (V1-29 increment 4 of 4) run `tests/telemetry_kind/test_qualify.py`, execute `promtool check
+  rules` and `promtool test rules` against `contracts/telemetry/alerts-v1-test.yaml`, and
+  qualify live `openmettle-api` and `openmettle-worker` pods against pinned Grafana Alloy
+  (`v1.10.0`) and Prometheus (`v3.5.0`) on an ephemeral `dev` `kind` cluster: HTTPS OTLP
+  trace and metrics ingestion with synthetic CA, inbound `traceparent` / secret redaction,
+  per-process UUIDv4 `instance` separation, closed-enum contract label verification on every
+  live `openmettle_*` series, collector-outage resilience (zero probe failures and zero
+  restarts while `telemetry.dropped` is logged and `OpenMettleTelemetryDropsDetected`
+  activates in Prometheus), and clean SIGTERM shutdown.

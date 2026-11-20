@@ -10,6 +10,7 @@ Contract only: nothing here is served by the running API. Read
 | `vendor/oas-3.2/` | Official OpenAPI 3.2 schema files, unmodified, Apache-2.0 |
 | `telemetry/v1.json` | Canonical telemetry contract v1: redaction policy, log/trace allowlists and bounded metrics (ADR 0028) |
 | `telemetry/alerts-v1.yaml` | Deterministic Prometheus alert rules over telemetry contract v1 signals (ADR 0028) |
+| `telemetry/alerts-v1-test.yaml` | Deterministic `promtool test rules` suite covering positive and negative cases for v1 alerts (ADR 0028) |
 
 After changing the document, regenerate fixtures and run the checks:
 
