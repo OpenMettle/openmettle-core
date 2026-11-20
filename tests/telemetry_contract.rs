@@ -229,10 +229,26 @@ fn telemetry_contract_metrics_match_rust_descriptors_and_cardinality_ceiling() {
 fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
     let instance_id = "11111111-2222-4333-8444-555555555555";
     let store = Metrics::new();
-    assert!(
-        store.encode_otlp(Process::Api, Some(instance_id)).is_none(),
-        "empty registry produces no OTLP batch"
-    );
+    let baseline = store
+        .encode_otlp(Process::Api, Some(instance_id))
+        .expect("fresh registry emits zero-initialized openmettle.telemetry.dropped baseline");
+    let baseline_metrics = &baseline.resource_metrics[0].scope_metrics[0].metrics;
+    assert_eq!(baseline_metrics.len(), 1);
+    assert_eq!(baseline_metrics[0].name, "openmettle.telemetry.dropped");
+    match baseline_metrics[0].data.as_ref().unwrap() {
+        metric::Data::Sum(sum) => {
+            assert_eq!(sum.data_points.len(), DroppedSignal::ALL.len());
+            assert!(sum.data_points.iter().all(|dp| {
+                matches!(
+                    dp.value,
+                    Some(
+                        opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(0)
+                    )
+                )
+            }));
+        }
+        other => panic!("expected Sum for openmettle.telemetry.dropped, got {other:?}"),
+    }
 
     // Exhaust every single enum combination across all 8 metrics.
     for &m in telemetry::Method::ALL {

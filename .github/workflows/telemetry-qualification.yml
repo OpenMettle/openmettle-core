@@ -31,11 +31,13 @@ jobs:
       - name: Validate and unit-test v1 Prometheus alert rules with pinned promtool
         run: |
           docker pull "$PROMETHEUS_IMAGE"
-          docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges \
+          docker run --rm --network none --read-only --user 65534:65534 \
+            --cap-drop ALL --security-opt no-new-privileges \
             --entrypoint /bin/promtool \
             --volume "$PWD/contracts/telemetry:/work:ro" \
             "$PROMETHEUS_IMAGE" check rules /work/alerts-v1.yaml
-          docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges \
+          docker run --rm --network none --read-only --user 65534:65534 \
+            --cap-drop ALL --security-opt no-new-privileges \
             --entrypoint /bin/promtool \
             --volume "$PWD/contracts/telemetry:/work:ro" \
             "$PROMETHEUS_IMAGE" test rules /work/alerts-v1-test.yaml

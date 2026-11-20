@@ -70,9 +70,11 @@ by pre-allocated `AtomicU64` counters and fixed-bucket histograms (`DURATION_BUC
   worker processes produce disjoint Prometheus `instance` streams without exposing host, pod,
   or user identities.
 - When `OTLP_METRICS_ENDPOINT` is set, one Tokio task periodically snapshots non-zero
-  cumulative metrics, encodes `ExportMetricsServiceRequest` via `opentelemetry-proto`
-  (`metrics` feature enabled with zero new crates in `Cargo.lock`), and POSTs with
-  `Content-Type: application/x-protobuf` over the ADR 0010 `Route`.
+  cumulative metrics plus all three zero-initialized `openmettle.telemetry.dropped`
+  (`DroppedSignal::ALL`) series from process startup so Prometheus records a zero baseline
+  before any first collector outage, encodes `ExportMetricsServiceRequest` via
+  `opentelemetry-proto` (`metrics` feature enabled with zero new crates in `Cargo.lock`), and
+  POSTs with `Content-Type: application/x-protobuf` over the ADR 0010 `Route`.
 - Failures (non-2xx, timeout, DNS/TLS/transport error, or oversized body) drop the export
   cycle without retry, increment `openmettle.telemetry.dropped{signal="metric_exports"}`, and
   emit one `telemetry.dropped` event with `dropped_metric_exports` to stderr.
@@ -84,7 +86,9 @@ by pre-allocated `AtomicU64` counters and fixed-bucket histograms (`DURATION_BUC
 `contracts/telemetry/alerts-v1.yaml` defines Prometheus alert rules strictly over the v1
 metrics emitted today: `OpenMettleApiHighServerErrorRatio` (scoped to `job="openmettle-api"`
 and excluding `healthz`/`readyz` probes), `OpenMettleDatabaseReadinessFailing`,
-`OpenMettleTelemetryDropsDetected`, and `OpenMettleProviderTransportFailures`.
+`OpenMettleTelemetryDropsDetected` (`increase(openmettle_telemetry_dropped_total[15m]) > 0`
+with `for: 5m` so a single collector outage transitions from zero baseline to `firing` and
+resolves cleanly), and `OpenMettleProviderTransportFailures`.
 `contracts/telemetry/alerts-v1-test.yaml` supplies deterministic positive and negative
 `promtool test rules` cases for all four alerts, executed alongside `promtool check rules`
 in CI via the pinned Prometheus image.
@@ -120,6 +124,7 @@ package enters `Cargo.lock`, and the ADR 0026 banned-crate guard in
   (`v1.10.0`) and Prometheus (`v3.5.0`) on an ephemeral `dev` `kind` cluster: HTTPS OTLP
   trace and metrics ingestion with synthetic CA, inbound `traceparent` / secret redaction,
   per-process UUIDv4 `instance` separation, closed-enum contract label verification on every
-  live `openmettle_*` series, collector-outage resilience (zero probe failures and zero
-  restarts while `telemetry.dropped` is logged and `OpenMettleTelemetryDropsDetected`
-  activates in Prometheus), and clean SIGTERM shutdown.
+  live `openmettle_*` series, single-outage collector resilience (zero probe failures and zero
+  restarts while `telemetry.dropped` is logged, `openmettle_telemetry_dropped_total` rises
+  from its zero baseline, and `OpenMettleTelemetryDropsDetected` reaches `firing` in
+  Prometheus), and clean SIGTERM shutdown.

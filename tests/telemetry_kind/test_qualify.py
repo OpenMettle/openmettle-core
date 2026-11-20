@@ -244,6 +244,62 @@ class SeriesValidationAndParserTests(unittest.TestCase):
         with self.assertRaisesRegex(qualify.QualificationFailure, "outside contract enum"):
             qualify.validate_prometheus_series(bad_enum, self.contract)
 
+    def test_rejects_undeclared_metric_label_le_and_missing_required_labels(self):
+        undeclared_metric = [{
+            "metric": {
+                "__name__": "openmettle_undeclared_counter_total",
+                "job": "openmettle-api",
+                "instance": self.uuid_api,
+            }
+        }]
+        with self.assertRaisesRegex(qualify.QualificationFailure, "undeclared openmettle Prometheus series"):
+            qualify.validate_prometheus_series(undeclared_metric, self.contract)
+
+        undeclared_label = [{
+            "metric": {
+                "__name__": "openmettle_telemetry_dropped_total",
+                "job": "openmettle-api",
+                "instance": self.uuid_api,
+                "signal": "metric_exports",
+                "extra_tag": "unexpected",
+            }
+        }]
+        with self.assertRaisesRegex(qualify.QualificationFailure, "undeclared label extra_tag"):
+            qualify.validate_prometheus_series(undeclared_label, self.contract)
+
+        missing_label = [{
+            "metric": {
+                "__name__": "openmettle_db_readiness_checks_total",
+                "job": "openmettle-api",
+                "instance": self.uuid_api,
+            }
+        }]
+        with self.assertRaisesRegex(qualify.QualificationFailure, r"missing declared label\(s\): outcome"):
+            qualify.validate_prometheus_series(missing_label, self.contract)
+
+        missing_le = [{
+            "metric": {
+                "__name__": "openmettle_db_readiness_duration_seconds_bucket",
+                "job": "openmettle-api",
+                "instance": self.uuid_api,
+                "outcome": "ok",
+            }
+        }]
+        with self.assertRaisesRegex(qualify.QualificationFailure, r"missing declared label\(s\): le"):
+            qualify.validate_prometheus_series(missing_le, self.contract)
+
+        undeclared_le = [{
+            "metric": {
+                "__name__": "openmettle_db_readiness_duration_seconds_bucket",
+                "job": "openmettle-api",
+                "instance": self.uuid_api,
+                "outcome": "ok",
+                "le": "999",
+            }
+        }]
+        with self.assertRaisesRegex(qualify.QualificationFailure, "undeclared histogram bucket le=999"):
+            qualify.validate_prometheus_series(undeclared_le, self.contract)
+
     def test_parses_alloy_accepted_spans_metric(self):
         sample = (
             "# HELP otelcol_receiver_accepted_spans_total Number of spans accepted.\n"
@@ -257,6 +313,11 @@ class GuardTests(unittest.TestCase):
     def test_refuses_without_opt_in(self):
         with self.assertRaises(qualify.Refusal):
             qualify.check_opt_in({})
+
+    def test_refuses_missing_openssl_during_preflight(self):
+        runner = FakeRunner({("openssl", "version"): done(returncode=1)})
+        with self.assertRaisesRegex(qualify.Refusal, "required runner tool unusable: openssl"):
+            qualify.check_openssl(runner)
 
     def test_refuses_wrong_cluster_prefix_or_existing_cluster(self):
         runner = FakeRunner({("kind", "get", "clusters"): done(f"{NAME}\n")})

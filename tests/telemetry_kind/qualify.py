@@ -18,6 +18,7 @@ tests/kubernetes/install-tools.sh.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
 import json
 import os
@@ -169,9 +170,9 @@ def load_alerts_text(path: Path = ALERTS_FILE) -> str:
 
 
 def render_prometheus_config() -> str:
+    # Rule group openmettle-core-v1 in alerts-v1.yaml sets its own `interval: 30s`.
     return (
-        "global:\n"
-        "  evaluation_interval: 5s\n"
+        "# Rule group openmettle-core-v1 evaluates every 30s (declared in alerts-v1.yaml).\n"
         "otlp:\n"
         "  translation_strategy: UnderscoreEscapingWithSuffixes\n"
         "rule_files:\n"
@@ -213,8 +214,8 @@ def render_alloy_config() -> str:
 def generate_collector_tls(workdir: Path) -> dict[str, str]:
     """Generate an ephemeral RSA-2048 CA and server certificate for ALLOY_HOST.
 
-    The CA key signs the one collector certificate and is immediately unlinked. Returns
-    PEM strings for ca_crt, tls_crt and tls_key.
+    The CA private key is unlinked immediately after signing the collector certificate, and the
+    entire temporary directory is removed in `finally` before returning PEM strings.
     """
     tls_dir = workdir / "collector-tls"
     tls_dir.mkdir(mode=0o700)
@@ -263,6 +264,7 @@ def generate_collector_tls(workdir: Path) -> dict[str, str]:
             "-extfile", str(config), "-extensions", "collector",
             "-out", str(srv_crt),
         )
+        ca_key.unlink(missing_ok=True)
         return {
             "ca_crt": ca_crt.read_text(encoding="utf-8"),
             "tls_crt": srv_crt.read_text(encoding="utf-8"),
@@ -737,6 +739,11 @@ def validate_prometheus_series(series_list: list[dict], telemetry_contract: dict
         instance = labels.get("instance")
         if not job or not instance:
             raise QualificationFailure(f"series {name} missing job or instance resource label")
+        missing = sorted(set(expected_labels) - set(labels))
+        if missing:
+            raise QualificationFailure(
+                f"series {name} missing declared label(s): {', '.join(missing)}"
+            )
         instances_by_job.setdefault(job, set()).add(instance)
 
     return {
@@ -767,6 +774,15 @@ def check_cluster_absent(run, name: str) -> None:
     existing = run(["kind", "get", "clusters"]).stdout.split()
     if name in existing:
         raise Refusal(f"kind cluster {name} already exists; refusing to reuse it")
+
+
+def check_openssl(run) -> None:
+    try:
+        result = run(["openssl", "version"], check=False, timeout=30)
+    except Refusal as exc:
+        raise Refusal("required runner tool missing: openssl") from exc
+    if result.returncode != 0:
+        raise Refusal("required runner tool unusable: openssl")
 
 
 def http_request(port: int, path: str, headers: dict[str, str] | None = None, timeout: float = 5.0):
@@ -812,6 +828,12 @@ class PortForward:
             if match:
                 self.port = int(match.group(1))
                 return
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
 
     def close(self):
         if self.proc.poll() is None:
@@ -899,6 +921,7 @@ class TelemetryQualification:
 
     def preflight(self):
         check_tools(self.run)
+        check_openssl(self.run)
         check_docker_context(self.run, self.context)
         check_cluster_absent(self.run, self.name)
         if self.kubeconfig.exists():
@@ -957,32 +980,75 @@ class TelemetryQualification:
         manifests = render_manifests(
             self.process_contract, self.images, passwords, tls, self.alerts_yaml, self.run_id,
         )
+        # Apply namespaces, Postgres, Prometheus, and Alloy first so the collector is ready
+        # before openmettle-api/worker start and emit their initial zero-baseline drop series.
+        infra_items = []
+        app_items = []
+        for item in manifests["items"]:
+            if item["kind"] == "Deployment" and item["metadata"].get("namespace") == APP_NAMESPACE:
+                app_items.append(item)
+            else:
+                infra_items.append(item)
         self.verify_identity()
-        self.kube("apply", "--filename", "-", input=json.dumps(manifests))
+        self.kube(
+            "apply", "--filename", "-",
+            input=json.dumps({"apiVersion": "v1", "kind": "List", "items": infra_items}),
+        )
         self.kube("--namespace", DB_NAMESPACE, "rollout", "status", "deployment/postgres",
                   "--timeout=300s", timeout=330)
         self.kube("--namespace", TELEMETRY_NAMESPACE, "rollout", "status", "deployment/prometheus",
                   "--timeout=300s", timeout=330)
         self.kube("--namespace", TELEMETRY_NAMESPACE, "rollout", "status", "deployment/alloy",
                   "--timeout=300s", timeout=330)
+        self.verify_identity()
+        self.kube(
+            "apply", "--filename", "-",
+            input=json.dumps({"apiVersion": "v1", "kind": "List", "items": app_items}),
+        )
         for role in ROLES:
             self.kube("--namespace", APP_NAMESPACE, "rollout", "status",
                       f"deployment/openmettle-{role}", "--timeout=180s", timeout=210)
         self.passed("telemetry stack and app pods ready under restricted PSS")
 
-    def prom_query(self, prom_port: int, expr: str) -> list[dict]:
+    def prom_query(
+        self, prom_port: int, expr: str, *, allow_transient: bool = False,
+    ) -> list[dict] | None:
         encoded = urllib.parse.urlencode({"query": expr})
         status, body = http_request(prom_port, f"/api/v1/query?{encoded}")
-        self.expect(status == 200, f"Prometheus query {expr!r} failed: status={status} body={body[:300]}")
-        payload = json.loads(body)
-        self.expect(payload.get("status") == "success", f"Prometheus query error: {payload}")
+        if status != 200:
+            if allow_transient:
+                return None
+            raise QualificationFailure(
+                f"Prometheus query {expr!r} failed: status={status} body={body[:300]}"
+            )
+        try:
+            payload = json.loads(body)
+        except ValueError as exc:
+            if allow_transient:
+                return None
+            raise QualificationFailure(f"Prometheus query {expr!r} returned invalid JSON: {exc}") from exc
+        if payload.get("status") != "success":
+            if allow_transient:
+                return None
+            raise QualificationFailure(f"Prometheus query error: {payload}")
         return payload["data"]["result"]
 
-    def prom_rules(self, prom_port: int) -> list[dict]:
+    def prom_rules(self, prom_port: int, *, allow_transient: bool = False) -> list[dict] | None:
         status, body = http_request(prom_port, "/api/v1/rules")
-        self.expect(status == 200, f"Prometheus /api/v1/rules failed: status={status}")
-        payload = json.loads(body)
-        self.expect(payload.get("status") == "success", f"Prometheus /api/v1/rules error: {payload}")
+        if status != 200:
+            if allow_transient:
+                return None
+            raise QualificationFailure(f"Prometheus /api/v1/rules failed: status={status}")
+        try:
+            payload = json.loads(body)
+        except ValueError as exc:
+            if allow_transient:
+                return None
+            raise QualificationFailure(f"Prometheus /api/v1/rules returned invalid JSON: {exc}") from exc
+        if payload.get("status") != "success":
+            if allow_transient:
+                return None
+            raise QualificationFailure(f"Prometheus /api/v1/rules error: {payload}")
         return payload["data"]["groups"]
 
     def scale_alloy(self, replicas: int):
@@ -1037,16 +1103,25 @@ class TelemetryQualification:
         self.expect(len(api_pods) == 1, f"expected 1 api pod, found {len(api_pods)}")
         api_pod = api_pods[0]["metadata"]["name"]
 
-        prom_pf = PortForward(self.kubectl, self.env, TELEMETRY_NAMESPACE,
-                              "service/prometheus", PROMETHEUS_PORT)
-        alloy_pf = PortForward(self.kubectl, self.env, TELEMETRY_NAMESPACE,
-                               "service/alloy", ALLOY_ADMIN_PORT)
-        api_pf = PortForward(self.kubectl, self.env, APP_NAMESPACE,
-                             f"pod/{api_pod}", api_spec["port"])
-        try:
+        with contextlib.ExitStack() as stack:
+            prom_pf = stack.enter_context(PortForward(
+                self.kubectl, self.env, TELEMETRY_NAMESPACE,
+                "service/prometheus", PROMETHEUS_PORT,
+            ))
+            alloy_pf = stack.enter_context(PortForward(
+                self.kubectl, self.env, TELEMETRY_NAMESPACE,
+                "service/alloy", ALLOY_ADMIN_PORT,
+            ))
+            api_pf = stack.enter_context(PortForward(
+                self.kubectl, self.env, APP_NAMESPACE,
+                f"pod/{api_pod}", api_spec["port"],
+            ))
+
             # 1. Verify all 4 v1 Prometheus alert rules are loaded and healthy.
             def rules_loaded():
-                groups = self.prom_rules(prom_pf.port)
+                groups = self.prom_rules(prom_pf.port, allow_transient=True)
+                if not groups:
+                    return None
                 for group in groups:
                     if group.get("name") == "openmettle-core-v1":
                         rules = {r["name"]: r for r in group.get("rules", [])}
@@ -1101,32 +1176,44 @@ class TelemetryQualification:
             self.passed("HTTPS OTLP trace ingestion and inbound traceparent/secret redaction",
                         accepted_spans=accepted_spans)
 
-            # 4. Verify Prometheus ingested API and worker metrics with valid contract labels.
+            # 4. Verify Prometheus ingested API and worker metrics (including zero-initialized
+            # drop counters) with valid contract labels.
             def core_metrics_ingested():
                 unmatched = self.prom_query(
                     prom_pf.port,
                     'openmettle_http_server_requests_total{job="openmettle-api",'
                     'openmettle_route_class="unmatched",http_response_status_class="4xx"}',
+                    allow_transient=True,
                 )
                 readyz = self.prom_query(
                     prom_pf.port,
                     'openmettle_db_readiness_checks_total{job="openmettle-api",outcome="ok"}',
+                    allow_transient=True,
                 )
                 duration = self.prom_query(
                     prom_pf.port,
                     'openmettle_http_server_request_duration_seconds_count{job="openmettle-api",'
                     'openmettle_route_class="unmatched",http_response_status_class="4xx"}',
+                    allow_transient=True,
                 )
                 worker = self.prom_query(
                     prom_pf.port,
                     'openmettle_db_readiness_checks_total{job="openmettle-worker",outcome="ok"}',
+                    allow_transient=True,
                 )
-                if unmatched and readyz and duration and worker:
+                drop_baseline = self.prom_query(
+                    prom_pf.port,
+                    'openmettle_telemetry_dropped_total{job="openmettle-api",'
+                    'signal="metric_exports"}',
+                    allow_transient=True,
+                )
+                if unmatched and readyz and duration and worker and drop_baseline:
                     return {
                         "api_unmatched_4xx": float(unmatched[0]["value"][1]),
                         "api_db_ready_ok": float(readyz[0]["value"][1]),
                         "api_duration_count": float(duration[0]["value"][1]),
                         "worker_db_ready_ok": float(worker[0]["value"][1]),
+                        "api_drop_baseline": float(drop_baseline[0]["value"][1]),
                     }
                 return None
 
@@ -1134,6 +1221,10 @@ class TelemetryQualification:
                 "Prometheus OTLP metric ingestion for API and worker",
                 core_metrics_ingested,
                 timeout=90,
+            )
+            self.expect(
+                ingested["api_drop_baseline"] == 0.0,
+                f"expected zero-initialized metric_exports drop baseline before outage, got {ingested['api_drop_baseline']}",
             )
             all_series = self.prom_query(prom_pf.port, '{__name__=~"openmettle_.*"}')
             validation = validate_prometheus_series(all_series, self.telemetry_contract)
@@ -1149,8 +1240,8 @@ class TelemetryQualification:
                 **validation,
             )
 
-            # 5. Collector-outage resilience & OpenMettleTelemetryDropsDetected alert evaluation.
-            # Close Alloy port-forward before scaling Alloy to 0.
+            # 5. Single collector outage: verify API resilience and that OpenMettleTelemetryDropsDetected
+            # transitions from zero baseline through pending into firing (for: 5m over [15m] window).
             alloy_pf.close()
             probe_results: list[tuple] = []
             stop_probing = threading.Event()
@@ -1185,6 +1276,7 @@ class TelemetryQualification:
                     prom_pf.port,
                     'openmettle_telemetry_dropped_total{job="openmettle-api",'
                     'signal="metric_exports"}',
+                    allow_transient=True,
                 )
                 if not rows:
                     return None
@@ -1194,37 +1286,18 @@ class TelemetryQualification:
             prober = threading.Thread(target=probe_loop, daemon=True)
             prober.start()
             try:
-                # Outage pulse 1: scale Alloy to 0 until API records a metric_exports drop,
-                # then restore Alloy and wait for Prometheus to ingest sample N1 >= 1.
-                _log("collector outage pulse 1: scaling Alloy to 0")
+                _log("collector outage: scaling Alloy to 0 until telemetry.dropped is logged")
                 self.scale_alloy(0)
-                pulse1_events = self.wait_for(
-                    "openmettle-api stderr telemetry.dropped during pulse 1",
+                self.wait_for(
+                    "openmettle-api stderr telemetry.dropped during collector outage",
                     lambda: api_metric_drop_events() or None,
                     timeout=45,
                 )
+                _log("collector recovery: scaling Alloy back to 1")
                 self.scale_alloy(1)
-                n1 = self.wait_for(
-                    "first metric_exports drop sample in Prometheus",
+                drops_after_outage = self.wait_for(
+                    "metric_exports drop counter >= 1 in Prometheus after single outage",
                     lambda: drop_counter_at_least(1.0),
-                    timeout=90,
-                )
-
-                # Outage pulse 2: increase counter N1 -> N2 so increase(...[5m]) > 0.
-                before_pulse2 = len(api_metric_drop_events())
-                _log(f"collector outage pulse 2 (N1={n1}): scaling Alloy to 0")
-                self.scale_alloy(0)
-                self.wait_for(
-                    "openmettle-api stderr telemetry.dropped during pulse 2",
-                    lambda: (
-                        events if len(events := api_metric_drop_events()) > before_pulse2 else None
-                    ),
-                    timeout=45,
-                )
-                self.scale_alloy(1)
-                n2 = self.wait_for(
-                    f"metric_exports drop counter to increase above {n1}",
-                    lambda: drop_counter_at_least(n1 + 1.0),
                     timeout=90,
                 )
             finally:
@@ -1236,9 +1309,16 @@ class TelemetryQualification:
                 if (p[0] == "healthz" and p[1] != (200, "ok\n"))
                 or (p[0] == "readyz" and p[1] != (200, "ready\n"))
             ]
+            api_pf_exit = api_pf.proc.poll()
+            if api_pf_exit is not None:
+                raise QualificationFailure(
+                    f"API port-forward exited unexpectedly with code {api_pf_exit} during collector "
+                    f"outage ({len(bad_probes)}/{len(probe_results)} failed probes; sample={bad_probes[:5]!r})"
+                )
             self.expect(
                 len(probe_results) >= 20 and not bad_probes,
-                f"API probes degraded during collector outage: {len(bad_probes)} failures of {len(probe_results)}",
+                f"API probes degraded during collector outage: {len(bad_probes)} failures of "
+                f"{len(probe_results)}; sample={bad_probes[:5]!r}",
             )
 
             # Verify zero restarts across API and worker.
@@ -1257,12 +1337,15 @@ class TelemetryQualification:
                 self.expect(forbidden not in api_logs,
                             f"forbidden canary leaked into openmettle-api stderr logs: {forbidden}")
             dropped_events = api_metric_drop_events()
-            self.expect(len(dropped_events) >= len(pulse1_events) + 1,
-                        "expected telemetry.dropped stderr events from both outage pulses")
+            self.expect(len(dropped_events) >= 1,
+                        "expected at least one telemetry.dropped stderr event from collector outage")
 
-            # Verify Prometheus evaluates OpenMettleTelemetryDropsDetected into pending or firing.
-            def drops_alert_active():
-                for group in self.prom_rules(prom_pf.port):
+            # Verify Prometheus evaluates OpenMettleTelemetryDropsDetected all the way to firing.
+            def drops_alert_firing():
+                groups = self.prom_rules(prom_pf.port, allow_transient=True)
+                if not groups:
+                    return None
+                for group in groups:
                     if group.get("name") != "openmettle-core-v1":
                         continue
                     for rule in group.get("rules", []):
@@ -1271,18 +1354,23 @@ class TelemetryQualification:
                         for alert in rule.get("alerts", []):
                             labels = alert.get("labels", {})
                             if (
-                                alert.get("state") in ("pending", "firing")
+                                alert.get("state") == "firing"
                                 and labels.get("signal") == "metric_exports"
                             ):
                                 return alert
                 return None
 
-            active_alert = self.wait_for(
-                "Prometheus OpenMettleTelemetryDropsDetected alert to activate",
-                drops_alert_active,
-                timeout=90,
+            _log(
+                f"drop counter reached {drops_after_outage}; waiting for "
+                "OpenMettleTelemetryDropsDetected to reach firing state (for: 5m)"
             )
-            alert_labels = active_alert.get("labels", {})
+            firing_alert = self.wait_for(
+                "Prometheus OpenMettleTelemetryDropsDetected alert to fire",
+                drops_alert_firing,
+                timeout=480,
+                interval=5.0,
+            )
+            alert_labels = firing_alert.get("labels", {})
             for key, expected in (
                 ("severity", "warning"),
                 ("service", "openmettle-core"),
@@ -1293,23 +1381,18 @@ class TelemetryQualification:
                     alert_labels.get(key) == expected,
                     f"alert label {key}={alert_labels.get(key)!r} != {expected!r}",
                 )
-            # Re-validate all openmettle_* series now that telemetry_dropped is also present.
             final_series = self.prom_query(prom_pf.port, '{__name__=~"openmettle_.*"}')
             validate_prometheus_series(final_series, self.telemetry_contract)
 
             self.passed(
-                "collector-outage resilience and Prometheus alert evaluation",
+                "collector-outage resilience and Prometheus alert firing",
                 probes_total=len(probe_results),
-                drop_counter_pulse1=n1,
-                drop_counter_pulse2=n2,
+                drop_counter_baseline=ingested["api_drop_baseline"],
+                drop_counter_after_outage=drops_after_outage,
                 stderr_dropped_events=len(dropped_events),
-                alert_state=active_alert.get("state"),
+                alert_state=firing_alert.get("state"),
                 alert_labels=alert_labels,
             )
-        finally:
-            api_pf.close()
-            alloy_pf.close()
-            prom_pf.close()
 
         # 6. Clean SIGTERM shutdown with active OTLP trace + metrics exporters.
         worker_exits = self.scale_down_observing_exit("worker")
@@ -1392,6 +1475,11 @@ def main(argv=None) -> int:
         qualification.report["result"] = "failed"
         qualification.report["error"] = str(exc)
         print(f"qualification failed: {exc}", file=sys.stderr)
+        qualification.diagnostics()
+    except Exception as exc:
+        qualification.report["result"] = "failed"
+        qualification.report["error"] = f"{type(exc).__name__}: {exc}"
+        print(f"qualification failed unexpectedly ({type(exc).__name__}): {exc}", file=sys.stderr)
         qualification.diagnostics()
     finally:
         cleanup_failures = qualification.cleanup()
