@@ -686,7 +686,8 @@ pub enum CapabilityGate {
     OptIn,
 }
 
-fn valid_capability(name: &str) -> bool {
+/// The capability name rule, mirrored exactly by the migration 15 `CHECK` constraints.
+pub fn valid_capability(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
         && name.bytes().all(|b| {
@@ -759,6 +760,8 @@ pub fn authorize_run_continuation(
         _ => RunContinuation::Continue,
     }
 }
+
+pub mod store;
 
 #[cfg(test)]
 mod tests;

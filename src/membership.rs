@@ -326,6 +326,40 @@ async fn apply_assignment(
     Ok(true)
 }
 
+/// Mapped membership state, selector kind and claim value of enrolled approvals, evaluated at
+/// `$1` milliseconds, or at the primary clock when `$1` is NULL. The single predicate shared by
+/// [`current`] and authorization hydration (`crate::authz::store`); callers append a WHERE.
+macro_rules! membership_state {
+    () => {
+        "SELECT CASE
+          WHEN NOT m.enabled OR NOT a.active OR a.expires_ms <= t.ms OR u.disabled_at IS NOT NULL
+            OR r.last_revision <> m.rule_revision OR NOT v.enabled
+            OR v.binding_format <> 'openmettle.project-member' OR v.binding_version <> 1
+            OR v.binding <> convert_to(m.project_id::text,'UTF8')
+            OR e.revision IS NULL OR h.id IS DISTINCT FROM (m.observation).change_id THEN 'failed'
+          WHEN m.issued_ms IS NULL THEN 'missing'
+          WHEN m.epoch IS DISTINCT FROM e.epoch
+            OR m.approval_generation IS DISTINCT FROM a.access_generation
+            OR m.user_generation IS DISTINCT FROM u.session_generation THEN 'failed'
+          WHEN t.ms < m.issued_ms OR t.ms >= least(m.expires_ms, m.issued_ms + 1000::bigint*m.max_age_seconds) THEN 'stale'
+          WHEN (m.observation).state='present' AND
+               (h.decision <> 'grant' OR h.cycle_id IS DISTINCT FROM h.id OR h.mapping_revision <> m.rule_revision) THEN 'failed'
+          ELSE (m.observation).state END AS state, v.selector_kind, v.claim_value
+         FROM openmettle.membership_observations m JOIN openmettle.local_identity_approvals a ON a.id=m.approval_id
+         JOIN openmettle.user_identities i ON i.id=a.identity_id JOIN openmettle.users u ON u.id=i.user_id
+         JOIN openmettle.grant_mapping_rules r ON r.id=m.rule_id AND r.provider_config_id=a.provider_id AND r.issuer=i.issuer
+         JOIN openmettle.grant_mapping_revisions v ON v.rule_id=r.id AND v.revision=m.rule_revision
+         LEFT JOIN openmettle.grant_assignments g ON g.scope_id=m.scope_id AND g.project_id=m.project_id
+           AND g.grantee_user_id=u.id AND g.mapping_rule_id=r.id AND g.assignment_key=a.id::text
+           AND g.assignment_format='openmettle.project-member' AND g.assignment_version=1
+         LEFT JOIN openmettle.grant_changes h ON h.assignment_id=g.id AND h.revision=g.last_revision
+         LEFT JOIN LATERAL (SELECT epoch,revision FROM openmettle.login_provider_revisions WHERE provider_id=a.provider_id
+                            ORDER BY epoch DESC LIMIT 1) e ON true
+         CROSS JOIN (SELECT coalesce($1::bigint, floor(extract(epoch FROM clock_timestamp())*1000)::bigint) AS ms) t"
+    };
+}
+pub(crate) use membership_state;
+
 /// Current mapped membership for one exact approval and project. Failure, expiry, rule
 /// replacement and incomplete observations yield no positive decision. Use a primary connection.
 pub async fn current(
@@ -340,34 +374,15 @@ pub async fn current(
     if c.is_in_transaction() {
         return Err(Error::Rejected);
     }
-    let query = sqlx::query_scalar::<_,String>(
-        "SELECT CASE
-          WHEN NOT m.enabled OR NOT a.active OR a.expires_ms <= t.ms OR u.disabled_at IS NOT NULL
-            OR r.last_revision <> m.rule_revision OR NOT v.enabled
-            OR v.binding_format <> 'openmettle.project-member' OR v.binding_version <> 1
-            OR v.binding <> convert_to(m.project_id::text,'UTF8')
-            OR e.revision IS NULL OR h.id IS DISTINCT FROM (m.observation).change_id THEN 'failed'
-          WHEN m.issued_ms IS NULL THEN 'missing'
-          WHEN m.epoch IS DISTINCT FROM e.epoch
-            OR m.approval_generation IS DISTINCT FROM a.access_generation
-            OR m.user_generation IS DISTINCT FROM u.session_generation THEN 'failed'
-          WHEN t.ms < m.issued_ms OR t.ms >= least(m.expires_ms, m.issued_ms + 1000::bigint*m.max_age_seconds) THEN 'stale'
-          WHEN (m.observation).state='present' AND
-               (h.decision <> 'grant' OR h.cycle_id IS DISTINCT FROM h.id OR h.mapping_revision <> m.rule_revision) THEN 'failed'
-          ELSE (m.observation).state END
-         FROM openmettle.membership_observations m JOIN openmettle.local_identity_approvals a ON a.id=m.approval_id
-         JOIN openmettle.user_identities i ON i.id=a.identity_id JOIN openmettle.users u ON u.id=i.user_id
-         JOIN openmettle.grant_mapping_rules r ON r.id=m.rule_id AND r.provider_config_id=a.provider_id AND r.issuer=i.issuer
-         JOIN openmettle.grant_mapping_revisions v ON v.rule_id=r.id AND v.revision=m.rule_revision
-         LEFT JOIN openmettle.grant_assignments g ON g.scope_id=m.scope_id AND g.project_id=m.project_id
-           AND g.grantee_user_id=u.id AND g.mapping_rule_id=r.id AND g.assignment_key=a.id::text
-           AND g.assignment_format='openmettle.project-member' AND g.assignment_version=1
-         LEFT JOIN openmettle.grant_changes h ON h.assignment_id=g.id AND h.revision=g.last_revision
-         LEFT JOIN LATERAL (SELECT epoch,revision FROM openmettle.login_provider_revisions WHERE provider_id=a.provider_id
-                            ORDER BY epoch DESC LIMIT 1) e ON true
-         CROSS JOIN (SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint AS ms) t
-         WHERE a.id=$1::uuid AND m.project_id=$2::uuid"
-    ).bind(approval).bind(project).fetch_optional(c);
+    let query = sqlx::query_scalar::<_, String>(concat!(
+        "SELECT s.state FROM (",
+        membership_state!(),
+        " WHERE a.id=$2::uuid AND m.project_id=$3::uuid) s"
+    ))
+    .bind(None::<i64>)
+    .bind(approval)
+    .bind(project)
+    .fetch_optional(c);
     let result = tokio::time::timeout(policy.deadline(), query)
         .await
         .map_err(|_| Error::Timeout)??;
