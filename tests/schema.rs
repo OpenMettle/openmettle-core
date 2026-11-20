@@ -1882,3 +1882,6 @@ mod authz_store;
 
 #[path = "schema/authz_projects.rs"]
 mod authz_projects;
+
+#[path = "schema/authz_runs.rs"]
+mod authz_runs;

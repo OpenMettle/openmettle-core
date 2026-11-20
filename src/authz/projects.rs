@@ -642,15 +642,18 @@ pub async fn update_project_settings(
     project_write(c, ctx, project_id, change, authorize, apply).await
 }
 
-/// One `archived_at` or `deleted_at` transition of an existing settings row.
+/// One `archived_at` or `deleted_at` transition of an existing settings row. Archive and delete
+/// also cancel every non-terminal run in the project's scope in the same transaction, because
+/// the worker cannot read `project_settings` (ADR 0027 PR5). Restore revives no run.
 async fn lifecycle(
     c: &mut PgConnection,
     ctx: &AuditContext<'_>,
     project_id: &str,
     (action, required, sql): (&'static str, Action, &'static str),
+    cancel_runs: bool,
 ) -> Result<WriteOutcome, StoreError> {
     let change = project_change(action, project_id, json!({}));
-    let apply = async |tx: &mut WriteTransaction<'_>, _: &str| {
+    let apply = async |tx: &mut WriteTransaction<'_>, scope: &str| {
         let c = tx.connection()?;
         let changed = sqlx::query(sql)
             .bind(project_id)
@@ -659,6 +662,10 @@ async fn lifecycle(
             .await?
             .rows_affected();
         if changed == 1 {
+            if cancel_runs {
+                // Last statement: run rows are locked after the project row (`authz::runs`).
+                super::runs::cancel_scope_runs(c, scope).await?;
+            }
             return Ok(());
         }
         let settled: bool = sqlx::query_scalar(
@@ -686,7 +693,7 @@ pub async fn archive_project(
                       updated_at = clock_timestamp(), updated_by_user_id = $2::uuid
                 WHERE project_id = $1::uuid AND archived_at IS NULL";
     let step = ("project.archive", Action::ManageProjectSettings, sql);
-    lifecycle(c, ctx, project_id, step).await
+    lifecycle(c, ctx, project_id, step, true).await
 }
 
 pub async fn restore_project(
@@ -699,7 +706,7 @@ pub async fn restore_project(
                       updated_at = clock_timestamp(), updated_by_user_id = $2::uuid
                 WHERE project_id = $1::uuid AND archived_at IS NOT NULL";
     let step = ("project.restore", Action::ManageProjectSettings, sql);
-    lifecycle(c, ctx, project_id, step).await
+    lifecycle(c, ctx, project_id, step, false).await
 }
 
 /// Soft delete. A deleted project is concealed from every later write; nothing is removed.
@@ -713,7 +720,7 @@ pub async fn delete_project(
                       updated_at = clock_timestamp(), updated_by_user_id = $2::uuid
                 WHERE project_id = $1::uuid AND deleted_at IS NULL";
     let step = ("project.delete", Action::DeleteProject, sql);
-    lifecycle(c, ctx, project_id, step).await
+    lifecycle(c, ctx, project_id, step, true).await
 }
 
 /// Give `grantee` exactly one direct project role, revoking any other direct role it holds, so

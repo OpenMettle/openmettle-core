@@ -266,7 +266,8 @@ fn unique(error: sqlx::Error, constraint: &str, conflict: &'static str) -> Store
     }
 }
 
-async fn begin(c: &mut PgConnection) -> Result<WriteTransaction<'_>, StoreError> {
+/// One bounded READ COMMITTED transaction, shared by the writers and the run recheck.
+pub(super) async fn begin(c: &mut PgConnection) -> Result<WriteTransaction<'_>, StoreError> {
     let mut tx = WriteTransaction::begin(c).await?;
     for sql in [
         "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
@@ -555,7 +556,9 @@ pub async fn revoke_account_admin(
 }
 
 /// Disable an account, refusing to disable the last enabled `account_admin`. The session
-/// generation advances so re-enabling never revives an earlier session (ADR 0013).
+/// generation advances so re-enabling never revives an earlier session (ADR 0013). Every
+/// non-terminal run the user owns is cancelled in the same transaction (ADR 0027 PR5);
+/// re-enabling does not revive them.
 pub async fn disable_user(
     c: &mut PgConnection,
     ctx: &AuditContext<'_>,
@@ -580,8 +583,10 @@ pub async fn disable_user(
               WHERE id = $1::uuid",
             )
             .bind(user)
-            .execute(c)
+            .execute(&mut *c)
             .await?;
+            // Last statement: run rows are locked after every other lock (see `authz::runs`).
+            super::runs::cancel_user_runs(c, user).await?;
             Ok(())
         },
     )

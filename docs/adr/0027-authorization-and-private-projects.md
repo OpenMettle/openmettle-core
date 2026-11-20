@@ -318,6 +318,58 @@ Run invalidation on share, revoke or disable remains PR5. Hydration does not con
 or deleted projects from the worker; PR4b and PR5 must decide how lifecycle affects reads and
 running work.
 
+### PR5: Worker execution-time recheck and live run invalidation
+
+`src/authz/runs.rs` adds no migration, route, worker loop or dependency. It uses the migration
+15 grants: `UPDATE (state, wait_reason)` on `runs` for both roles and worker `SELECT` on the
+authority, membership, group and capability tables.
+
+- **Recheck.** `recheck_run` takes a `RunRecheckRequest`: the run's scope and ID, the approval
+  the run was admitted under, the capabilities the next step uses and, optionally, one extra
+  conversation or artifact the step writes. It validates every identifier and capability name
+  before any query. It works as `openmettle_worker` or `openmettle_api` and runs one bounded
+  READ COMMITTED transaction:
+  1. Lock the run row `FOR NO KEY UPDATE`. A missing run is `NotFound`. A terminal run
+     (`succeeded`, `failed`, `cancelled`, `interrupted`) returns `Terminal` unchanged.
+  2. Re-hydrate the run owner with `hydrate_worker_principal` and load the platform denies.
+  3. Hydrate the run scope from `scopes` independently of its targets. Hydrate the run's
+     conversation and any extra target with `hydrate_resource`.
+  4. Decide with `authorize_run_continuation`, with `originating_session_active: false`. A
+     missing principal, scope, conversation or extra target invalidates as `NotFound`. A
+     target in another scope is concealed. The extra target needs the same write access as
+     the conversation, so a share downgraded to `Read` invalidates a step that writes it.
+  5. On `Continue`, change nothing. On `Invalidate(reason)`, set the run to `cancelled` with
+     no wait reason and return `Invalidated(reason)`. A repeated recheck returns `Terminal`.
+
+  An approval that is not one of the owner's reads as inactive, so the recheck fails closed.
+  The recheck never reads `account_admins`, `project_settings`, `authorization_audit` or
+  `local_sessions`. Logout is not consulted and `sessions::logout` is unchanged, so logging out
+  never cancels queued or running work.
+- **Lifecycle and disablement.** The worker has no `SELECT` on `project_settings` and must not
+  gain one. The API therefore cancels runs in the lifecycle transaction itself:
+  `archive_project` and `delete_project` cancel every non-terminal run in the project's scope,
+  and `disable_user` cancels every non-terminal run the user owns. A replay, a refused change
+  or `restore_project` cancels nothing, and restore or re-enable revives no run. The other
+  revocations (approval, provider, capability, membership, group, OIDC evidence, share) take
+  effect at the worker's next recheck, which PR5 requires before dispatch and before each tool
+  or provider step.
+- **Lock order.** The recheck locks one run row, then only reads without row locks and updates
+  the row it holds, so it never waits while holding a run lock. Bulk cancellation is the last
+  statement of its transaction, after the project row lock (archive, delete) or after
+  `account_admin_lock` and the user row (disable). It locks every affected run row in ascending
+  `id` order through a materialized CTE before updating any. No path locks a run row and then
+  waits on a project, user or `account_admin_lock` row, so the recheck and bulk cancellations
+  cannot form a wait cycle, and two overlapping bulk cancellations take their shared rows in
+  the same order.
+- **Limits.** A `Continue` is valid only for the observation it made. A revocation that
+  commits during a step is seen at the next recheck. Cancellation moves `cancelling` and
+  `reconciling` runs to `cancelled` as well. Their operation records, including unknown
+  outcomes, are not changed. `sessions::disable_user` (the ADR 0013 internal operation) does
+  not cancel runs; the next recheck invalidates them. Run admission is not part of PR5: it
+  must refuse new runs in an archived or deleted project and serialize with archive on the
+  project row. Otherwise a run admitted concurrently with an archive survives it, and the
+  worker cannot see the archive.
+
 ## Verification
 
 `src/authz/tests.rs` covers vocabulary acceptance and rejection, the role matrix,
@@ -348,3 +400,26 @@ For PR4a, `tests/schema/authz_projects.rs` covers:
 
 Its pure tests cover settings validation. The PostgreSQL tests are `#[ignore]` and need the
 CI PostgreSQL 18 service.
+
+For PR5, unit tests in `src/authz/runs.rs` cover request validation, the terminal-state
+vocabulary and its SQL predicate, and the pure decision: missing or inactive owner, missing
+or out-of-scope targets, project role, extra-target access and capabilities.
+`tests/schema/authz_runs.rs` runs against PostgreSQL 18 and covers:
+
+| Cause | Effect |
+| --- | --- |
+| Authorized personal and project runs; logout of the originating sessions | `Continue` for both roles; state unchanged |
+| Approval withdrawal, approval expiry at `now_ms`, provider retirement, an approval of another user | Worker recheck cancels (`InactivePrincipal`) |
+| Withdrawn `runs.use_yolo`, user deny, platform deny | Cancelled (`Policy`) only for runs that use the capability |
+| `revoke_project_member`; demotion from `Editor` to `Viewer` | Cancelled (`NotFound`; `Policy`) |
+| `remove_local_group_member`, `disable_local_group`, stale OIDC evidence | Cancelled (`NotFound`) |
+| `unshare_resource`; share downgraded to `Read` on the conversation or on an extra artifact target; extra target out of scope or missing | Cancelled (`NotFound`; `Policy`) |
+| `disable_user`, `archive_project`, `delete_project` | Every live run cancelled when the change commits; terminal and unrelated runs untouched; replay, restore and re-enable revive nothing |
+
+Every invalidation is checked to be idempotent: the row is `cancelled` with no wait reason
+and a repeated recheck returns `Terminal`. Terminal runs are never changed. The tests also
+show the worker cannot read `account_admins`, `project_settings`, `authorization_audit` or
+`local_sessions`, or update any run column except its lifecycle columns. Three concurrency
+checks complete without deadlock or lock timeout: a held recheck performs its reads while an
+archive waits on the run row; a worker cancels the row a waiting disablement needs; and
+rechecks race a disablement and an archive over the same runs.
