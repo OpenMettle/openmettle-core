@@ -41,18 +41,23 @@ impl From<sqlx::Error> for StoreError {
 }
 impl From<crate::runs::Error> for StoreError {
     fn from(error: crate::runs::Error) -> Self {
+        use crate::runs::Error as E;
         match error {
-            crate::runs::Error::Database(error) => Self::Database(error),
+            E::Database(error) => Self::Database(error),
+            // A concurrent ADR 0006 change won the assignment's revision; nothing was written.
+            E::Conflict | E::StaleRevision => Self::Conflict("concurrent grant change"),
+            E::Invalid => Self::InvalidInput("grant"),
+            E::NotFound => Self::NotFound,
             _ => Self::Database(sqlx::Error::Protocol("transaction unavailable".into())),
         }
     }
 }
 
-fn uuid(value: &str, what: &'static str) -> Result<(), StoreError> {
+pub(super) fn uuid(value: &str, what: &'static str) -> Result<(), StoreError> {
     crate::runs::uuid(value).map_err(|_| StoreError::InvalidInput(what))
 }
 
-fn check(decision: Decision) -> Result<(), StoreError> {
+pub(super) fn check(decision: Decision) -> Result<(), StoreError> {
     match decision {
         Decision::Allow => Ok(()),
         Decision::Deny(reason) => Err(StoreError::Denied(reason)),
@@ -107,7 +112,7 @@ const PRINCIPAL: &str = "SELECT sc.id::text, u.disabled_at IS NULL,
         WHERE a.id = $2::uuid AND i.user_id = u.id) ap ON true
  WHERE u.id = $1::uuid";
 
-async fn hydrate(
+pub(super) async fn hydrate(
     c: &mut PgConnection,
     user_id: &str,
     approval_id: &str,
@@ -194,10 +199,11 @@ impl AuditContext<'_> {
     fn validate(&self) -> Result<(), StoreError> {
         uuid(self.actor_user_id, "actor_user_id")?;
         uuid(self.actor_approval_id, "actor_approval_id")?;
-        if !(1..=128).contains(&self.request_key.len()) {
+        // PostgreSQL text cannot hold NUL, so it is refused here rather than by the database.
+        if !crate::runs::bounded(self.request_key, 128) {
             return Err(StoreError::InvalidInput("request_key"));
         }
-        if !(1..=512).contains(&self.reason.len()) {
+        if !crate::runs::bounded(self.reason, 512) {
             return Err(StoreError::InvalidInput("reason"));
         }
         Ok(())
@@ -220,20 +226,27 @@ impl WriteOutcome {
     }
 }
 
-/// One audited change. `target_id: None` asks the store to assign a new UUID (group creation);
-/// a replay then matches whatever target the original request recorded.
-struct Change {
-    action: &'static str,
-    target_kind: &'static str,
-    target_id: Option<String>,
-    details: Value,
+/// One audited change. `target_id: None` asks the store to assign a new UUID (group or project
+/// creation); a replay then matches whatever target the original request recorded.
+pub(super) struct Change {
+    pub(super) action: &'static str,
+    pub(super) target_kind: &'static str,
+    pub(super) target_id: Option<String>,
+    pub(super) details: Value,
 }
 
-const UNCHANGED: StoreError = StoreError::Conflict("target is already in the requested state");
+pub(super) const UNCHANGED: StoreError =
+    StoreError::Conflict("target is already in the requested state");
 
 /// A flat local group name, at least as strict as the migration 15 `CHECK`.
 pub fn valid_group_name(name: &str) -> bool {
-    (1..=128).contains(&name.len()) && name.trim() == name && !name.chars().any(char::is_control)
+    valid_name(name, 128)
+}
+
+/// 1 to `max` bytes, no surrounding whitespace and no control character: at least as strict as
+/// the migration 15 name `CHECK`s.
+pub(super) fn valid_name(name: &str, max: usize) -> bool {
+    (1..=max).contains(&name.len()) && name.trim() == name && !name.chars().any(char::is_control)
 }
 
 fn capability(name: &str) -> Result<(), StoreError> {
@@ -269,7 +282,102 @@ async fn begin(c: &mut PgConnection) -> Result<WriteTransaction<'_>, StoreError>
     Ok(tx)
 }
 
-/// The shared write protocol, in one transaction:
+/// Run `body` in one READ COMMITTED write transaction: commit on success, roll back otherwise.
+/// The audit context is validated before the transaction starts.
+pub(super) async fn transact<T>(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'_>,
+    body: impl AsyncFnOnce(&mut WriteTransaction<'_>) -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    ctx.validate()?;
+    let mut tx = begin(c).await?;
+    match body(&mut tx).await {
+        Ok(value) => {
+            tx.commit().await?;
+            Ok(value)
+        }
+        Err(error) => {
+            tx.rollback().await?;
+            Err(error)
+        }
+    }
+}
+
+/// The actor re-hydrated from the primary inside the write transaction; it must be active.
+pub(super) async fn acting(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'_>,
+) -> Result<Principal, StoreError> {
+    let actor =
+        hydrate_api_principal(c, ctx.actor_user_id, ctx.actor_approval_id, ctx.now_ms).await?;
+    super::require(actor.as_ref())
+        .cloned()
+        .map_err(StoreError::Denied)
+}
+
+/// Insert the audit row first, so a reused request key is detected before any change. `Applied`
+/// carries the new (or given) target ID: apply the change next. `Replayed` means this exact
+/// change is already recorded: write nothing. A different recorded change is a `Conflict`.
+pub(super) async fn record(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'_>,
+    change: &Change,
+) -> Result<WriteOutcome, StoreError> {
+    let target = match &change.target_id {
+        Some(id) => id.clone(),
+        None => {
+            sqlx::query_scalar("SELECT gen_random_uuid()::text")
+                .fetch_one(&mut *c)
+                .await?
+        }
+    };
+    let details = change.details.to_string();
+    let inserted = sqlx::query(
+        "INSERT INTO openmettle.authorization_audit
+             (actor_user_id, action, target_kind, target_id, request_key, reason, details)
+         VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb)
+         ON CONFLICT (actor_user_id, request_key) DO NOTHING",
+    )
+    .bind(ctx.actor_user_id)
+    .bind(change.action)
+    .bind(change.target_kind)
+    .bind(&target)
+    .bind(ctx.request_key)
+    .bind(ctx.reason)
+    .bind(&details)
+    .execute(&mut *c)
+    .await?
+    .rows_affected();
+    if inserted == 1 {
+        return Ok(WriteOutcome::Applied { target_id: target });
+    }
+    let row = sqlx::query(
+        "SELECT action, target_kind, target_id, details = $3::jsonb
+           FROM openmettle.authorization_audit
+          WHERE actor_user_id = $1::uuid AND request_key = $2",
+    )
+    .bind(ctx.actor_user_id)
+    .bind(ctx.request_key)
+    .bind(&details)
+    .fetch_one(&mut *c)
+    .await?;
+    let recorded: String = row.try_get(2)?;
+    let same = row.try_get::<&str, _>(0)? == change.action
+        && row.try_get::<&str, _>(1)? == change.target_kind
+        && change.target_id.as_ref().is_none_or(|id| *id == recorded)
+        && row.try_get::<bool, _>(3)?;
+    if same {
+        Ok(WriteOutcome::Replayed {
+            target_id: recorded,
+        })
+    } else {
+        Err(StoreError::Conflict(
+            "request_key already recorded another change",
+        ))
+    }
+}
+
+/// The administration write protocol, in one transaction:
 /// 1. account administration and user lifecycle lock `account_admin_lock` before anything else;
 /// 2. the actor is re-hydrated from the primary and must be an active `account_admin`;
 /// 3. the audit row is inserted first, so a reused request key is detected before any change;
@@ -281,91 +389,29 @@ async fn write(
     change: Change,
     apply: impl AsyncFnOnce(&mut PgConnection, &Principal, &str) -> Result<(), StoreError>,
 ) -> Result<WriteOutcome, StoreError> {
-    ctx.validate()?;
-    let mut tx = begin(c).await?;
-    let result = async {
+    transact(c, ctx, async move |tx| {
         let c = tx.connection()?;
         if matches!(action, Action::ManageAccountAdmin | Action::ManageAccounts) {
             sqlx::query("SELECT id FROM openmettle.account_admin_lock WHERE id FOR UPDATE")
-                .execute(&mut *c)
+                .fetch_one(&mut *c)
                 .await?;
         }
-        let actor =
-            hydrate_api_principal(c, ctx.actor_user_id, ctx.actor_approval_id, ctx.now_ms).await?;
-        let actor = super::require(actor.as_ref()).map_err(StoreError::Denied)?;
+        let actor = acting(c, ctx).await?;
         check(super::authorize_admin(
-            actor,
+            &actor,
             AdminChange {
                 action,
                 removes_enabled_admin: false,
                 enabled_account_admins: 0,
             },
         ))?;
-        let target = match &change.target_id {
-            Some(id) => id.clone(),
-            None => {
-                sqlx::query_scalar("SELECT gen_random_uuid()::text")
-                    .fetch_one(&mut *c)
-                    .await?
-            }
-        };
-        let details = change.details.to_string();
-        let inserted = sqlx::query(
-            "INSERT INTO openmettle.authorization_audit
-                 (actor_user_id, action, target_kind, target_id, request_key, reason, details)
-             VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb)
-             ON CONFLICT (actor_user_id, request_key) DO NOTHING",
-        )
-        .bind(ctx.actor_user_id)
-        .bind(change.action)
-        .bind(change.target_kind)
-        .bind(&target)
-        .bind(ctx.request_key)
-        .bind(ctx.reason)
-        .bind(&details)
-        .execute(&mut *c)
-        .await?
-        .rows_affected();
-        if inserted == 0 {
-            let row = sqlx::query(
-                "SELECT action, target_kind, target_id, details = $3::jsonb
-                   FROM openmettle.authorization_audit
-                  WHERE actor_user_id = $1::uuid AND request_key = $2",
-            )
-            .bind(ctx.actor_user_id)
-            .bind(ctx.request_key)
-            .bind(&details)
-            .fetch_one(&mut *c)
-            .await?;
-            let recorded: String = row.try_get(2)?;
-            let same = row.try_get::<&str, _>(0)? == change.action
-                && row.try_get::<&str, _>(1)? == change.target_kind
-                && change.target_id.as_ref().is_none_or(|id| *id == recorded)
-                && row.try_get::<bool, _>(3)?;
-            return if same {
-                Ok(WriteOutcome::Replayed {
-                    target_id: recorded,
-                })
-            } else {
-                Err(StoreError::Conflict(
-                    "request_key already recorded another change",
-                ))
-            };
+        let outcome = record(c, ctx, &change).await?;
+        if let WriteOutcome::Applied { target_id } = &outcome {
+            apply(c, &actor, target_id).await?;
         }
-        apply(c, actor, &target).await?;
-        Ok(WriteOutcome::Applied { target_id: target })
-    }
-    .await;
-    match result {
-        Ok(outcome) => {
-            tx.commit().await?;
-            Ok(outcome)
-        }
-        Err(error) => {
-            tx.rollback().await?;
-            Err(error)
-        }
-    }
+        Ok(outcome)
+    })
+    .await
 }
 
 fn user_change(action: &'static str, user_id: &str) -> Result<Change, StoreError> {
@@ -412,7 +458,7 @@ async fn keep_last_admin(
 }
 
 /// Whether the user exists and is enabled, holding the row lock for the rest of the transaction.
-async fn lock_user(
+pub(super) async fn lock_user(
     c: &mut PgConnection,
     user_id: &str,
     exclusive: bool,
@@ -595,7 +641,7 @@ fn group_name(name: &str) -> Result<(), StoreError> {
 const DUPLICATE_GROUP: &str = "a local group already has this name";
 
 /// (name, enabled) of a group, locked for the rest of the transaction.
-async fn lock_group(
+pub(super) async fn lock_group(
     c: &mut PgConnection,
     group_id: &str,
     exclusive: bool,
@@ -1014,6 +1060,8 @@ mod tests {
             (&"k".repeat(129) as &str, "r", "request_key"),
             ("k", "", "reason"),
             ("k", &"r".repeat(513) as &str, "reason"),
+            ("k\0", "r", "request_key"),
+            ("k", "r\0", "reason"),
         ] {
             assert!(matches!(
                 ctx(key, reason).validate(),

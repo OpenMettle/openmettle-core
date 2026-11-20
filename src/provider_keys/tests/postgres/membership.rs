@@ -180,7 +180,7 @@ impl Enrollment {
         grants::Assignment {
             scope: &self.scope,
             target: grants::Target::Project(&self.project),
-            grantee: &self.user,
+            grantee: grants::Grantee::User(&self.user),
             format: "openmettle.project-member",
             version: 1,
             key: &self.approval,
@@ -253,7 +253,7 @@ async fn direct_grant(
             assignment: grants::Assignment {
                 scope,
                 target: grants::Target::Project(project),
-                grantee: user,
+                grantee: grants::Grantee::User(user),
                 format: "openmettle.project-member",
                 version: 1,
                 key: approval,

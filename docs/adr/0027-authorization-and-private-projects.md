@@ -21,7 +21,8 @@ route or enforcement point. Later increments hydrate its inputs and call it:
 | PR1 (this) | Policy evaluator, vocabulary parser, this record. No migration, route or dependency. |
 | PR2 | Migration 15: local groups, project-role and resource-grant writers, capability denies, `account_admin`, audit table and worker grants. |
 | PR3 | Principal hydration per request; admin and membership API with audit. |
-| PR4 | Project, conversation and artifact routes enforcing the evaluator. |
+| PR4a | Migration 16 group and project-wide grantees; project, membership and share store. |
+| PR4b | Project, conversation and artifact routes enforcing the evaluator. |
 | PR5 | Worker execution-time recheck and run invalidation. |
 
 ## Principal
@@ -254,6 +255,69 @@ roles. It adds no migration, route or dependency.
   `user_id`. Capability changes use target kind `capability` with the capability name as the
   target.
 
+### PR4a: Group grantees and project/resource store
+
+`migrations/0016_grant_group_grantees.sql` is additive. It adds no route, worker loop or
+dependency.
+
+- `grant_assignments.grantee_kind` is `user` (the default), `local_group`, `oidc_group` or
+  `project`. Exactly the matching column is set: `grantee_user_id` (now nullable),
+  `grantee_local_group_id` (references `local_groups`) or `grantee_oidc_group_id` (1 to 1024
+  bytes, no control character). A `project` grantee names no column and applies only to
+  conversation and artifact targets. Every version 5 to 15 row reads `user` with NULL group
+  columns. Writers that name only `grantee_user_id` keep working.
+- The migration 5 natural key, whose generated name is not part of any contract, is found by
+  its exact column list and replaced by `grant_assignments_unique_key`, which adds the kind
+  and group columns, `NULLS NOT DISTINCT`. Partial indexes serve group lookups.
+- `projects.lock_guard` is an inert column (`CHECK (lock_guard = false)`). Its API
+  `UPDATE` grant only lets the API lock a project row `FOR NO KEY UPDATE`, serialising
+  project writers without blocking concurrent foreign-key `FOR KEY SHARE` locks, as
+  `login_providers` does since migration 8. The API also gains `INSERT` on the three grantee
+  columns.
+
+`grants::Assignment.grantee` is a borrowed `grants::Grantee`. A user grantee keeps the exact
+ADR 0006 version 1 request identity, so earlier requests replay unchanged. Other kinds encode
+`kind NUL id`. `grants::find_assignment` reads an assignment by its natural key.
+
+`src/authz/projects.rs`:
+
+- **Hydration** works as `openmettle_api` and `openmettle_worker`, reads the primary on every
+  call and never reads `account_admins` or `project_settings`. `hydrate_project` returns
+  current assignments whose vocabulary parses for the target, with their recorded head and,
+  for mapped rows, ADR 0021 evidence from the shared `membership_state` predicate. Rows naming
+  a disabled user or a disabled local group are omitted, so a disabled owner never satisfies
+  the last-owner invariant. `hydrate_resource` returns a conversation or artifact with its
+  creator, personal or project scope and parsed shares. Lifecycle state is read separately
+  with `load_project_settings` (API only). A project without a settings row reads an empty
+  name, empty instructions, `{}` and revision 0.
+- **Writes** run as `openmettle_api` with the PR3 protocol in one transaction: lock, re-hydrate
+  the actor, authorize with this module's policy, insert or replay the audit row, then apply.
+  A change that alters nothing returns `Conflict` and writes no audit row.
+  - `create_project` (any active principal) creates the scope, project and settings and grants
+    the creator a direct `owner` role. Audit details hold a SHA-256 digest of the settings
+    request, never the name or instructions.
+  - `update_project_settings`, `archive_project`, `restore_project` and `delete_project` lock
+    the project row and need `Owner` (`ManageProjectSettings`, `DeleteProject`). The update
+    writes the first row of a pre-15 project. Archive, restore and delete need an existing
+    row. Delete sets `deleted_at`. A deleted project is then concealed from every write.
+  - `set_project_member_role` and `revoke_project_member` lock the project row, so concurrent
+    owner changes serialize and `authorize_member_change` decides on the hydrated project. A
+    grantee holds at most one active direct `openmettle.project-role`: a new role revokes the
+    superseded one, so demoting an owner removes the `owner` grant. A user or local group
+    grantee must exist and be enabled to receive a role. Revocation needs neither.
+  - `share_resource` and `unshare_resource` lock the project row, or the personal scope
+    owner's user row. They hydrate the resource and require a share manager
+    (`authorize_revoke`). A new share also needs `authorize_share` with the recipient's own
+    principal, hydrated through each of its approvals, or the group's effective project
+    membership. One active `openmettle.resource-grant` key is kept per grantee. Revocation
+    never checks the grantee's membership.
+  - Each ADR 0006 change uses a request key derived from the audit request key, so an audited
+    replay never re-writes a grant.
+
+Run invalidation on share, revoke or disable remains PR5. Hydration does not conceal archived
+or deleted projects from the worker; PR4b and PR5 must decide how lifecycle affects reads and
+running work.
+
 ## Verification
 
 `src/authz/tests.rs` covers vocabulary acceptance and rejection, the role matrix,
@@ -267,4 +331,20 @@ against PostgreSQL and HTTP.
 For PR3, `tests/schema/authz_store.rs` runs against PostgreSQL 18 as the bounded roles. It
 covers hydration for both roles, OIDC evidence states, every write with its audit row,
 replays, request-key conflicts, refusals and the last-administrator race under
-`account_admin_lock`. Route enforcement remains PR4.
+`account_admin_lock`. Route enforcement remains PR4b.
+
+For PR4a, `tests/schema/authz_projects.rs` covers:
+
+- the version 15 to 16 upgrade, including a version-15 user grant replayed byte for byte;
+- constraints and role boundaries for every grantee kind;
+- project creation, settings, archive, restore, delete and pre-15 defaults;
+- role precedence across direct, local-group, OIDC-group and mapped grants, including stale
+  evidence, namespaces and disabled users and groups;
+- the last-direct-owner race serialized on the project row;
+- private-by-default sharing for every role, personal and project scopes, stale-row
+  revocation and lapsed membership;
+- account-admin non-escalation;
+- worker hydration.
+
+Its pure tests cover settings validation. The PostgreSQL tests are `#[ignore]` and need the
+CI PostgreSQL 18 service.

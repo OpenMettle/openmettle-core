@@ -2,7 +2,7 @@
 use super::cancellation::{ResponseBarrier, cancel_at_response};
 use super::*;
 use openmettle_core::grants::{
-    self, Assignment, ChangeInput, Decision, GrantReceipt, MappingInput, Target,
+    self, Assignment, ChangeInput, Decision, GrantReceipt, Grantee, MappingInput, Target,
 };
 
 const PROVIDER: &str = "00000000-0000-0000-0000-000000000001";
@@ -13,7 +13,7 @@ fn input<'a>(c: &'a Context, key: &'a str) -> ChangeInput<'a> {
         assignment: Assignment {
             scope: &c.scope,
             target: Target::Conversation(&c.conversation),
-            grantee: &c.actor,
+            grantee: Grantee::User(&c.actor),
             format: "test.assignment",
             version: 1,
             key: "synthetic",
@@ -510,7 +510,7 @@ async fn sql_roles_scopes_null_checks_and_immutable_origin() {
     let (project_id, ps) = project(&mut api, &c.actor).await;
     let mut r = input(&c, "project");
     r.assignment.scope = &ps;
-    r.assignment.grantee = &other.actor;
+    r.assignment.grantee = Grantee::User(&other.actor);
     r.assignment.target = Target::Project(&project_id);
     let pr = change(&db, &r).await.unwrap();
     assert!(state(&db, &ps, &pr.assignment).await.recorded_active);
@@ -678,7 +678,7 @@ async fn old_domain_snapshot(db: &TestDb) -> Vec<String> {
         "artifact_revisions",
     ] {
         let rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT (to_jsonb(t) - 'session_generation' - 'session_issued')::text FROM openmettle.{table} t ORDER BY 1"
+            "SELECT (to_jsonb(t) - 'session_generation' - 'session_issued' - 'lock_guard')::text FROM openmettle.{table} t ORDER BY 1"
         )))
         .fetch_all(&mut c)
         .await
@@ -812,6 +812,82 @@ async fn coded_invitations(db: &TestDb) -> Vec<String> {
 }
 const MEMBERSHIP_PROVIDER: &str = "00000000-0000-0000-0000-000000000007";
 const MEMBERSHIP_APPROVAL: &str = "00000000-0000-0000-0000-0000000000a8";
+/// Write a single version 5..15 user grant through the pre-16 API column grants so populated
+/// upgrade fixtures can seed older databases before migration 16 adds the grantee columns.
+async fn populate_v5_grant(db: &TestDb, r: &ChangeInput<'_>) -> String {
+    let (kind, target) = match r.assignment.target {
+        Target::Project(id) => ("project", id),
+        Target::Conversation(id) => ("conversation", id),
+        Target::Artifact(id) => ("artifact", id),
+    };
+    let Grantee::User(grantee_user) = r.assignment.grantee else {
+        panic!("pre-16 grant fixture only supports user grantees");
+    };
+    let source = if r.assignment.mapping_rule.is_some() {
+        "mapped"
+    } else {
+        "direct"
+    };
+    let identity = format!("synthetic-v5-grant/{}", r.key).into_bytes();
+    let digest = [0x5au8; 32];
+    let mut api = connect(&db.0, API).await;
+    api.execute("BEGIN").await.unwrap();
+    let assignment: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.grant_assignments
+            (scope_id,target_kind,project_id,conversation_id,artifact_id,grantee_user_id,
+             assignment_format,assignment_version,assignment_key,source_kind,mapping_rule_id,
+             created_by_user_id)
+         VALUES($1::uuid,$2,CASE WHEN $2='project' THEN $3::uuid END,
+                CASE WHEN $2='conversation' THEN $3::uuid END,
+                CASE WHEN $2='artifact' THEN $3::uuid END,
+                $4::uuid,$5,$6,$7,$8,$9::uuid,$10::uuid)
+         RETURNING id::text",
+    )
+    .bind(r.assignment.scope)
+    .bind(kind)
+    .bind(target)
+    .bind(grantee_user)
+    .bind(r.assignment.format)
+    .bind(r.assignment.version)
+    .bind(r.assignment.key)
+    .bind(source)
+    .bind(r.assignment.mapping_rule)
+    .bind(r.actor)
+    .fetch_one(&mut api)
+    .await
+    .unwrap();
+    let change_id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(&mut api)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.grant_changes
+            (id,scope_id,assignment_id,revision,source_kind,mapping_rule_id,mapping_revision,
+             actor_user_id,request_key,decision,cycle_id,request_identity,request_digest)
+         VALUES($1::uuid,$2::uuid,$3::uuid,1,$4,$5::uuid,$6,$7::uuid,$8,'grant',$1::uuid,$9,$10)",
+    )
+    .bind(&change_id)
+    .bind(r.assignment.scope)
+    .bind(&assignment)
+    .bind(source)
+    .bind(r.assignment.mapping_rule)
+    .bind(r.mapping_revision)
+    .bind(r.actor)
+    .bind(r.key)
+    .bind(&identity)
+    .bind(&digest[..])
+    .execute(&mut api)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE openmettle.grant_assignments SET last_revision=1 WHERE id=$1::uuid")
+        .bind(&assignment)
+        .execute(&mut api)
+        .await
+        .unwrap();
+    api.execute("COMMIT").await.unwrap();
+    change_id
+}
+
 // Version-11 membership state written through its own grants: the owner records a mapping rule
 // revision, an enrollment receipt and its missing observation (as the configuration script
 // does). The API records the enrollment-derived grant and confirms the observation, as
@@ -863,13 +939,13 @@ async fn populate_membership(db: &TestDb, c: &Context, project: &str, scope: &st
     .execute(&mut owner)
     .await
     .unwrap();
-    let grant = change(
+    let grant_change = populate_v5_grant(
         db,
         &ChangeInput {
             assignment: Assignment {
                 scope,
                 target: Target::Project(project),
-                grantee: &c.actor,
+                grantee: Grantee::User(&c.actor),
                 format: "openmettle.project-member",
                 version: 1,
                 key: MEMBERSHIP_APPROVAL,
@@ -882,8 +958,7 @@ async fn populate_membership(db: &TestDb, c: &Context, project: &str, scope: &st
             decision: Decision::Grant,
         },
     )
-    .await
-    .unwrap();
+    .await;
     let confirmed = sqlx::query(
         "UPDATE openmettle.membership_observations SET issued_ms=1000,expires_ms=4102444800000,
             observation=ROW('present',$2::uuid)::openmettle.membership_evidence,
@@ -892,7 +967,7 @@ async fn populate_membership(db: &TestDb, c: &Context, project: &str, scope: &st
          WHERE approval_id=$1::uuid",
     )
     .bind(MEMBERSHIP_APPROVAL)
-    .bind(&grant.change)
+    .bind(&grant_change)
     .bind(MEMBERSHIP_PROVIDER)
     .execute(&mut connect(&db.0, API).await)
     .await
@@ -1036,7 +1111,7 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
         let mut grant = input(&c, "upgrade-grant");
         grant.assignment.mapping_rule = Some(RULE1);
         grant.mapping_revision = Some(1);
-        change(&db, &grant).await.unwrap();
+        populate_v5_grant(&db, &grant).await;
     }
     let with_login = versions.contains(&6);
     if with_login {
@@ -1408,6 +1483,11 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
             "openmettle.authorization_audit",
             "openmettle.runs.state",
             "openmettle.runs.wait_reason",
+            // Migration 16 (ADR 0027 PR4a).
+            "openmettle.grant_assignments.grantee_kind",
+            "openmettle.grant_assignments.grantee_local_group_id",
+            "openmettle.grant_assignments.grantee_oidc_group_id",
+            "openmettle.projects.lock_guard",
         ];
         let worker_reads = [
             "openmettle_worker has SELECT on openmettle.membership_observations",
@@ -1532,8 +1612,10 @@ async fn grant_snapshot(db: &TestDb) -> Vec<String> {
         "grant_assignments",
         "grant_changes",
     ] {
+        // Migration 16 only adds grantee columns: 'user' and NULLs on every earlier row.
         let rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT t::text FROM openmettle.{table} t ORDER BY t::text"
+            "SELECT (to_jsonb(t) - 'grantee_kind' - 'grantee_local_group_id'
+                     - 'grantee_oidc_group_id')::text FROM openmettle.{table} t ORDER BY 1"
         )))
         .fetch_all(&mut db.admin().await)
         .await

@@ -101,6 +101,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "authorization and private projects",
         sql: include_str!("../migrations/0015_authorization_and_projects.sql"),
     },
+    Source {
+        version: 16,
+        description: "group and project grantees",
+        sql: include_str!("../migrations/0016_grant_group_grantees.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.
