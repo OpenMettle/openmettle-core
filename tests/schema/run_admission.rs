@@ -39,8 +39,6 @@ const OPEN: ClaimLimits = ClaimLimits {
 };
 const ARCHIVED: &str = "project is archived";
 const EXPIRED: (&str, &[u8]) = ("openmettle.run-expired", b"{}");
-const NEW_COLUMNS: &str =
-    "- 'actor_approval_id' - 'round_limit' - 'queue_expires_at' - 'claim_token' - 'claimed_at'";
 
 /// One admission request: a conversation, its branch and input message, and a key.
 #[derive(Clone)]
@@ -1336,34 +1334,23 @@ async fn populated_upgrade_from_version_18_leaves_existing_runs_unadmitted() {
     let r = request(&db, &scope, "personal", &alice, "before").await;
     // Bare `create_run` names only pre-19 columns, so it works on schema 18.
     let old = bare_run(&db, &r).await;
-    let rows = async || {
-        let mut c = connect(&db.0, OWNER).await;
-        let mut rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT (to_jsonb(t) {NEW_COLUMNS})::text FROM openmettle.runs t ORDER BY id"
-        )))
-        .fetch_all(&mut c)
-        .await
-        .unwrap();
-        let events: Vec<String> = sqlx::query_scalar(
-            "SELECT to_jsonb(e)::text FROM openmettle.run_events e ORDER BY run_id, sequence",
-        )
-        .fetch_all(&mut c)
-        .await
-        .unwrap();
-        rows.extend(events);
-        rows
-    };
-    let before = rows().await;
-    assert_eq!(before.len(), 2);
+    let tables = ["runs", "run_events"];
+    let before = snapshot_at(&mut connect(&db.0, OWNER).await, &tables, 18).await;
+    assert_eq!(before.len(), 4);
+    assert_eq!(before[0], "runs: 1");
+    assert_eq!(before[2], "run_events: 1");
 
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
     assert_eq!(db.history().await, all_versions());
-    assert_eq!(rows().await, before);
-    let unadmitted = "SELECT count(*) FROM openmettle.runs
-                       WHERE actor_approval_id IS NULL AND round_limit IS NULL
-                         AND queue_expires_at IS NULL AND claim_token IS NULL
-                         AND claimed_at IS NULL";
-    assert_eq!(scalar(&db, unadmitted).await, 1);
+    // Strips and asserts every column added after migration 18 holds its declared default
+    // (including all five migration-19 admission/claim columns staying NULL).
+    assert_eq!(
+        snapshot_at(&mut connect(&db.0, OWNER).await, &tables, 18).await,
+        before
+    );
+    for entry in expected_added_tables_since(18) {
+        assert!(db.exists(&format!("openmettle.{}", entry.table)).await);
+    }
     // The pre-19 run is never claimed; the first sweep fails it with one terminal event.
     assert_eq!(claim(&db).await, None);
     assert_eq!(expire(&db, 1000).await, [old.as_str()]);

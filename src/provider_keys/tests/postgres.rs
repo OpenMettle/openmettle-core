@@ -10,16 +10,9 @@ use crate::{
 };
 use sqlx::{AssertSqlSafe, Connection, Executor, PgConnection, postgres::PgConnectOptions};
 
-const OWNER: &str = "openmettle_owner";
-const API: &str = "openmettle_api";
-/// Session issuance (ADR 0030): the only role that can insert a session.
-const ISSUANCE: &str = "openmettle_issuance";
-const WORKER: &str = "openmettle_worker";
-/// Synthetic test-only credential shared with the schema suite; never a deployment value.
-const PASSWORD: &str = "fixture-only-password";
-// The schema suite's role-creation and role-state advisory keys.
-const ROLE_LOCK: i64 = 720202;
-const ROLE_STATE_LOCK: i64 = 720203;
+#[path = "../../../tests/support/pg.rs"]
+mod pg;
+use pg::{API, ISSUANCE, OWNER, PASSWORD, WORKER, admin_options};
 
 // Documented operator protocol (ADR 0012): lock the stable provider row, append, confirm the
 // new row is the latest for the provider, then commit (or roll back if it is not).
@@ -39,17 +32,9 @@ async fn is_current(owner: &mut PgConnection, epoch: i64) -> bool {
         .unwrap()
 }
 
-fn admin_options() -> PgConnectOptions {
-    std::env::var("TEST_DATABASE_URL")
-        .expect("TEST_DATABASE_URL required")
-        .parse()
-        .expect("valid TEST_DATABASE_URL")
-}
-
 struct Db {
     name: String,
-    // Holds the shared role-state lock for the database's lifetime.
-    _admin: PgConnection,
+    inner: pg::DisposableDb,
 }
 impl Db {
     async fn new() -> Self {
@@ -57,57 +42,10 @@ impl Db {
     }
     /// A fresh database holding only `sources`, for upgrade tests.
     async fn at(sources: &[migrate::Source]) -> Self {
-        let mut admin = PgConnection::connect_with(&admin_options()).await.unwrap();
-        sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(ROLE_LOCK)
-            .execute(&mut admin)
-            .await
-            .unwrap();
-        for role in [OWNER, API, ISSUANCE, WORKER] {
-            let exists: bool =
-                sqlx::query_scalar("SELECT EXISTS (SELECT FROM pg_roles WHERE rolname = $1)")
-                    .bind(role)
-                    .fetch_one(&mut admin)
-                    .await
-                    .unwrap();
-            if !exists {
-                admin
-                    .execute(AssertSqlSafe(format!(
-                        "CREATE ROLE {role} LOGIN PASSWORD '{PASSWORD}'"
-                    )))
-                    .await
-                    .unwrap();
-            }
-        }
-        sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(ROLE_LOCK)
-            .execute(&mut admin)
-            .await
-            .unwrap();
-        sqlx::query("SELECT pg_advisory_lock_shared($1)")
-            .bind(ROLE_STATE_LOCK)
-            .execute(&mut admin)
-            .await
-            .unwrap();
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let name = format!(
-            "om_authority_{}_{}_{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        );
-        admin
-            .execute(AssertSqlSafe(format!(
-                "CREATE DATABASE {name} OWNER {OWNER}"
-            )))
-            .await
-            .unwrap();
+        let inner = pg::DisposableDb::create("om_authority", false, false, "").await;
         let db = Self {
-            name,
-            _admin: admin,
+            name: inner.name().to_owned(),
+            inner,
         };
         db.upgrade(sources).await;
         db
@@ -126,32 +64,10 @@ impl Db {
         .unwrap();
     }
     fn options(&self, role: &str) -> PgConnectOptions {
-        admin_options()
-            .database(&self.name)
-            .username(role)
-            .password(PASSWORD)
+        self.inner.options(role)
     }
     async fn connect(&self, role: &str) -> PgConnection {
-        PgConnection::connect_with(&self.options(role))
-            .await
-            .unwrap()
-    }
-}
-impl Drop for Db {
-    fn drop(&mut self) {
-        let statement = format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", self.name);
-        let _ = std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async {
-                    if let Ok(mut admin) = PgConnection::connect_with(&admin_options()).await {
-                        let _ = admin.execute(AssertSqlSafe(statement)).await;
-                    }
-                })
-        })
-        .join();
+        self.inner.connect(role).await
     }
 }
 

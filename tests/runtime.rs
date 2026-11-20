@@ -12,6 +12,8 @@ mod env_support;
 use env_support::scrub_env;
 #[path = "auth_config_support/mod.rs"]
 mod auth_config_support;
+#[path = "support/pg.rs"]
+mod pg;
 // The transport fixture's synthetic CA; its leaf certificates are not needed here.
 #[allow(dead_code)]
 #[path = "provider_http_support/ca.rs"]
@@ -2259,85 +2261,15 @@ async fn postgres_readiness_is_independent_of_optional_evaluation() {
     stop(&mut api, "-TERM");
 }
 
-/// Synthetic cluster roles shared with `tests/schema.rs`, which creates them the same way.
-const DATABASE_ROLES: [&str; 4] = [
-    "openmettle_owner",
-    "openmettle_api",
-    "openmettle_issuance",
-    "openmettle_worker",
-];
-/// Synthetic test-only credential for those roles; never a deployment value.
-const ROLE_PASSWORD: &str = "fixture-only-password";
-
 /// A fresh migrated database owned by `openmettle_owner`, dropped when the test ends. Its
 /// administrative connection holds the shared role-state lock, as every test database does.
-struct MigratedDb {
-    name: String,
-    _admin: sqlx::PgConnection,
-}
+struct MigratedDb(pg::DisposableDb);
 impl MigratedDb {
-    fn admin_options() -> sqlx::postgres::PgConnectOptions {
-        std::env::var("TEST_DATABASE_URL")
-            .expect("TEST_DATABASE_URL required")
-            .parse()
-            .expect("valid TEST_DATABASE_URL")
-    }
     async fn new() -> Self {
-        use sqlx::{AssertSqlSafe, Connection, Executor};
-        let mut admin = sqlx::PgConnection::connect_with(&Self::admin_options())
-            .await
-            .unwrap();
-        admin
-            .execute("SELECT pg_advisory_lock(720202)")
-            .await
-            .unwrap();
-        for role in DATABASE_ROLES {
-            let exists: bool =
-                sqlx::query_scalar("SELECT EXISTS (SELECT FROM pg_roles WHERE rolname = $1)")
-                    .bind(role)
-                    .fetch_one(&mut admin)
-                    .await
-                    .unwrap();
-            if !exists {
-                admin
-                    .execute(AssertSqlSafe(format!(
-                        "CREATE ROLE {role} LOGIN PASSWORD '{ROLE_PASSWORD}'"
-                    )))
-                    .await
-                    .unwrap();
-            }
-        }
-        admin
-            .execute("SELECT pg_advisory_unlock(720202)")
-            .await
-            .unwrap();
-        admin
-            .execute("SELECT pg_advisory_lock_shared(720203)")
-            .await
-            .unwrap();
-        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos();
-        let name = format!("om_runtime_{}_{seq}_{nanos}", std::process::id());
-        admin
-            .execute(AssertSqlSafe(format!(
-                "CREATE DATABASE {name} OWNER openmettle_owner"
-            )))
-            .await
-            .unwrap();
-        let db = Self {
-            name,
-            _admin: admin,
-        };
+        let db = pg::DisposableDb::create("om_runtime", false, false, "").await;
         openmettle_core::migrate::apply(
             &openmettle_core::migrate::Settings {
-                database: Self::admin_options()
-                    .database(&db.name)
-                    .username("openmettle_owner")
-                    .password(ROLE_PASSWORD),
+                database: db.options(pg::OWNER),
                 connect_timeout: Duration::from_secs(5),
                 lock_timeout: Duration::from_secs(10),
                 statement_timeout: Duration::from_secs(30),
@@ -2346,36 +2278,11 @@ impl MigratedDb {
         )
         .await
         .unwrap();
-        db
+        Self(db)
     }
     /// An application role's URL, never the owner's.
     fn url(&self, role: &str) -> String {
-        let admin = Self::admin_options();
-        format!(
-            "postgres://{role}:{ROLE_PASSWORD}@{}:{}/{}?sslmode=disable",
-            admin.get_host(),
-            admin.get_port(),
-            self.name
-        )
-    }
-}
-impl Drop for MigratedDb {
-    fn drop(&mut self) {
-        let statement = format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", self.name);
-        let _ = thread::spawn(move || {
-            use sqlx::{AssertSqlSafe, Connection, Executor};
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async {
-                    let options = MigratedDb::admin_options();
-                    if let Ok(mut admin) = sqlx::PgConnection::connect_with(&options).await {
-                        let _ = admin.execute(AssertSqlSafe(statement)).await;
-                    }
-                })
-        })
-        .join();
+        self.0.url(role)
     }
 }
 
@@ -2400,7 +2307,7 @@ async fn postgres_mounted_session_routes_use_the_primary_database() {
     issuance.set_nonblocking(true).unwrap();
     let mut api = start_mounted(
         &bind,
-        &db.url("openmettle_api"),
+        &db.url(pg::API),
         &unavailable_issuance(&issuance),
         &auth,
         "json",
@@ -2453,7 +2360,7 @@ async fn postgres_mounted_session_routes_use_the_primary_database() {
     stop(&mut api, "-TERM");
     let (stdout, stderr) = drain(&mut api);
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(!stderr.contains(SESSION) && !stderr.contains(ROLE_PASSWORD));
+    assert!(!stderr.contains(SESSION) && !stderr.contains(pg::PASSWORD));
     let events: Vec<serde_json::Value> = stderr
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
