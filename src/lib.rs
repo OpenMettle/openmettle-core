@@ -219,8 +219,9 @@ fn routes(health: Health) -> Router {
 ///
 /// The settings checks refused `/healthz`, `/readyz` and every `/v1` path as browser and
 /// native paths, and every browser path as a native path, and the constructors repeat them,
-/// so no merge can shadow a route or panic.
-fn app(config: &Config, pool: &PgPool) -> Result<Router, auth_config::Error> {
+/// so no merge can shadow a route or panic. The issuance pool, when built, is returned beside
+/// the router so `serve` can close it within the drain deadline.
+fn app(config: &Config, pool: &PgPool) -> Result<(Router, Option<PgPool>), auth_config::Error> {
     let operational = routes(Health {
         pool: pool.clone(),
         timeout: config.database_timeout,
@@ -228,12 +229,12 @@ fn app(config: &Config, pool: &PgPool) -> Result<Router, auth_config::Error> {
     // `Config::parse` sets both or neither.
     let (Some(path), Some((issuance, connections))) = (&config.auth_config, &config.issuance)
     else {
-        return Ok(operational);
+        return Ok((operational, None));
     };
     let (settings, profile) = auth_config::load_browser(path)?;
     let native = settings.native().cloned();
     let issuance = lazy_pool(issuance, *connections, config.database_timeout);
-    let service = Arc::new(BrowserAuth::new(settings, pool.clone(), issuance));
+    let service = Arc::new(BrowserAuth::new(settings, pool.clone(), issuance.clone()));
     let handoff = LoginHandoff::new(service.clone(), profile.handoff())
         .map_err(auth_config::Error::BrowserHandoff)?;
     let sign_in = router_with_sessions(handoff, profile.router(), profile.sessions())
@@ -252,7 +253,10 @@ fn app(config: &Config, pool: &PgPool) -> Result<Router, auth_config::Error> {
         bearer = Some(auth);
     }
     let origin = profile.handoff().origin;
-    Ok(app.merge(v1::router(service, bearer, origin, pool.clone())))
+    Ok((
+        app.merge(v1::router(service, bearer, origin, pool.clone())),
+        Some(issuance),
+    ))
 }
 
 #[derive(Clone)]
@@ -343,8 +347,8 @@ pub async fn run(role: Role) -> u8 {
     // The same holds for the browser sign-in settings: refused before telemetry is installed
     // or the listener opens, with the offline check's fixed category line (ADRs 0015, 0025).
     let pool = pool(&config);
-    let app = match app(&config, &pool) {
-        Ok(app) => app,
+    let (app, issuance) = match app(&config, &pool) {
+        Ok(built) => built,
         Err(error) => {
             eprintln!("auth configuration error: {error}");
             return 78;
@@ -358,7 +362,7 @@ pub async fn run(role: Role) -> u8 {
         }
     };
     let (drain, flush) = shutdown_budget(config.shutdown_timeout);
-    let code = match serve(config.bind, app, pool, process, drain).await {
+    let code = match serve(config.bind, app, pool, issuance, process, drain).await {
         Ok(()) => {
             telemetry::process_stopped(process);
             0
@@ -401,6 +405,7 @@ async fn serve(
     bind: SocketAddr,
     app: Router,
     pool: PgPool,
+    issuance: Option<PgPool>,
     process: Process,
     drain: Duration,
 ) -> Result<(), ProcessFailure> {
@@ -430,7 +435,13 @@ async fn serve(
     let _ = stop_tx.send(());
     tokio::time::timeout(drain, async {
         server.await.map_err(|_| ProcessFailure::Shutdown)?;
-        pool.close().await;
+        // Both pools close within the deadline, so idle connections end cleanly before the
+        // runtime is shut down.
+        if let Some(issuance) = &issuance {
+            tokio::join!(pool.close(), issuance.close());
+        } else {
+            pool.close().await;
+        }
         Ok(())
     })
     .await

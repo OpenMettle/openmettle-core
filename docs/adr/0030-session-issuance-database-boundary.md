@@ -155,7 +155,8 @@ and `native::Attempt::store`. Its inputs come from the sealed exchanged proof.
   role.
 - The issuance pool is lazy, uses `DB_TIMEOUT_MS` for acquisition and disables statement
   logging, like the primary pool. Readiness stays one primary query; an unusable issuance
-  pool refuses sign-ins only.
+  pool refuses sign-ins only. On SIGTERM or SIGINT both pools close concurrently within the
+  same drain deadline.
 - The worker and the migrator never read the setting, and exit 78 if
   `OPENMETTLE_API_ISSUANCE_DATABASE_URL` is present in their environment.
 - `openmettle-deploy` adds a `database.issuance` Secret reference mounted into the API
@@ -271,6 +272,5 @@ Where PR2 provides it:
 ## Remaining
 
 Core PR2 is implemented: migration 18, `boundaries.sql`, the issuance pool and settings,
-tests, README and operator guides. Its PostgreSQL evidence is pending CI. `openmettle-deploy`
-still needs the Secret and the connection budget. #73 stays open until both land and the
-owner accepts.
+tests, README and operator guides. `openmettle-deploy` still needs the Secret and the
+connection budget. #73 stays open until both land and the owner accepts.

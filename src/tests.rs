@@ -262,7 +262,7 @@ async fn send(
 async fn unset_auth_config_serves_the_operational_routes_only() {
     let database = TcpListener::bind("127.0.0.1:0").unwrap();
     let config = config(&database, None);
-    let address = serve_observed(app(&config, &pool(&config)).unwrap()).await;
+    let address = serve_observed(app(&config, &pool(&config)).unwrap().0).await;
     assert_eq!(send(address, "GET", "/healthz", "").await.0, 200);
     for (method, path) in [
         ("POST", "/auth/login"),
@@ -338,7 +338,7 @@ async fn version_2_settings_mount_the_sign_in_routes_under_observation() {
     let path = dir.write("auth.json", document.to_string().as_bytes());
     let config = config(&database, Some(&path));
     let (capture, _guard) = Capture::install(Format::Json, Verbosity::Debug);
-    let address = serve_observed(app(&config, &pool(&config)).unwrap()).await;
+    let address = serve_observed(app(&config, &pool(&config)).unwrap().0).await;
 
     let state = format!("{}.{}", "s".repeat(43), "t".repeat(43));
     let bound = format!(
@@ -483,7 +483,7 @@ async fn native_profile_mounts_the_native_routes_beside_the_browser_routes() {
     let path = dir.write("auth.json", document.to_string().as_bytes());
     let config = config(&database, Some(&path));
     let (capture, _guard) = Capture::install(Format::Json, Verbosity::Debug);
-    let address = serve_observed(app(&config, &pool(&config)).unwrap()).await;
+    let address = serve_observed(app(&config, &pool(&config)).unwrap().0).await;
 
     let preview = format!(
         "/auth/native/authorize?client_id=openmettle-desktop\
@@ -665,7 +665,7 @@ async fn v1_routes_refuse_before_the_database_under_observation() {
     let path = dir.write("auth.json", document.to_string().as_bytes());
     let config = config(&database, Some(&path));
     let (capture, _guard) = Capture::install(Format::Json, Verbosity::Debug);
-    let address = serve_observed(app(&config, &pool(&config)).unwrap()).await;
+    let address = serve_observed(app(&config, &pool(&config)).unwrap().0).await;
 
     // Well-formed credentials pass the shape check; nothing here lets them reach the pool.
     let token = format!("{}.{}", "Q".repeat(43), "Q".repeat(43));
@@ -1027,7 +1027,7 @@ async fn v1_sessions_are_validated_on_the_primary_and_native_needs_its_profile()
         let database = TcpListener::bind("127.0.0.1:0").unwrap();
         let path = dir.write("auth.json", document.to_string().as_bytes());
         let config = config(&database, Some(&path));
-        let address = serve_observed(app(&config, &pool(&config)).unwrap()).await;
+        let address = serve_observed(app(&config, &pool(&config)).unwrap().0).await;
         let (got, head, body) = send(address, "GET", "/v1/capabilities", channel).await;
         assert_eq!(got, status, "{channel}");
         assert!(head.contains("openmettle-api-version: 1.0"));
