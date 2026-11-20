@@ -5,6 +5,10 @@ Status: implementation of the coordinator-agreed V1-02 persistence increment, 17
 This does not complete #3 or enable product APIs. Follow ADR 0003 for migration and role
 provisioning. Migrations 1 and 2 are unchanged.
 
+> [ADR 0032](0032-durable-run-admission-and-fair-work-queue.md) specifies V1-10 admission,
+> queue deadlines, pre-execution cancellation and the fair worker claim on these tables;
+> migration 19 adds their columns.
+
 ## Scope and identities
 
 Migration 3 adds `conversation_branches`, `runs`, `run_events` and `operations`. A branch is
