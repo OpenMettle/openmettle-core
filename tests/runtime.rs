@@ -724,8 +724,17 @@ fn auth_config_check_succeeds_offline_without_serving_settings() {
     let bundle = ca::Ca::new().pem();
     let v1 = auth_config_support::document(&dir, &bundle);
     let v2 = auth_config_support::document_v2(&dir, &bundle);
+    // ADR 0029: the optional native profile is checked by the same command.
+    let native = auth_config_support::document_v2_native(&dir, &bundle);
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
-    for (document, serving_settings) in [(&v1, false), (&v1, true), (&v2, false), (&v2, true)] {
+    for (document, serving_settings) in [
+        (&v1, false),
+        (&v1, true),
+        (&v2, false),
+        (&v2, true),
+        (&native, false),
+        (&native, true),
+    ] {
         let path = dir.write("auth.json", document.to_string().as_bytes());
         let mut command = command(false);
         if serving_settings {
@@ -844,6 +853,75 @@ fn auth_config_check_rejects_with_fixed_redacted_categories() {
         document.to_string().into_bytes(),
         "browser profile refused: login rate is outside its allowed range",
     ));
+    // ADR 0029: the native profile is unknown in version 1 and judged in version 2.
+    let native = auth_config_support::document_v2_native(&dir, &ca::Ca::new().pem());
+    let mut document = valid.clone();
+    document["native"] = native["native"].clone();
+    cases.push((
+        document.to_string().into_bytes(),
+        "configuration has an unknown field",
+    ));
+    for (pointer, value, category) in [
+        (
+            "/native",
+            serde_json::Value::Null,
+            "a configuration field has the wrong type or keyword",
+        ),
+        (
+            "/native/provider_id",
+            "synthetic-secret".into(),
+            "native profile refused: native provider is not configured",
+        ),
+        (
+            "/native/issuer",
+            "http://synthetic-secret.example.test".into(),
+            "native profile refused: native issuer is not a canonical HTTPS origin",
+        ),
+        (
+            "/native/callback",
+            "https://synthetic-secret.example.test/cb".into(),
+            "native profile refused: native callback is not a plain HTTPS path on the issuer origin",
+        ),
+        (
+            "/native/client_id",
+            "synthetic secret".into(),
+            "native profile refused: native client identifier is not acceptable",
+        ),
+        (
+            "/native/redirect_uri",
+            "https://synthetic-secret.example.test/x?y".into(),
+            "native profile refused: native app link is not a canonical HTTPS URL",
+        ),
+        (
+            "/native/callback",
+            "https://app.example.test/synthetic-secret//x".into(),
+            "native profile refused: native callback path is not a plain literal path",
+        ),
+        (
+            "/native/callback",
+            "https://app.example.test/readyz".into(),
+            "native profile refused: native routes or app link collide with another route",
+        ),
+        (
+            "/native/redirect_uri",
+            "https://app.example.test/auth/logout".into(),
+            "native profile refused: native routes or app link collide with another route",
+        ),
+        (
+            "/native/rate/interval_milliseconds",
+            0.into(),
+            "native profile refused: native rate is outside its allowed range",
+        ),
+        (
+            "/native/max_in_flight",
+            1025.into(),
+            "native profile refused: native in-flight cap is outside its allowed range",
+        ),
+    ] {
+        let mut document = native.clone();
+        *document.pointer_mut(pointer).unwrap() = value;
+        cases.push((document.to_string().into_bytes(), category));
+    }
     for (bytes, category) in cases {
         let path = dir.write("synthetic-secret.json", &bytes);
         let output = command(false)
@@ -1025,6 +1103,25 @@ fn api_refuses_invalid_auth_config_with_a_fixed_redacted_line() {
     for (pointer, value, line) in later {
         run(&changed(pointer, value), line);
     }
+    // ADR 0029: a refused native profile is the same kind of fixed line, before any listener.
+    let native = auth_config_support::document_v2_native(&dir, &bundle);
+    for (pointer, value) in [
+        ("/native/callback", "https://app.example.test/healthz"),
+        (
+            "/native/redirect_uri",
+            "https://app.example.test/auth/session",
+        ),
+        ("/native/client_id", "CANARY client"),
+    ] {
+        let mut document = native.clone();
+        *document.pointer_mut(pointer).unwrap() = value.into();
+        let line = if pointer == "/native/client_id" {
+            "auth configuration error: native profile refused: native client identifier is not acceptable"
+        } else {
+            "auth configuration error: native profile refused: native routes or app link collide with another route"
+        };
+        run(&write("CANARY-native.json", &document), line);
+    }
     // Earlier settings are still reported first, and a valid file does not excuse them.
     let output = command(false)
         .env("OPENMETTLE_API_DATABASE_URL", "invalid://CANARY")
@@ -1043,7 +1140,8 @@ fn api_refuses_invalid_auth_config_with_a_fixed_redacted_line() {
 #[test]
 fn worker_ignores_auth_config_and_mounts_no_sign_in_route() {
     let dir = auth_config_support::Dir::new();
-    let v2 = auth_config_support::document_v2(&dir, &ca::Ca::new().pem());
+    // With a native profile (ADR 0029), so its routes would be mounted if it were read.
+    let v2 = auth_config_support::document_v2_native(&dir, &ca::Ca::new().pem());
     let valid = dir.write("auth.json", v2.to_string().as_bytes());
     let (_database, url) = unavailable_database();
     for path in [valid.as_str(), "", "CANARY-relative", "/CANARY-absent"] {
@@ -1069,6 +1167,10 @@ fn worker_ignores_auth_config_and_mounts_no_sign_in_route() {
             ("GET", "/callback"),
             ("GET", "/auth/session"),
             ("POST", "/auth/logout"),
+            ("GET", "/auth/native/authorize"),
+            ("POST", "/auth/native/token"),
+            ("GET", "/auth/native/session"),
+            ("POST", "/auth/native/logout"),
         ] {
             let extra = format!(
                 "Origin: https://app.example.test\r\nSec-Fetch-Site: same-origin\r\n\
@@ -1088,13 +1190,13 @@ fn worker_ignores_auth_config_and_mounts_no_sign_in_route() {
             .collect();
         assert_eq!(events[0]["event"], "process.started", "{stderr}");
         assert_eq!(events.last().unwrap()["event"], "process.stopped");
-        // Its lifecycle, health polling and four unknown routes; no sign-in route template.
+        // Its lifecycle, health polling and eight unknown routes; no sign-in route template.
         let routes: Vec<&str> = events
             .iter()
             .filter_map(|event| event["http.route"].as_str())
             .filter(|route| *route != "/healthz")
             .collect();
-        assert_eq!(routes, ["unmatched"; 4], "{stderr}");
+        assert_eq!(routes, ["unmatched"; 8], "{stderr}");
         assert!(
             events
                 .iter()
@@ -1474,6 +1576,148 @@ fn api_mounts_browser_sign_in_routes_from_a_valid_auth_config() {
     }
 }
 
+/// ADR 0029 through the real API binary, without PostgreSQL or a provider: a native profile
+/// mounts the five native routes beside the browser routes and the probes. Previews and
+/// refusals touch no pool, and telemetry holds only allowlisted fields and no planted value.
+#[test]
+fn api_mounts_native_sign_in_routes_beside_the_browser_routes() {
+    let dir = auth_config_support::Dir::new();
+    let document = auth_config_support::document_v2_native(&dir, &ca::Ca::new().pem());
+    dir.write("login-key-b", b"CANARY-login-key-active-00000000");
+    let auth = dir.write("CANARY-auth.json", document.to_string().as_bytes());
+    let (database, url) = unavailable_database();
+    database.set_nonblocking(true).unwrap();
+    let preview = format!(
+        "/auth/native/authorize?client_id=openmettle-desktop\
+         &redirect_uri=https%3A%2F%2Fapp.example.test%2Fnative%2Fcomplete&response_type=code\
+         &state={}&code_challenge_method=S256&code_challenge={}",
+        "s".repeat(43),
+        "c".repeat(43)
+    );
+    let foreign = preview.replace("openmettle-desktop", "CANARY-client");
+    let bearer = format!("Authorization: Bearer {SESSION}\r\n");
+    let token = "Content-Type: application/json\r\nContent-Length: 30\r\n\r\n\
+                 {\"code\":\"CANARY-code-0000000\"}";
+    // (method, target, extra head, status, body prefix, route template)
+    let cases: Vec<(&str, &str, String, u16, &str, &str)> = vec![
+        ("GET", "/healthz", String::new(), 200, "ok\n", "/healthz"),
+        (
+            "GET",
+            &preview,
+            String::new(),
+            200,
+            "<!doctype html>",
+            "/auth/native/authorize",
+        ),
+        (
+            "GET",
+            &foreign,
+            String::new(),
+            403,
+            "native sign-in refused\n",
+            "/auth/native/authorize",
+        ),
+        (
+            "GET",
+            "/auth/native/callback?code=CANARY-code&state=CANARY-state",
+            String::new(),
+            403,
+            "native sign-in refused\n",
+            "/auth/native/callback",
+        ),
+        (
+            "POST",
+            "/auth/native/token",
+            token.into(),
+            403,
+            "native sign-in refused\n",
+            "/auth/native/token",
+        ),
+        (
+            "GET",
+            "/auth/native/session",
+            String::new(),
+            403,
+            "native sign-in refused\n",
+            "/auth/native/session",
+        ),
+        (
+            "POST",
+            "/auth/native/logout",
+            "Content-Length: 0\r\nOrigin: https://app.example.test\r\n".into(),
+            403,
+            "native sign-in refused\n",
+            "/auth/native/logout",
+        ),
+        // A well-formed bearer reaches the primary pool, which cannot connect.
+        (
+            "GET",
+            "/auth/native/session",
+            bearer,
+            503,
+            "native sign-in unavailable\n",
+            "/auth/native/session",
+        ),
+        (
+            "POST",
+            "/auth/login",
+            "Content-Length: 0\r\n".into(),
+            403,
+            "login origin refused\n",
+            "/auth/login",
+        ),
+    ];
+    let bind = address();
+    let mut process = start_mounted(&bind, &url, &auth, "json", "150");
+    wait_status(&mut process, &bind, "/healthz", 200);
+    assert!(database.accept().is_err());
+    for (index, (method, target, extra, status, body, _)) in cases.iter().enumerate() {
+        let (got, head, text) = exchange(&bind, &request(method, target, extra));
+        assert_eq!(got, *status, "{method} {target}");
+        assert!(text.starts_with(body), "{method} {target}: {text}");
+        assert!(!head.contains("set-cookie") && !head.contains("location"));
+        assert!(!head.contains("request-id") && !head.contains("canary"));
+        assert_eq!(
+            head.contains("\r\ncache-control: no-store"),
+            *target != "/healthz"
+        );
+        // Every case before the bearer was decided without the primary pool.
+        if index == 6 {
+            assert!(database.accept().is_err());
+        }
+    }
+    stop(&mut process, "-TERM");
+    let (stdout, stderr) = drain(&mut process);
+    assert!(stdout.is_empty(), "{stdout}");
+    for canary in [
+        "CANARY",
+        "canary",
+        SESSION,
+        "sssssssss",
+        "ccccccccc",
+        "openmettle-desktop",
+        "native/complete",
+        "0b5c6f4e",
+        "app.example.test",
+        dir.path("").as_str(),
+    ] {
+        assert!(!stderr.contains(canary), "{canary}:\n{stderr}");
+    }
+    let events: Vec<serde_json::Value> = stderr
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let planted = &events[events.len() - 2 - cases.len()..events.len() - 2];
+    for (event, (method, _, _, status, _, route)) in planted.iter().zip(&cases) {
+        assert_eq!(event["event"], "http.request.completed");
+        assert_eq!(event["http.route"], *route);
+        assert_eq!(event["http.request.method"], *method);
+        assert_eq!(event["http.response.status_code"], *status);
+        assert_eq!(event.as_object().unwrap().len(), 8, "{event}");
+    }
+    assert_eq!(events.last().unwrap()["event"], "process.stopped");
+}
+
 #[test]
 fn unavailable_database_keeps_liveness_and_bounded_readiness() {
     // Hold a TCP listener that never speaks PostgreSQL to exercise query/connect timeout.
@@ -1813,7 +2057,8 @@ impl Drop for MigratedDb {
 async fn postgres_mounted_session_routes_use_the_primary_database() {
     let db = MigratedDb::new().await;
     let dir = auth_config_support::Dir::new();
-    let document = auth_config_support::document_v2(&dir, &ca::Ca::new().pem());
+    // With the native profile (ADR 0029), whose session routes use the same pool and role.
+    let document = auth_config_support::document_v2_native(&dir, &ca::Ca::new().pem());
     let auth = dir.write("auth.json", document.to_string().as_bytes());
     let bind = address();
     let mut api = start_mounted(&bind, &db.api_url(), &auth, "json", "2000");
@@ -1840,6 +2085,23 @@ async fn postgres_mounted_session_routes_use_the_primary_database() {
             assert!(head.contains("\r\ncache-control: no-store"));
             assert!(!head.contains("set-cookie") && !head.contains("location"));
         }
+        let bearer = format!("Authorization: Bearer {SESSION}\r\n");
+        for (method, target, extra) in [
+            ("GET", "/auth/native/session", bearer.clone()),
+            (
+                "POST",
+                "/auth/native/logout",
+                format!("Content-Length: 0\r\n{bearer}"),
+            ),
+        ] {
+            let (status, head, body) = exchange(&bind, &request(method, target, &extra));
+            assert_eq!(
+                (status, body.as_str()),
+                (403, "native sign-in refused\n"),
+                "{method} {target}"
+            );
+            assert!(head.contains("\r\ncache-control: no-store"));
+        }
         let (status, _, body) = exchange(&bind, &request("GET", "/readyz", ""));
         assert_eq!((status, body.as_str()), (200, "ready\n"));
     }
@@ -1851,12 +2113,12 @@ async fn postgres_mounted_session_routes_use_the_primary_database() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    // Six refusals by the database, none of them a server error.
+    // Twelve refusals by the database, browser and native, none of them a server error.
     let refused = events
         .iter()
         .filter(|event| event["http.response.status_code"] == 403)
         .count();
-    assert_eq!(refused, 6, "{stderr}");
+    assert_eq!(refused, 12, "{stderr}");
     assert!(events.iter().all(|event| event["level"] != "WARN"));
     assert_eq!(events.last().unwrap()["event"], "process.stopped");
 }

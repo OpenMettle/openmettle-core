@@ -1,4 +1,5 @@
-//! HTTP adapter for the unmounted native service. TLS and authority filtering belong to ingress.
+//! HTTP adapter for the native service, mounted by the API from a `native` profile (ADR 0029).
+//! TLS and authority filtering belong to ingress.
 use super::*;
 use crate::browser_auth::router::{self, Budget, Rate};
 use axum::{
@@ -28,12 +29,18 @@ fn single(request: &Parts, name: header::HeaderName) -> Option<&str> {
 }
 
 impl NativeAuth {
-    /// Build one router per process. Each route and accepted method has its own bucket at the
-    /// supplied rate, so the authorization preview `GET` and the starting `POST` spend
-    /// separately. Any other method is refused before it takes a slot or spends a unit.
+    /// [`Self::router_shared`] for a service the caller does not otherwise keep.
     pub fn router(self, rate: Rate) -> Result<Router, Error> {
-        let bodies = Arc::new(Semaphore::new(self.operations.available_permits()));
-        let auth = Arc::new(self);
+        Arc::new(self).router_shared(rate)
+    }
+    /// Build one router per process over this shared service, which the caller may keep, for
+    /// example to validate bearers elsewhere (ADR 0029). Each route and accepted method has its
+    /// own bucket at the supplied rate, so the authorization preview `GET` and the starting
+    /// `POST` spend separately. Any other method is refused before it takes a slot or spends
+    /// a unit. Request slots number the configured in-flight cap.
+    pub fn router_shared(self: &Arc<Self>, rate: Rate) -> Result<Router, Error> {
+        let bodies = Arc::new(Semaphore::new(self.in_flight));
+        let auth = self.clone();
         let mut router = Router::new();
         let callback = auth.callback[auth.issuer.len()..].to_owned();
         for (path, methods) in [

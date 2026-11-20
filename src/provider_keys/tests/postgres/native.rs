@@ -1,5 +1,5 @@
-//! Two independent provider managers and primary pools run the unmounted native router
-//! (ADR 0023). The schema is the migrated one, including migration 14.
+//! Two independent provider managers and primary pools run the native router (ADR 0023),
+//! which the API mounts from a native profile (ADR 0029). The schema is the migrated one, including migration 14.
 use super::super::{
     handoff::{ORIGIN, request},
     router::{CODE, FORM_TYPE, Reply, head, limits, send, serve},
@@ -411,6 +411,12 @@ async fn two_replicas_deliver_once_with_exact_pkce_registration_and_channel() {
     nothing_released(&lost);
     let bearer = bearer(&ok);
     nothing_released(&send(b, &req).await);
+    // ADR 0029: a service kept beside its mounted routes validates the bearer to the
+    // session's approval and primary observation, which hydrate the API principal.
+    let shared = Arc::new(profile(auth.clone()));
+    let _routes = shared.router_shared(limits().begin).unwrap();
+    let context = shared.validate(&bearer).await.unwrap();
+    sessions::assert_authorization_context(&mut f, &context, &bearer).await;
     assert!(auth.validate(&bearer).await.is_err());
     assert!(auth.logout(&bearer).await.is_err());
     let browser = sessions::issue(&mut f).await;
@@ -433,7 +439,8 @@ async fn two_replicas_deliver_once_with_exact_pkce_registration_and_channel() {
         assert_eq!(status(a, method, route, &bearer).await, 204);
     }
     assert_eq!(status(b, "GET", "session", &bearer).await, 403);
-    auth.validate(browser.expose()).await.unwrap();
+    let context = auth.validate(browser.expose()).await.unwrap();
+    sessions::assert_authorization_context(&mut f, &context, browser.expose()).await;
     let empty: bool = sqlx::query_scalar("SELECT sealed IS NULL FROM openmettle.native_handoffs")
         .fetch_one(&mut f.owner)
         .await

@@ -111,3 +111,20 @@ pub fn document_v2(dir: &Dir, bundle: &[u8]) -> Value {
     });
     document
 }
+
+/// A valid version-2 document with the optional native profile (ADR 0029): [`document_v2`]
+/// plus native routes on the same origin. None of its paths is a browser, provider callback
+/// or operational path. Every number is distinct from the browser profile's.
+pub fn document_v2_native(dir: &Dir, bundle: &[u8]) -> Value {
+    let mut document = document_v2(dir, bundle);
+    document["native"] = json!({
+        "provider_id": "0b5c6f4e-2a1d-4c3b-9e8f-7a6b5c4d3e2f",
+        "issuer": "https://app.example.test",
+        "callback": "https://app.example.test/auth/native/callback",
+        "client_id": "openmettle-desktop",
+        "redirect_uri": "https://app.example.test/native/complete",
+        "rate": {"burst": 23, "interval_milliseconds": 503},
+        "max_in_flight": 65
+    });
+    document
+}

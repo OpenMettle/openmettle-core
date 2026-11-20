@@ -104,7 +104,7 @@ Unset, no exporter, task, DNS slot or socket exists and the process behaves exac
 | --- | --- | --- |
 | `OPENMETTLE_API_AUTH_CONFIG` | unset | Unset: the API loads no auth file, serves `/healthz` and `/readyz` only and answers `404` on every sign-in path, as before. Set: the absolute path of a [version-2 auth settings document](#browser-routing-profile-version-2), loaded once at startup |
 
-When set, the API validates the document and the files it names with the same loader as `--check-auth-config`, before it installs telemetry or opens its listener. It then mounts the document's four routes beside the probes: the initiation `POST`, the provider's registered callback `GET`, the session check `GET` and the logout `POST`. They use the API's existing database pool. `/readyz` is still one database query and contacts no provider. Native sign-in is not mounted.
+When set, the API validates the document and the files it names with the same loader as `--check-auth-config`, before it installs telemetry or opens its listener. It then mounts the document's four routes beside the probes: the initiation `POST`, the provider's registered callback `GET`, the session check `GET` and the logout `POST`. They use the API's existing database pool. `/readyz` is still one database query and contacts no provider. If the document also has the optional [native profile](#native-sign-in-profile-version-2), the API mounts the five native sign-in routes beside them over the same service and pool ([ADR 0029](docs/adr/0029-native-sign-in-mounting-and-session-context.md)); otherwise every `/auth/native/` path is `404`.
 
 A refusal exits 78 with one fixed stderr line and no listener:
 
@@ -113,6 +113,7 @@ A refusal exits 78 with one fixed stderr line and no listener:
 | The value is empty or not an absolute path | `configuration error: invalid AUTH_CONFIG` |
 | The document or a file it names is refused | `auth configuration error: ` and the category `--check-auth-config` prints |
 | The document is version 1 | `auth configuration error: serving requires a version 2 browser profile` |
+| The native profile is refused | `auth configuration error: native profile refused: ` and a fixed category |
 
 No line carries a path, value, URL, identifier or parser message. Run `--check-auth-config` in the same image and mounts first: it accepts version 1, which serving refuses. There is no live reload; restart the API to apply changed files. Request events for these routes carry the route's configured literal path, the method, the status and a server-generated request ID, and nothing from the request.
 
@@ -151,8 +152,9 @@ The nonce verifier accepts stored digests without weakening the existing token c
 From migration 13 the sealed value also carries an optional home invitation code, at one
 fixed length (ADR 0022). Logins sealed before that migration still complete.
 
-The native handoff below is not mounted; the browser cookie handoff below is
-mounted only when `OPENMETTLE_API_AUTH_CONFIG` is set (ADR 0025). Key files are read only by the offline check below and by `openmettle-api` at startup when `OPENMETTLE_API_AUTH_CONFIG` is set. Internal local approval and sessions are described below. The outstanding-login
+The browser cookie handoff below is mounted only when `OPENMETTLE_API_AUTH_CONFIG` is set
+(ADR 0025), and the native handoff only when that document also has a native profile
+(ADR 0029). Key files are read only by the offline check below and by `openmettle-api` at startup when `OPENMETTLE_API_AUTH_CONFIG` is set. Internal local approval and sessions are described below. The outstanding-login
 cap below is not a rate limit. The login router below adds per-process request,
 rate and concurrency bounds; public exposure remains blocked on ingress
 transport limits, operated cleanup and retired-key reservation reclamation. After database restore, invalidate pending login transactions and
@@ -274,7 +276,7 @@ The operator sets a limit of 1–1000 rows per batch. Session deletion
 preserves issuance markers and nonce reservations. See the
 [session and login-gate cleanup procedure](docs/operator/session-cleanup.md).
 
-There is no tenant/group qualification or reconciliation; the cookie handoff below is mounted only on request (ADR 0025) and the native handoff is not mounted.
+There is no tenant/group qualification or reconciliation; the cookie handoff below is mounted only on request (ADR 0025) and the native handoff only with a native profile (ADR 0029).
 Run the managed PostgreSQL tests only in isolated CI with the explicit module filter above;
 normal workspace tests leave them ignored. Migration 8 and authentic v7 compatibility are CI gates.
 
@@ -373,6 +375,22 @@ version-1 document still passes unchanged and must not contain `browser`. The AP
 the profile's routes only when `OPENMETTLE_API_AUTH_CONFIG` names the document
 ([ADR 0025](docs/adr/0025-browser-auth-runtime-mounting.md)); by default it serves
 `/healthz` and `/readyz` only. The check cannot show that ingress, browsers or the provider registration agree with it.
+
+### Native sign-in profile (version 2)
+
+[ADR 0029](docs/adr/0029-native-sign-in-mounting-and-session-context.md) adds one optional
+`native` object to version 2. When present it needs all of `provider_id`, `issuer` (the
+canonical HTTPS origin that serves the native routes), `callback` (the exact upstream
+callback on that origin), `client_id` (1–128 ASCII letters, digits, `-`, `.` or `_`),
+`redirect_uri` (the exact HTTPS app link), `rate` (`burst` 1–65 536 and
+`interval_milliseconds` 1–3 600 000, applied to each native route and method) and
+`max_in_flight` (1–1024). Absent means no native routes; `null` is refused. Version 1 must
+not contain it.
+
+`--check-auth-config` and API startup judge it with the native service's own settings
+check, after the browser profile. The native paths and the app link must not collide with
+`/healthz`, `/readyz`, the browser routes or a provider's registered callback. A refusal is
+`auth configuration error: native profile refused: ` followed by one fixed category.
 
 ## Pooled browser-auth service
 
@@ -595,9 +613,10 @@ registrations, and deployed ingress remain qualification gaps for V1-04.
 
 ## Native sign-in
 
-[ADR 0023](docs/adr/0023-native-sign-in.md) adds `src/browser_auth/native.rs`, an unmounted
-router that brokers sign-in for a native app through the same provider registration, with
-its own upstream callback. **No process constructs it.** The app opens the system browser
+[ADR 0023](docs/adr/0023-native-sign-in.md) adds `src/browser_auth/native.rs`, a router
+that brokers sign-in for a native app through the same provider registration, with its own
+upstream callback. **It is off by default.** The API mounts it only from a
+[native profile](#native-sign-in-profile-version-2) (ADR 0029). The app opens the system browser
 at the deployment, where the person confirms the sign-in and, for a first sign-in, enters
 their [invitation code](docs/operator/home-invitations.md). The app never handles that
 code. After the provider sign-in the API redirects to the app's registered HTTPS link with
@@ -678,3 +697,8 @@ membership, platform and user capability denies, last-owner and last-admin refus
 execution-time run recheck. `account_admin` never grants content access. Nothing calls it
 yet: it adds no migration, route or enforcement, and inputs must be hydrated from the primary
 database by later increments.
+
+A validated browser or native session now also reports the approval it was issued under and
+the primary database's millisecond clock at which it was checked
+(`sessions::Context::{approval_id, observed_ms}`, [ADR 0029](docs/adr/0029-native-sign-in-mounting-and-session-context.md)),
+the inputs `authz::store::hydrate_api_principal` takes. No route hydrates a principal yet.

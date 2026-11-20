@@ -5,7 +5,9 @@
 //! the same settings checks as the handoff and router. Loading performs no network, DNS,
 //! database or listener work, enters no async runtime and mounts nothing. The API loads a
 //! version-2 document at startup through [`load_browser`] when `OPENMETTLE_API_AUTH_CONFIG`
-//! names one (ADR 0025). Settings and
+//! names one (ADR 0025). Version 2 may also carry one optional native sign-in profile, judged
+//! by the native service's own settings check and mounted beside the browser routes
+//! (ADR 0029). Settings and
 //! login secrets come from the deployment files. Native trust follows ADR 0010 and honors
 //! `SSL_CERT_FILE` and `SSL_CERT_DIR`. Success validates local inputs for this build.
 //! Provider reachability, durable authority (ADR 0012) and agreement between replicas require
@@ -13,7 +15,7 @@
 use crate::{
     auth::{self, ProviderIdentity},
     browser_auth::{
-        handoff,
+        handoff, native,
         router::{self, Rate},
     },
     login::{self, KeyRing},
@@ -33,7 +35,8 @@ use std::{
 
 /// The original document: login, token, refresh, session and provider settings.
 pub const VERSION: u64 = 1;
-/// [`VERSION`] plus one required browser-routing profile (ADR 0020).
+/// [`VERSION`] plus one required browser-routing profile (ADR 0020) and one optional native
+/// sign-in profile (ADR 0029).
 pub const VERSION_2: u64 = 2;
 /// Maximum serialized document size, applied before parsing.
 pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
@@ -79,6 +82,10 @@ pub enum Error {
     /// The browser profile's paths, rate budgets or in-flight cap, refused by the router's
     /// own settings check with its fixed category.
     BrowserRouter(router::SettingsError),
+    /// The native profile's provider, issuer, callback, client, app link, route collisions,
+    /// rate or in-flight cap, refused by the native service's own settings check with its
+    /// fixed category (ADR 0029).
+    Native(native::SettingsError),
     /// A valid version-1 document where serving needs the version-2 browser profile. Only
     /// [`load_browser`] returns it; the offline check still accepts version 1.
     BrowserProfileRequired,
@@ -108,6 +115,7 @@ impl fmt::Display for Error {
             // The wrapped categories are fixed lines too; neither carries a value.
             Self::BrowserHandoff(error) => return write!(f, "browser profile refused: {error}"),
             Self::BrowserRouter(error) => return write!(f, "browser profile refused: {error}"),
+            Self::Native(error) => return write!(f, "native profile refused: {error}"),
             Self::BrowserProfileRequired => "serving requires a version 2 browser profile",
         })
     }
@@ -146,6 +154,15 @@ impl Object {
     fn optional_integer(&mut self, name: &str) -> Result<Option<u64>, Error> {
         if self.0.contains_key(name) {
             self.integer(name).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+    /// An object member that may be absent. A present `null` or other type is refused, so the
+    /// member has exactly two accepted shapes: absent, or an object.
+    fn optional_object(&mut self, name: &str) -> Result<Option<Self>, Error> {
+        if self.0.contains_key(name) {
+            self.object(name).map(Some)
         } else {
             Ok(None)
         }
@@ -289,16 +306,6 @@ impl BrowserProfile {
     /// Shape only. Integers too large for the router's types saturate, so the router's own
     /// range check refuses them in its usual order; no bound is added here.
     fn parse(value: Value) -> Result<Self, Error> {
-        let saturate = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
-        let rate = |value: Value| {
-            let mut rate = Object::new(value)?;
-            let parsed = Rate {
-                burst: saturate(rate.integer("burst")?),
-                interval: Duration::from_millis(rate.integer("interval_milliseconds")?),
-            };
-            rate.end()?;
-            Ok(parsed)
-        };
         let mut browser = Object::new(value)?;
         let mut paths = browser.object("paths")?;
         let mut rates = browser.object("rates")?;
@@ -331,6 +338,85 @@ impl BrowserProfile {
     }
 }
 
+/// A JSON integer for a `u32` setting. Too large saturates, so the owning range check
+/// refuses it in its usual order rather than accepting a clamped value.
+fn saturate(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+/// One `{"burst", "interval_milliseconds"}` rate object, shape only.
+fn rate(value: Value) -> Result<Rate, Error> {
+    let mut rate = Object::new(value)?;
+    let parsed = Rate {
+        burst: saturate(rate.integer("burst")?),
+        interval: Duration::from_millis(rate.integer("interval_milliseconds")?),
+    };
+    rate.end()?;
+    Ok(parsed)
+}
+
+/// The optional version-2 native sign-in profile (ADR 0029): one selected provider, the
+/// deployment issuer and its upstream callback, the native client and its exact app link,
+/// one rate for each native route and method, and one in-flight cap.
+///
+/// Only [`load`] returns one, inside [`AuthConfig`], after the native service's own settings
+/// check accepted it. It holds settings only: no route, listener or admission state.
+#[derive(Clone)]
+pub struct NativeProfile {
+    provider_id: String,
+    issuer: String,
+    callback: String,
+    client_id: String,
+    redirect_uri: String,
+    rate: Rate,
+    max_in_flight: u32,
+}
+impl fmt::Debug for NativeProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NativeProfile(..)")
+    }
+}
+impl NativeProfile {
+    /// Settings for the native service.
+    pub fn settings(&self) -> native::Settings<'_> {
+        native::Settings {
+            provider: &self.provider_id,
+            issuer: &self.issuer,
+            callback: &self.callback,
+            client: &self.client_id,
+            redirect: &self.redirect_uri,
+            max_in_flight: self.max_in_flight,
+        }
+    }
+    /// The rate of each native route and accepted method, for `NativeAuth::router_shared`.
+    pub fn rate(&self) -> Rate {
+        self.rate
+    }
+    /// Shape only, as for [`BrowserProfile::parse`].
+    fn parse(mut native: Object) -> Result<Self, Error> {
+        let parsed = Self {
+            provider_id: native.string("provider_id")?,
+            issuer: native.string("issuer")?,
+            callback: native.string("callback")?,
+            client_id: native.string("client_id")?,
+            redirect_uri: native.string("redirect_uri")?,
+            rate: rate(native.take("rate")?)?,
+            max_in_flight: saturate(native.integer("max_in_flight")?),
+        };
+        native.end()?;
+        Ok(parsed)
+    }
+    /// The native service's settings check against the registered providers and the checked
+    /// browser profile. It builds no service, route or task.
+    fn check(
+        self,
+        providers: &[ManagedProvider],
+        browser: Option<&BrowserProfile>,
+    ) -> Result<Self, Error> {
+        native::check(providers, browser, self.settings(), self.rate).map_err(Error::Native)?;
+        Ok(self)
+    }
+}
+
 /// The complete shape of either version, checked before any policy is evaluated or other file
 /// is read.
 struct Document {
@@ -353,6 +439,8 @@ struct Document {
     providers: Vec<Provider>,
     /// Required in version 2. Version 1 has no such member, so there it is an unknown field.
     browser: Option<BrowserProfile>,
+    /// Optional in version 2, and an unknown field in version 1.
+    native: Option<NativeProfile>,
 }
 impl Document {
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
@@ -398,6 +486,13 @@ impl Document {
                 .collect::<Result<_, _>>()?,
             browser: match version {
                 VERSION_2 => Some(BrowserProfile::parse(root.take("browser")?)?),
+                _ => None,
+            },
+            native: match version {
+                VERSION_2 => root
+                    .optional_object("native")?
+                    .map(NativeProfile::parse)
+                    .transpose()?,
                 _ => None,
             },
         };
@@ -467,6 +562,7 @@ pub struct AuthConfig {
     manager: ProviderManager,
     providers: Vec<ManagedProvider>,
     browser: Option<BrowserProfile>,
+    native: Option<NativeProfile>,
 }
 impl fmt::Debug for AuthConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -497,6 +593,10 @@ impl AuthConfig {
     pub fn browser(&self) -> Option<&BrowserProfile> {
         self.browser.as_ref()
     }
+    /// The validated native sign-in profile of a version-2 document that has one (ADR 0029).
+    pub fn native(&self) -> Option<&NativeProfile> {
+        self.native.as_ref()
+    }
     /// Test-only assembly from parts built with fixture trust. Production state comes from
     /// [`load`] alone.
     #[cfg(test)]
@@ -515,6 +615,7 @@ impl AuthConfig {
             manager,
             providers,
             browser: None,
+            native: None,
         }
     }
 }
@@ -613,6 +714,11 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
         .browser
         .map(|profile| profile.check(&providers))
         .transpose()?;
+    // Then the native profile, judged against the checked browser routes it must not shadow.
+    let native = document
+        .native
+        .map(|profile| profile.check(&providers, browser.as_ref()))
+        .transpose()?;
     Ok(AuthConfig {
         keys,
         login_lifetime,
@@ -621,6 +727,7 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
         manager,
         providers,
         browser,
+        native,
     })
 }
 

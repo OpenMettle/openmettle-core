@@ -185,6 +185,10 @@ exercised.
 > [ADR 0025](0025-browser-auth-runtime-mounting.md) supplies runtime enablement, off by
 > default. The other items stand.
 
+> [ADR 0029](0029-native-sign-in-mounting-and-session-context.md) adds an optional `native` member to version 2, judged by the
+> native service's own settings check in the same way, and mounts it beside the browser
+> routes.
+
 Runtime enablement remains open: startup loading, constructing the service, handoff and
 router, and mounting. Deployment and browser qualification, ingress routing and telemetry
 redaction, operated cleanup and retired-key reservation reclamation, native handoff,

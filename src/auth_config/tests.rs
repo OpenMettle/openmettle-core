@@ -25,6 +25,12 @@ impl Fixture {
         let document = support::document_v2(&dir, &Ca::new().pem());
         Self { dir, document }
     }
+    /// The same files with a version-2 document that has a native profile (ADR 0029).
+    fn native() -> Self {
+        let dir = Dir::new();
+        let document = support::document_v2_native(&dir, &Ca::new().pem());
+        Self { dir, document }
+    }
     fn load(&self) -> Result<AuthConfig, Error> {
         self.load_bytes(self.document.to_string().as_bytes())
     }
@@ -1251,4 +1257,603 @@ fn serving_load_requires_the_version_2_profile() {
     assert_eq!(refused("auth.json"), Err(Error::Path));
     assert_eq!(refused(&v1.dir.path("absent")), Err(Error::ConfigFile));
     assert_eq!(refused(&v1.dir.write("auth.json", b"{")), Err(Error::Json));
+}
+
+// Version 2: the optional native sign-in profile (ADR 0029).
+
+const NATIVE_OBJECTS: [&str; 2] = ["/native", "/native/rate"];
+fn native_refusal(error: native::SettingsError) -> Error {
+    Error::Native(error)
+}
+
+#[test]
+fn native_profile_is_optional_in_version_two_and_retained_when_present() {
+    // Every existing version-2 document, which has no native member, is unchanged.
+    let config = Fixture::v2().load().unwrap();
+    assert!(config.browser().is_some() && config.native().is_none());
+
+    let config = Fixture::native().load().unwrap();
+    assert!(tokio::runtime::Handle::try_current().is_err());
+    let profile = config.native().expect("the native profile is retained");
+    let settings = profile.settings();
+    assert_eq!(
+        (
+            settings.provider,
+            settings.issuer,
+            settings.callback,
+            settings.client,
+            settings.redirect,
+            settings.max_in_flight,
+        ),
+        (
+            PROVIDER,
+            "https://app.example.test",
+            "https://app.example.test/auth/native/callback",
+            "openmettle-desktop",
+            "https://app.example.test/native/complete",
+            65,
+        )
+    );
+    assert_eq!(
+        profile.rate(),
+        Rate {
+            burst: 23,
+            interval: Duration::from_millis(503)
+        }
+    );
+    // The browser profile beside it is unchanged.
+    assert_eq!(config.browser().unwrap().router().initiation, "/auth/login");
+    // No origin, link, client or provider identifier when debug-printed.
+    assert_eq!(
+        format!("{config:?} {profile:?} {settings:?}"),
+        "AuthConfig(..) NativeProfile(..) NativeSettings(..)"
+    );
+
+    // Inclusive bounds.
+    for (pointer, value) in [
+        ("/native/rate/burst", json!(1)),
+        ("/native/rate/burst", json!(router::MAX_BURST)),
+        ("/native/rate/interval_milliseconds", json!(1)),
+        ("/native/rate/interval_milliseconds", json!(3_600_000)),
+        ("/native/max_in_flight", json!(1)),
+        ("/native/max_in_flight", json!(native::MAX_IN_FLIGHT)),
+        ("/native/client_id", json!("a".repeat(128))),
+        ("/native/client_id", json!("A-z.0_9")),
+    ] {
+        let mut fixture = Fixture::native();
+        fixture.set(pointer, value);
+        assert!(fixture.load().is_ok(), "{pointer}");
+    }
+}
+
+#[test]
+fn native_profile_shape_is_strict() {
+    let v1 = Fixture::new();
+    let fixture = Fixture::native();
+    let profile = fixture.document["native"].clone();
+    // Version 1 keeps its exact shape: the member is unknown there.
+    let mut document = v1.document.clone();
+    document["native"] = profile.clone();
+    assert_eq!(
+        refusal(v1.load_bytes(document.to_string().as_bytes())),
+        Error::UnknownField
+    );
+    let mut document = fixture.document.clone();
+    document["version"] = json!(1);
+    document.as_object_mut().unwrap().remove("browser");
+    assert_eq!(
+        refusal(fixture.load_bytes(document.to_string().as_bytes())),
+        Error::UnknownField
+    );
+    // Present means an object: `null` is not absence.
+    for value in [
+        json!(null),
+        json!([]),
+        json!(PROVIDER),
+        json!(1),
+        json!(true),
+    ] {
+        assert_eq!(fixture.with("/native", value), Error::Field);
+    }
+    // Seven members and two rate members, each required; unknown members are refused.
+    assert_eq!(missing_and_unknown(&fixture, &NATIVE_OBJECTS), 9);
+    for pointer in [
+        "/native/provider_id",
+        "/native/issuer",
+        "/native/callback",
+        "/native/client_id",
+        "/native/redirect_uri",
+    ] {
+        for value in [json!(1), json!(null), json!(["x"]), json!({})] {
+            assert_eq!(fixture.with(pointer, value), Error::Field, "{pointer}");
+        }
+    }
+    for pointer in [
+        "/native/max_in_flight",
+        "/native/rate/burst",
+        "/native/rate/interval_milliseconds",
+    ] {
+        for value in [
+            json!("64"),
+            json!(64.0),
+            json!(6.4e1),
+            json!(-1),
+            json!(null),
+            json!([64]),
+        ] {
+            assert_eq!(fixture.with(pointer, value), Error::Field, "{pointer}");
+        }
+    }
+    for value in [json!([23, 503]), json!(null), json!("23/503")] {
+        assert_eq!(fixture.with("/native/rate", value), Error::Field);
+    }
+    // Repeated members, in the profile and its rate, and a repeated profile.
+    let text = fixture.document.to_string();
+    for member in [
+        r#""client_id":"openmettle-desktop""#,
+        r#""redirect_uri":"https://app.example.test/native/complete""#,
+        r#""max_in_flight":65"#,
+        r#""burst":23"#,
+        r#""interval_milliseconds":503"#,
+        r#""rate":{"#,
+        r#""native":{"#,
+    ] {
+        assert_eq!(text.matches(member).count(), 1, "{member}");
+        let repeated = if member.ends_with('{') {
+            text.replacen(member, &format!("{member}}},{member}"), 1)
+        } else {
+            text.replacen(member, &format!("{member},{member}"), 1)
+        };
+        assert_eq!(
+            refusal(fixture.load_bytes(repeated.as_bytes())),
+            Error::DuplicateField,
+            "{member}"
+        );
+    }
+}
+
+/// Every refusal of the native settings check, by category, in the order it decides them.
+/// Each case is a set of JSON pointer replacements in the native fixture.
+type NativeCase = (
+    Vec<(&'static str, Value)>,
+    Result<(), native::SettingsError>,
+);
+fn native_cases() -> Vec<NativeCase> {
+    use native::SettingsError::*;
+    let app = |path: &str| json!(format!("https://app.example.test{path}"));
+    let broker = |path: &str| json!(format!("https://broker.example.test{path}"));
+    let on_broker = |link: Value| {
+        vec![
+            ("/native/issuer", json!("https://broker.example.test")),
+            ("/native/callback", broker("/auth/native/callback")),
+            ("/native/redirect_uri", link),
+        ]
+    };
+    let long_path = format!("/{}", "a".repeat(router::MAX_PATH_BYTES));
+    let long_host = format!(
+        "https://{}.example.test",
+        vec!["a".repeat(60); 34].join(".")
+    );
+    let one = |pointer: &'static str, value: Value| vec![(pointer, value)];
+    let mut cases = vec![
+        (vec![], Ok(())),
+        (
+            one("/native/provider_id", json!(OTHER_PROVIDER)),
+            Err(Provider),
+        ),
+        (
+            one("/native/provider_id", json!(PROVIDER.to_ascii_uppercase())),
+            Err(Provider),
+        ),
+        (one("/native/provider_id", json!("")), Err(Provider)),
+        (
+            one("/native/issuer", json!("http://app.example.test")),
+            Err(Issuer),
+        ),
+        (
+            one("/native/issuer", json!("https://app.example.test/")),
+            Err(Issuer),
+        ),
+        (
+            one("/native/issuer", json!("https://APP.example.test")),
+            Err(Issuer),
+        ),
+        (
+            one("/native/issuer", json!("https://app.example.test:443")),
+            Err(Issuer),
+        ),
+        (
+            one("/native/issuer", json!("app.example.test")),
+            Err(Issuer),
+        ),
+        (one("/native/issuer", json!(long_host)), Err(Issuer)),
+        // Canonical, but the callback is not on it.
+        (
+            one("/native/issuer", json!("https://other.example.test")),
+            Err(Callback),
+        ),
+        (
+            one(
+                "/native/callback",
+                json!("http://app.example.test/auth/native/callback"),
+            ),
+            Err(Callback),
+        ),
+        (
+            one("/native/callback", app("/auth/native/callback?x=1")),
+            Err(Callback),
+        ),
+        (
+            one("/native/callback", app("/auth/native/callback#x")),
+            Err(Callback),
+        ),
+        (one("/native/callback", app("/")), Err(Callback)),
+        (one("/native/callback", app("//auth")), Err(Callback)),
+        (one("/native/callback", app("/a%20b")), Err(Callback)),
+        (one("/native/callback", app("/a/../b")), Err(Callback)),
+        (
+            one(
+                "/native/callback",
+                json!("https://user@app.example.test/auth/native/callback"),
+            ),
+            Err(Callback),
+        ),
+        (
+            one("/native/callback", broker("/auth/native/callback")),
+            Err(Callback),
+        ),
+        (one("/native/client_id", json!("")), Err(Client)),
+        (
+            one("/native/client_id", json!("a".repeat(129))),
+            Err(Client),
+        ),
+        (
+            one("/native/client_id", json!("openmettle desktop")),
+            Err(Client),
+        ),
+        (
+            one("/native/client_id", json!("openmettle~desktop")),
+            Err(Client),
+        ),
+        (one("/native/client_id", json!("désktop")), Err(Client)),
+        (
+            one(
+                "/native/redirect_uri",
+                json!("http://app.example.test/native/complete"),
+            ),
+            Err(Redirect),
+        ),
+        (
+            one("/native/redirect_uri", app("/native/complete?x=1")),
+            Err(Redirect),
+        ),
+        (
+            one("/native/redirect_uri", json!("https://app.example.test")),
+            Err(Redirect),
+        ),
+        (
+            one("/native/redirect_uri", json!("com.example.app:/complete")),
+            Err(Redirect),
+        ),
+        (one("/native/redirect_uri", json!("")), Err(Redirect)),
+        // An exact link whose path is no plain route path.
+        (one("/native/callback", app("/a//b")), Err(Route)),
+        (one("/native/callback", app(&long_path)), Err(Route)),
+        // The callback against operational, native, browser and provider callback routes.
+        (one("/native/callback", app("/healthz")), Err(Collision)),
+        (one("/native/callback", app("/readyz")), Err(Collision)),
+        (
+            one("/native/callback", app("/auth/native/token")),
+            Err(Collision),
+        ),
+        (
+            one("/native/callback", app("/auth/native/authorize")),
+            Err(Collision),
+        ),
+        (one("/native/callback", app("/auth/login")), Err(Collision)),
+        (
+            one("/native/callback", app("/auth/session")),
+            Err(Collision),
+        ),
+        (one("/native/callback", app("/home")), Err(Collision)),
+        (one("/native/callback", app("/callback")), Err(Collision)),
+        // The app link against the provider callback, native and operational routes of
+        // the issuer, and browser and operational routes of the browser origin.
+        (
+            one("/native/redirect_uri", app("/callback")),
+            Err(Collision),
+        ),
+        (
+            one("/native/redirect_uri", app("/auth/native/session")),
+            Err(Collision),
+        ),
+        (
+            one("/native/redirect_uri", app("/auth/native/callback")),
+            Err(Collision),
+        ),
+        (one("/native/redirect_uri", app("/healthz")), Err(Collision)),
+        (
+            one("/native/redirect_uri", app("/auth/logout")),
+            Err(Collision),
+        ),
+        (on_broker(app("/auth/session")), Err(Collision)),
+        (on_broker(app("/home")), Err(Collision)),
+        (on_broker(app("/readyz")), Err(Collision)),
+        (on_broker(app("/callback")), Err(Collision)),
+        (on_broker(broker("/auth/native/token")), Err(Collision)),
+        (on_broker(broker("/readyz")), Err(Collision)),
+        // Controls: browser paths as an app link on another origin, and native paths for a
+        // link elsewhere.
+        (on_broker(app("/app-link")), Ok(())),
+        (on_broker(broker("/auth/session")), Ok(())),
+        (on_broker(broker("/callback")), Ok(())),
+        // One router serves both route sets and ignores the host, so a native route never
+        // repeats a mounted browser route on another origin either. The landing is not a
+        // route, so only a shared origin protects it.
+        (
+            vec![
+                ("/native/issuer", json!("https://broker.example.test")),
+                ("/native/callback", broker("/auth/login")),
+            ],
+            Err(Collision),
+        ),
+        (
+            vec![
+                ("/native/issuer", json!("https://broker.example.test")),
+                ("/native/callback", broker("/callback")),
+            ],
+            Err(Collision),
+        ),
+        (
+            vec![
+                ("/native/issuer", json!("https://broker.example.test")),
+                ("/native/callback", broker("/auth/logout")),
+            ],
+            Err(Collision),
+        ),
+        (
+            vec![
+                ("/native/issuer", json!("https://broker.example.test")),
+                ("/native/callback", broker("/home")),
+            ],
+            Ok(()),
+        ),
+        (
+            one(
+                "/native/redirect_uri",
+                json!("https://links.example.test/auth/native/token"),
+            ),
+            Ok(()),
+        ),
+    ];
+    for (member, value) in [
+        ("burst", json!(0)),
+        ("burst", json!(u64::from(router::MAX_BURST) + 1)),
+        ("burst", json!(u64::from(u32::MAX) + 1)),
+        ("burst", json!(u64::MAX)),
+        ("interval_milliseconds", json!(0)),
+        ("interval_milliseconds", json!(3_600_001)),
+        ("interval_milliseconds", json!(u64::MAX)),
+    ] {
+        let pointer = if member == "burst" {
+            "/native/rate/burst"
+        } else {
+            "/native/rate/interval_milliseconds"
+        };
+        cases.push((one(pointer, value), Err(Rate)));
+    }
+    for value in [
+        json!(0),
+        json!(native::MAX_IN_FLIGHT + 1),
+        json!(u64::from(u32::MAX) + 1),
+        json!(u64::MAX),
+    ] {
+        cases.push((one("/native/max_in_flight", value), Err(InFlight)));
+    }
+    // Earlier categories are decided first.
+    cases.push((
+        vec![
+            ("/native/max_in_flight", json!(0)),
+            ("/native/rate/burst", json!(0)),
+        ],
+        Err(Rate),
+    ));
+    cases.push((
+        vec![
+            ("/native/rate/burst", json!(0)),
+            ("/native/callback", app("/healthz")),
+        ],
+        Err(Collision),
+    ));
+    cases.push((
+        vec![
+            ("/native/redirect_uri", json!("http://x")),
+            ("/native/client_id", json!("")),
+        ],
+        Err(Client),
+    ));
+    cases.push((
+        vec![
+            ("/native/provider_id", json!(OTHER_PROVIDER)),
+            ("/native/issuer", json!("http://x")),
+        ],
+        Err(Provider),
+    ));
+    cases
+}
+fn with_all(document: &Value, changes: &[(&str, Value)]) -> Value {
+    let mut document = document.clone();
+    for (pointer, value) in changes {
+        *document.pointer_mut(pointer).unwrap() = value.clone();
+    }
+    document
+}
+
+#[test]
+fn native_settings_refusals_have_fixed_categories() {
+    let fixture = Fixture::native();
+    let mut categories = HashSet::new();
+    for (changes, expected) in native_cases() {
+        let document = with_all(&fixture.document, &changes);
+        let outcome = fixture
+            .load_bytes(document.to_string().as_bytes())
+            .map(drop);
+        assert_eq!(outcome, expected.map_err(native_refusal), "{changes:?}");
+        categories.insert(format!("{expected:?}"));
+    }
+    // Success and all nine categories were reached.
+    assert_eq!(categories.len(), 10);
+    // The browser profile is judged first, and version-1 refusals before both.
+    let mut fixture = Fixture::native();
+    fixture.set("/native/max_in_flight", json!(0));
+    fixture.set("/browser/max_in_flight", json!(0));
+    assert_eq!(
+        refusal(fixture.load()),
+        router_refusal(router::SettingsError::InFlight)
+    );
+    fixture.set("/session/retained_per_user", json!(0));
+    assert_eq!(refusal(fixture.load()), Error::SessionPolicy);
+    // A native route never shadows a browser path even if the browser profile moves.
+    let mut fixture = Fixture::native();
+    fixture.set(
+        "/browser/paths/session_check",
+        json!("/auth/native/session"),
+    );
+    assert_eq!(
+        refusal(fixture.load()),
+        native_refusal(native::SettingsError::Collision)
+    );
+}
+
+#[test]
+fn native_refusals_carry_no_configuration_values() {
+    use native::SettingsError::*;
+    for error in [
+        Provider, Issuer, Callback, Client, Redirect, Route, Collision, Rate, InFlight,
+    ] {
+        let text = format!("{error} {error:?} {}", native_refusal(error));
+        assert!(!text.contains('/') && !text.contains("http"), "{text}");
+    }
+    assert_eq!(
+        native_refusal(Collision).to_string(),
+        "native profile refused: native routes or app link collide with another route"
+    );
+    let fixture = Fixture::native();
+    for (pointer, value) in [
+        ("/native/provider_id", "synthetic-secret"),
+        ("/native/issuer", "https://synthetic-secret.example.test"),
+        ("/native/issuer", "http://synthetic-secret"),
+        (
+            "/native/callback",
+            "https://app.example.test/synthetic-secret?x",
+        ),
+        (
+            "/native/callback",
+            "https://app.example.test/synthetic-secret//x",
+        ),
+        ("/native/client_id", "synthetic secret"),
+        (
+            "/native/redirect_uri",
+            "https://synthetic-secret.example.test/healthz?x",
+        ),
+        ("/native/redirect_uri", "https://app.example.test/healthz"),
+    ] {
+        let error = fixture.with(pointer, json!(value));
+        let text = format!("{error} {error:?}");
+        assert!(text.starts_with("native profile refused: "), "{text}");
+        for canary in [
+            "synthetic",
+            "/",
+            "app.example",
+            "desktop",
+            PROVIDER,
+            "healthz",
+        ] {
+            assert!(!text.contains(canary), "{canary}: {text}");
+        }
+    }
+}
+
+/// One implementation: each native profile the offline check accepts or refuses gets the
+/// same outcome from the native service built over the same providers and browser profile.
+/// `NativeAuth::new` has no rate and reports `Configuration`; a refused rate is then refused
+/// by `router_shared`. The lazy pool is never used, so nothing connects.
+#[tokio::test]
+async fn offline_native_outcomes_match_the_native_constructors() {
+    use crate::{
+        browser_auth::{BrowserAuth, native::NativeAuth},
+        sessions,
+    };
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use std::sync::Arc;
+    let fixture = Fixture::native();
+    let pool = PgPoolOptions::new().connect_lazy_with(
+        PgConnectOptions::new()
+            .host("127.0.0.1")
+            .port(9)
+            .username("fixture"),
+    );
+    for (changes, expected) in native_cases() {
+        let document = with_all(&fixture.document, &changes);
+        let offline = fixture
+            .load_bytes(document.to_string().as_bytes())
+            .map(drop);
+        assert_eq!(offline, expected.map_err(native_refusal), "{changes:?}");
+        let mut root = Object::new(document.clone()).unwrap();
+        let profile = NativeProfile::parse(root.object("native").unwrap()).unwrap();
+        // The same settings without the profile, so only the constructors judge it.
+        let mut without = document.clone();
+        without.as_object_mut().unwrap().remove("native");
+        let config = fixture.load_bytes(without.to_string().as_bytes()).unwrap();
+        let auth = Arc::new(BrowserAuth::new(config, pool.clone()));
+        let checked = NativeAuth::checked(auth.clone(), profile.settings(), profile.rate());
+        assert_eq!(
+            checked.as_ref().map(drop).map_err(|e| *e),
+            expected,
+            "{changes:?}"
+        );
+        let settings = profile.settings();
+        let built = NativeAuth::new(
+            auth,
+            settings.provider,
+            settings.issuer,
+            settings.callback,
+            settings.client,
+            settings.redirect,
+            settings.max_in_flight,
+        );
+        // Without a rate, `new` refuses what the check refuses before the rate, and a
+        // rate refused by the check is refused when the routes are built.
+        match (expected, built) {
+            (Ok(()), Ok(auth)) => assert!(Arc::new(auth).router_shared(profile.rate()).is_ok()),
+            (Err(native::SettingsError::Rate), Ok(auth)) => assert_eq!(
+                Arc::new(auth).router_shared(profile.rate()).err(),
+                Some(sessions::Error::Configuration),
+                "{changes:?}"
+            ),
+            (Err(_), Err(error)) => assert_eq!(error, sessions::Error::Configuration),
+            (expected, built) => panic!("{changes:?}: {expected:?} {:?}", built.map(drop)),
+        }
+    }
+}
+
+/// Serving takes the same loader: the native profile is retained beside the browser one.
+#[test]
+fn serving_load_retains_the_native_profile() {
+    let fixture = Fixture::native();
+    let path = fixture
+        .dir
+        .write("auth.json", fixture.document.to_string().as_bytes());
+    let (config, browser) = load_browser(Path::new(&path)).unwrap();
+    assert_eq!(browser.handoff().origin, "https://app.example.test");
+    assert_eq!(config.native().unwrap().rate().burst, 23);
+    let mut document = fixture.document.clone();
+    document["native"]["max_in_flight"] = json!(0);
+    let path = fixture
+        .dir
+        .write("auth.json", document.to_string().as_bytes());
+    assert_eq!(
+        load_browser(Path::new(&path)).map(drop),
+        Err(native_refusal(native::SettingsError::InFlight))
+    );
 }

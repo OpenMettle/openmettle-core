@@ -6,7 +6,8 @@
 //! (ADR 0017) and [`router`] its bounded Axum router (ADRs 0018 and 0019). The API constructs
 //! the service and mounts that router only when `OPENMETTLE_API_AUTH_CONFIG` names a
 //! version-2 settings document (ADR 0025); by default nothing constructs either.
-//! [`native`] provides the separate native code handoff, which no process mounts.
+//! [`native`] provides the separate native code handoff. The API mounts it over the same
+//! service only when that document also names a native profile (ADR 0029).
 pub mod handoff;
 pub mod native;
 pub mod router;

@@ -1,10 +1,13 @@
-//! Unmounted API-brokered native login (ADR 0023). The app supplies its own S256 challenge.
+//! API-brokered native login (ADR 0023). The app supplies its own S256 challenge. The API
+//! mounts it beside the browser routes when the version-2 settings name a `native` profile
+//! (ADR 0029); otherwise nothing constructs it.
 //! The person confirms the sign-in in the system browser, where a first sign-in also enters
 //! its invitation code (ADR 0022). The app never handles that code.
 mod routes;
-use super::{BrowserAuth, Checkout, handoff, path_byte, session_settled};
+use super::{BrowserAuth, Checkout, handoff, path_byte, router::Rate, session_settled};
 use crate::sessions::native::{self, Attempt};
 use crate::{
+    auth_config::BrowserProfile,
     provider_keys::ManagedProvider,
     sessions::{self, Channel, Credential, Error, Validation},
 };
@@ -65,7 +68,14 @@ pub struct NativeAuth {
     redirect: Url,
     registration: [u8; 32],
     audience: [u8; 32],
+    /// The configured cap of `operations`, which also sizes the router's request slots.
+    in_flight: usize,
     operations: Semaphore,
+}
+impl std::fmt::Debug for NativeAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NativeAuth(..)")
+    }
 }
 /// Inputs of the app's back-channel HTTPS POST. No cookie participates.
 pub struct Redemption<'a> {
@@ -92,6 +102,193 @@ fn exact_link(value: &str) -> Option<Url> {
         && url.path().bytes().all(path_byte))
     .then_some(url)
 }
+/// Largest native in-flight cap.
+pub const MAX_IN_FLIGHT: u32 = 1024;
+
+/// Explicit native deployment settings (ADRs 0023 and 0029). None has a default and none is
+/// taken from a request. The route rate is supplied separately, to the check and the router.
+#[derive(Clone, Copy)]
+pub struct Settings<'a> {
+    /// The configured provider UUID, matched exactly.
+    pub provider: &'a str,
+    /// The deployment issuer: a canonical HTTPS origin that serves the native routes.
+    pub issuer: &'a str,
+    /// The exact upstream callback, a plain path on the issuer origin.
+    pub callback: &'a str,
+    /// The native client identifier.
+    pub client: &'a str,
+    /// The exact app link that receives the code.
+    pub redirect: &'a str,
+    /// Native operations at once, and the router's request slots.
+    pub max_in_flight: u32,
+}
+impl std::fmt::Debug for Settings<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NativeSettings(..)")
+    }
+}
+
+/// Fixed refusals of [`Settings`] and the route rate, in the order [`check`] decides them.
+/// No variant carries a value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsError {
+    /// Not an exactly configured provider UUID, or its registration cannot be bound.
+    Provider,
+    Issuer,
+    /// Not an exact HTTPS link with a plain path on the issuer origin.
+    Callback,
+    Client,
+    Redirect,
+    /// The callback path is not a plain literal route path.
+    Route,
+    /// A native route or the app link collides with an operational, browser or provider
+    /// callback route.
+    Collision,
+    Rate,
+    InFlight,
+}
+impl std::fmt::Display for SettingsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Provider => "native provider is not configured",
+            Self::Issuer => "native issuer is not a canonical HTTPS origin",
+            Self::Callback => "native callback is not a plain HTTPS path on the issuer origin",
+            Self::Client => "native client identifier is not acceptable",
+            Self::Redirect => "native app link is not a canonical HTTPS URL",
+            Self::Route => "native callback path is not a plain literal path",
+            Self::Collision => "native routes or app link collide with another route",
+            Self::Rate => "native rate is outside its allowed range",
+            Self::InFlight => "native in-flight cap is outside its allowed range",
+        })
+    }
+}
+impl std::error::Error for SettingsError {}
+
+/// [`Settings`] that passed the check: the selected provider, the parsed app link and the
+/// provider's configuration binding.
+struct Checked<'a> {
+    provider: &'a ManagedProvider,
+    redirect: Url,
+    binding: Vec<u8>,
+}
+
+/// Every settings check of [`NativeAuth::new`] and [`NativeAuth::router_shared`], against the
+/// configured providers and the checked browser profile alone (ADR 0029). It needs no
+/// service, pool, runtime, listener or network, so the offline configuration check runs the
+/// same rules, in the order of [`SettingsError`].
+pub(crate) fn check(
+    providers: &[ManagedProvider],
+    browser: Option<&BrowserProfile>,
+    settings: Settings<'_>,
+    rate: Rate,
+) -> Result<(), SettingsError> {
+    plan(providers, browser, settings, Some(rate)).map(drop)
+}
+
+/// The single implementation behind [`check`] and [`NativeAuth::new`], which has no rate.
+fn plan<'a>(
+    providers: &'a [ManagedProvider],
+    browser: Option<&BrowserProfile>,
+    settings: Settings<'_>,
+    rate: Option<Rate>,
+) -> Result<Checked<'a>, SettingsError> {
+    let Settings {
+        provider,
+        issuer,
+        callback,
+        client,
+        redirect,
+        max_in_flight,
+    } = settings;
+    let provider = super::configured(providers, provider).ok_or(SettingsError::Provider)?;
+    let binding = provider
+        .registration_binding()
+        .map_err(|_| SettingsError::Provider)?;
+    if !handoff::canonical_origin(issuer) || issuer.len() > 2048 {
+        return Err(SettingsError::Issuer);
+    }
+    let callback_url = exact_link(callback)
+        .filter(|url| url.origin().ascii_serialization() == issuer)
+        .ok_or(SettingsError::Callback)?;
+    if client.is_empty()
+        || client.len() > 128
+        || !client
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b))
+    {
+        return Err(SettingsError::Client);
+    }
+    let redirect = exact_link(redirect).ok_or(SettingsError::Redirect)?;
+    let redirect_origin = redirect.origin().ascii_serialization();
+    let routes = [START, TOKEN, SESSION, LOGOUT, callback_url.path()];
+    super::router::check_paths(&routes).map_err(|error| match error {
+        super::router::SettingsError::Collision => SettingsError::Collision,
+        _ => SettingsError::Route,
+    })?;
+    let core = |path: &str| super::router::CORE_PATHS.contains(&path);
+    // The app link never lands on a native or operational route of the issuer.
+    if redirect_origin == issuer && (routes.contains(&redirect.path()) || core(redirect.path())) {
+        return Err(SettingsError::Collision);
+    }
+    if let Some(profile) = browser {
+        let browser_origin = profile.handoff().origin;
+        let browser_paths = [
+            profile.router().initiation,
+            profile.sessions().session,
+            profile.sessions().logout,
+            profile.handoff().landing,
+        ];
+        // The native routes never shadow a browser route on a shared origin, and the app
+        // link never lands on a browser or operational route of the browser origin,
+        // whichever origin the native deployment itself uses.
+        if (browser_origin == issuer && browser_paths.iter().any(|path| routes.contains(path)))
+            || (redirect_origin == browser_origin
+                && (browser_paths.contains(&redirect.path()) || core(redirect.path())))
+        {
+            return Err(SettingsError::Collision);
+        }
+        // The API serves both route sets from one router, which matches paths without the
+        // host (ADR 0029). A native route therefore never repeats a mounted browser route,
+        // on any origin: the three literal paths and the selected provider's callback.
+        let mounted_callback = super::configured(providers, profile.handoff().provider)
+            .and_then(|selected| selected.callback().ok())
+            .and_then(|callback| Url::parse(&callback).ok())
+            .ok_or(SettingsError::Collision)?;
+        if browser_paths[..3]
+            .iter()
+            .chain([&mounted_callback.path()])
+            .any(|path| routes.contains(path))
+        {
+            return Err(SettingsError::Collision);
+        }
+    }
+    for other in providers {
+        // A registered callback that cannot be read cannot be shown not to collide.
+        let browser_url = other
+            .callback()
+            .ok()
+            .and_then(|callback| Url::parse(&callback).ok())
+            .ok_or(SettingsError::Collision)?;
+        if (browser_url.origin().ascii_serialization() == issuer
+            && routes.contains(&browser_url.path()))
+            || browser_url == redirect
+        {
+            return Err(SettingsError::Collision);
+        }
+    }
+    if let Some(rate) = rate {
+        super::router::Budget::new(rate, std::time::Instant::now())
+            .map_err(|_| SettingsError::Rate)?;
+    }
+    if !(1..=MAX_IN_FLIGHT).contains(&max_in_flight) {
+        return Err(SettingsError::InFlight);
+    }
+    Ok(Checked {
+        provider,
+        redirect,
+        binding,
+    })
+}
 fn refused() -> Response<&'static str> {
     handoff::respond(StatusCode::FORBIDDEN, "native sign-in refused\n")
 }
@@ -114,7 +311,8 @@ fn session_failure(error: Error) -> Response<&'static str> {
 }
 impl NativeAuth {
     /// Deployment inputs. The issuer is a canonical HTTPS origin and owns the upstream callback.
-    /// The app link must be a canonical HTTPS URL registered for this client.
+    /// The app link must be a canonical HTTPS URL registered for this client. Every refusal is
+    /// `Configuration`; [`check`] decides it, with its fixed category, without this service.
     pub fn new(
         auth: Arc<BrowserAuth>,
         provider: &str,
@@ -124,65 +322,47 @@ impl NativeAuth {
         redirect: &str,
         max_in_flight: u32,
     ) -> Result<Self, Error> {
-        let provider = auth
-            .provider(provider)
-            .map_err(|_| Error::Configuration)?
-            .clone();
-        let callback_url = exact_link(callback).ok_or(Error::Configuration)?;
-        let redirect = exact_link(redirect).ok_or(Error::Configuration)?;
-        let redirect_origin = redirect.origin().ascii_serialization();
-        let routes = [START, TOKEN, SESSION, LOGOUT, callback_url.path()];
-        super::router::check_paths(&routes).map_err(|_| Error::Configuration)?;
-        if let Some(profile) = auth.config.browser() {
-            let browser_origin = profile.handoff().origin;
-            let settings = profile.router();
-            let sessions = profile.sessions();
-            let browser_paths = [
-                settings.initiation,
-                sessions.session,
-                sessions.logout,
-                profile.handoff().landing,
-            ];
-            // The native routes never shadow a browser route on a shared origin, and the
-            // app link never lands on a browser or operational route of the browser origin,
-            // whichever origin the native deployment itself uses.
-            if (browser_origin == issuer && browser_paths.iter().any(|path| routes.contains(path)))
-                || (redirect_origin == browser_origin
-                    && (browser_paths.contains(&redirect.path())
-                        || super::router::CORE_PATHS.contains(&redirect.path())))
-            {
-                return Err(Error::Configuration);
-            }
-        }
-        for other in auth.config.providers() {
-            let browser_callback = other.callback().map_err(|_| Error::Configuration)?;
-            let browser_url = Url::parse(&browser_callback).map_err(|_| Error::Configuration)?;
-            if (browser_url.origin().ascii_serialization() == issuer
-                && routes.contains(&browser_url.path()))
-                || browser_url == redirect
-            {
-                return Err(Error::Configuration);
-            }
-        }
-        if !handoff::canonical_origin(issuer)
-            || issuer.len() > 2048
-            || callback_url.origin().ascii_serialization() != issuer
-            || (redirect_origin == issuer
-                && (routes.contains(&redirect.path())
-                    || super::router::CORE_PATHS.contains(&redirect.path())))
-            || client.is_empty()
-            || client.len() > 128
-            || !client
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b))
-            || !(1..=1024).contains(&max_in_flight)
-        {
-            return Err(Error::Configuration);
-        }
+        let settings = Settings {
+            provider,
+            issuer,
+            callback,
+            client,
+            redirect,
+            max_in_flight,
+        };
+        Self::build(auth, settings, None).map_err(|_| Error::Configuration)
+    }
+    /// [`Self::new`] for a loaded profile (ADR 0029): the same checks plus the route rate,
+    /// refused with the offline check's fixed category.
+    pub(crate) fn checked(
+        auth: Arc<BrowserAuth>,
+        settings: Settings<'_>,
+        rate: Rate,
+    ) -> Result<Self, SettingsError> {
+        Self::build(auth, settings, Some(rate))
+    }
+    fn build(
+        auth: Arc<BrowserAuth>,
+        settings: Settings<'_>,
+        rate: Option<Rate>,
+    ) -> Result<Self, SettingsError> {
+        let checked = plan(
+            auth.config.providers(),
+            auth.config.browser(),
+            settings,
+            rate,
+        )?;
+        let provider = checked.provider.clone();
+        let redirect = checked.redirect;
+        let Settings {
+            issuer,
+            callback,
+            client,
+            max_in_flight,
+            ..
+        } = settings;
         let registration = hash(&[
-            &provider
-                .registration_binding()
-                .map_err(|_| Error::Configuration)?,
+            &checked.binding,
             issuer.as_bytes(),
             callback.as_bytes(),
             client.as_bytes(),
@@ -198,6 +378,7 @@ impl NativeAuth {
             redirect,
             registration,
             audience,
+            in_flight: max_in_flight as usize,
             operations: Semaphore::new(max_in_flight as usize),
         })
     }
