@@ -7,6 +7,12 @@ capability evaluator and qualification tests. Neither adds a route, authenticati
 authorization enforcement, cursor signing or runtime HTTP error handling. Final V1-03
 acceptance belongs to the coordinator after review and owner merge.
 
+Update, 20 November 2026 (V1-05 PR4b, ADR 0027): the contract gains fourteen project,
+membership, conversation and artifact operations, and all fifteen operations are served,
+authenticated and authorized when `OPENMETTLE_API_AUTH_CONFIG` is set. V1-04 settled both
+security schemes. See [Served operations](#served-operations-v1-05-pr4b). Cursors, run
+idempotency and SSE remain unimplemented.
+
 ## Canonical source and versions
 
 `contracts/openapi/openmettle-v1.json` is the single hand-maintained source. It uses
@@ -29,11 +35,11 @@ Generated fixtures live in `contracts/fixtures/`; do not edit them by hand. Rege
 
 | Area | Contract | Not implemented |
 | --- | --- | --- |
-| Endpoint | `GET /v1/capabilities`, `x-openmettle-implementation: not-implemented`, authenticated | Route, handler, data source. The API returns 404. |
-| Authentication | Provisional `browserSession` (`__Host-` cookie) and `nativeSession` (bearer OpenMettle session credential) schemes | V1-04 owns names, lifetime, CSRF, native handoff and login flows |
-| Errors | RFC 9457 `Problem` with code/status binding | Runtime mapping and redaction |
-| Pagination | `cursor`/`limit` parameters and `PageInfo` | Cursor issuance, binding and MAC |
-| Idempotency | `Idempotency-Key` parameter and `idempotency_conflict` | Request identity storage (V1-10) |
+| Endpoints | `GET /v1/capabilities` and, since V1-05, the project, membership, conversation and artifact operations; each `x-openmettle-implementation: implemented`, authenticated | Served only with `OPENMETTLE_API_AUTH_CONFIG`; otherwise 404. Capability data sources: the list is empty |
+| Authentication | `browserSession` (`__Host-openmettle-session` cookie, CSRF `Origin` binding) and `nativeSession` (bearer OpenMettle session credential), settled by V1-04 (ADRs 0019 and 0029) | — |
+| Errors | RFC 9457 `Problem` with code/status binding | Runtime mapping and redaction are implemented for `/v1` (ADR 0027 PR4b) |
+| Pagination | `cursor`/`limit` parameters and `PageInfo` | Cursor issuance, binding and MAC; no list operation |
+| Idempotency | `Idempotency-Key` parameter and `idempotency_conflict` | Implemented for the V1-05 writes through the authorization audit; run request identity storage (V1-10) |
 | Events | `RunEvent` envelope, `RunEventItem` and `RunEventStream` media type, `Last-Event-ID`/`after` | SSE endpoint, retention, resync (V1-12) |
 | Capabilities | `CapabilityList`, `Capability`, `Readiness` | Provider adapters, authenticated serving and authorization (V1-04/05) |
 
@@ -56,9 +62,9 @@ their lifecycle is agreed. No voice, provider-compatibility or MCP endpoint is d
   maximum. Idempotency keys are 1–128 visible ASCII characters (0x21–0x7E), so character and
   byte length are equal.
 - **Requests:** request objects must set `additionalProperties: false` or
-  `unevaluatedProperties: false`. Unknown request fields fail with `validation`. No operation has
-  a request body yet; the rule is enforced by a contract lint, which is tested against an
-  injected body.
+  `unevaluatedProperties: false`. Unknown request fields fail with `validation`. A contract lint
+  enforces the rule and is tested against an injected open body; the server decodes every body
+  into a closed type that refuses unknown, duplicate and wrongly typed members.
 - **Responses:** response objects are extensible. Consumers ignore unknown fields. String
   vocabularies in responses (`code`, `kind`, readiness `state`, event `type`) are open:
   consumers map unrecognized values to an explicit unknown or unrecognized case and never
@@ -84,8 +90,9 @@ The same key with the identical request returns the original outcome. The same k
 different request returns 409 `idempotency_conflict`. Retries after an uncertain outcome
 (timeout, connection loss, unknown commit) must resend the identical request, including any
 client-chosen input identity such as a message UUID: ADR 0004 binds that UUID into run identity.
-There is no retention-period, expiry or exactly-once promise. These rules are contract text;
-V1-10 implements them.
+There is no retention-period, expiry or exactly-once promise. The V1-05 writes implement these
+rules through the append-only authorization audit (ADR 0027 PR4b); V1-10 implements them for
+runs.
 
 ## Pagination
 
@@ -128,8 +135,8 @@ optional `errors` locations. Client-supplied values are never echoed.
 422 is not used. The schema binds each known code to its status. Unknown codes are allowed with
 any 4xx/5xx status and are classified by status class. `detail` never carries credentials,
 upstream provider bodies, identity claims, internal identifiers or information about other
-users. Synthetic fixtures show the intended shape only; they do not prove runtime redaction,
-which needs runtime tests when errors are implemented.
+users. Synthetic fixtures show the intended shape only. Runtime problems of the `/v1` routes are
+tested separately: see [Served operations](#served-operations-v1-05-pr4b).
 
 ## Capabilities
 
@@ -161,14 +168,21 @@ are described below.
 - every component schema compiles; every generated fixture validates as declared, with format
   assertion enabled. Invalid fixtures must fail at the declared instance path with the declared
   keyword. SSE `data` content is decoded and validated against its `contentSchema`;
-- lints require authentication, `not-implemented`, version headers and problem-only error
-  responses on operations, and bounded, closed and privacy-safe schemas. Each lint is shown to
-  fire on a mutated document;
+- lints require authentication, an implementation status of `implemented` or
+  `not-implemented`, settled (not provisional) security schemes, version headers and
+  problem-only error responses on operations, and bounded, closed and privacy-safe schemas.
+  Each lint is shown to fire on a mutated document. The browser scheme's cookie name is the one
+  the server sets;
 - an independent typed consumer (`tests/contract/consumer.rs`), sharing no types with any server
   code, decodes every valid and compatible fixture. It maps unknown values explicitly, rejects
   structural failures, unsupported majors and out-of-range sequences, advances SSE cursors over
   unrecognized events and drops replayed sequences;
-- the API binary returns 404 for every contract path.
+- the API binary started without `OPENMETTLE_API_AUTH_CONFIG` returns 404 for every contract
+  path;
+- the API binary started with a version-2 document and its native profile, over a database
+  that never answers, returns problems that validate against `Problem`, carry the version and
+  `no-store` headers and echo no request value, for every operation without a session and for
+  each pre-database refusal.
 
 `scripts/contract_fixtures.py` (standard library) generates fixtures from Example Objects with
 `x-openmettle-fixture`. Besides declared mutations, it adds an unknown root field to each object
@@ -276,7 +290,40 @@ prerequisites for the contract/evaluator. No dependency or feature changes are r
 ## Downstream implementation
 
 Authenticated serving of `/v1/capabilities`, runtime problem mapping and runtime redaction
-tests belong to V1-04/05. Idempotency (V1-10), SSE replay (V1-12), deploy (V1-32), and ACP
-consume the qualified contract. These dependents are not prerequisites for closing #4:
-V1-04 itself depends on V1-03. Contract fixtures do not establish runtime privacy or
-consumer adoption; those require separate evidence in their owning tickets.
+tests are delivered by V1-05 PR4b (below). Run idempotency (V1-10), SSE replay (V1-12),
+deploy (V1-32), and ACP consume the qualified contract. These dependents are not
+prerequisites for closing #4: V1-04 itself depends on V1-03. Contract fixtures do not
+establish runtime privacy or consumer adoption; those require separate evidence in their
+owning tickets.
+
+## Served operations (V1-05 PR4b)
+
+`src/v1.rs` serves the fifteen operations when `OPENMETTLE_API_AUTH_CONFIG` is set. Their
+authorization and lifecycle rules are recorded in ADR 0027. The wire rules of this record apply
+as follows.
+
+- **Problems.** Every error is `application/problem+json` with `type: about:blank`, the
+  status's reason phrase as `title`, one fixed `detail` per category and the request ID that
+  telemetry logged for the request. No request value, identifier, credential, database error
+  or internal policy reason appears. A path or method the contract does not define under `/v1`
+  is `404 not_found`. Request target and header limits, a missing or malformed
+  `Idempotency-Key`, a malformed path UUID, a wrong media type and a refused body are
+  `400 validation`. A full in-flight bound or an unreachable primary is `503 unavailable`;
+  an elapsed session or database deadline is `504 timeout`. A wrong `Origin` on the cookie
+  channel is `401 unauthenticated`, so `403 policy` stays reserved for callers who may know the
+  target exists.
+- **Versions and caching.** Every response, success or problem, carries
+  `OpenMettle-API-Version: 1.0` and `Cache-Control: no-store`.
+- **Media types.** A body is one JSON object with `Content-Type: application/json`, optionally
+  `; charset=utf-8`, of at most 64 KiB. Operations without a body refuse a non-empty one.
+- **Idempotency.** The server derives the stored request key as a SHA-256 digest of
+  `openmettle/v1-idempotency/1`, the `operationId`, the path identifier and the client key. The
+  audit table is unique per actor, so the client key is scoped to the actor, the operation and
+  its target. A create replays to `201` with the project; a delete replays to `204`.
+- **Numbers and times.** `revision` and `last_revision` are `NonNegativeDecimal`; `created_at`
+  and `generated_at` are `Timestamp` values in UTC with six fractional digits.
+
+`tests/contract.rs` validates live problems of the mounted binary without PostgreSQL, and the
+independent consumer decodes the new response fixtures. `tests/schema/authz_http.rs` exercises
+every operation over PostgreSQL 18 on both session channels and decodes each response with the
+same consumer.

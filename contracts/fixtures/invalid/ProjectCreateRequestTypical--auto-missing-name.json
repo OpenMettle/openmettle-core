@@ -1,0 +1,25 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ProjectCreateRequestTypical--auto-missing-name",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "defaults": {
+      "model": "synthetic-model"
+    },
+    "instructions": "Answer briefly.",
+    "reason": "Synthetic project for a fixture"
+  },
+  "mutation": {
+    "name": "auto-missing-name",
+    "op": "remove",
+    "path": "/name"
+  },
+  "schema": "#/components/schemas/ProjectCreateRequest",
+  "source": "#/components/examples/ProjectCreateRequestTypical"
+}

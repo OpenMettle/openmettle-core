@@ -1,0 +1,19 @@
+{
+  "class": "valid",
+  "direction": "request",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "MemberRoleRequestTypical",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "grantee": {
+      "grantee_id": "7f3ebc40-9d51-4eaf-9a2c-3d4e5f607182",
+      "kind": "user"
+    },
+    "role": "editor"
+  },
+  "mutation": null,
+  "schema": "#/components/schemas/MemberRoleRequest",
+  "source": "#/components/examples/MemberRoleRequestTypical"
+}

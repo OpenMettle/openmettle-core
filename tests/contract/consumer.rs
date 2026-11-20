@@ -351,3 +351,210 @@ impl EventCursor {
         }))
     }
 }
+
+// --- projects, conversations and artifacts (V1-05) ---------------------------------------------
+
+/// A project role. An unrecognized role is surfaced, and the client assumes nothing from it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Role {
+    Viewer,
+    Editor,
+    Owner,
+    Unrecognized(String),
+}
+
+impl Role {
+    fn from_wire(role: String) -> Self {
+        match role.as_str() {
+            "viewer" => Self::Viewer,
+            "editor" => Self::Editor,
+            "owner" => Self::Owner,
+            _ => Self::Unrecognized(role),
+        }
+    }
+    /// Only an owner is offered settings, lifecycle and member management.
+    pub fn manages_project(&self) -> bool {
+        *self == Self::Owner
+    }
+}
+
+/// A resource access. An unrecognized access is never treated as write.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Access {
+    Read,
+    Write,
+    Unrecognized(String),
+}
+
+impl Access {
+    fn from_wire(access: String) -> Self {
+        match access.as_str() {
+            "read" => Self::Read,
+            "write" => Self::Write,
+            _ => Self::Unrecognized(access),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Grantee {
+    User(String),
+    LocalGroup(String),
+    OidcGroup(String),
+    WholeProject,
+    Unrecognized(String),
+}
+
+#[derive(Deserialize)]
+struct WireGrantee {
+    kind: String,
+    grantee_id: Option<String>,
+}
+
+fn grantee(wire: WireGrantee) -> Result<Grantee, String> {
+    Ok(match (wire.kind.as_str(), wire.grantee_id) {
+        ("user", Some(id)) => Grantee::User(id),
+        ("local_group", Some(id)) => Grantee::LocalGroup(id),
+        ("oidc_group", Some(id)) => Grantee::OidcGroup(id),
+        ("project", None) => Grantee::WholeProject,
+        ("user" | "local_group" | "oidc_group" | "project", _) => {
+            return Err(format!("malformed {} grantee", wire.kind));
+        }
+        _ => Grantee::Unrecognized(wire.kind),
+    })
+}
+
+#[derive(Debug)]
+pub struct Project {
+    pub id: String,
+    pub name: String,
+    pub defaults: Map<String, Value>,
+    pub revision: i64,
+    pub archived: bool,
+    pub role: Role,
+}
+
+#[derive(Deserialize)]
+struct WireProject {
+    project_id: String,
+    #[allow(dead_code)]
+    scope_id: String,
+    name: String,
+    #[allow(dead_code)]
+    instructions: String,
+    defaults: Map<String, Value>,
+    revision: String,
+    archived: bool,
+    role: String,
+}
+
+pub fn decode_project(value: &Value) -> Result<Project, String> {
+    let wire: WireProject = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    Ok(Project {
+        id: wire.project_id,
+        name: wire.name,
+        defaults: wire.defaults,
+        revision: parse_decimal(&wire.revision, true)?,
+        archived: wire.archived,
+        role: Role::from_wire(wire.role),
+    })
+}
+
+#[derive(Debug)]
+pub struct MemberGrant {
+    pub project_id: String,
+    pub grantee: Grantee,
+    pub role: Role,
+}
+
+#[derive(Deserialize)]
+struct WireMemberGrant {
+    project_id: String,
+    grantee: WireGrantee,
+    role: String,
+}
+
+pub fn decode_member_grant(value: &Value) -> Result<MemberGrant, String> {
+    let wire: WireMemberGrant = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    Ok(MemberGrant {
+        project_id: wire.project_id,
+        grantee: grantee(wire.grantee)?,
+        role: Role::from_wire(wire.role),
+    })
+}
+
+#[derive(Debug)]
+pub struct Share {
+    pub resource_kind: String,
+    pub resource_id: String,
+    pub grantee: Grantee,
+    pub access: Access,
+}
+
+#[derive(Deserialize)]
+struct WireShare {
+    resource_kind: String,
+    resource_id: String,
+    grantee: WireGrantee,
+    access: String,
+}
+
+pub fn decode_share(value: &Value) -> Result<Share, String> {
+    let wire: WireShare = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    Ok(Share {
+        resource_kind: wire.resource_kind,
+        resource_id: wire.resource_id,
+        grantee: grantee(wire.grantee)?,
+        access: Access::from_wire(wire.access),
+    })
+}
+
+/// The caller's access to one conversation or artifact.
+#[derive(Debug)]
+pub struct ItemAccess {
+    pub id: String,
+    /// `None` in a personal scope.
+    pub project_id: Option<String>,
+    pub last_revision: Option<i64>,
+    pub access: Access,
+    pub can_manage_shares: bool,
+}
+
+#[derive(Deserialize)]
+struct WireItemAccess {
+    conversation_id: Option<String>,
+    artifact_id: Option<String>,
+    #[allow(dead_code)]
+    scope_kind: String,
+    #[allow(dead_code)]
+    scope_id: String,
+    #[serde(deserialize_with = "required_nullable")]
+    project_id: Option<String>,
+    #[allow(dead_code)]
+    created_at: String,
+    last_revision: Option<String>,
+    access: String,
+    can_manage_shares: bool,
+}
+
+/// An artifact also requires its exact last revision.
+pub fn decode_item_access(value: &Value, artifact: bool) -> Result<ItemAccess, String> {
+    let wire: WireItemAccess = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    let (id, last_revision) = match artifact {
+        true => (
+            wire.artifact_id.ok_or("missing artifact_id")?,
+            Some(parse_decimal(
+                &wire.last_revision.ok_or("missing last_revision")?,
+                true,
+            )?),
+        ),
+        false => (wire.conversation_id.ok_or("missing conversation_id")?, None),
+    };
+    Ok(ItemAccess {
+        id,
+        project_id: wire.project_id,
+        last_revision,
+        access: Access::from_wire(wire.access),
+        can_manage_shares: wire.can_manage_shares,
+    })
+}

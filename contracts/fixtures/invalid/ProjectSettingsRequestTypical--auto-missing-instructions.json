@@ -1,0 +1,22 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ProjectSettingsRequestTypical--auto-missing-instructions",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "defaults": {},
+    "name": "Renamed project"
+  },
+  "mutation": {
+    "name": "auto-missing-instructions",
+    "op": "remove",
+    "path": "/instructions"
+  },
+  "schema": "#/components/schemas/ProjectSettingsRequest",
+  "source": "#/components/examples/ProjectSettingsRequestTypical"
+}

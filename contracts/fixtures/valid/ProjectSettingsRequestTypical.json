@@ -1,0 +1,17 @@
+{
+  "class": "valid",
+  "direction": "request",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "ProjectSettingsRequestTypical",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "defaults": {},
+    "instructions": "",
+    "name": "Renamed project"
+  },
+  "mutation": null,
+  "schema": "#/components/schemas/ProjectSettingsRequest",
+  "source": "#/components/examples/ProjectSettingsRequestTypical"
+}

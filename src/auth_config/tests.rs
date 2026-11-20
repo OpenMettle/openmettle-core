@@ -1052,10 +1052,14 @@ fn browser_paths_and_admission_use_the_router_rules() {
             ("/auth#x", Path),
             ("/%61uth", Path),
             (long.as_str(), Path),
-            // The selected provider's registered callback path, and the operational routes.
+            // The selected provider's registered callback path, the operational routes and
+            // the application API prefix (ADR 0027 PR4b).
             ("/callback", Collision),
             ("/healthz", Collision),
             ("/readyz", Collision),
+            ("/v1", Collision),
+            ("/v1/", Collision),
+            ("/v1/projects", Collision),
         ] {
             assert_eq!(
                 v2.with(pointer, json!(value)),
@@ -1557,6 +1561,28 @@ fn native_cases() -> Vec<NativeCase> {
         ),
         (one("/native/callback", app("/home")), Err(Collision)),
         (one("/native/callback", app("/callback")), Err(Collision)),
+        // The application API prefix, on any origin: one router serves it (ADR 0027 PR4b).
+        (one("/native/callback", app("/v1/callback")), Err(Collision)),
+        (
+            vec![
+                ("/native/issuer", json!("https://broker.example.test")),
+                ("/native/callback", broker("/v1/native/callback")),
+            ],
+            Err(Collision),
+        ),
+        (one("/native/redirect_uri", app("/v1")), Err(Collision)),
+        (
+            one("/native/redirect_uri", app("/v1/projects")),
+            Err(Collision),
+        ),
+        (on_broker(app("/v1/capabilities")), Err(Collision)),
+        (
+            one(
+                "/native/redirect_uri",
+                json!("https://links.example.test/v1/complete"),
+            ),
+            Ok(()),
+        ),
         // The app link against the provider callback, native and operational routes of
         // the issuer, and browser and operational routes of the browser origin.
         (

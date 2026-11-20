@@ -1,0 +1,24 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "/grantee",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "MemberRoleRequestTypical--grantee-without-id",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "grantee": {
+      "kind": "user"
+    },
+    "role": "editor"
+  },
+  "mutation": {
+    "name": "grantee-without-id",
+    "op": "remove",
+    "path": "/grantee/grantee_id"
+  },
+  "schema": "#/components/schemas/MemberRoleRequest",
+  "source": "#/components/examples/MemberRoleRequestTypical"
+}

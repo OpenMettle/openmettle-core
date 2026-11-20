@@ -1,0 +1,28 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "/defaults",
+    "keyword": "not",
+    "valid": false
+  },
+  "fixture": "ProjectSettingsRequestTypical--legacy-collection-default",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "defaults": {
+      "collection_ids": []
+    },
+    "instructions": "",
+    "name": "Renamed project"
+  },
+  "mutation": {
+    "name": "legacy-collection-default",
+    "op": "set",
+    "path": "/defaults",
+    "value": {
+      "collection_ids": []
+    }
+  },
+  "schema": "#/components/schemas/ProjectSettingsRequest",
+  "source": "#/components/examples/ProjectSettingsRequestTypical"
+}

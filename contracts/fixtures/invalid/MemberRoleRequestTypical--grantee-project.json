@@ -1,0 +1,26 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "/grantee/kind",
+    "keyword": "enum",
+    "valid": false
+  },
+  "fixture": "MemberRoleRequestTypical--grantee-project",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "grantee": {
+      "grantee_id": "7f3ebc40-9d51-4eaf-9a2c-3d4e5f607182",
+      "kind": "project"
+    },
+    "role": "editor"
+  },
+  "mutation": {
+    "name": "grantee-project",
+    "op": "set",
+    "path": "/grantee/kind",
+    "value": "project"
+  },
+  "schema": "#/components/schemas/MemberRoleRequest",
+  "source": "#/components/examples/MemberRoleRequestTypical"
+}

@@ -336,6 +336,15 @@ async fn hydration_reads_current_primary_state_for_both_roles() {
 /// `synthetic-team`, written through the same grants the configuration script and session
 /// issuance use. Returns the owner connection for later state changes.
 pub(super) async fn present_membership(db: &TestDb, account: &Account) -> PgConnection {
+    present_membership_at(db, account, NOW).await
+}
+
+/// [`present_membership`] observed at `now_ms` and current for one minute after it.
+pub(super) async fn present_membership_at(
+    db: &TestDb,
+    account: &Account,
+    now_ms: i64,
+) -> PgConnection {
     let mut owner = connect(&db.0, OWNER).await;
     let (project, scope) = project(&mut owner, &account.user).await;
     let mut api = connect(&db.0, API).await;
@@ -405,7 +414,7 @@ pub(super) async fn present_membership(db: &TestDb, account: &Account) -> PgConn
     .bind(&project)
     .bind(&scope)
     .bind(&grant.change)
-    .bind(NOW)
+    .bind(now_ms)
     .bind(PROVIDER)
     .execute(&mut owner)
     .await

@@ -55,27 +55,28 @@ impl From<sessions::Error> for Error {
 /// whose protocol or transaction state is unknown.
 ///
 /// The guard is always created inside the future that the phase deadline wraps, so an
-/// elapsed deadline drops it together with the cancelled borrow.
-struct Checkout {
+/// elapsed deadline drops it together with the cancelled borrow. The `/v1` routes use the
+/// same guard for their authorization reads and writes (ADR 0027 PR4b).
+pub(crate) struct Checkout {
     connection: PoolConnection<Postgres>,
     in_doubt: bool,
 }
 impl Checkout {
-    async fn acquire(pool: &PgPool) -> Result<Self, sqlx::Error> {
+    pub(crate) async fn acquire(pool: &PgPool) -> Result<Self, sqlx::Error> {
         Ok(Self {
             connection: pool.acquire().await?,
             in_doubt: false,
         })
     }
     /// Lends the connection to database work. It stays in doubt until settled.
-    fn lend(&mut self) -> &mut PgConnection {
+    pub(crate) fn lend(&mut self) -> &mut PgConnection {
         self.in_doubt = true;
         &mut self.connection
     }
     /// Ends the phase. `reusable` requires an acknowledgement for every transaction the helper
     /// opened. The depth check rejects a tracked open transaction. SQLx can clear its tracked
     /// depth while a rollback is still queued, so safe reuse depends on the helper's outcome.
-    fn settle(mut self, reusable: bool) {
+    pub(crate) fn settle(mut self, reusable: bool) {
         self.in_doubt = !reusable || self.connection.is_in_transaction();
     }
 }

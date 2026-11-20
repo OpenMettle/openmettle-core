@@ -1,0 +1,21 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "MemberRoleRequestTypical--auto-missing-grantee",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "role": "editor"
+  },
+  "mutation": {
+    "name": "auto-missing-grantee",
+    "op": "remove",
+    "path": "/grantee"
+  },
+  "schema": "#/components/schemas/MemberRoleRequest",
+  "source": "#/components/examples/MemberRoleRequestTypical"
+}

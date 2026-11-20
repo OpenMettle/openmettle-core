@@ -238,6 +238,10 @@ pub(super) struct Change {
 pub(super) const UNCHANGED: StoreError =
     StoreError::Conflict("target is already in the requested state");
 
+/// The [`StoreError::Conflict`] of a request key that already recorded another change. The API
+/// reports it as `idempotency_conflict` and every other conflict as `conflict` (ADR 0007).
+pub const KEY_REUSED: &str = "request_key already recorded another change";
+
 /// A flat local group name, at least as strict as the migration 15 `CHECK`.
 pub fn valid_group_name(name: &str) -> bool {
     valid_name(name, 128)
@@ -372,9 +376,7 @@ pub(super) async fn record(
             target_id: recorded,
         })
     } else {
-        Err(StoreError::Conflict(
-            "request_key already recorded another change",
-        ))
+        Err(StoreError::Conflict(KEY_REUSED))
     }
 }
 

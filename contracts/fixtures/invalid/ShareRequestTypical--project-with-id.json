@@ -1,0 +1,29 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "/grantee",
+    "keyword": "not",
+    "valid": false
+  },
+  "fixture": "ShareRequestTypical--project-with-id",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "access": "read",
+    "grantee": {
+      "grantee_id": "80a1cd51-ae62-4fb0-8b3d-4e5f60718293",
+      "kind": "project"
+    }
+  },
+  "mutation": {
+    "name": "project-with-id",
+    "op": "set",
+    "path": "/grantee",
+    "value": {
+      "grantee_id": "80a1cd51-ae62-4fb0-8b3d-4e5f60718293",
+      "kind": "project"
+    }
+  },
+  "schema": "#/components/schemas/ShareRequest",
+  "source": "#/components/examples/ShareRequestTypical"
+}

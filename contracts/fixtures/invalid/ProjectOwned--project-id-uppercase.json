@@ -1,0 +1,31 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "/project_id",
+    "keyword": "pattern",
+    "valid": false
+  },
+  "fixture": "ProjectOwned--project-id-uppercase",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "archived": false,
+    "defaults": {
+      "model": "synthetic-model"
+    },
+    "instructions": "Answer briefly.",
+    "name": "Synthetic project",
+    "project_id": "5D1C9A2E-7B3F-4C8D-9E0A-1B2C3D4E5F60",
+    "revision": "1",
+    "role": "owner",
+    "scope_id": "6e2dab3f-8c40-4d9e-8f1b-2c3d4e5f6071"
+  },
+  "mutation": {
+    "name": "project-id-uppercase",
+    "op": "set",
+    "path": "/project_id",
+    "value": "5D1C9A2E-7B3F-4C8D-9E0A-1B2C3D4E5F60"
+  },
+  "schema": "#/components/schemas/Project",
+  "source": "#/components/examples/ProjectOwned"
+}

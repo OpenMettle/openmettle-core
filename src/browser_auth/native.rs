@@ -225,8 +225,9 @@ fn plan<'a>(
         super::router::SettingsError::Collision => SettingsError::Collision,
         _ => SettingsError::Route,
     })?;
-    let core = |path: &str| super::router::CORE_PATHS.contains(&path);
-    // The app link never lands on a native or operational route of the issuer.
+    // Operational routes and the application API under `/v1` (ADR 0027 PR4b).
+    let core = super::router::reserved;
+    // The app link never lands on a native, operational or API route of the issuer.
     if redirect_origin == issuer && (routes.contains(&redirect.path()) || core(redirect.path())) {
         return Err(SettingsError::Collision);
     }

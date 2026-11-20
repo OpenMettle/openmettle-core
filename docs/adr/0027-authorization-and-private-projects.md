@@ -1,9 +1,9 @@
 # 0027 — Central authorization policy and private-by-default projects
 
-Status: proposed V1-05 increments 1–3, 4a and 5; PR4b routes remain. 19 November 2026.
-Agent-authored; implements the owner decisions recorded on #6 the same day. Owner approval
-of this record, independent review and CI acceptance are separate gates. Refs #6. #6
-remains open.
+Status: proposed V1-05 increments 1–3, 4a and 5 (19 November 2026) and 4b (20 November
+2026). Agent-authored; implements the owner decisions recorded on #6. Owner approval of this
+record, independent review and CI acceptance are separate gates. Refs #6 and #34. #6 remains
+open.
 
 ## Problem
 
@@ -316,8 +316,7 @@ ADR 0006 version 1 request identity, so earlier requests replay unchanged. Other
     replay never re-writes a grant.
 
 Run invalidation on share, revoke or disable remains PR5. Hydration does not conceal archived
-or deleted projects from the worker; PR4b and PR5 must decide how lifecycle affects reads and
-running work.
+or deleted projects from the worker; PR5 cancels their runs and PR4b settles reads and writes.
 
 ### PR5: Worker execution-time recheck and live run invalidation
 
@@ -371,6 +370,83 @@ authority, membership, group and capability tables.
   project row. Otherwise a run admitted concurrently with an archive survives it, and the
   worker cannot see the archive.
 
+### PR4b: Authenticated `/v1` routes
+
+`src/v1.rs` is the enforcement surface. It adds no migration or dependency. `crate::app` mounts
+it beside the sign-in routes only when `OPENMETTLE_API_AUTH_CONFIG` is set; without it every
+`/v1` path stays `404`. The fifteen operations of ADR 0007 are:
+
+| Operation | Route | Store call |
+| --- | --- | --- |
+| `listCapabilities` | `GET /v1/capabilities` | Principal hydration and `require`; an empty, core-only list |
+| `createProject` | `POST /v1/projects` | `create_project`, then `read_project` (`201`) |
+| `getProject` | `GET /v1/projects/{project_id}` | `read_project` |
+| `updateProjectSettings` | `PUT /v1/projects/{project_id}` | `update_project_settings`, then `read_project` |
+| `archiveProject`, `restoreProject` | `POST /v1/projects/{project_id}/archive`, `/restore` | `archive_project`, `restore_project`, then `read_project` |
+| `deleteProject` | `DELETE /v1/projects/{project_id}` | `delete_project` (`204`) |
+| `setProjectMemberRole` | `PUT /v1/projects/{project_id}/members` | `set_project_member_role` |
+| `revokeProjectMember` | `POST /v1/projects/{project_id}/members/revoke` | `revoke_project_member` (`204`) |
+| `getConversation`, `getArtifact` | `GET /v1/conversations/{id}`, `/v1/artifacts/{id}` | `read_resource` |
+| `shareConversation`, `shareArtifact` | `PUT …/shares` | `share_resource` |
+| `revokeConversationShare`, `revokeArtifactShare` | `POST …/shares/revoke` | `unshare_resource` (`204`) |
+
+There is no list, message, run, upload or streaming operation: cursor MACs (ADR 0007), run
+creation (V1-07, V1-10), SSE (V1-12) and artifact upload (V1-15) remain with their tickets.
+
+- **Sessions.** A request presents exactly one channel: the `__Host-openmettle-session` cookie
+  (found by the handoff's single-cookie rule) or one `Authorization: Bearer` native credential,
+  accepted only when a native profile is mounted. Both, neither, a repeated field, another
+  scheme or a malformed cookie or bearer is `401` before any database work. The cookie channel binds the
+  configured browser origin as ADR 0019 does for logout: an unsafe method needs exactly one
+  `Origin` with those bytes, and a safe method that sends `Origin` must send that one. A missing,
+  `null`, repeated or foreign `Origin` is `401`, not `403`, so `policy` still implies the caller
+  may know the target. `BrowserAuth::validate` and `NativeAuth::validate` return the ADR 0029
+  context on the primary; a refused credential is `401`, a deadline `504`, any other failure
+  `503`.
+- **Hydration.** Each request hydrates the principal with `hydrate_api_principal` at the
+  context's approval and observed time, and every project and resource on the primary. Nothing
+  is cached between requests, so disablement, logout, group, membership, evidence and share
+  changes apply to the next request. Writes re-hydrate inside their own transaction as before.
+- **Connections.** All database work of one request runs on one pooled connection in the
+  `Checkout` guard of ADR 0016, inside a 10 s deadline. A `StoreError::Database`, an elapsed
+  deadline or a dropped future closes the connection instead of returning it, because the
+  outcome of a statement or commit is unknown. The guard closes rather than detaches, so the
+  pool never exceeds its size.
+- **Request keys.** The client `Idempotency-Key` (1–128 visible ASCII characters) is checked
+  before any database work. The audit `request_key` is the lowercase hex SHA-256 of
+  `openmettle/v1-idempotency/1`, the `operationId`, the path identifier and the client key,
+  length-prefixed. The audit table is unique per actor, so a client key is scoped to the
+  actor, the operation and its target, and the same key on another operation is a new request.
+  `KEY_REUSED` is `409 idempotency_conflict`; every other store conflict is `409 conflict`.
+  The audit reason is the request's optional `reason`, or the `operationId`.
+- **Validation before the database.** Bodies decode into closed types: unknown, duplicate and
+  mistyped members, a non-object body, a grantee kind the operation does not accept, a role or
+  access outside the grant vocabulary, and settings that `ProjectSettingsInput::validate`
+  refuses (including the legacy `folder_id` and `collection_id` defaults) are `400`.
+- **Bounds.** 256 requests in flight (`503` beyond, never queued), the browser router's target
+  and header ceilings, and 64 KiB JSON bodies read within 2 s.
+- **Paths.** The browser and native settings checks reserve `/v1` and every path under it as
+  they reserve `/healthz` and `/readyz` (`browser_auth::router::reserved`). A sign-in route, a
+  native callback on any origin, and an app link on the issuer or browser origin there is
+  `Collision`, offline and at startup, so `Router::merge` cannot panic.
+
+**Lifecycle** is decided in `src/authz/projects.rs`, once for the store and the routes:
+
+- A **deleted** project, and every item in it, is `404` on every read and write, also to its
+  owner. The one exception is an exact replay of the delete: the same actor, still allowed to
+  delete it, with the same request key that recorded `project.delete` receives `Replayed`
+  (`204`). Any other key is concealed, and the audit row it would add is rolled back. An
+  inactive actor still receives `InactivePrincipal`.
+- An **archived** project stays readable to its members and grantees. Its items report access
+  `read`; `can_manage_shares` stays the share-manager decision, because revocation remains
+  available. `update_project_settings`, `set_project_member_role` and `share_resource` refuse
+  with `ARCHIVED` (`409 conflict`) after the lock, re-hydration and authorization, so a
+  non-member still receives `404` and a viewer `403`. `restore_project`, `delete_project`,
+  `revoke_project_member` and `unshare_resource` stay available.
+- `lock_project` now reads lifecycle in a second statement after the row lock is granted. A
+  single statement's snapshot predates the lock wait and could miss an archive or delete
+  committed by the writer it waited for.
+
 ## Verification
 
 `src/authz/tests.rs` covers vocabulary acceptance and rejection, the role matrix,
@@ -384,7 +460,7 @@ against PostgreSQL and HTTP.
 For PR3, `tests/schema/authz_store.rs` runs against PostgreSQL 18 as the bounded roles. It
 covers hydration for both roles, OIDC evidence states, every write with its audit row,
 replays, request-key conflicts, refusals and the last-administrator race under
-`account_admin_lock`. Route enforcement remains PR4b.
+`account_admin_lock`. Route enforcement is covered under PR4b below.
 
 For PR4a, `tests/schema/authz_projects.rs` covers:
 
@@ -424,3 +500,34 @@ show the worker cannot read `account_admins`, `project_settings`, `authorization
 checks complete without deadlock or lock timeout: a held recheck performs its reads while an
 archive waits on the run row; a worker cancels the row a waiting disablement needs; and
 rechecks race a disablement and an archive over the same runs.
+
+For PR4b:
+
+- `src/v1/tests.rs` checks that the served routes are exactly the contract's implemented
+  operations, the ADR 0007 mapping of every denial and store error, the media-type,
+  `Idempotency-Key` and body rules, request-key scoping and timestamp format.
+- `src/tests.rs` drives the mounted `app()` without PostgreSQL. Missing, ambiguous and
+  repeated credentials, every refused `Origin` on the cookie channel, invalid keys, unknown or
+  legacy body members, wrong media types, oversized heads and bodies, malformed identifiers and
+  undefined operations are refused before the pool is dialled. Each response is versioned and
+  uncacheable, names the request ID that telemetry logged, and is recorded under its route
+  template and the `v1` route class, with no planted value in a response or telemetry. A
+  well-formed credential on either channel reaches the primary (`503` when it cannot connect);
+  a bearer without a native profile is `401`.
+- `src/browser_auth/router.rs` and `src/auth_config/tests.rs` show `/v1` and paths under it
+  refused as browser paths, native callbacks and app links, and a shared prefix such as `/v10`
+  accepted.
+- `tests/contract.rs` validates the problems of the mounted binary against the contract.
+- `tests/schema/authz_http.rs` runs the real API binary over PostgreSQL 18 as
+  `openmettle_api`, with seeded browser sessions (sent with the configured `Origin`) and native
+  bearers. It covers capabilities for active, withdrawn, logged-out and disabled callers; project
+  create with replay across channels, reused keys and legacy defaults; reads, settings, roles and
+  the viewer's refusals; archive cancelling a live run and freezing settings, roles and new
+  shares while reads, revocations and restore stay available; delete with its exact replay and
+  concealment of a new key, the project and its items. A third test covers role precedence across
+  direct, local-group and OIDC-group grants, the last direct owner, private-by-default project
+  conversations and personal artifacts with user, group and whole-project shares, refused
+  reshares and non-member grantees, account-administrator `404` on all thirteen project and item
+  routes, and revocation on the next request after member removal, group disablement, stale OIDC
+  evidence and native logout. These tests are `#[ignore]` and need the CI PostgreSQL 18
+  service.
