@@ -316,10 +316,12 @@ async fn export_carries_only_allowlisted_root_request_spans_over_tls_http1() {
     );
     for request in collector.requests() {
         for resource in &request.resource_spans {
-            let attributes = &resource.resource.as_ref().unwrap().attributes;
-            assert_eq!(attributes.len(), 1);
-            assert_eq!(attributes[0].key, "service.name");
-            assert_eq!(text(&attributes[0].value), Some("openmettle-api"));
+            let res_attrs = attributes(&resource.resource.as_ref().unwrap().attributes);
+            assert_eq!(res_attrs.len(), 2);
+            assert_eq!(text(res_attrs["service.name"]), Some("openmettle-api"));
+            assert!(super::is_v4(
+                text(res_attrs["service.instance.id"]).unwrap()
+            ));
             for scope in &resource.scope_spans {
                 assert_eq!(scope.scope.as_ref().unwrap().name, TARGET);
             }
@@ -1016,6 +1018,18 @@ async fn metrics_export_sends_valid_protobuf_over_tls_http1() {
     let decoded = ExportMetricsServiceRequest::decode(body.as_slice())
         .expect("OTLP ExportMetricsServiceRequest protobuf");
     assert_eq!(decoded.resource_metrics.len(), 1);
+    let res_attrs = attributes(
+        &decoded.resource_metrics[0]
+            .resource
+            .as_ref()
+            .unwrap()
+            .attributes,
+    );
+    assert_eq!(res_attrs.len(), 2);
+    assert_eq!(text(res_attrs["service.name"]), Some("openmettle-api"));
+    assert!(super::is_v4(
+        text(res_attrs["service.instance.id"]).unwrap()
+    ));
     let scope_metrics = &decoded.resource_metrics[0].scope_metrics[0];
     let names: Vec<&str> = scope_metrics
         .metrics
@@ -1084,4 +1098,116 @@ async fn metrics_export_drops_on_collector_failure_and_reports_to_stderr() {
             .all(|v| v["dropped_metric_exports"].as_u64().unwrap_or(0) >= 1),
         "{dropped_events:?}"
     );
+}
+
+/// A stalled metrics collector (accepts TCP and never reads) must not extend `Exporter::stop`
+/// beyond its shutdown budget.
+#[tokio::test]
+async fn metrics_stalled_collector_does_not_extend_shutdown_deadline() {
+    let collector = Stalled::start().await;
+    let ca = Ca::new();
+    let tuning = Tuning {
+        deadline: Duration::from_secs(5),
+        interval: Duration::from_millis(10),
+        ..FAST
+    };
+    let store = Arc::new(metrics::Metrics::new());
+    store.record_db_readiness(metrics::ReadinessOutcome::Ok, Duration::from_millis(1));
+    let dest = metrics_destination(collector.port, &ca, tuning);
+    let (_, exporter) = otlp::start_with_metrics(dest, Process::Api, store);
+
+    until(|| collector.connections() >= 1).await;
+    let budget = Duration::from_millis(125);
+    let started = Instant::now();
+    exporter.stop(tokio::time::Instant::now() + budget).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "stalled metrics collector held shutdown for {:?}",
+        started.elapsed()
+    );
+}
+
+/// When both `OTLP_TRACES_ENDPOINT` and `OTLP_METRICS_ENDPOINT` are configured, both tasks
+/// export concurrently over the shared transport, carry the exact same `service.instance.id`,
+/// and drain cleanly on `Exporter::stop`.
+#[tokio::test]
+async fn traces_and_metrics_export_concurrently_and_stop_cleanly() {
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+
+    let ca = Ca::new();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let recorded = captured.clone();
+    let server = Server::start(ca.leaf(COLLECTOR, false), move |received| {
+        recorded
+            .lock()
+            .unwrap()
+            .push((received.head.clone(), received.body.clone()));
+        Reply::Bytes(response(200, &[], b""))
+    })
+    .await;
+
+    let dir = Dir::new();
+    let path = dir.write("collector-ca.pem", &ca.pem());
+    let traces_url = format!("https://{COLLECTOR}:{}/v1/traces", server.port);
+    let metrics_url = format!("https://{COLLECTOR}:{}/v1/metrics", server.port);
+    let settings = otlp::Settings::parse(|key| {
+        Ok(match key {
+            "OTLP_TRACES_ENDPOINT" => Some(traces_url.clone()),
+            "OTLP_METRICS_ENDPOINT" => Some(metrics_url.clone()),
+            "OTLP_CA_FILE" => Some(path.clone()),
+            _ => None,
+        })
+    })
+    .unwrap()
+    .unwrap();
+    let dest = Destination::load(&settings)
+        .unwrap()
+        .with_lookup(loopback)
+        .with_tuning(FAST)
+        .allow_loopback_fixture();
+
+    let store = Arc::new(metrics::Metrics::new());
+    store.record_db_readiness(metrics::ReadinessOutcome::Ok, Duration::from_millis(2));
+    let (tracer, exporter) = otlp::start_with_metrics(dest, Process::Api, store);
+    let tracer = tracer.expect("traces endpoint configured");
+    let (_capture, _guard) = Capture::install_traced(Format::Json, Verbosity::Info, tracer);
+    drop(request_span(
+        RequestId::generate(),
+        &Route(None),
+        Method::Get,
+    ));
+    finish(exporter).await;
+
+    let requests = captured.lock().unwrap().clone();
+    let trace_body = requests
+        .iter()
+        .find(|(h, _)| h.starts_with("POST /v1/traces HTTP/1.1\r\n"))
+        .map(|(_, b)| b)
+        .expect("expected /v1/traces export");
+    let metric_body = requests
+        .iter()
+        .find(|(h, _)| h.starts_with("POST /v1/metrics HTTP/1.1\r\n"))
+        .map(|(_, b)| b)
+        .expect("expected /v1/metrics export");
+
+    let trace_req = ExportTraceServiceRequest::decode(trace_body.as_slice()).unwrap();
+    let metric_req = ExportMetricsServiceRequest::decode(metric_body.as_slice()).unwrap();
+    let trace_res = attributes(
+        &trace_req.resource_spans[0]
+            .resource
+            .as_ref()
+            .unwrap()
+            .attributes,
+    );
+    let metric_res = attributes(
+        &metric_req.resource_metrics[0]
+            .resource
+            .as_ref()
+            .unwrap()
+            .attributes,
+    );
+    let trace_instance = text(trace_res["service.instance.id"]).unwrap();
+    let metric_instance = text(metric_res["service.instance.id"]).unwrap();
+    assert!(super::is_v4(trace_instance));
+    assert_eq!(trace_instance, metric_instance);
 }

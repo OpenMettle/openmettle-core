@@ -6,12 +6,18 @@
     "inbound_trace_context": "ignored",
     "logs_transport": "stderr",
     "otlp_transport": "https-http1-protobuf",
+    "prometheus_translation": "UnderscoreEscapingWithSuffixes",
+    "resource_attributes": [
+      "service.name",
+      "service.instance.id"
+    ],
     "retention_ceilings": {
       "traces_hours": 72,
       "logs_days": 7,
       "metrics_days": 14
     },
-    "max_total_series": 312,
+    "max_data_point_streams": 357,
+    "max_prometheus_series_per_process": 1020,
     "disallowed_metric_label_substrings": [
       "user_id",
       "scope_id",
@@ -149,10 +155,10 @@
       "prometheus_name": "openmettle_http_server_requests_total",
       "kind": "counter",
       "unit": "{request}",
-      "max_series": 200,
+      "max_series": 240,
       "labels": {
         "http.request.method": ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "_OTHER"],
-        "http.route": ["healthz", "readyz", "auth", "v1", "unmatched"],
+        "openmettle.route_class": ["healthz", "readyz", "auth", "v1", "other", "unmatched"],
         "http.response.status_class": ["2xx", "3xx", "4xx", "5xx", "other"]
       }
     },
@@ -161,10 +167,10 @@
       "prometheus_name": "openmettle_http_server_request_duration_seconds",
       "kind": "histogram",
       "unit": "s",
-      "max_series": 25,
+      "max_series": 30,
       "buckets": [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
       "labels": {
-        "http.route": ["healthz", "readyz", "auth", "v1", "unmatched"],
+        "openmettle.route_class": ["healthz", "readyz", "auth", "v1", "other", "unmatched"],
         "http.response.status_class": ["2xx", "3xx", "4xx", "5xx", "other"]
       }
     },
@@ -217,6 +223,7 @@
       "prometheus_name": "openmettle_storage_operations_total",
       "kind": "counter",
       "unit": "{operation}",
+      "semantics": "helper_attempts_before_commit",
       "max_series": 42,
       "labels": {
         "operation": ["reserve", "settle", "release", "retain", "restore", "begin_purge", "confirm_purge"],

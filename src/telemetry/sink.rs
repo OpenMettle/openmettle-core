@@ -6,7 +6,11 @@
 //! the write fails. After the next successful write the thread writes one
 //! `telemetry.dropped` event with the count. A stalled or closed stderr therefore costs
 //! telemetry lines, never request handling or shutdown.
-use super::{Settings, lines_dropped, subscriber};
+use super::{
+    Settings, lines_dropped,
+    metrics::{self, DroppedSignal, MetricsSource},
+    subscriber,
+};
 use std::{
     collections::VecDeque,
     io::Write,
@@ -36,6 +40,7 @@ struct State {
 
 struct Shared {
     state: Mutex<State>,
+    metrics: MetricsSource,
     wake_writer: Condvar,
     wake_flush: Condvar,
 }
@@ -72,6 +77,36 @@ impl Queue {
     where
         W: Write + Send + 'static,
     {
+        Self::spawn_inner(
+            out,
+            capacity,
+            settings,
+            MetricsSource::Global(metrics::global()),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_with_metrics<W>(
+        out: W,
+        capacity: usize,
+        settings: Settings,
+        metrics: Arc<metrics::Metrics>,
+    ) -> std::io::Result<Self>
+    where
+        W: Write + Send + 'static,
+    {
+        Self::spawn_inner(out, capacity, settings, MetricsSource::Owned(metrics))
+    }
+
+    fn spawn_inner<W>(
+        out: W,
+        capacity: usize,
+        settings: Settings,
+        metrics: MetricsSource,
+    ) -> std::io::Result<Self>
+    where
+        W: Write + Send + 'static,
+    {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 lines: VecDeque::with_capacity(capacity.min(CAPACITY)),
@@ -81,6 +116,7 @@ impl Queue {
                 dropped: 0,
                 closed: false,
             }),
+            metrics,
             wake_writer: Condvar::new(),
             wake_flush: Condvar::new(),
         });
@@ -103,6 +139,11 @@ impl Queue {
             self.guard.shared.wake_writer.notify_one();
         } else {
             state.dropped = state.dropped.saturating_add(1);
+            self.guard
+                .shared
+                .metrics
+                .as_ref()
+                .record_dropped(DroppedSignal::LogLines, 1);
         }
     }
 
@@ -233,6 +274,10 @@ fn write_lines<W: Write>(shared: Arc<Shared>, mut out: W, settings: Settings) {
             let mut state = shared.lock();
             state.dropped = state.dropped.saturating_add(1);
             state.handled += 1;
+            shared
+                .metrics
+                .as_ref()
+                .record_dropped(DroppedSignal::LogLines, 1);
         }
         shared.wake_flush.notify_all();
     }

@@ -8,20 +8,20 @@ groups:
       - alert: OpenMettleApiHighServerErrorRatio
         expr: |
           (
-            sum(rate(openmettle_http_server_requests_total{http_response_status_class="5xx"}[5m]))
+            sum(rate(openmettle_http_server_requests_total{job="openmettle-api",openmettle_route_class!~"healthz|readyz",http_response_status_class="5xx"}[5m]))
             /
-            clamp_min(sum(rate(openmettle_http_server_requests_total[5m])), 1e-9)
+            clamp_min(sum(rate(openmettle_http_server_requests_total{job="openmettle-api",openmettle_route_class!~"healthz|readyz"}[5m])), 1e-9)
           ) > 0.05
           and
-          sum(increase(openmettle_http_server_requests_total{http_response_status_class="5xx"}[5m])) >= 5
+          sum(increase(openmettle_http_server_requests_total{job="openmettle-api",openmettle_route_class!~"healthz|readyz",http_response_status_class="5xx"}[5m])) >= 5
         for: 5m
         labels:
           severity: warning
           service: openmettle-api
           signal_contract: v1
         annotations:
-          summary: "OpenMettle HTTP 5xx error ratio exceeded 5%"
-          description: "More than 5% of completed HTTP requests returned 5xx over the last 5 minutes."
+          summary: "OpenMettle API HTTP 5xx error ratio exceeded 5%"
+          description: "More than 5% of non-probe API HTTP requests returned 5xx over the last 5 minutes."
 
       - alert: OpenMettleDatabaseReadinessFailing
         expr: |

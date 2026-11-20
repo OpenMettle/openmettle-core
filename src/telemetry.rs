@@ -636,14 +636,12 @@ pub fn process_panicked(role: Process) {
 /// The stderr writer dropped `count` lines since its last report, because the queue was full
 /// or a write failed. `error`, so every configured level shows it.
 fn lines_dropped(count: u64) {
-    metrics::global().record_dropped(metrics::DroppedSignal::LogLines, count);
     tracing::error!(target: TARGET, event = "telemetry.dropped", dropped_lines = count);
 }
 
 /// The OTLP exporter dropped `count` spans since its last report, because the queue was full
 /// or a batch was not delivered. At most once per export cycle, to stderr only.
 fn spans_dropped(count: u64) {
-    metrics::global().record_dropped(metrics::DroppedSignal::TraceSpans, count);
     tracing::error!(target: TARGET, event = "telemetry.dropped", dropped_spans = count);
 }
 

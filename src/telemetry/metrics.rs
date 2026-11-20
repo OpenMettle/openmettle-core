@@ -21,6 +21,28 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+/// Contract version carried on `InstrumentationScope.version` and checked against
+/// `contracts/telemetry/v1.json`.
+pub const CONTRACT_VERSION: &str = "1.0.0";
+
+/// Process-wide or test-isolated handle to a [`Metrics`] store.
+#[derive(Clone)]
+pub(crate) enum MetricsSource {
+    Global(&'static Metrics),
+    #[cfg(test)]
+    Owned(std::sync::Arc<Metrics>),
+}
+
+impl MetricsSource {
+    pub(crate) fn as_ref(&self) -> &Metrics {
+        match self {
+            Self::Global(m) => m,
+            #[cfg(test)]
+            Self::Owned(m) => m,
+        }
+    }
+}
+
 /// Upper bounds in seconds for every duration histogram in telemetry contract v1.
 pub const DURATION_BUCKETS: [f64; 11] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
@@ -35,6 +57,7 @@ pub enum RouteClass {
     Readyz,
     Auth,
     V1,
+    Other,
     Unmatched,
 }
 
@@ -44,19 +67,21 @@ impl RouteClass {
         Self::Readyz,
         Self::Auth,
         Self::V1,
+        Self::Other,
         Self::Unmatched,
     ];
-    pub const NAMES: &'static [&'static str] = &["healthz", "readyz", "auth", "v1", "unmatched"];
+    pub const NAMES: &'static [&'static str] =
+        &["healthz", "readyz", "auth", "v1", "other", "unmatched"];
 
     /// Classifies a matched Axum route template (never an unmatched raw target).
     pub fn of(route: &str) -> Self {
         match route {
             "/healthz" => Self::Healthz,
             "/readyz" => Self::Readyz,
-            r if r.starts_with("/v1/") || r == "/v1" => Self::V1,
+            r if r == "/auth" || r.starts_with("/auth/") => Self::Auth,
+            r if r == "/v1" || r.starts_with("/v1/") => Self::V1,
             "unmatched" => Self::Unmatched,
-            // Browser sign-in / session / logout routes mounted by ADR 0025.
-            _ => Self::Auth,
+            _ => Self::Other,
         }
     }
 
@@ -70,7 +95,8 @@ impl RouteClass {
             Self::Readyz => 1,
             Self::Auth => 2,
             Self::V1 => 3,
-            Self::Unmatched => 4,
+            Self::Other => 4,
+            Self::Unmatched => 5,
         }
     }
 }
@@ -365,7 +391,7 @@ pub struct MetricDescriptor {
 }
 
 impl MetricDescriptor {
-    /// Exact upper bound on the number of series this metric can ever produce.
+    /// Exact upper bound on the number of OTLP data-point streams this metric can ever produce.
     pub const fn max_series(&self) -> usize {
         let mut total = 1usize;
         let mut i = 0;
@@ -374,6 +400,16 @@ impl MetricDescriptor {
             i += 1;
         }
         total
+    }
+
+    /// Exact upper bound on the number of Prometheus series this metric expands to per process
+    /// (counters are 1:1; each histogram stream expands to `buckets.len() + 1` `_bucket`
+    /// series plus `_sum` and `_count`).
+    pub const fn max_prometheus_series(&self) -> usize {
+        match self.buckets {
+            Some(buckets) => self.max_series() * (buckets.len() + 3),
+            None => self.max_series(),
+        }
     }
 }
 
@@ -391,7 +427,7 @@ pub const DESCRIPTORS: &[MetricDescriptor] = &[
                 values: Method::NAMES,
             },
             LabelDescriptor {
-                name: "http.route",
+                name: "openmettle.route_class",
                 values: RouteClass::NAMES,
             },
             LabelDescriptor {
@@ -409,7 +445,7 @@ pub const DESCRIPTORS: &[MetricDescriptor] = &[
         description: "End-to-end HTTP request handling duration.",
         labels: &[
             LabelDescriptor {
-                name: "http.route",
+                name: "openmettle.route_class",
                 values: RouteClass::NAMES,
             },
             LabelDescriptor {
@@ -484,7 +520,7 @@ pub const DESCRIPTORS: &[MetricDescriptor] = &[
         prometheus_name: "openmettle_storage_operations_total",
         kind: InstrumentKind::Counter,
         unit: "{operation}",
-        description: "Artifact storage accounting and lifecycle operations.",
+        description: "Artifact storage accounting and lifecycle helper attempts (including retries before transaction commit).",
         labels: &[
             LabelDescriptor {
                 name: "operation",
@@ -511,12 +547,23 @@ pub const DESCRIPTORS: &[MetricDescriptor] = &[
     },
 ];
 
-/// Sum of `max_series()` across all v1 metrics.
+/// Sum of `max_series()` (OTLP data-point streams) across all v1 metrics.
 pub const fn max_total_series() -> usize {
     let mut total = 0usize;
     let mut i = 0;
     while i < DESCRIPTORS.len() {
         total += DESCRIPTORS[i].max_series();
+        i += 1;
+    }
+    total
+}
+
+/// Sum of `max_prometheus_series()` across all v1 metrics (per process, excluding `target_info`).
+pub const fn max_total_prometheus_series() -> usize {
+    let mut total = 0usize;
+    let mut i = 0;
+    while i < DESCRIPTORS.len() {
+        total += DESCRIPTORS[i].max_prometheus_series();
         i += 1;
     }
     total
@@ -666,7 +713,11 @@ impl Metrics {
 
     /// Encodes every non-zero cumulative metric series as an OTLP `ExportMetricsServiceRequest`.
     /// Returns `None` when nothing has been recorded yet so idle processes send no empty batch.
-    pub fn encode_otlp(&self, role: Process) -> Option<ExportMetricsServiceRequest> {
+    pub fn encode_otlp(
+        &self,
+        role: Process,
+        instance_id: Option<&str>,
+    ) -> Option<ExportMetricsServiceRequest> {
         let now = unix_nanos().max(self.start_time_unix_nano);
         let start = self.start_time_unix_nano;
         let mut metrics = Vec::with_capacity(DESCRIPTORS.len());
@@ -687,7 +738,7 @@ impl Metrics {
                             value,
                             &[
                                 ("http.request.method", method.as_str()),
-                                ("http.route", route.as_str()),
+                                ("openmettle.route_class", route.as_str()),
                                 ("http.response.status_class", status.as_str()),
                             ],
                         ));
@@ -711,7 +762,7 @@ impl Metrics {
                         sum,
                         buckets,
                         &[
-                            ("http.route", route.as_str()),
+                            ("openmettle.route_class", route.as_str()),
                             ("http.response.status_class", status.as_str()),
                         ],
                     ));
@@ -816,17 +867,22 @@ impl Metrics {
         if metrics.is_empty() {
             return None;
         }
+        let mut resource_attributes =
+            vec![kv("service.name", &format!("openmettle-{}", role.as_str()))];
+        if let Some(id) = instance_id {
+            resource_attributes.push(kv("service.instance.id", id));
+        }
         Some(ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
                 resource: Some(Resource {
-                    attributes: vec![kv("service.name", &format!("openmettle-{}", role.as_str()))],
+                    attributes: resource_attributes,
                     dropped_attributes_count: 0,
                     entity_refs: Vec::new(),
                 }),
                 scope_metrics: vec![ScopeMetrics {
                     scope: Some(InstrumentationScope {
                         name: TARGET.to_owned(),
-                        version: "1.0.0".to_owned(),
+                        version: CONTRACT_VERSION.to_owned(),
                         attributes: Vec::new(),
                         dropped_attributes_count: 0,
                     }),

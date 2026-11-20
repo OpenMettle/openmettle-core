@@ -12,8 +12,8 @@
 //! encodes `ExportMetricsServiceRequest` and POSTs it over the same [`Route`] and DNS slots.
 //! Failures drop without retry and emit one `telemetry.dropped` event to stderr per cycle.
 use super::{
-    Process, TARGET, metric_exports_dropped,
-    metrics::{DroppedSignal, Metrics},
+    Process, RequestId, TARGET, metric_exports_dropped,
+    metrics::{DroppedSignal, MetricsSource},
     spans_dropped,
 };
 use crate::provider_http::{
@@ -22,7 +22,7 @@ use crate::provider_http::{
     transport::{self, Endpoint, Limits, Lookup, Range, Route},
 };
 use openidconnect::http::{self, HeaderMap, HeaderValue, header};
-use opentelemetry::{InstrumentationScope, trace::TracerProvider as _};
+use opentelemetry::{InstrumentationScope, KeyValue, trace::TracerProvider as _};
 use opentelemetry_proto::{
     tonic::collector::trace::v1::ExportTraceServiceRequest,
     transform::{
@@ -261,22 +261,6 @@ struct SharedTransport {
     loopback: bool,
 }
 
-enum MetricsSource {
-    Global(&'static Metrics),
-    #[cfg(test)]
-    Owned(Arc<Metrics>),
-}
-
-impl MetricsSource {
-    fn as_ref(&self) -> &Metrics {
-        match self {
-            Self::Global(m) => m,
-            #[cfg(test)]
-            Self::Owned(m) => m,
-        }
-    }
-}
-
 /// The running OTLP exporter(s), kept by the process to stop them within the shutdown deadline.
 pub struct Exporter {
     traces: Option<(SdkTracerProvider, JoinHandle<()>)>,
@@ -344,7 +328,7 @@ pub fn start(destination: Destination, role: Process) -> (Option<SdkTracer>, Exp
 pub(crate) fn start_with_metrics(
     destination: Destination,
     role: Process,
-    metrics: Arc<Metrics>,
+    metrics: Arc<super::metrics::Metrics>,
 ) -> (Option<SdkTracer>, Exporter) {
     start_inner(destination, role, MetricsSource::Owned(metrics))
 }
@@ -374,13 +358,19 @@ fn start_inner(
         #[cfg(test)]
         loopback,
     });
+    // Per-process random UUIDv4 so replicas produce distinct Prometheus `instance` streams
+    // without disclosing any host, pod, user or scope identity.
+    let instance_id = RequestId::generate().map(|id| id.to_string());
     let (tracer, traces) = match trace_endpoint {
         Some(endpoint) => {
             let (queue, spans) = mpsc::channel(transport.tuning.queue);
             let shared = Arc::new(Shared::default());
-            let resource = Resource::builder_empty()
-                .with_service_name(format!("openmettle-{}", role.as_str()))
-                .build();
+            let mut builder = Resource::builder_empty()
+                .with_service_name(format!("openmettle-{}", role.as_str()));
+            if let Some(id) = &instance_id {
+                builder = builder.with_attribute(KeyValue::new("service.instance.id", id.clone()));
+            }
+            let resource = builder.build();
             let attributes = ResourceAttributesWithSchema::from(&resource);
             let limits = SpanLimits {
                 max_attributes_per_span: 8,
@@ -402,6 +392,7 @@ fn start_inner(
             let task = tokio::spawn(export_traces(
                 spans,
                 shared,
+                metrics.clone(),
                 transport.clone(),
                 endpoint,
                 attributes,
@@ -415,6 +406,7 @@ fn start_inner(
         let task = tokio::spawn(export_metrics(
             metrics,
             role,
+            instance_id,
             stop.clone(),
             transport,
             endpoint,
@@ -428,6 +420,7 @@ fn start_inner(
 async fn export_traces(
     mut spans: mpsc::Receiver<SpanData>,
     shared: Arc<Shared>,
+    metrics: MetricsSource,
     transport: Arc<SharedTransport>,
     endpoint: Endpoint,
     resource: ResourceAttributesWithSchema,
@@ -473,7 +466,7 @@ async fn export_traces(
                 )
                 .await;
             }
-            report(&shared);
+            report(&shared, &metrics);
             return;
         }
         if !batch.is_empty() {
@@ -486,7 +479,7 @@ async fn export_traces(
             )
             .await;
         }
-        report(&shared);
+        report(&shared, &metrics);
     }
 }
 
@@ -494,6 +487,7 @@ async fn export_traces(
 async fn export_metrics(
     metrics: MetricsSource,
     role: Process,
+    instance_id: Option<String>,
     stop: Arc<Notify>,
     transport: Arc<SharedTransport>,
     endpoint: Endpoint,
@@ -505,7 +499,14 @@ async fn export_metrics(
             () = stop.notified() => true,
             () = tokio::time::sleep(interval) => false,
         };
-        send_metrics(&transport, &endpoint, metrics.as_ref(), role).await;
+        send_metrics(
+            &transport,
+            &endpoint,
+            metrics.as_ref(),
+            role,
+            instance_id.as_deref(),
+        )
+        .await;
         if stopping {
             return;
         }
@@ -515,10 +516,11 @@ async fn export_metrics(
 async fn send_metrics(
     transport: &SharedTransport,
     endpoint: &Endpoint,
-    metrics: &Metrics,
+    metrics: &super::metrics::Metrics,
     role: Process,
+    instance_id: Option<&str>,
 ) {
-    let Some(request) = metrics.encode_otlp(role) else {
+    let Some(request) = metrics.encode_otlp(role, instance_id) else {
         return;
     };
     if !post(transport, endpoint, request.encode_to_vec()).await {
@@ -528,9 +530,12 @@ async fn send_metrics(
 }
 
 /// At most one `telemetry.dropped` event per cycle, to stderr only.
-fn report(shared: &Shared) {
+fn report(shared: &Shared, metrics: &MetricsSource) {
     let dropped = shared.dropped.swap(0, Ordering::Relaxed);
     if dropped > 0 {
+        metrics
+            .as_ref()
+            .record_dropped(DroppedSignal::TraceSpans, dropped);
         spans_dropped(dropped);
     }
 }

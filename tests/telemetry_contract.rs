@@ -3,8 +3,8 @@
 use openmettle_core::telemetry::{
     self, Process,
     metrics::{
-        self, DESCRIPTORS, DURATION_BUCKETS, DroppedSignal, InstrumentKind, Metrics,
-        ProviderOperation, ProviderOutcome, ReadinessOutcome, RouteClass, StatusClass,
+        self, CONTRACT_VERSION, DESCRIPTORS, DURATION_BUCKETS, DroppedSignal, InstrumentKind,
+        Metrics, ProviderOperation, ProviderOutcome, ReadinessOutcome, RouteClass, StatusClass,
         StorageOperation, StorageOutcome,
     },
 };
@@ -29,12 +29,26 @@ fn load_contract() -> Value {
 #[test]
 fn telemetry_contract_matches_compiled_log_and_trace_allowlists() {
     let contract = load_contract();
-    assert_eq!(contract["contract_version"].as_str(), Some("1.0.0"));
+    assert_eq!(
+        contract["contract_version"].as_str(),
+        Some(CONTRACT_VERSION)
+    );
     assert_eq!(contract["service_namespace"].as_str(), Some("openmettle"));
     assert_eq!(
         contract["policy"]["inbound_trace_context"].as_str(),
         Some("ignored")
     );
+    assert_eq!(
+        contract["policy"]["prometheus_translation"].as_str(),
+        Some("UnderscoreEscapingWithSuffixes")
+    );
+    let resource_attrs: Vec<&str> = contract["policy"]["resource_attributes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(resource_attrs, ["service.name", "service.instance.id"]);
     assert_eq!(
         contract["policy"]["retention_ceilings"]["traces_hours"].as_u64(),
         Some(72)
@@ -101,7 +115,8 @@ fn telemetry_contract_metrics_match_rust_descriptors_and_cardinality_ceiling() {
         "contracts/telemetry/v1.json metric list must match metrics::DESCRIPTORS 1:1"
     );
 
-    let mut total_series = 0usize;
+    let mut total_streams = 0usize;
+    let mut total_prom_series = 0usize;
     let mut seen_otel = BTreeSet::new();
     let mut seen_prom = BTreeSet::new();
     for (entry, descriptor) in contract_metrics.iter().zip(DESCRIPTORS.iter()) {
@@ -123,7 +138,8 @@ fn telemetry_contract_metrics_match_rust_descriptors_and_cardinality_ceiling() {
             "max_series mismatch on {}",
             descriptor.name
         );
-        total_series += descriptor.max_series();
+        total_streams += descriptor.max_series();
+        total_prom_series += descriptor.max_prometheus_series();
 
         match descriptor.buckets {
             Some(expected_buckets) => {
@@ -197,18 +213,24 @@ fn telemetry_contract_metrics_match_rust_descriptors_and_cardinality_ceiling() {
         }
     }
 
-    assert_eq!(total_series, metrics::max_total_series());
+    assert_eq!(total_streams, metrics::max_total_series());
+    assert_eq!(total_prom_series, metrics::max_total_prometheus_series());
     assert_eq!(
-        contract["policy"]["max_total_series"].as_u64(),
-        Some(total_series as u64)
+        contract["policy"]["max_data_point_streams"].as_u64(),
+        Some(total_streams as u64)
+    );
+    assert_eq!(
+        contract["policy"]["max_prometheus_series_per_process"].as_u64(),
+        Some(total_prom_series as u64)
     );
 }
 
 #[test]
 fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
+    let instance_id = "11111111-2222-4333-8444-555555555555";
     let store = Metrics::new();
     assert!(
-        store.encode_otlp(Process::Api).is_none(),
+        store.encode_otlp(Process::Api, Some(instance_id)).is_none(),
         "empty registry produces no OTLP batch"
     );
 
@@ -238,28 +260,32 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
     }
 
     let request = store
-        .encode_otlp(Process::Api)
+        .encode_otlp(Process::Api, Some(instance_id))
         .expect("populated registry encodes OTLP metrics");
     assert_eq!(request.resource_metrics.len(), 1);
     let rm = &request.resource_metrics[0];
-    let service_name = rm
+    let res_attrs: BTreeMap<&str, &str> = rm
         .resource
         .as_ref()
         .unwrap()
         .attributes
         .iter()
-        .find(|kv| kv.key == "service.name")
-        .unwrap();
-    assert_eq!(
-        service_name.value.as_ref().unwrap().value,
-        Some(
-            opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
-                "openmettle-api".to_owned()
-            )
-        )
-    );
+        .map(|kv| {
+            let val = match kv.value.as_ref().unwrap().value.as_ref().unwrap() {
+                opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(s) => {
+                    s.as_str()
+                }
+                other => panic!("expected string resource attribute, got {other:?}"),
+            };
+            (kv.key.as_str(), val)
+        })
+        .collect();
+    assert_eq!(res_attrs.get("service.name"), Some(&"openmettle-api"));
+    assert_eq!(res_attrs.get("service.instance.id"), Some(&instance_id));
+    assert_eq!(res_attrs.len(), 2);
 
     let scope = &rm.scope_metrics[0];
+    assert_eq!(scope.scope.as_ref().unwrap().version, CONTRACT_VERSION);
     assert_eq!(scope.metrics.len(), DESCRIPTORS.len());
 
     let mut total_points = 0usize;
@@ -288,6 +314,40 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
     assert_eq!(total_points, metrics::max_total_series());
 }
 
+/// Extracts every `expr: |` PromQL block from `contracts/telemetry/alerts-v1.yaml`.
+fn extract_alert_exprs(yaml: &str) -> Vec<String> {
+    let mut exprs = Vec::new();
+    let lines: Vec<&str> = yaml.lines().collect();
+    let mut idx = 0;
+    while idx < lines.len() {
+        let trimmed = lines[idx].trim_start();
+        if trimmed == "expr: |" {
+            let base_indent = lines[idx].len() - trimmed.len();
+            idx += 1;
+            let mut block = String::new();
+            while idx < lines.len() {
+                let line = lines[idx];
+                if line.trim().is_empty() {
+                    block.push('\n');
+                    idx += 1;
+                    continue;
+                }
+                let indent = line.len() - line.trim_start().len();
+                if indent <= base_indent {
+                    break;
+                }
+                block.push_str(line.trim());
+                block.push('\n');
+                idx += 1;
+            }
+            exprs.push(block);
+        } else {
+            idx += 1;
+        }
+    }
+    exprs
+}
+
 #[test]
 fn alert_rules_reference_only_declared_v1_metrics_and_safe_labels() {
     let contract = load_contract();
@@ -298,16 +358,25 @@ fn alert_rules_reference_only_declared_v1_metrics_and_safe_labels() {
         .map(|v| v.as_str().unwrap())
         .collect();
 
-    // Map each Prometheus metric name to its allowed Prometheus-normalized label names.
-    let mut allowed_metrics: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // Map each Prometheus metric name to its allowed Prometheus-normalized label names -> enum values.
+    let mut allowed_metrics: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
     for entry in contract["metrics"].as_array().unwrap() {
         let prom_name = entry["prometheus_name"].as_str().unwrap().to_owned();
-        let labels = entry["labels"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(|k| k.replace('.', "_"))
-            .collect();
+        let mut labels: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (k, vals) in entry["labels"].as_object().unwrap() {
+            let set = vals
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_owned())
+                .collect();
+            labels.insert(k.replace('.', "_"), set);
+        }
+        // Standard Prometheus resource label derived from `service.name`.
+        labels.insert(
+            "job".to_owned(),
+            ["openmettle-api".to_owned(), "openmettle-worker".to_owned()].into(),
+        );
         allowed_metrics.insert(prom_name, labels);
     }
 
@@ -320,52 +389,98 @@ fn alert_rules_reference_only_declared_v1_metrics_and_safe_labels() {
     assert!(alert_count >= 4, "expected at least 4 v1 alert rules");
     assert!(yaml.contains("signal_contract: v1"));
 
-    // No disallowed label or ID substring may appear anywhere in the alert rules file.
-    let lower_yaml = yaml.to_ascii_lowercase();
-    for bad in &disallowed {
-        assert!(
-            !lower_yaml.contains(bad),
-            "alerts-v1.yaml must not reference disallowed identifier/field {bad}"
-        );
-    }
+    let exprs = extract_alert_exprs(&yaml);
+    assert_eq!(
+        exprs.len(),
+        alert_count,
+        "every alert rule must have an expr block"
+    );
 
-    // Every `openmettle_*` metric identifier in alerts-v1.yaml must exist in v1.json, and any
-    // `{label=...}` selector attached to it must reference only declared labels of that metric.
-    let bytes = yaml.as_bytes();
-    let mut i = 0;
     let mut found_metrics = BTreeSet::new();
-    while i < bytes.len() {
-        if yaml[i..].starts_with("openmettle_") {
-            let start = i;
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+    for expr in &exprs {
+        // Disallowed identifier substrings are checked on PromQL expressions (not comments/descriptions).
+        let lower = expr.to_ascii_lowercase();
+        for bad in &disallowed {
+            assert!(
+                !lower.contains(bad),
+                "alert expr must not reference disallowed identifier/field {bad}: {expr}"
+            );
+        }
+
+        // Collect every `openmettle_*` metric referenced in this expression and validate selectors.
+        let bytes = expr.as_bytes();
+        let mut i = 0;
+        let mut expr_metrics = Vec::new();
+        while i < bytes.len() {
+            if expr[i..].starts_with("openmettle_") {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let ident = &expr[start..i];
+                let allowed_labels = allowed_metrics.get(ident).unwrap_or_else(|| {
+                    panic!("alerts-v1.yaml references undeclared metric {ident}")
+                });
+                found_metrics.insert(ident.to_owned());
+                expr_metrics.push(ident.to_owned());
+
+                if i < bytes.len() && bytes[i] == b'{' {
+                    let close = expr[i..]
+                        .find('}')
+                        .expect("unclosed PromQL selector in alerts-v1.yaml")
+                        + i;
+                    let selector = &expr[i + 1..close];
+                    for matcher in selector.split(',') {
+                        let matcher = matcher.trim();
+                        if matcher.is_empty() {
+                            continue;
+                        }
+                        let op_pos = matcher
+                            .find(['=', '!'])
+                            .unwrap_or_else(|| panic!("malformed selector {matcher:?}"));
+                        let key = matcher[..op_pos].trim();
+                        let allowed_values = allowed_labels.get(key).unwrap_or_else(|| {
+                            panic!("alerts-v1.yaml references undeclared label {key} on {ident}")
+                        });
+                        let rhs = matcher[op_pos..]
+                            .trim_start_matches(['=', '!', '~'])
+                            .trim()
+                            .trim_matches('"');
+                        for atom in rhs.split('|') {
+                            assert!(
+                                allowed_values.contains(atom),
+                                "alerts-v1.yaml uses undeclared value {atom:?} for {ident}.{key} (allowed: {allowed_values:?})"
+                            );
+                        }
+                    }
+                    i = close + 1;
+                }
+            } else {
                 i += 1;
             }
-            let ident = &yaml[start..i];
-            let allowed_labels = allowed_metrics
-                .get(ident)
-                .unwrap_or_else(|| panic!("alerts-v1.yaml references undeclared metric {ident}"));
-            found_metrics.insert(ident.to_owned());
+        }
 
-            // Check optional PromQL selector `{k="v", ...}` right after the metric name.
-            if i < bytes.len() && bytes[i] == b'{' {
-                let close = yaml[i..]
-                    .find('}')
-                    .expect("unclosed PromQL selector in alerts-v1.yaml")
-                    + i;
-                let selector = &yaml[i + 1..close];
-                for matcher in selector.split(',') {
-                    let key = matcher.split(['=', '!', '~']).next().unwrap().trim();
-                    if !key.is_empty() {
-                        assert!(
-                            allowed_labels.contains(key),
-                            "alerts-v1.yaml references undeclared label {key} on {ident}"
-                        );
-                    }
-                }
-                i = close + 1;
+        // Validate every `by (...)` grouping clause against the metrics referenced in this expr.
+        let mut rest = expr.as_str();
+        while let Some(pos) = rest.find("by (") {
+            let after = &rest[pos + 4..];
+            let close = after
+                .find(')')
+                .expect("unclosed by (...) in alerts-v1.yaml");
+            let group_labels = &after[..close];
+            for label in group_labels
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                assert!(
+                    expr_metrics
+                        .iter()
+                        .all(|m| allowed_metrics[m].contains_key(label)),
+                    "alerts-v1.yaml groups by undeclared label {label:?} on {expr_metrics:?}"
+                );
             }
-        } else {
-            i += 1;
+            rest = &after[close + 1..];
         }
     }
     assert!(
