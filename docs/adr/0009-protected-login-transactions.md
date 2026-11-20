@@ -5,7 +5,9 @@ sprint #34. Implementation and independent qualification are separate gates.
 
 [ADR 0022](0022-home-invitation-codes.md) adds a second sealed format that also carries an
 optional home invitation code. See [the amendment](#amendment-sealed-format-aes256gcm-v2-adr-0022)
-below. The original increment follows.
+below. [ADR 0030](0030-session-issuance-database-boundary.md) (proposed) moves the
+`session_issued` marker and session insertion to a separate `openmettle_issuance` role;
+initiation and consumption stay with `openmettle_api`. The original increment follows.
 
 ## Boundary
 
