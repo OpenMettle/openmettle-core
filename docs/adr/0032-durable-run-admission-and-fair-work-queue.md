@@ -1,10 +1,11 @@
 # 0032 — Durable run admission and fair PostgreSQL work queue
 
-Status: proposed V1-10 design (PR1) with its PR2 implementation, 20 November 2026.
-Agent-authored; owner approval, independent review and CI acceptance are separate gates.
-Refs #10. PR2 adds migration 19, the store functions and their PostgreSQL 18 schema tests (see
-[Implementation](#implementation-pr2)); the workstation measurement follows in PR3. #10
-remains open.
+Status: proposed V1-10 design (PR1) with its PR2 implementation and PR3 measurement harness,
+20 November 2026. Agent-authored; owner approval, independent review and CI acceptance are
+separate gates. Refs #10. PR2 adds migration 19, the store functions and their PostgreSQL 18
+schema tests (see [Implementation](#implementation-pr2)); PR3 adds the
+[measurement harness](#measurement-harness-pr3). No workstation measurement has been run; #10
+remains open for it.
 
 ## Problem
 
@@ -345,7 +346,7 @@ run `INSERT` and an append for a run row the caller already holds.
 | --- | --- | --- |
 | PR1 | ADR 0032 and a pointer from ADR 0004 | Review |
 | PR2 | Migration 19, `boundaries.sql` version 19, `admit_run`, replay lookup, `cancel_run`, `expire_queued`, `claim_next`, terminal events in the three revocation paths, schema tests on CI PostgreSQL 18 (`tests/schema/run_admission.rs`, terminal-event assertions in `tests/schema/authz_runs.rs`) | Tests below pass in CI |
-| PR3 | An ignored test harness that drives many actors and claimers against a disposable database and records latency, lock waits and `EXPLAIN (ANALYZE, BUFFERS)` of the claim | Owner-run on the workstation profile in the agreed 20:00–07:00 window; results recorded on #10 |
+| PR3 | An ignored test harness that drives many actors and claimers against a disposable database and records latency, lock waits and `EXPLAIN (ANALYZE, BUFFERS)` of the admission counts and the claim (`tests/schema/run_admission_measurement.rs`); CI runs its bounded profile | CI: the bounded profile passes. Capacity: owner-run on the workstation profile in the agreed 20:00–07:00 window; results recorded on #10 (open) |
 
 PR2 tests use the existing disposable PostgreSQL fixture:
 
@@ -365,6 +366,76 @@ PR2 tests use the existing disposable PostgreSQL fixture:
 - Claim skips a run row locked by the API instead of waiting.
 - Privileges: each role is refused the columns and table it is not granted; populated upgrade
   from version 18 to 19.
+
+### Measurement harness (PR3)
+
+One routine, `measure_queue_contention_and_plans`, drives a migrated disposable database and
+returns a JSON report. It measures:
+
+- **Admission contention.** Half the actors admit into one shared ("hot") project, so they
+  serialize on its row; the others admit into their personal scopes. Each actor admits its runs
+  sequentially on its own `openmettle_api` connection through `admit_run`, and cancels every
+  fourth one with `cancel_run`. The report gives p50, p95, p99, maximum and mean latency per
+  group, plus throughput.
+- **Claim serialization.** Concurrent `openmettle_worker` claimers call `claim_next` with
+  bounded executing limits until the queue drains. Each holds its claimed run briefly, then
+  marks it `succeeded` directly as a stand-in for the V1-11 executor. The report gives claim
+  latency, throughput and empty polls.
+- **Lock waits.** A superuser connection samples `pg_stat_activity` rows with
+  `wait_event_type = 'Lock'` and classifies each waiter by the statement it is blocked in:
+  project row, user row, `run_dispatch_lock` or other. Before the load, a calibration step
+  holds each of the three locks and blocks one admission or claim on each. It then requires
+  exactly one sample in each class, which proves the classification against the shipped
+  statements. The same sampler records the peak executing runs per actor and per scope.
+- **Invariants.** The report records executing limits exceeded in any sample, duplicate claims,
+  lost completions, admissions that are neither claimed nor cancelled, and live runs left after
+  the drain. Every count must be zero.
+- **Plans over history.** Before the load, terminal runs with 512-byte snapshots are seeded so
+  that history spans many heap pages. After the drain, the harness leaves a bounded live set
+  (queued, plus some running) and runs `ANALYZE`. It then records `EXPLAIN (ANALYZE, BUFFERS,
+  FORMAT JSON)` of the admission `LIVE_COUNTS` statement as `openmettle_api`. It also records
+  the `CLAIM` statement as `openmettle_worker`, in a rolled-back transaction after taking the
+  dispatch lock. The SQL is rebuilt from `src/authz/runs.rs`, embedded at compile time, so the
+  harness explains the shipped text rather than a copy. Each plan summary has execution and
+  planning time, shared hit and read buffers, the indexes used and any sequential scans.
+  `seq_scan` is not disabled.
+
+The verification requires a complete report, all invariants at zero, `LIVE_COUNTS` using
+`runs_live_actor_idx` and `runs_live_scope_idx`, `CLAIM` using `runs_dispatch_idx`, and
+no sequential scan or history index on `runs` in either plan. Only the partial live indexes and
+`runs_pkey` (the claim's `UPDATE` join) are allowed.
+
+| Profile | Test | When it runs | Default size |
+| --- | --- | --- | --- |
+| Bounded CI | `bounded_queue_measurement_reports_contention_invariants_and_index_plans` | Every hosted CI run, in the existing `--test schema -- --ignored` step on PostgreSQL 18 | 6 actors (3 in the hot project) × 12 runs, 4 claimers, 900 history rows, executing limits 1 per actor and 2 per scope |
+| Workstation | `workstation_queue_contention_profile` | Only with `OPENMETTLE_QUEUE_BENCH=1`; otherwise it returns at once, because CI runs every ignored schema test | 48 actors × 40 runs, 16 claimers, 200 000 history rows, executing limits 2 per actor and 8 per scope |
+
+The workstation sizes are starting points, not recommended limits. Override them with
+`OPENMETTLE_QUEUE_BENCH_ACTORS`, `OPENMETTLE_QUEUE_BENCH_RUNS_PER_ACTOR`,
+`OPENMETTLE_QUEUE_BENCH_CLAIMERS` and `OPENMETTLE_QUEUE_BENCH_HISTORY`. The run opens about
+one connection per actor and per claimer, plus a few more, so the server's `max_connections`
+must exceed `actors + claimers + 10`. The report is always printed to standard error;
+`OPENMETTLE_QUEUE_BENCH_REPORT` also writes it to a file.
+
+The owner runs the workstation profile in the agreed 20:00–07:00 window against a disposable
+PostgreSQL 18 service with a superuser fixture account (the same `TEST_DATABASE_URL` contract as
+the other schema tests). The command creates its own database:
+
+```sh
+OPENMETTLE_QUEUE_BENCH=1 \
+OPENMETTLE_QUEUE_BENCH_REPORT="$PWD/target/queue-bench-report.json" \
+TEST_DATABASE_URL='postgres://<fixture>@<host>:5432/<db>?sslmode=disable' \
+cargo test --locked --release --test schema \
+  run_admission::run_admission_measurement::workstation_queue_contention_profile \
+  -- --ignored --exact --nocapture
+```
+
+Attach the JSON report, the PostgreSQL configuration and the workstation profile to #10.
+The CI profile shows that the harness, its SQL and its invariants work on hosted PostgreSQL 18,
+and that the planner uses the partial indexes over a history-dominated table. Its latencies come
+from a shared CI runner and are not capacity evidence. No capacity number for the workstation
+profile, and no decision on `LISTEN`/`NOTIFY` or admission serialization, is claimed until the
+owner's run is recorded on #10.
 
 ## Boundaries
 

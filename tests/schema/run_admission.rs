@@ -23,6 +23,9 @@ use openmettle_core::{
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
+// PR3: the contention, lock-wait and plan measurement harness over the same fixtures.
+mod run_admission_measurement;
+
 const LIMITS: AdmissionLimits = AdmissionLimits {
     live_per_actor: 1000,
     live_per_scope: 10_000,
