@@ -952,10 +952,7 @@ fn form(boundary: &str, parts: &[String], close: bool) -> String {
 }
 
 fn sha256(bytes: &str) -> String {
-    Sha256::digest(bytes.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    format!("{:x}", Sha256::digest(bytes.as_bytes()))
 }
 
 /// The value of header `name` in a lowercase head.

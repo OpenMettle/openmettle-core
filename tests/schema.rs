@@ -4,29 +4,24 @@
 #[path = "support/env.rs"]
 mod env_support;
 use env_support::scrub_env;
+#[path = "support/pg.rs"]
+mod pg;
 use openmettle_core::migrate::{self, Failure, MIGRATIONS, Settings, Source};
-use sqlx::{AssertSqlSafe, Connection, Executor, PgConnection, Row, postgres::PgConnectOptions};
+use pg::{
+    API, CAPPED, ISSUANCE, OWNER, PASSWORD, WORKER, admin, admin_blocking, admin_options, connect,
+    role_options, role_url,
+};
+use sqlx::{AssertSqlSafe, Connection, Executor, PgConnection, Row};
 use sqlx_core::migrate::{Migrate, MigrateError};
 use std::{
+    collections::BTreeSet,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     process::{Child, Command, Output, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
-
-const OWNER: &str = "openmettle_owner";
-const API: &str = "openmettle_api";
-/// Session issuance (ADR 0030); required from migration 18.
-const ISSUANCE: &str = "openmettle_issuance";
-const WORKER: &str = "openmettle_worker";
-const CAPPED: &str = "openmettle_fixture_capped";
-/// Synthetic test-only credential for disposable fixture roles; never a deployment value.
-const PASSWORD: &str = "fixture-only-password";
 
 // --- process helpers ------------------------------------------------------------------------
 
@@ -137,104 +132,6 @@ fn versions_through(last: i64) -> Vec<i64> {
     (1..=last).collect()
 }
 
-fn admin_options() -> PgConnectOptions {
-    std::env::var("TEST_DATABASE_URL")
-        .expect("TEST_DATABASE_URL required")
-        .parse()
-        .expect("valid TEST_DATABASE_URL")
-}
-
-fn role_options(database: &str, role: &str) -> PgConnectOptions {
-    admin_options()
-        .database(database)
-        .username(role)
-        .password(PASSWORD)
-}
-
-fn role_url(database: &str, role: &str) -> String {
-    let admin = admin_options();
-    format!(
-        "postgres://{role}:{PASSWORD}@{}:{}/{database}?sslmode=disable",
-        admin.get_host(),
-        admin.get_port()
-    )
-}
-
-async fn admin(database: Option<&str>) -> PgConnection {
-    let mut options = admin_options();
-    if let Some(database) = database {
-        options = options.database(database);
-    }
-    PgConnection::connect_with(&options).await.unwrap()
-}
-
-async fn connect(database: &str, role: &str) -> PgConnection {
-    PgConnection::connect_with(&role_options(database, role))
-        .await
-        .unwrap()
-}
-
-/// Creates the synthetic cluster roles once; serialized across concurrent tests.
-async fn ensure_roles(admin: &mut PgConnection) {
-    admin
-        .execute("SELECT pg_advisory_lock(720202)")
-        .await
-        .unwrap();
-    for role in [OWNER, API, ISSUANCE, WORKER, CAPPED] {
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS (SELECT FROM pg_roles WHERE rolname = $1)")
-                .bind(role)
-                .fetch_one(&mut *admin)
-                .await
-                .unwrap();
-        if !exists {
-            let limit = if role == CAPPED { 2 } else { -1 };
-            admin
-                .execute(AssertSqlSafe(format!(
-                    "CREATE ROLE {role} LOGIN PASSWORD '{PASSWORD}' CONNECTION LIMIT {limit}"
-                )))
-                .await
-                .unwrap();
-        }
-    }
-    admin
-        .execute(AssertSqlSafe(format!("GRANT {API} TO {CAPPED}")))
-        .await
-        .unwrap();
-    admin
-        .execute("SELECT pg_advisory_unlock(720202)")
-        .await
-        .unwrap();
-}
-
-static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-/// Advisory key serializing tests that change cluster-wide fixture roles: every test database
-/// holds it shared; a test that alters role memberships or attributes holds it exclusively.
-const ROLE_STATE_LOCK: i64 = 720203;
-
-/// Runs statements as the fixture superuser on a blocking thread; used for cleanup in `Drop`.
-fn admin_blocking(database: Option<String>, statements: Vec<String>) {
-    let _ = thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let mut options = admin_options();
-                if let Some(database) = &database {
-                    options = options.database(database);
-                }
-                if let Ok(mut admin) = PgConnection::connect_with(&options).await {
-                    for statement in statements {
-                        let _ = admin.execute(AssertSqlSafe(statement)).await;
-                    }
-                }
-            })
-    })
-    .join();
-}
-
 /// Restores cluster role state when dropped, including after a failed assertion.
 struct Restore(&'static [&'static str]);
 impl Drop for Restore {
@@ -244,40 +141,26 @@ impl Drop for Restore {
 }
 
 /// A fresh database owned by openmettle_owner, dropped when the test ends.
-struct TestDb(String, #[allow(dead_code)] PgConnection);
+struct TestDb(String, #[allow(dead_code)] pg::DisposableDb);
 impl TestDb {
     async fn new() -> Self {
-        Self::create("SELECT pg_advisory_lock_shared($1)", "").await
+        Self::with_options(false, "").await
     }
     /// For tests that change cluster-wide role state; excludes all other test databases.
     async fn exclusive() -> Self {
-        Self::create("SELECT pg_advisory_lock($1)", "").await
+        Self::with_options(true, "").await
     }
     async fn create(lock: &'static str, options: &'static str) -> Self {
-        let mut admin = admin(None).await;
-        ensure_roles(&mut admin).await;
-        sqlx::query(lock)
-            .bind(ROLE_STATE_LOCK)
-            .execute(&mut admin)
-            .await
-            .unwrap();
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos();
-        let name = format!(
-            "om_schema_{}_{}_{nanos}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        );
-        admin
-            .execute(AssertSqlSafe(format!(
-                "CREATE DATABASE {name} OWNER {OWNER} {options}"
-            )))
-            .await
-            .unwrap();
-        // `admin` keeps the role-state lock for the database's lifetime.
-        Self(name, admin)
+        let exclusive = match lock {
+            "SELECT pg_advisory_lock($1)" => true,
+            "SELECT pg_advisory_lock_shared($1)" => false,
+            other => panic!("unexpected role-state lock query: {other}"),
+        };
+        Self::with_options(exclusive, options).await
+    }
+    async fn with_options(exclusive: bool, options: &str) -> Self {
+        let db = pg::DisposableDb::create("om_schema", exclusive, true, options).await;
+        Self(db.name().to_owned(), db)
     }
     async fn schema_exists(&self) -> bool {
         sqlx::query_scalar("SELECT to_regnamespace('openmettle') IS NOT NULL")
@@ -356,14 +239,6 @@ impl TestDb {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-    }
-}
-impl Drop for TestDb {
-    fn drop(&mut self) {
-        admin_blocking(
-            None,
-            vec![format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", self.0)],
-        );
     }
 }
 
@@ -448,35 +323,356 @@ async fn message(
     .await
 }
 
-/// Rows written before an upgrade, unchanged by it. Columns that later migrations add are
-/// excluded from the comparison; the nullable migration-19 `runs` columns must stay unset.
-async fn snapshot(connection: &mut PgConnection, tables: &[&str]) -> Vec<String> {
-    const V19_RUN_COLUMNS: [&str; 5] = [
-        "actor_approval_id",
-        "round_limit",
-        "queue_expires_at",
-        "claim_token",
-        "claimed_at",
-    ];
+// --- declarative additive-schema registry -----------------------------------------------------
+
+/// Expected JSON value of an additive column on rows that existed before the migration adding it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColumnDefault {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Str(&'static str),
+    /// Non-null value assigned dynamically at upgrade time (for example `clock_timestamp()`).
+    AnyNonNull,
+}
+
+impl ColumnDefault {
+    fn matches(self, value: &serde_json::Value) -> bool {
+        match self {
+            Self::Null => value.is_null(),
+            Self::Bool(expected) => value.as_bool() == Some(expected),
+            Self::Int(expected) => value.as_i64() == Some(expected),
+            Self::Str(expected) => value.as_str() == Some(expected),
+            Self::AnyNonNull => !value.is_null(),
+        }
+    }
+
+    fn describe(self) -> String {
+        match self {
+            Self::Null => "null".to_owned(),
+            Self::Bool(v) => v.to_string(),
+            Self::Int(v) => v.to_string(),
+            Self::Str(v) => format!("{v:?}"),
+            Self::AnyNonNull => "a non-null value".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AdditiveColumn {
+    since: i64,
+    table: &'static str,
+    column: &'static str,
+    default: ColumnDefault,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AdditiveTable {
+    since: i64,
+    table: &'static str,
+    /// Optional singleton seed row inserted by the migration, as JSON text.
+    seed_row: Option<&'static str>,
+}
+
+const SINGLETON_LOCK_SEED: &str = r#"{"id": true, "lock_guard": false}"#;
+
+/// Single declarative registry of every column added to an existing table by migrations after
+/// the early schema baselines, ordered by `since` migration version. Adding entries here
+/// automatically updates every historical upgrade test (`v1`–`v18`).
+const ADDITIVE_COLUMNS: &[AdditiveColumn] = &[
+    AdditiveColumn {
+        since: 8,
+        table: "login_providers",
+        column: "lock_guard",
+        default: ColumnDefault::Bool(false),
+    },
+    AdditiveColumn {
+        since: 8,
+        table: "login_providers",
+        column: "access_generation",
+        default: ColumnDefault::Int(0),
+    },
+    AdditiveColumn {
+        since: 8,
+        table: "login_providers",
+        column: "changed_at",
+        default: ColumnDefault::AnyNonNull,
+    },
+    AdditiveColumn {
+        since: 8,
+        table: "login_providers",
+        column: "changed_by",
+        default: ColumnDefault::Str("migration-8"),
+    },
+    AdditiveColumn {
+        since: 8,
+        table: "login_providers",
+        column: "change_reason",
+        default: ColumnDefault::Str("initial session authority"),
+    },
+    AdditiveColumn {
+        since: 8,
+        table: "users",
+        column: "session_generation",
+        default: ColumnDefault::Int(0),
+    },
+    AdditiveColumn {
+        since: 8,
+        table: "login_transactions",
+        column: "session_issued",
+        default: ColumnDefault::Bool(false),
+    },
+    AdditiveColumn {
+        since: 13,
+        table: "home_invitations",
+        column: "code_hash",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 16,
+        table: "grant_assignments",
+        column: "grantee_kind",
+        default: ColumnDefault::Str("user"),
+    },
+    AdditiveColumn {
+        since: 16,
+        table: "grant_assignments",
+        column: "grantee_local_group_id",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 16,
+        table: "grant_assignments",
+        column: "grantee_oidc_group_id",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 16,
+        table: "projects",
+        column: "lock_guard",
+        default: ColumnDefault::Bool(false),
+    },
+    AdditiveColumn {
+        since: 17,
+        table: "artifact_revisions",
+        column: "display_name",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 18,
+        table: "users",
+        column: "lock_guard",
+        default: ColumnDefault::Bool(false),
+    },
+    AdditiveColumn {
+        since: 18,
+        table: "grant_mapping_rules",
+        column: "lock_guard",
+        default: ColumnDefault::Bool(false),
+    },
+    AdditiveColumn {
+        since: 19,
+        table: "runs",
+        column: "actor_approval_id",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 19,
+        table: "runs",
+        column: "round_limit",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 19,
+        table: "runs",
+        column: "queue_expires_at",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 19,
+        table: "runs",
+        column: "claim_token",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 19,
+        table: "runs",
+        column: "claimed_at",
+        default: ColumnDefault::Null,
+    },
+];
+
+/// Single declarative registry of every table added after migration 14, ordered by `since`
+/// migration version, along with any singleton seed row inserted by its migration.
+const ADDITIVE_TABLES: &[AdditiveTable] = &[
+    AdditiveTable {
+        since: 15,
+        table: "account_admin_lock",
+        seed_row: Some(SINGLETON_LOCK_SEED),
+    },
+    AdditiveTable {
+        since: 15,
+        table: "account_admins",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 15,
+        table: "authorization_audit",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 15,
+        table: "local_group_memberships",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 15,
+        table: "local_groups",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 15,
+        table: "platform_capability_denies",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 15,
+        table: "project_settings",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 15,
+        table: "user_capability_denies",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 15,
+        table: "user_capability_grants",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 19,
+        table: "run_dispatch_lock",
+        seed_row: Some(SINGLETON_LOCK_SEED),
+    },
+];
+
+fn additive_columns_since(base_version: i64) -> impl Iterator<Item = &'static AdditiveColumn> {
+    ADDITIVE_COLUMNS
+        .iter()
+        .filter(move |entry| entry.since > base_version)
+}
+
+fn expected_added_tables_since(base_version: i64) -> impl Iterator<Item = &'static AdditiveTable> {
+    assert!(
+        base_version >= 14,
+        "ADDITIVE_TABLES tracks tables added after migration 14"
+    );
+    ADDITIVE_TABLES
+        .iter()
+        .filter(move |entry| entry.since > base_version)
+}
+
+fn canonical_json(raw: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .unwrap_or_else(|error| panic!("invalid JSON ({error}): {raw}"))
+        .to_string()
+}
+
+/// Normalizes one JSON row from `table` to the schema at `base_version`: strips every column
+/// added after `base_version` and asserts each present stripped column holds its declared
+/// pre-existing-row default.
+fn normalize_upgraded_row(table: &str, base_version: i64, raw: &str) -> Result<String, String> {
+    let mut value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| format!("{table}: invalid row JSON ({error}): {raw}"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| format!("{table}: expected JSON object row, got {raw}"))?;
+    for entry in additive_columns_since(base_version).filter(|entry| entry.table == table) {
+        if let Some(found) = object.remove(entry.column)
+            && !entry.default.matches(&found)
+        {
+            return Err(format!(
+                "{table}.{} (migration {}): expected {}, got {found}",
+                entry.column,
+                entry.since,
+                entry.default.describe()
+            ));
+        }
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_upgraded_rows(
+    table: &str,
+    base_version: i64,
+    rows: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    rows.iter()
+        .map(|row| {
+            normalize_upgraded_row(table, base_version, row)
+                .unwrap_or_else(|error| panic!("{error}"))
+        })
+        .collect()
+}
+
+async fn snapshot_tables(
+    connection: &mut PgConnection,
+    tables: &[&str],
+    base_version: i64,
+    require_nonempty: bool,
+) -> Vec<String> {
     let mut rows = Vec::new();
     for table in tables {
-        // Absent keys (before migration 19, or other tables) and JSON nulls are both unset.
-        let table_rows: Vec<(String, bool)> = sqlx::query_as(AssertSqlSafe(format!(
-            "SELECT (to_jsonb(t) - 'session_generation' - 'lock_guard' - $1::text[])::text,
-                    NOT (jsonb_strip_nulls(to_jsonb(t)) ?| $1::text[])
-             FROM openmettle.{table} t ORDER BY id"
+        let raw_rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT to_jsonb(t)::text FROM openmettle.{table} t"
         )))
-        .bind(V19_RUN_COLUMNS)
         .fetch_all(&mut *connection)
         .await
         .unwrap();
-        rows.push(format!("{table}: {}", table_rows.len()));
-        for (row, v19_unset) in table_rows {
-            assert!(v19_unset, "{table} row sets a migration-19 column: {row}");
-            rows.push(row);
+        if require_nonempty {
+            assert!(
+                !raw_rows.is_empty(),
+                "upgrade fixture must populate {table}"
+            );
         }
+        let mut normalized: Vec<String> = raw_rows
+            .iter()
+            .map(|row| {
+                normalize_upgraded_row(table, base_version, row)
+                    .unwrap_or_else(|error| panic!("{error}"))
+            })
+            .collect();
+        normalized.sort();
+        rows.push(format!("{table}: {}", normalized.len()));
+        rows.extend(normalized);
     }
     rows
+}
+
+/// Rows written before an upgrade from `base_version`, unchanged by it. Columns added after
+/// `base_version` are stripped after asserting each holds its declared pre-existing-row default.
+async fn snapshot_at(
+    connection: &mut PgConnection,
+    tables: &[&str],
+    base_version: i64,
+) -> Vec<String> {
+    snapshot_tables(connection, tables, base_version, false).await
+}
+
+/// Same as `snapshot_at`, additionally asserting each listed table is populated by the fixture.
+async fn snapshot_nonempty_at(
+    connection: &mut PgConnection,
+    tables: &[&str],
+    base_version: i64,
+) -> Vec<String> {
+    snapshot_tables(connection, tables, base_version, true).await
+}
+
+/// Convenience wrapper for the early (`v1`–`v3`) baseline upgrade tests, before any additive
+/// columns existed (the first additive columns arrive in migration 8).
+async fn snapshot(connection: &mut PgConnection, tables: &[&str]) -> Vec<String> {
+    snapshot_at(connection, tables, 3).await
 }
 
 /// A migration run refused for exactly this one boundary violation.
@@ -524,6 +720,227 @@ fn released_migration_sources_match_their_pinned_hashes() {
             hash,
             "migration {}",
             migration.version
+        );
+    }
+}
+
+/// Plain non-DB check that the declarative additive-schema registry stays ordered, unique,
+/// in sync with the embedded migration SQL, strips post-baseline columns holding their
+/// declared defaults, and rejects doctored non-default values.
+#[test]
+fn additive_schema_registry_normalizes_and_validates_defaults() {
+    let valid_ident = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    };
+    let versions: BTreeSet<i64> = all_versions().into_iter().collect();
+
+    // Registry ordering, identifiers, uniqueness and seed JSON validity.
+    let mut prev_col_version = 0;
+    let mut seen_columns = BTreeSet::new();
+    for entry in ADDITIVE_COLUMNS {
+        assert!(
+            entry.since >= prev_col_version,
+            "ADDITIVE_COLUMNS must be sorted by `since`: {entry:?}"
+        );
+        prev_col_version = entry.since;
+        assert!(
+            versions.contains(&entry.since),
+            "unknown version: {entry:?}"
+        );
+        assert!(valid_ident(entry.table), "invalid table: {entry:?}");
+        assert!(valid_ident(entry.column), "invalid column: {entry:?}");
+        assert!(
+            seen_columns.insert((entry.table, entry.column)),
+            "duplicate additive column: {entry:?}"
+        );
+    }
+
+    let mut prev_table_version = 14;
+    let mut seen_tables = BTreeSet::new();
+    for entry in ADDITIVE_TABLES {
+        assert!(
+            entry.since >= prev_table_version && entry.since > 14,
+            "ADDITIVE_TABLES must be sorted and after migration 14: {entry:?}"
+        );
+        prev_table_version = entry.since;
+        assert!(
+            versions.contains(&entry.since),
+            "unknown version: {entry:?}"
+        );
+        assert!(valid_ident(entry.table), "invalid table: {entry:?}");
+        assert!(
+            seen_tables.insert(entry.table),
+            "duplicate additive table: {entry:?}"
+        );
+        if let Some(seed) = entry.seed_row {
+            let parsed: serde_json::Value = serde_json::from_str(seed).unwrap();
+            assert!(parsed.is_object(), "seed row must be a JSON object: {seed}");
+        }
+    }
+
+    // Cross-check the registry 1-to-1 against every ADD COLUMN and post-v14 CREATE TABLE in
+    // the embedded migration SQL so future additive migrations cannot drift from the registry.
+    let mut sql_columns = BTreeSet::new();
+    let mut sql_tables = BTreeSet::new();
+    for migration in MIGRATIONS {
+        let stripped: String = migration
+            .sql
+            .lines()
+            .map(|line| line.split("--").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for stmt in stripped.split(';') {
+            let tokens: Vec<&str> = stmt.split_whitespace().collect();
+            if tokens.len() >= 3
+                && tokens[0].eq_ignore_ascii_case("ALTER")
+                && tokens[1].eq_ignore_ascii_case("TABLE")
+                && let Some(table) = tokens[2].strip_prefix("openmettle.")
+            {
+                let table = table.trim_end_matches('(');
+                for window in tokens.windows(3) {
+                    if window[0].eq_ignore_ascii_case("ADD")
+                        && window[1].eq_ignore_ascii_case("COLUMN")
+                    {
+                        sql_columns.insert((
+                            migration.version,
+                            table.to_owned(),
+                            window[2].trim_end_matches(',').to_owned(),
+                        ));
+                    }
+                }
+            }
+            if migration.version > 14
+                && tokens.len() >= 3
+                && tokens[0].eq_ignore_ascii_case("CREATE")
+                && tokens[1].eq_ignore_ascii_case("TABLE")
+                && let Some(table) = tokens[2].strip_prefix("openmettle.")
+            {
+                sql_tables.insert((migration.version, table.trim_end_matches('(').to_owned()));
+            }
+        }
+    }
+    let registered_columns: BTreeSet<(i64, String, String)> = ADDITIVE_COLUMNS
+        .iter()
+        .map(|e| (e.since, e.table.to_owned(), e.column.to_owned()))
+        .collect();
+    assert_eq!(registered_columns, sql_columns);
+    let registered_tables: BTreeSet<(i64, String)> = ADDITIVE_TABLES
+        .iter()
+        .map(|e| (e.since, e.table.to_owned()))
+        .collect();
+    assert_eq!(registered_tables, sql_tables);
+
+    // `expected_added_tables_since` filters accurately and preserves singleton lock seeds.
+    let after_14: Vec<(&str, Option<&str>)> = expected_added_tables_since(14)
+        .map(|e| (e.table, e.seed_row))
+        .collect();
+    assert_eq!(after_14.len(), 10);
+    assert!(after_14.contains(&("account_admin_lock", Some(SINGLETON_LOCK_SEED))));
+    assert!(after_14.contains(&("run_dispatch_lock", Some(SINGLETON_LOCK_SEED))));
+    let after_18: Vec<(&str, Option<&str>)> = expected_added_tables_since(18)
+        .map(|e| (e.table, e.seed_row))
+        .collect();
+    assert_eq!(
+        after_18,
+        vec![("run_dispatch_lock", Some(SINGLETON_LOCK_SEED))]
+    );
+
+    // `normalize_upgraded_row` strips only columns added after `base_version` when they hold
+    // their declared defaults, leaving columns already present at `base_version` intact.
+    let pre_19_run = r#"{"id":"r1","state":"queued"}"#;
+    let upgraded_run = r#"{
+        "id": "r1",
+        "state": "queued",
+        "actor_approval_id": null,
+        "round_limit": null,
+        "queue_expires_at": null,
+        "claim_token": null,
+        "claimed_at": null
+    }"#;
+    assert_eq!(
+        normalize_upgraded_row("runs", 18, upgraded_run).unwrap(),
+        pre_19_run
+    );
+    assert_eq!(
+        normalize_upgraded_row("runs", 18, pre_19_run).unwrap(),
+        pre_19_run
+    );
+
+    let upgraded_user_v7 = r#"{"id":"u1","session_generation":0,"lock_guard":false}"#;
+    assert_eq!(
+        normalize_upgraded_row("users", 7, upgraded_user_v7).unwrap(),
+        r#"{"id":"u1"}"#
+    );
+    // At base_version 8, `session_generation` already existed and must NOT be stripped.
+    let upgraded_user_v8 = r#"{"id":"u1","session_generation":1,"lock_guard":false}"#;
+    assert_eq!(
+        normalize_upgraded_row("users", 8, upgraded_user_v8).unwrap(),
+        r#"{"id":"u1","session_generation":1}"#
+    );
+
+    let upgraded_grant = r#"{
+        "id": "g1",
+        "grantee_kind": "user",
+        "grantee_local_group_id": null,
+        "grantee_oidc_group_id": null
+    }"#;
+    assert_eq!(
+        normalize_upgraded_row("grant_assignments", 14, upgraded_grant).unwrap(),
+        r#"{"id":"g1"}"#
+    );
+
+    let upgraded_provider = r#"{
+        "id": "p1",
+        "lock_guard": false,
+        "access_generation": 0,
+        "changed_at": "2026-01-01T00:00:00Z",
+        "changed_by": "migration-8",
+        "change_reason": "initial session authority"
+    }"#;
+    assert_eq!(
+        normalize_upgraded_row("login_providers", 7, upgraded_provider).unwrap(),
+        r#"{"id":"p1"}"#
+    );
+
+    // Doctored non-default values on stripped columns must be rejected with clear diagnostics.
+    for (table, base, row, expected_column) in [
+        (
+            "runs",
+            18,
+            r#"{"id":"r1","round_limit":10}"#,
+            "runs.round_limit",
+        ),
+        (
+            "users",
+            14,
+            r#"{"id":"u1","lock_guard":true}"#,
+            "users.lock_guard",
+        ),
+        (
+            "users",
+            7,
+            r#"{"id":"u1","session_generation":1}"#,
+            "users.session_generation",
+        ),
+        (
+            "grant_assignments",
+            14,
+            r#"{"id":"g1","grantee_kind":"project"}"#,
+            "grant_assignments.grantee_kind",
+        ),
+        (
+            "login_providers",
+            7,
+            r#"{"id":"p1","changed_at":null}"#,
+            "login_providers.changed_at",
+        ),
+    ] {
+        let error = normalize_upgraded_row(table, base, row).unwrap_err();
+        assert!(
+            error.contains(expected_column),
+            "expected error naming {expected_column}, got: {error}"
         );
     }
 }
@@ -807,7 +1224,7 @@ async fn populated_upgrade_preserves_identity_and_ownership() {
     personal_scope(&mut api, &bob).await;
     let (_, project_scope) = project(&mut api, &alice).await;
     let tables = ["users", "user_identities", "scopes", "projects"];
-    let before = snapshot(&mut api, &tables).await;
+    let before = snapshot_at(&mut api, &tables, 1).await;
     drop(api);
 
     let output = migrate_command(&db.url(OWNER), &[]).output().unwrap();
@@ -815,7 +1232,7 @@ async fn populated_upgrade_preserves_identity_and_ownership() {
     assert_eq!(db.history().await, all_versions());
 
     let mut api = connect(&db.0, API).await;
-    assert_eq!(snapshot(&mut api, &tables).await, before);
+    assert_eq!(snapshot_at(&mut api, &tables, 1).await, before);
     // Pre-existing identifiers remain valid ownership targets after the upgrade.
     let personal = conversation(&mut api, &alice_scope, "personal", &alice)
         .await

@@ -188,10 +188,7 @@ fn walk<'a>(value: &'a Value, path: String, visit: &mut impl FnMut(&str, &'a Val
 fn vendored_oas_schemas_match_pinned_digests() {
     for (_, file, digest) in VENDORED {
         let bytes = read(&root().join("contracts/vendor/oas-3.2").join(file));
-        let actual: String = Sha256::digest(&bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let actual = format!("{:x}", Sha256::digest(&bytes));
         assert_eq!(
             actual, digest,
             "{file} differs from the pinned official copy"
@@ -870,10 +867,7 @@ fn multipart_examples_parse_to_one_upload_in_either_order() {
         revision["display_name"].as_str()
     );
     assert_eq!(file.len().to_string(), revision["size_bytes"]);
-    let digest: String = Sha256::digest(&file)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let digest = format!("{:x}", Sha256::digest(&file));
     assert_eq!(digest, revision["sha256"]);
     assert!(metadata.is_valid(&serde_json::from_slice(&form.metadata).unwrap()));
 

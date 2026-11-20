@@ -657,40 +657,29 @@ async fn migration_five_failure_kill_timeout_and_concurrent_retry() {
     );
     db.wait_no_migration_session().await;
 }
-async fn old_domain_snapshot(db: &TestDb) -> Vec<String> {
-    let mut c = db.admin().await;
-    let mut result = Vec::new();
-    for table in [
-        "users",
-        "user_identities",
-        "scopes",
-        "projects",
-        "conversations",
-        "messages",
-        "conversation_branches",
-        "runs",
-        "run_events",
-        "operations",
-        "storage_instance",
-        "storage_accounts",
-        "artifacts",
-        "storage_reservations",
-        "artifact_revisions",
-    ] {
-        // Columns added by later migrations; the upgrade assertions check they stay unset.
-        let rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT (to_jsonb(t) - 'session_generation' - 'session_issued' - 'lock_guard' - 'display_name'
-                     - 'actor_approval_id' - 'round_limit' - 'queue_expires_at' - 'claim_token' - 'claimed_at')::text
-               FROM openmettle.{table} t ORDER BY 1"
-        )))
-        .fetch_all(&mut c)
-        .await
-        .unwrap();
-        assert!(!rows.is_empty(), "upgrade fixture must populate {table}");
-        result.push(table.into());
-        result.extend(rows);
-    }
-    result
+async fn old_domain_snapshot(db: &TestDb, base_version: i64) -> Vec<String> {
+    snapshot_nonempty_at(
+        &mut db.admin().await,
+        &[
+            "users",
+            "user_identities",
+            "scopes",
+            "projects",
+            "conversations",
+            "messages",
+            "conversation_branches",
+            "runs",
+            "run_events",
+            "operations",
+            "storage_instance",
+            "storage_accounts",
+            "artifacts",
+            "storage_reservations",
+            "artifact_revisions",
+        ],
+        base_version,
+    )
+    .await
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 and authentic V4_BINARY_DIR required"]
@@ -791,17 +780,25 @@ async fn populate_invitations(db: &TestDb) {
         .unwrap();
     }
 }
-// Every invitation column that schema 12 wrote. Migration 13 adds only code_hash. The filter
-// reads code_hash through the row's JSON, so the snapshot also works on a schema-12 database,
-// where the column does not exist yet.
-async fn invitation_snapshot(db: &TestDb) -> Vec<String> {
-    sqlx::query_scalar(
-        "SELECT (to_jsonb(t) - 'code_hash')::text FROM openmettle.home_invitations t
-          WHERE to_jsonb(t) ->> 'code_hash' IS NULL ORDER BY 1",
+// Every invitation column present at `base_version`. Migration 13 adds only `code_hash`
+// (NULL on closed pre-13 rows); the filter reads it through JSON so it works on schema 12 too.
+async fn invitation_snapshot(db: &TestDb, base_version: i64) -> Vec<String> {
+    let raw: Vec<String> = sqlx::query_scalar(
+        "SELECT to_jsonb(t)::text FROM openmettle.home_invitations t
+          WHERE to_jsonb(t) ->> 'code_hash' IS NULL",
     )
     .fetch_all(&mut db.admin().await)
     .await
-    .unwrap()
+    .unwrap();
+    let mut rows: Vec<String> = raw
+        .iter()
+        .map(|row| {
+            normalize_upgraded_row("home_invitations", base_version, row)
+                .unwrap_or_else(|error| panic!("{error}"))
+        })
+        .collect();
+    rows.sort();
+    rows
 }
 // Every invitation that holds a code hash, complete. Only schema 13 and later write one.
 async fn coded_invitations(db: &TestDb) -> Vec<String> {
@@ -996,23 +993,17 @@ async fn membership_snapshot(db: &TestDb) -> Vec<String> {
     result
 }
 // Synthetic protected-login rows written with the API role's version-6 column grants.
-async fn login_snapshot(db: &TestDb) -> Vec<String> {
-    let mut c = db.admin().await;
-    let mut result = Vec::new();
-    for table in ["login_nonce_reservations", "login_transactions"] {
-        let rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT (to_jsonb(t) - 'session_generation' - 'session_issued')::text FROM openmettle.{table} t ORDER BY 1"
-        )))
-        .fetch_all(&mut c)
-        .await
-        .unwrap();
-        assert!(!rows.is_empty(), "upgrade fixture must populate {table}");
-        result.extend(rows);
-    }
-    result
+async fn login_snapshot(db: &TestDb, base_version: i64) -> Vec<String> {
+    snapshot_nonempty_at(
+        &mut db.admin().await,
+        &["login_nonce_reservations", "login_transactions"],
+        base_version,
+    )
+    .await
 }
 async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool) {
     use openmettle_core::storage::{self as accounting, ReservationInput, Settlement};
+    let base_version = *versions.last().unwrap();
     let db = TestDb::new().await;
     let old = std::path::PathBuf::from(
         std::env::var(binary_env).expect("build authentic released binaries first"),
@@ -1187,7 +1178,7 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
     // Populate the v12-only domain before upgrading the authentic predecessor.
     let invitations_before = if versions.contains(&12) {
         populate_invitations(&db).await;
-        let rows = invitation_snapshot(&db).await;
+        let rows = invitation_snapshot(&db, base_version).await;
         assert_eq!(rows.len(), 3, "redeemed, withdrawn and expired invitations");
         rows
     } else {
@@ -1250,12 +1241,12 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
         vec![]
     };
     let login_before = if with_login {
-        login_snapshot(&db).await
+        login_snapshot(&db, base_version).await
     } else {
         vec![]
     };
     let grant_before = if with_grants {
-        grant_snapshot(&db).await
+        grant_snapshot(&db, base_version).await
     } else {
         vec![]
     };
@@ -1265,7 +1256,7 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
     } else {
         (None, "migration-9".into())
     };
-    let before = old_domain_snapshot(&db).await;
+    let before = old_domain_snapshot(&db, base_version).await;
     let history: Vec<String> =
         sqlx::query_scalar("SELECT t::text FROM openmettle._sqlx_migrations t ORDER BY version")
             .fetch_all(&mut db.admin().await)
@@ -1285,12 +1276,12 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
         .await
         .unwrap();
     assert_eq!(db.history().await, versions_through(14));
-    assert_eq!(old_domain_snapshot(&db).await, before);
+    assert_eq!(old_domain_snapshot(&db, base_version).await, before);
     if with_grants {
-        assert_eq!(grant_snapshot(&db).await, grant_before);
+        assert_eq!(grant_snapshot(&db, base_version).await, grant_before);
     }
     if with_login {
-        assert_eq!(login_snapshot(&db).await, login_before);
+        assert_eq!(login_snapshot(&db, base_version).await, login_before);
     }
     // Migration 9 installs only an unconfigured limit: initiation stays refused until the owner
     // configures it, and existing login, approval and session rows are untouched.
@@ -1313,7 +1304,10 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
     // Migration 13 keeps every closed invitation exactly as schema 12 wrote it and gives none a
     // code. The code-less redemption function is gone, and no v11 role privilege is widened.
     // Migration 14 changes no invitation row: a pending schema-13 invitation keeps its hash.
-    assert_eq!(invitation_snapshot(&db).await, invitations_before);
+    assert_eq!(
+        invitation_snapshot(&db, base_version).await,
+        invitations_before
+    );
     assert_eq!(coded_invitations(&db).await, coded_before);
     assert_eq!(
         count(
@@ -1453,34 +1447,20 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
         .await
         .unwrap();
     assert_eq!(db.history().await, all_versions());
-    assert_eq!(old_domain_snapshot(&db).await, before);
-    // Migration 17 names no existing revision; the snapshot omits only that new column.
-    let named: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM openmettle.artifact_revisions WHERE display_name IS NOT NULL",
-    )
-    .fetch_one(&mut db.admin().await)
-    .await
-    .unwrap();
-    assert_eq!(named, 0);
-    // Migration 19 (ADR 0032) admits and claims no existing run: every one keeps NULL
-    // admission and claim columns, so it is never claimed and the expiry sweep fails it.
-    let admitted: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM openmettle.runs
-          WHERE actor_approval_id IS NOT NULL OR round_limit IS NOT NULL
-             OR queue_expires_at IS NOT NULL OR claim_token IS NOT NULL OR claimed_at IS NOT NULL",
-    )
-    .fetch_one(&mut db.admin().await)
-    .await
-    .unwrap();
-    assert_eq!(admitted, 0);
+    // Every column added after `base_version` (including migration 17's `display_name` and
+    // migration 19's run admission/claim columns) is verified against its declared default here.
+    assert_eq!(old_domain_snapshot(&db, base_version).await, before);
     if with_grants {
-        assert_eq!(grant_snapshot(&db).await, grant_before);
+        assert_eq!(grant_snapshot(&db, base_version).await, grant_before);
     }
     if with_login {
-        assert_eq!(login_snapshot(&db).await, login_before);
+        assert_eq!(login_snapshot(&db, base_version).await, login_before);
     }
     assert_eq!(membership_snapshot(&db).await, membership_before);
-    assert_eq!(invitation_snapshot(&db).await, invitations_before);
+    assert_eq!(
+        invitation_snapshot(&db, base_version).await,
+        invitations_before
+    );
     if with_sessions {
         // Migration 18 (ADR 0030) keeps every session row, and the one issued before the
         // upgrade still validates as the API role. Its secret is 32 bytes of 0x0a.
@@ -1511,33 +1491,18 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
             .unwrap_or_else(|| panic!("{text}"));
         let reported: Vec<&str> = reported.lines().next().unwrap().split("; ").collect();
         assert!(!reported.is_empty(), "{text}");
-        let v15 = [
-            "openmettle.project_settings",
-            "openmettle.local_groups",
-            "openmettle.local_group_memberships",
-            "openmettle.account_admin_lock",
-            "openmettle.account_admins",
-            "openmettle.platform_capability_denies",
-            "openmettle.user_capability_denies",
-            "openmettle.user_capability_grants",
-            "openmettle.authorization_audit",
-            "openmettle.runs.state",
-            "openmettle.runs.wait_reason",
-            // Migration 16 (ADR 0027 PR4a).
-            "openmettle.grant_assignments.grantee_kind",
-            "openmettle.grant_assignments.grantee_local_group_id",
-            "openmettle.grant_assignments.grantee_oidc_group_id",
-            "openmettle.projects.lock_guard",
-            // Migration 17 (ADR 0031).
-            "openmettle.artifact_revisions.display_name",
-            // Migration 19 (ADR 0032).
-            "openmettle.runs.actor_approval_id",
-            "openmettle.runs.round_limit",
-            "openmettle.runs.queue_expires_at",
-            "openmettle.runs.claim_token",
-            "openmettle.runs.claimed_at",
-            "openmettle.run_dispatch_lock",
-        ];
+        let later_objects: Vec<String> = expected_added_tables_since(14)
+            .map(|entry| format!("openmettle.{}", entry.table))
+            .chain(
+                additive_columns_since(14)
+                    .map(|entry| format!("openmettle.{}.{}", entry.table, entry.column)),
+            )
+            // Pre-existing `runs` columns that gained worker UPDATE grants in migration 15.
+            .chain([
+                "openmettle.runs.state".to_owned(),
+                "openmettle.runs.wait_reason".to_owned(),
+            ])
+            .collect();
         let worker_reads = [
             "openmettle_worker has SELECT on openmettle.membership_observations",
             "openmettle_worker has SELECT on openmettle.local_identity_approvals",
@@ -1549,7 +1514,7 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
             let later = violation.contains("openmettle.native_handoffs")
                 || violation.ends_with(" on function openmettle.redeem_home_invitation(uuid,text,text,text,bigint,bytea)")
                 || worker_reads.contains(violation)
-                || v15.iter().any(|object| {
+                || later_objects.iter().any(|object| {
                     violation.ends_with(&format!(" on {object}"))
                         || violation.contains(&format!(" on {object}."))
                 });
@@ -1590,11 +1555,11 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
         assert!(process.0.wait().unwrap().success());
     }
     change(&db, &input(&c, "after-upgrade")).await.unwrap();
-    assert_eq!(old_domain_snapshot(&db).await, before); // Sharing changes no owner, charge or limit.
+    assert_eq!(old_domain_snapshot(&db, base_version).await, before); // Sharing changes no owner, charge or limit.
     migrate::apply(&db.settings(Duration::from_secs(10)), MIGRATIONS)
         .await
         .unwrap();
-    assert_eq!(old_domain_snapshot(&db).await, before);
+    assert_eq!(old_domain_snapshot(&db, base_version).await, before);
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
@@ -1653,25 +1618,16 @@ async fn legal_bounds_and_distinct_provider_bindings() {
     );
 }
 
-async fn grant_snapshot(db: &TestDb) -> Vec<String> {
-    let mut result = Vec::new();
-    for table in [
-        "grant_mapping_rules",
-        "grant_mapping_revisions",
-        "grant_assignments",
-        "grant_changes",
-    ] {
-        // Migration 16 only adds grantee columns: 'user' and NULLs on every earlier row.
-        // Migration 18 only adds the inert rule lock guard: false on every row.
-        let rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT (to_jsonb(t) - 'grantee_kind' - 'grantee_local_group_id'
-                     - 'grantee_oidc_group_id' - 'lock_guard')::text FROM openmettle.{table} t ORDER BY 1"
-        )))
-        .fetch_all(&mut db.admin().await)
-        .await
-        .unwrap();
-        assert!(!rows.is_empty());
-        result.extend(rows);
-    }
-    result
+async fn grant_snapshot(db: &TestDb, base_version: i64) -> Vec<String> {
+    snapshot_nonempty_at(
+        &mut db.admin().await,
+        &[
+            "grant_mapping_rules",
+            "grant_mapping_revisions",
+            "grant_assignments",
+            "grant_changes",
+        ],
+        base_version,
+    )
+    .await
 }
