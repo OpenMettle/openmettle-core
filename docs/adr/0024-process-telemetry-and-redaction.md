@@ -143,7 +143,7 @@ An invalid value exits 78 with one fixed line, `configuration error: invalid LOG
 | `migration.failed` | error | `role`, `error.type`: the `migrate::Failure` class (`Invalid`, `ConnectTimeout`, `Connect`, `Check`, `Refused`, `Violated` or `Migrate`), or `SignalRegistration` when signal handlers could not be installed before the run |
 | `migration.interrupted` | error | `role`, `signal`. The run exits 1, so it is visible at every level |
 | `http.request.completed` | debug or warn | `request_id`, `http.route`, `http.request.method`, `http.response.status_code`, `duration_us` |
-| `telemetry.dropped` | error | `dropped_lines` |
+| `telemetry.dropped` | error | `dropped_lines` (and `dropped_spans` / `dropped_metric_exports` when OTLP export is enabled; ADRs 0026 and 0028) |
 
 Each JSON line is one object with `timestamp`, `level` and these fields at the top level.
 

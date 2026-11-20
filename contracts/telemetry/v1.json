@@ -1,0 +1,251 @@
+{
+  "contract_version": "1.0.0",
+  "service_namespace": "openmettle",
+  "semantic_conventions_version": "1.37.0",
+  "policy": {
+    "inbound_trace_context": "ignored",
+    "logs_transport": "stderr",
+    "otlp_transport": "https-http1-protobuf",
+    "prometheus_translation": "UnderscoreEscapingWithSuffixes",
+    "resource_attributes": [
+      "service.name",
+      "service.instance.id"
+    ],
+    "retention_ceilings": {
+      "traces_hours": 72,
+      "logs_days": 7,
+      "metrics_days": 14
+    },
+    "max_data_point_streams": 357,
+    "max_prometheus_series_per_process": 1020,
+    "disallowed_metric_label_substrings": [
+      "user_id",
+      "scope_id",
+      "project_id",
+      "conversation_id",
+      "artifact_id",
+      "request_id",
+      "run_id",
+      "attempt_id",
+      "operation_id",
+      "lease_id",
+      "session_id",
+      "token",
+      "secret",
+      "password",
+      "cookie",
+      "email",
+      "subject",
+      "prompt",
+      "body",
+      "query"
+    ],
+    "excluded_from_all_telemetry": [
+      "prompts",
+      "responses",
+      "documents",
+      "credentials",
+      "tool_arguments",
+      "raw_exception_bodies",
+      "user_id",
+      "scope_id",
+      "cookies",
+      "authorization_headers",
+      "query_strings"
+    ]
+  },
+  "logs": {
+    "target": "openmettle_core::telemetry",
+    "allowed_fields": [
+      "event",
+      "role",
+      "signal",
+      "request_id",
+      "http.route",
+      "http.request.method",
+      "http.response.status_code",
+      "duration_us",
+      "error.type",
+      "schema_version",
+      "dropped_lines",
+      "dropped_spans",
+      "dropped_metric_exports"
+    ],
+    "events": [
+      {
+        "name": "http.request.completed",
+        "levels": ["debug", "warn"],
+        "fields": ["event", "request_id", "http.route", "http.request.method", "http.response.status_code", "duration_us"]
+      },
+      {
+        "name": "process.started",
+        "levels": ["info"],
+        "fields": ["event", "role"]
+      },
+      {
+        "name": "process.stopping",
+        "levels": ["info"],
+        "fields": ["event", "role", "signal"]
+      },
+      {
+        "name": "process.stopped",
+        "levels": ["info"],
+        "fields": ["event", "role"]
+      },
+      {
+        "name": "process.failed",
+        "levels": ["error"],
+        "fields": ["event", "role", "error.type"]
+      },
+      {
+        "name": "process.panicked",
+        "levels": ["error"],
+        "fields": ["event", "role"]
+      },
+      {
+        "name": "telemetry.dropped",
+        "levels": ["error"],
+        "fields": ["event", "dropped_lines", "dropped_spans", "dropped_metric_exports"]
+      },
+      {
+        "name": "migration.started",
+        "levels": ["info"],
+        "fields": ["event", "role"]
+      },
+      {
+        "name": "migration.completed",
+        "levels": ["info"],
+        "fields": ["event", "role", "schema_version"]
+      },
+      {
+        "name": "migration.failed",
+        "levels": ["error"],
+        "fields": ["event", "role", "error.type"]
+      },
+      {
+        "name": "migration.interrupted",
+        "levels": ["error"],
+        "fields": ["event", "role", "signal"]
+      }
+    ]
+  },
+  "traces": {
+    "target": "openmettle_core::telemetry",
+    "allowed_fields": [
+      "otel.kind",
+      "request_id",
+      "http.route",
+      "http.request.method",
+      "http.response.status_code"
+    ],
+    "spans": [
+      {
+        "name": "http.server.request",
+        "kind": "server",
+        "excluded_routes": ["/healthz", "/readyz"],
+        "max_attributes": 8,
+        "max_events": 0,
+        "max_links": 0
+      }
+    ]
+  },
+  "metrics": [
+    {
+      "name": "openmettle.http.server.requests",
+      "prometheus_name": "openmettle_http_server_requests_total",
+      "kind": "counter",
+      "unit": "{request}",
+      "max_series": 240,
+      "labels": {
+        "http.request.method": ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "_OTHER"],
+        "openmettle.route_class": ["healthz", "readyz", "auth", "v1", "other", "unmatched"],
+        "http.response.status_class": ["2xx", "3xx", "4xx", "5xx", "other"]
+      }
+    },
+    {
+      "name": "openmettle.http.server.request.duration",
+      "prometheus_name": "openmettle_http_server_request_duration_seconds",
+      "kind": "histogram",
+      "unit": "s",
+      "max_series": 30,
+      "buckets": [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+      "labels": {
+        "openmettle.route_class": ["healthz", "readyz", "auth", "v1", "other", "unmatched"],
+        "http.response.status_class": ["2xx", "3xx", "4xx", "5xx", "other"]
+      }
+    },
+    {
+      "name": "openmettle.db.readiness.checks",
+      "prometheus_name": "openmettle_db_readiness_checks_total",
+      "kind": "counter",
+      "unit": "{check}",
+      "max_series": 3,
+      "labels": {
+        "outcome": ["ok", "timeout", "error"]
+      }
+    },
+    {
+      "name": "openmettle.db.readiness.duration",
+      "prometheus_name": "openmettle_db_readiness_duration_seconds",
+      "kind": "histogram",
+      "unit": "s",
+      "max_series": 3,
+      "buckets": [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+      "labels": {
+        "outcome": ["ok", "timeout", "error"]
+      }
+    },
+    {
+      "name": "openmettle.provider.http.requests",
+      "prometheus_name": "openmettle_provider_http_requests_total",
+      "kind": "counter",
+      "unit": "{request}",
+      "max_series": 18,
+      "labels": {
+        "operation": ["discovery", "jwks", "token"],
+        "outcome": ["ok", "http_error", "timeout", "transport", "refused", "body_limit"]
+      }
+    },
+    {
+      "name": "openmettle.provider.http.duration",
+      "prometheus_name": "openmettle_provider_http_duration_seconds",
+      "kind": "histogram",
+      "unit": "s",
+      "max_series": 18,
+      "buckets": [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+      "labels": {
+        "operation": ["discovery", "jwks", "token"],
+        "outcome": ["ok", "http_error", "timeout", "transport", "refused", "body_limit"]
+      }
+    },
+    {
+      "name": "openmettle.storage.operations",
+      "prometheus_name": "openmettle_storage_operations_total",
+      "kind": "counter",
+      "unit": "{operation}",
+      "semantics": "helper_attempts_before_commit",
+      "max_series": 42,
+      "labels": {
+        "operation": ["reserve", "settle", "release", "retain", "restore", "begin_purge", "confirm_purge"],
+        "outcome": ["ok", "quota_refused", "conflict", "not_found", "invalid", "error"]
+      }
+    },
+    {
+      "name": "openmettle.telemetry.dropped",
+      "prometheus_name": "openmettle_telemetry_dropped_total",
+      "kind": "counter",
+      "unit": "{item}",
+      "max_series": 3,
+      "labels": {
+        "signal": ["log_lines", "trace_spans", "metric_exports"]
+      }
+    }
+  ],
+  "reserved_signals": [
+    {"name": "openmettle.runs.queue.age", "owner_ticket": "V1-10", "status": "planned"},
+    {"name": "openmettle.runs.cancellations", "owner_ticket": "V1-11", "status": "planned"},
+    {"name": "openmettle.capacity.grants", "owner_ticket": "V1-17", "status": "planned"},
+    {"name": "openmettle.storage.quota.drift", "owner_ticket": "V1-18", "status": "planned"},
+    {"name": "openmettle.backup.runs", "owner_ticket": "V1-30", "status": "planned"}
+  ]
+}

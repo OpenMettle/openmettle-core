@@ -38,6 +38,7 @@ use tracing_subscriber::{
     layer::{Context, Filter, SubscriberExt},
 };
 
+pub mod metrics;
 pub mod otlp;
 mod sink;
 
@@ -59,6 +60,7 @@ pub const FIELDS: &[&str] = &[
     "schema_version",
     "dropped_lines",
     "dropped_spans",
+    "dropped_metric_exports",
 ];
 
 /// The only field names [`SpanGuard`] admits: the request span's. `otel.kind` is consumed by
@@ -307,7 +309,7 @@ pub fn install(
     let (tracer, exporter) = match export {
         Some(destination) => {
             let (tracer, exporter) = otlp::start(destination, role);
-            (Some(tracer), Some(exporter))
+            (tracer, Some(exporter))
         }
         None => (None, None),
     };
@@ -450,6 +452,20 @@ pub enum Method {
 }
 
 impl Method {
+    pub const ALL: &'static [Self] = &[
+        Self::Get,
+        Self::Head,
+        Self::Post,
+        Self::Put,
+        Self::Delete,
+        Self::Patch,
+        Self::Options,
+        Self::Other,
+    ];
+    pub const NAMES: &'static [&'static str] = &[
+        "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "_OTHER",
+    ];
+
     fn of(method: &HttpMethod) -> Self {
         match *method {
             HttpMethod::GET => Self::Get,
@@ -462,16 +478,19 @@ impl Method {
             _ => Self::Other,
         }
     }
-    fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
+        Self::NAMES[self.index()]
+    }
+    pub(crate) const fn index(self) -> usize {
         match self {
-            Self::Get => "GET",
-            Self::Head => "HEAD",
-            Self::Post => "POST",
-            Self::Put => "PUT",
-            Self::Delete => "DELETE",
-            Self::Patch => "PATCH",
-            Self::Options => "OPTIONS",
-            Self::Other => "_OTHER",
+            Self::Get => 0,
+            Self::Head => 1,
+            Self::Post => 2,
+            Self::Put => 3,
+            Self::Delete => 4,
+            Self::Patch => 5,
+            Self::Options => 6,
+            Self::Other => 7,
         }
     }
 }
@@ -510,11 +529,18 @@ async fn request(mut request: Request, next: Next) -> Response {
     let span = (!route.is_probe()).then(|| request_span(id, &route, method));
     let response = next.run(request).await;
     let status = response.status().as_u16();
+    let elapsed = started.elapsed();
     if let Some(span) = &span {
         // As i64: the bridge has no u64 visitor and would export the code as a string.
         span.record("http.response.status_code", i64::from(status));
     }
-    request_completed(id, &route, method, status, started.elapsed());
+    metrics::global().record_http(
+        method,
+        metrics::RouteClass::of(route.as_str()),
+        metrics::StatusClass::of(status),
+        elapsed,
+    );
+    request_completed(id, &route, method, status, elapsed);
     response
 }
 
@@ -617,6 +643,16 @@ fn lines_dropped(count: u64) {
 /// or a batch was not delivered. At most once per export cycle, to stderr only.
 fn spans_dropped(count: u64) {
     tracing::error!(target: TARGET, event = "telemetry.dropped", dropped_spans = count);
+}
+
+/// The OTLP metrics exporter dropped `count` export cycles since its last report. At most
+/// once per export cycle, to stderr only.
+fn metric_exports_dropped(count: u64) {
+    tracing::error!(
+        target: TARGET,
+        event = "telemetry.dropped",
+        dropped_metric_exports = count
+    );
 }
 
 /// A migration run is starting.

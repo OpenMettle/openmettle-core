@@ -1,25 +1,28 @@
-//! OTLP/HTTP protobuf trace export (ADR 0026), off by default.
+//! OTLP/HTTP protobuf trace and metrics export (ADRs 0026, 0028), off by default.
 //!
-//! Configured only through `OTLP_TRACES_ENDPOINT` (with optional `OTLP_CA_FILE` and
-//! `OTLP_PRIVATE_RANGES`) under the API's or worker's prefix. Unset, none of this module runs:
-//! no tracer provider, task, DNS slot or socket exists.
+//! Configured only through `OTLP_TRACES_ENDPOINT` and/or `OTLP_METRICS_ENDPOINT` (with optional
+//! `OTLP_CA_FILE` and `OTLP_PRIVATE_RANGES`) under the API's or worker's prefix. Unset, none of
+//! this module runs: no tracer provider, export task, DNS slot or socket exists.
 //!
-//! Configured, the [`SpanGuard`](super::SpanGuard) admits only this crate's request span, so
-//! the SDK sees nothing else. Ended spans are offered to a bounded queue without waiting
-//! ([`Processor`]); one Tokio task batches them, encodes `ExportTraceServiceRequest` with the
-//! generated protobuf messages and POSTs each batch over the ADR 0010 transport core
-//! ([`Route`]) to the one configured HTTPS endpoint, with its own two DNS slots. A full queue,
-//! a non-2xx answer, a timeout or any transport failure drops spans and counts them; the task
-//! reports the count to stderr at most once per cycle. Nothing is retried, redirected,
-//! proxied, compressed or authenticated, and no inbound trace context is read.
-use super::{Process, TARGET, spans_dropped};
+//! When trace export is configured, [`SpanGuard`](super::SpanGuard) admits only this crate's
+//! request span, so the SDK sees nothing else. Ended spans are offered to a bounded queue without
+//! waiting ([`Processor`]); one Tokio task batches them, encodes `ExportTraceServiceRequest` and
+//! POSTs each batch over the ADR 0010 transport core ([`Route`]). When metrics export is
+//! configured, one Tokio task periodically snapshots the fixed-cardinality [`Metrics`] registry,
+//! encodes `ExportMetricsServiceRequest` and POSTs it over the same [`Route`] and DNS slots.
+//! Failures drop without retry and emit one `telemetry.dropped` event to stderr per cycle.
+use super::{
+    Process, RequestId, TARGET, metric_exports_dropped,
+    metrics::{DroppedSignal, MetricsSource},
+    spans_dropped,
+};
 use crate::provider_http::{
     MAX_PRIVATE_RANGES, MAX_RESPONSE_HEADER_BYTES, MAX_RESPONSE_HEADERS, MAX_TRUST_BUNDLE_BYTES,
     Trust,
     transport::{self, Endpoint, Limits, Lookup, Range, Route},
 };
 use openidconnect::http::{self, HeaderMap, HeaderValue, header};
-use opentelemetry::{InstrumentationScope, trace::TracerProvider as _};
+use opentelemetry::{InstrumentationScope, KeyValue, trace::TracerProvider as _};
 use opentelemetry_proto::{
     tonic::collector::trace::v1::ExportTraceServiceRequest,
     transform::{
@@ -51,7 +54,7 @@ use tokio::{
 pub const QUEUE_CAPACITY: usize = 2048;
 /// Spans per request.
 pub const MAX_BATCH: usize = 512;
-/// The longest a span waits for a batch to fill.
+/// The longest a span waits for a batch to fill, and the metrics snapshot export period.
 pub const EXPORT_INTERVAL: Duration = Duration::from_secs(5);
 /// One export, from DNS queueing to the end of the response.
 pub const EXPORT_DEADLINE: Duration = Duration::from_secs(3);
@@ -65,22 +68,25 @@ pub const DNS_LOOKUP_SLOTS: usize = 2;
 /// Validated export settings. Nothing is read from disk until [`Destination::load`].
 #[derive(Clone)]
 pub struct Settings {
-    endpoint: Endpoint,
+    traces: Option<Endpoint>,
+    metrics: Option<Endpoint>,
     allowed: Vec<Range>,
     ca_file: Option<PathBuf>,
 }
 
 impl Settings {
-    /// Reads `OTLP_TRACES_ENDPOINT`, `OTLP_CA_FILE` and `OTLP_PRIVATE_RANGES`, always all three
-    /// and in that order. No endpoint means export is off; the other two are then refused,
-    /// so a CA or range is never silently ignored. Errors name the key, never the value.
+    /// Reads `OTLP_TRACES_ENDPOINT`, `OTLP_METRICS_ENDPOINT`, `OTLP_CA_FILE` and
+    /// `OTLP_PRIVATE_RANGES`, always all four and in that order. When neither endpoint is set,
+    /// export is off and the other two are refused so a CA or range is never silently ignored.
+    /// Errors name the key, never the value.
     pub fn parse(
         get: impl Fn(&str) -> Result<Option<String>, &'static str>,
     ) -> Result<Option<Self>, &'static str> {
-        let endpoint = get("OTLP_TRACES_ENDPOINT")?;
+        let traces = get("OTLP_TRACES_ENDPOINT")?;
+        let metrics = get("OTLP_METRICS_ENDPOINT")?;
         let ca_file = get("OTLP_CA_FILE")?;
         let ranges = get("OTLP_PRIVATE_RANGES")?;
-        let Some(endpoint) = endpoint else {
+        if traces.is_none() && metrics.is_none() {
             if ca_file.is_some() {
                 return Err("invalid OTLP_CA_FILE");
             }
@@ -88,9 +94,13 @@ impl Settings {
                 return Err("invalid OTLP_PRIVATE_RANGES");
             }
             return Ok(None);
-        };
-        let endpoint =
-            transport::endpoint(&endpoint).map_err(|_| "invalid OTLP_TRACES_ENDPOINT")?;
+        }
+        let traces = traces
+            .map(|url| transport::endpoint(&url).map_err(|_| "invalid OTLP_TRACES_ENDPOINT"))
+            .transpose()?;
+        let metrics = metrics
+            .map(|url| transport::endpoint(&url).map_err(|_| "invalid OTLP_METRICS_ENDPOINT"))
+            .transpose()?;
         let ca_file = ca_file.map(PathBuf::from);
         if ca_file.as_deref().is_some_and(|path| !path.is_absolute()) {
             return Err("invalid OTLP_CA_FILE");
@@ -115,7 +125,8 @@ impl Settings {
             }
         };
         Ok(Some(Self {
-            endpoint,
+            traces,
+            metrics,
             allowed,
             ca_file,
         }))
@@ -141,9 +152,10 @@ const TUNING: Tuning = Tuning {
     request_body: MAX_REQUEST_BYTES,
 };
 
-/// A loaded destination: the endpoint, its address allowlist, TLS trust and DNS slots.
+/// A loaded destination: configured endpoints, address allowlist, TLS trust and DNS slots.
 pub struct Destination {
-    endpoint: Endpoint,
+    traces: Option<Endpoint>,
+    metrics: Option<Endpoint>,
     allowed: Vec<Range>,
     tls: Arc<rustls::ClientConfig>,
     lookup: Lookup,
@@ -172,7 +184,8 @@ impl Destination {
         .map_err(|_| refusal)?;
         let tls = transport::client_config(roots).map_err(|_| refusal)?;
         Ok(Self {
-            endpoint: settings.endpoint.clone(),
+            traces: settings.traces.clone(),
+            metrics: settings.metrics.clone(),
             allowed: settings.allowed.clone(),
             tls,
             lookup: Arc::new(transport::system_lookup),
@@ -237,72 +250,182 @@ impl SpanProcessor for Processor {
     }
 }
 
-/// The running exporter, kept by the process to stop it within the shutdown deadline.
+/// Shared transport settings held by whichever OTLP export tasks are active.
+struct SharedTransport {
+    allowed: Vec<Range>,
+    tls: Arc<rustls::ClientConfig>,
+    lookup: Lookup,
+    slots: Arc<Semaphore>,
+    tuning: Tuning,
+    #[cfg(test)]
+    loopback: bool,
+}
+
+/// The running OTLP exporter(s), kept by the process to stop them within the shutdown deadline.
 pub struct Exporter {
-    provider: SdkTracerProvider,
-    task: JoinHandle<()>,
+    traces: Option<(SdkTracerProvider, JoinHandle<()>)>,
+    metrics: Option<(Arc<Notify>, JoinHandle<()>)>,
 }
 
 impl Exporter {
-    /// Stops accepting spans, lets the task send what is queued until `deadline`, then
-    /// cancels it. Cancelling drops any connection in progress, which closes its socket.
+    /// Stops accepting spans and signals the metrics task, lets active exporters finish until
+    /// `deadline`, then aborts any remaining task (closing its socket).
     pub async fn stop(mut self, deadline: Instant) {
-        let _ = self.provider.shutdown();
-        if tokio::time::timeout_at(deadline, &mut self.task)
-            .await
-            .is_err()
-        {
-            self.task.abort();
+        if let Some((provider, _)) = &self.traces {
+            let _ = provider.shutdown();
+        }
+        if let Some((stop, _)) = &self.metrics {
+            stop.notify_one();
+        }
+        let mut trace_task = self.traces.as_mut().map(|(_, task)| task);
+        let mut metric_task = self.metrics.as_mut().map(|(_, task)| task);
+        let drain = async {
+            let t = async {
+                if let Some(task) = trace_task.as_deref_mut() {
+                    let _ = task.await;
+                }
+            };
+            let m = async {
+                if let Some(task) = metric_task.as_deref_mut() {
+                    let _ = task.await;
+                }
+            };
+            tokio::join!(t, m);
+        };
+        if tokio::time::timeout_at(deadline, drain).await.is_err() {
+            if let Some(task) = trace_task {
+                task.abort();
+            }
+            if let Some(task) = metric_task {
+                task.abort();
+            }
         }
     }
 }
 
 impl Drop for Exporter {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some((_, task)) = &self.traces {
+            task.abort();
+        }
+        if let Some((_, task)) = &self.metrics {
+            task.abort();
+        }
     }
 }
 
-/// Starts the export task on the current Tokio runtime and returns the tracer for the span
-/// layer. Sampling, limits and the resource are explicit, so ambient `OTEL_*` variables have
-/// no effect: always on, at most eight attributes and no events or links per span, and
-/// `service.name = openmettle-{role}` as the only resource attribute.
-pub fn start(destination: Destination, role: Process) -> (SdkTracer, Exporter) {
-    let (queue, spans) = mpsc::channel(destination.tuning.queue);
-    let shared = Arc::new(Shared::default());
-    let resource = Resource::builder_empty()
-        .with_service_name(format!("openmettle-{}", role.as_str()))
-        .build();
-    let attributes = ResourceAttributesWithSchema::from(&resource);
-    let limits = SpanLimits {
-        max_attributes_per_span: 8,
-        max_events_per_span: 0,
-        max_links_per_span: 0,
-        max_attributes_per_event: 0,
-        max_attributes_per_link: 0,
-    };
-    let provider = SdkTracerProvider::builder()
-        .with_sampler(Sampler::AlwaysOn)
-        .with_span_limits(limits)
-        .with_resource(resource)
-        .with_span_processor(Processor {
-            queue,
-            shared: shared.clone(),
-        })
-        .build();
-    let tracer = provider.tracer_with_scope(InstrumentationScope::builder(TARGET).build());
-    let task = tokio::spawn(export(spans, shared, destination, attributes));
-    (tracer, Exporter { provider, task })
+/// Starts whichever OTLP export tasks `destination` configured on the current Tokio runtime.
+/// Sampling, limits and resource are explicit, so ambient `OTEL_*` variables have no effect.
+pub fn start(destination: Destination, role: Process) -> (Option<SdkTracer>, Exporter) {
+    start_inner(
+        destination,
+        role,
+        MetricsSource::Global(super::metrics::global()),
+    )
 }
 
-/// The export task: one batch in flight at a time.
-async fn export(
+#[cfg(test)]
+pub(crate) fn start_with_metrics(
+    destination: Destination,
+    role: Process,
+    metrics: Arc<super::metrics::Metrics>,
+) -> (Option<SdkTracer>, Exporter) {
+    start_inner(destination, role, MetricsSource::Owned(metrics))
+}
+
+fn start_inner(
+    destination: Destination,
+    role: Process,
+    metrics: MetricsSource,
+) -> (Option<SdkTracer>, Exporter) {
+    let Destination {
+        traces: trace_endpoint,
+        metrics: metric_endpoint,
+        allowed,
+        tls,
+        lookup,
+        slots,
+        tuning,
+        #[cfg(test)]
+        loopback,
+    } = destination;
+    let transport = Arc::new(SharedTransport {
+        allowed,
+        tls,
+        lookup,
+        slots,
+        tuning,
+        #[cfg(test)]
+        loopback,
+    });
+    // Per-process random UUIDv4 so replicas produce distinct Prometheus `instance` streams
+    // without disclosing any host, pod, user or scope identity.
+    let instance_id = RequestId::generate().map(|id| id.to_string());
+    let (tracer, traces) = match trace_endpoint {
+        Some(endpoint) => {
+            let (queue, spans) = mpsc::channel(transport.tuning.queue);
+            let shared = Arc::new(Shared::default());
+            let mut builder = Resource::builder_empty()
+                .with_service_name(format!("openmettle-{}", role.as_str()));
+            if let Some(id) = &instance_id {
+                builder = builder.with_attribute(KeyValue::new("service.instance.id", id.clone()));
+            }
+            let resource = builder.build();
+            let attributes = ResourceAttributesWithSchema::from(&resource);
+            let limits = SpanLimits {
+                max_attributes_per_span: 8,
+                max_events_per_span: 0,
+                max_links_per_span: 0,
+                max_attributes_per_event: 0,
+                max_attributes_per_link: 0,
+            };
+            let provider = SdkTracerProvider::builder()
+                .with_sampler(Sampler::AlwaysOn)
+                .with_span_limits(limits)
+                .with_resource(resource)
+                .with_span_processor(Processor {
+                    queue,
+                    shared: shared.clone(),
+                })
+                .build();
+            let tracer = provider.tracer_with_scope(InstrumentationScope::builder(TARGET).build());
+            let task = tokio::spawn(export_traces(
+                spans,
+                shared,
+                metrics.clone(),
+                transport.clone(),
+                endpoint,
+                attributes,
+            ));
+            (Some(tracer), Some((provider, task)))
+        }
+        None => (None, None),
+    };
+    let metrics = metric_endpoint.map(|endpoint| {
+        let stop = Arc::new(Notify::new());
+        let task = tokio::spawn(export_metrics(
+            metrics,
+            role,
+            instance_id,
+            stop.clone(),
+            transport,
+            endpoint,
+        ));
+        (stop, task)
+    });
+    (tracer, Exporter { traces, metrics })
+}
+
+/// The trace export task: one batch in flight at a time.
+async fn export_traces(
     mut spans: mpsc::Receiver<SpanData>,
     shared: Arc<Shared>,
-    destination: Destination,
+    metrics: MetricsSource,
+    transport: Arc<SharedTransport>,
+    endpoint: Endpoint,
     resource: ResourceAttributesWithSchema,
 ) {
-    let tuning = destination.tuning;
+    let tuning = transport.tuning;
     let mut batch = Vec::with_capacity(tuning.batch);
     loop {
         let wake = Instant::now() + tuning.interval;
@@ -334,29 +457,93 @@ async fn export(
                 if batch.is_empty() {
                     break;
                 }
-                send(&destination, &resource, &shared, std::mem::take(&mut batch)).await;
+                send_spans(
+                    &transport,
+                    &endpoint,
+                    &resource,
+                    &shared,
+                    std::mem::take(&mut batch),
+                )
+                .await;
             }
-            report(&shared);
+            report(&shared, &metrics);
             return;
         }
         if !batch.is_empty() {
-            send(&destination, &resource, &shared, std::mem::take(&mut batch)).await;
+            send_spans(
+                &transport,
+                &endpoint,
+                &resource,
+                &shared,
+                std::mem::take(&mut batch),
+            )
+            .await;
         }
-        report(&shared);
+        report(&shared, &metrics);
+    }
+}
+
+/// Periodic cumulative metrics export task: one snapshot in flight at a time.
+async fn export_metrics(
+    metrics: MetricsSource,
+    role: Process,
+    instance_id: Option<String>,
+    stop: Arc<Notify>,
+    transport: Arc<SharedTransport>,
+    endpoint: Endpoint,
+) {
+    let interval = transport.tuning.interval;
+    loop {
+        let stopping = tokio::select! {
+            biased;
+            () = stop.notified() => true,
+            () = tokio::time::sleep(interval) => false,
+        };
+        send_metrics(
+            &transport,
+            &endpoint,
+            metrics.as_ref(),
+            role,
+            instance_id.as_deref(),
+        )
+        .await;
+        if stopping {
+            return;
+        }
+    }
+}
+
+async fn send_metrics(
+    transport: &SharedTransport,
+    endpoint: &Endpoint,
+    metrics: &super::metrics::Metrics,
+    role: Process,
+    instance_id: Option<&str>,
+) {
+    let Some(request) = metrics.encode_otlp(role, instance_id) else {
+        return;
+    };
+    if !post(transport, endpoint, request.encode_to_vec()).await {
+        metrics.record_dropped(DroppedSignal::MetricExports, 1);
+        metric_exports_dropped(1);
     }
 }
 
 /// At most one `telemetry.dropped` event per cycle, to stderr only.
-fn report(shared: &Shared) {
+fn report(shared: &Shared, metrics: &MetricsSource) {
     let dropped = shared.dropped.swap(0, Ordering::Relaxed);
     if dropped > 0 {
+        metrics
+            .as_ref()
+            .record_dropped(DroppedSignal::TraceSpans, dropped);
         spans_dropped(dropped);
     }
 }
 
-/// Exports one batch; any failure drops the whole batch and counts its spans.
-async fn send(
-    destination: &Destination,
+/// Exports one trace batch; any failure drops the whole batch and counts its spans.
+async fn send_spans(
+    transport: &SharedTransport,
+    endpoint: &Endpoint,
     resource: &ResourceAttributesWithSchema,
     shared: &Shared,
     batch: Vec<SpanData>,
@@ -365,35 +552,35 @@ async fn send(
     let request = ExportTraceServiceRequest {
         resource_spans: group_spans_by_resource_and_scope(batch, resource),
     };
-    if !post(destination, request.encode_to_vec()).await {
+    if !post(transport, endpoint, request.encode_to_vec()).await {
         shared.dropped.fetch_add(count, Ordering::Relaxed);
     }
 }
 
 /// One POST over the shared transport core: no retry, redirect, proxy or extra header. Only
 /// a 2xx answer counts as delivered; a partial-success body is not decoded.
-async fn post(destination: &Destination, body: Vec<u8>) -> bool {
+async fn post(transport: &SharedTransport, endpoint: &Endpoint, body: Vec<u8>) -> bool {
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/x-protobuf"),
     );
     let route = Route {
-        endpoint: &destination.endpoint,
-        allowed: &destination.allowed,
-        tls: &destination.tls,
-        lookup: &destination.lookup,
-        slots: &destination.slots,
+        endpoint,
+        allowed: &transport.allowed,
+        tls: &transport.tls,
+        lookup: &transport.lookup,
+        slots: &transport.slots,
         #[cfg(test)]
-        loopback: destination.loopback,
+        loopback: transport.loopback,
     };
     let limits = Limits {
-        request_body: destination.tuning.request_body,
+        request_body: transport.tuning.request_body,
         response_body: MAX_RESPONSE_BYTES,
         response_headers: MAX_RESPONSE_HEADERS,
         response_header_bytes: MAX_RESPONSE_HEADER_BYTES,
-        setup: destination.tuning.deadline,
-        total: destination.tuning.deadline,
+        setup: transport.tuning.deadline,
+        total: transport.tuning.deadline,
     };
     matches!(
         route.send(http::Method::POST, &headers, body, &limits).await,

@@ -6,7 +6,7 @@ use crate::{
     auth_config::tests::support::Dir,
     provider_http::fixture::{self, Ca, Reply, Server, loopback, response},
     telemetry::{
-        Format, Method, Process, RequestId, Route, TARGET, Verbosity, observe,
+        Format, Method, Process, RequestId, Route, TARGET, Verbosity, metrics, observe,
         otlp::{self, Destination, Exporter, Tuning},
         request_span,
     },
@@ -55,6 +55,34 @@ fn settings(port: u16, ca_file: Option<&str>) -> otlp::Settings {
     })
     .unwrap()
     .unwrap()
+}
+
+fn metrics_destination(port: u16, ca: &Ca, tuning: Tuning) -> otlp::Destination {
+    let dir = Dir::new();
+    let path = dir.write("collector-ca.pem", &ca.pem());
+    let endpoint = format!("https://{COLLECTOR}:{port}/v1/metrics");
+    let settings = otlp::Settings::parse(|key| {
+        Ok(match key {
+            "OTLP_METRICS_ENDPOINT" => Some(endpoint.clone()),
+            "OTLP_CA_FILE" => Some(path.clone()),
+            _ => None,
+        })
+    })
+    .unwrap()
+    .unwrap();
+    otlp::Destination::load(&settings)
+        .unwrap()
+        .with_lookup(loopback)
+        .with_tuning(tuning)
+        .allow_loopback_fixture()
+}
+
+fn start_traces(
+    destination: otlp::Destination,
+    role: Process,
+) -> (opentelemetry_sdk::trace::SdkTracer, otlp::Exporter) {
+    let (tracer, exporter) = otlp::start(destination, role);
+    (tracer.expect("traces endpoint configured"), exporter)
 }
 
 /// A destination for `port` trusting only `ca`, loaded through `OTLP_CA_FILE` as in
@@ -231,7 +259,7 @@ fn get_request(target: &str) -> String {
 #[tokio::test]
 async fn export_carries_only_allowlisted_root_request_spans_over_tls_http1() {
     let collector = Collector::accepting().await;
-    let (tracer, exporter) = otlp::start(collector.destination(), Process::Api);
+    let (tracer, exporter) = start_traces(collector.destination(), Process::Api);
     let (capture, _guard) = Capture::install_traced(Format::Json, Verbosity::Debug, tracer);
     let address = serve_app().await;
     let post = format!(
@@ -288,10 +316,12 @@ async fn export_carries_only_allowlisted_root_request_spans_over_tls_http1() {
     );
     for request in collector.requests() {
         for resource in &request.resource_spans {
-            let attributes = &resource.resource.as_ref().unwrap().attributes;
-            assert_eq!(attributes.len(), 1);
-            assert_eq!(attributes[0].key, "service.name");
-            assert_eq!(text(&attributes[0].value), Some("openmettle-api"));
+            let res_attrs = attributes(&resource.resource.as_ref().unwrap().attributes);
+            assert_eq!(res_attrs.len(), 2);
+            assert_eq!(text(res_attrs["service.name"]), Some("openmettle-api"));
+            assert!(super::is_v4(
+                text(res_attrs["service.instance.id"]).unwrap()
+            ));
             for scope in &resource.scope_spans {
                 assert_eq!(scope.scope.as_ref().unwrap().name, TARGET);
             }
@@ -383,7 +413,7 @@ async fn a_stalled_collector_costs_spans_not_serving_or_shutdown() {
         deadline: Duration::from_millis(200),
         ..FAST
     };
-    let (tracer, exporter) = otlp::start(destination(collector.port, &ca, tuning), Process::Api);
+    let (tracer, exporter) = start_traces(destination(collector.port, &ca, tuning), Process::Api);
     let (capture, _guard) = Capture::install_traced(Format::Json, Verbosity::Info, tracer);
     let address = serve_app().await;
 
@@ -551,7 +581,7 @@ async fn failed_exports_drop_their_batch_once_without_retry_or_redirect() {
         let reply = case.reply;
         let server = Server::start(ca.leaf(case.leaf, false), move |_| reply(0)).await;
         let destination = destination(server.port, &ca, FAST).with_lookup(case.lookup);
-        let (tracer, exporter) = otlp::start(destination, Process::Worker);
+        let (tracer, exporter) = start_traces(destination, Process::Worker);
         let (capture, guard) = Capture::install_traced(Format::Json, Verbosity::Info, tracer);
         for _ in 0..3 {
             drop(request_span(
@@ -603,7 +633,7 @@ async fn an_oversized_batch_is_dropped_before_resolution() {
             counted.fetch_add(1, Ordering::SeqCst);
             loopback(host, port)
         });
-    let (tracer, exporter) = otlp::start(destination, Process::Api);
+    let (tracer, exporter) = start_traces(destination, Process::Api);
     let (capture, _guard) = Capture::install_traced(Format::Json, Verbosity::Info, tracer);
     for _ in 0..5 {
         drop(request_span(
@@ -655,7 +685,7 @@ async fn exporter_dns_slots_are_isolated_from_provider_transports() {
     });
     let slots = destination.slots.clone();
     assert_eq!(slots.available_permits(), otlp::DNS_LOOKUP_SLOTS);
-    let (tracer, exporter) = otlp::start(destination, Process::Api);
+    let (tracer, exporter) = start_traces(destination, Process::Api);
     let (capture, _guard) = Capture::install_traced(Format::Json, Verbosity::Info, tracer);
     for _ in 0..3 {
         drop(request_span(
@@ -824,16 +854,17 @@ fn serving_configuration_reads_otlp_keys_after_logging_and_before_auth_config() 
         let level = position("LOG_LEVEL").unwrap();
         let endpoint = position("OTLP_TRACES_ENDPOINT").unwrap();
         assert_eq!(
-            asked[endpoint..endpoint + 3],
+            asked[endpoint..endpoint + 4],
             [
                 "OTLP_TRACES_ENDPOINT",
+                "OTLP_METRICS_ENDPOINT",
                 "OTLP_CA_FILE",
                 "OTLP_PRIVATE_RANGES"
             ]
         );
         assert!(level < endpoint);
         match role {
-            crate::Role::Api => assert_eq!(position("AUTH_CONFIG"), Some(endpoint + 3)),
+            crate::Role::Api => assert_eq!(position("AUTH_CONFIG"), Some(endpoint + 4)),
             crate::Role::Worker => assert_eq!(position("AUTH_CONFIG"), None),
         }
         // A refused OTLP key precedes the AUTH_CONFIG check and follows LOG_* checks.
@@ -873,4 +904,310 @@ fn without_export_the_request_span_is_disabled() {
         assert_eq!(text.lines().count(), 1, "{text}");
         assert!(!text.contains("http.server.request") && !text.contains("request_id"));
     }
+}
+
+#[test]
+fn metrics_endpoint_settings_parse_alone_and_with_traces() {
+    const TRACES: &str = "https://alloy.monitoring.svc.cluster.local:4318/v1/traces";
+    const METRICS: &str = "https://alloy.monitoring.svc.cluster.local:4318/v1/metrics";
+    let parse = |pairs: &[(&str, &str)]| {
+        otlp::Settings::parse(|key| {
+            Ok(pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| (*v).to_owned()))
+        })
+    };
+    assert!(
+        parse(&[("OTLP_METRICS_ENDPOINT", METRICS)])
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        parse(&[
+            ("OTLP_METRICS_ENDPOINT", METRICS),
+            ("OTLP_CA_FILE", "/etc/openmettle/collector-ca.pem"),
+            ("OTLP_PRIVATE_RANGES", "10.43.0.0/16"),
+        ])
+        .unwrap()
+        .is_some()
+    );
+    assert!(
+        parse(&[
+            ("OTLP_TRACES_ENDPOINT", TRACES),
+            ("OTLP_METRICS_ENDPOINT", METRICS),
+        ])
+        .unwrap()
+        .is_some()
+    );
+    for bad in [
+        "",
+        "http://alloy.monitoring.svc:4318/v1/metrics",
+        "https://127.0.0.1:4318/v1/metrics",
+        "https://alloy.monitoring.svc:4318/v1/metrics?token=secret",
+    ] {
+        assert_eq!(
+            parse(&[("OTLP_METRICS_ENDPOINT", bad)]).err(),
+            Some("invalid OTLP_METRICS_ENDPOINT"),
+            "{bad:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn metrics_export_sends_valid_protobuf_over_tls_http1() {
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+    use opentelemetry_proto::tonic::metrics::v1::metric;
+
+    let ca = Ca::new();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let recorded = captured.clone();
+    let server = Server::start(ca.leaf(COLLECTOR, false), move |received| {
+        recorded
+            .lock()
+            .unwrap()
+            .push((received.head.clone(), received.body.clone()));
+        Reply::Bytes(response(200, &[], b""))
+    })
+    .await;
+
+    let store = Arc::new(metrics::Metrics::new());
+    store.record_http(
+        Method::Get,
+        metrics::RouteClass::V1,
+        metrics::StatusClass::S2xx,
+        Duration::from_millis(15),
+    );
+    store.record_db_readiness(metrics::ReadinessOutcome::Ok, Duration::from_millis(2));
+    store.record_provider_http(
+        metrics::ProviderOperation::Jwks,
+        metrics::ProviderOutcome::Ok,
+        Duration::from_millis(40),
+    );
+    store.record_storage(
+        metrics::StorageOperation::Reserve,
+        metrics::StorageOutcome::QuotaRefused,
+    );
+
+    let dest = metrics_destination(server.port, &ca, FAST);
+    let (tracer, exporter) = otlp::start_with_metrics(dest, Process::Api, store);
+    assert!(
+        tracer.is_none(),
+        "metrics-only configuration must not install a tracer"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while captured.lock().unwrap().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for metrics export"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    exporter
+        .stop(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+
+    let requests = captured.lock().unwrap().clone();
+    assert!(!requests.is_empty());
+    let (head, body) = &requests[0];
+    assert!(
+        head.starts_with("POST /v1/metrics HTTP/1.1\r\n"),
+        "unexpected request head: {head:?}"
+    );
+    let decoded = ExportMetricsServiceRequest::decode(body.as_slice())
+        .expect("OTLP ExportMetricsServiceRequest protobuf");
+    assert_eq!(decoded.resource_metrics.len(), 1);
+    let res_attrs = attributes(
+        &decoded.resource_metrics[0]
+            .resource
+            .as_ref()
+            .unwrap()
+            .attributes,
+    );
+    assert_eq!(res_attrs.len(), 2);
+    assert_eq!(text(res_attrs["service.name"]), Some("openmettle-api"));
+    assert!(super::is_v4(
+        text(res_attrs["service.instance.id"]).unwrap()
+    ));
+    let scope_metrics = &decoded.resource_metrics[0].scope_metrics[0];
+    let names: Vec<&str> = scope_metrics
+        .metrics
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
+    assert!(names.contains(&"openmettle.http.server.requests"));
+    assert!(names.contains(&"openmettle.http.server.request.duration"));
+    assert!(names.contains(&"openmettle.db.readiness.checks"));
+    assert!(names.contains(&"openmettle.db.readiness.duration"));
+    assert!(names.contains(&"openmettle.provider.http.requests"));
+    assert!(names.contains(&"openmettle.provider.http.duration"));
+    assert!(names.contains(&"openmettle.storage.operations"));
+
+    let http_req = scope_metrics
+        .metrics
+        .iter()
+        .find(|m| m.name == "openmettle.http.server.requests")
+        .unwrap();
+    let Some(metric::Data::Sum(sum)) = &http_req.data else {
+        panic!("expected monotonic Sum");
+    };
+    assert!(sum.is_monotonic);
+    assert_eq!(sum.data_points.len(), 1);
+}
+
+#[tokio::test]
+async fn metrics_export_drops_on_collector_failure_and_reports_to_stderr() {
+    let ca = Ca::new();
+    let server = Server::start(ca.leaf(COLLECTOR, false), |_| {
+        Reply::Bytes(response(503, &[], b""))
+    })
+    .await;
+    let store = Arc::new(metrics::Metrics::new());
+    store.record_db_readiness(metrics::ReadinessOutcome::Error, Duration::from_millis(5));
+
+    let (capture, _guard) = Capture::install(Format::Json, Verbosity::Info);
+    let dest = metrics_destination(server.port, &ca, FAST);
+    let (_, exporter) = otlp::start_with_metrics(dest, Process::Worker, store.clone());
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while store.dropped_count(metrics::DroppedSignal::MetricExports) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for dropped metric export report"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    exporter
+        .stop(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+
+    let text = capture.text();
+    let dropped_events: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|v: &serde_json::Value| v["event"] == "telemetry.dropped")
+        .collect();
+    assert!(
+        !dropped_events.is_empty(),
+        "expected telemetry.dropped in {text}"
+    );
+    assert!(
+        dropped_events
+            .iter()
+            .all(|v| v["dropped_metric_exports"].as_u64().unwrap_or(0) >= 1),
+        "{dropped_events:?}"
+    );
+}
+
+/// A stalled metrics collector (accepts TCP and never reads) must not extend `Exporter::stop`
+/// beyond its shutdown budget.
+#[tokio::test]
+async fn metrics_stalled_collector_does_not_extend_shutdown_deadline() {
+    let collector = Stalled::start().await;
+    let ca = Ca::new();
+    let tuning = Tuning {
+        deadline: Duration::from_secs(5),
+        interval: Duration::from_millis(10),
+        ..FAST
+    };
+    let store = Arc::new(metrics::Metrics::new());
+    store.record_db_readiness(metrics::ReadinessOutcome::Ok, Duration::from_millis(1));
+    let dest = metrics_destination(collector.port, &ca, tuning);
+    let (_, exporter) = otlp::start_with_metrics(dest, Process::Api, store);
+
+    until(|| collector.connections() >= 1).await;
+    let budget = Duration::from_millis(125);
+    let started = Instant::now();
+    exporter.stop(tokio::time::Instant::now() + budget).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "stalled metrics collector held shutdown for {:?}",
+        started.elapsed()
+    );
+}
+
+/// When both `OTLP_TRACES_ENDPOINT` and `OTLP_METRICS_ENDPOINT` are configured, both tasks
+/// export concurrently over the shared transport, carry the exact same `service.instance.id`,
+/// and drain cleanly on `Exporter::stop`.
+#[tokio::test]
+async fn traces_and_metrics_export_concurrently_and_stop_cleanly() {
+    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+
+    let ca = Ca::new();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let recorded = captured.clone();
+    let server = Server::start(ca.leaf(COLLECTOR, false), move |received| {
+        recorded
+            .lock()
+            .unwrap()
+            .push((received.head.clone(), received.body.clone()));
+        Reply::Bytes(response(200, &[], b""))
+    })
+    .await;
+
+    let dir = Dir::new();
+    let path = dir.write("collector-ca.pem", &ca.pem());
+    let traces_url = format!("https://{COLLECTOR}:{}/v1/traces", server.port);
+    let metrics_url = format!("https://{COLLECTOR}:{}/v1/metrics", server.port);
+    let settings = otlp::Settings::parse(|key| {
+        Ok(match key {
+            "OTLP_TRACES_ENDPOINT" => Some(traces_url.clone()),
+            "OTLP_METRICS_ENDPOINT" => Some(metrics_url.clone()),
+            "OTLP_CA_FILE" => Some(path.clone()),
+            _ => None,
+        })
+    })
+    .unwrap()
+    .unwrap();
+    let dest = Destination::load(&settings)
+        .unwrap()
+        .with_lookup(loopback)
+        .with_tuning(FAST)
+        .allow_loopback_fixture();
+
+    let store = Arc::new(metrics::Metrics::new());
+    store.record_db_readiness(metrics::ReadinessOutcome::Ok, Duration::from_millis(2));
+    let (tracer, exporter) = otlp::start_with_metrics(dest, Process::Api, store);
+    let tracer = tracer.expect("traces endpoint configured");
+    let (_capture, _guard) = Capture::install_traced(Format::Json, Verbosity::Info, tracer);
+    drop(request_span(
+        RequestId::generate(),
+        &Route(None),
+        Method::Get,
+    ));
+    finish(exporter).await;
+
+    let requests = captured.lock().unwrap().clone();
+    let trace_body = requests
+        .iter()
+        .find(|(h, _)| h.starts_with("POST /v1/traces HTTP/1.1\r\n"))
+        .map(|(_, b)| b)
+        .expect("expected /v1/traces export");
+    let metric_body = requests
+        .iter()
+        .find(|(h, _)| h.starts_with("POST /v1/metrics HTTP/1.1\r\n"))
+        .map(|(_, b)| b)
+        .expect("expected /v1/metrics export");
+
+    let trace_req = ExportTraceServiceRequest::decode(trace_body.as_slice()).unwrap();
+    let metric_req = ExportMetricsServiceRequest::decode(metric_body.as_slice()).unwrap();
+    let trace_res = attributes(
+        &trace_req.resource_spans[0]
+            .resource
+            .as_ref()
+            .unwrap()
+            .attributes,
+    );
+    let metric_res = attributes(
+        &metric_req.resource_metrics[0]
+            .resource
+            .as_ref()
+            .unwrap()
+            .attributes,
+    );
+    let trace_instance = text(trace_res["service.instance.id"]).unwrap();
+    let metric_instance = text(metric_res["service.instance.id"]).unwrap();
+    assert!(super::is_v4(trace_instance));
+    assert_eq!(trace_instance, metric_instance);
 }

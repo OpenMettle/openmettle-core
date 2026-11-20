@@ -296,6 +296,8 @@ fn every_constructor_passes_the_guard_with_its_fields() {
     migration_interrupted(Signal::Terminate);
     process_panicked(Process::Migrate);
     lines_dropped(3);
+    spans_dropped(2);
+    metric_exports_dropped(1);
     let route = Route(None);
     let id = RequestId::generate();
     request_completed(id, &route, Method::Other, 404, Duration::from_micros(7));
@@ -334,6 +336,16 @@ fn every_constructor_passes_the_guard_with_its_fields() {
             "ERROR",
             ["timestamp", "level", "event", "dropped_lines"].into(),
         ),
+        (
+            "telemetry.dropped",
+            "ERROR",
+            ["timestamp", "level", "event", "dropped_spans"].into(),
+        ),
+        (
+            "telemetry.dropped",
+            "ERROR",
+            ["timestamp", "level", "event", "dropped_metric_exports"].into(),
+        ),
         ("http.request.completed", "DEBUG", request(&["request_id"])),
         // No ID is recorded rather than an invented one.
         ("http.request.completed", "WARN", request(&[])),
@@ -361,11 +373,13 @@ fn every_constructor_passes_the_guard_with_its_fields() {
     assert_eq!(field(7, "role"), "migrate");
     assert_eq!(field(8, "role"), "migrate");
     assert_eq!(field(9, "dropped_lines"), 3);
-    assert_eq!(field(10, "request_id"), id.unwrap().to_string().as_str());
-    assert_eq!(field(10, "http.route"), "unmatched");
-    assert_eq!(field(10, "http.request.method"), "_OTHER");
-    assert_eq!(field(10, "http.response.status_code"), 404);
-    assert_eq!(field(10, "duration_us"), 7);
+    assert_eq!(field(10, "dropped_spans"), 2);
+    assert_eq!(field(11, "dropped_metric_exports"), 1);
+    assert_eq!(field(12, "request_id"), id.unwrap().to_string().as_str());
+    assert_eq!(field(12, "http.route"), "unmatched");
+    assert_eq!(field(12, "http.request.method"), "_OTHER");
+    assert_eq!(field(12, "http.response.status_code"), 404);
+    assert_eq!(field(12, "duration_us"), 7);
 }
 
 /// The shutdown deadline covers draining and the final flush together.
@@ -611,6 +625,31 @@ fn write_errors_and_failed_drop_reports_are_preserved_until_recovery() {
     assert_eq!(report["level"], "ERROR");
     assert_eq!(report["dropped_lines"], 2);
     assert_eq!(lines[3], "line 4");
+}
+
+/// Retrying a failed `telemetry.dropped` stderr report must never double-count the lost lines
+/// in `openmettle.telemetry.dropped{signal="log_lines"}` (ADR 0028).
+#[test]
+fn write_errors_and_failed_drop_reports_do_not_double_count_log_line_drops() {
+    let flaky = Flaky::new([false, false, true, false, true, false, true, true, true]);
+    let store = Arc::new(metrics::Metrics::new());
+    let queue =
+        sink::Queue::spawn_with_metrics(flaky.clone(), 16, JSON_INFO, store.clone()).unwrap();
+    for i in 0..=5 {
+        offer(&queue, &format!("line {i}\n"));
+    }
+    assert!(queue.flush(Duration::from_secs(10)));
+    // Exactly two application lines failed to write (lines 0 and 1); two failed drop-report
+    // writes retried the notice but did not inflate the lost-line counter.
+    assert_eq!(store.dropped_count(metrics::DroppedSignal::LogLines), 2);
+    let text = flaky.written.text();
+    let reports: Vec<Value> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|v| v["event"] == "telemetry.dropped")
+        .collect();
+    assert_eq!(reports.len(), 1, "{text}");
+    assert_eq!(reports[0]["dropped_lines"], 2);
 }
 
 /// Under concurrent emitters, `flush` never returns `true` until the caller's own accepted

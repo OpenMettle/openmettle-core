@@ -7,8 +7,28 @@
 //! Each helper follows it. Callers composing several helpers or owners in one transaction can
 //! still deadlock (SQLSTATE 40P01): abandon the whole transaction and retry it with the same
 //! idempotency keys. Never infer success from a failed or interrupted commit.
-use crate::runs::{Error, WriteTransaction, bounded, digest, finish, identity, lock_run, uuid};
+use crate::{
+    runs::{Error, WriteTransaction, bounded, digest, finish, identity, lock_run, uuid},
+    telemetry::metrics::{self, StorageOperation, StorageOutcome},
+};
 use sqlx::{Acquire, Postgres, Row, Transaction};
+
+fn record<T>(operation: StorageOperation, result: Result<T, Error>) -> Result<T, Error> {
+    let outcome = match &result {
+        Ok(_) => StorageOutcome::Ok,
+        Err(Error::OwnerLimit | Error::InstanceLimit | Error::LimitUnconfigured) => {
+            StorageOutcome::QuotaRefused
+        }
+        Err(Error::Conflict | Error::StaleRevision | Error::NotEligible | Error::Unresolved) => {
+            StorageOutcome::Conflict
+        }
+        Err(Error::NotFound) => StorageOutcome::NotFound,
+        Err(Error::Invalid) => StorageOutcome::Invalid,
+        Err(Error::Database(_) | Error::TransactionUnavailable) => StorageOutcome::Error,
+    };
+    metrics::global().record_storage(operation, outcome);
+    result
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReservationState {
@@ -58,6 +78,13 @@ fn optional(value: Option<&str>) -> [&[u8]; 2] {
 /// original reservation and its current state without rechecking limits; changed input
 /// conflicts.
 pub async fn reserve(
+    tx: &mut WriteTransaction<'_>,
+    r: &ReservationInput<'_>,
+) -> Result<Reservation, Error> {
+    record(StorageOperation::Reserve, reserve_inner(tx, r).await)
+}
+
+async fn reserve_inner(
     tx: &mut WriteTransaction<'_>,
     r: &ReservationInput<'_>,
 ) -> Result<Reservation, Error> {
@@ -212,6 +239,10 @@ pub struct Settlement<'a> {
 /// exact replay returns the same revision; different metadata or a released reservation
 /// conflicts.
 pub async fn settle(tx: &mut WriteTransaction<'_>, s: &Settlement<'_>) -> Result<String, Error> {
+    record(StorageOperation::Settle, settle_inner(tx, s).await)
+}
+
+async fn settle_inner(tx: &mut WriteTransaction<'_>, s: &Settlement<'_>) -> Result<String, Error> {
     uuid(s.scope)?;
     uuid(s.reservation)?;
     if s.size_bytes < 0 || s.content_digest.len() != 32 || !bounded(s.media_type, 255) {
@@ -282,6 +313,17 @@ pub async fn settle(tx: &mut WriteTransaction<'_>, s: &Settlement<'_>) -> Result
 /// reconciled that no bytes from this reservation remain to be settled. Timeouts never
 /// authorize release, and there is no automatic expiry. Repeating a release is a no-op.
 pub async fn release(
+    tx: &mut WriteTransaction<'_>,
+    scope: &str,
+    reservation: &str,
+) -> Result<(), Error> {
+    record(
+        StorageOperation::Release,
+        release_inner(tx, scope, reservation).await,
+    )
+}
+
+async fn release_inner(
     tx: &mut WriteTransaction<'_>,
     scope: &str,
     reservation: &str,
@@ -379,19 +421,24 @@ async fn lock_revision(
 }
 
 async fn lifecycle<T>(
+    operation: StorageOperation,
     tx: &mut WriteTransaction<'_>,
     scope: &str,
     revision: &str,
     step: impl AsyncFnOnce(&mut Transaction<'_, Postgres>) -> Result<T, Error>,
 ) -> Result<T, Error> {
-    uuid(scope)?;
-    uuid(revision)?;
-    let mut outer = tx.take_active()?;
-    let mut sp = outer.begin().await?;
-    let result = step(&mut sp).await;
-    let result = finish(sp, result).await?;
-    tx.restore(outer);
-    result
+    let result = async {
+        uuid(scope)?;
+        uuid(revision)?;
+        let mut outer = tx.take_active()?;
+        let mut sp = outer.begin().await?;
+        let result = step(&mut sp).await;
+        let result = finish(sp, result).await?;
+        tx.restore(outer);
+        result
+    }
+    .await;
+    record(operation, result)
 }
 
 /// Move an active revision to retained with `purge_after = now() + grace`, keeping its bytes
@@ -404,9 +451,9 @@ pub async fn retain_revision(
     grace_seconds: u32,
 ) -> Result<String, Error> {
     if grace_seconds == 0 {
-        return Err(Error::Invalid);
+        return record(StorageOperation::Retain, Err(Error::Invalid));
     }
-    lifecycle(tx, scope, revision, async |sp| {
+    lifecycle(StorageOperation::Retain, tx, scope, revision, async |sp| {
         let (state, size, deadline, ..) = lock_revision(sp, scope, revision).await?;
         if state != "active" {
             return deadline.ok_or(Error::Invalid);
@@ -434,7 +481,7 @@ pub async fn restore_revision(
     scope: &str,
     revision: &str,
 ) -> Result<(), Error> {
-    lifecycle(tx, scope, revision, async |sp| {
+    lifecycle(StorageOperation::Restore, tx, scope, revision, async |sp| {
         let (state, size, _, before, ..) = lock_revision(sp, scope, revision).await?;
         match state.as_str() {
             "active" => return Ok(()),
@@ -456,23 +503,29 @@ pub async fn begin_purge(
     scope: &str,
     revision: &str,
 ) -> Result<(), Error> {
-    lifecycle(tx, scope, revision, async |sp| {
-        let (state, _, _, _, due, _) = lock_revision(sp, scope, revision).await?;
-        match state.as_str() {
-            "purging" | "purged" => return Ok(()),
-            "retained" if due => {}
-            _ => return Err(Error::NotEligible),
-        }
-        sqlx::query(
-            "UPDATE openmettle.artifact_revisions SET state='purging',purging_at=now()
-             WHERE scope_id=$1::uuid AND id=$2::uuid",
-        )
-        .bind(scope)
-        .bind(revision)
-        .execute(&mut **sp)
-        .await?;
-        Ok(())
-    })
+    lifecycle(
+        StorageOperation::BeginPurge,
+        tx,
+        scope,
+        revision,
+        async |sp| {
+            let (state, _, _, _, due, _) = lock_revision(sp, scope, revision).await?;
+            match state.as_str() {
+                "purging" | "purged" => return Ok(()),
+                "retained" if due => {}
+                _ => return Err(Error::NotEligible),
+            }
+            sqlx::query(
+                "UPDATE openmettle.artifact_revisions SET state='purging',purging_at=now()
+                 WHERE scope_id=$1::uuid AND id=$2::uuid",
+            )
+            .bind(scope)
+            .bind(revision)
+            .execute(&mut **sp)
+            .await?;
+            Ok(())
+        },
+    )
     .await
 }
 
@@ -484,22 +537,28 @@ pub async fn confirm_purge(
     scope: &str,
     revision: &str,
 ) -> Result<(), Error> {
-    lifecycle(tx, scope, revision, async |sp| {
-        let (state, size, _, _, _, claimed) = lock_revision(sp, scope, revision).await?;
-        match state.as_str() {
-            "purged" => return Ok(()),
-            "purging" if claimed => {}
-            _ => return Err(Error::NotEligible),
-        }
-        sqlx::query(
-            "UPDATE openmettle.artifact_revisions SET state='purged',purged_at=now()
-             WHERE scope_id=$1::uuid AND id=$2::uuid",
-        )
-        .bind(scope)
-        .bind(revision)
-        .execute(&mut **sp)
-        .await?;
-        adjust(sp, scope, 0, -size, 0).await
-    })
+    lifecycle(
+        StorageOperation::ConfirmPurge,
+        tx,
+        scope,
+        revision,
+        async |sp| {
+            let (state, size, _, _, _, claimed) = lock_revision(sp, scope, revision).await?;
+            match state.as_str() {
+                "purged" => return Ok(()),
+                "purging" if claimed => {}
+                _ => return Err(Error::NotEligible),
+            }
+            sqlx::query(
+                "UPDATE openmettle.artifact_revisions SET state='purged',purged_at=now()
+                 WHERE scope_id=$1::uuid AND id=$2::uuid",
+            )
+            .bind(scope)
+            .bind(revision)
+            .execute(&mut **sp)
+            .await?;
+            adjust(sp, scope, 0, -size, 0).await
+        },
+    )
     .await
 }

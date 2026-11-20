@@ -224,6 +224,7 @@ async fn no_planted_canary_reaches_the_production_sink() {
     for format in [Format::Json, Format::Text] {
         let collector = Collector::accepting().await;
         let (tracer, exporter) = otlp::start(collector.destination(), Process::Api);
+        let tracer = tracer.expect("traces endpoint configured");
         let (capture, _guard) = Capture::install_traced(format, Verbosity::Debug, tracer);
         let (database, pool, handoff) = handoff(&h);
         let login = router_with_sessions(handoff, limits(), sessions()).unwrap();

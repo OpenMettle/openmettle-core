@@ -99,6 +99,7 @@ pub enum Trust<'a> {
 /// Token-endpoint transport for one provider. Implements the library's `AsyncHttpClient`.
 #[derive(Clone)]
 pub struct ProviderTransport {
+    operation: crate::telemetry::metrics::ProviderOperation,
     method: http::Method,
     trust_digest: [u8; 32],
     endpoint: Endpoint,
@@ -152,6 +153,7 @@ impl ProviderTransport {
         }
         let trust_digest = hash.finalize().into();
         Ok(Self {
+            operation: crate::telemetry::metrics::ProviderOperation::Token,
             method: http::Method::POST,
             trust_digest,
             endpoint,
@@ -193,28 +195,47 @@ impl ProviderTransport {
     }
 
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, Error> {
-        self.admit(&request)?;
-        let route = Route {
-            endpoint: &self.endpoint,
-            allowed: &self.allowed,
-            tls: &self.tls,
-            lookup: &self.lookup,
-            slots: &self.slots,
-            #[cfg(test)]
-            loopback: self.loopback,
+        use crate::telemetry::metrics::{self, ProviderOutcome};
+        let started = std::time::Instant::now();
+        let result = async {
+            self.admit(&request)?;
+            let route = Route {
+                endpoint: &self.endpoint,
+                allowed: &self.allowed,
+                tls: &self.tls,
+                lookup: &self.lookup,
+                slots: &self.slots,
+                #[cfg(test)]
+                loopback: self.loopback,
+            };
+            let limits = Limits {
+                request_body: MAX_REQUEST_BODY_BYTES,
+                response_body: MAX_RESPONSE_BYTES,
+                response_headers: MAX_RESPONSE_HEADERS,
+                response_header_bytes: MAX_RESPONSE_HEADER_BYTES,
+                setup: self.setup,
+                total: self.total,
+            };
+            let (parts, body) = request.into_parts();
+            route
+                .send(parts.method, &parts.headers, body, &limits)
+                .await
+        }
+        .await;
+        let outcome = match &result {
+            Ok(response) if response.status().is_success() => ProviderOutcome::Ok,
+            Ok(_) => ProviderOutcome::HttpError,
+            Err(Error::Timeout) => ProviderOutcome::Timeout,
+            Err(Error::Destination | Error::Address | Error::Configuration) => {
+                ProviderOutcome::Refused
+            }
+            Err(Error::TooLarge) => ProviderOutcome::BodyLimit,
+            Err(Error::Resolve | Error::Connect | Error::Tls | Error::Protocol) => {
+                ProviderOutcome::Transport
+            }
         };
-        let limits = Limits {
-            request_body: MAX_REQUEST_BODY_BYTES,
-            response_body: MAX_RESPONSE_BYTES,
-            response_headers: MAX_RESPONSE_HEADERS,
-            response_header_bytes: MAX_RESPONSE_HEADER_BYTES,
-            setup: self.setup,
-            total: self.total,
-        };
-        let (parts, body) = request.into_parts();
-        route
-            .send(parts.method, &parts.headers, body, &limits)
-            .await
+        metrics::global().record_provider_http(self.operation, outcome, started.elapsed());
+        result
     }
 }
 
@@ -243,15 +264,17 @@ impl ProviderDocuments {
         discovery: &str,
         jwks: &str,
     ) -> Result<Self, Error> {
-        let get = |url: &str| -> Result<ProviderTransport, Error> {
+        use crate::telemetry::metrics::ProviderOperation;
+        let get = |url: &str, operation: ProviderOperation| -> Result<ProviderTransport, Error> {
             let mut transport = token.clone();
+            transport.operation = operation;
             transport.endpoint = endpoint(url)?;
             transport.method = http::Method::GET;
             Ok(transport)
         };
         Ok(Self {
-            discovery: get(discovery)?,
-            jwks: get(jwks)?,
+            discovery: get(discovery, ProviderOperation::Discovery)?,
+            jwks: get(jwks, ProviderOperation::Jwks)?,
         })
     }
     pub async fn fetch_discovery(&self) -> Result<HttpResponse, Error> {
