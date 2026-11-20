@@ -7,7 +7,9 @@ provisioning. Migrations 1 and 2 are unchanged.
 
 > [ADR 0032](0032-durable-run-admission-and-fair-work-queue.md) specifies V1-10 admission,
 > queue deadlines, pre-execution cancellation and the fair worker claim on these tables;
-> migration 19 adds their columns.
+> migration 19 adds their columns. [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md)
+> specifies the V1-11 worker fencing required below: leases, execution deadlines, cooperative
+> cancellation, settlement from the operations ledger and restart recovery (migration 20).
 
 ## Scope and identities
 
