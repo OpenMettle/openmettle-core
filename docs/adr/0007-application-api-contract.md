@@ -17,6 +17,11 @@ Update, 20 November 2026 (V1-15 PR2, ADR 0031): four artifact operations add mul
 revision metadata and byte-range downloads, and the `416 range_not_satisfiable` problem. See
 [Artifact payload operations](#artifact-payload-operations-v1-15-pr2).
 
+Update, 20 November 2026 (V1-12 PR1): [ADR 0034](0034-ordered-events-and-replayable-sse.md)
+proposes the run snapshot and event stream operations, wire event types, cursor MACs, replay
+retention, resynchronization and authorization during replay, and proposes replacing the
+`Last-Event-ID`/`after` conflict rule below with header precedence. Nothing is served yet.
+
 ## Canonical source and versions
 
 `contracts/openapi/openmettle-v1.json` is the single hand-maintained source. It uses
@@ -114,8 +119,9 @@ Each SSE item has an opaque `id` (the resume cursor) and a `data` string contain
 and validate it explicitly. This revision defines no event types. Clients ignore event types they
 do not recognize but still advance their cursor; they ignore sequences they have already applied.
 A client resumes with `Last-Event-ID` or `after`. If both are present and differ, the request is
-invalid (`validation`). Retention, expired-cursor resynchronization, snapshots, buffering and
-authorization during replay belong to V1-12 and are not specified here.
+invalid (`validation`); ADR 0034 proposes replacing this with `Last-Event-ID` precedence.
+Retention, expired-cursor resynchronization, snapshots, buffering and authorization during
+replay belong to V1-12 (ADR 0034).
 
 ## Errors
 
