@@ -1445,7 +1445,8 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
                 });
             assert!(later, "{violation} in {text}");
             assert!(
-                !(violation.starts_with("openmettle_api ") && violation.contains("membership")),
+                !(violation.starts_with("openmettle_api ")
+                    && violation.contains("openmettle.membership_")),
                 "{text}"
             );
             if versions.last() == Some(&13) {

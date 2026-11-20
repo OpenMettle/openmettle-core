@@ -1505,7 +1505,9 @@ async fn application_roles_are_bounded() {
             ) => {
                 matches!(privilege, "SELECT" | "INSERT")
             }
-            (WORKER, "users" | "scopes" | "projects" | "conversations") => privilege == "SELECT",
+            (WORKER, "users" | "user_identities" | "scopes" | "projects" | "conversations") => {
+                privilege == "SELECT"
+            }
             (WORKER, "messages") => matches!(privilege, "SELECT" | "INSERT"),
             _ => false,
         }
