@@ -1,8 +1,8 @@
 //! Shared operational contract and persistence primitives; no worker queue yet. The API can
 //! also mount the browser sign-in routes, beside them the native sign-in routes, and the
-//! authenticated `/v1` project, conversation and artifact routes (ADRs 0025, 0029 and 0027
-//! PR4b), all off by default: without `OPENMETTLE_API_AUTH_CONFIG` it serves `/healthz` and
-//! `/readyz` only.
+//! authenticated `/v1` project, conversation and artifact routes (ADRs 0025, 0029, 0027 PR4b
+//! and 0031), all off by default: without `OPENMETTLE_API_AUTH_CONFIG` it serves `/healthz`
+//! and `/readyz` only. Artifact uploads and downloads also need `OPENMETTLE_API_ARTIFACTS_DIR`.
 pub mod artifact_fs;
 pub mod auth;
 pub mod auth_config;
@@ -220,8 +220,14 @@ fn routes(health: Health) -> Router {
 /// The settings checks refused `/healthz`, `/readyz` and every `/v1` path as browser and
 /// native paths, and every browser path as a native path, and the constructors repeat them,
 /// so no merge can shadow a route or panic. The issuance pool, when built, is returned beside
-/// the router so `serve` can close it within the drain deadline.
-fn app(config: &Config, pool: &PgPool) -> Result<(Router, Option<PgPool>), auth_config::Error> {
+/// the router so `serve` can close it within the drain deadline. `artifacts` is the store
+/// `run` opened from `ARTIFACTS_DIR`; without it the `/v1` payload operations answer
+/// `503 provisioning` (ADR 0031).
+fn app(
+    config: &Config,
+    pool: &PgPool,
+    artifacts: Option<artifact_fs::Store>,
+) -> Result<(Router, Option<PgPool>), auth_config::Error> {
     let operational = routes(Health {
         pool: pool.clone(),
         timeout: config.database_timeout,
@@ -254,7 +260,7 @@ fn app(config: &Config, pool: &PgPool) -> Result<(Router, Option<PgPool>), auth_
     }
     let origin = profile.handoff().origin;
     Ok((
-        app.merge(v1::router(service, bearer, origin, pool.clone())),
+        app.merge(v1::router(service, bearer, origin, pool.clone(), artifacts)),
         Some(issuance),
     ))
 }
@@ -337,17 +343,24 @@ pub async fn run(role: Role) -> u8 {
             return 78;
         }
     };
-    // The artifacts directory must exist as a real directory with usable subdirectories.
-    if let Some(dir) = &config.artifacts_dir
-        && artifact_fs::Store::open(dir).is_err()
+    // The artifacts directory must exist as a real directory with usable subdirectories. It
+    // is opened once; the API's `/v1` routes use this store.
+    let artifacts = match config
+        .artifacts_dir
+        .as_deref()
+        .map(artifact_fs::Store::open)
     {
-        eprintln!("configuration error: invalid ARTIFACTS_DIR");
-        return 78;
-    }
+        None => None,
+        Some(Ok(store)) => Some(store),
+        Some(Err(_)) => {
+            eprintln!("configuration error: invalid ARTIFACTS_DIR");
+            return 78;
+        }
+    };
     // The same holds for the browser sign-in settings: refused before telemetry is installed
     // or the listener opens, with the offline check's fixed category line (ADRs 0015, 0025).
     let pool = pool(&config);
-    let (app, issuance) = match app(&config, &pool) {
+    let (app, issuance) = match app(&config, &pool, artifacts) {
         Ok(built) => built,
         Err(error) => {
             eprintln!("auth configuration error: {error}");

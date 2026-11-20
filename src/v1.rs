@@ -1,4 +1,4 @@
-//! Authenticated application API routes under `/v1` (ADR 0007; ADR 0027 PR4b).
+//! Authenticated application API routes under `/v1` (ADR 0007; ADR 0027 PR4b; ADR 0031 PR2).
 //!
 //! **Off by default.** `crate::app` mounts [`router`] beside the browser sign-in routes only
 //! when `OPENMETTLE_API_AUTH_CONFIG` names a version-2 settings document (ADR 0025). Without it
@@ -14,9 +14,12 @@
 //!    with the configured `Origin` on an unsafe method and on any request that sends one, or
 //!    one `Authorization: Bearer` native credential (ADR 0029). Both, neither, a repeated
 //!    field or a refused `Origin` is `401 unauthenticated`.
-//! 5. Request shape: the path identifier, a write's `Idempotency-Key` and the body profile:
+//! 5. Request shape: the path identifiers, a write's `Idempotency-Key` and the body profile:
 //!    empty, or one `application/json` object of at most [`MAX_BODY_BYTES`] read within
-//!    [`BODY_READ_TIMEOUT`]. A refusal is `400 validation`.
+//!    [`BODY_READ_TIMEOUT`]. A refusal is `400 validation`. An artifact upload instead checks
+//!    its query and multipart `Content-Type`, and its body is streamed later; a download checks
+//!    its `Range`. An artifact payload operation without `ARTIFACTS_DIR` is then
+//!    `503 provisioning` (see [`artifacts`]).
 //! 6. Session validation on the primary, then the operation within [`OPERATION_TIMEOUT`]. The
 //!    principal and every target are hydrated on the primary for this request alone and
 //!    decided by `crate::authz`; nothing is cached across requests.
@@ -25,6 +28,7 @@
 //! `Cache-Control: no-store`. A problem has a fixed title and detail per category and never
 //! echoes a request value, identifier, credential, database error or internal reason.
 use crate::{
+    artifact_fs,
     authz::{
         self, GrantPermission, GrantVocabulary, Grantee, PROJECT_ROLE, Principal, ProjectRole,
         RESOURCE_GRANT, ResourceAccess, ResourceKind,
@@ -147,6 +151,11 @@ const TIMEOUT: Problem = problem(
     "timeout",
     "The request did not complete in time.",
 );
+const PROVISIONING: Problem = problem(
+    StatusCode::SERVICE_UNAVAILABLE,
+    "provisioning",
+    "This deployment is not provisioned for the request.",
+);
 
 impl Problem {
     fn response(self, id: Option<RequestId>) -> Response {
@@ -233,6 +242,10 @@ enum Op {
     GetResource(ResourceKind),
     ShareResource(ResourceKind),
     RevokeResourceShare(ResourceKind),
+    CreateArtifact,
+    CreateArtifactRevision,
+    GetArtifactRevision,
+    DownloadArtifactRevision,
 }
 
 impl Op {
@@ -255,13 +268,25 @@ impl Op {
             Self::ShareResource(_) => "shareArtifact",
             Self::RevokeResourceShare(Conversation) => "revokeConversationShare",
             Self::RevokeResourceShare(_) => "revokeArtifactShare",
+            Self::CreateArtifact => "createArtifact",
+            Self::CreateArtifactRevision => "createArtifactRevision",
+            Self::GetArtifactRevision => "getArtifactRevision",
+            Self::DownloadArtifactRevision => "downloadArtifactRevision",
         }
     }
     fn reads(self) -> bool {
         matches!(
             self,
-            Self::ListCapabilities | Self::GetProject | Self::GetResource(_)
+            Self::ListCapabilities
+                | Self::GetProject
+                | Self::GetResource(_)
+                | Self::GetArtifactRevision
+                | Self::DownloadArtifactRevision
         )
+    }
+    /// Streams a `multipart/form-data` artifact upload (ADR 0031).
+    fn uploads(self) -> bool {
+        matches!(self, Self::CreateArtifact | Self::CreateArtifactRevision)
     }
     /// Takes one JSON object; every other operation takes an empty body.
     fn json(self) -> bool {
@@ -277,7 +302,10 @@ impl Op {
     }
     /// Names its target by a UUID in the third path segment.
     fn targeted(self) -> bool {
-        !matches!(self, Self::ListCapabilities | Self::CreateProject)
+        !matches!(
+            self,
+            Self::ListCapabilities | Self::CreateProject | Self::CreateArtifact
+        )
     }
 }
 
@@ -512,14 +540,15 @@ async fn read_body(op: Op, headers: &HeaderMap, body: Body) -> Result<Bytes, Pro
     }
 }
 
-/// The UUID in the third path segment, as the router matched it. Unreserved characters only,
-/// so the raw segment is exactly the identifier.
-fn target(parts: &Parts) -> Result<&str, Problem> {
+/// The UUID in path segment `n` (the first path parameter is segment 3), as the router matched
+/// it. Unreserved characters only, so the raw segment is exactly
+/// the identifier.
+fn path_id(parts: &Parts, n: usize) -> Result<&str, Problem> {
     parts
         .uri
         .path()
         .split('/')
-        .nth(3)
+        .nth(n)
         .filter(|id| crate::runs::uuid(id).is_ok())
         .ok_or(IDENTIFIER)
 }
@@ -605,24 +634,29 @@ struct Api {
     origin: String,
     /// The primary pool the sign-in services also use (ADR 0016).
     pool: PgPool,
+    /// The validated `ARTIFACTS_DIR` (ADR 0031); `None` refuses the payload operations.
+    artifacts: Option<artifact_fs::Store>,
     in_flight: Semaphore,
 }
 
 /// Builds the `/v1` routes over the mounted browser service, the optional native service, the
-/// configured browser origin and the primary pool. Mount it with `Router::merge`; the sign-in
-/// settings checks refuse every `/v1` path (`browser_auth::router::reserved`), so the merge
-/// cannot panic. `/v1` and any other path under it are `404 not_found` problems.
+/// configured browser origin, the primary pool and the optional artifact store. Mount it with
+/// `Router::merge`; the sign-in settings checks refuse every `/v1` path
+/// (`browser_auth::router::reserved`), so the merge cannot panic. `/v1` and any other path
+/// under it are `404 not_found` problems.
 pub fn router(
     browser: Arc<BrowserAuth>,
     native: Option<Arc<NativeAuth>>,
     origin: &str,
     pool: PgPool,
+    artifacts: Option<artifact_fs::Store>,
 ) -> Router {
     let api = Arc::new(Api {
         browser,
         native,
         origin: origin.to_owned(),
         pool,
+        artifacts,
         in_flight: Semaphore::new(MAX_IN_FLIGHT),
     });
     let mut router = Router::new();
@@ -645,7 +679,7 @@ pub fn router(
 }
 
 /// Every contract path template with its operations, by method.
-fn routes() -> [(&'static str, Vec<(Method, Op)>); 13] {
+fn routes() -> [(&'static str, Vec<(Method, Op)>); 17] {
     use Op::*;
     use ResourceKind::{Artifact, Conversation};
     let (get, put, post) = (Method::GET, Method::PUT, Method::POST);
@@ -688,9 +722,10 @@ fn routes() -> [(&'static str, Vec<(Method, Op)>); 13] {
             "/v1/conversations/{conversation_id}/shares/revoke",
             vec![(post.clone(), RevokeResourceShare(Conversation))],
         ),
+        ("/v1/artifacts", vec![(post.clone(), CreateArtifact)]),
         (
             "/v1/artifacts/{artifact_id}",
-            vec![(get, GetResource(Artifact))],
+            vec![(get.clone(), GetResource(Artifact))],
         ),
         (
             "/v1/artifacts/{artifact_id}/shares",
@@ -698,20 +733,35 @@ fn routes() -> [(&'static str, Vec<(Method, Op)>); 13] {
         ),
         (
             "/v1/artifacts/{artifact_id}/shares/revoke",
-            vec![(post, RevokeResourceShare(Artifact))],
+            vec![(post.clone(), RevokeResourceShare(Artifact))],
+        ),
+        (
+            "/v1/artifacts/{artifact_id}/revisions",
+            vec![(post, CreateArtifactRevision)],
+        ),
+        (
+            "/v1/artifacts/{artifact_id}/revisions/{revision_id}",
+            vec![(get.clone(), GetArtifactRevision)],
+        ),
+        (
+            "/v1/artifacts/{artifact_id}/revisions/{revision_id}/content",
+            vec![(get, DownloadArtifactRevision)],
         ),
     ]
+}
+
+/// The request's ID, inserted by `telemetry::observe`, so a problem names the logged request.
+fn request_id(extensions: &axum::http::Extensions) -> Option<RequestId> {
+    extensions
+        .get::<RequestId>()
+        .copied()
+        .or_else(RequestId::generate)
 }
 
 impl Api {
     async fn serve(&self, operations: &[(Method, Op)], request: Request) -> Response {
         let head = request.method() == Method::HEAD;
-        // Inserted by `telemetry::observe`, so the problem names the logged request.
-        let id = request
-            .extensions()
-            .get::<RequestId>()
-            .copied()
-            .or_else(RequestId::generate);
+        let id = request_id(request.extensions());
         let mut response = self
             .handle(operations, request)
             .await
@@ -750,12 +800,23 @@ impl Api {
             return Err(UNAVAILABLE);
         };
         let session = self.session(&parts)?;
-        let target = if op.targeted() { target(&parts)? } else { "" };
+        let target = if op.targeted() {
+            path_id(&parts, 3)?
+        } else {
+            ""
+        };
+        if op.uploads() {
+            let key = idempotency_key(&parts.headers)?;
+            return self.upload(op, &parts, body, session, target, key).await;
+        }
         let key = match op.reads() {
             true => None,
             false => Some(request_key(op, target, idempotency_key(&parts.headers)?)),
         };
         let body = read_body(op, &parts.headers, body).await?;
+        if matches!(op, Op::GetArtifactRevision | Op::DownloadArtifactRevision) {
+            return self.revision(op, &parts, session, target).await;
+        }
         let (input, reason) = decode(op, &body)?;
         let context = self.authenticate(session).await?;
         let call = Call {
@@ -1027,6 +1088,8 @@ async fn read_project(
     let principal = principal(c, context).await?;
     projects::read_project(c, &principal, project_id, context.observed_ms()).await
 }
+
+mod artifacts;
 
 #[cfg(test)]
 mod tests;

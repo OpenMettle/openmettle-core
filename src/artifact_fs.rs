@@ -17,18 +17,25 @@ use crate::{
 };
 use axum::body::{Bytes, HttpBody};
 use http_body_util::BodyExt;
+use hyper::body::{Frame, SizeHint};
 use sha2::{Digest as _, Sha256};
 use sqlx::{PgPool, Row};
 use std::{
     fmt, fs,
-    io::{ErrorKind, Write},
+    future::Future,
+    io::{ErrorKind, Read, Seek, SeekFrom, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    pin::Pin,
+    task::{Context, Poll},
     time::Duration,
 };
+use tokio::task::JoinHandle;
 
 const STAGING: &str = "staging";
 const REVISIONS: &str = "revisions";
+/// Largest chunk one read of a payload file returns.
+const READ_CHUNK: u64 = 64 * 1024;
 /// Largest batch one reconciliation call handles.
 pub const MAX_BATCH: i64 = 1000;
 
@@ -156,6 +163,45 @@ impl Store {
         })
     }
 
+    /// Opens the published payload of a settled revision and positions it at `start`; the body
+    /// streams the next `len` bytes. The file must be a regular file (not a symbolic link) of
+    /// exactly `size` bytes, else [`Error::Missing`]. `start + len` must not exceed `size`.
+    pub async fn read(
+        &self,
+        reservation: &str,
+        size: i64,
+        start: u64,
+        len: u64,
+    ) -> Result<Content, Error> {
+        let (_, path) = self.paths(reservation)?;
+        let size = u64::try_from(size).map_err(|_| Error::Missing)?;
+        if start.checked_add(len).is_none_or(|end| end > size) {
+            return Err(Error::Missing);
+        }
+        let file = blocking(move || {
+            let regular = |m: &fs::Metadata| m.file_type().is_file() && m.len() == size;
+            if !fs::symlink_metadata(&path).is_ok_and(|m| regular(&m)) {
+                return Err(ErrorKind::NotFound.into());
+            }
+            let mut file = fs::File::open(&path)?;
+            if !regular(&file.metadata()?) {
+                return Err(ErrorKind::NotFound.into());
+            }
+            file.seek(SeekFrom::Start(start))?;
+            Ok(file)
+        })
+        .await
+        .map_err(|e| match e.kind() {
+            ErrorKind::NotFound => Error::Missing,
+            _ => Error::Io,
+        })?;
+        Ok(Content {
+            file: Some(file),
+            remaining: len,
+            pending: None,
+        })
+    }
+
     /// Unlinks both payload paths of `reservation` (absent is fine) and syncs the directories.
     async fn remove(&self, reservation: &str) -> Result<(), Error> {
         let (staging, revision) = self.paths(reservation)?;
@@ -252,6 +298,73 @@ impl Drop for Staged {
         if !self.publishing {
             let _ = fs::remove_file(&self.path);
         }
+    }
+}
+
+/// One blocking read: the file back and the chunk it filled.
+type PendingRead = JoinHandle<std::io::Result<(fs::File, Vec<u8>)>>;
+
+/// A response body streaming a byte range of one payload file in chunks of at most 64 KiB, each
+/// read on the blocking pool. Its exact size is known up front. A file that ends early yields
+/// an error, which aborts the response.
+pub struct Content {
+    /// `None` while a read is pending.
+    file: Option<fs::File>,
+    remaining: u64,
+    pending: Option<PendingRead>,
+}
+
+impl HttpBody for Content {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+        let this = self.get_mut();
+        if this.pending.is_none() {
+            if this.remaining == 0 {
+                return Poll::Ready(None);
+            }
+            let Some(mut file) = this.file.take() else {
+                return Poll::Ready(Some(Err(ErrorKind::Other.into())));
+            };
+            // At most READ_CHUNK, so the cast cannot truncate.
+            let mut chunk = vec![0; this.remaining.min(READ_CHUNK) as usize];
+            this.pending = Some(tokio::task::spawn_blocking(move || {
+                file.read_exact(&mut chunk)?;
+                Ok((file, chunk))
+            }));
+        }
+        let Some(pending) = this.pending.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let read = std::task::ready!(Pin::new(pending).poll(cx));
+        this.pending = None;
+        Poll::Ready(Some(match read {
+            Ok(Ok((file, chunk))) => {
+                this.file = Some(file);
+                this.remaining -= chunk.len() as u64;
+                Ok(Frame::data(Bytes::from(chunk)))
+            }
+            Ok(Err(error)) => {
+                this.remaining = 0;
+                Err(error)
+            }
+            Err(_) => {
+                this.remaining = 0;
+                Err(ErrorKind::Other.into())
+            }
+        }))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.remaining == 0 && self.pending.is_none()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.remaining)
     }
 }
 

@@ -702,7 +702,7 @@ fn consumer_decodes_every_valid_and_newer_compatible_response() {
 type Decode = fn(&Value) -> Result<(), String>;
 
 /// The consumer's decoders of the V1-05 project, conversation and artifact responses.
-fn v1_decoders() -> [(&'static str, Decode); 5] {
+fn v1_decoders() -> [(&'static str, Decode); 6] {
     [
         ("#/components/schemas/Project", |v| {
             consumer::decode_project(v).map(drop)
@@ -718,6 +718,9 @@ fn v1_decoders() -> [(&'static str, Decode); 5] {
         }),
         ("#/components/schemas/ArtifactAccess", |v| {
             consumer::decode_item_access(v, true).map(drop)
+        }),
+        ("#/components/schemas/ArtifactRevision", |v| {
+            consumer::decode_revision(v).map(drop)
         }),
     ]
 }
@@ -785,6 +788,119 @@ fn consumer_reads_projects_and_items_without_inferring_access() {
     let mut unrevised = fixture("ArtifactAccessShared");
     unrevised.as_object_mut().unwrap().remove("last_revision");
     assert!(consumer::decode_item_access(&unrevised, true).is_err());
+
+    use consumer::RevisionState;
+    let revision = consumer::decode_revision(&fixture("ArtifactRevisionActive")).unwrap();
+    assert_eq!((revision.revision, revision.size_bytes), (1, 12));
+    assert_eq!(revision.display_name.as_deref(), Some("notes.txt"));
+    assert!(revision.state.downloadable() && revision.project_id.is_none());
+    assert!(!revision.artifact_id.is_empty() && !revision.revision_id.is_empty());
+    assert!(revision.media_type.starts_with("text/plain") && revision.sha256.len() == 64);
+    let unnamed = consumer::decode_revision(&fixture("ArtifactRevisionActive--unnamed")).unwrap();
+    assert!(unnamed.display_name.is_none());
+    // A newer state is surfaced and never offered for download.
+    let newer = fixture("ArtifactRevisionActive--unrecognized-state");
+    let newer = consumer::decode_revision(&newer).unwrap();
+    assert_eq!(
+        newer.state,
+        RevisionState::Unrecognized("archived_cold".into())
+    );
+    assert!(!newer.state.downloadable());
+    // A revision is numbered from 1, and its digest is exact.
+    for (member, value) in [("revision", json!("0")), ("sha256", json!("AB".repeat(32)))] {
+        let mut bad = fixture("ArtifactRevisionActive");
+        bad[member] = value;
+        assert!(consumer::decode_revision(&bad).is_err(), "{member}");
+    }
+}
+
+/// The contract's multipart examples of `createArtifact`, as a client sends them: the boundary
+/// on their first line.
+fn multipart_example(name: &str) -> (String, Vec<u8>) {
+    let content = &contract()["paths"]["/v1/artifacts"]["post"]["requestBody"]["content"];
+    let wire = content["multipart/form-data"]["examples"][name]["serializedValue"]
+        .as_str()
+        .unwrap();
+    let boundary = wire.lines().next().unwrap().strip_prefix("--").unwrap();
+    (
+        format!("multipart/form-data; boundary={boundary}"),
+        wire.as_bytes().to_vec(),
+    )
+}
+
+/// The file bytes and form of one body fed in `chunk`-byte pieces, or the parser's refusal.
+fn parse_upload(
+    content_type: &str,
+    body: &[u8],
+    chunk: usize,
+) -> Result<(Vec<u8>, openmettle_core::multipart::Form), openmettle_core::multipart::Error> {
+    let mut parser = openmettle_core::multipart::Parser::new(content_type)?;
+    let mut file = Vec::new();
+    for piece in body.chunks(chunk) {
+        file.extend(parser.feed(piece)?);
+    }
+    Ok((file, parser.finish()?))
+}
+
+/// ADR 0031 wire fixtures: both documented part orders, under different boundaries, yield the
+/// same file, media type, display name and metadata, which is why the boundary and part order
+/// are not part of the upload's idempotency identity. The bytes match the documented revision;
+/// a truncated or repeated part is refused.
+#[test]
+fn multipart_examples_parse_to_one_upload_in_either_order() {
+    use openmettle_core::multipart::Error;
+    let metadata = validator_for("#/components/schemas/ArtifactUploadMetadata");
+    let (file_first, file_first_body) = multipart_example("fileFirst");
+    let (metadata_first, metadata_first_body) = multipart_example("metadataFirst");
+    assert_ne!(file_first, metadata_first);
+    let expected = parse_upload(&file_first, &file_first_body, usize::MAX).unwrap();
+    for (content_type, body) in [
+        (&file_first, &file_first_body),
+        (&metadata_first, &metadata_first_body),
+    ] {
+        for chunk in [1, 7, usize::MAX] {
+            assert_eq!(parse_upload(content_type, body, chunk).unwrap(), expected);
+        }
+    }
+    let (file, form) = expected;
+    let revision = fixture("ArtifactRevisionActive");
+    assert_eq!(form.media_type, revision["media_type"]);
+    assert_eq!(
+        form.display_name.as_deref(),
+        revision["display_name"].as_str()
+    );
+    assert_eq!(file.len().to_string(), revision["size_bytes"]);
+    let digest: String = Sha256::digest(&file)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(digest, revision["sha256"]);
+    assert!(metadata.is_valid(&serde_json::from_slice(&form.metadata).unwrap()));
+
+    // An interrupted body: before the closing delimiter, and in the middle of the file.
+    let close = b"--openmettle-example-retry--\r\n".len();
+    let truncated = &metadata_first_body[..metadata_first_body.len() - close];
+    assert_eq!(
+        parse_upload(&metadata_first, truncated, 5),
+        Err(Error::Truncated)
+    );
+    let cut = file_first_body
+        .windows(5)
+        .position(|w| w == b"hello")
+        .unwrap()
+        + 3;
+    assert_eq!(
+        parse_upload(&file_first, &file_first_body[..cut], usize::MAX),
+        Err(Error::Truncated)
+    );
+    // The file part again before the whole form: a repeated part.
+    let text = std::str::from_utf8(&file_first_body).unwrap();
+    let second = text[1..].find("--openmettle-example-a").unwrap() + 1;
+    let repeated = format!("{}{text}", &text[..second]);
+    assert_eq!(
+        parse_upload(&file_first, repeated.as_bytes(), usize::MAX),
+        Err(Error::DuplicatePart)
+    );
 }
 
 #[test]
@@ -889,6 +1005,7 @@ fn consumer_classifies_problems_without_trusting_unknown_codes() {
         ("ProblemNotFound", Category::NotFound),
         ("ProblemConflict", Category::Conflict),
         ("ProblemIdempotencyConflict", Category::IdempotencyConflict),
+        ("ProblemRangeNotSatisfiable", Category::RangeNotSatisfiable),
         ("ProblemQuota", Category::Quota),
         ("ProblemRateLimited", Category::RateLimited),
         ("ProblemInternal", Category::Internal),
@@ -1120,14 +1237,17 @@ fn mounted_api_problems_conform_to_the_contract() {
     let json = "content-type: application/json\r\n";
     let id = "0f0e0d0c-0b0a-4908-8706-050403020100";
     let unknown = r#"{"name":"CANARY-name","folder_id":"CANARY-folder"}"#;
-    use consumer::Category::{NotFound, Unauthenticated, Unavailable, Validation};
+    use consumer::Category::{NotFound, Provisioning, Unauthenticated, Unavailable, Validation};
+    let multipart = "content-type: multipart/form-data; boundary=CANARY\r\n";
+    let revision = format!("/v1/artifacts/{id}/revisions/{id}");
     let mut cases: Vec<(String, consumer::Category)> = Vec::new();
     // Every implemented operation refuses an anonymous request before any other check.
     for (template, item) in contract()["paths"].as_object().unwrap() {
         let target = template.replace(['{', '}'], "").replace("project_id", id);
         let target = target
             .replace("conversation_id", id)
-            .replace("artifact_id", id);
+            .replace("artifact_id", id)
+            .replace("revision_id", id);
         for method in item.as_object().unwrap().keys() {
             let method = method.to_ascii_uppercase();
             cases.push((
@@ -1157,6 +1277,31 @@ fn mounted_api_problems_conform_to_the_contract() {
             Validation,
         ),
         (format!("GET /v1/projects/CANARY-id HTTP/1.1\r\n{bearer}\r\n"), Validation),
+        (format!("GET /v1/artifacts/{id}/revisions/CANARY-id HTTP/1.1\r\n{bearer}\r\n"), Validation),
+        // Artifact uploads: the key, the query and the multipart type precede the store check.
+        (format!("POST /v1/artifacts HTTP/1.1\r\n{bearer}{multipart}\r\n"), Validation),
+        (
+            format!("POST /v1/artifacts?scope_id=CANARY-scope HTTP/1.1\r\n{bearer}{key}{multipart}\r\n"),
+            Validation,
+        ),
+        (
+            format!("POST /v1/artifacts?max_bytes=0 HTTP/1.1\r\n{bearer}{key}{multipart}\r\n"),
+            Validation,
+        ),
+        (format!("POST /v1/artifacts HTTP/1.1\r\n{bearer}{key}{json}\r\n"), Validation),
+        (
+            format!("GET {revision}/content HTTP/1.1\r\n{bearer}range: bytes=0-1,CANARY\r\n\r\n"),
+            Validation,
+        ),
+        // Without ARTIFACTS_DIR, payload operations are refused before the session is checked;
+        // revision metadata still needs the primary.
+        (format!("POST /v1/artifacts HTTP/1.1\r\n{bearer}{key}{multipart}\r\n"), Provisioning),
+        (
+            format!("POST /v1/artifacts/{id}/revisions HTTP/1.1\r\n{cookie}origin: https://app.example.test\r\n{key}{multipart}\r\n"),
+            Provisioning,
+        ),
+        (format!("GET {revision}/content HTTP/1.1\r\n{bearer}\r\n"), Provisioning),
+        (format!("GET {revision} HTTP/1.1\r\n{bearer}\r\n"), Unavailable),
         // Paths and methods the contract does not define.
         ("GET /v1/CANARY-path HTTP/1.1\r\n\r\n".into(), NotFound),
         ("DELETE /v1/capabilities HTTP/1.1\r\n\r\n".into(), NotFound),
@@ -1193,6 +1338,14 @@ fn mounted_api_problems_conform_to_the_contract() {
             assert!(!body.contains(planted), "{line}: {body}");
         }
     }
+    // HEAD answers the GET's status and headers without a body.
+    let (status, head, body) = api
+        .exchange(&format!("HEAD {revision}/content HTTP/1.1\r\n{bearer}\r\n"))
+        .unwrap();
+    assert_eq!((status, body.as_str()), (503, ""));
+    assert!(
+        head.contains("openmettle-api-version: 1.0") && head.contains("cache-control: no-store")
+    );
 }
 
 #[tokio::test]

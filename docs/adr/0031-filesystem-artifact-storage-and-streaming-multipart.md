@@ -1,8 +1,9 @@
 # 0031 — Filesystem artifact storage and streaming multipart uploads
 
-Status: proposed V1-15 PR1 implementation contract, 20 November 2026. Agent-authored; owner
-approval, independent review and CI acceptance are separate gates. Refs #15; Refs #62. #15
-remains open: PR2 adds the HTTP routes and the OpenAPI changes.
+Status: proposed V1-15 implementation contract. PR1 (storage engine) and PR2 (HTTP routes and
+OpenAPI, [below](#pr2-http-routes)), 20 November 2026. Agent-authored; owner approval,
+independent review and CI acceptance are separate gates. Refs #15; Refs #62. #15 remains open
+for the work listed under [Consequences](#consequences).
 
 ## Problem
 
@@ -13,8 +14,7 @@ upload format is `multipart/form-data`, and no new crate may be added to parse i
 
 ## Decision
 
-PR1 adds the storage engine. It exposes no route: `POST /v1/artifacts`,
-`POST /v1/artifacts/{id}/revisions` and `GET .../content`, with their OpenAPI entries, are PR2.
+PR1 adds the storage engine; PR2 serves it through `/v1` ([PR2: HTTP routes](#pr2-http-routes)).
 
 | Item | Location |
 | --- | --- |
@@ -147,6 +147,56 @@ owner; a project scope needs an editor, conceals a missing, deleted or invisible
 refuses an archived one with `project is archived` after authorization. PR2 calls it before
 `reserve`.
 
+## PR2: HTTP routes
+
+| Item | Location |
+| --- | --- |
+| The four operations, query, `Range` and problem mapping | `src/v1/artifacts.rs`, routed by `src/v1.rs` |
+| The store opened once at startup and handed to the router | `src/lib.rs` |
+| Artifact read, download and write decisions with lifecycle | `authz::projects::authorize_artifact` |
+| Retry artifact lookup and revision reads | `storage::upload_artifact`, `storage::read_revision` |
+| Bounded streaming body over a payload range | `artifact_fs::Store::read`, `artifact_fs::Content` |
+| Operations, schemas, multipart wire examples and fixtures | `contracts/openapi/openmettle-v1.json`, `contracts/fixtures/` |
+
+The contract is in ADR 0007 ([Artifact payload operations](0007-application-api-contract.md#artifact-payload-operations-v1-15-pr2)).
+This section records the storage decisions behind it.
+
+- **Store.** `run` opens `ARTIFACTS_DIR` once and passes the `Store` to the router. Without it
+  the uploads and the content download answer `503 provisioning` before the session is
+  validated, so nothing is reserved or staged; revision metadata and every other route work.
+- **Target before reservation.** The scope comes from the query, never from the `metadata`
+  part: either part may arrive first, and the reservation must exist before the first file
+  byte is written. `createArtifact` authorizes `CreateInScope` with the project lifecycle
+  (`authorize_create_in_scope`); `createArtifactRevision` authorizes `Write` on the artifact
+  with its lifecycle (`authorize_artifact`). Both run on the primary before `reserve`. A
+  grant revoked while the body streams does not stop that upload; the next request is
+  decided again.
+- **Retry identity.** `max_bytes` is the query value or the 64 MiB route ceiling, never the
+  body length. The reservation key is the ADR 0007 request key (operation, target and client
+  key, SHA-256). A new artifact's UUID is random; `upload_artifact` returns the one an earlier
+  reservation with the same key chose, so an exact retry reserves the same identity. Two first
+  attempts racing on one key may pick different artifacts: the later `reserve` conflicts and
+  that request is `409 idempotency_conflict`.
+- **Metadata part.** A closed JSON object with no members (`{}`), decoded in the `ingest`
+  check. Unknown members are `400 validation`. New optional members are additive; one that
+  changes the stored revision must join the settlement replay comparison.
+- **Error mapping.** Multipart, body, metadata and ceiling refusals are `400 validation`;
+  `InProgress` is `409 conflict`; a reservation or settlement conflict, including a key whose
+  earlier upload was released, is `409 idempotency_conflict`; owner and instance limits are
+  `429 quota`; unconfigured limits are `503 provisioning`; I/O failures and a missing settled
+  payload are `500 internal`.
+- **Deadline.** Authorization, reservation, streaming and settlement run within 600 s
+  (`UPLOAD_TIMEOUT`). An elapsed upload drops its future: the staging file is unlinked and the
+  reservation stays `reserved` until a retry or `reconcile_expired`, whose `older_than` must
+  exceed 600 s plus settlement. The upload holds one of the 256 in-flight permits throughout.
+- **Downloads.** `Download` (equal to `Read` for artifacts) is decided on the primary for every
+  request. Only an `active` revision serves bytes; `retained`, `purging` and `purged` are
+  `409 conflict`, while their metadata stays readable. `Store::read` requires a regular file
+  of exactly the settled size, seeks to the range and streams 64 KiB reads from the blocking
+  pool with an exact `Content-Length`; a missing or resized file is `500 internal` without a
+  path. The in-flight permit is released when the response is returned, before its body
+  streams; the body holds an open file and at most one 64 KiB buffer.
+
 ## Topology limits
 
 The engine assumes one filesystem visible to every process that writes or purges payloads.
@@ -168,6 +218,7 @@ The engine assumes one filesystem visible to every process that writes or purges
 - `max_bytes` stays reserved for the whole upload and is charged against quotas until
   settlement. A crashed upload holds its reservation until `reconcile_expired` runs.
 - Retries that hit a crashed upload's staging file get `InProgress` until reconciliation.
-- Not implemented: routes, OpenAPI, a reconciliation schedule, a sweep for files without rows,
-  content reads, media-type allowlists, metadata schemas, request deadlines and throughput
-  qualification.
+- Not implemented: a reconciliation or purge schedule (the worker calls neither helper), a sweep
+  for files without rows, media-type allowlists, metadata members, a per-chunk idle deadline
+  (only the 600 s upload deadline), a separate bound on concurrent uploads, entity tags,
+  multi-range responses, and throughput or storage-class qualification.

@@ -27,7 +27,7 @@ fn routes_are_the_implemented_contract_operations() {
         }
     }
     assert_eq!(served, documented);
-    assert_eq!(served.len(), 15);
+    assert_eq!(served.len(), 19);
     for (path, _) in routes() {
         assert_eq!(
             crate::telemetry::metrics::RouteClass::of(path),
@@ -44,11 +44,14 @@ fn every_write_and_only_a_write_needs_a_key_and_reads_take_no_body() {
             if op.reads() {
                 assert!(!op.json(), "{}", op.id());
             }
-            // Every path parameter is the third segment.
+            // The first path parameter is the third segment.
             assert_eq!(
                 op.targeted(),
-                op.id() != "listCapabilities" && op.id() != "createProject"
+                !["listCapabilities", "createProject", "createArtifact"].contains(&op.id())
             );
+            // An upload streams its own multipart body, and only an upload does.
+            assert_eq!(op.uploads(), op.id().starts_with("createArtifact"));
+            assert!(!(op.uploads() && op.json()));
         }
     }
 }
@@ -120,6 +123,7 @@ fn problems_are_fixed_bounded_and_versioned() {
         INTERNAL,
         UNAVAILABLE,
         TIMEOUT,
+        PROVISIONING,
     ];
     for problem in all {
         let expected = match problem.code {
@@ -129,7 +133,7 @@ fn problems_are_fixed_bounded_and_versioned() {
             "not_found" => 404,
             "conflict" | "idempotency_conflict" => 409,
             "internal" => 500,
-            "unavailable" => 503,
+            "unavailable" | "provisioning" => 503,
             "timeout" => 504,
             other => panic!("unexpected code {other}"),
         };

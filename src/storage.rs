@@ -11,7 +11,7 @@ use crate::{
     runs::{Error, WriteTransaction, bounded, digest, finish, identity, lock_run, uuid},
     telemetry::metrics::{self, StorageOperation, StorageOutcome},
 };
-use sqlx::{Acquire, Postgres, Row, Transaction};
+use sqlx::{Acquire, PgConnection, Postgres, Row, Transaction};
 
 fn record<T>(operation: StorageOperation, result: Result<T, Error>) -> Result<T, Error> {
     let outcome = match &result {
@@ -186,6 +186,95 @@ async fn reserve_inner(
     let result = finish(sp, result).await?;
     tx.restore(outer);
     result
+}
+
+/// The artifact an upload under `(scope, actor, key)` names: the one an earlier reservation
+/// with that key chose, so an exact retry reserves the same identity again, or else a new random
+/// UUID. Two first attempts racing on one key may choose different artifacts; `reserve` then
+/// refuses the later one with `Conflict`.
+pub async fn upload_artifact(
+    c: &mut PgConnection,
+    scope: &str,
+    actor: &str,
+    key: &str,
+) -> Result<String, Error> {
+    uuid(scope)?;
+    uuid(actor)?;
+    if !bounded(key, 128) {
+        return Err(Error::Invalid);
+    }
+    Ok(sqlx::query_scalar(
+        "SELECT coalesce((SELECT artifact_id::text FROM openmettle.storage_reservations
+                           WHERE scope_id = $1::uuid AND actor_user_id = $2::uuid
+                             AND idempotency_key = $3),
+                         gen_random_uuid()::text)",
+    )
+    .bind(scope)
+    .bind(actor)
+    .bind(key)
+    .fetch_one(c)
+    .await?)
+}
+
+/// The stored metadata of one artifact revision and its scope. `reservation_id` names the
+/// payload file (ADR 0031) and never leaves the server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Revision {
+    pub id: String,
+    pub artifact_id: String,
+    pub revision: i64,
+    pub scope_id: String,
+    /// The containing project, or `None` in a personal scope.
+    pub project_id: Option<String>,
+    pub reservation_id: String,
+    pub size_bytes: i64,
+    pub content_digest: Vec<u8>,
+    pub media_type: String,
+    pub display_name: Option<String>,
+    /// `active`, `retained`, `purging` or `purged`.
+    pub state: String,
+    /// Creation time in Unix microseconds.
+    pub created_us: i64,
+}
+
+/// Reads revision `revision_id` of `artifact_id`, or `None` when it does not exist or belongs
+/// to another artifact. No authorization: the caller decides access to the artifact first.
+pub async fn read_revision(
+    c: &mut PgConnection,
+    artifact_id: &str,
+    revision_id: &str,
+) -> Result<Option<Revision>, Error> {
+    uuid(artifact_id)?;
+    uuid(revision_id)?;
+    let row = sqlx::query(
+        "SELECT r.id::text, r.artifact_id::text, r.revision, r.scope_id::text, s.project_id::text,
+                r.reservation_id::text, r.size_bytes, r.content_digest, r.media_type,
+                r.display_name, r.state,
+                (extract(epoch FROM r.created_at) * 1000000)::bigint
+           FROM openmettle.artifact_revisions r JOIN openmettle.scopes s ON s.id = r.scope_id
+          WHERE r.artifact_id = $1::uuid AND r.id = $2::uuid",
+    )
+    .bind(artifact_id)
+    .bind(revision_id)
+    .fetch_optional(c)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    Ok(Some(Revision {
+        id: row.try_get(0)?,
+        artifact_id: row.try_get(1)?,
+        revision: row.try_get(2)?,
+        scope_id: row.try_get(3)?,
+        project_id: row.try_get(4)?,
+        reservation_id: row.try_get(5)?,
+        size_bytes: row.try_get(6)?,
+        content_digest: row.try_get(7)?,
+        media_type: row.try_get(8)?,
+        display_name: row.try_get(9)?,
+        state: row.try_get(10)?,
+        created_us: row.try_get(11)?,
+    }))
 }
 
 /// Adds signed deltas to the owner account and then the instance row (fixed lock order).

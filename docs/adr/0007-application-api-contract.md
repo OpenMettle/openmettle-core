@@ -13,6 +13,10 @@ authenticated and authorized when `OPENMETTLE_API_AUTH_CONFIG` is set. V1-04 set
 security schemes. See [Served operations](#served-operations-v1-05-pr4b). Cursors, run
 idempotency and SSE remain unimplemented.
 
+Update, 20 November 2026 (V1-15 PR2, ADR 0031): four artifact operations add multipart uploads,
+revision metadata and byte-range downloads, and the `416 range_not_satisfiable` problem. See
+[Artifact payload operations](#artifact-payload-operations-v1-15-pr2).
+
 ## Canonical source and versions
 
 `contracts/openapi/openmettle-v1.json` is the single hand-maintained source. It uses
@@ -126,6 +130,7 @@ optional `errors` locations. Client-supplied values are never echoed.
 | 403 | `policy`: only when the caller is already authorized to know the resource exists |
 | 404 | `not_found`, also concealing resources the caller may not know about |
 | 409 | `conflict`, `idempotency_conflict` |
+| 416 | `range_not_satisfiable` |
 | 429 | `quota`, `rate_limited` |
 | 500 | `internal` |
 | 502 | `provider_failure` |
@@ -298,7 +303,8 @@ owning tickets.
 
 ## Served operations (V1-05 PR4b)
 
-`src/v1.rs` serves the fifteen operations when `OPENMETTLE_API_AUTH_CONFIG` is set. Their
+`src/v1.rs` serves the fifteen V1-05 operations, and the four artifact operations below, when
+`OPENMETTLE_API_AUTH_CONFIG` is set. Their
 authorization and lifecycle rules are recorded in ADR 0027. The wire rules of this record apply
 as follows.
 
@@ -315,7 +321,8 @@ as follows.
 - **Versions and caching.** Every response, success or problem, carries
   `OpenMettle-API-Version: 1.0` and `Cache-Control: no-store`.
 - **Media types.** A body is one JSON object with `Content-Type: application/json`, optionally
-  `; charset=utf-8`, of at most 64 KiB. Operations without a body refuse a non-empty one.
+  `; charset=utf-8`, of at most 64 KiB, except the streamed artifact uploads below. Operations
+  without a body refuse a non-empty one.
 - **Idempotency.** The server derives the stored request key as a SHA-256 digest of
   `openmettle/v1-idempotency/1`, the `operationId`, the path identifier and the client key. The
   audit table is unique per actor, so the client key is scoped to the actor, the operation and
@@ -327,3 +334,61 @@ as follows.
 independent consumer decodes the new response fixtures. `tests/schema/authz_http.rs` exercises
 every operation over PostgreSQL 18 on both session channels and decodes each response with the
 same consumer.
+
+## Artifact payload operations (V1-15 PR2)
+
+Storage, publication and reconciliation are ADR 0031. These operations follow every rule above;
+the additions are:
+
+| Operation | Request | Success |
+| --- | --- | --- |
+| `createArtifact` `POST /v1/artifacts` | Optional `scope_id` (default: the caller's personal scope) and `max_bytes` query; multipart body | `201` `ArtifactRevision`, revision `1` |
+| `createArtifactRevision` `POST /v1/artifacts/{artifact_id}/revisions` | Optional `max_bytes`; multipart body | `201` `ArtifactRevision`, the next revision |
+| `getArtifactRevision` `GET /v1/artifacts/{artifact_id}/revisions/{revision_id}` | — | `200` `ArtifactRevision` in any state |
+| `downloadArtifactRevision` `GET …/{revision_id}/content` | Optional `Range` | `200` or `206` bytes |
+
+- **Multipart.** OpenAPI 3.2 `multipart/form-data` with an `encoding` per part: one `file`
+  part (binary, explicit `Content-Type`, optional `filename` kept as `display_name`) and one
+  `metadata` part (`application/json`, the closed `ArtifactUploadMetadata` object, currently
+  `{}`), in either order. `createArtifact` carries both orders as `serializedValue` wire
+  examples under different boundaries; `tests/contract.rs` parses them to the same upload, and refuses
+  their truncated and repeated-part variants.
+- **Order of refusals.** After the shared route, bound, permit and session-channel steps: the
+  path identifiers, `Idempotency-Key`, the query (`scope_id` a canonical UUID and only on
+  `createArtifact`; `max_bytes` a canonical decimal from 1 to 67108864; nothing else, each at
+  most once) and one multipart `Content-Type` with a valid boundary, or for a download the
+  `Range`, are `400 validation`. Then a server without `OPENMETTLE_API_ARTIFACTS_DIR` answers
+  `503 provisioning`. Only then is the session validated and the target authorized.
+- **Authorization.** `createArtifact` needs the personal scope's owner or a project editor:
+  a missing, deleted or invisible project is `404`, a viewer `403 policy`, an archived project
+  `409 conflict`. `createArtifactRevision` needs write access to the artifact: an item the
+  caller may not read is `404`, a reader `403`, an archived project `409`. Reads need current
+  read access on every request; a revision of another artifact is `404`.
+- **Idempotency.** The request key binds the operation, the target (the effective scope of a
+  new artifact, or the artifact) and the client key. The reservation identity adds
+  `max_bytes`; the settlement adds size, SHA-256, media type and display name. An exact retry,
+  with any boundary or part order, replays `201` with the same body and one charge. A changed
+  request, or a key whose upload failed, is `409 idempotency_conflict`; a key whose upload is
+  still streaming is `409 conflict`. Quota is `429 quota`; unconfigured storage limits are
+  `503 provisioning`.
+- **`ArtifactRevision`.** `artifact_id`, `revision_id`, `revision` and `size_bytes`
+  (`NonNegativeDecimal`), `scope_kind`, `scope_id`, `project_id`, `media_type` as normalized
+  by the parser, `sha256` (64 lowercase hex digits), nullable `display_name`, `state` (open:
+  `active`, `retained`, `purging`, `purged`) and `created_at`. No storage path or reservation.
+- **Downloads.** Only `active` revisions serve bytes; another state is `409 conflict`. The
+  response carries the stored media type as `Content-Type`, an exact `Content-Length`,
+  `Accept-Ranges: bytes`, `X-Content-Type-Options: nosniff` and `Content-Disposition:
+  attachment` with the display name as an RFC 8187 `filename*` in which every byte outside
+  `attr-char` is percent-encoded. `Range` takes one RFC 9110 byte range (`first-last`,
+  `first-` or `-suffix`) and answers `206` with `Content-Range: bytes first-last/size`. A
+  range that does not overlap the content, including any range of an empty file and `-0`, is
+  `416 range_not_satisfiable` with `Content-Range: bytes */size`. A list of ranges, another
+  unit, a reversed or malformed range, or a repeated field is `400 validation`. With
+  `If-Range` the whole content is sent, because the server issues no validator. `HEAD` answers
+  like `GET` without a body. A missing or resized stored file is `500 internal`.
+
+`tests/contract.rs` checks the live refusals above without PostgreSQL, the multipart examples
+and the consumer's `decode_revision`. `tests/schema/authz_http.rs` exercises uploads, retries
+with a new boundary and part order, quota, lifecycle, downloads, ranges, `HEAD`, share and
+membership revocation, interrupted uploads and `reconcile_expired` over PostgreSQL 18 on both
+session channels.

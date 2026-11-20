@@ -392,6 +392,8 @@ it beside the sign-in routes only when `OPENMETTLE_API_AUTH_CONFIG` is set; with
 
 There is no list, message, run, upload or streaming operation: cursor MACs (ADR 0007), run
 creation (V1-07, V1-10), SSE (V1-12) and artifact upload (V1-15) remain with their tickets.
+V1-15 PR2 has since added artifact uploads, revision metadata and downloads, decided by
+`authorize_create_in_scope` and `authorize_artifact` (ADR 0031).
 
 - **Sessions.** A request presents exactly one channel: the `__Host-openmettle-session` cookie
   (found by the handoff's single-cookie rule) or one `Authorization: Bearer` native credential,
