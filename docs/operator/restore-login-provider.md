@@ -50,4 +50,4 @@ A row matching the recorded request proves the change committed, even if a later
 
 The event records the successful restoration and its database timestamp. Only the database owner has ordinary access. The procedure only appends events. The database owner and a superuser retain the ability to alter stored evidence. The operator UUID is an owner-supplied reference to the deployment change record. Attribution to a person depends on those external controls. Authority and receipt reads require the primary and the existing deployment guarantee that acknowledged commits survive failover.
 
-First application administrator designation and the identity evidence required for that grant remain outstanding for V1-05 under [ADR 0008](../adr/0008-oidc-id-token-verification.md#notes-for-follow-on-design).
+On schema 15 or later, designate the first application administrator with the [account administrator procedure](account-admin-recovery.md). The identity evidence for that choice is the inspected approval, under [ADR 0008](../adr/0008-oidc-id-token-verification.md#notes-for-follow-on-design).

@@ -87,6 +87,20 @@ contract (relation, role, privilege) AS (
     SELECT 'membership_observations', 'openmettle_api', 'SELECT' WHERE $1 >= 11
     UNION ALL
     SELECT 'native_handoffs', 'openmettle_api', 'SELECT' WHERE $1 >= 14
+    UNION ALL
+    -- V1-05 (ADR 0027): authorization state for the API, recheck reads for the worker.
+    SELECT relation, 'openmettle_api', 'SELECT' FROM (VALUES
+        ('project_settings'), ('local_groups'), ('local_group_memberships'),
+        ('account_admin_lock'), ('account_admins'), ('platform_capability_denies'),
+        ('user_capability_denies'), ('user_capability_grants'), ('authorization_audit')
+    ) AS authz(relation) WHERE $1 >= 15
+    UNION ALL
+    SELECT relation, 'openmettle_worker', 'SELECT' FROM (VALUES
+        ('membership_observations'), ('local_identity_approvals'), ('login_providers'),
+        ('login_provider_revisions'), ('user_identities'), ('local_groups'),
+        ('local_group_memberships'), ('platform_capability_denies'),
+        ('user_capability_denies'), ('user_capability_grants')
+    ) AS recheck(relation) WHERE $1 >= 15
 ),
 column_contract (relation, attribute, role, privilege) AS (
     VALUES ('users', 'disabled_at', 'openmettle_api', 'UPDATE')
@@ -118,6 +132,63 @@ column_contract (relation, attribute, role, privilege) AS (
         ('audience','INSERT'), ('challenge','INSERT'), ('sealed','INSERT'),
         ('expires_ms','INSERT'), ('sealed','UPDATE')
     ) AS native(attribute, privilege) WHERE $1 >= 14
+    UNION ALL
+    -- V1-05: inserts never name generated IDs, times, revisions or audit operator actors;
+    -- updates never change an ownership or key column.
+    SELECT relation, attribute, 'openmettle_api', privilege FROM (VALUES
+        ('project_settings','project_id','INSERT'), ('project_settings','scope_id','INSERT'),
+        ('project_settings','name','INSERT'), ('project_settings','instructions','INSERT'),
+        ('project_settings','defaults','INSERT'), ('project_settings','updated_by_user_id','INSERT'),
+        ('project_settings','name','UPDATE'), ('project_settings','instructions','UPDATE'),
+        ('project_settings','defaults','UPDATE'), ('project_settings','revision','UPDATE'),
+        ('project_settings','archived_at','UPDATE'), ('project_settings','deleted_at','UPDATE'),
+        ('project_settings','updated_at','UPDATE'), ('project_settings','updated_by_user_id','UPDATE'),
+        ('local_groups','id','INSERT'), ('local_groups','name','INSERT'),
+        ('local_groups','created_by_user_id','INSERT'), ('local_groups','updated_by_user_id','INSERT'),
+        ('local_groups','name','UPDATE'), ('local_groups','revision','UPDATE'),
+        ('local_groups','disabled_at','UPDATE'), ('local_groups','updated_at','UPDATE'),
+        ('local_groups','updated_by_user_id','UPDATE'),
+        ('local_group_memberships','group_id','INSERT'), ('local_group_memberships','user_id','INSERT'),
+        ('local_group_memberships','active','INSERT'),
+        ('local_group_memberships','updated_by_user_id','INSERT'),
+        ('local_group_memberships','active','UPDATE'), ('local_group_memberships','revision','UPDATE'),
+        ('local_group_memberships','updated_at','UPDATE'),
+        ('local_group_memberships','updated_by_user_id','UPDATE'),
+        ('account_admin_lock','lock_guard','UPDATE'),
+        ('account_admins','user_id','INSERT'), ('account_admins','active','INSERT'),
+        ('account_admins','updated_by_user_id','INSERT'),
+        ('account_admins','active','UPDATE'), ('account_admins','revision','UPDATE'),
+        ('account_admins','updated_at','UPDATE'), ('account_admins','updated_by_user_id','UPDATE'),
+        ('platform_capability_denies','capability','INSERT'),
+        ('platform_capability_denies','denied','INSERT'),
+        ('platform_capability_denies','updated_by_user_id','INSERT'),
+        ('platform_capability_denies','denied','UPDATE'),
+        ('platform_capability_denies','revision','UPDATE'),
+        ('platform_capability_denies','updated_at','UPDATE'),
+        ('platform_capability_denies','updated_by_user_id','UPDATE'),
+        ('user_capability_denies','user_id','INSERT'), ('user_capability_denies','capability','INSERT'),
+        ('user_capability_denies','denied','INSERT'),
+        ('user_capability_denies','updated_by_user_id','INSERT'),
+        ('user_capability_denies','denied','UPDATE'), ('user_capability_denies','revision','UPDATE'),
+        ('user_capability_denies','updated_at','UPDATE'),
+        ('user_capability_denies','updated_by_user_id','UPDATE'),
+        ('user_capability_grants','user_id','INSERT'), ('user_capability_grants','capability','INSERT'),
+        ('user_capability_grants','granted','INSERT'),
+        ('user_capability_grants','updated_by_user_id','INSERT'),
+        ('user_capability_grants','granted','UPDATE'), ('user_capability_grants','revision','UPDATE'),
+        ('user_capability_grants','updated_at','UPDATE'),
+        ('user_capability_grants','updated_by_user_id','UPDATE'),
+        ('authorization_audit','actor_user_id','INSERT'), ('authorization_audit','action','INSERT'),
+        ('authorization_audit','target_kind','INSERT'), ('authorization_audit','target_id','INSERT'),
+        ('authorization_audit','request_key','INSERT'), ('authorization_audit','reason','INSERT'),
+        ('authorization_audit','details','INSERT')
+    ) AS authz(relation, attribute, privilege) WHERE $1 >= 15
+    UNION ALL
+    -- Immediate run invalidation by share, revoke and disable transactions and the recheck.
+    SELECT 'runs', attribute, role, 'UPDATE'
+    FROM (VALUES ('state'), ('wait_reason')) AS lifecycle(attribute),
+         (VALUES ('openmettle_api'), ('openmettle_worker')) AS r(role)
+    WHERE $1 >= 15
     UNION ALL
     SELECT relation, attribute, 'openmettle_api', privilege FROM (VALUES
         ('login_nonce_reservations','key_id','INSERT'),

@@ -1,0 +1,92 @@
+-- ADR 0027 (schema 15+): make one enabled user an active account_admin. The same command is
+-- the first-administrator bootstrap and break-glass recovery; see account-admin-recovery.md.
+-- Connect directly as openmettle_owner on the primary with psql -X -q. Supply every variable:
+--   user_id    the account's internal user UUID, canonical lowercase form
+--   request    a new request UUID for this change, canonical lowercase form
+--   operator   the deployment-assigned opaque operator UUID, canonical lowercase form
+--   reason     1 to 512 bytes, recorded in the immutable audit row
+-- Fails closed on missing variables. Prints one fixed line and never echoes input values.
+-- Re-running a committed request with the same operator and user changes nothing.
+\set ON_ERROR_STOP on
+\set VERBOSITY terse
+BEGIN ISOLATION LEVEL READ COMMITTED;
+SET LOCAL search_path = pg_catalog, pg_temp;
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '5s';
+SET LOCAL synchronous_commit = on;
+
+-- Refuse any other login, including openmettle_api, and validate every input before a cast.
+SELECT current_user = 'openmettle_owner' AND session_user = current_user
+       AND :'user_id' COLLATE "C" ~ pattern AND :'request' COLLATE "C" ~ pattern
+       AND :'operator' COLLATE "C" ~ pattern
+       AND octet_length(:'reason') BETWEEN 1 AND 512 AS valid
+  FROM (VALUES ('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')) AS uuid(pattern) \gset
+\set replayed false
+\set same false
+\set eligible false
+\set granted false
+\if :valid
+  -- Every account_admin change and user disablement serializes on this one row. The user row
+  -- is then held FOR SHARE so it cannot be disabled before this transaction ends.
+  SELECT id FROM openmettle.account_admin_lock WHERE id FOR UPDATE \g /dev/null
+  SELECT id FROM openmettle.users WHERE id = :'user_id'::uuid FOR SHARE \g /dev/null
+  -- Fresh statement after any wait. A request key is unique per operator.
+  SELECT count(*) = 1 AS replayed,
+         coalesce(bool_and(action = 'account_admin.grant' AND target_kind = 'user'
+                           AND target_id = :'user_id'), false) AS same
+    FROM openmettle.authorization_audit
+   WHERE actor_kind = 'operator' AND operator_id = :'operator'::uuid
+     AND request_key = :'request' \gset
+\endif
+\if :replayed
+  ROLLBACK;
+  \if :same
+    \echo 'account admin grant already committed'
+  \else
+    DO $refused$ BEGIN RAISE EXCEPTION 'account admin grant refused: request already used for another change; no changes committed'; END; $refused$;
+  \endif
+\elif :valid
+  -- Only an existing, enabled user who is not already an active administrator.
+  SELECT EXISTS (SELECT FROM openmettle.users u
+                  WHERE u.id = :'user_id'::uuid AND u.disabled_at IS NULL
+                    AND NOT EXISTS (SELECT FROM openmettle.account_admins a
+                                     WHERE a.user_id = u.id AND a.active)) AS eligible \gset
+  \if :eligible
+    -- Insert, or reactivate an inactive row at its next revision. NULL updated_by_user_id
+    -- records the operator; the audit row below names them.
+    WITH enabled_before AS (
+      SELECT count(*) AS n FROM openmettle.account_admins a
+        JOIN openmettle.users u ON u.id = a.user_id
+       WHERE a.active AND u.disabled_at IS NULL
+    ), changed AS (
+      INSERT INTO openmettle.account_admins AS a (user_id, active, updated_by_user_id)
+      VALUES (:'user_id'::uuid, true, NULL)
+      ON CONFLICT (user_id) DO UPDATE
+         SET active = true, revision = a.revision + 1, updated_at = clock_timestamp(),
+             updated_by_user_id = NULL
+       WHERE NOT a.active
+      RETURNING a.revision
+    ), audited AS (
+      INSERT INTO openmettle.authorization_audit
+        (actor_kind, operator_id, action, target_kind, target_id, request_key, reason, details)
+      SELECT 'operator', :'operator'::uuid, 'account_admin.grant', 'user', :'user_id',
+             :'request', :'reason',
+             jsonb_build_object('revision', changed.revision,
+                                'enabled_admins_before', enabled_before.n)
+        FROM changed, enabled_before
+      RETURNING 1
+    )
+    SELECT count(*) = 1 AS granted FROM audited \gset
+  \endif
+  \if :granted
+    COMMIT;
+    -- Reached only after the server acknowledged COMMIT.
+    \echo 'account admin grant committed'
+  \else
+    ROLLBACK;
+    DO $refused$ BEGIN RAISE EXCEPTION 'account admin grant refused: no enabled user with this ID, or already an active administrator; no changes committed'; END; $refused$;
+  \endif
+\else
+  ROLLBACK;
+  DO $refused$ BEGIN RAISE EXCEPTION 'account admin grant refused: wrong role or missing or invalid input; nothing changed'; END; $refused$;
+\endif

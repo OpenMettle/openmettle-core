@@ -640,7 +640,7 @@ async fn fresh_install_is_idempotent_and_owned() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(
         db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
 
     let mut admin = db.admin().await;
@@ -726,7 +726,7 @@ async fn populated_upgrade_preserves_identity_and_ownership() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(
         db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
 
     let mut api = connect(&db.0, API).await;
@@ -814,7 +814,7 @@ async fn held_lock_times_out_and_is_released_for_retry() {
     assert_eq!(retry.status.code(), Some(0), "{}", stderr(&retry));
     assert_eq!(
         db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
 }
 
@@ -957,7 +957,7 @@ async fn killed_migrator_holding_the_lock_mid_migration_rolls_back() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(
         db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
 }
 
@@ -1171,7 +1171,7 @@ async fn wrong_login_is_refused_before_bootstrap_and_owner_retry_succeeds() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(
         db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
 
     // Later runs check identity as well.
@@ -1438,7 +1438,7 @@ async fn unsafe_privileges_defaults_and_ownership_are_refused() {
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
     assert_eq!(
         db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
 
     // A migration that grants beyond the contract is reported after it commits.
@@ -1457,8 +1457,9 @@ async fn unsafe_privileges_defaults_and_ownership_are_refused() {
         MIGRATIONS[11],
         MIGRATIONS[12],
         MIGRATIONS[13],
+        MIGRATIONS[14],
         Source {
-            version: 15,
+            version: 16,
             description: "over-grant",
             sql: "GRANT DELETE ON openmettle.messages TO openmettle_worker",
         },
@@ -1504,7 +1505,9 @@ async fn application_roles_are_bounded() {
             ) => {
                 matches!(privilege, "SELECT" | "INSERT")
             }
-            (WORKER, "users" | "scopes" | "projects" | "conversations") => privilege == "SELECT",
+            (WORKER, "users" | "user_identities" | "scopes" | "projects" | "conversations") => {
+                privilege == "SELECT"
+            }
             (WORKER, "messages") => matches!(privilege, "SELECT" | "INSERT"),
             _ => false,
         }
@@ -1600,7 +1603,8 @@ async fn application_roles_are_bounded() {
     for sql in [
         "INSERT INTO openmettle.users DEFAULT VALUES",
         "UPDATE openmettle.users SET disabled_at = now()",
-        "SELECT * FROM openmettle.user_identities",
+        // From migration 15 the worker reads identities for its recheck, but never writes them.
+        "UPDATE openmettle.user_identities SET subject = subject",
         "INSERT INTO openmettle.user_identities (user_id, issuer, subject) \
          SELECT id, 'https://issuer.example.test', 'worker' FROM openmettle.users",
         "INSERT INTO openmettle.scopes (kind, project_id) VALUES ('project', gen_random_uuid())",
@@ -1848,7 +1852,7 @@ async fn runtime_readiness_with_bounded_roles_never_migrates() {
     }
     assert_eq!(
         db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
 }
 

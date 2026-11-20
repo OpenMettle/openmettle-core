@@ -52,9 +52,17 @@ async fn exact_session_privileges_and_inert_lock_columns() {
         let mut c = connect(&db.0, role).await;
         if role == WORKER {
             expect_state(&mut c, "SELECT * FROM openmettle.local_sessions", "42501").await;
+            // From migration 15 the worker reads approvals for its recheck (ADR 0027), but
+            // cannot lock or change them.
             expect_state(
                 &mut c,
-                "SELECT * FROM openmettle.local_identity_approvals",
+                "SELECT id FROM openmettle.local_identity_approvals FOR SHARE",
+                "42501",
+            )
+            .await;
+            expect_state(
+                &mut c,
+                "UPDATE openmettle.local_identity_approvals SET lock_guard=false",
                 "42501",
             )
             .await;
@@ -136,7 +144,7 @@ async fn migration_eight_rollback_and_version_gated_privileges() {
         .unwrap();
     assert_eq!(
         db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
 }
 
