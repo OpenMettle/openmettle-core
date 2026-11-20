@@ -116,6 +116,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "session issuance role",
         sql: include_str!("../migrations/0018_session_issuance_role.sql"),
     },
+    Source {
+        version: 19,
+        description: "run admission and queue",
+        sql: include_str!("../migrations/0019_run_admission_and_queue.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

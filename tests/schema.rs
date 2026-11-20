@@ -498,6 +498,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "425c1d0aa9d3cf7d1910cab8f2ec55d3a5c8de24a169c181b5febeedc84f7c91",
         "6b2363d7267c088f75999b697fee05f74f88ee4a572be688558b03e9fe27d35c",
         "26a9aff24fdead77748763b8e73ecf834faddfcfa5b0c3b70eebc5dd624000db",
+        "93686928e8f33f08c340f6dbe6348727a1f9abb4c44c0e68061d10578d181e59",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
@@ -1915,6 +1916,9 @@ mod authz_runs;
 
 #[path = "schema/authz_http.rs"]
 mod authz_http;
+
+#[path = "schema/run_admission.rs"]
+mod run_admission;
 
 // Fixtures of the mounted-API tests in `authz_http`: synthetic auth settings, the transport
 // fixture's synthetic CA (its leaf certificates are not needed) and the independent contract

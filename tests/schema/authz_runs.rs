@@ -233,6 +233,32 @@ fn cancelled() -> (String, Option<String>) {
     ("cancelled".into(), None)
 }
 
+/// The run's terminal events (format, payload) under the ADR 0032 key, read as the owner role.
+pub(super) async fn terminal_events(db: &TestDb, run_id: &str) -> Vec<(String, Vec<u8>)> {
+    sqlx::query_as(
+        "SELECT format, payload FROM openmettle.run_events
+          WHERE run_id = $1::uuid AND append_key = 'run-terminal' AND format_version = 1",
+    )
+    .bind(run_id)
+    .fetch_all(&mut connect(&db.0, OWNER).await)
+    .await
+    .unwrap()
+}
+
+/// Exactly one `openmettle.run-cancelled` v1 terminal event with `reason`.
+pub(super) async fn cancelled_once(db: &TestDb, run_id: &str, reason: &str) {
+    let payload = format!(r#"{{"reason":"{reason}"}}"#).into_bytes();
+    assert_eq!(
+        terminal_events(db, run_id).await,
+        [("openmettle.run-cancelled".to_owned(), payload)],
+        "{run_id}"
+    );
+}
+
+async fn revoked_once(db: &TestDb, run: &Run) {
+    cancelled_once(db, &run.id, "revoked").await;
+}
+
 async fn recheck_on(
     c: &mut PgConnection,
     run: &Run,
@@ -283,9 +309,11 @@ async fn invalidated_at(
     let outcome = recheck_as(db, WORKER, run, capabilities, extra, now_ms).await;
     assert_eq!(outcome.unwrap(), RunRecheckOutcome::Invalidated(reason));
     assert_eq!(state_of(db, run).await, cancelled());
+    revoked_once(db, run).await;
     let again = recheck_as(db, WORKER, run, capabilities, extra, now_ms).await;
     assert_eq!(again.unwrap(), terminal("cancelled"));
     assert_eq!(state_of(db, run).await, cancelled());
+    revoked_once(db, run).await;
 }
 
 async fn invalidated(
@@ -614,16 +642,20 @@ async fn disable_user_cancels_every_live_run_it_owns_in_the_same_transaction() {
     ];
 
     applied(store::disable_user(&mut api(&db).await, &ctx(&admin, "disable"), &carol.user).await);
-    // Cancelled when the disablement commits, before any worker recheck.
+    // Cancelled when the disablement commits, before any worker recheck, each with one
+    // terminal event (ADR 0032).
     for run in &live {
         assert_eq!(state_of(&db, run).await, cancelled());
+        revoked_once(&db, run).await;
         assert_eq!(worker(&db, run, &[]).await, terminal("cancelled"));
     }
     for (state, run) in &ended {
         assert_eq!(state_of(&db, run).await, ((*state).to_owned(), None));
+        assert!(terminal_events(&db, &run.id).await.is_empty());
     }
     for run in &others {
         assert_eq!(state_of(&db, run).await, ("queued".into(), None));
+        assert!(terminal_events(&db, &run.id).await.is_empty());
         assert_eq!(worker(&db, run, &[]).await, CONTINUE);
     }
     // A replayed request cancels nothing new; re-enabling revives no run.
@@ -633,6 +665,7 @@ async fn disable_user_cancels_every_live_run_it_owns_in_the_same_transaction() {
     applied(store::enable_user(&mut api(&db).await, &ctx(&admin, "enable"), &carol.user).await);
     for run in &live {
         assert_eq!(state_of(&db, run).await, cancelled());
+        revoked_once(&db, run).await;
     }
 }
 
@@ -999,6 +1032,7 @@ async fn archive_and_delete_cancel_live_project_runs_in_the_same_transaction() {
     );
     for run in &live {
         assert_eq!(state_of(&db, run).await, cancelled());
+        revoked_once(&db, run).await;
         assert_eq!(
             recheck_on(&mut w, run, &[], None, NOW).await.unwrap(),
             terminal("cancelled")
@@ -1006,6 +1040,7 @@ async fn archive_and_delete_cancel_live_project_runs_in_the_same_transaction() {
     }
     for (state, run) in &ended {
         assert_eq!(state_of(&db, run).await, ((*state).to_owned(), None));
+        assert!(terminal_events(&db, &run.id).await.is_empty());
     }
     for run in other_project.iter().chain([&personal]) {
         assert_eq!(worker(&db, run, &[]).await, CONTINUE);
@@ -1017,13 +1052,16 @@ async fn archive_and_delete_cancel_live_project_runs_in_the_same_transaction() {
     );
     for run in &live {
         assert_eq!(state_of(&db, run).await, cancelled());
+        revoked_once(&db, run).await;
     }
     applied(projects::delete_project(&mut api(&db).await, &ctx(&alice, "delete"), &deleted).await);
     for run in &other_project {
         assert_eq!(state_of(&db, run).await, cancelled());
+        revoked_once(&db, run).await;
         assert_eq!(worker(&db, run, &[]).await, terminal("cancelled"));
     }
     assert_eq!(state_of(&db, &personal).await, ("queued".into(), None));
+    assert!(terminal_events(&db, &personal.id).await.is_empty());
 }
 
 // --- concurrency -------------------------------------------------------------------------------
@@ -1078,6 +1116,7 @@ async fn a_held_recheck_never_blocks_on_and_never_deadlocks_with_bulk_cancellati
     applied(archived);
     for r in [&run, &sibling] {
         assert_eq!(state_of(&db, r).await, cancelled());
+        revoked_once(&db, r).await;
     }
 
     // A worker that cancels the run it holds first leaves the waiting disablement nothing to
@@ -1110,6 +1149,9 @@ async fn a_held_recheck_never_blocks_on_and_never_deadlocks_with_bulk_cancellati
     for r in [&mine, &other] {
         assert_eq!(state_of(&db, r).await, cancelled());
     }
+    // The raw worker statement bypassed the protocol; the disablement cancelled only `other`.
+    assert!(terminal_events(&db, &mine.id).await.is_empty());
+    revoked_once(&db, &other).await;
 
     // Rechecks racing a disablement and an archive that both cover the same runs: every
     // transaction commits (no deadlock or lock timeout) and every run ends cancelled.
@@ -1156,8 +1198,10 @@ async fn a_held_recheck_never_blocks_on_and_never_deadlocks_with_bulk_cancellati
                 "round {round}: {outcome:?}"
             );
         }
+        // Whichever path cancelled a run, it recorded the one terminal event.
         for r in &races {
             assert_eq!(state_of(&db, r).await, cancelled(), "round {round}");
+            revoked_once(&db, r).await;
         }
     }
 }

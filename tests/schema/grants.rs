@@ -677,8 +677,11 @@ async fn old_domain_snapshot(db: &TestDb) -> Vec<String> {
         "storage_reservations",
         "artifact_revisions",
     ] {
+        // Columns added by later migrations; the upgrade assertions check they stay unset.
         let rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT (to_jsonb(t) - 'session_generation' - 'session_issued' - 'lock_guard' - 'display_name')::text FROM openmettle.{table} t ORDER BY 1"
+            "SELECT (to_jsonb(t) - 'session_generation' - 'session_issued' - 'lock_guard' - 'display_name'
+                     - 'actor_approval_id' - 'round_limit' - 'queue_expires_at' - 'claim_token' - 'claimed_at')::text
+               FROM openmettle.{table} t ORDER BY 1"
         )))
         .fetch_all(&mut c)
         .await
@@ -1459,6 +1462,17 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
     .await
     .unwrap();
     assert_eq!(named, 0);
+    // Migration 19 (ADR 0032) admits and claims no existing run: every one keeps NULL
+    // admission and claim columns, so it is never claimed and the expiry sweep fails it.
+    let admitted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM openmettle.runs
+          WHERE actor_approval_id IS NOT NULL OR round_limit IS NOT NULL
+             OR queue_expires_at IS NOT NULL OR claim_token IS NOT NULL OR claimed_at IS NOT NULL",
+    )
+    .fetch_one(&mut db.admin().await)
+    .await
+    .unwrap();
+    assert_eq!(admitted, 0);
     if with_grants {
         assert_eq!(grant_snapshot(&db).await, grant_before);
     }
@@ -1516,6 +1530,13 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
             "openmettle.projects.lock_guard",
             // Migration 17 (ADR 0031).
             "openmettle.artifact_revisions.display_name",
+            // Migration 19 (ADR 0032).
+            "openmettle.runs.actor_approval_id",
+            "openmettle.runs.round_limit",
+            "openmettle.runs.queue_expires_at",
+            "openmettle.runs.claim_token",
+            "openmettle.runs.claimed_at",
+            "openmettle.run_dispatch_lock",
         ];
         let worker_reads = [
             "openmettle_worker has SELECT on openmettle.membership_observations",

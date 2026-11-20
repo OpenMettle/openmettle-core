@@ -1,8 +1,9 @@
 # 0032 — Durable run admission and fair PostgreSQL work queue
 
-Status: proposed V1-10 PR1 design, 20 November 2026. Agent-authored; owner approval,
-independent review and CI acceptance are separate gates. Refs #10. Migration 19, the store
-functions and their tests follow in PR2; the workstation measurement follows in PR3. #10
+Status: proposed V1-10 design (PR1) with its PR2 implementation, 20 November 2026.
+Agent-authored; owner approval, independent review and CI acceptance are separate gates.
+Refs #10. PR2 adds migration 19, the store functions and their PostgreSQL 18 schema tests (see
+[Implementation](#implementation-pr2)); the workstation measurement follows in PR3. #10
 remains open.
 
 ## Problem
@@ -197,7 +198,7 @@ RETURNING r.scope_id::text, r.id::text, r.claim_token::text,
           r.actor_approval_id::text, r.round_limit;
 ```
 
-The same transaction appends `openmettle.run-claimed` (version 1, empty payload) under append
+The same transaction appends `openmettle.run-claimed` (version 1, payload `{}`) under append
 key `claim:<claim_token>`, then commits. If no row qualifies, `claim_next` returns `None`.
 
 - **Ordering rule.** Least-loaded actor first, then FIFO by admission time and ID. An actor with
@@ -244,10 +245,10 @@ same key for `succeeded`, `failed` and `interrupted`.
 
 | Trigger | Who | Transition | Terminal event |
 | --- | --- | --- | --- |
-| Caller cancels | API `cancel_run` | `queued` → `cancelled` | `openmettle.run-cancelled` v1, payload `requested` |
-| Queue deadline passes | worker `expire_queued` (either role may run it) | `queued` → `failed` | `openmettle.run-expired` v1, empty |
-| Archive, delete, disable | API bulk cancellation (ADR 0027) | non-terminal → `cancelled` | `openmettle.run-cancelled` v1, payload `revoked` |
-| Membership, share, capability, approval or provider revocation | worker `recheck_run` after claim | non-terminal → `cancelled` | `openmettle.run-cancelled` v1, payload `revoked` |
+| Caller cancels | API `cancel_run` | `queued` → `cancelled` | `openmettle.run-cancelled` v1, payload `{"reason":"requested"}` |
+| Queue deadline passes | worker `expire_queued` (either role may run it) | `queued` → `failed` | `openmettle.run-expired` v1, payload `{}` |
+| Archive, delete, disable | API bulk cancellation (ADR 0027) | non-terminal → `cancelled` | `openmettle.run-cancelled` v1, payload `{"reason":"revoked"}` |
+| Membership, share, capability, approval or provider revocation | worker `recheck_run` after claim | non-terminal → `cancelled` | `openmettle.run-cancelled` v1, payload `{"reason":"revoked"}` |
 
 - **`cancel_run(c, principal, scope_id, run_id)`.** The principal is hydrated by the route for
   the request. Lock the run row; a run of another actor is concealed (`NotFound`). `queued`
@@ -314,12 +315,36 @@ ADR 0004 records; V1-11 fencing is the enforcement step.
 - **`SKIP LOCKED` without the dispatch lock.** Limits overshoot under concurrent claims.
 - **Recheck inside the claim transaction.** Holds the global lock across several hydration reads.
 
+## Implementation (PR2)
+
+The store functions live in `authz::runs` (`src/authz/runs.rs`) beside the recheck they share
+their decision and transaction with; `src/runs.rs` gains only the admission columns of the
+run `INSERT` and an append for a run row the caller already holds.
+
+- `admit_run(tx, &RunAdmission, &AdmissionLimits)` returns `Admission::Admitted { run_id,
+  round_limit }`, `Admission::Replayed { run_id, state, round_limit }` or
+  `Admission::Refused(RunLimit)`; the caller commits only after `Admitted`. Errors are the
+  ADR 0027 `StoreError`: concealment is `Denied(DenialReason::NotFound)`, an inactive actor
+  `Denied(InactivePrincipal)`, a missing role or capability `Denied(Policy(_))`, and the two
+  conflicts are `Conflict(KEY_REUSED)` and `Conflict(ARCHIVED)`. A replay of a run written by
+  bare `create_run` or before version 19 reports `round_limit: None`.
+- Because exactness depends on each statement after a lock seeing earlier commits,
+  `admit_run` refuses a caller transaction that is not READ COMMITTED (`InvalidInput`).
+- `find_run(c, scope_id, actor_user_id, idempotency_key)` is the read-only replay lookup. It
+  returns the stored conversation, branch and input message IDs so a retry reuses the original
+  input identity, and `RunReplay::matches` compares a request with the stored identity.
+- `cancel_run` returns `CancelOutcome::{Cancelled, Terminal { state }, Executing { state }}`;
+  `expire_queued` returns the failed run IDs in ascending order; `claim_next` returns
+  `Option<ClaimedRun { scope_id, run_id, claim_token, actor_approval_id, round_limit }>`.
+- Bare `create_run` still names only the pre-19 columns, so its rows keep `NULL` admission
+  columns and it also works against an older schema.
+
 ## Delivery and evidence
 
 | PR | Content | Evidence for #10 |
 | --- | --- | --- |
-| PR1 (this) | ADR 0032 and a pointer from ADR 0004 | Review |
-| PR2 | Migration 19, `boundaries.sql` version 19, `admit_run`, replay lookup, `cancel_run`, `expire_queued`, `claim_next`, terminal events in the three revocation paths, schema tests on CI PostgreSQL 18 | Tests below pass in CI |
+| PR1 | ADR 0032 and a pointer from ADR 0004 | Review |
+| PR2 | Migration 19, `boundaries.sql` version 19, `admit_run`, replay lookup, `cancel_run`, `expire_queued`, `claim_next`, terminal events in the three revocation paths, schema tests on CI PostgreSQL 18 (`tests/schema/run_admission.rs`, terminal-event assertions in `tests/schema/authz_runs.rs`) | Tests below pass in CI |
 | PR3 | An ignored test harness that drives many actors and claimers against a disposable database and records latency, lock waits and `EXPLAIN (ANALYZE, BUFFERS)` of the claim | Owner-run on the workstation profile in the agreed 20:00–07:00 window; results recorded on #10 |
 
 PR2 tests use the existing disposable PostgreSQL fixture:
