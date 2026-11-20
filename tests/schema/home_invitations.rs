@@ -251,7 +251,7 @@ async fn migration_14_keeps_the_redemption_contract_and_gates_the_native_grants(
 
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
     assert_eq!(MIGRATIONS[NATIVE].version, 14);
-    assert_eq!(db.history().await, (1..=14).collect::<Vec<i64>>());
+    assert_eq!(db.history().await, (1..=15).collect::<Vec<i64>>());
     assert_eq!(function_contract(&mut owner).await, contract(CODED));
     let layouts: (bool, bool) = sqlx::query_as(body).fetch_one(&mut owner).await.unwrap();
     assert_eq!(layouts, (true, true), "schema 14 admits both layouts");
@@ -375,7 +375,7 @@ async fn pending_invitation_without_a_code_blocks_migration_13_until_withdrawn()
     );
     assert!(out.status.success(), "{}", stderr(&out));
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
-    assert_eq!(db.history().await, (1..=14).collect::<Vec<i64>>());
+    assert_eq!(db.history().await, (1..=15).collect::<Vec<i64>>());
     assert_eq!(function_contract(&mut owner).await, contract(CODED));
     // Both closed decisions survive, with no code and no way to become pending again.
     let rows: Vec<(String, bool, bool)> = sqlx::query_as(

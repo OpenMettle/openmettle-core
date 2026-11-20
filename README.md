@@ -257,6 +257,10 @@ it with the [approval change procedure](docs/operator/identity-approval-change.m
 On schema 10 or later, owners can perform an [audited restoration of a retired provider](docs/operator/restore-login-provider.md) during an OIDC outage. Fresh login still requires a successful provider exchange and current local approval.
 Validation and logout use the primary database without provider network access.
 Session context does not grant resource access; V1-05 checks remain required before exposure.
+Schema 15 stores V1-05 authorization state (project settings, local groups, account
+administrators, capability denies and an append-only audit) without any route using it yet.
+Owners designate the first or a break-glass `account_admin` with the
+[account administrator procedure](docs/operator/account-admin-recovery.md).
 
 Credentials are random opaque values; only domain-separated digests are stored. Lifetime,
 retained-row allowance and operation deadline are explicit bounded inputs with no deployment

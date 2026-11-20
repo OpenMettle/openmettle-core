@@ -1003,7 +1003,7 @@ async fn migration_four_failure_kill_timeout_and_concurrent_retry() {
     }
     assert_eq!(
         db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
     let singleton: (i64, Option<i64>) = sqlx::query_as(
         "SELECT count(*), max(instance_budget_bytes) FROM openmettle.storage_instance",
@@ -1100,7 +1100,7 @@ async fn populated_v3_upgrade_and_authentic_v3_binaries() {
         .unwrap();
     assert_eq!(
         db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
     let after = (
         snapshot(&mut api, &tables).await,

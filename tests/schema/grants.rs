@@ -652,7 +652,7 @@ async fn migration_five_failure_kill_timeout_and_concurrent_retry() {
     }
     assert_eq!(
         db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
     assert_eq!(
         count(&db, "SELECT count(*) FROM openmettle.grant_mapping_rules").await,
@@ -1210,7 +1210,9 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
         assert_eq!(refusal.status.code(), Some(1));
         assert!(stderr(&refusal).contains("database has migration 10"));
     }
-    migrate::apply(&db.settings(Duration::from_secs(10)), MIGRATIONS)
+    // Upgrade to schema 14 first so the historical refusals below stay exact; schema 15 is
+    // applied and checked after them.
+    migrate::apply(&db.settings(Duration::from_secs(10)), &MIGRATIONS[..14])
         .await
         .unwrap();
     assert_eq!(
@@ -1369,6 +1371,87 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
             "{}",
             stderr(&refused)
         );
+    }
+    let unchanged: Vec<String> =
+        sqlx::query_scalar("SELECT t::text FROM openmettle._sqlx_migrations t ORDER BY version")
+            .fetch_all(&mut db.admin().await)
+            .await
+            .unwrap();
+    assert_eq!(unchanged, full);
+
+    // Schema 15 keeps every row. Its V1-05 privileges are outside every historical contract
+    // too, so the historical migrator still stops at the boundary check. From v11, each
+    // reported violation is a v13 redemption, v14 native delivery or v15 privilege, and no
+    // API membership privilege is ever reported.
+    migrate::apply(&db.settings(Duration::from_secs(10)), MIGRATIONS)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.history().await,
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    );
+    assert_eq!(old_domain_snapshot(&db).await, before);
+    if with_grants {
+        assert_eq!(grant_snapshot(&db).await, grant_before);
+    }
+    if with_login {
+        assert_eq!(login_snapshot(&db).await, login_before);
+    }
+    assert_eq!(membership_snapshot(&db).await, membership_before);
+    assert_eq!(invitation_snapshot(&db).await, invitations_before);
+    let full: Vec<String> =
+        sqlx::query_scalar("SELECT t::text FROM openmettle._sqlx_migrations t ORDER BY version")
+            .fetch_all(&mut db.admin().await)
+            .await
+            .unwrap();
+    let refused = old_migrate();
+    assert_eq!(refused.status.code(), Some(1));
+    let text = stderr(&refused);
+    assert!(text.contains("boundary check refused"), "{text}");
+    if versions.last() >= Some(&11) {
+        // v11 to v13 report at most 20 sorted violations, joined by "; ", on one line.
+        let (_, reported) = text
+            .split_once("boundary check refused to migrate: ")
+            .unwrap_or_else(|| panic!("{text}"));
+        let reported: Vec<&str> = reported.lines().next().unwrap().split("; ").collect();
+        assert!(!reported.is_empty(), "{text}");
+        let v15 = [
+            "openmettle.project_settings",
+            "openmettle.local_groups",
+            "openmettle.local_group_memberships",
+            "openmettle.account_admin_lock",
+            "openmettle.account_admins",
+            "openmettle.platform_capability_denies",
+            "openmettle.user_capability_denies",
+            "openmettle.user_capability_grants",
+            "openmettle.authorization_audit",
+            "openmettle.runs.state",
+            "openmettle.runs.wait_reason",
+        ];
+        let worker_reads = [
+            "openmettle_worker has SELECT on openmettle.membership_observations",
+            "openmettle_worker has SELECT on openmettle.local_identity_approvals",
+            "openmettle_worker has SELECT on openmettle.login_providers",
+            "openmettle_worker has SELECT on openmettle.login_provider_revisions",
+            "openmettle_worker has SELECT on openmettle.user_identities",
+        ];
+        for violation in &reported {
+            let later = violation.contains("openmettle.native_handoffs")
+                || violation.ends_with(" on function openmettle.redeem_home_invitation(uuid,text,text,text,bigint,bytea)")
+                || worker_reads.contains(violation)
+                || v15.iter().any(|object| {
+                    violation.ends_with(&format!(" on {object}"))
+                        || violation.contains(&format!(" on {object}."))
+                });
+            assert!(later, "{violation} in {text}");
+            assert!(
+                !(violation.starts_with("openmettle_api ") && violation.contains("membership")),
+                "{text}"
+            );
+            if versions.last() == Some(&13) {
+                assert!(!violation.contains("redeem_home_invitation"), "{text}");
+            }
+        }
     }
     let unchanged: Vec<String> =
         sqlx::query_scalar("SELECT t::text FROM openmettle._sqlx_migrations t ORDER BY version")

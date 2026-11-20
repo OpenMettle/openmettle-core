@@ -311,13 +311,19 @@ async fn approved_project_mapping_orders_real_assertions_and_preserves_direct_gr
             .await
             .is_err()
     );
+    // From migration 15 the worker reads evidence for its recheck (ADR 0027), never writes it.
+    let mut worker = f.db.connect(WORKER).await;
+    worker
+        .execute("SELECT (observation).state FROM openmettle.membership_observations")
+        .await
+        .unwrap();
     assert!(
-        f.db.connect(WORKER)
-            .await
-            .execute("SELECT * FROM openmettle.membership_observations")
+        worker
+            .execute("UPDATE openmettle.membership_observations SET issued_ms=issued_ms")
             .await
             .is_err()
     );
+    drop(worker);
     let p = f.h.provider.clone();
     assert_eq!(
         current(&mut f.api, &approval, &project, &session_policy())

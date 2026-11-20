@@ -96,6 +96,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "native sign-in handoffs",
         sql: include_str!("../migrations/0014_native_handoffs.sql"),
     },
+    Source {
+        version: 15,
+        description: "authorization and private projects",
+        sql: include_str!("../migrations/0015_authorization_and_projects.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

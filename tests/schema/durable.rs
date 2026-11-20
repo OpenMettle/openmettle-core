@@ -684,7 +684,7 @@ async fn killed_migration_three_preserves_version_two() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(
         db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
     db.wait_no_migration_session().await;
 }
@@ -732,7 +732,7 @@ async fn version_three_failure_timeout_concurrent_upgrade() {
     }
     assert_eq!(
         db.history().await,
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
     db.wait_no_migration_session().await;
 }
@@ -773,10 +773,12 @@ async fn durable_roles_and_ownership_are_bounded() {
             }
         }
         for sql in [
-            "UPDATE openmettle.runs SET state='running'",
+            // Migration 15 grants UPDATE (state, wait_reason) for run invalidation only
+            // (authorization.rs); no other run column may change alongside them.
+            "UPDATE openmettle.runs SET state='running', actor_user_id=actor_user_id",
             "INSERT INTO openmettle.runs(state) VALUES ('succeeded')",
             "INSERT INTO openmettle.operations(outcome) VALUES ('succeeded')",
-            "UPDATE openmettle.runs SET wait_reason='approval'",
+            "UPDATE openmettle.runs SET wait_reason='approval', conversation_id=conversation_id",
             "UPDATE openmettle.runs SET scope_id=scope_id",
             "UPDATE openmettle.runs SET input_snapshot='x'::bytea",
             "UPDATE openmettle.runs SET request_digest=request_digest",

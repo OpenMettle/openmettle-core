@@ -194,6 +194,33 @@ denies and assignments) needs the same read-only grant; PR2 records it. No secre
 material or session credential is granted. PR5 performs the recheck before dispatch and at
 each tool or provider step.
 
+### Migration 15 (PR2)
+
+`migrations/0015_authorization_and_projects.sql` adds persistence only; no route reads it yet.
+
+- `project_settings`: name, instructions, `defaults` (a JSON object of at most 16 KiB with no
+  top-level `folder_id`, `folder_ids`, `collection_id` or `collection_ids`), revision and
+  `archived_at`/`deleted_at`, keyed by the stable project and scope IDs. A project without a
+  row, including every pre-15 project, has no name, empty instructions and `{}` defaults.
+- `local_groups` (flat; no nesting column) and `local_group_memberships`: one current-state
+  row per group and user with `active` and a revision, so removal and re-adding need no
+  `DELETE`.
+- `account_admins` with `active` and a revision. Every administrator change and user
+  disablement first locks the single `account_admin_lock` row `FOR UPDATE`; the API can take
+  it only through an inert `lock_guard` column. Bootstrap and break-glass use
+  `docs/operator/grant-account-admin.psql`.
+- `platform_capability_denies`, `user_capability_denies` and `user_capability_grants`, whose
+  capability check mirrors `valid_capability` in `src/authz.rs` exactly.
+- `authorization_audit`: append-only. Actor is a user or an operator UUID, never both; the
+  request key is unique per actor. The API may insert only user-actor rows (its column grant
+  excludes the ID, time, actor kind and operator) and can never update or delete.
+- Grants as specified above, plus API column-level writes on the new tables and
+  `UPDATE (state, wait_reason)` on `runs` for both roles. No `DELETE` or `TRUNCATE`.
+
+Group grantees on ADR 0006 assignments (`grant_assignments.grantee_user_id` is `NOT NULL`)
+are not part of this migration; sharing with or granting project roles to a group needs a
+later additive migration before PR3/PR4 writes them.
+
 ## Verification
 
 `src/authz/tests.rs` covers vocabulary acceptance and rejection, the role matrix,
