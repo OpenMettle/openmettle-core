@@ -1,6 +1,8 @@
-//! Shared operational contract and persistence primitives; no domain APIs or worker queue yet.
-//! The API can also mount the browser sign-in routes, and beside them the native sign-in
-//! routes, off by default (ADRs 0025 and 0029).
+//! Shared operational contract and persistence primitives; no worker queue yet. The API can
+//! also mount the browser sign-in routes, beside them the native sign-in routes, and the
+//! authenticated `/v1` project, conversation and artifact routes (ADRs 0025, 0029 and 0027
+//! PR4b), all off by default: without `OPENMETTLE_API_AUTH_CONFIG` it serves `/healthz` and
+//! `/readyz` only.
 pub mod auth;
 pub mod auth_config;
 pub mod authz;
@@ -17,6 +19,7 @@ pub mod runs;
 pub mod sessions;
 pub mod storage;
 pub mod telemetry;
+pub mod v1;
 
 use axum::{Router, extract::State, http::StatusCode, routing::get};
 use browser_auth::{
@@ -135,12 +138,14 @@ fn routes(health: Health) -> Router {
 /// Every route the process serves (ADR 0025): the operational routes, and for an API given
 /// `AUTH_CONFIG` the browser sign-in routes of that version-2 document, over the same primary
 /// pool (ADR 0016). A `native` profile in it adds the five native routes over the same
-/// service, so one provider manager and one pool serve both (ADR 0029). Loading reads local
-/// files only; no provider, DNS name or database is contacted, and the lazy pool stays
-/// unconnected. Readiness is unchanged and database-only.
+/// service, so one provider manager and one pool serve both (ADR 0029). The authenticated
+/// `/v1` routes are mounted beside them and accept a session from either channel (ADR 0027
+/// PR4b). Loading reads local files only; no provider, DNS name or database is contacted, and
+/// the lazy pool stays unconnected. Readiness is unchanged and database-only.
 ///
-/// The settings checks refused `/healthz` and `/readyz` and every browser path as native
-/// paths, and the constructors repeat them, so no merge can shadow a route or panic.
+/// The settings checks refused `/healthz`, `/readyz` and every `/v1` path as browser and
+/// native paths, and every browser path as a native path, and the constructors repeat them,
+/// so no merge can shadow a route or panic.
 fn app(config: &Config, pool: &PgPool) -> Result<Router, auth_config::Error> {
     let operational = routes(Health {
         pool: pool.clone(),
@@ -157,16 +162,20 @@ fn app(config: &Config, pool: &PgPool) -> Result<Router, auth_config::Error> {
     let sign_in = router_with_sessions(handoff, profile.router(), profile.sessions())
         .map_err(auth_config::Error::BrowserRouter)?;
     let mut app = operational.merge(sign_in);
+    let mut bearer = None;
     if let Some(native) = native {
-        let auth = NativeAuth::checked(service, native.settings(), native.rate())
+        let auth = NativeAuth::checked(service.clone(), native.settings(), native.rate())
             .map_err(auth_config::Error::Native)?;
+        let auth = Arc::new(auth);
         // The rate was accepted just above; a refusal here is that check's category.
-        let routes = Arc::new(auth)
+        let routes = auth
             .router_shared(native.rate())
             .map_err(|_| auth_config::Error::Native(browser_auth::native::SettingsError::Rate))?;
         app = app.merge(routes);
+        bearer = Some(auth);
     }
-    Ok(app)
+    let origin = profile.handoff().origin;
+    Ok(app.merge(v1::router(service, bearer, origin, pool.clone())))
 }
 
 #[derive(Clone)]

@@ -1,0 +1,21 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "MemberRevokeRequestTypical--auto-missing-grantee",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "reason": "Team disbanded"
+  },
+  "mutation": {
+    "name": "auto-missing-grantee",
+    "op": "remove",
+    "path": "/grantee"
+  },
+  "schema": "#/components/schemas/MemberRevokeRequest",
+  "source": "#/components/examples/MemberRevokeRequestTypical"
+}

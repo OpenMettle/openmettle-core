@@ -1,0 +1,27 @@
+{
+  "class": "valid",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "ResourceShareRead--whole-project",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "access": "read",
+    "grantee": {
+      "kind": "project"
+    },
+    "resource_id": "91b2de62-bf73-4c01-9c4e-5f60718293a4",
+    "resource_kind": "conversation"
+  },
+  "mutation": {
+    "name": "whole-project",
+    "op": "set",
+    "path": "/grantee",
+    "value": {
+      "kind": "project"
+    }
+  },
+  "schema": "#/components/schemas/ResourceShare",
+  "source": "#/components/examples/ResourceShareRead"
+}

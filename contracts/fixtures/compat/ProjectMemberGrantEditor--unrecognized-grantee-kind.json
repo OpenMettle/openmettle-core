@@ -1,0 +1,26 @@
+{
+  "class": "compat",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "ProjectMemberGrantEditor--unrecognized-grantee-kind",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "grantee": {
+      "kind": "service"
+    },
+    "project_id": "5d1c9a2e-7b3f-4c8d-9e0a-1b2c3d4e5f60",
+    "role": "editor"
+  },
+  "mutation": {
+    "name": "unrecognized-grantee-kind",
+    "op": "set",
+    "path": "/grantee",
+    "value": {
+      "kind": "service"
+    }
+  },
+  "schema": "#/components/schemas/ProjectMemberGrant",
+  "source": "#/components/examples/ProjectMemberGrantEditor"
+}

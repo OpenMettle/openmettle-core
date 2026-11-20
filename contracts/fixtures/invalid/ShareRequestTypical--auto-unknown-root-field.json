@@ -1,0 +1,28 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "additionalProperties",
+    "valid": false
+  },
+  "fixture": "ShareRequestTypical--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "access": "read",
+    "grantee": {
+      "grantee_id": "80a1cd51-ae62-4fb0-8b3d-4e5f60718293",
+      "kind": "local_group"
+    },
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/ShareRequest",
+  "source": "#/components/examples/ShareRequestTypical"
+}

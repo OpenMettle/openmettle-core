@@ -1,9 +1,15 @@
-//! Project settings, membership and resource shares (ADR 0027 PR4a). Hydration reads the
-//! primary on every call, never caches and works as `openmettle_api` and `openmettle_worker`.
-//! It never reads `account_admins`. Writers run only as `openmettle_api` and follow the PR3
-//! protocol in one READ COMMITTED transaction: lock, re-hydrate the actor, authorize with
-//! `src/authz.rs`, insert or replay the `authorization_audit` row, then apply. A change that
-//! would not alter current state returns `Conflict` and leaves no audit row.
+//! Project settings, membership and resource shares (ADR 0027 PR4a), and the project lifecycle
+//! rules the `/v1` routes enforce (PR4b). Hydration reads the primary on every call, never
+//! caches and works as `openmettle_api` and `openmettle_worker`. It never reads
+//! `account_admins`. Writers run only as `openmettle_api` and follow the PR3 protocol in one
+//! READ COMMITTED transaction: lock, re-hydrate the actor, authorize with `src/authz.rs`, insert
+//! or replay the `authorization_audit` row, then apply. A change that would not alter current
+//! state returns `Conflict` and leaves no audit row.
+//!
+//! Lifecycle: a deleted project is concealed from every read and write except the exact replay
+//! of the delete that recorded it. An archived project stays readable, and its revocations,
+//! restore and delete stay available, but settings, role grants and new shares are refused
+//! with [`ARCHIVED`] once the caller is authorized.
 use super::{
     Action, Decision, DenialReason, Grant, GrantPermission, GrantVocabulary, Grantee, MemberChange,
     Origin, PROJECT_ROLE, Principal, Project, ProjectRole, RESOURCE_GRANT, Resource,
@@ -25,19 +31,27 @@ const ROLE_KEYS: [&str; 3] = ["viewer", "editor", "owner"];
 const ACCESS_KEYS: [&str; 2] = ["read", "write"];
 const LEGACY_DEFAULTS: [&str; 4] = ["folder_id", "folder_ids", "collection_id", "collection_ids"];
 
-fn role_key(role: ProjectRole) -> &'static str {
+/// The vocabulary key of a project role, which is also its API wire value.
+pub fn role_key(role: ProjectRole) -> &'static str {
     ROLE_KEYS[role as usize]
 }
 
-fn access_key(access: ResourceAccess) -> &'static str {
+/// The vocabulary key of a resource access, which is also its API wire value.
+pub fn access_key(access: ResourceAccess) -> &'static str {
     ACCESS_KEYS[access as usize]
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 const CONCEALED: StoreError = StoreError::Denied(DenialReason::NotFound);
+
+/// Settings, role grants and new shares in an archived project, refused after authorization.
+pub const ARCHIVED: StoreError = StoreError::Conflict("project is archived");
+
+/// The audited action whose exact replay a deleted project still answers.
+const DELETE: &str = "project.delete";
 
 // --- settings ----------------------------------------------------------------------------------
 
@@ -264,7 +278,7 @@ pub async fn hydrate_project(
     }
 }
 
-fn resource_kind(kind: ResourceKind) -> Result<&'static str, StoreError> {
+pub(crate) fn resource_kind(kind: ResourceKind) -> Result<&'static str, StoreError> {
     match kind {
         ResourceKind::Conversation => Ok("conversation"),
         ResourceKind::Artifact => Ok("artifact"),
@@ -278,6 +292,10 @@ struct Located {
     creator_user_id: String,
     personal_owner: Option<String>,
     project_id: Option<String>,
+    /// Creation time in Unix microseconds.
+    created_us: i64,
+    /// An artifact's last revision; `None` for a conversation.
+    last_revision: Option<i64>,
 }
 
 async fn locate(
@@ -288,13 +306,15 @@ async fn locate(
     let sql = match resource_kind(kind)? {
         "conversation" => {
             "SELECT r.scope_id::text, r.owner_user_id::text, s.personal_user_id::text,
-                    s.project_id::text
+                    s.project_id::text, (extract(epoch FROM r.created_at) * 1000000)::bigint,
+                    NULL::bigint
                FROM openmettle.conversations r JOIN openmettle.scopes s ON s.id = r.scope_id
               WHERE r.id = $1::uuid"
         }
         _ => {
             "SELECT r.scope_id::text, r.owner_user_id::text, s.personal_user_id::text,
-                    s.project_id::text
+                    s.project_id::text, (extract(epoch FROM r.created_at) * 1000000)::bigint,
+                    r.last_revision
                FROM openmettle.artifacts r JOIN openmettle.scopes s ON s.id = r.scope_id
               WHERE r.id = $1::uuid"
         }
@@ -306,6 +326,8 @@ async fn locate(
             creator_user_id: row.try_get(1)?,
             personal_owner: row.try_get(2)?,
             project_id: row.try_get(3)?,
+            created_us: row.try_get(4)?,
+            last_revision: row.try_get(5)?,
         })
     })
     .transpose()
@@ -365,26 +387,45 @@ pub async fn hydrate_resource(
 
 // --- shared write steps ------------------------------------------------------------------------
 
+/// A locked project row: its scope and its lifecycle as read under the lock.
+struct Locked {
+    scope: String,
+    archived: bool,
+    deleted: bool,
+}
+
 /// Lock the project row FOR NO KEY UPDATE through its inert guard column (migration 16).
-/// Membership, share and settings changes on one project serialize here while admitting
-/// concurrent foreign-key `FOR KEY SHARE` locks. Returns `None` when the project is missing or
-/// deleted so callers can verify the actor is active before concealing it.
+/// Membership, share, settings and lifecycle changes on one project serialize here while
+/// admitting concurrent foreign-key `FOR KEY SHARE` locks. Lifecycle is read by a second
+/// statement, whose READ COMMITTED snapshot is taken after the lock is granted, so a change
+/// committed by the writer this one waited for is seen. Returns `None` when the project is
+/// missing so callers can verify the actor is active before concealing it.
 async fn lock_project(
     c: &mut PgConnection,
     project_id: &str,
-) -> Result<Option<String>, StoreError> {
-    let row: Option<(String, bool)> = sqlx::query_as(
-        "SELECT p.scope_id::text, EXISTS (SELECT FROM openmettle.project_settings s
-                                           WHERE s.project_id = p.id AND s.deleted_at IS NOT NULL)
-           FROM openmettle.projects p WHERE p.id = $1::uuid FOR NO KEY UPDATE OF p",
+) -> Result<Option<Locked>, StoreError> {
+    let scope: Option<String> = sqlx::query_scalar(
+        "SELECT scope_id::text FROM openmettle.projects WHERE id = $1::uuid FOR NO KEY UPDATE",
     )
     .bind(project_id)
-    .fetch_optional(c)
+    .fetch_optional(&mut *c)
     .await?;
-    Ok(match row {
-        Some((scope, false)) => Some(scope),
-        _ => None,
-    })
+    let Some(scope) = scope else {
+        return Ok(None);
+    };
+    let (archived, deleted): (bool, bool) = sqlx::query_as(
+        "SELECT coalesce(bool_or(archived_at IS NOT NULL), false),
+                coalesce(bool_or(deleted_at IS NOT NULL), false)
+           FROM openmettle.project_settings WHERE project_id = $1::uuid",
+    )
+    .bind(project_id)
+    .fetch_one(c)
+    .await?;
+    Ok(Some(Locked {
+        scope,
+        archived,
+        deleted,
+    }))
 }
 
 fn grantee_input(grantee: &Grantee) -> Result<(), StoreError> {
@@ -546,32 +587,60 @@ pub async fn create_project(
 }
 
 /// The project write protocol: lock the project, re-hydrate the actor and the project, decide
-/// with `authorize`, record the audit row, then `apply` with the project's scope ID.
+/// with `authorize`, record the audit row, then `apply` with the project's scope ID. A
+/// `frozen` change is refused with [`ARCHIVED`] while the project is archived.
 async fn project_write(
     c: &mut PgConnection,
     ctx: &AuditContext<'_>,
     project_id: &str,
-    change: Change,
+    (change, frozen): (Change, bool),
     authorize: impl FnOnce(&Principal, Project) -> Decision,
     apply: impl AsyncFnOnce(&mut WriteTransaction<'_>, &str) -> Result<(), StoreError>,
 ) -> Result<WriteOutcome, StoreError> {
     uuid(project_id, "project_id")?;
     transact(c, ctx, async move |tx| {
         let c = tx.connection()?;
-        let Some(scope) = lock_project(c, project_id).await? else {
+        let Some(locked) = lock_project(c, project_id).await? else {
             acting(c, ctx).await?;
             return Err(CONCEALED);
         };
         let actor = acting(c, ctx).await?;
-        let project = project_in(c, project_id, &scope, ctx.now_ms).await?;
-        check(authorize(&actor, project))?;
+        let project = project_in(c, project_id, &locked.scope, ctx.now_ms).await?;
+        let decision = authorize(&actor, project);
+        if locked.deleted {
+            return deleted_replay(c, ctx, &change, decision).await;
+        }
+        check(decision)?;
+        if frozen && locked.archived {
+            return Err(ARCHIVED);
+        }
         let outcome = record(c, ctx, &change).await?;
         if matches!(outcome, WriteOutcome::Applied { .. }) {
-            apply(tx, &scope).await?;
+            apply(tx, &locked.scope).await?;
         }
         Ok(outcome)
     })
     .await
+}
+
+/// A deleted project stays concealed from every write. The one exception is the exact replay
+/// of the delete that recorded it, by an actor still allowed to delete it, which answers
+/// `Replayed`. Any other request key is concealed, and the audit row `record` inserts for it
+/// is rolled back with the transaction.
+async fn deleted_replay(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'_>,
+    change: &Change,
+    decision: Decision,
+) -> Result<WriteOutcome, StoreError> {
+    if change.action != DELETE || !decision.is_allowed() {
+        return Err(CONCEALED);
+    }
+    match record(c, ctx, change).await {
+        Ok(replayed @ WriteOutcome::Replayed { .. }) => Ok(replayed),
+        Ok(WriteOutcome::Applied { .. }) | Err(StoreError::Conflict(_)) => Err(CONCEALED),
+        Err(error) => Err(error),
+    }
 }
 
 fn project_change(action: &'static str, project_id: &str, details: Value) -> Change {
@@ -588,6 +657,7 @@ fn manages(action: Action) -> impl FnOnce(&Principal, Project) -> Decision {
 }
 
 /// Replace the name, instructions and defaults. A pre-15 project gains its first settings row.
+/// Refused with [`ARCHIVED`] in an archived project.
 pub async fn update_project_settings(
     c: &mut PgConnection,
     ctx: &AuditContext<'_>,
@@ -639,7 +709,7 @@ pub async fn update_project_settings(
         .ok_or(UNCHANGED)
     };
     let authorize = manages(Action::ManageProjectSettings);
-    project_write(c, ctx, project_id, change, authorize, apply).await
+    project_write(c, ctx, project_id, (change, true), authorize, apply).await
 }
 
 /// One `archived_at` or `deleted_at` transition of an existing settings row. Archive and delete
@@ -680,7 +750,8 @@ async fn lifecycle(
             StoreError::Conflict("project settings are not initialised")
         })
     };
-    project_write(c, ctx, project_id, change, manages(required), apply).await
+    let authorize = manages(required);
+    project_write(c, ctx, project_id, (change, false), authorize, apply).await
 }
 
 pub async fn archive_project(
@@ -709,7 +780,8 @@ pub async fn restore_project(
     lifecycle(c, ctx, project_id, step, false).await
 }
 
-/// Soft delete. A deleted project is concealed from every later write; nothing is removed.
+/// Soft delete. A deleted project is concealed from every later read and write, except an
+/// exact replay of this delete; nothing is removed. Available in an archived project.
 pub async fn delete_project(
     c: &mut PgConnection,
     ctx: &AuditContext<'_>,
@@ -725,6 +797,7 @@ pub async fn delete_project(
 
 /// Give `grantee` exactly one direct project role, revoking any other direct role it holds, so
 /// demoting an owner removes the `owner` grant. A user must be enabled and a local group enabled.
+/// Refused with [`ARCHIVED`] in an archived project.
 pub async fn set_project_member_role(
     c: &mut PgConnection,
     ctx: &AuditContext<'_>,
@@ -736,6 +809,7 @@ pub async fn set_project_member_role(
 }
 
 /// Revoke every direct project role of `grantee`. Mapped ADR 0021 membership is not changed.
+/// Available in an archived project.
 pub async fn revoke_project_member(
     c: &mut PgConnection,
     ctx: &AuditContext<'_>,
@@ -774,7 +848,9 @@ async fn member_change(
         let assignment = direct(scope, Target::Project(project_id), grantee, PROJECT_ROLE);
         set_direct(tx, ctx, assignment, &ROLE_KEYS, role.map(role_key)).await
     };
-    project_write(c, ctx, project_id, change, authorize, apply).await
+    // Revocation stays available in an archived project; a new role does not.
+    let frozen = role.is_some();
+    project_write(c, ctx, project_id, (change, frozen), authorize, apply).await
 }
 
 /// A user or local group recipient must exist and be enabled; it stays locked FOR SHARE.
@@ -800,7 +876,8 @@ async fn recipient_enabled(c: &mut PgConnection, grantee: &Grantee) -> Result<()
 // --- resource shares ---------------------------------------------------------------------------
 
 /// Share a conversation or artifact with `grantee` at exactly `access`, replacing another access
-/// it holds. Inside a project the grantee must hold active project membership.
+/// it holds. Inside a project the grantee must hold active project membership. Refused with
+/// [`ARCHIVED`] in an archived project.
 pub async fn share_resource(
     c: &mut PgConnection,
     ctx: &AuditContext<'_>,
@@ -813,6 +890,7 @@ pub async fn share_resource(
 }
 
 /// Revoke `grantee`'s share. The grantee need not remain a member, so stale rows can be retired.
+/// Available in an archived project.
 pub async fn unshare_resource(
     c: &mut PgConnection,
     ctx: &AuditContext<'_>,
@@ -851,29 +929,35 @@ async fn share_change(
             return Err(CONCEALED);
         };
         // Share changes on one scope serialize: on the project row, or on the personal owner.
-        match (&located.personal_owner, &located.project_id) {
-            (_, Some(project)) => {
-                if lock_project(c, project).await?.is_none() {
+        // An item in a deleted project is concealed like a missing one.
+        let archived = match (&located.personal_owner, &located.project_id) {
+            (_, Some(project)) => match lock_project(c, project).await? {
+                Some(locked) if !locked.deleted => locked.archived,
+                _ => {
                     acting(c, ctx).await?;
                     return Err(CONCEALED);
                 }
-            }
+            },
             (Some(owner), _) => {
                 sqlx::query("SELECT FROM openmettle.users WHERE id = $1::uuid FOR NO KEY UPDATE")
                     .bind(owner)
                     .fetch_one(&mut *c)
                     .await?;
+                false
             }
             (None, None) => {
                 acting(c, ctx).await?;
                 return Err(CONCEALED);
             }
-        }
+        };
         let actor = acting(c, ctx).await?;
         let scope = located.scope_id.clone();
         let resource = hydrate_located(c, kind, resource_id, located, ctx.now_ms).await?;
         check(super::authorize_revoke(&actor, &resource))?;
         if access.is_some() {
+            if archived {
+                return Err(ARCHIVED);
+            }
             let project = match &resource.scope {
                 Scope::Project(project) => Some(project),
                 Scope::Personal { .. } => None,
@@ -948,6 +1032,111 @@ async fn recipient_principal(
     Ok(Principal {
         user_id: user_id.to_owned(),
         ..Principal::default()
+    })
+}
+
+// --- reads (PR4b) -------------------------------------------------------------------------------
+
+/// A project as one caller may read it: its current settings and the caller's effective role.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectView {
+    pub settings: ProjectSettings,
+    pub role: ProjectRole,
+}
+
+/// A conversation or artifact as one caller may read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceView {
+    pub scope_id: String,
+    /// The containing project, or `None` in a personal scope.
+    pub project_id: Option<String>,
+    /// Creation time in Unix microseconds.
+    pub created_us: i64,
+    /// An artifact's last revision; `None` for a conversation.
+    pub last_revision: Option<i64>,
+    /// Effective access: never more than `Read` in an archived project.
+    pub access: ResourceAccess,
+    /// [`super::authorize_revoke`]: the caller may change this item's shares.
+    pub can_manage_shares: bool,
+}
+
+fn active(principal: &Principal) -> Result<(), StoreError> {
+    super::require(Some(principal))
+        .map(drop)
+        .map_err(StoreError::Denied)
+}
+
+/// Read one project for `principal`, hydrated by the caller for this request. An inactive
+/// principal is refused before anything is read. A missing, deleted or invisible project is
+/// concealed; an archived one stays readable. `openmettle_api` only.
+pub async fn read_project(
+    c: &mut PgConnection,
+    principal: &Principal,
+    project_id: &str,
+    now_ms: i64,
+) -> Result<ProjectView, StoreError> {
+    active(principal)?;
+    let Some(settings) = load_project_settings(c, project_id).await? else {
+        return Err(CONCEALED);
+    };
+    let project = project_in(c, project_id, &settings.scope_id, now_ms).await?;
+    let role = project.role_of(principal);
+    check(super::authorize_scope(
+        principal,
+        &Scope::Project(project),
+        Action::Read,
+    ))?;
+    match role {
+        Some(role) if !settings.deleted => Ok(ProjectView { settings, role }),
+        _ => Err(CONCEALED),
+    }
+}
+
+/// Read one conversation or artifact for `principal` with [`super::authorize_resource`]. An
+/// item in a deleted project is concealed. In an archived project the item stays readable, its
+/// effective access is `Read` and shares can still be revoked. `openmettle_api` only.
+pub async fn read_resource(
+    c: &mut PgConnection,
+    principal: &Principal,
+    kind: ResourceKind,
+    resource_id: &str,
+    now_ms: i64,
+) -> Result<ResourceView, StoreError> {
+    active(principal)?;
+    resource_kind(kind)?;
+    uuid(resource_id, "resource_id")?;
+    let Some(located) = locate(c, kind, resource_id).await? else {
+        return Err(CONCEALED);
+    };
+    let archived = match &located.project_id {
+        Some(project) => match load_project_settings(c, project).await? {
+            Some(settings) if !settings.deleted => settings.archived,
+            _ => return Err(CONCEALED),
+        },
+        None => false,
+    };
+    let scope_id = located.scope_id.clone();
+    let project_id = located.project_id.clone();
+    let (created_us, last_revision) = (located.created_us, located.last_revision);
+    let resource = hydrate_located(c, kind, resource_id, located, now_ms).await?;
+    check(super::authorize_resource(
+        principal,
+        &resource,
+        Action::Read,
+    ))?;
+    let writable =
+        !archived && super::authorize_resource(principal, &resource, Action::Write).is_allowed();
+    Ok(ResourceView {
+        scope_id,
+        project_id,
+        created_us,
+        last_revision,
+        access: if writable {
+            ResourceAccess::Write
+        } else {
+            ResourceAccess::Read
+        },
+        can_manage_shares: super::authorize_revoke(principal, &resource).is_allowed(),
     })
 }
 

@@ -1,0 +1,27 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "/name",
+    "keyword": "minLength",
+    "valid": false
+  },
+  "fixture": "ProjectCreateRequestTypical--name-empty",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "defaults": {
+      "model": "synthetic-model"
+    },
+    "instructions": "Answer briefly.",
+    "name": "",
+    "reason": "Synthetic project for a fixture"
+  },
+  "mutation": {
+    "name": "name-empty",
+    "op": "set",
+    "path": "/name",
+    "value": ""
+  },
+  "schema": "#/components/schemas/ProjectCreateRequest",
+  "source": "#/components/examples/ProjectCreateRequestTypical"
+}

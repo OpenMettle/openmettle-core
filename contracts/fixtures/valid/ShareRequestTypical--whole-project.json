@@ -1,0 +1,25 @@
+{
+  "class": "valid",
+  "direction": "request",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "ShareRequestTypical--whole-project",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "access": "read",
+    "grantee": {
+      "kind": "project"
+    }
+  },
+  "mutation": {
+    "name": "whole-project",
+    "op": "set",
+    "path": "/grantee",
+    "value": {
+      "kind": "project"
+    }
+  },
+  "schema": "#/components/schemas/ShareRequest",
+  "source": "#/components/examples/ShareRequestTypical"
+}

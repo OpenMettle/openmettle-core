@@ -1,0 +1,29 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "/defaults",
+    "keyword": "not",
+    "valid": false
+  },
+  "fixture": "ProjectCreateRequestTypical--legacy-folder-default",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "defaults": {
+      "folder_id": "x"
+    },
+    "instructions": "Answer briefly.",
+    "name": "Synthetic project",
+    "reason": "Synthetic project for a fixture"
+  },
+  "mutation": {
+    "name": "legacy-folder-default",
+    "op": "set",
+    "path": "/defaults",
+    "value": {
+      "folder_id": "x"
+    }
+  },
+  "schema": "#/components/schemas/ProjectCreateRequest",
+  "source": "#/components/examples/ProjectCreateRequestTypical"
+}

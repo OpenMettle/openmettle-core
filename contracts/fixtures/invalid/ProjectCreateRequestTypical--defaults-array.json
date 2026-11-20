@@ -1,0 +1,25 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "/defaults",
+    "keyword": "type",
+    "valid": false
+  },
+  "fixture": "ProjectCreateRequestTypical--defaults-array",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "defaults": [],
+    "instructions": "Answer briefly.",
+    "name": "Synthetic project",
+    "reason": "Synthetic project for a fixture"
+  },
+  "mutation": {
+    "name": "defaults-array",
+    "op": "set",
+    "path": "/defaults",
+    "value": []
+  },
+  "schema": "#/components/schemas/ProjectCreateRequest",
+  "source": "#/components/examples/ProjectCreateRequestTypical"
+}

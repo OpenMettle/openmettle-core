@@ -1,0 +1,28 @@
+{
+  "class": "compat",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "ResourceShareRead--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "access": "read",
+    "grantee": {
+      "grantee_id": "7f3ebc40-9d51-4eaf-9a2c-3d4e5f607182",
+      "kind": "user"
+    },
+    "resource_id": "91b2de62-bf73-4c01-9c4e-5f60718293a4",
+    "resource_kind": "conversation",
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/ResourceShare",
+  "source": "#/components/examples/ResourceShareRead"
+}

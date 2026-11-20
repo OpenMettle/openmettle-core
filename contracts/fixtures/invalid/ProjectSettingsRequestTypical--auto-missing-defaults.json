@@ -1,0 +1,22 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ProjectSettingsRequestTypical--auto-missing-defaults",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "instructions": "",
+    "name": "Renamed project"
+  },
+  "mutation": {
+    "name": "auto-missing-defaults",
+    "op": "remove",
+    "path": "/defaults"
+  },
+  "schema": "#/components/schemas/ProjectSettingsRequest",
+  "source": "#/components/examples/ProjectSettingsRequestTypical"
+}

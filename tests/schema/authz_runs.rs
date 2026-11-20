@@ -57,7 +57,7 @@ async fn api(db: &TestDb) -> PgConnection {
 }
 
 #[derive(Clone)]
-struct Run {
+pub(super) struct Run {
     scope: String,
     id: String,
     conversation: String,
@@ -105,13 +105,13 @@ async fn start(db: &TestDb, scope: &str, conversation: &str, owner: &Account) ->
     }
 }
 
-async fn chat(db: &TestDb, scope: &str, kind: &str, owner: &Account) -> String {
+pub(super) async fn chat(db: &TestDb, scope: &str, kind: &str, owner: &Account) -> String {
     conversation(&mut api(db).await, scope, kind, &owner.user)
         .await
         .unwrap()
 }
 
-async fn personal_of(db: &TestDb, account: &Account) -> String {
+pub(super) async fn personal_of(db: &TestDb, account: &Account) -> String {
     sqlx::query_scalar("SELECT id::text FROM openmettle.scopes WHERE personal_user_id = $1::uuid")
         .bind(&account.user)
         .fetch_one(&mut connect(&db.0, OWNER).await)
@@ -127,12 +127,12 @@ async fn personal_run(db: &TestDb, owner: &Account) -> Run {
 }
 
 /// A run on a new conversation of `owner` in a project scope.
-async fn project_run(db: &TestDb, scope: &str, owner: &Account) -> Run {
+pub(super) async fn project_run(db: &TestDb, scope: &str, owner: &Account) -> Run {
     let conversation = chat(db, scope, "project", owner).await;
     start(db, scope, &conversation, owner).await
 }
 
-async fn artifact(db: &TestDb, scope: &str, kind: &str, owner: &Account) -> String {
+pub(super) async fn artifact(db: &TestDb, scope: &str, kind: &str, owner: &Account) -> String {
     sqlx::query_scalar(
         "INSERT INTO openmettle.artifacts (id, scope_id, scope_kind, owner_user_id)
          VALUES (gen_random_uuid(), $1::uuid, $2, $3::uuid) RETURNING id::text",
@@ -221,7 +221,7 @@ async fn set_state(db: &TestDb, run: &Run, state: &str) {
 }
 
 /// (state, wait_reason) read as the owner role.
-async fn state_of(db: &TestDb, run: &Run) -> (String, Option<String>) {
+pub(super) async fn state_of(db: &TestDb, run: &Run) -> (String, Option<String>) {
     sqlx::query_as("SELECT state, wait_reason FROM openmettle.runs WHERE id = $1::uuid")
         .bind(&run.id)
         .fetch_one(&mut connect(&db.0, OWNER).await)
@@ -297,10 +297,11 @@ async fn invalidated(
     invalidated_at(db, run, capabilities, None, NOW, reason).await;
 }
 
-/// The ADR 0013 browser-session digest, encoded independently of `src/sessions.rs`.
-fn session_hash(id: &str, secret: &[u8]) -> Vec<u8> {
-    let mut framed = b"openmettle/session-secret/1\0".to_vec();
-    for field in [id.as_bytes(), secret] {
+/// A domain-separated, length-prefixed SHA-256 digest: the ADR 0013 and ADR 0023 framing,
+/// encoded independently of `src/runs.rs`.
+pub(super) fn framed_digest(domain: &[u8], fields: &[&[u8]]) -> Vec<u8> {
+    let mut framed = domain.to_vec();
+    for field in fields {
         framed.extend_from_slice(&(field.len() as u64).to_be_bytes());
         framed.extend_from_slice(field);
     }
@@ -310,9 +311,26 @@ fn session_hash(id: &str, secret: &[u8]) -> Vec<u8> {
 /// A browser session issued to `account` through its approval, stored as issuance stores it.
 /// Returns the credential the browser would present.
 async fn session(db: &TestDb, account: &Account, n: u8) -> String {
+    seeded_session(db, account, n, None).await
+}
+
+/// A session issued to `account` through its approval, stored as issuance stores it: a browser
+/// session, or with `audience` a delivered native bearer of that registration (ADR 0023).
+/// Returns the credential the client would present. `n` must differ per session.
+pub(super) async fn seeded_session(
+    db: &TestDb,
+    account: &Account,
+    n: u8,
+    audience: Option<&[u8]>,
+) -> String {
     let id = URL_SAFE_NO_PAD.encode([n; 32]);
     let secret = [n.wrapping_add(100); 32];
     let gate = URL_SAFE_NO_PAD.encode([n.wrapping_add(50); 32]);
+    let domain: &[u8] = match audience {
+        None => b"openmettle/session-secret/1\0",
+        Some(_) => b"openmettle/native-session-secret/1\0",
+    };
+    let mut owner = connect(&db.0, OWNER).await;
     sqlx::query(
         "WITH reservation AS (
              INSERT INTO openmettle.login_nonce_reservations (key_id, nonce)
@@ -341,12 +359,27 @@ async fn session(db: &TestDb, account: &Account, n: u8) -> String {
     )
     .bind(&gate)
     .bind(&id)
-    .bind(session_hash(&id, &secret))
+    .bind(framed_digest(domain, &[id.as_bytes(), &secret]))
     .bind(&account.approval)
     .bind(FUTURE)
-    .execute(&mut connect(&db.0, OWNER).await)
+    .execute(&mut owner)
     .await
     .unwrap();
+    if let Some(audience) = audience {
+        // A redeemed handoff: unsealed, bound to the serving registration's audience.
+        sqlx::query(
+            "INSERT INTO openmettle.native_handoffs
+                 (session_id, code_hash, registration, audience, challenge, sealed, expires_ms)
+             VALUES ($1, sha256(convert_to($1 || ':code', 'UTF8')), decode(repeat('0b', 32), 'hex'),
+                     $2, decode(repeat('0c', 32), 'hex'), NULL, $3)",
+        )
+        .bind(&id)
+        .bind(audience)
+        .bind(FUTURE)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    }
     format!("{id}.{}", URL_SAFE_NO_PAD.encode(secret))
 }
 

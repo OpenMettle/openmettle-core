@@ -3,21 +3,240 @@
   "jsonSchemaDialect": "https://spec.openapis.org/oas/3.2/dialect/2026-02-26",
   "info": {
     "title": "OpenMettle application API",
-    "version": "1.0.0-draft.1",
-    "summary": "Versioned application contract (V1-03). Contract only: no operation in this document is implemented.",
-    "description": "Canonical source for the OpenMettle v1 application API contract. Wire rules, compatibility policy and limits are recorded in docs/adr/0007-application-api-contract.md. Every operation carries x-openmettle-implementation; `not-implemented` means the running API does not serve the route. Security schemes are provisional bindings until V1-04 settles session transport. Fixtures under contracts/fixtures are generated from the examples in this document by scripts/contract_fixtures.py.",
+    "version": "1.0.0-draft.2",
+    "summary": "Versioned application contract (V1-03), with the project, conversation and artifact operations of V1-05.",
+    "description": "Canonical source for the OpenMettle v1 application API contract. Wire rules, compatibility policy and limits are recorded in docs/adr/0007-application-api-contract.md; authorization and project lifecycle in docs/adr/0027-authorization-and-private-projects.md. Every operation carries x-openmettle-implementation: `implemented` operations are served by an API started with OPENMETTLE_API_AUTH_CONFIG, and `not-implemented` operations are not served. An API started without OPENMETTLE_API_AUTH_CONFIG serves no operation. Fixtures under contracts/fixtures are generated from the examples in this document by scripts/contract_fixtures.py.",
     "license": {
       "name": "MIT",
       "identifier": "MIT"
     }
   },
   "paths": {
+    "/v1/artifacts/{artifact_id}": {
+      "get": {
+        "operationId": "getArtifact",
+        "summary": "Read the caller's access to one artifact",
+        "description": "A artifact is private to its creator until shared. A project owner, an account administrator or another member cannot read an unshared item: it is not_found, as is an item in a deleted project or one whose project membership the caller has lost. In an archived project the item stays readable with access read.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ArtifactId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The caller's access to the artifact.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactAccess"
+                },
+                "examples": {
+                  "typical": {
+                    "$ref": "#/components/examples/ArtifactAccessShared"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/artifacts/{artifact_id}/shares": {
+      "put": {
+        "operationId": "shareArtifact",
+        "summary": "Share a artifact with a user, group or the whole project",
+        "description": "The creator holding editor or owner, or a project owner who can see the item, may share it. A viewer or another editor fails with policy. Inside a project the grantee must hold active project membership; the whole-project grantee is valid only in a project. New shares fail with conflict in an archived project.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ArtifactId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ShareRequest"
+              },
+              "examples": {
+                "typical": {
+                  "$ref": "#/components/examples/ShareRequestTypical"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The grantee's share.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResourceShare"
+                },
+                "examples": {
+                  "read": {
+                    "$ref": "#/components/examples/ResourceShareRead"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/artifacts/{artifact_id}/shares/revoke": {
+      "post": {
+        "operationId": "revokeArtifactShare",
+        "summary": "Revoke a share of a artifact",
+        "description": "The same share managers as sharing, including in an archived project. The grantee need not remain a member, so stale shares can always be retired. The grantee loses access on its next request.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ArtifactId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ShareRevokeRequest"
+              },
+              "examples": {
+                "typical": {
+                  "$ref": "#/components/examples/ShareRevokeRequestTypical"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "The share is revoked.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
     "/v1/capabilities": {
       "get": {
         "operationId": "listCapabilities",
         "summary": "List capabilities visible to the authenticated caller",
-        "description": "Returns installed, authorization and readiness dimensions independently for each capability. Absence of an optional provider never makes the core unavailable, and this operation is not an input to the operational /readyz probe. The response never contains provider endpoints, credentials, model secrets or another user's inventory. Not implemented: the running API returns 404 for this path until authentication (V1-04) and resource authorization (V1-05) exist.",
-        "x-openmettle-implementation": "not-implemented",
+        "description": "Returns installed, authorization and readiness dimensions independently for each capability. Absence of an optional provider never makes the core unavailable, and this operation is not an input to the operational /readyz probe. The response never contains provider endpoints, credentials, model secrets or another user's inventory. The caller's principal is hydrated on the primary for each request; a disabled account, withdrawn approval or logged-out session fails with unauthenticated. This core-only installation returns an empty list.",
+        "x-openmettle-implementation": "implemented",
         "security": [
           {
             "browserSession": []
@@ -64,6 +283,787 @@
           },
           "503": {
             "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/conversations/{conversation_id}": {
+      "get": {
+        "operationId": "getConversation",
+        "summary": "Read the caller's access to one conversation",
+        "description": "A conversation is private to its creator until shared. A project owner, an account administrator or another member cannot read an unshared item: it is not_found, as is an item in a deleted project or one whose project membership the caller has lost. In an archived project the item stays readable with access read.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ConversationId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The caller's access to the conversation.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationAccess"
+                },
+                "examples": {
+                  "typical": {
+                    "$ref": "#/components/examples/ConversationAccessProject"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/conversations/{conversation_id}/shares": {
+      "put": {
+        "operationId": "shareConversation",
+        "summary": "Share a conversation with a user, group or the whole project",
+        "description": "The creator holding editor or owner, or a project owner who can see the item, may share it. A viewer or another editor fails with policy. Inside a project the grantee must hold active project membership; the whole-project grantee is valid only in a project. New shares fail with conflict in an archived project.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ConversationId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ShareRequest"
+              },
+              "examples": {
+                "typical": {
+                  "$ref": "#/components/examples/ShareRequestTypical"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The grantee's share.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResourceShare"
+                },
+                "examples": {
+                  "read": {
+                    "$ref": "#/components/examples/ResourceShareRead"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/conversations/{conversation_id}/shares/revoke": {
+      "post": {
+        "operationId": "revokeConversationShare",
+        "summary": "Revoke a share of a conversation",
+        "description": "The same share managers as sharing, including in an archived project. The grantee need not remain a member, so stale shares can always be retired. The grantee loses access on its next request.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ConversationId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ShareRevokeRequest"
+              },
+              "examples": {
+                "typical": {
+                  "$ref": "#/components/examples/ShareRevokeRequestTypical"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "The share is revoked.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/projects": {
+      "post": {
+        "operationId": "createProject",
+        "summary": "Create a project owned by the caller",
+        "description": "Any active caller may create a project. The caller becomes its only direct owner. Replaying the same Idempotency-Key with the identical body returns the project again.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectCreateRequest"
+              },
+              "examples": {
+                "typical": {
+                  "$ref": "#/components/examples/ProjectCreateRequestTypical"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The new project.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Project"
+                },
+                "examples": {
+                  "owned": {
+                    "$ref": "#/components/examples/ProjectOwned"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}": {
+      "get": {
+        "operationId": "getProject",
+        "summary": "Read a project the caller is a member of",
+        "description": "Any member may read the project's settings and their own effective role. A non-member, including an account administrator, receives not_found. A deleted project is not_found. An archived project stays readable; its settings, role grants and new shares fail with conflict until it is restored.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ProjectId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The project.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Project"
+                },
+                "examples": {
+                  "owned": {
+                    "$ref": "#/components/examples/ProjectOwned"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      },
+      "put": {
+        "operationId": "updateProjectSettings",
+        "summary": "Replace a project's name, instructions and defaults",
+        "description": "Owner only. Replacing settings with identical values fails with conflict. A deleted project is not_found. An archived project stays readable; its settings, role grants and new shares fail with conflict until it is restored.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ProjectId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectSettingsRequest"
+              },
+              "examples": {
+                "typical": {
+                  "$ref": "#/components/examples/ProjectSettingsRequestTypical"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The updated project.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Project"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteProject",
+        "summary": "Soft-delete a project",
+        "description": "Owner only, including while archived. Every live run in the project is cancelled. The project is then not_found for every operation, except that replaying the delete with the same Idempotency-Key again returns 204.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ProjectId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The project is deleted.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/archive": {
+      "post": {
+        "operationId": "archiveProject",
+        "summary": "Archive a project",
+        "description": "Owner only. Every live run in the project is cancelled. The project stays readable; settings, role grants and new shares fail with conflict until it is restored, while revocations, restore and delete stay available. Archiving an archived project fails with conflict.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ProjectId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The project after the change.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Project"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/members": {
+      "put": {
+        "operationId": "setProjectMemberRole",
+        "summary": "Give a user or group exactly one direct project role",
+        "description": "Owner only. Demoting or removing the last direct user owner fails with policy. A user or local group must exist and be enabled. A deleted project is not_found. An archived project stays readable; its settings, role grants and new shares fail with conflict until it is restored.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ProjectId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemberRoleRequest"
+              },
+              "examples": {
+                "typical": {
+                  "$ref": "#/components/examples/MemberRoleRequestTypical"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The grantee's direct role.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectMemberGrant"
+                },
+                "examples": {
+                  "editor": {
+                    "$ref": "#/components/examples/ProjectMemberGrantEditor"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/members/revoke": {
+      "post": {
+        "operationId": "revokeProjectMember",
+        "summary": "Revoke every direct project role of a user or group",
+        "description": "Owner only, including while archived. Removing the last direct user owner fails with policy. Directory-mapped membership is unchanged. The removed member loses access to the project's items on its next request.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ProjectId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemberRevokeRequest"
+              },
+              "examples": {
+                "typical": {
+                  "$ref": "#/components/examples/MemberRevokeRequestTypical"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "The direct roles are revoked.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/restore": {
+      "post": {
+        "operationId": "restoreProject",
+        "summary": "Restore an archived project",
+        "description": "Owner only. No cancelled run is revived. Restoring a project that is not archived fails with conflict.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ProjectId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The project after the change.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Project"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
           }
         }
       }
@@ -75,15 +1075,13 @@
         "type": "apiKey",
         "in": "cookie",
         "name": "__Host-openmettle-session",
-        "description": "Provisional binding. Flutter web uses an OpenMettle application session held in a Secure, HttpOnly cookie with CSRF protection for unsafe methods (architecture v1). Cookie name, lifetime, rotation and CSRF mechanism are owned by V1-04 and may change before any operation is implemented.",
-        "x-openmettle-provisional": true
+        "description": "OpenMettle browser session (ADRs 0013 and 0019): the opaque credential in the Secure, HttpOnly, SameSite=Lax, host-only cookie set by the browser sign-in callback. An unsafe method requires exactly one Origin header equal to the configured application origin; a safe method may omit Origin, but any Origin it sends must be that origin. A refused Origin is 401 unauthenticated. The cookie must occur once and never together with an Authorization header."
       },
       "nativeSession": {
         "type": "http",
         "scheme": "bearer",
         "bearerFormat": "opaque OpenMettle application session credential",
-        "description": "Provisional binding. Native clients present an OpenMettle-issued application session credential obtained through the system-browser code/PKCE handoff owned by V1-04. Upstream OIDC provider tokens are never accepted as OpenMettle API credentials.",
-        "x-openmettle-provisional": true
+        "description": "OpenMettle native session (ADRs 0023 and 0029): the opaque bearer credential returned by the native token endpoint after the system-browser code/PKCE handoff, sent as one `Authorization: Bearer` field and never together with the session cookie. Upstream OIDC provider tokens are never accepted as OpenMettle API credentials."
       }
     },
     "headers": {
@@ -127,7 +1125,7 @@
         "name": "Idempotency-Key",
         "in": "header",
         "required": true,
-        "description": "Client-chosen key for a state-changing request. The server scopes it to the authenticated actor, the operation and the authorized scope; any actor or user identity in the request body is never used for this purpose. Repeating the same key with the identical request returns the original outcome; the same key with a different request fails with idempotency_conflict. Retries after an uncertain outcome must resend the identical request, including any client-supplied input identity. No retention period or exactly-once execution is promised.",
+        "description": "Client-chosen key for a state-changing request. The server scopes it to the authenticated actor, the operation and its path target; any actor or user identity in the request body is never used for this purpose. Repeating the same key with the identical request returns the original outcome; the same key with a different request fails with idempotency_conflict. Retries after an uncertain outcome must resend the identical request, including any client-supplied input identity. No retention period or exactly-once execution is promised.",
         "schema": {
           "$ref": "#/components/schemas/IdempotencyKey"
         }
@@ -146,6 +1144,33 @@
         "description": "Explicit SSE resume cursor for clients that cannot set Last-Event-ID. Must equal Last-Event-ID when both are sent.",
         "schema": {
           "$ref": "#/components/schemas/Cursor"
+        }
+      },
+      "ProjectId": {
+        "name": "project_id",
+        "in": "path",
+        "required": true,
+        "description": "The project's identifier. A malformed identifier fails with validation; a project the caller may not know about fails with not_found.",
+        "schema": {
+          "$ref": "#/components/schemas/Uuid"
+        }
+      },
+      "ConversationId": {
+        "name": "conversation_id",
+        "in": "path",
+        "required": true,
+        "description": "The conversation's identifier. A malformed identifier fails with validation; a conversation the caller may not know about fails with not_found.",
+        "schema": {
+          "$ref": "#/components/schemas/Uuid"
+        }
+      },
+      "ArtifactId": {
+        "name": "artifact_id",
+        "in": "path",
+        "required": true,
+        "description": "The artifact's identifier. A malformed identifier fails with validation; a artifact the caller may not know about fails with not_found.",
+        "schema": {
+          "$ref": "#/components/schemas/Uuid"
         }
       }
     },
@@ -272,6 +1297,89 @@
               },
               "provisioning": {
                 "$ref": "#/components/examples/ProblemProvisioning"
+              }
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "The caller may know the target exists but may not perform the action (policy).",
+        "headers": {
+          "OpenMettle-API-Version": {
+            "$ref": "#/components/headers/ApiVersion"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "examples": {
+              "policy": {
+                "$ref": "#/components/examples/ProblemPolicy"
+              }
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "The target does not exist, was deleted, or the caller may not know it exists (not_found).",
+        "headers": {
+          "OpenMettle-API-Version": {
+            "$ref": "#/components/headers/ApiVersion"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "examples": {
+              "notFound": {
+                "$ref": "#/components/examples/ProblemNotFound"
+              }
+            }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "The request conflicts with current state, for example an unchanged value or an archived project (conflict), or reuses an Idempotency-Key for a different request (idempotency_conflict).",
+        "headers": {
+          "OpenMettle-API-Version": {
+            "$ref": "#/components/headers/ApiVersion"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "examples": {
+              "conflict": {
+                "$ref": "#/components/examples/ProblemConflict"
+              },
+              "idempotencyConflict": {
+                "$ref": "#/components/examples/ProblemIdempotencyConflict"
+              }
+            }
+          }
+        }
+      },
+      "Timeout": {
+        "description": "A required service did not answer in time (timeout). The outcome of a write is unknown: retry with the identical request and Idempotency-Key.",
+        "headers": {
+          "OpenMettle-API-Version": {
+            "$ref": "#/components/headers/ApiVersion"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "examples": {
+              "timeout": {
+                "$ref": "#/components/examples/ProblemTimeout"
               }
             }
           }
@@ -830,6 +1938,488 @@
           },
           "data": {
             "type": "object"
+          }
+        }
+      },
+      "ProjectName": {
+        "description": "1 to 256 bytes, no leading or trailing whitespace and no control character.",
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256
+      },
+      "ProjectInstructions": {
+        "description": "At most 32 KiB without NUL.",
+        "type": "string",
+        "maxLength": 32768
+      },
+      "ProjectDefaults": {
+        "description": "Project defaults: a JSON object of at most 16 KiB in compact form. The legacy top-level members folder_id, folder_ids, collection_id and collection_ids are refused.",
+        "type": "object",
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "folder_id"
+              ]
+            },
+            {
+              "required": [
+                "folder_ids"
+              ]
+            },
+            {
+              "required": [
+                "collection_id"
+              ]
+            },
+            {
+              "required": [
+                "collection_ids"
+              ]
+            }
+          ]
+        }
+      },
+      "AuditReason": {
+        "description": "Optional reason recorded in the append-only authorization audit. Defaults to the operationId.",
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 512
+      },
+      "ProjectCreateRequest": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "$ref": "#/components/schemas/ProjectName"
+          },
+          "instructions": {
+            "$ref": "#/components/schemas/ProjectInstructions",
+            "default": ""
+          },
+          "defaults": {
+            "$ref": "#/components/schemas/ProjectDefaults",
+            "default": {}
+          },
+          "reason": {
+            "$ref": "#/components/schemas/AuditReason"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ProjectSettingsRequest": {
+        "description": "Replaces every setting.",
+        "type": "object",
+        "required": [
+          "name",
+          "instructions",
+          "defaults"
+        ],
+        "properties": {
+          "name": {
+            "$ref": "#/components/schemas/ProjectName"
+          },
+          "instructions": {
+            "$ref": "#/components/schemas/ProjectInstructions"
+          },
+          "defaults": {
+            "$ref": "#/components/schemas/ProjectDefaults"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/AuditReason"
+          }
+        },
+        "additionalProperties": false
+      },
+      "Project": {
+        "description": "A project as the caller may read it. A project created before settings existed has an empty name, empty instructions and {} defaults at revision 0.",
+        "type": "object",
+        "required": [
+          "project_id",
+          "scope_id",
+          "name",
+          "instructions",
+          "defaults",
+          "revision",
+          "archived",
+          "role"
+        ],
+        "properties": {
+          "project_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "scope_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 256
+          },
+          "instructions": {
+            "$ref": "#/components/schemas/ProjectInstructions"
+          },
+          "defaults": {
+            "type": "object"
+          },
+          "revision": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "archived": {
+            "description": "An archived project stays readable; settings, role grants and new shares fail with conflict until it is restored.",
+            "type": "boolean"
+          },
+          "role": {
+            "description": "The caller's effective role: the highest of its direct, local-group and OIDC-group grants. Open vocabulary.",
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "viewer",
+              "editor",
+              "owner"
+            ]
+          }
+        }
+      },
+      "MemberGrantee": {
+        "description": "A project member: a user, a local group or an OIDC group.",
+        "type": "object",
+        "required": [
+          "kind",
+          "grantee_id"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "user",
+              "local_group",
+              "oidc_group"
+            ]
+          },
+          "grantee_id": {
+            "description": "A user or local group UUID, or an exact OIDC group claim value of 1 to 1024 bytes without control characters.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
+        },
+        "additionalProperties": false
+      },
+      "ShareGrantee": {
+        "description": "A share recipient: a user, a local group, an OIDC group, or every member of the containing project (`project`, without grantee_id; project scopes only).",
+        "type": "object",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "user",
+              "local_group",
+              "oidc_group",
+              "project"
+            ]
+          },
+          "grantee_id": {
+            "description": "A user or local group UUID, or an exact OIDC group claim value of 1 to 1024 bytes without control characters.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
+        },
+        "additionalProperties": false,
+        "if": {
+          "properties": {
+            "kind": {
+              "const": "project"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        "then": {
+          "not": {
+            "required": [
+              "grantee_id"
+            ]
+          }
+        },
+        "else": {
+          "required": [
+            "grantee_id"
+          ]
+        }
+      },
+      "MemberRoleRequest": {
+        "description": "Gives the grantee exactly this direct role, replacing any other direct role.",
+        "type": "object",
+        "required": [
+          "grantee",
+          "role"
+        ],
+        "properties": {
+          "grantee": {
+            "$ref": "#/components/schemas/MemberGrantee"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "viewer",
+              "editor",
+              "owner"
+            ]
+          },
+          "reason": {
+            "$ref": "#/components/schemas/AuditReason"
+          }
+        },
+        "additionalProperties": false
+      },
+      "MemberRevokeRequest": {
+        "description": "Revokes every direct role of the grantee. Directory-mapped membership is unchanged.",
+        "type": "object",
+        "required": [
+          "grantee"
+        ],
+        "properties": {
+          "grantee": {
+            "$ref": "#/components/schemas/MemberGrantee"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/AuditReason"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ShareRequest": {
+        "description": "Shares the item with the grantee at exactly this access, replacing another.",
+        "type": "object",
+        "required": [
+          "grantee",
+          "access"
+        ],
+        "properties": {
+          "grantee": {
+            "$ref": "#/components/schemas/ShareGrantee"
+          },
+          "access": {
+            "type": "string",
+            "enum": [
+              "read",
+              "write"
+            ]
+          },
+          "reason": {
+            "$ref": "#/components/schemas/AuditReason"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ShareRevokeRequest": {
+        "description": "Revokes the grantee's share. The grantee need not remain a project member.",
+        "type": "object",
+        "required": [
+          "grantee"
+        ],
+        "properties": {
+          "grantee": {
+            "$ref": "#/components/schemas/ShareGrantee"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/AuditReason"
+          }
+        },
+        "additionalProperties": false
+      },
+      "Grantee": {
+        "description": "A grant recipient as recorded. grantee_id is absent for `project`.",
+        "type": "object",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "user",
+              "local_group",
+              "oidc_group",
+              "project"
+            ]
+          },
+          "grantee_id": {
+            "type": "string",
+            "maxLength": 1024
+          }
+        }
+      },
+      "ProjectMemberGrant": {
+        "type": "object",
+        "required": [
+          "project_id",
+          "grantee",
+          "role"
+        ],
+        "properties": {
+          "project_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "grantee": {
+            "$ref": "#/components/schemas/Grantee"
+          },
+          "role": {
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "viewer",
+              "editor",
+              "owner"
+            ]
+          }
+        }
+      },
+      "ResourceShare": {
+        "type": "object",
+        "required": [
+          "resource_kind",
+          "resource_id",
+          "grantee",
+          "access"
+        ],
+        "properties": {
+          "resource_kind": {
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "conversation",
+              "artifact"
+            ]
+          },
+          "resource_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "grantee": {
+            "$ref": "#/components/schemas/Grantee"
+          },
+          "access": {
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "read",
+              "write"
+            ]
+          }
+        }
+      },
+      "ConversationAccess": {
+        "description": "What the caller may do with one item. Items are private to their creator until shared; another user's unshared item is not_found.",
+        "type": "object",
+        "required": [
+          "conversation_id",
+          "scope_kind",
+          "scope_id",
+          "project_id",
+          "created_at",
+          "access",
+          "can_manage_shares"
+        ],
+        "properties": {
+          "conversation_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "scope_kind": {
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "personal",
+              "project"
+            ]
+          },
+          "scope_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "project_id": {
+            "description": "The containing project, or null in a personal scope.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "access": {
+            "description": "The caller's effective access. Never more than read in an archived project. Open vocabulary.",
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "read",
+              "write"
+            ]
+          },
+          "can_manage_shares": {
+            "description": "The caller may share this item or revoke its shares.",
+            "type": "boolean"
+          }
+        }
+      },
+      "ArtifactAccess": {
+        "description": "What the caller may do with one item. Items are private to their creator until shared; another user's unshared item is not_found.",
+        "type": "object",
+        "required": [
+          "artifact_id",
+          "scope_kind",
+          "scope_id",
+          "project_id",
+          "created_at",
+          "last_revision",
+          "access",
+          "can_manage_shares"
+        ],
+        "properties": {
+          "artifact_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "scope_kind": {
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "personal",
+              "project"
+            ]
+          },
+          "scope_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "project_id": {
+            "description": "The containing project, or null in a personal scope.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "last_revision": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "access": {
+            "description": "The caller's effective access. Never more than read in an archived project. Open vocabulary.",
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "read",
+              "write"
+            ]
+          },
+          "can_manage_shares": {
+            "description": "The caller may share this item or revoke its shares.",
+            "type": "boolean"
           }
         }
       }
@@ -1831,6 +3421,553 @@
               "expect": {
                 "instancePath": "",
                 "keyword": "minLength"
+              }
+            }
+          ]
+        }
+      },
+      "ProjectOwned": {
+        "summary": "A project read by its owner",
+        "dataValue": {
+          "project_id": "5d1c9a2e-7b3f-4c8d-9e0a-1b2c3d4e5f60",
+          "scope_id": "6e2dab3f-8c40-4d9e-8f1b-2c3d4e5f6071",
+          "name": "Synthetic project",
+          "instructions": "Answer briefly.",
+          "defaults": {
+            "model": "synthetic-model"
+          },
+          "revision": "1",
+          "archived": false,
+          "role": "owner"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Project",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "pre-settings-project",
+              "class": "valid",
+              "op": "set",
+              "path": "/name",
+              "value": ""
+            },
+            {
+              "name": "unrecognized-role",
+              "class": "compat",
+              "op": "set",
+              "path": "/role",
+              "value": "steward"
+            },
+            {
+              "name": "revision-json-number",
+              "class": "invalid",
+              "op": "set",
+              "path": "/revision",
+              "value": 1,
+              "expect": {
+                "instancePath": "/revision",
+                "keyword": "type"
+              }
+            },
+            {
+              "name": "archived-string",
+              "class": "invalid",
+              "op": "set",
+              "path": "/archived",
+              "value": "false",
+              "expect": {
+                "instancePath": "/archived",
+                "keyword": "type"
+              }
+            },
+            {
+              "name": "defaults-array",
+              "class": "invalid",
+              "op": "set",
+              "path": "/defaults",
+              "value": [],
+              "expect": {
+                "instancePath": "/defaults",
+                "keyword": "type"
+              }
+            },
+            {
+              "name": "project-id-uppercase",
+              "class": "invalid",
+              "op": "set",
+              "path": "/project_id",
+              "value": "5D1C9A2E-7B3F-4C8D-9E0A-1B2C3D4E5F60",
+              "expect": {
+                "instancePath": "/project_id",
+                "keyword": "pattern"
+              }
+            }
+          ]
+        }
+      },
+      "ProjectCreateRequestTypical": {
+        "summary": "Create a project",
+        "dataValue": {
+          "name": "Synthetic project",
+          "instructions": "Answer briefly.",
+          "defaults": {
+            "model": "synthetic-model"
+          },
+          "reason": "Synthetic project for a fixture"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/ProjectCreateRequest",
+          "direction": "request",
+          "mutations": [
+            {
+              "name": "without-optional-members",
+              "class": "valid",
+              "op": "remove",
+              "path": "/instructions"
+            },
+            {
+              "name": "without-defaults",
+              "class": "valid",
+              "op": "remove",
+              "path": "/defaults"
+            },
+            {
+              "name": "name-empty",
+              "class": "invalid",
+              "op": "set",
+              "path": "/name",
+              "value": "",
+              "expect": {
+                "instancePath": "/name",
+                "keyword": "minLength"
+              }
+            },
+            {
+              "name": "legacy-folder-default",
+              "class": "invalid",
+              "op": "set",
+              "path": "/defaults",
+              "value": {
+                "folder_id": "x"
+              },
+              "expect": {
+                "instancePath": "/defaults",
+                "keyword": "not"
+              }
+            },
+            {
+              "name": "defaults-array",
+              "class": "invalid",
+              "op": "set",
+              "path": "/defaults",
+              "value": [],
+              "expect": {
+                "instancePath": "/defaults",
+                "keyword": "type"
+              }
+            },
+            {
+              "name": "reason-empty",
+              "class": "invalid",
+              "op": "set",
+              "path": "/reason",
+              "value": "",
+              "expect": {
+                "instancePath": "/reason",
+                "keyword": "minLength"
+              }
+            }
+          ]
+        }
+      },
+      "ProjectSettingsRequestTypical": {
+        "summary": "Replace a project's settings",
+        "dataValue": {
+          "name": "Renamed project",
+          "instructions": "",
+          "defaults": {}
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/ProjectSettingsRequest",
+          "direction": "request",
+          "mutations": [
+            {
+              "name": "legacy-collection-default",
+              "class": "invalid",
+              "op": "set",
+              "path": "/defaults",
+              "value": {
+                "collection_ids": []
+              },
+              "expect": {
+                "instancePath": "/defaults",
+                "keyword": "not"
+              }
+            },
+            {
+              "name": "instructions-too-long",
+              "class": "invalid",
+              "op": "set",
+              "path": "/instructions",
+              "repeat": [
+                "i",
+                32769
+              ],
+              "expect": {
+                "instancePath": "/instructions",
+                "keyword": "maxLength"
+              }
+            }
+          ]
+        }
+      },
+      "MemberRoleRequestTypical": {
+        "summary": "Make a user an editor",
+        "dataValue": {
+          "grantee": {
+            "kind": "user",
+            "grantee_id": "7f3ebc40-9d51-4eaf-9a2c-3d4e5f607182"
+          },
+          "role": "editor"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/MemberRoleRequest",
+          "direction": "request",
+          "mutations": [
+            {
+              "name": "oidc-group-grantee",
+              "class": "valid",
+              "op": "set",
+              "path": "/grantee",
+              "value": {
+                "kind": "oidc_group",
+                "grantee_id": "synthetic-team"
+              }
+            },
+            {
+              "name": "role-unknown",
+              "class": "invalid",
+              "op": "set",
+              "path": "/role",
+              "value": "admin",
+              "expect": {
+                "instancePath": "/role",
+                "keyword": "enum"
+              }
+            },
+            {
+              "name": "grantee-project",
+              "class": "invalid",
+              "op": "set",
+              "path": "/grantee/kind",
+              "value": "project",
+              "expect": {
+                "instancePath": "/grantee/kind",
+                "keyword": "enum"
+              }
+            },
+            {
+              "name": "grantee-without-id",
+              "class": "invalid",
+              "op": "remove",
+              "path": "/grantee/grantee_id",
+              "expect": {
+                "instancePath": "/grantee",
+                "keyword": "required"
+              }
+            },
+            {
+              "name": "grantee-unknown-member",
+              "class": "invalid",
+              "op": "set",
+              "path": "/grantee/scope",
+              "value": "x",
+              "expect": {
+                "instancePath": "/grantee",
+                "keyword": "additionalProperties"
+              }
+            }
+          ]
+        }
+      },
+      "MemberRevokeRequestTypical": {
+        "summary": "Revoke a local group's direct roles",
+        "dataValue": {
+          "grantee": {
+            "kind": "local_group",
+            "grantee_id": "80a1cd51-ae62-4fb0-8b3d-4e5f60718293"
+          },
+          "reason": "Team disbanded"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/MemberRevokeRequest",
+          "direction": "request",
+          "mutations": [
+            {
+              "name": "role-member",
+              "class": "invalid",
+              "op": "set",
+              "path": "/role",
+              "value": "viewer",
+              "expect": {
+                "instancePath": "",
+                "keyword": "additionalProperties"
+              }
+            }
+          ]
+        }
+      },
+      "ShareRequestTypical": {
+        "summary": "Share an item with a local group",
+        "dataValue": {
+          "grantee": {
+            "kind": "local_group",
+            "grantee_id": "80a1cd51-ae62-4fb0-8b3d-4e5f60718293"
+          },
+          "access": "read"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/ShareRequest",
+          "direction": "request",
+          "mutations": [
+            {
+              "name": "whole-project",
+              "class": "valid",
+              "op": "set",
+              "path": "/grantee",
+              "value": {
+                "kind": "project"
+              }
+            },
+            {
+              "name": "project-with-id",
+              "class": "invalid",
+              "op": "set",
+              "path": "/grantee",
+              "value": {
+                "kind": "project",
+                "grantee_id": "80a1cd51-ae62-4fb0-8b3d-4e5f60718293"
+              },
+              "expect": {
+                "instancePath": "/grantee",
+                "keyword": "not"
+              }
+            },
+            {
+              "name": "user-without-id",
+              "class": "invalid",
+              "op": "set",
+              "path": "/grantee",
+              "value": {
+                "kind": "user"
+              },
+              "expect": {
+                "instancePath": "/grantee",
+                "keyword": "required"
+              }
+            },
+            {
+              "name": "access-unknown",
+              "class": "invalid",
+              "op": "set",
+              "path": "/access",
+              "value": "admin",
+              "expect": {
+                "instancePath": "/access",
+                "keyword": "enum"
+              }
+            }
+          ]
+        }
+      },
+      "ShareRevokeRequestTypical": {
+        "summary": "Revoke a user's share",
+        "dataValue": {
+          "grantee": {
+            "kind": "user",
+            "grantee_id": "7f3ebc40-9d51-4eaf-9a2c-3d4e5f607182"
+          }
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/ShareRevokeRequest",
+          "direction": "request",
+          "mutations": [
+            {
+              "name": "whole-project",
+              "class": "valid",
+              "op": "set",
+              "path": "/grantee",
+              "value": {
+                "kind": "project"
+              }
+            }
+          ]
+        }
+      },
+      "ProjectMemberGrantEditor": {
+        "summary": "A user's direct role after the change",
+        "dataValue": {
+          "project_id": "5d1c9a2e-7b3f-4c8d-9e0a-1b2c3d4e5f60",
+          "grantee": {
+            "kind": "user",
+            "grantee_id": "7f3ebc40-9d51-4eaf-9a2c-3d4e5f607182"
+          },
+          "role": "editor"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/ProjectMemberGrant",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "unrecognized-grantee-kind",
+              "class": "compat",
+              "op": "set",
+              "path": "/grantee",
+              "value": {
+                "kind": "service"
+              }
+            },
+            {
+              "name": "grantee-without-kind",
+              "class": "invalid",
+              "op": "remove",
+              "path": "/grantee/kind",
+              "expect": {
+                "instancePath": "/grantee",
+                "keyword": "required"
+              }
+            }
+          ]
+        }
+      },
+      "ResourceShareRead": {
+        "summary": "A conversation shared with a user for reading",
+        "dataValue": {
+          "resource_kind": "conversation",
+          "resource_id": "91b2de62-bf73-4c01-9c4e-5f60718293a4",
+          "grantee": {
+            "kind": "user",
+            "grantee_id": "7f3ebc40-9d51-4eaf-9a2c-3d4e5f607182"
+          },
+          "access": "read"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/ResourceShare",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "whole-project",
+              "class": "valid",
+              "op": "set",
+              "path": "/grantee",
+              "value": {
+                "kind": "project"
+              }
+            },
+            {
+              "name": "resource-id-not-uuid",
+              "class": "invalid",
+              "op": "set",
+              "path": "/resource_id",
+              "value": "conversation-1",
+              "expect": {
+                "instancePath": "/resource_id",
+                "keyword": "minLength"
+              }
+            }
+          ]
+        }
+      },
+      "ConversationAccessProject": {
+        "summary": "A project conversation its creator can edit and share",
+        "dataValue": {
+          "conversation_id": "91b2de62-bf73-4c01-9c4e-5f60718293a4",
+          "scope_kind": "project",
+          "scope_id": "6e2dab3f-8c40-4d9e-8f1b-2c3d4e5f6071",
+          "project_id": "5d1c9a2e-7b3f-4c8d-9e0a-1b2c3d4e5f60",
+          "created_at": "2026-11-17T09:00:00.000000Z",
+          "access": "write",
+          "can_manage_shares": true
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/ConversationAccess",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "personal-scope",
+              "class": "valid",
+              "op": "set",
+              "path": "/project_id",
+              "value": null
+            },
+            {
+              "name": "unrecognized-access",
+              "class": "compat",
+              "op": "set",
+              "path": "/access",
+              "value": "comment"
+            },
+            {
+              "name": "created-at-offset",
+              "class": "invalid",
+              "op": "set",
+              "path": "/created_at",
+              "value": "2026-11-17T09:00:00.000000+00:00",
+              "expect": {
+                "instancePath": "/created_at",
+                "keyword": "maxLength"
+              }
+            },
+            {
+              "name": "project-id-empty",
+              "class": "invalid",
+              "op": "set",
+              "path": "/project_id",
+              "value": "",
+              "expect": {
+                "instancePath": "/project_id",
+                "keyword": "anyOf"
+              }
+            }
+          ]
+        }
+      },
+      "ArtifactAccessShared": {
+        "summary": "An artifact shared with the caller for reading",
+        "dataValue": {
+          "artifact_id": "a2c3ef73-c084-4d12-8d5f-60718293a4b5",
+          "scope_kind": "personal",
+          "scope_id": "6e2dab3f-8c40-4d9e-8f1b-2c3d4e5f6071",
+          "project_id": null,
+          "last_revision": "3",
+          "created_at": "2026-11-17T09:00:00.000000Z",
+          "access": "read",
+          "can_manage_shares": false
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/ArtifactAccess",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "last-revision-json-number",
+              "class": "invalid",
+              "op": "set",
+              "path": "/last_revision",
+              "value": 3,
+              "expect": {
+                "instancePath": "/last_revision",
+                "keyword": "type"
+              }
+            },
+            {
+              "name": "can-manage-shares-null",
+              "class": "invalid",
+              "op": "set",
+              "path": "/can_manage_shares",
+              "value": null,
+              "expect": {
+                "instancePath": "/can_manage_shares",
+                "keyword": "type"
               }
             }
           ]

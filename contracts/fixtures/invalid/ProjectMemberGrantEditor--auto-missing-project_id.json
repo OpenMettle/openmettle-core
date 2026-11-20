@@ -1,0 +1,25 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ProjectMemberGrantEditor--auto-missing-project_id",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "grantee": {
+      "grantee_id": "7f3ebc40-9d51-4eaf-9a2c-3d4e5f607182",
+      "kind": "user"
+    },
+    "role": "editor"
+  },
+  "mutation": {
+    "name": "auto-missing-project_id",
+    "op": "remove",
+    "path": "/project_id"
+  },
+  "schema": "#/components/schemas/ProjectMemberGrant",
+  "source": "#/components/examples/ProjectMemberGrantEditor"
+}

@@ -66,7 +66,7 @@ It is the path of the selected provider's registered `callback`, as in ADRs 0017
 | `provider_id` | Exactly one configured `providers[].id`; no case folding (handoff) |
 | `origin` | Canonical HTTPS origin as browsers send it; the selected provider's callback must be this origin followed by a plain path (handoff) |
 | `landing_path` | Plain absolute path on that origin (handoff) |
-| `paths.initiation`, `paths.session_check`, `paths.logout` | Plain literal paths of at most 256 bytes. All four paths, including the callback path, differ from each other and from `/healthz` and `/readyz` (router) |
+| `paths.initiation`, `paths.session_check`, `paths.logout` | Plain literal paths of at most 256 bytes. All four paths, including the callback path, differ from each other, from `/healthz` and `/readyz`, and from `/v1` and every path under it, which the application API serves (router; ADR 0027 PR4b) |
 | `rates.<route>.burst` | 1–65 536 (router) |
 | `rates.<route>.interval_milliseconds` | 1–3 600 000, the router's 1 ms–1 hour (router) |
 | `max_in_flight` | 1–4096, shared by all four routes (router) |

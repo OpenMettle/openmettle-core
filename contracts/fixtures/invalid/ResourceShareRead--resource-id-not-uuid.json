@@ -1,0 +1,28 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "/resource_id",
+    "keyword": "minLength",
+    "valid": false
+  },
+  "fixture": "ResourceShareRead--resource-id-not-uuid",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "access": "read",
+    "grantee": {
+      "grantee_id": "7f3ebc40-9d51-4eaf-9a2c-3d4e5f607182",
+      "kind": "user"
+    },
+    "resource_id": "conversation-1",
+    "resource_kind": "conversation"
+  },
+  "mutation": {
+    "name": "resource-id-not-uuid",
+    "op": "set",
+    "path": "/resource_id",
+    "value": "conversation-1"
+  },
+  "schema": "#/components/schemas/ResourceShare",
+  "source": "#/components/examples/ResourceShareRead"
+}

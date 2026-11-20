@@ -1,0 +1,26 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "/access",
+    "keyword": "enum",
+    "valid": false
+  },
+  "fixture": "ShareRequestTypical--access-unknown",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "access": "admin",
+    "grantee": {
+      "grantee_id": "80a1cd51-ae62-4fb0-8b3d-4e5f60718293",
+      "kind": "local_group"
+    }
+  },
+  "mutation": {
+    "name": "access-unknown",
+    "op": "set",
+    "path": "/access",
+    "value": "admin"
+  },
+  "schema": "#/components/schemas/ShareRequest",
+  "source": "#/components/examples/ShareRequestTypical"
+}

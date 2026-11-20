@@ -357,28 +357,39 @@ pub(super) fn invitation(form: &[u8]) -> Option<Option<InvitationCode>> {
     }
     InvitationCode::parse(&value).map(Some)
 }
+/// Every value of cookie `name` across every `Cookie` field, in order. Names compare exactly.
+pub(crate) fn cookie_values<'h>(
+    headers: &'h HeaderMap,
+    name: &'h str,
+) -> impl Iterator<Item = &'h [u8]> + 'h {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .flat_map(move |field| {
+            field
+                .as_bytes()
+                .split(|b| *b == b';')
+                .filter_map(move |pair| {
+                    pair.trim_ascii()
+                        .strip_prefix(name.as_bytes())
+                        .and_then(|rest| rest.strip_prefix(b"="))
+                })
+        })
+}
 /// The value of cookie `name` when it occurs exactly once across every `Cookie` field and
 /// those fields are within [`MAX_COOKIE_BYTES`]. Names compare exactly.
-pub(super) fn single_cookie<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
-    let fields = || headers.get_all(header::COOKIE).iter();
-    if fields().map(HeaderValue::len).sum::<usize>() > MAX_COOKIE_BYTES {
+pub(crate) fn single_cookie<'h>(headers: &'h HeaderMap, name: &'h str) -> Option<&'h str> {
+    let total: usize = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .map(HeaderValue::len)
+        .sum();
+    if total > MAX_COOKIE_BYTES {
         return None;
     }
-    let mut found = None;
-    for field in fields() {
-        for pair in field.as_bytes().split(|b| *b == b';') {
-            let value = pair
-                .trim_ascii()
-                .strip_prefix(name.as_bytes())
-                .and_then(|rest| rest.strip_prefix(b"="));
-            if let Some(value) = value
-                && found.replace(value).is_some()
-            {
-                return None;
-            }
-        }
-    }
-    std::str::from_utf8(found?).ok()
+    let mut values = cookie_values(headers, name);
+    let found = values.next().filter(|_| values.next().is_none())?;
+    std::str::from_utf8(found).ok()
 }
 /// The caller cookie, found by the rule above.
 fn login_cookie(headers: &HeaderMap) -> Option<&str> {

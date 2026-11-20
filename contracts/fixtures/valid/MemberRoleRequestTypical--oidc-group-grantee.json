@@ -1,0 +1,27 @@
+{
+  "class": "valid",
+  "direction": "request",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "MemberRoleRequestTypical--oidc-group-grantee",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "grantee": {
+      "grantee_id": "synthetic-team",
+      "kind": "oidc_group"
+    },
+    "role": "editor"
+  },
+  "mutation": {
+    "name": "oidc-group-grantee",
+    "op": "set",
+    "path": "/grantee",
+    "value": {
+      "grantee_id": "synthetic-team",
+      "kind": "oidc_group"
+    }
+  },
+  "schema": "#/components/schemas/MemberRoleRequest",
+  "source": "#/components/examples/MemberRoleRequestTypical"
+}

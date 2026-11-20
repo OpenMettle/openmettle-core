@@ -73,7 +73,14 @@ const FORM_MEDIA_TYPE: &str = "application/x-www-form-urlencoded";
 const FORM_NOT_RECEIVED: &str = "login request body not received\n";
 /// Operational routes in `crate::routes`. A login path never shadows them when `crate::app`
 /// merges the two routers.
-pub(super) const CORE_PATHS: [&str; 2] = ["/healthz", "/readyz"];
+const CORE_PATHS: [&str; 2] = ["/healthz", "/readyz"];
+
+/// A path no sign-in route may take: an operational route, or `/v1` and everything under it,
+/// which the application API serves (ADR 0027 PR4b). `crate::app` merges every router, so a
+/// reserved path is refused here, and offline, rather than by a panic in `Router::merge`.
+pub(super) fn reserved(path: &str) -> bool {
+    CORE_PATHS.contains(&path) || path == "/v1" || path.starts_with("/v1/")
+}
 
 /// One rate budget: at most `burst` admissions at once, refilled by one every `interval`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,14 +161,14 @@ fn check_path(path: &str) -> Result<(), SettingsError> {
             .all(|segment| !matches!(segment, "" | "." | ".."));
     plain.then_some(()).ok_or(SettingsError::Path)
 }
-/// Every path is valid, no two are equal and none is an operational route. Checked before a
-/// route is added, so `Router::route` cannot panic on them.
+/// Every path is valid, no two are equal and none is [`reserved`]. Checked before a route is
+/// added, so `Router::route` cannot panic on them.
 pub(super) fn check_paths(paths: &[&str]) -> Result<(), SettingsError> {
     for path in paths {
         check_path(path)?;
     }
     for (index, path) in paths.iter().enumerate() {
-        if CORE_PATHS.contains(path) || paths[index + 1..].contains(path) {
+        if reserved(path) || paths[index + 1..].contains(path) {
             return Err(SettingsError::Collision);
         }
     }
@@ -253,7 +260,7 @@ const SESSION_LINES: Lines = Lines {
     rate: "session rate limit reached; try again later\n",
 };
 
-pub(super) fn target_bytes(uri: &Uri) -> usize {
+pub(crate) fn target_bytes(uri: &Uri) -> usize {
     uri.scheme_str()
         .map_or(0, |scheme| scheme.len() + "://".len())
         + uri
@@ -263,7 +270,7 @@ pub(super) fn target_bytes(uri: &Uri) -> usize {
             .path_and_query()
             .map_or(0, |target| target.as_str().len())
 }
-pub(super) fn header_bytes(headers: &HeaderMap) -> usize {
+pub(crate) fn header_bytes(headers: &HeaderMap) -> usize {
     headers
         .iter()
         .map(|(name, value)| name.as_str().len() + value.len())
@@ -271,7 +278,7 @@ pub(super) fn header_bytes(headers: &HeaderMap) -> usize {
 }
 /// The empty form and navigation profile: no `Transfer-Encoding`, every `Content-Length` is
 /// `0`, and the parsed body is known to be empty. Decided from metadata alone.
-pub(super) fn empty_body(headers: &HeaderMap, body: &Body) -> bool {
+pub(crate) fn empty_body(headers: &HeaderMap, body: &Body) -> bool {
     !headers.contains_key(header::TRANSFER_ENCODING)
         && headers
             .get_all(header::CONTENT_LENGTH)
@@ -491,6 +498,9 @@ mod tests {
             ("/auth/login/", "/auth/callback"),
             ("/a-b.c_d~e", "/x/y/z"),
             ("/healthz/login", "/readyz2"),
+            // Only `/v1` itself and paths under it are reserved, not a shared prefix.
+            ("/v10", "/v1x/callback"),
+            ("/auth/v1", "/api/v1/callback"),
         ] {
             assert_eq!(check_paths(&[initiation, callback]), Ok(()), "{initiation}");
         }
@@ -529,6 +539,12 @@ mod tests {
             ("/readyz", "/callback"),
             ("/login", "/healthz"),
             ("/login", "/readyz"),
+            // The application API prefix and everything under it (ADR 0027 PR4b).
+            ("/v1", "/callback"),
+            ("/v1/", "/callback"),
+            ("/v1/projects", "/callback"),
+            ("/login", "/v1/capabilities"),
+            ("/login", "/v1/auth/callback"),
         ] {
             assert_eq!(
                 check_paths(&[initiation, callback]),

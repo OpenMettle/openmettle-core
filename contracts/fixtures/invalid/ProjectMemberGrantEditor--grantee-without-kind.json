@@ -1,0 +1,25 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "/grantee",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ProjectMemberGrantEditor--grantee-without-kind",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "grantee": {
+      "grantee_id": "7f3ebc40-9d51-4eaf-9a2c-3d4e5f607182"
+    },
+    "project_id": "5d1c9a2e-7b3f-4c8d-9e0a-1b2c3d4e5f60",
+    "role": "editor"
+  },
+  "mutation": {
+    "name": "grantee-without-kind",
+    "op": "remove",
+    "path": "/grantee/kind"
+  },
+  "schema": "#/components/schemas/ProjectMemberGrant",
+  "source": "#/components/examples/ProjectMemberGrantEditor"
+}

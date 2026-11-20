@@ -1,0 +1,27 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ArtifactAccessShared--auto-missing-scope_id",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "access": "read",
+    "artifact_id": "a2c3ef73-c084-4d12-8d5f-60718293a4b5",
+    "can_manage_shares": false,
+    "created_at": "2026-11-17T09:00:00.000000Z",
+    "last_revision": "3",
+    "project_id": null,
+    "scope_kind": "personal"
+  },
+  "mutation": {
+    "name": "auto-missing-scope_id",
+    "op": "remove",
+    "path": "/scope_id"
+  },
+  "schema": "#/components/schemas/ArtifactAccess",
+  "source": "#/components/examples/ArtifactAccessShared"
+}

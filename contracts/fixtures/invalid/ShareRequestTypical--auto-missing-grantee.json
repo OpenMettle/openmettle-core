@@ -1,0 +1,21 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ShareRequestTypical--auto-missing-grantee",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "access": "read"
+  },
+  "mutation": {
+    "name": "auto-missing-grantee",
+    "op": "remove",
+    "path": "/grantee"
+  },
+  "schema": "#/components/schemas/ShareRequest",
+  "source": "#/components/examples/ShareRequestTypical"
+}

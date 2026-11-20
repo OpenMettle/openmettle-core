@@ -1,6 +1,14 @@
 //! Application API contract checks (ADR 0007). Offline: every reference resolves from
 //! vendored files and network or file retrieval is refused. These tests validate the
-//! canonical contract and its generated fixtures; no /v1 route is implemented.
+//! canonical contract and its generated fixtures, and the problems a mounted API returns
+//! without a database. Successful `/v1` responses are checked against PostgreSQL in
+//! `tests/schema/authz_http.rs`.
+#[path = "auth_config_support/mod.rs"]
+mod auth_config_support;
+// The transport fixture's synthetic CA; its leaf certificates are not needed here.
+#[allow(dead_code)]
+#[path = "provider_http_support/ca.rs"]
+mod ca;
 #[path = "contract/consumer.rs"]
 mod consumer;
 #[path = "support/env.rs"]
@@ -404,17 +412,24 @@ fn operation_problems(document: &Value) -> Vec<String> {
         .as_object()
         .cloned()
         .unwrap_or_default();
+    // V1-04 settled both session transports (ADRs 0019 and 0029).
     for (name, scheme) in &schemes {
-        if scheme.get("x-openmettle-provisional") != Some(&json!(true)) {
-            problems.push(format!("security scheme {name} is not marked provisional"));
+        if scheme.get("x-openmettle-provisional").is_some() {
+            problems.push(format!(
+                "security scheme {name} is still marked provisional"
+            ));
         }
     }
     for (path, item) in document["paths"].as_object().unwrap() {
         for (method, operation) in item.as_object().unwrap() {
             let at = format!("{method} {path}");
-            if operation.get("x-openmettle-implementation") != Some(&json!("not-implemented")) {
+            let status = operation.get("x-openmettle-implementation");
+            if ![json!("implemented"), json!("not-implemented")]
+                .iter()
+                .any(|allowed| status == Some(allowed))
+            {
                 problems.push(format!(
-                    "{at}: implementation status must be not-implemented"
+                    "{at}: implementation status must be implemented or not-implemented"
                 ));
             }
             let security = operation
@@ -460,10 +475,11 @@ fn operation_problems(document: &Value) -> Vec<String> {
 }
 
 #[test]
-fn operations_are_authenticated_unimplemented_and_use_problem_details() {
+fn operations_are_authenticated_declare_their_status_and_use_problem_details() {
     let problems = operation_problems(contract());
     assert!(problems.is_empty(), "{problems:#?}");
-    // The lint detects an anonymous operation and a non-problem error response.
+    // The lint detects an anonymous operation, a non-problem error response, a missing or
+    // unknown implementation status and a provisional security scheme.
     let mut weakened = contract().clone();
     let operation = &mut weakened["paths"]["/v1/capabilities"]["get"];
     operation["security"] = json!([{}]);
@@ -472,12 +488,63 @@ fn operations_are_authenticated_unimplemented_and_use_problem_details() {
         "headers": {"OpenMettle-API-Version": {"$ref": "#/components/headers/ApiVersion"}},
         "content": {"text/plain": {"schema": {"type": "string", "maxLength": 1}}}
     });
+    weakened["paths"]["/v1/projects"]["post"]["x-openmettle-implementation"] = json!("partial");
+    weakened["paths"]["/v1/projects/{project_id}"]["get"]
+        .as_object_mut()
+        .unwrap()
+        .remove("x-openmettle-implementation");
+    weakened["components"]["securitySchemes"]["nativeSession"]["x-openmettle-provisional"] =
+        json!(true);
     let found = operation_problems(&weakened);
-    assert!(
-        found.iter().any(|p| p.contains("authentication")),
-        "{found:?}"
+    for needle in [
+        "get /v1/capabilities: must require a declared authentication scheme",
+        "get /v1/capabilities 418: must be problem+json only",
+        "post /v1/projects: implementation status",
+        "get /v1/projects/{project_id}: implementation status",
+        "security scheme nativeSession is still marked provisional",
+    ] {
+        assert!(
+            found.iter().any(|p| p.contains(needle)),
+            "{needle}: {found:?}"
+        );
+    }
+}
+
+/// The settled session transports match the server: the browser cookie is the one the sign-in
+/// callback sets, the native credential is a bearer, and every implemented operation accepts
+/// either.
+#[test]
+fn security_schemes_match_the_served_session_transports() {
+    let schemes = &contract()["components"]["securitySchemes"];
+    assert_eq!(
+        (
+            &schemes["browserSession"]["type"],
+            &schemes["browserSession"]["in"],
+            &schemes["browserSession"]["name"],
+        ),
+        (
+            &json!("apiKey"),
+            &json!("cookie"),
+            &json!(openmettle_core::browser_auth::handoff::SESSION_COOKIE),
+        )
     );
-    assert!(found.iter().any(|p| p.contains("418")), "{found:?}");
+    assert_eq!(
+        (
+            &schemes["nativeSession"]["type"],
+            &schemes["nativeSession"]["scheme"]
+        ),
+        (&json!("http"), &json!("bearer"))
+    );
+    for item in contract()["paths"].as_object().unwrap().values() {
+        for operation in item.as_object().unwrap().values() {
+            assert_eq!(
+                operation["security"],
+                json!([{"browserSession": []}, {"nativeSession": []}]),
+                "{}",
+                operation["operationId"]
+            );
+        }
+    }
 }
 
 /// Every schema under components bounds strings, arrays and integers; object property
@@ -547,8 +614,7 @@ fn schema_problems(document: &Value) -> Vec<String> {
 fn schemas_are_bounded_private_and_requests_strict() {
     let problems = schema_problems(contract());
     assert!(problems.is_empty(), "{problems:#?}");
-    // Mutations prove each rule fires. No operation has a request body yet, so strictness
-    // is only exercised through this injected body.
+    // Mutations prove each rule fires, including request strictness on an injected open body.
     let mut weakened = contract().clone();
     let schemas = &mut weakened["components"]["schemas"];
     schemas["Cursor"]
@@ -626,12 +692,104 @@ fn consumer_decodes_every_valid_and_newer_compatible_response() {
         consumer::parse_decimal(f.instance.as_str().unwrap(), true)
             .unwrap_or_else(|e| panic!("{}: {e}", f.path));
     }
+    for (schema, decode) in v1_decoders() {
+        for f in fixtures_for(schema, &["valid", "compat"]) {
+            decode(&f.instance).unwrap_or_else(|e| panic!("{}: {e}", f.path));
+        }
+    }
+}
+
+type Decode = fn(&Value) -> Result<(), String>;
+
+/// The consumer's decoders of the V1-05 project, conversation and artifact responses.
+fn v1_decoders() -> [(&'static str, Decode); 5] {
+    [
+        ("#/components/schemas/Project", |v| {
+            consumer::decode_project(v).map(drop)
+        }),
+        ("#/components/schemas/ProjectMemberGrant", |v| {
+            consumer::decode_member_grant(v).map(drop)
+        }),
+        ("#/components/schemas/ResourceShare", |v| {
+            consumer::decode_share(v).map(drop)
+        }),
+        ("#/components/schemas/ConversationAccess", |v| {
+            consumer::decode_item_access(v, false).map(drop)
+        }),
+        ("#/components/schemas/ArtifactAccess", |v| {
+            consumer::decode_item_access(v, true).map(drop)
+        }),
+    ]
+}
+
+/// What a client may infer from the V1-05 responses, and what it must not.
+#[test]
+fn consumer_reads_projects_and_items_without_inferring_access() {
+    use consumer::{Access, Grantee, Role};
+    let project = consumer::decode_project(&fixture("ProjectOwned")).unwrap();
+    assert_eq!((project.revision, project.archived), (1, false));
+    assert!(project.role.manages_project() && project.defaults.contains_key("model"));
+    assert!(!project.id.is_empty() && !project.name.is_empty());
+    // A project created before settings existed has an empty name, and is still decoded.
+    let legacy = consumer::decode_project(&fixture("ProjectOwned--pre-settings-project")).unwrap();
+    assert!(legacy.name.is_empty());
+    // A newer role is surfaced but grants no management.
+    let newer = consumer::decode_project(&fixture("ProjectOwned--unrecognized-role")).unwrap();
+    assert_eq!(newer.role, Role::Unrecognized("steward".into()));
+    assert!(!newer.role.manages_project());
+
+    let grant = consumer::decode_member_grant(&fixture("ProjectMemberGrantEditor")).unwrap();
+    assert!(matches!(grant.grantee, Grantee::User(_)) && grant.role == Role::Editor);
+    assert!(!grant.project_id.is_empty());
+    let other = fixture("ProjectMemberGrantEditor--unrecognized-grantee-kind");
+    let other = consumer::decode_member_grant(&other).unwrap();
+    assert_eq!(other.grantee, Grantee::Unrecognized("service".into()));
+
+    let share = consumer::decode_share(&fixture("ResourceShareRead--whole-project")).unwrap();
+    assert_eq!(
+        (share.grantee, share.access),
+        (Grantee::WholeProject, Access::Read)
+    );
+    assert_eq!(share.resource_kind, "conversation");
+    assert!(!share.resource_id.is_empty());
+    // A whole-project grantee never carries an identifier, and a user grantee always does.
+    for malformed in [
+        json!({"kind": "project", "grantee_id": "x"}),
+        json!({"kind": "user"}),
+    ] {
+        let mut value = fixture("ResourceShareRead");
+        value["grantee"] = malformed;
+        assert!(consumer::decode_share(&value).is_err());
+    }
+
+    let item = consumer::decode_item_access(&fixture("ConversationAccessProject"), false).unwrap();
+    assert!(item.project_id.is_some() && item.access == Access::Write && item.can_manage_shares);
+    assert!(!item.id.is_empty() && item.last_revision.is_none());
+    let personal = fixture("ConversationAccessProject--personal-scope");
+    assert!(
+        consumer::decode_item_access(&personal, false)
+            .unwrap()
+            .project_id
+            .is_none()
+    );
+    let newer = fixture("ConversationAccessProject--unrecognized-access");
+    let newer = consumer::decode_item_access(&newer, false).unwrap();
+    assert_eq!(newer.access, Access::Unrecognized("comment".into()));
+    let artifact = consumer::decode_item_access(&fixture("ArtifactAccessShared"), true).unwrap();
+    assert_eq!(
+        (artifact.last_revision, artifact.access),
+        (Some(3), Access::Read)
+    );
+    // A conversation is not an artifact, and an artifact needs its revision.
+    assert!(consumer::decode_item_access(&fixture("ConversationAccessProject"), true).is_err());
+    let mut unrevised = fixture("ArtifactAccessShared");
+    unrevised.as_object_mut().unwrap().remove("last_revision");
+    assert!(consumer::decode_item_access(&unrevised, true).is_err());
 }
 
 #[test]
 fn consumer_rejects_invalid_structure_it_depends_on() {
     // Missing required members and wrong JSON types must not decode into defaults.
-    type Decode = fn(&Value) -> Result<(), String>;
     let decoders: [(&str, Decode); 4] = [
         ("#/components/schemas/CapabilityList", |v| {
             consumer::decode_capabilities(v).map(drop)
@@ -647,7 +805,7 @@ fn consumer_rejects_invalid_structure_it_depends_on() {
         }),
     ];
     let mut checked = 0;
-    for (schema, decode) in decoders {
+    for (schema, decode) in decoders.into_iter().chain(v1_decoders()) {
         for f in fixtures_for(schema, &["invalid"]) {
             let keyword = f.expect["keyword"].as_str().unwrap_or("decode");
             let structural = ["type", "required", "not", "decode"].contains(&keyword)
@@ -828,69 +986,206 @@ fn consumer_rejects_unsupported_versions_and_imprecise_numbers() {
     );
 }
 
-#[test]
-fn api_does_not_serve_contract_routes() {
-    // The contract is unimplemented: the running API must return 404 for every path.
-    use std::{
-        io::{Read, Write},
-        net::{TcpListener, TcpStream},
-        process::{Command, Stdio},
-        time::{Duration, Instant},
-    };
-    let bind = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .to_string();
-    let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_openmettle-api"));
-    scrub_env(&mut command);
-    let mut child = command
-        .env("OPENMETTLE_API_BIND", &bind)
-        .env(
-            "OPENMETTLE_API_DATABASE_URL",
-            format!(
-                "postgres://fixture@{}/fixture?sslmode=disable",
-                unavailable.local_addr().unwrap()
-            ),
-        )
-        .env("OPENMETTLE_API_DB_TIMEOUT_MS", "150")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let get = |path: &str| -> Option<String> {
-        let mut stream =
-            TcpStream::connect_timeout(&bind.parse().unwrap(), Duration::from_millis(300)).ok()?;
-        stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-        stream
-            .write_all(
-                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                    .as_bytes(),
-            )
-            .ok()?;
-        let mut response = String::new();
-        stream.read_to_string(&mut response).ok()?;
-        Some(response)
-    };
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while get("/healthz").is_none_or(|r| !r.starts_with("HTTP/1.1 200")) {
-        assert!(child.try_wait().unwrap().is_none(), "API exited");
-        assert!(Instant::now() < deadline, "API did not start");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let paths: Vec<String> = contract()["paths"]
+/// Every contract path with a synthetic identifier in each path parameter.
+fn concrete_paths() -> Vec<String> {
+    contract()["paths"]
         .as_object()
         .unwrap()
         .keys()
-        .cloned()
-        .collect();
-    for path in &paths {
-        let response = get(path).unwrap();
-        assert!(response.starts_with("HTTP/1.1 404"), "{path}: {response}");
+        .map(|template| {
+            template
+                .split('/')
+                .map(|segment| match segment.starts_with('{') {
+                    true => "0f0e0d0c-0b0a-4908-8706-050403020100",
+                    false => segment,
+                })
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .collect()
+}
+
+/// The API binary over a database address that accepts and never answers, optionally with an
+/// auth settings document. Killed on drop.
+struct Api(std::process::Child, String);
+impl Api {
+    fn start(auth: Option<&str>) -> (Self, std::net::TcpListener) {
+        use std::{
+            net::TcpListener,
+            process::{Command, Stdio},
+            time::{Duration, Instant},
+        };
+        let bind = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .to_string();
+        let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_openmettle-api"));
+        scrub_env(&mut command);
+        command
+            .env("OPENMETTLE_API_BIND", &bind)
+            .env(
+                "OPENMETTLE_API_DATABASE_URL",
+                format!(
+                    "postgres://fixture@{}/fixture?sslmode=disable",
+                    unavailable.local_addr().unwrap()
+                ),
+            )
+            .env("OPENMETTLE_API_DB_TIMEOUT_MS", "150")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(path) = auth {
+            command.env("OPENMETTLE_API_AUTH_CONFIG", path);
+        }
+        let mut api = Self(command.spawn().unwrap(), bind);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while api
+            .exchange("GET /healthz HTTP/1.1\r\n\r\n")
+            .is_none_or(|(status, _, _)| status != 200)
+        {
+            assert!(api.0.try_wait().unwrap().is_none(), "API exited");
+            assert!(Instant::now() < deadline, "API did not start");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        (api, unavailable)
     }
-    let _ = child.kill();
-    let _ = child.wait();
+
+    /// One request on a new connection: the status, the lowercase head and the body. `request`
+    /// is the request line and any header lines, ending with a blank line and an optional body.
+    fn exchange(&self, request: &str) -> Option<(u16, String, String)> {
+        use std::{
+            io::{Read, Write},
+            net::TcpStream,
+            time::Duration,
+        };
+        let (head, body) = request.split_once("\r\n\r\n").unwrap();
+        let request = format!("{head}\r\nhost: localhost\r\nconnection: close\r\n\r\n{body}");
+        let address = self.1.parse().unwrap();
+        let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(300)).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        stream.write_all(request.as_bytes()).ok()?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response).ok()?;
+        let (head, body) = response.split_once("\r\n\r\n")?;
+        let status = head.get(9..12)?.parse().ok()?;
+        Some((status, head.to_ascii_lowercase(), body.to_owned()))
+    }
+}
+impl Drop for Api {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn api_does_not_serve_contract_routes() {
+    // The `/v1` routes are mounted only with OPENMETTLE_API_AUTH_CONFIG (ADR 0027 PR4b). An
+    // API started without it must return 404 for every contract path, implemented or not.
+    let (api, _database) = Api::start(None);
+    for path in concrete_paths() {
+        let (status, head, _) = api
+            .exchange(&format!("GET {path} HTTP/1.1\r\n\r\n"))
+            .unwrap();
+        assert_eq!(status, 404, "{path}");
+        assert!(!head.contains("openmettle-api-version"), "{path}: {head}");
+    }
+}
+
+/// ADR 0007 through the real API binary, mounted with a version-2 document and its native
+/// profile, without PostgreSQL. Every refusal decided before the database, and the
+/// `unavailable` answer of a well-formed credential the primary cannot check, is a versioned,
+/// uncacheable problem that conforms to the canonical `Problem` schema, is classified by the
+/// independent consumer and echoes no request value.
+#[test]
+fn mounted_api_problems_conform_to_the_contract() {
+    let dir = auth_config_support::Dir::new();
+    let document = auth_config_support::document_v2_native(&dir, &ca::Ca::new().pem());
+    let path = dir.write("auth.json", document.to_string().as_bytes());
+    let (api, _database) = Api::start(Some(&path));
+    let validator = validator_for("#/components/schemas/Problem");
+    // Well-formed credentials: the shape check passes and validation needs the primary.
+    let credential = format!("{}.{}", "A".repeat(43), "A".repeat(43));
+    let bearer = format!("authorization: Bearer {credential}\r\n");
+    let cookie = format!("cookie: __Host-openmettle-session={credential}\r\n");
+    let key = "idempotency-key: CANARY-key\r\n";
+    let json = "content-type: application/json\r\n";
+    let id = "0f0e0d0c-0b0a-4908-8706-050403020100";
+    let unknown = r#"{"name":"CANARY-name","folder_id":"CANARY-folder"}"#;
+    use consumer::Category::{NotFound, Unauthenticated, Unavailable, Validation};
+    let mut cases: Vec<(String, consumer::Category)> = Vec::new();
+    // Every implemented operation refuses an anonymous request before any other check.
+    for (template, item) in contract()["paths"].as_object().unwrap() {
+        let target = template.replace(['{', '}'], "").replace("project_id", id);
+        let target = target
+            .replace("conversation_id", id)
+            .replace("artifact_id", id);
+        for method in item.as_object().unwrap().keys() {
+            let method = method.to_ascii_uppercase();
+            cases.push((
+                format!("{method} {target} HTTP/1.1\r\ncontent-length: 0\r\n\r\n"),
+                Unauthenticated,
+            ));
+        }
+    }
+    cases.extend([
+        // Both channels, a repeated bearer and a cookie write without the configured Origin.
+        (format!("GET /v1/capabilities HTTP/1.1\r\n{cookie}{bearer}\r\n"), Unauthenticated),
+        (format!("GET /v1/capabilities HTTP/1.1\r\n{bearer}{bearer}\r\n"), Unauthenticated),
+        (
+            format!("POST /v1/projects HTTP/1.1\r\n{cookie}{key}{json}content-length: 2\r\n\r\n{{}}"),
+            Unauthenticated,
+        ),
+        // Request shape, decided before the primary is asked.
+        (
+            format!("POST /v1/projects HTTP/1.1\r\n{bearer}{json}content-length: 2\r\n\r\n{{}}"),
+            Validation,
+        ),
+        (
+            format!(
+                "POST /v1/projects HTTP/1.1\r\n{bearer}{key}{json}content-length: {}\r\n\r\n{unknown}",
+                unknown.len()
+            ),
+            Validation,
+        ),
+        (format!("GET /v1/projects/CANARY-id HTTP/1.1\r\n{bearer}\r\n"), Validation),
+        // Paths and methods the contract does not define.
+        ("GET /v1/CANARY-path HTTP/1.1\r\n\r\n".into(), NotFound),
+        ("DELETE /v1/capabilities HTTP/1.1\r\n\r\n".into(), NotFound),
+        // Well-formed credentials on each channel; the primary never answers.
+        (format!("GET /v1/capabilities HTTP/1.1\r\n{bearer}\r\n"), Unavailable),
+        (format!("GET /v1/capabilities HTTP/1.1\r\n{cookie}\r\n"), Unavailable),
+    ]);
+    for (request, category) in cases {
+        let line = request.lines().next().unwrap().to_owned();
+        let (status, head, body) = api.exchange(&request).unwrap();
+        let problem: Value = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{line}: {e}"));
+        assert!(validator.is_valid(&problem), "{line}: {problem}");
+        let decoded = consumer::decode_problem(&problem).unwrap();
+        assert_eq!(
+            (decoded.status, decoded.category),
+            (status, category),
+            "{line}"
+        );
+        assert_eq!(problem["type"], "about:blank", "{line}");
+        for header in [
+            "content-type: application/problem+json",
+            "openmettle-api-version: 1.0",
+            "cache-control: no-store",
+        ] {
+            assert!(head.contains(header), "{line}: {head}");
+        }
+        let version = head
+            .lines()
+            .find_map(|l| l.strip_prefix("openmettle-api-version: "))
+            .unwrap();
+        assert_eq!(consumer::check_api_version(version), Ok(0), "{line}");
+        assert!(!head.contains("set-cookie"), "{line}: {head}");
+        for planted in ["CANARY", "AAAAAAAAAA", id] {
+            assert!(!body.contains(planted), "{line}: {body}");
+        }
+    }
 }
 
 #[tokio::test]

@@ -1,0 +1,26 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ResourceShareRead--auto-missing-resource_kind",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "access": "read",
+    "grantee": {
+      "grantee_id": "7f3ebc40-9d51-4eaf-9a2c-3d4e5f607182",
+      "kind": "user"
+    },
+    "resource_id": "91b2de62-bf73-4c01-9c4e-5f60718293a4"
+  },
+  "mutation": {
+    "name": "auto-missing-resource_kind",
+    "op": "remove",
+    "path": "/resource_kind"
+  },
+  "schema": "#/components/schemas/ResourceShare",
+  "source": "#/components/examples/ResourceShareRead"
+}

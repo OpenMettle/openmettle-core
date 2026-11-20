@@ -1,0 +1,27 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "/grantee",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ShareRequestTypical--user-without-id",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "access": "read",
+    "grantee": {
+      "kind": "user"
+    }
+  },
+  "mutation": {
+    "name": "user-without-id",
+    "op": "set",
+    "path": "/grantee",
+    "value": {
+      "kind": "user"
+    }
+  },
+  "schema": "#/components/schemas/ShareRequest",
+  "source": "#/components/examples/ShareRequestTypical"
+}

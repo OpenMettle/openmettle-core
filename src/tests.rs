@@ -521,3 +521,375 @@ async fn refused_native_profile_mounts_nothing() {
     database.set_nonblocking(true).unwrap();
     assert!(database.accept().is_err());
 }
+
+/// ADR 0027 PR4b: the `/v1` routes beside the sign-in routes. Every refusal below is decided
+/// from the request head and body alone, before the primary pool is asked: a versioned,
+/// uncacheable problem whose request ID is the one telemetry logged, under the route template
+/// and the `v1` route class. No planted value reaches a response or telemetry.
+#[tokio::test]
+async fn v1_routes_refuse_before_the_database_under_observation() {
+    let database = TcpListener::bind("127.0.0.1:0").unwrap();
+    let dir = Dir::new();
+    let document = support::document_v2_native(&dir, &Ca::new().pem());
+    let path = dir.write("auth.json", document.to_string().as_bytes());
+    let config = config(&database, Some(&path));
+    let (capture, _guard) = Capture::install(Format::Json, Verbosity::Debug);
+    let address = serve_observed(app(&config, &pool(&config)).unwrap()).await;
+
+    // Well-formed credentials pass the shape check; nothing here lets them reach the pool.
+    let token = format!("{}.{}", "Q".repeat(43), "Q".repeat(43));
+    let cookie = format!("cookie: __Host-openmettle-session={token}\r\n");
+    let bearer = format!("authorization: Bearer {token}\r\n");
+    let origin = "origin: https://app.example.test\r\n";
+    let key = "idempotency-key: CANARY-key\r\n";
+    let json = "content-type: application/json\r\n";
+    let body = |text: &str| format!("content-length: {}\r\n\r\n{text}", text.len());
+    let project = r#"{"name":"CANARY-name"}"#;
+    let id = "0f0e0d0c-0b0a-4908-8706-050403020100";
+    let item = format!("/v1/projects/{id}");
+    let archive = format!("/v1/projects/{id}/archive");
+    let upper = format!("/v1/projects/{}", id.to_uppercase());
+    let nested = format!("/v1/projects/{id}/CANARY-path");
+    let pad = format!("x-pad: {}\r\n", "p".repeat(30 * 1024));
+    let cases: Vec<(&str, &str, String, u16, &str, &str)> = vec![
+        // No session, and each refused channel combination.
+        (
+            "GET",
+            "/v1/capabilities",
+            String::new(),
+            401,
+            "unauthenticated",
+            "/v1/capabilities",
+        ),
+        (
+            "HEAD",
+            "/v1/capabilities",
+            String::new(),
+            401,
+            "",
+            "/v1/capabilities",
+        ),
+        (
+            "GET",
+            "/v1/capabilities",
+            format!("{cookie}{bearer}"),
+            401,
+            "unauthenticated",
+            "/v1/capabilities",
+        ),
+        (
+            "GET",
+            "/v1/capabilities",
+            format!("{bearer}{bearer}"),
+            401,
+            "unauthenticated",
+            "/v1/capabilities",
+        ),
+        (
+            "GET",
+            "/v1/capabilities",
+            format!(
+                "cookie: __Host-openmettle-session={token}; __Host-openmettle-session={token}\r\n"
+            ),
+            401,
+            "unauthenticated",
+            "/v1/capabilities",
+        ),
+        (
+            "GET",
+            "/v1/capabilities",
+            "authorization: Basic CANARY\r\n".into(),
+            401,
+            "unauthenticated",
+            "/v1/capabilities",
+        ),
+        (
+            "GET",
+            "/v1/capabilities",
+            format!("authorization: bearer {token}\r\n"),
+            401,
+            "unauthenticated",
+            "/v1/capabilities",
+        ),
+        (
+            "GET",
+            "/v1/capabilities",
+            "authorization: Bearer CANARY-bearer\r\n".into(),
+            401,
+            "unauthenticated",
+            "/v1/capabilities",
+        ),
+        // The cookie channel's Origin binding (CSRF): required on writes, checked on reads.
+        (
+            "POST",
+            "/v1/projects",
+            format!("{cookie}{key}{json}{}", body(project)),
+            401,
+            "unauthenticated",
+            "/v1/projects",
+        ),
+        (
+            "POST",
+            "/v1/projects",
+            format!(
+                "{cookie}origin: https://other.example.test\r\n{key}{json}{}",
+                body(project)
+            ),
+            401,
+            "unauthenticated",
+            "/v1/projects",
+        ),
+        (
+            "POST",
+            "/v1/projects",
+            format!("{cookie}origin: null\r\n{key}{json}{}", body(project)),
+            401,
+            "unauthenticated",
+            "/v1/projects",
+        ),
+        (
+            "POST",
+            "/v1/projects",
+            format!("{cookie}{origin}{origin}{key}{json}{}", body(project)),
+            401,
+            "unauthenticated",
+            "/v1/projects",
+        ),
+        (
+            "DELETE",
+            &item,
+            format!("{cookie}{key}content-length: 0\r\n"),
+            401,
+            "unauthenticated",
+            "/v1/projects/{project_id}",
+        ),
+        (
+            "GET",
+            "/v1/capabilities",
+            format!("{cookie}origin: https://other.example.test\r\n"),
+            401,
+            "unauthenticated",
+            "/v1/capabilities",
+        ),
+        // Request shape, after a usable channel was found.
+        (
+            "POST",
+            "/v1/projects",
+            format!("{bearer}{json}{}", body(project)),
+            400,
+            "validation",
+            "/v1/projects",
+        ),
+        (
+            "POST",
+            "/v1/projects",
+            format!(
+                "{bearer}idempotency-key: has space\r\n{json}{}",
+                body(project)
+            ),
+            400,
+            "validation",
+            "/v1/projects",
+        ),
+        (
+            "POST",
+            "/v1/projects",
+            format!("{bearer}{key}{key}{json}{}", body(project)),
+            400,
+            "validation",
+            "/v1/projects",
+        ),
+        (
+            "POST",
+            "/v1/projects",
+            format!("{bearer}{key}content-type: text/plain\r\n{}", body(project)),
+            400,
+            "validation",
+            "/v1/projects",
+        ),
+        (
+            "POST",
+            "/v1/projects",
+            format!(
+                "{bearer}{key}{json}{}",
+                body(r#"{"name":"A","folder_id":"CANARY-folder"}"#)
+            ),
+            400,
+            "validation",
+            "/v1/projects",
+        ),
+        (
+            "POST",
+            "/v1/projects",
+            format!(
+                "{bearer}{key}{json}{}",
+                body(r#"{"name":"A","defaults":{"folder_id":"CANARY"}}"#)
+            ),
+            400,
+            "validation",
+            "/v1/projects",
+        ),
+        (
+            "POST",
+            "/v1/projects",
+            format!("{bearer}{key}{json}content-length: 70000\r\n"),
+            400,
+            "validation",
+            "/v1/projects",
+        ),
+        (
+            "POST",
+            &archive,
+            format!("{bearer}{key}{}", body("x")),
+            400,
+            "validation",
+            "/v1/projects/{project_id}/archive",
+        ),
+        (
+            "GET",
+            "/v1/projects/CANARY-id",
+            bearer.clone(),
+            400,
+            "validation",
+            "/v1/projects/{project_id}",
+        ),
+        (
+            "GET",
+            &upper,
+            bearer.clone(),
+            400,
+            "validation",
+            "/v1/projects/{project_id}",
+        ),
+        (
+            "GET",
+            "/v1/capabilities",
+            format!("{bearer}{pad}"),
+            400,
+            "validation",
+            "/v1/capabilities",
+        ),
+        // Operations the contract does not define.
+        ("GET", "/v1", String::new(), 404, "not_found", "/v1"),
+        (
+            "GET",
+            "/v1/CANARY-path",
+            String::new(),
+            404,
+            "not_found",
+            "/v1/{*rest}",
+        ),
+        (
+            "GET",
+            &nested,
+            bearer.clone(),
+            404,
+            "not_found",
+            "/v1/{*rest}",
+        ),
+        (
+            "DELETE",
+            "/v1/capabilities",
+            bearer.clone(),
+            404,
+            "not_found",
+            "/v1/capabilities",
+        ),
+        (
+            "PATCH",
+            &item,
+            bearer.clone(),
+            404,
+            "not_found",
+            "/v1/projects/{project_id}",
+        ),
+    ];
+    let mut ids = Vec::new();
+    for (method, target, extra, status, code, _) in &cases {
+        let (got, head, body) = send(address, method, target, extra).await;
+        assert_eq!(got, *status, "{method} {target}");
+        assert!(head.contains("openmettle-api-version: 1.0"), "{head}");
+        assert!(head.contains("cache-control: no-store"), "{head}");
+        assert!(
+            !head.contains("set-cookie") && !head.contains("request-id"),
+            "{head}"
+        );
+        if *method == "HEAD" {
+            assert!(body.is_empty());
+            ids.push(None);
+            continue;
+        }
+        assert!(
+            head.contains("content-type: application/problem+json"),
+            "{head}"
+        );
+        let problem: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            (problem["status"].as_u64(), problem["code"].as_str()),
+            (Some(u64::from(*status)), Some(*code)),
+            "{method} {target}"
+        );
+        assert!(!body.contains("CANARY") && !body.contains("QQQQQQQQ") && !body.contains(id));
+        ids.push(Some(problem["request_id"].as_str().unwrap().to_owned()));
+    }
+    // No refusal above dialled the primary.
+    database.set_nonblocking(true).unwrap();
+    assert!(database.accept().is_err());
+
+    let events = capture.events("http.request.completed");
+    assert_eq!(events.len(), cases.len());
+    for ((event, (method, target, _, status, _, route)), id) in events.iter().zip(&cases).zip(&ids)
+    {
+        assert_eq!(event["http.route"], *route, "{method} {target}");
+        assert_eq!(event["http.response.status_code"], *status);
+        assert_eq!(
+            telemetry::metrics::RouteClass::of(route),
+            telemetry::metrics::RouteClass::V1
+        );
+        // The problem names the request that telemetry logged.
+        if let Some(id) = id {
+            assert_eq!(event["request_id"], id.as_str(), "{method} {target}");
+        }
+    }
+    capture.assert_absent(&[
+        b"CANARY",
+        b"QQQQQQQQQQ",
+        id.as_bytes(),
+        b"app.example.test",
+        dir.path("").as_bytes(),
+    ]);
+}
+
+/// A well-formed credential on either channel is validated on the primary. A pool that cannot
+/// connect is `503 unavailable`, never `401`. Without a native profile no bearer is accepted,
+/// and the pool is never asked.
+#[tokio::test]
+async fn v1_sessions_are_validated_on_the_primary_and_native_needs_its_profile() {
+    let token = format!("{}.{}", "Q".repeat(43), "Q".repeat(43));
+    let bearer = format!("authorization: Bearer {token}\r\n");
+    let cookie = format!("cookie: __Host-openmettle-session={token}\r\n");
+    let dir = Dir::new();
+    let bundle = Ca::new().pem();
+    for (document, channel, status) in [
+        (support::document_v2_native(&dir, &bundle), &bearer, 503),
+        (support::document_v2_native(&dir, &bundle), &cookie, 503),
+        (support::document_v2(&dir, &bundle), &cookie, 503),
+        (support::document_v2(&dir, &bundle), &bearer, 401),
+    ] {
+        let database = TcpListener::bind("127.0.0.1:0").unwrap();
+        let path = dir.write("auth.json", document.to_string().as_bytes());
+        let config = config(&database, Some(&path));
+        let address = serve_observed(app(&config, &pool(&config)).unwrap()).await;
+        let (got, head, body) = send(address, "GET", "/v1/capabilities", channel).await;
+        assert_eq!(got, status, "{channel}");
+        assert!(head.contains("openmettle-api-version: 1.0"));
+        let code = if status == 503 {
+            "unavailable"
+        } else {
+            "unauthenticated"
+        };
+        assert!(body.contains(&format!("\"code\":\"{code}\"")), "{body}");
+        database.set_nonblocking(true).unwrap();
+        assert_eq!(database.accept().is_ok(), status == 503, "{channel}");
+    }
+}

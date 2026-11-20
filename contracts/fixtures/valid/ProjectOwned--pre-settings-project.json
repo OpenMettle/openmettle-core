@@ -1,0 +1,29 @@
+{
+  "class": "valid",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "ProjectOwned--pre-settings-project",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "archived": false,
+    "defaults": {
+      "model": "synthetic-model"
+    },
+    "instructions": "Answer briefly.",
+    "name": "",
+    "project_id": "5d1c9a2e-7b3f-4c8d-9e0a-1b2c3d4e5f60",
+    "revision": "1",
+    "role": "owner",
+    "scope_id": "6e2dab3f-8c40-4d9e-8f1b-2c3d4e5f6071"
+  },
+  "mutation": {
+    "name": "pre-settings-project",
+    "op": "set",
+    "path": "/name",
+    "value": ""
+  },
+  "schema": "#/components/schemas/Project",
+  "source": "#/components/examples/ProjectOwned"
+}

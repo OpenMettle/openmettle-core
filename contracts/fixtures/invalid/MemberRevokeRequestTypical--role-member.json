@@ -1,0 +1,27 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "additionalProperties",
+    "valid": false
+  },
+  "fixture": "MemberRevokeRequestTypical--role-member",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "grantee": {
+      "grantee_id": "80a1cd51-ae62-4fb0-8b3d-4e5f60718293",
+      "kind": "local_group"
+    },
+    "reason": "Team disbanded",
+    "role": "viewer"
+  },
+  "mutation": {
+    "name": "role-member",
+    "op": "set",
+    "path": "/role",
+    "value": "viewer"
+  },
+  "schema": "#/components/schemas/MemberRevokeRequest",
+  "source": "#/components/examples/MemberRevokeRequestTypical"
+}

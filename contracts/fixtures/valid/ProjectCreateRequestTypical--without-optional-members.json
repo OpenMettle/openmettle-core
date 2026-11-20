@@ -1,0 +1,23 @@
+{
+  "class": "valid",
+  "direction": "request",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "ProjectCreateRequestTypical--without-optional-members",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "defaults": {
+      "model": "synthetic-model"
+    },
+    "name": "Synthetic project",
+    "reason": "Synthetic project for a fixture"
+  },
+  "mutation": {
+    "name": "without-optional-members",
+    "op": "remove",
+    "path": "/instructions"
+  },
+  "schema": "#/components/schemas/ProjectCreateRequest",
+  "source": "#/components/examples/ProjectCreateRequestTypical"
+}

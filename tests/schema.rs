@@ -1885,3 +1885,18 @@ mod authz_projects;
 
 #[path = "schema/authz_runs.rs"]
 mod authz_runs;
+
+#[path = "schema/authz_http.rs"]
+mod authz_http;
+
+// Fixtures of the mounted-API tests in `authz_http`: synthetic auth settings, the transport
+// fixture's synthetic CA (its leaf certificates are not needed) and the independent contract
+// consumer, of which these tests decode a subset.
+#[path = "auth_config_support/mod.rs"]
+mod auth_config_support;
+#[allow(dead_code)]
+#[path = "provider_http_support/ca.rs"]
+mod ca;
+#[allow(dead_code)]
+#[path = "contract/consumer.rs"]
+mod consumer;

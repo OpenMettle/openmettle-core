@@ -1,0 +1,29 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ProjectOwned--auto-missing-scope_id",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "archived": false,
+    "defaults": {
+      "model": "synthetic-model"
+    },
+    "instructions": "Answer briefly.",
+    "name": "Synthetic project",
+    "project_id": "5d1c9a2e-7b3f-4c8d-9e0a-1b2c3d4e5f60",
+    "revision": "1",
+    "role": "owner"
+  },
+  "mutation": {
+    "name": "auto-missing-scope_id",
+    "op": "remove",
+    "path": "/scope_id"
+  },
+  "schema": "#/components/schemas/Project",
+  "source": "#/components/examples/ProjectOwned"
+}
