@@ -270,8 +270,10 @@ dependency.
   its exact column list and replaced by `grant_assignments_unique_key`, which adds the kind
   and group columns, `NULLS NOT DISTINCT`. Partial indexes serve group lookups.
 - `projects.lock_guard` is an inert column (`CHECK (lock_guard = false)`). Its API
-  `UPDATE` grant only lets the API lock a project row `FOR UPDATE`, as `login_providers` does
-  since migration 8. The API also gains `INSERT` on the three grantee columns.
+  `UPDATE` grant only lets the API lock a project row `FOR NO KEY UPDATE`, serialising
+  project writers without blocking concurrent foreign-key `FOR KEY SHARE` locks, as
+  `login_providers` does since migration 8. The API also gains `INSERT` on the three grantee
+  columns.
 
 `grants::Assignment.grantee` is a borrowed `grants::Grantee`. A user grantee keeps the exact
 ADR 0006 version 1 request identity, so earlier requests replay unchanged. Other kinds encode

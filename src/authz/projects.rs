@@ -53,6 +53,15 @@ pub struct ProjectSettingsInput<'a> {
     pub defaults: &'a Value,
 }
 
+fn contains_nul(value: &Value) -> bool {
+    match value {
+        Value::String(s) => s.contains('\0'),
+        Value::Array(items) => items.iter().any(contains_nul),
+        Value::Object(map) => map.iter().any(|(k, v)| k.contains('\0') || contains_nul(v)),
+        _ => false,
+    }
+}
+
 impl ProjectSettingsInput<'_> {
     pub fn validate(&self) -> Result<(), StoreError> {
         if !store::valid_name(self.name, 256) {
@@ -65,11 +74,11 @@ impl ProjectSettingsInput<'_> {
             return Err(StoreError::InvalidInput("defaults"));
         };
         // The compact form is never longer than PostgreSQL's jsonb text, so this is a necessary
-        // bound; the CHECK decides the exact one. jsonb refuses the NUL escape outright.
+        // bound; the CHECK decides the exact one. jsonb refuses embedded NUL characters outright.
         let text = self.defaults.to_string();
         if LEGACY_DEFAULTS.iter().any(|key| object.contains_key(*key))
             || text.len() > 16384
-            || text.contains("\\u0000")
+            || contains_nul(self.defaults)
         {
             return Err(StoreError::InvalidInput("defaults"));
         }
@@ -356,21 +365,26 @@ pub async fn hydrate_resource(
 
 // --- shared write steps ------------------------------------------------------------------------
 
-/// Lock the project row FOR UPDATE through its inert guard column (migration 16). Membership,
-/// share and settings changes on one project serialize here. Missing or deleted is concealed.
-async fn lock_project(c: &mut PgConnection, project_id: &str) -> Result<String, StoreError> {
+/// Lock the project row FOR NO KEY UPDATE through its inert guard column (migration 16).
+/// Membership, share and settings changes on one project serialize here while admitting
+/// concurrent foreign-key `FOR KEY SHARE` locks. Returns `None` when the project is missing or
+/// deleted so callers can verify the actor is active before concealing it.
+async fn lock_project(
+    c: &mut PgConnection,
+    project_id: &str,
+) -> Result<Option<String>, StoreError> {
     let row: Option<(String, bool)> = sqlx::query_as(
         "SELECT p.scope_id::text, EXISTS (SELECT FROM openmettle.project_settings s
                                            WHERE s.project_id = p.id AND s.deleted_at IS NOT NULL)
-           FROM openmettle.projects p WHERE p.id = $1::uuid FOR UPDATE OF p",
+           FROM openmettle.projects p WHERE p.id = $1::uuid FOR NO KEY UPDATE OF p",
     )
     .bind(project_id)
     .fetch_optional(c)
     .await?;
-    match row {
-        Some((scope, false)) => Ok(scope),
-        _ => Err(CONCEALED),
-    }
+    Ok(match row {
+        Some((scope, false)) => Some(scope),
+        _ => None,
+    })
 }
 
 fn grantee_input(grantee: &Grantee) -> Result<(), StoreError> {
@@ -544,7 +558,10 @@ async fn project_write(
     uuid(project_id, "project_id")?;
     transact(c, ctx, async move |tx| {
         let c = tx.connection()?;
-        let scope = lock_project(c, project_id).await?;
+        let Some(scope) = lock_project(c, project_id).await? else {
+            acting(c, ctx).await?;
+            return Err(CONCEALED);
+        };
         let actor = acting(c, ctx).await?;
         let project = project_in(c, project_id, &scope, ctx.now_ms).await?;
         check(authorize(&actor, project))?;
@@ -829,7 +846,10 @@ async fn share_change(
         // Share changes on one scope serialize: on the project row, or on the personal owner.
         match (&located.personal_owner, &located.project_id) {
             (_, Some(project)) => {
-                lock_project(c, project).await?;
+                if lock_project(c, project).await?.is_none() {
+                    acting(c, ctx).await?;
+                    return Err(CONCEALED);
+                }
             }
             (Some(owner), _) => {
                 sqlx::query("SELECT FROM openmettle.users WHERE id = $1::uuid FOR NO KEY UPDATE")
@@ -837,7 +857,10 @@ async fn share_change(
                     .fetch_one(&mut *c)
                     .await?;
             }
-            (None, None) => return Err(CONCEALED),
+            (None, None) => {
+                acting(c, ctx).await?;
+                return Err(CONCEALED);
+            }
         }
         let actor = acting(c, ctx).await?;
         let scope = located.scope_id.clone();
@@ -982,5 +1005,32 @@ mod tests {
             input.details()["settings_digest"].as_str().unwrap().len(),
             64
         );
+    }
+
+    #[test]
+    fn defaults_validation_rejects_embedded_nul_without_rejecting_literal_escape() {
+        let literal = json!({ "note": "\\u0000", "nested": ["\\u0000"] });
+        let ok = ProjectSettingsInput {
+            name: "Alpha",
+            instructions: "",
+            defaults: &literal,
+        };
+        assert!(ok.validate().is_ok());
+
+        for bad in [
+            json!({ "note": "a\0b" }),
+            json!({ "k\0": "v" }),
+            json!({ "nested": [{ "deep": "x\0y" }] }),
+        ] {
+            let input = ProjectSettingsInput {
+                name: "Alpha",
+                instructions: "",
+                defaults: &bad,
+            };
+            assert!(matches!(
+                input.validate(),
+                Err(StoreError::InvalidInput("defaults"))
+            ));
+        }
     }
 }

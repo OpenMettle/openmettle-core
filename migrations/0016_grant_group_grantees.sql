@@ -62,8 +62,8 @@ CREATE INDEX grant_assignments_oidc_group_idx
     ON openmettle.grant_assignments (grantee_oidc_group_id, scope_id, id)
     WHERE grantee_oidc_group_id IS NOT NULL;
 
--- Project membership and share changes lock the project row FOR UPDATE, which needs an UPDATE
--- privilege. The API can take the lock only through this inert guard column (ADR 0008 pattern).
+-- Project membership and share changes lock the project row FOR NO KEY UPDATE, which needs an
+-- UPDATE privilege. The API can take the lock only through this inert guard column (ADR 0008).
 ALTER TABLE openmettle.projects
     ADD COLUMN lock_guard boolean NOT NULL DEFAULT false CHECK (lock_guard = false);
 

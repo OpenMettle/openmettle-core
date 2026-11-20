@@ -107,7 +107,7 @@ pub struct Assignment<'a> {
     pub mapping_rule: Option<&'a str>,
 }
 impl<'a> Assignment<'a> {
-    /// Identifier formats of the scope, target and grantee; returns the target kind and ID.
+    /// Identifier formats and bounds of the assignment key; returns the target kind and ID.
     fn validate(&self) -> Result<(&'static str, &'a str), Error> {
         let (kind, target) = self.target.parts();
         uuid(self.scope)?;
@@ -120,6 +120,12 @@ impl<'a> Assignment<'a> {
             // A project-wide grantee is a resource share; it never targets the project itself.
             Grantee::Project if kind == "project" => return Err(Error::Invalid),
             _ => {}
+        }
+        if let Some(rule) = self.mapping_rule {
+            uuid(rule)?;
+        }
+        if !bounded(self.format, 128) || !bounded(self.key, 128) || self.version <= 0 {
+            return Err(Error::Invalid);
         }
         Ok((kind, target))
     }
@@ -352,9 +358,6 @@ pub async fn change_grant(
     let (kind, target) = a.validate()?;
     uuid(r.actor)?;
     let (grantee_kind, user, local_group, oidc_group) = a.grantee.columns();
-    if let Some(rule) = a.mapping_rule {
-        uuid(rule)?;
-    }
     let (decision, cycle) = match r.decision {
         Decision::Grant => ("grant", None),
         Decision::Revoke(c) => ("revoke", c),
@@ -363,10 +366,7 @@ pub async fn change_grant(
         uuid(cycle)?;
     }
     let next = revision(r.expected_revision)?;
-    if !bounded(a.format, 128)
-        || !bounded(a.key, 128)
-        || !bounded(r.key, 128)
-        || a.version <= 0
+    if !bounded(r.key, 128)
         || a.mapping_rule.is_some() != r.mapping_revision.is_some()
         || r.mapping_revision.is_some_and(|v| v <= 0)
     {
@@ -520,5 +520,45 @@ mod tests {
         assert!(change_identity(&c).len() < 32768);
         assert!(matches!(revision(i64::MAX), Err(Error::Invalid)));
         assert!(matches!(revision(-1), Err(Error::Invalid)));
+    }
+
+    #[test]
+    fn assignment_validate_checks_mapping_rule_bounds_and_version() {
+        let u = "00000000-0000-0000-0000-000000000001";
+        let long = "x".repeat(129);
+        let base = Assignment {
+            scope: u,
+            target: Target::Conversation(u),
+            grantee: Grantee::User(u),
+            format: "test.format",
+            version: 1,
+            key: "k",
+            mapping_rule: Some(u),
+        };
+        assert_eq!(base.validate().unwrap(), ("conversation", u));
+        assert!(matches!(
+            Assignment {
+                mapping_rule: Some("not-a-uuid"),
+                ..base
+            }
+            .validate(),
+            Err(Error::Invalid)
+        ));
+        assert!(matches!(
+            Assignment {
+                format: &long,
+                ..base
+            }
+            .validate(),
+            Err(Error::Invalid)
+        ));
+        assert!(matches!(
+            Assignment { key: "", ..base }.validate(),
+            Err(Error::Invalid)
+        ));
+        assert!(matches!(
+            Assignment { version: 0, ..base }.validate(),
+            Err(Error::Invalid)
+        ));
     }
 }

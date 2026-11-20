@@ -544,14 +544,23 @@ async fn migration_16_keeps_user_grants_and_constrains_every_grantee_kind() {
             Some(code) => expect_state(&mut api, &sql, code).await,
         }
     }
-    // The API takes the inert project lock but can never set it; the worker can do neither.
+    // The API takes the inert project lock FOR NO KEY UPDATE (admitting concurrent FK FOR KEY
+    // SHARE locks) but can never set it; the worker can do neither.
     let mut tx_api = connect(&db.0, API).await;
     tx_api.execute("BEGIN").await.unwrap();
-    sqlx::query("SELECT id FROM openmettle.projects WHERE id = $1::uuid FOR UPDATE")
+    sqlx::query("SELECT id FROM openmettle.projects WHERE id = $1::uuid FOR NO KEY UPDATE")
         .bind(&project_id)
         .execute(&mut tx_api)
         .await
         .unwrap();
+    let mut tx_share = connect(&db.0, API).await;
+    tx_share.execute("BEGIN").await.unwrap();
+    sqlx::query("SELECT id FROM openmettle.projects WHERE id = $1::uuid FOR KEY SHARE NOWAIT")
+        .bind(&project_id)
+        .execute(&mut tx_share)
+        .await
+        .unwrap();
+    tx_share.execute("ROLLBACK").await.unwrap();
     tx_api.execute("ROLLBACK").await.unwrap();
     expect_state(
         &mut api,
@@ -561,7 +570,7 @@ async fn migration_16_keeps_user_grants_and_constrains_every_grantee_kind() {
     .await;
     let mut worker = connect(&db.0, WORKER).await;
     for sql in [
-        "SELECT id FROM openmettle.projects FOR UPDATE",
+        "SELECT id FROM openmettle.projects FOR NO KEY UPDATE",
         "UPDATE openmettle.projects SET lock_guard = false",
         "INSERT INTO openmettle.grant_assignments (grantee_kind) VALUES ('project')",
         "UPDATE openmettle.grant_assignments SET grantee_kind = 'project'",
@@ -1165,7 +1174,7 @@ async fn project_row_lock_serializes_the_last_two_direct_owners_stepping_down() 
         assert_eq!(owners().await.len(), 2, "{round}");
         let mut holder = connect(&db.0, API).await;
         holder.execute("BEGIN").await.unwrap();
-        sqlx::query("SELECT id FROM openmettle.projects WHERE id = $1::uuid FOR UPDATE")
+        sqlx::query("SELECT id FROM openmettle.projects WHERE id = $1::uuid FOR NO KEY UPDATE")
             .bind(&p)
             .execute(&mut holder)
             .await
@@ -1599,5 +1608,123 @@ async fn worker_hydrates_projects_and_resources_without_admin_or_settings_reads(
             "42501",
         )
         .await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn inactive_principals_receive_inactive_not_existence_and_settings_edge_cases() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let bob = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let withdrawn = account(&mut owner, PROVIDER, false, FUTURE).await;
+    let mut c = api(&db).await;
+
+    // Literal "\u0000" text is not a NUL byte and round-trips through PostgreSQL jsonb.
+    let literal = json!({ "note": "\\u0000" });
+    let p = applied(
+        projects::create_project(
+            &mut c,
+            &ctx(&alice, "create-literal"),
+            &input("Lit", &literal),
+        )
+        .await,
+    );
+    let loaded = projects::load_project_settings(&mut c, &p)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.defaults, literal);
+
+    // Compact JSON <= 16 KiB that expands past 16 KiB in PostgreSQL jsonb::text maps cleanly to
+    // StoreError::InvalidInput("project settings") without leaving an audit row.
+    let mut map = serde_json::Map::new();
+    for i in 0..1500 {
+        map.insert(format!("k{i:04}"), json!(1));
+    }
+    let expanded = Value::Object(map);
+    assert!(expanded.to_string().len() <= 16384);
+    let audit_before = audit(&db).await.len();
+    assert!(matches!(
+        projects::update_project_settings(
+            &mut c,
+            &ctx(&alice, "expanded-defaults"),
+            &p,
+            &input("Lit", &expanded),
+        )
+        .await,
+        Err(StoreError::InvalidInput("project settings"))
+    ));
+    assert_eq!(audit(&db).await.len(), audit_before);
+
+    // Create a resource inside the project, then delete the project.
+    let scope = scope_of(&db, &p).await;
+    let item_id = chat(&db, &scope, "project", &alice).await;
+    applied(projects::delete_project(&mut c, &ctx(&alice, "delete"), &p).await);
+
+    // An inactive principal must receive InactivePrincipal (never NotFound) for nonexistent
+    // projects, deleted projects, and resources inside deleted projects.
+    for target in [UNKNOWN, p.as_str()] {
+        assert_eq!(
+            denied(
+                projects::update_project_settings(
+                    &mut c,
+                    &ctx(&withdrawn, "w-settings"),
+                    target,
+                    &input("No", &literal),
+                )
+                .await
+            ),
+            DenialReason::InactivePrincipal
+        );
+        assert_eq!(
+            denied(projects::delete_project(&mut c, &ctx(&withdrawn, "w-delete"), target).await),
+            DenialReason::InactivePrincipal
+        );
+        assert_eq!(
+            denied(
+                set_role(
+                    &db,
+                    &withdrawn,
+                    "w-role",
+                    target,
+                    &user(&bob),
+                    ProjectRole::Viewer,
+                )
+                .await
+            ),
+            DenialReason::InactivePrincipal
+        );
+    }
+    for resource in [UNKNOWN, item_id.as_str()] {
+        assert_eq!(
+            denied(
+                share(
+                    &db,
+                    &withdrawn,
+                    "w-share",
+                    (CONVERSATION, resource),
+                    &user(&bob),
+                    ResourceAccess::Read,
+                )
+                .await
+            ),
+            DenialReason::InactivePrincipal
+        );
+        assert_eq!(
+            denied(
+                unshare(
+                    &db,
+                    &withdrawn,
+                    "w-unshare",
+                    (CONVERSATION, resource),
+                    &user(&bob),
+                )
+                .await
+            ),
+            DenialReason::InactivePrincipal
+        );
     }
 }
