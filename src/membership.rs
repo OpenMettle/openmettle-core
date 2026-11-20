@@ -1,7 +1,7 @@
 //! Login-time reconciliation for owner-enrolled existing identities (ADR 0021).
 use crate::{
     auth::VerifiedAssertion,
-    grants::{self, Assignment, ChangeInput, Decision, Target},
+    grants::{self, Assignment, ChangeInput, Decision, Grantee, Target},
     runs::WriteTransaction,
     sessions::Error,
 };
@@ -33,6 +33,19 @@ impl Observation {
             Ambiguous => "ambiguous",
             Stale => "stale",
             Failed => "failed",
+        }
+    }
+
+    /// The observation named by a [`membership_state`] label. Anything else is `Failed`.
+    pub(crate) fn parse(label: Option<&str>) -> Self {
+        match label {
+            Some("present") => Present,
+            Some("absent") => Absent,
+            Some("partial") => Partial,
+            Some("missing") => Missing,
+            Some("ambiguous") => Ambiguous,
+            Some("stale") => Stale,
+            _ => Failed,
         }
     }
 }
@@ -218,7 +231,7 @@ pub(crate) async fn reconcile(
         let assignment = Assignment {
             scope,
             target: Target::Project(project),
-            grantee: subject.user,
+            grantee: Grantee::User(subject.user),
             format: "openmettle.project-member",
             version: 1,
             key: subject.approval,
@@ -265,6 +278,9 @@ async fn apply_assignment(
     login: &str,
     confirmed: &mut Option<String>,
 ) -> Result<bool, Error> {
+    let Grantee::User(user) = assignment.grantee else {
+        return Ok(false);
+    };
     let current = sqlx::query(
         "SELECT c.id::text AS change_id,a.last_revision,c.decision,c.cycle_id::text,c.mapping_revision
              FROM openmettle.grant_assignments a JOIN openmettle.grant_changes c
@@ -275,7 +291,7 @@ async fn apply_assignment(
     )
     .bind(assignment.scope)
     .bind(project)
-    .bind(assignment.grantee)
+    .bind(user)
     .bind(assignment.mapping_rule)
     .bind(assignment.key)
     .fetch_optional(tx.connection()?)
@@ -296,7 +312,7 @@ async fn apply_assignment(
         if active && (!present || row.try_get::<i64, _>("mapping_revision")? != revision) {
             let change = ChangeInput {
                 assignment,
-                actor: assignment.grantee,
+                actor: user,
                 key: &format!("membership-revoke/{login}"),
                 expected_revision: expected,
                 mapping_revision: Some(row.try_get("mapping_revision")?),
@@ -313,7 +329,7 @@ async fn apply_assignment(
             tx,
             &ChangeInput {
                 assignment,
-                actor: assignment.grantee,
+                actor: user,
                 key: &format!("membership-grant/{login}"),
                 expected_revision: expected,
                 mapping_revision: Some(revision),
@@ -386,15 +402,7 @@ pub async fn current(
     let result = tokio::time::timeout(policy.deadline(), query)
         .await
         .map_err(|_| Error::Timeout)??;
-    Ok(match result.as_deref() {
-        Some("present") => Present,
-        Some("absent") => Absent,
-        Some("partial") => Partial,
-        Some("missing") => Missing,
-        Some("ambiguous") => Ambiguous,
-        Some("stale") => Stale,
-        _ => Failed,
-    })
+    Ok(Observation::parse(result.as_deref()))
 }
 
 #[cfg(test)]

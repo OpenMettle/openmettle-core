@@ -7,25 +7,25 @@ use openmettle_core::{
         DenialReason, PolicyReason, Principal,
         store::{self, AuditContext, StoreError, WriteOutcome},
     },
-    grants::{self, Assignment, ChangeInput, Decision, MappingInput, Target},
+    grants::{self, Assignment, ChangeInput, Decision, Grantee, MappingInput, Target},
     runs::WriteTransaction,
 };
 use std::collections::BTreeSet;
 
 const ISSUER: &str = "https://authz-store.example.test";
-const PROVIDER: &str = "00000000-0000-0000-0000-0000000005a1";
+pub(super) const PROVIDER: &str = "00000000-0000-0000-0000-0000000005a1";
 const RETIRED: &str = "00000000-0000-0000-0000-0000000005a2";
 const RULE: &str = "00000000-0000-0000-0000-0000000005a3";
-const UNKNOWN: &str = "00000000-0000-0000-0000-0000000005ff";
-const NOW: i64 = 1_800_000_000_000;
-const FUTURE: i64 = 4_102_444_800_000;
+pub(super) const UNKNOWN: &str = "00000000-0000-0000-0000-0000000005ff";
+pub(super) const NOW: i64 = 1_800_000_000_000;
+pub(super) const FUTURE: i64 = 4_102_444_800_000;
 const LAST_ADMIN: DenialReason = DenialReason::Policy(PolicyReason::LastAccountAdmin);
 const NOT_ADMIN: DenialReason = DenialReason::Policy(PolicyReason::NotAccountAdmin);
 
 #[derive(Clone)]
-struct Account {
-    user: String,
-    approval: String,
+pub(super) struct Account {
+    pub(super) user: String,
+    pub(super) approval: String,
 }
 
 fn set(values: &[&str]) -> BTreeSet<String> {
@@ -33,7 +33,7 @@ fn set(values: &[&str]) -> BTreeSet<String> {
 }
 
 /// An active provider and a retired one, both for `ISSUER`.
-async fn providers(owner: &mut PgConnection) {
+pub(super) async fn providers(owner: &mut PgConnection) {
     for (id, revisions) in [
         (PROVIDER, &[Some("v1")][..]),
         (RETIRED, &[Some("v1"), None][..]),
@@ -48,7 +48,12 @@ async fn providers(owner: &mut PgConnection) {
 }
 
 /// An enabled user with a personal scope, one identity and its approval.
-async fn account(owner: &mut PgConnection, provider: &str, active: bool, expires: i64) -> Account {
+pub(super) async fn account(
+    owner: &mut PgConnection,
+    provider: &str,
+    active: bool,
+    expires: i64,
+) -> Account {
     let user = new_user(owner).await;
     personal_scope(owner, &user).await;
     let approval = sqlx::query_scalar(
@@ -71,7 +76,7 @@ async fn account(owner: &mut PgConnection, provider: &str, active: bool, expires
     Account { user, approval }
 }
 
-async fn make_admin(owner: &mut PgConnection, account: &Account) {
+pub(super) async fn make_admin(owner: &mut PgConnection, account: &Account) {
     sqlx::query("INSERT INTO openmettle.account_admins (user_id, active) VALUES ($1::uuid, true)")
         .bind(&account.user)
         .execute(owner)
@@ -79,7 +84,12 @@ async fn make_admin(owner: &mut PgConnection, account: &Account) {
         .unwrap();
 }
 
-async fn hydrate(db: &TestDb, role: &str, account: &Account, now: i64) -> Option<Principal> {
+pub(super) async fn hydrate(
+    db: &TestDb,
+    role: &str,
+    account: &Account,
+    now: i64,
+) -> Option<Principal> {
     let mut c = connect(&db.0, role).await;
     let result = if role == API {
         store::hydrate_api_principal(&mut c, &account.user, &account.approval, now).await
@@ -89,11 +99,11 @@ async fn hydrate(db: &TestDb, role: &str, account: &Account, now: i64) -> Option
     result.unwrap()
 }
 
-async fn principal(db: &TestDb, account: &Account) -> Principal {
+pub(super) async fn principal(db: &TestDb, account: &Account) -> Principal {
     hydrate(db, API, account, NOW).await.unwrap()
 }
 
-fn ctx<'a>(actor: &'a Account, request_key: &'a str) -> AuditContext<'a> {
+pub(super) fn ctx<'a>(actor: &'a Account, request_key: &'a str) -> AuditContext<'a> {
     AuditContext {
         actor_user_id: &actor.user,
         actor_approval_id: &actor.approval,
@@ -103,32 +113,32 @@ fn ctx<'a>(actor: &'a Account, request_key: &'a str) -> AuditContext<'a> {
     }
 }
 
-fn denied<T: std::fmt::Debug>(result: Result<T, StoreError>) -> DenialReason {
+pub(super) fn denied<T: std::fmt::Debug>(result: Result<T, StoreError>) -> DenialReason {
     match result {
         Err(StoreError::Denied(reason)) => reason,
         other => panic!("expected a denial, got {other:?}"),
     }
 }
 
-fn applied(result: Result<WriteOutcome, StoreError>) -> String {
+pub(super) fn applied(result: Result<WriteOutcome, StoreError>) -> String {
     match result {
         Ok(WriteOutcome::Applied { target_id }) => target_id,
         other => panic!("expected an applied change, got {other:?}"),
     }
 }
 
-fn conflict<T: std::fmt::Debug>(result: Result<T, StoreError>) -> &'static str {
+pub(super) fn conflict<T: std::fmt::Debug>(result: Result<T, StoreError>) -> &'static str {
     match result {
         Err(StoreError::Conflict(what)) => what,
         other => panic!("expected a conflict, got {other:?}"),
     }
 }
 
-const UNCHANGED: &str = "target is already in the requested state";
+pub(super) const UNCHANGED: &str = "target is already in the requested state";
 
 /// (actor_kind, operator is NULL, action, target_kind, target_id, details) in insertion order.
-type Audit = (String, bool, String, String, String, String);
-async fn audit(db: &TestDb) -> Vec<Audit> {
+pub(super) type Audit = (String, bool, String, String, String, String);
+pub(super) async fn audit(db: &TestDb) -> Vec<Audit> {
     sqlx::query_as(
         "SELECT actor_kind, operator_id IS NULL, action, target_kind, target_id, details::text
            FROM openmettle.authorization_audit ORDER BY occurred_at, id",
@@ -325,7 +335,7 @@ async fn hydration_reads_current_primary_state_for_both_roles() {
 /// An ADR 0021 enrollment for `account` with a current `present` observation of
 /// `synthetic-team`, written through the same grants the configuration script and session
 /// issuance use. Returns the owner connection for later state changes.
-async fn present_membership(db: &TestDb, account: &Account) -> PgConnection {
+pub(super) async fn present_membership(db: &TestDb, account: &Account) -> PgConnection {
     let mut owner = connect(&db.0, OWNER).await;
     let (project, scope) = project(&mut owner, &account.user).await;
     let mut api = connect(&db.0, API).await;
@@ -356,7 +366,7 @@ async fn present_membership(db: &TestDb, account: &Account) -> PgConnection {
             assignment: Assignment {
                 scope: &scope,
                 target: Target::Project(&project),
-                grantee: &account.user,
+                grantee: Grantee::User(&account.user),
                 format: "openmettle.project-member",
                 version: 1,
                 key: &account.approval,
@@ -855,7 +865,7 @@ async fn local_group_and_capability_writes_apply_on_the_next_hydration() {
 }
 
 /// Waits until `n` sessions in this database are blocked on a lock.
-async fn wait_for_lock_waiters(db: &TestDb, n: i64) {
+pub(super) async fn wait_for_lock_waiters(db: &TestDb, n: i64) {
     let mut admin = db.admin().await;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

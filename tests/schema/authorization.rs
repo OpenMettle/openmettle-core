@@ -174,10 +174,10 @@ async fn exec(
 
 #[test]
 fn migration_15_is_registered_and_the_admin_script_is_canonical() {
-    let latest = MIGRATIONS.last().unwrap();
+    let v15 = &MIGRATIONS[14];
     assert_eq!(
-        (MIGRATIONS.len(), latest.version, latest.description),
-        (15, 15, "authorization and private projects")
+        (v15.version, v15.description),
+        (15, "authorization and private projects")
     );
     assert!(GUIDE.contains("](grant-account-admin.psql)"));
     assert!(README.contains("](docs/operator/account-admin-recovery.md)"));
@@ -1153,13 +1153,33 @@ async fn populated_v14_upgrade_keeps_rows_and_adds_empty_authorization_state() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(db.history().await, all_versions());
     let after = everything(&db).await;
-    // Every pre-existing row is unchanged; history only gains version 15.
+    // Every pre-existing row is unchanged; history gains version 15 and later. Migration 16
+    // adds only columns whose values on every earlier row are fixed defaults.
+    let without_v16 = |rows: &BTreeSet<String>| -> BTreeSet<String> {
+        rows.iter()
+            .map(|row| {
+                let mut row: serde_json::Value = serde_json::from_str(row).unwrap();
+                let object = row.as_object_mut().unwrap();
+                for (column, value) in [
+                    ("lock_guard", serde_json::json!(false)),
+                    ("grantee_kind", serde_json::json!("user")),
+                    ("grantee_local_group_id", serde_json::Value::Null),
+                    ("grantee_oidc_group_id", serde_json::Value::Null),
+                ] {
+                    if let Some(found) = object.remove(column) {
+                        assert_eq!(found, value, "{column}");
+                    }
+                }
+                row.to_string()
+            })
+            .collect()
+    };
     for (table, rows) in &before {
         if table == "_sqlx_migrations" {
             assert!(rows.is_subset(&after[table]));
-            assert_eq!(after[table].len(), rows.len() + 1);
+            assert_eq!(after[table].len(), rows.len() + MIGRATIONS.len() - 14);
         } else {
-            assert_eq!(&after[table], rows, "{table}");
+            assert_eq!(without_v16(&after[table]), without_v16(rows), "{table}");
         }
     }
     // The new tables start empty, apart from the single administrator lock row.

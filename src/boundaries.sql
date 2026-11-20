@@ -190,6 +190,14 @@ column_contract (relation, attribute, role, privilege) AS (
          (VALUES ('openmettle_api'), ('openmettle_worker')) AS r(role)
     WHERE $1 >= 15
     UNION ALL
+    -- V1-05 PR4a: group and project-wide grantees, and the inert project row lock.
+    SELECT relation, attribute, 'openmettle_api', privilege FROM (VALUES
+        ('grant_assignments','grantee_kind','INSERT'),
+        ('grant_assignments','grantee_local_group_id','INSERT'),
+        ('grant_assignments','grantee_oidc_group_id','INSERT'),
+        ('projects','lock_guard','UPDATE')
+    ) AS grantees(relation, attribute, privilege) WHERE $1 >= 16
+    UNION ALL
     SELECT relation, attribute, 'openmettle_api', privilege FROM (VALUES
         ('login_nonce_reservations','key_id','INSERT'),
         ('login_nonce_reservations','nonce','INSERT'),

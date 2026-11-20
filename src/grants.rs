@@ -1,4 +1,4 @@
-//! Grant persistence and provenance, never authorization. See ADR 0006.
+//! Grant persistence and provenance, never authorization. See ADRs 0006 and 0027.
 use crate::runs::{Error, WriteTransaction, bounded, digest, finish, identity, uuid};
 use sqlx::{Acquire, PgConnection, Row, postgres::PgRow};
 
@@ -38,15 +38,91 @@ impl<'a> Target<'a> {
         }
     }
 }
+/// A borrowed [`crate::authz::Grantee`]: the recipient of an assignment (migration 16).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Grantee<'a> {
+    User(&'a str),
+    LocalGroup(&'a str),
+    /// The exact OIDC group claim value: 1 to 1024 bytes without control characters.
+    OidcGroup(&'a str),
+    /// Every member of the containing project; resource targets only.
+    Project,
+}
+impl<'a> From<&'a crate::authz::Grantee> for Grantee<'a> {
+    fn from(g: &'a crate::authz::Grantee) -> Self {
+        use crate::authz::Grantee as G;
+        match g {
+            G::User(id) => Self::User(id),
+            G::LocalGroup(id) => Self::LocalGroup(id),
+            G::OidcGroup(id) => Self::OidcGroup(id),
+            G::Project => Self::Project,
+        }
+    }
+}
+impl<'a> Grantee<'a> {
+    /// The `grantee_kind` and the user, local group and OIDC group columns. Exactly the column
+    /// of the kind is set.
+    pub(crate) fn columns(
+        self,
+    ) -> (
+        &'static str,
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a str>,
+    ) {
+        match self {
+            Self::User(id) => ("user", Some(id), None, None),
+            Self::LocalGroup(id) => ("local_group", None, Some(id), None),
+            Self::OidcGroup(id) => ("oidc_group", None, None, Some(id)),
+            Self::Project => ("project", None, None, None),
+        }
+    }
+    fn from_columns(row: &'a PgRow) -> Self {
+        match row.get::<&str, _>("grantee_kind") {
+            "user" => Self::User(row.get("grantee_user_id")),
+            "local_group" => Self::LocalGroup(row.get("grantee_local_group_id")),
+            "oidc_group" => Self::OidcGroup(row.get("grantee_oidc_group_id")),
+            _ => Self::Project,
+        }
+    }
+    /// Request-identity bytes. A user is its UUID, byte-identical to ADR 0006 version 1, so every
+    /// earlier request still replays. Other kinds are `kind NUL id`; a UUID never holds NUL.
+    fn identity(self) -> Vec<u8> {
+        match self.columns() {
+            ("user", Some(id), ..) => id.as_bytes().to_vec(),
+            (kind, _, local, oidc) => [kind, "\0", local.or(oidc).unwrap_or("")]
+                .concat()
+                .into_bytes(),
+        }
+    }
+}
 #[derive(Clone, Copy)]
 pub struct Assignment<'a> {
     pub scope: &'a str,
     pub target: Target<'a>,
-    pub grantee: &'a str,
+    pub grantee: Grantee<'a>,
     pub format: &'a str,
     pub version: i32,
     pub key: &'a str,
     pub mapping_rule: Option<&'a str>,
+}
+impl<'a> Assignment<'a> {
+    /// Identifier formats of the scope, target and grantee; returns the target kind and ID.
+    fn validate(&self) -> Result<(&'static str, &'a str), Error> {
+        let (kind, target) = self.target.parts();
+        uuid(self.scope)?;
+        uuid(target)?;
+        match self.grantee {
+            Grantee::User(id) | Grantee::LocalGroup(id) => uuid(id)?,
+            Grantee::OidcGroup(id) if !bounded(id, 1024) || id.chars().any(char::is_control) => {
+                return Err(Error::Invalid);
+            }
+            // A project-wide grantee is a resource share; it never targets the project itself.
+            Grantee::Project if kind == "project" => return Err(Error::Invalid),
+            _ => {}
+        }
+        Ok((kind, target))
+    }
 }
 #[derive(Clone, Copy)]
 pub enum Decision<'a> {
@@ -79,6 +155,14 @@ pub struct AssignmentSnapshot {
     pub recorded_active: bool,
     pub cycle: Option<String>,
     pub mapping_eligible: bool,
+}
+/// The migration 16 natural key of `grant_assignments a`, binding $1 scope, $2 target kind,
+/// $3 target, $4 grantee kind, $5 user, $6 local group, $7 OIDC group, $8 format, $9 version,
+/// $10 key and $11 mapping rule.
+macro_rules! natural_key {
+    () => {
+        "a.scope_id=$1::uuid AND a.target_kind=$2 AND a.target_id=$3::uuid AND a.grantee_kind=$4 AND a.grantee_user_id IS NOT DISTINCT FROM $5::uuid AND a.grantee_local_group_id IS NOT DISTINCT FROM $6::uuid AND a.grantee_oidc_group_id IS NOT DISTINCT FROM $7 AND a.assignment_format=$8 AND a.assignment_version=$9 AND a.assignment_key=$10 AND a.mapping_rule_id IS NOT DISTINCT FROM $11::uuid"
+    };
 }
 fn revision(v: i64) -> Result<i64, Error> {
     if !(0..i64::MAX).contains(&v) {
@@ -119,7 +203,7 @@ fn change_identity(r: &ChangeInput<'_>) -> Vec<u8> {
             a.scope.as_bytes(),
             kind.as_bytes(),
             target.as_bytes(),
-            a.grantee.as_bytes(),
+            &a.grantee.identity(),
             a.format.as_bytes(),
             &a.version.to_be_bytes(),
             a.key.as_bytes(),
@@ -222,7 +306,7 @@ async fn change_replay(
     r: &ChangeInput<'_>,
     id: &[u8],
 ) -> Result<Option<GrantReceipt>, Error> {
-    let row = sqlx::query("SELECT c.id::text AS change_id,c.assignment_id::text,c.revision,c.decision,c.cycle_id::text,c.mapping_revision,c.request_identity,c.request_digest,a.target_kind,a.target_id::text,a.grantee_user_id::text,a.assignment_format,a.assignment_version,a.assignment_key,a.mapping_rule_id::text FROM openmettle.grant_changes c JOIN openmettle.grant_assignments a ON a.id=c.assignment_id WHERE c.scope_id=$1::uuid AND c.actor_user_id=$2::uuid AND c.request_key=$3")
+    let row = sqlx::query("SELECT c.id::text AS change_id,c.assignment_id::text,c.revision,c.decision,c.cycle_id::text,c.mapping_revision,c.request_identity,c.request_digest,a.target_kind,a.target_id::text,a.grantee_kind,a.grantee_user_id::text,a.grantee_local_group_id::text,a.grantee_oidc_group_id,a.assignment_format,a.assignment_version,a.assignment_key,a.mapping_rule_id::text FROM openmettle.grant_changes c JOIN openmettle.grant_assignments a ON a.id=c.assignment_id WHERE c.scope_id=$1::uuid AND c.actor_user_id=$2::uuid AND c.request_key=$3")
         .bind(r.assignment.scope).bind(r.actor).bind(r.key).fetch_optional(c).await?;
     let Some(row) = row else { return Ok(None) };
     let target = match row.get::<&str, _>("target_kind") {
@@ -234,7 +318,7 @@ async fn change_replay(
         assignment: Assignment {
             scope: r.assignment.scope,
             target,
-            grantee: row.get("grantee_user_id"),
+            grantee: Grantee::from_columns(&row),
             format: row.get("assignment_format"),
             version: row.get("assignment_version"),
             key: row.get("assignment_key"),
@@ -265,10 +349,9 @@ pub async fn change_grant(
     r: &ChangeInput<'_>,
 ) -> Result<GrantReceipt, Error> {
     let a = r.assignment;
-    let (kind, target) = a.target.parts();
-    for v in [a.scope, target, a.grantee, r.actor] {
-        uuid(v)?;
-    }
+    let (kind, target) = a.validate()?;
+    uuid(r.actor)?;
+    let (grantee_kind, user, local_group, oidc_group) = a.grantee.columns();
     if let Some(rule) = a.mapping_rule {
         uuid(rule)?;
     }
@@ -307,10 +390,10 @@ pub async fn change_grant(
             // Revokes may name an old immutable mapping revision after disable/replacement.
             if decision=="grant" && (Some(current.get::<i64,_>("last_revision"))!=r.mapping_revision || enabled!=Some(true)) { return Err(Error::StaleRevision); }
         }
-        sqlx::query("INSERT INTO openmettle.grant_assignments(scope_id,target_kind,project_id,conversation_id,artifact_id,grantee_user_id,assignment_format,assignment_version,assignment_key,source_kind,mapping_rule_id,created_by_user_id) VALUES($1::uuid,$2,CASE WHEN $2='project' THEN $3::uuid END,CASE WHEN $2='conversation' THEN $3::uuid END,CASE WHEN $2='artifact' THEN $3::uuid END,$4::uuid,$5,$6,$7,$8,$9::uuid,$10::uuid) ON CONFLICT DO NOTHING")
-            .bind(a.scope).bind(kind).bind(target).bind(a.grantee).bind(a.format).bind(a.version).bind(a.key).bind(source).bind(a.mapping_rule).bind(r.actor).execute(&mut *sp).await?;
-        let row = sqlx::query("SELECT id::text,last_revision FROM openmettle.grant_assignments WHERE scope_id=$1::uuid AND target_kind=$2 AND target_id=$3::uuid AND grantee_user_id=$4::uuid AND assignment_format=$5 AND assignment_version=$6 AND assignment_key=$7 AND mapping_rule_id IS NOT DISTINCT FROM $8::uuid FOR NO KEY UPDATE")
-            .bind(a.scope).bind(kind).bind(target).bind(a.grantee).bind(a.format).bind(a.version).bind(a.key).bind(a.mapping_rule).fetch_one(&mut *sp).await?;
+        sqlx::query("INSERT INTO openmettle.grant_assignments(scope_id,target_kind,project_id,conversation_id,artifact_id,grantee_kind,grantee_user_id,grantee_local_group_id,grantee_oidc_group_id,assignment_format,assignment_version,assignment_key,source_kind,mapping_rule_id,created_by_user_id) VALUES($1::uuid,$2,CASE WHEN $2='project' THEN $3::uuid END,CASE WHEN $2='conversation' THEN $3::uuid END,CASE WHEN $2='artifact' THEN $3::uuid END,$4,$5::uuid,$6::uuid,$7,$8,$9,$10,$11,$12::uuid,$13::uuid) ON CONFLICT DO NOTHING")
+            .bind(a.scope).bind(kind).bind(target).bind(grantee_kind).bind(user).bind(local_group).bind(oidc_group).bind(a.format).bind(a.version).bind(a.key).bind(source).bind(a.mapping_rule).bind(r.actor).execute(&mut *sp).await?;
+        let row = sqlx::query(concat!("SELECT id::text,last_revision FROM openmettle.grant_assignments a WHERE ", natural_key!(), " FOR NO KEY UPDATE"))
+            .bind(a.scope).bind(kind).bind(target).bind(grantee_kind).bind(user).bind(local_group).bind(oidc_group).bind(a.format).bind(a.version).bind(a.key).bind(a.mapping_rule).fetch_one(&mut *sp).await?;
         if let Some(receipt) = change_replay(&mut sp,r,&id).await? { return Ok(receipt); }
         let assignment: String = row.get("id");
         if row.get::<i64,_>("last_revision")!=r.expected_revision { return Err(Error::StaleRevision); }
@@ -335,6 +418,21 @@ pub async fn change_grant(
     tx.restore(outer);
     result
 }
+/// Snapshot columns of `grant_assignments a`; callers append the WHERE clause.
+macro_rules! snapshot_sql {
+    () => {
+        "SELECT a.id::text,a.last_revision,coalesce(c.decision='grant',false) AS active,c.cycle_id::text,CASE WHEN a.source_kind='direct' THEN true ELSE coalesce(m.enabled AND c.mapping_revision=m.revision,false) END AS eligible FROM openmettle.grant_assignments a LEFT JOIN openmettle.grant_changes c ON c.assignment_id=a.id AND c.revision=a.last_revision LEFT JOIN openmettle.grant_mapping_rules r ON r.id=a.mapping_rule_id LEFT JOIN openmettle.grant_mapping_revisions m ON m.rule_id=r.id AND m.revision=r.last_revision WHERE "
+    };
+}
+fn snapshot(r: PgRow) -> AssignmentSnapshot {
+    AssignmentSnapshot {
+        assignment: r.get("id"),
+        revision: r.get("last_revision"),
+        recorded_active: r.get("active"),
+        cycle: r.get("cycle_id"),
+        mapping_eligible: r.get("eligible"),
+    }
+}
 /// One statement snapshot; recorded state and current mapping eligibility stay separate.
 /// Neither field checks user disablement, permissions, resource lifecycle or directory truth.
 pub async fn read_assignment(
@@ -344,15 +442,38 @@ pub async fn read_assignment(
 ) -> Result<Option<AssignmentSnapshot>, Error> {
     uuid(scope)?;
     uuid(assignment)?;
-    let row = sqlx::query("SELECT a.id::text,a.last_revision,coalesce(c.decision='grant',false) AS active,c.cycle_id::text,CASE WHEN a.source_kind='direct' THEN true ELSE coalesce(m.enabled AND c.mapping_revision=m.revision,false) END AS eligible FROM openmettle.grant_assignments a LEFT JOIN openmettle.grant_changes c ON c.assignment_id=a.id AND c.revision=a.last_revision LEFT JOIN openmettle.grant_mapping_rules r ON r.id=a.mapping_rule_id LEFT JOIN openmettle.grant_mapping_revisions m ON m.rule_id=r.id AND m.revision=r.last_revision WHERE a.scope_id=$1::uuid AND a.id=$2::uuid")
-        .bind(scope).bind(assignment).fetch_optional(c).await?;
-    Ok(row.map(|r| AssignmentSnapshot {
-        assignment: r.get("id"),
-        revision: r.get("last_revision"),
-        recorded_active: r.get("active"),
-        cycle: r.get("cycle_id"),
-        mapping_eligible: r.get("eligible"),
-    }))
+    let row = sqlx::query(concat!(
+        snapshot_sql!(),
+        "a.scope_id=$1::uuid AND a.id=$2::uuid"
+    ))
+    .bind(scope)
+    .bind(assignment)
+    .fetch_optional(c)
+    .await?;
+    Ok(row.map(snapshot))
+}
+/// The same snapshot located by the assignment's natural key, or `None` if it was never written.
+pub async fn find_assignment(
+    c: &mut PgConnection,
+    a: &Assignment<'_>,
+) -> Result<Option<AssignmentSnapshot>, Error> {
+    let (kind, target) = a.validate()?;
+    let (grantee_kind, user, local_group, oidc_group) = a.grantee.columns();
+    let row = sqlx::query(concat!(snapshot_sql!(), natural_key!()))
+        .bind(a.scope)
+        .bind(kind)
+        .bind(target)
+        .bind(grantee_kind)
+        .bind(user)
+        .bind(local_group)
+        .bind(oidc_group)
+        .bind(a.format)
+        .bind(a.version)
+        .bind(a.key)
+        .bind(a.mapping_rule)
+        .fetch_optional(c)
+        .await?;
+    Ok(row.map(snapshot))
 }
 
 #[cfg(test)]
@@ -384,7 +505,7 @@ mod tests {
             assignment: Assignment {
                 scope: u,
                 target: Target::Conversation(u),
-                grantee: u,
+                grantee: Grantee::OidcGroup(&s[..1024]),
                 format: &s[..128],
                 version: i32::MAX,
                 key: &s[..128],

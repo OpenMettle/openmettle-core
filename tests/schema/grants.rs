@@ -2,7 +2,7 @@
 use super::cancellation::{ResponseBarrier, cancel_at_response};
 use super::*;
 use openmettle_core::grants::{
-    self, Assignment, ChangeInput, Decision, GrantReceipt, MappingInput, Target,
+    self, Assignment, ChangeInput, Decision, GrantReceipt, Grantee, MappingInput, Target,
 };
 
 const PROVIDER: &str = "00000000-0000-0000-0000-000000000001";
@@ -13,7 +13,7 @@ fn input<'a>(c: &'a Context, key: &'a str) -> ChangeInput<'a> {
         assignment: Assignment {
             scope: &c.scope,
             target: Target::Conversation(&c.conversation),
-            grantee: &c.actor,
+            grantee: Grantee::User(&c.actor),
             format: "test.assignment",
             version: 1,
             key: "synthetic",
@@ -510,7 +510,7 @@ async fn sql_roles_scopes_null_checks_and_immutable_origin() {
     let (project_id, ps) = project(&mut api, &c.actor).await;
     let mut r = input(&c, "project");
     r.assignment.scope = &ps;
-    r.assignment.grantee = &other.actor;
+    r.assignment.grantee = Grantee::User(&other.actor);
     r.assignment.target = Target::Project(&project_id);
     let pr = change(&db, &r).await.unwrap();
     assert!(state(&db, &ps, &pr.assignment).await.recorded_active);
@@ -678,7 +678,7 @@ async fn old_domain_snapshot(db: &TestDb) -> Vec<String> {
         "artifact_revisions",
     ] {
         let rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT (to_jsonb(t) - 'session_generation' - 'session_issued')::text FROM openmettle.{table} t ORDER BY 1"
+            "SELECT (to_jsonb(t) - 'session_generation' - 'session_issued' - 'lock_guard')::text FROM openmettle.{table} t ORDER BY 1"
         )))
         .fetch_all(&mut c)
         .await
@@ -869,7 +869,7 @@ async fn populate_membership(db: &TestDb, c: &Context, project: &str, scope: &st
             assignment: Assignment {
                 scope,
                 target: Target::Project(project),
-                grantee: &c.actor,
+                grantee: Grantee::User(&c.actor),
                 format: "openmettle.project-member",
                 version: 1,
                 key: MEMBERSHIP_APPROVAL,
@@ -1408,6 +1408,11 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
             "openmettle.authorization_audit",
             "openmettle.runs.state",
             "openmettle.runs.wait_reason",
+            // Migration 16 (ADR 0027 PR4a).
+            "openmettle.grant_assignments.grantee_kind",
+            "openmettle.grant_assignments.grantee_local_group_id",
+            "openmettle.grant_assignments.grantee_oidc_group_id",
+            "openmettle.projects.lock_guard",
         ];
         let worker_reads = [
             "openmettle_worker has SELECT on openmettle.membership_observations",
@@ -1532,8 +1537,10 @@ async fn grant_snapshot(db: &TestDb) -> Vec<String> {
         "grant_assignments",
         "grant_changes",
     ] {
+        // Migration 16 only adds grantee columns: 'user' and NULLs on every earlier row.
         let rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT t::text FROM openmettle.{table} t ORDER BY t::text"
+            "SELECT (to_jsonb(t) - 'grantee_kind' - 'grantee_local_group_id'
+                     - 'grantee_oidc_group_id')::text FROM openmettle.{table} t ORDER BY 1"
         )))
         .fetch_all(&mut db.admin().await)
         .await
