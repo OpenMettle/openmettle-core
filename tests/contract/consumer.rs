@@ -204,6 +204,7 @@ pub enum Category {
     NotFound,
     Conflict,
     IdempotencyConflict,
+    RangeNotSatisfiable,
     Quota,
     RateLimited,
     Unavailable,
@@ -247,6 +248,7 @@ pub fn decode_problem(value: &Value) -> Result<Problem, String> {
         "not_found" => Some((Category::NotFound, 404)),
         "conflict" => Some((Category::Conflict, 409)),
         "idempotency_conflict" => Some((Category::IdempotencyConflict, 409)),
+        "range_not_satisfiable" => Some((Category::RangeNotSatisfiable, 416)),
         "quota" => Some((Category::Quota, 429)),
         "rate_limited" => Some((Category::RateLimited, 429)),
         "internal" => Some((Category::Internal, 500)),
@@ -556,5 +558,87 @@ pub fn decode_item_access(value: &Value, artifact: bool) -> Result<ItemAccess, S
         last_revision,
         access: Access::from_wire(wire.access),
         can_manage_shares: wire.can_manage_shares,
+    })
+}
+
+/// A revision's lifecycle state. Only an active revision is offered for download; an
+/// unrecognized state never is.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RevisionState {
+    Active,
+    Retained,
+    Purging,
+    Purged,
+    Unrecognized(String),
+}
+
+impl RevisionState {
+    fn from_wire(state: String) -> Self {
+        match state.as_str() {
+            "active" => Self::Active,
+            "retained" => Self::Retained,
+            "purging" => Self::Purging,
+            "purged" => Self::Purged,
+            _ => Self::Unrecognized(state),
+        }
+    }
+    pub fn downloadable(&self) -> bool {
+        *self == Self::Active
+    }
+}
+
+/// One immutable artifact revision.
+#[derive(Debug)]
+pub struct ArtifactRevision {
+    pub artifact_id: String,
+    pub revision_id: String,
+    pub revision: i64,
+    pub project_id: Option<String>,
+    pub media_type: String,
+    pub size_bytes: i64,
+    pub sha256: String,
+    pub display_name: Option<String>,
+    pub state: RevisionState,
+}
+
+#[derive(Deserialize)]
+struct WireArtifactRevision {
+    artifact_id: String,
+    revision_id: String,
+    revision: String,
+    #[allow(dead_code)]
+    scope_kind: String,
+    #[allow(dead_code)]
+    scope_id: String,
+    #[serde(deserialize_with = "required_nullable")]
+    project_id: Option<String>,
+    media_type: String,
+    size_bytes: String,
+    sha256: String,
+    #[serde(deserialize_with = "required_nullable")]
+    display_name: Option<String>,
+    state: String,
+    #[allow(dead_code)]
+    created_at: String,
+}
+
+/// The revision number and size are exact; the digest is 64 lowercase hexadecimal digits.
+pub fn decode_revision(value: &Value) -> Result<ArtifactRevision, String> {
+    let wire: WireArtifactRevision =
+        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    let hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+    if wire.sha256.len() != 64 || !wire.sha256.bytes().all(hex) {
+        return Err("sha256 is not 64 lowercase hexadecimal digits".into());
+    }
+    Ok(ArtifactRevision {
+        artifact_id: wire.artifact_id,
+        revision_id: wire.revision_id,
+        revision: parse_decimal(&wire.revision, false)?,
+        project_id: wire.project_id,
+        media_type: wire.media_type,
+        size_bytes: parse_decimal(&wire.size_bytes, true)?,
+        sha256: wire.sha256,
+        display_name: wire.display_name,
+        state: RevisionState::from_wire(wire.state),
     })
 }

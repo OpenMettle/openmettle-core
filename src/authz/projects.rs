@@ -1174,13 +1174,7 @@ pub async fn read_resource(
     let Some(located) = locate(c, kind, resource_id).await? else {
         return Err(CONCEALED);
     };
-    let archived = match &located.project_id {
-        Some(project) => match load_project_settings(c, project).await? {
-            Some(settings) if !settings.deleted => settings.archived,
-            _ => return Err(CONCEALED),
-        },
-        None => false,
-    };
+    let archived = archived(c, &located).await?;
     let scope_id = located.scope_id.clone();
     let project_id = located.project_id.clone();
     let (created_us, last_revision) = (located.created_us, located.last_revision);
@@ -1204,6 +1198,56 @@ pub async fn read_resource(
         },
         can_manage_shares: super::authorize_revoke(principal, &resource).is_allowed(),
     })
+}
+
+/// Whether a located item's project is archived. An item in a deleted project is concealed.
+async fn archived(c: &mut PgConnection, located: &Located) -> Result<bool, StoreError> {
+    match &located.project_id {
+        Some(project) => match load_project_settings(c, project).await? {
+            Some(settings) if !settings.deleted => Ok(settings.archived),
+            _ => Err(CONCEALED),
+        },
+        None => Ok(false),
+    }
+}
+
+/// Where an artifact lives, for a caller authorized to act on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactScope {
+    pub scope_id: String,
+    /// The containing project, or `None` in a personal scope.
+    pub project_id: Option<String>,
+}
+
+/// Decide `action` (`Read`, `Download` or `Write`) on one artifact for `principal`, hydrated by
+/// the caller for this request, with [`super::authorize_resource`] (ADR 0031). A missing
+/// artifact, one in a deleted project and one the caller may not read are concealed; a caller
+/// who may read but not write is refused with `Policy`. Reads stay available in an archived
+/// project; a write there is refused with [`ARCHIVED`] once the caller is authorized.
+/// `openmettle_api` only.
+pub async fn authorize_artifact(
+    c: &mut PgConnection,
+    principal: &Principal,
+    artifact_id: &str,
+    action: Action,
+    now_ms: i64,
+) -> Result<ArtifactScope, StoreError> {
+    active(principal)?;
+    uuid(artifact_id, "artifact_id")?;
+    let Some(located) = locate(c, ResourceKind::Artifact, artifact_id).await? else {
+        return Err(CONCEALED);
+    };
+    let archived = archived(c, &located).await?;
+    let scope = ArtifactScope {
+        scope_id: located.scope_id.clone(),
+        project_id: located.project_id.clone(),
+    };
+    let resource = hydrate_located(c, ResourceKind::Artifact, artifact_id, located, now_ms).await?;
+    check(super::authorize_resource(principal, &resource, action))?;
+    if archived && action == Action::Write {
+        return Err(ARCHIVED);
+    }
+    Ok(scope)
 }
 
 #[cfg(test)]

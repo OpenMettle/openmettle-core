@@ -1,0 +1,25 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ProblemRangeNotSatisfiable--auto-missing-type",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "code": "range_not_satisfiable",
+    "detail": "The requested range does not overlap the content.",
+    "request_id": "4a5b6c7d-8e9f-4a0b-9c1d-2e3f4a5b6c7d",
+    "status": 416,
+    "title": "Range Not Satisfiable"
+  },
+  "mutation": {
+    "name": "auto-missing-type",
+    "op": "remove",
+    "path": "/type"
+  },
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemRangeNotSatisfiable"
+}

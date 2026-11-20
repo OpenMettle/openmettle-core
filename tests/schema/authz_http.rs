@@ -1,9 +1,9 @@
-//! ADR 0027 PR4b: the authenticated `/v1` routes through the real API binary, mounted with a
-//! version-2 settings document and its native profile, over PostgreSQL 18 as
-//! `openmettle_api`. Sessions are seeded as issuance stores them, for the browser cookie
-//! channel (with the configured `Origin`) and the native bearer channel. Every response is
-//! decoded by the independent contract consumer. The owner role seeds fixtures and reads
-//! results. Every value is synthetic.
+//! ADR 0027 PR4b and ADR 0031 PR2: the authenticated `/v1` routes through the real API binary,
+//! mounted with a version-2 settings document, its native profile and an artifacts directory,
+//! over PostgreSQL 18 as `openmettle_api`. Sessions are seeded as issuance stores them, for the
+//! browser cookie channel (with the configured `Origin`) and the native bearer channel. Every
+//! response is decoded by the independent contract consumer. The owner role seeds fixtures and
+//! reads results. Every value is synthetic.
 use super::authz_runs::{
     artifact, chat, framed_digest, personal_of, project_run, seeded_session, state_of,
 };
@@ -11,8 +11,16 @@ use super::authz_store::{
     Account, FUTURE, PROVIDER, account, ctx, make_admin, present_membership_at, providers,
 };
 use super::*;
-use openmettle_core::authz::store;
+use openmettle_core::{
+    artifact_fs::{self, Store},
+    authz::store,
+    runs::WriteTransaction,
+    storage,
+};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use sqlx::postgres::PgPoolOptions;
+use std::{fs, net::Shutdown, path::Path};
 
 /// The browser origin and native registration of `document_v2_native`.
 const ORIGIN: &str = "https://app.example.test";
@@ -47,17 +55,24 @@ enum As<'a> {
     Native(&'a str),
 }
 
-/// The API binary with `AUTH_CONFIG`, connected as `openmettle_api` and, for session
-/// issuance, as `openmettle_issuance` (ADR 0030). Killed on drop.
+/// The API binary with `AUTH_CONFIG` and `ARTIFACTS_DIR`, connected as `openmettle_api` and,
+/// for session issuance, as `openmettle_issuance` (ADR 0030). Killed on drop.
 struct Api {
-    _process: Process,
-    _dir: auth_config_support::Dir,
+    process: Process,
+    dir: auth_config_support::Dir,
     bind: String,
 }
 
 impl Api {
     fn start(db: &TestDb) -> Self {
         let dir = auth_config_support::Dir::new();
+        fs::create_dir(dir.path("artifacts")).unwrap();
+        Self::start_in(db, dir)
+    }
+
+    /// Starts the binary over `dir`, whose `artifacts` directory an earlier process may have
+    /// left files in.
+    fn start_in(db: &TestDb, dir: auth_config_support::Dir) -> Self {
         let document = auth_config_support::document_v2_native(&dir, &ca::Ca::new().pem());
         let auth = dir.write("auth.json", document.to_string().as_bytes());
         let bind = address();
@@ -67,17 +82,30 @@ impl Api {
             .env("OPENMETTLE_API_DB_TIMEOUT_MS", "2000")
             .env("OPENMETTLE_API_AUTH_CONFIG", &auth)
             .env("OPENMETTLE_API_ISSUANCE_DATABASE_URL", db.url(ISSUANCE))
+            .env("OPENMETTLE_API_ARTIFACTS_DIR", dir.path("artifacts"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
         let mut process = Process(child);
         wait_ready(&mut process, &bind);
-        Self {
-            _process: process,
-            _dir: dir,
-            bind,
-        }
+        Self { process, dir, bind }
+    }
+
+    /// Kills the process as a crash would, keeping its directory.
+    fn kill(self) -> auth_config_support::Dir {
+        drop(self.process);
+        self.dir
+    }
+
+    /// The sorted file names in `staging` or `revisions`.
+    fn files(&self, sub: &str) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(Path::new(&self.dir.path("artifacts")).join(sub))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
     }
 
     /// One raw request on a new connection: the status, the lowercase head and the body.
@@ -87,8 +115,12 @@ impl Api {
             .set_read_timeout(Some(Duration::from_secs(15)))
             .unwrap();
         stream.write_all(request.as_bytes()).unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
+        // An upload refused before its body is read may be reset after the response arrives.
+        let mut response = Vec::new();
+        if let Err(error) = stream.read_to_end(&mut response) {
+            assert!(!response.is_empty(), "{error}");
+        }
+        let response = String::from_utf8(response).unwrap();
         let (head, body) = response.split_once("\r\n\r\n").unwrap();
         (
             head[9..12].parse().unwrap(),
@@ -97,16 +129,9 @@ impl Api {
         )
     }
 
-    /// One `/v1` request: the status and the JSON body (`null` when empty). Every response
-    /// is versioned and uncacheable, and every problem decodes with the contract consumer.
-    fn call(
-        &self,
-        who: As<'_>,
-        method: &str,
-        path: &str,
-        key: Option<&str>,
-        body: Option<&Value>,
-    ) -> (u16, Value) {
+    /// A `/v1` request head on `who`'s channel with the extra `headers` lines, announcing a
+    /// body of `len` bytes.
+    fn head(who: As<'_>, method: &str, path: &str, headers: &str, len: usize) -> String {
         let mut request = format!("{method} {path} HTTP/1.1\r\nhost: app.example.test\r\n");
         match who {
             As::Browser(cookie) => request.push_str(&format!(
@@ -116,30 +141,117 @@ impl Api {
                 request.push_str(&format!("authorization: Bearer {bearer}\r\n"));
             }
         }
-        if let Some(key) = key {
-            request.push_str(&format!("idempotency-key: {key}\r\n"));
-        }
-        let body = body.map(Value::to_string).unwrap_or_default();
-        if !body.is_empty() {
-            request.push_str("content-type: application/json\r\n");
-        }
+        request.push_str(headers);
         request.push_str(&format!(
-            "content-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
+            "content-length: {len}\r\nconnection: close\r\n\r\n"
         ));
+        request
+    }
+
+    /// One `/v1` request: the status, the lowercase head and the body. Every response is
+    /// versioned and uncacheable.
+    fn send(
+        &self,
+        who: As<'_>,
+        method: &str,
+        path: &str,
+        headers: &str,
+        body: &str,
+    ) -> (u16, String, String) {
+        let request = Self::head(who, method, path, headers, body.len()) + body;
         let (status, head, body) = self.raw(&request);
         assert!(head.contains("openmettle-api-version: 1.0"), "{head}");
         assert!(head.contains("cache-control: no-store"), "{head}");
-        let json = match body.is_empty() {
-            true => Value::Null,
-            false => serde_json::from_str(&body).unwrap(),
-        };
-        if status >= 400 {
-            let problem = consumer::decode_problem(&json).unwrap();
-            assert_eq!(problem.status, status);
-        }
-        (status, json)
+        (status, head, body)
     }
+
+    /// One `/v1` request: the status and the JSON body (`null` when empty). Every problem
+    /// decodes with the contract consumer.
+    fn call(
+        &self,
+        who: As<'_>,
+        method: &str,
+        path: &str,
+        key: Option<&str>,
+        body: Option<&Value>,
+    ) -> (u16, Value) {
+        let mut headers = String::new();
+        if let Some(key) = key {
+            headers.push_str(&format!("idempotency-key: {key}\r\n"));
+        }
+        let body = body.map(Value::to_string).unwrap_or_default();
+        if !body.is_empty() {
+            headers.push_str("content-type: application/json\r\n");
+        }
+        let (status, _, body) = self.send(who, method, path, &headers, &body);
+        decoded(status, &body)
+    }
+
+    /// One multipart upload under `key`; the boundary is the one `body` opens with. A created
+    /// revision decodes with the contract consumer.
+    fn upload(&self, who: As<'_>, path: &str, key: &str, body: &str) -> (u16, Value) {
+        let (status, _, body) = self.send(who, "POST", path, &upload_headers(key, body), body);
+        let response = decoded(status, &body);
+        if status == 201 {
+            consumer::decode_revision(&response.1).unwrap();
+        }
+        response
+    }
+
+    /// Sends an upload's head and its first `sent` body bytes, and leaves the request open.
+    fn begin_upload(
+        &self,
+        who: As<'_>,
+        path: &str,
+        key: &str,
+        body: &str,
+        sent: usize,
+    ) -> TcpStream {
+        let head = Self::head(who, "POST", path, &upload_headers(key, body), body.len());
+        let mut stream = TcpStream::connect(&self.bind).unwrap();
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(&body.as_bytes()[..sent]).unwrap();
+        stream
+    }
+
+    /// A `GET` or `HEAD` of revision content with an optional `Range`: the status, the
+    /// lowercase head and the body. A `GET` problem decodes with the contract consumer.
+    fn download(
+        &self,
+        who: As<'_>,
+        method: &str,
+        path: &str,
+        range: Option<&str>,
+    ) -> (u16, String, String) {
+        let range = range.map(|r| format!("range: {r}\r\n")).unwrap_or_default();
+        let (status, head, body) = self.send(who, method, path, &range, "");
+        if status >= 400 && method == "GET" {
+            assert!(
+                head.contains("content-type: application/problem+json"),
+                "{head}"
+            );
+            decoded(status, &body);
+        }
+        (status, head, body)
+    }
+}
+
+/// The JSON body of a response (`null` when empty); a problem decodes with the consumer.
+fn decoded(status: u16, body: &str) -> (u16, Value) {
+    let json = match body.is_empty() {
+        true => Value::Null,
+        false => serde_json::from_str(body).unwrap(),
+    };
+    if status >= 400 {
+        let problem = consumer::decode_problem(&json).unwrap();
+        assert_eq!(problem.status, status);
+    }
+    (status, json)
+}
+
+fn upload_headers(key: &str, body: &str) -> String {
+    let boundary = body.lines().next().unwrap().strip_prefix("--").unwrap();
+    format!("idempotency-key: {key}\r\ncontent-type: multipart/form-data; boundary={boundary}\r\n")
 }
 
 /// A migrated database with the synthetic providers, and the mounted API over it.
@@ -760,4 +872,695 @@ async fn roles_groups_and_private_items_are_enforced_on_every_request() {
     ));
     assert_eq!(status, 204);
     refused(role_of(vic_s), 401, "unauthenticated");
+}
+
+// --- artifact uploads and downloads (ADR 0031 PR2) --------------------------------------------
+
+const GIB: i64 = 1 << 30;
+
+/// Storage limits: a large instance budget and the given owner limits (`None` unconfigured).
+async fn limits(db: &TestDb, personal: Option<i64>, project: Option<i64>) {
+    sqlx::query(
+        "UPDATE openmettle.storage_instance
+            SET instance_budget_bytes = $1, personal_limit_bytes = $2, project_limit_bytes = $3",
+    )
+    .bind(1_i64 << 40)
+    .bind(personal)
+    .bind(project)
+    .execute(&mut connect(&db.0, OWNER).await)
+    .await
+    .unwrap();
+}
+
+/// Reservations in `state`.
+async fn reservations(db: &TestDb, state: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM openmettle.storage_reservations WHERE state = $1")
+        .bind(state)
+        .fetch_one(&mut connect(&db.0, OWNER).await)
+        .await
+        .unwrap()
+}
+
+/// The (active, retained, reserved) bytes charged to `scope`.
+async fn charged(db: &TestDb, scope: &str) -> (i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT coalesce(sum(active_bytes), 0)::bigint, coalesce(sum(retained_bytes), 0)::bigint,
+                coalesce(sum(reserved_bytes), 0)::bigint
+           FROM openmettle.storage_accounts WHERE scope_id = $1::uuid",
+    )
+    .bind(scope)
+    .fetch_one(&mut connect(&db.0, OWNER).await)
+    .await
+    .unwrap()
+}
+
+/// Polls `done` for up to ten seconds.
+async fn eventually(mut done: impl AsyncFnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done().await {
+        assert!(Instant::now() < deadline, "condition not reached");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The file part, with an optional file name and the given media type.
+fn file_part(filename: Option<&str>, media: &str, bytes: &str) -> String {
+    let filename = filename
+        .map(|f| format!("; filename=\"{f}\""))
+        .unwrap_or_default();
+    format!(
+        "Content-Disposition: form-data; name=\"file\"{filename}\r\nContent-Type: {media}\r\n\r\n{bytes}"
+    )
+}
+
+fn metadata_part(json: &str) -> String {
+    format!(
+        "Content-Disposition: form-data; name=\"metadata\"\r\nContent-Type: application/json\r\n\r\n{json}"
+    )
+}
+
+/// A form of `parts` under `boundary`, with or without its closing delimiter.
+fn form(boundary: &str, parts: &[String], close: bool) -> String {
+    let mut out: String = parts
+        .iter()
+        .map(|part| format!("--{boundary}\r\n{part}\r\n"))
+        .collect();
+    if close {
+        out.push_str(&format!("--{boundary}--\r\n"));
+    }
+    out
+}
+
+fn sha256(bytes: &str) -> String {
+    Sha256::digest(bytes.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The value of header `name` in a lowercase head.
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(": "))
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn artifact_uploads_are_authorized_before_staging_and_replay_once() {
+    let (db, api) = mounted().await;
+    limits(&db, Some(GIB), Some(GIB)).await;
+    let mut owner = connect(&db.0, OWNER).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let vic = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let bob = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let (a_b, a_n) = (browser(&db, &alice, 1).await, native(&db, &alice, 2).await);
+    let (v, b) = (native(&db, &vic, 3).await, native(&db, &bob, 4).await);
+    let (alice_b, alice_n) = (As::Browser(&a_b), As::Native(&a_n));
+    let (vic_n, bob_n) = (As::Native(&v), As::Native(&b));
+    let personal = personal_of(&db, &alice).await;
+    let created = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/projects",
+            Some("p"),
+            Some(&json!({"name": "P"})),
+        ),
+        201,
+    );
+    let p = created["project_id"].as_str().unwrap().to_owned();
+    let scope = created["scope_id"].as_str().unwrap().to_owned();
+    let members = format!("/v1/projects/{p}/members");
+    let viewer = member(("user", &vic.user), "viewer");
+    success(
+        api.call(alice_b, "PUT", &members, Some("vic"), Some(&viewer)),
+        200,
+    );
+
+    let text = "hello, world";
+    let file = file_part(Some("notes.txt"), "text/plain", text);
+    let meta = metadata_part("{}");
+    let note = form("a", &[file.clone(), meta.clone()], true);
+
+    // Each refusal is decided on the primary before anything is reserved or staged.
+    let into_project = format!("/v1/artifacts?scope_id={scope}");
+    refused(api.upload(vic_n, &into_project, "v", &note), 403, "policy");
+    refused(
+        api.upload(bob_n, &into_project, "b", &note),
+        404,
+        "not_found",
+    );
+    let into_alice = format!("/v1/artifacts?scope_id={personal}");
+    refused(api.upload(bob_n, &into_alice, "b", &note), 404, "not_found");
+    let unknown = "/v1/artifacts/0f0e0d0c-0b0a-4908-8706-050403020100/revisions";
+    refused(api.upload(alice_n, unknown, "u", &note), 404, "not_found");
+    for state in ["reserved", "settled", "released"] {
+        assert_eq!(reservations(&db, state).await, 0, "{state}");
+    }
+    assert!(api.files("staging").is_empty() && api.files("revisions").is_empty());
+
+    // Created in the personal scope by default. The exact retry, on the other channel with
+    // another boundary and the parts reversed, returns the same revision and charges once.
+    let first = success(
+        api.upload(alice_b, "/v1/artifacts?max_bytes=1000", "up", &note),
+        201,
+    );
+    let revision = consumer::decode_revision(&first).unwrap();
+    assert_eq!(
+        (
+            revision.revision,
+            revision.size_bytes,
+            revision.project_id.as_deref()
+        ),
+        (1, 12, None)
+    );
+    assert_eq!(revision.display_name.as_deref(), Some("notes.txt"));
+    assert_eq!(
+        (revision.media_type.as_str(), revision.sha256),
+        ("text/plain", sha256(text))
+    );
+    assert_eq!(
+        (first["scope_kind"].as_str(), first["scope_id"].as_str()),
+        (Some("personal"), Some(personal.as_str()))
+    );
+    let reversed = form("retry-boundary", &[meta.clone(), file.clone()], true);
+    let again = api.upload(alice_n, "/v1/artifacts?max_bytes=1000", "up", &reversed);
+    assert_eq!(success(again, 201), first);
+    assert_eq!(charged(&db, &personal).await, (12, 0, 0));
+    assert_eq!(reservations(&db, "settled").await, 1);
+    assert_eq!(api.files("revisions").len(), 1);
+    let access = success(
+        api.call(
+            alice_n,
+            "GET",
+            &format!("/v1/artifacts/{}", revision.artifact_id),
+            None,
+            None,
+        ),
+        200,
+    );
+    assert_eq!(access["last_revision"], "1");
+
+    // A changed file, name, media type or ceiling under that key is a different request.
+    for (path, body) in [
+        (
+            "/v1/artifacts?max_bytes=1000",
+            form(
+                "c",
+                &[
+                    file_part(Some("notes.txt"), "text/plain", "hello, World"),
+                    meta.clone(),
+                ],
+                true,
+            ),
+        ),
+        (
+            "/v1/artifacts?max_bytes=1000",
+            form(
+                "c",
+                &[
+                    file_part(Some("other.txt"), "text/plain", text),
+                    meta.clone(),
+                ],
+                true,
+            ),
+        ),
+        (
+            "/v1/artifacts?max_bytes=1000",
+            form(
+                "c",
+                &[
+                    file_part(Some("notes.txt"), "text/markdown", text),
+                    meta.clone(),
+                ],
+                true,
+            ),
+        ),
+        ("/v1/artifacts?max_bytes=999", note.clone()),
+    ] {
+        refused(
+            api.upload(alice_b, path, "up", &body),
+            409,
+            "idempotency_conflict",
+        );
+    }
+    assert_eq!(charged(&db, &personal).await, (12, 0, 0));
+
+    // Malformed bodies are refused after streaming starts: each staging file is unlinked and its
+    // reservation released, and the spent key cannot be reused.
+    let other =
+        "Content-Disposition: form-data; name=\"extra\"\r\nContent-Type: text/plain\r\n\r\nx"
+            .to_owned();
+    for (path, key, body) in [
+        (
+            "/v1/artifacts",
+            "truncated",
+            form("t", &[file.clone(), meta.clone()], false),
+        ),
+        (
+            "/v1/artifacts",
+            "duplicate",
+            form("d", &[file.clone(), file.clone(), meta.clone()], true),
+        ),
+        (
+            "/v1/artifacts",
+            "unknown-part",
+            form("u", &[file.clone(), meta.clone(), other], true),
+        ),
+        (
+            "/v1/artifacts",
+            "metadata",
+            form(
+                "m",
+                &[file.clone(), metadata_part("{\"scope_id\":\"x\"}")],
+                true,
+            ),
+        ),
+        ("/v1/artifacts?max_bytes=5", "too-large", note.clone()),
+    ] {
+        refused(api.upload(alice_b, path, key, &body), 400, "validation");
+    }
+    assert_eq!(reservations(&db, "released").await, 5);
+    assert_eq!(reservations(&db, "reserved").await, 0);
+    assert!(api.files("staging").is_empty());
+    refused(
+        api.upload(alice_b, "/v1/artifacts", "truncated", &note),
+        409,
+        "idempotency_conflict",
+    );
+    assert_eq!(charged(&db, &personal).await, (12, 0, 0));
+
+    // A project artifact and its next revision, replayed on the other channel.
+    let in_project = success(api.upload(alice_n, &into_project, "proj", &note), 201);
+    assert_eq!(
+        (
+            in_project["scope_kind"].as_str(),
+            in_project["project_id"].as_str()
+        ),
+        (Some("project"), Some(p.as_str()))
+    );
+    let artifact = in_project["artifact_id"].as_str().unwrap().to_owned();
+    let revisions = format!("/v1/artifacts/{artifact}/revisions");
+    let next = form(
+        "n",
+        &[
+            meta.clone(),
+            file_part(None, "application/json", "{\"v\":2}"),
+        ],
+        true,
+    );
+    let second = success(api.upload(alice_b, &revisions, "rev-2", &next), 201);
+    assert_eq!(
+        (
+            second["revision"].as_str(),
+            second["artifact_id"].as_str(),
+            &second["display_name"]
+        ),
+        (Some("2"), Some(artifact.as_str()), &Value::Null)
+    );
+    let next_again = next.replace("--n", "--n2");
+    assert_eq!(
+        success(api.upload(alice_n, &revisions, "rev-2", &next_again), 201),
+        second
+    );
+    // One key on two operations or targets is two requests.
+    let elsewhere = success(api.upload(alice_n, "/v1/artifacts", "rev-2", &note), 201);
+    assert_ne!(elsewhere["artifact_id"], second["artifact_id"]);
+
+    // Writing a revision needs write access: concealed before a share, policy for a reader,
+    // and conflict in an archived project, all before anything is reserved.
+    let before = reservations(&db, "settled").await + reservations(&db, "released").await;
+    refused(
+        api.upload(vic_n, &revisions, "v-rev", &note),
+        404,
+        "not_found",
+    );
+    let read = shared("project", None, "read");
+    let shares = format!("/v1/artifacts/{artifact}/shares");
+    success(
+        api.call(alice_b, "PUT", &shares, Some("share"), Some(&read)),
+        200,
+    );
+    refused(api.upload(vic_n, &revisions, "v-rev", &note), 403, "policy");
+    let archive = format!("/v1/projects/{p}/archive");
+    success(
+        api.call(alice_b, "POST", &archive, Some("archive"), None),
+        200,
+    );
+    refused(
+        api.upload(alice_b, &revisions, "rev-3", &note),
+        409,
+        "conflict",
+    );
+    refused(
+        api.upload(alice_b, &into_project, "proj-2", &note),
+        409,
+        "conflict",
+    );
+    let after = reservations(&db, "settled").await + reservations(&db, "released").await;
+    assert_eq!((after, reservations(&db, "reserved").await), (before, 0));
+    let restore = format!("/v1/projects/{p}/restore");
+    success(
+        api.call(alice_b, "POST", &restore, Some("restore"), None),
+        200,
+    );
+    success(api.upload(alice_b, &revisions, "rev-3", &note), 201);
+
+    // Quota refusals reserve nothing: an owner limit too small for the ceiling, then
+    // unconfigured limits.
+    limits(&db, Some(100), Some(GIB)).await;
+    let ceiling = "/v1/artifacts?max_bytes=1000";
+    refused(api.upload(alice_b, ceiling, "q1", &note), 429, "quota");
+    limits(&db, None, Some(GIB)).await;
+    refused(
+        api.upload(alice_b, ceiling, "q2", &note),
+        503,
+        "provisioning",
+    );
+    assert_eq!(reservations(&db, "reserved").await, 0);
+    assert!(api.files("staging").is_empty());
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn artifact_downloads_check_current_grants_and_serve_byte_ranges() {
+    let (db, api) = mounted().await;
+    limits(&db, Some(GIB), Some(GIB)).await;
+    let mut owner = connect(&db.0, OWNER).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let vic = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let bob = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let (a_b, a_n) = (browser(&db, &alice, 1).await, native(&db, &alice, 2).await);
+    let (v, b) = (native(&db, &vic, 3).await, browser(&db, &bob, 4).await);
+    let (alice_b, alice_n) = (As::Browser(&a_b), As::Native(&a_n));
+    let (vic_n, bob_b) = (As::Native(&v), As::Browser(&b));
+    let meta = metadata_part("{}");
+
+    let digits = "0123456789";
+    let body = form(
+        "a",
+        &[
+            file_part(Some("report v1.txt"), "text/plain", digits),
+            meta.clone(),
+        ],
+        true,
+    );
+    let created = success(
+        api.upload(alice_b, "/v1/artifacts?max_bytes=100", "doc", &body),
+        201,
+    );
+    let artifact = created["artifact_id"].as_str().unwrap().to_owned();
+    let revision = created["revision_id"].as_str().unwrap().to_owned();
+    let metadata = format!("/v1/artifacts/{artifact}/revisions/{revision}");
+    let content = format!("{metadata}/content");
+    assert_eq!(
+        success(api.call(alice_n, "GET", &metadata, None, None), 200),
+        created
+    );
+
+    // The whole content, with its stored media type and a safe attachment name.
+    let (status, head, bytes) = api.download(alice_b, "GET", &content, None);
+    assert_eq!((status, bytes.as_str()), (200, digits));
+    for (name, value) in [
+        ("content-type", "text/plain"),
+        ("content-length", "10"),
+        ("accept-ranges", "bytes"),
+        ("x-content-type-options", "nosniff"),
+        (
+            "content-disposition",
+            "attachment; filename*=utf-8''report%20v1.txt",
+        ),
+    ] {
+        assert_eq!(header(&head, name), Some(value), "{head}");
+    }
+    assert_eq!(header(&head, "content-range"), None);
+    // Single byte ranges, and HEAD with the same headers and no body.
+    for (range, part, content_range) in [
+        ("bytes=2-5", "2345", "bytes 2-5/10"),
+        ("bytes=7-", "789", "bytes 7-9/10"),
+        ("bytes=-3", "789", "bytes 7-9/10"),
+        ("bytes=0-99", digits, "bytes 0-9/10"),
+    ] {
+        let (status, head, bytes) = api.download(alice_n, "GET", &content, Some(range));
+        assert_eq!((status, bytes.as_str()), (206, part), "{range}");
+        assert_eq!(header(&head, "content-range"), Some(content_range));
+        assert_eq!(
+            header(&head, "content-length"),
+            Some(part.len().to_string().as_str())
+        );
+    }
+    let (status, head, bytes) = api.download(alice_n, "HEAD", &content, None);
+    assert_eq!(
+        (status, bytes.as_str(), header(&head, "content-length")),
+        (200, "", Some("10"))
+    );
+    let (status, head, bytes) = api.download(alice_n, "HEAD", &content, Some("bytes=2-5"));
+    assert_eq!((status, bytes.as_str()), (206, ""));
+    assert_eq!(header(&head, "content-range"), Some("bytes 2-5/10"));
+    assert_eq!(header(&head, "content-length"), Some("4"));
+    let (status, head, bytes) = api.download(alice_n, "GET", &content, Some("bytes=10-"));
+    assert_eq!(
+        (status, header(&head, "content-range")),
+        (416, Some("bytes */10"))
+    );
+    assert_eq!(decoded(status, &bytes).1["code"], "range_not_satisfiable");
+    let (status, _, bytes) = api.download(alice_n, "GET", &content, Some("bytes=0-1,4-5"));
+    assert_eq!(
+        (status, decoded(status, &bytes).1["code"].as_str()),
+        (400, Some("validation"))
+    );
+
+    // Current grants decide every request: nothing before a share, bytes while it lasts,
+    // nothing again the moment it is revoked.
+    let concealed = |who| {
+        refused(
+            api.call(who, "GET", &metadata, None, None),
+            404,
+            "not_found",
+        );
+        let (status, _, bytes) = api.download(who, "GET", &content, Some("bytes=0-3"));
+        assert!(status == 404 && !bytes.contains("0123"), "{status} {bytes}");
+    };
+    concealed(bob_b);
+    let to_bob = shared("user", Some(&bob.user), "read");
+    let shares = format!("/v1/artifacts/{artifact}/shares");
+    success(
+        api.call(alice_b, "PUT", &shares, Some("bob"), Some(&to_bob)),
+        200,
+    );
+    let (status, _, bytes) = api.download(bob_b, "GET", &content, Some("bytes=0-3"));
+    assert_eq!((status, bytes.as_str()), (206, "0123"));
+    let revoke = grantee("user", Some(&bob.user));
+    let revoked = api.call(
+        alice_b,
+        "POST",
+        &format!("{shares}/revoke"),
+        Some("bob-r"),
+        Some(&revoke),
+    );
+    success(revoked, 204);
+    concealed(bob_b);
+
+    // A project member reads through a whole-project share until the membership is revoked.
+    let project = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/projects",
+            Some("p"),
+            Some(&json!({"name": "P"})),
+        ),
+        201,
+    );
+    let (p, scope) = (
+        project["project_id"].as_str().unwrap(),
+        project["scope_id"].as_str().unwrap(),
+    );
+    let members = format!("/v1/projects/{p}/members");
+    let viewer = member(("user", &vic.user), "viewer");
+    success(
+        api.call(alice_b, "PUT", &members, Some("vic"), Some(&viewer)),
+        200,
+    );
+    let in_project = success(
+        api.upload(
+            alice_n,
+            &format!("/v1/artifacts?scope_id={scope}"),
+            "proj",
+            &body,
+        ),
+        201,
+    );
+    let project_artifact = in_project["artifact_id"].as_str().unwrap();
+    let project_content = format!(
+        "/v1/artifacts/{project_artifact}/revisions/{}/content",
+        in_project["revision_id"].as_str().unwrap()
+    );
+    let (status, _, _) = api.download(vic_n, "GET", &project_content, None);
+    assert_eq!(status, 404);
+    let whole = shared("project", None, "read");
+    let project_shares = format!("/v1/artifacts/{project_artifact}/shares");
+    success(
+        api.call(alice_b, "PUT", &project_shares, Some("whole"), Some(&whole)),
+        200,
+    );
+    let (status, _, bytes) = api.download(vic_n, "GET", &project_content, None);
+    assert_eq!((status, bytes.as_str()), (200, digits));
+    let vic_out = grantee("user", Some(&vic.user));
+    let out = api.call(
+        alice_b,
+        "POST",
+        &format!("{members}/revoke"),
+        Some("vic-r"),
+        Some(&vic_out),
+    );
+    success(out, 204);
+    let (status, _, bytes) = api.download(vic_n, "GET", &project_content, None);
+    assert!(status == 404 && !bytes.contains(digits));
+    // A revision of another artifact is concealed.
+    let foreign = format!("/v1/artifacts/{project_artifact}/revisions/{revision}");
+    refused(
+        api.call(alice_n, "GET", &foreign, None, None),
+        404,
+        "not_found",
+    );
+
+    // An empty file: the whole (empty) content, and no satisfiable range.
+    let empty = form(
+        "e",
+        &[
+            file_part(None, "application/octet-stream", ""),
+            meta.clone(),
+        ],
+        true,
+    );
+    let created = success(
+        api.upload(alice_b, "/v1/artifacts?max_bytes=1", "empty", &empty),
+        201,
+    );
+    assert_eq!(created["size_bytes"], "0");
+    let empty_content = format!(
+        "/v1/artifacts/{}/revisions/{}/content",
+        created["artifact_id"].as_str().unwrap(),
+        created["revision_id"].as_str().unwrap()
+    );
+    let (status, head, bytes) = api.download(alice_b, "GET", &empty_content, None);
+    assert_eq!(
+        (status, bytes.as_str(), header(&head, "content-length")),
+        (200, "", Some("0"))
+    );
+    let (status, head, _) = api.download(alice_b, "GET", &empty_content, Some("bytes=0-0"));
+    assert_eq!(
+        (status, header(&head, "content-range")),
+        (416, Some("bytes */0"))
+    );
+
+    // A retained revision keeps its metadata and serves no content.
+    let personal = personal_of(&db, &alice).await;
+    let mut c = connect(&db.0, API).await;
+    let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+    storage::retain_revision(&mut tx, &personal, &revision, 3600)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let retained = success(api.call(alice_n, "GET", &metadata, None, None), 200);
+    assert_eq!(retained["state"], "retained");
+    let (status, _, bytes) = api.download(alice_n, "GET", &content, None);
+    assert_eq!(
+        (status, decoded(status, &bytes).1["code"].as_str()),
+        (409, Some("conflict"))
+    );
+
+    // A payload missing from the volume is an internal error that names no path.
+    let reservation: String = sqlx::query_scalar(
+        "SELECT reservation_id::text FROM openmettle.artifact_revisions WHERE id = $1::uuid",
+    )
+    .bind(in_project["revision_id"].as_str().unwrap())
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    fs::remove_file(
+        Path::new(&api.dir.path("artifacts"))
+            .join("revisions")
+            .join(&reservation),
+    )
+    .unwrap();
+    let (status, _, bytes) = api.download(alice_n, "GET", &project_content, None);
+    assert_eq!(
+        (status, decoded(status, &bytes).1["code"].as_str()),
+        (500, Some("internal"))
+    );
+    assert!(!bytes.contains(&reservation) && !bytes.contains("revisions/"));
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn interrupted_uploads_leave_nothing_after_reconciliation() {
+    let (db, api) = mounted().await;
+    limits(&db, Some(GIB), Some(GIB)).await;
+    let mut owner = connect(&db.0, OWNER).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let (a_b, a_n) = (browser(&db, &alice, 1).await, native(&db, &alice, 2).await);
+    let (alice_b, alice_n) = (As::Browser(&a_b), As::Native(&a_n));
+    let personal = personal_of(&db, &alice).await;
+    let large = "x".repeat(4096);
+    let body = form(
+        "s",
+        &[
+            file_part(Some("big.txt"), "text/plain", &large),
+            metadata_part("{}"),
+        ],
+        true,
+    );
+
+    // A client that stops sending mid-body: its staging file is unlinked.
+    let mut gone = api.begin_upload(alice_n, "/v1/artifacts", "gone", &body, 1024);
+    gone.set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    eventually(async || api.files("staging").len() == 1).await;
+    gone.shutdown(Shutdown::Write).unwrap();
+    let mut rest = Vec::new();
+    let _ = gone.read_to_end(&mut rest);
+    eventually(async || api.files("staging").is_empty()).await;
+
+    // An upload still streaming holds its key: a retry is a conflict and touches nothing.
+    let slow = api.begin_upload(alice_n, "/v1/artifacts", "slow", &body, 1024);
+    eventually(async || api.files("staging").len() == 1).await;
+    refused(
+        api.upload(alice_b, "/v1/artifacts", "slow", &body),
+        409,
+        "conflict",
+    );
+    assert_eq!(api.files("staging").len(), 1);
+
+    // A crash leaves the staging file and its reservation; the reconciler removes both.
+    let dir = api.kill();
+    drop(slow);
+    let staging = Path::new(&dir.path("artifacts")).join("staging");
+    assert_eq!(fs::read_dir(&staging).unwrap().count(), 1);
+    assert!(reservations(&db, "reserved").await >= 1);
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&db.url(API))
+        .await
+        .unwrap();
+    let store = Store::open(Path::new(&dir.path("artifacts"))).unwrap();
+    let released = artifact_fs::reconcile_expired(&pool, &store, Duration::ZERO, 10)
+        .await
+        .unwrap();
+    assert!(released >= 1);
+    assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
+    assert_eq!(reservations(&db, "reserved").await, 0);
+    assert_eq!(charged(&db, &personal).await, (0, 0, 0));
+
+    // The reconciled key is spent; a new key uploads normally.
+    let api = Api::start_in(&db, dir);
+    refused(
+        api.upload(alice_n, "/v1/artifacts", "slow", &body),
+        409,
+        "idempotency_conflict",
+    );
+    let stored = success(api.upload(alice_n, "/v1/artifacts", "fresh", &body), 201);
+    assert_eq!(stored["size_bytes"], "4096");
+    assert_eq!(charged(&db, &personal).await, (4096, 0, 0));
 }

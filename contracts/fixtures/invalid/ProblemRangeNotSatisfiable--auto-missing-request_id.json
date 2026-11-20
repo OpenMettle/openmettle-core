@@ -1,0 +1,25 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ProblemRangeNotSatisfiable--auto-missing-request_id",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "code": "range_not_satisfiable",
+    "detail": "The requested range does not overlap the content.",
+    "status": 416,
+    "title": "Range Not Satisfiable",
+    "type": "about:blank"
+  },
+  "mutation": {
+    "name": "auto-missing-request_id",
+    "op": "remove",
+    "path": "/request_id"
+  },
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemRangeNotSatisfiable"
+}

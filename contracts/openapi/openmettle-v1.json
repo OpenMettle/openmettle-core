@@ -3,15 +3,122 @@
   "jsonSchemaDialect": "https://spec.openapis.org/oas/3.2/dialect/2026-02-26",
   "info": {
     "title": "OpenMettle application API",
-    "version": "1.0.0-draft.2",
-    "summary": "Versioned application contract (V1-03), with the project, conversation and artifact operations of V1-05.",
-    "description": "Canonical source for the OpenMettle v1 application API contract. Wire rules, compatibility policy and limits are recorded in docs/adr/0007-application-api-contract.md; authorization and project lifecycle in docs/adr/0027-authorization-and-private-projects.md. Every operation carries x-openmettle-implementation: `implemented` operations are served by an API started with OPENMETTLE_API_AUTH_CONFIG, and `not-implemented` operations are not served. An API started without OPENMETTLE_API_AUTH_CONFIG serves no operation. Fixtures under contracts/fixtures are generated from the examples in this document by scripts/contract_fixtures.py.",
+    "version": "1.0.0-draft.3",
+    "summary": "Versioned application contract (V1-03), with the project, conversation and artifact operations of V1-05 and the artifact uploads and downloads of V1-15.",
+    "description": "Canonical source for the OpenMettle v1 application API contract. Wire rules, compatibility policy and limits are recorded in docs/adr/0007-application-api-contract.md; authorization and project lifecycle in docs/adr/0027-authorization-and-private-projects.md. Every operation carries x-openmettle-implementation: `implemented` operations are served by an API started with OPENMETTLE_API_AUTH_CONFIG, and `not-implemented` operations are not served. An API started without OPENMETTLE_API_AUTH_CONFIG serves no operation; without OPENMETTLE_API_ARTIFACTS_DIR the artifact upload and download operations answer 503 provisioning. Artifact storage is described in docs/adr/0031-filesystem-artifact-storage-and-streaming-multipart.md. Fixtures under contracts/fixtures are generated from the examples in this document by scripts/contract_fixtures.py.",
     "license": {
       "name": "MIT",
       "identifier": "MIT"
     }
   },
   "paths": {
+    "/v1/artifacts": {
+      "post": {
+        "operationId": "createArtifact",
+        "summary": "Upload a new artifact",
+        "description": "Creates an artifact and its revision 1 in the caller's personal scope or a project scope. The artifact is private to the caller until shared. The target is authorized on the primary before anything is reserved or written. The Idempotency-Key is scoped to the caller, the operation and its target: an exact retry, even with another multipart boundary or part order, returns the same revision with 201 and is charged once. The same key with another file, media type, file name or max_bytes fails with idempotency_conflict, as does a key whose earlier upload failed; a retry while that key's upload is still streaming fails with conflict. Storage quota exhaustion is quota; unconfigured storage limits or an API without OPENMETTLE_API_ARTIFACTS_DIR are provisioning. A malformed or truncated body, a file over max_bytes and a refused metadata part are validation. An upload must finish within 600 seconds.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/ScopeId"
+          },
+          {
+            "$ref": "#/components/parameters/MaxBytes"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "The file and its metadata, streamed: the server never buffers the whole file and enforces max_bytes on the bytes it observes, whatever Content-Length says.",
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/ArtifactUploadRequest"
+              },
+              "encoding": {
+                "file": {
+                  "contentType": "*/*"
+                },
+                "metadata": {
+                  "contentType": "application/json"
+                }
+              },
+              "examples": {
+                "fileFirst": {
+                  "summary": "An upload with the file part first",
+                  "description": "Sent with Content-Type: multipart/form-data; boundary=openmettle-example-a. Settles as the ArtifactRevisionActive example; the part's media type is stored as text/plain;charset=utf-8.",
+                  "serializedValue": "--openmettle-example-a\r\nContent-Disposition: form-data; name=\"file\"; filename=\"notes.txt\"\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nhello, world\r\n--openmettle-example-a\r\nContent-Disposition: form-data; name=\"metadata\"\r\nContent-Type: application/json\r\n\r\n{}\r\n--openmettle-example-a--\r\n"
+                },
+                "metadataFirst": {
+                  "summary": "The same upload with another boundary and the metadata part first",
+                  "description": "Sent with Content-Type: multipart/form-data; boundary=openmettle-example-retry. Under the same Idempotency-Key this is an exact retry of ArtifactUploadFileFirst: it returns the same revision and is charged once.",
+                  "serializedValue": "--openmettle-example-retry\r\nContent-Disposition: form-data; name=\"metadata\"\r\nContent-Type: application/json\r\n\r\n{}\r\n--openmettle-example-retry\r\nContent-Disposition: form-data; name=\"file\"; filename=\"notes.txt\"\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nhello, world\r\n--openmettle-example-retry--\r\n"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The new artifact's first revision.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactRevision"
+                },
+                "examples": {
+                  "active": {
+                    "$ref": "#/components/examples/ArtifactRevisionActive"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
     "/v1/artifacts/{artifact_id}": {
       "get": {
         "operationId": "getArtifact",
@@ -60,6 +167,277 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/artifacts/{artifact_id}/revisions": {
+      "post": {
+        "operationId": "createArtifactRevision",
+        "summary": "Upload the next revision of an artifact",
+        "description": "Appends the next immutable revision. The caller needs write access to the artifact: an item the caller may not read is not_found, a reader gets policy and an artifact in an archived project gets conflict. The target is authorized on the primary before anything is reserved or written. The Idempotency-Key is scoped to the caller, the operation and its target: an exact retry, even with another multipart boundary or part order, returns the same revision with 201 and is charged once. The same key with another file, media type, file name or max_bytes fails with idempotency_conflict, as does a key whose earlier upload failed; a retry while that key's upload is still streaming fails with conflict. Storage quota exhaustion is quota; unconfigured storage limits or an API without OPENMETTLE_API_ARTIFACTS_DIR are provisioning. A malformed or truncated body, a file over max_bytes and a refused metadata part are validation. An upload must finish within 600 seconds.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ArtifactId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/MaxBytes"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "The file and its metadata, streamed: the server never buffers the whole file and enforces max_bytes on the bytes it observes, whatever Content-Length says.",
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/ArtifactUploadRequest"
+              },
+              "encoding": {
+                "file": {
+                  "contentType": "*/*"
+                },
+                "metadata": {
+                  "contentType": "application/json"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The new revision.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactRevision"
+                },
+                "examples": {
+                  "active": {
+                    "$ref": "#/components/examples/ArtifactRevisionActive"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/artifacts/{artifact_id}/revisions/{revision_id}": {
+      "get": {
+        "operationId": "getArtifactRevision",
+        "summary": "Read one revision's metadata",
+        "description": "Needs current read access to the artifact, decided on the primary on every request. Works without OPENMETTLE_API_ARTIFACTS_DIR. A revision of another artifact is not_found.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ArtifactId"
+          },
+          {
+            "$ref": "#/components/parameters/RevisionId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The revision.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactRevision"
+                },
+                "examples": {
+                  "active": {
+                    "$ref": "#/components/examples/ArtifactRevisionActive"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/artifacts/{artifact_id}/revisions/{revision_id}/content": {
+      "get": {
+        "operationId": "downloadArtifactRevision",
+        "summary": "Download one revision's content",
+        "description": "Needs current read access to the artifact, decided on the primary on every request, so a revoked share, membership or approval stops the next download. Streams the bytes without buffering the file. Only an active revision serves content; another state is conflict. HEAD returns the same status and headers without a body. A stored file that is missing or has another size is internal. Without OPENMETTLE_API_ARTIFACTS_DIR the operation is provisioning.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ArtifactId"
+          },
+          {
+            "$ref": "#/components/parameters/RevisionId"
+          },
+          {
+            "$ref": "#/components/parameters/Range"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The whole content.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Accept-Ranges": {
+                "$ref": "#/components/headers/AcceptRanges"
+              },
+              "Content-Disposition": {
+                "$ref": "#/components/headers/ContentDisposition"
+              },
+              "X-Content-Type-Options": {
+                "$ref": "#/components/headers/ContentTypeOptions"
+              }
+            },
+            "content": {
+              "*/*": {
+                "schema": {
+                  "description": "The content bytes, served with the revision's media_type as Content-Type.",
+                  "contentMediaType": "application/octet-stream"
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "The one requested range.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              },
+              "Content-Length": {
+                "$ref": "#/components/headers/ContentLength"
+              },
+              "Accept-Ranges": {
+                "$ref": "#/components/headers/AcceptRanges"
+              },
+              "Content-Disposition": {
+                "$ref": "#/components/headers/ContentDisposition"
+              },
+              "X-Content-Type-Options": {
+                "$ref": "#/components/headers/ContentTypeOptions"
+              },
+              "Content-Range": {
+                "$ref": "#/components/headers/ContentRange"
+              }
+            },
+            "content": {
+              "*/*": {
+                "schema": {
+                  "description": "The content bytes, served with the revision's media_type as Content-Type.",
+                  "contentMediaType": "application/octet-stream"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "416": {
+            "$ref": "#/components/responses/RangeNotSatisfiable"
           },
           "500": {
             "$ref": "#/components/responses/Internal"
@@ -1099,6 +1477,45 @@
           "minimum": 0,
           "maximum": 86400
         }
+      },
+      "ContentLength": {
+        "description": "Exact number of bytes in this response body.",
+        "required": true,
+        "schema": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 67108864
+        }
+      },
+      "ContentRange": {
+        "description": "bytes first-last/total for a partial response; bytes */total when the range is not satisfiable.",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "maxLength": 64
+        }
+      },
+      "AcceptRanges": {
+        "description": "Always bytes.",
+        "required": true,
+        "schema": {
+          "const": "bytes"
+        }
+      },
+      "ContentDisposition": {
+        "description": "attachment, with the display name as an RFC 8187 filename* parameter when the revision has one. Every byte outside attr-char is percent-encoded.",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "maxLength": 4096
+        }
+      },
+      "ContentTypeOptions": {
+        "description": "Always nosniff.",
+        "required": true,
+        "schema": {
+          "const": "nosniff"
+        }
       }
     },
     "parameters": {
@@ -1171,6 +1588,44 @@
         "description": "The artifact's identifier. A malformed identifier fails with validation; a artifact the caller may not know about fails with not_found.",
         "schema": {
           "$ref": "#/components/schemas/Uuid"
+        }
+      },
+      "RevisionId": {
+        "name": "revision_id",
+        "in": "path",
+        "required": true,
+        "description": "The revision's identifier. A malformed identifier fails with validation; a revision of another artifact, or of an artifact the caller may not know about, fails with not_found.",
+        "schema": {
+          "$ref": "#/components/schemas/Uuid"
+        }
+      },
+      "ScopeId": {
+        "name": "scope_id",
+        "in": "query",
+        "description": "The scope of the new artifact: the caller's personal scope (the default when absent) or a project scope where the caller is an editor or owner. A missing, deleted or invisible project fails with not_found; a viewer gets policy; an archived project gets conflict.",
+        "schema": {
+          "$ref": "#/components/schemas/Uuid"
+        }
+      },
+      "MaxBytes": {
+        "name": "max_bytes",
+        "in": "query",
+        "description": "The file's byte ceiling as a canonical decimal, 67108864 (64 MiB) by default. It is charged against storage quotas until the upload settles, then the actual size is charged instead. It is part of the request identity, so a retry must send the same value.",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 67108864,
+          "default": 67108864
+        }
+      },
+      "Range": {
+        "name": "Range",
+        "in": "header",
+        "description": "One RFC 9110 byte range: bytes=first-last, bytes=first- or bytes=-suffix. A list of ranges, another unit or a malformed range fails with validation; a range that does not overlap the content fails with 416. With If-Range the whole content is sent, because no validator is issued.",
+        "schema": {
+          "type": "string",
+          "minLength": 7,
+          "maxLength": 128
         }
       }
     },
@@ -1384,6 +1839,29 @@
             }
           }
         }
+      },
+      "RangeNotSatisfiable": {
+        "description": "The range does not overlap the content (range_not_satisfiable), including any range of an empty file.",
+        "headers": {
+          "OpenMettle-API-Version": {
+            "$ref": "#/components/headers/ApiVersion"
+          },
+          "Content-Range": {
+            "$ref": "#/components/headers/ContentRange"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "examples": {
+              "rangeNotSatisfiable": {
+                "$ref": "#/components/examples/ProblemRangeNotSatisfiable"
+              }
+            }
+          }
+        }
       }
     },
     "schemas": {
@@ -1500,6 +1978,7 @@
               "not_found",
               "conflict",
               "idempotency_conflict",
+              "range_not_satisfiable",
               "quota",
               "rate_limited",
               "unavailable",
@@ -1624,6 +2103,25 @@
               "properties": {
                 "status": {
                   "const": 409
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "code": {
+                  "const": "range_not_satisfiable"
+                }
+              },
+              "required": [
+                "code"
+              ]
+            },
+            "then": {
+              "properties": {
+                "status": {
+                  "const": 416
                 }
               }
             }
@@ -2420,6 +2918,126 @@
           "can_manage_shares": {
             "description": "The caller may share this item or revoke its shares.",
             "type": "boolean"
+          }
+        }
+      },
+      "Sha256Digest": {
+        "description": "SHA-256 digest of the content in lowercase hexadecimal.",
+        "type": "string",
+        "minLength": 64,
+        "maxLength": 64,
+        "pattern": "^[0-9a-f]{64}$"
+      },
+      "ArtifactUploadMetadata": {
+        "description": "The metadata part of an artifact upload. It has no members yet; new optional members are additive. Unknown members fail with validation.",
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "ArtifactUploadRequest": {
+        "description": "One artifact upload: exactly one file part and one metadata part, in either order. Any other part, a repeated part, a part header other than Content-Disposition and Content-Type, filename*, or a body without its closing delimiter fails with validation. The multipart boundary and the part order are not part of the request identity: a retry may use another boundary and order.",
+        "type": "object",
+        "required": [
+          "file",
+          "metadata"
+        ],
+        "properties": {
+          "file": {
+            "description": "The file bytes, at most max_bytes. The part needs an explicit Content-Type, which becomes the revision's media_type (not multipart/*); its optional filename, without any directory part, becomes display_name and never a path.",
+            "contentMediaType": "application/octet-stream"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/ArtifactUploadMetadata"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ArtifactRevision": {
+        "description": "One immutable artifact revision. It never carries a storage path or an internal reservation.",
+        "type": "object",
+        "required": [
+          "artifact_id",
+          "revision_id",
+          "revision",
+          "scope_kind",
+          "scope_id",
+          "project_id",
+          "media_type",
+          "size_bytes",
+          "sha256",
+          "display_name",
+          "state",
+          "created_at"
+        ],
+        "properties": {
+          "artifact_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "revision_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "revision": {
+            "description": "The revision number: 1 for the first, then consecutive.",
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "scope_kind": {
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "personal",
+              "project"
+            ]
+          },
+          "scope_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "project_id": {
+            "description": "The containing project, or null in a personal scope.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "media_type": {
+            "description": "The file part's Content-Type as the server normalized it: the type in lower case, then any parameters, separated by semicolons without white space. Served as the download's Content-Type.",
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 255
+          },
+          "size_bytes": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "sha256": {
+            "$ref": "#/components/schemas/Sha256Digest"
+          },
+          "display_name": {
+            "description": "The uploaded file name without any directory part, or null. Display metadata only.",
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 255
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "state": {
+            "description": "Lifecycle state. Only active revisions serve content; retained, purging and purged do not. Open vocabulary.",
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "active",
+              "retained",
+              "purging",
+              "purged"
+            ]
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
           }
         }
       }
@@ -3968,6 +4586,113 @@
               "expect": {
                 "instancePath": "/can_manage_shares",
                 "keyword": "type"
+              }
+            }
+          ]
+        }
+      },
+      "ArtifactRevisionActive": {
+        "summary": "The first revision of a personal artifact",
+        "dataValue": {
+          "artifact_id": "a2c3ef73-c084-4d12-8d5f-60718293a4b5",
+          "revision_id": "3b4c5d6e-7f80-4912-a3b4-c5d6e7f80912",
+          "revision": "1",
+          "scope_kind": "personal",
+          "scope_id": "6e2dab3f-8c40-4d9e-8f1b-2c3d4e5f6071",
+          "project_id": null,
+          "media_type": "text/plain;charset=utf-8",
+          "size_bytes": "12",
+          "sha256": "09ca7e4eaa6e8ae9c7d261167129184883644d07dfba7cbfbc4c8a2e08360d5b",
+          "display_name": "notes.txt",
+          "state": "active",
+          "created_at": "2026-11-20T09:00:00.000000Z"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/ArtifactRevision",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "unnamed",
+              "class": "valid",
+              "op": "set",
+              "path": "/display_name",
+              "value": null
+            },
+            {
+              "name": "unrecognized-state",
+              "class": "compat",
+              "op": "set",
+              "path": "/state",
+              "value": "archived_cold"
+            },
+            {
+              "name": "sha256-uppercase",
+              "class": "invalid",
+              "op": "set",
+              "path": "/sha256",
+              "value": "09CA7E4EAA6E8AE9C7D261167129184883644D07DFBA7CBFBC4C8A2E08360D5B",
+              "expect": {
+                "instancePath": "/sha256",
+                "keyword": "pattern"
+              }
+            },
+            {
+              "name": "size-bytes-json-number",
+              "class": "invalid",
+              "op": "set",
+              "path": "/size_bytes",
+              "value": 12,
+              "expect": {
+                "instancePath": "/size_bytes",
+                "keyword": "type"
+              }
+            },
+            {
+              "name": "display-name-empty",
+              "class": "invalid",
+              "op": "set",
+              "path": "/display_name",
+              "value": "",
+              "expect": {
+                "instancePath": "/display_name",
+                "keyword": "anyOf"
+              }
+            }
+          ]
+        }
+      },
+      "ArtifactUploadMetadataEmpty": {
+        "summary": "The metadata part of an upload",
+        "dataValue": {},
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/ArtifactUploadMetadata",
+          "direction": "request",
+          "mutations": []
+        }
+      },
+      "ProblemRangeNotSatisfiable": {
+        "summary": "range_not_satisfiable (416)",
+        "dataValue": {
+          "type": "about:blank",
+          "title": "Range Not Satisfiable",
+          "status": 416,
+          "code": "range_not_satisfiable",
+          "detail": "The requested range does not overlap the content.",
+          "request_id": "4a5b6c7d-8e9f-4a0b-9c1d-2e3f4a5b6c7d"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Problem",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "status-400",
+              "class": "invalid",
+              "op": "set",
+              "path": "/status",
+              "value": 400,
+              "expect": {
+                "instancePath": "/status",
+                "keyword": "const"
               }
             }
           ]
