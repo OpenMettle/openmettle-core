@@ -1,5 +1,6 @@
 //! Managed OIDC documents and key generations (ADR 0011). No routes, sessions or admission.
 pub(crate) mod documents;
+pub mod gateway;
 use crate::{
     auth::{self, ExpectedNonceDigest, ProviderIdentity, UnverifiedIdToken, VerifiedIdentity},
     invitation::InvitationCode,

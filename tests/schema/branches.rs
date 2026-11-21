@@ -813,9 +813,9 @@ async fn graph_column_grants_and_sealed_content() {
          has_column_privilege(r.oid,c.oid,a.attnum,'UPDATE') AS upd
          FROM pg_class c JOIN pg_attribute a ON a.attrelid=c.oid CROSS JOIN pg_roles r
          WHERE c.relnamespace='openmettle'::regnamespace AND c.relname IN ('branch_heads','message_parts','message_turns')
-           AND a.attnum>0 AND NOT a.attisdropped AND r.rolname IN ('openmettle_api','openmettle_worker','openmettle_issuance')")
+           AND a.attnum>0 AND NOT a.attisdropped AND r.rolname IN ('openmettle_api','openmettle_worker','openmettle_issuance','openmettle_gateway')")
         .fetch_all(&mut db.admin().await).await.unwrap();
-    assert_eq!(grants.len(), (5 + 9 + 8) * 3);
+    assert_eq!(grants.len(), (5 + 9 + 8) * 4);
     for row in grants {
         let (rel, col, role): (&str, &str, &str) = (row.get(0), row.get(1), row.get(2));
         let actual = (
@@ -824,7 +824,7 @@ async fn graph_column_grants_and_sealed_content() {
             row.get::<bool, _>("upd"),
         );
         let expected = match (role, rel) {
-            (ISSUANCE, _) => (false, false, false),
+            (ISSUANCE | pg::GATEWAY, _) => (false, false, false),
             (_, "branch_heads") => (true, role == API, col == "head_message_id"),
             (_, "message_parts") => (true, col != "id", false),
             (API, "message_turns") => (

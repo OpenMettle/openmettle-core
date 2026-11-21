@@ -1513,6 +1513,10 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
         for violation in &reported {
             let later = violation.contains("openmettle.native_handoffs")
                 || violation.ends_with(" on function openmettle.redeem_home_invitation(uuid,text,text,text,bigint,bytea)")
+                || [API, WORKER].iter().any(|role| {
+                    ["gateway_handoff(uuid,bytea,bytea,bytea,uuid)", "gateway_release(uuid,bytea)"]
+                        .iter().any(|signature| **violation == format!("{role} has EXECUTE on function openmettle.{signature}"))
+                })
                 || worker_reads.contains(violation)
                 || later_objects.iter().any(|object| {
                     violation.ends_with(&format!(" on {object}"))

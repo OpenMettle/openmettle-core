@@ -440,7 +440,7 @@ async fn boundary_audit_refuses_unsafe_issuance_provisioning() {
     let roles: &[(&str, &str)] = &[
         (
             "GRANT openmettle_issuance TO openmettle_fixture_capped",
-            "role openmettle_fixture_capped reaches more than one of openmettle_api, openmettle_issuance and openmettle_worker",
+            "role openmettle_fixture_capped reaches more than one of openmettle_api, openmettle_issuance, openmettle_worker and openmettle_gateway",
         ),
         (
             "GRANT pg_read_all_data TO openmettle_issuance",

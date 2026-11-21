@@ -757,6 +757,7 @@ pub fn authorize_run_continuation(
 
 pub mod approvals;
 pub mod branches;
+pub mod gateway;
 pub mod leases;
 pub mod projects;
 pub mod runs;

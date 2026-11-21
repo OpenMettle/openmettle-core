@@ -1953,3 +1953,39 @@ fn cursor_ring_requires_distinct_file_backed_keys_in_v2() {
     old.document["cursor_keys"] = support::cursor_keys(&old.dir);
     assert_eq!(refusal(old.load()), Error::UnknownField);
 }
+
+#[test]
+fn gateway_ring_checks_all_mounted_generations_offline() {
+    let mut f = Fixture::v2();
+    f.document["cursor_keys"] = support::cursor_keys(&f.dir);
+    let active = json!({"id":"g2","path":f.dir.write("g2",&[17;32])});
+    let old = json!({"id":"g1","path":f.dir.write("g1",&[16;32])});
+    f.document["gateway_keys"] = json!({"active":active,"decrypt_only":[old]});
+    assert!(f.load().unwrap().gateway_keys.is_some());
+    for path in [
+        "/login/keys/active/path",
+        "/login/keys/decrypt_only/0/path",
+        "/cursor_keys/active/path",
+        "/cursor_keys/verify_only/0/path",
+        "/gateway_keys/active/path",
+    ] {
+        assert_eq!(
+            f.with(
+                "/gateway_keys/decrypt_only/0/path",
+                f.document.pointer(path).unwrap().clone()
+            ),
+            Error::GatewayKeyRing
+        );
+    }
+    for (path, value) in [
+        ("/gateway_keys/decrypt_only/0/id", json!("g2")),
+        ("/gateway_keys/active/id", json!("bad id")),
+        (
+            "/gateway_keys/active/path",
+            json!(f.dir.write("short", &[0; 31])),
+        ),
+        ("/gateway_keys/decrypt_only", json!(vec![old; 4])),
+    ] {
+        assert_eq!(f.with(path, value), Error::GatewayKeyRing);
+    }
+}

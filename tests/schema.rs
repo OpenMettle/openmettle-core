@@ -634,6 +634,56 @@ const ADDITIVE_TABLES: &[AdditiveTable] = &[
         table: "run_approval_decisions",
         seed_row: None,
     },
+    AdditiveTable {
+        since: 23,
+        table: "gateway_bindings",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 23,
+        table: "gateway_nonces",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 23,
+        table: "gateway_generations",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 23,
+        table: "gateway_policy",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 23,
+        table: "gateway_intents",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 23,
+        table: "gateway_audit",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 23,
+        table: "gateway_reservations",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 23,
+        table: "gateway_requests",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 23,
+        table: "gateway_usage_reports",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 23,
+        table: "gateway_settlements",
+        seed_row: None,
+    },
 ];
 
 fn additive_columns_since(base_version: i64) -> impl Iterator<Item = &'static AdditiveColumn> {
@@ -793,6 +843,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "a4a226cb408141a41dfb7e174646d7027af6d34c34020d6ba8401aa6dfad7116",
         "47ee7ed667d0f65034e4b9ea8315f66807ae8ed5a4428f3afc1763d205c8bc00",
         "e9221570f5187a4fc2d666d3724d8646d6d4236d3cb7997538e80ec10355be57",
+        "1e9d1c48848f269a59bd1046ca3af1159d3158d33f6e27725fe5bf63b0385f3e",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
@@ -918,7 +969,7 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
     let after_14: Vec<(&str, Option<&str>)> = expected_added_tables_since(14)
         .map(|e| (e.table, e.seed_row))
         .collect();
-    assert_eq!(after_14.len(), 15);
+    assert_eq!(after_14.len(), 25);
     assert!(after_14.contains(&("account_admin_lock", Some(SINGLETON_LOCK_SEED))));
     assert!(after_14.contains(&("run_dispatch_lock", Some(SINGLETON_LOCK_SEED))));
     let after_18: Vec<(&str, Option<&str>)> = expected_added_tables_since(18)
@@ -933,6 +984,16 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
             ("message_turns", None),
             ("run_approvals", None),
             ("run_approval_decisions", None),
+            ("gateway_bindings", None),
+            ("gateway_nonces", None),
+            ("gateway_generations", None),
+            ("gateway_policy", None),
+            ("gateway_intents", None),
+            ("gateway_audit", None),
+            ("gateway_reservations", None),
+            ("gateway_requests", None),
+            ("gateway_usage_reports", None),
+            ("gateway_settlements", None),
         ]
     );
 
@@ -1817,7 +1878,7 @@ async fn unsafe_role_memberships_and_attributes_are_refused() {
         ),
         (
             &["GRANT openmettle_worker TO openmettle_fixture_capped"],
-            "role openmettle_fixture_capped reaches more than one of openmettle_api, openmettle_issuance and openmettle_worker",
+            "role openmettle_fixture_capped reaches more than one of openmettle_api, openmettle_issuance, openmettle_worker and openmettle_gateway",
         ),
         (
             &["GRANT openmettle_owner TO openmettle_fixture_capped"],
@@ -2462,3 +2523,6 @@ mod branches;
 
 #[path = "schema/approvals.rs"]
 mod approvals;
+
+#[path = "schema/gateway.rs"]
+mod gateway;

@@ -10,7 +10,11 @@
 //!
 //! The reusable bounded HTTP/1.1 core lives in [`transport`]; this module adds the provider's
 //! request admission, its process-wide DNS slot pool and its limits.
-use hyper::header;
+use crate::{
+    authz::gateway::Dispatch,
+    model_config::{Catalog, Effective},
+};
+use hyper::header::{self, HeaderValue};
 use openidconnect::{AsyncHttpClient, HttpRequest, HttpResponse, http};
 use std::{
     fmt,
@@ -21,6 +25,7 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
+pub mod gateway;
 pub mod inference;
 pub(crate) mod transport;
 use transport::{Endpoint, Limits, Lookup, Range, Route, endpoint, private_range};
@@ -351,3 +356,52 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests/provider_inference/redaction.rs"]
 mod inference_redaction;
+
+/// Couples the installation, authorized model and call identity to the existing
+/// inference codecs. The database connection is returned before this method runs.
+pub struct BillableInference {
+    pub installation: String,
+    pub route: inference::Gateway,
+}
+impl BillableInference {
+    pub async fn send<F: Future<Output = ()>>(
+        &self,
+        dispatch: Dispatch,
+        catalog: &Catalog,
+        effective: &Effective,
+        request: &inference::Request,
+        run: Option<inference::RunStop>,
+        visible: impl FnMut(inference::VisibleDelta) -> F,
+    ) -> Result<inference::Turn, inference::Error> {
+        if self.installation != dispatch.installation
+            || effective.model != dispatch.model
+            || dispatch.server != run.is_some()
+        {
+            return Err(inference::Error::Credential);
+        }
+        let id = HeaderValue::from_str(&dispatch.id).map_err(|_| inference::Error::Credential)?;
+        let token = dispatch
+            .authorization
+            .to_str()
+            .ok()
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .ok_or(inference::Error::Credential)?;
+        let cred = inference::Credential::Bearer(token);
+        transport::BILLABLE_REQUEST
+            .scope(std::cell::Cell::new(Some(id)), async {
+                match run {
+                    Some(stop) => {
+                        self.route
+                            .server(catalog, effective, request, cred, stop, visible)
+                            .await
+                    }
+                    None => {
+                        self.route
+                            .caller(catalog, effective, request, cred, visible)
+                            .await
+                    }
+                }
+            })
+            .await
+    }
+}

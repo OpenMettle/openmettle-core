@@ -209,7 +209,7 @@ pub(crate) struct Endpoint {
     host: String,
     port: u16,
     authority: String,
-    path: String,
+    pub(super) path: String,
 }
 pub(crate) fn endpoint(value: &str) -> Result<Endpoint, Error> {
     if value.is_empty()
@@ -338,6 +338,12 @@ pub(crate) struct Route<'a> {
     pub(crate) loopback: bool,
 }
 
+// Scoped to construction of one existing inference request. Its codec owns the
+// headers; consume the ID before any stream callback or other request can run.
+tokio::task_local! {
+    pub(super) static BILLABLE_REQUEST: std::cell::Cell<Option<header::HeaderValue>>;
+}
+
 impl Route<'_> {
     /// Sends one request to the configured endpoint. Only `GET` (empty body) and `POST` are
     /// accepted, and the only caller headers are at most one `Accept` and one `Content-Type`; the
@@ -350,9 +356,6 @@ impl Route<'_> {
         body: Vec<u8>,
         limits: &Limits,
     ) -> Result<HttpResponse, Error> {
-        let start = Instant::now();
-        let total = start + limits.total;
-        let setup = (start + limits.setup).min(total);
         if !(method == http::Method::POST || method == http::Method::GET && body.is_empty())
             || body.len() > limits.request_body
             || headers.keys_len() != headers.len()
@@ -361,6 +364,23 @@ impl Route<'_> {
                 .any(|k| k != header::ACCEPT && k != header::CONTENT_TYPE)
         {
             return Err(Error::Destination);
+        }
+        self.send_admitted(method, headers, body, limits).await
+    }
+
+    /// Gateway admin constructs its pinned method, path and sensitive headers internally.
+    pub(super) async fn send_admitted(
+        &self,
+        method: http::Method,
+        headers: &http::HeaderMap,
+        body: Vec<u8>,
+        limits: &Limits,
+    ) -> Result<HttpResponse, Error> {
+        let start = Instant::now();
+        let total = start + limits.total;
+        let setup = (start + limits.setup).min(total);
+        if body.len() > limits.request_body {
+            return Err(Error::TooLarge);
         }
         let outbound = self.request(method, headers, body)?;
         let tls = self.connect(setup).await?;
@@ -464,6 +484,11 @@ impl Route<'_> {
             .uri(self.endpoint.path.as_str())
             .header(header::HOST, self.endpoint.authority.as_str())
             .header(header::CONNECTION, "close");
+        if headers.contains_key(header::AUTHORIZATION)
+            && let Ok(Some(id)) = BILLABLE_REQUEST.try_with(std::cell::Cell::take)
+        {
+            outbound = outbound.header("x-request-id", id);
+        }
         for (name, value) in headers {
             outbound = outbound.header(name, value);
         }
