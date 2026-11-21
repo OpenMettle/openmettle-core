@@ -751,21 +751,30 @@ async fn slow_reader_times_out_releases_capacity_and_resumes_without_loss() {
     drop(idle);
     let mut observer = admin(Some(&f.db.0)).await;
     // On quiet HTTP/1.1 streams, the first Linux TCP write after FIN can elicit RST.
-    // EPIPE may surface on the second heartbeat, up to 30s after disconnect.
+    // EPIPE may surface on the second heartbeat, over 30s after disconnect.
     tokio::time::timeout(Duration::from_secs(45), async {
+        let mut empty_since: Option<Instant> = None;
         loop {
-            // Count the connection as idle only after it has missed two 500ms stream polls.
-            let (idle_count, active_count): (i64, i64) = sqlx::query_as(
-                "SELECT count(*) FILTER (WHERE state='idle' AND state_change <= now() - interval '1 second'),
-                        count(*) FILTER (WHERE state='active')
+            let (total_count, stale_idle_count): (i64, i64) = sqlx::query_as(
+                "SELECT count(*),
+                        count(*) FILTER (WHERE state='idle' AND state_change <= now() - interval '1 second')
                  FROM pg_stat_activity WHERE datname=current_database() AND usename=$1",
             )
             .bind(API)
             .fetch_one(&mut observer)
             .await
             .unwrap();
-            if (idle_count, active_count) == (1, 0) {
+            if (total_count, stale_idle_count) == (1, 1) {
                 break;
+            }
+            // Cancellation can close the sole connection. Wait through two 500ms polls
+            // so a surviving stream has time to reconnect.
+            if total_count == 0 {
+                if empty_since.get_or_insert_with(Instant::now).elapsed() >= Duration::from_secs(1) {
+                    break;
+                }
+            } else {
+                empty_since = None;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
