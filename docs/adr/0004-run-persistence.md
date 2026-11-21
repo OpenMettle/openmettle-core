@@ -23,8 +23,10 @@ owner. Neither a project scope nor a valid foreign key grants access to another 
 V1-05 authorization is required before exposing this data. RLS remains a future decision.
 
 Runs store immutable input/configuration bytes, format/version, identity and digest. Callers
-must include all effective execution choices and pinned profile/policy revisions in those
-bytes. Credentials must not be included. Snapshot interpretation is not implemented. Tenant
+must include all effective execution choices and pinned profile/policy revisions that form
+part of the request in those bytes. Under ADR 0035 this includes the requested execution
+mode. The server captures its admission evidence separately under the admission locks.
+Credentials must not be included. Snapshot interpretation is not implemented. Tenant
 indexes support scope/conversation runs, scope/run events and operations; actor lookup has a
 separate index. Foreign keys use NO ACTION. There is no retention or deletion job.
 

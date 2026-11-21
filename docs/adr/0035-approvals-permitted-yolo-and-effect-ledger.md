@@ -16,7 +16,7 @@ PostgreSQL records what the application authorized and what the endpoint subsequ
 | --- | --- |
 | [ADR 0004](0004-run-persistence.md), `src/runs.rs` | Bind the approval to the future `(run_id, logical_key)`. Use the existing operation UUID, intent identity and revisioned observations at dispatch. |
 | [ADR 0006](0006-grant-persistence.md) and [ADR 0027](0027-authorization-and-private-projects.md), `src/authz.rs` | Hydrate the actor on the primary. Bind the effect to the grant cycles and policy revisions that authorized it. |
-| [ADR 0032](0032-durable-run-admission-and-fair-work-queue.md) and [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md), `authz::runs` and `authz::leases` | Park between steps. Resume an approved wait through the fair claim with the original execution deadline. |
+| [ADR 0032](0032-durable-run-admission-and-fair-work-queue.md) and [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md), `authz::runs` and `authz::leases` | Resume an approved wait through the fair claim with its original execution deadline. ADR 0035 amends ADR 0033 to count `idempotent` writes with outcome `intent` or `outcome_unknown` as unresolved for park, settlement, `settle_expired` and reconciliation. |
 | [ADR 0007](0007-application-api-contract.md) and [ADR 0034](0034-ordered-events-and-replayable-sse.md) | Give the actor a private decision endpoint. Project lifecycle events for authorized conversation readers. |
 
 ## Request identity and decision
@@ -46,29 +46,64 @@ and the deadline is signed big-endian i64 UTC microseconds since the Unix epoch.
 ID and version to 128 UTF-8 bytes each and destination to the 512-byte `operations.target`
 limit. Bound the **whole** versioned operation request (including arguments and evidence)
 to ADR 0004's 64 KiB before parking. Keep the exact canonical bytes and immutable fields.
-On replay or use, reconstruct the binding and compare fields, bytes and digest. The digest
-on the wire lets a client name what it saw. Possession of it confers no authority.
+When replaying a proposal or using it for dispatch, reconstruct the binding and compare
+fields, bytes and digest. The digest on the wire lets a client name what it saw.
+Possession of it confers no authority.
 
 PR2 adds these records to `openmettle` in one additive migration. Names below are proposed.
 
 | Record | Identity and writes |
 | --- | --- |
-| `run_approvals` | Worker inserts an immutable UUID `id`, scoped run FK `(scope_id, run_id)`, logical key, tool, version, canonical arguments, destination, authority evidence, binding digest and two database timestamps, `approval_expires_at` and `resume_execution_expires_at`. Derive the actor from the locked run and bind its immutable ID. Unique `(run_id, logical_key)` and `(scope_id, run_id, id)`. |
-| `run_approval_decisions` | API inserts an immutable receipt with `approval_id` as primary key and a scoped FK to the request. Record the actor from the authenticated session, that session's internal locator, request binding digest, decision (`approve` or `deny`), scoped idempotency key and DB decision time. Exact replay reads this row. |
+| `runs` admission evidence | API inserts the authorized `execution_mode`, `originating_session_id` (nullable `text`, no FK to `local_sessions`) and `admission_evidence` (bounded, versioned authorizing grant and policy revisions). All three columns are nullable for pre-migration rows. The migration grants `openmettle_api` column `INSERT` only and `src/boundaries.sql` verifies that it has no `UPDATE` on them. |
+| `run_approvals` | Worker inserts an immutable UUID `id`, scoped run FK `(scope_id, run_id)`, logical key, tool, version, canonical arguments, destination, authority evidence, binding digest and two database timestamps, `approval_expires_at` and `resume_execution_expires_at`. Derive the actor from the locked run and bind its immutable ID. Keep `UNIQUE (run_id, logical_key)`, `UNIQUE (scope_id, run_id, id)` for the wait pointer and `UNIQUE (scope_id, run_id, id, logical_key)` for the operation. |
+| `run_approval_decisions` | API inserts an immutable receipt with `approval_id` as primary key and a scoped FK to the request. Record the actor from the authenticated session, that session's internal locator, request binding digest, decision (`approve` or `deny`), scoped idempotency key and DB decision time. Add `UNIQUE (approval_id, decision)` for the operation's decision FK. Exact replay reads this row. |
 | `runs.approval_wait_id` | Nullable UUID. Composite FK `(scope_id, id, approval_wait_id)` to `run_approvals(scope_id, run_id, id)`. The worker sets it on park. It names the latest request through resume and terminal history. Only a run in `waiting` for `approval` with this pointer can be claimed by the approval path. |
-| `operations.approval_id` | Nullable UUID, unique when present, with the same scoped request FK using the operation's `run_id`. For a human-approved effect the store verifies that the approved request has the operation's logical key. For YOLO it records the policy evidence in the immutable request envelope. |
+| `operations.approval_id` | Nullable UUID, unique when present. Two composite FKs bind a human-approved operation to its exact request and positive decision (below). For YOLO the worker records policy evidence in the immutable request envelope. |
 
-Bind the selected mode, its authorizing revisions and the originating session locator to
-the immutable run configuration snapshot at admission. An admission replay retains its
-original evidence. `runs.actor_approval_id` references the local **identity** approval.
-Each tool approval has its own UUID. PR2 extends the internal validated `sessions::Context`
-to carry the non-secret `local_sessions.id` for this purpose. Never store a cookie, bearer
-secret or secret hash in an approval. Store the locator without a session FK so session
-cleanup can delete the row. An absent row fails the effect check.
+Of the approval fields, only the client-requested mode (`ordinary` or `yolo`) belongs in
+`RunInput.config`. Its bytes in `config_snapshot` contribute to `request_identity` and
+`request_digest`. Changing the requested mode under the same `Idempotency-Key` returns
+`409 idempotency_conflict`. After `admit_run` takes the project then actor locks (the
+owner's user lock for a personal scope), it checks current authority. For a new admission
+it captures the three server fields under those locks and passes them to `insert_run` in
+`AdmissionColumns` (`src/runs.rs`). They are outside the request identity and digest.
+An authorized exact replay reads the original run, even from another active session or
+after a grant revision advances. It preserves the original snapshot bytes, identity,
+digest and all three server columns, including NULLs on pre-migration rows.
 
-At request creation, decision and immediately before dispatch, rehydrate the run actor with
-its admitted identity approval. Check `RunExecute` on the scope, conversation and affected
-resources, the tool capability, destination policy and any required live reservation.
+`runs.actor_approval_id` references the local **identity** approval. Each tool approval
+has its own UUID. PR2 extends the validated `sessions::Context` with the non-secret
+`local_sessions.id`. Session cleanup can delete expired or revoked sessions while the
+locator remains on the run or receipt. A missing bound session fails the effect check.
+Never store a cookie, bearer secret or secret hash in an approval.
+
+On `operations`, use `(scope_id, run_id, approval_id, logical_key)` as a foreign key to
+`run_approvals(scope_id, run_id, id, logical_key)`. Following migration 5's `cycle_kind`
+pattern, generate the stored column `approval_decision` as
+`CASE WHEN approval_id IS NOT NULL THEN 'approve' END`. Use `(approval_id, approval_decision)`
+as a foreign key to `run_approval_decisions(approval_id, decision)`. With `MATCH SIMPLE`
+on both FKs, a NULL approval ID needs no receipt. A non-NULL ID requires a matching
+request and an `approve` receipt, even for a direct SQL insert.
+
+The following `runs` constraint enforces the wait pointer and reason even when the reason is NULL.
+
+```sql
+CHECK (
+    (wait_reason IS NOT DISTINCT FROM 'approval') =
+        (state = 'waiting' AND approval_wait_id IS NOT NULL)
+    AND (wait_reason IS DISTINCT FROM 'approval' OR claim_token IS NULL)
+)
+```
+
+An approval wait therefore has a request and no claim. With a NULL token,
+`runs_claim_check` forces `claimed_at` to NULL and `runs_lease_check` forces both
+deadlines to NULL. After resume or settlement the run can retain its request pointer.
+A bare wait with a NULL pointer and a NULL or other reason remains valid until the sweep.
+
+Before creating a request, recording a new decision or dispatching the effect, rehydrate
+the run actor with its admitted identity approval. Check `RunExecute` on the scope,
+conversation and affected resources, the tool capability, destination policy and any
+required live reservation.
 Check the originating session's validity for this effect and, once approved, the deciding
 session's validity too. Both must belong to this actor and identity approval. Check revocation,
 expiry and issued provider, approval and user generations against current authority on
@@ -88,10 +123,11 @@ or a missing proof prevents dispatch.
 ## Permitted YOLO
 
 Admission defaults to ordinary approval. An authenticated actor must select YOLO explicitly
-for this run. At admission and each automatic dispatch, evaluate
+for this run. Under the locks for a new YOLO admission and at each automatic dispatch, evaluate
 `authorize_capability(principal, platform, "runs.use_yolo", CapabilityGate::OptIn)` with
-freshly loaded `PlatformPolicy`. Require the active assignment and the grant/policy revisions
-bound at opt-in. A platform or user deny wins even for an account administrator. The same
+freshly loaded `PlatformPolicy`. Capture the active assignment and grant/policy revisions
+in `runs.admission_evidence` at opt-in. Dispatch requires the same evidence and the stored
+`execution_mode = 'yolo'`. A platform or user deny wins even for an account administrator. The same
 actor must independently hold the effective project/resource grants and tool capability.
 
 | Per-call policy result | Worker action |
@@ -119,10 +155,12 @@ mutation, test the deadline **after** acquiring the run lock. Equality means exp
 1. **Park.** Stop and join all work owned by the step. Under `leases::fenced` with
    `Fence::Step`, require the current token, live lease, `state = 'running'`,
    `cancel_reason IS NULL` and a future execution deadline. Under the same run lock require
-   zero operations with `outcome IN ('intent','outcome_unknown')` and
-   `capability IN ('lookup','non_repeatable')`. An unobserved write or an undrained task
-   also prevents park. Use ADR 0033 settlement/reconciliation when the worker cannot
-   establish quiescence. Do not call `record_intent` for the proposed effect at this point.
+   zero operations on this run with `outcome IN ('intent','outcome_unknown')` and
+   `capability IN ('idempotent','lookup','non_repeatable')`. The proposed effect's
+   `(run_id, logical_key)` must also have no `operations` row, whatever its outcome or
+   capability. An existing row goes through ledger recovery. If work has not drained or
+   a write is unresolved, follow ADR 0033 settlement and reconciliation. Park before
+   calling `record_intent` for a new effect.
 2. Copy the exact `execution_expires_at` to the request's `resume_execution_expires_at`.
    Set `approval_expires_at` to the earliest of that timestamp, the DB time plus the bounded
    server approval TTL (positive and at most the configured execution timeout) and the
@@ -134,8 +172,9 @@ mutation, test the deadline **after** acquiring the run lock. Equality means exp
    order and commit. An uncertain commit is read back by the same logical key and bytes.
    Never extend either deadline on a retry. Release the worker slot and database connection.
 3. **Decide.** The API locks the run `FOR NO KEY UPDATE`, then looks up the scoped request.
-   For a new decision require this exact current wait, no cancel reason, current binding,
-   valid authority and time before approval expiry. Insert the receipt and append the
+   First handle an existing receipt under the replay rules below. For a new decision
+   require this exact current wait, no cancel reason, valid authority, time before
+   approval expiry and a matching client `binding_digest`. Insert the receipt and append the
    decision event in the same transaction. Approval makes the wait eligible for claim.
    It remains `waiting` without a lease. Denial immediately sets `cancelled`, clears
    `wait_reason`, sets `cancel_reason = 'requested'` and appends the existing terminal
@@ -144,8 +183,10 @@ mutation, test the deadline **after** acquiring the run lock. Equality means exp
    Acquire `run_dispatch_lock` first, then select one run `FOR NO KEY UPDATE OF r SKIP LOCKED`.
    Apply the same actor/scope executing counts and least-loaded-actor, then `created_at, id`
    order across both sources. A waiting run counts as live and occupies zero executing slots.
-   Under the lock recheck the pointer, positive decision, state, cancel reason and both
-   deadlines at DB time `t`. For a resumed run set `running`, clear `wait_reason`, generate
+   As in `src/authz/leases.rs`, materialize the locked run row before reading the clock.
+   Sample the primary's `clock_timestamp()` once as `t`. Recheck the wait pointer,
+   positive decision, state and cancel reason. Require both `t < approval_expires_at` and
+   `t < resume_execution_expires_at`. For a resumed run set `running`, clear `wait_reason`, generate
    a fresh `claim_token`, set `claimed_at = t`, restore `execution_expires_at` from the
    request and set `lease_expires_at = least(t + lease, execution_expires_at)` using the
    restored value. Append the resume event and commit. First claims keep their existing
@@ -172,16 +213,28 @@ second park, worker restart or lease renewal.
 
 The API and the worker serialize denial, cancellation, expiry and resume on the run row.
 The API never takes the dispatch lock. Archive/delete/disable retain their existing
-ordered bulk cancellations. An expired pending **or approved** wait becomes `failed` with
-`wait_reason = NULL` and one `run-terminal` event with reason `approval_expired`. A
-bounded worker sweep locks due waits by ascending run ID with `SKIP LOCKED` (1–1000) and
-rechecks the predicate under lock. Decision submission can perform the same expiry before
-returning a conflict. Commit the expiry and event before mapping the result to HTTP.
-A revoked or superseded binding cancels parked work with reason `revoked`. After resume,
-expiry before intent fails the run with `approval_expired` under the live fence. If an
-intent exists, the holder settles using the ledger. A terminal run makes all its approvals
-unusable. Keep the request and original receipt as history. During backup restore, revoke
-the restored bound sessions and cancel parked approvals before enabling workers. Inspect
+ordered bulk cancellations. For a bound pending or approved wait, only server-observed
+expiry (`approval_expires_at <= t`) fails the run with `approval_expired`. If the server
+observes revoked or superseded authority on a still-live wait, it sets `cancelled` with
+`cancel_reason = 'revoked'`. Both transitions clear `wait_reason` and append one
+`run-terminal` event atomically. Decision submission commits any such transition before
+returning a conflict. A wrong or stale digest from the client on a current, authorized,
+unexpired wait returns `409 conflict` without changing the run, request, receipt or events.
+
+The worker wait-expiry sweep selects from `runs` in ascending `id` order with
+`FOR NO KEY UPDATE SKIP LOCKED` and a batch limit of 1–1000. Recheck under lock that
+the state is `waiting` and either the current request is due (pending or approved), or
+`approval_wait_id IS NULL OR wait_reason IS DISTINCT FROM 'approval'`. Each matching run
+becomes `failed` with `wait_reason = NULL` and one `run-terminal` event in the same
+transaction. Use `approval_expired` for a bound, due request and `invalid_wait` for a bare
+or legacy wait. The latter needs no matching request row. Failing it frees the live actor
+and scope slots, as `expire_queued` and `settle_expired` do for missing queue and
+execution deadlines.
+
+After resume, expiry before intent fails the run with `approval_expired` under the live
+fence. If an intent exists, the holder settles using the ledger. A terminal run makes
+all its approvals unusable. Keep the request and original receipt as history. During backup
+restore, revoke the restored bound sessions and cancel parked approvals before enabling workers. Inspect
 committed intents through read-only reconciliation while dispatch remains disabled.
 
 ## Effect ledger and recovery (PLAN-09)
@@ -217,9 +270,11 @@ Record observations under `Fence::Hold` with `record_observation`, the expected 
 a stable append key and the original handle once known. A proven success or failure gives
 `succeeded` or `failed` with evidence. Timeout, disconnect or ambiguous cancellation gives
 `outcome_unknown`. A crash may leave `intent`. Either can settle later with proof. Preserve
-terminal observations on replay. Extend ADR 0033's unresolved-operation checks for park,
-settlement, expired leases and reconciliation to include unobserved idempotent writes.
-Deduplication proves nothing about their result. A new holder may observe them, never
+terminal observations on replay. ADR 0035 amends ADR 0033's unresolved-operation rule
+for park, settlement, `settle_expired` and reconciliation. For all four paths, count an
+`idempotent` write with `outcome IN ('intent','outcome_unknown')` alongside `lookup` and
+`non_repeatable` operations with those outcomes. Only `repeatable_read` is exempt.
+Deduplication proves nothing about a write's result. A new holder may observe it, never
 manufacture a new key or claim a clean cancellation while the result is unknown. A
 revocation committed before the final authority observation prevents dispatch. A concurrent
 revocation after that observation stops subsequent work and cannot recall the call. The database
@@ -235,40 +290,50 @@ records. Restrict writes to the following columns or existing column grants.
 | Role | Writes and additional reads |
 | --- | --- |
 | `openmettle_worker` | INSERT request fields, UPDATE `runs.approval_wait_id`, INSERT `operations.approval_id`. The existing worker grants cover claims, leases, `run_dispatch_lock`, observations and events. For effect-only session checks grant column SELECT on `local_sessions` for `id, user_id, approval_id, provider_id, identity_id, issued_client, issued_epoch, provider_generation, approval_generation, user_generation, created_ms, expires_ms, revoked`. Use existing authority-table reads. |
-| `openmettle_api` | INSERT decision fields except DB-generated time. Existing run state, wait/cancel reason, event counter and event grants suffice for denial or expiry. Workers alone write requests, operation intent and lease fields. |
+| `openmettle_api` | Grant column `INSERT (execution_mode, originating_session_id, admission_evidence)` on `openmettle.runs` and verify those grants in `src/boundaries.sql`. Never grant `UPDATE` on those columns. INSERT decision fields except DB-generated time. Existing run state, wait/cancel reason, event counter and event grants suffice for denial or expiry. Workers alone write requests, operation intent and lease fields. |
 | `openmettle_issuance` | No approval, operation or dispatch privileges. Session issuance keeps its migration 18 boundary. |
 
 Request/decision identity has no application UPDATE or DELETE grant. The worker cannot
 insert a human decision or read session secret hashes. Existing raw SQL grants do not
 enforce Rust fence or authorization protocols. Enable approval waits only after all active
 claim, cancellation and recovery writers and event readers understand them. Existing rows
-have NULL new references.
+have NULL new references and admission evidence. Before adding the wait check, clear any
+pre-migration `wait_reason = 'approval'` label with no request pointer. Preserve the run
+state and event history. The worker sweep fails bare and legacy waits, including rows
+with a NULL reason, and frees their live admission slots. They cannot resume.
 Legacy intents remain observable history and never acquire inferred human authority, YOLO
-eligibility or endpoint support. Bare or legacy waits lacking a valid binding cannot resume.
+eligibility or endpoint support.
 
 ## HTTP and visible events
 
 Use ADR 0007 OpenAPI 3.2.1 operations, browser session with the configured Origin on writes
 or native bearer, canonical path UUIDs, version header, `Cache-Control: no-store` and RFC
 9457 problems. Authenticate and authorize each request on the primary before returning a
-request or receipt. Require the run's actor, admitted identity approval and current scope,
-conversation and target access. A different actor (including a project owner, account
-administrator or conversation reader), concealed scope, or mismatched run/request is
-`404 not_found`. An invalid session is `401 unauthenticated`.
+request or receipt. Require the run's actor and current `RunRead` visibility on the
+scope and conversation (ADR 0034). A different actor (including a project owner,
+account administrator or conversation reader), revoked access, deleted scope or mismatched
+run/request returns `404 not_found`. An invalid session returns `401 unauthenticated`.
+Listing a pending request or making a new decision also requires the admitted identity
+approval, current execution and target authority, an unarchived project when applicable,
+and the live originating session.
 
 | Operation | Success |
 | --- | --- |
 | `listRunApprovals` · `GET /v1/runs/{run_id}/approvals` | `200` with an `items` array of at most one current, unexpired, authorized, undecided request. Return `approval_id`, `tool_id`, `tool_version`, `arguments_json` (the exact canonical UTF-8 text), `destination`, `binding_digest` (64 lowercase hex) and `approval_expires_at` (ADR 0007 Timestamp). Refuse tools whose effects cannot be shown without disclosing credentials. |
 | `decideRunApproval` · `POST /v1/runs/{run_id}/approvals/{approval_id}/decision` | Require `Idempotency-Key` and a closed JSON body with `decision` (`approve` or `deny`) and `binding_digest`. Return `200` with the immutable approval ID, decision, digest and decision time. |
 
-Derive the request key with ADR 0007's domain, operation and path, scoped to the actor and
-authorized context. Serialize submissions on the run. After current access checks, an
-identical key and input returns the original receipt, including after a lost response or
-subsequent terminal transition. It performs no state change. Changed input under the same
-key is `409 idempotency_conflict`. A different key after decision, a stale digest or an
-expired, cancelled or invalidated wait is `409 conflict`. Reject malformed inputs with
-`400 validation`. An authority lookup failure returns the existing availability/timeout
-problem and grants no approval.
+Derive the request key with ADR 0007's domain, operation and path, scoped to the actor
+and the run's scope. The key stays stable across sessions. Serialize submissions on the run.
+For an existing receipt, the same authenticated actor with current `RunRead` on the scope
+and conversation can replay the identical key and input. Return the original receipt without a state change, even
+after project archive, run cancellation or settlement, or logout of the originating
+session. Receipt replay requires neither `RunExecute` nor a live originating session.
+Changed input under the same key returns `409 idempotency_conflict`. A different key
+after decision returns `409 conflict`. For a new decision, a client digest mismatch on
+an otherwise valid wait returns `409 conflict` without mutation. An expired, cancelled
+or invalidated wait also returns `409 conflict` under the transition rules above.
+Reject malformed inputs with `400 validation`. An authority lookup failure returns the
+existing availability/timeout problem and grants no approval.
 
 Extend ADR 0034's `(format, format_version)` allowlist with the rows below. All formats
 and wire types are version 1. Append in the state transaction with the existing per-run
@@ -283,6 +348,7 @@ OpenAPI `if`/`then` data schema and fixture.
 | `openmettle.run-approval-decided` | `approval-decision:A` | `run.approval_decided` | `{}` |
 | `openmettle.run-resumed` | `claim:<fresh token>` | `run.resumed` | `{}` |
 | `openmettle.run-approval-expired` | `run-terminal` | `run.failed` | `{"reason":"approval_expired"}` |
+| `openmettle.run-failed` (bare or legacy wait) | `run-terminal` | `run.failed` | `{"reason":"invalid_wait"}` |
 
 The shared stream can prompt the actor to refresh the private endpoint. The decision,
 request UUID, arguments, digest, destination, session locator, token, operation evidence
@@ -294,15 +360,18 @@ hidden-event sequence advancement and malformed-known-payload failure as in ADR 
 | Slice | Deliverable and acceptance evidence |
 | --- | --- |
 | PR1 | This decision and the ADR 0004 pointer. Review against #13, migrations 3/19/20 and the live role and store boundaries. |
-| PR2 | Additive migration and versioned privileges, canonical identities, session evidence, admission mode, decision receipts, fenced park/consume, fair resume and bounded expiry/reconciliation in the worker path. Exercise the real store as API and worker on PostgreSQL 18. |
+| PR2 | Deliver the migration, versioned privileges, admission evidence, binding and decision store, fenced park/consume, fair resume and bounded worker sweeps. Implement the ADR 0033 amendment for unresolved `idempotent` writes across park, settlement, `settle_expired` and reconciliation. Update `unresolved!()` in `src/authz/leases.rs`, the existing `idempotent` replay case in `tests/schema/worker_leases.rs` and the forward pointer in [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md). Exercise the real store as API and worker on PostgreSQL 18. |
 | PR3 | Serve the two approval operations, extend the OpenAPI 3.2.1 document and SSE projection, generate fixtures and exercise both session channels, replay and refusals through HTTP on PostgreSQL 18. |
 
 | Gate | Required cases |
 | --- | --- |
 | PR2 · binding and policy | Known-answer digest, reordered object keys, duplicate fields, changed array order, tool/version/recipient substitution. Test explicit opt-in, absent or denied grant, scope, exhausted reservation, immutable prohibition, prompt injection and stale mapped membership. Revoke then regrant between checks. |
-| PR2 · wait races | Park with owned work, unresolved effect, stale token or lapsed lease must fail. Verify all four NULL fields on park. Race approve/deny, cancel, expiry and two claimers at slot limits. Assert one decision, at most one new token, no early dispatch and one terminal event. Test DB deadline equality after a lock wait, repeated parks and a saturated queue that outlasts approval. |
+| PR2 · admission and integrity | Replay after a grant revision advances and from a new active session. Compare the original identity, digest and all three server columns. Changing the requested mode under the same key must conflict. Verify API INSERT and denied UPDATE on each evidence column. As worker, attempt operation inserts for a wrong key, foreign run/scope, pending request and denial. Require FK rejection in each case and acceptance for the exact approved key and for an operation with NULL approval ID. |
+| PR2 · wait races | Refuse park with owned work, an unresolved write, any existing operation for the proposed key, a stale token or a lapsed lease. Verify all four NULL fields on park. Race approve/deny, cancel, expiry and two claimers at slot limits. Assert one decision, at most one new token, no early dispatch and one terminal event. Test equality at each resume deadline using the post-lock observation, repeated parks and a saturated queue that outlasts approval. |
+| PR2 · wait integrity and expiry | Reject an approval reason without a pointer, an approval reason outside `waiting`, and a pointed wait with a NULL or other reason or a live claim. Preserve the pointer after resume. Upgrade populated bare waits with NULL, `approval` and other reasons. With a small batch and a locked row, verify ordered, bounded sweeps, one failure event per run across retries, and recovered `live_per_actor` and `live_per_scope` capacity. |
+| PR2 · ADR 0033 amendment | For each of `intent` and `outcome_unknown`, verify an `idempotent` write blocks park and successful settlement, appears in reconciliation, and counts toward interruption in `settle_expired`. A `repeatable_read` on another key stays non-blocking. |
 | PR2 · recovery and roles | Lose the intent commit reply, crash either side of send, lose the outcome, expire the endpoint key, reconcile with/without a handle, and retry an observation. Count outbound writes with a synthetic adapter. Logout, identity withdrawal, restart and restore must never revive an approval. Exercise populated upgrade, legacy unknown intents, role denials including issuance, and session cleanup with retained receipts. |
-| PR3 · HTTP and SSE | Browser Origin and native bearer, cross-actor/foreign-run 404, malformed input, two competing decisions, exact replay and conflicting reuse. Replay park/decision/resume and terminal expiry after reconnect. Verify private fields are absent for a shared reader, revoked readers lose access, and snapshots agree with the terminal event. |
+| PR3 · HTTP and SSE | Exercise browser Origin and native bearer, malformed input, competing decisions and conflicting key reuse. A stale client digest leaves a valid wait untouched. Server-observed revocation cancels and expiry fails it. Replay the original receipt after archive, cancellation, settlement and originating-session logout. Verify 404 for a foreign actor/run, revoked read access and deleted scope. Replay park/decision/resume and terminal events after reconnect. Verify private fields are absent for a shared reader and snapshots agree with the terminal event. |
 
 V1-07 (#8) owns run creation, the effective configuration and the executor that calls this
 boundary. V1-14 (#14) owns actual MCP transport, reviewed tool schemas, endpoint guarantees
