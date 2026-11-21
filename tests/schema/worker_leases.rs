@@ -948,3 +948,1183 @@ async fn invalid_raw_cancelling_row_rolls_back_the_upgrade() {
 
 #[path = "worker_runtime.rs"]
 mod worker_runtime;
+
+mod live_turns {
+    use super::*;
+    use crate::{auth_config_support::Dir, ca::Ca};
+    use openmettle_core::{
+        artifact_fs::{self, Upload},
+        authz::branches::{
+            self, Conversation, Operation, Part, Root, UserInput,
+            snapshot::{Intent, Snapshots},
+        },
+        authz::{Grantee, ProjectRole, ResourceAccess, ResourceKind},
+        model_config::{Catalog, ConfigSnapshot, SNAPSHOT_FORMAT, SNAPSHOT_VERSION, Selection},
+        runs::RunInput,
+    };
+    use serde_json::{Value, json};
+    use std::{
+        path::{Path, PathBuf},
+        sync::OnceLock,
+    };
+    use tokio::sync::{mpsc, oneshot};
+
+    struct ModelRequest {
+        path: String,
+        body: Value,
+        reply: oneshot::Sender<Value>,
+    }
+    impl ModelRequest {
+        fn respond(self, value: Value) {
+            self.reply.send(value).expect("gateway request still open");
+        }
+    }
+    struct Provider {
+        port: u16,
+        ca: Ca,
+        requests: mpsc::Receiver<ModelRequest>,
+    }
+    impl Provider {
+        async fn new() -> Self {
+            use http_body_util::{BodyExt, Full};
+            use hyper::{Response, server::conn::http1, service::service_fn};
+            use hyper_util::rt::TokioIo;
+            let ca = Ca::new();
+            let identity = ca.leaf("provider.example.test", false);
+            let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(identity.chain, identity.key)
+            .unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (send, requests) = mpsc::channel(4);
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let acceptor = acceptor.clone();
+                    let send = send.clone();
+                    tokio::spawn(async move {
+                        let tls = acceptor.accept(stream).await.unwrap();
+                        let service =
+                            service_fn(move |r: hyper::Request<hyper::body::Incoming>| {
+                                let send = send.clone();
+                                async move {
+                                    let path = r.uri().path().to_owned();
+                                    assert!(
+                                        r.headers()["authorization"]
+                                            == "Bearer synthetic-turn-credential"
+                                    );
+                                    let bytes = r.into_body().collect().await.unwrap().to_bytes();
+                                    let (reply, rx) = oneshot::channel();
+                                    send.send(ModelRequest {
+                                        path,
+                                        body: serde_json::from_slice(&bytes).unwrap(),
+                                        reply,
+                                    })
+                                    .await
+                                    .ok()
+                                    .unwrap();
+                                    let value = rx.await.unwrap_or(Value::Null);
+                                    Ok::<_, std::convert::Infallible>(
+                                        Response::builder()
+                                            .header("content-type", "application/json")
+                                            .body(Full::new(bytes::Bytes::from(value.to_string())))
+                                            .unwrap(),
+                                    )
+                                }
+                            });
+                        let _ = http1::Builder::new()
+                            .serve_connection(TokioIo::new(tls), service)
+                            .await;
+                    });
+                }
+            });
+            Self { port, ca, requests }
+        }
+        async fn request(&mut self) -> ModelRequest {
+            tokio::time::timeout(Duration::from_secs(15), self.requests.recv())
+                .await
+                .expect("worker reached TLS gateway")
+                .unwrap()
+        }
+    }
+
+    fn worker_binary() -> &'static Path {
+        static BINARY: OnceLock<PathBuf> = OnceLock::new();
+        BINARY.get_or_init(|| {
+            // Cargo compiles the library without cfg(test) for integration tests. Start
+            // its test executable to use the real gateway with its test-only loopback resolver.
+            let build = Command::new(env!("CARGO"))
+                .args([
+                    "test",
+                    "--lib",
+                    "--locked",
+                    "--offline",
+                    "--no-run",
+                    "--message-format=json",
+                ])
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .output()
+                .unwrap();
+            assert!(
+                build.status.success(),
+                "worker fixture build: {}",
+                stderr(&build)
+            );
+            String::from_utf8(build.stdout)
+                .unwrap()
+                .lines()
+                .filter_map(|line| {
+                    let v: Value = serde_json::from_str(line).ok()?;
+                    (v["target"]["name"] == "openmettle_core" && v["profile"]["test"] == true)
+                        .then(|| PathBuf::from(v["executable"].as_str().unwrap()))
+                })
+                .next()
+                .expect("library test executable")
+        })
+    }
+
+    struct Chat {
+        f: Fixture,
+        root: Root,
+        catalog: Value,
+        session: Option<openmettle_core::authz::approvals::EffectSession>,
+        artifacts: Option<PathBuf>,
+        stop_during_observation: bool,
+    }
+
+    impl Chat {
+        async fn new() -> Self {
+            Self::on(Fixture::new().await).await
+        }
+
+        async fn on(f: Fixture) -> Self {
+            let root = applied(
+                branches::create_conversation(
+                    &mut api(&f.db).await,
+                    &ctx(&f.actor, "conversation"),
+                    &f.scope,
+                )
+                .await,
+            );
+            let mut catalog: Value =
+                serde_json::from_slice(include_bytes!("../fixtures/conversation-catalog-v1.json"))
+                    .unwrap();
+            let a = &mut catalog["models"]["a"];
+            a["pin"]["provider"] = "synthetic-sglang".into();
+            a["reasoning_format"] = "reasoning_content".into();
+            a["replay"] = json!([{"source":{"profile":a["pin"],"format":"reasoning_content"},"max_tokens_per_byte":2,"fixed_tokens":7}]);
+            catalog["models"]["b"]["pin"]["provider"] = "synthetic-external".into();
+            catalog["models"]["b"]["replay"] = json!([]);
+            Self {
+                f,
+                root,
+                catalog,
+                session: None,
+                artifacts: None,
+                stop_during_observation: false,
+            }
+        }
+
+        async fn with_tools(mut self) -> Self {
+            let token = crate::authz_runs::seeded_session(&self.f.db, &self.f.actor, 1, None).await;
+            let policy = openmettle_core::sessions::Policy::new(
+                Duration::from_secs(60),
+                10,
+                Duration::from_secs(3),
+            )
+            .unwrap();
+            self.session = Some(
+                openmettle_core::authz::approvals::EffectSession::validate(
+                    &mut api(&self.f.db).await,
+                    &token,
+                    &policy,
+                    None,
+                )
+                .await
+                .unwrap(),
+            );
+            self
+        }
+
+        async fn submit(&self, key: &str, model: &str, rounds: i64) -> (String, String) {
+            self.submit_parts(key, model, rounds, &[Part::Text(key.into())])
+                .await
+        }
+
+        async fn submit_parts(
+            &self,
+            key: &str,
+            model: &str,
+            rounds: i64,
+            parts: &[Part],
+        ) -> (String, String) {
+            let f = &self.f;
+            let chat = Conversation {
+                scope: &f.scope,
+                id: &self.root.conversation_id,
+            };
+            let branch = &self.root.branch_id;
+            let mut c = api(&f.db).await;
+            let head: Option<String> = sqlx::query_scalar("SELECT head_message_id::text FROM openmettle.branch_heads WHERE branch_id=$1::uuid")
+                .bind(branch).fetch_one(&mut c).await.unwrap();
+            let input: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+            let selection: Selection = serde_json::from_value(
+                json!({"model":model,"layer":{"controls":{"output_reserve":256}}}),
+            )
+            .unwrap();
+            let op = Operation::Append(UserInput { id: &input, parts });
+            let intent = Intent {
+                source_branch_id: branch,
+                expected_head_message_id: head.as_deref(),
+                operation: op,
+                selection: &selection,
+                requested_rounds: Some(rounds),
+            };
+            let catalog = Catalog::load(&serde_json::to_vec(&self.catalog).unwrap()).unwrap();
+            let config = ConfigSnapshot {
+                effective: catalog
+                    .resolve(&Selection::default(), &selection, None, |_, _| true)
+                    .unwrap(),
+                required_capabilities: catalog.model(model).unwrap().required_capabilities.clone(),
+                policy_revision: "openmettle.authz/1".into(),
+            };
+            let actor = principal(&f.db, &f.actor).await;
+            let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+            branches::prepare_turn(
+                &mut tx,
+                &ctx(&f.actor, key),
+                chat,
+                branch,
+                head.as_deref(),
+                op,
+            )
+            .await
+            .unwrap();
+            let history = branches::history(tx.connection().unwrap(), &actor, chat, branch, NOW)
+                .await
+                .unwrap()
+                .unwrap();
+            let pins = Snapshots::encode(&intent, &history, &catalog, &config).unwrap();
+            let capabilities: Vec<_> = config
+                .required_capabilities
+                .iter()
+                .map(|(name, gate)| queue::CapabilityUse { name, gate: *gate })
+                .collect();
+            let admission = queue::RunAdmission {
+                input: RunInput {
+                    scope: &f.scope,
+                    actor: &f.actor.user,
+                    conversation: chat.id,
+                    branch,
+                    message: &input,
+                    key,
+                    format: SNAPSHOT_FORMAT,
+                    version: SNAPSHOT_VERSION,
+                    input: &pins.input,
+                    config: &pins.config,
+                },
+                actor_approval_id: &f.actor.approval,
+                capabilities: &capabilities,
+                requested_rounds: Some(rounds),
+                now_ms: NOW,
+            };
+            let limits = queue::AdmissionLimits {
+                live_per_actor: 4,
+                live_per_scope: 4,
+                queued_in_instance: 4,
+                round_cap: 4,
+                queue_timeout: Duration::from_secs(60),
+            };
+            let admitted = match &self.session {
+                Some(session) => {
+                    queue::admit_run_with_mode(&mut tx, &admission, &limits, session).await
+                }
+                None => queue::admit_run(&mut tx, &admission, &limits).await,
+            }
+            .unwrap();
+            let queue::Admission::Admitted { run_id, .. } = admitted else {
+                panic!("admission")
+            };
+            tx.commit().await.unwrap();
+            (run_id, input)
+        }
+
+        fn start(&self, provider: &Provider) -> Process {
+            let mut child = Command::new(worker_binary())
+                .env("OPENMETTLE_TEST_TURN_WORKER", "1")
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "worker::turns::schema_fixture::worker_process",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap();
+            let input = child.stdin.as_mut().unwrap();
+            serde_json::to_writer(&mut *input,&json!({"database":self.f.db.url(WORKER),"catalog":self.catalog,
+                "tools":self.session.is_some(),"scope":self.f.scope,"actor":self.f.actor.user,"ca":String::from_utf8(provider.ca.pem()).unwrap(),"port":provider.port,
+                "artifacts":self.artifacts,"stop_during_observation":self.stop_during_observation})).unwrap();
+            writeln!(input).unwrap();
+            Process(child)
+        }
+
+        async fn done(&self, run: &str, state: &str, reason: Option<&str>) {
+            let mut c = api(&self.f.db).await;
+            tokio::time::timeout(Duration::from_secs(25), async {
+                loop {
+                    let stored: String =
+                        sqlx::query_scalar("SELECT state FROM openmettle.runs WHERE id=$1::uuid")
+                            .bind(run)
+                            .fetch_one(&mut c)
+                            .await
+                            .unwrap();
+                    if queue::is_terminal(&stored) {
+                        assert_eq!(stored, state);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("worker settlement");
+            let payload = reason.map_or_else(|| json!({}), |r| json!({"reason":r}));
+            terminal(
+                &self.f.db,
+                run,
+                &format!("openmettle.run-{state}"),
+                payload.to_string().as_bytes(),
+            )
+            .await;
+        }
+
+        async fn graph(&self) -> (i64, i64, i64, Option<String>) {
+            sqlx::query_as("SELECT (SELECT count(*) FROM openmettle.messages WHERE conversation_id=$1::uuid),
+            (SELECT count(*) FROM openmettle.message_turns WHERE conversation_id=$1::uuid),
+            (SELECT count(*) FROM openmettle.message_parts WHERE conversation_id=$1::uuid),head_message_id::text
+            FROM openmettle.branch_heads WHERE branch_id=$2::uuid")
+            .bind(&self.root.conversation_id).bind(&self.root.branch_id).fetch_one(&mut api(&self.f.db).await).await.unwrap()
+        }
+    }
+
+    fn completion(text: Value, reasoning: Option<&str>, usage: Value) -> Value {
+        json!({"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":text,
+            "reasoning_content":reasoning}}],"usage":usage})
+    }
+
+    fn tool_call(name: &str, arguments: &str) -> Value {
+        json!({"choices":[{"index":0,"finish_reason":"tool_calls","message":{
+            "role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":name,"arguments":arguments}}]}}],
+            "usage":{"prompt_tokens":71,"completion_tokens":8}})
+    }
+
+    async fn outcomes(chat: &Chat, run: &str) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT outcome FROM openmettle.operations WHERE scope_id=$1::uuid AND run_id=$2::uuid",
+        )
+        .bind(&chat.f.scope)
+        .bind(run)
+        .fetch_all(&mut worker(&chat.f.db).await)
+        .await
+        .unwrap()
+    }
+
+    async fn shared_image_chat(dir: &Dir) -> (Chat, Account, String, String) {
+        let mut f = Fixture::new().await;
+        let creator = f.actor.clone();
+        let (project, scope) = new_project(&f.db, &creator, "image project").await;
+        f.scope = scope;
+        let editor = account(&mut connect(&f.db.0, OWNER).await, PROVIDER, true, FUTURE).await;
+        let grantee = Grantee::User(editor.user.clone());
+        let mut c = api(&f.db).await;
+        applied(
+            projects::set_project_member_role(
+                &mut c,
+                &ctx(&creator, "editor"),
+                &project,
+                &grantee,
+                ProjectRole::Editor,
+            )
+            .await,
+        );
+        let mut chat = Chat::on(f).await;
+        chat.catalog["models"]["a"]["required_capabilities"] = json!({"model.a":"on_by_default"});
+        connect(&chat.f.db.0, OWNER).await.execute(
+            "UPDATE openmettle.storage_instance SET instance_budget_bytes=1024,project_limit_bytes=1024",
+        ).await.unwrap();
+        let root = PathBuf::from(dir.path(""));
+        let store = artifact_fs::Store::open(&root).unwrap();
+        let artifact = openmettle_core::storage::upload_artifact(
+            &mut c,
+            &chat.f.scope,
+            &creator.user,
+            "image",
+        )
+        .await
+        .unwrap();
+        let upload = Upload {
+            scope: &chat.f.scope,
+            actor: &creator.user,
+            key: "image",
+            artifact: &artifact,
+            max_bytes: 128,
+            content_type: "multipart/form-data; boundary=sample",
+        };
+        let body = http_body_util::Full::new(bytes::Bytes::from_static(
+            b"--sample\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.png\"\r\nContent-Type: image/png\r\n\r\npixels\r\n\
+              --sample\r\nContent-Disposition: form-data; name=\"metadata\"\r\nContent-Type: application/json\r\n\r\n{}\r\n--sample--\r\n"
+        ));
+        let pool = sqlx::PgPool::connect(&chat.f.db.url(API)).await.unwrap();
+        let image = artifact_fs::ingest(&pool, &store, &upload, body, |_| true)
+            .await
+            .unwrap();
+        for (kind, id, access) in [
+            (ResourceKind::Artifact, &artifact, ResourceAccess::Read),
+            (
+                ResourceKind::Conversation,
+                &chat.root.conversation_id,
+                ResourceAccess::Write,
+            ),
+        ] {
+            applied(
+                projects::share_resource(&mut c, &ctx(&creator, id), kind, id, &grantee, access)
+                    .await,
+            );
+        }
+        chat.f.actor = editor;
+        chat.artifacts = Some(root);
+        (chat, creator, artifact, image.revision)
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn worker_images_load_in_order_and_revoked_history_is_omitted() {
+        let dir = Dir::new();
+        let (chat, creator, artifact, revision) = shared_image_chat(&dir).await;
+        let mut server = Provider::new().await;
+        let parts = [
+            Part::Text("describe".into()),
+            Part::Attachment(revision.clone()),
+        ];
+        let (first, _) = chat.submit_parts("visible", "a", 2, &parts).await;
+        let worker = chat.start(&server);
+        let request = server.request().await;
+        assert_eq!(
+            request.body["messages"].as_array().unwrap().last().unwrap()["content"],
+            json!([
+                {"type":"text","text":"describe"}, {"type":"image_url","image_url":{"url":"data:image/png;base64,cGl4ZWxz"}}
+            ])
+        );
+        request.respond(completion(json!("image received"), None, Value::Null));
+        chat.done(&first, "succeeded", None).await;
+        drop(worker);
+
+        let (second, _) = chat.submit("follow up", "a", 2).await;
+        // The immutable snapshot still names the revision. Revoke only the artifact share.
+        applied(
+            projects::unshare_resource(
+                &mut api(&chat.f.db).await,
+                &ctx(&creator, "unshare image"),
+                ResourceKind::Artifact,
+                &artifact,
+                &Grantee::User(chat.f.actor.user.clone()),
+            )
+            .await,
+        );
+        let _worker = chat.start(&server);
+        let next = server.request().await;
+        let messages = next.body["messages"].as_array().unwrap();
+        assert_eq!(
+            messages[messages.len() - 3..],
+            [
+                json!({"role":"user", "content":"describe"}),
+                json!({"role":"assistant", "content":"image received"}),
+                json!({"role":"user", "content":"follow up"}),
+            ]
+        );
+        assert!(!next.body.to_string().contains(&revision));
+        next.respond(completion(json!("text only"), None, Value::Null));
+        chat.done(&second, "succeeded", None).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn revoked_run_authority_cancels_before_attachment_reads() {
+        for revoke_share in [false, true] {
+            let dir = Dir::new();
+            let (chat, creator, _, revision) = shared_image_chat(&dir).await;
+            let chat = chat.with_tools().await;
+            let mut server = Provider::new().await;
+            let parts = [Part::Text("describe".into()), Part::Attachment(revision)];
+            let (id, _) = chat
+                .submit_parts("revoke between rounds", "a", 3, &parts)
+                .await;
+            let _worker = chat.start(&server);
+            let first = server.request().await;
+            if revoke_share {
+                applied(
+                    projects::unshare_resource(
+                        &mut api(&chat.f.db).await,
+                        &ctx(&creator, "unshare chat"),
+                        ResourceKind::Conversation,
+                        &chat.root.conversation_id,
+                        &Grantee::User(chat.f.actor.user.clone()),
+                    )
+                    .await,
+                );
+            } else {
+                owner_exec(&chat.f.db, "INSERT INTO openmettle.user_capability_denies(user_id,capability,denied,updated_by_user_id)
+                    VALUES ($1::uuid,'model.a',true,$1::uuid)", &chat.f.actor.user).await;
+            }
+            // Settlement must finish while even the first path read is blocked. This
+            // excludes reading reasoning or opening the on-disk revision in this round.
+            let mut owner = connect(&chat.f.db.0, OWNER).await;
+            let mut hold = owner.begin().await.unwrap();
+            hold.execute("LOCK TABLE openmettle.message_turns IN ACCESS EXCLUSIVE MODE")
+                .await
+                .unwrap();
+            first.respond(tool_call("lookup", "{"));
+            chat.done(&id, "cancelled", Some("revoked")).await;
+            hold.commit().await.unwrap();
+            assert!(server.requests.try_recv().is_err());
+            assert!(outcomes(&chat, &id).await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn loss_of_identity_during_prompt_hydration_settles_revoked() {
+        for retire_provider in [false, true] {
+            let chat = Chat::new().await.with_tools().await;
+            let mut server = Provider::new().await;
+            let (id, input) = chat.submit("identity race", "a", 3).await;
+            let _worker = chat.start(&server);
+            let first = server.request().await;
+
+            // The rejected tool arguments request another round without executing a tool.
+            // Hold its prompt query after the leased authority check has succeeded.
+            let mut owner = connect(&chat.f.db.0, OWNER).await;
+            let mut hold = owner.begin().await.unwrap();
+            hold.execute("LOCK TABLE openmettle.branch_heads IN ACCESS EXCLUSIVE MODE")
+                .await
+                .unwrap();
+            first.respond(tool_call("lookup", "{"));
+            crate::authz_store::wait_for_lock_waiters(&chat.f.db, 1).await;
+            if retire_provider {
+                sqlx::query("INSERT INTO openmettle.login_provider_revisions(provider_id, revision) VALUES ($1::uuid, NULL)")
+                    .bind(PROVIDER).execute(&mut *hold).await.unwrap();
+            } else {
+                sqlx::query(
+                    "UPDATE openmettle.local_identity_approvals SET expires_ms=1 WHERE id=$1::uuid",
+                )
+                .bind(&chat.f.actor.approval)
+                .execute(&mut *hold)
+                .await
+                .unwrap();
+            }
+            hold.commit().await.unwrap();
+            chat.done(&id, "cancelled", Some("revoked")).await;
+            assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
+            assert!(outcomes(&chat, &id).await.is_empty());
+            assert!(server.requests.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn invalid_arguments_continue_without_a_tool_effect() {
+        let chat = Chat::new().await.with_tools().await;
+        let mut server = Provider::new().await;
+        let (id, _) = chat.submit("invalid arguments", "a", 2).await;
+        let _worker = chat.start(&server);
+        server.request().await.respond(tool_call("lookup", "{"));
+        let next = server.request().await;
+        let messages = next.body["messages"].as_array().unwrap();
+        let error = messages.last().unwrap();
+        assert_eq!(error["role"], "tool");
+        assert_eq!(error["tool_call_id"], "call-1");
+        assert_eq!(
+            serde_json::from_str::<Value>(error["content"].as_str().unwrap()).unwrap(),
+            json!({"error":{"code":"invalid_tool_arguments"}})
+        );
+        next.respond(completion(json!("corrected"), None, Value::Null));
+        chat.done(&id, "succeeded", None).await;
+        assert!(outcomes(&chat, &id).await.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn shutdown_mid_observation_commits_and_hands_off_the_lease() {
+        let mut chat = Chat::new().await.with_tools().await;
+        chat.stop_during_observation = true;
+        let mut server = Provider::new().await;
+        let (id, input) = chat.submit("drain observation", "a", 3).await;
+        let mut child = chat.start(&server);
+        server.request().await.respond(tool_call("lookup", "{}"));
+        tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("worker shut down after the observation");
+        assert_eq!(outcomes(&chat, &id).await, ["succeeded"]);
+        let (state, released): (String, bool) = sqlx::query_as(
+            "SELECT state, lease_expires_at <= clock_timestamp() FROM openmettle.runs WHERE id=$1::uuid"
+        ).bind(&id).fetch_one(&mut worker(&chat.f.db).await).await.unwrap();
+        assert_eq!(state, "running");
+        assert!(released);
+        assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
+        assert!(terminal_events(&chat.f.db, &id).await.is_empty());
+        assert!(server.requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn crash_after_observed_tool_refuses_restart_without_transcript() {
+        let chat = Chat::new().await.with_tools().await;
+        let mut server = Provider::new().await;
+        let (id, input) = chat.submit("crash after lookup", "a", 4).await;
+        let original = chat.start(&server);
+        server.request().await.respond(tool_call("lookup", "{}"));
+        let mut next = server.request().await;
+        assert_eq!(outcomes(&chat, &id).await, ["succeeded"]);
+        drop(original);
+        tokio::time::timeout(Duration::from_secs(5), next.reply.closed())
+            .await
+            .unwrap();
+        owner_exec(
+            &chat.f.db,
+            "UPDATE openmettle.runs SET lease_expires_at=clock_timestamp() WHERE id=$1::uuid",
+            &id,
+        )
+        .await;
+        let _replacement = chat.start(&server);
+        chat.done(&id, "failed", Some("step_failed")).await;
+        assert_eq!(outcomes(&chat, &id).await, ["succeeded"]);
+        assert_eq!(
+            events(&chat.f.db, &id)
+                .await
+                .iter()
+                .filter(|e| e.2 == "openmettle.model-round")
+                .count(),
+            2
+        );
+        assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
+        assert!(server.requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn invalidated_tool_intent_releases_the_reconciling_lease() {
+        let chat = Chat::new().await.with_tools().await;
+        let mut server = Provider::new().await;
+        let (id, input) = chat.submit("changed approval", "a", 3).await;
+        let _worker = chat.start(&server);
+        let pending = server.request().await;
+        let mut w = worker(&chat.f.db).await;
+        let token: String =
+            sqlx::query_scalar("SELECT claim_token::text FROM openmettle.runs WHERE id=$1::uuid")
+                .bind(&id)
+                .fetch_one(&mut w)
+                .await
+                .unwrap();
+        let lease = Lease {
+            scope_id: &chat.f.scope,
+            run_id: &id,
+            claim_token: &token,
+        };
+        super::intent(&mut w, &lease, "non_repeatable")
+            .await
+            .unwrap();
+        // Introduce a different pending approval while the model is answering.
+        // record_fenced_intent must invalidate this dispatch with one unresolved effect.
+        sqlx::query("WITH pending AS (INSERT INTO openmettle.run_approvals
+            (scope_id,run_id,actor_user_id,logical_key,tool_id,tool_version,canonical_arguments,
+             destination,authority_evidence,binding_digest,approval_expires_at,resume_execution_expires_at)
+            SELECT scope_id,id,actor_user_id,'other','lookup','1','{}','fixture','fixture',
+                   sha256('fixture'),execution_expires_at,execution_expires_at FROM openmettle.runs WHERE id=$1::uuid
+            RETURNING id,run_id)
+            UPDATE openmettle.runs r SET approval_wait_id=p.id FROM pending p WHERE r.id=p.run_id")
+            .bind(&id).execute(&mut w).await.unwrap();
+        pending.respond(tool_call("lookup", "{}"));
+        // The 30 s lease must be released promptly so the reconciler can claim it now.
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while terminal_events(&chat.f.db, &id).await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("reconciler took the released lease");
+        terminal(
+            &chat.f.db,
+            &id,
+            "openmettle.run-interrupted",
+            br#"{"unresolved":1}"#,
+        )
+        .await;
+        let reason: String =
+            sqlx::query_scalar("SELECT cancel_reason FROM openmettle.runs WHERE id=$1::uuid")
+                .bind(&id)
+                .fetch_one(&mut w)
+                .await
+                .unwrap();
+        assert_eq!(reason, "revoked");
+        assert_eq!(outcomes(&chat, &id).await, ["intent"]);
+        assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
+        assert!(server.requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn publication_validation_failure_settles_and_preserves_input() {
+        let chat = Chat::new().await;
+        let mut server = Provider::new().await;
+        let (id, input) = chat.submit("invalid answer", "a", 2).await;
+        let _worker = chat.start(&server);
+        let pending = server.request().await;
+        // The worker treats zero inserted assistant turns as a publication validation error.
+        // The preceding message insert must roll back before the fresh failure fence.
+        connect(&chat.f.db.0, OWNER).await.execute(
+            "CREATE FUNCTION omit_answer() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+             CREATE TRIGGER omit_answer BEFORE INSERT ON openmettle.message_turns FOR EACH ROW EXECUTE FUNCTION omit_answer()"
+        ).await.unwrap();
+        pending.respond(completion(json!("valid model answer"), None, Value::Null));
+        chat.done(&id, "failed", Some("step_failed")).await;
+        assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18"]
+    async fn lease_expiry_during_publication_rolls_back_all_answer_rows() {
+        let chat = Chat::new().await;
+        let (id, input) = chat.submit("late writer", "a", 4).await;
+        let mut w = worker(&chat.f.db).await;
+        let run = queue::claim_next(&mut w, &OPEN, &LEASES)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut c = api(&chat.f.db).await;
+        let mut blocking = c.begin().await.unwrap();
+        sqlx::query("SELECT head_message_id FROM openmettle.branch_heads WHERE branch_id=$1::uuid FOR NO KEY UPDATE")
+            .bind(&chat.root.branch_id).execute(&mut *blocking).await.unwrap();
+        let answer_id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+            .fetch_one(&mut w)
+            .await
+            .unwrap();
+        owner_exec(&chat.f.db,"UPDATE openmettle.runs SET lease_expires_at=clock_timestamp()+interval '1 second' WHERE id=$1::uuid",&id).await;
+        let attempt = tokio::spawn(async move {
+            settle_answer(
+                &mut w,
+                &run.lease(),
+                &LEASES,
+                &branches::Answer {
+                    id: &answer_id,
+                    parts: &[Part::Text("late answer".into())],
+                    reasoning: None,
+                    input_count: Some(4),
+                    output_count: Some(2),
+                },
+            )
+            .await
+        });
+        crate::authz_store::wait_for_lock_waiters(&chat.f.db, 1).await;
+        sqlx::query("SELECT pg_sleep(greatest(0,extract(epoch FROM lease_expires_at-clock_timestamp()))::double precision)
+            FROM openmettle.runs WHERE id=$1::uuid").bind(&id).execute(&mut *blocking).await.unwrap();
+        blocking.commit().await.unwrap();
+        assert!(matches!(attempt.await.unwrap(), Err(LeaseError::Expired)));
+        assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
+        assert!(terminal_events(&chat.f.db, &id).await.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn revoking_a_pinned_model_capability_blocks_the_tool_step() {
+        let mut chat = Chat::new().await.with_tools().await;
+        chat.catalog["models"]["a"]["required_capabilities"] = json!({"model.a":"on_by_default"});
+        let mut server = Provider::new().await;
+        let (id, input) = chat.submit("pinned capability", "a", 3).await;
+        let _worker = chat.start(&server);
+        let pending = server.request().await;
+        sqlx::query("INSERT INTO openmettle.user_capability_denies(user_id,capability,denied,updated_by_user_id)
+            VALUES($1::uuid,'model.a',true,$1::uuid)").bind(&chat.f.actor.user)
+            .execute(&mut connect(&chat.f.db.0,OWNER).await).await.unwrap();
+        pending.respond(tool_call("lookup", "{}"));
+        chat.done(&id, "cancelled", Some("revoked")).await;
+        assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
+        let n: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM openmettle.operations WHERE run_id=$1::uuid")
+                .bind(id)
+                .fetch_one(&mut worker(&chat.f.db).await)
+                .await
+                .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18"]
+    async fn terminal_event_conflict_rolls_back_the_answer_and_head() {
+        let chat = Chat::new().await;
+        let (run_id, input) = chat.submit("atomic publication", "a", 4).await;
+        let mut c = worker(&chat.f.db).await;
+        let run = queue::claim_next(&mut c, &OPEN, &LEASES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.run_id, run_id);
+        with_lease(&mut c, &run.lease(), Fence::Hold, async |tx, _| {
+            durable::append_event(tx, &run.scope_id, &run.run_id, "run-terminal", EVIDENCE).await
+        })
+        .await
+        .unwrap();
+        let id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+        let result = settle_answer(
+            &mut c,
+            &run.lease(),
+            &LEASES,
+            &branches::Answer {
+                id: &id,
+                parts: &[Part::Text("must roll back".into())],
+                reasoning: None,
+                input_count: Some(9),
+                output_count: Some(2),
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(LeaseError::Store(StoreError::Conflict(_)))
+        ));
+        assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM openmettle.runs WHERE id=$1::uuid")
+                .bind(run_id)
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+        assert_eq!(state, "running");
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn reviewed_tool_continuation_uses_only_final_usage_and_obeys_round_cap() {
+        let chat = Chat::new().await.with_tools().await;
+        let mut server = Provider::new().await;
+        let _worker = chat.start(&server);
+        let (id, _) = chat.submit("lookup", "a", 2).await;
+        let first = server.request().await;
+        assert_eq!(first.body["tools"][0]["function"]["name"], "lookup");
+        first.respond(tool_call("lookup", "{}"));
+        let second = server.request().await;
+        let path = second.body["messages"].as_array().unwrap();
+        assert_eq!(path[path.len() - 2]["tool_calls"][0]["id"], "call-1");
+        assert_eq!(
+            path.last().unwrap(),
+            &json!({"role":"tool","tool_call_id":"call-1","content":"registered result"})
+        );
+        second.respond(completion(
+            json!("final"),
+            None,
+            json!({"prompt_tokens":91,"completion_tokens":3}),
+        ));
+        chat.done(&id, "succeeded", None).await;
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT input_count,output_count FROM openmettle.message_turns WHERE run_id=$1::uuid",
+        )
+        .bind(&id)
+        .fetch_one(&mut worker(&chat.f.db).await)
+        .await
+        .unwrap();
+        assert_eq!(counts, (91, 3));
+        for (name, cap, reason) in [
+            ("lookup", 1, "round_limit"),
+            ("undeclared", 2, "step_failed"),
+        ] {
+            let (id, _) = chat.submit(reason, "a", cap).await;
+            let before = chat.graph().await;
+            server.request().await.respond(tool_call(name, "{}"));
+            chat.done(&id, "failed", Some(reason)).await;
+            assert_eq!(before, chat.graph().await);
+            let effects: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM openmettle.operations WHERE run_id=$1::uuid",
+            )
+            .bind(&id)
+            .fetch_one(&mut worker(&chat.f.db).await)
+            .await
+            .unwrap();
+            assert_eq!(effects, 0);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn publishes_measured_ordered_parts_and_only_qualified_reasoning() {
+        let chat = Chat::new().await;
+        let mut server = Provider::new().await;
+        let _worker = chat.start(&server);
+        let (one, input) = chat.submit("one", "a", 4).await;
+        server.request().await.respond(completion(
+            Value::Null,
+            Some("private reasoning"),
+            json!({"prompt_tokens":37,"completion_tokens":9}),
+        ));
+        chat.done(&one, "succeeded", None).await;
+        let mut w = worker(&chat.f.db).await;
+        let (id,parent,blocks,bytes,i,o): (String,String,String,i32,Option<i64>,Option<i64>) = sqlx::query_as(
+            "SELECT message_id::text,parent_message_id::text,reasoning_blocks::text,reasoning_bytes,input_count,output_count
+            FROM openmettle.message_turns t JOIN openmettle.messages m ON m.id=t.message_id WHERE run_id=$1::uuid")
+            .bind(&one).fetch_one(&mut w).await.unwrap();
+        assert_eq!(chat.graph().await, (2, 2, 1, Some(id)));
+        assert_eq!(parent, input);
+        assert_eq!((i, o), (Some(37), Some(9)));
+        assert_eq!(bytes as usize, blocks.len());
+        assert_eq!(
+            serde_json::from_str::<Value>(&blocks).unwrap(),
+            json!([{"text":"private reasoning"}])
+        );
+
+        let (two, _) = chat.submit("two", "a", 4).await;
+        let second = server.request().await;
+        assert_eq!(second.path, "/v1/chat/completions");
+        let qualified = second.body["messages"].as_array().unwrap();
+        assert_eq!(
+            qualified[qualified.len() - 3..],
+            [
+                json!({"role":"user","content":"one"}),
+                json!({"role":"assistant","reasoning_content":"private reasoning"}),
+                json!({"role":"user","content":"two"})
+            ]
+        );
+        second.respond(completion(
+            json!([{"type":"text","text":"first"},{"type":"text","text":"second"}]),
+            None,
+            Value::Null,
+        ));
+        chat.done(&two, "succeeded", None).await;
+        let parts:Vec<(i32,String)> = sqlx::query_as("SELECT ordinal,text_value FROM openmettle.message_parts p
+            JOIN openmettle.message_turns t USING(message_id) WHERE run_id=$1::uuid ORDER BY ordinal").bind(&two).fetch_all(&mut w).await.unwrap();
+        assert_eq!(parts, [(0, "first".into()), (1, "second".into())]);
+        let usage = |id| {
+            sqlx::query_as::<_,(Option<i64>,Option<i64>)>("SELECT input_count,output_count FROM openmettle.message_turns WHERE run_id=$1::uuid").bind(id)
+        };
+        assert_eq!(usage(&two).fetch_one(&mut w).await.unwrap(), (None, None));
+        let (three, _) = chat.submit("three", "b", 4).await;
+        let third = server.request().await;
+        assert_eq!(third.path, "/v1/responses");
+        let unqualified = &third.body;
+        assert_eq!(unqualified["model"], "b");
+        assert!(!unqualified.to_string().contains("private reasoning"));
+        let roles: Vec<_> = unqualified["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "user", "assistant", "user"]);
+        third.respond(json!({"status":"completed","output":[{"type":"message","id":"reply",
+            "role":"assistant","status":"completed","content":[{"type":"output_text","text":"other profile"}]}],
+            "usage":{"output_tokens":4}}));
+        chat.done(&three, "succeeded", None).await;
+        assert_eq!(
+            usage(&three).fetch_one(&mut w).await.unwrap(),
+            (None, Some(4))
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn head_conflict_and_cancellation_commit_no_graph_writes() {
+        for cancel in [false, true] {
+            let chat = Chat::new().await;
+            let mut server = Provider::new().await;
+            let (id, input) = chat.submit("race", "a", 4).await;
+            let _worker = chat.start(&server);
+            let pending = server.request().await;
+            if cancel {
+                let actor = principal(&chat.f.db, &chat.f.actor).await;
+                queue::cancel_run(&mut api(&chat.f.db).await, &actor, &chat.f.scope, &id)
+                    .await
+                    .unwrap();
+            } else {
+                // Race a complete, valid publication by a competing API writer.
+                let mut api = api(&chat.f.db).await;
+                let mut tx = api.begin().await.unwrap();
+                let next = message(
+                    &mut tx,
+                    &chat.f.scope,
+                    &chat.root.conversation_id,
+                    Some(&input),
+                )
+                .await
+                .unwrap();
+                sqlx::query("INSERT INTO openmettle.message_turns(scope_id,conversation_id,message_id,author_user_id)
+                    VALUES($1::uuid,$2::uuid,$3::uuid,$4::uuid)").bind(&chat.f.scope).bind(&chat.root.conversation_id).bind(&next).bind(&chat.f.actor.user)
+                    .execute(&mut *tx).await.unwrap();
+                sqlx::query("INSERT INTO openmettle.message_parts(scope_id,conversation_id,message_id,ordinal,kind,text_value)
+                    VALUES($1::uuid,$2::uuid,$3::uuid,0,'text','competing turn')").bind(&chat.f.scope).bind(&chat.root.conversation_id).bind(&next)
+                    .execute(&mut *tx).await.unwrap();
+                sqlx::query("UPDATE openmettle.branch_heads SET head_message_id=$1::uuid WHERE branch_id=$2::uuid")
+                    .bind(&next).bind(&chat.root.branch_id).execute(&mut *tx).await.unwrap();
+                tx.commit().await.unwrap();
+            }
+            let before = chat.graph().await;
+            pending.respond(completion(
+                json!("discard me"),
+                Some("discard blocks"),
+                Value::Null,
+            ));
+            if cancel {
+                chat.done(&id, "cancelled", Some("requested")).await;
+            } else {
+                chat.done(&id, "failed", Some("step_failed")).await;
+            }
+            assert_eq!(chat.graph().await, before);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn lost_holder_and_worker_restart_publish_once() {
+        let chat = Chat::new().await;
+        let mut first = Provider::new().await;
+        let (id, input) = chat.submit("recover", "a", 4).await;
+        let mut old = chat.start(&first);
+        let stale_request = first.request().await;
+        let token: String =
+            sqlx::query_scalar("SELECT claim_token::text FROM openmettle.runs WHERE id=$1::uuid")
+                .bind(&id)
+                .fetch_one(&mut worker(&chat.f.db).await)
+                .await
+                .unwrap();
+        owner_exec(
+            &chat.f.db,
+            "UPDATE openmettle.runs SET lease_expires_at=clock_timestamp() WHERE id=$1::uuid",
+            &id,
+        )
+        .await;
+        let mut second = Provider::new().await;
+        let _replacement = chat.start(&second);
+        let fresh_request = second.request().await;
+        stale_request.respond(completion(json!("old"), None, Value::Null));
+        let stale = Lease {
+            scope_id: &chat.f.scope,
+            run_id: &id,
+            claim_token: &token,
+        };
+        assert!(matches!(
+            settle_answer(
+                &mut worker(&chat.f.db).await,
+                &stale,
+                &LEASES,
+                &branches::Answer {
+                    id: &input,
+                    parts: &[],
+                    reasoning: None,
+                    input_count: None,
+                    output_count: None,
+                }
+            )
+            .await,
+            Err(LeaseError::StaleClaim)
+        ));
+        // Drain the first process while the replacement still owns the claim.
+        drop(old.0.stdin.take());
+        tokio::task::spawn_blocking(move || assert!(old.0.wait().unwrap().success()))
+            .await
+            .unwrap();
+        assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
+        fresh_request.respond(completion(json!("replacement"), None, Value::Null));
+        chat.done(&id, "succeeded", None).await;
+        let (messages, turns, parts, head) = chat.graph().await;
+        assert_eq!((messages, turns, parts), (2, 2, 2));
+        let value: String = sqlx::query_scalar(
+            "SELECT text_value FROM openmettle.message_parts WHERE message_id=$1::uuid",
+        )
+        .bind(head)
+        .fetch_one(&mut api(&chat.f.db).await)
+        .await
+        .unwrap();
+        assert_eq!(value, "replacement");
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn process_crash_preserves_the_round_budget_on_restart() {
+        for rounds in [1, 2] {
+            let chat = Chat::new().await;
+            let mut provider = Provider::new().await;
+            let (id, input) = chat.submit("crash during inference", "a", rounds).await;
+            let original = chat.start(&provider);
+            let mut request = provider.request().await;
+            drop(original); // Kill and wait, without giving the worker a drain or handoff.
+            tokio::time::timeout(Duration::from_secs(5), request.reply.closed())
+                .await
+                .expect("crashed worker disconnected");
+            assert_eq!(chat.graph().await, (1, 1, 1, Some(input.clone())));
+            owner_exec(
+                &chat.f.db,
+                "UPDATE openmettle.runs SET lease_expires_at=clock_timestamp() WHERE id=$1::uuid",
+                &id,
+            )
+            .await;
+            let _restarted = chat.start(&provider);
+            if rounds == 1 {
+                chat.done(&id, "failed", Some("round_limit")).await;
+                assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
+                assert!(provider.requests.try_recv().is_err());
+            } else {
+                provider
+                    .request()
+                    .await
+                    .respond(completion(json!("recovered"), None, Value::Null));
+                chat.done(&id, "succeeded", None).await;
+                let (messages, turns, parts, head) = chat.graph().await;
+                assert_eq!((messages, turns, parts), (2, 2, 2));
+                assert_ne!(head, Some(input));
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn deadline_and_mid_stream_cancel_close_inference_without_answers() {
+        for cancel in [true, false] {
+            let chat = Chat::new().await;
+            let mut server = Provider::new().await;
+            let (id, input) = chat.submit("stall", "a", 4).await;
+            let _worker = chat.start(&server);
+            let mut pending = server.request().await;
+            if cancel {
+                let actor = principal(&chat.f.db, &chat.f.actor).await;
+                queue::cancel_run(&mut api(&chat.f.db).await, &actor, &chat.f.scope, &id)
+                    .await
+                    .unwrap();
+                chat.done(&id, "cancelled", Some("requested")).await;
+            } else {
+                owner_exec(&chat.f.db,"UPDATE openmettle.runs SET lease_expires_at=now(),execution_expires_at=now() WHERE id=$1::uuid",&id).await;
+                chat.done(&id, "failed", Some("deadline_exceeded")).await;
+            }
+            tokio::time::timeout(Duration::from_secs(15), pending.reply.closed())
+                .await
+                .expect("peer closed");
+            assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
+        }
+    }
+}
