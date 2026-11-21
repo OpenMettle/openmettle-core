@@ -620,6 +620,24 @@ pub fn process_stopped(role: Process) {
     tracing::info!(target: TARGET, event = "process.stopped", role = role.as_str());
 }
 
+pub(crate) enum Sweep {
+    Queue,
+    Execution,
+    Uploads,
+    Retention,
+}
+
+pub(crate) fn sweep_failed(sweep: Sweep) {
+    let category = match sweep {
+        Sweep::Queue => "expire_queued",
+        Sweep::Execution => "settle_expired",
+        Sweep::Uploads => "reconcile_expired",
+        Sweep::Retention => "purge_due",
+    };
+    tracing::warn!(target: TARGET, event = "worker.sweep.failed", role = "worker",
+        "error.type" = category);
+}
+
 /// The process is exiting with a runtime failure.
 pub fn process_failed(role: Process, failure: ProcessFailure) {
     tracing::error!(

@@ -261,7 +261,7 @@ today: `Requested { state }`, `Terminal { state }`, or not found.
 The API therefore never makes an executing run terminal. Moving `running` to `cancelling`
 changes no executing count, so it needs no dispatch lock (ADR 0032).
 
-`recheck_leased(c, &Lease, &RunRecheckRequest) -> Result<RunRecheckOutcome, LeaseError>` is the
+`recheck_leased(c, &Lease, &RunRecheckRequest, &LeaseSettings) -> Result<RunRecheckOutcome, LeaseError>` is the
 worker's recheck before dispatch and before every model or tool step. It runs the ADR 0027
 decision after a `Step` fence, in the same transaction. On `Invalidate` it sets
 `cancel_reason = coalesce(cancel_reason, 'revoked')` and applies `settle(Stopped)` (below)

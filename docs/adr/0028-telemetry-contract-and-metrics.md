@@ -33,9 +33,11 @@ It records:
   `openmettle.route_class` so metric buckets never collide with SemConv `http.route` templates
   on trace spans), storage helper attempt semantics (counts helper executions including retries
   before transaction commit), and exact per-metric and total ceilings.
+- ADR 0033 adds `openmettle.runs.cancellations`. It counts terminal cancellation events
+  appended by store helpers before commit. Its reason is `requested` or `revoked`.
 - Reserved future signal namespaces (`openmettle.runs.queue.age`,
-  `openmettle.runs.cancellations`, `openmettle.capacity.grants`,
-  `openmettle.storage.quota.drift`, `openmettle.backup.runs`), owned by V1-10, V1-11, V1-17,
+  `openmettle.capacity.grants`,
+  `openmettle.storage.quota.drift`, `openmettle.backup.runs`), owned by V1-10, V1-17,
   V1-18 and V1-30 respectively.
 
 ### Statically bounded metrics registry
@@ -45,10 +47,10 @@ by pre-allocated `AtomicU64` counters and fixed-bucket histograms (`DURATION_BUC
 
 - Every metric label is a closed Rust enum (`Method`, `RouteClass`, `StatusClass`,
   `ReadinessOutcome`, `ProviderOperation`, `ProviderOutcome`, `StorageOperation`,
-  `StorageOutcome`, `DroppedSignal`). No `String`, raw path, user ID, scope ID, run ID, or
+  `StorageOutcome`, `DroppedSignal`, `CancelReason`). No `String`, raw path, user ID, scope ID, run ID, or
   request ID can be supplied as a metric label.
-- Total worst-case cardinality across all 8 v1 metrics is fixed at compile time: **357**
-  OTLP data-point streams per process, expanding to at most **1,020** Prometheus series per
+- Total worst-case cardinality across all nine v1 metrics is **359**
+  OTLP data-point streams per process, expanding to at most **1,022** Prometheus series per
   process (each 11-boundary histogram stream expands to 12 `_bucket` + `_sum` + `_count` = 14
   series, excluding `target_info`), multiplied by active replica count via `service.instance.id`.
 - Histogram snapshots derive `count` from the sum of loaded bucket counts so the OTLP

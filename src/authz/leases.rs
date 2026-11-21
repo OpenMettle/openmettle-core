@@ -50,6 +50,7 @@ pub enum ExecState {
     Reconciling,
 }
 
+#[repr(usize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CancelReason {
     Requested,
@@ -57,11 +58,10 @@ pub enum CancelReason {
 }
 
 impl CancelReason {
+    pub(crate) const NAMES: &[&str] = &["requested", "revoked"];
+
     pub(super) fn as_str(self) -> &'static str {
-        match self {
-            Self::Requested => "requested",
-            Self::Revoked => "revoked",
-        }
+        Self::NAMES[self as usize]
     }
 
     pub(super) fn payload(self) -> &'static [u8] {
@@ -267,16 +267,21 @@ pub async fn renew_lease(
 /// Make the lease due immediately, retaining the claim and its execution deadline.
 pub async fn release_lease(c: &mut PgConnection, lease: &Lease<'_>) -> Result<(), LeaseError> {
     fenced(c, lease, Fence::Hold, async |tx, _| {
-        sqlx::query(
-            "UPDATE openmettle.runs SET lease_expires_at = least(clock_timestamp(), execution_expires_at)
-              WHERE scope_id = $1::uuid AND id = $2::uuid",
-        )
-        .bind(lease.scope_id)
-        .bind(lease.run_id)
-        .execute(tx.connection()?)
-        .await?;
-        Ok(())
-    }).await
+        release_locked(tx.connection()?, lease).await
+    })
+    .await
+}
+
+async fn release_locked(c: &mut PgConnection, lease: &Lease<'_>) -> Result<(), StoreError> {
+    sqlx::query(
+        "UPDATE openmettle.runs SET lease_expires_at = least(clock_timestamp(), execution_expires_at)
+          WHERE scope_id = $1::uuid AND id = $2::uuid",
+    )
+    .bind(lease.scope_id)
+    .bind(lease.run_id)
+    .execute(c)
+    .await?;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -327,6 +332,16 @@ pub async fn unresolved_operations(
     lease: &Lease<'_>,
     limit: u32,
 ) -> Result<Vec<UnresolvedOperation>, LeaseError> {
+    unresolved_after(c, lease, limit, None).await
+}
+
+/// Keyset pagination visits an unavailable operation only once in a reconciliation pass.
+pub(crate) async fn unresolved_after(
+    c: &mut PgConnection,
+    lease: &Lease<'_>,
+    limit: u32,
+    after: Option<&str>,
+) -> Result<Vec<UnresolvedOperation>, LeaseError> {
     validate_limit(limit)?;
     fenced(c, lease, Fence::Hold, async |tx, _| {
         let rows = sqlx::query(concat!(
@@ -334,11 +349,12 @@ pub async fn unresolved_operations(
                 revision, downstream_handle FROM openmettle.operations
                 WHERE scope_id = $1::uuid AND run_id = $2::uuid AND ",
             unresolved!(),
-            " ORDER BY openmettle.operations.id LIMIT $3"
+            " AND ($4::uuid IS NULL OR id > $4::uuid) ORDER BY openmettle.operations.id LIMIT $3"
         ))
         .bind(lease.scope_id)
         .bind(lease.run_id)
         .bind(i64::from(limit))
+        .bind(after)
         .fetch_all(tx.connection()?)
         .await?;
         rows.iter()
@@ -447,7 +463,11 @@ impl Resolution {
                 bytes,
             },
         )
-        .await
+        .await?;
+        if let Self::Cancelled(reason) = self {
+            crate::telemetry::metrics::global().record_cancellation(reason);
+        }
+        Ok(())
     }
 }
 
@@ -478,6 +498,40 @@ const SETTLEMENT_INPUTS: &str = concat!(
     "), execution_expires_at > clock_timestamp() + $3::bigint * interval '1 millisecond'
          FROM openmettle.runs WHERE scope_id = $1::uuid AND id = $2::uuid"
 );
+
+/// Decide handover under the same lock that excludes new intents and cancellation.
+pub(crate) async fn handoff(
+    c: &mut PgConnection,
+    lease: &Lease<'_>,
+    settings: &LeaseSettings,
+) -> Result<(), LeaseError> {
+    fenced(c, lease, Fence::Hold, async |tx, held| {
+        let c = tx.connection()?;
+        if held.state == ExecState::Reconciling {
+            return release_locked(c, lease).await;
+        }
+        let pending = held.cancel.is_some()
+            || sqlx::query_scalar::<_, bool>(concat!(
+                "SELECT EXISTS (SELECT FROM openmettle.operations
+               WHERE scope_id = $1::uuid AND run_id = $2::uuid AND ",
+                unresolved!(),
+                ")"
+            ))
+            .bind(lease.scope_id)
+            .bind(lease.run_id)
+            .fetch_one(&mut *c)
+            .await?;
+        if pending {
+            let settled =
+                settle_locked(c, lease, held.state, held.cancel, settings, Settle::Stopped).await?;
+            if matches!(settled, Settled::Terminal { .. }) {
+                return Ok(());
+            }
+        }
+        release_locked(c, lease).await
+    })
+    .await
+}
 
 pub(super) async fn settle_locked(
     c: &mut PgConnection,

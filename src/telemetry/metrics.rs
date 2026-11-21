@@ -4,6 +4,7 @@
 //! series cardinality is fixed at compile time and cannot grow with users, scopes, runs or
 //! request IDs. Recording uses wait-free `AtomicU64` counters and fixed-bucket histograms.
 use super::{Method, Process, TARGET};
+use crate::authz::leases::CancelReason;
 use opentelemetry_proto::tonic::{
     collector::metrics::v1::ExportMetricsServiceRequest,
     common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value},
@@ -506,6 +507,18 @@ pub const DESCRIPTORS: &[MetricDescriptor] = &[
         }],
         buckets: None,
     },
+    MetricDescriptor {
+        name: "openmettle.runs.cancellations",
+        prometheus_name: "openmettle_runs_cancellations_total",
+        kind: InstrumentKind::Counter,
+        unit: "{run}",
+        description: "Terminal cancellation events appended by store helpers before transaction commit.",
+        labels: &[LabelDescriptor {
+            name: "reason",
+            values: CancelReason::NAMES,
+        }],
+        buckets: None,
+    },
 ];
 
 /// Sum of `max_series()` (OTLP data-point streams) across all v1 metrics.
@@ -587,6 +600,7 @@ pub struct Metrics {
     provider_requests: [AtomicU64; PROVIDER_SLOTS],
     provider_duration: [HistogramSlot; PROVIDER_SLOTS],
     storage_operations: [AtomicU64; STORAGE_SLOTS],
+    cancellations: [AtomicU64; CancelReason::NAMES.len()],
     telemetry_dropped: [AtomicU64; DROPPED_SLOTS],
 }
 
@@ -621,6 +635,7 @@ impl Metrics {
             provider_requests: std::array::from_fn(|_| AtomicU64::new(0)),
             provider_duration: std::array::from_fn(|_| HistogramSlot::new()),
             storage_operations: std::array::from_fn(|_| AtomicU64::new(0)),
+            cancellations: std::array::from_fn(|_| AtomicU64::new(0)),
             telemetry_dropped: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
@@ -660,6 +675,10 @@ impl Metrics {
     pub fn record_storage(&self, operation: StorageOperation, outcome: StorageOutcome) {
         let idx = operation.index() * StorageOutcome::NAMES.len() + outcome.index();
         self.storage_operations[idx].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_cancellation(&self, reason: CancelReason) {
+        self.cancellations[reason as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_dropped(&self, signal: DroppedSignal, count: u64) {
@@ -826,6 +845,15 @@ impl Metrics {
             ));
         }
         push_counter(&mut metrics, &DESCRIPTORS[7], drop_points);
+
+        let mut points = Vec::new();
+        for (slot, reason) in self.cancellations.iter().zip(CancelReason::NAMES) {
+            let value = slot.load(Ordering::Relaxed);
+            if value > 0 {
+                points.push(counter_point(start, now, value, &[("reason", reason)]));
+            }
+        }
+        push_counter(&mut metrics, &DESCRIPTORS[8], points);
 
         if metrics.is_empty() {
             return None;

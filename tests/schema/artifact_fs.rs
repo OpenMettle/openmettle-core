@@ -747,3 +747,127 @@ async fn purge_unlinks_the_payload_before_confirming() {
     assert_eq!(state, "purged");
     assert_totals(&f.db).await;
 }
+
+fn sweep_process(f: &Fixture, artifacts: bool) -> Process {
+    let mut cmd = binary("worker");
+    cmd.env("OPENMETTLE_WORKER_BIND", address())
+        .env("OPENMETTLE_WORKER_DATABASE_URL", f.db.url(WORKER))
+        .env("OPENMETTLE_WORKER_SWEEP_MS", "1000");
+    if artifacts {
+        cmd.env("OPENMETTLE_WORKER_ARTIFACTS_DIR", &f.root);
+    }
+    Process(cmd.spawn().unwrap())
+}
+
+async fn expired_runs(f: &Fixture, tx: &mut WriteTransaction<'_>, prefix: &str) -> [String; 2] {
+    let queued = runs::create_run(tx, &f.c.input(&format!("{prefix}-queue")))
+        .await
+        .unwrap();
+    let running = runs::create_run(tx, &f.c.input(&format!("{prefix}-running")))
+        .await
+        .unwrap();
+    // Legacy queued and executing rows with NULL deadlines are both due (ADR 0033).
+    sqlx::query("UPDATE openmettle.runs SET state = 'running' WHERE id = $1::uuid")
+        .bind(&running)
+        .execute(tx.connection().unwrap())
+        .await
+        .unwrap();
+    [queued, running]
+}
+
+async fn assert_swept(f: &Fixture, ids: &[String; 2]) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for (id, expected) in ids
+            .iter()
+            .zip(["openmettle.run-expired", "openmettle.run-failed"])
+        {
+            loop {
+                let events = crate::authz_runs::terminal_events(&f.db, id).await;
+                if let Some((format, _)) = events.first() {
+                    assert_eq!(events.len(), 1);
+                    assert_eq!(format, expected);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn worker_binary_sweeps_with_and_without_payloads_and_recovers_after_signals() {
+    use std::os::unix::process::ExitStatusExt;
+    let f = Fixture::new().await;
+    let doc = new_uuid(&f.db).await;
+    let old = f.reserve("abandoned", &doc, 100).await;
+    let staged = f.root.join("staging").join(&old);
+    fs::write(&staged, b"partial").unwrap();
+    sqlx::query("UPDATE openmettle.storage_reservations SET created_at = now() - interval '901 seconds' WHERE id = $1::uuid")
+        .bind(&old).execute(&mut f.db.admin().await).await.unwrap();
+    let body = form("x", &[METADATA, file(None, b"retained")], true);
+    let stored = f
+        .upload("retained", &doc, 100, "x", chunked(&body, 16), true)
+        .await
+        .unwrap();
+    let payload = f.root.join("revisions").join(&stored.reservation);
+    let mut c = connect(&f.db.0, API).await;
+    let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+    storage::retain_revision(&mut tx, &f.c.scope, &stored.revision, 1)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // Both signals hit a real sweep blocked on this fixture's table lock. The replacement
+    // must settle the queued work once, including a batch left behind by SIGKILL.
+    let mut owner = f.db.admin().await;
+    let mut seed = WriteTransaction::begin(&mut owner).await.unwrap();
+    let mut ids = expired_runs(&f, &mut seed, "first").await;
+    seed.commit().await.unwrap();
+    for (artifacts, sig) in [(false, "-TERM"), (true, "-KILL")] {
+        let mut process = sweep_process(&f, artifacts);
+        assert_swept(&f, &ids).await;
+        if artifacts {
+            tokio::time::timeout(Duration::from_secs(8), async {
+                while account(&f.db, &f.c.scope).await != (0, 0, 0) {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(staged.exists(), !artifacts);
+        assert_eq!(payload.exists(), !artifacts);
+        let mut lock = WriteTransaction::begin(&mut owner).await.unwrap();
+        lock.connection()
+            .unwrap()
+            .execute("LOCK openmettle.runs IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        ids = expired_runs(&f, &mut lock, sig).await;
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar("SELECT EXISTS (SELECT FROM pg_stat_activity WHERE datname = current_database() AND usename = 'openmettle_worker' AND wait_event_type = 'Lock' AND query LIKE '%WITH due AS MATERIALIZED%')")
+                    .fetch_one(&mut f.db.admin().await).await.unwrap();
+                if waiting { break }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }).await.unwrap();
+        signal(&process.0, sig);
+        lock.commit().await.unwrap();
+        let status = process.0.wait().unwrap();
+        if artifacts {
+            assert_eq!(status.signal(), Some(9));
+        } else {
+            assert_eq!(status.code(), Some(0));
+        }
+    }
+    let mut replacement = sweep_process(&f, true);
+    assert_swept(&f, &ids).await;
+    signal(&replacement.0, "-TERM");
+    assert!(replacement.0.wait().unwrap().success());
+    assert_eq!(f.state("abandoned").await.as_deref(), Some("released"));
+    assert_totals(&f.db).await;
+}

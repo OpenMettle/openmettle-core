@@ -895,3 +895,6 @@ async fn invalid_raw_cancelling_row_rolls_back_the_upgrade() {
         [id]
     );
 }
+
+#[path = "worker_runtime.rs"]
+mod worker_runtime;

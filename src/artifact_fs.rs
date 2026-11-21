@@ -36,6 +36,8 @@ const STAGING: &str = "staging";
 const REVISIONS: &str = "revisions";
 /// Largest chunk one read of a payload file returns.
 const READ_CHUNK: u64 = 64 * 1024;
+/// Wall-clock limit for the HTTP upload. Worker cleanup adds a settlement allowance.
+pub const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 /// Largest batch one reconciliation call handles.
 pub const MAX_BATCH: i64 = 1000;
 

@@ -16,15 +16,16 @@ This directory qualifies the V1-01 process contract in [`runtime/process-contrac
 | API stays ready while the worker scales to zero | 4 readiness probes per second during and 10 s after scale-down; same API pod, no restarts, `readyReplicas` 1 |
 | Independent scaling | Worker at 2 ready replicas while the API stays at 1 |
 | Database loss gates readiness only | API `/readyz` 503, `/healthz` 200, pods `NotReady`, then recovery with zero restarts |
+| Worker maintenance after termination | After SIGTERM scale-down and after a SIGKILL container restart (exit 137), the worker records the expected terminal event and payload for each due queued and executing run. |
 | Clean shutdown | Exit code 0 after SIGTERM for every API and worker container. A temporary finalizer keeps each pod visible until its exit code is read. |
 
-The app namespace enforces the `restricted` Pod Security Standard, so a pod that violates it is rejected and the run fails. Any failed HTTP request, rollout or assertion fails the run. A rendered manifest never counts as evidence. The cluster-free unit tests in `test_qualify.py` cover only guards and manifest derivation.
+The app namespace enforces the `restricted` Pod Security Standard, so a pod that violates it is rejected and the run fails. Any failed HTTP request, rollout or assertion fails the run. A rendered manifest never counts as evidence. The cluster-free unit tests in `test_qualify.py` cover guards, manifest derivation and recovery assertions.
 
 The fixtures set `enableServiceLinks: false`. Without it, Kubernetes injects variables such as `OPENMETTLE_API_PORT` and `OPENMETTLE_API_SERVICE_HOST` into every pod in the namespace. Those names collide with the process configuration prefix. Deploy packaging should disable service links too.
 
 ## Fixture values
 
-Resource requests (`100m` CPU and `64Mi` memory per process) are the contract's example values. Per-process settings differ deliberately to show that the processes are configured independently: the API uses 4 connections and 2000/5000 ms database/shutdown timeouts, and the worker uses 2 connections and 1500/4000 ms. None of these is production sizing or tuning. Database passwords are random for each run and are never printed. PostgreSQL uses an `emptyDir` volume and TLS is disabled (`sslmode=disable`). Both are acceptable only for this fixture.
+Resource requests (`100m` CPU and `64Mi` memory per process) are the contract's example values. Per-process settings differ deliberately to show that the processes are configured independently: the API uses 4 connections and 2000/5000 ms database/shutdown timeouts, and the worker uses 2 connections and 1500/4000 ms, with a 1,000 ms sweep interval. None of these is production sizing or tuning. Database passwords are random for each run and are never printed. PostgreSQL uses an `emptyDir` volume and TLS is disabled (`sslmode=disable`). Both are acceptable only for this fixture.
 
 ## Safety guards
 
@@ -69,4 +70,4 @@ Full digests are in `install-tools.sh` and `qualify.py`. They were resolved on 1
 - One single-node kind cluster on amd64. Multi-node scheduling, network policy, resource limits, autoscaling, real storage and TLS are not exercised.
 - Requests are scheduled, but they are not shown to be sufficient under load.
 - No RBAC is granted. The processes do not call the Kubernetes API, so no Role is needed.
-- No domain schema or job execution is involved. V1-02 and V1-03 own those.
+- The fixture applies the release schema to exercise maintenance. Live run execution and lease handover in kind require the V1-07 executor.

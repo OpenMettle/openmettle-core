@@ -2382,3 +2382,124 @@ async fn postgres_mounted_session_routes_use_the_primary_database() {
     assert!(events.iter().all(|event| event["level"] != "WARN"));
     assert_eq!(events.last().unwrap()["event"], "process.stopped");
 }
+
+#[test]
+fn worker_scheduling_configuration_is_validated_before_serving() {
+    let policy = [
+        ("RUN_SLOTS", "1"),
+        ("LEASE_MS", "30000"),
+        ("EXECUTION_TIMEOUT_MS", "60000"),
+        ("EXECUTING_PER_ACTOR", "1"),
+        ("EXECUTING_PER_SCOPE", "1"),
+    ];
+    let invoke = |worker: bool, vars: &[(&str, &str)], message: &str| {
+        let prefix = if worker {
+            "OPENMETTLE_WORKER"
+        } else {
+            "OPENMETTLE_API"
+        };
+        let mut child = command(worker);
+        child.env(
+            format!("{prefix}_DATABASE_URL"),
+            "postgres://localhost/test",
+        );
+        for (key, value) in vars {
+            child.env(format!("OPENMETTLE_WORKER_{key}"), value);
+        }
+        let output = child.output().unwrap();
+        assert_eq!(output.status.code(), Some(78));
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            format!("configuration error: {message}\n")
+        );
+    };
+    for (key, below, above) in [
+        ("SWEEP_MS", "999", "3600001"),
+        ("POLL_MS", "99", "60001"),
+        ("RUN_SLOTS", "0", "257"),
+        ("LEASE_MS", "29999", "600001"),
+        ("EXECUTION_TIMEOUT_MS", "59999", "86400001"),
+        ("EXECUTING_PER_ACTOR", "0", "1025"),
+        ("EXECUTING_PER_SCOPE", "0", "1025"),
+    ] {
+        invoke(
+            false,
+            &[(key, "")],
+            "worker scheduling settings are refused on the API",
+        );
+        for value in [below, above, "synthetic-invalid"] {
+            let mut vars = policy.to_vec();
+            vars.push((key, value));
+            invoke(true, &vars, key);
+        }
+    }
+    invoke(true, &policy, "RUN_SLOTS requires a worker executor");
+    invoke(
+        true,
+        &policy[..1],
+        "RUN_SLOTS requires lease and claim settings",
+    );
+    for &var in &policy[1..] {
+        invoke(true, &[var], "lease and claim settings require RUN_SLOTS");
+    }
+    for (change, message) in [
+        (
+            ("DB_TIMEOUT_MS", "5001"),
+            "LEASE_MS must cover six DB_TIMEOUT_MS",
+        ),
+        (
+            ("LEASE_MS", "30001"),
+            "EXECUTION_TIMEOUT_MS must cover two leases",
+        ),
+    ] {
+        let mut vars = policy.to_vec();
+        vars.push(change);
+        invoke(true, &vars, message);
+    }
+}
+
+#[test]
+fn failed_sweeps_report_fixed_categories_and_retry_next_tick() {
+    use std::io::{BufRead, BufReader};
+    let dir = auth_config_support::Dir::new();
+    let root = dir.path("payloads");
+    std::fs::create_dir(&root).unwrap();
+    let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "postgres://fixture:CANARY@{}/fixture",
+        unavailable.local_addr().unwrap()
+    );
+    let mut process = start_logging(
+        true,
+        &address(),
+        &url,
+        &[("SWEEP_MS", "1000"), ("ARTIFACTS_DIR", &root)],
+    );
+    let pipe = process.0.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(pipe).lines() {
+            let line = line.unwrap();
+            assert!(!line.contains("CANARY"));
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if event["event"] == "worker.sweep.failed" {
+                assert_eq!(event["level"], "WARN");
+                assert_eq!(event["role"], "worker");
+                tx.send(event["error.type"].as_str().unwrap().to_owned())
+                    .unwrap();
+            }
+        }
+    });
+    for _ in 0..2 {
+        for expected in [
+            "expire_queued",
+            "settle_expired",
+            "reconcile_expired",
+            "purge_due",
+        ] {
+            assert_eq!(rx.recv_timeout(Duration::from_secs(6)).unwrap(), expected);
+        }
+    }
+    stop(&mut process, "-TERM");
+    reader.join().unwrap();
+}

@@ -477,7 +477,11 @@ async fn cancel_event(
             bytes: reason.payload(),
         },
     )
-    .await
+    .await?;
+    if state == "cancelled" {
+        crate::telemetry::metrics::global().record_cancellation(reason);
+    }
+    Ok(())
 }
 
 async fn terminal_events(
