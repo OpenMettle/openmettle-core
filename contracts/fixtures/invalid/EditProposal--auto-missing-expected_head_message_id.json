@@ -1,0 +1,33 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "EditProposal--auto-missing-expected_head_message_id",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "selection": {
+      "preset": "study"
+    },
+    "turn": {
+      "input_message_id": "0f0e0d0c-0b0a-4908-8706-050403020102",
+      "mode": "edit",
+      "parts": [
+        {
+          "attachment": "0f0e0d0c-0b0a-4908-8706-050403020100"
+        }
+      ],
+      "target_message_id": "0f0e0d0c-0b0a-4908-8706-050403020101"
+    }
+  },
+  "mutation": {
+    "name": "auto-missing-expected_head_message_id",
+    "op": "remove",
+    "path": "/expected_head_message_id"
+  },
+  "schema": "#/components/schemas/TurnProposal",
+  "source": "#/components/examples/EditProposal"
+}

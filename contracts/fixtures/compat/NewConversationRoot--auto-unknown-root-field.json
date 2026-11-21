@@ -1,0 +1,24 @@
+{
+  "class": "compat",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "NewConversationRoot--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "branch_id": "0f0e0d0c-0b0a-4908-8706-050403020101",
+    "conversation_id": "0f0e0d0c-0b0a-4908-8706-050403020100",
+    "scope_id": "0f0e0d0c-0b0a-4908-8706-050403020102",
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/ConversationRoot",
+  "source": "#/components/examples/NewConversationRoot"
+}

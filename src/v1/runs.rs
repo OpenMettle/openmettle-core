@@ -128,7 +128,7 @@ fn request_cursor(parts: &Parts) -> Result<Option<Cursor>, Problem> {
     Ok(header.or(after))
 }
 
-const SNAPSHOT: &str = "SELECT r.scope_id::text, r.conversation_id::text, r.state, r.last_event_sequence,
+const SNAPSHOT: &str = "SELECT r.branch_id::text, r.input_message_id::text, r.scope_id::text, r.conversation_id::text, r.state, r.last_event_sequence,
     (extract(epoch FROM r.created_at)*1000000)::bigint AS created_us,
     CASE WHEN t.sequence IS NOT NULL THEN ROW(t.sequence, t.format, t.format_version, t.payload,
         (extract(epoch FROM t.created_at)*1000000)::bigint) END AS terminal
@@ -277,6 +277,16 @@ impl Api {
             .get::<Arc<CursorKeys>>()
             .ok_or(PROVISIONING)?;
         let context = self.authenticate(&session).await?;
+        self.run_response(&context, keys, run, StatusCode::OK).await
+    }
+
+    pub(super) async fn run_response(
+        &self,
+        context: &sessions::Context,
+        keys: &CursorKeys,
+        run: &str,
+        status: StatusCode,
+    ) -> Result<Response, Problem> {
         let row = self
             .database(async |c| {
                 let row = sqlx::query(SNAPSHOT)
@@ -284,7 +294,7 @@ impl Api {
                     .fetch_optional(&mut *c)
                     .await?
                     .ok_or(StoreError::NotFound)?;
-                authorize(c, &context, &row).await?;
+                authorize(c, context, &row).await?;
                 Ok(row)
             })
             .await?;
@@ -300,8 +310,9 @@ impl Api {
             .transpose()?
             .flatten();
         Ok(reply(
-            StatusCode::OK,
+            status,
             json!({
+                "branch_id": row.get::<&str,_>("branch_id"), "input_message_id": row.get::<&str,_>("input_message_id"),
                 "run_id": run, "conversation_id": row.get::<&str,_>("conversation_id"),
                 "state": wire_state(row.get("state")), "created_at": timestamp(row.get("created_us"))?,
                 "last_sequence": last.to_string(), "resume_cursor": binding.sign(keys, last), "terminal": terminal

@@ -18,7 +18,7 @@ use env_support::scrub_env;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::OnceLock,
 };
@@ -1479,4 +1479,91 @@ async fn evaluated_capabilities_match_canonical_schema() {
             }
         }
     }
+}
+
+#[test]
+fn consumer_reads_each_managed_conversation_operation() {
+    let operations = [
+        "createConversation",
+        "listConversations",
+        "createBranch",
+        "listBranches",
+        "getBranch",
+        "listMessages",
+        "listModels",
+        "listPresets",
+        "getPreset",
+        "previewConfiguration",
+        "createRun",
+        "cancelRun",
+    ];
+    let mut found = BTreeSet::new();
+    for path in contract()["paths"].as_object().unwrap().values() {
+        for op in path.as_object().unwrap().values() {
+            let id = op["operationId"].as_str().unwrap();
+            if !operations.contains(&id) {
+                continue;
+            }
+            for (status, r) in op["responses"].as_object().unwrap() {
+                if !status.starts_with('2') {
+                    continue;
+                }
+                let schema = r
+                    .pointer("/content/application~1json/schema/$ref")
+                    .unwrap()
+                    .as_str()
+                    .unwrap();
+                let all = fixtures_for(schema, &["valid", "compat"]);
+                assert!(!all.is_empty(), "{id} {status}");
+                for f in all {
+                    consumer::decode_conversation_operation(id, &f.instance)
+                        .unwrap_or_else(|e| panic!("{id} {}: {e}", f.path));
+                }
+            }
+            found.insert(id);
+        }
+    }
+    assert_eq!(found, operations.into_iter().collect());
+    let run = consumer::decode_run(&fixture("RunWithBranch")).unwrap();
+    assert!(run.branch_id.is_some() && run.input_message_id.is_some());
+    let legacy = consumer::decode_run(&fixture("RunSnapshot")).unwrap();
+    assert!(legacy.branch_id.is_none() && legacy.input_message_id.is_none());
+}
+
+#[test]
+fn auth_settings_validate_optional_catalog_and_admission_limits_offline() {
+    use openmettle_core::auth_config::{Error, load};
+    let dir = auth_config_support::Dir::new();
+    let mut doc = auth_config_support::document_v2_native(&dir, &ca::Ca::new().pem());
+    let check = |doc: &Value| {
+        load(Path::new(
+            &dir.write("auth.json", &serde_json::to_vec(doc).unwrap()),
+        ))
+        .map(drop)
+    };
+    assert!(check(&doc).is_ok());
+    doc["catalog_file"] = json!(dir.write(
+        "catalog.json",
+        br#"{"version":1,"revision":"empty","models":{},"presets":{}}"#
+    ));
+    doc["admission_limits"] = json!({"live_per_actor":1,"live_per_scope":2,"queued_in_instance":3,"queue_timeout_seconds":4,"round_cap":5});
+    assert!(check(&doc).is_ok());
+    for key in [
+        "live_per_actor",
+        "live_per_scope",
+        "queued_in_instance",
+        "queue_timeout_seconds",
+        "round_cap",
+    ] {
+        let mut invalid = doc.clone();
+        invalid["admission_limits"][key] = json!(0);
+        assert_eq!(check(&invalid), Err(Error::AdmissionLimits));
+        invalid["admission_limits"]
+            .as_object_mut()
+            .unwrap()
+            .remove(key);
+        assert_eq!(check(&invalid), Err(Error::MissingField));
+    }
+    doc["catalog_file"] = json!(dir.write("catalog.json", b"invalid"));
+    assert_eq!(check(&doc), Err(Error::Catalog));
 }

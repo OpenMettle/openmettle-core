@@ -16,7 +16,8 @@
 //!    one `Authorization: Bearer` native credential (ADR 0029). Both, neither, a repeated
 //!    field or a refused `Origin` is `401 unauthenticated`.
 //! 5. Request shape: the path identifiers, a write's `Idempotency-Key` and the body profile:
-//!    empty, or one `application/json` object of at most [`MAX_BODY_BYTES`] read within
+//!    empty, or one bounded `application/json` object (128 KiB for admission and preview,
+//!    64 KiB for other operations) read within
 //!    [`BODY_READ_TIMEOUT`]. A refusal is `400 validation`. An artifact upload instead checks
 //!    its query and multipart `Content-Type`, and its body is streamed later; a download checks
 //!    its `Range`. An artifact payload operation without `ARTIFACTS_DIR` is then
@@ -168,7 +169,13 @@ impl Problem {
             "detail": self.detail,
             "request_id": id.map_or_else(|| NIL_REQUEST_ID.to_owned(), |id| id.to_string()),
         });
-        respond(self.status, Some("application/problem+json"), body)
+        let mut response = respond(self.status, Some("application/problem+json"), body);
+        if self == submission::QUEUE_FULL {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        response
     }
 }
 
@@ -248,6 +255,18 @@ fn no_content() -> Response {
 /// The mounted application operations, each named by its `operationId`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Op {
+    CreateConversation,
+    ListConversations,
+    CreateBranch,
+    ListBranches,
+    GetBranch,
+    ListMessages,
+    ListModels,
+    ListPresets,
+    GetPreset,
+    PreviewConfiguration,
+    CreateRun,
+    CancelRun,
     GetRun,
     StreamRunEvents,
     ListCapabilities,
@@ -273,6 +292,18 @@ impl Op {
     fn id(self) -> &'static str {
         use ResourceKind::Conversation;
         match self {
+            Self::CreateConversation => "createConversation",
+            Self::ListConversations => "listConversations",
+            Self::CreateBranch => "createBranch",
+            Self::ListBranches => "listBranches",
+            Self::GetBranch => "getBranch",
+            Self::ListMessages => "listMessages",
+            Self::ListModels => "listModels",
+            Self::ListPresets => "listPresets",
+            Self::GetPreset => "getPreset",
+            Self::PreviewConfiguration => "previewConfiguration",
+            Self::CreateRun => "createRun",
+            Self::CancelRun => "cancelRun",
             Self::GetRun => "getRun",
             Self::StreamRunEvents => "streamRunEvents",
             Self::ListCapabilities => "listCapabilities",
@@ -299,7 +330,15 @@ impl Op {
     fn reads(self) -> bool {
         matches!(
             self,
-            Self::GetRun
+            Self::ListConversations
+                | Self::ListBranches
+                | Self::GetBranch
+                | Self::ListMessages
+                | Self::ListModels
+                | Self::ListPresets
+                | Self::GetPreset
+                | Self::PreviewConfiguration
+                | Self::GetRun
                 | Self::StreamRunEvents
                 | Self::ListCapabilities
                 | Self::GetProject
@@ -316,7 +355,11 @@ impl Op {
     fn json(self) -> bool {
         matches!(
             self,
-            Self::CreateProject
+            Self::CreateRun
+                | Self::CreateConversation
+                | Self::CreateBranch
+                | Self::PreviewConfiguration
+                | Self::CreateProject
                 | Self::UpdateProjectSettings
                 | Self::SetProjectMemberRole
                 | Self::RevokeProjectMember
@@ -328,7 +371,15 @@ impl Op {
     fn targeted(self) -> bool {
         !matches!(
             self,
-            Self::ListCapabilities | Self::CreateProject | Self::CreateArtifact
+            Self::GetPreset
+                | Self::ListModels
+                | Self::ListPresets
+                | Self::CreateRun
+                | Self::ListConversations
+                | Self::CreateConversation
+                | Self::ListCapabilities
+                | Self::CreateProject
+                | Self::CreateArtifact
         )
     }
 }
@@ -420,6 +471,14 @@ fn parse<T: DeserializeOwned>(body: &[u8]) -> Result<T, Problem> {
     serde_json::from_slice(body).map_err(|_| BODY)
 }
 
+fn parse_unique<T: DeserializeOwned>(body: &[u8]) -> Result<T, Problem> {
+    let value = crate::provider_keys::documents::unique(body).map_err(|_| BODY)?;
+    if !value.is_object() {
+        return Err(BODY);
+    }
+    serde_json::from_value(value).map_err(|_| BODY)
+}
+
 /// A role or access key, matched exactly by the one grant vocabulary (ADR 0027).
 fn vocabulary<P>(
     format: &str,
@@ -432,13 +491,14 @@ fn vocabulary<P>(
 }
 
 /// A request body decoded and checked before any database work.
-#[derive(Debug, PartialEq)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 enum Input {
     Empty,
     Settings {
         name: String,
         instructions: String,
         defaults: Value,
+        selection: Box<crate::model_config::Selection>,
     },
     /// A role grant, or a revocation without a role.
     Member {
@@ -457,11 +517,11 @@ enum Input {
 fn decode(op: Op, body: &[u8]) -> Result<(Input, Option<String>), Problem> {
     let (input, reason) = match op {
         Op::CreateProject => {
-            let b: NewProject = parse(body)?;
+            let b: NewProject = parse_unique(body)?;
             (settings(b.name, b.instructions, b.defaults)?, b.reason)
         }
         Op::UpdateProjectSettings => {
-            let b: SettingsUpdate = parse(body)?;
+            let b: SettingsUpdate = parse_unique(body)?;
             (settings(b.name, b.instructions, b.defaults)?, b.reason)
         }
         Op::SetProjectMemberRole => {
@@ -520,10 +580,12 @@ fn settings(name: String, instructions: String, defaults: Value) -> Result<Input
     }
     .validate()
     .map_err(store_problem)?;
+    let selection = crate::model_config::Selection::from_defaults(&defaults, "")?;
     Ok(Input::Settings {
         name,
         instructions,
         defaults,
+        selection: Box::new(selection),
     })
 }
 
@@ -555,10 +617,15 @@ async fn read_body(op: Op, headers: &HeaderMap, body: Body) -> Result<Bytes, Pro
         (Some(value), None) => json_media_type(value.as_bytes()),
         _ => false,
     };
-    if !declared || body.size_hint().lower() > MAX_BODY_BYTES as u64 {
+    let limit = if matches!(op, Op::CreateRun | Op::PreviewConfiguration) {
+        131072
+    } else {
+        MAX_BODY_BYTES
+    };
+    if !declared || body.size_hint().lower() > limit as u64 {
         return Err(BODY);
     }
-    match tokio::time::timeout(BODY_READ_TIMEOUT, to_bytes(body, MAX_BODY_BYTES)).await {
+    match tokio::time::timeout(BODY_READ_TIMEOUT, to_bytes(body, limit)).await {
         Ok(Ok(bytes)) => Ok(bytes),
         _ => Err(BODY),
     }
@@ -705,11 +772,39 @@ pub fn router(
 }
 
 /// Every contract path template with its operations, by method.
-fn routes() -> [(&'static str, Vec<(Method, Op)>); 19] {
+fn routes() -> [(&'static str, Vec<(Method, Op)>); 29] {
     use Op::*;
     use ResourceKind::{Artifact, Conversation};
     let (get, put, post) = (Method::GET, Method::PUT, Method::POST);
     [
+        (
+            "/v1/conversations",
+            vec![
+                (get.clone(), ListConversations),
+                (post.clone(), CreateConversation),
+            ],
+        ),
+        (
+            "/v1/conversations/{conversation_id}/branches",
+            vec![(get.clone(), ListBranches), (post.clone(), CreateBranch)],
+        ),
+        (
+            "/v1/conversations/{conversation_id}/branches/{branch_id}",
+            vec![(get.clone(), GetBranch)],
+        ),
+        (
+            "/v1/conversations/{conversation_id}/branches/{branch_id}/messages",
+            vec![(get.clone(), ListMessages)],
+        ),
+        (
+            "/v1/conversations/{conversation_id}/branches/{branch_id}/effective-configuration",
+            vec![(post.clone(), PreviewConfiguration)],
+        ),
+        ("/v1/models", vec![(get.clone(), ListModels)]),
+        ("/v1/presets", vec![(get.clone(), ListPresets)]),
+        ("/v1/presets/{preset_id}", vec![(get.clone(), GetPreset)]),
+        ("/v1/runs", vec![(post.clone(), CreateRun)]),
+        ("/v1/runs/{run_id}/cancel", vec![(post.clone(), CancelRun)]),
         ("/v1/runs/{run_id}", vec![(get.clone(), GetRun)]),
         (
             "/v1/runs/{run_id}/events",
@@ -808,7 +903,7 @@ impl Api {
         operations: &[(Method, Op)],
         request: Request,
     ) -> Result<Response, Problem> {
-        let (parts, body) = request.into_parts();
+        let (mut parts, body) = request.into_parts();
         // HEAD is GET without a body, which the server never sends.
         let method = match parts.method {
             Method::HEAD => Method::GET,
@@ -850,7 +945,7 @@ impl Api {
         }
         let key = match op.reads() {
             true => None,
-            false => Some(request_key(op, target, idempotency_key(&parts.headers)?)),
+            false => Some(idempotency_key(&parts.headers)?.to_owned()),
         };
         let body = read_body(op, &parts.headers, body).await?;
         if matches!(op, Op::GetArtifactRevision | Op::DownloadArtifactRevision) {
@@ -859,6 +954,26 @@ impl Api {
         if op == Op::GetRun {
             return self.snapshot(&parts, session, target).await;
         }
+        if matches!(
+            op,
+            Op::CreateConversation
+                | Op::ListConversations
+                | Op::CreateBranch
+                | Op::ListBranches
+                | Op::GetBranch
+                | Op::ListMessages
+                | Op::ListModels
+                | Op::ListPresets
+                | Op::GetPreset
+                | Op::PreviewConfiguration
+                | Op::CreateRun
+                | Op::CancelRun
+        ) {
+            return self
+                .conversation_operation(op, &mut parts, session, key.as_deref(), &body)
+                .await;
+        }
+        let key = key.map(|raw| request_key(op, target, &raw));
         let (input, reason) = decode(op, &body)?;
         let context = self.authenticate(&session).await?;
         let call = Call {
@@ -868,7 +983,11 @@ impl Api {
             key: key.as_deref().unwrap_or_default(),
             reason: reason.as_deref(),
         };
-        self.run(call, input).await
+        let catalog = parts
+            .extensions
+            .get::<Arc<crate::model_config::Catalog>>()
+            .map(Arc::as_ref);
+        self.run(call, input, catalog).await
     }
 
     /// Selects one session channel from the head alone, before any database work.
@@ -938,18 +1057,30 @@ impl Api {
         &self,
         work: impl AsyncFnOnce(&mut PgConnection) -> Result<T, StoreError>,
     ) -> Result<T, Problem> {
+        self.with_connection(async |c| work(c).await.map_err(store_problem))
+            .await
+    }
+
+    async fn with_connection<T>(
+        &self,
+        work: impl AsyncFnOnce(&mut PgConnection) -> Result<T, Problem>,
+    ) -> Result<T, Problem> {
         tokio::time::timeout(OPERATION_TIMEOUT, async {
             let mut db = Checkout::acquire(&self.pool).await?;
             let result = work(db.lend()).await;
-            db.settle(!matches!(result, Err(StoreError::Database(_))));
+            db.settle(!matches!(result.as_ref().err(), Some(p) if *p == UNAVAILABLE));
             result
         })
         .await
         .map_err(|_| TIMEOUT)?
-        .map_err(store_problem)
     }
 
-    async fn run(&self, call: Call<'_>, input: Input) -> Result<Response, Problem> {
+    async fn run(
+        &self,
+        call: Call<'_>,
+        input: Input,
+        catalog: Option<&crate::model_config::Catalog>,
+    ) -> Result<Response, Problem> {
         let Call {
             op,
             context,
@@ -979,6 +1110,7 @@ impl Api {
                     name,
                     instructions,
                     defaults,
+                    selection,
                 },
             ) => {
                 let settings = ProjectSettingsInput {
@@ -986,12 +1118,23 @@ impl Api {
                     instructions: &instructions,
                     defaults: &defaults,
                 };
+                let check_defaults = async |c: &mut PgConnection, actor: &Principal| {
+                    catalog::check_project_defaults(c, actor, catalog, &selection).await
+                };
                 let view = self
                     .database(async |c| {
                         let project = if op == Op::CreateProject {
-                            projects::create_project(c, &audit, &settings).await?
+                            projects::create_project_checked(c, &audit, &settings, check_defaults)
+                                .await?
                         } else {
-                            projects::update_project_settings(c, &audit, target, &settings).await?
+                            projects::update_project_settings_checked(
+                                c,
+                                &audit,
+                                target,
+                                &settings,
+                                check_defaults,
+                            )
+                            .await?
                         };
                         read_project(c, context, project.target_id()).await
                     })
@@ -1133,8 +1276,38 @@ async fn read_project(
     projects::read_project(c, &principal, project_id, context.observed_ms()).await
 }
 
+impl From<StoreError> for Problem {
+    fn from(e: StoreError) -> Self {
+        store_problem(e)
+    }
+}
+impl From<sqlx::Error> for Problem {
+    fn from(_: sqlx::Error) -> Self {
+        UNAVAILABLE
+    }
+}
+impl From<crate::runs::Error> for Problem {
+    fn from(e: crate::runs::Error) -> Self {
+        store_problem(e.into())
+    }
+}
+impl From<crate::model_config::Error> for Problem {
+    fn from(e: crate::model_config::Error) -> Self {
+        use crate::model_config::Error::*;
+        match e {
+            Invalid(_) => INVALID,
+            Unauthorized => POLICY,
+            Provisioning => PROVISIONING,
+        }
+    }
+}
+
 mod artifacts;
+mod catalog;
+mod conversations;
+mod pagination;
 mod runs;
+mod submission;
 
 #[cfg(test)]
 mod tests;

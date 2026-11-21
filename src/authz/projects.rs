@@ -539,6 +539,15 @@ pub async fn create_project(
     ctx: &AuditContext<'_>,
     settings: &ProjectSettingsInput<'_>,
 ) -> Result<WriteOutcome, StoreError> {
+    create_project_checked(c, ctx, settings, async |_, _| Ok(())).await
+}
+
+pub(crate) async fn create_project_checked(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'_>,
+    settings: &ProjectSettingsInput<'_>,
+    check_defaults: impl AsyncFnOnce(&mut PgConnection, &Principal) -> Result<(), StoreError>,
+) -> Result<WriteOutcome, StoreError> {
     settings.validate()?;
     let change = Change {
         action: "project.create",
@@ -548,11 +557,12 @@ pub async fn create_project(
     };
     transact(c, ctx, async |tx| {
         let c = tx.connection()?;
-        acting(c, ctx).await?;
+        let actor = acting(c, ctx).await?;
         let outcome = record(c, ctx, &change).await?;
         let WriteOutcome::Applied { target_id: project } = &outcome else {
             return Ok(outcome);
         };
+        check_defaults(c, &actor).await?;
         // The project and scope reference each other through deferred foreign keys.
         let scope: String = sqlx::query_scalar(
             "WITH s AS (INSERT INTO openmettle.scopes (id, kind, project_id)
@@ -595,7 +605,7 @@ async fn project_write(
     project_id: &str,
     (change, frozen): (Change, bool),
     authorize: impl FnOnce(&Principal, Project) -> Decision,
-    apply: impl AsyncFnOnce(&mut WriteTransaction<'_>, &str) -> Result<(), StoreError>,
+    apply: impl AsyncFnOnce(&mut WriteTransaction<'_>, &str, &Principal) -> Result<(), StoreError>,
 ) -> Result<WriteOutcome, StoreError> {
     uuid(project_id, "project_id")?;
     transact(c, ctx, async move |tx| {
@@ -616,7 +626,7 @@ async fn project_write(
         }
         let outcome = record(c, ctx, &change).await?;
         if matches!(outcome, WriteOutcome::Applied { .. }) {
-            apply(tx, &locked.scope).await?;
+            apply(tx, &locked.scope, &actor).await?;
         }
         Ok(outcome)
     })
@@ -682,10 +692,21 @@ pub async fn update_project_settings(
     project_id: &str,
     settings: &ProjectSettingsInput<'_>,
 ) -> Result<WriteOutcome, StoreError> {
+    update_project_settings_checked(c, ctx, project_id, settings, async |_, _| Ok(())).await
+}
+
+pub(crate) async fn update_project_settings_checked(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'_>,
+    project_id: &str,
+    settings: &ProjectSettingsInput<'_>,
+    check_defaults: impl AsyncFnOnce(&mut PgConnection, &Principal) -> Result<(), StoreError>,
+) -> Result<WriteOutcome, StoreError> {
     settings.validate()?;
     let change = project_change("project.settings_update", project_id, settings.details());
-    let apply = async |tx: &mut WriteTransaction<'_>, scope: &str| {
+    let apply = async |tx: &mut WriteTransaction<'_>, scope: &str, actor: &Principal| {
         let c = tx.connection()?;
+        check_defaults(c, actor).await?;
         let defaults = settings.defaults.to_string();
         let updated = sqlx::query(
             "UPDATE openmettle.project_settings
@@ -741,7 +762,7 @@ async fn lifecycle(
     cancel_runs: bool,
 ) -> Result<WriteOutcome, StoreError> {
     let change = project_change(action, project_id, json!({}));
-    let apply = async |tx: &mut WriteTransaction<'_>, scope: &str| {
+    let apply = async |tx: &mut WriteTransaction<'_>, scope: &str, _: &Principal| {
         let c = tx.connection()?;
         let changed = sqlx::query(sql)
             .bind(project_id)
@@ -859,7 +880,7 @@ async fn member_change(
     let authorize = |actor: &Principal, project: Project| {
         super::authorize_member_change(actor, &project, &member)
     };
-    let apply = async |tx: &mut WriteTransaction<'_>, scope: &str| {
+    let apply = async |tx: &mut WriteTransaction<'_>, scope: &str, _: &Principal| {
         if role.is_some() {
             recipient_enabled(tx.connection()?, grantee).await?;
         }
@@ -1179,6 +1200,19 @@ pub async fn read_resource(
     resource_id: &str,
     now_ms: i64,
 ) -> Result<ResourceView, StoreError> {
+    resource_view(c, principal, kind, resource_id, now_ms, Action::Read).await
+}
+
+/// Under the admission scope lock, authorize the resource and its accounting scope
+/// before looking up a replay. Archive caps the projection but permits exact retries.
+pub(crate) async fn resource_view(
+    c: &mut PgConnection,
+    principal: &Principal,
+    kind: ResourceKind,
+    resource_id: &str,
+    now_ms: i64,
+    action: Action,
+) -> Result<ResourceView, StoreError> {
     active(principal)?;
     resource_kind(kind)?;
     uuid(resource_id, "resource_id")?;
@@ -1190,11 +1224,10 @@ pub async fn read_resource(
     let project_id = located.project_id.clone();
     let (created_us, last_revision) = (located.created_us, located.last_revision);
     let resource = hydrate_located(c, kind, resource_id, located, now_ms).await?;
-    check(super::authorize_resource(
-        principal,
-        &resource,
-        Action::Read,
-    ))?;
+    check(super::authorize_resource(principal, &resource, action))?;
+    if action == Action::RunExecute {
+        check(super::authorize_scope(principal, &resource.scope, action))?;
+    }
     let writable =
         !archived && super::authorize_resource(principal, &resource, Action::Write).is_allowed();
     Ok(ResourceView {

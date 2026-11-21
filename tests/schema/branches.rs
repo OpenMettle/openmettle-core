@@ -1071,3 +1071,6 @@ async fn archived_project_allows_authorized_create_replay_and_refuses_new_graph_
     assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM openmettle.authorization_audit WHERE request_key IN ('another-chat','another-fork')")
         .fetch_one(&mut c).await.unwrap(),0);
 }
+
+#[path = "branches_http.rs"]
+mod branches_http;

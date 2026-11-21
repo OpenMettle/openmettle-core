@@ -1,0 +1,33 @@
+{
+  "class": "compat",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "StudyPreset--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "authorization": true,
+    "defaults": {
+      "controls": {},
+      "instructions": null
+    },
+    "installed": true,
+    "model_id": "example",
+    "preset_id": "study",
+    "readiness": {
+      "state": "unknown"
+    },
+    "revision": "study-v1",
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/PresetDescriptor",
+  "source": "#/components/examples/StudyPreset"
+}

@@ -27,7 +27,7 @@ fn routes_are_the_implemented_contract_operations() {
         }
     }
     assert_eq!(served, documented);
-    assert_eq!(served.len(), 21);
+    assert_eq!(served.len(), 33);
     for (path, _) in routes() {
         assert_eq!(
             crate::telemetry::metrics::RouteClass::of(path),
@@ -38,16 +38,23 @@ fn routes_are_the_implemented_contract_operations() {
 
 #[test]
 fn every_write_and_only_a_write_needs_a_key_and_reads_take_no_body() {
-    for (_, operations) in routes() {
+    for (path, operations) in routes() {
         for (method, op) in operations {
-            assert_eq!(op.reads(), method == Method::GET, "{}", op.id());
-            if op.reads() {
+            assert_eq!(
+                op.reads(),
+                method == Method::GET || op == Op::PreviewConfiguration,
+                "{}",
+                op.id()
+            );
+            if method == Method::GET {
                 assert!(!op.json(), "{}", op.id());
             }
             // The first path parameter is the third segment.
             assert_eq!(
                 op.targeted(),
-                !["listCapabilities", "createProject", "createArtifact"].contains(&op.id())
+                path.split('/')
+                    .nth(3)
+                    .is_some_and(|v| v.starts_with('{') && v != "{preset_id}")
             );
             // An upload streams its own multipart body, and only an upload does.
             assert_eq!(op.uploads(), op.id().starts_with("createArtifact"));
@@ -255,6 +262,7 @@ fn bodies_are_closed_json_objects_decoded_before_the_database() {
                 name: "Alpha".into(),
                 instructions: String::new(),
                 defaults: json!({}),
+                selection: Default::default(),
             },
             None
         )
@@ -302,7 +310,7 @@ fn bodies_are_closed_json_objects_decoded_before_the_database() {
     assert_eq!(decode(Op::GetProject, b"").unwrap(), (Input::Empty, None));
 
     let long_reason = format!(r#"{{"name":"A","reason":"{}"}}"#, "r".repeat(513));
-    let refused: [(Op, &[u8]); 21] = [
+    let refused: [(Op, &[u8]); 22] = [
         (Op::CreateProject, b""),
         (Op::CreateProject, b"[\"Alpha\"]"),
         (Op::CreateProject, b"null"),
@@ -311,6 +319,10 @@ fn bodies_are_closed_json_objects_decoded_before_the_database() {
         (Op::CreateProject, br#"{"name":" A"}"#),
         (Op::CreateProject, br#"{"name":"A","defaults":[]}"#),
         (Op::CreateProject, br#"{"name":"A","defaults":null}"#),
+        (
+            Op::CreateProject,
+            br#"{"name":"A","defaults":{"model_config":{"model":[]}}}"#,
+        ),
         (
             Op::CreateProject,
             br#"{"name":"A","defaults":{"folder_id":"x"}}"#,
@@ -444,4 +456,142 @@ async fn saturated_streams_refuse_immediately_and_leave_unary_capacity() {
     assert_eq!(call(Op::GetRun).await, StatusCode::UNAUTHORIZED);
     drop(occupied);
     assert_eq!(call(Op::StreamRunEvents).await, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn raw_limits_cover_json_escapes_before_decoding() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    for (op, bound) in [
+        (Op::CreateRun, 131072),
+        (Op::PreviewConfiguration, 131072),
+        (Op::CreateBranch, 65536),
+        (Op::CreateConversation, 65536),
+        (Op::UpdateProjectSettings, 65536),
+    ] {
+        let mut data = br#"{"escaped":"\u0061"}"#.to_vec();
+        data.resize(bound, b' ');
+        assert_eq!(
+            read_body(op, &headers, Body::from(data.clone()))
+                .await
+                .unwrap()
+                .len(),
+            bound
+        );
+        data.push(b' ');
+        assert_eq!(
+            read_body(op, &headers, Body::from(data)).await.unwrap_err(),
+            BODY
+        );
+    }
+}
+
+#[tokio::test]
+async fn streamed_json_body_limit_counts_bytes_across_chunks() {
+    use hyper::body::Frame;
+    use std::{
+        convert::Infallible,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    struct Chunks(std::array::IntoIter<Bytes, 2>);
+    impl HttpBody for Chunks {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+            Poll::Ready(self.0.next().map(|chunk| Ok(Frame::data(chunk))))
+        }
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    for (op, limit) in [
+        (Op::CreateConversation, MAX_BODY_BYTES),
+        (Op::CreateRun, 131072),
+    ] {
+        for extra in [0, 1] {
+            let chunks = [
+                Bytes::from(vec![b' '; limit - 1]),
+                Bytes::from(vec![b' '; 1 + extra]),
+            ];
+            let body = Body::from_stream(Body::new(Chunks(chunks.into_iter())).into_data_stream());
+            assert_eq!(body.size_hint().lower(), 0);
+            let size = read_body(op, &headers, body).await.map(|bytes| bytes.len());
+            assert_eq!(size, if extra == 0 { Ok(limit) } else { Err(BODY) });
+        }
+    }
+}
+
+#[tokio::test]
+async fn managed_routes_keep_request_values_out_of_logs_and_exported_spans() {
+    use crate::{
+        auth_config::tests::support,
+        telemetry::{
+            self, Format, Process, Verbosity, otlp,
+            tests::{
+                Capture, exchange,
+                otlp::{Collector, finish},
+            },
+        },
+    };
+    let dir = support::Dir::new();
+    let doc = support::document_v2(&dir, &crate::provider_http::fixture::Ca::new().pem());
+    let settings = crate::auth_config::load(std::path::Path::new(
+        &dir.write("auth.json", doc.to_string().as_bytes()),
+    ))
+    .unwrap();
+    let pool = PgPool::connect_lazy("postgres://localhost/unused").unwrap();
+    let api = router(
+        Arc::new(BrowserAuth::new(settings, pool.clone(), pool.clone())),
+        None,
+        "https://app.example.test",
+        pool,
+        None,
+    );
+    let collector = Collector::accepting().await;
+    let (tracer, exporter) = otlp::start(collector.destination(), Process::Api);
+    let (capture, _guard) =
+        Capture::install_traced(Format::Json, Verbosity::Debug, tracer.unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, telemetry::observe(api))
+            .await
+            .unwrap()
+    });
+    let id = "00000000-0000-0000-0000-000000001021";
+    let paths = [
+        "/v1/runs".to_owned(),
+        format!("/v1/conversations/{id}/branches/{id}/effective-configuration"),
+        "/v1/presets/CANARY-preset".into(),
+    ];
+    let body = r#"{"prompt":"CANARY-prompt","instructions":"CANARY-instruction"}"#;
+    for path in paths {
+        let method = if path.contains("presets") {
+            "GET"
+        } else {
+            "POST"
+        };
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\ncontent-type: application/json\r\nidempotency-key: CANARY-key\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert_eq!(exchange(address, request.as_bytes()).await, 401);
+    }
+    assert_eq!(capture.events("http.request.completed").len(), 3);
+    capture.assert_absent(&[b"CANARY", id.as_bytes()]);
+    finish(exporter).await;
+    assert_eq!(collector.spans().len(), 3);
+    collector.assert_absent(&[b"CANARY", id.as_bytes()]);
 }

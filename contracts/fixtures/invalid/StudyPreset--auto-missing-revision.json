@@ -1,0 +1,31 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "StudyPreset--auto-missing-revision",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "authorization": true,
+    "defaults": {
+      "controls": {},
+      "instructions": null
+    },
+    "installed": true,
+    "model_id": "example",
+    "preset_id": "study",
+    "readiness": {
+      "state": "unknown"
+    }
+  },
+  "mutation": {
+    "name": "auto-missing-revision",
+    "op": "remove",
+    "path": "/revision"
+  },
+  "schema": "#/components/schemas/PresetDescriptor",
+  "source": "#/components/examples/StudyPreset"
+}

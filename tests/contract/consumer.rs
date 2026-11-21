@@ -369,6 +369,8 @@ impl WireRunEvent {
 
 #[derive(Deserialize)]
 struct WireRun {
+    branch_id: Option<String>,
+    input_message_id: Option<String>,
     run_id: String,
     conversation_id: String,
     state: String,
@@ -380,6 +382,8 @@ struct WireRun {
 }
 
 pub struct Run {
+    pub branch_id: Option<String>,
+    pub input_message_id: Option<String>,
     pub run_id: String,
     pub conversation_id: String,
     pub state: String,
@@ -392,6 +396,8 @@ pub struct Run {
 pub fn decode_run(value: &Value) -> Result<Run, String> {
     let wire: WireRun = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
     Ok(Run {
+        branch_id: wire.branch_id,
+        input_message_id: wire.input_message_id,
         run_id: wire.run_id,
         conversation_id: wire.conversation_id,
         state: wire.state,
@@ -736,4 +742,161 @@ pub fn decode_revision(value: &Value) -> Result<ArtifactRevision, String> {
         display_name: wire.display_name,
         state: RevisionState::from_wire(wire.state),
     })
+}
+
+// A chat client selects returned graph IDs, renders only known visible part kinds and
+// treats an unfamiliar readiness or count vocabulary as unknown.
+#[derive(Deserialize)]
+struct Collection {
+    items: Vec<Value>,
+    page_info: WirePage,
+}
+#[derive(Deserialize)]
+struct RootIds {
+    conversation_id: String,
+    branch_id: String,
+    scope_id: String,
+}
+#[derive(Deserialize)]
+struct BranchSelection {
+    branch_id: String,
+    history_available: bool,
+    #[serde(deserialize_with = "required_nullable")]
+    head_message_id: Option<String>,
+}
+#[derive(Deserialize)]
+struct HistoryItem {
+    message_id: String,
+    role: String,
+    parts: Vec<Value>,
+    #[serde(deserialize_with = "required_nullable")]
+    input_count: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    output_count: Option<String>,
+}
+#[derive(Deserialize)]
+struct Descriptor {
+    model_id: String,
+    installed: bool,
+    authorization: bool,
+    readiness: WireReadiness,
+}
+#[derive(Deserialize)]
+struct CountField {
+    source: String,
+    #[serde(deserialize_with = "required_nullable")]
+    value: Option<String>,
+}
+fn text_field<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
+    v.get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing {key}"))
+}
+fn decode_descriptor(v: &Value, preset: bool) -> Result<(), String> {
+    let desc: Descriptor = serde_json::from_value(v.clone()).map_err(|e| e.to_string())?;
+    if desc.model_id.is_empty() {
+        return Err("missing model".into());
+    }
+    // All three dimensions are necessary to present a runnable selection.
+    let _can_run = desc.installed
+        && desc.authorization
+        && desc.readiness.state == "ready"
+        && desc.readiness.observed_at.is_some();
+    if preset {
+        text_field(v, "preset_id")?;
+        text_field(v, "revision")?;
+    }
+    Ok(())
+}
+fn decode_branch(v: &Value) -> Result<(), String> {
+    let b: BranchSelection = serde_json::from_value(v.clone()).map_err(|e| e.to_string())?;
+    if b.branch_id.is_empty() || (!b.history_available && b.head_message_id.is_some()) {
+        return Err("invalid branch selection".into());
+    }
+    Ok(())
+}
+fn decode_message(v: &Value) -> Result<(), String> {
+    let m: HistoryItem = serde_json::from_value(v.clone()).map_err(|e| e.to_string())?;
+    if m.message_id.is_empty() || m.role.is_empty() {
+        return Err("missing turn identity".into());
+    }
+    for n in [m.input_count, m.output_count].into_iter().flatten() {
+        parse_decimal(&n, true)?;
+    }
+    for p in m.parts {
+        text_field(&p, "part_id")?;
+        match text_field(&p, "kind")? {
+            "text" => {
+                text_field(&p, "text")?;
+            }
+            "attachment" => {
+                text_field(&p, "revision_id")?;
+                text_field(&p, "state")?;
+            }
+            _ => (),
+        }
+    }
+    Ok(())
+}
+fn decode_preview(v: &Value) -> Result<(), String> {
+    for name in ["ceiling", "context_window", "output_reserve"] {
+        let field: CountField =
+            serde_json::from_value(v[name].clone()).map_err(|e| e.to_string())?;
+        if field.source.is_empty() {
+            return Err("missing source".into());
+        }
+        if let Some(n) = field.value {
+            parse_decimal(&n, true)?;
+        }
+    }
+    for value in [
+        &v["usable_input"],
+        &v["measured"]["input_count"],
+        &v["measured"]["output_count"],
+    ] {
+        if !value.is_null() {
+            parse_decimal(value.as_str().ok_or("invalid count")?, true)?;
+        }
+    }
+    if text_field(&v["prompt"], "kind")? == "estimated" {
+        text_field(&v["prompt"], "estimator_revision")?;
+        parse_decimal(text_field(&v["prompt"], "count")?, true)?;
+    }
+    Ok(())
+}
+pub fn decode_conversation_operation(op: &str, v: &Value) -> Result<(), String> {
+    match op {
+        "createRun" | "cancelRun" => decode_run(v).map(drop),
+        "previewConfiguration" => decode_preview(v),
+        "getPreset" => decode_descriptor(v, true),
+        "createBranch" | "getBranch" => decode_branch(v),
+        "createConversation" => {
+            let ids: RootIds = serde_json::from_value(v.clone()).map_err(|e| e.to_string())?;
+            if [ids.branch_id, ids.conversation_id, ids.scope_id]
+                .iter()
+                .any(String::is_empty)
+            {
+                return Err("missing root".into());
+            }
+            Ok(())
+        }
+        _ => {
+            let page: Collection = serde_json::from_value(v.clone()).map_err(|e| e.to_string())?;
+            if page.page_info.next_cursor.is_some_and(|s| s.is_empty()) {
+                return Err("empty cursor".into());
+            }
+            for item in page.items {
+                match op {
+                    "listModels" | "listPresets" => decode_descriptor(&item, op == "listPresets")?,
+                    "listConversations" => {
+                        decode_item_access(&item, false)?;
+                    }
+                    "listBranches" => decode_branch(&item)?,
+                    "listMessages" => decode_message(&item)?,
+                    _ => return Err("unknown operation".into()),
+                }
+            }
+            Ok(())
+        }
+    }
 }

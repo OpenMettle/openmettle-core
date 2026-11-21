@@ -1,0 +1,31 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "StudyPreset--auto-missing-preset_id",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "authorization": true,
+    "defaults": {
+      "controls": {},
+      "instructions": null
+    },
+    "installed": true,
+    "model_id": "example",
+    "readiness": {
+      "state": "unknown"
+    },
+    "revision": "study-v1"
+  },
+  "mutation": {
+    "name": "auto-missing-preset_id",
+    "op": "remove",
+    "path": "/preset_id"
+  },
+  "schema": "#/components/schemas/PresetDescriptor",
+  "source": "#/components/examples/StudyPreset"
+}

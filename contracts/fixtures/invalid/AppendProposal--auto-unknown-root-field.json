@@ -1,0 +1,36 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "additionalProperties",
+    "valid": false
+  },
+  "fixture": "AppendProposal--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "expected_head_message_id": null,
+    "selection": {
+      "preset": "study"
+    },
+    "turn": {
+      "input_message_id": "0f0e0d0c-0b0a-4908-8706-050403020102",
+      "mode": "append",
+      "parts": [
+        {
+          "text": "Example question."
+        }
+      ]
+    },
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/TurnProposal",
+  "source": "#/components/examples/AppendProposal"
+}

@@ -1,0 +1,58 @@
+{
+  "class": "compat",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "VisibleModelPage--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "items": [
+      {
+        "authorization": true,
+        "conservative_ceiling": null,
+        "context_window": "8192",
+        "default_effort": null,
+        "defaults": {
+          "controls": {},
+          "instructions": null
+        },
+        "estimator_revision": "fixture-v1",
+        "installed": true,
+        "joint_sampling": false,
+        "model_id": "example",
+        "output_limit": "1024",
+        "profile": {
+          "checkpoint": "synthetic-v1",
+          "gateway": "synthetic-v1",
+          "parser": "synthetic-v1",
+          "provider": "synthetic-v1",
+          "revision": "synthetic-v1",
+          "runtime": "synthetic-v1",
+          "template": "synthetic-v1"
+        },
+        "readiness": {
+          "state": "unknown"
+        },
+        "reasoning_efforts": [],
+        "reasoning_format": null,
+        "temperature": null,
+        "top_p": null,
+        "usage_semantics": "final_call"
+      }
+    ],
+    "page_info": {
+      "next_cursor": null
+    },
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/ModelPage",
+  "source": "#/components/examples/VisibleModelPage"
+}

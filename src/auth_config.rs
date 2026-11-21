@@ -74,6 +74,8 @@ pub enum Error {
     CursorKeyFile,
     /// Invalid cursor key count, identifier or key separation.
     CursorKeyRing,
+    Catalog,
+    AdmissionLimits,
     /// No provider, or more than the configured manager capacity.
     ProviderCount,
     ProviderIdentity,
@@ -116,6 +118,8 @@ impl fmt::Display for Error {
             Self::CursorKeyFile => {
                 "a cursor key is not a readable regular file of exactly 32 bytes"
             }
+            Self::Catalog => "model catalog is unreadable or invalid",
+            Self::AdmissionLimits => "run admission limits are invalid",
             Self::CursorKeyRing => "cursor key count, identifiers or key separation are invalid",
             Self::ProviderCount => "provider count is outside the configured capacity",
             Self::ProviderIdentity => "a provider identity is invalid",
@@ -491,6 +495,8 @@ struct Document {
     login_lifetime_seconds: u64,
     active_key: KeyFile,
     cursor_keys: Option<CursorFiles>,
+    catalog_file: Option<String>,
+    admission_limits: Option<crate::authz::runs::AdmissionLimits>,
     decrypt_only_keys: Vec<KeyFile>,
     max_issued_at_age_seconds: u64,
     future_skew_seconds: u64,
@@ -556,6 +562,41 @@ impl Document {
             browser: match version {
                 VERSION_2 => Some(BrowserProfile::parse(root.take("browser")?)?),
                 _ => None,
+            },
+            catalog_file: if version == VERSION_2 && root.0.contains_key("catalog_file") {
+                Some(root.string("catalog_file")?)
+            } else {
+                None
+            },
+            admission_limits: if version == VERSION_2 {
+                root.optional_object("admission_limits")?
+                    .map(|mut o| {
+                        let limits = crate::authz::runs::AdmissionLimits {
+                            live_per_actor: o
+                                .integer("live_per_actor")?
+                                .try_into()
+                                .map_err(|_| Error::AdmissionLimits)?,
+                            live_per_scope: o
+                                .integer("live_per_scope")?
+                                .try_into()
+                                .map_err(|_| Error::AdmissionLimits)?,
+                            queued_in_instance: o
+                                .integer("queued_in_instance")?
+                                .try_into()
+                                .map_err(|_| Error::AdmissionLimits)?,
+                            queue_timeout: Duration::from_secs(o.integer("queue_timeout_seconds")?),
+                            round_cap: o
+                                .integer("round_cap")?
+                                .try_into()
+                                .map_err(|_| Error::AdmissionLimits)?,
+                        };
+                        o.end()?;
+                        limits.validate().map_err(|_| Error::AdmissionLimits)?;
+                        Ok(limits)
+                    })
+                    .transpose()?
+            } else {
+                None
             },
             cursor_keys: match version {
                 VERSION_2 => root
@@ -631,6 +672,8 @@ fn key_material(
 /// Everything the browser-auth runtime needs, constructed together or not at all. The manager
 /// is the single process-lifetime owner required by ADR 0011; providers are in document order.
 pub struct AuthConfig {
+    pub(crate) catalog: Option<crate::model_config::Catalog>,
+    pub(crate) admission_limits: Option<crate::authz::runs::AdmissionLimits>,
     pub(crate) cursor_keys: Option<CursorKeys>,
     keys: KeyRing,
     login_lifetime: Duration,
@@ -692,6 +735,8 @@ impl AuthConfig {
             manager,
             providers,
             cursor_keys: None,
+            catalog: None,
+            admission_limits: None,
             browser: None,
             native: None,
         }
@@ -799,7 +844,21 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
         .native
         .map(|profile| profile.check(&providers, browser.as_ref()))
         .transpose()?;
+    let catalog = document
+        .catalog_file
+        .as_deref()
+        .map(|path| {
+            crate::model_config::Catalog::load(&read(
+                Path::new(path),
+                MAX_CONFIG_BYTES,
+                Error::Catalog,
+            )?)
+            .map_err(|_| Error::Catalog)
+        })
+        .transpose()?;
     Ok(AuthConfig {
+        catalog,
+        admission_limits: document.admission_limits,
         cursor_keys,
         keys,
         login_lifetime,
