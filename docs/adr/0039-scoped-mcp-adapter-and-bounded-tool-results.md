@@ -19,13 +19,17 @@ taxonomy and returns a bounded inline or spilled result.
 | --- | --- |
 | [ADR 0010](0010-provider-http-transport.md) and [ADR 0038](0038-sglang-and-external-provider-conformance-adapter.md), `src/provider_http/transport.rs` | Add a Streamable HTTP JSON-RPC 2.0 MCP (`2026-07-28`) client over `provider_http::transport` with a dedicated DNS slot semaphore, strict header allowlist (rejecting `x-mcp-header` schemas) and 4 MiB streaming response ceiling. |
 | [ADR 0027](0027-authorization-and-private-projects.md) and [ADR 0035](0035-approvals-permitted-yolo-and-effect-ledger.md), `src/authz/approvals.rs` | Implement `EffectPolicy` in the reviewed tool registry, bind every invocation to `Proposal`, `Destination`, `EffectClass`, `EndpointKey` and `record_fenced_intent`, add PR2's next sequential schema migration (e.g., `0024`) for nullable durable pre-dispatch attempt accounting (`openmettle.operations.dispatched_attempts integer DEFAULT NULL CHECK (dispatched_attempts BETWEEN 0 AND 3)` with a monotonicity trigger forbidding `non-null -> NULL` or decrements, where PR2 inserts `0` only for `repeatable_read` and only PR3 (`N`) inserts `0` for writes so pre-upgrade and `N-1` rows remain `NULL` and are treated conservatively like `>= 1`), upgrade repair of pre-existing `queued`/`waiting` revision-zero `repeatable_read` intents and an `AFTER UPDATE OF state ON openmettle.runs` `SECURITY DEFINER` trigger (`openmettle.resolve_abandoned_repeatable_reads()`), and add PR3's sequential SQL migration installing/extending an `AFTER UPDATE OF state ON openmettle.runs` `SECURITY DEFINER` trigger (`openmettle.resolve_interrupted_write_intents()`, `NEW.state = 'interrupted'`) unconditionally transitioning all remaining revision-zero write intents to `outcome = 'outcome_unknown'`, `revision = 1` strictly before `run-terminal` to preserve exact `{"unresolved": n}` event/ledger parity across mixed-version `N-1`/`N` workers. |
-| [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md), `src/worker.rs` | Implement `ApprovedAdapter` for resumed writes, reuse the same committed-envelope dispatch for immediate reads and permitted YOLO writes, stop `outcome_unknown` writes into `ExecState::Reconciling` (adding `StepResult::Invalidated` -> `WorkEnd::Stop(Stop::LeaseLost)` in PR2 to halt deposed workers on lease loss), rely on PR2's and PR3's database triggers to resolve abandoned `repeatable_read` intents (pre-`waiting`/pre-terminal) and remaining revision-zero write intents (unconditionally to `outcome_unknown` pre-`interrupted` `run-terminal`, preserving `{"unresolved": n}` parity across mixed-version `N-1`/`N` workers), pre-resolve proven-unsent non-null `dispatched_attempts = 0` write intents to `outcome = 'failed'` (`revision = 1`) in PR3 `leases::settle_locked` **only** on direct-terminal settlement (`state == ExecState::Reconciling \|\| !time \|\| cancel.is_some() \|\| matches!(input, Settle::Failed(_))`, leaving `Running && cancel.is_none() && Settle::Stopped && time` in `'intent'` so `leases::decide` enters `ExecState::Reconciling` cleanly) and in PR3 `leases::settle_expired` before the `unresolved` CTE counts `u.n`, define deterministic recovery across `run_one` drain-window expiry (`WorkEnd::Incomplete`) for both unacknowledged commits (keyed committed-observation reuse) and uncommitted `'intent'` observations (including `outcome_unknown` -> `interrupted` for dispatched or legacy `dispatched_attempts IS NULL` writes without a downstream read-only lookup, even when direct terminal settlement bypasses `Executor::reconcile`), and implement destination-authorized read-only `Executor::reconcile` reading `dispatched_attempts: Option<i32>` on `UnresolvedOperation`. |
-| [ADR 0005](0005-artifact-storage-accounting.md) and [ADR 0031](0031-filesystem-artifact-storage-and-streaming-multipart.md), `src/storage.rs` and `src/artifact_fs.rs` | Add PR2's `openmettle.storage_reservations.spill_reclaiming boolean NOT NULL DEFAULT false` cleanup-claim column (`CHECK (NOT spill_reclaiming OR state IN ('reserved', 'released'))`), three-phase lease-fenced direct byte publication (`artifact_fs::publish_bytes`, gated by a process-wide `Arc<tokio::sync::Semaphore>` `spill_permits` bounded to `max_concurrent_runs`, pre-creating the single 0-byte payload file `staging/<reservation_id>` via `O_RDWR \| O_CREAT \| O_EXCL \| O_NOFOLLOW` mode `0600` + `flock(LOCK_SH \| LOCK_NB)` + `sync_dir(staging)` before Phase 1 `storage::reserve` with primary-DB lookup on ambiguous Phase-1 commit ack, moving that single `LOCK_SH`-held `payload_file` and `OwnedSemaphorePermit` directly into Phase 2 `spawn_blocking` with chunked `<= 64 KiB` cancellation checks and holding `LOCK_SH` across `renameat` + `sync_dir` without any `.lock` sidecar, never holding a DB transaction across disk I/O, racing Phase 2's `spawn_blocking` disk join against `step.deadline` and `step.stop.changed()`, local `step.deadline`/`step.stop` rechecks before Phase 3 settlement and immediately before commit, Phase 3 requiring `state = 'reserved' AND NOT spill_reclaiming` inside a single atomic `Fence::Step` `storage::settle` + `runs::record_observation` transaction, and rechecking `step.stop` under the `runs` lock and immediately before commit in inline `truncated_no_spill` fallbacks), startup writability probing (`Store::probe_writable`) and 3-step DB-claimed single-inode spill cleanup (`artifact_fs::reconcile_run_spills`, claiming `spill_reclaiming = true` before any unlink, taking `O_RDWR \| O_NOFOLLOW` + `LOCK_EX \| LOCK_NB` directly on `staging/<id>` / `revisions/<id>` and calling synchronous `set_len(0)` under `LOCK_EX` before `unlinkat`, then committing `storage::release`, plus an aged `> 900 s` orphan `staging/` sweep that acquires `LOCK_EX` *before* primary PostgreSQL recheck and skips every `state = 'reserved'` row), paired with a strictly inline read-only `artifact.read_range` tool and shared-volume `O_RDWR` `flock` qualification alongside ADR 0031. |
+| [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md), `src/worker.rs` | Implement `ApprovedAdapter` for resumed writes, reuse the same committed-envelope dispatch for immediate reads and permitted YOLO writes, stop `outcome_unknown` writes into `ExecState::Reconciling` (adding `StepResult::Invalidated` -> `WorkEnd::Stop(Stop::LeaseLost)` in PR2 to halt deposed workers on lease loss), rely on PR2's and PR3's database triggers to resolve abandoned `repeatable_read` intents (pre-`waiting`/pre-terminal) and remaining revision-zero write intents (unconditionally to `outcome_unknown` pre-`interrupted` `run-terminal`, preserving `{"unresolved": n}` parity across mixed-version `N-1`/`N` workers), evaluate `Settle::Succeeded` unconditionally against `n_raw` in PR3 `leases::settle_locked` (preserving `Err(StoreError::Conflict("unresolved operation"))` -> `Settle::Stopped` fallback) while for `input != Settle::Succeeded` pre-resolving proven-unsent non-null `dispatched_attempts = 0` write intents (`n_zero`) to `outcome = 'failed'` (`revision = 1`) and passing `n_after = n_raw - n_zero` to `decide` **iff** `state == ExecState::Reconciling \|\| !time \|\| (n_after == 0 && (cancel.is_some() \|\| matches!(input, Settle::Failed(_))))` (so both uncancelled `Running && cancel.is_none() && Settle::Stopped && time` and mixed-write `n_zero >= 1 && n_after >= 1 && time` enter `ExecState::Reconciling(n_raw)` without pre-resolution) and pre-resolving `dispatched_attempts = 0` write intents in PR3 `leases::settle_expired` before the `unresolved` CTE counts `u.n`, define deterministic recovery across `run_one` drain-window expiry (`WorkEnd::Incomplete`) for both unacknowledged commits (keyed committed-observation reuse) and uncommitted `'intent'` observations (including `outcome_unknown` -> `interrupted` for dispatched or legacy `dispatched_attempts IS NULL` writes without a downstream read-only lookup, even when direct terminal settlement bypasses `Executor::reconcile`), and implement destination-authorized read-only `Executor::reconcile` reading `dispatched_attempts: Option<i32>` on `UnresolvedOperation`. |
+| [ADR 0005](0005-artifact-storage-accounting.md) and [ADR 0031](0031-filesystem-artifact-storage-and-streaming-multipart.md), `src/storage.rs` and `src/artifact_fs.rs` | Add PR2's `openmettle.storage_reservations.spill_reclaiming boolean NOT NULL DEFAULT false` cleanup-claim column (`CHECK (NOT spill_reclaiming OR state IN ('reserved', 'released'))`), update `Store::stage` (`src/artifact_fs.rs`) so HTTP uploads also open `staging/<id>` read-write with `create_new(true).mode(0o600)` and hold `File::try_lock_shared()` while streaming, add three-phase lease-fenced direct byte publication (`artifact_fs::publish_bytes`, gated by a process-wide `Arc<tokio::sync::Semaphore>` `spill_permits` bounded to `max_concurrent_runs`, pre-creating the single 0-byte payload file `staging/<reservation_id>` via safe Rust 1.100 `fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600)` + `File::try_lock_shared()` + `sync_dir(&store.staging)` before Phase 1 `storage::reserve` with primary-DB `runs ... FOR NO KEY UPDATE` serialization on ambiguous Phase-1 commit ack, moving that single `LOCK_SH`-held `payload_file` and `OwnedSemaphorePermit` directly into Phase 2 `spawn_blocking` with chunked `<= 64 KiB` cancellation checks and holding `LOCK_SH` across `fs::rename` + `sync_dir` without any `.lock` sidecar, never holding a DB transaction across disk I/O, racing Phase 2's `spawn_blocking` disk join against `step.deadline` and `step.stop.changed()`, local `step.deadline`/`step.stop` rechecks before Phase 3 settlement and immediately before commit, Phase 3 preserving `storage::settle`'s existing `ReservationState::Settled` idempotent metadata-matching replay branch (`src/storage.rs:362-379`) while enforcing `AND NOT spill_reclaiming` strictly on its `ReservationState::Reserved` settlement branch inside a single atomic `Fence::Step` `storage::settle` + `runs::record_observation` transaction, and rechecking `step.stop` under the `runs` lock and immediately before commit in inline `truncated_no_spill` fallbacks), startup writability probing (`Store::probe_writable`) and 3-step DB-claimed single-inode spill cleanup (`artifact_fs::reconcile_run_spills`, claiming `spill_reclaiming = true` before any unlink, verifying non-symlink regular-file `(dev, ino)` identity via `fs::symlink_metadata` + `MetadataExt`, acquiring `File::try_lock()` (`LOCK_EX`) directly on read-write `staging/<id>` / `revisions/<id>`, re-verifying `(dev, ino)` and calling `probe_file.set_len(0)?` under `LOCK_EX` before `fs::remove_file` + `sync_dir` on both `staging/` and `revisions/`, then committing `storage::release`, plus an aged `> 900 s` orphan `staging/` sweep that acquires `File::try_lock()` *before* primary PostgreSQL recheck, serializes any zero-row observation against committing Phase 1 via `SELECT 1 FROM openmettle.storage_instance WHERE id FOR UPDATE` before re-querying `storage_reservations`, always skips `state = 'reserved'`, and on `state = 'settled'` reclaims only a proven-distinct stranded HTTP-upload retry inode still at `staging/<id>` whose `(dev, ino)` differs from `revisions/<id>` while leaving published `revisions/<id>` untouched), paired with a strictly inline read-only `artifact.read_range` tool and shared-volume read-write advisory `flock` qualification alongside ADR 0031. |
 
 **Zero new Cargo crates.** V1-14 reuses the locked `hyper`, `hyper-util`, `http-body-util`,
 `rustls`, `tokio-rustls`, `serde`, `serde_json`, `sha2`, `bytes`, `httpdate` and `ring` stack
-rather than adding `rmcp` or another unreviewed MCP SDK crate. Adopting an external MCP SDK
-later requires a separate dependency and V1-42 distribution gate.
+rather than adding `rmcp` or another unreviewed MCP SDK crate. All filesystem locking,
+metadata/inode verification, truncation, rename, removal and directory sync use stable safe
+Rust 1.100 `std::fs` and `std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, MetadataExt}`
+under `Cargo.toml`'s `unsafe_code = "forbid"` (matching `src/artifact_fs.rs`, with no
+`rustix`/`nix` crate and no unstable `std::fs::Dir`). Adopting an external MCP SDK later
+requires a separate dependency and V1-42 distribution gate.
 
 ## Tool registry, ownership and first read-only tool
 
@@ -496,20 +500,23 @@ worker's configured run-slot concurrency `max_concurrent_runs`, i.e.,
 three-phase separation with **both** short DB phases fenced under `Fence::Step`, a **disjoint
 per-attempt `reservation_id`**, a **single pre-created, pre-synced 0-byte payload file
 `<ARTIFACTS_DIR>/staging/<reservation_id>` (mode `0o600`, matching `src/artifact_fs.rs:151`)
-opened `O_RDWR` with `flock(LOCK_SH | LOCK_NB)` + `sync_dir(staging)` before Phase 1 and moved
-directly into Phase 2 without any separate `.lock` sidecar or second `open()` call**
-(eliminating pre-Phase-1 directory-loss, multi-FD `SIGKILL` `close_files()` ordering,
-pre-`open` thread-pause and Linux NFS `O_RDONLY` `LOCK_EX` gaps), racing Phase 2's
-`spawn_blocking` disk join against `step.deadline` and `step.stop.changed()`, local
-`step.deadline`/`step.stop` enforcement after Phase 2, before Phase 3 settlement and
-immediately before Phase 3 commits, Phase 3 requiring `state = 'reserved' AND NOT
-spill_reclaiming`, lock-acquired and pre-commit `step.stop` enforcement inside the inline
-`truncated_no_spill` fallback, and **single-transaction atomicity** between `storage::settle`
-and `runs::record_observation`:
+opened read-write via `fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600)`
+with `File::try_lock_shared()` + `sync_dir(&store.staging)` before Phase 1 and moved directly
+into Phase 2 without any separate `.lock` sidecar or second `open()` call** (all using stable
+safe Rust 1.100 `std::fs` + `std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, MetadataExt}`
+under `unsafe_code = "forbid"`, eliminating pre-Phase-1 directory-loss, multi-FD `SIGKILL`
+`close_files()` ordering, pre-`open` thread-pause and Linux NFS read-only `LOCK_EX` gaps),
+racing Phase 2's `spawn_blocking` disk join against `step.deadline` and `step.stop.changed()`,
+local `step.deadline`/`step.stop` enforcement after Phase 2, before Phase 3 settlement and
+immediately before Phase 3 commits, Phase 3 enforcing `AND NOT spill_reclaiming` strictly on
+`storage::settle`'s `ReservationState::Reserved` branch while preserving
+`ReservationState::Settled` idempotent replay, lock-acquired and pre-commit `step.stop`
+enforcement inside the inline `truncated_no_spill` fallback, and **single-transaction
+atomicity** between `storage::settle` and `runs::record_observation`:
 
 1. **Bounded spill permit acquisition, pre-Phase-1 durable 0-byte `staging/<reservation_id>`
-   (`O_RDWR` + `LOCK_SH` + `sync_dir(staging)`) and Phase 1 — Short `Fence::Step` reservation
-   (no filesystem I/O inside DB tx).** Before creating any file, entering Phase 1
+   (read-write + `LOCK_SH` + `sync_dir(&store.staging)`) and Phase 1 — Short `Fence::Step`
+   reservation (no filesystem I/O inside DB tx).** Before creating any file, entering Phase 1
    (`storage::reserve`) or spawning `spawn_blocking`, attempt to acquire an
    `OwnedSemaphorePermit` non-blockingly via `spill_permits.clone().try_acquire_owned()`. If no
    permit is available (`Err(TryAcquireError::NoPermits)`), skip staging creation and Phases
@@ -525,19 +532,25 @@ and `runs::record_observation`:
    any DB transaction), run pre-Phase-1 on `spawn_blocking`, raced in `tokio::select!` against
    `tokio::time::sleep_until(step.deadline)` and `step.stop.changed()` via a shared
    `Arc<AtomicBool>` (`cancelled = false`):
-   - Create the **0-byte payload file `<ARTIFACTS_DIR>/staging/<reservation_id>` itself** via
-     `openat(staging_dir_fd, "<reservation_id>", O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0600)`
-     -> `payload_file` (mode `0o600` `rw-------` owned by the runtime user, matching
-     `src/artifact_fs.rs:151`, and consuming zero logical bytes before quota reservation),
-     immediately acquire **`payload_file.try_lock_shared()`** (`flock(LOCK_SH | LOCK_NB)`, zero
-     `unsafe`), and **execute `sync_dir(staging_dir_fd)` (`fsync` on `staging/`) BEFORE Phase 1
-     (`storage::reserve`) runs**. Because `staging/` is `fsync`ed before Phase 1 commits
-     `storage_reservations`, a storage-host crash can never leave a committed worker-spill
-     `storage_reservations` row without its durable `staging/<reservation_id>` entry.
+   - Validate via `fs::symlink_metadata(&store.staging)` (`file_type().is_dir()` and expected
+     `(dir_meta.dev(), dir_meta.ino())` via `MetadataExt`, matching `src/artifact_fs.rs:108-130`)
+     that `staging/` is not a symlink, then create the **0-byte payload file
+     `<ARTIFACTS_DIR>/staging/<reservation_id>` itself** via
+     `fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&staging_path)`
+     -> `payload_file` (`create_new(true)` maps to POSIX `O_CREAT | O_EXCL`, refusing any
+     existing file or live/dangling symlink with `ErrorKind::AlreadyExists`; mode `0o600`
+     `rw-------` owned by the runtime user, matching `src/artifact_fs.rs:151`, and consuming
+     zero logical bytes before quota reservation), immediately acquire
+     **`payload_file.try_lock_shared()`** (stable safe Rust 1.100 `LOCK_SH | LOCK_NB`, zero
+     `unsafe`), and **execute `sync_dir(&store.staging)` (`fs::File::open(&store.staging)?.sync_all()`,
+     matching `src/artifact_fs.rs:223-225`) BEFORE Phase 1 (`storage::reserve`) runs**. Because
+     `staging/` is `fsync`ed before Phase 1 commits `storage_reservations`, a storage-host crash
+     can never leave a committed worker-spill `storage_reservations` row without its durable
+     `staging/<reservation_id>` entry.
    - If cutoff fires before pre-Phase-1 completes (before Phase 1 starts), set
-     `cancelled.store(true, Ordering::Release)` so the blocking helper unlinks
-     `staging/<reservation_id>` while holding `LOCK_SH`, drops `payload_file`, runs
-     `sync_dir(staging_dir_fd)` and drops `OwnedSemaphorePermit`; skip Phase 1 with **zero**
+     `cancelled.store(true, Ordering::Release)` so the blocking helper calls
+     `fs::remove_file(&staging_path)` while holding `LOCK_SH`, drops `payload_file`, runs
+     `sync_dir(&store.staging)` and drops `OwnedSemaphorePermit`; skip Phase 1 with **zero**
      `storage_reservations` row created and apply the spill-abort disposition rule below.
    - Once `payload_file` is open, holds `LOCK_SH` and `staging/` has been `fsync`ed, run
      Phase 1 under `leases::with_lease(..., Fence::Step, ...)`, calling `storage::reserve` with
@@ -552,8 +565,8 @@ and `runs::record_observation`:
    - **Phase 1 failure / lost-commit-ack handling:**
      - If Phase 1 fails with a **deterministic pre-commit PostgreSQL error or confirmed
        rollback** (for example `Fence::Step` rejecting with `StaleClaim`, `Expired`, `Terminal`
-       or `Stopping`, or `OMQ01` quota exceeded), unlink `staging/<reservation_id>` while
-       holding `LOCK_SH`, drop `payload_file`, run `sync_dir(staging_dir_fd)`, drop
+       or `Stopping`, or `OMQ01` quota exceeded), call `fs::remove_file(&staging_path)` while
+       holding `LOCK_SH`, drop `payload_file`, run `sync_dir(&store.staging)`, drop
        `OwnedSemaphorePermit` and apply the spill-abort disposition rule below.
      - If Phase 1 fails with an **ambiguous / lost commit acknowledgement** (connection drop or
        cutoff during `COMMIT`), **do NOT unlink `staging/<reservation_id>` blindly** and **do
@@ -566,14 +579,16 @@ and `runs::record_observation`:
        committing or aborting and releases its row lock), and **in a separate subsequent SQL
        statement** inside that same `READ COMMITTED` transaction (so PostgreSQL takes a fresh
        statement snapshot *after* `FOR NO KEY UPDATE` is acquired), execute `SELECT state FROM
-       openmettle.storage_reservations WHERE id = $1`. Unlink `staging/<reservation_id>` while
-       holding `LOCK_SH` + `drop(payload_file)` + `sync_dir(staging_dir_fd)` **only** when that
-       post-lock query succeeds and confirms **zero rows** (`None`). If a row exists
+       openmettle.storage_reservations WHERE id = $1`. Call `fs::remove_file(&staging_path)`
+       while holding `LOCK_SH` + `drop(payload_file)` + `sync_dir(&store.staging)` **only**
+       when that post-lock query succeeds and confirms **zero rows** (`None`). If a row exists
        (`state = 'reserved'`), **or if the recovery transaction itself fails or times out and
        cannot establish the outcome**, **keep `staging/<reservation_id>` intact on disk** and
        simply drop `payload_file` and `OwnedSemaphorePermit` so `reconcile_run_spills` (or the
-       aged `> 900 s` orphan sweep if Phase 1 aborted) cleans it up safely, then apply the
-       spill-abort disposition rule below.
+       aged `> 900 s` orphan sweep, which serializes any zero-row observation against any
+       in-flight committing Phase 1 via `SELECT 1 FROM openmettle.storage_instance WHERE id
+       FOR UPDATE` before re-querying `storage_reservations`) cleans it up safely, then apply
+       the spill-abort disposition rule below.
 2. **Phase 2 — Unfenced `spawn_blocking` disk I/O using the already-open, `LOCK_SH`-locked
    `payload_file` (strictly outside any DB transaction, zero sidecar `.lock` file).** With no
    PostgreSQL connection borrowed and no DB transaction open (so slow disk I/O `> 5 s` can
@@ -584,7 +599,7 @@ and `runs::record_observation`:
    `state = 'reserved'` for `reconcile_run_spills`), drop `OwnedSemaphorePermit` immediately,
    skip disk I/O and immediately apply the spill-abort disposition rule below. Otherwise,
    allocate a fresh shared `Arc<AtomicBool>` (`cancelled = false`), **move the already-open
-   `O_RDWR`, `LOCK_SH`-locked `payload_file` and the `OwnedSemaphorePermit` directly into
+   read-write, `LOCK_SH`-locked `payload_file` and the `OwnedSemaphorePermit` directly into
    Phase 2's `spawn_blocking` closure** — **zero second `open()` call and zero sidecar `.lock`
    file** (strictly bounding total concurrent in-flight plus detached spill jobs and buffered
    payload memory across the entire worker process) — and run the blocking disk pipeline on
@@ -592,16 +607,17 @@ and `runs::record_observation`:
    - Check `cancelled.load(Ordering::Acquire)` **before writing** and **before each `<= 64 KiB`
      chunk**, write payload bytes into `payload_file` while computing SHA-256, call
      `payload_file.sync_all()`, and recheck `cancelled.load(Ordering::Acquire)`.
-   - **If `cancelled` is `true` (or any write / `sync_all` error occurs):** **never** unlink
-     `staging/<reservation_id>` and **never** call `renameat`; simply **`drop(payload_file)`**
-     (closing the single descriptor and releasing `LOCK_SH`) and **`drop(permit)`**! Because
-     `staging/<reservation_id>` stays intact on disk with `<reservation_id>` in
-     `state = 'reserved'`, `reconcile_run_spills` will acquire `LOCK_EX` directly on that
-     single inode, synchronously reduce its logical byte length (`st_size`) to `0` via
-     `set_len(0)`, unlink it, `fsync` both `staging/` and `revisions/`, and release quota.
+   - **If `cancelled` is `true` (or any write / `sync_all` error occurs):** **never** call
+     `fs::remove_file` on `staging/<reservation_id>` and **never** call `fs::rename`; simply
+     **`drop(payload_file)`** (closing the single descriptor and releasing `LOCK_SH`) and
+     **`drop(permit)`**! Because `staging/<reservation_id>` stays intact on disk with
+     `<reservation_id>` in `state = 'reserved'`, `reconcile_run_spills` will acquire `LOCK_EX`
+     directly on that single inode, reduce its logical byte length (`st_size`) to `0` via
+     `probe_file.set_len(0)?`, remove it with `fs::remove_file`, `sync_dir` both `staging/`
+     and `revisions/`, and release quota.
    - **If `cancelled` is `false`:** **keep `LOCK_SH` on `payload_file` continuously across
-     `renameat(staging/<id> -> revisions/<id>)` + `sync_dir(revisions_dir_fd)` +
-     `sync_dir(staging_dir_fd)`**, then **`drop(payload_file)`** and **`drop(permit)`**!
+     `fs::rename(&staging_path, &revision_path)` + `sync_dir(&store.revisions)` +
+     `sync_dir(&store.staging)`**, then **`drop(payload_file)`** and **`drop(permit)`**!
    Because `run_one` (`src/worker.rs`) waits only up to the drain deadline
    `until = (Instant::now() + settings.lease / 6).min(shutdown_limit)` before dropping `work`,
    the async adapter MUST race the `spawn_blocking` `JoinHandle` in a `tokio::select!` against
@@ -619,23 +635,23 @@ and `runs::record_observation`:
      `StepResult` complete before `run_one` drops `work`. When the detached late
      `spawn_blocking` closure eventually unblocks, it inspects `cancelled.load(Ordering::Acquire)`
      before the next `<= 64 KiB` chunk or after `payload_file.sync_all()`, performs **no**
-     `unlinkat` and **no** `renameat`, and simply drops `payload_file` (closing the single
-     descriptor and releasing `LOCK_SH`) and drops `OwnedSemaphorePermit`. Because there is
-     only **one** payload descriptor (`payload_file`) holding `LOCK_SH` continuously from
-     pre-Phase-1 `openat` through exit (or `SIGKILL`), `reconcile_run_spills` cannot acquire
-     `LOCK_EX | LOCK_NB` or release quota while any writer holds the file; once `payload_file`
-     closes (or the worker crashes), `reconcile_run_spills` claims `spill_reclaiming = true`,
-     acquires `O_RDWR` `LOCK_EX | LOCK_NB` directly on `staging/<reservation_id>` /
-     `revisions/<reservation_id>`, synchronously zeroes its logical byte length (`st_size = 0`)
-     with `set_len(0)` before `unlinkat`, durably `fsync`s both `staging/` and `revisions/`,
-     and commits `storage::release`.
+     `fs::remove_file` and **no** `fs::rename`, and simply drops `payload_file` (closing the
+     single descriptor and releasing `LOCK_SH`) and drops `OwnedSemaphorePermit`. Because there
+     is only **one** payload handle (`payload_file`) holding `LOCK_SH` continuously from
+     pre-Phase-1 creation through exit (or `SIGKILL`), `reconcile_run_spills` cannot acquire
+     `File::try_lock()` (`LOCK_EX | LOCK_NB`) or release quota while any writer holds the file;
+     once `payload_file` closes (or the worker crashes), `reconcile_run_spills` claims
+     `spill_reclaiming = true`, acquires read-write `File::try_lock()` directly on
+     `staging/<reservation_id>` / `revisions/<reservation_id>`, reduces its logical byte length
+     (`st_size = 0`) with `probe_file.set_len(0)?` before `fs::remove_file`, durably `sync_dir`s
+     both `staging/` and `revisions/`, and commits `storage::release`.
    - **Normal uncancelled `spawn_blocking` completion (`cancelled == false`):** Unlike
      `Staged::publish` (`src/artifact_fs.rs`), an uncancelled Phase-2 spill helper never
      unlinks `revisions/<reservation_id>` on a post-rename `sync_dir` failure, nor if
      `step.deadline` or `step.stop` trips after the `JoinHandle` returns normally (leaving
      `<reservation_id>` in `state = 'reserved'` for `reconcile_run_spills`). On normal closure
-     exit, `payload_file` is dropped (after `renameat` + `sync_dir(revisions)` +
-     `sync_dir(staging)`) and `OwnedSemaphorePermit` is dropped (Phase 3 is DB-serialized
+     exit, `payload_file` is dropped (after `fs::rename` + `sync_dir(&store.revisions)` +
+     `sync_dir(&store.staging)`) and `OwnedSemaphorePermit` is dropped (Phase 3 is DB-serialized
      against `reconcile_run_spills` via `spill_reclaiming`). Immediately after `spawn_blocking`
      returns normally, re-check
      `Instant::now() < step.deadline && step.stop.borrow().is_none()`; if false, do not enter
@@ -661,25 +677,30 @@ and `runs::record_observation`:
    — following the canonical lock order
    `runs -> storage_reservations -> artifacts -> storage_accounts -> storage_instance`
    (`src/storage.rs`) — execute **both** `storage::settle` **and** `runs::record_observation`
-   atomically: lock `storage_reservations` (`FOR UPDATE`) and **require `state = 'reserved' AND
-   NOT spill_reclaiming`** (enforced in `storage::settle` in addition to PR2's table
-   `CHECK (NOT spill_reclaiming OR state IN ('reserved', 'released'))` constraint rejecting
-   `state = 'settled'` whenever `spill_reclaiming = true`). If `spill_reclaiming = true` (a
-   sweeper Step-1 claim won the DB lock before this stalled Phase 3) or `state = 'released'`,
-   Phase 3 fails closed (`Conflict`), rolls back **both** `storage::settle` and
+   atomically. `storage::settle` (`src/storage.rs:362-379`, tested by
+   `tests/schema/artifact_fs.rs:434`) **preserves its existing `ReservationState::Settled`
+   idempotent metadata-matching replay branch intact**, and applies **`AND NOT
+   spill_reclaiming` strictly to its `ReservationState::Reserved` settlement branch** (backed
+   by PR2's table `CHECK (NOT spill_reclaiming OR state IN ('reserved', 'released'))`
+   constraint, which guarantees `'settled'` rows never have `spill_reclaiming = true` and
+   rejects any `state = 'settled'` update while `spill_reclaiming = true`). Thus, once Step 1
+   of `reconcile_run_spills` commits `spill_reclaiming = true` on a `'reserved'` row, a stalled
+   Phase 3 observes `ReservationState::Reserved` with `spill_reclaiming = true` under `FOR
+   UPDATE`, fails closed with `Error::Conflict`, rolls back **both** `storage::settle` and
    `runs::record_observation` (leaving `storage_reservations` in `state = 'reserved',
-   spill_reclaiming = true` for `reconcile_run_spills`) and applies the spill-abort disposition
-   rule below; conversely, if Phase 3 commits `state = 'settled'` first, Step 1 of
+   spill_reclaiming = true` for `reconcile_run_spills`), and applies the spill-abort
+   disposition rule below; conversely, if Phase 3 commits `state = 'settled'` first, Step 1 of
    `reconcile_run_spills` sees `state = 'settled'` under the row lock and skips the row without
-   touching any file. When `state = 'reserved' AND NOT spill_reclaiming`, call `storage::settle`
-   with `media_type` (`text/plain; charset=utf-8` or `application/json; charset=utf-8`) and a
-   bounded display name passing `storage::valid_display_name` to create the immutable
-   `artifact_revisions` row and charge active quota, construct the bounded preview envelope
-   carrying the settled `(artifact_id, revision_id)`, and call `runs::record_observation`
-   (`openmettle.runs` already locked -> `openmettle.operations` `FOR UPDATE` ->
-   `openmettle.run_events` append). Because `storage::settle` (`src/storage.rs`) can still
-   block waiting for shared `storage_accounts` and `storage_instance` row locks *after* the
-   initial lock check, the Phase-3 `leases::fenced` closure MUST perform a **final**
+   touching any file. When `ReservationState::Reserved` has `NOT spill_reclaiming`,
+   `storage::settle` proceeds with `media_type` (`text/plain; charset=utf-8` or
+   `application/json; charset=utf-8`) and a bounded display name passing
+   `storage::valid_display_name` to create the immutable `artifact_revisions` row and charge
+   active quota, constructs the bounded preview envelope carrying the settled `(artifact_id,
+   revision_id)`, and calls `runs::record_observation` (`openmettle.runs` already locked ->
+   `openmettle.operations` `FOR UPDATE` -> `openmettle.run_events` append). Because
+   `storage::settle` (`src/storage.rs`) can still block waiting for shared `storage_accounts`
+   and `storage_instance` row locks *after* the initial lock check, the Phase-3
+   `leases::fenced` closure MUST perform a **final**
    `Instant::now() < step.deadline && step.stop.borrow().is_none()` check **after**
    `storage::settle` and `runs::record_observation` complete their SQL statements and
    **immediately before** returning `Ok(...)` to commit. If `step.deadline` expired or
@@ -1030,13 +1051,15 @@ workers, and `storage::release` continues to protect every unresolved write (inc
 `artifact_fs::reconcile_run_spills` to the worker maintenance sweep with strict ledger safety
 across both [ADR 0031](0031-filesystem-artifact-storage-and-streaming-multipart.md) crash
 windows, DB-serialized exclusion against stalled Phase-3 commits (`spill_reclaiming = true`
-claimed before any filesystem unlink), crash-safe single-inode `O_RDWR` `flock` exclusion plus
-synchronous `set_len(0)` (`ftruncate(fd, 0)`) logical-length truncation (`st_size = 0`,
-matching [ADR 0005](0005-artifact-storage-accounting.md)'s logical-byte accounting model) under
-`LOCK_EX` before `unlinkat`, unconditional durable `sync_dir` of both `staging/` and
-`revisions/` before quota decrement (eliminating multi-FD `SIGKILL` `close_files()` ordering,
-unsynced-unlink resurrection, pre-`open` thread-pause and Linux NFS `O_RDONLY` `LOCK_EX` gaps),
-zero post-terminal `run_events` appends and zero DB transactions held across disk I/O:
+claimed before any filesystem removal), crash-safe single-inode read-write `File::try_lock()`
+exclusion plus `probe_file.set_len(0)?` logical-length truncation (`st_size = 0`, matching
+[ADR 0005](0005-artifact-storage-accounting.md)'s logical-byte accounting model) under
+`LOCK_EX` before `fs::remove_file`, unconditional durable `sync_dir` of both `staging/` and
+`revisions/` before quota decrement (all implemented with stable safe Rust 1.100 `std::fs` +
+`std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, MetadataExt}` under `unsafe_code = "forbid"`,
+eliminating multi-FD `SIGKILL` `close_files()` ordering, unsynced-unlink resurrection,
+pre-`open` thread-pause and Linux NFS read-only `LOCK_EX` gaps), zero post-terminal `run_events`
+appends and zero DB transactions held across disk I/O:
 
 - Scan adapter-owned spill reservations matching the `tool-spill:` `idempotency_key` prefix
   with `operation_id IS NOT NULL` across `state = 'reserved'` and `state = 'released'`. Never
@@ -1048,17 +1071,18 @@ zero post-terminal `run_events` appends and zero DB transactions held across dis
   `reconcile_run_spills` only sweeps a `state = 'reserved'` `tool-spill:*` row once
   `created_at + spill_reservation_ttl <= clock_timestamp()`, where `spill_reservation_ttl`
   strictly exceeds the maximum single-attempt spill setup/I/O plus worker drain window.
-  Because `staging/<reservation_id>` itself is created, locked with `LOCK_SH` and
-  `sync_dir(staging)`ed **before** Phase 1 commits `storage_reservations`, and that single
-  `payload_file` descriptor retains `LOCK_SH` continuously across Phase 2 (including across
-  `renameat(staging/<id> -> revisions/<id>)` + `sync_dir` on uncancelled paths, and never
-  unlinking on cancelled paths), every live or paused Phase-2 writer continuously blocks
-  sweeper `LOCK_EX | LOCK_NB` on the single payload inode.
-- **3-step DB-claimed single-inode `O_RDWR` `LOCK_EX` + `set_len(0)` cleanup protocol.** For
+  Because `staging/<reservation_id>` itself is created, locked with `File::try_lock_shared()`
+  (`LOCK_SH`) and `sync_dir(&store.staging)`ed **before** Phase 1 commits
+  `storage_reservations`, and that single `payload_file` handle retains `LOCK_SH` continuously
+  across Phase 2 (including across `fs::rename(&staging_path, &revision_path)` + `sync_dir` on
+  uncancelled paths, and never unlinking on cancelled paths), every live or paused Phase-2
+  writer continuously blocks sweeper `File::try_lock()` (`LOCK_EX | LOCK_NB`) on the single
+  payload inode.
+- **3-step DB-claimed single-inode read-write `LOCK_EX` + `set_len(0)` cleanup protocol.** For
   each aged `state = 'reserved'` `tool-spill:*` candidate (either `spill_reclaiming = false` on
   first claim or `spill_reclaiming = true` on retry of an interrupted sweep):
   1. **Step 1 — Claim cleanup in PostgreSQL (`spill_reclaiming = true`) BEFORE any filesystem
-     unlink:** Open a short lock-ordered DB transaction (`openmettle.runs` first via `FOR NO
+     removal:** Open a short lock-ordered DB transaction (`openmettle.runs` first via `FOR NO
      KEY UPDATE`, then `openmettle.storage_reservations` via `FOR UPDATE SKIP LOCKED`, zero
      disk I/O inside the transaction), re-verify `state = 'reserved'`,
      `created_at + spill_reservation_ttl <= clock_timestamp()`, zero `artifact_revisions` row,
@@ -1067,115 +1091,185 @@ zero post-terminal `run_events` appends and zero DB transactions held across dis
      operation is resolved (`outcome IN ('succeeded', 'failed')`), and commit
      **`spill_reclaiming = true`** while keeping **`state = 'reserved'` and `max_bytes` fully
      charged** in `storage_accounts.reserved_bytes`! Because Phase 3 (`storage::settle`) locks
-     `storage_reservations FOR UPDATE` and requires `state = 'reserved' AND NOT
-     spill_reclaiming` (backed by `CHECK (NOT spill_reclaiming OR state IN ('reserved',
-     'released'))`), a Phase-3 commit that stalled past TTL after its final pre-commit deadline
-     check can **never** commit `state = 'settled'` once Step 1 commits `spill_reclaiming =
-     true` — and conversely, if Phase 3 already committed `state = 'settled'` before Step 1
-     acquired the lock, Step 1 observes `state = 'settled'` and skips the row without touching
-     any file.
-  2. **Step 2 — Acquire `O_RDWR` `LOCK_EX | LOCK_NB` directly on `staging/<id>` and
-     `revisions/<id>`, synchronously truncate via `set_len(0)` under `LOCK_EX`, `unlinkat`,
-     and durably `sync_dir` BOTH `staging/` and `revisions/` (outside any DB transaction):**
-     For each `spill_reclaiming = true` `<id>`, inspect `<ARTIFACTS_DIR>/staging/<id>` and
-     `<ARTIFACTS_DIR>/revisions/<id>` via `openat(dir_fd, "<id>", O_RDWR | O_NOFOLLOW)`
-     (`0o600` regular file; writable FD satisfies both local Linux `flock(LOCK_EX)` and Linux
-     NFS `F_WRLCK` byte-range translation, which rejects `LOCK_EX` on `O_RDONLY` descriptors):
-     - If `openat` returns `ENOENT`, that path is absent in memory (not renamed yet, already
-       renamed to the other directory, or already unlinked by an earlier sweeper pass after
-       `spill_reclaiming = true` that may have crashed *before* `sync_dir`).
-     - For an existing path (`probe_file`), call **`probe_file.try_lock()`**
-       (`flock(LOCK_EX | LOCK_NB)`, zero `unsafe`). If `try_lock()` returns **`EWOULDBLOCK` /
-       `EAGAIN`** (a live or paused Phase-2 writer still holds `LOCK_SH` on `payload_file` —
-       including across `renameat` + `sync_dir` — OR a concurrent sweeper holds `LOCK_EX`),
-       drop `probe_file` and **skip `<id>` on this pass**, keeping `state = 'reserved'`
-       (`spill_reclaiming = true`) and `max_bytes` **fully charged** in
-       `storage_accounts.reserved_bytes`!
+     `storage_reservations FOR UPDATE` and enforces `AND NOT spill_reclaiming` strictly on its
+     `ReservationState::Reserved` settlement branch (backed by `CHECK (NOT spill_reclaiming OR
+     state IN ('reserved', 'released'))`, while preserving `ReservationState::Settled`
+     idempotent metadata-matching replay intact), a Phase-3 commit that stalled past TTL after
+     its final pre-commit deadline check can **never** commit `state = 'settled'` once Step 1
+     commits `spill_reclaiming = true` — and conversely, if Phase 3 already committed
+     `state = 'settled'` before Step 1 acquired the lock, Step 1 observes `state = 'settled'`
+     and skips the row without touching any file.
+  2. **Step 2 — Open non-symlink regular file read-write, acquire `File::try_lock()` (`LOCK_EX`)
+     directly on `staging/<id>` and `revisions/<id>`, truncate via `set_len(0)` under `LOCK_EX`,
+     remove with `fs::remove_file`, and durably `sync_dir` BOTH `staging/` and `revisions/`
+     (outside any DB transaction):** For each `spill_reclaiming = true` `<id>`, inspect
+     `<ARTIFACTS_DIR>/staging/<id>` and `<ARTIFACTS_DIR>/revisions/<id>` using safe Rust 1.100
+     `std::fs` + `std::os::unix::fs::MetadataExt` (matching `src/artifact_fs.rs:184-191`, zero
+     `unsafe`): first validate `fs::symlink_metadata(dir)` on `staging/` and `revisions/`
+     (`file_type().is_dir()` and matching `(dev(), ino())`), then for each candidate `path`:
+     - Query `sym_meta = fs::symlink_metadata(&path)` (which does not follow symlinks). If
+       `ErrorKind::NotFound`, that path is absent in memory (not renamed yet, already renamed
+       to the other directory, or already removed by an earlier sweeper pass after
+       `spill_reclaiming = true` that may have crashed *before* `sync_dir`). If
+       `!sym_meta.file_type().is_file()`, fail closed and skip `<id>` conservatively.
+     - Open read-write via `fs::OpenOptions::new().read(true).write(true).open(&path)` (a
+       writable handle satisfies both local Linux `File::try_lock()` exclusive locking and
+       Linux NFS `F_WRLCK` byte-range translation, which rejects exclusive locks on read-only
+       descriptors), then verify `fd_meta = probe_file.metadata()?` satisfies
+       `fd_meta.file_type().is_file() && (fd_meta.dev(), fd_meta.ino()) == (sym_meta.dev(),
+       sym_meta.ino())` (if `path` was swapped with a symlink between `symlink_metadata` and
+       `open`, `symlink_metadata` returned the symlink's own inode whereas
+       `probe_file.metadata()` returns the target's inode, rejecting any symlink race without
+       `unsafe`).
+     - Call **`probe_file.try_lock()`** (stable safe Rust 1.100 `LOCK_EX | LOCK_NB`, zero
+       `unsafe`). If `try_lock()` returns **`TryLockError::WouldBlock`** (a live or paused
+       Phase-2 writer still holds `LOCK_SH` on `payload_file` — including across `fs::rename` +
+       `sync_dir` — OR a concurrent sweeper holds `LOCK_EX`), drop `probe_file` and **skip
+       `<id>` on this pass**, keeping `state = 'reserved'` (`spill_reclaiming = true`) and
+       `max_bytes` **fully charged** in `storage_accounts.reserved_bytes`!
      - Once **`LOCK_EX` succeeds on `probe_file`**:
-       1. Call **`probe_file.set_len(0)?` (`ftruncate(probe_fd, 0)`)** while holding `LOCK_EX`
-          **before `unlinkat`**. Unlike `unlink` alone (which leaves an open inode's size
-          unchanged until final `dput`/`evict`), `ftruncate(probe_fd, 0)` synchronously reduces
-          the live inode's **logical byte length (`st_size` / `i_size`) to `0` bytes**
-          (matching [ADR 0005](0005-artifact-storage-accounting.md)'s logical-byte quota
-          accounting model, and releasing unshared live-file extents synchronously on
-          non-snapshot filesystems; copy-on-write filesystem snapshots such as Btrfs/ZFS may
-          retain physical extents independently of logical quota accounting). Moreover, because
-          the writer holds only **one** descriptor (`payload_fd`) with no separate sidecar
-          `.lock` descriptor, `SIGKILL` `close_files()` (`linux/fs/file.c#L440-L466`) has zero
-          multi-FD teardown ordering gap (`locks_remove_file` runs in `__fput` of `payload_fd`
-          itself, and `set_len(0)` zeroes the live inode's logical byte length before
-          `unlinkat` removes the directory entry, so even a sweeper crash between `unlinkat`
-          and Step 3 leaves a `0`-byte inode).
-       2. Call **`unlinkat(dir_fd, "<id>", 0)`** and **`drop(probe_file)`**
-          (`close(probe_fd)`).
+       1. Re-verify `fs::symlink_metadata(&path)` still succeeds with `file_type().is_file()`
+          and `(dev(), ino()) == (fd_meta.dev(), fd_meta.ino())` under `LOCK_EX`; if not, drop
+          `probe_file` without truncating or removing.
+       2. Call **`probe_file.set_len(0)?`** while holding `LOCK_EX` **before
+          `fs::remove_file(&path)`**. Unlike removal alone (which leaves an open inode's size
+          unchanged until final close), `probe_file.set_len(0)?` reduces the open inode's
+          **logical byte length (`st_size` / `Metadata::len()`) to `0` bytes** under `LOCK_EX`
+          (matching [ADR 0005](0005-artifact-storage-accounting.md)'s logical-byte accounting
+          model; physical block reuse remains filesystem- and journal-dependent), while
+          `fs::remove_file` + `sync_dir` on both `staging/` and `revisions/` make directory
+          removal durable before `storage::release` commits. Moreover, because the writer holds
+          only **one** file handle (`payload_file`) with no separate sidecar `.lock` handle,
+          `SIGKILL` `close_files()` (`linux/fs/file.c#L440-L466`) has zero multi-FD teardown
+          ordering gap (`locks_remove_file` runs when `payload_file` itself closes, and
+          `set_len(0)` zeroes the open inode's logical byte length before `fs::remove_file`
+          removes the directory entry, so even a sweeper crash between `fs::remove_file` and
+          Step 3 leaves a `0`-byte inode).
+       3. Call **`fs::remove_file(&path)`** and **`drop(probe_file)`**.
      - **Unconditional durable directory sync before Step 3:** After handling both candidate
-       paths (when neither path returned `EWOULDBLOCK` / `EAGAIN`), **ALWAYS execute and
-       require successful `sync_dir(staging_dir_fd)` AND `sync_dir(revisions_dir_fd)` before
+       paths (when neither path returned `TryLockError::WouldBlock`), **ALWAYS execute and
+       require successful `sync_dir(&store.staging)` AND `sync_dir(&store.revisions)` before
        proceeding to Step 3 `storage::release` — including on retry passes where one or both
-       candidate paths returned `ENOENT`**. If an earlier sweeper unlinked `staging/<id>` or
-       `revisions/<id>` and crashed before `sync_dir`, skipping `sync_dir` on `ENOENT` would
-       allow Step 3 to release quota while a subsequent storage-host crash could still
-       resurrect the unsynced directory entry. If either `sync_dir` fails, abort cleanup for
-       `<id>` on this pass with `state = 'reserved'`, `spill_reclaiming = true` and `max_bytes`
-       still fully charged.
+       candidate paths returned `ErrorKind::NotFound`**. If an earlier sweeper removed
+       `staging/<id>` or `revisions/<id>` and crashed before `sync_dir`, skipping `sync_dir` on
+       `NotFound` would allow Step 3 to release quota while a subsequent storage-host crash
+       could still resurrect the unsynced directory entry. If either `sync_dir` fails, abort
+       cleanup for `<id>` on this pass with `state = 'reserved'`, `spill_reclaiming = true` and
+       `max_bytes` still fully charged.
   3. **Step 3 — Commit `storage::release` in a short lock-ordered DB transaction:** Open a
      short lock-ordered DB transaction (`openmettle.runs` `FOR NO KEY UPDATE` ->
      `openmettle.storage_reservations` `FOR UPDATE SKIP LOCKED`, zero disk I/O inside the DB
      transaction), re-verify `state = 'reserved' AND spill_reclaiming` and commit
      `storage::release` (`state = 'released'`, subtracting `max_bytes` from `reserved_bytes`
-     now that the live inode's logical byte length has been synchronously reduced to `0` via
-     `set_len(0)`, unlinked, and both `staging/` and `revisions/` have been durably `fsync`ed,
-     without calling `runs::record_observation` or appending any `run_events`). Because every
-     abandoned `repeatable_read` was transitioned to `outcome = 'failed'` strictly before
-     `run-terminal`, `storage::release` succeeds cleanly after TTL on terminal runs while
-     preserving `runs.last_event_sequence == terminal_sequence` (`204 No Content` on terminal
-     SSE cursor reconnect) and continuing to fail closed with `Error::Unresolved` on any
-     unresolved `idempotent`, `lookup` or `non_repeatable` write (including `outcome_unknown`
-     writes).
-- **Defense-in-depth `state = 'released'` pass and aged `> 900 s` orphan `staging/` sweep
-  (`LOCK_EX` before primary PostgreSQL recheck, skipping `'settled'` and verifying inode
-  identity).** Retain the `state = 'released'` retry pass to truncate (`st_size = 0`) and
-  remove any remaining `staging/<id>` or unsettled `revisions/<id>` files under
-  `O_RDWR | O_NOFOLLOW` + `LOCK_EX | LOCK_NB` + `set_len(0)` -> `unlinkat` -> `drop(probe_file)`
-  -> `sync_dir(staging_dir_fd)` + `sync_dir(revisions_dir_fd)` (outside any DB transaction).
-  Additionally sweep any aged `> 900 s` orphan `staging/<id>` directory entries older than the
-  `900 s` staging grace window using a strict **lock-before-DB-recheck** and
-  **inode-identity-before-truncate** order:
-  1. First open `staging/<id>` (`openat(staging_dir_fd, "<id>", O_RDWR | O_NOFOLLOW)`) and
-     attempt **`probe_file.try_lock()`** (`LOCK_EX | LOCK_NB`); on `EWOULDBLOCK` / `EAGAIN`,
-     drop `probe_file` and skip immediately (a live pre-Phase-1, Phase 1 or Phase 2 writer
-     still holds `LOCK_SH`).
-  2. **While continuing to hold `LOCK_EX` on `probe_file`, query primary PostgreSQL**
-     (`SELECT state FROM openmettle.storage_reservations WHERE id = $1`). Because a worker
-     spill holds `LOCK_SH` continuously from pre-Phase-1 `openat` across Phase 1
-     `storage::reserve` commit, acquiring `LOCK_EX` guarantees Phase 1 either already committed
-     (visible on primary) or can never commit afterward (and HTTP API uploads commit
-     `storage::reserve` before creating `staging/<id>`). On any DB query error, drop
-     `probe_file` and skip conservatively without touching disk.
-  3. **Skip BOTH `state = 'reserved'` AND `state = 'settled'`:** Drop `probe_file` immediately
-     with **zero** `set_len(0)` and **zero** `unlinkat`. For `state = 'reserved'`,
-     `reconcile_run_spills` / `reconcile_expired` owns cleanup. For `state = 'settled'`,
-     `renameat(staging/<id> -> revisions/<id>)` already moved that exact inode out of
-     `staging/` into `revisions/<id>` — if the orphan sweeper opened `staging/<id>` and paused
-     *before* `try_lock()` while the live publisher finished `renameat`, dropped `LOCK_SH` and
-     committed Phase 3 `storage::settle`, `probe_file` now refers to the **live published
-     `revisions/<id>` inode**, so calling `set_len(0)` would truncate the published revision!
-  4. **ONLY when primary PostgreSQL returns zero rows (`None`) OR `state = 'released'`, verify
-     `staging/<id>` inode identity BEFORE `set_len(0)`:** Before calling
-     `probe_file.set_len(0)?`, call `fstatat(staging_dir_fd, "<id>", AT_SYMLINK_NOFOLLOW)` and
-     verify that `staging/<id>` is still linked in `staging/` with the **exact same
-     `(st_dev, st_ino)`** as `probe_file.metadata()`. If `fstatat` returns `ENOENT` or a
-     different `(st_dev, st_ino)`, drop `probe_file` immediately with **zero** `set_len(0)` and
-     **zero** `unlinkat`. Only when `(st_dev, st_ino)` matches does the orphan sweep call
-     **`probe_file.set_len(0)?`** -> **`unlinkat(staging_dir_fd, "<id>", 0)`** ->
-     **`drop(probe_file)`** -> **`sync_dir(staging_dir_fd)`** (never touching settled
-     `revisions/<id>`).
-- **Shared-volume `O_RDWR` `flock` qualification (`ReadWriteMany`).** Alongside
+     now that the open inode's logical byte length has been reduced to `0` via `set_len(0)`,
+     the directory entry has been removed with `fs::remove_file`, and both `staging/` and
+     `revisions/` have been durably `sync_dir`ed, without calling `runs::record_observation` or
+     appending any `run_events`). Because every abandoned `repeatable_read` was transitioned to
+     `outcome = 'failed'` strictly before `run-terminal`, `storage::release` succeeds cleanly
+     after TTL on terminal runs while preserving `runs.last_event_sequence == terminal_sequence`
+     (`204 No Content` on terminal SSE cursor reconnect) and continuing to fail closed with
+     `Error::Unresolved` on any unresolved `idempotent`, `lookup` or `non_repeatable` write
+     (including `outcome_unknown` writes).
+- **HTTP upload `Store::stage` shared-lock alignment, defense-in-depth `state = 'released'`
+  pass, and aged `> 900 s` orphan `staging/` sweep (`LOCK_EX` before primary PostgreSQL
+  recheck, `storage_instance FOR UPDATE` zero-row serialization, and distinct settled retry
+  inode reclamation).**
+  - **PR2 `Store::stage` shared-lock update (`src/artifact_fs.rs:144-158`):** Update
+    `Store::stage` so HTTP uploads also open `staging/<id>` with
+    `fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600)` and
+    immediately acquire `file.try_lock_shared()` (`LOCK_SH | LOCK_NB`, returning
+    `Error::InProgress` if locked), holding `LOCK_SH` while streaming so any live HTTP upload
+    blocks sweeper `File::try_lock()`.
+  - **Defense-in-depth `state = 'released'` pass:** Retain the `state = 'released'` retry pass
+    to verify non-symlink regular-file `(dev, ino)` identity, acquire read-write
+    `probe_file.try_lock()`, re-verify `(dev, ino)`, call `probe_file.set_len(0)?` ->
+    `fs::remove_file(&path)` -> `drop(probe_file)` -> `sync_dir(&store.staging)` +
+    `sync_dir(&store.revisions)` (outside any DB transaction) on any remaining `staging/<id>`
+    or unsettled `revisions/<id>` files.
+  - **Aged `> 900 s` orphan `staging/` sweep:** Sweep any aged `> 900 s` orphan `staging/<id>`
+    directory entries older than the `900 s` staging grace window using a strict
+    **lock-before-DB-recheck**, **`storage_instance FOR UPDATE` zero-row serialization**, and
+    **inode-identity-before-truncate** order:
+    1. Validate `staging/` via `fs::symlink_metadata(&store.staging)` (`file_type().is_dir()`
+       and expected `(dev(), ino())`), check `sym_meta = fs::symlink_metadata(&staging_path)?`
+       has `sym_meta.file_type().is_file()`, open read-write via
+       `fs::OpenOptions::new().read(true).write(true).open(&staging_path)?` -> `probe_file`,
+       verify `probe_meta = probe_file.metadata()?` satisfies
+       `probe_meta.file_type().is_file() && (probe_meta.dev(), probe_meta.ino()) ==
+       (sym_meta.dev(), sym_meta.ino())` (capturing `(probe_dev, probe_ino)`), and attempt
+       **`probe_file.try_lock()`** (`LOCK_EX | LOCK_NB`); on `TryLockError::WouldBlock`, drop
+       `probe_file` and skip immediately (a live pre-Phase-1, Phase 1, Phase 2, or HTTP upload
+       writer still holds `LOCK_SH`).
+    2. **While continuing to hold `LOCK_EX` on `probe_file`, query primary PostgreSQL**
+       (`SELECT state FROM openmettle.storage_reservations WHERE id = $1`). On any DB query
+       error, drop `probe_file` and skip conservatively without touching disk.
+    3. **Serialize zero-row (`None`) observations against committing Phase 1 via
+       `storage_instance FOR UPDATE`:** If Phase 1 lost its commit ack while its PostgreSQL
+       backend stalled mid-commit and the publisher's lost-ack recovery timed out and dropped
+       `LOCK_SH` (leaving `staging/<id>` on disk), an unlocked `READ COMMITTED` `SELECT` could
+       observe zero rows right before Phase 1's `COMMIT` becomes visible. However, PostgreSQL
+       never commits an uncommitted session if `tx.commit()` was never sent
+       (`SET LOCAL idle_in_transaction_session_timeout = '5s'`, `src/authz/leases.rs:201-215`),
+       and **every** `storage::reserve` call that reaches `tx.commit()` already holds `FOR
+       UPDATE` on the singleton `openmettle.storage_instance` row (`WHERE id`,
+       `src/storage.rs:150`, the terminal leaf lock of `storage::reserve`) until its `COMMIT`
+       finishes (`openmettle_worker` already holds `SELECT` + `UPDATE` on
+       `openmettle.storage_instance` in `src/boundaries.sql`). Therefore, whenever the initial
+       query returns **zero rows (`None`)**, the sweeper **MUST serialize against any
+       in-flight committing Phase 1 backend** before treating `staging/<id>` as an uncommitted
+       orphan: open a short primary `READ COMMITTED` transaction, **first execute
+       `SELECT 1 FROM openmettle.storage_instance WHERE id FOR UPDATE`** (blocking until any
+       in-flight `storage::reserve` `COMMIT` completes, with zero lock cycle because
+       `storage_instance` is a leaf lock and the sweeper holds no prior DB locks; on lock
+       timeout or any DB error, drop `probe_file` and skip `<id>` conservatively without
+       unlinking), and **in a separate subsequent SQL statement** inside that transaction
+       re-execute `SELECT state FROM openmettle.storage_reservations WHERE id = $1`. Use that
+       post-`storage_instance`-lock result for the disposition below.
+    4. **Disposition by primary PostgreSQL state under `LOCK_EX`:**
+       - **`state = 'reserved'`:** **Always skip** — drop `probe_file` immediately with
+         **zero** `set_len(0)` and **zero** `fs::remove_file` (`reconcile_run_spills` /
+         `reconcile_expired` owns cleanup).
+       - **`state = 'settled'`:** Distinguish **published Inode A** (where `probe_file` was
+         opened before `fs::rename` moved Inode A out of `staging/` into `revisions/<id>` and
+         Phase 3 committed `storage::settle`) from a **separate stranded HTTP-upload retry
+         Inode B** still sitting at `staging/<id>` (which can arise if a concurrent HTTP upload
+         retry observed `ReservationState::Reserved` at `src/artifact_fs.rs:468`, paused before
+         `store.stage(&id)`, created a distinct Inode B in `staging/<id>` after Upload 1
+         already renamed Inode A to `revisions/<id>` and committed `storage::settle`, and then
+         crashed via `SIGKILL` while streaming). Check **both**:
+         - **(a)** `fs::symlink_metadata(&staging_path)` succeeds with `file_type().is_file()`
+           and **`(staging_meta.dev(), staging_meta.ino()) == (probe_dev, probe_ino)`**
+           (proving `probe_file` was **not** renamed out of `staging/`), **AND**
+         - **(b)** `fs::symlink_metadata(&revision_path)` either returns `ErrorKind::NotFound`
+           (already retention-purged) **or** returns metadata with
+           **`(rev_meta.dev(), rev_meta.ino()) != (probe_dev, probe_ino)`** (proving
+           `probe_file` is a **different inode** from the published `revisions/<id>` payload).
+         If **either** (a) or (b) fails (for example, `probe_file` was renamed to
+         `revisions/<id>`, so `staging/<id>` is `NotFound` and
+         `(rev_meta.dev(), rev_meta.ino()) == (probe_dev, probe_ino)`), drop `probe_file`
+         immediately with **zero `set_len(0)` and zero `fs::remove_file`**, keeping the
+         published `revisions/<id>` payload 100% intact. If **both** (a) and (b) hold under
+         `LOCK_EX`, `probe_file` is a proven-distinct dead retry inode stranded at
+         `staging/<id>` for an already-settled reservation — execute
+         **`probe_file.set_len(0)?`** -> **`fs::remove_file(&staging_path)`** ->
+         **`drop(probe_file)`** -> **`sync_dir(&store.staging)`**, leaving `revisions/<id>`
+         (Inode A) completely untouched.
+       - **Zero rows (`None`, confirmed after `storage_instance FOR UPDATE`) OR
+         `state = 'released'`:** Verify `fs::symlink_metadata(&staging_path)` still succeeds
+         with `file_type().is_file()` and
+         **`(staging_meta.dev(), staging_meta.ino()) == (probe_dev, probe_ino)`**. If
+         `NotFound`, non-file, or a different `(dev, ino)`, drop `probe_file` immediately with
+         **zero** `set_len(0)` and **zero** `fs::remove_file`. Only when `(dev, ino)` matches
+         does the orphan sweep execute **`probe_file.set_len(0)?`** ->
+         **`fs::remove_file(&staging_path)`** -> **`drop(probe_file)`** ->
+         **`sync_dir(&store.staging)`** (never touching settled `revisions/<id>`).
+- **Shared-volume read-write advisory `flock` qualification (`ReadWriteMany`).** Alongside
   [ADR 0031](0031-filesystem-artifact-storage-and-streaming-multipart.md)'s existing
-  multi-node `ReadWriteMany` qualification of POSIX `rename`, `O_EXCL` creation and `fsync`,
-  deployments running multiple worker pods over a shared network volume MUST additionally
-  qualify cross-node/cross-mount `O_RDWR` `flock` (`LOCK_SH` vs `LOCK_EX | LOCK_NB`) exclusion
-  semantics before relying on shared spill storage.
+  multi-node `ReadWriteMany` qualification of POSIX `rename`, `create_new` (`O_EXCL`) creation
+  and `fsync`, deployments running multiple worker pods over a shared network volume MUST
+  additionally qualify cross-node/cross-mount read-write advisory locking
+  (`File::try_lock_shared()` vs `File::try_lock()`) exclusion semantics before relying on
+  shared spill storage.
 
 ### Head/tail preview envelope and unavailable-spill policy
 
@@ -1235,7 +1329,7 @@ bytes) with `storage: "truncated_no_spill"`, `truncated: true`, `artifact_id: nu
 | Slice | Deliverable | Acceptance evidence |
 | --- | --- | --- |
 | PR1 | This ADR (`0039`). | Review against #14, #25, ADRs 0010, 0031, 0033, 0035 and 0038; `ai-guardrails docs audit` reports zero findings. |
-| PR2 | PR2's next sequential schema migration (e.g., `0024`) adding nullable `openmettle.operations.dispatched_attempts integer DEFAULT NULL CHECK (dispatched_attempts BETWEEN 0 AND 3)` with a `BEFORE UPDATE` monotonicity trigger forbidding `non-null -> NULL` or decrements (PR2 `approvals::record_fenced_intent` inserts `0` only for `repeatable_read`, leaving writes `DEFAULT NULL` until PR3), `openmettle.storage_reservations.spill_reclaiming boolean NOT NULL DEFAULT false` with `CHECK (NOT spill_reclaiming OR state IN ('reserved', 'released'))`, their matching `src/boundaries.sql` grants (`INSERT`/`UPDATE (dispatched_attempts)` and `UPDATE (spill_reclaiming)` for `openmettle_worker`, `$1 >= <v1_14_schema_version>`), the `AFTER UPDATE OF state ON openmettle.runs FOR EACH ROW` `SECURITY DEFINER` trigger `openmettle.resolve_abandoned_repeatable_reads()` (owned by `openmettle_owner`, `SET search_path = pg_catalog`, `REVOKE ALL FROM PUBLIC`, audited in `src/boundaries.sql`, preserving `openmettle_api`'s zero `UPDATE` grant on `openmettle.operations`, resolving abandoned revision-zero `capability = 'repeatable_read'` `outcome = 'intent'` rows to `outcome = 'failed'`, `revision = 1` with idempotent `abandoned-read:<operation_id>` ADR 0004 `identity`/`digest` observation `run_events` strictly before `run-waiting` / `run-terminal` uniformly across mixed-version `N-1` and `N` worker/API binaries without duplicate Rust-caller SQL updates) and one-time upgrade repair (as `openmettle_owner`) of pre-existing `state IN ('queued', 'waiting')` runs, `StepResult::Invalidated` and its `worker::execute` (`src/worker.rs`) mapping to `WorkEnd::Stop(Stop::LeaseLost)`, reviewed tool registry (`EffectPolicy`) rejecting `x-mcp-header` schemas, strict schema/argument validator and default expander, `approvals::start_replayed_read` with durable 3-attempt cap (`coalesce(dispatched_attempts, 1) < 3`), internal `artifact.read_range` v1 tool, `artifact_fs::Store::probe_writable`, three-phase `artifact_fs::publish_bytes` (gated by a process-wide bounded `Arc<tokio::sync::Semaphore>` `spill_permits` bounded to `max_concurrent_runs` / `OPENMETTLE_WORKER_RUN_SLOTS` via non-blocking `try_acquire_owned()` before pre-Phase-1 and Phase 1 — skipping staging creation and Phases 1–3 with zero files, zero `storage_reservations` rows and zero `spawn_blocking` tasks on `NoPermits` into inline `truncated_no_spill`; pre-minting `reservation_id = Uuid::new_v4()` and pre-creating the single 0-byte payload file `staging/<reservation_id>` via `openat(staging_dir_fd, "<reservation_id>", O_RDWR \| O_CREAT \| O_EXCL \| O_NOFOLLOW, 0600)` + `payload_file.try_lock_shared()` (`LOCK_SH \| LOCK_NB`) + `sync_dir(staging_dir_fd)` BEFORE Phase 1 inserts `storage_reservations`, raced against `step.deadline` and `step.stop.changed()`, unlinking `staging/<reservation_id>` while holding `LOCK_SH` + `drop(payload_file)` + `sync_dir(staging_dir_fd)` on pre-Phase-1 cutoff or deterministic Phase-1 pre-commit error/rollback, while on ambiguous/lost Phase-1 commit ack opening a new primary `READ COMMITTED` transaction that first acquires `SELECT 1 FROM openmettle.runs WHERE scope_id = $1 AND id = $2 FOR NO KEY UPDATE` and then in a separate subsequent SQL statement queries `SELECT state FROM openmettle.storage_reservations WHERE id = $1`, unlinking `staging/<reservation_id>` under `LOCK_SH` only when that post-lock query succeeds with zero rows (`None`) and keeping `staging/<reservation_id>` intact on disk when committed or when the recovery transaction fails/times out; moving the already-open `O_RDWR`, `LOCK_SH`-locked `payload_file` and `OwnedSemaphorePermit` directly into Phase 2's `spawn_blocking` closure with zero second `open()` call and zero `.lock` sidecar; no DB txn across disk I/O; per-attempt disjoint `reservation_id`; Phase 2 checking `cancelled.load(Ordering::Acquire)` before writing, before each `<= 64 KiB` chunk and after `payload_file.sync_all()`, never unlinking `staging/<reservation_id>` or calling `renameat` when cancelled — simply dropping `payload_file` and `OwnedSemaphorePermit` — and on uncancelled completion keeping `LOCK_SH` on `payload_file` across `renameat(staging/<id> -> revisions/<id>)` + `sync_dir(revisions_dir_fd)` + `sync_dir(staging_dir_fd)` before dropping `payload_file` and `OwnedSemaphorePermit`; racing Phase 2's `spawn_blocking` `JoinHandle` in `tokio::select!` against `tokio::time::sleep_until(step.deadline)` and `step.stop.changed()` via shared `Arc<AtomicBool>` (`cancelled`), detaching on cutoff while keeping `<reservation_id>` in `state = 'reserved'` and immediately running the inline `truncated_no_spill` fallback during the drain window; Phase 3 locking `storage_reservations FOR UPDATE` and requiring `state = 'reserved' AND NOT spill_reclaiming`, rolling back both `storage::settle` and `runs::record_observation` if `spill_reclaiming = true`, plus local `step.deadline`/`step.stop` rechecks after normal Phase 2 completion, under the Phase 3 `Fence::Step` lock before settling and again inside the Phase 3 closure after `storage::settle` + `runs::record_observation` complete their SQL statements immediately before commit, rolling back on cutoff; single atomic `Fence::Step` commit of `storage::settle` + `runs::record_observation`; spill-abort disposition committing inline `truncated_no_spill` under `Fence::Step` + `StepResult::Continue` when only shortened `step.deadline` elapsed and `step.stop` remains `None`, under `Fence::Hold` + `StepResult::Stopped` when `step.stop` is `Some(Stop::Shutdown)`, `Some(Stop::Cancel)` or `Some(Stop::Deadline)` or `LeaseError::Stopping(_)`, and returning `StepResult::Invalidated` on `Stop::LeaseLost`, `StaleClaim`, `Expired` or `Terminal`, with mandatory `*step.stop.borrow()` rechecks inside the fallback's `leases::fenced` closure both immediately after `leases::lock` acquires the `runs` row lock and immediately after `runs::record_observation` completes right before commit; deterministic `WorkEnd::Incomplete` drain-window expiry recovery for `repeatable_read`), 3-step DB-claimed single-inode `O_RDWR` `LOCK_EX` + `set_len(0)` `reconcile_run_spills` (Step 1: lock-ordered DB tx `runs` -> `storage_reservations` claiming `spill_reclaiming = true` while keeping `state = 'reserved'` and `max_bytes` charged BEFORE any filesystem unlink; Step 2: outside DB tx, `openat(dir_fd, "<id>", O_RDWR \| O_NOFOLLOW)` on `staging/<id>` and `revisions/<id>` + `probe_file.try_lock()` (`LOCK_EX \| LOCK_NB`), skipping `EWOULDBLOCK`/`EAGAIN` so `state = 'reserved'` (`spill_reclaiming = true`) and `max_bytes` stay charged, under `LOCK_EX` calling synchronous `probe_file.set_len(0)?` (`ftruncate(fd, 0)`) to zero the live inode's logical byte length (`st_size = 0`, matching ADR 0005; releasing unshared extents on non-snapshot filesystems) BEFORE `unlinkat` + `drop(probe_file)`, and unconditionally requiring successful `sync_dir(staging_dir_fd)` AND `sync_dir(revisions_dir_fd)` before Step 3 — including on retry passes where one or both paths returned `ENOENT`, aborting cleanup with `max_bytes` still charged if either `sync_dir` fails; Step 3: short lock-ordered DB tx committing `storage::release` with zero post-terminal `run_events`; plus defense-in-depth `state = 'released'` pass and aged `> 900 s` orphan `staging/` sweep that opens `O_RDWR \| O_NOFOLLOW` and acquires `LOCK_EX \| LOCK_NB` *before* querying primary PostgreSQL `SELECT state FROM openmettle.storage_reservations WHERE id = $1`, skipping BOTH `state = 'reserved'` AND `state = 'settled'` with zero `set_len(0)` / zero `unlinkat`, proceeding only on zero rows (`None`) or `state = 'released'`, and verifying via `fstatat(staging_dir_fd, "<id>", AT_SYMLINK_NOFOLLOW)` that `staging/<id>` still has the exact same `(st_dev, st_ino)` as `probe_file.metadata()` before calling `probe_file.set_len(0)?` -> `unlinkat` -> `drop(probe_file)` -> `sync_dir(staging_dir_fd)`), shared-volume `O_RDWR` `flock` qualification requirement alongside ADR 0031, and serialized-budget head/tail preview builder. | PostgreSQL 18 tests: cross-user, cross-scope, archived/deleted project, private project-scope spill ownership (other members denied until shared), share revocation and `active` -> `retained` transition between original read and replay, and non-`active` revision refusals; `max_bytes < 4` validation refusal, invalid UTF-8 binary semantic fault and strictly inline `artifact.read_range` under both 6x JSON escaping and `<= 200`-line `next_offset` pagination; unfinished `repeatable_read` replay through `approvals::start_replayed_read` (rechecking bound session and canonical proposal without issuing a write permit) plus crash-reclaim test at `dispatched_attempts == 3` proving dispatch refusal, terminal `failed` observation under `Fence::Step` and zero outbound sends; catalog registration rejection of `x-mcp-header` schemas plus duplicate-key, float, depth, bound and wildcard rejections; serialized-JSON `16 KiB` inline/spill thresholds (`\u001b` expansion, `200` lines, multi-byte UTF-8 cuts); startup `Store::probe_writable` fail-closed test on pre-existing read-only `staging/` and `revisions/`; unset-`ARTIFACTS_DIR`, unconfigured-store, quota-refused, `spill_saturated` and I/O fallback envelopes; Phase 3 rollback/crash simulation verifying `storage::settle` and `runs::record_observation` commit atomically inside one `Fence::Step` transaction so at most one active revision and one storage quota charge ever commit per operation (zero double-charged spill revisions on replacement-worker replay); `publish_bytes` and `reconcile_run_spills` Phase 1/2/3 stall, single-inode locking, cleanup-claim, orphan-sweep, saturation, `SIGKILL` and takeover tests covering (a) delaying Phase 2 `spawn_blocking` disk I/O past **both** the `5 s` PostgreSQL `idle_in_transaction_session_timeout` and the worker drain deadline during lease takeover (proving replacement worker settlement succeeds intact with its own disjoint `reservation_id` and the stalled old worker returns `StepResult::Invalidated` with zero corrupted/unlinked revisions and zero leaked settled quota), (b) **both race orders between a stalled Phase-3 commit and Step-1 `spill_reclaiming` claim** (when Step 1 commits `spill_reclaiming = true` first, stalled Phase 3 fails closed on `state = 'reserved' AND NOT spill_reclaiming` / table `CHECK` constraint and rolls back both `storage::settle` and `runs::record_observation` before applying the spill-abort disposition while `reconcile_run_spills` cleans up and releases; when Phase 3 commits `state = 'settled'` first, Step 1 sees `state = 'settled'` and skips without unlinking `revisions/<id>`), (c) **pre-Phase-1 `sync_dir(staging)` before `storage::reserve` and serialized lost Phase-1 commit-ack primary recheck**: verifying `staging/<id>` is created `0600`, `LOCK_SH`-locked and `sync_dir`ed before Phase 1, that deterministic pre-commit failure (`OMQ01` / `Fence::Step` rejection) unlinks `staging/<id>` under `LOCK_SH`, and — delaying Phase 1's commit across the start of the lost-ack recovery transaction — proving the `SELECT 1 FROM openmettle.runs ... FOR NO KEY UPDATE` wait followed by the subsequent `SELECT state FROM openmettle.storage_reservations` statement prevents premature `0`-row observation and preserves `staging/<id>` intact on disk when Phase 1 commits (and also preserves `staging/<id>` when the recovery transaction fails/times out, unlinking only when the post-lock query succeeds with zero rows), (d) **single-FD `LOCK_SH` / `LOCK_EX` + `set_len(0)` before `unlinkat` + unconditional `ENOENT` retry `sync_dir` across cutoff, paused `fsync`, `<= 64 KiB` chunk-boundary cancellation, and subprocess `SIGKILL` crash qualification**: stalling a cancelled Phase-2 writer both mid-chunk and during `payload_file.sync_all()` past `spill_reservation_ttl`, racing out of `tokio::select!` within the drain window to commit inline `truncated_no_spill`, running `reconcile_run_spills` while `payload_file` still holds `LOCK_SH` and asserting `spill_reclaiming = true`, `state = 'reserved'` and `max_bytes` remain fully charged (`EWOULDBLOCK` on sweeper `O_RDWR` `LOCK_EX \| LOCK_NB`), then verifying that once the writer observes `cancelled` and drops `payload_file` (or a child worker subprocess is terminated with `SIGKILL`) `reconcile_run_spills` acquires `LOCK_EX` on `staging/<id>` (or unsettled `revisions/<id>`), synchronously zeroes logical byte length (`st_size = 0`) via `set_len(0)` before `unlinkat`, `fsync`s both `staging/` and `revisions/`, and drops quota charge to zero, PLUS a retry test simulating an unsynced prior unlink (`ENOENT` on both `staging/<id>` and `revisions/<id>`) verifying both `staging/` and `revisions/` are `fsync`ed before Step 3 `storage::release` commits (and that a `sync_dir` failure on either directory aborts cleanup before `storage::release` with `max_bytes` still charged), (e) **aged `> 900 s` orphan `staging/` sweep `LOCK_EX`-before-DB-recheck, `'settled'`-skip and `fstatat` inode-identity tests**: racing (i) an aged `staging/<id>` whose Phase 1 `storage::reserve` commits while holding `LOCK_SH` right before writer cutoff (proving the orphan sweep acquires `LOCK_EX` *before* querying primary PostgreSQL, observes `state = 'reserved'` and skips unlinking), (ii) **pausing the orphan sweeper between `openat(staging/<id>)` and `try_lock()`, letting the live publisher finish `renameat(staging/<id> -> revisions/<id>)` and Phase 3 `storage::settle` (`state = 'settled'`), resuming the orphan sweeper, and verifying the published `revisions/<id>` payload's exact bytes and SHA-256 digest remain intact** (zero `set_len(0)`, zero `unlinkat`), and (iii) verifying the `fstatat(staging_dir_fd, "<id>", AT_SYMLINK_NOFOLLOW)` `(st_dev, st_ino)` guard skips `set_len(0)` when `staging/<id>` is `ENOENT` or replaced by a different inode, while an unreferenced pre-Phase-1 crash file with zero primary DB row (or `state = 'released'`) and matching `(st_dev, st_ino)` is truncated (`st_size = 0`) and unlinked under `LOCK_EX`, (f) local `step.deadline` expiry and `step.stop` firing while the DB lease is still live — including both pre-settlement cutoff and **holding the `storage_accounts` row lock across the local cutoff while the DB lease stays live** (proving Phase 3's final pre-commit check returns `Err` and rolls back both the `artifact_revisions` row and the `storage_accounts`/`storage_instance` quota charge, leaving `storage_reservations` in `state = 'reserved'`) — and asserting the exact resulting run and lease state alongside quota assertions: when only shortened `step.deadline` elapsed (`step.stop` stays `None`) on a completed known-outcome write with active `Fence::Step` lease, inline `truncated_no_spill` commits under `Fence::Step`, returns `StepResult::Continue` and leaves the run `running` with its active lease intact (zero `StoreError::InvalidInput("settle")` from `leases::decide`); when `step.stop` is `Some(Stop::Shutdown)`, `Some(Stop::Cancel)` or `Some(Stop::Deadline)` or `LeaseError::Stopping(_)`, inline `truncated_no_spill` commits under `Fence::Hold`, returns `StepResult::Stopped` and `run_one` hands off or settles cleanly; when the DB lease is lost (`StaleClaim`, `Expired`, `Terminal` or `Stop::LeaseLost`), `StepResult::Invalidated` -> `WorkEnd::Stop(Stop::LeaseLost)` exits with zero further PostgreSQL writes, (g) **blocking the inline `truncated_no_spill` fallback on a competing `FOR NO KEY UPDATE` lock on `openmettle.runs` while signaling `Stop::LeaseLost` locally with PostgreSQL `lease_expires_at` still in the future (inside `worker::monitor`'s safety margin)**, then releasing the competing lock and verifying the fallback rolls back with `StepResult::Invalidated` leaving `operations`, `run_events` and `runs.last_event_sequence` completely untouched (plus verifying a `Fence::Step` tool-deadline fallback that receives `Stop::Shutdown`, `Stop::Cancel` or `Stop::Deadline` while waiting on the lock commits under the held run lock and returns `StepResult::Stopped` rather than `StepResult::Continue`), (h) **`WorkEnd::Incomplete` drain-expiry contention tests for `repeatable_read`** holding a competing `FOR NO KEY UPDATE` lock on `openmettle.runs` across `run_one`'s full drain window, verifying `WorkEnd::Incomplete` drop, releasing the lock, driving recovery and asserting exact durable `operations.outcome` (safe replay under `Fence::Step` on a `running` run or trigger-resolved `failed` on `'waiting'`/terminal transition when uncommitted `'intent'`; reused committed `succeeded` observation with zero additional outbound sends on unacknowledged commit), and (i) **spill-semaphore (`spill_permits`) saturation test** (e.g., `1` spill permit) holding the first call's `spawn_blocking` job at `fsync`, triggering shortened `step.deadline` so the run continues (`StepResult::Continue`), executing subsequent large-output calls while the first task stays wedged, and verifying subsequent calls immediately fall back inline (`storage: "truncated_no_spill"`, `spill_error: "spill_saturated"`) with **zero** new staging files, **zero** new `storage_reservations` rows and **zero** queued `spawn_blocking` disk tasks until the first blocking closure drops `payload_file` and exits; crashed `repeatable_read` (`outcome = 'intent'`) + terminal settlement (`leases::settle`, `leases::settle_expired` and `approvals::park` -> immediate terminal `cancel_run`) + `reconcile_run_spills` freeing spill quota with zero stranded bytes and zero post-terminal `run_events`, plus a **populated-upgrade PostgreSQL 18 test** creating a pre-upgrade `waiting` run with a revision-zero `repeatable_read` `intent` and linked `tool-spill:*` reservation, running PR2's migration, immediately cancelling the run via `openmettle_api` (`cancel_run`), running `reconcile_run_spills`, and verifying zero stranded quota AND `204 No Content` on `GET`/`HEAD /v1/runs/{run_id}/events?after=<terminal_cursor>`, AND **mixed-version rolling-upgrade PostgreSQL 18 tests** verifying **(i)** after PR2's migration applies, executing pre-PR2 (`N-1`) `approvals::park` on a `running` run carrying a revision-zero `repeatable_read` `intent`, followed by API cancel/deny, resolves the intent before `run-waiting` and returns `204 No Content` on `GET`/`HEAD /v1/runs/{run_id}/events?after=<terminal_cursor>` and **(ii)** executing pre-PR2 (`N-1`) `leases::settle_expired` on an expired PR2 (`N`) run holding a `'reserved'` `tool-spill:*` `storage_reservations` row and an abandoned `repeatable_read` `intent`, then running `reconcile_run_spills`, succeeds in `storage::release` with zero stranded quota and returns `204 No Content` on the terminal SSE cursor, while preserving `storage::release` `Error::Unresolved` protection for `interrupted` runs with `outcome_unknown` writes, spill TTL/age guard against active publishers, defense-in-depth `state = 'released'` retryable cleanup, post-rename/pre-settlement cleanup of unsettled `revisions/<id>` and untouched `settled` rows; multi-node/shared-volume deployment qualification explicitly requiring cross-node/cross-mount `O_RDWR` `flock` (`LOCK_SH` vs `LOCK_EX \| LOCK_NB`) + `set_len(0)` before `unlinkat` exclusion alongside [ADR 0031](0031-filesystem-artifact-storage-and-streaming-multipart.md)'s `rename`, `O_EXCL` and `fsync` checks. |
+| PR2 | PR2's next sequential schema migration (e.g., `0024`) adding nullable `openmettle.operations.dispatched_attempts integer DEFAULT NULL CHECK (dispatched_attempts BETWEEN 0 AND 3)` with a `BEFORE UPDATE` monotonicity trigger forbidding `non-null -> NULL` or decrements (PR2 `approvals::record_fenced_intent` inserts `0` only for `repeatable_read`, leaving writes `DEFAULT NULL` until PR3), `openmettle.storage_reservations.spill_reclaiming boolean NOT NULL DEFAULT false` with `CHECK (NOT spill_reclaiming OR state IN ('reserved', 'released'))`, their matching `src/boundaries.sql` grants (`INSERT`/`UPDATE (dispatched_attempts)` and `UPDATE (spill_reclaiming)` for `openmettle_worker`, `$1 >= <v1_14_schema_version>`), the `AFTER UPDATE OF state ON openmettle.runs FOR EACH ROW` `SECURITY DEFINER` trigger `openmettle.resolve_abandoned_repeatable_reads()` (owned by `openmettle_owner`, `SET search_path = pg_catalog`, `REVOKE ALL FROM PUBLIC`, audited in `src/boundaries.sql`, preserving `openmettle_api`'s zero `UPDATE` grant on `openmettle.operations`, resolving abandoned revision-zero `capability = 'repeatable_read'` `outcome = 'intent'` rows to `outcome = 'failed'`, `revision = 1` with idempotent `abandoned-read:<operation_id>` ADR 0004 `identity`/`digest` observation `run_events` strictly before `run-waiting` / `run-terminal` uniformly across mixed-version `N-1` and `N` worker/API binaries without duplicate Rust-caller SQL updates) and one-time upgrade repair (as `openmettle_owner`) of pre-existing `state IN ('queued', 'waiting')` runs, `StepResult::Invalidated` and its `worker::execute` (`src/worker.rs`) mapping to `WorkEnd::Stop(Stop::LeaseLost)`, reviewed tool registry (`EffectPolicy`) rejecting `x-mcp-header` schemas, strict schema/argument validator and default expander, `approvals::start_replayed_read` with durable 3-attempt cap (`coalesce(dispatched_attempts, 1) < 3`), internal `artifact.read_range` v1 tool, `artifact_fs::Store::probe_writable`, updating `Store::stage` (`src/artifact_fs.rs:144-158`) so HTTP uploads also open `staging/<id>` via `fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600)` and hold `File::try_lock_shared()` (`LOCK_SH \| LOCK_NB`, returning `Error::InProgress` if locked) while streaming, three-phase `artifact_fs::publish_bytes` (implemented strictly with safe Rust 1.100 `std::fs` + `std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, MetadataExt}` under `unsafe_code = "forbid"` and zero new crates; gated by a process-wide bounded `Arc<tokio::sync::Semaphore>` `spill_permits` bounded to `max_concurrent_runs` / `OPENMETTLE_WORKER_RUN_SLOTS` via non-blocking `try_acquire_owned()` before pre-Phase-1 and Phase 1 — skipping staging creation and Phases 1–3 with zero files, zero `storage_reservations` rows and zero `spawn_blocking` tasks on `NoPermits` into inline `truncated_no_spill`; pre-minting `reservation_id = Uuid::new_v4()` and validating `staging/` via `fs::symlink_metadata` + `MetadataExt`, then pre-creating the single 0-byte payload file `staging/<reservation_id>` via `fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&staging_path)` + `payload_file.try_lock_shared()` (`LOCK_SH \| LOCK_NB`) + `sync_dir(&store.staging)` BEFORE Phase 1 inserts `storage_reservations`, raced against `step.deadline` and `step.stop.changed()`, removing `staging/<reservation_id>` with `fs::remove_file` while holding `LOCK_SH` + `drop(payload_file)` + `sync_dir(&store.staging)` on pre-Phase-1 cutoff or deterministic Phase-1 pre-commit error/rollback, while on ambiguous/lost Phase-1 commit ack opening a new primary `READ COMMITTED` transaction that first acquires `SELECT 1 FROM openmettle.runs WHERE scope_id = $1 AND id = $2 FOR NO KEY UPDATE` and then in a separate subsequent SQL statement queries `SELECT state FROM openmettle.storage_reservations WHERE id = $1`, removing `staging/<reservation_id>` under `LOCK_SH` only when that post-lock query succeeds with zero rows (`None`) and keeping `staging/<reservation_id>` intact on disk when committed or when the recovery transaction fails/times out; moving the already-open read-write, `LOCK_SH`-locked `payload_file` and `OwnedSemaphorePermit` directly into Phase 2's `spawn_blocking` closure with zero second `open()` call and zero `.lock` sidecar; no DB txn across disk I/O; per-attempt disjoint `reservation_id`; Phase 2 checking `cancelled.load(Ordering::Acquire)` before writing, before each `<= 64 KiB` chunk and after `payload_file.sync_all()`, never calling `fs::remove_file` on `staging/<reservation_id>` or `fs::rename` when cancelled — simply dropping `payload_file` and `OwnedSemaphorePermit` — and on uncancelled completion keeping `LOCK_SH` on `payload_file` across `fs::rename(&staging_path, &revision_path)` + `sync_dir(&store.revisions)` + `sync_dir(&store.staging)` before dropping `payload_file` and `OwnedSemaphorePermit`; racing Phase 2's `spawn_blocking` `JoinHandle` in `tokio::select!` against `tokio::time::sleep_until(step.deadline)` and `step.stop.changed()` via shared `Arc<AtomicBool>` (`cancelled`), detaching on cutoff while keeping `<reservation_id>` in `state = 'reserved'` and immediately running the inline `truncated_no_spill` fallback during the drain window; Phase 3 locking `storage_reservations FOR UPDATE` where `storage::settle` preserves its existing `ReservationState::Settled` idempotent metadata-matching replay branch (`src/storage.rs:362-379`, `tests/schema/artifact_fs.rs:434`) and enforces `AND NOT spill_reclaiming` strictly on its `ReservationState::Reserved` settlement branch, rolling back both `storage::settle` and `runs::record_observation` if `spill_reclaiming = true`, plus local `step.deadline`/`step.stop` rechecks after normal Phase 2 completion, under the Phase 3 `Fence::Step` lock before settling and again inside the Phase 3 closure after `storage::settle` + `runs::record_observation` complete their SQL statements immediately before commit, rolling back on cutoff; single atomic `Fence::Step` commit of `storage::settle` + `runs::record_observation`; spill-abort disposition committing inline `truncated_no_spill` under `Fence::Step` + `StepResult::Continue` when only shortened `step.deadline` elapsed and `step.stop` remains `None`, under `Fence::Hold` + `StepResult::Stopped` when `step.stop` is `Some(Stop::Shutdown)`, `Some(Stop::Cancel)` or `Some(Stop::Deadline)` or `LeaseError::Stopping(_)`, and returning `StepResult::Invalidated` on `Stop::LeaseLost`, `StaleClaim`, `Expired` or `Terminal`, with mandatory `*step.stop.borrow()` rechecks inside the fallback's `leases::fenced` closure both immediately after `leases::lock` acquires the `runs` row lock and immediately after `runs::record_observation` completes right before commit; deterministic `WorkEnd::Incomplete` drain-window expiry recovery for `repeatable_read`), 3-step DB-claimed single-inode read-write `LOCK_EX` + `set_len(0)` `reconcile_run_spills` (Step 1: lock-ordered DB tx `runs` -> `storage_reservations` claiming `spill_reclaiming = true` while keeping `state = 'reserved'` and `max_bytes` charged BEFORE any filesystem removal; Step 2: outside DB tx, validating non-symlink regular-file `(dev(), ino())` via `fs::symlink_metadata` + `fs::OpenOptions::new().read(true).write(true).open(&path)` + `probe_file.metadata()` on `staging/<id>` and `revisions/<id>` + `probe_file.try_lock()` (`LOCK_EX \| LOCK_NB`), skipping `TryLockError::WouldBlock` so `state = 'reserved'` (`spill_reclaiming = true`) and `max_bytes` stay charged, re-verifying `(dev(), ino())` under `LOCK_EX` and calling `probe_file.set_len(0)?` to zero the open inode's logical byte length (`st_size = 0`, matching ADR 0005) BEFORE `fs::remove_file(&path)` + `drop(probe_file)`, and unconditionally requiring successful `sync_dir(&store.staging)` AND `sync_dir(&store.revisions)` before Step 3 — including on retry passes where one or both paths returned `ErrorKind::NotFound`, aborting cleanup with `max_bytes` still charged if either `sync_dir` fails; Step 3: short lock-ordered DB tx committing `storage::release` with zero post-terminal `run_events`; plus defense-in-depth `state = 'released'` pass and aged `> 900 s` orphan `staging/` sweep that verifies non-symlink regular-file `(probe_dev, probe_ino)` and acquires `probe_file.try_lock()` *before* querying primary PostgreSQL `SELECT state FROM openmettle.storage_reservations WHERE id = $1`, serializes any zero-row (`None`) observation via a short primary `READ COMMITTED` transaction executing `SELECT 1 FROM openmettle.storage_instance WHERE id FOR UPDATE` followed by a separate subsequent `SELECT state FROM openmettle.storage_reservations WHERE id = $1` (skipping conservatively on lock timeout/error), always skips `state = 'reserved'`, on `state = 'settled'` checks **both** (a) `fs::symlink_metadata(&staging_path)` succeeds with `file_type().is_file()` and `(dev(), ino()) == (probe_dev, probe_ino)` AND (b) `fs::symlink_metadata(&revision_path)` returns `NotFound` or `(dev(), ino()) != (probe_dev, probe_ino)` (skipping with zero `set_len(0)` / zero `fs::remove_file` if either fails, and reclaiming only a proven-distinct dead retry inode while leaving published `revisions/<id>` untouched), and on confirmed zero rows (`None`) or `state = 'released'` verifies `(staging_meta.dev(), staging_meta.ino()) == (probe_dev, probe_ino)` before `probe_file.set_len(0)?` -> `fs::remove_file(&staging_path)` -> `drop(probe_file)` -> `sync_dir(&store.staging)`), shared-volume read-write advisory `flock` qualification requirement alongside ADR 0031, and serialized-budget head/tail preview builder. | PostgreSQL 18 tests: cross-user, cross-scope, archived/deleted project, private project-scope spill ownership (other members denied until shared), share revocation and `active` -> `retained` transition between original read and replay, and non-`active` revision refusals; `max_bytes < 4` validation refusal, invalid UTF-8 binary semantic fault and strictly inline `artifact.read_range` under both 6x JSON escaping and `<= 200`-line `next_offset` pagination; unfinished `repeatable_read` replay through `approvals::start_replayed_read` (rechecking bound session and canonical proposal without issuing a write permit) plus crash-reclaim test at `dispatched_attempts == 3` proving dispatch refusal, terminal `failed` observation under `Fence::Step` and zero outbound sends; catalog registration rejection of `x-mcp-header` schemas plus duplicate-key, float, depth, bound and wildcard rejections; serialized-JSON `16 KiB` inline/spill thresholds (`\u001b` expansion, `200` lines, multi-byte UTF-8 cuts); startup `Store::probe_writable` fail-closed test on pre-existing read-only `staging/` and `revisions/`; unset-`ARTIFACTS_DIR`, unconfigured-store, quota-refused, `spill_saturated` and I/O fallback envelopes; existing `storage::settle` `ReservationState::Settled` idempotent HTTP upload replay (`tests/schema/artifact_fs.rs:434`) preserved alongside `AND NOT spill_reclaiming` on `ReservationState::Reserved`; Phase 3 rollback/crash simulation verifying `storage::settle` and `runs::record_observation` commit atomically inside one `Fence::Step` transaction so at most one active revision and one storage quota charge ever commit per operation (zero double-charged spill revisions on replacement-worker replay); `publish_bytes` and `reconcile_run_spills` Phase 1/2/3 stall, single-inode locking, cleanup-claim, orphan-sweep, saturation, `SIGKILL` and takeover tests covering (a) delaying Phase 2 `spawn_blocking` disk I/O past **both** the `5 s` PostgreSQL `idle_in_transaction_session_timeout` and the worker drain deadline during lease takeover (proving replacement worker settlement succeeds intact with its own disjoint `reservation_id` and the stalled old worker returns `StepResult::Invalidated` with zero corrupted/unlinked revisions and zero leaked settled quota), (b) **both race orders between a stalled Phase-3 commit and Step-1 `spill_reclaiming` claim** (when Step 1 commits `spill_reclaiming = true` first, stalled Phase 3 fails closed on `ReservationState::Reserved` + `AND NOT spill_reclaiming` / table `CHECK` constraint and rolls back both `storage::settle` and `runs::record_observation` before applying the spill-abort disposition while `reconcile_run_spills` cleans up and releases; when Phase 3 commits `state = 'settled'` first, Step 1 sees `state = 'settled'` and skips without removing `revisions/<id>`), (c) **pre-Phase-1 `sync_dir(&store.staging)` before `storage::reserve` and serialized lost Phase-1 commit-ack primary recheck**: verifying `staging/<id>` is created `0600` via `create_new(true)`, `LOCK_SH`-locked and `sync_dir`ed before Phase 1, that deterministic pre-commit failure (`OMQ01` / `Fence::Step` rejection) removes `staging/<id>` under `LOCK_SH`, and — delaying Phase 1's commit across the start of the lost-ack recovery transaction — proving the `SELECT 1 FROM openmettle.runs ... FOR NO KEY UPDATE` wait followed by the subsequent `SELECT state FROM openmettle.storage_reservations` statement prevents premature `0`-row observation and preserves `staging/<id>` intact on disk when Phase 1 commits (and also preserves `staging/<id>` when the recovery transaction fails/times out, removing only when the post-lock query succeeds with zero rows), (d) **single-handle `LOCK_SH` / `LOCK_EX` + `set_len(0)` before `fs::remove_file` + unconditional `NotFound` retry `sync_dir` across cutoff, paused `fsync`, `<= 64 KiB` chunk-boundary cancellation, and subprocess `SIGKILL` crash qualification**: stalling a cancelled Phase-2 writer both mid-chunk and during `payload_file.sync_all()` past `spill_reservation_ttl`, racing out of `tokio::select!` within the drain window to commit inline `truncated_no_spill`, running `reconcile_run_spills` while `payload_file` still holds `LOCK_SH` and asserting `spill_reclaiming = true`, `state = 'reserved'` and `max_bytes` remain fully charged (`TryLockError::WouldBlock` on sweeper read-write `File::try_lock()`), then verifying that once the writer observes `cancelled` and drops `payload_file` (or a child worker subprocess is terminated with `SIGKILL`) `reconcile_run_spills` acquires `LOCK_EX` on `staging/<id>` (or unsettled `revisions/<id>`), zeroes logical byte length (`st_size = 0`) via `set_len(0)` before `fs::remove_file`, `sync_dir`s both `staging/` and `revisions/`, and drops quota charge to zero, PLUS a retry test simulating an unsynced prior removal (`ErrorKind::NotFound` on both `staging/<id>` and `revisions/<id>`) verifying both `staging/` and `revisions/` are `sync_dir`ed before Step 3 `storage::release` commits (and that a `sync_dir` failure on either directory aborts cleanup before `storage::release` with `max_bytes` still charged), (e) **aged `> 900 s` orphan `staging/` sweep `LOCK_EX`-before-DB-recheck, `storage_instance FOR UPDATE` zero-row serialization, published-vs-retry `'settled'` inode-identity tests**: racing (i) an aged `staging/<id>` whose Phase 1 `storage::reserve` commits while holding `LOCK_SH` right before writer cutoff (proving the orphan sweep acquires `LOCK_EX` *before* querying primary PostgreSQL, observes `state = 'reserved'` and skips removing), (ii) **Phase 1 commit-stall / lost-ack recovery timeout interleaving**: stalling Phase 1 mid-commit while publisher lost-ack recovery times out and drops `LOCK_SH` (leaving `staging/<id>` on disk), running the aged orphan sweeper so it acquires `LOCK_EX`, observes initial zero rows, serializes on `SELECT 1 FROM openmettle.storage_instance WHERE id FOR UPDATE`, observes `state = 'reserved'` after Phase 1 commits, and preserves `staging/<id>` intact, (iii) **pausing the orphan sweeper between opening `staging/<id>` and `try_lock()`, letting the live publisher finish `fs::rename(&staging_path, &revision_path)` and Phase 3 `storage::settle` (`state = 'settled'`), resuming the orphan sweeper, and verifying the published `revisions/<id>` payload's exact bytes and SHA-256 digest remain intact** (zero `set_len(0)`, zero `fs::remove_file`), PLUS a **crashed concurrent HTTP-upload retry test** where Retry 2 staged a distinct `staging/<id>` inode (Inode B) after Upload 1 settled Inode A (`state = 'settled'`), proving the aged sweep reclaims `staging/<id>` (Inode B) while preserving `revisions/<id>` (Inode A) bytes and SHA-256 intact (and confirming a live streaming HTTP upload holds `LOCK_SH` via `Store::stage` and blocks `LOCK_EX`), and (iv) verifying the `fs::symlink_metadata(&staging_path)` `(dev(), ino())` guard skips `set_len(0)` when `staging/<id>` is `NotFound`, a symlink, or replaced by a different inode, while an unreferenced pre-Phase-1 crash file with confirmed post-`storage_instance`-lock zero primary DB rows (or `state = 'released'`) and matching `(dev(), ino())` is truncated (`st_size = 0`) and removed under `LOCK_EX`, (f) local `step.deadline` expiry and `step.stop` firing while the DB lease is still live — including both pre-settlement cutoff and **holding the `storage_accounts` row lock across the local cutoff while the DB lease stays live** (proving Phase 3's final pre-commit check returns `Err` and rolls back both the `artifact_revisions` row and the `storage_accounts`/`storage_instance` quota charge, leaving `storage_reservations` in `state = 'reserved'`) — and asserting the exact resulting run and lease state alongside quota assertions: when only shortened `step.deadline` elapsed (`step.stop` stays `None`) on a completed known-outcome write with active `Fence::Step` lease, inline `truncated_no_spill` commits under `Fence::Step`, returns `StepResult::Continue` and leaves the run `running` with its active lease intact (zero `StoreError::InvalidInput("settle")` from `leases::decide`); when `step.stop` is `Some(Stop::Shutdown)`, `Some(Stop::Cancel)` or `Some(Stop::Deadline)` or `LeaseError::Stopping(_)`, inline `truncated_no_spill` commits under `Fence::Hold`, returns `StepResult::Stopped` and `run_one` hands off or settles cleanly; when the DB lease is lost (`StaleClaim`, `Expired`, `Terminal` or `Stop::LeaseLost`), `StepResult::Invalidated` -> `WorkEnd::Stop(Stop::LeaseLost)` exits with zero further PostgreSQL writes, (g) **blocking the inline `truncated_no_spill` fallback on a competing `FOR NO KEY UPDATE` lock on `openmettle.runs` while signaling `Stop::LeaseLost` locally with PostgreSQL `lease_expires_at` still in the future (inside `worker::monitor`'s safety margin)**, then releasing the competing lock and verifying the fallback rolls back with `StepResult::Invalidated` leaving `operations`, `run_events` and `runs.last_event_sequence` completely untouched (plus verifying a `Fence::Step` tool-deadline fallback that receives `Stop::Shutdown`, `Stop::Cancel` or `Stop::Deadline` while waiting on the lock commits under the held run lock and returns `StepResult::Stopped` rather than `StepResult::Continue`), (h) **`WorkEnd::Incomplete` drain-expiry contention tests for `repeatable_read`** holding a competing `FOR NO KEY UPDATE` lock on `openmettle.runs` across `run_one`'s full drain window, verifying `WorkEnd::Incomplete` drop, releasing the lock, driving recovery and asserting exact durable `operations.outcome` (safe replay under `Fence::Step` on a `running` run or trigger-resolved `failed` on `'waiting'`/terminal transition when uncommitted `'intent'`; reused committed `succeeded` observation with zero additional outbound sends on unacknowledged commit), and (i) **spill-semaphore (`spill_permits`) saturation test** (e.g., `1` spill permit) holding the first call's `spawn_blocking` job at `fsync`, triggering shortened `step.deadline` so the run continues (`StepResult::Continue`), executing subsequent large-output calls while the first task stays wedged, and verifying subsequent calls immediately fall back inline (`storage: "truncated_no_spill"`, `spill_error: "spill_saturated"`) with **zero** new staging files, **zero** new `storage_reservations` rows and **zero** queued `spawn_blocking` disk tasks until the first blocking closure drops `payload_file` and exits; crashed `repeatable_read` (`outcome = 'intent'`) + terminal settlement (`leases::settle`, `leases::settle_expired` and `approvals::park` -> immediate terminal `cancel_run`) + `reconcile_run_spills` freeing spill quota with zero stranded bytes and zero post-terminal `run_events`, plus a **populated-upgrade PostgreSQL 18 test** creating a pre-upgrade `waiting` run with a revision-zero `repeatable_read` `intent` and linked `tool-spill:*` reservation, running PR2's migration, immediately cancelling the run via `openmettle_api` (`cancel_run`), running `reconcile_run_spills`, and verifying zero stranded quota AND `204 No Content` on `GET`/`HEAD /v1/runs/{run_id}/events?after=<terminal_cursor>`, AND **mixed-version rolling-upgrade PostgreSQL 18 tests** verifying **(i)** after PR2's migration applies, executing pre-PR2 (`N-1`) `approvals::park` on a `running` run carrying a revision-zero `repeatable_read` `intent`, followed by API cancel/deny, resolves the intent before `run-waiting` and returns `204 No Content` on `GET`/`HEAD /v1/runs/{run_id}/events?after=<terminal_cursor>` and **(ii)** executing pre-PR2 (`N-1`) `leases::settle_expired` on an expired PR2 (`N`) run holding a `'reserved'` `tool-spill:*` `storage_reservations` row and an abandoned `repeatable_read` `intent`, then running `reconcile_run_spills`, succeeds in `storage::release` with zero stranded quota and returns `204 No Content` on the terminal SSE cursor, while preserving `storage::release` `Error::Unresolved` protection for `interrupted` runs with `outcome_unknown` writes, spill TTL/age guard against active publishers, defense-in-depth `state = 'released'` retryable cleanup, post-rename/pre-settlement cleanup of unsettled `revisions/<id>` and untouched `settled` rows; multi-node/shared-volume deployment qualification explicitly requiring cross-node/cross-mount read-write advisory locking (`File::try_lock_shared()` vs `File::try_lock()`) + `set_len(0)` before `fs::remove_file` exclusion alongside [ADR 0031](0031-filesystem-artifact-storage-and-streaming-multipart.md)'s `rename`, `create_new` (`O_EXCL`) and `fsync` checks. |
 | PR3 | PR3's sequential SQL migration installing/extending the `AFTER UPDATE OF state ON openmettle.runs FOR EACH ROW` `SECURITY DEFINER` trigger (`openmettle.resolve_interrupted_write_intents()`, `WHEN (OLD.state IS DISTINCT FROM 'interrupted' AND OLD.state NOT IN ('succeeded', 'failed', 'cancelled') AND NEW.state = 'interrupted')`, owned by `openmettle_owner`, `SET search_path = pg_catalog`, `REVOKE ALL FROM PUBLIC`, audited in `src/boundaries.sql`) unconditionally transitioning **all remaining** revision-zero write intents (`capability IN ('idempotent', 'lookup', 'non_repeatable') AND outcome = 'intent' AND revision = 0`) to `outcome = 'outcome_unknown'`, `revision = 1` (never `'failed'` inside the trigger) with bounded redacted observation evidence and ADR 0004 `openmettle/observation/1\0` `run_events` strictly before `run-terminal` so `openmettle.run-interrupted`'s `{"unresolved": n}` payload stays strictly equal to the post-settlement `unresolved!()` count across both `N-1` and `N` workers (`Δn = 0`); PR3 (`N`) `approvals::record_fenced_intent` explicitly inserting `dispatched_attempts = 0` for write capabilities (`idempotent`, `lookup`, `non_repeatable`) atomically with Step 5 incrementing `0 -> 1 -> 2 -> 3` under the monotonicity trigger (so pre-upgrade and `N-1` write rows remain `dispatched_attempts IS NULL`); PR3 (`N`) `leases::settle_locked` first querying `(n_raw, n_zero, time)` without mutating `openmettle.operations` (`n_after = n_raw - n_zero`), unconditionally evaluating `Settle::Succeeded` against `n_raw` without pre-resolution (preserving `Err(StoreError::Conflict("unresolved operation"))` so `src/worker.rs:676-681` retries with `Settle::Stopped`), and pre-resolving non-null `dispatched_attempts = 0` write intents to `outcome = 'failed'` (`revision = 1` + `openmettle/observation/1\0` `run_events`) passing `n = n_after` to `decide` **iff** `input != Settle::Succeeded && (state == ExecState::Reconciling \|\| !time \|\| (n_after == 0 && (cancel.is_some() \|\| matches!(input, Settle::Failed(_)))))`, otherwise passing `n = n_raw` untouched so `leases::decide` transitions cleanly to non-terminal `Resolution::Reconciling(n_raw)` without mutating intents (covering both uncancelled `Running && Settle::Stopped && time` and mixed-write `n_zero >= 1 && n_after >= 1 && time` under cancellation or `Settle::Failed(_)`), and PR3 (`N`) `leases::settle_expired` pre-resolving non-null `dispatched_attempts = 0` write intents on locked `due` runs to `outcome = 'failed'` (`revision = 1`) before the `SETTLE_EXPIRED` `unresolved` CTE counts `u.n`; Streamable HTTP MCP (`2026-07-28`) adapter over `provider_http::transport` (rejecting `x-mcp-header` schemas on `tools/list`), `MCP_DNS_SLOTS`, `McpCredentialProvider` seam, `ApprovedAdapter` implementation stopping `outcome_unknown` writes via `StepResult::Stopped` and reusing PR2's `StepResult::Invalidated` -> `WorkEnd::Stop(Stop::LeaseLost)` mapping for deposed workers, destination-authorized read-only `Executor::reconcile` under `Fence::Hold` (adding `dispatched_attempts: Option<i32>` to `leases::UnresolvedOperation` and implementing deterministic `WorkEnd::Incomplete` recovery: strictly non-null `dispatched_attempts == Some(0)` -> `failed` with zero network calls -> `Interrupted(0)` or `Cancelled(r)`; `dispatched_attempts IS NULL OR dispatched_attempts >= 1` with authorized read-only lookup -> `succeeded`/`failed`; `dispatched_attempts IS NULL OR dispatched_attempts >= 1` with no downstream read-only lookup -> `outcome = "outcome_unknown"`, `revision = 1` -> terminal `interrupted` `{"unresolved": 1}` with zero write re-sends), and `PLAN-10` / `PLAN-22` conformance harness on synthetic `rcgen` TLS + PostgreSQL 18. | Synthetic TLS + PostgreSQL 18 tests: MCP `2026-07-28` request headers (`MCP-Protocol-Version: 2026-07-28`, `Mcp-Method`, `Mcp-Name`, no `Mcp-Session-Id`, no `Mcp-Param-*`) **and** body `params._meta` (`io.modelcontextprotocol/protocolVersion` and `io.modelcontextprotocol/clientCapabilities = {}`) over `application/json` and `text/event-stream` (SSE comments and progress notifications before final response, mismatched JSON-RPC IDs, duplicate final responses, `input_required` and unexpected server-initiated request rejection, upstream `tools/list` `x-mcp-header` schema rejection before tool offer or call admission, `4 MiB` aggregate stream ceiling before buffering); bounded retries with durable `dispatched_attempts` (`0 -> 1 -> 2 -> 3`) increments under `Fence::Step` (enforcing the monotonicity trigger forbidding `non-null -> NULL` or decrements) and identical persisted `Idempotency-Key` on `repeatable_read`/`idempotent` plus proven-pre-send retries on `lookup`/`non_repeatable`, enforcing `step.stop`, `step.deadline` (including `EndpointKey::Supported.expires_us`), crash-reclaim at `dispatched_attempts == 3` with zero outbound HTTP sends, and full ADR 0035 effect-level + bound-session/generation revocation checks before every retry across all classes; **PR3 mixed-version rolling-upgrade tests** covering both (i) a legacy/`N-1` `dispatched_attempts IS NULL` write `intent` verifying `Executor::reconcile` and direct terminal settlement resolve it to `outcome = 'outcome_unknown'` (`revision = 1`, terminal `interrupted`), never `failed`, and (ii) an **`N-1` worker settling a run containing a PR3-created `dispatched_attempts = 0` write `intent`** directly to `'interrupted'`, explicitly asserting PR3's trigger fires strictly before `run-terminal`, transitions the write to `outcome = 'outcome_unknown'`, `revision = 1`, and preserves **exact equality** between the committed `openmettle.run-interrupted` payload's `{"unresolved": n}` value (`1`) and the post-settlement `unresolved!()` row count (`1`) in `openmettle.operations`; **reclaimed uncancelled `Running` run, graceful shutdown `leases::handoff`, `Settle::Succeeded` (`!time`) and mixed-write settlement regression tests**: covering **(a)** `reclaim_next -> execute -> Reconciling(1) -> reconcile -> Interrupted(0)` (zero network calls, `outcome = 'failed'`, `revision = 1`, `{"unresolved": 0}`) and `leases::handoff` on graceful worker shutdown (`Settled::Reconciling { unresolved: 1 }` followed by `release_locked`, then `reconcile -> Interrupted(0)`) with one `dispatched_attempts = 0` write intent (`> 1` lease interval remaining), proving zero `StoreError::InvalidInput("settle")` errors, **(b)** `Settle::Succeeded` (`StepResult::Finished`) with one `dispatched_attempts = 0` write intent and `<= 1` lease interval remaining (`!time`), verifying `Err(StoreError::Conflict("unresolved operation"))` -> `Settle::Stopped` fallback -> `failed` (`DeadlineExceeded`, never `Succeeded`, extending `tests/schema/worker_runtime.rs:208-225`), and **(c)** **mixed writes** (`1` `dispatched_attempts = 0` + `1` `dispatched_attempts = 1`) under cancellation and `Settle::Failed` for both `time == true` (`Reconciling(2)` with zero pre-resolution) and `time == false` (`n_zero -> 'failed'`, `n_after -> 'outcome_unknown'`, terminal `Interrupted(1)`); sticky whole-operation send uncertainty (`outcome_unknown` preserved when a retry fails pre-send or receives `401`/`403`/deadline after ambiguous attempt 1) and immediate halt via `StepResult::Stopped` into `ExecState::Reconciling` / `interrupted` on every uncertain write (`lookup`, `non_repeatable`, or exhausted/window-expired `idempotent`), proving no further model round runs and a fresh-`logical_key` proposal cannot be admitted and produces **zero** additional outbound sends (while known-outcome non-retryable failures return `retryable_by_model: false`); deposed-worker lease takeover matrix between a possible write send and `runs::record_observation` explicitly covering both **(a)** an expired or replaced lease on a non-terminal run (`Fence::Hold` rejecting with `LeaseError::Expired` or `LeaseError::StaleClaim`, verifying the deposed worker returns `StepResult::Invalidated` immediately without touching PostgreSQL, leaves the durable `outcome = 'intent'` write row intact, and the replacement worker reclaims the run via `leases::reclaim_next` and routes the durable `intent` write straight into `ExecState::Reconciling` or terminal settlement with **zero** model steps and **zero** duplicate outbound sends) and **(b)** an already-terminal run (`Fence::Hold` rejecting with `LeaseError::Terminal`, verifying the deposed worker returns `StepResult::Invalidated` immediately without touching PostgreSQL, no replacement worker claims the run, and **zero** further DB writes or outbound sends occur); **`WorkEnd::Incomplete` drain-expiry contention matrix** holding a competing `FOR NO KEY UPDATE` lock on `openmettle.runs` across `run_one`'s full drain window, verifying `WorkEnd::Incomplete` drop, releasing the lock, driving recovery (`handoff`/`settle` or `reclaim_next` -> `ExecState::Reconciling` -> `Executor::reconcile`), and asserting exact durable `operations.outcome` and **zero additional outbound write sends** across (i) an externally successful **`non_repeatable` write** (`dispatched_attempts >= 1`, no downstream lookup -> `Executor::reconcile` commits `outcome = 'outcome_unknown'`, `revision = 1` under `Fence::Hold` -> terminal `interrupted` `{"unresolved": 1}`), (ii) `idempotent` and `lookup` writes (`dispatched_attempts IS NULL OR dispatched_attempts >= 1` -> read-only reconciled `succeeded`; strictly non-null `dispatched_attempts = 0` -> `failed` with zero sends; `lookup` with `downstream_handle IS NULL` and no deterministic query -> `outcome_unknown` -> `interrupted`), (iii) the **unacknowledged-commit** subcase (`operations.outcome` already committed `'succeeded'` right before `WorkEnd::Incomplete` drop -> reclaiming worker reuses the committed observation by `(scope_id, run_id, logical_key)` with zero additional outbound sends), and (iv) **direct terminal settlement drain-expiry tests with insufficient reconciliation time (`<= 1` lease interval remaining)** on **both** `leases::settle(..., Settle::Stopped)` and `leases::settle_expired` after a dispatched `non_repeatable` write, verifying `operations.outcome = 'outcome_unknown'`, `revision = 1`, `runs.state = 'interrupted'`, exact `{"unresolved": 1}` matching `unresolved!()`, `run-terminal` as the final event (`204 No Content` on `GET`/`HEAD /v1/runs/{run_id}/events?after=<terminal_cursor>`), and zero additional outbound sends (plus verifying non-null `dispatched_attempts = 0` direct-terminal pre-settlement in `leases::settle_locked` iff `input != Settle::Succeeded && (state == ExecState::Reconciling \|\| !time \|\| (n_after == 0 && (cancel.is_some() \|\| matches!(input, Settle::Failed(_)))))` and in `leases::settle_expired` resolves to `outcome = 'failed'`, `revision = 1` before counting `u.n` without forcing `'interrupted'`); `lookup` reconciliation with and without `downstream_handle` passing `&ActiveRun`/`&Lease<'_>` into `Executor::reconcile`, enforcing both `recheck_decision` and the live destination-specific MCP server/connection/account authorization check under `Fence::Hold` in `ExecState::Reconciling` before `McpCredentialProvider` lookup (asserting **zero** `McpCredentialProvider` lookups and terminal `interrupted` settlement when destination/account access is revoked or disabled), and verifying `repeatable_read` exclusion from `Executor::reconcile`; semantic `isError: true` / `-32602` plus `PLAN-10` valid-schema wrong/stale-fact semantic recovery; internal-MCP identity-boundary check authenticating caller/scope via primary PostgreSQL authority rather than compiled bypass; `PLAN-22` fixed native vs internal-MCP vs remote-MCP route measurement harness hook; SSRF/TLS/redirect/`401`/`403`/`tools/list`-drift/`> 4 MiB` refusals; canary redaction checks across errors, stderr, traces and metrics; end-to-end `park` -> `decide` -> resume -> `ApprovedAdapter::send` -> spill -> `artifact.read_range` round trip including share-revocation and retention replay refusals. |
 
 ### External boundaries
