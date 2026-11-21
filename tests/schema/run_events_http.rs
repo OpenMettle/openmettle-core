@@ -750,18 +750,28 @@ async fn slow_reader_times_out_releases_capacity_and_resumes_without_loss() {
     assert_eq!(f.snapshot()["last_sequence"], total.to_string());
     drop(idle);
     let mut observer = admin(Some(&f.db.0)).await;
-    eventually(async || {
-        let idle_count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity
-            WHERE datname=current_database() AND usename=$1 AND state='idle'",
-        )
-        .bind(API)
-        .fetch_one(&mut observer)
-        .await
-        .unwrap();
-        idle_count == 1
+    // On quiet HTTP/1.1 streams, the first Linux TCP write after FIN can elicit RST.
+    // EPIPE may surface on the second heartbeat, up to 30s after disconnect.
+    tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            // Count the connection as idle only after it has missed two 500ms stream polls.
+            let (idle_count, active_count): (i64, i64) = sqlx::query_as(
+                "SELECT count(*) FILTER (WHERE state='idle' AND state_change <= now() - interval '1 second'),
+                        count(*) FILTER (WHERE state='active')
+                 FROM pg_stat_activity WHERE datname=current_database() AND usename=$1",
+            )
+            .bind(API)
+            .fetch_one(&mut observer)
+            .await
+            .unwrap();
+            if (idle_count, active_count) == (1, 0) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     })
-    .await;
+    .await
+    .expect("API pool did not stay idle after the quiet streams disconnected");
 
     let mut sequence = 1;
     while let Some((id, event)) = stalled.next().await {
