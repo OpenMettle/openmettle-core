@@ -69,12 +69,13 @@ impl Api {
             return Err(INVALID);
         }
         let preset = if op == Op::GetPreset {
-            Some(
-                Path::<String>::from_request_parts(parts, &())
-                    .await
-                    .map_err(|_| INVALID)?
-                    .0,
-            )
+            let Path(id) = Path::<String>::from_request_parts(parts, &())
+                .await
+                .map_err(|_| INVALID)?;
+            if !crate::model_config::name(&id) {
+                return Err(INVALID);
+            }
+            Some(id)
         } else {
             None
         };
@@ -93,8 +94,8 @@ impl Api {
         };
         let content = match op {
             Op::CreateRun => Content::Run(submission::Request::read(body)?),
-            Op::CreateConversation => Content::Create(parse(body)?),
-            Op::CreateBranch => Content::Branch(parse(body)?),
+            Op::CreateConversation => Content::Create(parse_unique(body)?),
+            Op::CreateBranch => Content::Branch(parse_unique(body)?),
             Op::PreviewConfiguration => Content::Preview(submission::Proposal::read(body)?),
             _ => Content::Empty,
         };

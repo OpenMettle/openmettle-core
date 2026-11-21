@@ -471,6 +471,14 @@ fn parse<T: DeserializeOwned>(body: &[u8]) -> Result<T, Problem> {
     serde_json::from_slice(body).map_err(|_| BODY)
 }
 
+fn parse_unique<T: DeserializeOwned>(body: &[u8]) -> Result<T, Problem> {
+    let value = crate::provider_keys::documents::unique(body).map_err(|_| BODY)?;
+    if !value.is_object() {
+        return Err(BODY);
+    }
+    serde_json::from_value(value).map_err(|_| BODY)
+}
+
 /// A role or access key, matched exactly by the one grant vocabulary (ADR 0027).
 fn vocabulary<P>(
     format: &str,
@@ -483,13 +491,14 @@ fn vocabulary<P>(
 }
 
 /// A request body decoded and checked before any database work.
-#[derive(Debug, PartialEq)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 enum Input {
     Empty,
     Settings {
         name: String,
         instructions: String,
         defaults: Value,
+        selection: Box<crate::model_config::Selection>,
     },
     /// A role grant, or a revocation without a role.
     Member {
@@ -506,16 +515,13 @@ enum Input {
 /// Decodes the body of `op` with its optional audit reason. Settings are checked with the
 /// store's own rules, so an invalid setting is refused before the session is validated.
 fn decode(op: Op, body: &[u8]) -> Result<(Input, Option<String>), Problem> {
-    if matches!(op, Op::CreateProject | Op::UpdateProjectSettings) {
-        crate::provider_keys::documents::unique(body).map_err(|_| BODY)?;
-    }
     let (input, reason) = match op {
         Op::CreateProject => {
-            let b: NewProject = parse(body)?;
+            let b: NewProject = parse_unique(body)?;
             (settings(b.name, b.instructions, b.defaults)?, b.reason)
         }
         Op::UpdateProjectSettings => {
-            let b: SettingsUpdate = parse(body)?;
+            let b: SettingsUpdate = parse_unique(body)?;
             (settings(b.name, b.instructions, b.defaults)?, b.reason)
         }
         Op::SetProjectMemberRole => {
@@ -574,10 +580,12 @@ fn settings(name: String, instructions: String, defaults: Value) -> Result<Input
     }
     .validate()
     .map_err(store_problem)?;
+    let selection = crate::model_config::Selection::from_defaults(&defaults, "")?;
     Ok(Input::Settings {
         name,
         instructions,
         defaults,
+        selection: Box::new(selection),
     })
 }
 
@@ -1102,6 +1110,7 @@ impl Api {
                     name,
                     instructions,
                     defaults,
+                    selection,
                 },
             ) => {
                 let settings = ProjectSettingsInput {
@@ -1109,31 +1118,25 @@ impl Api {
                     instructions: &instructions,
                     defaults: &defaults,
                 };
+                let check_defaults = async |c: &mut PgConnection, actor: &Principal| {
+                    catalog::check_project_defaults(c, actor, catalog, &selection).await
+                };
                 let view = self
-                    .with_connection(async |c| {
-                        if defaults.get("model_config").is_some() {
-                            let selection =
-                                crate::model_config::Selection::from_defaults(&defaults, "")?;
-                            if selection.model.is_some() || selection.preset.is_some() {
-                                let catalog = catalog.ok_or(INVALID)?;
-                                let actor = principal(c, context).await?;
-                                let policy = store::load_platform_capabilities(c).await?;
-                                catalog.resolve(
-                                    &selection,
-                                    &Default::default(),
-                                    None,
-                                    |model, preset| {
-                                        catalog::allowed(catalog, &actor, &policy, model, preset)
-                                    },
-                                )?;
-                            }
-                        }
+                    .database(async |c| {
                         let project = if op == Op::CreateProject {
-                            projects::create_project(c, &audit, &settings).await?
+                            projects::create_project_checked(c, &audit, &settings, check_defaults)
+                                .await?
                         } else {
-                            projects::update_project_settings(c, &audit, target, &settings).await?
+                            projects::update_project_settings_checked(
+                                c,
+                                &audit,
+                                target,
+                                &settings,
+                                check_defaults,
+                            )
+                            .await?
                         };
-                        Ok(read_project(c, context, project.target_id()).await?)
+                        read_project(c, context, project.target_id()).await
                     })
                     .await?;
                 let status = match op {

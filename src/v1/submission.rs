@@ -383,8 +383,18 @@ pub(super) async fn submit(
     limits: &AdmissionLimits,
     catalog: Option<&Catalog>,
 ) -> Result<(StatusCode, String), Problem> {
+    let ctx = call.context;
+    let actor = principal(c, ctx).await?;
+    let visible = projects::read_resource(
+        c,
+        &actor,
+        ResourceKind::Conversation,
+        &r.conversation_id,
+        ctx.observed_ms(),
+    )
+    .await?;
     let mut tx = WriteTransaction::begin_bounded(c, false).await?;
-    let result = admission(&mut tx, call, r, limits, catalog).await;
+    let result = admission(&mut tx, &visible.scope_id, call, r, limits, catalog).await;
     if matches!(result, Ok(Admission::Admitted { .. })) {
         tx.commit().await?
     } else {
@@ -408,20 +418,15 @@ pub(super) const QUEUE_FULL: Problem = problem(
 );
 async fn admission(
     tx: &mut WriteTransaction<'_>,
+    scope: &str,
     call: Call<'_>,
     r: &Request,
     limits: &AdmissionLimits,
     catalog: Option<&Catalog>,
 ) -> Result<Admission, Problem> {
     let c = tx.connection()?;
-    let scope: String =
-        sqlx::query_scalar("SELECT scope_id::text FROM openmettle.conversations WHERE id=$1::uuid")
-            .bind(&r.conversation_id)
-            .fetch_optional(&mut *c)
-            .await?
-            .ok_or(NOT_FOUND)?;
     let ctx = call.context;
-    queue::lock_scope_actor(c, &scope, ctx.user_id()).await?;
+    queue::lock_scope_actor(c, scope, ctx.user_id()).await?;
     let actor = principal(c, ctx).await?;
     let view = projects::resource_view(
         c,
@@ -432,9 +437,12 @@ async fn admission(
         authz::Action::RunExecute,
     )
     .await?;
+    if view.scope_id != scope {
+        return Err(NOT_FOUND);
+    }
     let key = request_key(call.op, &r.conversation_id, call.key);
     let chat = Conversation {
-        scope: &scope,
+        scope,
         id: &r.conversation_id,
     };
     let intent = Intent {
@@ -445,7 +453,7 @@ async fn admission(
         requested_rounds: r.proposal.requested_rounds,
     };
     let (branch, message, format, version, snapshots, gates) =
-        if let Some(found) = queue::find_run(c, &scope, ctx.user_id(), &key).await? {
+        if let Some(found) = queue::find_run(c, scope, ctx.user_id(), &key).await? {
             let (previous, config) = Snapshots::decode(&found).map_err(|_| KEY_CONFLICT)?;
             if !previous.matches(&intent) {
                 return Err(KEY_CONFLICT);
@@ -505,7 +513,7 @@ async fn admission(
         tx,
         &queue::RunAdmission {
             input: RunInput {
-                scope: &scope,
+                scope,
                 actor: ctx.user_id(),
                 conversation: chat.id,
                 branch: &branch,

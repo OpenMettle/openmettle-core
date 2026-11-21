@@ -60,9 +60,9 @@ impl Server {
             "live_per_actor":limits.0, "live_per_scope":limits.1, "queued_in_instance":limits.2,
             "queue_timeout_seconds":300, "round_cap":5
         });
+        doc["catalog_file"] = json!(dir.path("catalog.json"));
         configure(&mut doc, &mut catalog);
-        doc["catalog_file"] =
-            json!(dir.write("catalog.json", &serde_json::to_vec(&catalog).unwrap()));
+        dir.write("catalog.json", &serde_json::to_vec(&catalog).unwrap());
         let path = dir.write("auth.json", &serde_json::to_vec(&doc).unwrap());
         let bind = address();
         let mut process = Process(
@@ -85,9 +85,9 @@ impl Server {
         method: &str,
         path: &str,
         key: Option<&str>,
-        body: Option<&Value>,
+        body: Option<&str>,
     ) -> TcpStream {
-        let data = body.map(Value::to_string).unwrap_or_default();
+        let data = body.unwrap_or_default();
         let key = key
             .map(|k| format!("Idempotency-Key: {k}\r\n"))
             .unwrap_or_default();
@@ -114,6 +114,22 @@ impl Server {
         path: &str,
         key: Option<&str>,
         body: Option<&Value>,
+    ) -> Reply {
+        self.call_raw(
+            channel,
+            method,
+            path,
+            key,
+            body.map(Value::to_string).as_deref(),
+        )
+    }
+    fn call_raw(
+        &self,
+        channel: &str,
+        method: &str,
+        path: &str,
+        key: Option<&str>,
+        body: Option<&str>,
     ) -> Reply {
         let mut stream = BufReader::new(self.send(channel, method, path, key, body));
         let mut headers = String::new();
@@ -166,6 +182,9 @@ impl Server {
     }
     fn post(&self, who: &str, path: &str, key: &str, body: &Value) -> Reply {
         self.call(who, "POST", path, Some(key), Some(body))
+    }
+    fn put(&self, who: &str, path: &str, key: &str, body: &Value) -> Reply {
+        self.call(who, "PUT", path, Some(key), Some(body))
     }
     fn cancel(&self, who: &str, run: &Value) -> Reply {
         self.call(
@@ -323,6 +342,172 @@ async fn counts(db: &TestDb) -> (i64, i64, i64) {
         (SELECT count(*) FROM openmettle.run_events WHERE sequence=1 AND format='openmettle.run-created')")
         .fetch_one(&mut connect(&db.0, OWNER).await).await.unwrap()
 }
+
+async fn deny_model_a(db: &TestDb, actor: &Account) {
+    sqlx::query(
+        "INSERT INTO openmettle.platform_capability_denies (capability, denied, updated_by_user_id)
+         VALUES ('model.a', true, $1::uuid)",
+    )
+    .bind(&actor.user)
+    .execute(&mut connect(&db.0, OWNER).await)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "disposable PostgreSQL 18.1"]
+async fn project_defaults_validate_new_writes_and_replay_committed_keys() {
+    let db = TestDb::migrated().await;
+    let u = Users::new(&db).await;
+    let api = Server::new(&db, (5, 5, 5), "catalog/1");
+    let projects = "/v1/projects";
+    let create = json!({"name":"First","defaults":{"model_config":{"model":"a"}}});
+    let update =
+        json!({"name":"Second","instructions":"","defaults":{"model_config":{"preset":"study"}}});
+    let created = api.post(&u.cookie, projects, "create", &create).expect(201);
+    let path = format!("{projects}/{}", id(&created, "project_id"));
+    let updated = api.put(&u.cookie, &path, "update", &update).expect(200);
+
+    deny_model_a(&db, &u.actor).await;
+    let empty = Server::configured(&db, (5, 5, 5), "unused", |doc, _| {
+        doc.as_object_mut().unwrap().remove("catalog_file");
+    });
+    for (router, status, code) in [(&api, 403, "policy"), (&empty, 400, "validation")] {
+        assert_eq!(
+            router
+                .post(&u.bearer, projects, "create", &create)
+                .expect(201),
+            updated
+        );
+        assert_eq!(
+            router.put(&u.bearer, &path, "update", &update).expect(200),
+            updated
+        );
+        router
+            .post(&u.bearer, projects, "retry-create", &create)
+            .problem(status, code);
+        router
+            .put(&u.bearer, &path, "retry-update", &update)
+            .problem(status, code);
+    }
+    let plain = json!({"name":"Plain","instructions":"","defaults":{}});
+    empty
+        .post(&u.cookie, projects, "retry-create", &plain)
+        .expect(201);
+    empty
+        .put(&u.cookie, &path, "retry-update", &plain)
+        .expect(200);
+}
+
+#[tokio::test]
+#[ignore = "disposable PostgreSQL 18.1"]
+async fn project_visibility_authority_and_archive_precede_catalog_lookup() {
+    let db = TestDb::migrated().await;
+    let u = Users::new(&db).await;
+    let api = Server::new(&db, (5, 5, 5), "catalog/1");
+    let p = api
+        .post(
+            &u.cookie,
+            "/v1/projects",
+            "create",
+            &json!({"name":"Private"}),
+        )
+        .expect(201);
+    let path = format!("/v1/projects/{}", id(&p, "project_id"));
+    let denied =
+        json!({"name":"Denied","instructions":"","defaults":{"model_config":{"model":"a"}}});
+    let unknown =
+        json!({"name":"Unknown","instructions":"","defaults":{"model_config":{"model":"unknown"}}});
+    deny_model_a(&db, &u.actor).await;
+    api.put(&u.other, &path, "settings", &denied)
+        .problem(404, "not_found");
+    api.put(
+        &u.cookie,
+        &format!("/v1/projects/{INPUT}"),
+        "settings",
+        &denied,
+    )
+    .problem(404, "not_found");
+    api.put(&u.cookie, &path, "settings", &unknown)
+        .problem(400, "validation");
+    api.put(
+        &u.cookie,
+        &format!("{path}/members"),
+        "member",
+        &json!({"role":"viewer","grantee":{"kind":"user","grantee_id":u.peer.user}}),
+    )
+    .expect(200);
+    api.put(&u.other, &path, "settings", &unknown)
+        .problem(403, "policy");
+    api.call(
+        &u.cookie,
+        "POST",
+        &format!("{path}/archive"),
+        Some("archive"),
+        None,
+    )
+    .expect(200);
+    api.put(&u.cookie, &path, "settings", &unknown)
+        .problem(409, "conflict");
+    api.call(&u.cookie, "DELETE", &path, Some("delete"), None)
+        .expect(204);
+    api.put(&u.cookie, &path, "settings", &denied)
+        .problem(404, "not_found");
+}
+
+#[tokio::test]
+#[ignore = "disposable PostgreSQL 18.1"]
+async fn account_admin_cannot_read_or_lock_foreign_conversations_and_runs() {
+    let db = TestDb::migrated().await;
+    let u = Users::new(&db).await;
+    let api = Server::new(&db, (5, 5, 5), "catalog/1");
+    let mut owner = connect(&db.0, OWNER).await;
+    authz_store::make_admin(&mut owner, &u.peer).await;
+    let p = api
+        .post(
+            &u.cookie,
+            "/v1/projects",
+            "project",
+            &json!({"name":"Private"}),
+        )
+        .expect(201);
+    for (scope, message) in [
+        (json!({}), INPUT),
+        (json!({"scope_id":p["scope_id"]}), NEXT),
+    ] {
+        let root = api
+            .post(&u.cookie, "/v1/conversations", "chat", &scope)
+            .expect(201);
+        let body = submit(&root, proposal(message, None));
+        let run = api.post(&u.cookie, "/v1/runs", "run", &body).expect(201);
+        api.get(
+            &u.other,
+            &format!("/v1/conversations/{}", id(&root, "conversation_id")),
+        )
+        .problem(404, "not_found");
+        api.get(&u.other, &format!("/v1/runs/{}", id(&run, "run_id")))
+            .problem(404, "not_found");
+        // A foreign submission must answer while the owner's scope lock is held.
+        let mut locked = owner.begin().await.unwrap();
+        if scope.get("scope_id").is_some() {
+            sqlx::query("SELECT FROM openmettle.projects WHERE id=$1::uuid FOR UPDATE")
+                .bind(id(&p, "project_id"))
+                .fetch_one(&mut *locked)
+                .await
+                .unwrap();
+        } else {
+            sqlx::query("SELECT FROM openmettle.users WHERE id=$1::uuid FOR UPDATE")
+                .bind(&u.actor.user)
+                .fetch_one(&mut *locked)
+                .await
+                .unwrap();
+        }
+        api.post(&u.other, "/v1/runs", "foreign", &body)
+            .problem(404, "not_found");
+        locked.rollback().await.unwrap();
+    }
+}
+
 #[tokio::test]
 #[ignore = "disposable PostgreSQL 18.1"]
 async fn admission_replay_conflict_limits_and_archive() {
@@ -389,7 +574,13 @@ async fn admission_replay_conflict_limits_and_archive() {
     loss.problem(409, "idempotency_conflict");
     assert_eq!(counts(&db).await, (2, 2, 2));
     let after = submit(&root, proposal(EDIT, Some(INPUT)));
-    let undelivered = api.send(&u.cookie, "POST", "/v1/runs", Some("advance"), Some(&after));
+    let undelivered = api.send(
+        &u.cookie,
+        "POST",
+        "/v1/runs",
+        Some("advance"),
+        Some(&after.to_string()),
+    );
     // Wait for the server to reply, then close without consuming its response.
     assert_eq!(undelivered.peek(&mut [0]).unwrap(), 1);
     drop(undelivered);
@@ -435,6 +626,14 @@ async fn shares_catalog_preview_history_and_cancellation() {
     let u = Users::new(&db).await;
     let api = Server::new(&db, (10, 10, 10), "catalog/1");
     let ch = "/v1/conversations";
+    api.call_raw(
+        &u.cookie,
+        "POST",
+        ch,
+        Some("duplicate"),
+        Some(r#"{"scope_id":null,"scope_id":null}"#),
+    )
+    .problem(400, "validation");
     let bad_origin = u
         .cookie
         .replace("https://app.example.test", "https://elsewhere.example");
@@ -487,6 +686,12 @@ async fn shares_catalog_preview_history_and_cancellation() {
         api.get(&u.bearer, "/v1/presets/study").expect(200)["readiness"]["state"],
         "unknown"
     );
+    for invalid in ["x".repeat(257), "%C3%A9".repeat(129), "a%0Ab".to_owned()] {
+        api.get(&u.bearer, &format!("/v1/presets/{invalid}"))
+            .problem(400, "validation");
+    }
+    api.get(&u.bearer, &format!("/v1/presets/{}", "x".repeat(256)))
+        .problem(404, "not_found");
     let preview = format!("{b}/effective-configuration");
     let proposed = proposal(INPUT, None);
     let current = api
@@ -547,6 +752,12 @@ async fn shares_catalog_preview_history_and_cancellation() {
     )
     .expect(200);
     let fork = json!({"source_branch_id":root["branch_id"],"fork_message_id":INPUT});
+    let duplicate = format!(
+        r#"{{"source_branch_id":"{}","fork_message_id":"{INPUT}","fork_message_id":"{INPUT}"}}"#,
+        id(&root, "branch_id")
+    );
+    api.call_raw(&u.other, "POST", &list, Some("fork"), Some(&duplicate))
+        .problem(400, "validation");
     let child = api.post(&u.other, &list, "fork", &fork).expect(201);
     assert_eq!(api.post(&u.other, &list, "fork", &fork).expect(200), child);
     api.post(

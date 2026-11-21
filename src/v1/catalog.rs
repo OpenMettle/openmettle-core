@@ -1,9 +1,34 @@
 use super::{conversations::decimal, pagination::Page, *};
 use crate::{
     authz::{CapabilityGate, PlatformPolicy, authorize_capability},
-    model_config::{Catalog, Preset, Profile},
+    model_config::{Catalog, Error, Preset, Profile, Selection},
 };
 use std::collections::BTreeMap;
+
+pub(super) async fn check_project_defaults(
+    c: &mut PgConnection,
+    actor: &Principal,
+    catalog: Option<&Catalog>,
+    selection: &Selection,
+) -> Result<(), StoreError> {
+    if selection.model.is_none() && selection.preset.is_none() {
+        return Ok(());
+    }
+    let catalog = catalog.ok_or(StoreError::InvalidInput("project model_config"))?;
+    let policy = store::load_platform_capabilities(c).await?;
+    catalog
+        .resolve(selection, &Selection::default(), None, |model, preset| {
+            allowed(catalog, actor, &policy, model, preset)
+        })
+        .map(drop)
+        .map_err(|e| match e {
+            Error::Unauthorized => StoreError::Denied(authz::DenialReason::Policy(
+                authz::PolicyReason::CapabilityDenied,
+            )),
+            Error::Invalid(reason) => StoreError::InvalidInput(reason),
+            Error::Provisioning => StoreError::InvalidInput("project model_config"),
+        })
+}
 
 pub(super) fn allowed(
     catalog: &Catalog,

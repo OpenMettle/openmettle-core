@@ -45,6 +45,7 @@ pub struct Range {
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 #[serde(default, deny_unknown_fields)]
 pub struct Controls {
     pub temperature: Option<f64>,
@@ -55,6 +56,7 @@ pub struct Controls {
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 #[serde(default, deny_unknown_fields)]
 pub struct Layer {
     pub controls: Controls,
@@ -116,7 +118,7 @@ struct CatalogDocument {
 
 pub struct Catalog(CatalogDocument);
 
-fn name(s: &str) -> bool {
+pub(crate) fn name(s: &str) -> bool {
     crate::runs::bounded(s, 256) && !s.chars().any(char::is_control)
 }
 
@@ -376,6 +378,7 @@ impl Catalog {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 #[serde(default, deny_unknown_fields)]
 pub struct Selection {
     pub model: Option<String>,
