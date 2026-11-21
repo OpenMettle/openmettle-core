@@ -3,7 +3,7 @@
   "jsonSchemaDialect": "https://spec.openapis.org/oas/3.2/dialect/2026-02-26",
   "info": {
     "title": "OpenMettle application API",
-    "version": "1.0.0-draft.5",
+    "version": "1.0.0-draft.6",
     "summary": "Versioned application contract for capabilities, projects, conversations, artifacts and durable run replay.",
     "description": "Canonical source for the OpenMettle v1 application API contract. Wire rules, compatibility policy and limits are recorded in docs/adr/0007-application-api-contract.md; authorization and project lifecycle in docs/adr/0027-authorization-and-private-projects.md. Every operation carries x-openmettle-implementation: `implemented` operations are served by an API started with OPENMETTLE_API_AUTH_CONFIG, and `not-implemented` operations are not served. An API started without OPENMETTLE_API_AUTH_CONFIG serves no operation; without OPENMETTLE_API_ARTIFACTS_DIR the artifact upload and download operations answer 503 provisioning. Artifact storage is described in docs/adr/0031-filesystem-artifact-storage-and-streaming-multipart.md. Fixtures under contracts/fixtures are generated from the examples in this document by scripts/contract_fixtures.py. ADR 0036 defines managed conversation history, catalog and durable submission. Configure catalog_file and admission_limits in the version-2 auth document. Run mutations require cursor_keys. A full queue returns Retry-After in seconds.",
     "license": {
@@ -2382,7 +2382,7 @@
             "$ref": "#/components/responses/Timeout"
           }
         },
-        "description": "The v2 auth settings accept an optional catalog_file (absolute path, at most 1 MiB) and admission_limits with live_per_actor, live_per_scope, queued_in_instance, queue_timeout_seconds and round_cap. All five limits are required together. A configured cursor key signs the returned snapshot. An exact retry uses its pinned input and configuration after reauthorization. A live limit yields 429. A full queue yields 503 with Retry-After."
+        "description": "The v2 auth settings accept an optional catalog_file (absolute path, at most 1 MiB) and admission_limits with live_per_actor, live_per_scope, queued_in_instance, queue_timeout_seconds and round_cap. All five limits are required together. A configured cursor key signs the returned snapshot. An exact retry uses its pinned input and configuration after reauthorization. A live limit yields 429. A full queue yields 503 with Retry-After. Admission binds the validated session to the run. YOLO requires an explicit runs.use_yolo grant. An exact replay from another active session preserves the original binding."
       }
     },
     "/v1/runs/{run_id}/cancel": {
@@ -2457,6 +2457,164 @@
           },
           "504": {
             "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/runs/{run_id}/approvals": {
+      "get": {
+        "operationId": "listRunApprovals",
+        "summary": "List the actionable approval for the run actor",
+        "description": "The run actor needs current scope and conversation read access. Browser writes require the configured Origin. Return at most one current, undecided request while its binding, deadline, originating session and reviewed display policy are valid. A visible run with no actionable request returns an empty array.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RunId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current actionable approval requests.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              },
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunApprovalList"
+                },
+                "examples": {
+                  "current": {
+                    "$ref": "#/components/examples/RunApprovalPending"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/runs/{run_id}/approvals/{approval_id}/decision": {
+      "post": {
+        "operationId": "decideRunApproval",
+        "summary": "Record or replay an approval decision",
+        "description": "The run actor needs current scope and conversation read access. Browser writes require the configured Origin. A new decision requires current execution authority and a live originating session. Exact key and input replay the original receipt after logout, archive or settlement. A changed input under the same key returns idempotency_conflict. A stale binding, another key after decision, or an invalid wait returns conflict.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RunId"
+          },
+          {
+            "$ref": "#/components/parameters/ApprovalId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Original decision receipt.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              },
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalReceipt"
+                },
+                "examples": {
+                  "current": {
+                    "$ref": "#/components/examples/ApprovalReceipt"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApprovalDecisionRequest"
+              },
+              "examples": {
+                "approve": {
+                  "$ref": "#/components/examples/ApprovalDecision"
+                }
+              }
+            }
           }
         }
       }
@@ -2674,6 +2832,15 @@
         "name": "scope_id",
         "in": "query",
         "description": "Return visible conversations in this scope. Defaults to the caller’s personal scope.",
+        "schema": {
+          "$ref": "#/components/schemas/Uuid"
+        }
+      },
+      "ApprovalId": {
+        "name": "approval_id",
+        "in": "path",
+        "required": true,
+        "description": "Canonical approval UUID within this run.",
         "schema": {
           "$ref": "#/components/schemas/Uuid"
         }
@@ -3468,7 +3635,7 @@
         }
       },
       "RunEvent": {
-        "description": "Persisted event in ascending per-run sequence. Consumers advance past unknown types and versions and tolerate unknown reason codes.",
+        "description": "Persisted event in ascending per-run sequence. Consumers advance past unknown types and versions and tolerate unknown reason codes. Version 1 run.failed reasons include queue_expired, approval_expired and invalid_wait.",
         "type": "object",
         "required": [
           "run_id",
@@ -3612,6 +3779,110 @@
                       "$ref": "#/components/schemas/Code"
                     }
                   }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "run.approval_requested"
+                },
+                "type_version": {
+                  "const": 1
+                }
+              },
+              "required": [
+                "type",
+                "type_version"
+              ]
+            },
+            "then": {
+              "properties": {
+                "data": {
+                  "type": "object",
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "run.waiting"
+                },
+                "type_version": {
+                  "const": 1
+                }
+              },
+              "required": [
+                "type",
+                "type_version"
+              ]
+            },
+            "then": {
+              "properties": {
+                "data": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "reason"
+                  ],
+                  "properties": {
+                    "reason": {
+                      "const": "approval"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "run.approval_decided"
+                },
+                "type_version": {
+                  "const": 1
+                }
+              },
+              "required": [
+                "type",
+                "type_version"
+              ]
+            },
+            "then": {
+              "properties": {
+                "data": {
+                  "type": "object",
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "run.resumed"
+                },
+                "type_version": {
+                  "const": 1
+                }
+              },
+              "required": [
+                "type",
+                "type_version"
+              ]
+            },
+            "then": {
+              "properties": {
+                "data": {
+                  "type": "object",
+                  "additionalProperties": false
                 }
               }
             }
@@ -5263,6 +5534,14 @@
           },
           "proposal": {
             "$ref": "#/components/schemas/TurnProposal"
+          },
+          "execution_mode": {
+            "type": "string",
+            "enum": [
+              "standard",
+              "yolo"
+            ],
+            "default": "standard"
           }
         },
         "required": [
@@ -5699,6 +5978,112 @@
         "required": [
           "instructions",
           "controls"
+        ]
+      },
+      "PendingApproval": {
+        "type": "object",
+        "properties": {
+          "approval_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "tool_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "tool_version": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "arguments_json": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 65536,
+            "description": "Exact canonical UTF-8 JSON text of the reviewed arguments."
+          },
+          "destination": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "binding_digest": {
+            "$ref": "#/components/schemas/Sha256Digest"
+          },
+          "approval_expires_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        },
+        "required": [
+          "approval_id",
+          "tool_id",
+          "tool_version",
+          "arguments_json",
+          "destination",
+          "binding_digest",
+          "approval_expires_at"
+        ]
+      },
+      "RunApprovalList": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "maxItems": 1,
+            "items": {
+              "$ref": "#/components/schemas/PendingApproval"
+            }
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "ApprovalDecisionRequest": {
+        "type": "object",
+        "properties": {
+          "decision": {
+            "type": "string",
+            "enum": [
+              "approve",
+              "deny"
+            ]
+          },
+          "binding_digest": {
+            "$ref": "#/components/schemas/Sha256Digest"
+          }
+        },
+        "required": [
+          "decision",
+          "binding_digest"
+        ],
+        "additionalProperties": false
+      },
+      "ApprovalReceipt": {
+        "type": "object",
+        "properties": {
+          "approval_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "decision": {
+            "type": "string",
+            "enum": [
+              "approve",
+              "deny"
+            ]
+          },
+          "binding_digest": {
+            "$ref": "#/components/schemas/Sha256Digest"
+          },
+          "decided_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        },
+        "required": [
+          "approval_id",
+          "decision",
+          "binding_digest",
+          "decided_at"
         ]
       }
     },
@@ -7774,7 +8159,34 @@
         },
         "x-openmettle-fixture": {
           "schema": "#/components/schemas/RunCreateRequest",
-          "direction": "request"
+          "direction": "request",
+          "mutations": [
+            {
+              "name": "explicit-standard",
+              "op": "set",
+              "class": "valid",
+              "path": "/execution_mode",
+              "value": "standard"
+            },
+            {
+              "name": "explicit-yolo",
+              "op": "set",
+              "class": "valid",
+              "path": "/execution_mode",
+              "value": "yolo"
+            },
+            {
+              "name": "unknown-mode",
+              "op": "set",
+              "class": "invalid",
+              "path": "/execution_mode",
+              "value": "ordinary",
+              "expect": {
+                "instancePath": "/execution_mode",
+                "keyword": "enum"
+              }
+            }
+          ]
         }
       },
       "EditProposal": {
@@ -7882,6 +8294,270 @@
         "x-openmettle-fixture": {
           "schema": "#/components/schemas/EffectiveConfiguration",
           "direction": "response"
+        }
+      },
+      "RunApprovalPending": {
+        "summary": "One actionable request",
+        "dataValue": {
+          "items": [
+            {
+              "approval_id": "0f0e0d0c-0b0a-4908-8706-050403020108",
+              "tool_id": "mail",
+              "tool_version": "1",
+              "arguments_json": "{\"body\":\"Example\"}",
+              "destination": "[\"v1\",\"fixture\",\"inbox\",\"append\",\"reviewed\"]",
+              "binding_digest": "abababababababababababababababababababababababababababababababab",
+              "approval_expires_at": "2026-11-21T09:01:00.000000Z"
+            }
+          ]
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/RunApprovalList",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "no-pending",
+              "op": "set",
+              "class": "valid",
+              "path": "/items",
+              "value": []
+            },
+            {
+              "name": "multiple-pending",
+              "op": "set",
+              "class": "invalid",
+              "path": "/items",
+              "value": [
+                {
+                  "approval_id": "0f0e0d0c-0b0a-4908-8706-050403020108",
+                  "tool_id": "mail",
+                  "tool_version": "1",
+                  "arguments_json": "{\"body\":\"Example\"}",
+                  "destination": "[\"v1\",\"fixture\",\"inbox\",\"append\",\"reviewed\"]",
+                  "binding_digest": "abababababababababababababababababababababababababababababababab",
+                  "approval_expires_at": "2026-11-21T09:01:00.000000Z"
+                },
+                {
+                  "approval_id": "0f0e0d0c-0b0a-4908-8706-050403020108",
+                  "tool_id": "mail",
+                  "tool_version": "1",
+                  "arguments_json": "{\"body\":\"Example\"}",
+                  "destination": "[\"v1\",\"fixture\",\"inbox\",\"append\",\"reviewed\"]",
+                  "binding_digest": "abababababababababababababababababababababababababababababababab",
+                  "approval_expires_at": "2026-11-21T09:01:00.000000Z"
+                }
+              ],
+              "expect": {
+                "instancePath": "/items",
+                "keyword": "maxItems"
+              }
+            }
+          ]
+        }
+      },
+      "ApprovalDecision": {
+        "summary": "Submit a decision for the displayed binding",
+        "dataValue": {
+          "decision": "approve",
+          "binding_digest": "abababababababababababababababababababababababababababababababab"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/ApprovalDecisionRequest",
+          "direction": "request",
+          "mutations": [
+            {
+              "name": "deny",
+              "op": "set",
+              "class": "valid",
+              "path": "/decision",
+              "value": "deny"
+            },
+            {
+              "name": "unknown-decision",
+              "op": "set",
+              "class": "invalid",
+              "path": "/decision",
+              "value": "skip",
+              "expect": {
+                "instancePath": "/decision",
+                "keyword": "enum"
+              }
+            },
+            {
+              "name": "uppercase-digest",
+              "op": "set",
+              "class": "invalid",
+              "path": "/binding_digest",
+              "value": "ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB",
+              "expect": {
+                "instancePath": "/binding_digest",
+                "keyword": "pattern"
+              }
+            }
+          ]
+        }
+      },
+      "ApprovalReceipt": {
+        "summary": "Immutable decision receipt",
+        "dataValue": {
+          "approval_id": "0f0e0d0c-0b0a-4908-8706-050403020108",
+          "decision": "approve",
+          "binding_digest": "abababababababababababababababababababababababababababababababab",
+          "decided_at": "2026-11-21T09:00:05.000000Z"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/ApprovalReceipt",
+          "direction": "response"
+        }
+      },
+      "RunEventApprovalRequested": {
+        "summary": "Parsed run.approval_requested",
+        "dataValue": {
+          "id": "AQdleGFtcGxlAAAAAAAAAALdVUFmeuBEkIyAf6nRl9t599RVMC4__bRB6c6uTbrviQ",
+          "data": "{\"run_id\":\"0f0e0d0c-0b0a-4908-8706-050403020100\",\"sequence\":\"2\",\"type\":\"run.approval_requested\",\"type_version\":1,\"occurred_at\":\"2026-11-20T09:00:02.000000Z\",\"data\":{}}"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/RunEventItem",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "private-data",
+              "op": "set",
+              "class": "invalid",
+              "path": "/data#/data/approval_id",
+              "value": "0f0e0d0c-0b0a-4908-8706-050403020108",
+              "expect": {
+                "instancePath": "/data",
+                "keyword": "additionalProperties",
+                "content": "/data"
+              }
+            }
+          ]
+        }
+      },
+      "RunEventWaiting": {
+        "summary": "Parsed run.waiting with approval",
+        "dataValue": {
+          "id": "AQdleGFtcGxlAAAAAAAAAALdVUFmeuBEkIyAf6nRl9t599RVMC4__bRB6c6uTbrviQ",
+          "data": "{\"run_id\":\"0f0e0d0c-0b0a-4908-8706-050403020100\",\"sequence\":\"2\",\"type\":\"run.waiting\",\"type_version\":1,\"occurred_at\":\"2026-11-20T09:00:02.000000Z\",\"data\":{\"reason\":\"approval\"}}"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/RunEventItem",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "private-data",
+              "op": "set",
+              "class": "invalid",
+              "path": "/data#/data/approval_id",
+              "value": "0f0e0d0c-0b0a-4908-8706-050403020108",
+              "expect": {
+                "instancePath": "/data",
+                "keyword": "additionalProperties",
+                "content": "/data"
+              }
+            }
+          ]
+        }
+      },
+      "RunEventApprovalDecided": {
+        "summary": "Parsed run.approval_decided",
+        "dataValue": {
+          "id": "AQdleGFtcGxlAAAAAAAAAALdVUFmeuBEkIyAf6nRl9t599RVMC4__bRB6c6uTbrviQ",
+          "data": "{\"run_id\":\"0f0e0d0c-0b0a-4908-8706-050403020100\",\"sequence\":\"2\",\"type\":\"run.approval_decided\",\"type_version\":1,\"occurred_at\":\"2026-11-20T09:00:02.000000Z\",\"data\":{}}"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/RunEventItem",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "private-data",
+              "op": "set",
+              "class": "invalid",
+              "path": "/data#/data/approval_id",
+              "value": "0f0e0d0c-0b0a-4908-8706-050403020108",
+              "expect": {
+                "instancePath": "/data",
+                "keyword": "additionalProperties",
+                "content": "/data"
+              }
+            }
+          ]
+        }
+      },
+      "RunEventResumed": {
+        "summary": "Parsed run.resumed",
+        "dataValue": {
+          "id": "AQdleGFtcGxlAAAAAAAAAALdVUFmeuBEkIyAf6nRl9t599RVMC4__bRB6c6uTbrviQ",
+          "data": "{\"run_id\":\"0f0e0d0c-0b0a-4908-8706-050403020100\",\"sequence\":\"2\",\"type\":\"run.resumed\",\"type_version\":1,\"occurred_at\":\"2026-11-20T09:00:02.000000Z\",\"data\":{}}"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/RunEventItem",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "private-data",
+              "op": "set",
+              "class": "invalid",
+              "path": "/data#/data/approval_id",
+              "value": "0f0e0d0c-0b0a-4908-8706-050403020108",
+              "expect": {
+                "instancePath": "/data",
+                "keyword": "additionalProperties",
+                "content": "/data"
+              }
+            }
+          ]
+        }
+      },
+      "RunEventApprovalExpired": {
+        "summary": "Parsed run.failed with approval_expired",
+        "dataValue": {
+          "id": "AQdleGFtcGxlAAAAAAAAAALdVUFmeuBEkIyAf6nRl9t599RVMC4__bRB6c6uTbrviQ",
+          "data": "{\"run_id\":\"0f0e0d0c-0b0a-4908-8706-050403020100\",\"sequence\":\"2\",\"type\":\"run.failed\",\"type_version\":1,\"occurred_at\":\"2026-11-20T09:00:02.000000Z\",\"data\":{\"reason\":\"approval_expired\"}}"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/RunEventItem",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "private-data",
+              "op": "set",
+              "class": "invalid",
+              "path": "/data#/data/approval_id",
+              "value": "0f0e0d0c-0b0a-4908-8706-050403020108",
+              "expect": {
+                "instancePath": "/data",
+                "keyword": "additionalProperties",
+                "content": "/data"
+              }
+            }
+          ]
+        }
+      },
+      "RunEventInvalidWait": {
+        "summary": "Parsed run.failed with invalid_wait",
+        "dataValue": {
+          "id": "AQdleGFtcGxlAAAAAAAAAALdVUFmeuBEkIyAf6nRl9t599RVMC4__bRB6c6uTbrviQ",
+          "data": "{\"run_id\":\"0f0e0d0c-0b0a-4908-8706-050403020100\",\"sequence\":\"2\",\"type\":\"run.failed\",\"type_version\":1,\"occurred_at\":\"2026-11-20T09:00:02.000000Z\",\"data\":{\"reason\":\"invalid_wait\"}}"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/RunEventItem",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "private-data",
+              "op": "set",
+              "class": "invalid",
+              "path": "/data#/data/approval_id",
+              "value": "0f0e0d0c-0b0a-4908-8706-050403020108",
+              "expect": {
+                "instancePath": "/data",
+                "keyword": "additionalProperties",
+                "content": "/data"
+              }
+            }
+          ]
         }
       }
     }

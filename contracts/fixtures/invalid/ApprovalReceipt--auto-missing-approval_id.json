@@ -1,0 +1,23 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ApprovalReceipt--auto-missing-approval_id",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "binding_digest": "abababababababababababababababababababababababababababababababab",
+    "decided_at": "2026-11-21T09:00:05.000000Z",
+    "decision": "approve"
+  },
+  "mutation": {
+    "name": "auto-missing-approval_id",
+    "op": "remove",
+    "path": "/approval_id"
+  },
+  "schema": "#/components/schemas/ApprovalReceipt",
+  "source": "#/components/examples/ApprovalReceipt"
+}

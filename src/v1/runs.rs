@@ -177,7 +177,7 @@ fn wire_state(state: &str) -> &str {
 struct Empty {}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Cancellation {
+struct EventReason {
     reason: String,
 }
 
@@ -189,20 +189,30 @@ fn projection(
     let event = match (format, version) {
         ("openmettle.run-created", 1) if bytes.is_empty() => ("run.created", json!({})),
         ("openmettle.run-created", 1) => return Err(INTERNAL),
-        ("openmettle.run-claimed" | "openmettle.run-expired", 1) => {
-            parse::<Empty>(bytes).map_err(|_| INTERNAL)?;
-            if format == "openmettle.run-claimed" {
-                ("run.started", json!({}))
-            } else {
-                ("run.failed", json!({"reason":"queue_expired"}))
-            }
-        }
-        ("openmettle.run-cancelled", 1) => {
-            let cancellation: Cancellation = parse(bytes).map_err(|_| INTERNAL)?;
-            if !matches!(cancellation.reason.as_str(), "requested" | "revoked") {
-                return Err(INTERNAL);
-            }
-            ("run.cancelled", json!({"reason": cancellation.reason}))
+        (format, 1) => {
+            let empty = |kind, data| {
+                parse::<Empty>(bytes).map_err(|_| INTERNAL)?;
+                Ok((kind, data))
+            };
+            let reason = |kind, allowed: &[&str]| {
+                let event: EventReason = parse(bytes).map_err(|_| INTERNAL)?;
+                if !allowed.contains(&event.reason.as_str()) {
+                    return Err(INTERNAL);
+                }
+                Ok((kind, json!({"reason": event.reason})))
+            };
+            match format {
+                "openmettle.run-claimed" => empty("run.started", json!({})),
+                "openmettle.run-expired" => empty("run.failed", json!({"reason":"queue_expired"})),
+                "openmettle.run-approval-requested" => empty("run.approval_requested", json!({})),
+                "openmettle.run-approval-decided" => empty("run.approval_decided", json!({})),
+                "openmettle.run-resumed" => empty("run.resumed", json!({})),
+                "openmettle.run-waiting" => reason("run.waiting", &["approval"]),
+                "openmettle.run-approval-expired" => reason("run.failed", &["approval_expired"]),
+                "openmettle.run-invalid-wait" => reason("run.failed", &["invalid_wait"]),
+                "openmettle.run-cancelled" => reason("run.cancelled", &["requested", "revoked"]),
+                _ => return Ok(None),
+            }?
         }
         _ => return Ok(None),
     };
@@ -644,6 +654,27 @@ mod tests {
         );
         for (format, bytes) in [
             ("openmettle.run-created", b"{}".as_slice()),
+            (
+                "openmettle.run-approval-requested",
+                br#"{"approval_id":"private"}"#,
+            ),
+            (
+                "openmettle.run-approval-decided",
+                br#"{"decision":"approve"}"#,
+            ),
+            ("openmettle.run-resumed", br#"{"handle":"private"}"#),
+            (
+                "openmettle.run-waiting",
+                br#"{"reason":"approval","arguments":{}}"#,
+            ),
+            (
+                "openmettle.run-approval-expired",
+                br#"{"reason":"invalid_wait"}"#,
+            ),
+            (
+                "openmettle.run-invalid-wait",
+                br#"{"reason":"approval_expired"}"#,
+            ),
             ("openmettle.run-claimed", b"[]"),
             ("openmettle.run-expired", br#"{"detail":"private"}"#),
             ("openmettle.run-cancelled", br#"{"reason":"secret"}"#),

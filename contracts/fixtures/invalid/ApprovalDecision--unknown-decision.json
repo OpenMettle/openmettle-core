@@ -1,0 +1,23 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "/decision",
+    "keyword": "enum",
+    "valid": false
+  },
+  "fixture": "ApprovalDecision--unknown-decision",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "binding_digest": "abababababababababababababababababababababababababababababababab",
+    "decision": "skip"
+  },
+  "mutation": {
+    "name": "unknown-decision",
+    "op": "set",
+    "path": "/decision",
+    "value": "skip"
+  },
+  "schema": "#/components/schemas/ApprovalDecisionRequest",
+  "source": "#/components/examples/ApprovalDecision"
+}

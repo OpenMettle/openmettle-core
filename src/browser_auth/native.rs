@@ -9,7 +9,7 @@ use crate::sessions::native::{self, Attempt};
 use crate::{
     auth_config::BrowserProfile,
     provider_keys::ManagedProvider,
-    sessions::{self, Channel, Credential, Error, Validation},
+    sessions::{self, Channel, Credential, Error},
 };
 use axum::http::{Method, Response, StatusCode, header, request::Parts};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
@@ -601,21 +601,15 @@ impl NativeAuth {
     }
 
     pub async fn validate(&self, bearer: &str) -> Result<sessions::Context, Error> {
+        Ok(self.validate_effect(bearer).await?.into_context())
+    }
+    pub(crate) async fn validate_effect(
+        &self,
+        bearer: &str,
+    ) -> Result<crate::authz::approvals::EffectSession, Error> {
         sessions::well_formed(bearer)?;
         let _slot = self.operations.try_acquire().map_err(|_| Error::Capacity)?;
-        tokio::time::timeout(self.auth.config.session_policy().deadline(), async {
-            let mut db = Checkout::acquire(&self.auth.pool).await?;
-            let result = sessions::validate_inner(
-                db.lend(),
-                bearer,
-                Validation::NativeBearer(self.audience),
-            )
-            .await;
-            db.settle(session_settled(&result));
-            result
-        })
-        .await
-        .map_err(|_| Error::Timeout)?
+        self.auth.validate_effect(bearer, Some(self.audience)).await
     }
     pub async fn logout(&self, bearer: &str) -> Result<(), Error> {
         sessions::well_formed(bearer)?;

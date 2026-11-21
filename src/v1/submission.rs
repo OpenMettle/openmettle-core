@@ -14,7 +14,7 @@ use crate::{
     },
     runs::{RunInput, WriteTransaction},
 };
-use serde::Deserializer;
+use serde::{Deserializer, Serialize};
 
 #[derive(Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
@@ -160,9 +160,34 @@ fn wire_proposal<T: DeserializeOwned>(body: &[u8], submission: bool) -> Result<T
     }
     serde_json::from_value(value).map_err(|_| BODY)
 }
+#[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ExecutionMode {
+    #[default]
+    Standard,
+    Yolo,
+}
+
+// The v1 configuration remains readable by executors that only consume ConfigSnapshot.
+#[derive(Serialize)]
+struct AdmissionConfig<'a> {
+    #[serde(flatten)]
+    config: &'a ConfigSnapshot,
+    execution_mode: ExecutionMode,
+}
+
+#[derive(Deserialize)]
+struct StoredMode {
+    // Snapshots admitted before session binding used standard execution.
+    #[serde(default, deserialize_with = "string_enum")]
+    execution_mode: ExecutionMode,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Request {
+    #[serde(default, deserialize_with = "string_enum")]
+    execution_mode: ExecutionMode,
     conversation_id: String,
     branch_id: String,
     proposal: Proposal,
@@ -455,7 +480,9 @@ async fn admission(
     let (branch, message, format, version, snapshots, gates) =
         if let Some(found) = queue::find_run(c, scope, ctx.user_id(), &key).await? {
             let (previous, config) = Snapshots::decode(&found).map_err(|_| KEY_CONFLICT)?;
-            if !previous.matches(&intent) {
+            let mode: StoredMode =
+                serde_json::from_slice(&found.config_snapshot).map_err(|_| KEY_CONFLICT)?;
+            if mode.execution_mode != r.execution_mode || !previous.matches(&intent) {
                 return Err(KEY_CONFLICT);
             }
             (
@@ -485,7 +512,12 @@ async fn admission(
             .await?;
             let c = tx.connection()?;
             let catalog = catalog.ok_or(PROVISIONING)?;
-            let config = resolve(c, &actor, &view, catalog, intent.selection).await?;
+            let mut config = resolve(c, &actor, &view, catalog, intent.selection).await?;
+            if r.execution_mode == ExecutionMode::Yolo {
+                config
+                    .required_capabilities
+                    .insert("runs.use_yolo".into(), authz::CapabilityGate::OptIn);
+            }
             let history = branches::history(c, &actor, chat, &target.branch_id, ctx.observed_ms())
                 .await?
                 .ok_or(NOT_FOUND)?;
@@ -495,7 +527,12 @@ async fn admission(
                 .map(|t| t.metadata.clone())
                 .collect::<Vec<_>>();
             budget(catalog, &config.effective, &path, &history, None)?.admit()?;
-            let snapshots = Snapshots::encode(&intent, &history, catalog, &config)?;
+            let mut snapshots = Snapshots::encode(&intent, &history, catalog, &config)?;
+            snapshots.config = serde_json::to_vec(&AdmissionConfig {
+                config: &config,
+                execution_mode: r.execution_mode,
+            })
+            .map_err(|_| INTERNAL)?;
             (
                 target.branch_id,
                 target.input_message_id,
@@ -509,7 +546,7 @@ async fn admission(
         .iter()
         .map(|(name, gate)| queue::CapabilityUse { name, gate: *gate })
         .collect::<Vec<_>>();
-    Ok(queue::admit_run(
+    Ok(queue::admit_run_with_mode(
         tx,
         &queue::RunAdmission {
             input: RunInput {
@@ -530,6 +567,7 @@ async fn admission(
             now_ms: ctx.observed_ms(),
         },
         limits,
+        ctx,
     )
     .await?)
 }

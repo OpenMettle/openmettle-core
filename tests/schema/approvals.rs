@@ -20,7 +20,7 @@ use openmettle_core::{
 use serde_json::{Value, json};
 
 /// Reviewed synthetic adapter. Input can change arguments, never the registered class or recipient.
-struct Policy {
+pub(super) struct Policy {
     class: EffectClass,
     revision: &'static str,
     endpoint_expires_us: i64,
@@ -76,7 +76,7 @@ impl EffectPolicy for Policy {
         }))
     }
 }
-fn proposal(key: &str) -> Proposal {
+pub(super) fn proposal(key: &str) -> Proposal {
     Proposal::new(
         key,
         "mail",
@@ -91,7 +91,7 @@ fn proposal(key: &str) -> Proposal {
     )
     .unwrap()
 }
-const LIMITS: AdmissionLimits = AdmissionLimits {
+pub(super) const LIMITS: AdmissionLimits = AdmissionLimits {
     live_per_actor: 10,
     live_per_scope: 10,
     queued_in_instance: 100,

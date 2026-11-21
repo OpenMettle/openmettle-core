@@ -1,0 +1,20 @@
+{
+  "class": "valid",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "RunApprovalPending--no-pending",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "items": []
+  },
+  "mutation": {
+    "name": "no-pending",
+    "op": "set",
+    "path": "/items",
+    "value": []
+  },
+  "schema": "#/components/schemas/RunApprovalList",
+  "source": "#/components/examples/RunApprovalPending"
+}

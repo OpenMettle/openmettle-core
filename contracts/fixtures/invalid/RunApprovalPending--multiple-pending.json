@@ -1,0 +1,60 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "/items",
+    "keyword": "maxItems",
+    "valid": false
+  },
+  "fixture": "RunApprovalPending--multiple-pending",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "items": [
+      {
+        "approval_expires_at": "2026-11-21T09:01:00.000000Z",
+        "approval_id": "0f0e0d0c-0b0a-4908-8706-050403020108",
+        "arguments_json": "{\"body\":\"Example\"}",
+        "binding_digest": "abababababababababababababababababababababababababababababababab",
+        "destination": "[\"v1\",\"fixture\",\"inbox\",\"append\",\"reviewed\"]",
+        "tool_id": "mail",
+        "tool_version": "1"
+      },
+      {
+        "approval_expires_at": "2026-11-21T09:01:00.000000Z",
+        "approval_id": "0f0e0d0c-0b0a-4908-8706-050403020108",
+        "arguments_json": "{\"body\":\"Example\"}",
+        "binding_digest": "abababababababababababababababababababababababababababababababab",
+        "destination": "[\"v1\",\"fixture\",\"inbox\",\"append\",\"reviewed\"]",
+        "tool_id": "mail",
+        "tool_version": "1"
+      }
+    ]
+  },
+  "mutation": {
+    "name": "multiple-pending",
+    "op": "set",
+    "path": "/items",
+    "value": [
+      {
+        "approval_expires_at": "2026-11-21T09:01:00.000000Z",
+        "approval_id": "0f0e0d0c-0b0a-4908-8706-050403020108",
+        "arguments_json": "{\"body\":\"Example\"}",
+        "binding_digest": "abababababababababababababababababababababababababababababababab",
+        "destination": "[\"v1\",\"fixture\",\"inbox\",\"append\",\"reviewed\"]",
+        "tool_id": "mail",
+        "tool_version": "1"
+      },
+      {
+        "approval_expires_at": "2026-11-21T09:01:00.000000Z",
+        "approval_id": "0f0e0d0c-0b0a-4908-8706-050403020108",
+        "arguments_json": "{\"body\":\"Example\"}",
+        "binding_digest": "abababababababababababababababababababababababababababababababab",
+        "destination": "[\"v1\",\"fixture\",\"inbox\",\"append\",\"reviewed\"]",
+        "tool_id": "mail",
+        "tool_version": "1"
+      }
+    ]
+  },
+  "schema": "#/components/schemas/RunApprovalList",
+  "source": "#/components/examples/RunApprovalPending"
+}

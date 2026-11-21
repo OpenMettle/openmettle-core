@@ -195,17 +195,30 @@ impl BrowserAuth {
     }
     /// Local validation on the primary. No provider is contacted.
     pub async fn validate(&self, credential: &str) -> Result<sessions::Context, Error> {
+        Ok(self.validate_effect(credential, None).await?.into_context())
+    }
+
+    pub(crate) async fn validate_effect(
+        &self,
+        credential: &str,
+        native_audience: Option<[u8; 32]>,
+    ) -> Result<crate::authz::approvals::EffectSession, sessions::Error> {
         let policy = self.config.session_policy();
         sessions::well_formed(credential)?;
-        let result = tokio::time::timeout(policy.deadline(), async {
+        tokio::time::timeout(policy.deadline(), async {
             let mut db = Checkout::acquire(&self.pool).await?;
-            let result = sessions::validate(db.lend(), credential, policy).await;
+            let result = crate::authz::approvals::EffectSession::validate(
+                db.lend(),
+                credential,
+                policy,
+                native_audience,
+            )
+            .await;
             db.settle(session_settled(&result));
             result
         })
         .await
-        .map_err(|_| sessions::Error::Timeout)?;
-        Ok(result?)
+        .map_err(|_| sessions::Error::Timeout)?
     }
     /// Local revocation by possession of the credential. No provider is contacted.
     pub async fn logout(&self, credential: &str) -> Result<(), Error> {
