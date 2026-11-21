@@ -17,10 +17,10 @@ taxonomy and returns a bounded inline or spilled result.
 
 | Existing boundary | V1-14 addition |
 | --- | --- |
-| [ADR 0010](0010-provider-http-transport.md) and [ADR 0038](0038-sglang-and-external-provider-conformance-adapter.md), `src/provider_http/transport.rs` | Add a Streamable HTTP JSON-RPC 2.0 MCP client over `provider_http::transport` with a dedicated DNS slot semaphore, strict header allowlist and 4 MiB streaming response ceiling. |
+| [ADR 0010](0010-provider-http-transport.md) and [ADR 0038](0038-sglang-and-external-provider-conformance-adapter.md), `src/provider_http/transport.rs` | Add a Streamable HTTP JSON-RPC 2.0 MCP (`2026-07-28`) client over `provider_http::transport` with a dedicated DNS slot semaphore, strict header allowlist and 4 MiB streaming response ceiling. |
 | [ADR 0027](0027-authorization-and-private-projects.md) and [ADR 0035](0035-approvals-permitted-yolo-and-effect-ledger.md), `src/authz/approvals.rs` | Implement `EffectPolicy` in the reviewed tool registry and bind every invocation to `Proposal`, `Destination`, `EffectClass`, `EndpointKey` and `record_fenced_intent`. |
 | [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md), `src/worker.rs` | Implement `ApprovedAdapter` for resumed writes, reuse the same committed-envelope dispatch for immediate reads and permitted YOLO writes, and implement read-only `Executor::reconcile`. |
-| [ADR 0005](0005-artifact-storage-accounting.md) and [ADR 0031](0031-filesystem-artifact-storage-and-streaming-multipart.md), `src/storage.rs` and `src/artifact_fs.rs` | Add direct byte publication (`artifact_fs::publish_bytes`) and run-linked spill cleanup for outputs exceeding the inline threshold, paired with a read-only `artifact.read_range` tool. |
+| [ADR 0005](0005-artifact-storage-accounting.md) and [ADR 0031](0031-filesystem-artifact-storage-and-streaming-multipart.md), `src/storage.rs` and `src/artifact_fs.rs` | Add lease-fenced direct byte publication (`artifact_fs::publish_bytes`) and spill-scoped cleanup (`artifact_fs::reconcile_run_spills`) for outputs exceeding the inline ceiling, paired with a strictly inline read-only `artifact.read_range` tool. |
 
 **Zero new Cargo crates.** V1-14 reuses the locked `hyper`, `hyper-util`, `http-body-util`,
 `rustls`, `tokio-rustls`, `serde`, `serde_json`, `sha2`, `bytes`, `httpdate` and `ring` stack
@@ -40,21 +40,28 @@ The reviewed tool registry separates two tool classes behind one dispatch contra
 
 The first working tool is the reviewed internal tool `artifact.read_range` (`tool_version = "1"`).
 It accepts `artifact_id` (canonical UUID string), `revision_id` (canonical UUID string),
-`offset` (`0..=i64::MAX`, default `0`) and `max_bytes` (`1..=16384`, default `8192`).
+`offset` (`0..=i64::MAX`, default `0`) and `max_bytes` (`4..=16384`, default `8192`). Requiring
+`max_bytes >= 4` (one maximum-width UTF-8 code point) ensures every valid UTF-8 read before EOF
+makes forward progress; values below `4` or above `16384` fail closed with a schema validation
+refusal (`ToolFault::TerminalRefusal`).
 
-Before reading any byte, the handler verifies the run's live step fence and continuation
-authority on the primary (`recheck_leased` with the `tools.artifact.read` capability), hydrates
-the worker principal via `authz::store::hydrate_worker_principal`, loads the revision via
-`storage::read_revision`, confirms `revision.scope_id == run.scope_id`, checks
+Before reading or replaying any byte, the handler verifies the run's live step fence and
+continuation authority on the primary (`recheck_leased` with the `tools.artifact.read`
+capability), hydrates the worker principal via `authz::store::hydrate_worker_principal`, loads
+the revision via `storage::read_revision`, confirms `revision.scope_id == run.scope_id`, checks
 `authorize_resource(principal, resource, Action::Read)` on the artifact and requires
 `revision.state == "active"`. Leaving `Review.artifact` as `None` for reads avoids requiring
 write (`RunExecute`) access through `RunRecheckRequest::extra_target`, which stays reserved for
 artifact-writing tools. The handler accepts only UTF-8 text or JSON media types, requires
-`offset` to start on a UTF-8 character boundary (returning a semantic tool fault on binary
-content or misaligned offsets), reads `[offset, offset + len)` via `artifact_fs::Store::read`,
-trims any trailing split UTF-8 code point within `max_bytes` and returns the UTF-8 slice with
-`next_offset`, `size_bytes`, `media_type`, `content_digest` and `eof`. This single read-only
-tool also lets a model inspect sections of any spilled tool output on demand.
+`offset` to start on a UTF-8 character boundary and returns `ToolFault::Semantic` on binary
+media types, invalid UTF-8 bytes or misaligned offsets. It reads `[offset, offset + len)` via
+`artifact_fs::Store::read`, trims any trailing split UTF-8 code point within `max_bytes` and
+trims trailing code points further if needed so the **final UTF-8 serialized JSON tool-result
+string** fits `<= 16_384` bytes (accounting for JSON string escaping and envelope metadata).
+`artifact.read_range` pages stay strictly inline and never spill into derived artifacts. The
+response returns the UTF-8 slice with `next_offset`, `size_bytes`, `media_type`,
+`content_digest` and `eof`. This single read-only tool also lets a model inspect sections of
+any spilled tool output on demand, subject to live `Action::Read` and `active` revision checks.
 
 ### Ownership and hard prohibitions
 
@@ -109,15 +116,15 @@ order:
 ### Policy review and effect-ledger lifecycle
 
 The reviewed tool registry implements `approvals::EffectPolicy::review(scope, run, proposal)`.
-Unknown tools, schema violations, unpinned destinations, unavailable V1-28 credentials or
-missing required storage reservations return `Ok(None)` or `Err`, failing closed before
-parking or intent insertion.
+Unknown tools, schema violations, unpinned destinations or unavailable V1-28 credentials return
+`Ok(None)` or `Err`, failing closed before parking or intent insertion. V1-14 spills are
+post-response opportunistic artifacts and do not require `Review.reservation` before dispatch.
 
 | Reviewed `EffectClass` | `EndpointKey` and lookup support | Stored `operations.capability` | Approval and replay rule |
 | --- | --- | --- | --- |
-| `EffectClass::Read` | Any | `repeatable_read` | No human decision required; records `basis = "read"` intent after per-call authority check. |
+| `EffectClass::Read` | Any | `repeatable_read` | No human decision required; records `basis = "read"` intent after per-call authority check; excluded from `leases::unresolved_operations` and never blocks park or settlement. |
 | `EligibleWrite`, `HumanRequired`, `Sharing` | `EndpointKey::Supported` (active, unexpired window) | `idempotent` | Human approval (or permitted YOLO for `EligibleWrite`); persists outbound key before send; never silently resent on replay. |
-| `EligibleWrite`, `HumanRequired`, `Sharing` | `Unsupported` or `Unknown`, `authoritative_lookup = true` | `lookup` | Human approval (or permitted YOLO for `EligibleWrite`); reconciler queries `downstream_handle` or authoritative read. |
+| `EligibleWrite`, `HumanRequired`, `Sharing` | `Unsupported` or `Unknown`, `authoritative_lookup = true` | `lookup` | Human approval (or permitted YOLO for `EligibleWrite`); reconciler queries `downstream_handle` or deterministic authoritative lookup. |
 | `EligibleWrite`, `HumanRequired`, `Sharing` | `Unsupported` or `Unknown`, `authoritative_lookup = false` | `non_repeatable` | Human approval (or permitted YOLO for `EligibleWrite`); ambiguous send settles as `outcome_unknown` and interrupts. |
 | `EffectClass::Prohibited` | Any | Refused before insert | Rejected unconditionally in `Review::validate`; human approval cannot override. |
 
@@ -128,16 +135,27 @@ Per-call execution uses one fenced sequence in `openmettle-worker`:
 2. On `IntentResult::ApprovalRequired`, drain `StepContext::tasks`, call `approvals::park` and
    stop the step so the API can collect the human decision.
 3. On `IntentResult::Replayed(op_id)`, do **not** resend a write. Inspect the existing
-   `operations` row: reuse recorded terminal evidence if `succeeded` or `failed`, or defer to
-   ADR 0033 and ADR 0035 reconciliation if `intent` or `outcome_unknown`.
+   `operations` row:
+   - If `succeeded` or `failed`, never blindly replay cached bytes or previews after source
+     access is lost: before replaying any result backed by a source or spilled artifact,
+     reauthorize live `Action::Read` on `(artifact_id, revision_id)` and confirm
+     `revision.state == "active"`.
+   - If `intent` or `outcome_unknown`, unresolved writes (`idempotent`, `lookup`,
+     `non_repeatable`) defer to ADR 0033 and ADR 0035 reconciliation. Unfinished
+     `repeatable_read` operations are excluded from `leases::unresolved_operations`, never enter
+     `Executor::reconcile`, and instead execute fresh on retry or resume under rechecked
+     current authority and deadlines.
 4. On `IntentResult::Invalidated(_)`, stop immediately; the fenced check already settled the
    run.
 5. On `IntentResult::Applied(committed)`, release the PostgreSQL connection before any I/O and
-   call `committed.start(&step)`. If `start` returns `None`, issue no outbound call and leave
-   the `intent` for settlement or reconciliation.
-6. Dispatch the committed `openmettle.effect` v1 envelope through the adapter's
-   `ApprovedAdapter::send` path (the same path `worker::execute` uses after `pending_effect`
-   for resumed human approvals).
+   consume the one-use send permit `committed.start(&step)` once before attempt 1, applying the
+   returned shortened `deadline` to `step.deadline`. If `start` returns `None`, issue no
+   outbound call and leave the `intent` for settlement or reconciliation. On resumed human
+   approvals, `worker::execute` (`src/worker.rs`) has already consumed `intent.start(&step)`
+   and passes `ApprovedAdapter::send` the committed request bytes and shortened `step.deadline`.
+6. Dispatch the committed `openmettle.effect` v1 envelope through `ApprovedAdapter::send` (the
+   same committed-envelope path for immediate reads, permitted YOLO writes and resumed human
+   approvals).
 7. When `EndpointKey::Supported { field, key, .. }` is recorded in the committed envelope, emit
    `key` unchanged in the contract-pinned HTTP header or JSON-RPC `_meta` field. Never
    allocate a fresh key for the same `logical_key`.
@@ -146,56 +164,93 @@ Per-call execution uses one fenced sequence in `openmettle-worker`:
    revision, stable append key, `downstream_handle` when returned and bounded redacted
    evidence.
 
-`Executor::reconcile(&UnresolvedOperation, StepContext)` runs only when the reviewed contract
-declares a read-only reconciliation call and the operation is `lookup` or `idempotent` with a
-persisted `downstream_handle` or active `EndpointKey::Supported`. If the contract lacks a
-reconciler or the remote endpoint cannot prove an outcome, return `None` so ADR 0033 preserves
-uncertainty and settles the run as `interrupted`.
+`Executor::reconcile(&UnresolvedOperation, StepContext)` aligns strictly with
+`leases::unresolved_operations` (`src/authz/leases.rs`) and ADR 0035: `repeatable_read`
+operations are excluded and never enter `Executor::reconcile`. Reconciliation runs only for
+unresolved writes (`idempotent`, `lookup`, `non_repeatable`) when the reviewed contract
+declares a read-only reconciliation query:
+
+- For `lookup` writes, the reconciler queries **either** the persisted `downstream_handle`
+  **or** a deterministic, contract-defined authoritative lookup derived from the committed
+  canonical arguments and logical key (handling responses lost before a remote handle arrived).
+- For `idempotent` writes, the reconciler queries a read-only status endpoint keyed by the
+  persisted `EndpointKey::Supported` without resending the write.
+- Because `leases::UnresolvedOperation` carries only `(id, logical_key, target, capability,
+  outcome, revision, downstream_handle)` — not `(scope_id, run_id, actor_user_id)` or the
+  committed request bytes — PR3 loads the operation's committed `openmettle.effect` v1 payload
+  and its run's `(scope_id, run_id, actor_user_id)` on a worker DB connection (or extends the
+  worker's internal read projection), revalidates current run, actor and capability authority on
+  the primary via `recheck_leased`, and resolves credentials via `McpCredentialProvider` only
+  after that authority recheck succeeds.
+- If the contract lacks a reconciler, authority fails or the remote endpoint cannot prove an
+  outcome, return `None` so ADR 0033 preserves uncertainty and settles the run as `interrupted`.
 
 ## Transport, typed faults and bounded retries
 
 ### Streamable HTTP MCP transport over `provider_http::transport`
 
-External MCP calls reuse `provider_http::transport`'s canonical `https://` endpoint validator,
-IANA Server-Side Request Forgery (SSRF) address policy over all DNS answers, `rustls` (ring)
-TLS 1.2/1.3 ALPN `http/1.1` handshake, `Connection: close`, no-proxy, no-redirect and
+External MCP calls pin MCP revision **`2026-07-28`** ([ARCHITECTURE-v1.md](../../ARCHITECTURE-v1.md))
+and reuse `provider_http::transport`'s canonical `https://` endpoint validator, IANA
+Server-Side Request Forgery (SSRF) address policy over all DNS answers, `rustls` (ring) TLS
+1.2/1.3 ALPN `http/1.1` handshake, `Connection: close`, no-proxy, no-redirect and
 caller-driven hyper connection rules ([ADR 0010](0010-provider-http-transport.md)).
 
 - **Isolated DNS slots.** MCP owns a dedicated process-wide 8-slot `MCP_DNS_SLOTS` semaphore,
   separate from OIDC `DNS_SLOTS` and gateway inference `DNS_SLOTS`.
-- **Header admission.** Mirroring [ADR 0038](0038-sglang-and-external-provider-conformance-adapter.md),
-  add a narrow MCP request builder in `src/provider_http/` without widening `Route::send`.
-  Allow only `POST` with `Content-Type: application/json`,
-  `Accept: application/json, text/event-stream`, a pinned `MCP-Protocol-Version` header, an
-  optional server-supplied `Authorization` marked `HeaderValue::set_sensitive(true)` and an
-  optional contract-pinned `Idempotency-Key` header. Reject header blocks exceeding `2 KiB`
-  outbound or `8 KiB` / `32` headers inbound, and outbound bodies exceeding `128 KiB`.
-- **Stateless single-call framing.** Each `tools/call` uses one request/response exchange.
-  Accept `application/json` (one JSON-RPC 2.0 response matching the request `id`) or
-  `text/event-stream` (Server-Sent Events delivering one matching JSON-RPC 2.0 response event).
-  Match media types and `charset=utf-8` case-insensitively; refuse non-UTF-8 charsets,
-  non-`identity` `Content-Encoding`, chunked trailers, unsolicited server requests, duplicate
-  responses and premature EOF. Do not run background SSE notification loops.
+- **Header admission (`2026-07-28`).** Mirroring
+  [ADR 0038](0038-sglang-and-external-provider-conformance-adapter.md), add a narrow MCP
+  request builder in `src/provider_http/` without widening `Route::send`. Allow only `POST`
+  with `Content-Type: application/json`, `Accept: application/json, text/event-stream`,
+  `MCP-Protocol-Version: 2026-07-28`, `Mcp-Method` (`tools/call` or `tools/list`), `Mcp-Name`
+  (the reviewed tool name on `tools/call`) plus matching per-request metadata derived strictly
+  from the reviewed call, an optional server-supplied `Authorization` marked
+  `HeaderValue::set_sensitive(true)` and an optional contract-pinned `Idempotency-Key` header.
+  Keep stateful `Mcp-Session-Id` out of this stateless v1 profile (never send or adopt server
+  session IDs). Reject header blocks exceeding `2 KiB` outbound or `8 KiB` / `32` headers
+  inbound, and outbound bodies exceeding `128 KiB`.
+- **Stateless single-call framing (`2026-07-28`).** Each `tools/call` uses one request/response
+  exchange. Accept `application/json` (one JSON-RPC 2.0 response matching the request `id`) or
+  `text/event-stream` (Server-Sent Events delivering optional SSE comments and progress
+  notifications before one final matching JSON-RPC 2.0 response event). A matching JSON-RPC
+  `id` alone does not prove completion: MCP `2026-07-28` can return sampling, roots or
+  elicitation prompts inside an `input_required` result or emit server-to-client JSON-RPC
+  requests on SSE. Reject any server-initiated JSON-RPC request or `input_required` result
+  closed as `ToolFault::TerminalRefusal` (unsupported protocol/contract fault) without issuing
+  follow-up calls and without recording tool success. Match media types and `charset=utf-8`
+  case-insensitively; refuse non-UTF-8 charsets, non-`identity` `Content-Encoding`, chunked
+  trailers, mismatched JSON-RPC IDs, duplicate final responses and premature EOF. Do not run
+  background SSE notification loops.
 - **Hard inbound wire ceiling.** Enforce `MAX_TOOL_WIRE_BYTES = 4 MiB` (`4_194_304` bytes).
   Reject declared `Content-Length > 4 MiB` before reading any body bytes and abort chunked or
-  SSE reads through `http_body_util::Limited` as soon as observed bytes exceed `4 MiB`.
-- **Clocks and cancellation.** Apply `setup_timeout` (default `5 s`), `idle_read_timeout`
-  (default `15 s`) and a per-tool reviewed `call_timeout` (default `30 s`, maximum `300 s`).
-  Before starting any attempt, check `CommittedIntent::start(&step)` (enforcing
-  `step.stop.is_none()`, the pre-renewal `StepContext::deadline` snapshot and the intent's
-  authority expiry). While I/O is in flight, follow ADR 0038: race `step.stop`,
-  `ActiveRun::execution_deadline`, the intent's authority expiry and the adapter timeouts. On
+  SSE reads through `http_body_util::Limited` as soon as aggregate wire bytes across the stream
+  (including SSE comments and progress notifications) exceed `4 MiB`, before buffering.
+- **Clocks, retry rechecks and cancellation.** Apply `setup_timeout` (default `5 s`),
+  `idle_read_timeout` (default `15 s`) and a per-tool reviewed `call_timeout` (default `30 s`,
+  maximum `300 s`). `CommittedIntent::start(self, &step)` is consumed once before attempt 1
+  (and is already consumed by `worker::execute` on resumed human approvals, leaving the
+  shortened `step.deadline` that incorporates `EndpointKey::Supported.expires_us` and intent
+  authority expiry). Before every permitted retry (`repeatable_read` or unexpired `idempotent`
+  write), recheck `step.stop`, `step.deadline` and live principal, scope and capability
+  authority on the primary via `recheck_leased`. While I/O is in flight, follow ADR 0038: race
+  `step.stop`, `step.deadline`, `ActiveRun::execution_deadline` and the adapter timeouts. On
   any stop signal, drop the HTTP future immediately so the socket closes.
 
 ### Typed fault taxonomy and retry rules (`PLAN-10`)
 
-Every tool failure maps to one of three disjoint fault classes.
+Every tool failure maps to one of three disjoint fault classes. The adapter tracks transport
+send uncertainty as a **sticky flag across the whole logical operation**: once attempt 1 may
+have left the process (timeout, socket reset or mid-stream disconnect after request write), any
+subsequent retry that fails pre-send, hits a deadline or stop signal, or returns `401`/`403` or
+malformed framing MUST keep the ledger outcome `outcome_unknown` (never downgrading to
+proven-unsent `failed` or `aborted`). For `lookup` and `non_repeatable` writes, enforce zero
+post-send retries and forbid `retryable_by_model: true` after any ambiguous send so the model
+cannot re-issue an uncertain write under a fresh logical call.
 
 | Fault class | Qualifying evidence | Retries | Ledger outcome | Model / worker action |
 | --- | --- | --- | --- | --- |
-| **Transient transport** (`ToolFault::Transient`) | Pre-send DNS/TCP connect failure; HTTP `408`, `429`, `502`, `503`, `504`; mid-stream disconnect or idle/call timeout | Up to `3` total attempts (`1` initial + `2` retries) for `repeatable_read` and active unexpired `idempotent` writes with the identical persisted key. For `lookup`/`non_repeatable` writes: retry **only** proven pre-send failures; **never** retry after request bytes are sent. | `failed` for exhausted `repeatable_read` or proven pre-send failure; `outcome_unknown` for any sent `idempotent`, `lookup` or `non_repeatable` write that times out or disconnects without endpoint proof. | Sleep with `ring::rand::SystemRandom` full jitter (`250 ms`, `500 ms`). For a single valid integer `Retry-After` (seconds): sleep at least that delay when `<= 60 s` and within remaining call, authority and run execution deadlines; fail without retrying if `Retry-After` exceeds `60 s` or the remaining budget; ignore malformed or duplicate headers. Abort sleep immediately on `step.stop`. |
-| **Semantic tool fault** (`ToolFault::Semantic`) | MCP JSON-RPC `result` with `isError: true`, JSON-RPC `-32602`, or internal tool domain refusal (for example offset past EOF or non-`active` revision) | `0` transport retries | `failed` for reads and for writes whose reviewed contract guarantees `isError: true` caused no side effect; otherwise `outcome_unknown`. | Return a bounded structured error envelope (`status: "tool_error"`, closed `fault_code`, `<= 2 KiB` UTF-8 summary, `retryable_by_model`) so the model can recover within `round_limit`. |
-| **Policy, auth or contract failure** (`ToolFault::TerminalRefusal`) | Revoked session/grant/capability, schema/bounds violation, unpinned destination, missing V1-28 credential or V1-17 quota; SSRF `Address`, TLS cert/host failure, `3xx` redirect, `401`/`403`, unexpected `4xx`, `tools/list` drift, malformed JSON-RPC/framing or `> 4 MiB` response | `0` retries | `failed` when refused pre-send or on definitive `401`/`403`; `outcome_unknown` if malformed framing or `TooLarge` arrives after a write was already sent. | Fail closed immediately. Authority revocation settles the run under ADR 0033/0035; contract or auth refusals return fixed redacted diagnostics without fallback or upstream body echoing. |
+| **Transient transport** (`ToolFault::Transient`) | Pre-send DNS/TCP connect failure; HTTP `408`, `429`, `502`, `503`, `504`; mid-stream disconnect or idle/call timeout | Up to `3` total attempts (`1` initial + `2` retries) for `repeatable_read` and active unexpired `idempotent` writes with the identical persisted key, rechecking `step.stop`, `step.deadline` and `recheck_leased` before each retry. For `lookup`/`non_repeatable` writes: retry **only** proven pre-send failures; **never** retry after request bytes are sent. | `failed` for exhausted `repeatable_read` or proven pre-send failure when no prior attempt left the process; `outcome_unknown` for any `idempotent`, `lookup` or `non_repeatable` write once any attempt may have left the process without endpoint proof. | Sleep with `ring::rand::SystemRandom` full jitter (`250 ms`, `500 ms`). For a single valid integer `Retry-After` (seconds): sleep at least that delay when `<= 60 s` and within remaining call, authority and run execution deadlines; fail without retrying if `Retry-After` exceeds `60 s` or the remaining budget; ignore malformed or duplicate headers. Abort sleep immediately on `step.stop`. |
+| **Semantic tool fault** (`ToolFault::Semantic`) | MCP JSON-RPC `result` with `isError: true`, JSON-RPC `-32602`, or internal tool domain refusal (for example invalid UTF-8 binary content, offset past EOF or non-`active` revision) | `0` transport retries | `failed` for reads and for writes whose reviewed contract guarantees `isError: true` caused no side effect (and no prior attempt was ambiguous); otherwise `outcome_unknown`. | Return a bounded structured error envelope (`status: "tool_error"`, closed `fault_code`, `<= 2 KiB` UTF-8 summary, `retryable_by_model` forced `false` after any ambiguous write) so the model can recover within `round_limit`. |
+| **Policy, auth or contract failure** (`ToolFault::TerminalRefusal`) | Revoked session/grant/capability, schema/bounds violation (`max_bytes < 4`), unpinned destination, missing V1-28 credential or V1-17 quota; SSRF `Address`, TLS cert/host failure, `3xx` redirect, `401`/`403`, unexpected `4xx`, `tools/list` drift, `input_required` or server-initiated JSON-RPC request, malformed JSON-RPC/framing or `> 4 MiB` response | `0` retries | `failed` when refused pre-send or on definitive `401`/`403` with no prior ambiguous attempt; `outcome_unknown` if any prior write attempt may have left the process or if `input_required`, malformed framing or `TooLarge` arrives after a write was sent. | Fail closed immediately without follow-up calls. Authority revocation settles the run under ADR 0033/0035; contract or auth refusals return fixed redacted diagnostics with `retryable_by_model: false` and no upstream body echoing. |
 
 ### Redaction and telemetry
 
@@ -210,44 +265,93 @@ or `user_id`).
 
 ## Bounded inline tool results and scoped artifact spill
 
-Normalized UTF-8 tool output obeys three size bands:
+Normalized UTF-8 tool output obeys three size bands. The `16 KiB` (`16_384` bytes) ceiling
+applies to the **final UTF-8 serialized JSON tool-result string** (after JSON escaping — such
+as `\u001b` 6x expansion — and all envelope and provenance metadata), never just raw unescaped
+output bytes:
 
 | Band | Condition | Handling |
 | --- | --- | --- |
-| **Inline** | `<= 16 KiB` (`16_384` bytes) **and** `<= 200` lines | Returned directly in the tool-result envelope (`storage: "inline"`, `truncated: false`, `size_bytes`, `line_count`, `content_sha256`). |
-| **Spill** | Exceeds `16 KiB` or `200` lines, up to `4 MiB` (`4_194_304` bytes) | Published as an immutable scoped artifact in the run's `scope_id`; model receives a compact `<= 16 KiB` head/tail preview envelope with provenance and artifact coordinates. |
+| **Inline** | `<= 200` lines **and** final UTF-8 serialized JSON inline envelope `<= 16_384` bytes | Returned directly in the tool-result envelope (`storage: "inline"`, `truncated: false`, `size_bytes`, `line_count`, `content_sha256`). |
+| **Spill** | Exceeds `200` lines or `16_384` serialized JSON bytes, up to `4 MiB` (`4_194_304` bytes) raw payload | Published as an immutable scoped artifact in the run's `scope_id`; model receives a compact head/tail preview envelope whose final UTF-8 serialized JSON is `<= 16_384` bytes. |
 | **Refused** | Exceeds `4 MiB` wire or payload ceiling | Aborted during streaming before memory or disk exhaustion (`ToolFault::TerminalRefusal` / `TooLarge`). |
 
-### Scoped artifact publication and cleanup
+### Scoped artifact ownership, publication and cleanup
 
-`openmettle_worker` already holds PostgreSQL column grants on `storage_instance`,
-`storage_accounts`, `artifacts`, `storage_reservations` and `artifact_revisions` (including
-`display_name`, verified in `src/boundaries.sql`). PR2 adds a non-multipart helper
-`artifact_fs::publish_bytes` using the exact [ADR 0031](0031-filesystem-artifact-storage-and-streaming-multipart.md)
-durability order:
+**Private ownership, scope quota and retention.** Per `migrations/0004_artifacts_storage_accounting.sql`
+and [ADR 0027](0027-authorization-and-private-projects.md), a spilled tool artifact created
+inside a `project` scope still has `owner_user_id = run.actor_user_id` and is **private to that
+creator by default** until explicitly shared (a project scope never auto-publishes artifacts to
+other members), while the project scope's `storage_accounts` row owns the storage quota charge.
+Spilled tool artifacts follow the [ARCHITECTURE-v1.md](../../ARCHITECTURE-v1.md) retention
+lifecycle: they remain `active` while referenced by retained conversation turns (inheriting the
+scope/project retention policy on disassociation or deletion), immediately fail `Action::Read`
+once transitioned to `retained`, and are physically deleted only by `artifact_fs::purge_due`
+after their grace deadline expires.
 
-1. Derive a deterministic idempotency key from `(run_id, operation_id, "tool-spill")` and
-   resolve the artifact UUID via `storage::upload_artifact` so retries target one artifact.
-2. Call `storage::reserve` with `scope = run.scope_id`, `actor = run.actor_user_id`,
-   `max_bytes = payload.len() as i64`, `run = Some(run_id)` and `operation = Some(operation_id)`.
-3. Create `<ARTIFACTS_DIR>/staging/<reservation_id>` exclusively (mode `0600`), write the
-   normalized UTF-8 bytes, compute SHA-256 and `fsync`.
-4. In one short transaction, lock the reservation row `FOR UPDATE`, `rename` to
-   `revisions/<reservation_id>`, `fsync` `revisions/` and call `storage::settle` with
-   `media_type` (`text/plain; charset=utf-8` or `application/json; charset=utf-8`) and a
-   bounded display name passing `storage::valid_display_name`.
+**Lease-fenced lock-first publication (`artifact_fs::publish_bytes`).** `openmettle_worker`
+already holds PostgreSQL column grants on `storage_instance`, `storage_accounts`, `artifacts`,
+`storage_reservations` and `artifact_revisions` (including `display_name`, verified in
+`src/boundaries.sql`). PR2 adds `artifact_fs::publish_bytes`, reusing `artifact_fs::ingest`'s
+exact lock-first discipline (`src/artifact_fs.rs` and `src/storage.rs`) under the worker's live
+lease fence so a replay or deposed stale worker can never overwrite an immutable revision:
 
-Because `artifact_fs::reconcile_expired` currently scans only upload reservations
-(`run_id IS NULL`), PR2 adds `artifact_fs::reconcile_run_spills` to the worker maintenance
-sweep. It releases abandoned run-linked spill reservations (`state = 'reserved'`,
-`run_id IS NOT NULL`) only after unlinking their staging/revision files and only once the
-linked operation has a terminal outcome (`succeeded` or `failed`) or the run is terminal,
-preserving `storage::release`'s invariant that unresolved `intent`/`outcome_unknown`
-operations block release.
+1. Derive a deterministic adapter-owned idempotency key with a distinct spill domain prefix
+   (`tool-spill:<operation_id>`, `<= 128` bytes) and resolve the artifact UUID via
+   `storage::upload_artifact` so retries target one artifact.
+2. Under `leases::with_lease` (`Fence::Step`, or `Fence::Hold` when publishing alongside
+   `runs::record_observation`), call `storage::reserve` with `scope = run.scope_id`,
+   `actor = run.actor_user_id`, `max_bytes = payload.len() as i64`, `run = Some(run_id)` and
+   `operation = Some(operation_id)`.
+   - If `reserve` returns `ReservationState::Released`, refuse closed (`Conflict`) without
+     staging or touching filesystem paths.
+   - If `reserve` returns `ReservationState::Settled`, skip staging and rename completely;
+     verify exact `(artifact_id, size_bytes, content_digest, media_type, display_name,
+     created_by_user_id)` replay through `storage::settle` (refusing closed on digest or
+     metadata mismatch) and confirm the published regular file in `revisions/<reservation_id>`
+     has exact `size_bytes`.
+3. Only when `reserve` returns `ReservationState::Reserved` (and after releasing the DB
+   connection), create `<ARTIFACTS_DIR>/staging/<reservation_id>` exclusively (`create_new`,
+   mode `0600`), write the normalized UTF-8 bytes, compute SHA-256 and `fsync`.
+4. In one short fenced transaction (`leases::with_lease` with `Fence::Step` or `Fence::Hold`,
+   preserving the `runs` -> `storage_reservations` lock order so a deposed stale worker cannot
+   publish after takeover), lock the `storage_reservations` row `FOR UPDATE` first and inspect
+   its `state`:
+   - **If `state == 'reserved'`:** rename `staging/<reservation_id>` to
+     `revisions/<reservation_id>`, `fsync` `revisions/` and call `storage::settle` with
+     `media_type` (`text/plain; charset=utf-8` or `application/json; charset=utf-8`) and a
+     bounded display name passing `storage::valid_display_name`.
+   - **If `state == 'settled'`:** drop/unlink only the local staging file without touching
+     `revisions/<reservation_id>`, verify exact `(size_bytes, content_digest, media_type,
+     display_name, created_by_user_id)` replay via `storage::settle` (refusing closed on digest
+     or length mismatch) and confirm the published regular file matches `size_bytes`.
+   - **If `state == 'released'`:** drop/unlink only the local staging file and refuse closed
+     (`Conflict`).
+
+**Ledger-safe spill cleanup (`artifact_fs::reconcile_run_spills`).** Because
+`artifact_fs::reconcile_expired` scans only upload reservations (`run_id IS NULL`) and
+`run_id IS NOT NULL` matches all run-linked reservations (not only spills), PR2 adds
+`artifact_fs::reconcile_run_spills` to the worker maintenance sweep with strict ledger safety:
+
+- Scan only adapter-owned spill reservations matching the deterministic `tool-spill:`
+  `idempotency_key` prefix with `operation_id IS NOT NULL` and `state = 'reserved'`.
+- For each candidate, open a transaction respecting the existing lock order (`openmettle.runs`
+  first via `FOR NO KEY UPDATE`, then `openmettle.storage_reservations` via
+  `FOR UPDATE SKIP LOCKED`) and prove **both**:
+  1. the publisher lease is inactive (the run is terminal or has no live lease claim), **and**
+  2. the linked operation is resolved (terminal `succeeded` or `failed`, never `intent` or
+     `outcome_unknown`). A terminal run alone is **not** sufficient because an `interrupted`
+     run can still own an `outcome_unknown` operation (`src/authz/leases.rs`), for which
+     `storage::release` rightly refuses with `Error::Unresolved` (`src/storage.rs`).
+- Call `storage::release` (or confirm `state = 'released'`) and commit the DB release **before**
+  unlinking `<ARTIFACTS_DIR>/staging/<reservation_id>`. Never unlink settled
+  `revisions/<reservation_id>` payloads during spill reconciliation; settled revisions are
+  deleted only by `artifact_fs::purge_due` after retention expiry.
 
 ### Head/tail preview envelope and unavailable-spill policy
 
-A spilled result returns a closed JSON envelope capped at `16 KiB`:
+A spilled result returns a closed JSON envelope whose **final UTF-8 serialized JSON string** is
+capped at `16 KiB` (`16_384` bytes):
 
 - `status`: `"ok"`
 - `storage`: `"spilled"`
@@ -260,32 +364,39 @@ A spilled result returns a closed JSON envelope capped at `16 KiB`:
   `artifact_id`, `revision_id`, `content_sha256` (64 lowercase hex), `size_bytes`,
   `line_count`, `inline_head_bytes`, `inline_tail_bytes` and `omitted_bytes`.
 
-The model inspects omitted middle ranges by calling `artifact.read_range` with the returned
-`artifact_id` and `revision_id`, subject to live scope and `Action::Read` rechecks.
+If JSON string escaping (such as `\u001b` control characters) and envelope metadata push the
+serialized JSON above `16_384` bytes, trim `head` and `tail` preview code points symmetrically
+(preserving valid UTF-8 boundaries, non-overlap and accurate byte counts) until the final
+serialized JSON fits `<= 16_384` bytes. The model inspects omitted middle ranges by calling
+`artifact.read_range` with the returned `artifact_id` and `revision_id`, subject to live scope,
+`Action::Read` and `active` revision rechecks.
 
-**When spill storage is unavailable.** If `OPENMETTLE_WORKER_ARTIFACTS_DIR` is unset, storage
-limits are unconfigured, owner/instance storage quota is exhausted or filesystem publication
-fails:
+**Startup check, opportunistic spill fallback and deferral of `spill_required`.** Worker
+startup validates `OPENMETTLE_WORKER_ARTIFACTS_DIR` (via `artifact_fs::Store::open`) whenever a
+spill-capable adapter is registered so misconfigured mounts fail fast at boot. All V1-14 spills
+are **post-response opportunistic spills**; strict `spill_required` pre-reserved write tools
+are explicitly deferred out of V1-14 because `Review::validate` (`src/authz/approvals.rs`)
+requires an existing authorized `Review.artifact` whenever `Review.reservation` is set, whereas
+a newly spilled tool output has neither an `operation_id` nor a known byte length before intent
+commit and dispatch.
 
-- **Default tools (`spill_required = false`).** Record the proven tool outcome in `operations`
-  first (so a completed write is never hidden or falsely marked failed), include the redacted
-  `spill_error` (`store_unconfigured`, `quota_exceeded` or `storage_io`) in observation
-  evidence and return a bounded fallback envelope with `storage: "truncated_no_spill"`,
-  `truncated: true`, `artifact_id: null`, `revision_id: null`, the same UTF-8-safe `head`/`tail`
-  preview, `omitted_bytes` and `content_sha256`. Truncation is always explicit; partial output
-  is never labeled complete.
-- **Strict-spill tools (`spill_required = true`).** Reviewed tools whose contract requires
-  durable artifact output pre-reserve a `StorageReservation` in `Review.reservation` (already
-  enforced by `src/authz/approvals.rs`) so unconfigured storage or exhausted quota fails closed
-  before dispatch.
+If `OPENMETTLE_WORKER_ARTIFACTS_DIR` is unset, storage limits are unconfigured, owner/instance
+storage quota is exhausted or filesystem publication fails, the worker **always** records the
+tool's true observation in `operations` first (so a committed external write is never hidden,
+falsely marked failed or re-dispatched), includes the redacted `spill_error`
+(`store_unconfigured`, `quota_exceeded` or `storage_io`) in observation evidence and returns a
+bounded fallback envelope (`<= 16_384` serialized JSON bytes) with
+`storage: "truncated_no_spill"`, `truncated: true`, `artifact_id: null`, `revision_id: null`,
+the same UTF-8-safe `head`/`tail` preview, `omitted_bytes` and `content_sha256`. Truncation is
+always explicit; partial output is never labeled complete.
 
 ## Delivery and verification
 
 | Slice | Deliverable | Acceptance evidence |
 | --- | --- | --- |
 | PR1 | This ADR (`0039`). | Review against #14, #25, ADRs 0010, 0031, 0033, 0035 and 0038; `ai-guardrails docs audit` reports zero findings. |
-| PR2 | Reviewed tool registry (`EffectPolicy`), strict schema/argument validator and default expander, internal `artifact.read_range` v1 tool, `artifact_fs::publish_bytes`, `reconcile_run_spills` and head/tail preview builder. | PostgreSQL 18 tests: cross-user, cross-scope, archived/deleted project and non-`active` revision refusals; duplicate-key, float, depth, bound and wildcard rejections; inline vs spill thresholds (`16 KiB`, `200` lines, multi-byte UTF-8 cuts); unconfigured-store, quota-refused and I/O fallback envelopes; crash/retry spill reservation reconciliation. |
-| PR3 | Streamable HTTP MCP adapter over `provider_http::transport`, `MCP_DNS_SLOTS`, `McpCredentialProvider` seam, `ApprovedAdapter` implementation, read-only `Executor::reconcile`, and `PLAN-10` / `PLAN-22` conformance harness on synthetic `rcgen` TLS + PostgreSQL 18. | Synthetic TLS + PostgreSQL 18 tests: bounded retries with identical persisted `Idempotency-Key` on `repeatable_read`/`idempotent` (`408`/`429` with `Retry-After`/`502`/`503`/`504`, pre-send TCP reset) obeying `step.stop` and deadlines; zero post-send retries on `lookup`/`non_repeatable` writes (exact server write count `1`, `outcome_unknown` in ledger); semantic `isError: true` / `-32602` with zero transport retries; SSRF/TLS/redirect/`401`/`403`/`tools/list`-drift/`> 4 MiB` refusals; canary redaction checks across errors, stderr, traces and metrics; end-to-end `park` -> `decide` -> resume -> `ApprovedAdapter::send` -> spill -> `artifact.read_range` round trip. |
+| PR2 | Reviewed tool registry (`EffectPolicy`), strict schema/argument validator and default expander, internal `artifact.read_range` v1 tool, lease-fenced `artifact_fs::publish_bytes`, `reconcile_run_spills` and serialized-budget head/tail preview builder. | PostgreSQL 18 tests: cross-user, cross-scope, archived/deleted project, private project-scope spill ownership (other members denied until shared), share revocation and `active` -> `retained` transition between original read and replay, and non-`active` revision refusals; `max_bytes < 4` validation refusal, invalid UTF-8 binary semantic fault and strictly inline `artifact.read_range` under 6x JSON escaping; duplicate-key, float, depth, bound and wildcard rejections; serialized-JSON `16 KiB` inline/spill thresholds (`\u001b` expansion, `200` lines, multi-byte UTF-8 cuts); unconfigured-store, quota-refused and I/O fallback envelopes; `publish_bytes` settled-replay match/mismatch, `released` refusal and stale-lease rejection; `reconcile_run_spills` coverage of `interrupted` runs with `outcome_unknown` and concurrent publisher races. |
+| PR3 | Streamable HTTP MCP (`2026-07-28`) adapter over `provider_http::transport`, `MCP_DNS_SLOTS`, `McpCredentialProvider` seam, `ApprovedAdapter` implementation, read-only `Executor::reconcile`, and `PLAN-10` / `PLAN-22` conformance harness on synthetic `rcgen` TLS + PostgreSQL 18. | Synthetic TLS + PostgreSQL 18 tests: MCP `2026-07-28` request headers (`MCP-Protocol-Version: 2026-07-28`, `Mcp-Method`, `Mcp-Name`, no `Mcp-Session-Id`) over `application/json` and `text/event-stream` (SSE comments and progress notifications before final response, mismatched JSON-RPC IDs, duplicate final responses, `input_required` and server-initiated request rejection, `4 MiB` aggregate stream ceiling before buffering); bounded retries with identical persisted `Idempotency-Key` on `repeatable_read`/`idempotent` rechecking `step.stop`, `step.deadline` and `recheck_leased` before each retry; sticky whole-operation send uncertainty (`outcome_unknown` preserved when a retry fails pre-send or receives `401`/`403`/deadline after ambiguous attempt 1); zero post-send retries and `retryable_by_model: false` on ambiguous `lookup`/`non_repeatable` writes; `lookup` reconciliation with and without `downstream_handle` plus post-recheck credential lookup and `repeatable_read` exclusion from `Executor::reconcile`; semantic `isError: true` / `-32602` plus `PLAN-10` valid-schema wrong/stale-fact semantic recovery; internal-MCP identity-boundary check authenticating caller/scope via primary PostgreSQL authority rather than compiled bypass; `PLAN-22` fixed native vs internal-MCP vs remote-MCP route measurement harness hook; SSRF/TLS/redirect/`401`/`403`/`tools/list`-drift/`> 4 MiB` refusals; canary redaction checks across errors, stderr, traces and metrics; end-to-end `park` -> `decide` -> resume -> `ApprovedAdapter::send` -> spill -> `artifact.read_range` round trip including share-revocation and retention replay refusals. |
 
 ### External boundaries
 
