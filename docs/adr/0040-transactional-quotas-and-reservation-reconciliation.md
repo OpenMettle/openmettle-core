@@ -22,11 +22,11 @@ reservation exactly once internally.
 
 | Existing boundary | V1-17 addition |
 | --- | --- |
-| [ADR 0005](0005-artifact-storage-accounting.md), [`src/storage.rs`](../../src/storage.rs) | Keep `storage_instance`, `storage_accounts`, `storage_reservations` and `artifact_revisions` as the single storage ledger. Add `storage_instance.volume_id`, per-scope overrides, fail-closed rolling-upgrade backstop triggers on `storage_accounts` (`OMQ01`) and on `storage_reservations`/`artifact_revisions` for unpinned `openmettle_worker` releases/purges (`OMQ03`), warning thresholds, reservation `lease_expires_at` and DB-plus-filesystem drift verification. |
-| [ADR 0031](0031-filesystem-artifact-storage-and-streaming-multipart.md), [`src/artifact_fs.rs`](../../src/artifact_fs.rs) | Bind upload reservations (`run_id IS NULL`) to `lease_expires_at` within the 600 s upload timeout plus 300 s settlement margin. Pin durable artifact volume identity (`storage_instance.volume_id` <-> `<root>/.openmettle-volume-id` with matching `st_dev` across `revisions/` and `staging/`): restrict automatic bootstrap pinning strictly to an empty storage ledger (`OMQ03` otherwise); keep `storage_instance.volume_id IS NULL` across the entire `N-1 -> N` binary replacement so `enforce_worker_storage_volume_pinned()` (`OMQ03`) hard-blocks all `N-1` worker cleaners until zero `N-1` workers remain; run verified volume adoption only after 100% `N-1 -> N` replacement (unconditionally re-verifying revisions, `'reserved'` payloads, and requiring independent `--expected-fs-uuid` volume attestation whenever zero digest-bearing revisions are verified on disk, including on retry, while accepting missing `state = 'purging'` files once volume identity is established); and gate **all** `N` worker cleaners — explicitly including `artifact_fs::purge_due` alongside `reconcile_expired`, run-linked `ENOENT` recovery and `staging/` cleanup — on verified non-null `volume_id` + sentinel/`st_dev` identity. Keep `reconcile_expired` and `purge_due` as the sole upload and purge cleaners. Preserve published revision payloads after post-rename/pre-settlement crashes and recognize missing `purging` payloads as a valid resumable mid-purge state during both adoption and restore verification. |
+| [ADR 0005](0005-artifact-storage-accounting.md), [`src/storage.rs`](../../src/storage.rs) | Keep `storage_instance`, `storage_accounts`, `storage_reservations` and `artifact_revisions` as the single storage ledger. Add `storage_instance.volume_id`, `storage_instance.bootstrap_auto_pin_allowed`, per-scope overrides, fail-closed rolling-upgrade PostgreSQL ledger backstop triggers on `storage_accounts` (`OMQ01`) and on `storage_reservations`/`artifact_revisions` for unpinned `openmettle_worker` releases/purges (`OMQ03`), warning thresholds, reservation `lease_expires_at` and DB-plus-filesystem drift verification. |
+| [ADR 0031](0031-filesystem-artifact-storage-and-streaming-multipart.md), [`src/artifact_fs.rs`](../../src/artifact_fs.rs) | Bind upload reservations (`run_id IS NULL`) to `lease_expires_at` within the 600 s upload timeout plus 300 s settlement margin. Pin durable artifact volume identity (`storage_instance.volume_id` <-> role-tagged sentinels `<root>/.openmettle-volume-id`, `<root>/revisions/.openmettle-volume-id`, and `<root>/staging/.openmettle-volume-id` published atomically via write-temp + `fsync` + `linkat` + `unlinkat`, with matching `st_dev` across all three open directory FDs): gate automatic bootstrap pinning strictly on `src/migrate.rs` fresh-from-zero history (`applied == 0`, `storage_instance.bootstrap_auto_pin_allowed = true`) AND an empty storage ledger (`OMQ03` on every upgrade); require **mandatory pre-migration quiescence of all `N-1` legacy artifact cleaners (unsetting `OPENMETTLE_WORKER_ARTIFACTS_DIR` and draining in-flight `worker::maintenance` sweeps)** before running `openmettle-migrate` (treating `enforce_worker_storage_volume_pinned()` (`OMQ03`) strictly as a PostgreSQL ledger backstop because `N-1` unlinks before mutating PostgreSQL); keep `storage_instance.volume_id IS NULL` across the entire `N-1 -> N` binary replacement; run verified volume adoption only after 100% `N-1 -> N` replacement (unconditionally re-verifying revisions and `'reserved'` payloads, requiring `--expected-fs-uuid` independent volume attestation whenever ledger rows exist with zero digest-bearing revisions verified on disk, including on retry, while accepting missing `state = 'purging'` files once volume identity is established); and gate **all** `N` worker cleaners — explicitly including `artifact_fs::purge_due` alongside `reconcile_expired`, run-linked `ENOENT` recovery and `staging/` cleanup — on verified non-null `volume_id` + all three role-tagged sentinels/`st_dev` before any unlink or DB mutation. Keep `reconcile_expired` and `purge_due` as the sole upload and purge cleaners. Preserve published revision payloads after post-rename/pre-settlement crashes and recognize missing `purging` payloads as a valid resumable mid-purge state during both adoption and restore verification. |
 | [ADR 0032](0032-durable-run-admission-and-fair-work-queue.md) and [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md), [`src/authz/runs.rs`](../../src/authz/runs.rs) | Keep exact partial-index counts on `runs` for live and executing runs. Resolve per-scope overrides for live caps and `round_cap` (`1..=1000`) at admission, and serialize `executing_runs_*` cap changes with `claim_next` (including approval resume) via `run_dispatch_lock`. Compose usage and device holds inside admission and renew run-bound holds on the worker lease cadence. |
-| [ADR 0035](0035-approvals-permitted-yolo-and-effect-ledger.md), [`src/authz/approvals.rs`](../../src/authz/approvals.rs) | Keep `StorageReservation` for run-bound artifact and tool-result spills (including V1-14 (`#14`) bounded outputs). Align parked reservation expiry with `resume_execution_expires_at`. Require configured `ARTIFACTS_DIR`, verified non-null pinned `storage_instance.volume_id` <-> `<root>/.openmettle-volume-id` (`O_NOFOLLOW`, matching `st_dev` with open `revisions/` and `staging/` FDs) and directory-relative `ENOENT` proof that `revisions/<id>` does not exist before committing `storage::release` and unlinking `staging/<id>`, plus retryable staging cleanup via persistent `StagingSweepState` (`Idle`/`Open`/`InFlight`/`InvalidatedInFlight`/`DrainingEof` + `pending_names` held outside `worker::sweep`'s 15 s `tokio::time::timeout`, preserving single-reader serialization and originating `(dir_dev, dir_ino)` identity across directory replacement and EOF drain) for already-`released` rows; never release or unlink when `revisions/<id>` exists while `state = 'reserved'` or when `volume_id IS NULL` or volume identity/`revisions/` verification fails. |
-| [ADR 0037](0037-gateway-provisioning-and-usage-reconciliation.md) | Reconcile local token and cost budget holds strictly from authoritative `openmettle_gateway` settlement reports (`openmettle.gateway_usage_reports` in Migration `0023`) via narrow `SECURITY DEFINER` transitions. Introduce in-transaction `authz::gateway` helpers (`reserve_in`, `handoff_in`, `release_in`) so inserting `'reserved'` `openmettle.gateway_requests` and creating all metered `openmettle.quota_reservations` holds execute atomically in one `WriteTransaction`, backed by a two-phase ADR 0003 rolling-upgrade activation gate (`openmettle.quota_enforcement.metering_enforced`, auto-`true` on fresh installs when `gateway_bindings`, `gateway_reservations` and `gateway_requests` are all empty, `false` on populated upgrades until flipped irreversibly `false -> true` in a standalone single-statement transaction by `openmettle_owner`) plus a `DEFERRABLE INITIALLY DEFERRED` commit-time `CONSTRAINT TRIGGER quota_enforce_gateway_handoff_holds` (`openmettle.enforce_gateway_handoff_holds()`, locking `quota_enforcement FOR SHARE` and recording handoff-time obligations in `openmettle.quota_gateway_handoffs`, `OMQ04`, zero edits to frozen `0023`), lease-generation-fenced successor-worker unwind `openmettle.quota_unwind_superseded_round(...)` (checking `quota_reservations.allocating_claim_token` so replay never unwinds the successor's own attempt), and bounded raw index-key paging with a constant clamped age cutoff in `quota_release_orphan_gateway_requests` for pre-V1-17 orphan `'reserved'` rows. Enforce scope-pinned composite FK `(scope_id, gateway_request_id) REFERENCES openmettle.gateway_requests (scope_id, id)`, unique `(gateway_request_id, resource_kind)`, a `SECURITY DEFINER` `BEFORE INSERT OR UPDATE` gateway-binding guard trigger, 32-byte `p_dispatch` secret verification (`dispatch_hash = sha256(p_dispatch)`), ownership recheck under sweep locks, composite FKs to `gateway_usage_reports`, nullable `accepted_source_revision` supporting `revision >= 0` (including `revision = 0`), run-to-round `held` allocation coupled atomically with `openmettle.gateway_handoff` / `openmettle.gateway_release`, caller-scoped `SECURITY DEFINER` `openmettle.quota_recover_lost_handoff` for lost commit-ack recovery (without granting `SELECT` on `gateway_requests`, validating against recorded handoff-time obligations in `quota_gateway_handoffs` and recognizing `'handoff_committed'`, `'settled'` and `'written_off'` holds across activation), atomic stale-sweep closure of `'reserved'` `gateway_requests` (`'reserved' -> 'released'` + `gateway_reservations` restoration), signed partial corrections and SQL-enforced `BEFORE INSERT OR UPDATE OR DELETE` deployment denomination immutability (`OMQ02`) with the seeded `('instance', 'usage_cost_micros')` row strictly `UPDATE`-only after migration (serialized via `quota_cost_unit_lock` with zero lock cycle alongside a `BEFORE INSERT` guard trigger on `gateway_usage_reports` (`cost IS NOT NULL`, zero edits to frozen `0023`)). |
+| [ADR 0035](0035-approvals-permitted-yolo-and-effect-ledger.md), [`src/authz/approvals.rs`](../../src/authz/approvals.rs) | Keep `StorageReservation` for run-bound artifact and tool-result spills (including V1-14 (`#14`) bounded outputs). Align parked reservation expiry with `resume_execution_expires_at`. Require configured `ARTIFACTS_DIR`, verified non-null pinned `storage_instance.volume_id` <-> role-tagged `.openmettle-volume-id` sentinels in `<root>`, `<root>/revisions`, and `<root>/staging` (`O_NOFOLLOW`, matching `st_dev` across open directory FDs) and directory-relative `ENOENT` proof that `revisions/<id>` does not exist before committing `storage::release` and unlinking `staging/<id>`, plus retryable staging cleanup via persistent `StagingSweepState` (`Idle`/`Open`/`InFlight`/`InvalidatedInFlight`/`DrainingEof` + `pending_names` held outside `worker::sweep`'s 15 s `tokio::time::timeout`, retaining an open `dir_fd` across `Open`/`InFlight`/`DrainingEof` until `pending_names` is empty to prevent `dir_ino` reuse and preserve single-reader serialization across directory replacement and EOF drain) for already-`released` rows; never release or unlink when `revisions/<id>` exists while `state = 'reserved'` or when `volume_id IS NULL` or volume identity/sentinel/`revisions/` verification fails. |
+| [ADR 0037](0037-gateway-provisioning-and-usage-reconciliation.md) | Reconcile local token and cost budget holds strictly from authoritative `openmettle_gateway` settlement reports (`openmettle.gateway_usage_reports` in Migration `0023`) via narrow `SECURITY DEFINER` transitions. Introduce in-transaction `authz::gateway` helpers (`reserve_in`, `handoff_in`, `release_in`) so inserting `'reserved'` `openmettle.gateway_requests` and creating all metered `openmettle.quota_reservations` holds execute atomically in one `WriteTransaction`, backed by a two-phase ADR 0003 rolling-upgrade activation gate (`openmettle.quota_enforcement.metering_enforced`, seeded `true` **only** on genuine fresh-from-zero installs where `src/migrate.rs` observed `applied == 0` AND all core/storage/gateway tables are empty, and `false` on **every** upgrade `applied >= 1` — including unused upgrades with empty tables — until flipped irreversibly `false -> true` in a standalone single-statement transaction by `openmettle_owner`) plus a `DEFERRABLE INITIALLY DEFERRED` commit-time `CONSTRAINT TRIGGER quota_enforce_gateway_handoff_holds` (`openmettle.enforce_gateway_handoff_holds()`, recording handoff-time obligations in `openmettle.quota_gateway_handoffs` **before** acquiring `quota_enforcement FOR SHARE` as the final sink lock, `OMQ04`, zero edits to frozen `0023`), lease-generation-fenced successor-worker unwind `openmettle.quota_unwind_superseded_round(...)` (checking `quota_reservations.allocating_claim_token` so replay never unwinds the successor's own attempt, and cleanly unwinding unbound `N-1` `'reserved'` rounds), lazy idempotent once-per-run parent hold initialization (`openmettle.quota_ensure_legacy_run_holds` / start of `quota_allocate_round`) when an `N` worker claims or reclaims an `N-1`-admitted run, and bounded raw index-key paging with a constant clamped age cutoff in `quota_release_orphan_gateway_requests` for pre-V1-17 orphan `'reserved'` rows. Enforce scope-pinned composite FK `(scope_id, gateway_request_id) REFERENCES openmettle.gateway_requests (scope_id, id)`, unique `(gateway_request_id, resource_kind)`, a `SECURITY DEFINER` `BEFORE INSERT OR UPDATE` gateway-binding guard trigger, 32-byte `p_dispatch` secret verification (`dispatch_hash = sha256(p_dispatch)`), ownership recheck under sweep locks, composite FKs to `gateway_usage_reports`, nullable `accepted_source_revision` supporting `revision >= 0` (including `revision = 0`), run-to-round `held` allocation coupled atomically with `openmettle.gateway_handoff` / `openmettle.gateway_release`, caller-scoped `SECURITY DEFINER` `openmettle.quota_recover_lost_handoff` for lost commit-ack recovery (without granting `SELECT` on `gateway_requests`, validating against recorded handoff-time obligations in `quota_gateway_handoffs` and recognizing `'handoff_committed'` and `'settled'` holds across activation), atomic stale-sweep closure of `'reserved'` `gateway_requests` (`'reserved' -> 'released'` + `gateway_reservations` restoration), signed partial corrections and SQL-enforced `BEFORE INSERT OR UPDATE OR DELETE` deployment denomination immutability (`OMQ02`) with the seeded `('instance', 'usage_cost_micros')` row strictly `UPDATE`-only after migration (serialized via `quota_cost_unit_lock` with zero lock cycle alongside a `BEFORE INSERT` guard trigger on `gateway_usage_reports` (`cost IS NOT NULL`, zero edits to frozen `0023`)). |
 | [ADR 0007](0007-application-api-contract.md) and [ADR 0027](0027-authorization-and-private-projects.md) | Expose authenticated `/v1` effective-quota projections (including active threshold warnings), audited `ManageQuotas` override routes backed by `SECURITY DEFINER` functions and privacy-safe `429 quota` / `429 rate_limited` / `503 provisioning` RFC 9457 problems. |
 | V1-18 (`#18`) shared capacity controller | Separate user and project concurrent device-slot quotas (`window_kind = 'concurrent'`) from GPU VRAM allocation. Gate admission in PostgreSQL, reject run-linked `device_reservations` holds in generic `quota_commit_handoff`, require lease-fenced `openmettle_worker` handoff of run device holds exclusively via `quota_commit_device_handoff`, and release device quota holds only after durable V1-18 confirmation of backend release or non-allocation. |
 
@@ -174,10 +174,13 @@ is additive and preserves all migration 4 storage rows.
 ```sql
 ALTER TABLE openmettle.storage_instance
     ADD COLUMN volume_id uuid,
+    ADD COLUMN bootstrap_auto_pin_allowed boolean NOT NULL DEFAULT false,
     ADD COLUMN warn_pct_1 smallint NOT NULL DEFAULT 80 CHECK (warn_pct_1 BETWEEN 1 AND 99),
     ADD COLUMN warn_pct_2 smallint NOT NULL DEFAULT 90
         CHECK (warn_pct_2 BETWEEN 1 AND 99 AND warn_pct_2 > warn_pct_1),
-    ADD COLUMN config_revision bigint NOT NULL DEFAULT 1 CHECK (config_revision >= 1);
+    ADD COLUMN config_revision bigint NOT NULL DEFAULT 1 CHECK (config_revision >= 1),
+    ADD CONSTRAINT storage_instance_auto_pin_check
+        CHECK (volume_id IS NULL OR NOT bootstrap_auto_pin_allowed);
 
 ALTER TABLE openmettle.storage_reservations
     ADD COLUMN lease_expires_at timestamptz,
@@ -231,23 +234,41 @@ CREATE TABLE openmettle.quota_cost_unit_lock (
 INSERT INTO openmettle.quota_cost_unit_lock (id) VALUES (true);
 
 -- Singleton rolling-upgrade activation gate for mandatory gateway metering.
--- Seeded true automatically on fresh installs (zero existing gateway state across
--- gateway_bindings, gateway_reservations, and gateway_requests); seeded false on
--- populated upgrades until flipped write-once false -> true by openmettle_owner
--- in a standalone single-statement transaction once all N-1 replicas are replaced by N.
+-- Seeded true ONLY on genuine fresh-from-zero installations where src/migrate.rs's
+-- migrate_within_boundaries captured applied == 0 in openmettle._sqlx_migrations
+-- (exposed via pg_catalog.set_config('openmettle.bootstrap_from_zero', ..., false)
+-- after RESET ALL before each version run) AND all core, storage and gateway tables
+-- are empty. Seeded false on EVERY upgrade (applied >= 1, including unused existing
+-- installations with empty users/storage_*/gateway_* tables) until flipped write-once
+-- false -> true by openmettle_owner in a standalone single-statement transaction once
+-- all N-1 replicas are replaced by N.
 CREATE TABLE openmettle.quota_enforcement (
     id boolean PRIMARY KEY DEFAULT true CHECK (id),
     metering_enforced boolean NOT NULL,
     metering_enforced_at timestamptz,
     CHECK (NOT metering_enforced OR metering_enforced_at IS NOT NULL)
 );
-INSERT INTO openmettle.quota_enforcement (id, metering_enforced, metering_enforced_at)
-SELECT true, is_fresh, CASE WHEN is_fresh THEN clock_timestamp() END
-  FROM (
-      SELECT NOT EXISTS (SELECT 1 FROM openmettle.gateway_bindings)
-             AND NOT EXISTS (SELECT 1 FROM openmettle.gateway_reservations)
-             AND NOT EXISTS (SELECT 1 FROM openmettle.gateway_requests) AS is_fresh
-  ) s;
+WITH fresh AS (
+    SELECT coalesce(pg_catalog.current_setting('openmettle.bootstrap_from_zero', true), 'false') = 'true'
+           AND NOT EXISTS (SELECT 1 FROM openmettle.users)
+           AND NOT EXISTS (SELECT 1 FROM openmettle.scopes)
+           AND NOT EXISTS (SELECT 1 FROM openmettle.projects)
+           AND NOT EXISTS (SELECT 1 FROM openmettle.runs)
+           AND NOT EXISTS (SELECT 1 FROM openmettle.storage_reservations)
+           AND NOT EXISTS (SELECT 1 FROM openmettle.artifact_revisions)
+           AND NOT EXISTS (SELECT 1 FROM openmettle.gateway_bindings)
+           AND NOT EXISTS (SELECT 1 FROM openmettle.gateway_reservations)
+           AND NOT EXISTS (SELECT 1 FROM openmettle.gateway_requests) AS is_fresh_bootstrap
+),
+seed_enforcement AS (
+    INSERT INTO openmettle.quota_enforcement (id, metering_enforced, metering_enforced_at)
+    SELECT true, is_fresh_bootstrap, CASE WHEN is_fresh_bootstrap THEN clock_timestamp() END
+      FROM fresh
+)
+UPDATE openmettle.storage_instance si
+   SET bootstrap_auto_pin_allowed = fresh.is_fresh_bootstrap
+  FROM fresh
+ WHERE si.id;
 
 -- Records exact handoff-time metering obligations at COMMIT inside
 -- enforce_gateway_handoff_holds() (zero schema edits to frozen Migration 0023's
@@ -619,12 +640,12 @@ CREATE TRIGGER quota_enforcement_write_once
 
 -- Added in PR2's migration (zero edits to frozen Migration 0023). Fires at COMMIT
 -- after both openmettle.gateway_handoff and openmettle.quota_commit_handoff run in
--- the same WriteTransaction, locking openmettle.quota_enforcement FOR SHARE (so
--- READ COMMITTED commits serialize strictly against openmettle_owner's standalone
--- UPDATE acquiring FOR NO KEY UPDATE), rejecting un-transitioned bound holds
--- unconditionally, rejecting missing required metered holds once
--- metering_enforced = true, and recording handoff-time obligations in
--- openmettle.quota_gateway_handoffs.
+-- the same WriteTransaction. Acquires receipt-side locks on
+-- openmettle.quota_gateway_handoffs (ROW EXCLUSIVE + FOR KEY SHARE on already-locked
+-- gateway_requests(NEW.id)) BEFORE locking openmettle.quota_enforcement FOR SHARE as
+-- the final sink lock (preserving ... -> quota_gateway_handoffs -> quota_enforcement
+-- while serializing READ COMMITTED commits against openmettle_owner's standalone
+-- UPDATE acquiring FOR NO KEY UPDATE).
 CREATE FUNCTION openmettle.enforce_gateway_handoff_holds()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -648,8 +669,47 @@ BEGIN
             USING ERRCODE = 'OMQ04';
     END IF;
 
-    -- FOR SHARE (not FOR KEY SHARE) conflicts with openmettle_owner's standalone
-    -- UPDATE (FOR NO KEY UPDATE) while allowing concurrent handoffs to run in parallel.
+    -- Compute cost requirement via non-locking reads before acquiring table/row locks.
+    SELECT cost_denomination INTO v_cost_denom
+      FROM openmettle.quota_defaults
+     WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros';
+
+    IF v_cost_denom IS NOT NULL THEN
+        SELECT kind INTO v_scope_kind
+          FROM openmettle.scopes
+         WHERE id = NEW.scope_id;
+        SELECT id INTO v_actor_scope_id
+          FROM openmettle.scopes
+         WHERE personal_user_id = NEW.actor_user_id;
+
+        v_cost_required := EXISTS (
+            SELECT 1
+              FROM openmettle.quota_defaults qd
+             WHERE qd.resource_kind = 'usage_cost_micros'
+               AND qd.hard_limit IS NOT NULL
+               AND qd.scope_kind IN ('instance', 'personal', v_scope_kind)
+        ) OR EXISTS (
+            SELECT 1
+              FROM openmettle.quota_overrides qo
+             WHERE qo.resource_kind = 'usage_cost_micros'
+               AND qo.scope_id IN (NEW.scope_id, v_actor_scope_id)
+               AND qo.revoked_at IS NULL
+               AND (qo.expires_at IS NULL OR qo.expires_at > clock_timestamp())
+        );
+    END IF;
+
+    -- Acquire ROW EXCLUSIVE on quota_gateway_handoffs (and FOR KEY SHARE on
+    -- gateway_requests(NEW.id), already held FOR UPDATE by gateway_handoff) BEFORE
+    -- touching quota_enforcement so quota_enforcement is genuinely the final lock.
+    INSERT INTO openmettle.quota_gateway_handoffs (
+        gateway_request_id, metering_enforced, cost_required
+    ) VALUES (
+        NEW.id, false, v_cost_required
+    );
+
+    -- Final table/row lock of the transaction: FOR SHARE (not FOR KEY SHARE) conflicts
+    -- with openmettle_owner's standalone UPDATE (FOR NO KEY UPDATE) while allowing
+    -- concurrent handoffs to run in parallel.
     SELECT metering_enforced INTO STRICT v_enforced
       FROM openmettle.quota_enforcement
      WHERE id
@@ -667,51 +727,23 @@ BEGIN
                 USING ERRCODE = 'OMQ04';
         END IF;
 
-        SELECT cost_denomination INTO v_cost_denom
-          FROM openmettle.quota_defaults
-         WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros';
-
-        IF v_cost_denom IS NOT NULL THEN
-            SELECT kind INTO v_scope_kind
-              FROM openmettle.scopes
-             WHERE id = NEW.scope_id;
-            SELECT id INTO v_actor_scope_id
-              FROM openmettle.scopes
-             WHERE personal_user_id = NEW.actor_user_id;
-
-            v_cost_required := EXISTS (
-                SELECT 1
-                  FROM openmettle.quota_defaults qd
-                 WHERE qd.resource_kind = 'usage_cost_micros'
-                   AND qd.hard_limit IS NOT NULL
-                   AND qd.scope_kind IN ('instance', 'personal', v_scope_kind)
-            ) OR EXISTS (
-                SELECT 1
-                  FROM openmettle.quota_overrides qo
-                 WHERE qo.resource_kind = 'usage_cost_micros'
-                   AND qo.scope_id IN (NEW.scope_id, v_actor_scope_id)
-                   AND qo.revoked_at IS NULL
-                   AND (qo.expires_at IS NULL OR qo.expires_at > clock_timestamp())
-            );
-
-            IF v_cost_required AND NOT EXISTS (
-                SELECT 1
-                  FROM openmettle.quota_reservations qr
-                 WHERE qr.gateway_request_id = NEW.id
-                   AND qr.resource_kind = 'usage_cost_micros'
-                   AND qr.state = 'handoff_committed'
-            ) THEN
-                RAISE EXCEPTION 'missing handoff_committed usage_cost_micros reservation for gateway handoff'
-                    USING ERRCODE = 'OMQ04';
-            END IF;
+        IF v_cost_required AND NOT EXISTS (
+            SELECT 1
+              FROM openmettle.quota_reservations qr
+             WHERE qr.gateway_request_id = NEW.id
+               AND qr.resource_kind = 'usage_cost_micros'
+               AND qr.state = 'handoff_committed'
+        ) THEN
+            RAISE EXCEPTION 'missing handoff_committed usage_cost_micros reservation for gateway handoff'
+                USING ERRCODE = 'OMQ04';
         END IF;
-    END IF;
 
-    INSERT INTO openmettle.quota_gateway_handoffs (
-        gateway_request_id, metering_enforced, cost_required
-    ) VALUES (
-        NEW.id, v_enforced, v_cost_required
-    );
+        -- Updates only our own uncommitted tuple on already-locked quota_gateway_handoffs
+        -- (no FK on metering_enforced), acquiring zero additional table or FK locks.
+        UPDATE openmettle.quota_gateway_handoffs
+           SET metering_enforced = true
+         WHERE gateway_request_id = NEW.id;
+    END IF;
 
     RETURN NULL;
 END;
@@ -724,10 +756,12 @@ CREATE CONSTRAINT TRIGGER quota_enforce_gateway_handoff_holds
     WHEN (OLD.state = 'reserved' AND NEW.state = 'handed_off')
     EXECUTE FUNCTION openmettle.enforce_gateway_handoff_holds();
 
--- Added in PR2's migration. Fails closed if an N-1 openmettle_worker runs
--- reconcile_expired or purge_due while storage_instance.volume_id IS NULL
--- (which stays NULL throughout the entire N-1 -> N binary rollout).
--- openmettle_api (disjoint role per ADR 0003) keeps in-flight upload abort cleanup working.
+-- Added in PR2's migration. PostgreSQL ledger defense-in-depth backstop while
+-- storage_instance.volume_id IS NULL (protecting DB storage accounting if an operator
+-- forgets mandatory pre-migration N-1 cleaner quiescence on an empty mount; NOT a
+-- substitute for quiescing N-1 cleaners before migration because N-1 unlinks before
+-- mutating PostgreSQL). openmettle_api (disjoint role per ADR 0003) keeps in-flight
+-- upload abort cleanup working.
 CREATE FUNCTION openmettle.enforce_worker_storage_volume_pinned()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -782,51 +816,72 @@ CREATE TRIGGER artifact_revisions_worker_volume_pin_guard
   holds to the same gateway request. Likewise, `quota_reservations_device_grant_uidx` binds each
   durable `device_grant_id` to at most one `device_reservations` hold.
 - **Commit-time mandatory gateway metering across rolling upgrades (`OMQ04`), strictly serialized
-  under `READ COMMITTED`.** Because frozen Migration `0023` leaves `EXECUTE` on
-  `openmettle.gateway_handoff` granted to `openmettle_api` and `openmettle_worker`, an `N-1`
-  binary (`src/authz/gateway.rs`) can still commit `gateway_handoff` on its own with zero
-  `quota_reservations` rows. PR2 closes this without editing frozen `0023` via three coordinated
-  layers: (a) the singleton `openmettle.quota_enforcement` activation row (`metering_enforced
-  boolean NOT NULL`, `SELECT`-granted to runtime roles, write-once `false -> true` by
-  `openmettle_owner` in a standalone single-statement transaction holding zero other locks,
-  enforced by `quota_enforcement_write_once`) is seeded `true` automatically on fresh
-  installations (`NOT EXISTS` across all three `0023` tables: `gateway_bindings`,
-  `gateway_reservations` and `gateway_requests`) and `false` on populated upgrades (including
-  upgrades that already hold a `gateway_reservations` row from `authz::gateway::hold` before any
-  binding or request exists) so `N-1` replicas drain cleanly before `openmettle_owner`
-  (`openmettle-admin`) flips it irreversibly `false -> true`; (b) `DEFERRABLE INITIALLY DEFERRED`
+  under `READ COMMITTED`, and deployment-history freshness gating (`src/migrate.rs`).** Because
+  frozen Migration `0023` leaves `EXECUTE` on `openmettle.gateway_handoff` granted to
+  `openmettle_api` and `openmettle_worker`, an `N-1` binary (`src/authz/gateway.rs`) can still
+  commit `gateway_handoff` on its own with zero `quota_reservations` rows. PR2 closes this without
+  editing frozen `0023` via three coordinated layers: (a) `src/migrate.rs`'s
+  `migrate_within_boundaries` — which already holds SQLx's session advisory lock and inspects
+  `openmettle._sqlx_migrations` (`applied = coalesce(max(version), 0)`) before applying pending
+  migrations — captures `applied` once before the version loop and executes `SELECT
+  pg_catalog.set_config('openmettle.bootstrap_from_zero', CASE WHEN $1 = 0 THEN 'true' ELSE
+  'false' END, false)` after `RESET ALL` before each `migrator.run_to(version, ...)` call. PR2's
+  migration defines `is_fresh_bootstrap` strictly as `coalesce(pg_catalog.current_setting('openmettle.bootstrap_from_zero',
+  true), 'false') = 'true'` **AND** empty `users`, `scopes`, `projects`, `runs`,
+  `storage_reservations`, `artifact_revisions`, `gateway_bindings`, `gateway_reservations` and
+  `gateway_requests`. The singleton `openmettle.quota_enforcement.metering_enforced` (`SELECT`-granted
+  to runtime roles, write-once `false -> true` by `openmettle_owner` in a standalone
+  single-statement transaction holding zero other locks, enforced by
+  `quota_enforcement_write_once`) and `openmettle.storage_instance.bootstrap_auto_pin_allowed`
+  seed `true` **iff `is_fresh_bootstrap`**, and `false` on **every** upgrade (`applied >= 1` —
+  even an existing deployment that has never created users, artifacts or gateway rows yet!) so
+  `N-1` replicas drain cleanly before `openmettle_owner` (`openmettle-admin`) flips
+  `metering_enforced` irreversibly `false -> true`; (b) `DEFERRABLE INITIALLY DEFERRED`
   `CONSTRAINT TRIGGER quota_enforce_gateway_handoff_holds`
   (`openmettle.enforce_gateway_handoff_holds()`, `SECURITY DEFINER`, `SET search_path = pg_catalog`,
   audited in `src/boundaries.sql`) fires at `COMMIT` on `gateway_requests` `'reserved' ->
   'handed_off'`, unconditionally rejecting (`OMQ04`) any bound hold not in `'handoff_committed'`
-  even while `metering_enforced = false`, and then locks the singleton `quota_enforcement` row
-  with **`FOR SHARE`** (specifically `FOR SHARE`, not `FOR KEY SHARE`, because `openmettle_owner`'s
-  activation `UPDATE` acquires `FOR NO KEY UPDATE`, which conflicts with `FOR SHARE` while still
-  allowing concurrent handoffs to proceed in parallel): if the trigger acquires `FOR SHARE` first,
-  `openmettle_owner`'s `UPDATE` blocks until the handoff commits (so an unmetered handoff strictly
-  commits *before* activation); if `openmettle_owner`'s `UPDATE` acquires `FOR NO KEY UPDATE`
-  first, the deferred trigger blocks at `FOR SHARE` until activation commits, re-reads the
-  committed `metering_enforced = true` row under PostgreSQL `READ COMMITTED`, and aborts any
-  unmetered `0023`-only handoff with `OMQ04` before `COMMIT` succeeds (rolling back
-  `gateway_requests` to `'reserved'` so `Dispatch` is never returned after activation); and (c)
-  after validation passes, `enforce_gateway_handoff_holds()` records the exact handoff-time
-  obligations `(gateway_request_id, metering_enforced, cost_required)` in
-  `openmettle.quota_gateway_handoffs` (owned by `openmettle_owner`, `REVOKE ALL FROM PUBLIC`, zero
-  direct DML grants to runtime roles) so post-commit recovery (`quota_recover_lost_handoff`)
-  validates against handoff-time obligations rather than live `quota_enforcement` or live
-  `quota_defaults`.
-- **Unpinned worker storage volume guard (`OMQ03`).** On populated upgrades,
-  `storage_instance.volume_id` remains `NULL` throughout the **entire `N-1 -> N` binary
-  replacement** (until zero `N-1` worker processes remain running). While `volume_id IS NULL`,
-  `SECURITY DEFINER` `BEFORE UPDATE` trigger `openmettle.enforce_worker_storage_volume_pinned()`
-  on both `openmettle.storage_reservations` (`OLD.state = 'reserved' AND NEW.state = 'released'`)
-  and `openmettle.artifact_revisions` (`NEW.state IN ('purging', 'purged')`) rejects any
-  `openmettle_worker` transition with `OMQ03` (leaving disjoint `openmettle_api` in-flight upload
-  abort cleanup unaffected), ensuring every draining `N-1` worker running `reconcile_expired` or
-  `purge_due` against an empty replacement mount fails closed in PostgreSQL with zero released
-  holds or confirmed purges. Verified volume adoption pins `storage_instance.volume_id` only after
-  100% of `N-1` worker replicas are replaced by `N` binaries; starting or resuming any `N-1` worker
-  after pinning is forbidden by the rollout contract.
+  even while `metering_enforced = false`, computing `v_cost_required` via non-locking reads, and
+  **inserting `(NEW.id, false, v_cost_required)` into `openmettle.quota_gateway_handoffs` FIRST**
+  (acquiring `ROW EXCLUSIVE` on `quota_gateway_handoffs` and `FOR KEY SHARE` on already-`FOR
+  UPDATE`-locked `gateway_requests(NEW.id)` **before** touching `quota_enforcement`), and **only
+  then** locking the singleton `quota_enforcement` row with **`FOR SHARE`** as the **final
+  table/row lock of the transaction** (specifically `FOR SHARE`, not `FOR KEY SHARE`, because
+  `openmettle_owner`'s activation `UPDATE` acquires `FOR NO KEY UPDATE`, which conflicts with `FOR
+  SHARE` while still allowing concurrent handoffs to proceed in parallel): if the trigger acquires
+  `FOR SHARE` first, `openmettle_owner`'s `UPDATE` blocks until the handoff commits (so an
+  unmetered handoff strictly commits *before* activation); if `openmettle_owner`'s `UPDATE`
+  acquires `FOR NO KEY UPDATE` first, the deferred trigger blocks at `FOR SHARE` until activation
+  commits, re-reads the committed `metering_enforced = true` row under PostgreSQL `READ COMMITTED`,
+  aborts any unmetered `0023`-only handoff with `OMQ04` before `COMMIT` succeeds (rolling back
+  both `gateway_requests` to `'reserved'` and the uncommitted `quota_gateway_handoffs` insert so
+  `Dispatch` is never returned after activation), and on valid metered handoffs updates only its
+  own uncommitted `quota_gateway_handoffs` tuple (`SET metering_enforced = true`, zero additional
+  table or FK locks); and (c) `openmettle.quota_gateway_handoffs` (owned by `openmettle_owner`,
+  `REVOKE ALL FROM PUBLIC`, zero direct DML grants to runtime roles) preserves exact handoff-time
+  obligations so post-commit recovery (`quota_recover_lost_handoff`) validates against
+  handoff-time obligations rather than live `quota_enforcement` or live `quota_defaults`.
+- **Mandatory pre-migration `N-1` cleaner quiescence + unpinned worker storage volume backstop
+  (`OMQ03`).** On **every** upgrade (`applied >= 1`, even with empty `storage_*` tables),
+  `storage_instance.bootstrap_auto_pin_allowed` seeds `false` and `storage_instance.volume_id`
+  stays `NULL` across the **entire `N-1 -> N` binary replacement** (until zero `N-1` worker
+  processes remain running). Because `N-1`'s `artifact_fs::reconcile_expired` unlinks both payload
+  paths *before* calling `storage::release` (`src/artifact_fs.rs:660-669`) and `N-1`'s
+  `artifact_fs::purge_due` skips any `UPDATE` in `storage::begin_purge` for an already-`'purging'`
+  revision (`src/storage.rs:628-636`) and unlinks `revisions/<reservation>` *before*
+  `confirm_purge` executes (`src/artifact_fs.rs:694-707`), **operators MUST quiesce all `N-1`
+  worker artifact cleaners (unset `OPENMETTLE_WORKER_ARTIFACTS_DIR` across all `N-1` workers and
+  drain all in-flight `worker::maintenance` sweeps to completion) BEFORE running
+  `openmettle-migrate`**. While `volume_id IS NULL`, `SECURITY DEFINER` `BEFORE UPDATE` trigger
+  `openmettle.enforce_worker_storage_volume_pinned()` (`OMQ03`) on both
+  `openmettle.storage_reservations` (`OLD.state = 'reserved' AND NEW.state = 'released'`) and
+  `openmettle.artifact_revisions` (`NEW.state IN ('purging', 'purged')`) provides a **PostgreSQL
+  ledger defense-in-depth backstop** (protecting DB storage accounting if an operator forgets
+  quiescence on an empty mount, while leaving disjoint `openmettle_api` in-flight upload abort
+  cleanup unaffected) — explicitly **NOT** a substitute for pre-migration `N-1` cleaner quiescence.
+  Verified volume adoption pins `storage_instance.volume_id` only after 100% of `N-1` worker
+  replicas are replaced by `N` binaries; starting or resuming any `N-1` worker after pinning is
+  strictly forbidden by the rollout contract.
 - **Immutable deployment cost denomination with concurrent `0023` serialization (zero lock cycle).**
   PR2 seeds the singleton `('instance', 'usage_cost_micros')` row in `quota_defaults`
   (`cost_denomination = NULL`) *before* attaching `quota_defaults_cost_denomination_immutable` and
@@ -910,9 +965,11 @@ account_admin_lock -> run_dispatch_lock -> projects -> users -> runs -> branch_h
                     then instance rows asc (resource_kind, window_start, id))
   -> storage_accounts (asc scope_id) -> storage_instance (singleton instance row last)
   -> quota_overrides (written only inside SECURITY DEFINER while holding matching dispatch/entity/budget lock)
-  -> quota_gateway_handoffs (inserted at COMMIT under already-locked gateway_requests FOR UPDATE)
-  -> quota_enforcement (pure sink/leaf: FOR SHARE at COMMIT in enforce_gateway_handoff_holds;
-                        standalone single-statement UPDATE by openmettle_owner holding zero other locks)
+  -> quota_gateway_handoffs (inserted at COMMIT under already-locked gateway_requests FOR UPDATE,
+                             strictly BEFORE locking quota_enforcement)
+  -> quota_enforcement (pure sink/leaf — final lock of the transaction: FOR SHARE at COMMIT in
+                        enforce_gateway_handoff_holds; standalone single-statement UPDATE by
+                        openmettle_owner holding zero other locks)
 ```
 
 | Path | Exact lock sequence |
@@ -920,41 +977,46 @@ account_admin_lock -> run_dispatch_lock -> projects -> users -> runs -> branch_h
 | Run admission with usage/device hold (`openmettle_api`) | `projects` (if project, `FOR NO KEY UPDATE`) -> actor `users` (`FOR NO KEY UPDATE`) -> new `runs` row -> inside `quota_reserve(...)` (`SECURITY DEFINER`): upsert and `FOR NO KEY UPDATE` affected `quota_budgets` (scope rows asc, then instance row last) -> non-locking `SELECT` on `quota_overrides` and `quota_defaults` -> insert `quota_reservations` + `quota_reservation_charges` -> update `reserved_held` and evaluate `quota_warning_events`. |
 | Standalone gateway request + metered quota hold (`openmettle_api`, atomic `authz::gateway::reserve_in` + `quota_reserve`) | In **one PostgreSQL `WriteTransaction`**: `authz::gateway::reserve_in(&mut tx, ...)` inserts the caller `gateway_reservations` row (`run_id IS NULL`) and `'reserved'` `gateway_requests` row (whose `gateway_allocate` trigger updates `gateway_reservations.allocated`); immediately in the **same transaction**, `openmettle.quota_reserve(...)` (`SECURITY DEFINER`) locks `gateway_requests` (`FOR SHARE`, verifying `scope_id`, `actor_user_id`, `run_id IS NULL`, `state = 'reserved'`, and 32-byte `p_dispatch` matching `dispatch_hash = sha256(p_dispatch)`) -> upserts and `FOR NO KEY UPDATE` affected `quota_budgets` (scope rows asc, then instance row last) -> non-locking `SELECT` on `quota_overrides` and `quota_defaults` -> inserts ALL metered `quota_reservations` holds (`usage_tokens`, `usage_cost_micros`, reinforced by `quota_reservations_gateway_binding_guard`) + `quota_reservation_charges` -> updates `reserved_held` and evaluates `quota_warning_events`. Any quota refusal or pre-commit crash rolls back both `gateway_requests`/`gateway_reservations` and all quota holds atomically. |
 | Worker claim and approval resume (`openmettle_worker`, [`src/authz/runs.rs`](../../src/authz/runs.rs)) | `run_dispatch_lock` (`FOR NO KEY UPDATE`) -> one eligible `queued` or approved-`waiting` `runs` row (`FOR NO KEY UPDATE SKIP LOCKED`), evaluating effective `executing_runs_per_actor` and `executing_runs_per_scope` (active `quota_overrides` coalesced with `quota_defaults`) inside the claim query. Serializes directly on `run_dispatch_lock` with `executing_runs_*` override and default updates. `reclaim_next` ([`src/authz/leases.rs`](../../src/authz/leases.rs)) only re-leases already-executing runs (`running`, `cancelling`, `reconciling`) without increasing executing counts or taking `run_dispatch_lock`. |
-| Run-to-round gateway request + hold allocation (`openmettle_worker`, atomic `authz::gateway::reserve_in` + `quota_allocate_round`) | In **one PostgreSQL `WriteTransaction`**: lock `runs` (`FOR NO KEY UPDATE`, verifying active `Step` lease `state = 'running'`, `cancel_reason IS NULL`, `claim_token`, `lease_expires_at > clock_timestamp()`) -> `authz::gateway::reserve_in(&mut tx, ...)` inserts the `'reserved'` `gateway_requests` row (`run_id IS NOT NULL`, whose `gateway_allocate` trigger locks and updates `gateway_reservations.allocated`) -> immediately in the **same transaction**, `openmettle.quota_allocate_round(...)` (`SECURITY DEFINER`) re-verifies `runs` (`FOR NO KEY UPDATE`) -> `gateway_reservations` (`FOR SHARE`) -> `gateway_requests` (`FOR SHARE`, verifying `state = 'reserved'`, matching `scope_id`, `actor_user_id`, `run_id`, and 32-byte `p_dispatch` matching `dispatch_hash = sha256(p_dispatch)`) -> parent `quota_reservations` (`FOR NO KEY UPDATE`) -> inserts ALL metered child `quota_reservations` (at least `usage_tokens`, plus `usage_cost_micros` when applicable) in **`state = 'held'`** bound to `gateway_request_id` with **`allocating_claim_token = p_claim_token`** (enforced by `CHECK (parent_reservation_id IS NULL OR allocating_claim_token IS NOT NULL)` and `quota_reservations_gateway_binding_guard`) + copies `quota_reservation_charges` -> decrements parent `held_units`, increments `allocated_units` (`quota_budgets.reserved_held` delta = `0`). Any failure or pre-commit crash rolls back `gateway_requests`, `gateway_reservations.allocated` and all child holds together without stranding `gateway_requests_run_round_active_idx`. |
-| Gateway handoff (`openmettle_api` standalone or `openmettle_worker` run round, atomic `authz::gateway::handoff_in` + `quota_commit_handoff`) | In **one PostgreSQL `WriteTransaction`**: `authz::gateway::handoff_in(&mut tx, ...)` invokes `openmettle.gateway_handoff(...)` (Migration `0023`), which locks `account_admin_lock -> projects -> login_providers / local_identity_approvals -> users -> runs` (`FOR SHARE`, verifying active `Step` lease for run rounds) -> `local_sessions` (`FOR SHARE`) -> `gateway_bindings` (`FOR SHARE`) -> `gateway_reservations` (`FOR SHARE`) -> `gateway_requests` (`FOR UPDATE`) and transitions `gateway_requests.state` `'reserved' -> 'handed_off'`; immediately in the **same transaction**, `openmettle.quota_commit_handoff(...)` locks `gateway_requests` (`FOR SHARE`, no lock upgrade; verifying `state = 'handed_off'`) -> `quota_reservations` (`FOR NO KEY UPDATE`, verifying `state = 'held'`, matching `gateway_request_id`, caller role/`origin_role`, and rejecting any run-linked `device_reservations` hold) and transitions `quota_reservations.state` `'held' -> 'handoff_committed'`. At `COMMIT`, deferred `CONSTRAINT TRIGGER quota_enforce_gateway_handoff_holds` (`openmettle.enforce_gateway_handoff_holds()`, `SECURITY DEFINER`) verifies zero bound holds remain outside `'handoff_committed'`, acquires **`FOR SHARE`** on singleton `openmettle.quota_enforcement` (strictly serializing both commit orders against `openmettle_owner`'s standalone single-statement `UPDATE` acquiring `FOR NO KEY UPDATE` while allowing concurrent handoffs in parallel), verifies required `'handoff_committed'` holds (`usage_tokens` plus applicable `usage_cost_micros`) whenever `metering_enforced = true` (rolling back `gateway_handoff` with `OMQ04` otherwise), and inserts `(NEW.id, v_enforced, v_cost_required)` into `openmettle.quota_gateway_handoffs` (while `gateway_handoff` already holds `FOR UPDATE` on `gateway_requests`). Any pre-commit or commit-time failure rolls back both transitions before ciphertext leaves the process; on lost commit acknowledgement (`UnknownCommit`), the caller suppresses HTTP dispatch and invokes `openmettle.quota_recover_lost_handoff(...)`. |
-| Lost commit-ack handoff recovery (`openmettle_api` / `openmettle_worker`, via `quota_recover_lost_handoff`) | Inside `SECURITY DEFINER`: verify `pg_has_role(session_user, CASE WHEN p_run_id IS NULL THEN 'openmettle_api' ELSE 'openmettle_worker' END, 'USAGE')`, `octet_length(p_dispatch) = 32`, and matching `gateway_requests` (`id`, `dispatch_hash = sha256(p_dispatch)`, `scope_id`, `actor_user_id`, `run_id`) -> lock `(runs ->) gateway_reservations -> gateway_requests -> (parent ->) quota_reservations` (all bound rows in deterministic order, `FOR NO KEY UPDATE`) -> re-verify `(q.scope_id, q.actor_user_id) = (qr.scope_id, qr.actor_user_id) AND q.run_id IS NOT DISTINCT FROM qr.run_id` -> if `gateway_requests.state = 'handed_off'`, read recorded handoff-time obligations from `openmettle.quota_gateway_handoffs` (`COALESCE(metering_enforced, false)`, `COALESCE(cost_required, false)`), assert zero bound holds have `qr.state NOT IN ('handoff_committed', 'settled', 'written_off')` (`OMQ04` if any `'held'` or `'released'` bound row exists — explicitly recognizing `'settled'` and `'written_off'` as valid committed post-handoff evidence), evaluate required hold presence against `handoff.metering_enforced` and `handoff.cost_required` (NOT live `quota_enforcement` or live `quota_defaults`), and return `'handoff_committed'` (when `handoff.metering_enforced = true` with required `usage_tokens` and, iff `handoff.cost_required = true`, `usage_cost_micros` in `('handoff_committed', 'settled', 'written_off')`, raising `OMQ04` if missing; or when `handoff.metering_enforced = false` and valid post-handoff bound holds exist) or `'unmetered_legacy_handoff'` (when `handoff.metering_enforced = false` and zero bound holds exist, even if live `quota_enforcement.metering_enforced` has since flipped to `true`, keeping HTTP dispatch suppressed in all `'handed_off'` outcomes); otherwise lock charged `quota_budgets` (if not returning to an active `'held'` parent), atomically unwind `'reserved'`/`'released'` `gateway_requests` + `gateway_reservations.allocated` + bound `'held'` `quota_reservations`, and return `'unwound_unsent'`. |
-| Fenced successor-worker unwind of superseded `'reserved'` round (`openmettle_worker`, via `quota_unwind_superseded_round`) | Inside `SECURITY DEFINER`: verify `pg_has_role(session_user, 'openmettle_worker', 'USAGE')` and `p_round BETWEEN 1 AND 1000` -> lock `runs` (`FOR NO KEY UPDATE`, verifying current live worker lease `r.scope_id = p_scope_id AND r.id = p_run_id AND r.claim_token = p_claim_token AND r.state IN ('running', 'cancelling', 'reconciling') AND r.lease_expires_at > clock_timestamp()`) -> `gateway_reservations` (`FOR NO KEY UPDATE`) -> active `gateway_requests` `q` for `(run_id = p_run_id, round = p_round, state <> 'released')` (`FOR NO KEY UPDATE`) -> parent `quota_reservations` (`FOR NO KEY UPDATE`, asc `id`) -> bound child `quota_reservations` (`FOR NO KEY UPDATE`, asc `id`). If `EXISTS (SELECT 1 FROM openmettle.quota_reservations qr WHERE qr.gateway_request_id = q.id AND qr.allocating_claim_token = p_claim_token)`, `q` was allocated by the current lease generation `p_claim_token` itself, so leave `q` and its holds untouched and return `false` (idempotent replay no-op). Only when `q.state = 'reserved'` (never `'handed_off'`) AND zero bound holds carry `allocating_claim_token = p_claim_token` (covering both `N-1` unbound predecessor rows and `N` predecessor rows with `allocating_claim_token = T1 <> p_claim_token`), atomically transition `gateway_requests.state := 'released'`, restore `gateway_reservations.allocated := allocated - q.units`, and transition all bound `'held'` child holds to `'released'` (`held_units = 0`, `closed_at = clock_timestamp()`), returning capacity directly to their active `'held'` parent run holds (`allocated_units := allocated_units - child.reserved_units`, `held_units := held_units + child.held_units`, `quota_budgets` delta = `0`), returning `true`. Leaves `'handed_off'` untouched and returns `false`. |
+| Lazy once-per-run parent hold initialization for `N-1`-admitted runs (`openmettle_worker`, `quota_ensure_legacy_run_holds`) | Before executing `quota_allocate_round` on a live leased run `(scope_id, run_id)` admitted by an `N-1` API replica (which created `runs` + `gateway_reservations` with zero local parent `quota_reservations` holds), `openmettle.quota_ensure_legacy_run_holds(...)` (or the initial guard at the start of `quota_allocate_round` strictly before locking any existing `quota_reservations` row) acquires locks in canonical `quota_reserve` order: `runs` (`FOR NO KEY UPDATE`, verifying active `Step` lease `state = 'running'`, `cancel_reason IS NULL`, `claim_token = p_claim_token`, `lease_expires_at > clock_timestamp()`) -> non-locking check for existing run-level parent `usage_tokens` hold (`parent_reservation_id IS NULL AND gateway_request_id IS NULL`; returns immediately if already present) -> `gateway_reservations` (`FOR SHARE`, reading remaining unallocated admission budget `max_units - allocated`) -> upserts and `FOR NO KEY UPDATE` charged `quota_budgets` (scope rows asc, instance row last) -> non-locking `SELECT` on `quota_overrides` and `quota_defaults` (returning `OMQ01` if over budget) -> inserts the missing run-level parent `quota_reservations` hold(s) (`usage_tokens` for `max_units - allocated` plus applicable `usage_cost_micros` run ceiling, `origin_role = 'worker'`, deterministic idempotency key `("legacy-run-parent", run_id, resource_kind)`) + `quota_reservation_charges`, increments `reserved_held`, and evaluates `quota_warning_events`. Never locks any pre-existing `quota_reservations` row after `quota_budgets`. |
+| Run-to-round gateway request + hold allocation (`openmettle_worker`, atomic `authz::gateway::reserve_in` + `quota_allocate_round`) | In **one PostgreSQL `WriteTransaction`**: lock `runs` (`FOR NO KEY UPDATE`, verifying active `Step` lease `state = 'running'`, `cancel_reason IS NULL`, `claim_token`, `lease_expires_at > clock_timestamp()`) -> `authz::gateway::reserve_in(&mut tx, ...)` inserts the `'reserved'` `gateway_requests` row (`run_id IS NOT NULL`, whose `gateway_allocate` trigger locks and updates `gateway_reservations.allocated`) -> immediately in the **same transaction**, `openmettle.quota_allocate_round(...)` (`SECURITY DEFINER`) re-verifies `runs` (`FOR NO KEY UPDATE`) -> `gateway_reservations` (`FOR SHARE`) -> `gateway_requests` (`FOR SHARE`, verifying `state = 'reserved'`, matching `scope_id`, `actor_user_id`, `run_id`, and 32-byte `p_dispatch` matching `dispatch_hash = sha256(p_dispatch)`) -> (if the run is `N-1`-admitted with zero parent holds and `quota_ensure_legacy_run_holds` was not run in a prior step, initializes the missing parent hold(s) in canonical `runs -> gateway_reservations -> quota_budgets` order strictly before locking any existing `quota_reservations` row, then slices from that uncommitted parent row) -> parent `quota_reservations` (`FOR NO KEY UPDATE`) -> inserts ALL metered child `quota_reservations` (at least `usage_tokens`, plus `usage_cost_micros` when applicable) in **`state = 'held'`** bound to `gateway_request_id` with **`allocating_claim_token = p_claim_token`** (enforced by `CHECK (parent_reservation_id IS NULL OR allocating_claim_token IS NOT NULL)` and `quota_reservations_gateway_binding_guard`) + copies `quota_reservation_charges` -> decrements parent `held_units`, increments `allocated_units` (`quota_budgets.reserved_held` delta = `0`). Any failure or pre-commit crash rolls back `gateway_requests`, `gateway_reservations.allocated` and all child holds together without stranding `gateway_requests_run_round_active_idx`. |
+| Gateway handoff (`openmettle_api` standalone or `openmettle_worker` run round, atomic `authz::gateway::handoff_in` + `quota_commit_handoff`) | In **one PostgreSQL `WriteTransaction`**: `authz::gateway::handoff_in(&mut tx, ...)` invokes `openmettle.gateway_handoff(...)` (Migration `0023`), which locks `account_admin_lock -> projects -> login_providers / local_identity_approvals -> users -> runs` (`FOR SHARE`, verifying active `Step` lease for run rounds) -> `local_sessions` (`FOR SHARE`) -> `gateway_bindings` (`FOR SHARE`) -> `gateway_reservations` (`FOR SHARE`) -> `gateway_requests` (`FOR UPDATE`) and transitions `gateway_requests.state` `'reserved' -> 'handed_off'`; immediately in the **same transaction**, `openmettle.quota_commit_handoff(...)` locks `gateway_requests` (`FOR SHARE`, no lock upgrade; verifying `state = 'handed_off'`) -> `quota_reservations` (`FOR NO KEY UPDATE`, verifying `state = 'held'`, matching `gateway_request_id`, caller role/`origin_role`, and rejecting any run-linked `device_reservations` hold) and transitions `quota_reservations.state` `'held' -> 'handoff_committed'`. At `COMMIT`, deferred `CONSTRAINT TRIGGER quota_enforce_gateway_handoff_holds` (`openmettle.enforce_gateway_handoff_holds()`, `SECURITY DEFINER`) verifies zero bound holds remain outside `'handoff_committed'`, computes `v_cost_required` via non-locking reads, **inserts `(NEW.id, false, v_cost_required)` into `openmettle.quota_gateway_handoffs` FIRST** (acquiring `ROW EXCLUSIVE` on `quota_gateway_handoffs` and `FOR KEY SHARE` on already-`FOR UPDATE`-locked `gateway_requests(NEW.id)` before touching `quota_enforcement`), and **then acquires `FOR SHARE` on singleton `openmettle.quota_enforcement` as the final table/row lock of the transaction** (strictly serializing both commit orders against `openmettle_owner`'s standalone single-statement `UPDATE` acquiring `FOR NO KEY UPDATE` while allowing concurrent handoffs in parallel); if `metering_enforced = true`, it verifies required `'handoff_committed'` holds (`usage_tokens` plus applicable `usage_cost_micros`, rolling back `gateway_handoff` and the uncommitted `quota_gateway_handoffs` insert with `OMQ04` otherwise) and updates its own uncommitted `quota_gateway_handoffs` tuple (`SET metering_enforced = true`, acquiring zero additional table or FK locks). Any pre-commit or commit-time failure rolls back both transitions before ciphertext leaves the process; on lost commit acknowledgement (`UnknownCommit`), the caller suppresses HTTP dispatch and invokes `openmettle.quota_recover_lost_handoff(...)`. |
+| Lost commit-ack handoff recovery (`openmettle_api` / `openmettle_worker`, via `quota_recover_lost_handoff`) | Inside `SECURITY DEFINER`: verify `pg_has_role(session_user, CASE WHEN p_run_id IS NULL THEN 'openmettle_api' ELSE 'openmettle_worker' END, 'USAGE')`, `octet_length(p_dispatch) = 32`, and matching `gateway_requests` (`id`, `dispatch_hash = sha256(p_dispatch)`, `scope_id`, `actor_user_id`, `run_id`) -> lock `(runs ->) gateway_reservations -> gateway_requests -> (parent ->) quota_reservations` (all bound rows in deterministic order, `FOR NO KEY UPDATE`) -> re-verify `(q.scope_id, q.actor_user_id) = (qr.scope_id, qr.actor_user_id) AND q.run_id IS NOT DISTINCT FROM qr.run_id` -> if `gateway_requests.state = 'handed_off'`, read recorded handoff-time obligations from `openmettle.quota_gateway_handoffs` (`COALESCE(metering_enforced, false)`, `COALESCE(cost_required, false)`), assert zero bound holds have `qr.state NOT IN ('handoff_committed', 'settled')` (`OMQ04` if any `'held'` or `'released'` bound row exists — explicitly recognizing `'settled'` as valid committed post-handoff evidence), evaluate required hold presence against `handoff.metering_enforced` and `handoff.cost_required` (NOT live `quota_enforcement` or live `quota_defaults`), and return `'handoff_committed'` (when `handoff.metering_enforced = true` with required `usage_tokens` and, iff `handoff.cost_required = true`, `usage_cost_micros` in `('handoff_committed', 'settled')`, raising `OMQ04` if missing; or when `handoff.metering_enforced = false` and valid post-handoff bound holds exist) or `'unmetered_legacy_handoff'` (when `handoff.metering_enforced = false` and zero bound holds exist, even if live `quota_enforcement.metering_enforced` has since flipped to `true`, keeping HTTP dispatch suppressed in all `'handed_off'` outcomes); otherwise lock charged `quota_budgets` (if not returning to an active `'held'` parent), atomically unwind `'reserved'`/`'released'` `gateway_requests` + `gateway_reservations.allocated` + bound `'held'` `quota_reservations`, and return `'unwound_unsent'`. |
+| Fenced successor-worker unwind of superseded `'reserved'` round (`openmettle_worker`, via `quota_unwind_superseded_round`) | Inside `SECURITY DEFINER`: verify `pg_has_role(session_user, 'openmettle_worker', 'USAGE')` and `p_round BETWEEN 1 AND 1000` -> lock `runs` (`FOR NO KEY UPDATE`, verifying current live worker lease `r.scope_id = p_scope_id AND r.id = p_run_id AND r.claim_token = p_claim_token AND r.state IN ('running', 'cancelling', 'reconciling') AND r.lease_expires_at > clock_timestamp()`) -> `gateway_reservations` (`FOR NO KEY UPDATE`) -> active `gateway_requests` `q` for `(run_id = p_run_id, round = p_round, state <> 'released')` (`FOR NO KEY UPDATE`) -> any existing parent `quota_reservations` (`FOR NO KEY UPDATE`, asc `id`) -> any bound child `quota_reservations` (`FOR NO KEY UPDATE`, asc `id`). If `EXISTS (SELECT 1 FROM openmettle.quota_reservations qr WHERE qr.gateway_request_id = q.id AND qr.allocating_claim_token = p_claim_token)`, `q` was allocated by the current lease generation `p_claim_token` itself, so leave `q` and its holds untouched and return `false` (idempotent replay no-op). Only when `q.state = 'reserved'` (never `'handed_off'`) AND zero bound holds carry `allocating_claim_token = p_claim_token`, atomically transition `gateway_requests.state := 'released'` and restore `gateway_reservations.allocated := allocated - q.units`: for an **unbound `N-1` `'reserved'` round** (zero bound child `quota_reservations` rows), this succeeds cleanly without requiring parent `quota_reservations` rows to exist yet; when bound `'held'` child holds exist (predecessor `N` attempt with `allocating_claim_token = T1 <> p_claim_token`), additionally transition all bound `'held'` child holds to `'released'` (`held_units = 0`, `closed_at = clock_timestamp()`) and return their capacity directly to their active `'held'` parent run holds (`allocated_units := allocated_units - child.reserved_units`, `held_units := held_units + child.held_units`, `quota_budgets` delta = `0`). Returns `true` on unwind, leaving `'handed_off'` untouched and returning `false`. |
 | Run-linked device handoff (`openmettle_worker`, via `quota_commit_device_handoff`) | **Sole** transition path for run-linked `device_reservations` holds. Inside `SECURITY DEFINER`: `runs` (`FOR NO KEY UPDATE`, verifying active `Step` lease `state = 'running'`, `cancel_reason IS NULL`, matching `claim_token`, `lease_expires_at > clock_timestamp()`) -> `quota_reservations` (`FOR NO KEY UPDATE`, `resource_kind = 'device_reservations'`, `run_id IS NOT NULL`, `origin_role IN ('api', 'worker')`, matching `scope_id` and `run_id`) -> bind durable `device_grant_id` and transition `held -> handoff_committed`. |
 | Gateway cost report insert & first `cost_denomination` configuration | `openmettle_owner` configures `('instance', 'usage_cost_micros')` in `quota_defaults` solely via direct `UPDATE` (never `INSERT ... ON CONFLICT`). `enforce_cost_denomination_immutability()` rejects `INSERT` (including `INSERT ... ON CONFLICT`), `DELETE`, and rename into/out of `('instance', 'usage_cost_micros')` with `OMQ02` **without acquiring `quota_cost_unit_lock`**, acquiring `quota_cost_unit_lock` (`FOR UPDATE`) exclusively under `BEFORE UPDATE` after PostgreSQL already holds the `quota_defaults` row lock (`quota_defaults` -> `quota_cost_unit_lock`). `openmettle_gateway` inserting `gateway_usage_reports` (`WHEN NEW.cost IS NOT NULL`) fires `BEFORE INSERT` trigger `enforce_gateway_report_cost_unit()` (`SECURITY DEFINER`), which performs a non-locking `SELECT` on `quota_defaults` (never locking `quota_defaults`) and, when `cost_denomination IS NULL`, locks `quota_cost_unit_lock` (`FOR UPDATE`) before re-checking `quota_defaults` and `gateway_usage_reports` — serializing both commit orders and concurrent unconfigured cost reports with zero lock cycle. |
 | Gateway usage settlement or correction (`openmettle_gateway`, via `quota_settle_gateway_usage`) | Inside `SECURITY DEFINER`: `runs` (if run-linked, `FOR SHARE`) -> `gateway_bindings` (`FOR SHARE`) -> `gateway_reservations` (`FOR SHARE`) -> `gateway_requests` (`FOR SHARE`) -> `quota_reservations` (`FOR NO KEY UPDATE`) -> charged `quota_budgets` via `quota_reservation_charges` (scope rows asc, instance row last) -> insert `quota_reconciliations` (with composite FKs to `openmettle.gateway_usage_reports`) -> update reservation (`held_units`, `settled_units`, `accepted_source_revision`, `state`/`closed_at`), budget balances and `quota_warning_events`. |
-| Pre-send abort, stale release, orphan `'reserved'` gateway sweep or V1-18 device release (via `quota_release_unsent` / `quota_release_orphan_gateway_requests` / `quota_release_device_slot`) | **One reservation/request per short transaction, locks acquired inside `SECURITY DEFINER`:** `runs` (if run-linked: `FOR NO KEY UPDATE SKIP LOCKED` in stale/orphan sweep, `FOR NO KEY UPDATE` on explicit abort/release) -> if bound to `gateway_request_id`, `gateway_reservations` -> `gateway_requests` (explicit pre-send unwind couples with `authz::gateway::release_in(&mut tx, ...)` / `openmettle.gateway_release(p_request, p_dispatch)` after locking `runs`, or verifies `gateway_requests.state = 'released'` from a prior `gateway_release` commit; sweep mode acquires `FOR NO KEY UPDATE SKIP LOCKED` on `gateway_reservations` then `gateway_requests`, proceeds if `gateway_requests.state = 'released'`, **atomically transitions stale `'reserved'` `gateway_requests` to `'released'` and restores `gateway_reservations.allocated`** when expiry/terminal preconditions hold, and leaves `'handed_off'` or locked rows untouched) -> parent `quota_reservations` (if child, `FOR NO KEY UPDATE SKIP LOCKED` in sweep / `FOR NO KEY UPDATE` on explicit release) -> target `quota_reservations` (`FOR NO KEY UPDATE SKIP LOCKED` in stale sweep, `FOR NO KEY UPDATE` on explicit abort/release). Whenever `gateway_request_id IS NOT NULL`, `quota_release_unsent` **explicitly re-verifies `(q.scope_id, q.actor_user_id) = (qr.scope_id, qr.actor_user_id) AND q.run_id IS NOT DISTINCT FROM qr.run_id` under lock before mutating either ledger** (raising an invariant error and mutating neither ledger on mismatch). If unwinding an unsent child hold back to an active `held` parent run hold, transfer `held_units` back to parent (`quota_budgets` delta = `0`); otherwise lock charged `quota_budgets` via `quota_reservation_charges` (scope rows asc, instance row last) -> insert `quota_reconciliations` -> update reservation (`closed_at = clock_timestamp()`) and budget balances. Separately, `openmettle.quota_release_orphan_gateway_requests(...)` captures `v_age_cutoff := clock_timestamp() - p_max_reserved_age` once in PL/pgSQL, clamps `(v_upper_created_at, v_upper_id)` to `LEAST((p_pass_upper_created_at, p_pass_upper_id), (v_age_cutoff, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid))`, materializes a bounded page of at most `p_page_size` raw `(created_at, id)` index keys from `gateway_requests_reserved_idx` using only constant PL/pgSQL bounds (zero `clock_timestamp()` inside the `SELECT`), filters binding absence and run eligibility only on those keys, locks `(runs ->) gateway_reservations -> gateway_requests` (`FOR NO KEY UPDATE SKIP LOCKED`) for eligible orphans, and advances the persistent cursor across pages even when a page contains zero orphans. |
+| Pre-send abort, stale release, orphan `'reserved'` gateway sweep or V1-18 device release (via `quota_release_unsent` / `quota_release_orphan_gateway_requests` / `quota_release_device_slot`) | **One reservation/request per short transaction, locks acquired inside `SECURITY DEFINER`:** `runs` (if run-linked: `FOR NO KEY UPDATE SKIP LOCKED` in stale/orphan sweep, `FOR NO KEY UPDATE` on explicit abort/release) -> if bound to `gateway_request_id`, `gateway_reservations` -> `gateway_requests` (explicit pre-send unwind couples with `authz::gateway::release_in(&mut tx, ...)` / `openmettle.gateway_release(p_request, p_dispatch)` after locking `runs`, or verifies `gateway_requests.state = 'released'` from a prior `gateway_release` commit; sweep mode acquires `FOR NO KEY UPDATE SKIP LOCKED` on `gateway_reservations` then `gateway_requests`, proceeds if `gateway_requests.state = 'released'`, **atomically transitions stale `'reserved'` `gateway_requests` to `'released'` and restores `gateway_reservations.allocated`** when expiry/terminal preconditions hold, and leaves `'handed_off'` or locked rows untouched) -> parent `quota_reservations` (if child, `FOR NO KEY UPDATE SKIP LOCKED` in sweep / `FOR NO KEY UPDATE` on explicit release) -> target `quota_reservations` (`FOR NO KEY UPDATE SKIP LOCKED` in stale sweep, `FOR NO KEY UPDATE` on explicit abort/release). Whenever `gateway_request_id IS NOT NULL`, `quota_release_unsent` **explicitly re-verifies `(q.scope_id, q.actor_user_id) = (qr.scope_id, qr.actor_user_id) AND q.run_id IS NOT DISTINCT FROM qr.run_id` under lock before mutating either ledger** (raising an invariant error and mutating neither ledger on mismatch). If unwinding an unsent child hold back to an active `held` parent run hold, transfer `held_units` back to parent (`quota_budgets` delta = `0`); otherwise lock charged `quota_budgets` via `quota_reservation_charges` (scope rows asc, instance row last) -> insert `quota_reconciliations` -> update reservation (`closed_at = clock_timestamp()`) and budget balances. Separately, `openmettle.quota_release_orphan_gateway_requests(...)` captures `v_age_cutoff := clock_timestamp() - p_max_reserved_age` once in PL/pgSQL, clamps scalar `v_upper_created_at` and `v_upper_id` via `IF (p_pass_upper_created_at, p_pass_upper_id) <= (v_age_cutoff, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid) THEN ... ELSE ... END IF;`, materializes a bounded page of at most `p_page_size` raw `(created_at, id)` index keys from `gateway_requests_reserved_idx` using only constant PL/pgSQL bounds (zero `clock_timestamp()` inside the `SELECT`), filters binding absence and run eligibility only on those keys, locks `(runs ->) gateway_reservations -> gateway_requests` (`FOR NO KEY UPDATE SKIP LOCKED`) for eligible orphans, and advances the persistent cursor across pages even when a page contains zero orphans. |
 | Storage upload reservation (`openmettle_api` / `openmettle_worker`) | `runs` (if run-linked) -> `storage_accounts` (`FOR UPDATE`) -> non-locking `SELECT` on `storage_reservations`, `artifacts`, `quota_overrides` -> `storage_instance` (`FOR UPDATE`) -> insert `storage_reservations` -> update `storage_accounts` then `storage_instance` -> call `quota_record_storage_warning(...)`. |
 | Storage upload settlement (`storage::settle`) | `projects` (if authorized in tx) -> `storage_reservations` (`FOR UPDATE`) -> `artifacts` (`FOR UPDATE`) -> insert `artifact_revisions` -> update `storage_reservations` -> `storage_accounts` -> `storage_instance`. |
 | Storage retention and purge confirmation (`storage::retain_revision`, `restore_revision`, `begin_purge`, `confirm_purge`) | `artifact_revisions` (`FOR UPDATE`) -> `storage_accounts` -> `storage_instance` (never locks `artifacts` or `storage_reservations`, [`src/storage.rs`](../../src/storage.rs)). |
 | Storage release (`storage::release`) | `runs` (`FOR NO KEY UPDATE SKIP LOCKED` in worker stale sweep, `FOR NO KEY UPDATE` on explicit release, if `run_id IS NOT NULL`) -> `storage_reservations` (`FOR UPDATE SKIP LOCKED` in sweep, `FOR UPDATE` on explicit release) -> `storage_accounts` -> `storage_instance`. |
 | Override write (`openmettle_api` via `quota_upsert_scope_override` / `quota_revoke_scope_override`, `ManageQuotas`) | Inside `SECURITY DEFINER`: if `resource_kind IN ('executing_runs_per_actor', 'executing_runs_per_scope')`, acquire `run_dispatch_lock` (`FOR NO KEY UPDATE`) first -> target entity row (`projects` `FOR NO KEY UPDATE` for project scopes; personal owner `users` `FOR NO KEY UPDATE` for personal/actor scopes) -> if `storage_bytes`, `storage_accounts` (`FOR UPDATE`); if metered usage/device, current active `quota_budgets` (`FOR NO KEY UPDATE`, ascending) -> upsert/revoke `quota_overrides` (incrementing `revision` to re-arm warning watermarks); then caller inserts `authorization_audit` in the same transaction. Live-run and round-cap kinds (`live_runs_*`, `round_cap`) serialize on `projects`/`users` matching `lock_scope_actor`; `openmettle_owner` updates to `executing_runs_*` rows in `quota_defaults` also acquire `run_dispatch_lock` (`FOR NO KEY UPDATE`) first so default cap changes serialize with `claim_next`. |
 
-During `quota_reserve`, the idempotency replay lookup performs a non-locking `SELECT` on
-`quota_reservations` (matching `src/storage.rs`), so `quota_reserve` never waits on a reservation
-row while holding a budget lock. `settle`, `allocate_round`, `commit_handoff`,
-`commit_device_handoff`, `recover_lost_handoff`, `unwind_superseded_round` and `release` always
-lock the run, gateway and reservation rows before budget rows.
+During `quota_reserve` and `quota_ensure_legacy_run_holds`, the idempotency / existing-parent
+lookup performs a non-locking `SELECT` on `quota_reservations` (matching `src/storage.rs`), so
+neither ever waits on a pre-existing reservation row while holding a budget lock. `settle`,
+`allocate_round` (once parent holds exist), `commit_handoff`, `commit_device_handoff`,
+`recover_lost_handoff`, `unwind_superseded_round` and `release` always lock the run, gateway and
+reservation rows before budget rows.
 `enforce_cost_denomination_immutability` never acquires `quota_cost_unit_lock` during `INSERT` or
 rename (only under `BEFORE UPDATE` after the `quota_defaults` row lock is already held),
 `enforce_gateway_report_cost_unit` never locks `quota_defaults` (only `quota_cost_unit_lock`),
 `enforce_worker_storage_volume_pinned` performs strictly a non-locking `SELECT`, and
-`enforce_gateway_handoff_holds()` acquires **`FOR SHARE`** on `openmettle.quota_enforcement` and
-inserts into `openmettle.quota_gateway_handoffs` (referencing the already-`FOR UPDATE`-locked
-`gateway_requests` row) at `COMMIT`, while `openmettle_owner` flips `openmettle.quota_enforcement`
-in a **standalone single-statement transaction** holding zero other locks — making
-`quota_enforcement` a pure sink/leaf in the lock graph so no path holding `quota_enforcement` ever
-waits on another lock. Likewise, no path holding a `quota_reservations`, `quota_budgets`,
-`storage_*` or `quota_overrides` lock waits on `quota_defaults` or `quota_cost_unit_lock`; no path
-holding a `projects`, `users`, `runs`, quota or storage lock waits on `run_dispatch_lock`; and no
-path holding a quota or storage lock waits on `projects`, `users`, `runs`, `gateway_bindings`,
-`gateway_intents`, `gateway_reservations` or `gateway_requests`, making the global lock graph
-strictly acyclic. If a caller composes multiple unrelated owners and PostgreSQL reports SQLSTATE
-`40P01`, the caller rolls back the whole transaction and retries with identical idempotency keys.
+`enforce_gateway_handoff_holds()` inserts into `openmettle.quota_gateway_handoffs` (referencing the
+already-`FOR UPDATE`-locked `gateway_requests` row) **before** acquiring **`FOR SHARE`** on
+`openmettle.quota_enforcement` as the final table/row lock of the transaction (updating only its
+own uncommitted `quota_gateway_handoffs` tuple with zero additional locks when `metering_enforced
+= true`), while `openmettle_owner` flips `openmettle.quota_enforcement` in a **standalone
+single-statement transaction** holding zero other locks — strictly matching `... ->
+quota_gateway_handoffs -> quota_enforcement` and making `quota_enforcement` a genuine pure
+sink/leaf in the lock graph so no path holding `quota_enforcement` ever waits on another lock.
+Likewise, no path holding a `quota_reservations`, `quota_budgets`, `storage_*` or `quota_overrides`
+lock waits on `quota_defaults` or `quota_cost_unit_lock`; no path holding a `projects`, `users`,
+`runs`, quota or storage lock waits on `run_dispatch_lock`; and no path holding a quota or storage
+lock waits on `projects`, `users`, `runs`, `gateway_bindings`, `gateway_intents`,
+`gateway_reservations` or `gateway_requests`, making the global lock graph strictly acyclic. If a
+caller composes multiple unrelated owners and PostgreSQL reports SQLSTATE `40P01`, the caller rolls
+back the whole transaction and retries with identical idempotency keys.
 
 ### Exact-once internal reconciliation
 
@@ -976,15 +1038,15 @@ cost hold until resolved.
 | Event | State transition and exact-once accounting |
 | --- | --- |
 | Exact reservation replay | Same `(scope_id, actor_user_id, resource_kind, idempotency_key)` with matching `request_identity` and `request_digest` returns the existing reservation, state and server-selected charged windows without rechecking limits or double-charging. Changed input returns `409 idempotency_conflict`. |
-| Atomic gateway request + metered hold creation (`authz::gateway::reserve_in` + `quota_reserve` / `quota_allocate_round`, ADR 0037 / Migration `0023`) | In Migration `0023`'s `src/authz/gateway.rs`, standalone `authz::gateway::reserve()` commits `gateway_requests` before returning, which would leave `gateway_reservations.allocated` stranded and occupy `gateway_requests_run_round_active_idx` if a process crashed before creating `quota_reservations`. PR2 therefore introduces in-transaction helpers `authz::gateway::reserve_in(&mut WriteTransaction, ...)` (alongside `handoff_in` and `release_in`) so **inserting the `'reserved'` `openmettle.gateway_requests` row (plus the caller `gateway_reservations` row when `run_id IS NULL`) and creating ALL corresponding metered `openmettle.quota_reservations` holds (`usage_tokens`, `usage_cost_micros` via `quota_reserve` for standalone calls or `quota_allocate_round` for run rounds) execute atomically in a single PostgreSQL `WriteTransaction`** — rolling back both if any quota hold fails or the process crashes before commit. Both `quota_reserve` and `quota_allocate_round` (reinforced by `quota_reservations_gateway_binding_guard`) verify `q.scope_id = scope_id`, `q.actor_user_id = actor_user_id`, `q.run_id IS NOT DISTINCT FROM run_id`, `q.state = 'reserved'`, and the caller's 32-byte `p_dispatch` secret (`q.dispatch_hash = sha256(p_dispatch)`). For run rounds, `quota_allocate_round` additionally verifies the worker's active `Step` lease on `runs` and transfers `slice_units <= parent.held_units` from the server-owned run's `held` parent reservation to a child round reservation in **`state = 'held'`** (pre-handoff) bound to `gateway_request_id` with **`allocating_claim_token = p_claim_token`** (at least a `usage_tokens` child hold on every `N` round allocation, plus `usage_cost_micros` when applicable), copying `quota_reservation_charges`. Parent decrements `held_units` and increments `allocated_units`; `quota_budgets.reserved_held` changes by `0` (never double-debited). Because the child stays `'held'` until dispatch handoff, a pre-send failure never orphans it in `'handoff_committed'`. Unallocated parent remainder releases once when the run can start no further rounds. |
-| Gateway & standalone pre-dispatch handoff (`authz::gateway::handoff_in` + `quota_commit_handoff`, `quota_enforce_gateway_handoff_holds`, plus `quota_recover_lost_handoff`) | For metered usage holds (`usage_tokens`, `usage_cost_micros`) — both standalone API calls (`openmettle_api`, `run_id IS NULL`) and worker run rounds (`openmettle_worker`, `run_id IS NOT NULL`) — `quota_commit_handoff` executes **atomically in the same `WriteTransaction` immediately after `authz::gateway::handoff_in` / `openmettle.gateway_handoff(...)`**, locking `gateway_requests` (`FOR SHARE`) to verify `gateway_requests.state = 'handed_off'` before transitioning the caller's matching `held` reservation (`origin_role` matching caller) to `'handoff_committed'`. At `COMMIT`, `DEFERRABLE INITIALLY DEFERRED` `CONSTRAINT TRIGGER quota_enforce_gateway_handoff_holds` (`openmettle.enforce_gateway_handoff_holds()`, `OMQ04`) unconditionally rejects any bound hold left outside `'handoff_committed'` (even while `metering_enforced = false`), locks singleton `openmettle.quota_enforcement` with **`FOR SHARE`** (serializing both commit orders against `openmettle_owner`'s standalone `UPDATE` acquiring `FOR NO KEY UPDATE`), requires bound `'handoff_committed'` holds for `usage_tokens` and any applicable `usage_cost_micros` limit whenever `metering_enforced = true` (rolling back any `N-1` `0023`-only `gateway_handoff` cleanly to `'reserved'`), and records the exact handoff-time obligation `(NEW.id, v_enforced, v_cost_required)` in `openmettle.quota_gateway_handoffs`. Any pre-commit or commit-time refusal rolls back both transitions cleanly and prevents dispatch. On a **lost commit acknowledgement (`UnknownCommit`)** (connection drop during `COMMIT` reply, leaving commit outcome unknown in PostgreSQL), because Migration `0023` grants `SELECT` on `openmettle.gateway_requests` **only** to `openmettle_gateway` (never to `openmettle_api` or `openmettle_worker`), the caller **MUST suppress HTTP transport dispatch** (matching [ADR 0037](0037-gateway-provisioning-and-usage-reconciliation.md) and `src/authz/gateway.rs`) and invoke the caller-scoped `SECURITY DEFINER` recovery entrypoint **`openmettle.quota_recover_lost_handoff(p_request_id uuid, p_dispatch bytea, p_scope_id uuid, p_actor_user_id uuid, p_run_id uuid) RETURNS text`**. That function verifies caller role (`openmettle_api` for `p_run_id IS NULL`, `openmettle_worker` for `p_run_id IS NOT NULL`), `octet_length(p_dispatch) = 32`, and `gateway_requests` ownership + `dispatch_hash = sha256(p_dispatch)` (preserved by `0023`'s `gateway_handoff`), locks `(runs ->) gateway_reservations -> gateway_requests -> (parent ->) quota_reservations -> quota_budgets` in canonical `FOR NO KEY UPDATE` order, and resolves the outcome: (a) if `gateway_requests.state = 'handed_off'`, it reads the recorded handoff-time obligation from `openmettle.quota_gateway_handoffs` (`COALESCE(metering_enforced, false)`, `COALESCE(cost_required, false)` — any pre-PR2 `0023` handoff absent from the table unambiguously means `metering_enforced = false, cost_required = false`), asserts zero bound `quota_reservations` rows remain in pre-handoff or unsent states (**`qr.state NOT IN ('handoff_committed', 'settled', 'written_off')`**, raising `OMQ04` if any bound `'held'` or `'released'` row exists — explicitly recognizing **`'settled'`** from a fast final gateway usage report and **`'written_off'`** as valid committed post-handoff evidence), and evaluates required hold presence strictly against **handoff-time** `handoff.metering_enforced` and `handoff.cost_required` (NOT live `quota_enforcement.metering_enforced` or live `quota_defaults`): when `handoff.metering_enforced = true`, it requires bound `usage_tokens` (and `usage_cost_micros` iff `handoff.cost_required = true`) in `state IN ('handoff_committed', 'settled', 'written_off')` (`OMQ04` if missing) and returns `'handoff_committed'`; when `handoff.metering_enforced = false`, it returns `'handoff_committed'` if valid post-handoff bound holds exist or `'unmetered_legacy_handoff'` if zero bound holds exist (even if live `quota_enforcement.metering_enforced` has since flipped to `true`), keeping HTTP dispatch strictly suppressed in all `'handed_off'` outcomes for downstream gateway reconciliation; (b) if `gateway_requests.state = 'reserved'` (or `'released'` with remaining `'held'` bound holds), it atomically unwinds `gateway_requests.state := 'released'` and decrements `gateway_reservations.allocated` (if `'reserved'`), transitions bound `'held'` `quota_reservations` to `'released'` (returning round capacity to an active `'held'` parent or restoring `quota_budgets` on standalone/terminal runs, setting `closed_at`), and returns `'unwound_unsent'`. For standalone non-run device holds (`resource_kind = 'device_reservations' AND run_id IS NULL`), `quota_commit_handoff` binds `device_grant_id` on the caller's own `origin_role` `held` row. **Generic `quota_commit_handoff` explicitly rejects all run-linked device holds (`resource_kind = 'device_reservations' AND run_id IS NOT NULL`, SQLSTATE `42501`) for both `openmettle_api` and `openmettle_worker`**, forcing exclusive use of `quota_commit_device_handoff`. |
-| Fenced successor-worker unwind of crashed post-commit `'reserved'` round (`quota_unwind_superseded_round`) | If Worker 1 (`T1`) commits `(reserve_in + quota_allocate_round)` for `(run_id, round)` and crashes immediately before `handoff_in`, its 32-byte `Pending.secret` is lost in process memory while Migration `0023`'s `gateway_requests_run_round_active_idx` blocks retrying `round` (`23505`). After Worker 1's lease expires and Worker 2 (`T2`) reclaims the still-live (`running`) run via `leases::reclaim_next` (minting a fresh `claim_token = T2` that invalidates Worker 1 in `0023`'s `gateway_handoff`), Worker 2 invokes **`openmettle.quota_unwind_superseded_round(p_scope_id uuid, p_run_id uuid, p_claim_token uuid, p_round integer) RETURNS boolean`** (`SECURITY DEFINER`, `openmettle_worker` only). Acquiring canonical `FOR NO KEY UPDATE` locks on `runs -> gateway_reservations -> active gateway_requests (q) -> parent & child quota_reservations`, it verifies Worker 2 holds the current live lease (`r.claim_token = p_claim_token AND r.state IN ('running', 'cancelling', 'reconciling') AND r.lease_expires_at > clock_timestamp()`). Next, it checks whether any bound child `quota_reservations` row for `q.id` carries **`allocating_claim_token = p_claim_token`**: if `EXISTS (SELECT 1 FROM openmettle.quota_reservations qr WHERE qr.gateway_request_id = q.id AND qr.allocating_claim_token = p_claim_token)`, `q` was allocated by the **current** lease generation `p_claim_token` itself (not a superseded predecessor lease), so it leaves `q` and its holds completely untouched and returns `false` as an idempotent replay no-op (preventing a replayed unwind under `T2` from releasing Worker 2's own replacement request!). Only when an active `gateway_requests` row `q` for `(run_id = p_run_id, round = p_round)` is `state = 'reserved'` (never `'handed_off'`) **AND** zero bound holds carry `allocating_claim_token = p_claim_token` (covering both `N-1` unbound predecessor attempts and `N` predecessor attempts whose child holds carry `allocating_claim_token = T1 <> p_claim_token`), it atomically transitions `gateway_requests.state := 'released'`, restores `gateway_reservations.allocated := allocated - q.units`, transitions all bound `'held'` child `quota_reservations` rows to `'released'` (`held_units = 0`, `closed_at = clock_timestamp()`, inserting `quota_reconciliations` with `kind = 'release'`, `delta_active = 0`, `delta_reserved = 0`), returns their capacity directly to their active `'held'` parent run holds (`parent.allocated_units := parent.allocated_units - child.reserved_units`, `parent.held_units := parent.held_units + child.held_units`, `quota_budgets` delta = `0`), and returns `true` so Worker 2 can immediately retry `p_round` cleanly. If already `'handed_off'` (or no active `'reserved'` predecessor row exists), it leaves the row untouched and returns `false` so Worker 2 reconciles or advances. |
+| Atomic gateway request + metered hold creation (`authz::gateway::reserve_in` + `quota_reserve` / `quota_ensure_legacy_run_holds` + `quota_allocate_round`, ADR 0037 / Migration `0023`) | In Migration `0023`'s `src/authz/gateway.rs`, standalone `authz::gateway::reserve()` commits `gateway_requests` before returning, which would leave `gateway_reservations.allocated` stranded and occupy `gateway_requests_run_round_active_idx` if a process crashed before creating `quota_reservations`. PR2 therefore introduces in-transaction helpers `authz::gateway::reserve_in(&mut WriteTransaction, ...)` (alongside `handoff_in` and `release_in`) so **inserting the `'reserved'` `openmettle.gateway_requests` row (plus the caller `gateway_reservations` row when `run_id IS NULL`) and creating ALL corresponding metered `openmettle.quota_reservations` holds (`usage_tokens`, `usage_cost_micros` via `quota_reserve` for standalone calls or `quota_allocate_round` for run rounds) execute atomically in a single PostgreSQL `WriteTransaction`** — rolling back both if any quota hold fails or the process crashes before commit. Both `quota_reserve` and `quota_allocate_round` (reinforced by `quota_reservations_gateway_binding_guard`) verify `q.scope_id = scope_id`, `q.actor_user_id = actor_user_id`, `q.run_id IS NOT DISTINCT FROM run_id`, `q.state = 'reserved'`, and the caller's 32-byte `p_dispatch` secret (`q.dispatch_hash = sha256(p_dispatch)`). **Lazy once-per-run parent hold backfill for `N-1`-admitted runs:** because a run admitted by an `N-1` API replica created `runs` + `gateway_reservations` with zero local parent `quota_reservations` holds, when an `N` worker claims or reclaims that run and prepares a round, `openmettle.quota_ensure_legacy_run_holds(...)` (or the initial guard at the start of `quota_allocate_round` strictly before locking any existing `quota_reservations` row) checks whether a run-level parent `usage_tokens` hold (`parent_reservation_id IS NULL AND gateway_request_id IS NULL`) exists; if absent, it acquires canonical locks `runs` (`FOR NO KEY UPDATE`, active `Step` lease) -> `gateway_reservations` (`FOR SHARE`, reading remaining unallocated admission budget `max_units - allocated`) -> charged `quota_budgets` (scope rows asc, instance row last, `FOR NO KEY UPDATE`), checks active `quota_budgets` hard limits (returning `OMQ01` if over budget), and inserts the missing run-level parent `quota_reservations` hold(s) (`usage_tokens` for `max_units - allocated` plus applicable `usage_cost_micros` run ceiling, `origin_role = 'worker'`, deterministic idempotency key `("legacy-run-parent", run_id, resource_kind)`) **exactly once** (terminal/settlement cleanup releases any unallocated remainder on that `origin_role = 'worker'` parent hold identically to normal parent holds; subsequent rounds and retries see the parent hold already present and allocate child holds normally without re-charging `quota_budgets`). For run rounds, `quota_allocate_round` additionally verifies the worker's active `Step` lease on `runs` and transfers `slice_units <= parent.held_units` from the server-owned run's `held` parent reservation to a child round reservation in **`state = 'held'`** (pre-handoff) bound to `gateway_request_id` with **`allocating_claim_token = p_claim_token`** (at least a `usage_tokens` child hold on every `N` round allocation, plus `usage_cost_micros` when applicable), copying `quota_reservation_charges`. Parent decrements `held_units` and increments `allocated_units`; `quota_budgets.reserved_held` changes by `0` (never double-debited). Because the child stays `'held'` until dispatch handoff, a pre-send failure never orphans it in `'handoff_committed'`. Unallocated parent remainder releases once when the run can start no further rounds. |
+| Gateway & standalone pre-dispatch handoff (`authz::gateway::handoff_in` + `quota_commit_handoff`, `quota_enforce_gateway_handoff_holds`, plus `quota_recover_lost_handoff`) | For metered usage holds (`usage_tokens`, `usage_cost_micros`) — both standalone API calls (`openmettle_api`, `run_id IS NULL`) and worker run rounds (`openmettle_worker`, `run_id IS NOT NULL`) — `quota_commit_handoff` executes **atomically in the same `WriteTransaction` immediately after `authz::gateway::handoff_in` / `openmettle.gateway_handoff(...)`**, locking `gateway_requests` (`FOR SHARE`) to verify `gateway_requests.state = 'handed_off'` before transitioning the caller's matching `held` reservation (`origin_role` matching caller) to `'handoff_committed'`. At `COMMIT`, `DEFERRABLE INITIALLY DEFERRED` `CONSTRAINT TRIGGER quota_enforce_gateway_handoff_holds` (`openmettle.enforce_gateway_handoff_holds()`, `OMQ04`) unconditionally rejects any bound hold left outside `'handoff_committed'` (even while `metering_enforced = false`), computes `v_cost_required` via non-locking reads, **inserts `(NEW.id, false, v_cost_required)` into `openmettle.quota_gateway_handoffs` FIRST**, and **then acquires `FOR SHARE` on singleton `openmettle.quota_enforcement` as the final lock** (serializing both commit orders against `openmettle_owner`'s standalone `UPDATE` acquiring `FOR NO KEY UPDATE`); when `metering_enforced = true`, it requires bound `'handoff_committed'` holds for `usage_tokens` and any applicable `usage_cost_micros` limit (rolling back any `N-1` `0023`-only `gateway_handoff` and the uncommitted `quota_gateway_handoffs` insert cleanly with `OMQ04`) and updates only its own uncommitted `quota_gateway_handoffs` row (`SET metering_enforced = true`, zero additional locks). Any pre-commit or commit-time refusal rolls back both transitions cleanly and prevents dispatch. On a **lost commit acknowledgement (`UnknownCommit`)** (connection drop during `COMMIT` reply, leaving commit outcome unknown in PostgreSQL), because Migration `0023` grants `SELECT` on `openmettle.gateway_requests` **only** to `openmettle_gateway` (never to `openmettle_api` or `openmettle_worker`), the caller **MUST suppress HTTP transport dispatch** (matching [ADR 0037](0037-gateway-provisioning-and-usage-reconciliation.md) and `src/authz/gateway.rs`) and invoke the caller-scoped `SECURITY DEFINER` recovery entrypoint **`openmettle.quota_recover_lost_handoff(p_request_id uuid, p_dispatch bytea, p_scope_id uuid, p_actor_user_id uuid, p_run_id uuid) RETURNS text`**. That function verifies caller role (`openmettle_api` for `p_run_id IS NULL`, `openmettle_worker` for `p_run_id IS NOT NULL`), `octet_length(p_dispatch) = 32`, and `gateway_requests` ownership + `dispatch_hash = sha256(p_dispatch)` (preserved by `0023`'s `gateway_handoff`), locks `(runs ->) gateway_reservations -> gateway_requests -> (parent ->) quota_reservations -> quota_budgets` in canonical `FOR NO KEY UPDATE` order, and resolves the outcome: (a) if `gateway_requests.state = 'handed_off'`, it reads the recorded handoff-time obligation from `openmettle.quota_gateway_handoffs` (`COALESCE(metering_enforced, false)`, `COALESCE(cost_required, false)` — any pre-PR2 `0023` handoff absent from the table unambiguously means `metering_enforced = false, cost_required = false`), asserts zero bound `quota_reservations` rows remain in pre-handoff or unsent states (**`qr.state NOT IN ('handoff_committed', 'settled')`**, raising `OMQ04` if any bound `'held'` or `'released'` row exists — explicitly recognizing **`'settled'`** from a fast final gateway usage report as valid committed post-handoff evidence), and evaluates required hold presence strictly against **handoff-time** `handoff.metering_enforced` and `handoff.cost_required` (NOT live `quota_enforcement.metering_enforced` or live `quota_defaults`): when `handoff.metering_enforced = true`, it requires bound `usage_tokens` (and `usage_cost_micros` iff `handoff.cost_required = true`) in `state IN ('handoff_committed', 'settled')` (`OMQ04` if missing) and returns `'handoff_committed'`; when `handoff.metering_enforced = false`, it returns `'handoff_committed'` if valid post-handoff bound holds exist or `'unmetered_legacy_handoff'` if zero bound holds exist (even if live `quota_enforcement.metering_enforced` has since flipped to `true`), keeping HTTP dispatch strictly suppressed in all `'handed_off'` outcomes for downstream gateway reconciliation; (b) if `gateway_requests.state = 'reserved'` (or `'released'` with remaining `'held'` bound holds), it atomically unwinds `gateway_requests.state := 'released'` and decrements `gateway_reservations.allocated` (if `'reserved'`), transitions bound `'held'` `quota_reservations` to `'released'` (returning round capacity to an active `'held'` parent or restoring `quota_budgets` on standalone/terminal runs, setting `closed_at`), and returns `'unwound_unsent'`. For standalone non-run device holds (`resource_kind = 'device_reservations' AND run_id IS NULL`), `quota_commit_handoff` binds `device_grant_id` on the caller's own `origin_role` `held` row. **Generic `quota_commit_handoff` explicitly rejects all run-linked device holds (`resource_kind = 'device_reservations' AND run_id IS NOT NULL`, SQLSTATE `42501`) for both `openmettle_api` and `openmettle_worker`**, forcing exclusive use of `quota_commit_device_handoff`. |
+| Fenced successor-worker unwind of crashed post-commit `'reserved'` round (`quota_unwind_superseded_round`) | If Worker 1 (`T1`) commits `(reserve_in + quota_allocate_round)` (or an `N-1` worker commits an unbound `'reserved'` round via `0023` `authz::gateway::reserve`) for `(run_id, round)` and crashes immediately before `handoff_in`, its 32-byte `Pending.secret` is lost in process memory while Migration `0023`'s `gateway_requests_run_round_active_idx` blocks retrying `round` (`23505`). After Worker 1's lease expires and Worker 2 (`T2`) reclaims the still-live (`running`) run via `leases::reclaim_next` (minting a fresh `claim_token = T2` that invalidates Worker 1 in `0023`'s `gateway_handoff`), Worker 2 invokes **`openmettle.quota_unwind_superseded_round(p_scope_id uuid, p_run_id uuid, p_claim_token uuid, p_round integer) RETURNS boolean`** (`SECURITY DEFINER`, `openmettle_worker` only). Acquiring canonical `FOR NO KEY UPDATE` locks on `runs -> gateway_reservations -> active gateway_requests (q) -> any existing parent & bound child quota_reservations`, it verifies Worker 2 holds the current live lease (`r.claim_token = p_claim_token AND r.state IN ('running', 'cancelling', 'reconciling') AND r.lease_expires_at > clock_timestamp()`). Next, it checks whether any bound child `quota_reservations` row for `q.id` carries **`allocating_claim_token = p_claim_token`**: if `EXISTS (SELECT 1 FROM openmettle.quota_reservations qr WHERE qr.gateway_request_id = q.id AND qr.allocating_claim_token = p_claim_token)`, `q` was allocated by the **current** lease generation `p_claim_token` itself (not a superseded predecessor lease), so it leaves `q` and its holds completely untouched and returns `false` as an idempotent replay no-op (preventing a replayed unwind under `T2` from releasing Worker 2's own replacement request!). Only when an active `gateway_requests` row `q` for `(run_id = p_run_id, round = p_round)` is `state = 'reserved'` (never `'handed_off'`) **AND** zero bound holds carry `allocating_claim_token = p_claim_token`, it atomically transitions `gateway_requests.state := 'released'` and restores `gateway_reservations.allocated := allocated - q.units`: when zero bound child `quota_reservations` rows exist (an **unbound `N-1` `'reserved'` round**), this completes cleanly without requiring parent `quota_reservations` rows to exist yet (allowing Worker 2 to initialize the run's parent hold via `quota_ensure_legacy_run_holds` and allocate the replacement round); when bound `'held'` child `quota_reservations` rows exist (a predecessor `N` attempt carrying `allocating_claim_token = T1 <> p_claim_token`), it additionally transitions those child holds to `'released'` (`held_units = 0`, `closed_at = clock_timestamp()`, inserting `quota_reconciliations` with `kind = 'release'`, `delta_active = 0`, `delta_reserved = 0`) and returns their capacity directly to their active `'held'` parent run holds (`parent.allocated_units := parent.allocated_units - child.reserved_units`, `parent.held_units := parent.held_units + child.held_units`, `quota_budgets` delta = `0`). Returns `true` so Worker 2 can immediately retry `p_round` cleanly. If already `'handed_off'` (or no active `'reserved'` predecessor row exists), it leaves the row untouched and returns `false` so Worker 2 reconciles or advances. |
 | Run-linked device handoff (`api` admission -> `worker` dispatch) | Run admission (`POST /v1/runs`) reserves `device_reservations` with `origin_role = 'api'`. At dispatch, `openmettle_worker` invokes `openmettle.quota_commit_device_handoff(...)` (the sole allowed transition path for run-linked device holds), which locks `runs -> quota_reservations` in canonical order, verifies the calling worker's active `Step` lease (`runs.state = 'running'`, `runs.cancel_reason IS NULL`, matching `claim_token`, `runs.lease_expires_at > clock_timestamp()`), requires `resource_kind = 'device_reservations'` (`run_id IS NOT NULL`, `origin_role IN ('api', 'worker')`) matching `(scope_id, run_id)`, binds the run's durable V1-18 `device_grant_id` and transitions `state = 'handoff_committed'` before external device activation. `openmettle_api` has zero `EXECUTE` grant on `quota_commit_device_handoff` and is rejected by `quota_commit_handoff` on any run-linked device hold; `openmettle_worker` remains forbidden from mutating `origin_role = 'api'` holds of any other resource kind or any unleased/cancelled run. |
 | Pre-send abort, `gateway_release` unwind, queued cancellation, unallocated parent remainder or orphan `'reserved'` gateway sweep | Only while `state = 'held'`: for a hold bound to `gateway_request_id`, explicit pre-send unwind couples with `authz::gateway::release_in(&mut tx, ...)` / Migration `0023`'s `openmettle.gateway_release(p_request, p_dispatch)` (setting `gateway_requests.state = 'released'` and returning units to `gateway_reservations`), and `quota_release_unsent` verifies `gateway_requests.state = 'released'` before unwinding. In **both** explicit pre-send unwind and sweep mode, after acquiring canonical locks on `(runs ->) gateway_reservations -> gateway_requests -> (parent ->) quota_reservations`, `quota_release_unsent` **explicitly re-verifies `(q.scope_id, q.actor_user_id) = (qr.scope_id, qr.actor_user_id) AND q.run_id IS NOT DISTINCT FROM qr.run_id` before modifying either ledger** (raising an invariant error and mutating neither ledger on mismatch). When unwinding an unsent child round hold whose parent run hold is still active (`state = 'held'` on a non-terminal run), `quota_release_unsent` locks parent before child, returns `child.held_units` to `parent.held_units` (decrementing `parent.allocated_units`, `quota_budgets.reserved_held` delta = `0`), inserts `quota_reconciliations` (`kind = 'release'`, `delta_active = 0`, `delta_reserved = 0`), and sets child `state = 'released'`, `held_units = 0`, `closed_at = clock_timestamp()`. For standalone holds, parent remainders or terminal-run child holds (including stale sweep after a pre-handoff crash), `quota_release_unsent` (`SECURITY DEFINER`, owned by `openmettle_owner`) acquires locks internally in canonical order (`FOR NO KEY UPDATE SKIP LOCKED` on `runs`, `gateway_reservations`, `gateway_requests`, parent and target `quota_reservations` in sweep mode), re-verifies eligibility and ownership, and when `gateway_request_id IS NOT NULL`: proceeds if `gateway_requests.state = 'released'`; **atomically transitions `gateway_requests.state = 'released'` and restores `gateway_reservations.allocated = allocated - req.units` in the exact same transaction** if `gateway_requests.state = 'reserved'` (without needing the caller's lost dispatch secret, ensuring any delayed `openmettle.gateway_handoff` call fails closed); or leaves the local hold untouched if `gateway_requests.state = 'handed_off'` or locked. Eligible releases insert `quota_reconciliations` (`kind = 'release'`, `delta_active = 0`, `delta_reserved = -held_units`), decrement `reserved_held`, and set `state = 'released'`, `held_units = 0` and `closed_at = clock_timestamp()`. Repeating release is a no-op. For rolling-upgrade / defense-in-depth safety against pre-V1-17 `'reserved'` `gateway_requests` rows having zero bound `quota_reservations` rows, `openmettle_worker` also runs `openmettle.quota_release_orphan_gateway_requests(...)` using bounded raw `(created_at, id)` index-key paging over `gateway_requests_reserved_idx` with a single constant clamped age-cutoff upper bound (zero `clock_timestamp()` inside the scan query) to release aged unbound `'reserved'` requests and restore `gateway_reservations.allocated`. |
 | Open partial gateway report or signed partial correction (ADR 0037 / Migration `0023`) | `quota_settle_gateway_usage` requires `state = 'handoff_committed'`, locates the single `openmettle.gateway_usage_reports` row matching `(request_id = qr.gateway_request_id, source = p_report_source, report_id = p_report_id, revision = p_source_revision)` (`revision >= 0`), verifies immutable deployment `cost_denomination` against `gateway_usage_reports.unit` (when `cost IS NOT NULL`) and requires **`accepted_source_revision IS NULL OR p_source_revision > accepted_source_revision`** (so valid `revision = 0` initial reports are accepted cleanly). For cumulative total `C` vs prior `settled_units = S` and `held_units = H`, compute `new_held = greatest(0, reserved_units - C)`, `delta_active = C - S` and **signed** `delta_reserved = new_held - H`. The single atomic `UPDATE` on `quota_reservations` persists `held_units = new_held`, `settled_units = C`, **`accepted_source_revision = p_source_revision`** and `revision = revision + 1` in the same transaction alongside the composite-FK `quota_reconciliations` row and `quota_budgets`, so delayed older reports (`p_source_revision <= accepted_source_revision`) can never pass the guard. Example: on a `100`-token hold (`accepted_source_revision IS NULL`) where `revision = 0` reports `60` partial (`60` measured, `40` held, `accepted_source_revision = 0`), an authoritative `revision = 1` partial correction to `20` applies `delta_active = -40` and `delta_reserved = +40` (`20` measured, `80` held, `accepted_source_revision = 1`, preserving `100` total exposure while open). |
 | Authoritative final gateway report (including overage, zero charge or `revision = 0` final) | Requires `state = 'handoff_committed'`, matching `openmettle.gateway_usage_reports` row (`final = true`) and **`accepted_source_revision IS NULL OR p_source_revision > accepted_source_revision`** (accepting an immediate `revision = 0` final report cleanly). Applies `delta_active = C - S` (full overage if `C > reserved_units`) and `delta_reserved = -H`. The single atomic `UPDATE` sets `state = 'settled'`, `held_units = 0`, `settled_units = C`, **`accepted_source_revision = p_source_revision`**, `revision = revision + 1` and `closed_at = clock_timestamp()`. Closes the hold once per unit; a late partial report cannot reopen `settled`. |
 | Post-final authoritative correction | Requires `state = 'settled'`, matching `openmettle.gateway_usage_reports` row and **`accepted_source_revision IS NULL OR p_source_revision > accepted_source_revision`**. Applies signed `delta_active = C_new - S` and `delta_reserved = 0` (rejecting negative `active_used`), atomically updating `settled_units = C_new`, `accepted_source_revision = p_source_revision` and `revision = revision + 1`. Same-revision duplicates with identical values are no-ops; differing values at an already accepted revision or mismatched `unit` denominations quarantine under ADR 0037 without mutating balances. |
-| Failed upload, interrupted write or retention purge | Non-run upload failures unlink `staging/<id>` and call `storage::release` once; `settle` moves actual bytes to `active_bytes` and releases `max_bytes - size_bytes` once; `confirm_purge` decrements `retained_bytes` once after confirmed payload deletion (ADR 0005, ADR 0031). On populated upgrades, `storage_instance.volume_id` stays `NULL` throughout the entire `N-1 -> N` binary replacement so `enforce_worker_storage_volume_pinned()` (`OMQ03`) hard-blocks all `N-1` worker cleaners until zero `N-1` workers remain; verified volume adoption runs only after 100% `N-1 -> N` replacement (unconditionally re-verifying revisions, `'reserved'` payloads, and requiring independent `--expected-fs-uuid` volume attestation whenever zero digest-bearing revisions are verified on disk, including on retry, while accepting missing `purging` files once volume identity is established). All `N` worker storage cleaners — explicitly including `artifact_fs::purge_due` alongside `reconcile_expired`, run-linked `storage_reservations` recovery and `staging/` cleanup — verify non-null pinned `storage_instance.volume_id` <-> `<root>/.openmettle-volume-id` (`O_NOFOLLOW`, auto-pinned strictly on an empty storage ledger) and exact `st_dev` match with open `revisions/` and `staging/` directory handles (failing closed with zero released holds, purges or unlinked files when `volume_id IS NULL` or on missing, mismatched, symlinked or different-`st_dev` sentinels or empty replacement directories). Run-linked `storage_reservations` recovery additionally requires directory-relative `ENOENT` proof that `revisions/<id>` does not exist before committing `storage::release` and unlinking `staging/<id>`, with retryable `staging/<id>` cleanup via persistent `StagingSweepState` (`Idle`/`Open`/`InFlight`/`InvalidatedInFlight`/`DrainingEof` + `pending_names` held outside `worker::sweep`'s 15 s `tokio::time::timeout`) for already-`released` rows; if `revisions/<id>` exists while `state = 'reserved'`, both hold and payload are preserved for settlement or operator reconciliation. |
+| Failed upload, interrupted write or retention purge | Non-run upload failures unlink `staging/<id>` and call `storage::release` once; `settle` moves actual bytes to `active_bytes` and releases `max_bytes - size_bytes` once; `confirm_purge` decrements `retained_bytes` once after confirmed payload deletion (ADR 0005, ADR 0031). On **every** upgrade (`applied >= 1`), operators **MUST quiesce all `N-1` worker artifact cleaners (unset `OPENMETTLE_WORKER_ARTIFACTS_DIR` and drain all in-flight `worker::maintenance` sweeps) BEFORE running `openmettle-migrate`**, `storage_instance.bootstrap_auto_pin_allowed` seeds `false`, and `storage_instance.volume_id` stays `NULL` throughout the entire `N-1 -> N` binary replacement (with `enforce_worker_storage_volume_pinned()` (`OMQ03`) acting as a PostgreSQL ledger backstop); verified volume adoption runs only after 100% `N-1 -> N` replacement (unconditionally re-verifying revisions and `'reserved'` payloads, requiring independent `--expected-fs-uuid` volume attestation whenever ledger rows exist with zero digest-bearing revisions verified on disk, including on retry, while accepting missing `purging` files once volume identity is established, and publishing all three role-tagged sentinels atomically via write-temp + `fsync` + `linkat` + `unlinkat`). All `N` worker storage cleaners — explicitly including `artifact_fs::purge_due` alongside `reconcile_expired`, run-linked `storage_reservations` recovery and `staging/` cleanup — verify non-null pinned `storage_instance.volume_id` <-> role-tagged `.openmettle-volume-id` sentinels in `<root>` (`:root`), `<root>/revisions` (`:revisions`), and `<root>/staging` (`:staging`) via `openat(..., O_NOFOLLOW)` on open directory FDs sharing equal `st_dev` (failing closed with zero released holds, purges or unlinked files when `volume_id IS NULL` or on missing, mismatched, wrong-role, symlinked or different-`st_dev` sentinels or empty replacement directories). Run-linked `storage_reservations` recovery additionally requires directory-relative `ENOENT` proof that `revisions/<id>` does not exist before committing `storage::release` and unlinking `staging/<id>`, with retryable `staging/<id>` cleanup via persistent `StagingSweepState` (`Idle`/`Open`/`InFlight`/`InvalidatedInFlight`/`DrainingEof` + `pending_names` held outside `worker::sweep`'s 15 s `tokio::time::timeout`, retaining an open `dir_fd` across `Open`/`InFlight`/`DrainingEof` until `pending_names` is empty) for already-`released` rows; if `revisions/<id>` exists while `state = 'reserved'`, both hold and payload are preserved for settlement or operator reconciliation. |
 | Terminal failed, cancelled or interrupted run | Unallocated `held` parent, standalone or unsent child quota holds release once. `handoff_committed` usage holds stay held until `openmettle_gateway` supplies an authoritative final report (including zero-charge final proof). `handoff_committed` device holds stay held until durable V1-18 confirmation of release or non-allocation. Run-linked `storage_reservations` stay held while any linked operation is `intent` or `outcome_unknown`, or while `revisions/<id>` exists on disk awaiting SQL settlement. |
 
 **Independent drift verification and restore validation.** PR2 adds a read-only
@@ -1003,10 +1065,13 @@ mismatch summaries without exposing raw gateway rows:
    `storage_accounts` and `storage_instance` counters (`active_bytes`, `retained_bytes`,
    `reserved_bytes`) against sums recomputed from `artifact_revisions` (`state = 'active'` and
    `state IN ('retained', 'purging')`) and `storage_reservations` (`state = 'reserved'`).
-2. **Storage DB-to-filesystem verification (`artifact_fs`):** first verifies non-null pinned
-   `storage_instance.volume_id` <-> `<root>/.openmettle-volume-id` (`O_NOFOLLOW`) and exact
-   `st_dev` match with open `revisions/` and `staging/` directory FDs (failing restore validation
-   immediately when `volume_id IS NULL` or on missing, mismatched or different-`st_dev` sentinels):
+2. **Storage DB-to-filesystem verification (`artifact_fs`):** first opens `<root>`,
+   `<root>/revisions` and `<root>/staging` (`O_RDONLY | O_DIRECTORY | O_NOFOLLOW`), verifies equal
+   `st_dev` across all three FDs, and verifies via `openat(..., O_RDONLY | O_NOFOLLOW)` on each FD
+   that its `.openmettle-volume-id` regular file on that same `st_dev` matches non-null pinned
+   `storage_instance.volume_id` AND its exact `:root`, `:revisions`, or `:staging` role tag
+   (failing restore validation immediately when `volume_id IS NULL` or on missing, mismatched,
+   wrong-role, symlinked or different-`st_dev` sentinels):
    - *Active and retained revisions:* every `artifact_revisions` row in `state IN ('active',
      'retained')` MUST have a matching regular (non-symlink) file at `revisions/<reservation_id>`
      whose on-disk length equals `size_bytes`. Any missing, symlinked or wrong-sized payload for
@@ -1023,10 +1088,12 @@ mismatch summaries without exposing raw gateway rows:
    - *Unsettled published payloads and orphan scan:* any `revisions/<id>` paired with
      `storage_reservations.state = 'reserved'` (post-rename, pre-settlement crash window) is
      reported explicitly as an unsettled published payload requiring deterministic retry settlement
-     or operator reconciliation (never silently unlinked or released). Any file in `revisions/`
-     lacking a matching `active`/`retained`/`purging` revision or `reserved` reservation, and any
-     file in `staging/` lacking a matching `reserved` reservation (after worker startup/retryable
-     cleanup of `released` rows), fails as an unreferenced orphan.
+     or operator reconciliation (never silently unlinked or released). Ignoring the verified
+     `.openmettle-volume-id` sentinel file (strictly disjoint from canonical lowercase UUID payload
+     filenames per `src/artifact_fs.rs`), any payload file in `revisions/` lacking a matching
+     `active`/`retained`/`purging` revision or `reserved` reservation, and any payload file in
+     `staging/` lacking a matching `reserved` reservation (after worker startup/retryable cleanup
+     of `released` rows), fails as an unreferenced orphan.
 3. **Usage and device budget verification (inside `quota_verify_accounting_drift()`):** compares
    every `quota_budgets.reserved_held` row against `SUM(qr.held_units)` joined via
    `quota_reservation_charges` for `qr.state IN ('held', 'handoff_committed')`, compares
@@ -1140,10 +1207,13 @@ candidate scanning from **one-reservation-per-transaction** settlement:
      p_max_reserved_age` as a per-row filter rather than a B-tree index range stop condition and
      could scan an arbitrarily large young tail whenever `p_pass_upper_created_at` extends past
      the age cutoff — at the start of `quota_release_orphan_gateway_requests(...)` the function
-     captures **`v_age_cutoff timestamptz := clock_timestamp() - p_max_reserved_age;`** once in
-     PL/pgSQL and clamps the index-range upper bound once to **`(v_upper_created_at, v_upper_id)
-     := LEAST((p_pass_upper_created_at, p_pass_upper_id), (v_age_cutoff,
-     'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid))`**. To prevent both an aged prefix of
+     captures **`v_age_cutoff timestamptz := clock_timestamp() - p_max_reserved_age;`** once in PL/pgSQL and
+     clamps the scalar index-range upper bounds using valid PostgreSQL 18 PL/pgSQL assignments:
+     `IF (p_pass_upper_created_at, p_pass_upper_id) <= (v_age_cutoff,
+     'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid) THEN v_upper_created_at :=
+     p_pass_upper_created_at; v_upper_id := p_pass_upper_id; ELSE v_upper_created_at :=
+     v_age_cutoff; v_upper_id := 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid; END IF;`. To prevent
+     both an aged prefix of
      legitimately bound `'reserved'` entries and a young tail past `v_age_cutoff` from causing an
      unbounded index scan before `LIMIT`, each call **first materializes a bounded page of at most
      `p_page_size` raw `(created_at, id)` index keys** directly from Migration `0023`'s
@@ -1167,82 +1237,121 @@ candidate scanning from **one-reservation-per-transaction** settlement:
      keys were returned and all keys in that partial page were inspected, or when the cursor
      reaches `(v_upper_created_at, v_upper_id)`).
 2. **Storage holds (`storage_reservations`) and retention purges (`artifact_revisions`).**
-   - *Durable artifact volume identity (`storage_instance.volume_id` <-> `<root>/.openmettle-volume-id`):*
+   - *Durable artifact volume identity (`storage_instance.volume_id` <-> role-tagged sentinels in
+     `<root>`, `<root>/revisions`, and `<root>/staging`):*
      If the artifact volume unmounts, an ordinary empty `revisions/` directory can remain at the
      mount point — or `Store::open` ([`src/artifact_fs.rs`](../../src/artifact_fs.rs)) can create
-     empty `staging/` and `revisions/` directories on worker restart — causing an open `revisions/`
-     directory handle and `fstatat("<id>")` (or `N-1`'s `remove()` treating `ErrorKind::NotFound`
-     as `Ok(())` in `reconcile_expired` and `purge_due`) to succeed while the original volume still
-     holds the published payload. On a populated pre-V1-17 upgrade (`storage_instance.volume_id IS
-     NULL`), naive auto-pinning would create `<root>/.openmettle-volume-id` on an empty replacement
-     directory, and any `N-1` worker running after `volume_id` is pinned lacks Rust sentinel checks
-     and could release `storage_reservations` or confirm `artifact_revisions` `'purged'`
-     transitions against an empty mount. PR2 closes every layer with a durable volume identity
-     sentinel between PostgreSQL (`openmettle.storage_instance.volume_id uuid`) and the artifact
-     root (`<root>/.openmettle-volume-id`, regular file, `O_NOFOLLOW`, canonical lowercase UUID), a
-     PostgreSQL `BEFORE UPDATE` worker volume-pin guard, and a strict one-way populated-upgrade
-     sequence:
-     - **Automatic pinning restricted strictly to an empty storage ledger
-       (`storage_instance.volume_id IS NULL`), plus strict `N-1 -> N` binary replacement BEFORE
-       pinning:** `openmettle.storage_pin_volume_id(uuid)` (locking
-       `openmettle.storage_instance FOR UPDATE`) and `Store::open` bootstrap auto-pinning are
-       permitted **ONLY when BOTH `NOT EXISTS (SELECT 1 FROM openmettle.storage_reservations)` AND
-       `NOT EXISTS (SELECT 1 FROM openmettle.artifact_revisions)`**. On an empty fresh
-       installation, `Store::open` creates `<root>/.openmettle-volume-id` exclusively (`O_CREAT |
-       O_EXCL | O_NOFOLLOW`, mode `0600`), `fsync`s the sentinel and `<root>`, and pins that UUID
-       write-once via `openmettle.storage_pin_volume_id(uuid)` (or reads an existing sentinel and
-       pins it); if another replica concurrently pinned a different `volume_id`, startup refuses to
-       proceed. If **any** row exists in `openmettle.storage_reservations` or
-       `openmettle.artifact_revisions` while `storage_instance.volume_id IS NULL`:
+     empty `staging/` and `revisions/` directories on worker restart, or an operator/script can
+     replace *only* `<root>/revisions` (or `<root>/staging`) with a fresh empty directory on the
+     **same filesystem (`st_dev`)** — causing an open `revisions/` directory handle and
+     `fstatat("<id>")` (or `N-1`'s `remove()` treating `ErrorKind::NotFound` as `Ok(())` in
+     `reconcile_expired` and `purge_due`) to succeed while the original volume or directory still
+     holds the published payload. Moreover, on an existing upgrade (`applied >= 1`), even empty
+     `storage_*` tables cannot distinguish a fresh install from an existing unused deployment with
+     live `N-1` pods; and in `N-1`, `reconcile_expired` unlinks both payload paths *before* calling
+     `storage::release` (`src/artifact_fs.rs:660-669`) and `purge_due` skips any `UPDATE` in
+     `storage::begin_purge` for an already-`'purging'` revision (`src/storage.rs:628-636`) and
+     unlinks `revisions/<reservation>` *before* `confirm_purge` executes
+     (`src/artifact_fs.rs:694-707`), meaning a PostgreSQL trigger alone rolls back the DB update
+     *after* an `N-1` worker has already deleted the file. PR2 closes every layer with:
+     - **Role-tagged sentinels across all three directories (namespace-disjoint from payloads):**
+       Because payload filenames in `staging/` and `revisions/` are strictly canonical lowercase
+       UUIDs (`runs::uuid` in `src/artifact_fs.rs:134-135`, never starting with `.`),
+       `.openmettle-volume-id` (and temporary `.openmettle-volume-id.tmp.*`) is 100%
+       namespace-disjoint from payload files and ignored by `StagingSweepState` UUID filtering and
+       orphan scans. PR2 binds `openmettle.storage_instance.volume_id` **plus explicit directory
+       role** across **all three directories** (regular files, `O_NOFOLLOW`, mode `0600`):
+       - `<root>/.openmettle-volume-id` -> `"<volume_uuid>:root\n"`
+       - `<root>/revisions/.openmettle-volume-id` -> `"<volume_uuid>:revisions\n"`
+       - `<root>/staging/.openmettle-volume-id` -> `"<volume_uuid>:staging\n"`
+       Replacing `<root>/revisions` or `<root>/staging` (or swapping them) even on the exact same
+       filesystem (`st_dev`) immediately fails closed with zero unlinks and zero DB mutations.
+     - **Automatic bootstrap pinning gated strictly on `src/migrate.rs` fresh-from-zero history
+       (`applied == 0`, `storage_instance.bootstrap_auto_pin_allowed = true`) AND empty storage
+       ledger:** In PR2's migration, `storage_instance.bootstrap_auto_pin_allowed` seeds `true`
+       **ONLY when `is_fresh_bootstrap` holds** (`openmettle.bootstrap_from_zero = 'true'` set by
+       `src/migrate.rs` when `applied == 0` in `openmettle._sqlx_migrations`, AND all core,
+       storage and gateway tables are empty) and `false` on **EVERY** upgrade (`applied >= 1`,
+       even an existing unused deployment with zero `users`, `storage_*`, or `gateway_*` rows!).
+       `openmettle.storage_pin_volume_id(uuid)` (locking `openmettle.storage_instance FOR UPDATE`)
+       and `Store::open` bootstrap auto-pinning are permitted **ONLY when `volume_id IS NULL AND
+       bootstrap_auto_pin_allowed = true` AND BOTH `NOT EXISTS (SELECT 1 FROM
+       openmettle.storage_reservations)` AND `NOT EXISTS (SELECT 1 FROM
+       openmettle.artifact_revisions)`** — atomically setting `volume_id = p_volume_id,
+       bootstrap_auto_pin_allowed = false` (enforced by `CHECK (volume_id IS NULL OR NOT
+       bootstrap_auto_pin_allowed)`). On a genuine fresh-from-zero installation, `Store::open`
+       publishes and `fsync`s all three role-tagged sentinels atomically via the `linkat` protocol
+       below (in `<root>`, `<root>/revisions`, and `<root>/staging`) and pins `sentinel_uuid`
+       write-once via `openmettle.storage_pin_volume_id(sentinel_uuid)`; if another replica
+       concurrently pinned a different `volume_id`, startup refuses to proceed. On **every**
+       upgrade (`bootstrap_auto_pin_allowed = false`) or whenever any row exists in
+       `openmettle.storage_reservations` or `openmettle.artifact_revisions` while
+       `storage_instance.volume_id IS NULL`:
        1. `openmettle.storage_pin_volume_id(uuid)` refuses with `ERRCODE = 'OMQ03'` and
-          `Store::open` **MUST NOT** write `<root>/.openmettle-volume-id` on an unverified
+          `Store::open` **MUST NOT** write any `.openmettle-volume-id` sentinel on an unverified
           directory.
        2. All PR2 (`N`) worker storage cleaners — explicitly including **`artifact_fs::purge_due`**
           alongside `artifact_fs::reconcile_expired`, run-linked `ENOENT` storage recovery and
-          `staging/` `ReadDir` cleanup — **remain disabled (fail closed with zero released holds,
-          zero `begin_purge`/`confirm_purge` transitions and zero unlinked files)** while
+          `staging/` `ReadDir` cleanup — **remain disabled (fail closed with zero unlinks, zero
+          released holds, and zero `begin_purge`/`confirm_purge` transitions)** while
           `storage_instance.volume_id IS NULL` (while `N` workers still execute normal run turns
           cleanly).
-       3. **Strict one-way populated-upgrade sequence (`N-1 -> N` binary replacement BEFORE pinning
-          `volume_id`):**
-          - *Phase 1 (migration while `volume_id IS NULL`):* Apply PR2's migration
-            (`storage_instance.volume_id` stays `NULL`, `quota_enforcement.metering_enforced =
-            false`). Throughout the entire `N-1 -> N` rolling deployment,
-            `storage_instance.volume_id` **MUST remain `NULL`** so the `SECURITY DEFINER` `BEFORE
-            UPDATE` trigger `openmettle.enforce_worker_storage_volume_pinned()` (`OMQ03`) on both
+       3. **Strict 4-step mandatory upgrade sequence (pre-migration `N-1` cleaner quiescence ->
+          migration -> 100% `N-1 -> N` replacement -> verified adoption & activation):**
+          - *Step 1 (Before migration — MANDATORY `N-1` cleaner quiescence & in-flight sweep
+            drain):* Operators **MUST** unset `OPENMETTLE_WORKER_ARTIFACTS_DIR` across all `N-1`
+            worker replicas (rolling restart with `OPENMETTLE_WORKER_ARTIFACTS_DIR` unset, or
+            scaling `openmettle-worker` to `0`) and confirm zero `N-1` worker processes hold
+            `OPENMETTLE_WORKER_ARTIFACTS_DIR` or have an in-flight `worker::maintenance` sweep
+            **before** running `openmettle-migrate`, keeping legacy cleaners drained through 100%
+            `N-1 -> N` replacement and verified adoption. The `SECURITY DEFINER` `BEFORE UPDATE`
+            trigger `openmettle.enforce_worker_storage_volume_pinned()` (`OMQ03`) on
             `openmettle.storage_reservations` (`WHEN (OLD.state = 'reserved' AND NEW.state =
             'released')`) and `openmettle.artifact_revisions` (`WHEN (NEW.state IN ('purging',
-            'purged'))`) hard-blocks every `openmettle_worker` `reconcile_expired` and `purge_due`
-            mutation in PostgreSQL even while `N-1` workers drain in-flight turns (or with `N-1`
-            cleaners additionally disabled via unset `OPENMETTLE_WORKER_ARTIFACTS_DIR`), while
-            disjoint `openmettle_api` (ADR 0003) keeps in-flight upload abort/failure cleanup
-            working.
-          - *Phase 2 (100% `N-1 -> N` binary replacement):* Complete the full `N-1 -> N` rolling
-            replacement across all `openmettle-worker` and `openmettle-api` replicas and verify
-            **zero `N-1` worker processes remain running** (`N` workers execute normal turns
-            cleanly while their storage cleaners fail closed on `volume_id IS NULL`).
-          - *Phase 3 (verified adoption, pin & activation):* **Only after zero `N-1` workers
-            remain**, run `openmettle-admin` verified volume adoption to write/`fsync`
-            `<root>/.openmettle-volume-id` and pin `storage_instance.volume_id` (then run orphan
-            gateway sweep and flip `quota_enforcement.metering_enforced = true` in a standalone
-            single-statement transaction). **Starting, rolling back to, or resuming any `N-1`
-            worker binary after `storage_instance.volume_id` is pinned is strictly forbidden by
-            the rollout contract**, because `N-1` workers lack Rust `.openmettle-volume-id` /
-            `st_dev` verification and treat `ENOENT` in `src/artifact_fs.rs` as successful
-            removal.
-     - **Verified, idempotent volume adoption required on populated upgrades
-       (`storage_instance.volume_id IS NULL` with existing ledger rows, run ONLY after zero `N-1`
-       workers remain):** Enabling storage cleaners on a populated upgraded installation requires
-       an explicit verified volume-adoption step (executed by `openmettle_owner` / operator CLI
+            'purged'))`) is strictly a **PostgreSQL ledger defense-in-depth backstop** (protecting
+            DB accounting if an operator forgets quiescence on an empty mount, while disjoint
+            `openmettle_api` keeps in-flight upload abort cleanup working) — **NOT** a substitute
+            for pre-migration `N-1` cleaner quiescence because `N-1` unlinks payload files before
+            mutating PostgreSQL.
+          - *Step 2 (Migration):* Run `openmettle-migrate` (`storage_instance.volume_id IS NULL`,
+            `storage_instance.bootstrap_auto_pin_allowed = false`,
+            `quota_enforcement.metering_enforced = false` on every upgrade where `applied >= 1`).
+          - *Step 3 (100% `N-1 -> N` binary replacement):* Roll 100% of `openmettle-api` and
+            `openmettle-worker` replicas from `N-1` to `N` (`N` workers may have
+            `OPENMETTLE_WORKER_ARTIFACTS_DIR` configured because `N` cleaners verify non-null
+            pinned `volume_id` + all three role-tagged directory sentinels/`st_dev` *before*
+            touching any filesystem path, failing closed with zero unlinks while `volume_id IS
+            NULL`). Confirm **zero `N-1` replicas remain running**.
+          - *Step 4 (Verified adoption, pin & activation):* **Only after zero `N-1` replicas
+            remain**, run `openmettle-admin` verified volume adoption (`volume_id` `NULL ->
+            <uuid>`, `bootstrap_auto_pin_allowed = false`, publishing and `fsync`ing all three
+            role-tagged sentinels atomically via `linkat`), run the pre-upgrade orphan gateway
+            sweep (`quota_release_orphan_gateway_requests`), and flip
+            `quota_enforcement.metering_enforced = true` in a standalone single-statement
+            transaction. **Starting, rolling back to, or resuming any `N-1` worker binary after
+            `storage_instance.volume_id` is pinned is strictly forbidden by the rollout contract**,
+            because `N-1` workers lack Rust role-tagged `.openmettle-volume-id` / `st_dev`
+            verification and unlink before mutating PostgreSQL.
+     - **Verified, idempotent volume adoption required on every upgrade (`storage_instance.volume_id
+       IS NULL` with `bootstrap_auto_pin_allowed = false`, run ONLY after zero `N-1` replicas
+       remain):** Enabling storage cleaners on an upgraded installation requires an explicit
+       verified volume-adoption step (executed by `openmettle_owner` / operator CLI
        `openmettle-admin` procedure documented in PR2's operator runbook update) **before**
        `Store::open` directory creation. Every invocation — **both initial run and any operator
-       retry after a crash or lost DB connection following sentinel `fsync`** — executes steps 1
-       and 2 unconditionally **before** step 3 writes or accepts any `<root>/.openmettle-volume-id`:
+       retry after a crash or lost DB connection following sentinel publication** — executes steps
+       1 and 2 unconditionally **before** step 3 writes or accepts any `.openmettle-volume-id`:
        1. *Pre-existing directory & single-device check:* Open `<root>`, `<root>/staging`, and
           `<root>/revisions` with `O_RDONLY | O_DIRECTORY | O_NOFOLLOW` (never auto-creating
           directories during adoption) and verify all three share the exact same `st_dev`.
        2. *Unconditional ledger payload & volume identity verification (executed on every run and
           retry strictly before step 3):*
+          - **Genuinely empty storage ledger on an unused upgrade (`0` rows in both
+            `storage_reservations` and `artifact_revisions`):** If both `storage_reservations` and
+            `artifact_revisions` contain zero rows on an upgraded deployment (`applied >= 1`,
+            `bootstrap_auto_pin_allowed = false`), step 2 sees an empty ledger and proceeds cleanly
+            to step 3 (atomically linking all three role-tagged sentinels and pinning
+            `storage_instance.volume_id`) **without requiring `--expected-fs-uuid` for nonexistent
+            ledger rows**.
           - **Published and purging revisions (`artifact_revisions`):** Every
             `openmettle.artifact_revisions` row in `state IN ('active', 'retained')` **MUST**
             exist relative to `<root>/revisions` (`AT_SYMLINK_NOFOLLOW` regular file on
@@ -1261,68 +1370,94 @@ candidate scanning from **one-reservation-per-transaction** settlement:
             adoption **MUST fail closed (`OMQ03` / CLI error)** rather than accepting empty
             replacement directories (preventing a post-rename `'reserved'` payload on the real
             volume from being released later by `ENOENT`).
-          - **General zero-verified-revision rule (covering reservation-only ledgers, missing-file
-            `purging`-only ledgers, and historical `released`/`purged`-only ledgers, on both
-            initial run and retry):** Whenever **zero** digest-bearing revisions (`active`,
-            `retained`, or still-present `purging`) were positively verified on disk during step 2,
-            revision checks alone have not cryptographically established volume identity — so
-            `openmettle-admin` adoption **MUST require independent volume evidence** before step 3
-            writes or accepts `<root>/.openmettle-volume-id`: specifically, verifying expected
-            on-disk `'reserved'` payload presence (`revisions/<id>` or `staging/<id>`) when
-            unsettled payloads exist on disk **plus** explicit operator mount/filesystem identity
-            attestation (**`--expected-fs-uuid <fs_uuid>`**, verified against the mounted
-            filesystem backing `<root>`'s `st_dev`, required whenever zero digest-bearing
-            revisions are verified on disk), and an explicit **`--confirm-no-on-disk-payloads`**
-            flag alongside `--expected-fs-uuid <fs_uuid>` for the rare case where every
-            `'reserved'`/`'purging'`/`'purged'` row genuinely has zero surviving files on the real
-            volume. Re-executing step 2 unconditionally before step 3 ensures a retry after crash
-            still rejects an empty or wrong mount even if a stray `.openmettle-volume-id` file
-            were present.
-       3. *Idempotent sentinel creation / verification & DB pin (only after step 2 passes):*
-          Attempt `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` (mode `0600`) on
-          `<root>/.openmettle-volume-id`, writing a fresh canonical lowercase UUID
-          (`sentinel_uuid`) and `fsync`ing the sentinel + `<root>`. If creation returns `EEXIST`
-          (e.g., operator retry after a prior run crashed between sentinel `fsync` and PostgreSQL
-          commit), open `<root>/.openmettle-volume-id` with `O_RDONLY | O_NOFOLLOW`, verify it is a
-          regular file on the exact same `st_dev` containing a valid canonical lowercase UUID
-          (`existing_uuid`, adopting `sentinel_uuid = existing_uuid`), and `fsync` the sentinel +
-          `<root>` (failing closed if symlinked, non-regular, wrong `st_dev` or malformed). Then
-          lock `openmettle.storage_instance FOR UPDATE` as `openmettle_owner`: if `volume_id IS
-          NULL`, pin `volume_id = sentinel_uuid`; if `volume_id = sentinel_uuid`, succeed
-          idempotently as a no-op; if `volume_id <> sentinel_uuid`, fail closed (`ERRCODE =
-          'OMQ03'`).
+          - **General zero-verified-revision rule for populated ledgers (covering reservation-only
+            ledgers, missing-file `purging`-only ledgers, and historical `released`/`purged`-only
+            ledgers, on both initial run and retry):** Whenever at least one row exists in
+            `storage_reservations` or `artifact_revisions` AND **zero** digest-bearing revisions
+            (`active`, `retained`, or still-present `purging`) were positively verified on disk
+            during step 2, revision checks alone have not cryptographically established volume
+            identity — so `openmettle-admin` adoption **MUST require independent volume evidence**
+            before step 3 writes or accepts `.openmettle-volume-id`: specifically, verifying
+            expected on-disk `'reserved'` payload presence (`revisions/<id>` or `staging/<id>`)
+            when unsettled payloads exist on disk **plus** explicit operator mount/filesystem
+            identity attestation (**`--expected-fs-uuid <fs_uuid>`**, verified against the mounted
+            filesystem backing `<root>`'s `st_dev`, required whenever ledger rows exist with zero
+            digest-bearing revisions verified on disk), and an explicit
+            **`--confirm-no-on-disk-payloads`** flag alongside `--expected-fs-uuid <fs_uuid>` for
+            the rare case where every `'reserved'`/`'purging'`/`'purged'` row genuinely has zero
+            surviving files on the real volume. Re-executing step 2 unconditionally before step 3
+            ensures a retry after crash still rejects an empty or wrong mount even if a stray
+            `.openmettle-volume-id` file were present.
+       3. *Atomic `linkat` sentinel publication across `<root>`, `<root>/revisions`, and
+          `<root>/staging` & idempotent DB pin (only after step 2 passes; same atomic publication
+          protocol used by fresh-bootstrap auto-pinning):*
+          Never create `.openmettle-volume-id` directly with `O_CREAT | O_EXCL` before writing its
+          payload (a crash between `openat` and `write` would leave a 0-byte sentinel that causes
+          every retry to fail permanently). Instead:
+          - Relative to each verified directory FD (`root_fd`, `revisions_dir_fd`,
+            `staging_dir_fd`), remove any leftover `.openmettle-volume-id.tmp.*` staging files from
+            an interrupted prior run. Determine `sentinel_uuid`: inspect
+            `<root>/.openmettle-volume-id` via `openat(root_fd, ".openmettle-volume-id", O_RDONLY |
+            O_NOFOLLOW)` — if present, verify it is a regular file on `<root>`'s `st_dev`
+            containing valid `"<existing_uuid>:root\n"` and adopt `sentinel_uuid = existing_uuid`
+            (failing closed with `OMQ03` if symlinked, non-regular, wrong `st_dev`, or malformed);
+            otherwise generate a fresh canonical lowercase v4 UUID.
+          - For each of `(root_fd, "root")`, `(revisions_dir_fd, "revisions")`, and
+            `(staging_dir_fd, "staging")` in deterministic order: create
+            `.openmettle-volume-id.tmp.<pid>.<nonce>` relative to `dir_fd` (`O_WRONLY | O_CREAT |
+            O_EXCL | O_NOFOLLOW`, mode `0600`), write the complete `"<sentinel_uuid>:<role>\n"`
+            payload, **`fsync` the temp FD**, close it, and publish it via **`linkat(dir_fd,
+            tmp_name, dir_fd, ".openmettle-volume-id", 0)`** (POSIX atomic hard-link creation,
+            which never exposes a 0-byte or partial `.openmettle-volume-id` and fails with `EEXIST`
+            without overwriting any existing `.openmettle-volume-id`), then unconditionally
+            `unlinkat(dir_fd, tmp_name, 0)`. If `linkat` returns `EEXIST`, open
+            `.openmettle-volume-id` (`openat(dir_fd, ".openmettle-volume-id", O_RDONLY |
+            O_NOFOLLOW)`) and verify it is a regular file on the exact same `st_dev` containing the
+            exact expected `"<sentinel_uuid>:<role>\n"` (failing closed with `OMQ03` on mismatch,
+            wrong role tag, symlink, non-regular file, wrong `st_dev`, or corruption). Finally call
+            `fsync(dir_fd)`.
+          - Lock `openmettle.storage_instance FOR UPDATE` as `openmettle_owner`: if `volume_id IS
+            NULL`, set `volume_id = sentinel_uuid, bootstrap_auto_pin_allowed = false`; if
+            `volume_id = sentinel_uuid`, succeed idempotently as a no-op; if `volume_id <>
+            sentinel_uuid`, fail closed (`ERRCODE = 'OMQ03'`).
      - **Fail-closed verification once pinned (`storage_instance.volume_id IS NOT NULL`):** Once
        `storage_instance.volume_id` is non-null in PostgreSQL, `Store::open` and **every** worker
        cleaner — explicitly including **`artifact_fs::purge_due`**, `artifact_fs::reconcile_expired`,
        run-linked `ENOENT` storage recovery and `staging/` `ReadDir` cleanup — **MUST refuse to
        initialize a fresh sentinel** (and must not accept a newly created or empty replacement
-       directory) and **MUST verify** that: (a) `<root>/.openmettle-volume-id` exists as a regular
-       file opened with `O_RDONLY | O_NOFOLLOW` and matches non-null `storage_instance.volume_id`,
-       and (b) its `fstat` device ID (`st_dev`) equals the exact `st_dev` of both the open
-       `<root>/revisions` (`O_RDONLY | O_DIRECTORY | O_NOFOLLOW`) and `<root>/staging` (`O_RDONLY |
-       O_DIRECTORY | O_NOFOLLOW`) directory file descriptors before unlinking relative to the
-       verified directory FD or committing `begin_purge` / `confirm_purge` / `storage::release`. If
-       the sentinel is missing, unreadable, symlinked/non-regular, mismatched or on a different
-       `st_dev`, startup and all cleaners **fail closed immediately** with **zero released holds
-       and zero confirmed purges**.
+       directory) and **MUST verify BEFORE touching any payload path or mutating PostgreSQL** that:
+       (a) `<root>`, `revisions_dir_fd` (`<root>/revisions`), and `staging_dir_fd`
+       (`<root>/staging`) all open with `O_RDONLY | O_DIRECTORY | O_NOFOLLOW` and share the exact
+       same `st_dev`, and (b) `.openmettle-volume-id` opened via `openat(..., O_RDONLY |
+       O_NOFOLLOW)` on **each** of `<root>`, `revisions_dir_fd`, and `staging_dir_fd` is a regular
+       file on that exact same `st_dev` containing non-null pinned `storage_instance.volume_id`
+       paired with its exact `:root`, `:revisions`, or `:staging` role tag. All subsequent
+       `fstatat`/`unlinkat` calls execute strictly relative to those verified `revisions_dir_fd`
+       and `staging_dir_fd` descriptors. If any of the three sentinels is missing, unreadable,
+       symlinked/non-regular, wrong-role, mismatched, or on a different `st_dev` (including if only
+       `<root>/revisions` or `<root>/staging` was replaced or swapped on the same filesystem),
+       startup and all cleaners **fail closed immediately** with **zero unlinked files, zero
+       released holds, and zero confirmed purges**.
    - *Non-run uploads (`run_id IS NULL`) and retention purges (`artifact_fs::purge_due`):*
      Non-run uploads continue through `artifact_fs::reconcile_expired` and retention purges
      continue through `artifact_fs::purge_due` — **both** requiring configured
-     `OPENMETTLE_WORKER_ARTIFACTS_DIR` and verified non-null pinned volume sentinel + `st_dev`
-     identity across `<root>/.openmettle-volume-id`, `<root>/revisions` and `<root>/staging` before
-     unlinking relative to the verified directory FD or committing `storage::release`,
-     `storage::begin_purge` or `storage::confirm_purge`. `reconcile_expired` honors
-     `coalesce(lease_expires_at, created_at + interval '900 seconds') <= clock_timestamp()`,
-     locking one reservation `FOR UPDATE SKIP LOCKED` per transaction while unlinking its
-     unsettled staging/upload paths relative to the verified FD before `storage::release`.
+     `OPENMETTLE_WORKER_ARTIFACTS_DIR` and verified non-null pinned volume identity across all
+     three role-tagged `.openmettle-volume-id` sentinels (`<root>` `:root`, `<root>/revisions`
+     `:revisions`, `<root>/staging` `:staging`) and open directory FDs sharing equal `st_dev`
+     **before** any `fstatat`/`unlinkat` relative to the verified `revisions_dir_fd` /
+     `staging_dir_fd` or any `storage::release`, `storage::begin_purge`, or `storage::confirm_purge`
+     call. `reconcile_expired` honors `coalesce(lease_expires_at, created_at + interval '900
+     seconds') <= clock_timestamp()`, locking one reservation `FOR UPDATE SKIP LOCKED` per
+     transaction while unlinking its unsettled staging/upload paths relative to the verified FDs
+     before `storage::release`.
    - *Run-linked storage holds (`run_id IS NOT NULL`):* Requires configured
      `OPENMETTLE_WORKER_ARTIFACTS_DIR` (`ARTIFACTS_DIR`, `artifact_fs::Store`) with verified
-     non-null pinned `storage_instance.volume_id` sentinel identity. If `ARTIFACTS_DIR` is
-     unavailable, unset, `storage_instance.volume_id IS NULL`, or sentinel/`st_dev` verification
-     fails, run-linked storage recovery **MUST NOT** call `storage::release` and skips this phase
-     without mutating any reservation. Otherwise, scan
-     candidates with `state = 'reserved'`, filtered **before `LIMIT`** for terminal linked runs,
-     zero `intent`/`outcome_unknown` operations and expired `lease_expires_at` (or legacy
+     non-null pinned `storage_instance.volume_id` and all three role-tagged directory sentinels. If
+     `ARTIFACTS_DIR` is unavailable, unset, `storage_instance.volume_id IS NULL`, or
+     sentinel/`st_dev` verification fails, run-linked storage recovery **MUST NOT** unlink any file
+     or call `storage::release` and skips this phase without mutating any reservation. Otherwise,
+     scan candidates with `state = 'reserved'`, filtered **before `LIMIT`** for terminal linked
+     runs, zero `intent`/`outcome_unknown` operations and expired `lease_expires_at` (or legacy
      `lease_expires_at IS NULL` meeting the terminal-run grace rule above), using the same
      bounded-pass cursor `(coalesce(lease_expires_at, created_at), id) > last_attempted AND
      (coalesce(lease_expires_at, created_at), id) <= pass_upper_bound ORDER BY
@@ -1335,23 +1470,25 @@ candidate scanning from **one-reservation-per-transaction** settlement:
         LOCKED`). If either row is contended, skip immediately without blocking.
      2. Re-verify under lock that `state = 'reserved'`, expiry holds, the run is terminal (no
         active worker lease) and zero linked operations are in `('intent', 'outcome_unknown')`.
-     3. Verify the pinned volume sentinel, live `revisions/` and `staging/` directory handles and
-        inspect leaf `<id>` relative to `revisions/`:
+     3. Verify the pinned volume identity across `<root>`, `revisions_dir_fd`, and
+        `staging_dir_fd` and inspect leaf `<id>` relative to `revisions_dir_fd`:
         - **Fail-closed volume sentinel and `revisions/` verification:** Before inspecting leaf
-          `<id>`, recovery MUST open `<root>/.openmettle-volume-id` (`O_RDONLY | O_NOFOLLOW`),
-          `<root>/revisions` (`O_RDONLY | O_DIRECTORY | O_NOFOLLOW`) and `<root>/staging`
-          (`O_RDONLY | O_DIRECTORY | O_NOFOLLOW`), verify that the sentinel matches non-null
-          `storage_instance.volume_id` and that all three FDs share the exact same `st_dev`. Any
-          error, `volume_id IS NULL`, missing/unmounted directory, missing/mismatched sentinel or
-          `st_dev` mismatch **fails closed immediately** with zero released holds.
+          `<id>`, recovery MUST open `<root>`, `revisions_dir_fd` (`<root>/revisions`), and
+          `staging_dir_fd` (`<root>/staging`) with `O_RDONLY | O_DIRECTORY | O_NOFOLLOW`, verify
+          all three share the exact same `st_dev`, and verify via `openat(..., O_RDONLY |
+          O_NOFOLLOW)` on each of the three directory FDs that `.openmettle-volume-id` is a regular
+          file on that same `st_dev` matching non-null `storage_instance.volume_id` and its exact
+          `:root`, `:revisions`, or `:staging` role tag. Any error, `volume_id IS NULL`,
+          missing/unmounted directory, missing/mismatched/wrong-role sentinel or `st_dev` mismatch
+          **fails closed immediately** with zero unlinks and zero released holds.
         - **Directory-relative `ENOENT` proof required before release:** Perform the leaf `<id>`
-          lookup relative to that verified `revisions/` directory handle (`openat` / `fstatat`
-          with `AT_SYMLINK_NOFOLLOW`). Only when the volume sentinel + `st_dev` verification
+          lookup relative to that verified `revisions_dir_fd` (`openat` / `fstatat` with
+          `AT_SYMLINK_NOFOLLOW`). Only when the three-directory sentinel + `st_dev` verification
           succeeds AND that directory-relative probe returns `ENOENT` (confirming atomic rename
           `staging/<id> -> revisions/<id>` never occurred on the pinned mounted volume and no
           published bytes still owe SQL settlement) may recovery execute and **commit
           `storage::release`** (or confirm `state = 'released'`), and then — only after commit —
-          unlink `staging/<id>` relative to the verified `staging/` FD if present.
+          unlink `staging/<id>` relative to the verified `staging_dir_fd` if present.
         - **Post-rename, pre-settlement crash window (`revisions/<id>` present):** If leaf `<id>`
           exists inside `revisions/` while `storage_reservations.state = 'reserved'` (or if the
           directory-relative probe returns any error other than `ENOENT`), recovery **MUST NOT**
@@ -1363,7 +1500,8 @@ candidate scanning from **one-reservation-per-transaction** settlement:
           into `artifact_revisions` or explicit `openmettle_owner` reconciliation settles or
           purges it.
    - *Retryable `staging/` cleanup after post-release crashes (persistent `StagingSweepState` across
-     `worker::sweep`'s 15 s outer `tokio::time::timeout`):*
+     `worker::sweep`'s 15 s outer `tokio::time::timeout`, retaining open `dir_fd` through EOF
+     drain):*
      Because a worker may crash after committing `storage::release` (`state = 'released'`) and
      before unlinking `staging/<id>`, a sweep querying only `state = 'reserved'` would skip that
      `released` row permanently and leave an orphan `staging/<id>` file that fails
@@ -1375,66 +1513,82 @@ candidate scanning from **one-reservation-per-transaction** settlement:
      locally owned `JoinHandle` would be dropped when `timeout` cancels the future, discarding both
      the `ReadDir` handle and its returned entries (forcing restart from entry 0 or leaking
      overlapping `spawn_blocking` readers — because `JoinHandle::drop` detaches running blocking
-     work rather than cancelling it). On startup recovery and during bounded worker storage sweeps,
-     `worker::maintenance` therefore holds a persistent **`StagingSweepState`** across `SWEEP_MS`
-     ticks **outside** the per-tick `tokio::time::timeout` future, with five explicit states —
-     **`Idle`**, **`Open { dir_dev, dir_ino, reader }`**, **`InFlight { dir_dev, dir_ino, handle
-     }`**, **`InvalidatedInFlight { handle }`**, and **`DrainingEof { dir_dev, dir_ino }`** (where
-     `handle` is the sole `JoinHandle<io::Result<(ReadDir, Vec<String>, bool)>>`) — plus a
-     **`VecDeque<String>` of undrained `pending_names`**:
-     - At the start of each tick, verify `<root>/.openmettle-volume-id`, `<root>/revisions`, and
-       `<root>/staging` (`O_NOFOLLOW`), confirming non-null pinned `storage_instance.volume_id` and
-       `st_dev` equality across all three, and inspect `<root>/staging`'s live `(cur_dev,
-       cur_ino)`:
+     work rather than cancelling it). Furthermore, dropping the last open FD on `<root>/staging`
+     when transitioning to `DrainingEof` would allow the filesystem to free and reuse `dir_ino` for
+     a freshly recreated `<root>/staging` directory before the next tick! On startup recovery and
+     during bounded worker storage sweeps, `worker::maintenance` therefore holds a persistent
+     **`StagingSweepState`** across `SWEEP_MS` ticks **outside** the per-tick `tokio::time::timeout`
+     future, carrying an open directory descriptor (`dir_fd: OwnedFd` / `std::fs::File` opened with
+     `O_RDONLY | O_DIRECTORY | O_NOFOLLOW` on the verified `<root>/staging` directory) across all
+     active states — **`Idle`**, **`Open { dir_fd, dir_dev, dir_ino, reader }`**, **`InFlight {
+     dir_fd, dir_dev, dir_ino, handle }`**, **`InvalidatedInFlight { handle }`**, and
+     **`DrainingEof { dir_fd, dir_dev, dir_ino }`** (where `handle` is the sole
+     `JoinHandle<io::Result<(ReadDir, Vec<String>, bool)>>` returning only canonical lowercase UUID
+     names and ignoring `.openmettle-volume-id*`) — plus a **`VecDeque<String>` of undrained
+     `pending_names`**, dropping `dir_fd` **only when `pending_names.is_empty()` and the state
+     transitions to `Idle` (or when invalidated into `InvalidatedInFlight` / `Idle` after clearing
+     `pending_names`)**:
+     - At the start of each tick, open `<root>`, `<root>/revisions`, and `<root>/staging`
+       (`O_RDONLY | O_DIRECTORY | O_NOFOLLOW`), verify non-null pinned `storage_instance.volume_id`,
+       equal `st_dev` across all three FDs, and valid role-tagged `.openmettle-volume-id` sentinels
+       (`:root`, `:revisions`, `:staging` via `openat(..., O_RDONLY | O_NOFOLLOW)` on each FD), and
+       inspect `<root>/staging`'s live `(cur_dev, cur_ino)`:
        - *If volume sentinel/`st_dev` verification fails:* clear `pending_names` with zero unlinks;
-         if `StagingSweepState` is `InFlight { handle, .. }`, transition to **`InvalidatedInFlight
-         { handle }`** (never dropping the running `handle` into `Idle`); if `Open` or
-         `DrainingEof`, transition to `Idle`; and fail closed for the tick without spawning any new
-         reader.
-       - *If `(cur_dev, cur_ino)` changed against parked `Open { dir_dev, dir_ino, .. }`, `InFlight
-         { dir_dev, dir_ino, handle }`, or `DrainingEof { dir_dev, dir_ino }`:* clear
-         `pending_names` with zero unlinks; transition `Open` or `DrainingEof` to `Idle`; and
-         transition `InFlight { handle, .. }` to **`InvalidatedInFlight { handle }`** (never `Idle`
-         — preserving the single-reader guarantee even across directory replacement and 15 s tick
-         timeouts!).
+         if `StagingSweepState` is `InFlight { handle, .. }`, drop `dir_fd` and transition to
+         **`InvalidatedInFlight { handle }`** (never dropping the running `handle` into `Idle`); if
+         `Open` or `DrainingEof`, drop `dir_fd` and transition to `Idle`; and fail closed for the
+         tick without spawning any new reader.
+       - *If `(cur_dev, cur_ino)` changed against parked `Open { dir_fd, dir_dev, dir_ino, .. }`,
+         `InFlight { dir_fd, dir_dev, dir_ino, handle }`, or `DrainingEof { dir_fd, dir_dev,
+         dir_ino }`:* clear `pending_names` with zero unlinks; drop `dir_fd` and transition `Open`
+         or `DrainingEof` to `Idle`; and drop `dir_fd` while transitioning `InFlight { handle, ..
+         }` to **`InvalidatedInFlight { handle }`** (never `Idle` — preserving the single-reader
+         guarantee even across directory replacement and 15 s tick timeouts!). Because `dir_fd`
+         remained open across `Open`, `InFlight`, and `DrainingEof`, removing and recreating
+         `<root>/staging` on the same filesystem cannot reuse `dir_ino` while `pending_names` is
+         non-empty.
      - If `StagingSweepState` is **`InvalidatedInFlight { handle }`**, **await `&mut handle` until
        the blocking slice finishes** (if it exceeds this tick's 15 s `timeout`,
        `InvalidatedInFlight { handle }` stays parked and zero new readers may start), **discard its
        returned `ReadDir` and names without touching `pending_names` or unlinking anything, and
        ONLY THEN transition to `Idle`**.
-     - If `StagingSweepState` is **`InFlight { dir_dev, dir_ino, handle }`** (with verified
+     - If `StagingSweepState` is **`InFlight { dir_fd, dir_dev, dir_ino, handle }`** (with verified
        matching `(cur_dev, cur_ino) == (dir_dev, dir_ino)`), **first await the parked `&mut
        handle`** (never spawning a second concurrent `ReadDir` task; if the wedged slice exceeds
-       this tick's 15 s `timeout` again, `InFlight` remains parked in `StagingSweepState`). When
-       `handle` resolves, append its returned canonical UUIDs to `pending_names` and transition to
-       `Open { dir_dev, dir_ino, reader }` when `eof == false`, or drop `reader` and transition to
-       **`DrainingEof { dir_dev, dir_ino }`** when `eof == true` (never directly to `Idle`, so the
-       originating `(dir_dev, dir_ino)` stays pinned to any remaining `pending_names` across tick
-       boundaries!).
+       this tick's 15 s `timeout` again, `InFlight` remains parked in `StagingSweepState` holding
+       `dir_fd`). When `handle` resolves, append its returned canonical UUIDs to `pending_names`
+       and transition to `Open { dir_fd, dir_dev, dir_ino, reader }` when `eof == false`, or drop
+       `reader` while **retaining `dir_fd`** and transition to **`DrainingEof { dir_fd, dir_dev,
+       dir_ino }`** when `eof == true` (never dropping `dir_fd` or transitioning directly to `Idle`
+       while `pending_names` is non-empty, so `dir_ino` cannot be reused across tick boundaries!).
      - Drain `pending_names` in bounded batches against `openmettle.storage_reservations` (`WHERE
        id = ANY($1)`) **exactly once** (popping entries only as processed, checking `Instant::now()
-       < sweep_deadline` and `inspected_entries < batch_size`), idempotently unlinking
-       `staging/<id>` relative to the verified `staging/` FD whenever the matching row is already
-       `state = 'released'` (or `state = 'settled'`), or whenever no `storage_reservations` row
-       exists and the file exceeds the `900 s` staging grace window (or during startup recovery).
-       Never unlink a `staging/<id>` file whose `storage_reservations` row is still `state =
-       'reserved'` outside the verified `reconcile_expired` / run-linked release path above.
-       When `StagingSweepState` is **`DrainingEof { dir_dev, dir_ino }`**, transition to `Idle`
+       < sweep_deadline` and `inspected_entries < batch_size`), idempotently executing `unlinkat`
+       for `staging/<id>` **strictly relative to the retained verified `dir_fd`** (after confirming
+       `<root>/staging` (`O_NOFOLLOW`) still has `(cur_dev, cur_ino) == (dir_dev, dir_ino)` and
+       valid `"<volume_uuid>:staging\n"`) whenever the matching row is already `state = 'released'`
+       (or `state = 'settled'`), or whenever no `storage_reservations` row exists and the file
+       exceeds the `900 s` staging grace window (or during startup recovery). Never unlink a
+       `staging/<id>` file whose `storage_reservations` row is still `state = 'reserved'` outside
+       the verified `reconcile_expired` / run-linked release path above. When `StagingSweepState`
+       is **`DrainingEof { dir_fd, dir_dev, dir_ino }`**, drop `dir_fd` and transition to `Idle`
        **only once `pending_names.is_empty()`** (if budget is exhausted mid-drain, keep
-       `DrainingEof { dir_dev, dir_ino }` parked so the next tick re-verifies `(cur_dev, cur_ino)
-       == (dir_dev, dir_ino)` before draining the remaining names).
+       `DrainingEof { dir_fd, dir_dev, dir_ino }` parked holding `dir_fd` so the next tick
+       re-verifies `(cur_dev, cur_ino) == (dir_dev, dir_ino)` and valid `:staging` sentinel before
+       draining the remaining names).
      - Only once `pending_names` is empty, `StagingSweepState` is `Idle` or `Open`, and budget
        remains (`Instant::now() < sweep_deadline` and `inspected_entries < batch_size`), open a
-       fresh `ReadDir` stream if `Idle` and **transition `StagingSweepState` from `Open { dir_dev,
-       dir_ino, reader }` to `InFlight { dir_dev, dir_ino, handle }` before awaiting** the single
+       verified `dir_fd` (`O_RDONLY | O_DIRECTORY | O_NOFOLLOW`) plus a fresh `ReadDir` stream if
+       `Idle` and **transition `StagingSweepState` from `Open { dir_fd, dir_dev, dir_ino, reader }`
+       to `InFlight { dir_fd, dir_dev, dir_ino, handle }` before awaiting** the single
        `spawn_blocking` slice (at most `64` directory entries), so any 15 s `tokio::time::timeout`
-       cancellation mid-slice leaves `InFlight` parked for the next tick rather than dropping the
-       `ReadDir` stream or entries.
+       cancellation mid-slice leaves `InFlight` (and its open `dir_fd`) parked for the next tick
+       rather than dropping the `ReadDir` stream or entries.
      - Stop the tick as soon as `Instant::now() >= sweep_deadline` (15 s budget) or
-       `inspected_entries >= batch_size`, `fsync`ing `staging/` after any unlinks while preserving
+       `inspected_entries >= batch_size`, `fsync`ing `dir_fd` after any unlinks while preserving
        `StagingSweepState` (`Open`, `InFlight`, `InvalidatedInFlight`, `DrainingEof`, and any
        remaining `pending_names`) across ticks. When `DrainingEof` finishes draining
-       (`pending_names.is_empty()`), `fsync` `staging/` after any unlinks and leave
+       (`pending_names.is_empty()`), `fsync` `dir_fd` after any unlinks, drop `dir_fd`, and leave
        `StagingSweepState` in `Idle` so a subsequent tick starts the next pass.
 3. **Overdue post-handoff visibility.** A separate read-only bounded query counts
    `quota_reservations` in `state = 'handoff_committed'` with `lease_expires_at <=
@@ -1459,46 +1613,51 @@ Because PostgreSQL 18 requires `UPDATE` privilege to execute `SELECT ... FOR NO 
 either; all `quota_*` row locking and writes (as well as `quota_cost_unit_lock` locking inside the
 `gateway_usage_reports_cost_unit_guard` trigger, gateway-binding verification inside
 `quota_reservations_gateway_binding_guard`, commit-time handoff hold verification,
-`quota_enforcement FOR SHARE` locking and `quota_gateway_handoffs` recording inside
-`quota_enforce_gateway_handoff_holds` / `enforce_gateway_handoff_holds()`, unpinned worker storage
-guarding inside `enforce_worker_storage_volume_pinned()`, and empty-ledger-only
-`storage_instance.volume_id` bootstrapping) run strictly inside narrow `openmettle_owner`-owned
-`SECURITY DEFINER` functions with `SET search_path = pg_catalog`, schema-qualified relations,
-`REVOKE ALL ON FUNCTION ... FROM PUBLIC` and exact `oid::regprocedure` signatures audited in
-`src/boundaries.sql` (following [ADR 0030](0030-session-issuance-database-boundary.md) and
-ADR 0037). Neither `openmettle_api` nor `openmettle_worker` receives direct `SELECT` privileges on
-Migration `0023`'s `openmettle.gateway_requests` or `openmettle.gateway_usage_reports` (or other
-gateway tables): lost commit-ack handoff recovery runs solely through
-`openmettle.quota_recover_lost_handoff(...)`, fenced successor-worker superseded-round unwind runs
-solely through `openmettle.quota_unwind_superseded_round(...)`, pre-upgrade orphan `'reserved'`
-gateway sweep runs solely through `openmettle.quota_release_orphan_gateway_requests(...)`, and SQL
-drift verification runs solely through `openmettle.quota_verify_accounting_drift()`.
+`quota_gateway_handoffs` recording before `quota_enforcement FOR SHARE` locking inside
+`quota_enforce_gateway_handoff_holds` / `enforce_gateway_handoff_holds()`, PostgreSQL ledger
+backstop guarding for unpinned worker storage mutations inside
+`enforce_worker_storage_volume_pinned()`, lazy legacy-run parent hold initialization inside
+`quota_ensure_legacy_run_holds()`, and fresh-bootstrap-only `storage_instance.volume_id`
+auto-pinning) run strictly inside narrow `openmettle_owner`-owned `SECURITY DEFINER` functions
+with `SET search_path = pg_catalog`, schema-qualified relations, `REVOKE ALL ON FUNCTION ... FROM
+PUBLIC` and exact `oid::regprocedure` signatures audited in `src/boundaries.sql` (following
+[ADR 0030](0030-session-issuance-database-boundary.md) and ADR 0037). Neither `openmettle_api` nor
+`openmettle_worker` receives direct `SELECT` privileges on Migration `0023`'s
+`openmettle.gateway_requests` or `openmettle.gateway_usage_reports` (or other gateway tables):
+lost commit-ack handoff recovery runs solely through `openmettle.quota_recover_lost_handoff(...)`,
+lazy legacy-run parent hold backfill runs solely through
+`openmettle.quota_ensure_legacy_run_holds(...)`, fenced successor-worker superseded-round unwind
+runs solely through `openmettle.quota_unwind_superseded_round(...)`, pre-upgrade orphan
+`'reserved'` gateway sweep runs solely through
+`openmettle.quota_release_orphan_gateway_requests(...)`, and SQL drift verification runs solely
+through `openmettle.quota_verify_accounting_drift()`.
 
 | Object or `SECURITY DEFINER` entrypoint | `openmettle_api` | `openmettle_worker` | `openmettle_gateway` (Migration `0023`) | `openmettle_issuance` (ADR 0030) |
 | --- | --- | --- | --- | --- |
 | `quota_defaults` | `SELECT` only | `SELECT` only | `SELECT` only | None |
 | `quota_cost_unit_lock` | None | None | None (locked internally by `SECURITY DEFINER` trigger `enforce_gateway_report_cost_unit()`) | None |
 | `quota_enforcement` | `SELECT` only | `SELECT` only | `SELECT` only | None |
-| `quota_gateway_handoffs` | None (written at `COMMIT` by `SECURITY DEFINER` `enforce_gateway_handoff_holds()`; read internally by `SECURITY DEFINER` `quota_recover_lost_handoff()`) | None (same, plus `quota_verify_accounting_drift()`) | None | None |
+| `quota_gateway_handoffs` | None (written at `COMMIT` by `SECURITY DEFINER` `enforce_gateway_handoff_holds()` before locking `quota_enforcement FOR SHARE`; read internally by `SECURITY DEFINER` `quota_recover_lost_handoff()`) | None (same, plus `quota_verify_accounting_drift()`) | None | None |
 | `quota_overrides` | `SELECT` only | `SELECT` only | `SELECT` only | None |
 | `quota_budgets`, `quota_reservations`, `quota_reservation_charges`, `quota_reconciliations`, `quota_warning_events` | `SELECT` only | `SELECT` only | `SELECT` only | None |
-| `openmettle.storage_pin_volume_id(uuid)` | `EXECUTE` (locks `storage_instance FOR UPDATE`; permits write-once `volume_id` pinning **only** while `volume_id IS NULL` AND BOTH `NOT EXISTS (SELECT 1 FROM openmettle.storage_reservations)` AND `NOT EXISTS (SELECT 1 FROM openmettle.artifact_revisions)`, refusing populated upgrades with `OMQ03`; never modifies or clears a non-null `volume_id`) | `EXECUTE` (same) | None | None |
+| `openmettle.storage_pin_volume_id(uuid)` | `EXECUTE` (locks `storage_instance FOR UPDATE`; permits write-once `volume_id` auto-pinning **only** while `volume_id IS NULL AND bootstrap_auto_pin_allowed = true` AND BOTH `NOT EXISTS (SELECT 1 FROM openmettle.storage_reservations)` AND `NOT EXISTS (SELECT 1 FROM openmettle.artifact_revisions)`, atomically setting `volume_id = p_volume_id` and clearing `bootstrap_auto_pin_allowed = false`; refuses every upgraded deployment (`bootstrap_auto_pin_allowed = false`, even with empty storage tables) and every populated ledger with `OMQ03`; never modifies or clears a non-null `volume_id`) | `EXECUTE` (same) | None | None |
 | `openmettle.quota_upsert_scope_override(...)` and `openmettle.quota_revoke_scope_override(...)` | `EXECUTE` (validates caller role & scope/kind/bounds invariants, requiring `('instance', 'usage_cost_micros').cost_denomination IS NOT NULL` for `usage_cost_micros`; locks `run_dispatch_lock` for `executing_runs_*`, `projects`/`users`, and `storage_accounts` or active `quota_budgets` in canonical order; upserts/revokes `quota_overrides` and increments `revision` to re-arm warning watermarks) | None | None | None |
 | `openmettle.quota_reserve(...)` | `EXECUTE` (tags `origin_role = 'api'`; when `gateway_request_id IS NOT NULL`, executes in the same `WriteTransaction` as `authz::gateway::reserve_in`, verifying `gateway_requests` ownership `(scope_id, actor_user_id, run_id IS NULL)`, `state = 'reserved'`, and 32-byte `p_dispatch` matching `dispatch_hash = sha256(p_dispatch)` reinforced by `quota_reservations_gateway_binding_guard`; locks `quota_budgets` internally and records `quota_warning_events`) | `EXECUTE` (tags `origin_role = 'worker'`; locks `quota_budgets` internally and records `quota_warning_events`) | None | None |
-| `openmettle.quota_allocate_round(...)` | None | `EXECUTE` (executes in the same `WriteTransaction` as `authz::gateway::reserve_in`; verifies active `Step` lease on `runs`, `'reserved'` `gateway_requests` row matching `(scope_id, actor_user_id, run_id)`, and 32-byte `p_dispatch` matching `dispatch_hash = sha256(p_dispatch)` reinforced by `quota_reservations_gateway_binding_guard`; creates child `quota_reservations` row in `state = 'held'` with `allocating_claim_token = p_claim_token` via parent-to-child slice transfer with zero net budget debit) | None | None |
-| `openmettle.quota_commit_handoff(...)` | `EXECUTE` (own `origin_role = 'api'` standalone `run_id IS NULL` `held` rows only; requires `gateway_requests.state = 'handed_off'` from `authz::gateway::handoff_in` / `openmettle.gateway_handoff` in the same tx for metered usage holds, verified at `COMMIT` by deferred `quota_enforce_gateway_handoff_holds` locking `quota_enforcement FOR SHARE` and recording `quota_gateway_handoffs`; **explicitly rejects all run-linked `device_reservations` holds (`run_id IS NOT NULL`, SQLSTATE `42501`)**) | `EXECUTE` (own `origin_role = 'worker'` `held` rows only, including run-round metered usage holds requiring `gateway_requests.state = 'handed_off'` from `authz::gateway::handoff_in` / `openmettle.gateway_handoff` in the same tx, verified at `COMMIT` by deferred `quota_enforce_gateway_handoff_holds` locking `quota_enforcement FOR SHARE` and recording `quota_gateway_handoffs`; **explicitly rejects all run-linked `device_reservations` holds (`run_id IS NOT NULL`, SQLSTATE `42501`)**) | None | None |
-| `openmettle.quota_recover_lost_handoff(uuid, bytea, uuid, uuid, uuid)` (`RETURNS text`) | `EXECUTE` (`p_run_id IS NULL` only; verifies `pg_has_role(session_user, 'openmettle_api', 'USAGE')`, `octet_length(p_dispatch) = 32`, and matching `gateway_requests` `(id, dispatch_hash = sha256(p_dispatch), scope_id, actor_user_id, run_id)`; locks `(runs ->) gateway_reservations -> gateway_requests -> (parent ->) quota_reservations -> quota_budgets` in canonical `FOR NO KEY UPDATE` order; on `'handed_off'`, reads recorded handoff-time obligations from `quota_gateway_handoffs` (`COALESCE(metering_enforced, false)`, `COALESCE(cost_required, false)`), asserts zero bound holds have `qr.state NOT IN ('handoff_committed', 'settled', 'written_off')` (`OMQ04` on `'held'`/`'released'`), evaluates required hold presence against `handoff.metering_enforced` / `handoff.cost_required` (NOT live `quota_enforcement` or `quota_defaults`), and returns `'handoff_committed'` (including when bound holds already settled to `'settled'` or `'written_off'`) or `'unmetered_legacy_handoff'` (when `handoff.metering_enforced = false` and zero bound holds exist, even after live activation, keeping HTTP dispatch suppressed); otherwise atomically unwinds `'reserved'`/`'released'` request and bound `'held'` holds returning `'unwound_unsent'`) | `EXECUTE` (`p_run_id IS NOT NULL` only; verifies `pg_has_role(session_user, 'openmettle_worker', 'USAGE')`, `octet_length(p_dispatch) = 32`, and matching `gateway_requests`; same canonical locking, `quota_gateway_handoffs` obligation validation, `'settled'`/`'written_off'` recognition, and `'handoff_committed'` / `'unmetered_legacy_handoff'` / `'unwound_unsent'` resolution returning round capacity to an active `'held'` parent or restoring `quota_budgets` on terminal runs) | None | None |
-| `openmettle.quota_unwind_superseded_round(uuid, uuid, uuid, integer)` (`RETURNS boolean`) | None | `EXECUTE` (lease-generation-fenced successor-worker unwind for a predecessor's crashed post-commit `'reserved'` round; locks `runs -> gateway_reservations -> active gateway_requests (q) -> parent & child quota_reservations` (`FOR NO KEY UPDATE`), verifies current live lease `r.claim_token = p_claim_token AND r.state IN ('running', 'cancelling', 'reconciling') AND r.lease_expires_at > clock_timestamp()`, returns `false` without mutating if `EXISTS` any bound hold with `allocating_claim_token = p_claim_token` so replay never unwinds the successor's own replacement request, and otherwise transitions `'reserved'` `gateway_requests` to `'released'`, restores `gateway_reservations.allocated`, and releases bound `'held'` child holds back to active `'held'` parent holds returning `true`, leaving `'handed_off'` untouched returning `false`) | None | None |
+| `openmettle.quota_ensure_legacy_run_holds(...)` | None | `EXECUTE` (lazy, idempotent once-per-run parent hold backfill for a live leased `N-1`-admitted run `(scope_id, run_id)` that lacks run-level parent `quota_reservations` holds; acquires locks in canonical `runs` (`FOR NO KEY UPDATE`, verifying active `Step` lease) -> `gateway_reservations` (`FOR SHARE`, reading remaining unallocated admission budget `max_units - allocated`) -> charged `quota_budgets` (`FOR NO KEY UPDATE`) order before locking any `quota_reservations` row; inserts missing run-level parent hold(s) (`usage_tokens` for `max_units - allocated` plus applicable `usage_cost_micros` ceiling, `origin_role = 'worker'`, deterministic idempotency key `("legacy-run-parent", run_id, resource_kind)`), enforcing active `quota_budgets` hard limits (`OMQ01`) and returning immediately on retries/subsequent rounds once present) | None | None |
+| `openmettle.quota_allocate_round(...)` | None | `EXECUTE` (executes in the same `WriteTransaction` as `authz::gateway::reserve_in`; on an `N-1`-admitted run lacking a run-level parent hold, invokes `quota_ensure_legacy_run_holds(...)` before locking any `quota_reservations` row so canonical lock order is preserved; verifies active `Step` lease on `runs`, `'reserved'` `gateway_requests` row matching `(scope_id, actor_user_id, run_id)`, and 32-byte `p_dispatch` matching `dispatch_hash = sha256(p_dispatch)` reinforced by `quota_reservations_gateway_binding_guard`; creates child `quota_reservations` row in `state = 'held'` with `allocating_claim_token = p_claim_token` via parent-to-child slice transfer with zero net budget debit) | None | None |
+| `openmettle.quota_commit_handoff(...)` | `EXECUTE` (own `origin_role = 'api'` standalone `run_id IS NULL` `held` rows only; requires `gateway_requests.state = 'handed_off'` from `authz::gateway::handoff_in` / `openmettle.gateway_handoff` in the same tx for metered usage holds, verified at `COMMIT` by deferred `quota_enforce_gateway_handoff_holds` inserting `quota_gateway_handoffs` first and then locking `quota_enforcement FOR SHARE` as the final lock; **explicitly rejects all run-linked `device_reservations` holds (`run_id IS NOT NULL`, SQLSTATE `42501`)**) | `EXECUTE` (own `origin_role = 'worker'` `held` rows only, including run-round metered usage holds requiring `gateway_requests.state = 'handed_off'` from `authz::gateway::handoff_in` / `openmettle.gateway_handoff` in the same tx, verified at `COMMIT` by deferred `quota_enforce_gateway_handoff_holds` inserting `quota_gateway_handoffs` first and then locking `quota_enforcement FOR SHARE` as the final lock; **explicitly rejects all run-linked `device_reservations` holds (`run_id IS NOT NULL`, SQLSTATE `42501`)**) | None | None |
+| `openmettle.quota_recover_lost_handoff(uuid, bytea, uuid, uuid, uuid)` (`RETURNS text`) | `EXECUTE` (`p_run_id IS NULL` only; verifies `pg_has_role(session_user, 'openmettle_api', 'USAGE')`, `octet_length(p_dispatch) = 32`, and matching `gateway_requests` `(id, dispatch_hash = sha256(p_dispatch), scope_id, actor_user_id, run_id)`; locks `(runs ->) gateway_reservations -> gateway_requests -> (parent ->) quota_reservations -> quota_budgets` in canonical `FOR NO KEY UPDATE` order; on `'handed_off'`, reads recorded handoff-time obligations from `quota_gateway_handoffs` (`COALESCE(metering_enforced, false)`, `COALESCE(cost_required, false)`), asserts zero bound holds have `qr.state NOT IN ('handoff_committed', 'settled')` (`OMQ04` on `'held'`/`'released'`), evaluates required hold presence against `handoff.metering_enforced` / `handoff.cost_required` (NOT live `quota_enforcement` or `quota_defaults`), and returns `'handoff_committed'` (including when bound holds already settled to `'settled'`) or `'unmetered_legacy_handoff'` (when `handoff.metering_enforced = false` and zero bound holds exist, even after live activation, keeping HTTP dispatch suppressed); otherwise atomically unwinds `'reserved'`/`'released'` request and bound `'held'` holds returning `'unwound_unsent'`) | `EXECUTE` (`p_run_id IS NOT NULL` only; verifies `pg_has_role(session_user, 'openmettle_worker', 'USAGE')`, `octet_length(p_dispatch) = 32`, and matching `gateway_requests`; same canonical locking, `quota_gateway_handoffs` obligation validation, `'settled'` recognition, and `'handoff_committed'` / `'unmetered_legacy_handoff'` / `'unwound_unsent'` resolution returning round capacity to an active `'held'` parent or restoring `quota_budgets` on terminal runs) | None | None |
+| `openmettle.quota_unwind_superseded_round(uuid, uuid, uuid, integer)` (`RETURNS boolean`) | None | `EXECUTE` (lease-generation-fenced successor-worker unwind for a predecessor's crashed post-commit `'reserved'` round — including an unbound `N-1` `'reserved'` round with zero bound child `quota_reservations` rows and no parent `quota_reservations` row yet; locks `runs -> gateway_reservations -> active gateway_requests (q) -> (if bound) parent & child quota_reservations` (`FOR NO KEY UPDATE`), verifies current live lease `r.claim_token = p_claim_token AND r.state IN ('running', 'cancelling', 'reconciling') AND r.lease_expires_at > clock_timestamp()`, returns `false` without mutating if `EXISTS` any bound hold with `allocating_claim_token = p_claim_token` so replay never unwinds the successor's own replacement request, and otherwise transitions `'reserved'` `gateway_requests` to `'released'`, restores `gateway_reservations.allocated`, and releases any bound `'held'` child holds back to active `'held'` parent holds returning `true`, leaving `'handed_off'` untouched returning `false`) | None | None |
 | `openmettle.quota_commit_device_handoff(...)` | None | `EXECUTE` (**sole** transition path for run-linked `device_reservations` holds; locks `runs -> quota_reservations` in canonical order; verifies active `Step` lease `runs.state = 'running'`, `runs.cancel_reason IS NULL`, matching `claim_token`, `lease_expires_at > clock_timestamp()`; transitions that run's `device_reservations` `held` row with `origin_role IN ('api', 'worker')` to `handoff_committed` bound to durable `device_grant_id`) | None | None |
 | `openmettle.quota_renew_lease(...)` | None | `EXECUTE` (`held` run-linked rows only, fenced to active run lease) | None | None |
 | `openmettle.quota_release_unsent(...)` | `EXECUTE` (own `origin_role = 'api'` `held` rows only; explicit pre-send unwind couples with `authz::gateway::release_in` / `openmettle.gateway_release` / requires `gateway_requests.state = 'released'` for gateway-bound holds; re-verifies `(q.scope_id, q.actor_user_id) = (qr.scope_id, qr.actor_user_id) AND q.run_id IS NOT DISTINCT FROM qr.run_id` under lock before mutating either ledger; locks internally and sets `closed_at`) | `EXECUTE` (own `origin_role = 'worker'` `held` or eligible stale/terminal-run `held` rows; explicit pre-send unwind couples with `authz::gateway::release_in` / `openmettle.gateway_release` / verifies `gateway_requests.state = 'released'` and returns round capacity to an active `held` parent or releases on terminal runs; sweep mode locks `(runs ->) gateway_reservations -> gateway_requests -> (parent ->) quota_reservations` with `FOR NO KEY UPDATE SKIP LOCKED`; **explicitly re-verifies `(q.scope_id, q.actor_user_id) = (qr.scope_id, qr.actor_user_id) AND q.run_id IS NOT DISTINCT FROM qr.run_id` under lock** raising an invariant error without mutating either ledger on mismatch; proceeds if `gateway_requests.state = 'released'`, **atomically transitions stale `'reserved'` `gateway_requests` to `'released'` and restores `gateway_reservations.allocated` in the same transaction** when expiry/terminal preconditions hold, leaves `'handed_off'` or locked rows untouched, and sets `closed_at`) | None | None |
-| `openmettle.quota_release_orphan_gateway_requests(interval, timestamptz, uuid, timestamptz, uuid, integer)` | None | `EXECUTE` (bounded defense-in-depth sweep capturing `v_age_cutoff := clock_timestamp() - p_max_reserved_age` once in PL/pgSQL, clamping `(v_upper_created_at, v_upper_id)` via `LEAST`, and materializing at most `p_page_size` raw `(created_at, id)` keys from `gateway_requests_reserved_idx` using only constant PL/pgSQL bounds — zero `clock_timestamp()` inside the `SELECT` — before testing `NOT EXISTS` bound `quota_reservations` and run-lease/terminal eligibility; locks `(runs ->) gateway_reservations -> gateway_requests` with `FOR NO KEY UPDATE SKIP LOCKED`, transitions `'reserved' -> 'released'`, restores `gateway_reservations.allocated`, and always advances the persistent cursor past inspected pages even on zero-orphan pages) | None | None |
+| `openmettle.quota_release_orphan_gateway_requests(interval, timestamptz, uuid, timestamptz, uuid, integer)` | None | `EXECUTE` (bounded defense-in-depth sweep capturing `v_age_cutoff := clock_timestamp() - p_max_reserved_age` once in PL/pgSQL, clamping scalar `v_upper_created_at` and `v_upper_id` via a PostgreSQL 18 `IF (p_pass_upper_created_at, p_pass_upper_id) <= (v_age_cutoff, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid) THEN ... ELSE ... END IF;` block, and materializing at most `p_page_size` raw `(created_at, id)` keys from `gateway_requests_reserved_idx` using only constant PL/pgSQL bounds — zero `clock_timestamp()` inside the `SELECT` — before testing `NOT EXISTS` bound `quota_reservations` and run-lease/terminal eligibility; locks `(runs ->) gateway_reservations -> gateway_requests` with `FOR NO KEY UPDATE SKIP LOCKED`, transitions `'reserved' -> 'released'`, restores `gateway_reservations.allocated`, and always advances the persistent cursor past inspected pages even on zero-orphan pages) | None | None |
 | `openmettle.quota_settle_gateway_usage(...)` | None | None | `EXECUTE` (`usage_tokens`/`usage_cost_micros` only; validates single `openmettle.gateway_usage_reports` row matching `(request_id, source, report_id, revision)` with `revision >= 0`, immutable `cost_denomination` vs `gateway_usage_reports.unit` and `accepted_source_revision IS NULL OR p_source_revision > accepted_source_revision`; persists `accepted_source_revision` atomically with composite-FK `quota_reconciliations` and records `quota_warning_events`) | None |
 | `openmettle.quota_release_device_slot(...)` | None | `EXECUTE` (`device_reservations` `handoff_committed` only; verifies durable V1-18 release/non-allocation record; sets `closed_at`) | None | None |
 | `openmettle.quota_record_storage_warning(...)` | `EXECUTE` (evaluates storage threshold crossing from locked `storage_accounts`/`storage_instance` and records deduplicated `quota_warning_events`) | `EXECUTE` (same) | None | None |
 | `openmettle.quota_verify_accounting_drift()` (`STABLE`) | None | `EXECUTE` (read-only aggregate/mismatch drift summaries across `storage_*`, `quota_*` and Migration `0023`'s `gateway_reservations`/`gateway_requests`/`gateway_usage_reports`/`gateway_settlements` without granting raw table `SELECT` on `gateway_usage_reports`; also callable by `openmettle_owner` during restore validation) | None | None |
-| `storage_reservations.lease_expires_at` | `INSERT`, `UPDATE` (with migration 4 grants) | `INSERT`, `UPDATE` (with migration 4 grants; `reserved -> released` guarded by `enforce_worker_storage_volume_pinned()` (`OMQ03`) while `volume_id IS NULL`) | None | None |
-| `storage_instance`, `storage_accounts`, `artifacts`, `artifact_revisions` | Existing migration 4 grants (`volume_id`, `warn_pct_*`, `config_revision` `SELECT` only) | Existing migration 4 grants (`volume_id`, `warn_pct_*`, `config_revision` `SELECT` only; `artifact_revisions` transitions to `'purging'`/`'purged'` guarded by `enforce_worker_storage_volume_pinned()` (`OMQ03`) while `volume_id IS NULL`) | None | None |
+| `storage_reservations.lease_expires_at` | `INSERT`, `UPDATE` (with migration 4 grants) | `INSERT`, `UPDATE` (with migration 4 grants; `reserved -> released` guarded by PostgreSQL ledger backstop `enforce_worker_storage_volume_pinned()` (`OMQ03`) while `volume_id IS NULL`) | None | None |
+| `storage_instance`, `storage_accounts`, `artifacts`, `artifact_revisions` | Existing migration 4 grants (`volume_id`, `bootstrap_auto_pin_allowed`, `warn_pct_*`, `config_revision` `SELECT` only) | Existing migration 4 grants (`volume_id`, `bootstrap_auto_pin_allowed`, `warn_pct_*`, `config_revision` `SELECT` only; `artifact_revisions` transitions to `'purging'`/`'purged'` guarded by PostgreSQL ledger backstop `enforce_worker_storage_volume_pinned()` (`OMQ03`) while `volume_id IS NULL`) | None | None |
 
 Only `openmettle_owner` writes `quota_defaults` (updating the migration-seeded `('instance',
 'usage_cost_micros')` row strictly via direct `UPDATE` — never `INSERT ... ON CONFLICT` — subject
@@ -1507,62 +1666,104 @@ and acquiring `SELECT FROM openmettle.run_dispatch_lock FOR NO KEY UPDATE` befor
 `executing_runs_*` defaults), `quota_enforcement` (flipping `metering_enforced` write-once `false
 -> true` via `openmettle-admin` in a standalone single-statement transaction holding zero other
 locks, subject to `quota_enforcement_write_once` (`OMQ04`)), and `storage_instance` limits,
-warning thresholds and `config_revision` (with `storage_instance.volume_id` auto-pinned write-once
-from `NULL` via `storage_pin_volume_id` strictly on an empty storage ledger, or pinned via
-`openmettle_owner` idempotent verified volume adoption on populated upgrades **only after zero
-`N-1` worker processes remain running**). `openmettle_issuance` receives zero quota or storage
-privileges. No runtime role receives `DELETE`, `TRUNCATE`, DDL or grant options.
+warning thresholds, `bootstrap_auto_pin_allowed` and `config_revision` (with
+`storage_instance.volume_id` auto-pinned write-once from `NULL` via `storage_pin_volume_id`
+strictly when `bootstrap_auto_pin_allowed = true` on a fresh `applied == 0` bootstrap with an
+empty storage ledger, or pinned via `openmettle_owner` idempotent verified volume adoption on
+every upgrade **only after mandatory pre-migration `N-1` cleaner quiescence and 100% `N-1 -> N`
+replacement confirm zero `N-1` worker processes remain running**). `openmettle_issuance` receives
+zero quota or storage privileges. No runtime role receives `DELETE`, `TRUNCATE`, DDL or grant
+options.
 
 **Rolling-upgrade safety (ADR 0003).** Mixed-version deployments running `N-1` API/worker binaries
 against the V1-17 PR2 schema are protected across three fail-closed database and rollout gates:
 
-1. **Mandatory gateway metering activation (`quota_enforcement.metering_enforced` +
-   `quota_enforce_gateway_handoff_holds` + `quota_gateway_handoffs`, `OMQ04`).** Because frozen
-   Migration `0023` grants `EXECUTE` on `openmettle.gateway_handoff` to `openmettle_api` and
-   `openmettle_worker`, an `N-1` binary can still commit `gateway_handoff` with zero
-   `quota_reservations` rows. PR2 seeds `openmettle.quota_enforcement.metering_enforced = true`
-   automatically on fresh installations (when `gateway_bindings`, `gateway_reservations` and
-   `gateway_requests` are all empty, enforcing mandatory metering from transaction 1) and `false`
-   on populated upgrades (including installations with only a `gateway_reservations` row from
-   `authz::gateway::hold`) so `N-1` API/worker pods finish draining during rolling deployment.
-   Immediately once all `N-1` replicas are replaced by `N`, `openmettle_owner` (`openmettle-admin`)
-   flips `metering_enforced` irreversibly `false -> true` in a **standalone single-statement
-   transaction** holding zero other locks. Deferred `CONSTRAINT TRIGGER
-   quota_enforce_gateway_handoff_holds` rejects any un-transitioned bound hold unconditionally
-   (even while `false`), locks `quota_enforcement` with **`FOR SHARE`** (strictly serializing both
-   commit orders against `openmettle_owner`'s `FOR NO KEY UPDATE` activation `UPDATE` under `READ
-   COMMITTED` so no unmetered `0023` handoff can commit *after* activation), aborts any
-   `0023`-only `gateway_handoff` lacking required `'handoff_committed'` holds (`usage_tokens` plus
-   applicable `usage_cost_micros`) at `COMMIT` with `OMQ04` once `true` (rolling back
-   `gateway_requests` to `'reserved'`), and records exact handoff-time obligations in
-   `openmettle.quota_gateway_handoffs` so post-activation `quota_recover_lost_handoff` still
-   recognizes pre-activation unmetered handoffs and already-`'settled'`/`'written_off'` holds
-   cleanly.
-2. **Strict one-way `N-1 -> N` worker replacement BEFORE pinning `storage_instance.volume_id`
-   (`enforce_worker_storage_volume_pinned()`, `OMQ03`).** On populated upgrades,
-   `storage_instance.volume_id` **MUST remain `NULL` throughout the entire `N-1 -> N` rolling
-   deployment until 100% of `N-1` worker (and API) replicas are drained and replaced by `N`
-   binaries and zero `N-1` worker processes remain running**:
-   - While `storage_instance.volume_id IS NULL`, `SECURITY DEFINER` `BEFORE UPDATE` trigger
-     `openmettle.enforce_worker_storage_volume_pinned()` (`OMQ03`) on both
-     `openmettle.storage_reservations` (`OLD.state = 'reserved' AND NEW.state = 'released'`) and
-     `openmettle.artifact_revisions` (`NEW.state IN ('purging', 'purged')`) hard-blocks all
-     `openmettle_worker` `reconcile_expired` and `purge_due` mutations in PostgreSQL even while
-     `N-1` workers drain in-flight turns (or with `N-1` cleaners additionally disabled), while
-     disjoint `openmettle_api` in-flight upload abort cleanup continues unaffected and `N` workers
-     execute normal turns cleanly while their storage cleaners fail closed on `volume_id IS NULL`.
-   - **Only after zero `N-1` workers remain**, operators run `openmettle-admin` verified volume
-     adoption (unconditionally re-verifying revisions, `'reserved'` payloads, and requiring
-     `--expected-fs-uuid` independent volume attestation whenever zero digest-bearing revisions
-     are verified on disk) to write/`fsync` `<root>/.openmettle-volume-id` and pin
-     `storage_instance.volume_id`, enabling all PR2 (`N`) worker cleaners (`artifact_fs::purge_due`,
-     `reconcile_expired`, run-linked `ENOENT` recovery and `staging/` cleanup), which verify
-     non-null pinned `volume_id` + sentinel/`st_dev` identity before every unlink or DB
-     transition.
+1. **Deployment-history fresh-install detection and mandatory gateway metering activation
+   (`openmettle.bootstrap_from_zero` + `quota_enforcement.metering_enforced` +
+   `quota_enforce_gateway_handoff_holds` + `quota_gateway_handoffs` +
+   `quota_ensure_legacy_run_holds`, `OMQ04`).** Because frozen Migration `0023` grants `EXECUTE`
+   on `openmettle.gateway_handoff` to `openmettle_api` and `openmettle_worker`, an `N-1` binary
+   can still commit `gateway_handoff` with zero `quota_reservations` rows — including on an
+   existing deployment upgraded from `0023 -> 0024` that has never used gateway or artifacts yet
+   (empty `gateway_*` and `storage_*` tables while `N-1` pods are still live). To eliminate any
+   false-fresh classification, PR2 updates `migrate_within_boundaries` in `src/migrate.rs` (which
+   already holds SQLx's advisory lock and reads `applied = coalesce(max(version), 0)` from
+   `openmettle._sqlx_migrations` before applying pending migrations) to execute
+   `SELECT pg_catalog.set_config('openmettle.bootstrap_from_zero', CASE WHEN $1 = 0 THEN 'true'
+   ELSE 'false' END, false)` (bound to `applied`, re-applied after each `RESET ALL` before every
+   `migrator.run_to(version, ...)`) so `is_fresh_bootstrap` requires **both**
+   `coalesce(pg_catalog.current_setting('openmettle.bootstrap_from_zero', true), 'false') = 'true'`
+   AND empty core/storage/gateway tables (`users`, `scopes`, `projects`, `runs`,
+   `storage_reservations`, `artifact_revisions`, `gateway_bindings`, `gateway_reservations`,
+   `gateway_requests`). `quota_enforcement.metering_enforced` therefore seeds `true` **iff
+   `is_fresh_bootstrap`**, and `false` on **every** upgrade (`applied >= 1`, even with 100% empty
+   tables) so `N-1` API/worker pods finish draining during rolling deployment. When an `N` worker
+   claims or reclaims an `N-1`-admitted run (which created `runs` + `gateway_reservations` with
+   zero parent `quota_reservations` holds), `quota_unwind_superseded_round` cleanly unwinds any
+   unbound `N-1` `'reserved'` round without requiring parent holds yet, and
+   `quota_ensure_legacy_run_holds` (at the start of `quota_allocate_round`, before locking
+   `quota_reservations`) lazily initializes the run's parent hold(s) exactly once in canonical
+   `runs -> gateway_reservations -> quota_budgets` order. Immediately once all `N-1` replicas are
+   replaced by `N`, `openmettle_owner` (`openmettle-admin`) flips `metering_enforced` irreversibly
+   `false -> true` in a **standalone single-statement transaction** holding zero other locks.
+   Deferred `CONSTRAINT TRIGGER quota_enforce_gateway_handoff_holds` rejects any un-transitioned
+   bound hold unconditionally (even while `false`), inserts the handoff receipt into
+   `openmettle.quota_gateway_handoffs` **first** (`metering_enforced = false`), and then acquires
+   `SELECT metering_enforced ... FROM openmettle.quota_enforcement WHERE id FOR SHARE` as the
+   **final table/row lock** of the transaction (strictly serializing both commit orders against
+   `openmettle_owner`'s `FOR NO KEY UPDATE` activation `UPDATE` under `READ COMMITTED` so no
+   unmetered `0023` handoff can commit *after* activation). When `v_enforced = true`, it aborts
+   any `0023`-only `gateway_handoff` lacking required `'handoff_committed'` holds (`usage_tokens`
+   plus applicable `usage_cost_micros`) at `COMMIT` with `OMQ04` (rolling back both
+   `gateway_requests` to `'reserved'` and the `quota_gateway_handoffs` insert) or marks the
+   uncommitted receipt `metering_enforced = true` (zero additional table/FK locks) so
+   post-activation `quota_recover_lost_handoff` still recognizes pre-activation unmetered handoffs
+   and bound holds already transitioned to `'settled'` cleanly.
+2. **Mandatory pre-migration `N-1` cleaner quiescence, deployment-history auto-pin gating, and
+   verified three-directory adoption (`storage_instance.bootstrap_auto_pin_allowed`,
+   `enforce_worker_storage_volume_pinned()`, `OMQ03`).** On **every** upgrade (`applied >= 1`,
+   including completely unused installations with empty `storage_*` tables),
+   `storage_instance.bootstrap_auto_pin_allowed` seeds `false` and `storage_instance.volume_id`
+   **MUST remain `NULL`** across the entire `N-1 -> N` binary replacement so no `N` replica can
+   auto-pin the volume while `N-1` workers remain alive. Operators follow the mandatory four-step
+   upgrade sequence:
+   - **Step 1 (Mandatory — before migration):** Quiesce all `N-1` legacy artifact cleaners by
+     unsetting `OPENMETTLE_WORKER_ARTIFACTS_DIR` across all `N-1` worker replicas (rolling restart
+     with `OPENMETTLE_WORKER_ARTIFACTS_DIR` unset, or scaling `openmettle-worker` to `0`) and
+     confirming zero `N-1` worker processes hold `OPENMETTLE_WORKER_ARTIFACTS_DIR` or have an
+     in-flight `worker::maintenance` sweep. Because `N-1` `reconcile_expired` unlinks payload
+     paths before calling `storage::release` and an already-`'purging'` revision passes
+     `begin_purge` without an `UPDATE` so `N-1` `purge_due` unlinks the file before `confirm_purge`
+     fires `OMQ03`, **`enforce_worker_storage_volume_pinned()` (`OMQ03`) is strictly a PostgreSQL
+     ledger defense-in-depth backstop** (protecting DB byte accounting if an operator forgets
+     quiescence on an empty replacement mount), **NOT a substitute for pre-migration `N-1`
+     quiescence**. Disjoint `openmettle_api` in-flight upload abort cleanup continues unaffected
+     while `volume_id IS NULL`.
+   - **Step 2:** Run `openmettle-migrate` (`volume_id IS NULL`, `bootstrap_auto_pin_allowed =
+     false`, `metering_enforced = false`).
+   - **Step 3:** Roll 100% of `openmettle-api` and `openmettle-worker` replicas from `N-1` to `N`
+     and confirm zero `N-1` replicas remain. `N` workers may already have
+     `OPENMETTLE_WORKER_ARTIFACTS_DIR` configured during rollout because every `N` cleaner checks
+     non-null pinned `volume_id` and all three role-tagged directory sentinels *before* touching
+     any filesystem path, failing closed while `volume_id IS NULL`.
+   - **Step 4:** **Only after zero `N-1` workers remain**, operators run `openmettle-admin`
+     verified volume adoption (unconditionally re-verifying revisions and `'reserved'` payloads,
+     requiring `--expected-fs-uuid` independent volume attestation whenever the ledger is
+     non-empty with zero digest-bearing revisions verified on disk, and linking cleanly without
+     `--expected-fs-uuid` when an upgraded deployment's storage ledger is genuinely empty) to
+     publish and `fsync` all three role-tagged sentinels (`<root>/.openmettle-volume-id` ->
+     `"<uuid>:root\n"`, `<root>/revisions/.openmettle-volume-id` -> `"<uuid>:revisions\n"`,
+     `<root>/staging/.openmettle-volume-id` -> `"<uuid>:staging\n"`) atomically via write-temp ->
+     `fsync` -> `linkat` -> `unlinkat` and pin `storage_instance.volume_id`, enabling all PR2 (`N`)
+     worker cleaners (`artifact_fs::purge_due`, `reconcile_expired`, run-linked `ENOENT` recovery
+     and `staging/` cleanup), which verify non-null pinned `volume_id`, equal `st_dev`, and all
+     three role-tagged sentinels via `openat(..., O_RDONLY | O_NOFOLLOW)` before every `fstatat` /
+     `unlinkat` or DB transition; then run the gateway orphan sweep and flip `metering_enforced =
+     true`.
    - **Starting, rolling back to, or resuming any `N-1` worker binary after
      `storage_instance.volume_id` is pinned is strictly forbidden by the rollout contract**,
-     because `N-1` lacks Rust `.openmettle-volume-id` / `st_dev` checks and treats `ENOENT` in
-     `src/artifact_fs.rs` as successful deletion.
+     because `N-1` lacks Rust `.openmettle-volume-id` / `st_dev` checks and unlinks files before
+     mutating PostgreSQL.
 3. **Lowered `storage_bytes` overrides (`enforce_storage_override()`, `OMQ01`).** Older API and
    worker binaries running `src/storage.rs` read only `storage_instance.personal_limit_bytes` /
    `project_limit_bytes` and would ignore a lowered `quota_overrides` row for `storage_bytes`
@@ -1650,7 +1851,7 @@ Every quota refusal and warning stays redacted under
 | Slice | Deliverable | Required evidence |
 | --- | --- | --- |
 | PR1 (this record) | ADR 0040 only. | Review against `#17`, `ARCHITECTURE-v1.md`, ADRs 0005/0007/0027/0031–0033/0035–0037, `ai-guardrails docs audit` (`0` findings) and `scripts/check_repository.py`. |
-| PR2 · schema, store and worker recovery | Additive PostgreSQL 18 migration (after Migration `0023`, zero edits to frozen `0023`), `storage_instance.volume_id`, `quota_enforcement` singleton control table (`metering_enforced`, write-once `false -> true`, seeded `true` on fresh installs with zero `gateway_bindings`, `gateway_reservations`, and `gateway_requests` and `false` on populated upgrades), `quota_gateway_handoffs` handoff-time obligation ledger (`gateway_request_id` PK referencing `gateway_requests(id) ON DELETE CASCADE`, `metering_enforced`, `cost_required`, `committed_at`, zero direct DML grants to runtime roles), `quota_reservations.allocating_claim_token` (`CHECK (parent_reservation_id IS NULL OR allocating_claim_token IS NOT NULL)`), seeded strictly-`UPDATE`-only `('instance', 'usage_cost_micros')` default row and `quota_cost_unit_lock`, scope-pinned composite FK `(scope_id, gateway_request_id) REFERENCES openmettle.gateway_requests (scope_id, id)`, `SECURITY DEFINER` transition, bootstrap, override, recovery and drift functions (`storage_pin_volume_id`, `quota_upsert_scope_override`, `quota_revoke_scope_override`, `quota_reserve`, `quota_allocate_round`, `quota_commit_handoff`, `quota_recover_lost_handoff`, `quota_commit_device_handoff`, `quota_renew_lease`, `quota_release_unsent`, `quota_unwind_superseded_round`, `quota_release_orphan_gateway_requests`, `quota_settle_gateway_usage`, `quota_release_device_slot`, `quota_record_storage_warning`, `quota_verify_accounting_drift`), `enforce_storage_override`, `quota_enforcement_write_once` (`OMQ04`), `SECURITY DEFINER` `DEFERRABLE INITIALLY DEFERRED` `CONSTRAINT TRIGGER quota_enforce_gateway_handoff_holds` (`openmettle.enforce_gateway_handoff_holds()`, locking `openmettle.quota_enforcement WHERE id FOR SHARE` and inserting into `openmettle.quota_gateway_handoffs`, `OMQ04`), `SECURITY DEFINER` `BEFORE UPDATE` `enforce_worker_storage_volume_pinned` triggers on `storage_reservations` and `artifact_revisions` (`OMQ03`), `SECURITY DEFINER` `BEFORE INSERT OR UPDATE` `enforce_quota_reservation_gateway_binding`, `BEFORE INSERT OR UPDATE OR DELETE` `enforce_cost_denomination_immutability` and `SECURITY DEFINER` `BEFORE INSERT` `enforce_gateway_report_cost_unit` triggers, versioned `src/boundaries.sql` entries, `authz::gateway::{reserve_in, handoff_in, release_in}` in-transaction helpers, `src/quotas.rs` store, `storage::reserve` override integration, `Store::open` empty-ledger-only volume sentinel pinning/verification, verified volume-identity gating across all worker artifact cleaners including `artifact_fs::purge_due` and `reconcile_expired`, idempotent `purging`-tolerant `openmettle-admin` verified populated-volume adoption CLI procedure (running unconditional step-2 verification on every invocation and retry, checking `storage_reservations` `'reserved'` rows, and requiring `--expected-fs-uuid` — plus `--confirm-no-on-disk-payloads` when genuinely payload-empty — whenever zero digest-bearing revisions are verified on disk) and operator runbook update mandating the strict one-way populated-upgrade sequence (100% `N-1 -> N` worker and API replacement with `storage_instance.volume_id IS NULL` before verified adoption, forbidding `N-1` start/resume after pinning, and standalone single-statement `metering_enforced = true` activation), `claim_next` executing-cap override evaluation, DB-plus-filesystem `verify_accounting_drift`, bounded raw index-key paging (`<= p_page_size`) with once-captured constant clamped `v_age_cutoff` (zero `clock_timestamp()` inside `SELECT`) in `quota_release_orphan_gateway_requests`, and bounded-pass (`pass_upper_bound`) `SKIP LOCKED` one-per-tx `reconcile_stale_quotas` with persistent 5-state `StagingSweepState` (`Idle`/`Open`/`InFlight`/`InvalidatedInFlight`/`DrainingEof` + `pending_names: VecDeque<String>`) held outside `worker::sweep`'s 15 s `tokio::time::timeout` in `src/worker.rs`. | PostgreSQL 18 tests in `tests/schema/grants.rs` and `tests/schema/quotas.rs` executing all override, reservation, device-handoff, lost-handoff-recovery, superseded-round-unwind, orphan-gateway-sweep, gateway-settlement, drift-verification and stale-sweep paths **connected as the actual runtime roles** (`openmettle_api`, `openmettle_worker`, `openmettle_gateway`, `openmettle_issuance`) and asserting denial of direct `INSERT`/`UPDATE`/`DELETE`/`SELECT ... FOR NO KEY UPDATE` on all `quota_*` tables (plus zero privileges on `quota_cost_unit_lock` and `quota_gateway_handoffs`, `SELECT`-only on `quota_enforcement` and `storage_instance.volume_id`), denial of direct `SELECT` by `openmettle_api` and `openmettle_worker` on `openmettle.gateway_requests` and `openmettle.gateway_usage_reports` while qualifying `openmettle.quota_verify_accounting_drift()`, `openmettle.quota_unwind_superseded_round(...)` and `openmettle.quota_release_orphan_gateway_requests(...)` as `openmettle_worker` (and denying `EXECUTE` to `openmettle_api`, `openmettle_gateway` and `openmettle_issuance`) and qualifying `openmettle.quota_recover_lost_handoff(...)` as `openmettle_api` (`p_run_id IS NULL`) and `openmettle_worker` (`p_run_id IS NOT NULL`) while denying `openmettle_gateway` and `openmettle_issuance`, denial of `openmettle_api` calling either `quota_commit_handoff` or `quota_commit_device_handoff` on a run-linked `device_reservations` hold, denial of `openmettle_worker` calling generic `quota_commit_handoff` on a run-linked `device_reservations` hold, and denial of cross-role/unleased calls; N-way concurrent admission non-oversubscription across distinct project/actor/instance windows; non-windowed `device_reservations` surviving UTC rollover and `api`-admitted run device handoff exclusively via `quota_commit_device_handoff` under active `claim_token` lease (plus refusal for wrong resource kind or stale/unleased/cancelled run); cross-scope lock-order race with zero deadlocks; concurrent `executing_runs_per_actor` / `executing_runs_per_scope` cap lowering racing `claim_next` (and approval resume) serialized on `run_dispatch_lock` with zero overshoot; exact-once reconciliation across exact replay (recovering server-chosen windows), unique `(gateway_request_id, resource_kind)` enforcement rejecting duplicate keys, scope-pinned composite FK `(scope_id, gateway_request_id) REFERENCES openmettle.gateway_requests (scope_id, id)` and Migration `0023` composite FKs to `gateway_usage_reports` (`(request_id, revision)` and `(source, report_id, revision)`), **single-transaction atomic `authz::gateway::reserve_in` + `quota_reserve` / `quota_allocate_round` rollback test proving that when any metered quota hold fails or the transaction aborts before commit, neither `gateway_requests`, `gateway_reservations.allocated`, nor `quota_reservations` persists (and `gateway_requests_run_round_active_idx` is not stranded)**, **original `0023` `authz::gateway::reserve` + `Pending::handoff` rolling-upgrade activation test across `quota_enforcement.metering_enforced` (proving fresh installs auto-seed `metering_enforced = true`; populated upgrades — including a migration/upgrade test with an existing `openmettle.gateway_reservations` row and zero `gateway_bindings`/`gateway_requests` rows — seed `false` so `N-1` `0023`-only handoff succeeds during rolling deploy and `quota_recover_lost_handoff` reports `'unmetered_legacy_handoff'` while suppressing HTTP dispatch, whereas any bound `'held'`/`'released'` quota hold still fails at `COMMIT` with `OMQ04`; flipping write-once `metering_enforced = true` as `openmettle_owner` in a standalone single-statement transaction — rejecting `true -> false` with `OMQ04` — causes the `0023`-only handoff to fail at `COMMIT` with `OMQ04` and roll back `gateway_requests` to `'reserved'`, and requires both bound `'handoff_committed'` `usage_tokens` and applicable `usage_cost_micros` holds), PLUS a two-connection concurrency test covering both commit orders between an unmetered `0023` `gateway_handoff` commit and `openmettle_owner`'s `metering_enforced = true` activation (`FOR SHARE` vs `FOR NO KEY UPDATE`), proving that whichever transaction acquires the lock first strictly commits first and an unmetered handoff can never observe `metering_enforced = false` and commit after activation**, **fenced successor-worker unwind test (`openmettle.quota_unwind_superseded_round`) simulating worker process death immediately between `(reserve_in + quota_allocate_round)` commit and handoff, lease expiry + `leases::reclaim_next` by a successor worker, fenced unwind transitioning `gateway_requests` to `'released'`, restoring `gateway_reservations.allocated` and parent run `quota_reservations` capacity (`allocated_units`/`held_units`) while releasing child holds and freeing `gateway_requests_run_round_active_idx`, clean retry of the same round, and a replay test calling `quota_unwind_superseded_round` again with the same live `claim_token` after the successor worker has already unwound the predecessor and reserved the same `round` again (proving the successor's replacement `'reserved'` request and child holds carrying `allocating_claim_token = p_claim_token` remain intact and `false` is returned, plus `'handed_off'` left untouched returning `false`, and stale `claim_token` / non-worker calls refused)**, **pre-upgrade orphan `'reserved'` `gateway_requests` sweep test via `openmettle.quota_release_orphan_gateway_requests(...)` connected as `openmettle_worker` releasing aged unbound `'reserved'` rows while restoring `gateway_reservations.allocated`, freeing `gateway_requests_run_round_active_idx`, and skipping active leased runs or bound requests, PLUS (a) a bounded raw index-key paging test with a multi-page prefix of aged legitimately bound `'reserved'` requests ahead of a trailing orphan proving each call inspects at most `p_page_size` raw `(created_at, id)` keys from `gateway_requests_reserved_idx`, advances the persistent cursor across zero-orphan pages without exhausting sweep budget, and releases the trailing orphan on a subsequent page, and (b) a large all-young `'reserved'` tail test verifying bounded index buffer/key touches (`raw_keys_scanned = 0` past `v_age_cutoff`) with zero per-row `clock_timestamp()` filtering**, **negative binding and ownership-recheck tests proving cross-scope, cross-actor, cross-run, non-`'reserved'` state, or wrong-`p_dispatch`-secret bind attempts in `quota_reserve` / `quota_allocate_round` (and `quota_reservations_gateway_binding_guard`) are rejected and that `quota_release_unsent` ownership rechecks fail closed with an invariant error mutating neither ledger on mismatch**, run-to-round `held` allocation without double-debit coupled atomically with `authz::gateway::handoff_in` (`openmettle.gateway_handoff`) + `quota_commit_handoff` (rolling back both on pre-commit refusal), **lost commit acknowledgement (`UnknownCommit`) integration tests connected directly as unprivileged `openmettle_api` and `openmettle_worker` logins exercising all `openmettle.quota_recover_lost_handoff(...)` outcomes — `'handoff_committed'` (preserving durable `gateway_requests.state = 'handed_off'` + all required `'handoff_committed'`/`'settled'`/`'written_off'` quota holds recorded in `quota_gateway_handoffs`, including a test where `quota_settle_gateway_usage` has already moved bound holds to `'settled'` before recovery runs, asserting zero bound holds remain `'held'`/`'released'`, suppressing HTTP dispatch for gateway reconciliation), `'unmetered_legacy_handoff'` (including a pre-activation unmetered handoff committed while `metering_enforced = false` and recovered via `quota_recover_lost_handoff` *after* live `metering_enforced` flipped `true`, still returning `'unmetered_legacy_handoff'` with zero `OMQ04` and suppressing HTTP dispatch), and `'unwound_unsent'` (atomically unwinding `'reserved'`/`'released'` `gateway_requests`, restoring `gateway_reservations.allocated`, and releasing bound `'held'` holds to an active parent or `quota_budgets`) plus wrong-role/wrong-secret/mismatched-ownership/missing-required-hold (`OMQ04`) refusals**, pre-send unwind via `authz::gateway::release_in` (`openmettle.gateway_release`) + `quota_release_unsent` returning capacity to an active parent run hold (or releasing on terminal runs), **stale sweep atomically transitioning a stale `'reserved'` `gateway_requests` row to `'released'` and restoring `gateway_reservations.allocated` in the same `SECURITY DEFINER` transaction as releasing `quota_reservations` (proving a delayed `openmettle.gateway_handoff` with the original dispatch secret fails closed while `'handed_off'` rows remain untouched)**, cancellation, pre-send abort (with `closed_at`), valid `revision = 0` initial partial and final reports accepted when `accepted_source_revision IS NULL` (persisting `accepted_source_revision = 0` and rejecting subsequent `revision <= 0`), signed downward partial correction (`delta_reserved > 0`), independent token/cost settlement, `BEFORE INSERT OR UPDATE OR DELETE` `cost_denomination` immutability trigger (`OMQ02`, proving `INSERT` — including `INSERT ... ON CONFLICT DO UPDATE` — `DELETE`, and rename into/out of the seeded `('instance', 'usage_cost_micros')` row unconditionally fail with `OMQ02` without acquiring `quota_cost_unit_lock`, eliminating any AB/BA lock cycle) plus `BEFORE INSERT` `gateway_usage_reports_cost_unit_guard` serialized via `quota_cost_unit_lock` with **explicit concurrency tests covering both commit orders with different units (direct `UPDATE quota_defaults` vs `openmettle_gateway` `INSERT INTO gateway_usage_reports` with `cost IS NOT NULL`, plus two concurrent `gateway_usage_reports` inserts with different units while `cost_denomination IS NULL`)** and mismatch quarantine, final overage settlement plus subsequent refusal, upload abort and `confirm_purge`; override raise/lower/expiry and `hard_limit = 0` preserving data and deletion grace; `round_cap` `1..=1000` validation; stale sweep using `FOR NO KEY UPDATE SKIP LOCKED` on `runs`, `gateway_reservations`, `gateway_requests` and `quota_reservations` (proving a locked gateway row is skipped immediately without stalling the sweep) with bounded-pass `pass_upper_bound` cursor + wraparound across `SWEEP_MS` ticks (60 s default interval, 15 s budget) proving continuously arriving tail rows and a multi-tick locked prefix never stall or starve later rows; **previous-version (`N-1`) worker unpinned-volume guard test exercising both `artifact_fs::reconcile_expired` and `artifact_fs::purge_due` as `openmettle_worker` against an empty replacement mount while `storage_instance.volume_id IS NULL`, proving both fail closed in PostgreSQL (`OMQ03` via `enforce_worker_storage_volume_pinned`) with zero released `storage_reservations` and zero `purging`/`purged` transitions or byte-charge reductions while disjoint `openmettle_api` in-flight upload abort `storage::release` remains permitted**; **post-pinning `N` cleaner empty-mount test (exercising the interval immediately after pinning `storage_instance.volume_id` following 100% `N-1 -> N` replacement) proving all `N` cleaners (`purge_due`, `reconcile_expired`, run-linked `ENOENT` recovery, and `staging/` sweep) pointed at an empty replacement mount fail closed on missing/mismatched `.openmettle-volume-id` with zero unlinks and zero DB transitions while succeeding on the pinned volume**; **populated-upgrade volume-identity acceptance tests (upgrade a database containing pre-existing `artifact_revisions` and `storage_reservations` with `storage_instance.volume_id IS NULL`, start against an empty replacement directory where `Store::open` creates empty `staging/` and `revisions/`, proving `volume_id` stays `NULL`, `storage_pin_volume_id` refuses with `OMQ03`, no `.openmettle-volume-id` sentinel is written, zero reservations are released and zero files unlinked, verified volume adoption rejects the empty replacement mount and missing `active`/`retained` files, verified volume adoption succeeds on the real original volume including when a mid-purge `state = 'purging'` revision's file is already unlinked while retaining its byte charge until `purge_due` confirms `'purged'`, interrupting adoption after sentinel `fsync` and before DB commit allows operator retry to re-verify the volume unconditionally and pin `storage_instance.volume_id` idempotently with the existing sentinel UUID while rejecting mismatched DB `volume_id` with `OMQ03`, AND a reservation-only populated ledger test with `1` post-rename `'reserved'` payload at `revisions/<id>` and `0` `artifact_revisions` rows proving adoption and retry — even with a stray `.openmettle-volume-id` — fail closed on empty replacement directories without pinning `volume_id`, and succeed on the real volume only with independent volume verification via `--expected-fs-uuid`, plus `--confirm-no-on-disk-payloads` for genuinely payload-empty ledgers)**; run-linked storage recovery and `artifact_fs::purge_due` requiring configured `ARTIFACTS_DIR`, non-null pinned `storage_instance.volume_id` <-> `<root>/.openmettle-volume-id` (`O_NOFOLLOW`, `fsync`ed on empty-ledger bootstrap only; refusing fresh initialization once non-null) and exact `st_dev` match with open `revisions/` and `staging/` directory FDs before unlinking or committing `begin_purge` / `confirm_purge` / `storage::release` (preserving hold + payload when `revisions/<id>` exists while `state = 'reserved'`, and **proving worker restart with an accessible empty replacement directory while `storage_instance.volume_id` is pinned — as well as missing, mismatched, symlinked or different-`st_dev` sentinels — fails closed across both `reconcile_expired` and `purge_due` with zero released charges**), plus **persistent 5-state `StagingSweepState` `ReadDir` `staging/` cleanup tests covering (a) directory enumeration spanning multiple ticks (parking the open `ReadDir` stream, resuming from the parked offset without restarting from entry 0, and unlinking a `released` staging file near the end of the directory), (b) a single `<= 64`-entry `spawn_blocking` `ReadDir` slice exceeding one tick's `worker::sweep` 15 s `tokio::time::timeout` deadline (proving Tick 1 times out cleanly without spawning duplicate `spawn_blocking` tasks while keeping `InFlight` parked in `StagingSweepState`, and Tick 2 re-verifies directory identity and consumes that completed slice's entries from `pending_names` exactly once), and (c) `<root>/staging` directory replacement during both windows — while `InFlight` is parked across ticks (`InvalidatedInFlight` awaits the handle to completion, discards its `ReadDir` and names, and starts no second reader until it transitions to `Idle`) and after an `eof = true` slice leaves undrained `pending_names` in `DrainingEof` across a tick boundary (discarding remaining `pending_names` with zero unlinks from the replacement directory before transitioning to `Idle`)**; restore verification (`verify_accounting_drift` + `openmettle.quota_verify_accounting_drift()`) recognizing `state = 'purging'` with missing `revisions/<id>` (`ENOENT`) as a valid resumable mid-purge state while failing hard on `volume_id IS NULL`, missing `active`/`retained` payloads and DB/`0023` drift; and populated previous-writer rolling-upgrade test with a lowered `storage_bytes` override proving fail-closed refusal (`OMQ01`) on old `storage::reserve` while `settle`/`release`/`retain`/`purge` succeed. |
+| PR2 · schema, store and worker recovery | Additive PostgreSQL 18 migration (after Migration `0023`, zero edits to frozen `0023`), `src/migrate.rs` (`migrate_within_boundaries` capturing `applied = coalesce(max(version), 0)` once under SQLx's advisory lock and setting `openmettle.bootstrap_from_zero` via `pg_catalog.set_config` after each `RESET ALL` before every `migrator.run_to(version, ...)`), `storage_instance.volume_id` and `storage_instance.bootstrap_auto_pin_allowed` (`CHECK (volume_id IS NULL OR NOT bootstrap_auto_pin_allowed)`, seeded `true` iff `is_fresh_bootstrap` — requiring both `openmettle.bootstrap_from_zero = 'true'` and empty core/storage/gateway tables — and `false` on every upgrade `applied >= 1`), `quota_enforcement` singleton control table (`metering_enforced`, write-once `false -> true`, seeded `true` iff `is_fresh_bootstrap` and `false` on every upgrade `applied >= 1`), `quota_gateway_handoffs` handoff-time obligation ledger (`gateway_request_id` PK referencing `gateway_requests(id) ON DELETE CASCADE`, `metering_enforced`, `cost_required`, `committed_at`, zero direct DML grants to runtime roles), `quota_reservations.allocating_claim_token` (`CHECK (parent_reservation_id IS NULL OR allocating_claim_token IS NOT NULL)`), seeded strictly-`UPDATE`-only `('instance', 'usage_cost_micros')` default row and `quota_cost_unit_lock`, scope-pinned composite FK `(scope_id, gateway_request_id) REFERENCES openmettle.gateway_requests (scope_id, id)`, `SECURITY DEFINER` transition, bootstrap, override, recovery and drift functions (`storage_pin_volume_id`, `quota_upsert_scope_override`, `quota_revoke_scope_override`, `quota_reserve`, `quota_ensure_legacy_run_holds`, `quota_allocate_round`, `quota_commit_handoff`, `quota_recover_lost_handoff`, `quota_commit_device_handoff`, `quota_renew_lease`, `quota_release_unsent`, `quota_unwind_superseded_round`, `quota_release_orphan_gateway_requests`, `quota_settle_gateway_usage`, `quota_release_device_slot`, `quota_record_storage_warning`, `quota_verify_accounting_drift`), `enforce_storage_override`, `quota_enforcement_write_once` (`OMQ04`), `SECURITY DEFINER` `DEFERRABLE INITIALLY DEFERRED` `CONSTRAINT TRIGGER quota_enforce_gateway_handoff_holds` (`openmettle.enforce_gateway_handoff_holds()`, inserting into `openmettle.quota_gateway_handoffs` first and then locking `openmettle.quota_enforcement WHERE id FOR SHARE` as the final lock, `OMQ04`), `SECURITY DEFINER` `BEFORE UPDATE` PostgreSQL ledger defense-in-depth backstop `enforce_worker_storage_volume_pinned` triggers on `storage_reservations` and `artifact_revisions` (`OMQ03`), `SECURITY DEFINER` `BEFORE INSERT OR UPDATE` `enforce_quota_reservation_gateway_binding`, `BEFORE INSERT OR UPDATE OR DELETE` `enforce_cost_denomination_immutability` and `SECURITY DEFINER` `BEFORE INSERT` `enforce_gateway_report_cost_unit` triggers, versioned `src/boundaries.sql` entries, `authz::gateway::{reserve_in, handoff_in, release_in}` in-transaction helpers, `src/quotas.rs` store, `storage::reserve` override integration, `Store::open` fresh-bootstrap-only (`bootstrap_auto_pin_allowed = true` + empty ledger) three-directory role-tagged volume sentinel pinning (`<root>/.openmettle-volume-id` `:root`, `<root>/revisions/.openmettle-volume-id` `:revisions`, `<root>/staging/.openmettle-volume-id` `:staging`) published atomically via write-temp -> `fsync` -> `linkat` -> `unlinkat`, verified three-directory sentinel + `st_dev` + open-FD (`fstatat`/`unlinkat`) gating across all worker artifact cleaners (`artifact_fs::purge_due`, `reconcile_expired`, run-linked `ENOENT` recovery, and `staging/` sweep), idempotent `purging`-tolerant `openmettle-admin` verified volume adoption CLI procedure (publishing all three role-tagged sentinels atomically via `linkat`, running unconditional step-2 verification on every invocation and retry, checking `storage_reservations` `'reserved'` rows, requiring `--expected-fs-uuid` — plus `--confirm-no-on-disk-payloads` when genuinely payload-empty — whenever a non-empty storage ledger has zero digest-bearing revisions verified on disk, and linking cleanly without `--expected-fs-uuid` on upgraded deployments with an empty storage ledger) and operator runbook update mandating the four-step upgrade sequence (Step 1 mandatory pre-migration `N-1` worker cleaner quiescence + draining in-flight `worker::maintenance` sweeps, documenting `OMQ03` strictly as a PostgreSQL ledger defense-in-depth backstop rather than a substitute for quiescence; Step 2 `openmettle-migrate`; Step 3 100% `N-1 -> N` worker and API replacement with `storage_instance.volume_id IS NULL`; Step 4 verified adoption + gateway orphan sweep + standalone single-statement `metering_enforced = true` activation, forbidding `N-1` start/resume after pinning), `claim_next` executing-cap override evaluation, DB-plus-filesystem `verify_accounting_drift`, bounded raw index-key paging (`<= p_page_size`) with once-captured constant `v_age_cutoff` clamped via valid PostgreSQL 18 scalar `IF` assignments (zero `clock_timestamp()` inside `SELECT`) in `quota_release_orphan_gateway_requests`, and bounded-pass (`pass_upper_bound`) `SKIP LOCKED` one-per-tx `reconcile_stale_quotas` with persistent 5-state `StagingSweepState` (`Idle`/`Open`/`InFlight`/`InvalidatedInFlight`/`DrainingEof` + `pending_names: VecDeque<String>`) retaining an open verified `dir_fd` across `Open`, `InFlight`, and `DrainingEof` until `pending_names` is empty and held outside `worker::sweep`'s 15 s `tokio::time::timeout` in `src/worker.rs`. | PostgreSQL 18 tests in `tests/schema/grants.rs` and `tests/schema/quotas.rs` executing all override, reservation, legacy-run-hold-backfill, device-handoff, lost-handoff-recovery, superseded-round-unwind, orphan-gateway-sweep, gateway-settlement, drift-verification and stale-sweep paths **connected as the actual runtime roles** (`openmettle_api`, `openmettle_worker`, `openmettle_gateway`, `openmettle_issuance`) and asserting denial of direct `INSERT`/`UPDATE`/`DELETE`/`SELECT ... FOR NO KEY UPDATE` on all `quota_*` tables (plus zero privileges on `quota_cost_unit_lock` and `quota_gateway_handoffs`, `SELECT`-only on `quota_enforcement`, `storage_instance.volume_id`, and `storage_instance.bootstrap_auto_pin_allowed`), denial of direct `SELECT` by `openmettle_api` and `openmettle_worker` on `openmettle.gateway_requests` and `openmettle.gateway_usage_reports` while qualifying `openmettle.quota_verify_accounting_drift()`, `openmettle.quota_ensure_legacy_run_holds(...)`, `openmettle.quota_unwind_superseded_round(...)` and `openmettle.quota_release_orphan_gateway_requests(...)` as `openmettle_worker` (and denying `EXECUTE` to `openmettle_api`, `openmettle_gateway` and `openmettle_issuance`) and qualifying `openmettle.quota_recover_lost_handoff(...)` as `openmettle_api` (`p_run_id IS NULL`) and `openmettle_worker` (`p_run_id IS NOT NULL`) while denying `openmettle_gateway` and `openmettle_issuance`, denial of `openmettle_api` calling either `quota_commit_handoff` or `quota_commit_device_handoff` on a run-linked `device_reservations` hold, denial of `openmettle_worker` calling generic `quota_commit_handoff` on a run-linked `device_reservations` hold, and denial of cross-role/unleased calls; N-way concurrent admission non-oversubscription across distinct project/actor/instance windows; non-windowed `device_reservations` surviving UTC rollover and `api`-admitted run device handoff exclusively via `quota_commit_device_handoff` under active `claim_token` lease (plus refusal for wrong resource kind or stale/unleased/cancelled run); cross-scope lock-order race with zero deadlocks; concurrent `executing_runs_per_actor` / `executing_runs_per_scope` cap lowering racing `claim_next` (and approval resume) serialized on `run_dispatch_lock` with zero overshoot; exact-once reconciliation across exact replay (recovering server-chosen windows), unique `(gateway_request_id, resource_kind)` enforcement rejecting duplicate keys, scope-pinned composite FK `(scope_id, gateway_request_id) REFERENCES openmettle.gateway_requests (scope_id, id)` and Migration `0023` composite FKs to `gateway_usage_reports` (`(request_id, revision)` and `(source, report_id, revision)`), **single-transaction atomic `authz::gateway::reserve_in` + `quota_reserve` / `quota_allocate_round` rollback test proving that when any metered quota hold fails or the transaction aborts before commit, neither `gateway_requests`, `gateway_reservations.allocated`, nor `quota_reservations` persists (and `gateway_requests_run_round_active_idx` is not stranded)**, **deployment-history fresh-vs-upgrade seeding and `0023` rolling-upgrade activation tests across `openmettle.bootstrap_from_zero`, `quota_enforcement.metering_enforced`, and `storage_instance.bootstrap_auto_pin_allowed`: (a) fresh `applied == 0` bootstrap via `migrate_within_boundaries` auto-seeds `metering_enforced = true` and `bootstrap_auto_pin_allowed = true` (permitting `Store::open` auto-pinning once and clearing `bootstrap_auto_pin_allowed = false`); (b) an existing, completely unused `0001..0023` installation (`applied = 23`, zero rows in `users`, `scopes`, `projects`, `runs`, `storage_*`, and `gateway_*`) upgraded to `0024` via `migrate_within_boundaries` seeds `metering_enforced = false`, `bootstrap_auto_pin_allowed = false`, and `volume_id IS NULL`, proving legacy `0023` handoff succeeds during rollout, `N` startup (`Store::open` / `storage_pin_volume_id`) refuses to auto-pin (`OMQ03`), and post-replacement `openmettle-admin` adoption (cleanly linking all three role-tagged sentinels without `--expected-fs-uuid` on the empty storage ledger) plus `metering_enforced = true` activation completes cleanly; (c) populated upgrades (including an existing `openmettle.gateway_reservations` row with zero `gateway_bindings`/`gateway_requests` rows) seed `false` so `N-1` `0023`-only handoff succeeds during rolling deploy and `quota_recover_lost_handoff` reports `'unmetered_legacy_handoff'` while suppressing HTTP dispatch, whereas any bound `'held'`/`'released'` quota hold still fails at `COMMIT` with `OMQ04`; flipping write-once `metering_enforced = true` as `openmettle_owner` in a standalone single-statement transaction — rejecting `true -> false` with `OMQ04` — causes `0023`-only handoffs to fail at `COMMIT` with `OMQ04` and roll back `gateway_requests` to `'reserved'`, requiring both bound `'handoff_committed'` `usage_tokens` and applicable `usage_cost_micros` holds; PLUS (d) a two-connection concurrency test covering both commit orders between an unmetered `0023` `gateway_handoff` commit (inserting `quota_gateway_handoffs` first and then locking `quota_enforcement FOR SHARE` as the final lock) and `openmettle_owner`'s `metering_enforced = true` activation (`FOR NO KEY UPDATE`), proving zero deadlock, strict lock-order serialization, and that an unmetered handoff can never observe `metering_enforced = false` and commit after activation**, **rolling-upgrade legacy-run reclaim and lazy parent-hold initialization test (`quota_unwind_superseded_round` + `quota_ensure_legacy_run_holds` + `quota_allocate_round`) where an `N-1` API replica admits a run (`runs` + `gateway_reservations`, zero parent `quota_reservations`) and an `N-1` worker commits an unbound `'reserved'` round before crashing, and an `N` worker reclaims the run, cleanly unwinds the unbound legacy `'reserved'` round via `quota_unwind_superseded_round` (with zero parent `quota_reservations` present, freeing `gateway_requests_run_round_active_idx` and restoring `gateway_reservations.allocated`), initializes the run-level parent hold(s) exactly once via `quota_ensure_legacy_run_holds` (enforcing `quota_budgets` hard limits with `OMQ01` when over budget and staying idempotent across retries and subsequent rounds), and allocates + settles the replacement round cleanly**, **fenced successor-worker unwind test (`openmettle.quota_unwind_superseded_round`) simulating worker process death immediately between `(reserve_in + quota_allocate_round)` commit and handoff, lease expiry + `leases::reclaim_next` by a successor worker, fenced unwind transitioning `gateway_requests` to `'released'`, restoring `gateway_reservations.allocated` and parent run `quota_reservations` capacity (`allocated_units`/`held_units`) while releasing child holds and freeing `gateway_requests_run_round_active_idx`, clean retry of the same round, and a replay test calling `quota_unwind_superseded_round` again with the same live `claim_token` after the successor worker has already unwound the predecessor and reserved the same `round` again (proving the successor's replacement `'reserved'` request and child holds carrying `allocating_claim_token = p_claim_token` remain intact and `false` is returned, plus `'handed_off'` left untouched returning `false`, and stale `claim_token` / non-worker calls refused)**, **pre-upgrade orphan `'reserved'` `gateway_requests` sweep test via `openmettle.quota_release_orphan_gateway_requests(...)` (using valid scalar PostgreSQL 18 `IF` upper-bound clamping) connected as `openmettle_worker` releasing aged unbound `'reserved'` rows while restoring `gateway_reservations.allocated`, freeing `gateway_requests_run_round_active_idx`, and skipping active leased runs or bound requests, PLUS (a) a bounded raw index-key paging test with a multi-page prefix of aged legitimately bound `'reserved'` requests ahead of a trailing orphan proving each call inspects at most `p_page_size` raw `(created_at, id)` keys from `gateway_requests_reserved_idx`, advances the persistent cursor across zero-orphan pages without exhausting sweep budget, and releases the trailing orphan on a subsequent page, and (b) a large all-young `'reserved'` tail test verifying bounded index buffer/key touches (`raw_keys_scanned = 0` past `v_age_cutoff`) with zero per-row `clock_timestamp()` filtering**, **negative binding and ownership-recheck tests proving cross-scope, cross-actor, cross-run, non-`'reserved'` state, or wrong-`p_dispatch`-secret bind attempts in `quota_reserve` / `quota_allocate_round` (and `quota_reservations_gateway_binding_guard`) are rejected and that `quota_release_unsent` ownership rechecks fail closed with an invariant error mutating neither ledger on mismatch**, run-to-round `held` allocation without double-debit coupled atomically with `authz::gateway::handoff_in` (`openmettle.gateway_handoff`) + `quota_commit_handoff` (rolling back both on pre-commit refusal), **lost commit acknowledgement (`UnknownCommit`) integration tests connected directly as unprivileged `openmettle_api` and `openmettle_worker` logins exercising all `openmettle.quota_recover_lost_handoff(...)` outcomes — `'handoff_committed'` (preserving durable `gateway_requests.state = 'handed_off'` + all required `'handoff_committed'`/`'settled'` quota holds recorded in `quota_gateway_handoffs`, including a test where `quota_settle_gateway_usage` has already moved bound holds to `'settled'` before recovery runs, asserting zero bound holds remain `'held'`/`'released'`, suppressing HTTP dispatch for gateway reconciliation), `'unmetered_legacy_handoff'` (including a pre-activation unmetered handoff committed while `metering_enforced = false` and recovered via `quota_recover_lost_handoff` *after* live `metering_enforced` flipped `true`, still returning `'unmetered_legacy_handoff'` with zero `OMQ04` and suppressing HTTP dispatch), and `'unwound_unsent'` (atomically unwinding `'reserved'`/`'released'` `gateway_requests`, restoring `gateway_reservations.allocated`, and releasing bound `'held'` holds to an active parent or `quota_budgets`) plus wrong-role/wrong-secret/mismatched-ownership/missing-required-hold (`OMQ04`) refusals**, pre-send unwind via `authz::gateway::release_in` (`openmettle.gateway_release`) + `quota_release_unsent` returning capacity to an active parent run hold (or releasing on terminal runs), **stale sweep atomically transitioning a stale `'reserved'` `gateway_requests` row to `'released'` and restoring `gateway_reservations.allocated` in the same `SECURITY DEFINER` transaction as releasing `quota_reservations` (proving a delayed `openmettle.gateway_handoff` with the original dispatch secret fails closed while `'handed_off'` rows remain untouched)**, cancellation, pre-send abort (with `closed_at`), valid `revision = 0` initial partial and final reports accepted when `accepted_source_revision IS NULL` (persisting `accepted_source_revision = 0` and rejecting subsequent `revision <= 0`), signed downward partial correction (`delta_reserved > 0`), independent token/cost settlement, `BEFORE INSERT OR UPDATE OR DELETE` `cost_denomination` immutability trigger (`OMQ02`, proving `INSERT` — including `INSERT ... ON CONFLICT DO UPDATE` — `DELETE`, and rename into/out of the seeded `('instance', 'usage_cost_micros')` row unconditionally fail with `OMQ02` without acquiring `quota_cost_unit_lock`, eliminating any AB/BA lock cycle) plus `BEFORE INSERT` `gateway_usage_reports_cost_unit_guard` serialized via `quota_cost_unit_lock` with **explicit concurrency tests covering both commit orders with different units (direct `UPDATE quota_defaults` vs `openmettle_gateway` `INSERT INTO gateway_usage_reports` with `cost IS NOT NULL`, plus two concurrent `gateway_usage_reports` inserts with different units while `cost_denomination IS NULL`)** and mismatch quarantine, final overage settlement plus subsequent refusal, upload abort and `confirm_purge`; override raise/lower/expiry and `hard_limit = 0` preserving data and deletion grace; `round_cap` `1..=1000` validation; stale sweep using `FOR NO KEY UPDATE SKIP LOCKED` on `runs`, `gateway_reservations`, `gateway_requests` and `quota_reservations` (proving a locked gateway row is skipped immediately without stalling the sweep) with bounded-pass `pass_upper_bound` cursor + wraparound across `SWEEP_MS` ticks (60 s default interval, 15 s budget) proving continuously arriving tail rows and a multi-tick locked prefix never stall or starve later rows; **unpinned-volume DB-guard backstop and `N` cleaner pre-unlink safety tests covering (a) `enforce_worker_storage_volume_pinned` (`OMQ03`) exercising both `reconcile_expired` and `purge_due` DB transitions as `openmettle_worker` on an empty replacement mount while `storage_instance.volume_id IS NULL` (proving zero released `storage_reservations` and zero `purging`/`purged` transitions or byte-charge reductions while disjoint `openmettle_api` in-flight upload abort `storage::release` remains permitted), AND (b) `N` cleaners (`purge_due`, `reconcile_expired`, run-linked `ENOENT` recovery, and `staging/` sweep) run against BOTH an existing on-disk payload and an empty replacement mount while `volume_id IS NULL` or when any directory sentinel is missing/mismatched (proving `N` cleaners verify non-null pinned `volume_id`, equal `st_dev`, and all three role-tagged sentinels *before* touching or unlinking any file, leaving existing on-disk payloads completely untouched and committing zero DB mutations)**; **post-pinning same-filesystem subdirectory-replacement test preserving valid `<root>/.openmettle-volume-id` (`:root`) and `<root>/staging/.openmettle-volume-id` (`:staging`) while replacing `<root>/revisions` with a fresh empty directory on the same filesystem (`st_dev`) — plus swapped `:root`/`:revisions`/`:staging` role sentinels — proving all `N` cleaners (`purge_due`, `reconcile_expired`, run-linked `ENOENT` recovery, and `staging/` sweep) fail closed with zero unlinks and retaining all holds/revisions**; **sentinel atomic `linkat` crash/interruption tests covering (a) crash/interruption after temp-file creation or partial write (`.openmettle-volume-id.tmp.*`) before `linkat` publication (proving retry cleans up `.tmp.*` and publishes all three role-tagged sentinels cleanly with zero 0-byte `.openmettle-volume-id` corruption), and (b) crash after linking a subset of the three directory sentinels (`<root>`, `<root>/revisions`, `<root>/staging`) before DB commit (proving retry re-verifies already-linked sentinels, completes the remaining sentinels with the same `sentinel_uuid`, and pins `storage_instance.volume_id` cleanly)**; **populated-upgrade volume-identity acceptance tests (upgrade a database containing pre-existing `artifact_revisions` and `storage_reservations` with `storage_instance.volume_id IS NULL`, start against an empty replacement directory where `Store::open` creates empty `staging/` and `revisions/`, proving `volume_id` stays `NULL`, `storage_pin_volume_id` refuses with `OMQ03`, no `.openmettle-volume-id` sentinel is written, zero reservations are released and zero files unlinked, verified volume adoption rejects the empty replacement mount and missing `active`/`retained` files, verified volume adoption succeeds on the real original volume including when a mid-purge `state = 'purging'` revision's file is already unlinked while retaining its byte charge until `purge_due` confirms `'purged'`, interrupting adoption after sentinel `fsync` and before DB commit allows operator retry to re-verify the volume unconditionally and pin `storage_instance.volume_id` idempotently with the existing sentinel UUID while rejecting mismatched DB `volume_id` with `OMQ03`, AND a reservation-only populated ledger test with `1` post-rename `'reserved'` payload at `revisions/<id>` and `0` `artifact_revisions` rows proving adoption and retry — even with a stray `.openmettle-volume-id` — fail closed on empty replacement directories without pinning `volume_id`, and succeed on the real volume only with independent volume verification via `--expected-fs-uuid`, plus `--confirm-no-on-disk-payloads` for genuinely payload-empty ledgers)**; run-linked storage recovery and `artifact_fs::purge_due` requiring configured `ARTIFACTS_DIR`, non-null pinned `storage_instance.volume_id` <-> all three role-tagged `.openmettle-volume-id` sentinels (`O_NOFOLLOW`, `fsync`ed via `linkat` on fresh `bootstrap_auto_pin_allowed = true` empty-ledger bootstrap only; refusing fresh initialization once non-null or on upgrades) and exact `st_dev` match across open `<root>`, `revisions_dir_fd`, and `staging_dir_fd` before executing relative `fstatat`/`unlinkat` or committing `begin_purge` / `confirm_purge` / `storage::release` (preserving hold + payload when `revisions/<id>` exists while `state = 'reserved'`, and **proving worker restart with an accessible empty replacement directory while `storage_instance.volume_id` is pinned — as well as missing, mismatched, wrong-role, symlinked or different-`st_dev` sentinels — fails closed across both `reconcile_expired` and `purge_due` with zero released charges**), plus **persistent 5-state `StagingSweepState` `ReadDir` `staging/` cleanup tests covering (a) directory enumeration spanning multiple ticks (parking the open `dir_fd` + `ReadDir` stream, resuming from the parked offset without restarting from entry 0, and unlinking a `released` staging file via `unlinkat` relative to `dir_fd` near the end of the directory), (b) a single `<= 64`-entry `spawn_blocking` `ReadDir` slice exceeding one tick's `worker::sweep` 15 s `tokio::time::timeout` deadline (proving Tick 1 times out cleanly without spawning duplicate `spawn_blocking` tasks while keeping `InFlight` and its open `dir_fd` parked in `StagingSweepState`, and Tick 2 re-verifies directory identity and consumes that completed slice's entries from `pending_names` exactly once), and (c) `<root>/staging` directory replacement during both windows — while `InFlight` is parked across ticks (`InvalidatedInFlight` awaits the handle to completion, discards its `ReadDir` and names, and starts no second reader until it transitions to `Idle`) and after an `eof = true` slice leaves undrained `pending_names` in `DrainingEof` across a tick boundary, explicitly removing the old `<root>/staging` directory and immediately creating a replacement `<root>/staging` directory on the same filesystem to exercise inode-reuse pressure (proving the retained open `dir_fd` prevents `dir_ino` reuse so `(cur_dev, cur_ino) == (dir_dev, dir_ino)` cannot match, zero entries are unlinked from the replacement directory, and `dir_fd` is dropped only when `StagingSweepState` transitions to `Idle`)**; restore verification (`verify_accounting_drift` + `openmettle.quota_verify_accounting_drift()`) recognizing `state = 'purging'` with missing `revisions/<id>` (`ENOENT`) as a valid resumable mid-purge state while failing hard on `volume_id IS NULL`, missing `active`/`retained` payloads, missing/mismatched role-tagged sentinels in `<root>`, `<root>/revisions`, or `<root>/staging`, and DB/`0023` drift; and populated previous-writer rolling-upgrade test with a lowered `storage_bytes` override proving fail-closed refusal (`OMQ01`) on old `storage::reserve` while `settle`/`release`/`retain`/`purge` succeed. |
 | PR3 · `/v1` API, OpenAPI and wired enforcement | `/v1` quota read (with `warnings` projection) and `ManageQuotas` routes (gated on rolling-upgrade completion), OpenAPI 3.2.1 schemas and regenerated `contracts/fixtures/`, independent consumer decoding, and wired quota enforcement in `src/v1/artifacts.rs`, `admit_run`, `claim_next` and ADR 0037 settlement paths. | Contract validation (`tests/contract.rs`) and PostgreSQL 18 HTTP tests on both session channels covering effective limits/usage/reservations/warnings visibility, warning deduplication and re-arming on override/config edits, concurrent `/v1` `setQuotaOverride` lowering of `executing_runs_*` caps racing `claim_next`, `404` concealment for non-members and non-member admins, audited override changes and replay conflicts, safe `429 quota` / `429 rate_limited` / `503 provisioning` RFC 9457 problems with redaction canaries, and allowed reads, downloads, cancellations and deletions at hard limit. |
 
 **Boundaries.** V1-15 (`#15`) and V1-16 (`#16`) own artifact payload transport, retention
