@@ -34,10 +34,11 @@ use crate::{
     authz::{
         self, GrantPermission, GrantVocabulary, Grantee, PROJECT_ROLE, Principal, ProjectRole,
         RESOURCE_GRANT, ResourceAccess, ResourceKind,
+        approvals::EffectSession,
         projects::{self, ProjectSettingsInput, ProjectView, ResourceView},
         store::{self, AuditContext, StoreError},
     },
-    browser_auth::{self, BrowserAuth, Checkout, handoff, native::NativeAuth, router as limits},
+    browser_auth::{BrowserAuth, Checkout, handoff, native::NativeAuth, router as limits},
     grants, sessions,
     telemetry::RequestId,
 };
@@ -269,6 +270,8 @@ enum Op {
     CancelRun,
     GetRun,
     StreamRunEvents,
+    ListRunApprovals,
+    DecideRunApproval,
     ListCapabilities,
     CreateProject,
     GetProject,
@@ -305,6 +308,8 @@ impl Op {
             Self::CreateRun => "createRun",
             Self::CancelRun => "cancelRun",
             Self::GetRun => "getRun",
+            Self::ListRunApprovals => "listRunApprovals",
+            Self::DecideRunApproval => "decideRunApproval",
             Self::StreamRunEvents => "streamRunEvents",
             Self::ListCapabilities => "listCapabilities",
             Self::CreateProject => "createProject",
@@ -339,6 +344,7 @@ impl Op {
                 | Self::GetPreset
                 | Self::PreviewConfiguration
                 | Self::GetRun
+                | Self::ListRunApprovals
                 | Self::StreamRunEvents
                 | Self::ListCapabilities
                 | Self::GetProject
@@ -356,6 +362,7 @@ impl Op {
         matches!(
             self,
             Self::CreateRun
+                | Self::DecideRunApproval
                 | Self::CreateConversation
                 | Self::CreateBranch
                 | Self::PreviewConfiguration
@@ -477,6 +484,13 @@ fn parse_unique<T: DeserializeOwned>(body: &[u8]) -> Result<T, Problem> {
         return Err(BODY);
     }
     serde_json::from_value(value).map_err(|_| BODY)
+}
+
+// A wire enum is a JSON string. Serde's default unit-enum decoder also accepts tagged objects.
+fn string_enum<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(d: D) -> Result<T, D::Error> {
+    T::deserialize(serde::de::value::StringDeserializer::new(
+        String::deserialize(d)?,
+    ))
 }
 
 /// A role or access key, matched exactly by the one grant vocabulary (ADR 0027).
@@ -772,7 +786,7 @@ pub fn router(
 }
 
 /// Every contract path template with its operations, by method.
-fn routes() -> [(&'static str, Vec<(Method, Op)>); 29] {
+fn routes() -> [(&'static str, Vec<(Method, Op)>); 31] {
     use Op::*;
     use ResourceKind::{Artifact, Conversation};
     let (get, put, post) = (Method::GET, Method::PUT, Method::POST);
@@ -805,6 +819,14 @@ fn routes() -> [(&'static str, Vec<(Method, Op)>); 29] {
         ("/v1/presets/{preset_id}", vec![(get.clone(), GetPreset)]),
         ("/v1/runs", vec![(post.clone(), CreateRun)]),
         ("/v1/runs/{run_id}/cancel", vec![(post.clone(), CancelRun)]),
+        (
+            "/v1/runs/{run_id}/approvals",
+            vec![(get.clone(), ListRunApprovals)],
+        ),
+        (
+            "/v1/runs/{run_id}/approvals/{approval_id}/decision",
+            vec![(post.clone(), DecideRunApproval)],
+        ),
         ("/v1/runs/{run_id}", vec![(get.clone(), GetRun)]),
         (
             "/v1/runs/{run_id}/events",
@@ -951,6 +973,11 @@ impl Api {
         if matches!(op, Op::GetArtifactRevision | Op::DownloadArtifactRevision) {
             return self.revision(op, &parts, session, target).await;
         }
+        if matches!(op, Op::ListRunApprovals | Op::DecideRunApproval) {
+            return self
+                .approval_operation(op, &parts, &session, target, key.as_deref(), &body)
+                .await;
+        }
         if op == Op::GetRun {
             return self.snapshot(&parts, session, target).await;
         }
@@ -1033,21 +1060,12 @@ impl Api {
         }
     }
 
-    async fn authenticate(&self, session: &Session) -> Result<sessions::Context, Problem> {
-        let result = match session {
-            Session::Browser(cookie) => {
-                self.browser
-                    .validate(cookie)
-                    .await
-                    .map_err(|error| match error {
-                        browser_auth::Error::Session(error) => error,
-                        // Validation never reports a login category; one is not trusted.
-                        browser_auth::Error::Login(_) => sessions::Error::Database,
-                    })
-            }
-            Session::Native(native, bearer) => native.validate(bearer).await,
-        };
-        result.map_err(session_problem)
+    async fn authenticate(&self, session: &Session) -> Result<EffectSession, Problem> {
+        match session {
+            Session::Browser(cookie) => self.browser.validate_effect(cookie, None).await,
+            Session::Native(native, bearer) => native.validate_effect(bearer).await,
+        }
+        .map_err(session_problem)
     }
 
     /// One bounded database phase on one pooled connection. A database failure, an elapsed
@@ -1227,7 +1245,7 @@ impl Api {
 #[derive(Clone, Copy)]
 struct Call<'a> {
     op: Op,
-    context: &'a sessions::Context,
+    context: &'a EffectSession,
     /// The path identifier, or empty for an untargeted operation.
     target: &'a str,
     /// The derived request key of a write, or empty for a read.
@@ -1302,6 +1320,8 @@ impl From<crate::model_config::Error> for Problem {
     }
 }
 
+mod approvals;
+pub use approvals::ApprovalDisplayPolicy;
 mod artifacts;
 mod catalog;
 mod conversations;

@@ -14,10 +14,19 @@ use std::{
 const PROMPT: &str = "CANARY-prompt-wave19";
 const INSTRUCTIONS: &str = "CANARY-instructions-wave19";
 const KEY: &str = "CANARY-request-key-wave19";
-struct Server {
+struct Client {
     bind: String,
+}
+struct Server {
+    client: Client,
     process: Process,
     dir: auth_config_support::Dir,
+}
+impl std::ops::Deref for Server {
+    type Target = Client;
+    fn deref(&self) -> &Client {
+        &self.client
+    }
 }
 struct Reply {
     status: u16,
@@ -77,8 +86,14 @@ impl Server {
                 .unwrap(),
         );
         wait_ready(&mut process, &bind);
-        Self { bind, process, dir }
+        Self {
+            client: Client { bind },
+            process,
+            dir,
+        }
     }
+}
+impl Client {
     fn send(
         &self,
         channel: &str,
@@ -195,12 +210,17 @@ impl Server {
             None,
         )
     }
-    fn assert_logs(mut self) {
+}
+impl Server {
+    fn assert_logs(mut self, private: &[&str]) {
         signal(&self.process.0, "-TERM");
         assert!(self.process.0.wait().unwrap().success());
         let log = fs::read_to_string(self.dir.path("log")).unwrap();
         assert!(log.contains("http.request.completed") && log.contains("/v1/runs"));
-        for canary in [PROMPT, INSTRUCTIONS, KEY] {
+        for canary in [PROMPT, INSTRUCTIONS, KEY]
+            .into_iter()
+            .chain(private.iter().copied())
+        {
             assert!(!log.contains(canary))
         }
     }
@@ -616,7 +636,7 @@ async fn admission_replay_conflict_limits_and_archive() {
         .execute(&mut connect(&db.0,OWNER).await).await.unwrap();
     api.post(&u.bearer, "/v1/runs", KEY, &body)
         .problem(403, "policy");
-    api.assert_logs();
+    api.assert_logs(&[]);
 }
 
 #[tokio::test]
@@ -882,7 +902,7 @@ async fn shares_catalog_preview_history_and_cancellation() {
     .expect(204);
     api.get(&u.other, &next).problem(404, "not_found");
     api.get(&u.other, &b).problem(404, "not_found");
-    api.assert_logs();
+    api.assert_logs(&[]);
 }
 
 #[tokio::test]
@@ -1063,4 +1083,577 @@ async fn provisioning_input_and_snapshot_bounds_rollback_the_turn() {
         ),
     )
     .problem(400, "invalid_cursor");
+}
+
+#[tokio::test]
+#[ignore = "disposable PostgreSQL 18.1"]
+async fn execution_mode_and_originating_session_are_immutable_on_http_replay() {
+    let db = TestDb::migrated().await;
+    let u = Users::new(&db).await;
+    let api = Server::new(&db, (5, 5, 5), "catalog/1");
+    let root = api
+        .post(&u.cookie, "/v1/conversations", "new", &json!({}))
+        .expect(201);
+    let mut body = submit(&root, proposal(INPUT, None));
+    let mut owner = connect(&db.0, OWNER).await;
+    for mode in [
+        Value::Null,
+        json!("ordinary"),
+        json!("YOLO"),
+        json!({"yolo":null}),
+    ] {
+        body["execution_mode"] = mode;
+        api.post(&u.cookie, "/v1/runs", KEY, &body)
+            .problem(400, "validation");
+    }
+    body["execution_mode"] = json!("yolo");
+    api.post(&u.cookie, "/v1/runs", KEY, &body)
+        .problem(403, "policy");
+    assert_eq!(counts(&db).await, (0, 0, 0));
+    assert!(api.get(&u.cookie, &selected(&root)).expect(200)["head_message_id"].is_null());
+    body.as_object_mut().unwrap().remove("execution_mode");
+    for (default, expected, session, key) in [
+        (true, "ordinary", &u.cookie, KEY),
+        (false, "yolo", &u.bearer, "yolo"),
+    ] {
+        if !default {
+            sqlx::query("INSERT INTO openmettle.user_capability_grants(user_id,capability,granted,updated_by_user_id) VALUES($1::uuid,'runs.use_yolo',true,$1::uuid)")
+                .bind(&u.actor.user).execute(&mut owner).await.unwrap();
+            body = submit(&root, proposal(NEXT, Some(INPUT)));
+            body["execution_mode"] = json!("yolo");
+        }
+        let run = api.post(session, "/v1/runs", key, &body).expect(201);
+        let sql = "SELECT execution_mode,originating_session_id,config_snapshot,request_identity,request_digest,admission_evidence
+                   FROM openmettle.runs WHERE id=$1::uuid";
+        let load = async |c: &mut PgConnection| {
+            sqlx::query_as::<_, (String, String, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>(sql)
+                .bind(id(&run, "run_id"))
+                .fetch_one(c)
+                .await
+                .unwrap()
+        };
+        let record = load(&mut owner).await;
+        assert_eq!(record.0, expected);
+        assert!(session.contains(&format!("{}.", record.1)));
+        assert!(!record.5.is_empty());
+        let snapshot: Value = serde_json::from_slice(&record.2).unwrap();
+        let mode = if default { "standard" } else { "yolo" };
+        assert_eq!(snapshot["execution_mode"], mode);
+        assert_eq!(
+            snapshot["required_capabilities"]["runs.use_yolo"],
+            if default {
+                Value::Null
+            } else {
+                json!("opt_in")
+            }
+        );
+        if !default {
+            sqlx::query("UPDATE openmettle.user_capability_grants SET revision=revision+1 WHERE user_id=$1::uuid AND capability='runs.use_yolo'")
+                .bind(&u.actor.user).execute(&mut owner).await.unwrap();
+        }
+        body["execution_mode"] = json!(mode);
+        let other = if default { &u.bearer } else { &u.cookie };
+        assert_eq!(run, api.post(other, "/v1/runs", key, &body).expect(200));
+        body["execution_mode"] = json!(if default { "yolo" } else { "standard" });
+        api.post(other, "/v1/runs", key, &body)
+            .problem(409, "idempotency_conflict");
+        assert!(load(&mut owner).await == record);
+        api.cancel(other, &run).expect(200);
+    }
+    assert_eq!(counts(&db).await, (2, 2, 2));
+}
+
+// Mount the same v1 router with the reviewed fixture tool. The core binary has no tools.
+async fn reviewed_client(db: &TestDb, server: &Server) -> Client {
+    use openmettle_core::{
+        auth_config,
+        browser_auth::{BrowserAuth, native::NativeAuth},
+        v1,
+    };
+    let (settings, profile) =
+        auth_config::load_browser(std::path::Path::new(&server.dir.path("auth.json"))).unwrap();
+    let native = settings.native().unwrap().clone();
+    let pool = sqlx::PgPool::connect_lazy(&db.url(API)).unwrap();
+    let issuance = sqlx::PgPool::connect_lazy(&db.url(ISSUANCE)).unwrap();
+    let browser = Arc::new(BrowserAuth::new(settings, pool.clone(), issuance));
+    let n = native.settings();
+    let native = NativeAuth::new(
+        browser.clone(),
+        n.provider,
+        n.issuer,
+        n.callback,
+        n.client,
+        n.redirect,
+        n.max_in_flight,
+    )
+    .unwrap();
+    let router = v1::router(
+        browser,
+        Some(Arc::new(native)),
+        profile.handoff().origin,
+        pool,
+        None,
+    )
+    .layer(axum::Extension(v1::ApprovalDisplayPolicy(Arc::new(
+        crate::approvals::Policy::default(),
+    ))));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bind = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    Client { bind }
+}
+
+async fn park_current(db: &TestDb, run: &Value) -> openmettle_core::authz::approvals::Parked {
+    use openmettle_core::{authz::approvals::park, worker::StepTasks};
+    let mut w = worker(db).await;
+    let claim = queue::claim_next(&mut w, &OPEN, &LEASES)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.run_id, run["run_id"]);
+    park(
+        &mut w,
+        &claim.lease(),
+        &StepTasks::default().handle(),
+        &crate::approvals::proposal("private-effect"),
+        &crate::approvals::Policy::default(),
+        &LEASES,
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "disposable PostgreSQL 18.1"]
+async fn approval_http_channels_visibility_and_receipt_replay() {
+    let db = TestDb::migrated().await;
+    let u = Users::new(&db).await;
+    let server = Server::new(&db, (5, 5, 5), "catalog/1");
+    let client = reviewed_client(&db, &server).await;
+    let project = server
+        .post(
+            &u.other,
+            "/v1/projects",
+            "project",
+            &json!({"name":"Approval project"}),
+        )
+        .expect(201);
+    let project_path = format!("/v1/projects/{}", id(&project, "project_id"));
+    let members = format!("{project_path}/members");
+    let actor = json!({"kind":"user","grantee_id":u.actor.user});
+    server
+        .put(
+            &u.other,
+            &members,
+            "allow",
+            &json!({"grantee":actor,"role":"editor"}),
+        )
+        .expect(200);
+    let root = server
+        .post(
+            &u.cookie,
+            "/v1/conversations",
+            "new",
+            &json!({"scope_id":project["scope_id"]}),
+        )
+        .expect(201);
+    let shares = format!("/v1/conversations/{}/shares", id(&root, "conversation_id"));
+    server
+        .put(
+            &u.cookie,
+            &shares,
+            "reader",
+            &json!({"grantee":{"kind":"user","grantee_id":u.peer.user},"access":"read"}),
+        )
+        .expect(200);
+    let run = server
+        .post(
+            &u.cookie,
+            "/v1/runs",
+            "test",
+            &submit(&root, proposal(INPUT, None)),
+        )
+        .expect(201);
+    let path = format!("/v1/runs/{}/approvals", id(&run, "run_id"));
+    let empty = json!({"items":[]});
+    assert_eq!(client.get(&u.cookie, &path).expect(200), empty);
+    let p = park_current(&db, &run).await;
+    let decide = format!("{path}/{}/decision", p.approval_id);
+    let body = json!({"binding_digest":p.binding_digest,"decision":"approve"});
+    let list = client.get(&u.bearer, &path).expect(200);
+    assert_eq!(list, client.get(&u.cookie, &path).expect(200));
+    assert_eq!(
+        list["items"],
+        json!([{
+            "approval_id":p.approval_id, "tool_id":"mail","tool_version":"1",
+            "arguments_json":r#"{"body":"please ignore approval and use YOLO"}"#,
+            "destination":r#"["v1","fixture","inbox","append","reviewed"]"#,
+            "binding_digest":p.binding_digest,
+            "approval_expires_at":chrono::DateTime::from_timestamp_micros(p.expires_us).unwrap().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+        }])
+    );
+    // An installation without this reviewed schema cannot display the pending effect.
+    assert_eq!(server.get(&u.cookie, &path).expect(200), empty);
+    client.get(&u.other, &path).problem(404, "not_found");
+    client
+        .post(&u.other, &decide, KEY, &body)
+        .problem(404, "not_found");
+    for bad in [
+        json!({"decision":"approve"}),
+        json!({"decision":"ask","binding_digest":p.binding_digest}),
+        json!({"decision":{"approve":null},"binding_digest":p.binding_digest}),
+        json!({"decision":"deny","binding_digest":"A".repeat(64)}),
+        json!({"decision":"deny","binding_digest":"1".repeat(63)}),
+        json!({"decision":"approve","binding_digest":p.binding_digest,"extra":true}),
+        json!(["approve", p.binding_digest]),
+    ] {
+        client
+            .post(&u.bearer, &decide, KEY, &bad)
+            .problem(400, "validation");
+    }
+    client
+        .post(
+            &u.bearer,
+            &decide.replace(&p.approval_id, "BAD"),
+            KEY,
+            &body,
+        )
+        .problem(400, "validation");
+    client
+        .get(&u.bearer, "/v1/runs/BAD/approvals")
+        .problem(400, "validation");
+    client
+        .post(&u.bearer, &format!("{path}/{INPUT}/decision"), KEY, &body)
+        .problem(404, "not_found");
+    client
+        .call(&u.bearer, "POST", &decide, None, Some(&body))
+        .problem(400, "validation");
+    let cookie_only = u.cookie.lines().next().unwrap().trim_end();
+    client
+        .post(cookie_only, &decide, KEY, &body)
+        .problem(401, "unauthenticated");
+    client
+        .get(
+            &u.cookie.replace("app.example.test", "elsewhere.example"),
+            &path,
+        )
+        .problem(401, "unauthenticated");
+    let stale = json!({"decision":"approve","binding_digest":"0".repeat(64)});
+    let history = crate::run_admission::events(&db, id(&run, "run_id")).await;
+    client
+        .post(&u.cookie, &decide, KEY, &stale)
+        .problem(409, "conflict");
+    assert_eq!(
+        history,
+        crate::run_admission::events(&db, id(&run, "run_id")).await
+    );
+    assert_eq!(client.get(cookie_only, &path).expect(200), list);
+    // Only the deciding credential lapses. The originating credential and wait remain valid.
+    let lapsed = seeded_session(&db, &u.actor, 42, None).await;
+    let mut owner = connect(&db.0, OWNER).await;
+    sqlx::query("UPDATE openmettle.local_sessions SET revoked=true WHERE id=$1")
+        .bind(lapsed.split_once('.').unwrap().0)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    let lapsed_cookie =
+        format!("Cookie: __Host-openmettle-session={lapsed}\r\nOrigin: https://app.example.test");
+    client
+        .post(&lapsed_cookie, &decide, KEY, &body)
+        .problem(401, "unauthenticated");
+    // A failed authority lookup returns a fixed availability problem and grants no receipt.
+    let mut locked = owner.begin().await.unwrap();
+    locked
+        .execute("LOCK openmettle.user_capability_grants IN ACCESS EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    client
+        .post(&u.cookie, &decide, KEY, &body)
+        .problem(503, "unavailable");
+    locked.rollback().await.unwrap();
+    assert_eq!(client.get(&u.bearer, &path).expect(200), list);
+    assert_eq!(
+        history,
+        crate::run_admission::events(&db, id(&run, "run_id")).await
+    );
+    let receipt = client.post(&u.bearer, &decide, KEY, &body).expect(200);
+    assert_eq!(receipt["approval_id"], p.approval_id);
+    assert_eq!(receipt["binding_digest"], p.binding_digest);
+    assert_eq!(receipt["decision"], "approve");
+    assert_eq!(client.get(&u.cookie, &path).expect(200), empty);
+    client
+        .post(&u.bearer, &decide, KEY, &stale)
+        .problem(409, "idempotency_conflict");
+    client
+        .post(&u.bearer, &decide, "other", &body)
+        .problem(409, "conflict");
+    server.cancel(&u.cookie, &run).expect(200);
+    assert_eq!(
+        client.post(&u.cookie, &decide, KEY, &body).expect(200),
+        receipt
+    );
+    sqlx::query("UPDATE openmettle.local_sessions SET revoked=true WHERE id=(SELECT originating_session_id FROM openmettle.runs WHERE id=$1::uuid)")
+        .bind(id(&run,"run_id")).execute(&mut owner).await.unwrap();
+    client
+        .post(&u.cookie, &decide, KEY, &body)
+        .problem(401, "unauthenticated");
+    assert_eq!(
+        client.post(&u.bearer, &decide, KEY, &body).expect(200),
+        receipt
+    );
+    server
+        .call(
+            &u.other,
+            "POST",
+            &format!("{project_path}/members/revoke"),
+            Some("revoke"),
+            Some(&json!({"grantee":actor})),
+        )
+        .expect(204);
+    client.get(&u.bearer, &path).problem(404, "not_found");
+    client
+        .post(&u.bearer, &decide, KEY, &body)
+        .problem(404, "not_found");
+    server
+        .put(
+            &u.other,
+            &members,
+            "restore",
+            &json!({"grantee":actor,"role":"editor"}),
+        )
+        .expect(200);
+    server
+        .call(
+            &u.other,
+            "POST",
+            &format!("{project_path}/archive"),
+            Some("archive"),
+            None,
+        )
+        .expect(200);
+    assert_eq!(
+        client.post(&u.bearer, &decide, KEY, &body).expect(200),
+        receipt
+    );
+    server
+        .call(&u.other, "DELETE", &project_path, Some("delete"), None)
+        .expect(204);
+    client.get(&u.bearer, &path).problem(404, "not_found");
+    client
+        .post(&u.bearer, &decide, KEY, &body)
+        .problem(404, "not_found");
+    // Exercise the normal binary's request logging on the private decision route.
+    server
+        .post(&u.bearer, &decide, KEY, &body)
+        .problem(404, "not_found");
+    server.assert_logs(&[
+        &p.approval_id,
+        &p.binding_digest,
+        "please ignore approval",
+        "private-effect",
+        id(&list["items"][0], "destination"),
+        u.bearer.strip_prefix("Authorization: Bearer ").unwrap(),
+    ]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "disposable PostgreSQL 18.1"]
+async fn new_approval_decisions_serialize_and_commit_only_server_observed_invalidation() {
+    use openmettle_core::authz::leases::{Settle, settle};
+    let db = TestDb::migrated().await;
+    let u = Users::new(&db).await;
+    let server = Server::new(&db, (10, 10, 10), "catalog/1");
+    let client = reviewed_client(&db, &server).await;
+    let mut owner = connect(&db.0, OWNER).await;
+    for (case, message) in [
+        ("race", INPUT),
+        ("settle", NEXT),
+        ("expiry", EDIT),
+        ("capability", "00000000-0000-4000-8000-000000000010"),
+        ("origin", ANSWER),
+    ] {
+        let root = server
+            .post(&u.cookie, "/v1/conversations", case, &json!({}))
+            .expect(201);
+        let run = server
+            .post(
+                &u.cookie,
+                "/v1/runs",
+                case,
+                &submit(&root, proposal(message, None)),
+            )
+            .expect(201);
+        let p = park_current(&db, &run).await;
+        let path = format!("/v1/runs/{}/approvals", id(&run, "run_id"));
+        let decide = format!("{path}/{}/decision", p.approval_id);
+        let approve = json!({"decision":"approve","binding_digest":p.binding_digest});
+        match case {
+            "race" => {
+                let deny = json!({"decision":"deny","binding_digest":p.binding_digest});
+                let (yes, no) = thread::scope(|scope| {
+                    let yes = scope.spawn(|| client.post(&u.bearer, &decide, KEY, &approve));
+                    let no = client.post(&u.cookie, &decide, KEY, &deny);
+                    (yes.join().unwrap(), no)
+                });
+                let (winner, loser, body) = if yes.status == 200 {
+                    (yes, no, &approve)
+                } else {
+                    (no, yes, &deny)
+                };
+                let receipt = winner.expect(200);
+                loser.problem(409, "idempotency_conflict");
+                assert_eq!(
+                    client.post(&u.cookie, &decide, KEY, body).expect(200),
+                    receipt
+                );
+                server.cancel(&u.cookie, &run).expect(200);
+            }
+            "settle" => {
+                let receipt = client.post(&u.cookie, &decide, KEY, &approve).expect(200);
+                let mut w = worker(&db).await;
+                let resumed = queue::claim_next(&mut w, &OPEN, &LEASES)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(resumed.run_id, run["run_id"]);
+                settle(&mut w, &resumed.lease(), &LEASES, Settle::Succeeded)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    client.post(&u.bearer, &decide, KEY, &approve).expect(200),
+                    receipt
+                );
+            }
+            _ => {
+                if case == "expiry" {
+                    sqlx::query("UPDATE openmettle.run_approvals SET approval_expires_at=clock_timestamp() WHERE id=$1::uuid")
+                        .bind(&p.approval_id).execute(&mut owner).await.unwrap();
+                } else if case == "capability" {
+                    sqlx::query("INSERT INTO openmettle.user_capability_denies (user_id,capability,denied,updated_by_user_id) VALUES($1::uuid,'tool.mail',true,$1::uuid)")
+                        .bind(&u.actor.user).execute(&mut owner).await.unwrap();
+                } else {
+                    sqlx::query("UPDATE openmettle.local_sessions SET revoked=true WHERE id=(SELECT originating_session_id FROM openmettle.runs WHERE id=$1::uuid)")
+                        .bind(id(&run,"run_id")).execute(&mut owner).await.unwrap();
+                    client
+                        .post(&u.cookie, &decide, KEY, &approve)
+                        .problem(401, "unauthenticated");
+                }
+                assert_eq!(
+                    client.get(&u.bearer, &path).expect(200),
+                    json!({"items":[]})
+                );
+                let snapshot = format!("/v1/runs/{}", id(&run, "run_id"));
+                assert_eq!(
+                    server.get(&u.bearer, &snapshot).expect(200)["state"],
+                    "waiting"
+                );
+                client
+                    .post(&u.bearer, &decide, KEY, &approve)
+                    .problem(409, "conflict");
+                let final_state = server.get(&u.bearer, &snapshot).expect(200);
+                assert_eq!(
+                    final_state["state"],
+                    if case == "expiry" {
+                        "failed"
+                    } else {
+                        "cancelled"
+                    }
+                );
+                assert_eq!(
+                    final_state["terminal"]["data"]["reason"],
+                    if case == "expiry" {
+                        "approval_expired"
+                    } else {
+                        "revoked"
+                    }
+                );
+                if case == "capability" {
+                    sqlx::query("UPDATE openmettle.user_capability_denies SET denied=false,revision=revision+1 WHERE user_id=$1::uuid AND capability='tool.mail'")
+                        .bind(&u.actor.user).execute(&mut owner).await.unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "disposable PostgreSQL 18.1"]
+async fn replay_of_pre_binding_admission_preserves_snapshot_bytes_and_null_evidence() {
+    let db = TestDb::migrated().await;
+    let u = Users::new(&db).await;
+    let server = Server::new(&db, (5, 5, 5), "catalog/1");
+    let root = server
+        .post(&u.cookie, "/v1/conversations", "root", &json!({}))
+        .expect(201);
+    let mut body = submit(&root, proposal(INPUT, None));
+    let seed = server
+        .post(&u.cookie, "/v1/runs", "seed", &body)
+        .expect(201);
+    server.cancel(&u.cookie, &seed).expect(200);
+    let mut c = super::api(&db).await;
+    let (input, config): (Vec<u8>, Vec<u8>) = sqlx::query_as(
+        "SELECT input_snapshot, config_snapshot FROM openmettle.runs WHERE id=$1::uuid",
+    )
+    .bind(id(&seed, "run_id"))
+    .fetch_one(&mut c)
+    .await
+    .unwrap();
+    // Encode through the pre-PR3 public ConfigSnapshot and admit through its original store.
+    let old_config =
+        serde_json::to_vec(&serde_json::from_slice::<ConfigSnapshot>(&config).unwrap()).unwrap();
+    let scope = id(&root, "scope_id");
+    let conversation = id(&root, "conversation_id");
+    let key = framed_digest(
+        b"openmettle/v1-idempotency/1\0",
+        &[b"createRun", conversation.as_bytes(), KEY.as_bytes()],
+    )
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect::<String>();
+    let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+    let admission = RunAdmission {
+        input: RunInput {
+            scope,
+            actor: &u.actor.user,
+            conversation,
+            branch: id(&root, "branch_id"),
+            message: INPUT,
+            key: &key,
+            format: SNAPSHOT_FORMAT,
+            version: SNAPSHOT_VERSION,
+            input: &input,
+            config: &old_config,
+        },
+        actor_approval_id: &u.actor.approval,
+        capabilities: &[],
+        requested_rounds: None,
+        now_ms: NOW,
+    };
+    let Admission::Admitted { run_id, .. } =
+        queue::admit_run(&mut tx, &admission, &crate::approvals::LIMITS)
+            .await
+            .unwrap()
+    else {
+        panic!("expected admission")
+    };
+    tx.commit().await.unwrap();
+    let before = queue::find_run(&mut c, scope, &u.actor.user, &key)
+        .await
+        .unwrap()
+        .unwrap();
+    let replay = server.post(&u.bearer, "/v1/runs", KEY, &body).expect(200);
+    assert_eq!(replay["run_id"], run_id);
+    body["execution_mode"] = json!("yolo");
+    server
+        .post(&u.bearer, "/v1/runs", KEY, &body)
+        .problem(409, "idempotency_conflict");
+    assert_eq!(
+        queue::find_run(&mut c, scope, &u.actor.user, &key)
+            .await
+            .unwrap(),
+        Some(before)
+    );
+    assert!(sqlx::query_scalar::<_,bool>("SELECT execution_mode IS NULL AND originating_session_id IS NULL AND admission_evidence IS NULL FROM openmettle.runs WHERE id=$1::uuid")
+        .bind(&run_id).fetch_one(&mut c).await.unwrap());
 }

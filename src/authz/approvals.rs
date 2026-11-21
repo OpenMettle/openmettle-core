@@ -37,7 +37,17 @@ pub struct EffectSession {
     context: sessions::Context,
     locator: String,
 }
+impl std::ops::Deref for EffectSession {
+    type Target = sessions::Context;
+    fn deref(&self) -> &Self::Target {
+        self.context()
+    }
+}
 impl EffectSession {
+    pub(crate) fn into_context(self) -> sessions::Context {
+        self.context
+    }
+
     pub async fn validate(
         c: &mut PgConnection,
         credential: &str,
@@ -504,7 +514,7 @@ pub(super) async fn admission<'a>(
     let config = unique(r.input.config).map_err(|_| INVALID)?;
     let mode = match config.as_object().ok_or(INVALID)?.get("execution_mode") {
         None => "ordinary",
-        Some(Value::String(s)) if s == "ordinary" => "ordinary",
+        Some(Value::String(s)) if s == "ordinary" || s == "standard" => "ordinary",
         Some(Value::String(s)) if s == "yolo" => "yolo",
         _ => return Err(INVALID),
     };
@@ -954,7 +964,8 @@ pub async fn expire_waits(c: &mut PgConnection, limit: u32) -> Result<Vec<String
     .await
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HumanDecision {
     Approve,
     Deny,
@@ -1014,6 +1025,157 @@ const INSERT_DECISION: &str = "INSERT INTO openmettle.run_approval_decisions
                 WHERE now_us<$16 AND base=$17 AND tool=$18
                 RETURNING (extract(epoch FROM decided_at)*1000000)::bigint AS decided";
 
+async fn locked_actor_run(
+    c: &mut PgConnection,
+    session: &EffectSession,
+    scope: &str,
+    run: &str,
+) -> Result<PgRow, StoreError> {
+    let r = sqlx::query(RUN)
+        .bind(run)
+        .bind(scope)
+        .fetch_optional(c)
+        .await?
+        .ok_or(HIDDEN)?;
+    if r.try_get::<&str, _>("actor_user_id")? != session.user_id() {
+        return Err(HIDDEN);
+    }
+    Ok(r)
+}
+
+// The deciding session can differ from the originating one, including on a receipt replay.
+async fn readable<'a>(
+    c: &mut PgConnection,
+    session: &'a EffectSession,
+    scope: &'a str,
+    run: &'a str,
+    r: &'a PgRow,
+) -> Result<(Subject<'a>, projects::ResourceView), StoreError> {
+    let reader = Subject {
+        scope,
+        run: Some(run),
+        actor: session.user_id(),
+        approval: session.approval_id(),
+        conversation: r.try_get("conversation_id")?,
+        session: session.locator(),
+    };
+    let now = session_proof(&reader).session_time(c).await?;
+    let principal = store::hydrate_api_principal(c, reader.actor, reader.approval, now)
+        .await?
+        .ok_or(HIDDEN)?;
+    let current = runs::run_scope(c, scope, now).await?.ok_or(HIDDEN)?;
+    if !super::authorize_scope(&principal, &current, super::Action::Read).is_allowed() {
+        return Err(HIDDEN);
+    }
+    let view = projects::read_resource(
+        c,
+        &principal,
+        ResourceKind::Conversation,
+        reader.conversation,
+        now,
+    )
+    .await?;
+    if view.scope_id != scope {
+        return Err(HIDDEN);
+    }
+    Ok((reader, view))
+}
+
+async fn current_binding(
+    c: &mut PgConnection,
+    s: &Subject<'_>,
+    a: &PgRow,
+    p: &Proposal,
+    session: &EffectSession,
+    view: &projects::ResourceView,
+    policy: &impl EffectPolicy,
+) -> Result<(Binding, Snapshot, Review), StoreError> {
+    if view.project_id.is_some() && view.access != super::ResourceAccess::Write {
+        return Err(DENIED);
+    }
+    let review = reviewed(policy, s, p)?;
+    let snap = authorized(c, &proof(s, &review, Some(session.locator())), &review).await?;
+    let binding = Binding::new(p, s, &snap, &review, a.try_get("expires")?, false)?;
+    if !binding.matches(p, a)? || snap.now >= validity(&snap, &review) {
+        return Err(DENIED);
+    }
+    Ok((binding, snap, review))
+}
+
+/// Actor-only fields of a current request approved by the display policy.
+pub struct PendingApproval {
+    pub approval_id: String,
+    pub tool_id: String,
+    pub tool_version: String,
+    pub arguments_json: String,
+    pub destination: String,
+    pub binding_digest: String,
+    pub expires_us: i64,
+}
+
+/// Observe the current wait under the same run lock as a decision. A read never settles it.
+pub async fn list_pending(
+    c: &mut PgConnection,
+    session: &EffectSession,
+    scope: &str,
+    run: &str,
+    policy: &impl EffectPolicy,
+) -> Result<Option<PendingApproval>, StoreError> {
+    runs::transaction(c, async |c| {
+        let r = locked_actor_run(c, session, scope, run).await?;
+        let (reader, view) = readable(c, session, scope, run, &r).await?;
+        let Some(id) = r.try_get::<Option<&str>, _>("approval_wait_id")? else {
+            return Ok(None);
+        };
+        if r.try_get::<&str, _>("state")? != "waiting"
+            || r.try_get::<Option<&str>, _>("cancel_reason")?.is_some()
+            || r.try_get::<Option<&str>, _>("actor_approval_id")? != Some(reader.approval)
+        {
+            return Ok(None);
+        }
+        let a = sqlx::query(REQUEST)
+            .bind(run)
+            .bind(id)
+            .fetch_one(&mut *c)
+            .await?;
+        let expires: i64 = a.try_get("expires")?;
+        if a.try_get::<Option<&str>, _>("decision")?.is_some() || expires <= db_time(c).await? {
+            return Ok(None);
+        }
+        let s = subject(&r, scope, run)?;
+        let p = stored_proposal(&a)?;
+        let (binding, snap, review) =
+            match current_binding(c, &s, &a, &p, session, &view, policy).await {
+                Ok(current) => current,
+                Err(StoreError::Denied(_)) => {
+                    session_proof(&reader).session_time(c).await?;
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            };
+        if db_time(c).await? >= expires.min(validity(&snap, &review)) {
+            return Ok(None);
+        }
+        Ok(Some(PendingApproval {
+            approval_id: id.to_owned(),
+            tool_id: p.tool,
+            tool_version: p.version,
+            arguments_json: p.arguments.to_string(),
+            destination: p.destination,
+            binding_digest: projects::hex(&binding.hash),
+            expires_us: expires,
+        }))
+    })
+    .await
+}
+
+pub(crate) fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Replay requires current actor visibility. Only a new receipt consumes effect authority.
 pub async fn decide(
     c: &mut PgConnection,
@@ -1025,11 +1187,7 @@ pub async fn decide(
     for id in [i.scope, i.run, i.approval] {
         store::uuid(id, "approval target")?;
     }
-    if i.binding_digest.len() != 64
-        || !i
-            .binding_digest
-            .bytes()
-            .all(|b| matches!(b,b'0'..=b'9'|b'a'..=b'f'))
+    if !valid_digest(i.binding_digest)
         || !bounded(i.idempotency_key, 128)
         || !i
             .idempotency_key
@@ -1048,39 +1206,8 @@ pub async fn decide(
         ],
     )));
     runs::transaction(c, async |c| {
-        let r = sqlx::query(RUN)
-            .bind(i.run)
-            .bind(i.scope)
-            .fetch_optional(&mut *c)
-            .await?
-            .ok_or(HIDDEN)?;
-        let actor = session.context.user_id();
-        if r.try_get::<&str, _>("actor_user_id")? != actor {
-            return Err(HIDDEN);
-        }
-        let conv = r.try_get("conversation_id")?;
-        let reader = Subject {
-            scope: i.scope,
-            run: Some(i.run),
-            actor,
-            approval: session.context.approval_id(),
-            conversation: conv,
-            session: session.locator(),
-        };
-        let caller = session_proof(&reader);
-        let now = caller.session_time(c).await?;
-        let principal = store::hydrate_api_principal(c, actor, reader.approval, now)
-            .await?
-            .ok_or(HIDDEN)?;
-        let scope = runs::run_scope(c, i.scope, now).await?.ok_or(HIDDEN)?;
-        if !super::authorize_scope(&principal, &scope, super::Action::Read).is_allowed() {
-            return Err(HIDDEN);
-        }
-        let view =
-            projects::read_resource(c, &principal, ResourceKind::Conversation, conv, now).await?;
-        if view.scope_id != i.scope {
-            return Err(HIDDEN);
-        }
+        let r = locked_actor_run(c, session, i.scope, i.run).await?;
+        let (reader, view) = readable(c, session, i.scope, i.run, &r).await?;
         let a = sqlx::query(REQUEST)
             .bind(i.run)
             .bind(i.approval)
@@ -1124,16 +1251,9 @@ pub async fn decide(
         }
         let p = stored_proposal(&a)?;
         let attempt = async {
-            if view.project_id.is_some() && view.access != super::ResourceAccess::Write {
-                return Err(DENIED);
-            }
-            let review = reviewed(policy, &s, &p)?;
+            let (binding, snap, review) =
+                current_binding(c, &s, &a, &p, session, &view, policy).await?;
             let proof = proof(&s, &review, Some(session.locator()));
-            let snap = authorized(c, &proof, &review).await?;
-            let binding = Binding::new(&p, &s, &snap, &review, expires, false)?;
-            if !binding.matches(&p, &a)? || snap.now >= validity(&snap, &review) {
-                return Err(DENIED);
-            }
             if projects::hex(&binding.hash) != i.binding_digest {
                 return Err(CONFLICT);
             }
@@ -1157,7 +1277,7 @@ pub async fn decide(
         let decided_us = match attempt {
             Ok(time) => time,
             Err(StoreError::Denied(_)) => {
-                caller.session_time(c).await?;
+                session_proof(&reader).session_time(c).await?;
                 invalidate_wait(c, i.scope, i.run, expires).await?;
                 return Ok(None);
             }

@@ -1,0 +1,24 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "content": "/data",
+    "instancePath": "/data",
+    "keyword": "additionalProperties",
+    "valid": false
+  },
+  "fixture": "RunEventApprovalRequested--private-data",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "data": "{\"data\":{\"approval_id\":\"0f0e0d0c-0b0a-4908-8706-050403020108\"},\"occurred_at\":\"2026-11-20T09:00:02.000000Z\",\"run_id\":\"0f0e0d0c-0b0a-4908-8706-050403020100\",\"sequence\":\"2\",\"type\":\"run.approval_requested\",\"type_version\":1}",
+    "id": "AQdleGFtcGxlAAAAAAAAAALdVUFmeuBEkIyAf6nRl9t599RVMC4__bRB6c6uTbrviQ"
+  },
+  "mutation": {
+    "name": "private-data",
+    "op": "set",
+    "path": "/data#/data/approval_id",
+    "value": "0f0e0d0c-0b0a-4908-8706-050403020108"
+  },
+  "schema": "#/components/schemas/RunEventItem",
+  "source": "#/components/examples/RunEventApprovalRequested"
+}

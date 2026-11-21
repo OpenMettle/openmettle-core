@@ -1,0 +1,21 @@
+{
+  "class": "valid",
+  "direction": "request",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "ApprovalDecision--deny",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "binding_digest": "abababababababababababababababababababababababababababababababab",
+    "decision": "deny"
+  },
+  "mutation": {
+    "name": "deny",
+    "op": "set",
+    "path": "/decision",
+    "value": "deny"
+  },
+  "schema": "#/components/schemas/ApprovalDecisionRequest",
+  "source": "#/components/examples/ApprovalDecision"
+}

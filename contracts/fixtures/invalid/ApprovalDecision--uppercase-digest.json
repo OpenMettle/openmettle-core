@@ -1,0 +1,23 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "/binding_digest",
+    "keyword": "pattern",
+    "valid": false
+  },
+  "fixture": "ApprovalDecision--uppercase-digest",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "binding_digest": "ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB",
+    "decision": "approve"
+  },
+  "mutation": {
+    "name": "uppercase-digest",
+    "op": "set",
+    "path": "/binding_digest",
+    "value": "ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB"
+  },
+  "schema": "#/components/schemas/ApprovalDecisionRequest",
+  "source": "#/components/examples/ApprovalDecision"
+}

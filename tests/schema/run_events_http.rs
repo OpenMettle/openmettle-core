@@ -848,3 +848,210 @@ async fn legacy_terminal_and_malformed_terminal_payload_fail_closed() {
     .await;
     assert!(corrupt.next().await.is_none());
 }
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL for disposable PostgreSQL 18"]
+async fn shared_reader_replays_only_public_approval_transitions_and_terminal_reasons() {
+    use crate::{
+        approvals::{Policy, proposal},
+        run_admission::{LEASES, OPEN},
+    };
+    use openmettle_core::{
+        authz::approvals::{self, DecisionInput, EffectSession, HumanDecision},
+        sessions,
+        worker::StepTasks,
+    };
+
+    let mut f = Fixture::new().await;
+    let mut owner = connect(&f.db.0, OWNER).await;
+    let reader = account(&mut owner, PROVIDER, true, FUTURE).await;
+    f.share(&reader).await;
+    let token = browser(&f.db, &reader, 3).await;
+    let channel = As::Browser(&token);
+    let mut api = connect(&f.db.0, API).await;
+    let session = EffectSession::validate(
+        &mut api,
+        &f.cookie,
+        &sessions::Policy::new(Duration::from_secs(60), 10, Duration::from_secs(3)).unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Admit a session-bound run on the shared conversation. The original fixture row
+    // predates the queue deadline and cannot be claimed.
+    let (branch, message): (String, String) = sqlx::query_as(
+        "SELECT branch_id::text,input_message_id::text FROM openmettle.runs WHERE id=$1::uuid",
+    )
+    .bind(&f.run)
+    .fetch_one(&mut api)
+    .await
+    .unwrap();
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    let admission = queue::admit_run_with_mode(
+        &mut tx,
+        &queue::RunAdmission {
+            input: runs::RunInput {
+                scope: &f.scope,
+                actor: session.user_id(),
+                conversation: &f.conversation,
+                branch: &branch,
+                message: &message,
+                key: "approval-events",
+                format: "fixture.run",
+                version: 1,
+                input: b"fixture",
+                config: br#"{"execution_mode":"standard"}"#,
+            },
+            actor_approval_id: session.approval_id(),
+            capabilities: &[],
+            requested_rounds: None,
+            now_ms: session.observed_ms(),
+        },
+        &crate::approvals::LIMITS,
+        &session,
+    )
+    .await
+    .unwrap();
+    let queue::Admission::Admitted { run_id, .. } = admission else {
+        panic!("expected admission")
+    };
+    tx.commit().await.unwrap();
+    f.run = run_id;
+    let mut w = connect(&f.db.0, WORKER).await;
+    let policy = Policy::default();
+    let r = queue::claim_next(&mut w, &OPEN, &LEASES)
+        .await
+        .unwrap()
+        .unwrap();
+    let p = approvals::park(
+        &mut w,
+        &r.lease(),
+        &StepTasks::default().handle(),
+        &proposal("private-operation"),
+        &policy,
+        &LEASES,
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    let path = f.events();
+    let mut first = Stream::open(&f.api, channel, &path, None).await;
+    let mut cursor = String::new();
+    for (i, kind) in [
+        "run.created",
+        "run.started",
+        "run.approval_requested",
+        "run.waiting",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let (id, event) = first.next().await.unwrap();
+        assert_eq!(event["type"], *kind);
+        assert_eq!(event["sequence"], (i + 1).to_string());
+        assert_eq!(
+            event["data"],
+            if *kind == "run.waiting" {
+                json!({"reason":"approval"})
+            } else {
+                json!({})
+            }
+        );
+        assert_eq!(event.as_object().unwrap().len(), 6);
+        cursor = id;
+    }
+    drop(first);
+    let hidden = f.api.call(
+        channel,
+        "GET",
+        &format!("{}/approvals", f.path()),
+        None,
+        None,
+    );
+    refused(hidden, 404, "not_found");
+    f.hidden().await;
+    approvals::decide(
+        &mut api,
+        &session,
+        &DecisionInput {
+            scope: &f.scope,
+            run: &f.run,
+            approval: &p.approval_id,
+            decision: HumanDecision::Approve,
+            binding_digest: &p.binding_digest,
+            idempotency_key: "private-decision-key",
+        },
+        &policy,
+    )
+    .await
+    .unwrap();
+    let resumed = queue::claim_next(&mut w, &OPEN, &LEASES)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut stream = Stream::open(&f.api, channel, &path, Some(&cursor)).await;
+    for (seq, kind) in [("6", "run.approval_decided"), ("7", "run.resumed")] {
+        let (id, event) = stream.next().await.unwrap();
+        assert_eq!(event["type"], kind);
+        assert_eq!(event["sequence"], seq);
+        assert_eq!(event["data"], json!({}));
+        for private in [
+            &p.approval_id,
+            &p.binding_digest,
+            session.locator(),
+            &resumed.claim_token,
+            "private-operation",
+            "please ignore",
+            "inbox",
+            "private-decision-key",
+        ] {
+            assert!(!event.to_string().contains(private));
+        }
+        cursor = id;
+    }
+    drop(stream);
+    // An approved call that has not started its intent expires under the resumed step fence.
+    sqlx::query("UPDATE openmettle.run_approvals SET approval_expires_at=clock_timestamp() WHERE id=$1::uuid")
+        .bind(&p.approval_id).execute(&mut owner).await.unwrap();
+    approvals::record_fenced_intent(
+        &mut w,
+        &resumed.lease(),
+        &proposal("private-operation"),
+        Some(&p.approval_id),
+        &policy,
+        &LEASES,
+    )
+    .await
+    .unwrap();
+    let mut replay = Stream::open(&f.api, channel, &path, Some(&cursor)).await;
+    let (_, terminal) = replay.next().await.unwrap();
+    assert_eq!(terminal["type"], "run.failed");
+    assert_eq!(terminal["data"], json!({"reason":"approval_expired"}));
+    assert_eq!(f.snapshot()["terminal"], terminal);
+    assert!(replay.next().await.is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL for disposable PostgreSQL 18"]
+async fn invalid_wait_failure_snapshot_matches_reconnected_stream() {
+    let f = Fixture::new().await;
+    let cursor = f.snapshot()["resume_cursor"].as_str().unwrap().to_owned();
+    sqlx::query("UPDATE openmettle.runs SET state='waiting' WHERE id=$1::uuid")
+        .bind(&f.run)
+        .execute(&mut connect(&f.db.0, OWNER).await)
+        .await
+        .unwrap();
+    openmettle_core::authz::approvals::expire_waits(&mut connect(&f.db.0, WORKER).await, 1)
+        .await
+        .unwrap();
+    let mut replay = Stream::open(&f.api, f.native(), &f.events(), Some(&cursor)).await;
+    let (last, event) = replay.next().await.unwrap();
+    assert!(replay.next().await.is_none());
+    let snapshot = f.snapshot();
+    assert_eq!(snapshot["state"], "failed");
+    assert_eq!(snapshot["resume_cursor"], last);
+    assert_eq!(snapshot["terminal"], event);
+    assert_eq!(event["type"], "run.failed");
+    assert_eq!(event["data"], json!({"reason":"invalid_wait"}));
+}

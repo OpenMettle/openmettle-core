@@ -581,6 +581,18 @@ fn schema_problems(document: &Value) -> Vec<String> {
                 && !path.ends_with("/properties")
             {
                 for name in properties.keys() {
+                    // ADR 0035 exposes only the SHA-256 binding on the actor's private operations.
+                    if name == "binding_digest"
+                        && matches!(
+                            path,
+                            "#/components/schemas/PendingApproval"
+                                | "#/components/schemas/ApprovalDecisionRequest"
+                                | "#/components/schemas/ApprovalReceipt"
+                        )
+                        && properties[name] == json!({"$ref":"#/components/schemas/Sha256Digest"})
+                    {
+                        continue;
+                    }
                     if SENSITIVE_NAMES.iter().any(|s| name.contains(s)) {
                         problems.push(format!("{path}: sensitive property name {name}"));
                     }
@@ -1311,7 +1323,8 @@ fn mounted_api_problems_conform_to_the_contract() {
             .replace("conversation_id", id)
             .replace("artifact_id", id)
             .replace("revision_id", id)
-            .replace("run_id", id);
+            .replace("run_id", id)
+            .replace("approval_id", id);
         for method in item.as_object().unwrap().keys() {
             let method = method.to_ascii_uppercase();
             cases.push((
@@ -1496,6 +1509,8 @@ fn consumer_reads_each_managed_conversation_operation() {
         "previewConfiguration",
         "createRun",
         "cancelRun",
+        "listRunApprovals",
+        "decideRunApproval",
     ];
     let mut found = BTreeSet::new();
     for path in contract()["paths"].as_object().unwrap().values() {
@@ -1566,4 +1581,31 @@ fn auth_settings_validate_optional_catalog_and_admission_limits_offline() {
     }
     doc["catalog_file"] = json!(dir.write("catalog.json", b"invalid"));
     assert_eq!(check(&doc), Err(Error::Catalog));
+}
+
+#[test]
+fn consumer_recognizes_the_approval_lifecycle() {
+    use consumer::{Applied, EventKind, Reason};
+    for (example, kind) in [
+        ("RunEventApprovalRequested", EventKind::ApprovalRequested),
+        ("RunEventWaiting", EventKind::Waiting(Reason::Approval)),
+        ("RunEventApprovalDecided", EventKind::ApprovalDecided),
+        ("RunEventResumed", EventKind::Resumed),
+        (
+            "RunEventApprovalExpired",
+            EventKind::Failed(Reason::ApprovalExpired),
+        ),
+        (
+            "RunEventInvalidWait",
+            EventKind::Failed(Reason::InvalidWait),
+        ),
+    ] {
+        let Applied::New(event) = consumer::EventCursor::default()
+            .apply(&fixture(example))
+            .unwrap()
+        else {
+            panic!("missing event")
+        };
+        assert_eq!(event.kind, kind);
+    }
 }

@@ -1,0 +1,21 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "ApprovalDecision--auto-missing-binding_digest",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "decision": "approve"
+  },
+  "mutation": {
+    "name": "auto-missing-binding_digest",
+    "op": "remove",
+    "path": "/binding_digest"
+  },
+  "schema": "#/components/schemas/ApprovalDecisionRequest",
+  "source": "#/components/examples/ApprovalDecision"
+}

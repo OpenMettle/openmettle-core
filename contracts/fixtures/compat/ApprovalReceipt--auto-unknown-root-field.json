@@ -1,0 +1,25 @@
+{
+  "class": "compat",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "ApprovalReceipt--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "approval_id": "0f0e0d0c-0b0a-4908-8706-050403020108",
+    "binding_digest": "abababababababababababababababababababababababababababababababab",
+    "decided_at": "2026-11-21T09:00:05.000000Z",
+    "decision": "approve",
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/ApprovalReceipt",
+  "source": "#/components/examples/ApprovalReceipt"
+}

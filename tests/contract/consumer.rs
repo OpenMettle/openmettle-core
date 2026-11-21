@@ -302,6 +302,10 @@ pub struct RunEvent {
 pub enum EventKind {
     Created,
     Started,
+    ApprovalRequested,
+    ApprovalDecided,
+    Waiting(Reason),
+    Resumed,
     Cancelled(Reason),
     Failed(Reason),
     Unknown(String),
@@ -312,6 +316,9 @@ pub enum Reason {
     Requested,
     Revoked,
     QueueExpired,
+    Approval,
+    ApprovalExpired,
+    InvalidWait,
     Unknown(String),
 }
 
@@ -338,7 +345,10 @@ impl WireRunEvent {
         let kind = match (self.kind.as_str(), self.type_version) {
             ("run.created", 1) => EventKind::Created,
             ("run.started", 1) => EventKind::Started,
-            ("run.cancelled" | "run.failed", 1) => {
+            ("run.approval_requested", 1) => EventKind::ApprovalRequested,
+            ("run.approval_decided", 1) => EventKind::ApprovalDecided,
+            ("run.resumed", 1) => EventKind::Resumed,
+            ("run.cancelled" | "run.failed" | "run.waiting", 1) => {
                 let value = self
                     .data
                     .get("reason")
@@ -348,12 +358,15 @@ impl WireRunEvent {
                     "requested" => Reason::Requested,
                     "revoked" => Reason::Revoked,
                     "queue_expired" => Reason::QueueExpired,
+                    "approval" => Reason::Approval,
+                    "approval_expired" => Reason::ApprovalExpired,
+                    "invalid_wait" => Reason::InvalidWait,
                     other => Reason::Unknown(other.to_owned()),
                 };
-                if self.kind == "run.failed" {
-                    EventKind::Failed(reason)
-                } else {
-                    EventKind::Cancelled(reason)
+                match self.kind.as_str() {
+                    "run.failed" => EventKind::Failed(reason),
+                    "run.waiting" => EventKind::Waiting(reason),
+                    _ => EventKind::Cancelled(reason),
                 }
             }
             _ => EventKind::Unknown(self.kind),
@@ -866,7 +879,37 @@ fn decode_preview(v: &Value) -> Result<(), String> {
 }
 pub fn decode_conversation_operation(op: &str, v: &Value) -> Result<(), String> {
     match op {
-        "createRun" | "cancelRun" => decode_run(v).map(drop),
+        "getRun" | "createRun" | "cancelRun" => decode_run(v).map(drop),
+        "listRunApprovals" => {
+            let items = v["items"].as_array().ok_or("missing approvals")?;
+            if items.len() > 1 {
+                return Err("multiple pending requests".into());
+            }
+            for item in items {
+                for field in [
+                    "approval_id",
+                    "tool_id",
+                    "tool_version",
+                    "destination",
+                    "binding_digest",
+                    "approval_expires_at",
+                ] {
+                    text_field(item, field)?;
+                }
+                let arguments: Value = serde_json::from_str(text_field(item, "arguments_json")?)
+                    .map_err(|e| e.to_string())?;
+                if !arguments.is_object() {
+                    return Err("invalid arguments".into());
+                }
+            }
+            Ok(())
+        }
+        "decideRunApproval" => {
+            for field in ["approval_id", "decision", "binding_digest", "decided_at"] {
+                text_field(v, field)?;
+            }
+            Ok(())
+        }
         "previewConfiguration" => decode_preview(v),
         "getPreset" => decode_descriptor(v, true),
         "createBranch" | "getBranch" => decode_branch(v),
