@@ -131,6 +131,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "conversation branch graph",
         sql: include_str!("../migrations/0021_conversation_branch_graph.sql"),
     },
+    Source {
+        version: 22,
+        description: "approvals and effect ledger",
+        sql: include_str!("../migrations/0022_approvals_and_effect_ledger.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

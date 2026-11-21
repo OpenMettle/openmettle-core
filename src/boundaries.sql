@@ -2,7 +2,7 @@
 -- any schema or history object, and again after migrations. It returns one row per violation.
 -- $1: the highest successfully applied migration version (0 before migration 1). Migration 1
 -- revokes the PUBLIC database/public-schema defaults, which are tolerated only before that.
--- Version 21 adds branch heads, turns and ordered message parts.
+-- Version 22 adds effect approval requests, decisions and worker session checks.
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -26,6 +26,21 @@ principals (oid) AS (
     SELECT oid FROM application
     UNION
     SELECT 0::oid
+),
+effect_columns (relation, attribute, role, privilege) AS (
+    SELECT relation, attribute, role, privilege FROM (VALUES
+        ('runs','openmettle_api','INSERT',ARRAY['execution_mode','originating_session_id','admission_evidence']),
+        ('runs','openmettle_worker','UPDATE',ARRAY['approval_wait_id']),
+        ('operations','openmettle_worker','INSERT',ARRAY['approval_id']),
+        ('run_approvals','openmettle_worker','INSERT',ARRAY['scope_id','run_id','actor_user_id','logical_key',
+            'tool_id','tool_version','canonical_arguments','destination','authority_evidence','binding_digest',
+            'approval_expires_at','resume_execution_expires_at']),
+        ('run_approval_decisions','openmettle_api','INSERT',ARRAY['approval_id','scope_id','run_id','actor_user_id',
+            'deciding_session_id','binding_digest','decision','request_key']),
+        ('local_sessions','openmettle_worker','SELECT',ARRAY['id','user_id','approval_id','provider_id','identity_id',
+            'issued_client','issued_epoch','provider_generation','approval_generation','user_generation',
+            'created_ms','expires_ms','revoked'])
+    ) AS t(relation,role,privilege,columns), unnest(columns) attribute WHERE $1 >= 22
 ),
 contract (relation, role, privilege) AS (
     VALUES
@@ -121,6 +136,9 @@ contract (relation, role, privilege) AS (
         (VALUES ('openmettle_api'), ('openmettle_worker')) AS r(role) WHERE $1 >= 21
     UNION ALL
     SELECT 'message_turns', 'openmettle_worker', 'SELECT' WHERE $1 >= 21
+    UNION ALL
+    SELECT relation, role, 'SELECT' FROM (VALUES ('run_approvals'), ('run_approval_decisions')) AS g(relation),
+        (VALUES ('openmettle_api'), ('openmettle_worker')) AS r(role) WHERE $1 >= 22
 ),
 column_contract (relation, attribute, role, privilege) AS (
     VALUES ('users', 'disabled_at', 'openmettle_api', 'UPDATE')
@@ -181,6 +199,8 @@ column_contract (relation, attribute, role, privilege) AS (
         ('openmettle_worker', 'INSERT', ARRAY['scope_id','conversation_id','message_id','run_id',
             'reasoning_blocks','reasoning_bytes','input_count','output_count'])
     ) AS t(role,privilege,columns), unnest(columns) attribute WHERE $1 >= 21
+    UNION ALL
+    SELECT * FROM effect_columns
     UNION ALL
     -- Migration 18's inert guards for the issuance role's row locks.
     SELECT relation, 'lock_guard', 'openmettle_issuance', 'UPDATE' FROM (VALUES
@@ -548,6 +568,17 @@ violations (violation) AS (
                AND (g.object_name::text, g.column_name::text,
                     pg_get_userbyid(g.grantee)::text, g.privilege)
                    IN (SELECT relation, attribute, role, privilege FROM column_contract))
+    UNION ALL
+    SELECT format('%s lacks %s on openmettle.%s.%s', c.role, c.privilege, c.relation, c.attribute)
+    FROM effect_columns c WHERE NOT EXISTS (
+        SELECT FROM grants g WHERE g.kind='column' AND g.schema_name='openmettle'
+          AND g.object_name=c.relation AND g.column_name=c.attribute
+          AND pg_get_userbyid(g.grantee)=c.role AND g.privilege=c.privilege)
+    UNION ALL
+    SELECT format('%s lacks SELECT on openmettle.%s', c.role, c.relation) FROM contract c
+    WHERE c.relation IN ('run_approvals','run_approval_decisions') AND NOT EXISTS (
+        SELECT FROM grants g WHERE g.kind='relation' AND g.schema_name='openmettle'
+          AND g.object_name=c.relation AND pg_get_userbyid(g.grantee)=c.role AND g.privilege=c.privilege)
     UNION ALL
     -- Even permitted privileges must not be delegable to another application principal.
     SELECT format('%s has grant option for %s on %s',

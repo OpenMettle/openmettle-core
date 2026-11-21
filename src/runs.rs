@@ -273,27 +273,54 @@ pub(crate) async fn insert_run(
     r: &RunInput<'_>,
     admission: Option<&AdmissionColumns<'_>>,
 ) -> Result<(String, bool), Error> {
+    insert_admitted(tx, r, admission, None).await
+}
+
+pub(crate) struct EffectAdmission<'a> {
+    pub mode: &'static str,
+    pub session: &'a str,
+    pub evidence: Vec<u8>,
+}
+
+pub(crate) async fn insert_admitted(
+    tx: &mut WriteTransaction<'_>,
+    r: &RunInput<'_>,
+    admission: Option<&AdmissionColumns<'_>>,
+    effect: Option<&EffectAdmission<'_>>,
+) -> Result<(String, bool), Error> {
     let id = run_identity(r)?;
     let hash = digest(&id);
     // A bare insert names only the pre-19 columns, so it also works on an older schema.
-    let sql = if admission.is_some() {
-        "INSERT INTO openmettle.runs
-             (scope_id,actor_user_id,conversation_id,branch_id,input_message_id,idempotency_key,snapshot_format,snapshot_version,input_snapshot,config_snapshot,request_identity,request_digest,actor_approval_id,round_limit,queue_expires_at)
-             VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6,$7,$8,$9,$10,$11,$12,$13::uuid,$14,clock_timestamp() + $15::bigint * interval '1 millisecond') ON CONFLICT
-             (scope_id,actor_user_id,idempotency_key) DO NOTHING RETURNING id::text"
-    } else {
-        "INSERT INTO openmettle.runs
-             (scope_id,actor_user_id,conversation_id,branch_id,input_message_id,idempotency_key,snapshot_format,snapshot_version,input_snapshot,config_snapshot,request_identity,request_digest)
-             VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT
-             (scope_id,actor_user_id,idempotency_key) DO NOTHING RETURNING id::text"
+    const BASE: &str = "INSERT INTO openmettle.runs
+        (scope_id, actor_user_id, conversation_id, branch_id, input_message_id, idempotency_key,
+         snapshot_format, snapshot_version, input_snapshot, config_snapshot, request_identity, request_digest";
+    const VALUES: &str =
+        ") VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6,$7,$8,$9,$10,$11,$12";
+    let (columns, values) = match (admission, effect) {
+        (Some(_), Some(_)) => (
+            ",actor_approval_id,round_limit,queue_expires_at,execution_mode,originating_session_id,admission_evidence",
+            ",$13::uuid,$14,clock_timestamp() + $15::bigint * interval '1 millisecond',$16,$17,$18",
+        ),
+        (Some(_), None) => (
+            ",actor_approval_id,round_limit,queue_expires_at",
+            ",$13::uuid,$14,clock_timestamp() + $15::bigint * interval '1 millisecond'",
+        ),
+        (None, None) => ("", ""),
+        _ => return Err(Error::Invalid),
     };
+    let sql = format!(
+        "{BASE}{columns}{VALUES}{values}) ON CONFLICT (scope_id,actor_user_id,idempotency_key) DO NOTHING RETURNING id::text"
+    );
     let mut outer = tx.take_active()?;
     let mut sp = outer.begin().await?;
     let result = async {
-        let mut insert = sqlx::query_scalar(sql)
+        let mut insert = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(r.scope).bind(r.actor).bind(r.conversation).bind(r.branch).bind(r.message).bind(r.key).bind(r.format).bind(r.version).bind(r.input).bind(r.config).bind(&id).bind(&hash);
         if let Some(a) = admission {
             insert = insert.bind(a.approval).bind(a.round_limit).bind(a.queue_timeout_ms);
+        }
+        if let Some(e) = effect {
+            insert = insert.bind(e.mode).bind(e.session).bind(&e.evidence);
         }
         let inserted: Option<String> = insert.fetch_optional(&mut *sp).await?;
         if let Some(run) = inserted {
@@ -434,6 +461,27 @@ pub struct Intent<'a> {
     pub request: Payload<'a>,
 }
 pub async fn record_intent(tx: &mut WriteTransaction<'_>, r: &Intent<'_>) -> Result<String, Error> {
+    let identity = intent_identity(r)?;
+    let mut outer = tx.take_active()?;
+    let mut sp = outer.begin().await?;
+    let result = async {
+        lock_run(&mut sp, r.scope, r.run).await?;
+        if let Some(id) = existing_intent(&mut sp, r, None, &identity).await? { return Ok(id); }
+        let operation = sqlx::query_scalar::<_, String>("INSERT INTO openmettle.operations
+            (scope_id,run_id,logical_key,target,capability,format,format_version,request,request_identity,request_digest)
+            VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id::text")
+            .bind(r.scope).bind(r.run).bind(r.key).bind(r.target).bind(r.capability).bind(r.request.format)
+            .bind(r.request.version).bind(r.request.bytes).bind(&identity).bind(digest(&identity)).fetch_one(&mut *sp).await?;
+        intent_event(&mut sp, r, &operation, &identity).await?;
+        Ok(operation)
+    }.await;
+    let result = finish(sp, result).await?;
+    tx.inner = Some(outer);
+    result
+}
+
+/// Validate the proposal and frame its immutable ADR 0004 identity.
+pub(crate) fn intent_identity(r: &Intent<'_>) -> Result<Vec<u8>, Error> {
     uuid(r.scope)?;
     uuid(r.run)?;
     r.request.validate(65536)?;
@@ -443,7 +491,7 @@ pub async fn record_intent(tx: &mut WriteTransaction<'_>, r: &Intent<'_>) -> Res
     {
         return Err(Error::Invalid);
     }
-    let id = identity(
+    Ok(identity(
         b"openmettle/intent/1\0",
         &[
             r.scope.as_bytes(),
@@ -455,32 +503,59 @@ pub async fn record_intent(tx: &mut WriteTransaction<'_>, r: &Intent<'_>) -> Res
             &r.request.version.to_be_bytes(),
             r.request.bytes,
         ],
-    );
-    let mut outer = tx.take_active()?;
-    let mut sp = outer.begin().await?;
-    let result = async {
-        lock_run(&mut sp,r.scope,r.run).await?;
-        let old = sqlx::query("SELECT id::text,request_identity,request_digest,target,capability,format,format_version,request FROM
-             openmettle.operations WHERE scope_id=$1::uuid AND run_id=$2::uuid AND logical_key=$3")
-            .bind(r.scope).bind(r.run).bind(r.key).fetch_optional(&mut *sp).await?;
-        if let Some(row) = old {
-            if row.get::<Vec<u8>,_>("request_identity") != id || row.get::<Vec<u8>,_>("request_digest") != digest(&id)
-                || row.get::<String,_>("target") != r.target || row.get::<String,_>("capability") != r.capability
-                || row.get::<String,_>("format") != r.request.format || row.get::<i32,_>("format_version") != r.request.version
-                || row.get::<Vec<u8>,_>("request") != r.request.bytes { return Err(Error::Conflict); }
-            return Ok(row.get("id"));
+    ))
+}
+
+pub(crate) async fn existing_intent(
+    c: &mut PgConnection,
+    r: &Intent<'_>,
+    approval: Option<&str>,
+    id: &[u8],
+) -> Result<Option<String>, Error> {
+    let old = sqlx::query("SELECT id::text,request_identity,request_digest,target,capability,format,format_version,request,
+             to_jsonb(o)->>'approval_id' AS approval FROM openmettle.operations o
+             WHERE scope_id=$1::uuid AND run_id=$2::uuid AND logical_key=$3")
+            .bind(r.scope).bind(r.run).bind(r.key).fetch_optional(&mut *c).await?;
+    if let Some(row) = old {
+        if row.get::<Vec<u8>, _>("request_identity") != id
+            || row.get::<Vec<u8>, _>("request_digest") != digest(id)
+            || row.get::<String, _>("target") != r.target
+            || row.get::<String, _>("capability") != r.capability
+            || row.get::<String, _>("format") != r.request.format
+            || row.get::<i32, _>("format_version") != r.request.version
+            || row.get::<Vec<u8>, _>("request") != r.request.bytes
+        {
+            return Err(Error::Conflict);
         }
-        let operation: String = sqlx::query_scalar("INSERT INTO openmettle.operations
-             (scope_id,run_id,logical_key,target,capability,format,format_version,request,request_identity,request_digest)
-             VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id::text")
-            .bind(r.scope).bind(r.run).bind(r.key).bind(r.target).bind(r.capability).bind(r.request.format).bind(r.request.version).bind(r.request.bytes).bind(&id).bind(digest(&id)).fetch_one(&mut *sp).await?;
-        let event_id = identity(b"openmettle/intent-event/1\0", &[operation.as_bytes(),&id]);
-        append_locked(&mut sp,r.scope,r.run,&format!("intent:{operation}"),&event_id,Payload{format:"openmettle.operation-intent",version:1,bytes:operation.as_bytes()}).await?;
-        Ok(operation)
-    }.await;
-    let result = finish(sp, result).await?;
-    tx.inner = Some(outer);
-    result
+        if row.get::<Option<String>, _>("approval").as_deref() != approval {
+            return Err(Error::Conflict);
+        }
+        return Ok(Some(row.get("id")));
+    }
+    Ok(None)
+}
+
+pub(crate) async fn intent_event(
+    c: &mut PgConnection,
+    r: &Intent<'_>,
+    operation: &str,
+    id: &[u8],
+) -> Result<(), Error> {
+    let event_id = identity(b"openmettle/intent-event/1\0", &[operation.as_bytes(), id]);
+    append_locked(
+        c,
+        r.scope,
+        r.run,
+        &format!("intent:{operation}"),
+        &event_id,
+        Payload {
+            format: "openmettle.operation-intent",
+            version: 1,
+            bytes: operation.as_bytes(),
+        },
+    )
+    .await?;
+    Ok(())
 }
 pub struct Observation<'a> {
     pub scope: &'a str,

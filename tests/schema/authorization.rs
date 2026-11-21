@@ -341,11 +341,34 @@ async fn migration_15_grants_exactly_the_contract() {
             assert_eq!(granted, expected, "{role} UPDATE runs.{column}");
         }
     }
-    // The worker still reaches no secret, session, key, receipt, audit or admin table.
+    // ADR 0035 grants the worker only these session columns for effect authorization.
+    let readable: Vec<String> = sqlx::query_scalar(
+        "SELECT attname::text FROM pg_attribute WHERE attrelid = 'openmettle.local_sessions'::regclass
+         AND attnum > 0 AND NOT attisdropped AND has_column_privilege($1, attrelid, attnum, 'SELECT')
+         ORDER BY attname",
+    ).bind(WORKER).fetch_all(&mut admin).await.unwrap();
+    assert_eq!(
+        readable,
+        [
+            "approval_generation",
+            "approval_id",
+            "created_ms",
+            "expires_ms",
+            "id",
+            "identity_id",
+            "issued_client",
+            "issued_epoch",
+            "provider_generation",
+            "provider_id",
+            "revoked",
+            "user_generation",
+            "user_id"
+        ]
+    );
+    // Other private authority, receipt, and administration tables remain inaccessible.
     for table in [
         "login_transactions",
         "login_nonce_reservations",
-        "local_sessions",
         "native_handoffs",
         "provider_recoveries",
         "home_invitations",
@@ -423,6 +446,16 @@ async fn migration_15_grants_exactly_the_contract() {
         owner.execute(grant).await.unwrap();
         refused_with(&settings, MIGRATIONS, violation).await;
         owner.execute(revoke).await.unwrap();
+        if revoke == "REVOKE SELECT ON openmettle.local_sessions FROM openmettle_worker" {
+            // Revoking a table grant also revokes its existing column grants.
+            owner
+                .execute(AssertSqlSafe(format!(
+                    "GRANT SELECT ({}) ON openmettle.local_sessions TO openmettle_worker",
+                    readable.join(", ")
+                )))
+                .await
+                .unwrap();
+        }
     }
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
 

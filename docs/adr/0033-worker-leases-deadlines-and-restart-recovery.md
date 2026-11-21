@@ -269,6 +269,11 @@ before returning `Invalidated`. Rechecks happen between steps, when the holder h
 so this normally ends `cancelled` with `{"reason":"revoked"}`. A lapsed or stale holder gets
 `LeaseError` and changes nothing; it does not reach the decision.
 
+[ADR 0035](0035-approvals-permitted-yolo-and-effect-ledger.md) amends the unresolved-write rule below.
+Park, settlement, expired-run settlement and reconciliation count `idempotent`, `lookup` and
+`non_repeatable` operations with outcome `intent` or `outcome_unknown`. Only
+`repeatable_read` is exempt. Endpoint deduplication cannot establish a write's outcome.
+
 ### Settlement
 
 `settle(c, &Lease, &LeaseSettings, Settle) -> Result<Settled, LeaseError>`, after a `Hold` fence:

@@ -790,7 +790,15 @@ fn verify(report: &Value) {
         }
         for index in &used {
             assert!(
-                LIVE_INDEXES.contains(index) || *index == "runs_pkey",
+                LIVE_INDEXES.contains(index)
+                    || *index == "runs_pkey"
+                    || (name == "claim"
+                        && matches!(
+                            *index,
+                            "run_approvals_pkey"
+                                | "run_approval_decisions_pkey"
+                                | "run_approval_decisions_approval_id_decision_key"
+                        )),
                 "{name} reads history through {index}"
             );
         }
