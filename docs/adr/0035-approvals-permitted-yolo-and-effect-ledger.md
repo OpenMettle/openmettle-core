@@ -54,9 +54,9 @@ PR2 adds these records to `openmettle` in one additive migration. Names below ar
 
 | Record | Identity and writes |
 | --- | --- |
-| `runs` admission evidence | API inserts the authorized `execution_mode`, `originating_session_id` (nullable `text`, no FK to `local_sessions`) and `admission_evidence` (bounded, versioned authorizing grant and policy revisions). All three columns are nullable for pre-migration rows. The migration grants `openmettle_api` column `INSERT` only and `src/boundaries.sql` verifies that it has no `UPDATE` on them. |
+| `runs` admission evidence | API inserts the authorized `execution_mode`, `originating_session_id` (nullable `text`, no FK to `local_sessions`) and `admission_evidence` (bounded, versioned authorizing grant and policy revisions). Following migration 19's `runs_admission_check`, a `CHECK` requires all three to be NULL (pre-migration or bare `create_run` rows) or all three to be present within size limits with `execution_mode IN ('ordinary', 'yolo')`. The migration grants `openmettle_api` column `INSERT` only and `src/boundaries.sql` verifies that it has no `UPDATE` on them. |
 | `run_approvals` | Worker inserts an immutable UUID `id`, scoped run FK `(scope_id, run_id)`, logical key, tool, version, canonical arguments, destination, authority evidence, binding digest and two database timestamps, `approval_expires_at` and `resume_execution_expires_at`. Derive the actor from the locked run and bind its immutable ID. Keep `UNIQUE (run_id, logical_key)`, `UNIQUE (scope_id, run_id, id)` for the wait pointer and `UNIQUE (scope_id, run_id, id, logical_key)` for the operation. |
-| `run_approval_decisions` | API inserts an immutable receipt with `approval_id` as primary key and a scoped FK to the request. Record the actor from the authenticated session, that session's internal locator, request binding digest, decision (`approve` or `deny`), scoped idempotency key and DB decision time. Add `UNIQUE (approval_id, decision)` for the operation's decision FK. Exact replay reads this row. |
+| `run_approval_decisions` | API inserts an immutable receipt with `approval_id` as primary key and a scoped FK from `(scope_id, run_id, approval_id)` to `run_approvals(scope_id, run_id, id)`. Record the actor from the authenticated session, that session's internal locator, request binding digest, decision (`approve` or `deny`), scoped idempotency key and DB decision time. Enforce `UNIQUE (scope_id, actor_user_id, request_key)` for idempotency and `UNIQUE (approval_id, decision)` for the operation's decision FK. Exact replay reads this row. |
 | `runs.approval_wait_id` | Nullable UUID. Composite FK `(scope_id, id, approval_wait_id)` to `run_approvals(scope_id, run_id, id)`. The worker sets it on park. It names the latest request through resume and terminal history. Only a run in `waiting` for `approval` with this pointer can be claimed by the approval path. |
 | `operations.approval_id` | Nullable UUID, unique when present. Two composite FKs bind a human-approved operation to its exact request and positive decision (below). For YOLO the worker records policy evidence in the immutable request envelope. |
 
@@ -226,10 +226,10 @@ The worker wait-expiry sweep selects from `runs` in ascending `id` order with
 the state is `waiting` and either the current request is due (pending or approved), or
 `approval_wait_id IS NULL OR wait_reason IS DISTINCT FROM 'approval'`. Each matching run
 becomes `failed` with `wait_reason = NULL` and one `run-terminal` event in the same
-transaction. Use `approval_expired` for a bound, due request and `invalid_wait` for a bare
-or legacy wait. The latter needs no matching request row. Failing it frees the live actor
-and scope slots, as `expire_queued` and `settle_expired` do for missing queue and
-execution deadlines.
+transaction. Use `approval_expired` for a bound, due request. For a bare or legacy wait,
+append `openmettle.run-invalid-wait` v1 with `{"reason":"invalid_wait"}`. This wait needs
+no matching request row. Failing it frees the live actor and scope slots, as `expire_queued`
+and `settle_expired` do for missing queue and execution deadlines.
 
 After resume, expiry before intent fails the run with `approval_expired` under the live
 fence. If an intent exists, the holder settles using the ledger. A terminal run makes
@@ -260,7 +260,8 @@ the endpoint's specified field. A caller's HTTP decision key has a different pur
 Unsupported or unknown idempotency on a write selects `lookup` when there is an authoritative
 lookup, otherwise `non_repeatable`. An operation UUID alone cannot establish endpoint
 support. Today's `record_intent` returns the same UUID for an insert and a replay.
-Have the fenced store return which occurred under the run lock. Only the process that
+Have the fenced helper return which occurred under the run lock. Before reporting a replay,
+it must match `request_identity`, `request_digest` and `operations.approval_id` (including NULL). Only the process that
 observes a successful commit of a new intent may initiate that write. A lost commit reply,
 crash before send, lost response or stale claim goes to ledger inspection. Neither an
 identical approval receipt nor finding the same UUID is a send instruction. Release the DB
@@ -348,7 +349,7 @@ OpenAPI `if`/`then` data schema and fixture.
 | `openmettle.run-approval-decided` | `approval-decision:A` | `run.approval_decided` | `{}` |
 | `openmettle.run-resumed` | `claim:<fresh token>` | `run.resumed` | `{}` |
 | `openmettle.run-approval-expired` | `run-terminal` | `run.failed` | `{"reason":"approval_expired"}` |
-| `openmettle.run-failed` (bare or legacy wait) | `run-terminal` | `run.failed` | `{"reason":"invalid_wait"}` |
+| `openmettle.run-invalid-wait` | `run-terminal` | `run.failed` | `{"reason":"invalid_wait"}` |
 
 The shared stream can prompt the actor to refresh the private endpoint. The decision,
 request UUID, arguments, digest, destination, session locator, token, operation evidence
