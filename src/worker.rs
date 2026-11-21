@@ -678,11 +678,17 @@ async fn run_one<E: Executor>(
     };
     let input = match end {
         WorkEnd::Answer(answer) if cause.is_none() => {
-            let result = turns::publish(&mut c, &lease, &settings, answer).await;
-            if matches!(result, Ok(Settled::Reconciling { .. })) {
-                let _ = leases::release_lease(&mut c, &lease).await;
+            match turns::publish(&mut c, &lease, &settings, answer).await {
+                // Publication rolled back. Settle the rejected answer under a fresh fence.
+                Err(LeaseError::Store(StoreError::InvalidInput(_) | StoreError::Denied(_))) => {
+                    Settle::Failed(FailReason::StepFailed)
+                }
+                Ok(Settled::Reconciling { .. }) => {
+                    let _ = leases::release_lease(&mut c, &lease).await;
+                    return;
+                }
+                _ => return,
             }
-            return;
         }
         WorkEnd::Invalidated => {
             let _ = leases::release_lease(&mut c, &lease).await;

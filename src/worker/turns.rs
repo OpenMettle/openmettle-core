@@ -84,6 +84,16 @@ pub(super) async fn publish(
 }
 
 const FAILED: StepResult = StepResult::Failed(FailReason::StepFailed);
+fn lease_step(error: LeaseError) -> StepResult {
+    match error {
+        LeaseError::Stopping(_) => StepResult::Stopped,
+        LeaseError::StaleClaim | LeaseError::Expired | LeaseError::Terminal { .. } => {
+            StepResult::Invalidated
+        }
+        LeaseError::Store(_) => FAILED,
+    }
+}
+
 impl<R: TurnRoutes> TurnExecutor<R> {
     pub fn new(pool: PgPool, catalog: Arc<Catalog>, leases: LeaseSettings, routes: R) -> Self {
         Self {
@@ -131,10 +141,7 @@ impl<R: TurnRoutes> TurnExecutor<R> {
         match queue::recheck_leased(&mut c, &claim.lease(), &check, &self.leases).await {
             Ok(RunRecheckOutcome::Continue) => Ok(()),
             Ok(_) => Err(StepResult::Invalidated),
-            Err(LeaseError::StaleClaim | LeaseError::Expired | LeaseError::Terminal { .. }) => {
-                Err(StepResult::Invalidated)
-            }
-            Err(_) => Err(FAILED),
+            Err(error) => Err(lease_step(error)),
         }
     }
 
@@ -143,9 +150,9 @@ impl<R: TurnRoutes> TurnExecutor<R> {
         let mut c = self.pool.acquire().await.map_err(|_| FAILED)?;
         let number = leases::with_lease(&mut c, &claim.lease(), Fence::Step, async |tx, _| {
             let (used, has_effect): (i64,bool) = sqlx::query_as("SELECT
-                (SELECT count(*) FROM openmettle.run_events WHERE run_id=$1::uuid AND format='openmettle.model-round'),
-                EXISTS(SELECT FROM openmettle.operations WHERE run_id=$1::uuid)")
-                .bind(&claim.run_id).fetch_one(tx.connection()?).await?;
+                (SELECT count(*) FROM openmettle.run_events WHERE scope_id=$2::uuid AND run_id=$1::uuid AND format='openmettle.model-round'),
+                EXISTS(SELECT FROM openmettle.operations WHERE scope_id=$2::uuid AND run_id=$1::uuid)")
+                .bind(&claim.run_id).bind(&claim.scope_id).fetch_one(tx.connection()?).await?;
             if restarting && has_effect {
                 // The in-memory tool transcript did not survive. Never redispatch a past effect.
                 return Err(crate::runs::Error::Conflict);
@@ -156,7 +163,7 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                     Payload { format: "openmettle.model-round", version: 1, bytes: b"{}" }).await?;
             }
             Ok(round)
-        }).await.map_err(|_| FAILED)?;
+        }).await.map_err(lease_step)?;
         if number > i64::from(claim.round_limit) {
             Err(StepResult::Failed(FailReason::RoundLimit))
         } else {
@@ -179,6 +186,9 @@ impl<R: TurnRoutes> TurnExecutor<R> {
         self.authority(&run.claim, config).await?;
         let intent = {
             let mut c = self.pool.acquire().await.map_err(|_| FAILED)?;
+            if cx.stop.borrow().is_some() {
+                return Err(StepResult::Stopped);
+            }
             approvals::record_fenced_intent(
                 &mut c,
                 &run.claim.lease(),
@@ -188,11 +198,12 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 &self.leases,
             )
             .await
-            .map_err(|_| FAILED)?
+            .map_err(lease_step)?
         };
-        let IntentResult::Applied(intent) = intent else {
-            // No automatic send permit (including human approval required or a replay).
-            return Err(FAILED);
+        let intent = match intent {
+            IntentResult::Applied(intent) => intent,
+            IntentResult::Invalidated(_) => return Err(StepResult::Invalidated),
+            IntentResult::ApprovalRequired | IntentResult::Replayed(_) => return Err(FAILED),
         };
         let op = intent.operation_id.clone();
         // This new intent carries a fresh, lease-bounded send deadline. A previous
@@ -201,13 +212,25 @@ impl<R: TurnRoutes> TurnExecutor<R> {
             deadline: run.execution_deadline,
             ..cx.clone()
         };
-        let (bytes, deadline) = intent.start(&step).ok_or(FAILED)?;
+        let Some((bytes, deadline)) = intent.start(&step) else {
+            return Err(if step.stop.borrow().is_some() {
+                StepResult::Stopped
+            } else {
+                FAILED
+            });
+        };
         step.deadline = deadline;
         let result = timeout_at(deadline, effects.adapter.send(run, op.clone(), bytes, step))
             .await
             .map_err(|_| FAILED)?;
-        let StepResult::ToolOutput(output) = result else {
-            return Err(FAILED);
+        let output = match result {
+            StepResult::ToolOutput(output) => output,
+            StepResult::Stopped | StepResult::Invalidated | StepResult::Failed(_) => {
+                return Err(result);
+            }
+            StepResult::Answer(_) | StepResult::Continue | StepResult::Finished => {
+                return Err(FAILED);
+            }
         };
         if output.len() > 65536 {
             return Err(FAILED);
@@ -225,11 +248,72 @@ impl<R: TurnRoutes> TurnExecutor<R> {
         if observed { Ok(output) } else { Err(FAILED) }
     }
 
+    async fn prepare_round(
+        &self,
+        claim: &ClaimedRun,
+        config: &ConfigSnapshot,
+        continuation: &[History],
+        tools: Option<Vec<Tool>>,
+    ) -> Result<(Route, Request, i64), StepResult> {
+        self.authority(claim, config).await?;
+        let prompt = {
+            let mut c = self.pool.acquire().await.map_err(|_| FAILED)?;
+            branches::worker_prompt(
+                &mut c,
+                claim,
+                config,
+                &self.catalog,
+                self.artifacts.as_ref(),
+            )
+            .await
+        };
+        let WorkerPrompt { actor, mut history } = match prompt {
+            Ok(prompt) => prompt,
+            Err(StoreError::Denied(_)) => {
+                // Identity or visibility can change between the fenced check and hydration.
+                self.authority(claim, config).await?;
+                return Err(FAILED);
+            }
+            Err(_) => return Err(FAILED),
+        };
+        let route = self
+            .routes
+            .route(claim, &actor, &config.effective)
+            .await
+            .map_err(inference::Error::step_result)?;
+        history.extend_from_slice(continuation);
+        let request = Request {
+            history,
+            parallel: None,
+            tools,
+            stream: route.stream,
+        };
+        if request.tools.is_some() {
+            let bound = self
+                .routes
+                .tool_prompt_bound(&config.effective, &request)
+                .ok_or(FAILED)?;
+            if bound > config.effective.usable_input().ok_or(FAILED)? {
+                return Err(FAILED);
+            }
+        }
+        let round = self.next_round(claim, continuation.is_empty()).await?;
+        self.authority(claim, config).await?;
+        Ok((route, request, round))
+    }
+
     async fn execute_turn(
         &self,
         run: &ActiveRun,
         cx: StepContext,
     ) -> Result<FinalAnswer, StepResult> {
+        let mut stop = cx.stop.clone();
+        let config = {
+            let mut c = self.pool.acquire().await.map_err(|_| FAILED)?;
+            branches::worker_config(&mut c, &run.claim)
+                .await
+                .map_err(|_| FAILED)?
+        };
         let mut continuation = Vec::new();
         let mut tools = self
             .effects
@@ -237,40 +321,11 @@ impl<R: TurnRoutes> TurnExecutor<R> {
             .map(|_| self.routes.tools(&run.claim))
             .filter(|t| !t.is_empty());
         loop {
-            let WorkerPrompt {
-                actor,
-                config,
-                mut history,
-            } = {
-                let mut c = self.pool.acquire().await.map_err(|_| FAILED)?;
-                branches::worker_prompt(&mut c, &run.claim, &self.catalog, self.artifacts.as_ref())
-                    .await
-                    .map_err(|_| FAILED)?
+            let (route, request, round) = tokio::select! {
+                biased;
+                _ = stop.wait_for(Option::is_some) => return Err(StepResult::Stopped),
+                ready = self.prepare_round(&run.claim, &config, &continuation, tools) => ready?,
             };
-            self.authority(&run.claim, &config).await?;
-            let route = self
-                .routes
-                .route(&run.claim, &actor, &config.effective)
-                .await
-                .map_err(inference::Error::step_result)?;
-            history.extend_from_slice(&continuation);
-            let request = Request {
-                history,
-                parallel: None,
-                tools,
-                stream: route.stream,
-            };
-            if request.tools.is_some() {
-                let bound = self
-                    .routes
-                    .tool_prompt_bound(&config.effective, &request)
-                    .ok_or(FAILED)?;
-                if bound > config.effective.usable_input().ok_or(FAILED)? {
-                    return Err(FAILED);
-                }
-            }
-            let round = self.next_round(&run.claim, continuation.is_empty()).await?;
-            self.authority(&run.claim, &config).await?;
             let turn = route
                 .gateway
                 .server(
@@ -335,14 +390,11 @@ impl<R: TurnRoutes> TurnExecutor<R> {
 
 impl<R: TurnRoutes> Executor for TurnExecutor<R> {
     async fn step(&self, run: &ActiveRun, cx: StepContext) -> StepResult {
-        let mut stop = cx.stop.clone();
-        // The monitor renews the lease while HTTP is open. The gateway applies the hard
-        // execution deadline and adapter timeouts; the watch also interrupts DB/route work.
-        tokio::select! {
-            biased;
-            _ = stop.wait_for(Option::is_some) => StepResult::Stopped,
-            answer = self.execute_turn(run, cx) => answer.map_or_else(|r|r, StepResult::Answer),
-        }
+        // The gateway observes stop itself. An in-flight tool keeps its runner's drain
+        // window to record the downstream outcome before the lease is handed off.
+        self.execute_turn(run, cx)
+            .await
+            .map_or_else(|r| r, StepResult::Answer)
     }
     fn can_resume_approved(&self, _: &Proposal) -> bool {
         // This executor only runs tools in a live model transcript. A bare parked

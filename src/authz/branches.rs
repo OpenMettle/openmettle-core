@@ -6,6 +6,7 @@ use super::{
     Action, DenialReason, Principal, ResourceKind, Scope, authorize_resource, projects, runs,
     store::{self, AuditContext, Change, StoreError, WriteOutcome},
 };
+use crate::model_config::{ConfigSnapshot, SNAPSHOT_FORMAT, SNAPSHOT_VERSION};
 use crate::runs::{WriteTransaction, digest, identity};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -653,7 +654,7 @@ pub(crate) async fn path_turns(
     limit: i32,
     now: i64,
 ) -> Result<Vec<HistoryTurn>, StoreError> {
-    use crate::model_config::{ConfigSnapshot, PathTurn, SNAPSHOT_FORMAT, SNAPSHOT_VERSION};
+    use crate::model_config::PathTurn;
     let rows = sqlx::query(concat!(
         path!("WHERE p.depth+1 < $3"),
         "SELECT p.id::text,p.parent_message_id::text,t.author_user_id::text,t.run_id::text,t.reasoning_bytes,t.input_count,
@@ -726,38 +727,50 @@ pub(crate) async fn path_turns(
     Ok(turns)
 }
 
-/// Read the immutable path anchored by the admitted input, including worker-only replay data.
-/// Never substitute a newer branch head or a newly available attachment for a pinned omission.
+/// The run's immutable capability requirements can be read before touching conversation data.
+pub(crate) async fn worker_config(
+    c: &mut PgConnection,
+    claim: &runs::ClaimedRun,
+) -> Result<ConfigSnapshot, StoreError> {
+    let invalid = || StoreError::InvalidInput("stored configuration snapshot");
+    let bytes: Vec<u8> = sqlx::query_scalar(
+        "SELECT config_snapshot FROM openmettle.runs WHERE scope_id=$1::uuid AND id=$2::uuid
+         AND claim_token=$3::uuid AND snapshot_format=$4 AND snapshot_version=$5",
+    )
+    .bind(&claim.scope_id)
+    .bind(&claim.run_id)
+    .bind(&claim.claim_token)
+    .bind(SNAPSHOT_FORMAT)
+    .bind(SNAPSHOT_VERSION)
+    .fetch_optional(c)
+    .await?
+    .ok_or_else(invalid)?;
+    serde_json::from_slice(&bytes).map_err(|_| invalid())
+}
+
 pub(crate) struct WorkerPrompt {
     pub actor: String,
-    pub config: crate::model_config::ConfigSnapshot,
     pub history: Vec<crate::provider_http::inference::History>,
 }
 
+/// After the leased authority check, read only the path anchored by the admitted input.
 pub(crate) async fn worker_prompt(
     c: &mut PgConnection,
     claim: &runs::ClaimedRun,
+    config: &ConfigSnapshot,
     catalog: &crate::model_config::Catalog,
     artifacts: Option<&crate::artifact_fs::Store>,
 ) -> Result<WorkerPrompt, StoreError> {
-    use crate::model_config::{ConfigSnapshot, SNAPSHOT_FORMAT, SNAPSHOT_VERSION};
     use crate::provider_http::inference::{History, Reasoning};
     let invalid = || StoreError::InvalidInput("stored conversation snapshot");
     let r = sqlx::query("SELECT r.actor_user_id::text,r.conversation_id::text,r.input_message_id::text,
-          r.snapshot_format,r.snapshot_version,r.input_snapshot,r.config_snapshot,
+          r.input_snapshot,
           floor(extract(epoch FROM clock_timestamp())*1000)::bigint AS now_ms
         FROM openmettle.runs r JOIN openmettle.branch_heads h USING (scope_id, conversation_id, branch_id)
         WHERE r.id=$1::uuid AND r.scope_id=$2::uuid AND r.claim_token=$3::uuid
           AND h.head_message_id=r.input_message_id")
         .bind(&claim.run_id).bind(&claim.scope_id).bind(&claim.claim_token)
         .fetch_optional(&mut *c).await?.ok_or_else(invalid)?;
-    if r.try_get::<&str, _>("snapshot_format")? != SNAPSHOT_FORMAT
-        || r.try_get::<i32, _>("snapshot_version")? != SNAPSHOT_VERSION
-    {
-        return Err(invalid());
-    }
-    let config: ConfigSnapshot =
-        serde_json::from_slice(r.try_get("config_snapshot")?).map_err(|_| invalid())?;
     let input: snapshot::InputSnapshot =
         serde_json::from_slice(r.try_get("input_snapshot")?).map_err(|_| invalid())?;
     let target = catalog.target(&config.effective).map_err(|_| invalid())?;
@@ -775,6 +788,14 @@ pub(crate) async fn worker_prompt(
         scope: &claim.scope_id,
         id: r.try_get("conversation_id")?,
     };
+    let conversation = projects::hydrate_resource(c, ResourceKind::Conversation, chat.id, now)
+        .await?
+        .ok_or(HIDDEN)?;
+    store::check(authorize_resource(
+        &actor,
+        &conversation,
+        Action::RunExecute,
+    ))?;
     let start: &str = r.try_get("input_message_id")?;
     // One extra ancestor detects an incomplete pin without reading an unbounded legacy path.
     let turns = path_turns(
@@ -879,7 +900,6 @@ pub(crate) async fn worker_prompt(
     }
     Ok(WorkerPrompt {
         actor: actor_id,
-        config,
         history,
     })
 }

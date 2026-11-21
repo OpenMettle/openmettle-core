@@ -18,6 +18,8 @@ struct Setup {
     port: u16,
     ca: String,
     tools: bool,
+    artifacts: Option<std::path::PathBuf>,
+    stop_during_observation: bool,
 }
 
 struct Routes {
@@ -74,7 +76,10 @@ impl TurnRoutes for Routes {
     }
 }
 
-struct Lookup(PgPool);
+struct Lookup {
+    pool: PgPool,
+    shutdown: Option<Arc<tokio::sync::Notify>>,
+}
 impl EffectPolicy for Lookup {
     fn review(&self, _: &str, _: &str, p: &Proposal) -> Result<Option<Review>, StoreError> {
         Ok((p.tool == "lookup"
@@ -102,10 +107,10 @@ impl ApprovedAdapter for Lookup {
         run: &'a ActiveRun,
         op: String,
         _: Vec<u8>,
-        _: StepContext,
+        mut step: StepContext,
     ) -> std::pin::Pin<Box<dyn Future<Output = StepResult> + Send + 'a>> {
         Box::pin(async move {
-            let mut c = self.0.acquire().await.unwrap();
+            let mut c = self.pool.acquire().await.unwrap();
             let lease = run.claim.lease();
             leases::with_lease(&mut c, &lease, Fence::Hold, async |tx, _| {
                 record_observation(
@@ -125,11 +130,21 @@ impl ApprovedAdapter for Lookup {
                         },
                     },
                 )
-                .await
+                .await?;
+                if let Some(shutdown) = &self.shutdown {
+                    // Request shutdown while this write is still uncommitted.
+                    shutdown.notify_one();
+                    step.stop.wait_for(Option::is_some).await.unwrap();
+                }
+                Ok(())
             })
             .await
             .unwrap();
-            StepResult::ToolOutput("registered result".into())
+            if step.stop.borrow().is_some() {
+                StepResult::Stopped
+            } else {
+                StepResult::ToolOutput("registered result".into())
+            }
         })
     }
 }
@@ -160,7 +175,7 @@ async fn worker_process() {
                 json: true,
                 sse: false,
                 functions: Some(inference::SchemaSubset::Flat),
-                images: false,
+                images: setup.artifacts.is_some(),
                 parallel: false,
                 usage: true,
                 tool_separator_whitespace: false,
@@ -202,25 +217,42 @@ async fn worker_process() {
         settings.policy.unwrap().leases,
         routes,
     );
+    if let Some(path) = setup.artifacts {
+        executor = executor.with_artifacts(artifact_fs::Store::open(&path).unwrap());
+    }
+    let observation_shutdown = Arc::new(tokio::sync::Notify::new());
     if setup.tools {
-        let lookup = Arc::new(Lookup(pool.clone()));
+        let lookup = Arc::new(Lookup {
+            pool: pool.clone(),
+            shutdown: setup
+                .stop_during_observation
+                .then(|| observation_shutdown.clone()),
+        });
         executor = executor.with_effects(Arc::new(ApprovedEffects {
             policy: lookup.clone(),
             adapter: lookup,
         }));
     }
-    let shutdown = tokio::task::spawn_blocking(|| {
-        std::io::stdin()
-            .lock()
-            .read_line(&mut String::new())
+    let shutdown = async {
+        if setup.stop_during_observation {
+            observation_shutdown.notified().await;
+        } else {
+            tokio::task::spawn_blocking(|| {
+                std::io::stdin()
+                    .lock()
+                    .read_line(&mut String::new())
+                    .unwrap()
+            })
+            .await
             .unwrap();
-    });
+        }
+    };
     super::super::run(
         &pool,
         None,
         settings,
         Arc::new(executor),
-        async { shutdown.await.unwrap() },
+        shutdown,
         Duration::from_secs(4),
     )
     .await;
