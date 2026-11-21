@@ -382,6 +382,32 @@ async fn cancellation_and_unknown_commit_keep_grant_identity() {
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
+async fn gateway_usage_and_settlement_column_grants() {
+    let db = TestDb::migrated().await;
+    let mut c = db.admin().await;
+    for (table, column, insert, update) in [
+        ("gateway_usage_reports", "reasoning_included", true, false),
+        ("gateway_settlements", "final", true, true),
+        ("gateway_settlements", "updated_at", false, false),
+        ("gateway_requests", "settled_final", false, false),
+    ] {
+        for role in [pg::GATEWAY, API, WORKER, ISSUANCE, "public"] {
+            let writes: (bool, bool) = sqlx::query_as(
+                "SELECT has_column_privilege($1,$2,$3,'INSERT'), has_column_privilege($1,$2,$3,'UPDATE')",
+            )
+            .bind(role).bind(format!("openmettle.{table}")).bind(column)
+            .fetch_one(&mut c).await.unwrap();
+            assert_eq!(
+                writes,
+                (role == pg::GATEWAY && insert, role == pg::GATEWAY && update),
+                "{role} {table}.{column}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
 async fn sql_roles_scopes_null_checks_and_immutable_origin() {
     let db = TestDb::migrated().await;
     let c = Context::new(&db).await;

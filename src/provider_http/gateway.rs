@@ -6,6 +6,7 @@ use hyper::{
     Method, StatusCode,
     header::{self, HeaderMap, HeaderValue},
 };
+use rustls::crypto::SharedSecret;
 use serde::{Deserialize, Serialize};
 use std::{
     fmt,
@@ -147,7 +148,7 @@ impl Admin {
         path: String,
         intent: Option<&Create>,
         deadline: Instant,
-    ) -> Result<openidconnect::HttpResponse, Error> {
+    ) -> Result<hyper::Response<SharedSecret>, Error> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(super::Error::Timeout.into());
@@ -188,12 +189,14 @@ impl Admin {
         } else {
             Vec::new()
         };
+        let conditional_put = method == Method::PUT && intent.is_some();
         let res = tokio::time::timeout_at(
             deadline,
             route.send_admitted(method, &headers, body, &limits),
         )
         .await
-        .map_err(|_| super::Error::Timeout)??;
+        .map_err(|_| super::Error::Timeout)??
+        .map(SharedSecret::from);
         let status = res.status();
         match status.as_u16() {
             408 | 429 | 503 => {
@@ -216,6 +219,7 @@ impl Admin {
                     });
                 Err(Error::Deferred(delay))
             }
+            412 if conditional_put => Ok(res),
             400..=499 if status != StatusCode::NOT_FOUND => Err(Error::Refused(status.as_u16())),
             200..=299 | 404 => Ok(res),
             _ => Err(Error::Protocol),
@@ -233,7 +237,7 @@ impl Admin {
         }
 
         if res.status() == 200
-            && serde_json::from_slice::<Readiness>(res.body()).is_ok_and(|r| r.ready)
+            && serde_json::from_slice::<Readiness>(res.body().secret_bytes()).is_ok_and(|r| r.ready)
         {
             Ok(())
         } else {
@@ -254,17 +258,17 @@ impl Admin {
             res = self
                 .request(Method::PUT, i.path(), Some(i), deadline)
                 .await?;
-            if !matches!(res.status().as_u16(), 200 | 201) {
+            if !matches!(res.status().as_u16(), 200 | 201 | 412) {
                 return Err(Error::Protocol);
             }
+            drop(res);
             res = self.request(Method::GET, i.path(), None, deadline).await?;
         }
         if res.status() != StatusCode::OK {
             return Err(Error::Protocol);
         }
-        let body = rustls::crypto::SharedSecret::from(res.into_body());
         let observed: Observed =
-            serde_json::from_slice(body.secret_bytes()).map_err(|_| Error::Protocol)?;
+            serde_json::from_slice(res.body().secret_bytes()).map_err(|_| Error::Protocol)?;
         if &observed.intent != i {
             return Err(Error::Protocol);
         }
@@ -296,7 +300,8 @@ impl Admin {
             if res.status() != 200 {
                 return Err(Error::Protocol);
             }
-            let p: Page = serde_json::from_slice(res.body()).map_err(|_| Error::Protocol)?;
+            let p: Page =
+                serde_json::from_slice(res.body().secret_bytes()).map_err(|_| Error::Protocol)?;
             if p.ids.len() > PAGE_SIZE
                 || (p.more && p.ids.is_empty())
                 || !p.ids.iter().all(|id| crate::runs::is_canonical_uuid(id))

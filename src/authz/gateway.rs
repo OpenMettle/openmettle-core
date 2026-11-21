@@ -5,6 +5,7 @@ use crate::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::rand::{SecureRandom, SystemRandom};
+use rustls::crypto::SharedSecret;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::fmt;
@@ -157,11 +158,11 @@ impl Pending<'_> {
                 credential,
                 native_audience,
             } => (
-                Some(
+                Some(SharedSecret::from(
                     URL_SAFE_NO_PAD
                         .decode(&credential[44..])
                         .map_err(|_| Error::Refused)?,
-                ),
+                )),
                 native_audience,
                 None,
             ),
@@ -172,7 +173,7 @@ impl Pending<'_> {
             sqlx::query("SELECT * FROM openmettle.gateway_handoff($1::uuid,$2,$3,$4,$5::uuid)")
                 .bind(&self.id)
                 .bind(self.secret.as_slice())
-                .bind(proof)
+                .bind(proof.as_ref().map(SharedSecret::secret_bytes))
                 .bind(audience.map(|a| a.as_slice()))
                 .bind(lease)
                 .fetch_optional(tx.connection()?)

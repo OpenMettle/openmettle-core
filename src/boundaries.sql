@@ -58,18 +58,20 @@ gateway_columns (relation,attribute,role,privilege) AS (
         ('gateway_intents','openmettle_gateway','INSERT',ARRAY['binding_id','desired_revision','generation','action','expected_revision','parameters']),
         ('gateway_intents','openmettle_gateway','UPDATE',ARRAY['claim','due_at','complete']),
         ('gateway_audit','openmettle_gateway','INSERT',ARRAY['binding_id','desired_revision','operation_id','step','outcome','remote_handle','remote_revision']),
-        ('gateway_usage_reports','openmettle_gateway','INSERT',ARRAY['request_id','source','report_id','revision','final','prompt_tokens','completion_tokens','reasoning_tokens','cost','unit']),
-        ('gateway_settlements','openmettle_gateway','INSERT',ARRAY['request_id','revision','measured','outstanding']),
-        ('gateway_settlements','openmettle_gateway','UPDATE',ARRAY['revision','measured','outstanding']),
+        ('gateway_usage_reports','openmettle_gateway','INSERT',ARRAY['request_id','source','report_id','revision','final','prompt_tokens','completion_tokens','reasoning_tokens','reasoning_included','cost','unit']),
+        ('gateway_settlements','openmettle_gateway','INSERT',ARRAY['request_id','revision','final','measured','outstanding']),
+        ('gateway_settlements','openmettle_gateway','UPDATE',ARRAY['revision','final','measured','outstanding']),
         ('gateway_reservations','openmettle_api','INSERT',ARRAY['id','scope_id','actor_user_id','approval_id','run_id','units']),
         ('gateway_requests','openmettle_api','INSERT',ARRAY['id','reservation_id','scope_id','actor_user_id','approval_id','installation','model','units','dispatch_hash','session_id']),
         ('gateway_requests','openmettle_worker','INSERT',ARRAY['id','reservation_id','scope_id','actor_user_id','approval_id','installation','model','units','dispatch_hash','run_id','round'])
     ) AS t(relation,role,privilege,columns), unnest(columns) attribute WHERE $1 >= 23
 ),
-gateway_functions (signature,inference) AS (
-    SELECT * FROM (VALUES ('openmettle.gateway_allocate()',false), ('openmettle.gateway_run_hold()',false),
-        ('openmettle.gateway_handoff(uuid,bytea,bytea,bytea,uuid)',true),
-        ('openmettle.gateway_release(uuid,bytea)',true)) AS f WHERE $1 >= 23
+gateway_functions (signature,definer,inference) AS (
+    SELECT * FROM (VALUES ('openmettle.gateway_allocate()',true,false), ('openmettle.gateway_run_hold()',true,false),
+        ('openmettle.gateway_advance_settlement()',false,false),
+        ('openmettle.gateway_mark_settled_final()',true,false),
+        ('openmettle.gateway_handoff(uuid,bytea,bytea,bytea,uuid)',true,true),
+        ('openmettle.gateway_release(uuid,bytea)',true,true)) AS f WHERE $1 >= 23
 ),
 contract (relation, role, privilege) AS (
     VALUES
@@ -628,7 +630,7 @@ violations (violation) AS (
     UNION ALL
     SELECT format('unsafe or missing gateway function %s', f.signature)
     FROM gateway_functions f LEFT JOIN pg_proc p ON p.oid=to_regprocedure(f.signature)
-    WHERE p.oid IS NULL OR NOT p.prosecdef OR pg_get_userbyid(p.proowner)<>'openmettle_owner'
+    WHERE p.oid IS NULL OR p.prosecdef <> f.definer OR pg_get_userbyid(p.proowner)<>'openmettle_owner'
        OR p.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog']
        OR EXISTS (SELECT FROM aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a
                   WHERE a.grantee<>p.proowner AND (NOT f.inference OR a.is_grantable OR

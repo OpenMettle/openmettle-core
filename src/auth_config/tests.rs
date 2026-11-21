@@ -587,28 +587,23 @@ fn login_keys_are_ordered_bounded_and_distinct() {
         path: fixture.dir.path(name),
     };
     // Active first, then decrypt-only keys in document order, regardless of name order.
-    assert_eq!(
-        key_material(
-            &key("login-b", "login-key-b"),
-            &[key("login-a", "login-key-a")]
-        )
-        .unwrap(),
-        [
-            ("login-b".to_owned(), [0xb1; 32]),
-            ("login-a".to_owned(), [0xa0; 32])
-        ]
-    );
-    assert_eq!(
-        key_material(
-            &key("login-a", "login-key-a"),
-            &[key("login-b", "login-key-b")]
-        )
-        .unwrap(),
-        [
-            ("login-a".to_owned(), [0xa0; 32]),
-            ("login-b".to_owned(), [0xb1; 32])
-        ]
-    );
+    for (active, previous) in [
+        (
+            ("login-b", "login-key-b", 0xb1),
+            ("login-a", "login-key-a", 0xa0),
+        ),
+        (
+            ("login-a", "login-key-a", 0xa0),
+            ("login-b", "login-key-b", 0xb1),
+        ),
+    ] {
+        let keys = key_material(&key(active.0, active.1), &[key(previous.0, previous.1)]).unwrap();
+        assert_eq!(keys.len(), 2);
+        for ((id, bytes), expected) in keys.iter().zip([active, previous]) {
+            assert_eq!(id, expected.0);
+            assert!(bytes.secret_bytes() == [expected.2; KEY_BYTES]);
+        }
+    }
 
     let entry = |id: &str, path: &str| json!({"id": id, "path": path});
     let (active, old) = (

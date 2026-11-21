@@ -5,7 +5,7 @@ BEGIN
         AND NOT (rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls)) THEN
         RAISE EXCEPTION 'provision a restricted openmettle_gateway role before migration 23';
     END IF;
-    EXECUTE pg_catalog.format('GRANT CONNECT ON DATABASE %I TO openmettle_gateway', current_database());
+    EXECUTE pg_catalog.format('GRANT CONNECT ON DATABASE %I TO openmettle_gateway', pg_catalog.current_database());
 END
 $$;
 GRANT USAGE ON SCHEMA openmettle TO openmettle_gateway;
@@ -77,6 +77,7 @@ CREATE TABLE openmettle.gateway_intents (
     claim uuid,
     due_at timestamptz NOT NULL DEFAULT clock_timestamp() CHECK (isfinite(due_at)),
     complete boolean NOT NULL DEFAULT false,
+    CHECK (NOT complete OR claim IS NULL),
     UNIQUE (binding_id,desired_revision,generation,action),
     UNIQUE (binding_id,desired_revision,operation_id)
 );
@@ -109,6 +110,7 @@ CREATE TABLE openmettle.gateway_reservations (
     allocated bigint NOT NULL DEFAULT 0 CHECK (allocated BETWEEN 0 AND units),
     FOREIGN KEY (scope_id,run_id,actor_user_id) REFERENCES openmettle.runs (scope_id,id,actor_user_id),
     UNIQUE (id,scope_id,actor_user_id,approval_id,run_owned),
+    UNIQUE (scope_id,id),
     UNIQUE (id,run_id)
 );
 CREATE TABLE openmettle.gateway_requests (
@@ -126,6 +128,7 @@ CREATE TABLE openmettle.gateway_requests (
     units bigint NOT NULL CHECK (units > 0),
     dispatch_hash bytea NOT NULL CHECK (octet_length(dispatch_hash) = 32),
     state text NOT NULL DEFAULT 'reserved' CHECK (state IN ('reserved','released','handed_off')),
+    settled_final boolean NOT NULL DEFAULT false CHECK (NOT settled_final OR state = 'handed_off'),
     binding_id uuid,
     generation bigint,
     policy_revision bigint,
@@ -141,9 +144,16 @@ CREATE TABLE openmettle.gateway_requests (
     FOREIGN KEY (binding_id,actor_user_id) REFERENCES openmettle.gateway_bindings (id,user_id),
     FOREIGN KEY (binding_id,policy_revision,scope_id,approval_id,model) REFERENCES openmettle.gateway_policy,
     UNIQUE (id,report_source),
-    UNIQUE NULLS NOT DISTINCT (reservation_id,round)
+    UNIQUE (scope_id,id)
 );
-CREATE INDEX gateway_requests_outstanding_idx ON openmettle.gateway_requests (created_at,id) WHERE state = 'handed_off';
+CREATE UNIQUE INDEX gateway_requests_caller_reservation_idx
+    ON openmettle.gateway_requests (reservation_id) WHERE run_id IS NULL;
+CREATE UNIQUE INDEX gateway_requests_run_round_active_idx
+    ON openmettle.gateway_requests (reservation_id,round) WHERE run_id IS NOT NULL AND state <> 'released';
+CREATE INDEX gateway_requests_reserved_idx
+    ON openmettle.gateway_requests (created_at,id) WHERE state = 'reserved';
+CREATE INDEX gateway_requests_outstanding_idx
+    ON openmettle.gateway_requests (created_at,id) WHERE state = 'handed_off' AND NOT settled_final;
 CREATE TABLE openmettle.gateway_usage_reports (
     request_id uuid NOT NULL,
     source uuid NOT NULL,
@@ -153,19 +163,57 @@ CREATE TABLE openmettle.gateway_usage_reports (
     prompt_tokens bigint CHECK (prompt_tokens >= 0),
     completion_tokens bigint CHECK (completion_tokens >= 0),
     reasoning_tokens bigint CHECK (reasoning_tokens >= 0),
+    reasoning_included boolean,
     cost numeric CHECK (cost >= 0 AND cost < 1e18 AND scale(cost) <= 12),
     unit text CHECK (octet_length(unit) BETWEEN 1 AND 32),
     CHECK ((cost IS NULL) = (unit IS NULL)),
+    CHECK (reasoning_tokens IS NULL OR reasoning_included IS NOT NULL),
     FOREIGN KEY (request_id,source) REFERENCES openmettle.gateway_requests (id,report_source),
-    PRIMARY KEY (source,report_id,revision), UNIQUE (request_id,revision)
+    PRIMARY KEY (source,report_id,revision), UNIQUE (request_id,revision),
+    UNIQUE (request_id,revision,final)
 );
 CREATE TABLE openmettle.gateway_settlements (
     request_id uuid PRIMARY KEY,
     revision bigint NOT NULL,
+    final boolean NOT NULL,
     measured bigint CHECK (measured >= 0),
     outstanding bigint NOT NULL CHECK (outstanding >= 0),
-    FOREIGN KEY (request_id,revision) REFERENCES openmettle.gateway_usage_reports (request_id,revision)
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    FOREIGN KEY (request_id,revision,final) REFERENCES openmettle.gateway_usage_reports (request_id,revision,final)
 );
+CREATE INDEX gateway_settlements_nonfinal_idx
+    ON openmettle.gateway_settlements (updated_at,request_id) WHERE NOT final;
+
+-- Exact replays preserve the scan position. Corrections require a newer report,
+-- and only another final report can correct a final settlement.
+CREATE FUNCTION openmettle.gateway_advance_settlement() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+BEGIN
+    IF NEW IS DISTINCT FROM OLD THEN
+        IF NEW.revision <= OLD.revision OR (OLD.final AND NOT NEW.final) THEN
+            RAISE EXCEPTION 'invalid gateway settlement revision or finality' USING ERRCODE='23514';
+        END IF;
+        NEW.updated_at := clock_timestamp();
+    END IF;
+    RETURN NEW;
+END
+$$;
+REVOKE ALL ON FUNCTION openmettle.gateway_advance_settlement() FROM PUBLIC;
+CREATE TRIGGER gateway_advance_settlement BEFORE UPDATE ON openmettle.gateway_settlements
+    FOR EACH ROW EXECUTE FUNCTION openmettle.gateway_advance_settlement();
+
+-- AFTER fires only for an accepted settlement, including an upsert. No runtime
+-- login can write the request marker directly.
+CREATE FUNCTION openmettle.gateway_mark_settled_final() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+BEGIN
+    UPDATE openmettle.gateway_requests SET settled_final=true WHERE id=NEW.request_id AND NOT settled_final;
+    RETURN NULL;
+END
+$$;
+REVOKE ALL ON FUNCTION openmettle.gateway_mark_settled_final() FROM PUBLIC;
+CREATE TRIGGER gateway_mark_settled_final AFTER INSERT OR UPDATE OF final ON openmettle.gateway_settlements
+    FOR EACH ROW WHEN (NEW.final) EXECUTE FUNCTION openmettle.gateway_mark_settled_final();
 
 -- Admission replay locks the same run as admission. An identical hold is a
 -- no-op. A reused run or hold with changed ownership or units is a conflict.
@@ -403,9 +451,9 @@ GRANT INSERT (binding_id,revision,scope_id,approval_id,model,report_source,provi
 GRANT INSERT (binding_id,desired_revision,generation,action,expected_revision,parameters) ON openmettle.gateway_intents TO openmettle_gateway;
 GRANT UPDATE (claim,due_at,complete) ON openmettle.gateway_intents TO openmettle_gateway;
 GRANT INSERT (binding_id,desired_revision,operation_id,step,outcome,remote_handle,remote_revision) ON openmettle.gateway_audit TO openmettle_gateway;
-GRANT INSERT (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens,reasoning_tokens,cost,unit) ON openmettle.gateway_usage_reports TO openmettle_gateway;
-GRANT INSERT (request_id,revision,measured,outstanding) ON openmettle.gateway_settlements TO openmettle_gateway;
-GRANT UPDATE (revision,measured,outstanding) ON openmettle.gateway_settlements TO openmettle_gateway;
+GRANT INSERT (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens,reasoning_tokens,reasoning_included,cost,unit) ON openmettle.gateway_usage_reports TO openmettle_gateway;
+GRANT INSERT (request_id,revision,final,measured,outstanding) ON openmettle.gateway_settlements TO openmettle_gateway;
+GRANT UPDATE (revision,final,measured,outstanding) ON openmettle.gateway_settlements TO openmettle_gateway;
 GRANT INSERT (id,scope_id,actor_user_id,approval_id,run_id,units) ON openmettle.gateway_reservations TO openmettle_api;
 GRANT INSERT (id,reservation_id,scope_id,actor_user_id,approval_id,installation,model,units,dispatch_hash,session_id) ON openmettle.gateway_requests TO openmettle_api;
 GRANT INSERT (id,reservation_id,scope_id,actor_user_id,approval_id,installation,model,units,dispatch_hash,run_id,round) ON openmettle.gateway_requests TO openmettle_worker;

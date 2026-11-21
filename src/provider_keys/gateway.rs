@@ -116,21 +116,28 @@ impl fmt::Debug for GatewayKeys {
 }
 impl GatewayKeys {
     pub fn new(material: &[(String, [u8; 32])]) -> Result<Self, Protection> {
+        Self::from_bytes(material.iter().map(|(id, key)| (id, key.as_slice())))
+    }
+
+    pub(crate) fn from_bytes<'a>(
+        material: impl ExactSizeIterator<Item = (&'a String, &'a [u8])>,
+    ) -> Result<Self, Protection> {
         if !(1..=4).contains(&material.len()) {
             return Err(Protection);
         }
-        let mut keys = Vec::new();
-        for (n, (id, raw)) in material.iter().enumerate() {
+        let mut keys: Vec<Key> = Vec::with_capacity(material.len());
+        for (id, raw) in material {
+            let fingerprint: [u8; 32] = Sha256::digest(raw).into();
             if !crate::auth_config::CursorKeys::valid_id(id)
-                || material[..n]
+                || keys
                     .iter()
-                    .any(|(prev, b)| prev == id || bool::from(b.ct_eq(raw)))
+                    .any(|k| &k.id == id || bool::from(k.fingerprint.ct_eq(&fingerprint)))
             {
                 return Err(Protection);
             }
             keys.push(Key {
                 id: id.clone(),
-                fingerprint: Sha256::digest(raw).into(),
+                fingerprint,
                 key: aead::LessSafeKey::new(
                     aead::UnboundKey::new(&aead::AES_256_GCM, raw).map_err(|_| Protection)?,
                 ),

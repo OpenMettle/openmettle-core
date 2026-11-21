@@ -24,6 +24,7 @@ use crate::{
     sessions,
 };
 use ring::hmac;
+use rustls::crypto::SharedSecret;
 use serde_json::{Map, Value, error::Category};
 use std::{
     collections::HashSet,
@@ -226,14 +227,11 @@ impl CursorKeys {
     }
 }
 
-fn shared_key_material(
-    left: &[(String, [u8; KEY_BYTES])],
-    right: &[(String, [u8; KEY_BYTES])],
-) -> bool {
+fn shared_key_material(left: &[(String, SharedSecret)], right: &[(String, SharedSecret)]) -> bool {
     let mut shared = subtle::Choice::from(0);
     for (_, key) in left {
         for (_, other) in right {
-            shared |= key.ct_eq(other);
+            shared |= key.secret_bytes().ct_eq(other.secret_bytes());
         }
     }
     bool::from(shared)
@@ -260,8 +258,8 @@ impl CursorFiles {
 
     fn load(
         &self,
-        login: &[(String, [u8; KEY_BYTES])],
-        gateway: &[(String, [u8; KEY_BYTES])],
+        login: &[(String, SharedSecret)],
+        gateway: &[(String, SharedSecret)],
     ) -> Result<CursorKeys, Error> {
         let keys = key_material(&self.active, &self.verify_only).map_err(|error| match error {
             Error::KeyRing => Error::CursorKeyRing,
@@ -274,17 +272,16 @@ impl CursorFiles {
         for (i, (id, material)) in keys.iter().enumerate() {
             if !CursorKeys::valid_id(id)
                 || keys[..i].iter().any(|(other, _)| other == id)
-                || login
-                    .iter()
-                    .chain(&keys[..i])
-                    .any(|(_, other)| bool::from(material.ct_eq(other)))
+                || login.iter().chain(&keys[..i]).any(|(_, other)| {
+                    bool::from(material.secret_bytes().ct_eq(other.secret_bytes()))
+                })
             {
                 return Err(Error::CursorKeyRing);
             }
         }
         let mut keys = keys
             .into_iter()
-            .map(|(id, bytes)| (id, hmac::Key::new(hmac::HMAC_SHA256, &bytes)));
+            .map(|(id, bytes)| (id, hmac::Key::new(hmac::HMAC_SHA256, bytes.secret_bytes())));
         Ok(CursorKeys {
             active: keys.next().ok_or(Error::CursorKeyRing)?,
             verify_only: keys.collect(),
@@ -673,10 +670,14 @@ fn read(path: &Path, limit: usize, refusal: Error) -> Result<Vec<u8>, Error> {
     if !file.metadata().is_ok_and(bounded) {
         return Err(refusal);
     }
-    let mut bytes = Vec::new();
+    // A raw key and the oversize sentinel fit without reallocating secret bytes.
+    let mut bytes = Vec::with_capacity(limit.min(KEY_BYTES) + 1);
     match file.take(limit as u64 + 1).read_to_end(&mut bytes) {
         Ok(length) if length <= limit => Ok(bytes),
-        _ => Err(refusal),
+        _ => {
+            drop(SharedSecret::from(bytes));
+            Err(refusal)
+        }
     }
 }
 
@@ -685,16 +686,18 @@ fn read(path: &Path, limit: usize, refusal: Error) -> Result<Vec<u8>, Error> {
 fn key_material(
     active: &KeyFile,
     decrypt_only: &[KeyFile],
-) -> Result<Vec<(String, [u8; KEY_BYTES])>, Error> {
+) -> Result<Vec<(String, SharedSecret)>, Error> {
     if decrypt_only.len() >= login::MAX_KEYS {
         return Err(Error::KeyRing);
     }
     std::iter::once(active)
         .chain(decrypt_only)
         .map(|key| {
-            let bytes = read(Path::new(&key.path), KEY_BYTES, Error::KeyFile)?;
-            let material = bytes.try_into().map_err(|_| Error::KeyFile)?;
-            Ok((key.id.clone(), material))
+            let bytes = SharedSecret::from(read(Path::new(&key.path), KEY_BYTES, Error::KeyFile)?);
+            if bytes.secret_bytes().len() != KEY_BYTES {
+                return Err(Error::KeyFile);
+            }
+            Ok((key.id.clone(), bytes))
         })
         .collect()
 }
@@ -833,7 +836,10 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
             if shared_key_material(gateway, &material) {
                 return Err(Error::GatewayKeyRing);
             }
-            provider_keys::gateway::GatewayKeys::new(gateway).map_err(|_| Error::GatewayKeyRing)
+            provider_keys::gateway::GatewayKeys::from_bytes(
+                gateway.iter().map(|(id, key)| (id, key.secret_bytes())),
+            )
+            .map_err(|_| Error::GatewayKeyRing)
         })
         .transpose()?;
     let cursor_keys = document
@@ -841,7 +847,17 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
         .as_ref()
         .map(|files| files.load(&material, gateway_material.as_deref().unwrap_or_default()))
         .transpose()?;
-    let keys = KeyRing::new(material).map_err(|_| Error::KeyRing)?;
+    drop(gateway_material);
+    let login_keys = material
+        .into_iter()
+        .map(|(id, key)| {
+            (
+                id,
+                key.secret_bytes().try_into().expect("validated key length"),
+            )
+        })
+        .collect();
+    let keys = KeyRing::new(login_keys).map_err(|_| Error::KeyRing)?;
 
     let manager = ProviderManager::new(refresh_policy);
     let mut seen = HashSet::new();

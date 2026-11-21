@@ -448,6 +448,11 @@ async fn migration_15_grants_exactly_the_contract() {
             "REVOKE UPDATE (scope_id) ON openmettle.runs FROM openmettle_worker",
             "openmettle_worker has UPDATE on openmettle.runs.scope_id",
         ),
+        (
+            "GRANT UPDATE (settled_final) ON openmettle.gateway_requests TO openmettle_gateway",
+            "REVOKE UPDATE (settled_final) ON openmettle.gateway_requests FROM openmettle_gateway",
+            "openmettle_gateway has UPDATE on openmettle.gateway_requests.settled_final",
+        ),
     ] {
         owner.execute(grant).await.unwrap();
         refused_with(&settings, MIGRATIONS, violation).await;

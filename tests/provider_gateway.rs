@@ -152,6 +152,60 @@ async fn committed_creates_with_lost_replies_recover_by_handle() {
 }
 
 #[tokio::test]
+async fn conditional_create_recovers_only_the_verified_intent_after_412() {
+    for (observed_revision, expected_success) in [(Some(1), true), (Some(2), false), (None, false)]
+    {
+        let ca = Ca::new();
+        let step = std::sync::atomic::AtomicUsize::new(0);
+        let server = Server::start(ca.leaf(fixture::HOST, false), move |req| {
+            let mut expected = intent(Resource::Key);
+            let path = format!("/admin/v1/keys/{}", expected.target);
+            let line = req.head.lines().next().unwrap();
+            let response = match step.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    assert_eq!(line, "GET /admin/v1/ready HTTP/1.1");
+                    fixture::json(br#"{"ready":true}"#)
+                }
+                1 => {
+                    assert_eq!(line, format!("GET {path} HTTP/1.1"));
+                    fixture::response(404, &[], b"")
+                }
+                2 => {
+                    assert_eq!(line, format!("PUT {path} HTTP/1.1"));
+                    assert!(req.head.contains("if-none-match: *\r\n"));
+                    fixture::response(412, &[], b"unverified-echo")
+                }
+                3 => {
+                    assert_eq!(line, format!("GET {path} HTTP/1.1"));
+                    if let Some(revision) = observed_revision {
+                        expected.revision = revision;
+                        let observed = json!({"intent": expected, "bearer": USER});
+                        fixture::json(&serde_json::to_vec(&observed).unwrap())
+                    } else {
+                        fixture::response(404, &[], b"")
+                    }
+                }
+                _ => panic!("unexpected retry"),
+            };
+            Reply::Bytes(response)
+        })
+        .await;
+        let result = client(&server, &ca)
+            .ensure(&intent(Resource::Key), deadline())
+            .await;
+        if expected_success {
+            assert_eq!(
+                result.unwrap().unwrap().authorization(),
+                Bearer::new(USER.as_bytes()).unwrap().authorization()
+            );
+        } else {
+            assert_eq!(result.unwrap_err(), admin::Error::Protocol);
+        }
+        assert_eq!(server.requests.load(Ordering::SeqCst), 4);
+    }
+}
+
+#[tokio::test]
 async fn transient_status_defers_beyond_batch_and_permanent_refusal_stops_at_readiness() {
     for (status, retry, seconds) in [
         (408, "0", Some(0)),
@@ -161,6 +215,7 @@ async fn transient_status_defers_beyond_batch_and_permanent_refusal_stops_at_rea
         (503, "Fri, 01 Jan", None),
         (403, "0", None),
         (401, "0", None),
+        (412, "0", None),
         (422, "0", None),
         (307, "0", None),
     ] {
@@ -210,7 +265,7 @@ async fn transient_status_defers_beyond_batch_and_permanent_refusal_stops_at_rea
                 );
                 assert_eq!(server.requests.load(Ordering::SeqCst), 3);
             }
-            (401 | 403 | 422, admin::Error::Refused(s)) => assert_eq!(s, status),
+            (401 | 403 | 412 | 422, admin::Error::Refused(s)) => assert_eq!(s, status),
             (307, admin::Error::Protocol) => {}
             _ => panic!("unexpected response {err:?}"),
         }
