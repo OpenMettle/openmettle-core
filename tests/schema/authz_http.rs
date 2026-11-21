@@ -74,11 +74,21 @@ impl Api {
     /// left files in.
     fn start_in(db: &TestDb, dir: auth_config_support::Dir) -> Self {
         let document = auth_config_support::document_v2_native(&dir, &ca::Ca::new().pem());
+        Self::configured(db, dir, document, 4)
+    }
+
+    fn configured(
+        db: &TestDb,
+        dir: auth_config_support::Dir,
+        document: Value,
+        connections: u32,
+    ) -> Self {
         let auth = dir.write("auth.json", document.to_string().as_bytes());
         let bind = address();
         let child = binary("api")
             .env("OPENMETTLE_API_BIND", &bind)
             .env("OPENMETTLE_API_DATABASE_URL", db.url(API))
+            .env("OPENMETTLE_API_DB_MAX_CONNECTIONS", connections.to_string())
             .env("OPENMETTLE_API_DB_TIMEOUT_MS", "2000")
             .env("OPENMETTLE_API_AUTH_CONFIG", &auth)
             .env("OPENMETTLE_API_ISSUANCE_DATABASE_URL", db.url(ISSUANCE))
@@ -1561,3 +1571,6 @@ async fn interrupted_uploads_leave_nothing_after_reconciliation() {
     assert_eq!(stored["size_bytes"], "4096");
     assert_eq!(charged(&db, &personal).await, (4096, 0, 0));
 }
+
+#[path = "run_events_http.rs"]
+mod run_events_http;

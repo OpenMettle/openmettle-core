@@ -128,3 +128,9 @@ pub fn document_v2_native(dir: &Dir, bundle: &[u8]) -> Value {
     });
     document
 }
+
+/// Two synthetic cursor keys. Tests can swap their roles to model a rolling rotation.
+pub fn cursor_keys(dir: &Dir) -> Value {
+    json!({"active":{"id":"cursor-b","path":dir.write("cursor-b", &[2;32])},
+        "verify_only":[{"id":"cursor-a","path":dir.write("cursor-a", &[1;32])}]})
+}

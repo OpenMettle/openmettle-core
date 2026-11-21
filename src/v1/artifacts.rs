@@ -12,9 +12,9 @@
 //! - **Download.** The `Range` header and `ARTIFACTS_DIR`, then current `Download` on the
 //!   artifact on every request, then only an `active` revision streams from the store.
 use super::{
-    API_VERSION, Api, BODY, CONFLICT, INTERNAL, INVALID, KEY_CONFLICT, NOT_FOUND, Op, PROVISIONING,
-    Problem, Session, TIMEOUT, UNAVAILABLE, VERSION_HEADER, path_id, principal, problem, reply,
-    request_id, request_key, timestamp,
+    Api, BODY, CONFLICT, INTERNAL, INVALID, KEY_CONFLICT, NOT_FOUND, Op, PROVISIONING, Problem,
+    Session, TIMEOUT, UNAVAILABLE, path_id, principal, problem, reply, request_id, request_key,
+    response_headers, single_header, timestamp,
 };
 use crate::{
     artifact_fs,
@@ -152,12 +152,10 @@ fn byte_range(headers: &HeaderMap) -> Result<Option<ByteRange>, Problem> {
     if headers.contains_key(header::IF_RANGE) {
         return Ok(None);
     }
-    let mut values = headers.get_all(header::RANGE).iter();
-    let value = match (values.next(), values.next()) {
-        (None, _) => return Ok(None),
-        (Some(value), None) => value.to_str().map_err(|_| RANGE)?,
-        _ => return Err(RANGE),
+    let Some(value) = single_header(headers, header::RANGE, RANGE)? else {
+        return Ok(None);
     };
+    let value = value.to_str().map_err(|_| RANGE)?;
     let spec = value
         .get(..6)
         .filter(|unit| unit.eq_ignore_ascii_case("bytes="))
@@ -261,10 +259,7 @@ async fn read_revision(
 
 /// Exactly one `Content-Type` that the multipart parser accepts.
 fn multipart_type(headers: &HeaderMap) -> Result<&str, Problem> {
-    let mut media = headers.get_all(header::CONTENT_TYPE).iter();
-    let (Some(value), None) = (media.next(), media.next()) else {
-        return Err(BODY);
-    };
+    let value = single_header(headers, header::CONTENT_TYPE, BODY)?.ok_or(BODY)?;
     let value = value.to_str().map_err(|_| BODY)?;
     Parser::new(value).map_err(|_| BODY)?;
     Ok(value)
@@ -279,14 +274,14 @@ impl Api {
         op: Op,
         parts: &Parts,
         body: Body,
-        session: Session<'_>,
+        session: Session,
         target: &str,
         client_key: &str,
     ) -> Result<Response, Problem> {
         let query = upload_query(op, parts.uri.query())?;
         let content_type = multipart_type(&parts.headers)?;
         let store = self.artifacts.as_ref().ok_or(PROVISIONING)?;
-        let context = self.authenticate(session).await?;
+        let context = self.authenticate(&session).await?;
         let (actor, now) = (context.user_id(), context.observed_ms());
         let (scope, key, artifact) = if op == Op::CreateArtifact {
             let scope = query.scope.unwrap_or(context.personal_scope_id());
@@ -335,7 +330,7 @@ impl Api {
         &self,
         op: Op,
         parts: &Parts,
-        session: Session<'_>,
+        session: Session,
         artifact: &str,
     ) -> Result<Response, Problem> {
         let revision_id = path_id(parts, 5)?;
@@ -347,7 +342,7 @@ impl Api {
             ),
             false => (None, None),
         };
-        let context = self.authenticate(session).await?;
+        let context = self.authenticate(&session).await?;
         let action = if download {
             Action::Download
         } else {
@@ -388,8 +383,7 @@ impl Api {
         let mut response = Response::new(Body::new(content));
         *response.status_mut() = status;
         let headers = response.headers_mut();
-        headers.insert(VERSION_HEADER, HeaderValue::from_static(API_VERSION));
-        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        response_headers(headers);
         headers.insert(header::CONTENT_TYPE, media_type);
         headers.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
         headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));

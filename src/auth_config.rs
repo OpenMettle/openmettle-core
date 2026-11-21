@@ -23,6 +23,7 @@ use crate::{
     provider_keys::{self, ManagedProvider, ProviderConfig, ProviderManager, RefreshPolicy},
     sessions,
 };
+use ring::hmac;
 use serde_json::{Map, Value, error::Category};
 use std::{
     collections::HashSet,
@@ -32,6 +33,7 @@ use std::{
     path::Path,
     time::Duration,
 };
+use subtle::ConstantTimeEq;
 
 /// The original document: login, token, refresh, session and provider settings.
 pub const VERSION: u64 = 1;
@@ -68,6 +70,10 @@ pub enum Error {
     KeyFile,
     /// Key count, identifiers or repeated material refused by [`KeyRing`].
     KeyRing,
+    /// An unreadable cursor key file or a key with an incorrect length.
+    CursorKeyFile,
+    /// Invalid cursor key count, identifier or key separation.
+    CursorKeyRing,
     /// No provider, or more than the configured manager capacity.
     ProviderCount,
     ProviderIdentity,
@@ -107,6 +113,10 @@ impl fmt::Display for Error {
             Self::SessionPolicy => "session policy is out of range",
             Self::KeyFile => "a login key is not a readable regular file of exactly 32 bytes",
             Self::KeyRing => "login key count, identifiers or material are not acceptable",
+            Self::CursorKeyFile => {
+                "a cursor key is not a readable regular file of exactly 32 bytes"
+            }
+            Self::CursorKeyRing => "cursor key count, identifiers or key separation are invalid",
             Self::ProviderCount => "provider count is outside the configured capacity",
             Self::ProviderIdentity => "a provider identity is invalid",
             Self::DuplicateProvider => "provider identifiers are not unique",
@@ -195,6 +205,67 @@ impl KeyFile {
         };
         key.end()?;
         Ok(parsed)
+    }
+}
+
+/// Dedicated HMAC keys in signing order, active first (ADR 0034).
+pub(crate) struct CursorKeys {
+    pub(crate) active: (String, hmac::Key),
+    pub(crate) verify_only: Vec<(String, hmac::Key)>,
+}
+
+impl CursorKeys {
+    pub(crate) fn valid_id(id: &str) -> bool {
+        (1..=64).contains(&id.len())
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+    }
+}
+
+struct CursorFiles {
+    active: KeyFile,
+    verify_only: Vec<KeyFile>,
+}
+impl CursorFiles {
+    fn parse(mut keys: Object) -> Result<Self, Error> {
+        let active = KeyFile::parse(keys.take("active")?)?;
+        let verify_only = keys
+            .array("verify_only")?
+            .into_iter()
+            .map(KeyFile::parse)
+            .collect::<Result<_, _>>()?;
+        keys.end()?;
+        Ok(Self {
+            active,
+            verify_only,
+        })
+    }
+
+    fn load(&self, login: &[(String, [u8; KEY_BYTES])]) -> Result<CursorKeys, Error> {
+        let keys = key_material(&self.active, &self.verify_only).map_err(|error| match error {
+            Error::KeyRing => Error::CursorKeyRing,
+            Error::KeyFile => Error::CursorKeyFile,
+            other => other,
+        })?;
+        for (i, (id, material)) in keys.iter().enumerate() {
+            if !CursorKeys::valid_id(id)
+                || keys[..i].iter().any(|(other, _)| other == id)
+                || login
+                    .iter()
+                    .chain(&keys[..i])
+                    .any(|(_, other)| bool::from(material.ct_eq(other)))
+            {
+                return Err(Error::CursorKeyRing);
+            }
+        }
+        let mut keys = keys
+            .into_iter()
+            .map(|(id, bytes)| (id, hmac::Key::new(hmac::HMAC_SHA256, &bytes)));
+        Ok(CursorKeys {
+            active: keys.next().ok_or(Error::CursorKeyRing)?,
+            verify_only: keys.collect(),
+        })
     }
 }
 
@@ -422,6 +493,7 @@ impl NativeProfile {
 struct Document {
     login_lifetime_seconds: u64,
     active_key: KeyFile,
+    cursor_keys: Option<CursorFiles>,
     decrypt_only_keys: Vec<KeyFile>,
     max_issued_at_age_seconds: u64,
     future_skew_seconds: u64,
@@ -486,6 +558,13 @@ impl Document {
                 .collect::<Result<_, _>>()?,
             browser: match version {
                 VERSION_2 => Some(BrowserProfile::parse(root.take("browser")?)?),
+                _ => None,
+            },
+            cursor_keys: match version {
+                VERSION_2 => root
+                    .optional_object("cursor_keys")?
+                    .map(CursorFiles::parse)
+                    .transpose()?,
                 _ => None,
             },
             native: match version {
@@ -555,6 +634,7 @@ fn key_material(
 /// Everything the browser-auth runtime needs, constructed together or not at all. The manager
 /// is the single process-lifetime owner required by ADR 0011; providers are in document order.
 pub struct AuthConfig {
+    pub(crate) cursor_keys: Option<CursorKeys>,
     keys: KeyRing,
     login_lifetime: Duration,
     token_policy: auth::Policy,
@@ -614,6 +694,7 @@ impl AuthConfig {
             session_policy,
             manager,
             providers,
+            cursor_keys: None,
             browser: None,
             native: None,
         }
@@ -662,11 +743,13 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
         return Err(Error::ProviderCount);
     }
 
-    let keys = KeyRing::new(key_material(
-        &document.active_key,
-        &document.decrypt_only_keys,
-    )?)
-    .map_err(|_| Error::KeyRing)?;
+    let material = key_material(&document.active_key, &document.decrypt_only_keys)?;
+    let cursor_keys = document
+        .cursor_keys
+        .as_ref()
+        .map(|files| files.load(&material))
+        .transpose()?;
+    let keys = KeyRing::new(material).map_err(|_| Error::KeyRing)?;
 
     let manager = ProviderManager::new(refresh_policy);
     let mut seen = HashSet::new();
@@ -720,6 +803,7 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
         .map(|profile| profile.check(&providers, browser.as_ref()))
         .transpose()?;
     Ok(AuthConfig {
+        cursor_keys,
         keys,
         login_lifetime,
         token_policy,

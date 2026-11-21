@@ -269,6 +269,23 @@ a step was performed on every replica or in the database.
 2. Make the new key `active` and move the previous active key to `decrypt_only`. Roll out.
 3. After the maximum login lifetime plus the rollout overlap, remove the old key.
 
+**Run cursor keys (version 2, ADR 0034).** The optional top-level `cursor_keys` object
+contains one `active` key and a `verify_only` array of zero to three keys. Each has an
+`id` of 1–64 ASCII letters, digits, hyphens or underscores and an absolute file `path`.
+The bounded reader requires 32 raw bytes. Repeated identifiers, repeated key material and
+material shared with any login key fail the offline check. Without this object both run
+reads return `503 provisioning`.
+
+1. Generate a new key with a fresh identifier in the deployment secret store. A private
+   file generated with `openssl rand 32` redirected to a new file has the required format.
+2. Add the file under `verify_only` on all replicas. Validate each revision with
+   `openmettle-api --check-auth-config /etc/openmettle/auth/auth.json` before rollout.
+3. After every replica can verify the new key, make it active. Keep the previous active
+   key in `verify_only` while clients still need its cursors.
+4. Remove a retired key to force its clients to fetch a fresh snapshot. After a database
+   restore, retire **all** pre-restore keys before accepting requests. A restored sequence
+   number may identify different content.
+
 **Provider configuration change** (ADRs 0012 and 0013). Choose a new `revision`, append it
 with the owner write protocol, and roll the changed document out. Replicas whose revision
 differs from the current database row refuse logins during the rollout. Replacing an issuer

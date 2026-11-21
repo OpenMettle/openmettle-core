@@ -699,8 +699,11 @@ fn consumer_decodes_every_valid_and_newer_compatible_response() {
 type Decode = fn(&Value) -> Result<(), String>;
 
 /// The consumer's decoders of the V1-05 project, conversation and artifact responses.
-fn v1_decoders() -> [(&'static str, Decode); 6] {
+fn v1_decoders() -> [(&'static str, Decode); 7] {
     [
+        ("#/components/schemas/Run", |v| {
+            consumer::decode_run(v).map(drop)
+        }),
         ("#/components/schemas/Project", |v| {
             consumer::decode_project(v).map(drop)
         }),
@@ -1030,7 +1033,10 @@ fn consumer_advances_cursor_over_unrecognized_events_and_drops_duplicates() {
         panic!("first event reported as duplicate");
     };
     assert_eq!(event.sequence, 42);
-    assert_eq!(event.unrecognized_type, "example.note");
+    assert_eq!(
+        event.kind,
+        consumer::EventKind::Unknown("example.note".into())
+    );
     assert_eq!(event.run_id, "0f0e0d0c-0b0a-4908-8706-050403020100");
     assert!(event.data.is_empty());
     assert_eq!(
@@ -1049,6 +1055,11 @@ fn consumer_advances_cursor_over_unrecognized_events_and_drops_duplicates() {
     };
     assert_eq!(event.sequence, i64::MAX);
     assert_eq!(cursor.last_id.as_deref(), Some("bGF0ZXItY3Vyc29y"));
+    assert!(matches!(
+        cursor.apply(&first).unwrap(),
+        consumer::Applied::Duplicate
+    ));
+    assert_eq!(cursor.last_id.as_deref(), Some("bGF0ZXItY3Vyc29y"));
     // Undecodable items do not advance the cursor.
     for name in [
         "RunEventItemNote--sequence-above-signed-64",
@@ -1059,6 +1070,61 @@ fn consumer_advances_cursor_over_unrecognized_events_and_drops_duplicates() {
         assert!(cursor.apply(&fixture(name)).is_err(), "{name}");
         assert_eq!(cursor.last_id.as_deref(), Some("bGF0ZXItY3Vyc29y"));
     }
+}
+
+#[test]
+fn configured_run_reads_reach_primary_session_validation() {
+    let dir = auth_config_support::Dir::new();
+    let mut document = auth_config_support::document_v2_native(&dir, &ca::Ca::new().pem());
+    document["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+    let path = dir.write("auth.json", document.to_string().as_bytes());
+    let (api, _database) = Api::start(Some(&path));
+    let token = format!("{}.{}", "A".repeat(43), "A".repeat(43));
+    for suffix in ["", "/events"] {
+        let request = format!(
+            "GET /v1/runs/00000000-0000-0000-0000-000000000001{suffix} HTTP/1.1\r\nauthorization: Bearer {token}\r\n\r\n"
+        );
+        let (status, _, _) = api.exchange(&request).unwrap();
+        assert!(matches!(status, 503 | 504));
+    }
+}
+
+#[test]
+fn serialized_lifecycle_replays_to_the_snapshot() {
+    let example = &contract()["components"]["examples"]["RunLifecycleStream"];
+    let frames: Vec<_> = example["serializedValue"]
+        .as_str()
+        .unwrap()
+        .split("\n\n")
+        .filter_map(consumer::sse_item)
+        .collect();
+    assert_eq!(json!(frames), example["dataValue"]);
+    let mut position = consumer::EventCursor::default();
+    let snapshot = consumer::decode_run(&fixture("RunSnapshot")).unwrap();
+    let mut kinds = vec![];
+    for frame in frames {
+        assert!(validator_for("#/components/schemas/RunEventItem").is_valid(&frame));
+        let consumer::Applied::New(event) = position.apply(&frame).unwrap() else {
+            panic!("duplicate sequence")
+        };
+        assert_eq!(event.run_id, snapshot.run_id);
+        kinds.push(event.kind);
+    }
+    use consumer::{EventKind, Reason};
+    assert_eq!(
+        kinds,
+        [
+            EventKind::Created,
+            EventKind::Started,
+            EventKind::Cancelled(Reason::Requested)
+        ]
+    );
+    assert_eq!(snapshot.terminal.unwrap().kind, kinds.pop().unwrap());
+    assert_eq!(snapshot.state, "cancelled");
+    assert_eq!(position.last_id.unwrap(), snapshot.resume_cursor);
+    assert_eq!(position.last_sequence.unwrap(), snapshot.last_sequence);
+    assert_ne!(snapshot.conversation_id, snapshot.run_id);
+    assert_eq!(snapshot.created_at, "2026-11-20T09:00:01.000000Z");
 }
 
 #[test]
@@ -1241,7 +1307,8 @@ fn mounted_api_problems_conform_to_the_contract() {
         let target = target
             .replace("conversation_id", id)
             .replace("artifact_id", id)
-            .replace("revision_id", id);
+            .replace("revision_id", id)
+            .replace("run_id", id);
         for method in item.as_object().unwrap().keys() {
             let method = method.to_ascii_uppercase();
             cases.push((
@@ -1272,6 +1339,9 @@ fn mounted_api_problems_conform_to_the_contract() {
         ),
         (format!("GET /v1/projects/CANARY-id HTTP/1.1\r\n{bearer}\r\n"), Validation),
         (format!("GET /v1/artifacts/{id}/revisions/CANARY-id HTTP/1.1\r\n{bearer}\r\n"), Validation),
+        (format!("GET /v1/runs/{id} HTTP/1.1\r\n{bearer}\r\n"), Provisioning),
+        (format!("GET /v1/runs/{id}/events HTTP/1.1\r\n{cookie}\r\n"), Provisioning),
+        (format!("GET /v1/runs/{id}/events?cursor=x HTTP/1.1\r\n{cookie}\r\n"), Validation),
         // Artifact uploads: the key, the query and the multipart type precede the store check.
         (format!("POST /v1/artifacts HTTP/1.1\r\n{bearer}{multipart}\r\n"), Validation),
         (

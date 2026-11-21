@@ -27,7 +27,7 @@ fn routes_are_the_implemented_contract_operations() {
         }
     }
     assert_eq!(served, documented);
-    assert_eq!(served.len(), 19);
+    assert_eq!(served.len(), 21);
     for (path, _) in routes() {
         assert_eq!(
             crate::telemetry::metrics::RouteClass::of(path),
@@ -412,4 +412,36 @@ fn artifact_read_and_download_are_one_decision() {
             authorize_resource(principal, &artifact, Action::Download)
         );
     }
+}
+
+#[tokio::test]
+async fn saturated_streams_refuse_immediately_and_leave_unary_capacity() {
+    use crate::auth_config::tests::support;
+    let dir = support::Dir::new();
+    let document = support::document_v2(&dir, &crate::provider_http::fixture::Ca::new().pem());
+    let path = dir.write("auth.json", document.to_string().as_bytes());
+    let settings = crate::auth_config::load(std::path::Path::new(&path)).unwrap();
+    let pool = PgPool::connect_lazy("postgres://localhost/unused").unwrap();
+    let api = Arc::new(Api {
+        browser: Arc::new(BrowserAuth::new(settings, pool.clone(), pool.clone())),
+        native: None,
+        origin: "https://app.example.test".into(),
+        pool,
+        artifacts: None,
+        in_flight: Semaphore::new(MAX_IN_FLIGHT),
+        streams: Arc::new(Semaphore::new(runs::SSE_MAX_IN_FLIGHT)),
+    });
+    let occupied = api.streams.clone().try_acquire_many_owned(128).unwrap();
+    let call = async |op| {
+        api.serve(&[(Method::GET, op)], Request::new(Body::empty()))
+            .await
+            .status()
+    };
+    assert_eq!(
+        call(Op::StreamRunEvents).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(call(Op::GetRun).await, StatusCode::UNAUTHORIZED);
+    drop(occupied);
+    assert_eq!(call(Op::StreamRunEvents).await, StatusCode::UNAUTHORIZED);
 }

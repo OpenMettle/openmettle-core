@@ -1,0 +1,21 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "RunEventCancelled--auto-missing-data",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "id": "AQdleGFtcGxlAAAAAAAAAAPX4G_25L6evhHoy1RVdAyip9DN9oR5tDgnPL_6AVB-OQ"
+  },
+  "mutation": {
+    "name": "auto-missing-data",
+    "op": "remove",
+    "path": "/data"
+  },
+  "schema": "#/components/schemas/RunEventItem",
+  "source": "#/components/examples/RunEventCancelled"
+}
