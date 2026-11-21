@@ -18,9 +18,9 @@ taxonomy and returns a bounded inline or spilled result.
 | Existing boundary | V1-14 addition |
 | --- | --- |
 | [ADR 0010](0010-provider-http-transport.md) and [ADR 0038](0038-sglang-and-external-provider-conformance-adapter.md), `src/provider_http/transport.rs` | Add a Streamable HTTP JSON-RPC 2.0 MCP (`2026-07-28`) client over `provider_http::transport` with a dedicated DNS slot semaphore, strict header allowlist (rejecting `x-mcp-header` schemas) and 4 MiB streaming response ceiling. |
-| [ADR 0027](0027-authorization-and-private-projects.md) and [ADR 0035](0035-approvals-permitted-yolo-and-effect-ledger.md), `src/authz/approvals.rs` | Implement `EffectPolicy` in the reviewed tool registry, bind every invocation to `Proposal`, `Destination`, `EffectClass`, `EndpointKey` and `record_fenced_intent`, and add schema 23 durable pre-dispatch attempt accounting (`openmettle.operations.dispatched_attempts`). |
-| [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md), `src/worker.rs` | Implement `ApprovedAdapter` for resumed writes, reuse the same committed-envelope dispatch for immediate reads and permitted YOLO writes, stop `outcome_unknown` writes into `ExecState::Reconciling`, and implement destination-authorized read-only `Executor::reconcile`. |
-| [ADR 0005](0005-artifact-storage-accounting.md) and [ADR 0031](0031-filesystem-artifact-storage-and-streaming-multipart.md), `src/storage.rs` and `src/artifact_fs.rs` | Add three-phase lease-fenced direct byte publication (`artifact_fs::publish_bytes`, never holding a DB transaction across disk I/O), startup writability probing (`Store::probe_writable`) and spill-scoped cleanup (`artifact_fs::reconcile_run_spills`), paired with a strictly inline read-only `artifact.read_range` tool. |
+| [ADR 0027](0027-authorization-and-private-projects.md) and [ADR 0035](0035-approvals-permitted-yolo-and-effect-ledger.md), `src/authz/approvals.rs` | Implement `EffectPolicy` in the reviewed tool registry, bind every invocation to `Proposal`, `Destination`, `EffectClass`, `EndpointKey` and `record_fenced_intent`, and add PR2's next sequential schema migration (e.g., `0024`) for durable pre-dispatch attempt accounting (`openmettle.operations.dispatched_attempts`). |
+| [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md), `src/worker.rs` | Implement `ApprovedAdapter` for resumed writes, reuse the same committed-envelope dispatch for immediate reads and permitted YOLO writes, stop `outcome_unknown` writes into `ExecState::Reconciling` (halting deposed workers via `StepResult::Invalidated` on `Fence::Hold` lease loss), resolve abandoned `repeatable_read` intents before `run-terminal`, and implement destination-authorized read-only `Executor::reconcile`. |
+| [ADR 0005](0005-artifact-storage-accounting.md) and [ADR 0031](0031-filesystem-artifact-storage-and-streaming-multipart.md), `src/storage.rs` and `src/artifact_fs.rs` | Add three-phase lease-fenced direct byte publication (`artifact_fs::publish_bytes`, never holding a DB transaction across disk I/O, executing Phase 3 `storage::settle` and `runs::record_observation` atomically in one `Fence::Step` transaction after rechecking local `step.deadline`/`step.stop`), startup writability probing (`Store::probe_writable`) and spill-scoped cleanup (`artifact_fs::reconcile_run_spills`), paired with a strictly inline read-only `artifact.read_range` tool. |
 
 **Zero new Cargo crates.** V1-14 reuses the locked `hyper`, `hyper-util`, `http-body-util`,
 `rustls`, `tokio-rustls`, `serde`, `serde_json`, `sha2`, `bytes`, `httpdate` and `ring` stack
@@ -136,18 +136,19 @@ post-response opportunistic artifacts and do not require `Review.reservation` be
 | `EligibleWrite`, `HumanRequired`, `Sharing` | `Unsupported` or `Unknown`, `authoritative_lookup = false` | `non_repeatable` | Human approval (or permitted YOLO for `EligibleWrite`); ambiguous send settles as `outcome_unknown` and interrupts. |
 | `EffectClass::Prohibited` | Any | Refused before insert | Rejected unconditionally in `Review::validate`; human approval cannot override. |
 
-**Durable pre-dispatch attempt accounting (schema 23).** `openmettle.operations`
-(`migrations/0003_runs_events_operations.sql`) currently has no attempt counter column, so
-in-memory attempt tracking would let a worker crash after attempt 3 before
+**Durable pre-dispatch attempt accounting (PR2 sequential schema migration).**
+`openmettle.operations` (`migrations/0003_runs_events_operations.sql`) currently has no attempt
+counter column, so in-memory attempt tracking would let a worker crash after attempt 3 before
 `record_observation` and allow a reclaiming worker to dispatch three more attempts on a
-`repeatable_read` replay. PR2 therefore adds migration 23 introducing
+`repeatable_read` replay. PR2 therefore adds its next sequential schema migration (e.g., `0024`,
+avoiding collision with sibling migrations landing on `main` first) introducing
 `dispatched_attempts integer NOT NULL DEFAULT 0 CHECK (dispatched_attempts >= 0)` on
 `openmettle.operations`, grants `UPDATE (dispatched_attempts)` to `openmettle_worker` and adds
-the matching `$1 >= 23` column entry to `src/boundaries.sql`. Before **every** outbound HTTP
-send — attempt 1, every in-process retry and every crash-reclaim replay — a `Fence::Step`
-transaction atomically locks the run and operation row (`FOR UPDATE`), verifies
-`dispatched_attempts < 3` and increments `dispatched_attempts = dispatched_attempts + 1` before
-releasing the PostgreSQL connection.
+the matching `$1 >= <v1_14_schema_version>` column entry to `src/boundaries.sql`. Before
+**every** outbound HTTP send — attempt 1, every in-process retry and every crash-reclaim replay
+— a `Fence::Step` transaction atomically locks the run and operation row (`FOR UPDATE`),
+verifies `dispatched_attempts < 3` and increments `dispatched_attempts = dispatched_attempts + 1`
+before releasing the PostgreSQL connection.
 
 Per-call execution uses one fenced sequence in `openmettle-worker`:
 
@@ -198,22 +199,41 @@ Per-call execution uses one fenced sequence in `openmettle-worker`:
 7. When `EndpointKey::Supported { field, key, .. }` is recorded in the committed envelope, emit
    `key` unchanged in the contract-pinned HTTP header or JSON-RPC `_meta` field. Never
    allocate a fresh key for the same `logical_key`.
-8. After dispatch, borrow a connection and record the outcome under
-   `leases::with_lease(..., Fence::Hold, ...)` via `runs::record_observation` with the expected
-   revision, stable append key, `downstream_handle` when returned and bounded redacted
-   evidence.
-9. **Uncertain writes halt model continuation immediately.** Whenever any external write
-   (`lookup`, `non_repeatable`, or an `idempotent` write whose retries or
-   `EndpointKey::Supported` window expired after a possible send) ends with an uncertain remote
-   outcome, the adapter MUST commit `runs::record_observation` with
-   `outcome = "outcome_unknown"` under `Fence::Hold` and immediately return
-   **`StepResult::Stopped`** — **never** `StepResult::Continue`. In `src/worker.rs`, returning
-   `StepResult::Stopped` exits `worker::execute` with `WorkEnd::Complete(Settle::Stopped)`, so
-   `run_one` calls `leases::settle(..., Settle::Stopped)` and transitions the run to
-   `ExecState::Reconciling` (when execution budget remains) or terminal `interrupted`
-   (`src/authz/leases.rs`). Because `worker::execute` never runs another model step once a run
-   is in `ExecState::Reconciling` (or on crash recovery while `leases::unresolved_operations`
-   is non-empty) and `Fence::Step` rejects new intents with `LeaseError::Stopping` or
+8. After dispatch, record the outcome in PostgreSQL with the expected revision, stable append
+   key, `downstream_handle` when returned and bounded redacted evidence:
+   - For **inline** results, errors or `truncated_no_spill` fallbacks, borrow a connection and
+     commit `runs::record_observation` under `leases::with_lease(..., Fence::Hold, ...)`. If
+     `Fence::Hold` rejects with `LeaseError::StaleClaim`, `LeaseError::Expired` or
+     `LeaseError::Terminal`, stop immediately with `StepResult::Invalidated` without further
+     PostgreSQL writes.
+   - For **spilled** results, `storage::settle` and `runs::record_observation` commit
+     **atomically together in Phase 3's single `Fence::Step` transaction** (never across two
+     separate transactions; see the three-phase publication rules below).
+9. **Uncertain writes halt model continuation immediately (including on deposed-worker lease
+   loss).** Whenever any external write (`lookup`, `non_repeatable`, or an `idempotent` write
+   whose retries or `EndpointKey::Supported` window expired after a possible send) ends with an
+   uncertain remote outcome, the adapter MUST attempt to commit `runs::record_observation` with
+   `outcome = "outcome_unknown"` under `leases::with_lease(..., Fence::Hold, ...)`:
+   - If `Fence::Hold` succeeds, immediately return **`StepResult::Stopped`** — **never**
+     `StepResult::Continue`. In `src/worker.rs`, returning `StepResult::Stopped` exits
+     `worker::execute` with `WorkEnd::Complete(Settle::Stopped)`, so `run_one` calls
+     `leases::settle(..., Settle::Stopped)` and transitions the run to `ExecState::Reconciling`
+     (when execution budget remains) or terminal `interrupted` (`src/authz/leases.rs`).
+   - If `Fence::Hold` rejects with **`LeaseError::StaleClaim`**, **`LeaseError::Expired`** or
+     **`LeaseError::Terminal`** (because the worker's claim already expired, was replaced or
+     the run became terminal between the possible write send and `record_observation`), the
+     deposed worker MUST stop immediately with **`StepResult::Invalidated`** (added to
+     `StepResult` in PR3 and mapped in `worker::execute` to `WorkEnd::Stop(Stop::LeaseLost)` so
+     `run_one` exits immediately without touching PostgreSQL). That leaves the already-committed
+     durable `outcome = 'intent'` write row intact so the replacement worker's recovery path
+     (`src/worker.rs`, `execute` checking
+     `recovered && !leases::unresolved_operations(...).is_empty()` and returning
+     `WorkEnd::Complete(Settle::Stopped)`) routes the unresolved write directly into
+     `ExecState::Reconciling` or terminal settlement before any model step.
+
+   Because `worker::execute` never runs another model step once a run is in
+   `ExecState::Reconciling` (or on crash recovery while `leases::unresolved_operations` is
+   non-empty) and `Fence::Step` rejects new intents with `LeaseError::Stopping` or
    `LeaseError::Terminal`, no subsequent model round can propose the same mutation under a
    fresh `tool_call_id` or fresh `logical_key` (which `approvals::record_fenced_intent` would
    otherwise admit as a new operation).
@@ -336,22 +356,26 @@ subsequent retry that fails pre-send, hits a deadline or stop signal, or returns
 malformed framing MUST keep the ledger outcome `outcome_unknown` (never downgrading to
 proven-unsent `failed` or `aborted`). Whenever **any** external write (`lookup`,
 `non_repeatable`, or an `idempotent` write whose retries or `EndpointKey::Supported` window
-expired after a possible send) ends with `outcome_unknown`, the adapter commits
-`outcome = "outcome_unknown"` via `runs::record_observation` under `Fence::Hold` and returns
-**`StepResult::Stopped`** immediately — **never** `StepResult::Continue` and never a
+expired after a possible send) ends with `outcome_unknown`, the adapter attempts to commit
+`outcome = "outcome_unknown"` via `runs::record_observation` under `Fence::Hold`: on commit, it
+returns **`StepResult::Stopped`** immediately — **never** `StepResult::Continue` and never a
 model-visible error envelope — so `leases::settle(..., Settle::Stopped)` moves the run into
-`ExecState::Reconciling` (or terminal `interrupted`) with zero further model rounds. By
-contrast, `retryable_by_model: false` in model-visible tool error envelopes applies to
-**known-outcome** non-retryable failures (such as pre-send validation/policy refusals, proven
-pre-send transport failures or confirmed downstream `401`/`403`/contract-guaranteed
-side-effect-free `isError` responses where the remote write outcome is authoritatively `failed`
-and the run may continue within its round budget).
+`ExecState::Reconciling` (or terminal `interrupted`) with zero further model rounds; if
+`Fence::Hold` rejects with `LeaseError::StaleClaim`, `LeaseError::Expired` or
+`LeaseError::Terminal`, the deposed worker stops immediately with **`StepResult::Invalidated`**
+without touching PostgreSQL so the intact durable `outcome = 'intent'` write row routes the
+replacement worker (`src/worker.rs`) straight into `ExecState::Reconciling` / settlement before
+any model step. By contrast, `retryable_by_model: false` in model-visible tool error envelopes
+applies to **known-outcome** non-retryable failures (such as pre-send validation/policy
+refusals, proven pre-send transport failures or confirmed downstream
+`401`/`403`/contract-guaranteed side-effect-free `isError` responses where the remote write
+outcome is authoritatively `failed` and the run may continue within its round budget).
 
 | Fault class | Qualifying evidence | Retries | Ledger outcome | Model / worker action |
 | --- | --- | --- | --- | --- |
-| **Transient transport** (`ToolFault::Transient`) | Pre-send DNS/TCP connect failure; HTTP `408`, `429`, `502`, `503`, `504`; mid-stream disconnect or idle/call timeout | Up to `3` durable total attempts (`openmettle.operations.dispatched_attempts < 3`, atomically incremented under `Fence::Step` before each send) for `repeatable_read` and active unexpired `idempotent` writes with the identical persisted key; for `lookup` and `non_repeatable` writes, retry **only** proven pre-send DNS/connection-refused failures and **never** retry after request bytes are sent. Before **every** permitted retry across all classes, enforce `dispatched_attempts < 3`, `step.stop`, `step.deadline` (including `EndpointKey::Supported.expires_us`) and a fenced ADR 0035 effect-level authority recheck (principal, scope, target, capability, destination policy plus live bound session and approval/user/provider generations). | `failed` for exhausted `repeatable_read` or proven pre-send failure when no prior attempt left the process; `outcome_unknown` for any `idempotent`, `lookup` or `non_repeatable` write once any attempt may have left the process without endpoint proof. | Sleep with `ring::rand::SystemRandom` full jitter (`250 ms`, `500 ms`). For a single valid integer `Retry-After` (seconds): sleep at least that delay when `<= 60 s` and within remaining call, authority and run execution deadlines; fail without retrying if `Retry-After` exceeds `60 s` or the remaining budget; ignore malformed or duplicate headers. Abort sleep immediately on `step.stop`. For known-outcome `failed` reads or proven-unsent writes, return a bounded error envelope (`retryable_by_model: false` for non-retryable failures). For **every** write ending in `outcome_unknown` (including an `idempotent` write whose retries or `EndpointKey::Supported` window expired after a possible send), commit `outcome = "outcome_unknown"` under `Fence::Hold` and return `StepResult::Stopped` into `ExecState::Reconciling` / `interrupted` (zero further model rounds). |
-| **Semantic tool fault** (`ToolFault::Semantic`) | MCP JSON-RPC `result` with `isError: true`, JSON-RPC `-32602`, or internal tool domain refusal (for example invalid UTF-8 binary content, offset past EOF or non-`active` revision) | `0` transport retries | `failed` for reads and for writes whose reviewed contract guarantees `isError: true` caused no side effect (and no prior attempt was ambiguous); otherwise `outcome_unknown`. | For known-outcome `failed` results, return a bounded structured error envelope (`status: "tool_error"`, closed `fault_code`, `<= 2 KiB` UTF-8 summary, `retryable_by_model`) so the model can recover within `round_limit`. If an uncertain write ends in `outcome_unknown`, commit `outcome = "outcome_unknown"` under `Fence::Hold` and return `StepResult::Stopped` into reconciliation/settlement (never `StepResult::Continue`). |
-| **Policy, auth or contract failure** (`ToolFault::TerminalRefusal`) | Revoked session/grant/capability, schema/bounds violation (`max_bytes < 4`), `x-mcp-header`-annotated tool schema, unpinned destination, missing V1-28 credential or V1-17 quota; SSRF `Address`, TLS cert/host failure, `3xx` redirect, `401`/`403`, unexpected `4xx`, `tools/list` drift, `input_required` or server-initiated JSON-RPC request, malformed JSON-RPC/framing or `> 4 MiB` response | `0` retries | `failed` when refused pre-send or on definitive `401`/`403` with no prior ambiguous attempt; `outcome_unknown` if any prior write attempt may have left the process or if `input_required`, malformed framing or `TooLarge` arrives after a write was sent. | Fail closed immediately without follow-up calls. Authority revocation settles the run under ADR 0033/0035. Known-outcome contract or auth refusals (`failed`) return fixed redacted diagnostics with `retryable_by_model: false` and no upstream body echoing. Any write ending in `outcome_unknown` commits `outcome = "outcome_unknown"` under `Fence::Hold` and returns `StepResult::Stopped` into `ExecState::Reconciling` / `interrupted` (never `StepResult::Continue`). |
+| **Transient transport** (`ToolFault::Transient`) | Pre-send DNS/TCP connect failure; HTTP `408`, `429`, `502`, `503`, `504`; mid-stream disconnect or idle/call timeout | Up to `3` durable total attempts (`openmettle.operations.dispatched_attempts < 3`, atomically incremented under `Fence::Step` before each send) for `repeatable_read` and active unexpired `idempotent` writes with the identical persisted key; for `lookup` and `non_repeatable` writes, retry **only** proven pre-send DNS/connection-refused failures and **never** retry after request bytes are sent. Before **every** permitted retry across all classes, enforce `dispatched_attempts < 3`, `step.stop`, `step.deadline` (including `EndpointKey::Supported.expires_us`) and a fenced ADR 0035 effect-level authority recheck (principal, scope, target, capability, destination policy plus live bound session and approval/user/provider generations). | `failed` for exhausted `repeatable_read` or proven pre-send failure when no prior attempt left the process; `outcome_unknown` for any `idempotent`, `lookup` or `non_repeatable` write once any attempt may have left the process without endpoint proof. | Sleep with `ring::rand::SystemRandom` full jitter (`250 ms`, `500 ms`). For a single valid integer `Retry-After` (seconds): sleep at least that delay when `<= 60 s` and within remaining call, authority and run execution deadlines; fail without retrying if `Retry-After` exceeds `60 s` or the remaining budget; ignore malformed or duplicate headers. Abort sleep immediately on `step.stop`. For known-outcome `failed` reads or proven-unsent writes, return a bounded error envelope (`retryable_by_model: false` for non-retryable failures). For **every** write ending in `outcome_unknown` (including an `idempotent` write whose retries or `EndpointKey::Supported` window expired after a possible send), attempt `outcome = "outcome_unknown"` under `Fence::Hold` and return `StepResult::Stopped` into `ExecState::Reconciling` / `interrupted`, or `StepResult::Invalidated` immediately without touching PostgreSQL if `Fence::Hold` rejects with `StaleClaim`, `Expired` or `Terminal` (zero further model rounds). |
+| **Semantic tool fault** (`ToolFault::Semantic`) | MCP JSON-RPC `result` with `isError: true`, JSON-RPC `-32602`, or internal tool domain refusal (for example invalid UTF-8 binary content, offset past EOF or non-`active` revision) | `0` transport retries | `failed` for reads and for writes whose reviewed contract guarantees `isError: true` caused no side effect (and no prior attempt was ambiguous); otherwise `outcome_unknown`. | For known-outcome `failed` results, return a bounded structured error envelope (`status: "tool_error"`, closed `fault_code`, `<= 2 KiB` UTF-8 summary, `retryable_by_model`) so the model can recover within `round_limit`. If an uncertain write ends in `outcome_unknown`, attempt `outcome = "outcome_unknown"` under `Fence::Hold` and return `StepResult::Stopped` into reconciliation/settlement (or `StepResult::Invalidated` on `StaleClaim | Expired | Terminal`, never `StepResult::Continue`). |
+| **Policy, auth or contract failure** (`ToolFault::TerminalRefusal`) | Revoked session/grant/capability, schema/bounds violation (`max_bytes < 4`), `x-mcp-header`-annotated tool schema, unpinned destination, missing V1-28 credential or V1-17 quota; SSRF `Address`, TLS cert/host failure, `3xx` redirect, `401`/`403`, unexpected `4xx`, `tools/list` drift, `input_required` or server-initiated JSON-RPC request, malformed JSON-RPC/framing or `> 4 MiB` response | `0` retries | `failed` when refused pre-send or on definitive `401`/`403` with no prior ambiguous attempt; `outcome_unknown` if any prior write attempt may have left the process or if `input_required`, malformed framing or `TooLarge` arrives after a write was sent. | Fail closed immediately without follow-up calls. Authority revocation settles the run under ADR 0033/0035. Known-outcome contract or auth refusals (`failed`) return fixed redacted diagnostics with `retryable_by_model: false` and no upstream body echoing. Any write ending in `outcome_unknown` attempts `outcome = "outcome_unknown"` under `Fence::Hold` and returns `StepResult::Stopped` into `ExecState::Reconciling` / `interrupted` (or `StepResult::Invalidated` on `StaleClaim | Expired | Terminal`, never `StepResult::Continue`). |
 
 ### Redaction and telemetry
 
@@ -401,8 +425,9 @@ step once its drain deadline (`settings.lease / 6`) elapses and `Staged::publish
 (`src/artifact_fs.rs`) unlinks `revisions/<id>` on post-rename `sync_dir` failure,
 `artifact_fs::publish_bytes` MUST **never** hold a `leases::fenced` DB transaction open across
 `spawn_blocking` filesystem I/O. Instead, PR2 mirrors `artifact_fs::ingest`'s three-phase
-separation with **both** short DB phases fenced under `Fence::Step` and a **disjoint
-per-attempt `reservation_id`**:
+separation with **both** short DB phases fenced under `Fence::Step`, a **disjoint per-attempt
+`reservation_id`**, local `step.deadline`/`step.stop` enforcement before settlement and
+**single-transaction atomicity** between `storage::settle` and `runs::record_observation`:
 
 1. **Phase 1 — Short `Fence::Step` reservation (no filesystem I/O).** Mint a fresh per-attempt
    random 128-bit UUID/nonce `<attempt_id>` (`ring::rand::SystemRandom`), giving an
@@ -413,9 +438,11 @@ per-attempt `reservation_id`**:
    `operation = Some(operation_id)`. Commit and release the PostgreSQL connection before any
    disk I/O. Every worker spill attempt therefore owns a **disjoint `reservation_id`,
    `staging/<reservation_id>` and `revisions/<reservation_id>`**: a replacement worker never
-   reuses or settles an earlier worker's `reservation_id`. (If `Fence::Step` fails because the
-   run was cancelled or reclaimed, abort spill publication and still record the tool's true
-   observation under `Fence::Hold` with `storage: "truncated_no_spill"`.)
+   reuses or settles an earlier worker's `reservation_id`. (If `Fence::Step` rejects with
+   `StaleClaim`, `Expired` or `Terminal`, stop immediately with `StepResult::Invalidated`
+   without touching PostgreSQL; if `Fence::Step` rejects with `Stopping`, abort spill
+   publication and — for a completed tool call whose DB lease is still live — record the tool's
+   true observation under `Fence::Hold` with `storage: "truncated_no_spill"`.)
 2. **Phase 2 — Unfenced `spawn_blocking` disk I/O (strictly outside any DB transaction).** With
    no PostgreSQL connection borrowed and no DB transaction open (so slow disk I/O `> 5 s` can
    never trip `idle_in_transaction_session_timeout`), create
@@ -428,26 +455,100 @@ per-attempt `reservation_id`**:
    `reconcile_run_spills`). Because each attempt owns a disjoint `reservation_id`, a stalled
    `spawn_blocking` thread on a deposed worker can never overwrite, clobber or unlink a
    replacement worker's revision even if `fsync` stalls past both the `5 s` DB timeout and the
-   worker drain deadline.
-3. **Phase 3 — Short `Fence::Step` settlement (no filesystem I/O).** Borrow a connection and
-   open a short `leases::with_lease(..., Fence::Step, ...)` transaction (zero disk I/O inside
-   the transaction). If the worker lost its lease, timed out or was cancelled while Phase 2 was
-   running, `Fence::Step` fails closed (`StaleClaim`, `Expired` or `Stopping`) **before**
-   `storage::settle` can execute, leaving `<reservation_id>` in `state = 'reserved'` with zero
-   settled revision and zero leaked settled quota. Otherwise lock `storage_reservations`
-   (`FOR UPDATE`), verify `state == 'reserved'` (refusing closed with `Conflict` if already
-   `released`), call `storage::settle` with `media_type` (`text/plain; charset=utf-8` or
-   `application/json; charset=utf-8`) and a bounded display name passing
-   `storage::valid_display_name`, and commit. On replay of an already-`succeeded` operation,
-   the adapter reads `(artifact_id, revision_id)` from the committed observation evidence
-   (after live `Action::Read` and `active` rechecks) rather than re-running `publish_bytes`.
+   worker drain deadline. Immediately after `spawn_blocking` returns, check
+   `Instant::now() < step.deadline && step.stop.borrow().is_none()`; if false, do not enter
+   Phase 3 (leaving `<reservation_id>` in `state = 'reserved'` for `reconcile_run_spills`) and
+   return cleanly per the timeout/stop rule (recording only a non-spilled `truncated_no_spill`
+   observation under `Fence::Hold` if an already-completed external write's outcome must be
+   preserved while the DB lease is still live).
+3. **Phase 3 — Single atomic `Fence::Step` settlement and observation (no filesystem I/O).**
+   Borrow a connection and open **one** short `leases::with_lease(..., Fence::Step, ...)`
+   transaction (zero disk I/O inside the transaction). `Fence::Step` (`src/authz/leases.rs`)
+   locks `openmettle.runs` (`FOR NO KEY UPDATE`) and verifies DB lease/execution timestamps,
+   `state = 'running'` and `cancel_reason IS NULL`, failing closed with `StaleClaim`, `Expired`,
+   `Terminal` or `Stopping` if the DB lease lapsed, was replaced or was cancelled while Phase 2
+   ran (leaving `<reservation_id>` in `state = 'reserved'` with zero settled revision and zero
+   leaked quota; returning `StepResult::Invalidated` without touching PostgreSQL on
+   `StaleClaim | Expired | Terminal`). Because `Fence::Step` checks only DB timestamps, `state`
+   and `cancel_reason` — **not** the shortened local `step.deadline` (`src/authz/approvals.rs`,
+   `CommittedIntent::start`) or local `step.stop` (`Stop::Shutdown` / `Stop::Cancel`) — Phase 3
+   MUST re-check `Instant::now() < step.deadline && step.stop.borrow().is_none()` **after**
+   acquiring the `Fence::Step` DB lock and **before** executing `storage::settle` or
+   `runs::record_observation`. If the local deadline expired or `step.stop` fired while the DB
+   lease is still live, Phase 3 aborts and rolls back without settling `storage_reservations`
+   and returns cleanly according to the timeout/stop rule (zero active revision, zero settled
+   quota; for an already-completed external write whose DB lease is still live, record only the
+   non-spilled `storage: "truncated_no_spill"` observation under `Fence::Hold` before returning
+   `StepResult::Stopped`, never settling the spill). Otherwise, inside that **exact same
+   `Fence::Step` PostgreSQL transaction** — following the canonical lock order
+   `runs -> storage_reservations -> artifacts -> storage_accounts -> storage_instance`
+   (`src/storage.rs`) — execute **both** `storage::settle` **and** `runs::record_observation`
+   atomically: lock `storage_reservations` (`FOR UPDATE`), verify `state == 'reserved'`
+   (refusing closed with `Conflict` if already `released`), call `storage::settle` with
+   `media_type` (`text/plain; charset=utf-8` or `application/json; charset=utf-8`) and a
+   bounded display name passing `storage::valid_display_name` to create the immutable
+   `artifact_revisions` row and charge active quota, construct the bounded preview envelope
+   carrying the settled `(artifact_id, revision_id)`, and call `runs::record_observation`
+   (`openmettle.runs` already locked -> `openmettle.operations` `FOR UPDATE` ->
+   `openmettle.run_events` append) before committing once. Either **both** the settled revision
+   charge and the terminal operation observation commit together, or neither commits (leaving
+   `state = 'reserved'` for TTL sweep and guaranteeing at most one active revision and one
+   storage charge ever commit per operation — never allowing a crash between `storage::settle`
+   and `runs::record_observation` to strand an active charged spill revision alongside an
+   `outcome = 'intent'` `repeatable_read` that a replacement worker would replay and charge a
+   second time). On replay of an already-`succeeded` operation, the adapter reads
+   `(artifact_id, revision_id)` from the committed observation evidence (after live
+   `Action::Read` and `active` rechecks) rather than re-running `publish_bytes`.
+
+**Pre-terminal resolution of abandoned `repeatable_read` intents (preserving SSE `204`
+cursors).** `runs::record_observation` (`src/runs.rs`) appends an event to
+`openmettle.run_events` and increments `runs.last_event_sequence`, while
+`GET`/`HEAD /v1/runs/{run_id}/events` (`src/v1/runs.rs`) returns `204 No Content` only when
+`first.terminal && position == first.last` (`tests/schema/run_events_http.rs`). Calling
+`runs::record_observation` *after* a run is already terminal (for instance inside
+`reconcile_run_spills`) would advance `runs.last_event_sequence` past the terminal `run-*`
+event's sequence and break reconnecting SSE clients (`200` instead of `204 No Content`).
+Meanwhile, `storage::release` (`src/storage.rs`) rightly refuses with `Error::Unresolved`
+whenever the linked operation has `outcome IN ('intent', 'outcome_unknown')`, so an abandoned
+`repeatable_read` that crashed at `outcome = 'intent'` (`revision = 0`) after reserving a spill
+would strand reserved quota forever if left unresolved at termination. PR2 therefore resolves
+abandoned revision-zero `capability = 'repeatable_read'` (`outcome = 'intent'`) operations to
+`outcome = 'failed'` (using existing `openmettle_worker` column grants, stable append key
+`abandoned-read:<operation_id>` and non-empty redacted evidence, with zero edits to frozen
+migrations) **strictly BEFORE appending the final `run-terminal` (`run-*`) event**, under the
+already-locked `openmettle.runs` row, across every worker transition path:
+
+- `leases::settle_locked` (`src/authz/leases.rs`) whenever `resolution` is terminal (not
+  `Resolution::Reconciling(_)`), covering `leases::settle`, `leases::handoff`,
+  `authz::runs::recheck_leased` / `recheck_claim` and `approvals::invalidate_running`
+  revocation;
+- `leases::settle_expired` (`src/authz/leases.rs`) for each locked due run strictly before
+  `resolution.event(...)`;
+- worker-invoked `approvals::fail` (`src/authz/approvals.rs`, covering `approvals::expire_waits`
+  and `approvals::invalidate_running` expiry) strictly before `runs::append(..., TERMINAL_KEY,
+  ...)`; and
+- `approvals::park` (`src/authz/approvals.rs`, executed by `openmettle_worker` under
+  `Fence::Step`) strictly before transitioning `running -> waiting` and appending
+  `run-waiting`. Because `queued` runs have never been claimed (zero operations) and `waiting`
+  runs enter `waiting` with zero remaining `repeatable_read` `intent` rows, every immediate
+  terminal transition executed by `openmettle_api` on `queued` or `waiting` runs
+  (`authz::runs::cancel_run`, `cancel_scope_runs`, `cancel_user_runs`, `recheck_run`,
+  `expire_queued` and `approvals::decide` on `Deny` / `invalidate_wait`) is guaranteed to
+  append `run-terminal` as the true final event with zero abandoned `repeatable_read` intents
+  left behind and without granting `openmettle_api` any `UPDATE` privilege on
+  `openmettle.operations` (`src/boundaries.sql`).
+
+Write operations (`idempotent`, `lookup` and `non_repeatable`) are **never** modified by this
+helper, so `storage::release` continues to protect every unresolved write (including
+`outcome_unknown` writes on `interrupted` runs) with `Error::Unresolved`.
 
 **Ledger-safe spill cleanup (`artifact_fs::reconcile_run_spills`).** Because
 `artifact_fs::reconcile_expired` scans only upload reservations (`run_id IS NULL`) and
 `run_id IS NOT NULL` matches all run-linked reservations (not only spills), PR2 adds
 `artifact_fs::reconcile_run_spills` to the worker maintenance sweep with strict ledger safety
 across both [ADR 0031](0031-filesystem-artifact-storage-and-streaming-multipart.md) crash
-windows and zero DB transactions held across disk unlinks:
+windows, zero post-terminal `run_events` appends and zero DB transactions held across disk
+unlinks:
 
 - Scan adapter-owned spill reservations matching the `tool-spill:` `idempotency_key` prefix
   with `operation_id IS NOT NULL` across `state = 'reserved'` and `state = 'released'`. Never
@@ -466,29 +567,19 @@ windows and zero DB transactions held across disk unlinks:
   `Fence::Step`, and its orphaned file is cleaned up on the next `state = 'released'` sweep.
 - For each aged `state = 'reserved'` candidate, open a short lock-ordered DB transaction
   (`openmettle.runs` first via `FOR NO KEY UPDATE`, then `openmettle.storage_reservations` via
-  `FOR UPDATE SKIP LOCKED`, with zero filesystem I/O inside the transaction) and verify:
-  1. `created_at + spill_reservation_ttl <= clock_timestamp()` **and** the publisher lease is
-     inactive or superseded (the run is terminal, its lease has lapsed with
-     `lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp()`, or the linked
-     operation is already resolved with `outcome IN ('succeeded', 'failed')`); **and**
-  2. **Resolving abandoned terminal `repeatable_read` intents without weakening write guards.**
-     `storage::release` (`src/storage.rs`) rightly refuses with `Error::Unresolved` whenever
-     the linked operation has `outcome IN ('intent', 'outcome_unknown')`. If a
-     `repeatable_read` reserved a spill with `operation = Some(operation_id)`, crashed before
-     `record_observation` and the run later expired via `leases::settle_expired` (or ended
-     terminally) with that read still at `outcome = 'intent'`, calling `storage::release` alone
-     would fail forever and permanently strand the reserved quota. Therefore, when the locked
-     run is **terminal** and the linked operation has `capability = 'repeatable_read'` and
-     `outcome = 'intent'` (`revision = 0`), a store helper inside the same run-locked short
-     transaction first transitions **only** that abandoned read-only operation to
-     `outcome = 'failed'` via `runs::record_observation` (using existing `openmettle_worker` column grants, stable
-     append key `spill-abandoned-read:<operation_id>` and non-empty redacted evidence, with
-     zero edits to frozen migrations). Write operations (`idempotent`, `lookup` and
-     `non_repeatable`) are never modified by this helper, so `storage::release` continues to
-     protect every unresolved write (including `outcome_unknown` writes on `interrupted` runs)
-     with `Error::Unresolved`.
-- Call `storage::release` and commit the short DB transaction; then, outside the DB
-  transaction, unlink **both** `<ARTIFACTS_DIR>/staging/<reservation_id>` and any unsettled
+  `FOR UPDATE SKIP LOCKED`, with zero filesystem I/O inside the transaction), verify
+  `created_at + spill_reservation_ttl <= clock_timestamp()` **and** that the publisher lease is
+  inactive or superseded (the run is terminal, its lease has lapsed with
+  `lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp()`, or the linked operation
+  is already resolved with `outcome IN ('succeeded', 'failed')`), and call `storage::release`
+  without calling `runs::record_observation` or appending any `run_events`. Because every
+  abandoned `repeatable_read` was already transitioned to `outcome = 'failed'` strictly before
+  `run-terminal`, `storage::release` succeeds cleanly after TTL on terminal runs while
+  preserving `runs.last_event_sequence == terminal_sequence` (`204 No Content` on terminal SSE
+  cursor reconnect) and continuing to fail closed with `Error::Unresolved` on any unresolved
+  `idempotent`, `lookup` or `non_repeatable` write.
+- Commit the short DB transaction; then, outside the DB transaction, unlink **both**
+  `<ARTIFACTS_DIR>/staging/<reservation_id>` and any unsettled
   `<ARTIFACTS_DIR>/revisions/<reservation_id>` file for that released `reservation_id` (a
   `released` reservation has no `artifact_revisions` row and is never visited by `purge_due`).
 - For any `state = 'released'` spill candidate (covering crashes after `storage::release`
@@ -553,8 +644,8 @@ always explicit; partial output is never labeled complete.
 | Slice | Deliverable | Acceptance evidence |
 | --- | --- | --- |
 | PR1 | This ADR (`0039`). | Review against #14, #25, ADRs 0010, 0031, 0033, 0035 and 0038; `ai-guardrails docs audit` reports zero findings. |
-| PR2 | Schema 23 migration (`openmettle.operations.dispatched_attempts`) and `src/boundaries.sql` grant (`$1 >= 23`), reviewed tool registry (`EffectPolicy`) rejecting `x-mcp-header` schemas, strict schema/argument validator and default expander, `approvals::start_replayed_read` with durable 3-attempt cap, internal `artifact.read_range` v1 tool, `artifact_fs::Store::probe_writable`, three-phase `artifact_fs::publish_bytes` (no DB txn across disk I/O, per-attempt unique `reservation_id`), `reconcile_run_spills` and serialized-budget head/tail preview builder. | PostgreSQL 18 tests: cross-user, cross-scope, archived/deleted project, private project-scope spill ownership (other members denied until shared), share revocation and `active` -> `retained` transition between original read and replay, and non-`active` revision refusals; `max_bytes < 4` validation refusal, invalid UTF-8 binary semantic fault and strictly inline `artifact.read_range` under both 6x JSON escaping and `<= 200`-line `next_offset` pagination; unfinished `repeatable_read` replay through `approvals::start_replayed_read` (rechecking bound session and canonical proposal without issuing a write permit) plus crash-reclaim test at `dispatched_attempts == 3` proving dispatch refusal, terminal `failed` observation under `Fence::Step` and zero outbound sends; catalog registration rejection of `x-mcp-header` schemas plus duplicate-key, float, depth, bound and wildcard rejections; serialized-JSON `16 KiB` inline/spill thresholds (`\u001b` expansion, `200` lines, multi-byte UTF-8 cuts); startup `Store::probe_writable` fail-closed test on pre-existing read-only `staging/` and `revisions/`; unset-`ARTIFACTS_DIR`, unconfigured-store, quota-refused and I/O fallback envelopes; `publish_bytes` stall test delaying Phase 2 `spawn_blocking` disk I/O past **both** the `5 s` PostgreSQL `idle_in_transaction_session_timeout` and the worker drain deadline during lease takeover, proving replacement worker settlement succeeds intact with its own disjoint `reservation_id` and the stalled old worker produces zero corrupted/unlinked revisions and zero leaked settled quota; `reconcile_run_spills` coverage of crashed `repeatable_read` (`outcome = 'intent'`) + `leases::settle_expired` freeing spill quota with zero stranded bytes while preserving `storage::release` `Error::Unresolved` protection for `interrupted` runs with `outcome_unknown` writes, spill TTL/age guard against active publishers, post-release/pre-unlink and post-TTL late-rename retryable cleanup of `released` rows, post-rename/pre-settlement cleanup of unsettled `revisions/<id>` and untouched `settled` rows. |
-| PR3 | Streamable HTTP MCP (`2026-07-28`) adapter over `provider_http::transport` (rejecting `x-mcp-header` schemas on `tools/list`), `MCP_DNS_SLOTS`, `McpCredentialProvider` seam, `ApprovedAdapter` implementation stopping `outcome_unknown` writes via `StepResult::Stopped`, destination-authorized read-only `Executor::reconcile` under `Fence::Hold`, and `PLAN-10` / `PLAN-22` conformance harness on synthetic `rcgen` TLS + PostgreSQL 18. | Synthetic TLS + PostgreSQL 18 tests: MCP `2026-07-28` request headers (`MCP-Protocol-Version: 2026-07-28`, `Mcp-Method`, `Mcp-Name`, no `Mcp-Session-Id`, no `Mcp-Param-*`) **and** body `params._meta` (`io.modelcontextprotocol/protocolVersion` and `io.modelcontextprotocol/clientCapabilities = {}`) over `application/json` and `text/event-stream` (SSE comments and progress notifications before final response, mismatched JSON-RPC IDs, duplicate final responses, `input_required` and unexpected server-initiated request rejection, upstream `tools/list` `x-mcp-header` schema rejection before tool offer or call admission, `4 MiB` aggregate stream ceiling before buffering); bounded retries with durable `dispatched_attempts < 3` increments under `Fence::Step` and identical persisted `Idempotency-Key` on `repeatable_read`/`idempotent` plus proven-pre-send retries on `lookup`/`non_repeatable`, enforcing `step.stop`, `step.deadline` (including `EndpointKey::Supported.expires_us`), crash-reclaim at `dispatched_attempts == 3` with zero outbound HTTP sends, and full ADR 0035 effect-level + bound-session/generation revocation checks before every retry across all classes; sticky whole-operation send uncertainty (`outcome_unknown` preserved when a retry fails pre-send or receives `401`/`403`/deadline after ambiguous attempt 1) and immediate halt via `StepResult::Stopped` into `ExecState::Reconciling` / `interrupted` on every uncertain write (`lookup`, `non_repeatable`, or exhausted/window-expired `idempotent`), proving no further model round runs and a fresh-`logical_key` proposal cannot be admitted and produces **zero** additional outbound sends (while known-outcome non-retryable failures return `retryable_by_model: false`); `lookup` reconciliation with and without `downstream_handle` passing `&ActiveRun`/`&Lease<'_>` into `Executor::reconcile`, enforcing both `recheck_decision` and the live destination-specific MCP server/connection/account authorization check under `Fence::Hold` in `ExecState::Reconciling` before `McpCredentialProvider` lookup (asserting **zero** `McpCredentialProvider` lookups and terminal `interrupted` settlement when destination/account access is revoked or disabled), and verifying `repeatable_read` exclusion from `Executor::reconcile`; semantic `isError: true` / `-32602` plus `PLAN-10` valid-schema wrong/stale-fact semantic recovery; internal-MCP identity-boundary check authenticating caller/scope via primary PostgreSQL authority rather than compiled bypass; `PLAN-22` fixed native vs internal-MCP vs remote-MCP route measurement harness hook; SSRF/TLS/redirect/`401`/`403`/`tools/list`-drift/`> 4 MiB` refusals; canary redaction checks across errors, stderr, traces and metrics; end-to-end `park` -> `decide` -> resume -> `ApprovedAdapter::send` -> spill -> `artifact.read_range` round trip including share-revocation and retention replay refusals. |
+| PR2 | PR2's next sequential schema migration (e.g., `0024`) adding `openmettle.operations.dispatched_attempts` and its matching `src/boundaries.sql` grant (`$1 >= <v1_14_schema_version>`), reviewed tool registry (`EffectPolicy`) rejecting `x-mcp-header` schemas, strict schema/argument validator and default expander, `approvals::start_replayed_read` with durable 3-attempt cap, internal `artifact.read_range` v1 tool, `artifact_fs::Store::probe_writable`, three-phase `artifact_fs::publish_bytes` (no DB txn across disk I/O, per-attempt unique `reservation_id`, local `step.deadline`/`step.stop` rechecks after Phase 2 and under the Phase 3 `Fence::Step` lock before settling, single atomic `Fence::Step` commit of `storage::settle` + `runs::record_observation`), pre-terminal resolution of abandoned revision-zero `repeatable_read` `intent` operations in worker terminal settlements (`leases::settle_locked`, `leases::settle_expired`, worker `approvals::fail`) and `approvals::park` strictly before `run-terminal` / `run-waiting`, `reconcile_run_spills` (zero post-terminal `run_events`) and serialized-budget head/tail preview builder. | PostgreSQL 18 tests: cross-user, cross-scope, archived/deleted project, private project-scope spill ownership (other members denied until shared), share revocation and `active` -> `retained` transition between original read and replay, and non-`active` revision refusals; `max_bytes < 4` validation refusal, invalid UTF-8 binary semantic fault and strictly inline `artifact.read_range` under both 6x JSON escaping and `<= 200`-line `next_offset` pagination; unfinished `repeatable_read` replay through `approvals::start_replayed_read` (rechecking bound session and canonical proposal without issuing a write permit) plus crash-reclaim test at `dispatched_attempts == 3` proving dispatch refusal, terminal `failed` observation under `Fence::Step` and zero outbound sends; catalog registration rejection of `x-mcp-header` schemas plus duplicate-key, float, depth, bound and wildcard rejections; serialized-JSON `16 KiB` inline/spill thresholds (`\u001b` expansion, `200` lines, multi-byte UTF-8 cuts); startup `Store::probe_writable` fail-closed test on pre-existing read-only `staging/` and `revisions/`; unset-`ARTIFACTS_DIR`, unconfigured-store, quota-refused and I/O fallback envelopes; Phase 3 rollback/crash simulation verifying `storage::settle` and `runs::record_observation` commit atomically inside one `Fence::Step` transaction so at most one active revision and one storage quota charge ever commit per operation (zero double-charged spill revisions on replacement-worker replay); `publish_bytes` Phase 2/3 stall and takeover tests covering (a) delaying Phase 2 `spawn_blocking` disk I/O past **both** the `5 s` PostgreSQL `idle_in_transaction_session_timeout` and the worker drain deadline during lease takeover (proving replacement worker settlement succeeds intact with its own disjoint `reservation_id` and the stalled old worker produces zero corrupted/unlinked revisions and zero leaked settled quota) and (b) local `step.deadline` expiry and `step.stop` firing while the DB lease is still live (proving Phase 3 aborts/rolls back before settling `storage_reservations` with zero active revision and zero settled quota); crashed `repeatable_read` (`outcome = 'intent'`) + terminal settlement (`leases::settle`, `leases::settle_expired` and `approvals::park` -> immediate terminal `cancel_run`) + `reconcile_run_spills` freeing spill quota with zero stranded bytes and zero post-terminal `run_events`, asserting reconnecting `GET`/`HEAD /v1/runs/{run_id}/events?after=<terminal_cursor>` still returns `204 No Content`, while preserving `storage::release` `Error::Unresolved` protection for `interrupted` runs with `outcome_unknown` writes, spill TTL/age guard against active publishers, post-release/pre-unlink and post-TTL late-rename retryable cleanup of `released` rows, post-rename/pre-settlement cleanup of unsettled `revisions/<id>` and untouched `settled` rows. |
+| PR3 | Streamable HTTP MCP (`2026-07-28`) adapter over `provider_http::transport` (rejecting `x-mcp-header` schemas on `tools/list`), `MCP_DNS_SLOTS`, `McpCredentialProvider` seam, `ApprovedAdapter` implementation stopping `outcome_unknown` writes via `StepResult::Stopped` and deposed workers via `StepResult::Invalidated` (mapped in `worker::execute` to `WorkEnd::Stop(Stop::LeaseLost)`), destination-authorized read-only `Executor::reconcile` under `Fence::Hold`, and `PLAN-10` / `PLAN-22` conformance harness on synthetic `rcgen` TLS + PostgreSQL 18. | Synthetic TLS + PostgreSQL 18 tests: MCP `2026-07-28` request headers (`MCP-Protocol-Version: 2026-07-28`, `Mcp-Method`, `Mcp-Name`, no `Mcp-Session-Id`, no `Mcp-Param-*`) **and** body `params._meta` (`io.modelcontextprotocol/protocolVersion` and `io.modelcontextprotocol/clientCapabilities = {}`) over `application/json` and `text/event-stream` (SSE comments and progress notifications before final response, mismatched JSON-RPC IDs, duplicate final responses, `input_required` and unexpected server-initiated request rejection, upstream `tools/list` `x-mcp-header` schema rejection before tool offer or call admission, `4 MiB` aggregate stream ceiling before buffering); bounded retries with durable `dispatched_attempts < 3` increments under `Fence::Step` and identical persisted `Idempotency-Key` on `repeatable_read`/`idempotent` plus proven-pre-send retries on `lookup`/`non_repeatable`, enforcing `step.stop`, `step.deadline` (including `EndpointKey::Supported.expires_us`), crash-reclaim at `dispatched_attempts == 3` with zero outbound HTTP sends, and full ADR 0035 effect-level + bound-session/generation revocation checks before every retry across all classes; sticky whole-operation send uncertainty (`outcome_unknown` preserved when a retry fails pre-send or receives `401`/`403`/deadline after ambiguous attempt 1) and immediate halt via `StepResult::Stopped` into `ExecState::Reconciling` / `interrupted` on every uncertain write (`lookup`, `non_repeatable`, or exhausted/window-expired `idempotent`), proving no further model round runs and a fresh-`logical_key` proposal cannot be admitted and produces **zero** additional outbound sends (while known-outcome non-retryable failures return `retryable_by_model: false`); deposed-worker lease takeover between a possible write send and `runs::record_observation` (`Fence::Hold` rejecting with `LeaseError::StaleClaim`, `LeaseError::Expired` or `LeaseError::Terminal`), verifying the deposed worker returns `StepResult::Invalidated` immediately without touching PostgreSQL, leaves the durable `outcome = 'intent'` write row intact, and the replacement worker's recovery path (`src/worker.rs`) routes the unresolved write directly into `ExecState::Reconciling` / settlement with **zero** further model rounds and **zero** duplicate outbound sends; `lookup` reconciliation with and without `downstream_handle` passing `&ActiveRun`/`&Lease<'_>` into `Executor::reconcile`, enforcing both `recheck_decision` and the live destination-specific MCP server/connection/account authorization check under `Fence::Hold` in `ExecState::Reconciling` before `McpCredentialProvider` lookup (asserting **zero** `McpCredentialProvider` lookups and terminal `interrupted` settlement when destination/account access is revoked or disabled), and verifying `repeatable_read` exclusion from `Executor::reconcile`; semantic `isError: true` / `-32602` plus `PLAN-10` valid-schema wrong/stale-fact semantic recovery; internal-MCP identity-boundary check authenticating caller/scope via primary PostgreSQL authority rather than compiled bypass; `PLAN-22` fixed native vs internal-MCP vs remote-MCP route measurement harness hook; SSRF/TLS/redirect/`401`/`403`/`tools/list`-drift/`> 4 MiB` refusals; canary redaction checks across errors, stderr, traces and metrics; end-to-end `park` -> `decide` -> resume -> `ApprovedAdapter::send` -> spill -> `artifact.read_range` round trip including share-revocation and retention replay refusals. |
 
 ### External boundaries
 
