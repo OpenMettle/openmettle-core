@@ -3,9 +3,9 @@
   "jsonSchemaDialect": "https://spec.openapis.org/oas/3.2/dialect/2026-02-26",
   "info": {
     "title": "OpenMettle application API",
-    "version": "1.0.0-draft.4",
+    "version": "1.0.0-draft.5",
     "summary": "Versioned application contract for capabilities, projects, conversations, artifacts and durable run replay.",
-    "description": "Canonical source for the OpenMettle v1 application API contract. Wire rules, compatibility policy and limits are recorded in docs/adr/0007-application-api-contract.md; authorization and project lifecycle in docs/adr/0027-authorization-and-private-projects.md. Every operation carries x-openmettle-implementation: `implemented` operations are served by an API started with OPENMETTLE_API_AUTH_CONFIG, and `not-implemented` operations are not served. An API started without OPENMETTLE_API_AUTH_CONFIG serves no operation; without OPENMETTLE_API_ARTIFACTS_DIR the artifact upload and download operations answer 503 provisioning. Artifact storage is described in docs/adr/0031-filesystem-artifact-storage-and-streaming-multipart.md. Fixtures under contracts/fixtures are generated from the examples in this document by scripts/contract_fixtures.py.",
+    "description": "Canonical source for the OpenMettle v1 application API contract. Wire rules, compatibility policy and limits are recorded in docs/adr/0007-application-api-contract.md; authorization and project lifecycle in docs/adr/0027-authorization-and-private-projects.md. Every operation carries x-openmettle-implementation: `implemented` operations are served by an API started with OPENMETTLE_API_AUTH_CONFIG, and `not-implemented` operations are not served. An API started without OPENMETTLE_API_AUTH_CONFIG serves no operation; without OPENMETTLE_API_ARTIFACTS_DIR the artifact upload and download operations answer 503 provisioning. Artifact storage is described in docs/adr/0031-filesystem-artifact-storage-and-streaming-multipart.md. Fixtures under contracts/fixtures are generated from the examples in this document by scripts/contract_fixtures.py. ADR 0036 defines managed conversation history, catalog and durable submission. Configure catalog_file and admission_limits in the version-2 auth document. Run mutations require cursor_keys. A full queue returns Retry-After in seconds.",
     "license": {
       "name": "MIT",
       "identifier": "MIT"
@@ -1598,6 +1598,865 @@
           }
         }
       }
+    },
+    "/v1/conversations": {
+      "post": {
+        "operationId": "createConversation",
+        "summary": "Create a private conversation and its empty root",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "Complete JSON body limit is 65536 bytes.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConversationCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Exact replay.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationRoot"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Created.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationRoot"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      },
+      "get": {
+        "operationId": "listConversations",
+        "summary": "List visible conversations by creation time and ID",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ConversationScope"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current authorized projection.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/conversations/{conversation_id}/branches": {
+      "post": {
+        "operationId": "createBranch",
+        "summary": "Fork at an explicit ancestor or create the first managed root",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ConversationId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "Complete JSON body limit is 65536 bytes.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BranchCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Exact replay.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Branch"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Created.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Branch"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      },
+      "get": {
+        "operationId": "listBranches",
+        "summary": "List branches by creation time and ID",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ConversationId"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current authorized projection.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/conversations/{conversation_id}/branches/{branch_id}": {
+      "get": {
+        "operationId": "getBranch",
+        "summary": "Select a branch without moving its head",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ConversationId"
+          },
+          {
+            "$ref": "#/components/parameters/BranchId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current authorized projection.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Branch"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/conversations/{conversation_id}/branches/{branch_id}/effective-configuration": {
+      "post": {
+        "operationId": "previewConfiguration",
+        "summary": "Preview the proposed turn and its effective budget",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ConversationId"
+          },
+          {
+            "$ref": "#/components/parameters/BranchId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "Complete JSON body limit is 131072 bytes.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TurnProposal"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Current authorized projection.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EffectiveConfiguration"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        },
+        "description": "Uses the admission resolver without writing. Counts include instructions, turn and part framing, attachments and qualified reasoning replay. A versioned catalog profile may declare prompt_bound with fixed_tokens, tokens_per_turn, tokens_per_part, tokens_per_byte and a nullable tokens_per_attachment for its estimator_revision. These deployment-qualified upper bounds apply to that profile. Missing evidence leaves the prompt count unknown."
+      }
+    },
+    "/v1/conversations/{conversation_id}/branches/{branch_id}/messages": {
+      "get": {
+        "operationId": "listMessages",
+        "summary": "Read the pinned path from head to root",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ConversationId"
+          },
+          {
+            "$ref": "#/components/parameters/BranchId"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current authorized projection.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              },
+              "OpenMettle-History-Available": {
+                "description": "False for a legacy branch without a managed head.",
+                "schema": {
+                  "type": "string",
+                  "const": "false"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessagePage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "operationId": "listModels",
+        "summary": "List authorized model descriptors by ID",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current authorized projection.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/presets": {
+      "get": {
+        "operationId": "listPresets",
+        "summary": "List authorized preset descriptors by ID",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current authorized projection.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PresetPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/presets/{preset_id}": {
+      "get": {
+        "operationId": "getPreset",
+        "summary": "Read one authorized preset",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PresetId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current authorized projection.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PresetDescriptor"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/runs": {
+      "post": {
+        "operationId": "createRun",
+        "summary": "Admit or replay an append, edit or retry",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "Complete JSON body limit is 131072 bytes.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Exact replay.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Run"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Created.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Run"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        },
+        "description": "The v2 auth settings accept an optional catalog_file (absolute path, at most 1 MiB) and admission_limits with live_per_actor, live_per_scope, queued_in_instance, queue_timeout_seconds and round_cap. All five limits are required together. A configured cursor key signs the returned snapshot. An exact retry uses its pinned input and configuration after reauthorization. A live limit yields 429. A full queue yields 503 with Retry-After."
+      }
+    },
+    "/v1/runs/{run_id}/cancel": {
+      "post": {
+        "operationId": "cancelRun",
+        "summary": "Cancel a run owned by the caller",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RunId"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cancelled or already terminal.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Run"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Cancellation requested from the lease holder.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Run"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1786,6 +2645,32 @@
         "in": "path",
         "required": true,
         "description": "Canonical run UUID. A missing run or a run in an unreadable conversation returns not_found.",
+        "schema": {
+          "$ref": "#/components/schemas/Uuid"
+        }
+      },
+      "BranchId": {
+        "name": "branch_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/Uuid"
+        }
+      },
+      "PresetId": {
+        "name": "preset_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      },
+      "ConversationScope": {
+        "name": "scope_id",
+        "in": "query",
+        "description": "Return visible conversations in this scope. Defaults to the caller’s personal scope.",
         "schema": {
           "$ref": "#/components/schemas/Uuid"
         }
@@ -2789,8 +3674,18 @@
             "default": ""
           },
           "defaults": {
-            "$ref": "#/components/schemas/ProjectDefaults",
-            "default": {}
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProjectDefaults"
+              },
+              {
+                "properties": {
+                  "model_config": {
+                    "$ref": "#/components/schemas/ProjectModelConfig"
+                  }
+                }
+              }
+            ]
           },
           "reason": {
             "$ref": "#/components/schemas/AuditReason"
@@ -2814,7 +3709,18 @@
             "$ref": "#/components/schemas/ProjectInstructions"
           },
           "defaults": {
-            "$ref": "#/components/schemas/ProjectDefaults"
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProjectDefaults"
+              },
+              {
+                "properties": {
+                  "model_config": {
+                    "$ref": "#/components/schemas/ProjectModelConfig"
+                  }
+                }
+              }
+            ]
           },
           "reason": {
             "$ref": "#/components/schemas/AuditReason"
@@ -3375,8 +4281,1422 @@
                 "type": "null"
               }
             ]
+          },
+          "branch_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "input_message_id": {
+            "$ref": "#/components/schemas/Uuid"
           }
         }
+      },
+      "ConversationCreateRequest": {
+        "type": "object",
+        "properties": {
+          "scope_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "ConversationRoot": {
+        "type": "object",
+        "properties": {
+          "conversation_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "branch_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "scope_id": {
+            "$ref": "#/components/schemas/Uuid"
+          }
+        },
+        "required": [
+          "conversation_id",
+          "branch_id",
+          "scope_id"
+        ]
+      },
+      "BranchCreateRequest": {
+        "type": "object",
+        "properties": {
+          "source_branch_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "fork_message_id": {
+            "$ref": "#/components/schemas/Uuid"
+          }
+        },
+        "additionalProperties": false,
+        "dependentRequired": {
+          "source_branch_id": [
+            "fork_message_id"
+          ],
+          "fork_message_id": [
+            "source_branch_id"
+          ]
+        }
+      },
+      "Branch": {
+        "type": "object",
+        "properties": {
+          "conversation_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "branch_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "history_available": {
+            "type": "boolean"
+          },
+          "parent_branch_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "fork_message_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "head_message_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "conversation_id",
+          "branch_id",
+          "created_at",
+          "history_available",
+          "parent_branch_id",
+          "fork_message_id",
+          "head_message_id"
+        ]
+      },
+      "VisiblePart": {
+        "type": "object",
+        "properties": {
+          "part_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "kind": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "text": {
+            "type": "string",
+            "minLength": 0,
+            "maxLength": 65536
+          },
+          "revision_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "state": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "required": [
+          "part_id",
+          "kind"
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "kind": {
+                  "const": "text"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "text"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "kind": {
+                  "const": "attachment"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "revision_id",
+                "state"
+              ]
+            }
+          }
+        ]
+      },
+      "Message": {
+        "type": "object",
+        "properties": {
+          "message_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "parent_message_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "role": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "parts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VisiblePart"
+            },
+            "maxItems": 128
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "input_count": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NonNegativeDecimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "output_count": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NonNegativeDecimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "message_id",
+          "parent_message_id",
+          "role",
+          "parts",
+          "run_id",
+          "input_count",
+          "output_count"
+        ]
+      },
+      "ProfilePin": {
+        "type": "object",
+        "properties": {
+          "provider": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "revision": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "checkpoint": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "template": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "parser": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "runtime": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "gateway": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "required": [
+          "provider",
+          "revision",
+          "checkpoint",
+          "template",
+          "parser",
+          "runtime",
+          "gateway"
+        ]
+      },
+      "SamplingRange": {
+        "type": "object",
+        "properties": {
+          "min": {
+            "type": "number"
+          },
+          "max": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "min",
+          "max"
+        ]
+      },
+      "ModelDescriptor": {
+        "type": "object",
+        "properties": {
+          "model_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "profile": {
+            "$ref": "#/components/schemas/ProfilePin"
+          },
+          "installed": {
+            "type": "boolean"
+          },
+          "readiness": {
+            "$ref": "#/components/schemas/Readiness"
+          },
+          "context_window": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NonNegativeDecimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "conservative_ceiling": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NonNegativeDecimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "output_limit": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NonNegativeDecimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "temperature": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SamplingRange"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "top_p": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SamplingRange"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "joint_sampling": {
+            "type": "boolean"
+          },
+          "reasoning_efforts": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "maxItems": 65536
+          },
+          "default_effort": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "usage_semantics": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "authorization": {
+            "type": "boolean"
+          },
+          "defaults": {
+            "$ref": "#/components/schemas/DescriptorDefaults"
+          },
+          "estimator_revision": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 256,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reasoning_format": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 256,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "model_id",
+          "profile",
+          "installed",
+          "readiness",
+          "context_window",
+          "conservative_ceiling",
+          "output_limit",
+          "temperature",
+          "top_p",
+          "joint_sampling",
+          "reasoning_efforts",
+          "default_effort",
+          "usage_semantics",
+          "authorization",
+          "defaults",
+          "estimator_revision",
+          "reasoning_format"
+        ],
+        "description": "An installed catalog descriptor visible under current caller and platform policy. Readiness stays unknown until the provider has a current observation."
+      },
+      "PresetDescriptor": {
+        "type": "object",
+        "properties": {
+          "preset_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "model_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "revision": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "installed": {
+            "type": "boolean"
+          },
+          "readiness": {
+            "$ref": "#/components/schemas/Readiness"
+          },
+          "authorization": {
+            "type": "boolean"
+          },
+          "defaults": {
+            "$ref": "#/components/schemas/DescriptorDefaults"
+          }
+        },
+        "required": [
+          "preset_id",
+          "model_id",
+          "revision",
+          "installed",
+          "readiness",
+          "authorization",
+          "defaults"
+        ],
+        "description": "An installed catalog descriptor visible under current caller and platform policy. Readiness stays unknown until the provider has a current observation."
+      },
+      "ConversationPage": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConversationAccess"
+            },
+            "maxItems": 100
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ]
+      },
+      "BranchPage": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Branch"
+            },
+            "maxItems": 100
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ]
+      },
+      "MessagePage": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Message"
+            },
+            "maxItems": 100
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ]
+      },
+      "ModelPage": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelDescriptor"
+            },
+            "maxItems": 100
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ]
+      },
+      "PresetPage": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PresetDescriptor"
+            },
+            "maxItems": 100
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ]
+      },
+      "InputPart": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 65536
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "attachment": {
+                "$ref": "#/components/schemas/Uuid"
+              }
+            },
+            "required": [
+              "attachment"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "TurnRequest": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "const": "append"
+              },
+              "input_message_id": {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              "parts": {
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/InputPart"
+                },
+                "maxItems": 128
+              }
+            },
+            "required": [
+              "mode",
+              "input_message_id",
+              "parts"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "const": "edit"
+              },
+              "target_message_id": {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              "input_message_id": {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              "parts": {
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/InputPart"
+                },
+                "maxItems": 128
+              }
+            },
+            "required": [
+              "mode",
+              "target_message_id",
+              "input_message_id",
+              "parts"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "const": "retry"
+              },
+              "target_message_id": {
+                "$ref": "#/components/schemas/Uuid"
+              }
+            },
+            "required": [
+              "mode",
+              "target_message_id"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "ControlOverrides": {
+        "type": "object",
+        "properties": {
+          "temperature": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "top_p": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "context_window": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NonNegativeDecimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "output_reserve": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NonNegativeDecimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "SelectionRequest": {
+        "type": "object",
+        "properties": {
+          "model": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "preset": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "layer": {
+            "type": "object",
+            "properties": {
+              "controls": {
+                "$ref": "#/components/schemas/ControlOverrides"
+              },
+              "instructions": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 0,
+                    "maxLength": 32768
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      "ProjectModelConfig": {
+        "type": "object",
+        "properties": {
+          "model": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "preset": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "controls": {
+            "type": "object",
+            "properties": {
+              "temperature": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "top_p": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "reasoning_effort": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "context_window": {
+                "anyOf": [
+                  {
+                    "allOf": [
+                      {
+                        "$ref": "#/components/schemas/NonNegativeDecimal"
+                      },
+                      {
+                        "not": {
+                          "const": "0"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9223372036854775807
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "A positive decimal token count. Project defaults also accept existing integer values."
+              },
+              "output_reserve": {
+                "anyOf": [
+                  {
+                    "allOf": [
+                      {
+                        "$ref": "#/components/schemas/NonNegativeDecimal"
+                      },
+                      {
+                        "not": {
+                          "const": "0"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9223372036854775807
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "A positive decimal token count. Project defaults also accept existing integer values."
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      "TurnProposal": {
+        "type": "object",
+        "properties": {
+          "expected_head_message_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "turn": {
+            "$ref": "#/components/schemas/TurnRequest"
+          },
+          "selection": {
+            "$ref": "#/components/schemas/SelectionRequest"
+          },
+          "requested_rounds": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 2147483647
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "expected_head_message_id",
+          "turn"
+        ],
+        "additionalProperties": false
+      },
+      "RunCreateRequest": {
+        "type": "object",
+        "properties": {
+          "conversation_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "branch_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "proposal": {
+            "$ref": "#/components/schemas/TurnProposal"
+          }
+        },
+        "required": [
+          "conversation_id",
+          "branch_id",
+          "proposal"
+        ],
+        "additionalProperties": false
+      },
+      "SourcedCount": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "source": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "value": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NonNegativeDecimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "state",
+          "source",
+          "value"
+        ]
+      },
+      "SourcedNumber": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "source",
+          "value"
+        ]
+      },
+      "SourcedEffort": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "source",
+          "value"
+        ]
+      },
+      "PromptCount": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "count": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NonNegativeDecimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "estimator_revision": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "count",
+          "estimator_revision"
+        ]
+      },
+      "MeasuredUsage": {
+        "type": "object",
+        "properties": {
+          "message_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "run_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "profile_revision": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "input_count": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NonNegativeDecimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "output_count": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NonNegativeDecimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "message_id",
+          "run_id",
+          "profile_revision",
+          "input_count",
+          "output_count"
+        ]
+      },
+      "ConfigurationOmission": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "control": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "message_id": {
+            "$ref": "#/components/schemas/Uuid"
+          }
+        },
+        "required": [
+          "source",
+          "control",
+          "reason"
+        ]
+      },
+      "EffectiveConfiguration": {
+        "type": "object",
+        "properties": {
+          "model": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "model_source": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "preset": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "preset_source": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "profile": {
+            "$ref": "#/components/schemas/ProfilePin"
+          },
+          "catalog_revision": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "preset_revision": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "project_revision": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NonNegativeDecimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "context_window": {
+            "$ref": "#/components/schemas/SourcedCount"
+          },
+          "ceiling": {
+            "$ref": "#/components/schemas/SourcedCount"
+          },
+          "output_reserve": {
+            "$ref": "#/components/schemas/SourcedCount"
+          },
+          "usable_input": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NonNegativeDecimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "usable_input_operands": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "maxItems": 2
+          },
+          "temperature": {
+            "$ref": "#/components/schemas/SourcedNumber"
+          },
+          "top_p": {
+            "$ref": "#/components/schemas/SourcedNumber"
+          },
+          "reasoning_effort": {
+            "$ref": "#/components/schemas/SourcedEffort"
+          },
+          "omissions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConfigurationOmission"
+            },
+            "maxItems": 2147483647
+          },
+          "instruction_sources": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "maxItems": 4
+          },
+          "measured": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MeasuredUsage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "prompt": {
+            "$ref": "#/components/schemas/PromptCount"
+          }
+        },
+        "required": [
+          "model",
+          "model_source",
+          "preset",
+          "preset_source",
+          "profile",
+          "catalog_revision",
+          "preset_revision",
+          "project_revision",
+          "context_window",
+          "ceiling",
+          "output_reserve",
+          "usable_input",
+          "usable_input_operands",
+          "temperature",
+          "top_p",
+          "reasoning_effort",
+          "omissions",
+          "instruction_sources",
+          "measured",
+          "prompt"
+        ]
+      },
+      "DescriptorDefaults": {
+        "type": "object",
+        "properties": {
+          "instructions": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1048576
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "controls": {
+            "type": "object",
+            "properties": {
+              "temperature": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "top_p": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "reasoning_effort": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "context_window": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/NonNegativeDecimal"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "output_reserve": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/NonNegativeDecimal"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "required": [
+          "instructions",
+          "controls"
+        ]
       }
     },
     "examples": {
@@ -5160,6 +7480,405 @@
               "value": "future_state"
             }
           ]
+        }
+      },
+      "RunWithBranch": {
+        "summary": "RunWithBranch",
+        "dataValue": {
+          "run_id": "0f0e0d0c-0b0a-4908-8706-050403020100",
+          "conversation_id": "0f0e0d0c-0b0a-4908-8706-050403020101",
+          "state": "cancelled",
+          "created_at": "2026-11-20T09:00:01.000000Z",
+          "last_sequence": "3",
+          "resume_cursor": "AQdleGFtcGxlAAAAAAAAAAPX4G_25L6evhHoy1RVdAyip9DN9oR5tDgnPL_6AVB-OQ",
+          "terminal": {
+            "run_id": "0f0e0d0c-0b0a-4908-8706-050403020100",
+            "sequence": "3",
+            "type": "run.cancelled",
+            "type_version": 1,
+            "occurred_at": "2026-11-20T09:00:03.000000Z",
+            "data": {
+              "reason": "requested"
+            }
+          },
+          "branch_id": "0f0e0d0c-0b0a-4908-8706-050403020101",
+          "input_message_id": "0f0e0d0c-0b0a-4908-8706-050403020102"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Run",
+          "direction": "response"
+        }
+      },
+      "CreatePersonalConversation": {
+        "summary": "CreatePersonalConversation",
+        "dataValue": {},
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/ConversationCreateRequest",
+          "direction": "request"
+        }
+      },
+      "NewConversationRoot": {
+        "summary": "NewConversationRoot",
+        "dataValue": {
+          "conversation_id": "0f0e0d0c-0b0a-4908-8706-050403020100",
+          "branch_id": "0f0e0d0c-0b0a-4908-8706-050403020101",
+          "scope_id": "0f0e0d0c-0b0a-4908-8706-050403020102"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/ConversationRoot",
+          "direction": "response"
+        }
+      },
+      "CreateChildBranch": {
+        "summary": "CreateChildBranch",
+        "dataValue": {
+          "source_branch_id": "0f0e0d0c-0b0a-4908-8706-050403020100",
+          "fork_message_id": "0f0e0d0c-0b0a-4908-8706-050403020102"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/BranchCreateRequest",
+          "direction": "request"
+        }
+      },
+      "SelectedBranch": {
+        "summary": "SelectedBranch",
+        "dataValue": {
+          "conversation_id": "0f0e0d0c-0b0a-4908-8706-050403020100",
+          "branch_id": "0f0e0d0c-0b0a-4908-8706-050403020101",
+          "created_at": "2026-11-20T09:00:01.000000Z",
+          "history_available": true,
+          "parent_branch_id": null,
+          "fork_message_id": null,
+          "head_message_id": "0f0e0d0c-0b0a-4908-8706-050403020102"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Branch",
+          "direction": "response"
+        }
+      },
+      "StudyPreset": {
+        "summary": "StudyPreset",
+        "dataValue": {
+          "preset_id": "study",
+          "model_id": "example",
+          "revision": "study-v1",
+          "installed": true,
+          "readiness": {
+            "state": "unknown"
+          },
+          "authorization": true,
+          "defaults": {
+            "instructions": null,
+            "controls": {}
+          }
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/PresetDescriptor",
+          "direction": "response"
+        }
+      },
+      "VisibleConversationPage": {
+        "summary": "VisibleConversationPage",
+        "dataValue": {
+          "items": [
+            {
+              "conversation_id": "91b2de62-bf73-4c01-9c4e-5f60718293a4",
+              "scope_kind": "project",
+              "scope_id": "6e2dab3f-8c40-4d9e-8f1b-2c3d4e5f6071",
+              "project_id": "5d1c9a2e-7b3f-4c8d-9e0a-1b2c3d4e5f60",
+              "created_at": "2026-11-17T09:00:00.000000Z",
+              "access": "write",
+              "can_manage_shares": true
+            }
+          ],
+          "page_info": {
+            "next_cursor": null
+          }
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/ConversationPage",
+          "direction": "response"
+        }
+      },
+      "VisibleBranchPage": {
+        "summary": "VisibleBranchPage",
+        "dataValue": {
+          "items": [
+            {
+              "conversation_id": "0f0e0d0c-0b0a-4908-8706-050403020100",
+              "branch_id": "0f0e0d0c-0b0a-4908-8706-050403020101",
+              "created_at": "2026-11-20T09:00:01.000000Z",
+              "history_available": true,
+              "parent_branch_id": null,
+              "fork_message_id": null,
+              "head_message_id": "0f0e0d0c-0b0a-4908-8706-050403020102"
+            }
+          ],
+          "page_info": {
+            "next_cursor": null
+          }
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/BranchPage",
+          "direction": "response"
+        }
+      },
+      "VisibleMessagePage": {
+        "summary": "VisibleMessagePage",
+        "dataValue": {
+          "items": [
+            {
+              "message_id": "0f0e0d0c-0b0a-4908-8706-050403020102",
+              "parent_message_id": null,
+              "role": "user",
+              "parts": [
+                {
+                  "part_id": "0f0e0d0c-0b0a-4908-8706-050403020101",
+                  "kind": "text",
+                  "text": "Example question."
+                }
+              ],
+              "run_id": null,
+              "input_count": null,
+              "output_count": null
+            }
+          ],
+          "page_info": {
+            "next_cursor": null
+          }
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/MessagePage",
+          "direction": "response"
+        }
+      },
+      "VisibleModelPage": {
+        "summary": "VisibleModelPage",
+        "dataValue": {
+          "items": [
+            {
+              "model_id": "example",
+              "profile": {
+                "provider": "synthetic-v1",
+                "revision": "synthetic-v1",
+                "checkpoint": "synthetic-v1",
+                "template": "synthetic-v1",
+                "parser": "synthetic-v1",
+                "runtime": "synthetic-v1",
+                "gateway": "synthetic-v1"
+              },
+              "installed": true,
+              "readiness": {
+                "state": "unknown"
+              },
+              "context_window": "8192",
+              "conservative_ceiling": null,
+              "output_limit": "1024",
+              "temperature": null,
+              "top_p": null,
+              "joint_sampling": false,
+              "reasoning_efforts": [],
+              "default_effort": null,
+              "usage_semantics": "final_call",
+              "authorization": true,
+              "defaults": {
+                "instructions": null,
+                "controls": {}
+              },
+              "estimator_revision": "fixture-v1",
+              "reasoning_format": null
+            }
+          ],
+          "page_info": {
+            "next_cursor": null
+          }
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/ModelPage",
+          "direction": "response"
+        }
+      },
+      "VisiblePresetPage": {
+        "summary": "VisiblePresetPage",
+        "dataValue": {
+          "items": [
+            {
+              "preset_id": "study",
+              "model_id": "example",
+              "revision": "study-v1",
+              "installed": true,
+              "readiness": {
+                "state": "unknown"
+              },
+              "authorization": true,
+              "defaults": {
+                "instructions": null,
+                "controls": {}
+              }
+            }
+          ],
+          "page_info": {
+            "next_cursor": null
+          }
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/PresetPage",
+          "direction": "response"
+        }
+      },
+      "AppendProposal": {
+        "summary": "AppendProposal",
+        "dataValue": {
+          "expected_head_message_id": null,
+          "turn": {
+            "mode": "append",
+            "input_message_id": "0f0e0d0c-0b0a-4908-8706-050403020102",
+            "parts": [
+              {
+                "text": "Example question."
+              }
+            ]
+          },
+          "selection": {
+            "preset": "study"
+          }
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/TurnProposal",
+          "direction": "request"
+        }
+      },
+      "SubmitAppend": {
+        "summary": "SubmitAppend",
+        "dataValue": {
+          "conversation_id": "0f0e0d0c-0b0a-4908-8706-050403020100",
+          "branch_id": "0f0e0d0c-0b0a-4908-8706-050403020101",
+          "proposal": {
+            "expected_head_message_id": null,
+            "turn": {
+              "mode": "append",
+              "input_message_id": "0f0e0d0c-0b0a-4908-8706-050403020102",
+              "parts": [
+                {
+                  "text": "Example question."
+                }
+              ]
+            },
+            "selection": {
+              "preset": "study"
+            }
+          }
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/RunCreateRequest",
+          "direction": "request"
+        }
+      },
+      "EditProposal": {
+        "summary": "EditProposal",
+        "dataValue": {
+          "expected_head_message_id": null,
+          "turn": {
+            "mode": "edit",
+            "target_message_id": "0f0e0d0c-0b0a-4908-8706-050403020101",
+            "input_message_id": "0f0e0d0c-0b0a-4908-8706-050403020102",
+            "parts": [
+              {
+                "attachment": "0f0e0d0c-0b0a-4908-8706-050403020100"
+              }
+            ]
+          },
+          "selection": {
+            "preset": "study"
+          }
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/TurnProposal",
+          "direction": "request"
+        }
+      },
+      "RetryProposal": {
+        "summary": "RetryProposal",
+        "dataValue": {
+          "expected_head_message_id": null,
+          "turn": {
+            "mode": "retry",
+            "target_message_id": "0f0e0d0c-0b0a-4908-8706-050403020101"
+          },
+          "selection": {
+            "preset": "study"
+          }
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/TurnProposal",
+          "direction": "request"
+        }
+      },
+      "PreviewStudy": {
+        "summary": "PreviewStudy",
+        "dataValue": {
+          "model": "example",
+          "model_source": "preset",
+          "preset": "study",
+          "preset_source": "request",
+          "profile": {
+            "provider": "synthetic-v1",
+            "revision": "synthetic-v1",
+            "checkpoint": "synthetic-v1",
+            "template": "synthetic-v1",
+            "parser": "synthetic-v1",
+            "runtime": "synthetic-v1",
+            "gateway": "synthetic-v1"
+          },
+          "catalog_revision": "v1",
+          "preset_revision": "v1",
+          "project_revision": null,
+          "context_window": {
+            "state": "known",
+            "value": "8192",
+            "source": "model"
+          },
+          "ceiling": {
+            "state": "known",
+            "value": "8192",
+            "source": "model"
+          },
+          "output_reserve": {
+            "state": "known",
+            "value": "1024",
+            "source": "preset"
+          },
+          "usable_input": "7168",
+          "usable_input_operands": [
+            "ceiling",
+            "output_reserve"
+          ],
+          "temperature": {
+            "value": null,
+            "source": "gateway_default"
+          },
+          "top_p": {
+            "value": null,
+            "source": "gateway_default"
+          },
+          "reasoning_effort": {
+            "value": null,
+            "source": "gateway_default"
+          },
+          "omissions": [],
+          "instruction_sources": [
+            "preset"
+          ],
+          "measured": null,
+          "prompt": {
+            "kind": "estimated",
+            "count": "25",
+            "estimator_revision": "fixture-v1"
+          }
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/EffectiveConfiguration",
+          "direction": "response"
         }
       }
     }

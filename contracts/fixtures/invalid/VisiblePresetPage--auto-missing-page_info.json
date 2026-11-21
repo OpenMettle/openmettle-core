@@ -1,0 +1,36 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "VisiblePresetPage--auto-missing-page_info",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "items": [
+      {
+        "authorization": true,
+        "defaults": {
+          "controls": {},
+          "instructions": null
+        },
+        "installed": true,
+        "model_id": "example",
+        "preset_id": "study",
+        "readiness": {
+          "state": "unknown"
+        },
+        "revision": "study-v1"
+      }
+    ]
+  },
+  "mutation": {
+    "name": "auto-missing-page_info",
+    "op": "remove",
+    "path": "/page_info"
+  },
+  "schema": "#/components/schemas/PresetPage",
+  "source": "#/components/examples/VisiblePresetPage"
+}

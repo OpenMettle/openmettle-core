@@ -1,0 +1,77 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "PreviewStudy--auto-missing-preset_source",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "catalog_revision": "v1",
+    "ceiling": {
+      "source": "model",
+      "state": "known",
+      "value": "8192"
+    },
+    "context_window": {
+      "source": "model",
+      "state": "known",
+      "value": "8192"
+    },
+    "instruction_sources": [
+      "preset"
+    ],
+    "measured": null,
+    "model": "example",
+    "model_source": "preset",
+    "omissions": [],
+    "output_reserve": {
+      "source": "preset",
+      "state": "known",
+      "value": "1024"
+    },
+    "preset": "study",
+    "preset_revision": "v1",
+    "profile": {
+      "checkpoint": "synthetic-v1",
+      "gateway": "synthetic-v1",
+      "parser": "synthetic-v1",
+      "provider": "synthetic-v1",
+      "revision": "synthetic-v1",
+      "runtime": "synthetic-v1",
+      "template": "synthetic-v1"
+    },
+    "project_revision": null,
+    "prompt": {
+      "count": "25",
+      "estimator_revision": "fixture-v1",
+      "kind": "estimated"
+    },
+    "reasoning_effort": {
+      "source": "gateway_default",
+      "value": null
+    },
+    "temperature": {
+      "source": "gateway_default",
+      "value": null
+    },
+    "top_p": {
+      "source": "gateway_default",
+      "value": null
+    },
+    "usable_input": "7168",
+    "usable_input_operands": [
+      "ceiling",
+      "output_reserve"
+    ]
+  },
+  "mutation": {
+    "name": "auto-missing-preset_source",
+    "op": "remove",
+    "path": "/preset_source"
+  },
+  "schema": "#/components/schemas/EffectiveConfiguration",
+  "source": "#/components/examples/PreviewStudy"
+}

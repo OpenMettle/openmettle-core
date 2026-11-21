@@ -1,0 +1,26 @@
+{
+  "class": "valid",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "StudyPreset",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "authorization": true,
+    "defaults": {
+      "controls": {},
+      "instructions": null
+    },
+    "installed": true,
+    "model_id": "example",
+    "preset_id": "study",
+    "readiness": {
+      "state": "unknown"
+    },
+    "revision": "study-v1"
+  },
+  "mutation": null,
+  "schema": "#/components/schemas/PresetDescriptor",
+  "source": "#/components/examples/StudyPreset"
+}

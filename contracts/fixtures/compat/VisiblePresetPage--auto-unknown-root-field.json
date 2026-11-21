@@ -1,0 +1,40 @@
+{
+  "class": "compat",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "VisiblePresetPage--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "items": [
+      {
+        "authorization": true,
+        "defaults": {
+          "controls": {},
+          "instructions": null
+        },
+        "installed": true,
+        "model_id": "example",
+        "preset_id": "study",
+        "readiness": {
+          "state": "unknown"
+        },
+        "revision": "study-v1"
+      }
+    ],
+    "page_info": {
+      "next_cursor": null
+    },
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/PresetPage",
+  "source": "#/components/examples/VisiblePresetPage"
+}

@@ -1,0 +1,31 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "VisibleConversationPage--auto-missing-page_info",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "items": [
+      {
+        "access": "write",
+        "can_manage_shares": true,
+        "conversation_id": "91b2de62-bf73-4c01-9c4e-5f60718293a4",
+        "created_at": "2026-11-17T09:00:00.000000Z",
+        "project_id": "5d1c9a2e-7b3f-4c8d-9e0a-1b2c3d4e5f60",
+        "scope_id": "6e2dab3f-8c40-4d9e-8f1b-2c3d4e5f6071",
+        "scope_kind": "project"
+      }
+    ]
+  },
+  "mutation": {
+    "name": "auto-missing-page_info",
+    "op": "remove",
+    "path": "/page_info"
+  },
+  "schema": "#/components/schemas/ConversationPage",
+  "source": "#/components/examples/VisibleConversationPage"
+}

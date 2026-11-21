@@ -1,0 +1,22 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "NewConversationRoot--auto-missing-branch_id",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "conversation_id": "0f0e0d0c-0b0a-4908-8706-050403020100",
+    "scope_id": "0f0e0d0c-0b0a-4908-8706-050403020102"
+  },
+  "mutation": {
+    "name": "auto-missing-branch_id",
+    "op": "remove",
+    "path": "/branch_id"
+  },
+  "schema": "#/components/schemas/ConversationRoot",
+  "source": "#/components/examples/NewConversationRoot"
+}

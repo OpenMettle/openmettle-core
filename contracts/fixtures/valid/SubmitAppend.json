@@ -1,0 +1,31 @@
+{
+  "class": "valid",
+  "direction": "request",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "SubmitAppend",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "branch_id": "0f0e0d0c-0b0a-4908-8706-050403020101",
+    "conversation_id": "0f0e0d0c-0b0a-4908-8706-050403020100",
+    "proposal": {
+      "expected_head_message_id": null,
+      "selection": {
+        "preset": "study"
+      },
+      "turn": {
+        "input_message_id": "0f0e0d0c-0b0a-4908-8706-050403020102",
+        "mode": "append",
+        "parts": [
+          {
+            "text": "Example question."
+          }
+        ]
+      }
+    }
+  },
+  "mutation": null,
+  "schema": "#/components/schemas/RunCreateRequest",
+  "source": "#/components/examples/SubmitAppend"
+}

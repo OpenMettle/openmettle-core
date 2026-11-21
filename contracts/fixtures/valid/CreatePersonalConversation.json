@@ -1,0 +1,13 @@
+{
+  "class": "valid",
+  "direction": "request",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "CreatePersonalConversation",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {},
+  "mutation": null,
+  "schema": "#/components/schemas/ConversationCreateRequest",
+  "source": "#/components/examples/CreatePersonalConversation"
+}

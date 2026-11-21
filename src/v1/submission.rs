@@ -1,0 +1,557 @@
+//! The graph and durable run share one bounded write transaction.
+use super::{catalog, conversations::decimal, *};
+use crate::{
+    authz::{
+        branches::{
+            self, Conversation, History, Operation, Part, PartContent, UserInput,
+            snapshot::{Intent, Snapshots},
+        },
+        runs::{self as queue, Admission, AdmissionLimits, RunLimit},
+    },
+    model_config::{
+        Budget, Catalog, ConfigSnapshot, Effective, Field, PathTurn, PromptEstimate,
+        SNAPSHOT_FORMAT, SNAPSHOT_VERSION, Selection,
+    },
+    runs::{RunInput, WriteTransaction},
+};
+use serde::Deserializer;
+
+#[derive(Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum Turn {
+    Append {
+        input_message_id: String,
+        parts: Vec<Part>,
+    },
+    Edit {
+        target_message_id: String,
+        input_message_id: String,
+        parts: Vec<Part>,
+    },
+    Retry {
+        target_message_id: String,
+    },
+}
+
+fn required_nullable<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Option::deserialize(d)
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Proposal {
+    #[serde(deserialize_with = "required_nullable")]
+    expected_head_message_id: Option<String>,
+    turn: Turn,
+    #[serde(default)]
+    selection: Selection,
+    requested_rounds: Option<i64>,
+}
+impl Proposal {
+    pub(super) fn read(body: &[u8]) -> Result<Self, Problem> {
+        let proposal: Self = wire_proposal(body, false)?;
+        proposal.validate()?;
+        Ok(proposal)
+    }
+
+    fn operation(&self) -> Operation<'_> {
+        match &self.turn {
+            Turn::Append {
+                input_message_id,
+                parts,
+            } => Operation::Append(UserInput {
+                id: input_message_id,
+                parts,
+            }),
+            Turn::Edit {
+                target_message_id,
+                input_message_id,
+                parts,
+            } => Operation::Edit {
+                target: target_message_id,
+                replacement: UserInput {
+                    id: input_message_id,
+                    parts,
+                },
+            },
+            Turn::Retry { target_message_id } => Operation::Retry {
+                target: target_message_id,
+            },
+        }
+    }
+    fn validate(&self) -> Result<(), Problem> {
+        let check = |s: &str| crate::runs::uuid(s).map_err(|_| INVALID);
+        if let Some(head) = &self.expected_head_message_id {
+            check(head)?
+        }
+        if self
+            .requested_rounds
+            .is_some_and(|n| !(1..=i64::from(i32::MAX)).contains(&n))
+        {
+            return Err(INVALID);
+        }
+        if self
+            .selection
+            .layer
+            .instructions
+            .as_ref()
+            .is_some_and(|s| s.len() > 32768 || s.contains('\0'))
+        {
+            return Err(INVALID);
+        }
+        for name in [
+            &self.selection.model,
+            &self.selection.preset,
+            &self.selection.layer.controls.reasoning_effort,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
+                return Err(INVALID);
+            }
+        }
+        match self.operation() {
+            Operation::Append(input) => {
+                check(input.id)?;
+                branches::validate_parts(input.parts, true)?;
+            }
+            Operation::Edit {
+                target,
+                replacement,
+            } => {
+                check(target)?;
+                check(replacement.id)?;
+                branches::validate_parts(replacement.parts, true)?;
+            }
+            Operation::Retry { target } => check(target)?,
+        }
+        Ok(())
+    }
+}
+
+// Serde also accepts positional arrays for derived structs. Check nested object shapes and
+// canonical decimal counts on the wire before converting to the storage representation.
+fn wire_proposal<T: DeserializeOwned>(body: &[u8], submission: bool) -> Result<T, Problem> {
+    let mut value = crate::provider_keys::documents::unique(body).map_err(|_| BODY)?;
+    if !value.is_object() {
+        return Err(BODY);
+    }
+    let proposal = if submission {
+        value.get_mut("proposal").ok_or(BODY)?
+    } else {
+        &mut value
+    };
+    if !proposal.is_object() || !proposal.get("turn").is_some_and(Value::is_object) {
+        return Err(BODY);
+    }
+    if let Some(selection) = proposal.get_mut("selection") {
+        if !selection.is_object() {
+            return Err(BODY);
+        }
+        if let Some(layer) = selection.get_mut("layer") {
+            if !layer.is_object() {
+                return Err(BODY);
+            }
+            if let Some(controls) = layer.get_mut("controls") {
+                let controls = controls.as_object_mut().ok_or(BODY)?;
+                crate::model_config::decode_control_counts(controls, false).map_err(|_| BODY)?;
+            }
+        }
+    }
+    serde_json::from_value(value).map_err(|_| BODY)
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Request {
+    conversation_id: String,
+    branch_id: String,
+    proposal: Proposal,
+}
+impl Request {
+    pub fn read(body: &[u8]) -> Result<Self, Problem> {
+        let r: Self = wire_proposal(body, true)?;
+        crate::runs::uuid(&r.conversation_id)
+            .and_then(|_| crate::runs::uuid(&r.branch_id))
+            .map_err(|_| INVALID)?;
+        r.proposal.validate()?;
+        Ok(r)
+    }
+}
+
+async fn resolve(
+    c: &mut PgConnection,
+    actor: &Principal,
+    view: &ResourceView,
+    catalog: &Catalog,
+    selection: &Selection,
+) -> Result<ConfigSnapshot, Problem> {
+    let (project, rev) = if let Some(id) = &view.project_id {
+        let settings = projects::load_project_settings(c, id)
+            .await?
+            .ok_or(NOT_FOUND)?;
+        (Selection::project(&settings)?, Some(settings.revision))
+    } else {
+        (Selection::default(), None)
+    };
+    let policy = store::load_platform_capabilities(c).await?;
+    let effective = catalog.resolve(&project, selection, rev, |model, preset| {
+        catalog::allowed(catalog, actor, &policy, model, preset)
+    })?;
+    let required_capabilities =
+        catalog::capabilities(catalog, &effective.model, effective.preset.as_deref())?;
+    Ok(ConfigSnapshot {
+        effective,
+        required_capabilities,
+        policy_revision: "openmettle.authz/1".into(),
+    })
+}
+
+// Only a deployment-qualified encoding bound for the selected profile can authorize admission.
+// Every assembled turn, instruction and part includes its framing. No tools are proposed here.
+fn budget<'a>(
+    catalog: &Catalog,
+    e: &Effective,
+    path: &'a [PathTurn],
+    history: &History,
+    proposed: Option<&[Part]>,
+) -> Result<Budget<'a>, Problem> {
+    let profile = catalog.target(e)?;
+    let estimate = profile
+        .prompt_bound
+        .as_ref()
+        .zip(profile.estimator_revision.as_deref())
+        .map(|(b, revision)| {
+            let mut text = Some(u64::from(b.fixed_tokens));
+            let mut attachments = Some(0u64);
+            let mut charge = |bytes: usize, framing: u32| {
+                text = text.and_then(|n| {
+                    n.checked_add(u64::from(framing))?
+                        .checked_add((bytes as u64).checked_mul(u64::from(b.tokens_per_byte))?)
+                });
+            };
+            for i in &e.instructions {
+                charge(i.text.len(), b.tokens_per_turn);
+            }
+            let mut part = |p: &Part| match p {
+                Part::Text(s) => charge(s.len(), b.tokens_per_part),
+                Part::Attachment(_) => {
+                    charge(0, b.tokens_per_part);
+                    attachments = attachments
+                        .and_then(|n| n.checked_add(u64::from(b.tokens_per_attachment?)));
+                }
+            };
+            for t in &history.turns {
+                for p in &t.parts {
+                    if let PartContent::Available(value) = &p.value {
+                        part(value)
+                    }
+                }
+            }
+            if let Some(parts) = proposed {
+                for p in parts {
+                    part(p)
+                }
+            }
+            let turns = history.turns.len() as u64 + u64::from(proposed.is_some());
+            PromptEstimate {
+                profile: &profile.pin,
+                revision,
+                instructions: Some(0),
+                history: text
+                    .and_then(|n| n.checked_add(turns.checked_mul(u64::from(b.tokens_per_turn))?)),
+                proposed_input: Some(0),
+                tools: Some(0),
+                attachments,
+            }
+        });
+    Ok(catalog.budget(e, path, estimate.as_ref())?)
+}
+fn field(f: &Field<u64>) -> Value {
+    json!({"state":if f.value.is_some(){"known"}else{"unknown"},"value":decimal(f.value),"source":f.source})
+}
+
+pub(super) async fn preview(
+    c: &mut PgConnection,
+    call: Call<'_>,
+    actor: &Principal,
+    view: &ResourceView,
+    branch: &str,
+    catalog: Option<&Catalog>,
+    proposal: &Proposal,
+) -> Result<Response, Problem> {
+    let chat = Conversation {
+        scope: &view.scope_id,
+        id: call.target,
+    };
+    let now = call.context.observed_ms();
+    let mut history = branches::history(c, actor, chat, branch, now)
+        .await?
+        .ok_or(NOT_FOUND)?;
+    if history.head != proposal.expected_head_message_id {
+        return Err(CONFLICT);
+    }
+    let (target, user) = match proposal.operation() {
+        Operation::Append(_) => (None, false),
+        Operation::Edit { target, .. } => (Some(target), true),
+        Operation::Retry { target } => (Some(target), false),
+    };
+    if let Some(target) = target {
+        let index = history
+            .turns
+            .iter()
+            .position(|t| t.metadata.message_id == target)
+            .ok_or(NOT_FOUND)?;
+        if history.turns[index].author_user_id.is_some() != user {
+            return Err(INVALID);
+        }
+        history.turns.drain(..=index);
+    }
+    let proposed = match proposal.operation() {
+        Operation::Append(i) | Operation::Edit { replacement: i, .. } => {
+            for p in i.parts {
+                if let Part::Attachment(id) = p {
+                    branches::readable_revision(c, actor, chat.scope, id, now).await?
+                }
+            }
+            Some(i.parts)
+        }
+        Operation::Retry { .. } => {
+            let input = history
+                .turns
+                .first()
+                .filter(|t| t.author_user_id.is_some())
+                .ok_or(INVALID)?;
+            if input
+                .parts
+                .iter()
+                .any(|p| !matches!(p.value, PartContent::Available(_)))
+            {
+                return Err(NOT_FOUND);
+            }
+            None
+        }
+    };
+    let catalog = catalog.ok_or(PROVISIONING)?;
+    let config = resolve(c, actor, view, catalog, &proposal.selection).await?;
+    let e = &config.effective;
+    let path = history
+        .turns
+        .iter()
+        .map(|t| t.metadata.clone())
+        .collect::<Vec<_>>();
+    let b = budget(catalog, e, &path, &history, proposed)?;
+    let prompt = match b.estimated {
+        Some(n) => {
+            json!({"kind":"estimated","count":n.upper_bound.to_string(),"estimator_revision":n.revision})
+        }
+        None => json!({"kind":"unknown","count":null,"estimator_revision":null}),
+    };
+    let measured = b.measured.map(|turn| {
+        json!({
+            "message_id": turn.message_id, "run_id": turn.run_id,
+            "profile_revision": turn.profile.as_ref().map(|p| &p.revision),
+            "input_count": decimal(turn.input_count), "output_count": decimal(turn.output_count),
+        })
+    });
+    let mut omissions: Vec<Value> = e.omissions.iter().map(|o| json!(o)).collect();
+    for t in &history.turns {
+        for p in &t.parts {
+            if !matches!(p.value, PartContent::Available(_)) {
+                omissions.push(json!({"source":"history","control":"attachment","reason":"unavailable","message_id":t.metadata.message_id}));
+            }
+        }
+    }
+    Ok(reply(
+        StatusCode::OK,
+        json!({
+            "model": e.model, "model_source": e.model_source, "preset": e.preset, "preset_source": e.preset_source,
+            "profile": e.profile, "catalog_revision": e.catalog_revision, "preset_revision": e.preset_revision,
+            "project_revision": e.project_revision.map(|n| n.to_string()), "context_window": field(&e.context_window),
+            "ceiling": field(&e.ceiling), "output_reserve": field(&e.output_reserve), "usable_input": decimal(b.usable_input),
+            "usable_input_operands": ["ceiling", "output_reserve"], "temperature": e.temperature, "top_p": e.top_p,
+            "reasoning_effort": e.reasoning_effort, "omissions": omissions,
+            "instruction_sources": e.instructions.iter().map(|i|i.source).collect::<Vec<_>>(),
+            "measured": measured, "prompt": prompt
+        }),
+    ))
+}
+
+pub(super) async fn submit(
+    c: &mut PgConnection,
+    call: Call<'_>,
+    r: &Request,
+    limits: &AdmissionLimits,
+    catalog: Option<&Catalog>,
+) -> Result<(StatusCode, String), Problem> {
+    let mut tx = WriteTransaction::begin_bounded(c, false).await?;
+    let result = admission(&mut tx, call, r, limits, catalog).await;
+    if matches!(result, Ok(Admission::Admitted { .. })) {
+        tx.commit().await?
+    } else {
+        tx.rollback().await?
+    }
+    match result? {
+        Admission::Admitted { run_id, .. } => Ok((StatusCode::CREATED, run_id)),
+        Admission::Replayed { run_id, .. } => Ok((StatusCode::OK, run_id)),
+        Admission::Refused(RunLimit::ActorLimit | RunLimit::ScopeLimit) => Err(problem(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "A live run limit has been reached.",
+        )),
+        Admission::Refused(RunLimit::QueueFull) => Err(QUEUE_FULL),
+    }
+}
+pub(super) const QUEUE_FULL: Problem = problem(
+    StatusCode::SERVICE_UNAVAILABLE,
+    "unavailable",
+    "The run queue is full.",
+);
+async fn admission(
+    tx: &mut WriteTransaction<'_>,
+    call: Call<'_>,
+    r: &Request,
+    limits: &AdmissionLimits,
+    catalog: Option<&Catalog>,
+) -> Result<Admission, Problem> {
+    let c = tx.connection()?;
+    let scope: String =
+        sqlx::query_scalar("SELECT scope_id::text FROM openmettle.conversations WHERE id=$1::uuid")
+            .bind(&r.conversation_id)
+            .fetch_optional(&mut *c)
+            .await?
+            .ok_or(NOT_FOUND)?;
+    let ctx = call.context;
+    queue::lock_scope_actor(c, &scope, ctx.user_id()).await?;
+    let actor = principal(c, ctx).await?;
+    let view = projects::resource_view(
+        c,
+        &actor,
+        ResourceKind::Conversation,
+        &r.conversation_id,
+        ctx.observed_ms(),
+        authz::Action::RunExecute,
+    )
+    .await?;
+    let key = request_key(call.op, &r.conversation_id, call.key);
+    let chat = Conversation {
+        scope: &scope,
+        id: &r.conversation_id,
+    };
+    let intent = Intent {
+        source_branch_id: &r.branch_id,
+        expected_head_message_id: r.proposal.expected_head_message_id.as_deref(),
+        operation: r.proposal.operation(),
+        selection: &r.proposal.selection,
+        requested_rounds: r.proposal.requested_rounds,
+    };
+    let (branch, message, format, version, snapshots, gates) =
+        if let Some(found) = queue::find_run(c, &scope, ctx.user_id(), &key).await? {
+            let (previous, config) = Snapshots::decode(&found).map_err(|_| KEY_CONFLICT)?;
+            if !previous.matches(&intent) {
+                return Err(KEY_CONFLICT);
+            }
+            (
+                found.branch_id,
+                found.input_message_id,
+                found.snapshot_format,
+                found.snapshot_version,
+                Snapshots {
+                    input: found.input_snapshot,
+                    config: found.config_snapshot,
+                },
+                config.required_capabilities,
+            )
+        } else {
+            let audit = AuditContext {
+                request_key: &key,
+                ..call.audit()
+            };
+            let target = branches::prepare_turn(
+                tx,
+                &audit,
+                chat,
+                &r.branch_id,
+                intent.expected_head_message_id,
+                intent.operation,
+            )
+            .await?;
+            let c = tx.connection()?;
+            let catalog = catalog.ok_or(PROVISIONING)?;
+            let config = resolve(c, &actor, &view, catalog, intent.selection).await?;
+            let history = branches::history(c, &actor, chat, &target.branch_id, ctx.observed_ms())
+                .await?
+                .ok_or(NOT_FOUND)?;
+            let path = history
+                .turns
+                .iter()
+                .map(|t| t.metadata.clone())
+                .collect::<Vec<_>>();
+            budget(catalog, &config.effective, &path, &history, None)?.admit()?;
+            let snapshots = Snapshots::encode(&intent, &history, catalog, &config)?;
+            (
+                target.branch_id,
+                target.input_message_id,
+                SNAPSHOT_FORMAT.to_owned(),
+                SNAPSHOT_VERSION,
+                snapshots,
+                config.required_capabilities,
+            )
+        };
+    let caps = gates
+        .iter()
+        .map(|(name, gate)| queue::CapabilityUse { name, gate: *gate })
+        .collect::<Vec<_>>();
+    Ok(queue::admit_run(
+        tx,
+        &queue::RunAdmission {
+            input: RunInput {
+                scope: &scope,
+                actor: ctx.user_id(),
+                conversation: chat.id,
+                branch: &branch,
+                message: &message,
+                key: &key,
+                format: &format,
+                version,
+                input: &snapshots.input,
+                config: &snapshots.config,
+            },
+            actor_approval_id: ctx.approval_id(),
+            capabilities: &caps,
+            requested_rounds: intent.requested_rounds,
+            now_ms: ctx.observed_ms(),
+        },
+        limits,
+    )
+    .await?)
+}
+pub(super) async fn cancel(
+    c: &mut PgConnection,
+    call: Call<'_>,
+) -> Result<(StatusCode, String), Problem> {
+    let ctx = call.context;
+    let actor = principal(c, ctx).await?;
+    let (scope, conversation): (String, String) = sqlx::query_as(
+        "SELECT scope_id::text, conversation_id::text FROM openmettle.runs
+         WHERE id=$1::uuid AND actor_user_id=$2::uuid",
+    )
+    .bind(call.target)
+    .bind(ctx.user_id())
+    .fetch_optional(&mut *c)
+    .await?
+    .ok_or(NOT_FOUND)?;
+    projects::read_resource(
+        c,
+        &actor,
+        ResourceKind::Conversation,
+        &conversation,
+        ctx.observed_ms(),
+    )
+    .await?;
+    let result = queue::cancel_run(c, &actor, &scope, call.target).await?;
+    let status = match result {
+        queue::CancelOutcome::Requested { .. } => StatusCode::ACCEPTED,
+        _ => StatusCode::OK,
+    };
+    Ok((status, call.target.to_owned()))
+}

@@ -1,0 +1,24 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "EditProposal--auto-missing-turn",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "expected_head_message_id": null,
+    "selection": {
+      "preset": "study"
+    }
+  },
+  "mutation": {
+    "name": "auto-missing-turn",
+    "op": "remove",
+    "path": "/turn"
+  },
+  "schema": "#/components/schemas/TurnProposal",
+  "source": "#/components/examples/EditProposal"
+}

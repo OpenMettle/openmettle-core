@@ -361,6 +361,8 @@ fn app(
         return Ok((operational, None));
     };
     let (mut settings, profile) = auth_config::load_browser(path)?;
+    let catalog = settings.catalog.take();
+    let admission_limits = settings.admission_limits;
     let cursor_keys = settings.cursor_keys.take();
     let native = settings.native().cloned();
     let issuance = lazy_pool(issuance, *connections, config.database_timeout);
@@ -384,6 +386,12 @@ fn app(
     }
     let origin = profile.handoff().origin;
     let mut v1 = v1::router(service, bearer, origin, pool.clone(), artifacts);
+    if let Some(catalog) = catalog {
+        v1 = v1.layer(axum::Extension(Arc::new(catalog)));
+    }
+    if let Some(limits) = admission_limits {
+        v1 = v1.layer(axum::Extension(limits));
+    }
     if let Some(keys) = cursor_keys {
         v1 = v1.layer(axum::Extension(Arc::new(keys)));
     }

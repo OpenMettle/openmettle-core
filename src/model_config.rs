@@ -63,7 +63,22 @@ pub struct Layer {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct PromptBound {
+    pub fixed_tokens: u32,
+    pub tokens_per_turn: u32,
+    pub tokens_per_part: u32,
+    pub tokens_per_byte: u32,
+    pub tokens_per_attachment: Option<u32>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Profile {
+    /// Deployment-qualified upper bounds for this exact profile and estimator revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_bound: Option<PromptBound>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub required_capabilities: BTreeMap<String, crate::authz::CapabilityGate>,
     pub pin: ProfilePin,
     pub defaults: Layer,
     pub context_window: Option<u64>,
@@ -83,6 +98,8 @@ pub struct Profile {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Preset {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub required_capabilities: BTreeMap<String, crate::authz::CapabilityGate>,
     pub revision: String,
     pub model: String,
     pub defaults: Layer,
@@ -101,6 +118,29 @@ pub struct Catalog(CatalogDocument);
 
 fn name(s: &str) -> bool {
     crate::runs::bounded(s, 256) && !s.chars().any(char::is_control)
+}
+
+/// Convert canonical wire counts for typed decoding. Older project documents store integers.
+pub(crate) fn decode_control_counts(
+    controls: &mut serde_json::Map<String, serde_json::Value>,
+    project_defaults: bool,
+) -> Result<(), Error> {
+    for key in ["context_window", "output_reserve"] {
+        let Some(v) = controls.get_mut(key) else {
+            continue;
+        };
+        if v.is_null() || (project_defaults && v.is_u64()) {
+            continue;
+        }
+        let s = v.as_str().ok_or(Error::Invalid("control count"))?;
+        let n = s
+            .parse::<i64>()
+            .ok()
+            .filter(|n| *n >= 0 && n.to_string() == s)
+            .ok_or(Error::Invalid("control count"))?;
+        *v = n.into();
+    }
+    Ok(())
 }
 
 impl ProfilePin {
@@ -128,6 +168,16 @@ impl Catalog {
         }
         for (id, p) in &doc.models {
             if !name(id)
+                || p.required_capabilities
+                    .keys()
+                    .any(|k| !crate::authz::valid_capability(k))
+                || p.prompt_bound
+                    .as_ref()
+                    .is_some_and(|b| b.tokens_per_byte == 0 || p.estimator_revision.is_none())
+                || [p.context_window, p.output_limit, p.conservative_ceiling]
+                    .into_iter()
+                    .flatten()
+                    .any(|n| n > i64::MAX as u64)
                 || !p.pin.valid()
                 || !name(&p.usage_semantics)
                 || [p.context_window, p.output_limit, p.conservative_ceiling].contains(&Some(0))
@@ -165,7 +215,13 @@ impl Catalog {
             )?;
         }
         for (id, preset) in &catalog.0.presets {
-            if !name(id) || !name(&preset.revision) {
+            if !name(id)
+                || !name(&preset.revision)
+                || preset
+                    .required_capabilities
+                    .keys()
+                    .any(|k| !crate::authz::valid_capability(k))
+            {
                 return Err(Error::Invalid("preset"));
             }
             catalog.resolve(
@@ -179,6 +235,18 @@ impl Catalog {
             )?;
         }
         Ok(catalog)
+    }
+
+    pub(crate) fn revision(&self) -> &str {
+        &self.0.revision
+    }
+
+    pub(crate) fn models(&self) -> &BTreeMap<String, Profile> {
+        &self.0.models
+    }
+
+    pub(crate) fn presets(&self) -> &BTreeMap<String, Preset> {
+        &self.0.presets
     }
 
     /// Deterministically encode a validated document for storage and subsequent reload.
@@ -318,6 +386,13 @@ pub struct Selection {
 impl Selection {
     /// Load only the typed model_config object. Instructions have their own project column.
     pub fn project(settings: &crate::authz::projects::ProjectSettings) -> Result<Self, Error> {
+        Self::from_defaults(&settings.defaults, &settings.instructions)
+    }
+
+    pub(crate) fn from_defaults(
+        defaults: &serde_json::Value,
+        instructions: &str,
+    ) -> Result<Self, Error> {
         #[derive(Default, Deserialize)]
         #[serde(default, deny_unknown_fields)]
         struct Defaults {
@@ -325,20 +400,46 @@ impl Selection {
             preset: Option<String>,
             controls: Controls,
         }
-        let typed: Defaults = settings
-            .defaults
-            .get("model_config")
-            .map(|v| serde_json::from_value(v.clone()))
+        let mut typed = defaults.get("model_config").cloned();
+        if let Some(v) = typed.as_mut() {
+            let fields = v
+                .as_object_mut()
+                .ok_or(Error::Invalid("project model_config"))?;
+            if let Some(controls) = fields.get_mut("controls") {
+                decode_control_counts(
+                    controls
+                        .as_object_mut()
+                        .ok_or(Error::Invalid("project model_config"))?,
+                    true,
+                )?;
+            }
+        }
+        let typed: Defaults = typed
+            .map(serde_json::from_value)
             .transpose()
             .map_err(|_| Error::Invalid("project model_config"))?
             .unwrap_or_default();
+        if [
+            &typed.model,
+            &typed.preset,
+            &typed.controls.reasoning_effort,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|id| !name(id))
+            || [typed.controls.context_window, typed.controls.output_reserve]
+                .into_iter()
+                .flatten()
+                .any(|value| !(1..=i64::MAX as u64).contains(&value))
+        {
+            return Err(Error::Invalid("project model_config"));
+        }
         Ok(Self {
             model: typed.model,
             preset: typed.preset,
             layer: Layer {
                 controls: typed.controls,
-                instructions: (!settings.instructions.is_empty())
-                    .then(|| settings.instructions.clone()),
+                instructions: (!instructions.is_empty()).then(|| instructions.to_owned()),
             },
         })
     }

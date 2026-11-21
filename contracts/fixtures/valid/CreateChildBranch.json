@@ -1,0 +1,16 @@
+{
+  "class": "valid",
+  "direction": "request",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "CreateChildBranch",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "fork_message_id": "0f0e0d0c-0b0a-4908-8706-050403020102",
+    "source_branch_id": "0f0e0d0c-0b0a-4908-8706-050403020100"
+  },
+  "mutation": null,
+  "schema": "#/components/schemas/BranchCreateRequest",
+  "source": "#/components/examples/CreateChildBranch"
+}

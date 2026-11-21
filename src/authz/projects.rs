@@ -1179,6 +1179,19 @@ pub async fn read_resource(
     resource_id: &str,
     now_ms: i64,
 ) -> Result<ResourceView, StoreError> {
+    resource_view(c, principal, kind, resource_id, now_ms, Action::Read).await
+}
+
+/// Under the admission scope lock, authorize the resource and its accounting scope
+/// before looking up a replay. Archive caps the projection but permits exact retries.
+pub(crate) async fn resource_view(
+    c: &mut PgConnection,
+    principal: &Principal,
+    kind: ResourceKind,
+    resource_id: &str,
+    now_ms: i64,
+    action: Action,
+) -> Result<ResourceView, StoreError> {
     active(principal)?;
     resource_kind(kind)?;
     uuid(resource_id, "resource_id")?;
@@ -1190,11 +1203,10 @@ pub async fn read_resource(
     let project_id = located.project_id.clone();
     let (created_us, last_revision) = (located.created_us, located.last_revision);
     let resource = hydrate_located(c, kind, resource_id, located, now_ms).await?;
-    check(super::authorize_resource(
-        principal,
-        &resource,
-        Action::Read,
-    ))?;
+    check(super::authorize_resource(principal, &resource, action))?;
+    if action == Action::RunExecute {
+        check(super::authorize_scope(principal, &resource.scope, action))?;
+    }
     let writable =
         !archived && super::authorize_resource(principal, &resource, Action::Write).is_allowed();
     Ok(ResourceView {

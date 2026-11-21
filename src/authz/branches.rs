@@ -145,10 +145,11 @@ async fn lock_head(
 
 // Follow immutable parent edges only. A legacy branch has no managed head to start from.
 macro_rules! path {
-    () => { "WITH RECURSIVE path(id,parent_message_id,depth) AS (
+    () => { path!("") };
+    ($bound:literal) => { concat!("WITH RECURSIVE path(id,parent_message_id,depth) AS (
         SELECT id,parent_message_id,0 FROM openmettle.messages WHERE conversation_id=$1::uuid AND id=$2::uuid
         UNION ALL SELECT m.id,m.parent_message_id,p.depth+1 FROM path p JOIN openmettle.messages m
-        ON m.id=p.parent_message_id AND m.conversation_id=$1::uuid) " }
+        ON m.id=p.parent_message_id AND m.conversation_id=$1::uuid ", $bound, ") ") }
 }
 async fn ancestor(
     c: &mut PgConnection,
@@ -281,7 +282,7 @@ async fn revision_is_active(
     Ok(active)
 }
 
-async fn readable_revision(
+pub(crate) async fn readable_revision(
     c: &mut PgConnection,
     actor: &Principal,
     scope: &str,
@@ -295,7 +296,7 @@ async fn readable_revision(
     }
 }
 
-fn validate_parts(parts: &[Part], user: bool) -> Result<(), StoreError> {
+pub(crate) fn validate_parts(parts: &[Part], user: bool) -> Result<(), StoreError> {
     let mut bytes = 0;
     let mut attachment = false;
     if parts.len() > 128 {
@@ -594,6 +595,7 @@ pub struct VisiblePart {
     pub value: PartContent,
 }
 pub struct HistoryTurn {
+    pub parent_message_id: Option<String>,
     pub author_user_id: Option<String>,
     pub metadata: crate::model_config::PathTurn,
     pub parts: Vec<VisiblePart>,
@@ -613,7 +615,21 @@ pub async fn history(
     branch: &str,
     now: i64,
 ) -> Result<Option<History>, StoreError> {
-    use crate::model_config::{ConfigSnapshot, PathTurn, SNAPSHOT_FORMAT, SNAPSHOT_VERSION};
+    let Some(head) = history_head(c, actor, chat, branch, now).await? else {
+        return Ok(None);
+    };
+    let turns = path_turns(c, actor, chat, head.as_deref(), i32::MAX, now).await?;
+    Ok(Some(History { head, turns }))
+}
+
+/// Outer None denotes a legacy branch. An inner None is an empty managed head.
+pub(crate) async fn history_head(
+    c: &mut PgConnection,
+    actor: &Principal,
+    chat: Conversation<'_>,
+    branch: &str,
+    now: i64,
+) -> Result<Option<Option<String>>, StoreError> {
     let resource =
         projects::read_resource(c, actor, ResourceKind::Conversation, chat.id, now).await?;
     if resource.scope_id != chat.scope {
@@ -626,17 +642,27 @@ pub async fn history(
         WHERE b.scope_id=$1::uuid AND b.conversation_id=$2::uuid AND b.id=$3::uuid",
     )
         .bind(chat.scope).bind(chat.id).bind(branch).fetch_optional(&mut *c).await?.ok_or(HIDDEN)?;
-    if !managed {
-        return Ok(None);
-    }
+    Ok(managed.then_some(head))
+}
+
+// The caller authorizes the branch and supplies its head or a MAC-authenticated ancestor.
+pub(crate) async fn path_turns(
+    c: &mut PgConnection,
+    actor: &Principal,
+    chat: Conversation<'_>,
+    start: Option<&str>,
+    limit: i32,
+    now: i64,
+) -> Result<Vec<HistoryTurn>, StoreError> {
+    use crate::model_config::{ConfigSnapshot, PathTurn, SNAPSHOT_FORMAT, SNAPSHOT_VERSION};
     let rows = sqlx::query(concat!(
-        path!(),
-        "SELECT p.id::text,t.author_user_id::text,t.run_id::text,t.reasoning_bytes,t.input_count,
+        path!("WHERE p.depth+1 < $3"),
+        "SELECT p.id::text,p.parent_message_id::text,t.author_user_id::text,t.run_id::text,t.reasoning_bytes,t.input_count,
         t.output_count,r.snapshot_format,r.snapshot_version,r.config_snapshot FROM path p
         JOIN openmettle.message_turns t ON t.message_id=p.id LEFT JOIN openmettle.runs r ON r.id=t.run_id
         ORDER BY p.depth"
     ))
-        .bind(chat.id).bind(&head).fetch_all(&mut *c).await?;
+        .bind(chat.id).bind(start).bind(limit).fetch_all(&mut *c).await?;
     let mut turns = Vec::with_capacity(rows.len());
     for r in rows {
         let config = if r.try_get::<Option<&str>, _>("snapshot_format")? == Some(SNAPSHOT_FORMAT)
@@ -651,6 +677,7 @@ pub async fn history(
             None
         };
         turns.push(HistoryTurn {
+            parent_message_id: r.try_get("parent_message_id")?,
             author_user_id: r.try_get("author_user_id")?,
             metadata: PathTurn {
                 message_id: r.try_get("id")?,
@@ -669,12 +696,12 @@ pub async fn history(
         });
     }
     let rows = sqlx::query(concat!(
-        path!(),
+        path!("WHERE p.depth+1 < $3"),
         "SELECT p.depth,v.id::text,v.ordinal,v.text_value,
         v.artifact_revision_id::text FROM path p JOIN openmettle.message_parts v ON v.message_id=p.id
         ORDER BY p.depth,v.ordinal"
     ))
-    .bind(chat.id).bind(&head).fetch_all(&mut *c).await?;
+    .bind(chat.id).bind(start).bind(limit).fetch_all(&mut *c).await?;
     for r in rows {
         let value = match r.try_get::<Option<String>, _>("artifact_revision_id")? {
             None => PartContent::Available(Part::Text(r.try_get("text_value")?)),
@@ -697,5 +724,5 @@ pub async fn history(
             value,
         });
     }
-    Ok(Some(History { head, turns }))
+    Ok(turns)
 }
