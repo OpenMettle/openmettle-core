@@ -533,3 +533,11 @@ For PR4b:
   routes, and revocation on the next request after member removal, group disablement, stale OIDC
   evidence and native logout. These tests are `#[ignore]` and need the CI PostgreSQL 18
   service.
+
+## Amendment by ADR 0033
+
+Authorization loss cancels queued and waiting runs immediately. For executing runs, the API
+records a cooperative cancellation request. The lease holder calls `recheck_leased` before
+each step. It supplies the lease settings so a revoked run can settle against the operations
+ledger and the remaining execution time in the same transaction.
+See [Worker leases, deadlines, fencing and restart recovery](0033-worker-leases-deadlines-and-restart-recovery.md).

@@ -460,3 +460,11 @@ owner's run is recorded on #10.
   until it is claimed and rechecked, or expires.
 - Not implemented here: routes, settings, the worker loop, leases, priority classes, runtime
   administrator limits, queue-depth metrics and any measured capacity.
+
+## Amendment by ADR 0033
+
+`claim_next` now takes lease settings and returns the time remaining on the lease and the
+execution deadline. Caller cancellation returns `Requested { state }` for executing runs.
+The first request records its reason and the lease holder settles the run. Queued and
+waiting runs cancel immediately.
+See [Worker leases, deadlines, fencing and restart recovery](0033-worker-leases-deadlines-and-restart-recovery.md).

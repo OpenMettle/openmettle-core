@@ -500,6 +500,24 @@ const ADDITIVE_COLUMNS: &[AdditiveColumn] = &[
         column: "claimed_at",
         default: ColumnDefault::Null,
     },
+    AdditiveColumn {
+        since: 20,
+        table: "runs",
+        column: "lease_expires_at",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 20,
+        table: "runs",
+        column: "execution_expires_at",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 20,
+        table: "runs",
+        column: "cancel_reason",
+        default: ColumnDefault::Null,
+    },
 ];
 
 /// Single declarative registry of every table added after migration 14, ordered by `since`
@@ -711,6 +729,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "6b2363d7267c088f75999b697fee05f74f88ee4a572be688558b03e9fe27d35c",
         "26a9aff24fdead77748763b8e73ecf834faddfcfa5b0c3b70eebc5dd624000db",
         "93686928e8f33f08c340f6dbe6348727a1f9abb4c44c0e68061d10578d181e59",
+        "a4a226cb408141a41dfb7e174646d7027af6d34c34020d6ba8401aa6dfad7116",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
@@ -2352,6 +2371,9 @@ mod authz_http;
 
 #[path = "schema/run_admission.rs"]
 mod run_admission;
+
+#[path = "schema/worker_leases.rs"]
+mod worker_leases;
 
 // Fixtures of the mounted-API tests in `authz_http`: synthetic auth settings, the transport
 // fixture's synthetic CA (its leaf certificates are not needed) and the independent contract
