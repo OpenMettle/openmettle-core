@@ -98,7 +98,7 @@ pub async fn create_conversation(
     c: &mut PgConnection,
     ctx: &AuditContext<'_>,
     scope: &str,
-) -> Result<Root, StoreError> {
+) -> Result<WriteOutcome<Root>, StoreError> {
     let ctx = AuditContext {
         reason: "create conversation",
         ..*ctx
@@ -128,7 +128,7 @@ pub async fn create_conversation(
                 WHERE conversation_id=$1::uuid AND parent_branch_id IS NULL")
                 .bind(id).fetch_one(c).await?
         };
-        Ok(Root { conversation_id: id.to_owned(), branch_id })
+        Ok(outcome.map(|conversation_id| Root { conversation_id, branch_id }))
     }).await
 }
 
@@ -254,17 +254,18 @@ pub struct RunTarget {
     pub input_message_id: String,
 }
 
-async fn readable_revision(
+/// Only visible active or retained revisions reach the caller. Only active ones supply bytes.
+async fn revision_is_active(
     c: &mut PgConnection,
     actor: &Principal,
     scope: &str,
     id: &str,
     now: i64,
-) -> Result<(), StoreError> {
+) -> Result<bool, StoreError> {
     store::uuid(id, "artifact_revision_id")?;
-    let artifact: String = sqlx::query_scalar(
-        "SELECT artifact_id::text FROM openmettle.artifact_revisions
-        WHERE scope_id=$1::uuid AND id=$2::uuid AND state='active'",
+    let (artifact, active): (String, bool) = sqlx::query_as(
+        "SELECT artifact_id::text, state='active' FROM openmettle.artifact_revisions
+        WHERE scope_id=$1::uuid AND id=$2::uuid AND state IN ('active','retained')",
     )
     .bind(scope)
     .bind(id)
@@ -276,7 +277,22 @@ async fn readable_revision(
     let resource = projects::hydrate_resource(c, ResourceKind::Artifact, &artifact, now)
         .await?
         .ok_or(HIDDEN)?;
-    store::check(authorize_resource(actor, &resource, Action::Read))
+    store::check(authorize_resource(actor, &resource, Action::Read))?;
+    Ok(active)
+}
+
+async fn readable_revision(
+    c: &mut PgConnection,
+    actor: &Principal,
+    scope: &str,
+    id: &str,
+    now: i64,
+) -> Result<(), StoreError> {
+    if revision_is_active(c, actor, scope, id, now).await? {
+        Ok(())
+    } else {
+        Err(HIDDEN)
+    }
 }
 
 fn validate_parts(parts: &[Part], user: bool) -> Result<(), StoreError> {
@@ -379,6 +395,10 @@ pub async fn prepare_turn(
     expected_head: Option<&str>,
     op: Operation<'_>,
 ) -> Result<RunTarget, StoreError> {
+    ctx.validate()?;
+    if let Some(id) = expected_head {
+        store::uuid(id, "expected_head_message_id")?;
+    }
     let c = tx.connection()?;
     let (actor, archived) = write_access(c, ctx, chat, Action::RunExecute).await?;
     if archived {
@@ -561,11 +581,17 @@ async fn publish_locked_answer(
     publish(c, chat, branch, Some(input), answer.id, answer.parts).await
 }
 
+#[derive(PartialEq, Eq)]
+pub enum PartContent {
+    Available(Part),
+    RetainedAttachment(String),
+    UnavailableAttachment,
+}
+
 pub struct VisiblePart {
     pub id: String,
     pub ordinal: i32,
-    /// None is an unavailable attachment. Its revision and owning artifact are concealed.
-    pub value: Option<Part>,
+    pub value: PartContent,
 }
 pub struct HistoryTurn {
     pub author_user_id: Option<String>,
@@ -651,10 +677,13 @@ pub async fn history(
     .bind(chat.id).bind(&head).fetch_all(&mut *c).await?;
     for r in rows {
         let value = match r.try_get::<Option<String>, _>("artifact_revision_id")? {
-            None => Some(Part::Text(r.try_get("text_value")?)),
-            Some(id) => match readable_revision(c, actor, chat.scope, &id, now).await {
-                Ok(()) => Some(Part::Attachment(id)),
-                Err(StoreError::Denied(DenialReason::NotFound)) => None,
+            None => PartContent::Available(Part::Text(r.try_get("text_value")?)),
+            Some(id) => match revision_is_active(c, actor, chat.scope, &id, now).await {
+                Ok(true) => PartContent::Available(Part::Attachment(id)),
+                Ok(false) => PartContent::RetainedAttachment(id),
+                Err(StoreError::Denied(DenialReason::NotFound)) => {
+                    PartContent::UnavailableAttachment
+                }
                 Err(error) => return Err(error),
             },
         };

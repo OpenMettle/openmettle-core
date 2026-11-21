@@ -18,6 +18,7 @@ CREATE TABLE openmettle.branch_heads (
 );
 CREATE UNIQUE INDEX branch_heads_root_idx ON openmettle.branch_heads (conversation_id)
     WHERE parent_branch_id IS NULL;
+CREATE INDEX branch_heads_conversation_idx ON openmettle.branch_heads (conversation_id, head_message_id);
 
 CREATE TABLE openmettle.message_turns (
     scope_id uuid NOT NULL,
@@ -35,7 +36,7 @@ CREATE TABLE openmettle.message_turns (
     CHECK ((author_user_id IS NULL) <> (run_id IS NULL)),
     CHECK (run_id IS NOT NULL OR (reasoning_blocks IS NULL AND input_count IS NULL AND output_count IS NULL)),
     CHECK (reasoning_blocks IS NULL OR (jsonb_typeof(reasoning_blocks) = 'array'
-        AND jsonb_array_length(reasoning_blocks) <= 128
+        AND jsonb_array_length(reasoning_blocks) BETWEEN 1 AND 128
         AND NOT jsonb_path_exists(reasoning_blocks, '$[*] ? (@.type() != "object")'))),
     CHECK ((reasoning_blocks IS NULL AND reasoning_bytes = 0)
         OR (reasoning_blocks IS NOT NULL AND reasoning_bytes = octet_length(reasoning_blocks::text)

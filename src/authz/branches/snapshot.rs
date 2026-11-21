@@ -1,6 +1,6 @@
 //! The v1 storage encoding for a managed submission. Compare only normalized client intent
 //! on replay. The original snapshot bytes remain the input to the durable run identity.
-use super::{History, Operation, Part};
+use super::{History, Operation, Part, PartContent};
 use crate::{
     authz::runs::RunReplay,
     model_config::{Catalog, ConfigSnapshot, Error, SNAPSHOT_FORMAT, SNAPSHOT_VERSION, Selection},
@@ -58,33 +58,32 @@ impl Snapshots {
         config: &ConfigSnapshot,
     ) -> Result<Self, Error> {
         let target = catalog.target(&config.effective)?;
-        let path = history
-            .turns
-            .iter()
-            .map(|turn| {
-                let attachments = turn
-                    .parts
-                    .iter()
-                    .filter_map(|part| {
-                        let revision_id = match &part.value {
-                            Some(Part::Text(_)) => return None,
-                            Some(Part::Attachment(id)) => Some(id.clone()),
-                            None => None,
-                        };
-                        Some(Attachment {
-                            ordinal: part.ordinal,
-                            revision_id,
-                        })
-                    })
-                    .collect();
-                PinnedTurn {
-                    message_id: turn.metadata.message_id.clone(),
-                    replay_reasoning: turn.metadata.reasoning_bytes > 0
-                        && turn.metadata.replay_rule(target).is_some(),
-                    attachments,
-                }
-            })
-            .collect();
+        let mut path = Vec::with_capacity(history.turns.len());
+        for (depth, turn) in history.turns.iter().enumerate() {
+            let mut attachments = Vec::new();
+            for part in &turn.parts {
+                let revision_id = match &part.value {
+                    PartContent::Available(Part::Text(_)) => continue,
+                    PartContent::Available(Part::Attachment(id)) => Some(id.clone()),
+                    PartContent::RetainedAttachment(_) | PartContent::UnavailableAttachment => {
+                        if depth == 0 {
+                            return Err(Error::Invalid("input attachment"));
+                        }
+                        None
+                    }
+                };
+                attachments.push(Attachment {
+                    ordinal: part.ordinal,
+                    revision_id,
+                });
+            }
+            path.push(PinnedTurn {
+                message_id: turn.metadata.message_id.clone(),
+                replay_reasoning: turn.metadata.reasoning_bytes > 0
+                    && turn.metadata.replay_rule(target).is_some(),
+                attachments,
+            });
+        }
         let input = InputSnapshot {
             intent: serde_json::to_value(intent)
                 .map_err(|_| Error::Invalid("submission intent"))?,

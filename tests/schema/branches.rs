@@ -7,7 +7,10 @@ use super::{
 };
 use openmettle_core::{
     authz::{
-        branches::{self, Answer, Conversation, Fork, Operation, Part, Root, RunTarget, UserInput},
+        branches::{
+            self, Answer, Conversation, Fork, Operation, Part, PartContent, Root, RunTarget,
+            UserInput,
+        },
         runs::{self as queue, Admission, AdmissionLimits, RunAdmission},
         store::{StoreError, WriteOutcome},
     },
@@ -36,10 +39,10 @@ impl Fixture {
         authz_store::providers(&mut owner).await;
         let actor = authz_store::account(&mut owner, PROVIDER, true, FUTURE).await;
         let scope = personal_of(db, &actor).await;
-        let root =
+        let root = authz_store::applied(
             branches::create_conversation(&mut api(db).await, &ctx(&actor, "new-chat"), &scope)
-                .await
-                .unwrap();
+                .await,
+        );
         Self { actor, scope, root }
     }
     fn chat(&self) -> Conversation<'_> {
@@ -118,12 +121,14 @@ async fn published_paths_replay_revisions_and_budget_survive_forks() {
     let root = &f.root.branch_id;
     let (mut c, mut w) = (api(&db).await, worker(&db).await);
     let actor = authz_store::principal(&db, &f.actor).await;
-    assert_eq!(
+    let WriteOutcome::Replayed { target_id } =
         branches::create_conversation(&mut c, &ctx(&f.actor, "new-chat"), &f.scope)
             .await
-            .unwrap(),
-        f.root
-    );
+            .unwrap()
+    else {
+        panic!("expected conversation replay")
+    };
+    assert_eq!(target_id, f.root);
     let empty = branches::history(&mut c, &actor, chat, root, NOW)
         .await
         .unwrap()
@@ -251,20 +256,25 @@ async fn published_paths_replay_revisions_and_budget_survive_forks() {
         "branch has live run"
     );
 
-    // Before the valid worker publication, try a forged producer and a false byte count.
-    for (parent, bytes) in [(None, 4), (Some(INPUT), 1)] {
+    // Refuse a forged producer, a false byte count and empty reasoning with its true byte count.
+    for (parent, blocks, bytes) in [
+        (None, "[{}]", 4),
+        (Some(INPUT), "[{}]", 1),
+        (Some(INPUT), "[]", 2),
+    ] {
         let mut tx = WriteTransaction::begin(&mut w).await.unwrap();
         let con = tx.connection().unwrap();
         let id = message(con, &f.scope, chat.id, parent).await.unwrap();
         let result = sqlx::query(
             "INSERT INTO openmettle.message_turns
             (scope_id,conversation_id,message_id,run_id,reasoning_blocks,reasoning_bytes)
-            VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,'[{}]',$5)",
+            VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::jsonb,$6)",
         )
         .bind(&f.scope)
         .bind(chat.id)
         .bind(id)
         .bind(&run_id)
+        .bind(blocks)
         .bind(bytes)
         .execute(con)
         .await;
@@ -315,7 +325,7 @@ async fn published_paths_replay_revisions_and_budget_survive_forks() {
     let original_parts = &original.turns[1].parts;
     for (i, part) in original_parts.iter().enumerate() {
         assert_eq!(part.ordinal, i as i32);
-        assert!(part.value.as_ref() == Some(&parts[i]));
+        assert!(matches!(&part.value, PartContent::Available(value) if value == &parts[i]));
     }
 
     let retry = f
@@ -479,7 +489,6 @@ async fn published_paths_replay_revisions_and_budget_survive_forks() {
         .unwrap()
         .unwrap();
     assert_eq!(history.head.as_deref(), Some(ANSWER));
-    assert!(history.turns[1].parts[1].value.is_none());
     assert_eq!(
         authz_store::audit(&db)
             .await
@@ -491,6 +500,109 @@ async fn published_paths_replay_revisions_and_budget_survive_forks() {
             ("branch.create", "branch")
         ]
     );
+
+    // The reader can see the same path but has no share on the attachment's artifact.
+    use openmettle_core::authz::{Grantee, ResourceAccess, ResourceKind, projects};
+    let reader =
+        authz_store::account(&mut connect(&db.0, OWNER).await, PROVIDER, true, FUTURE).await;
+    authz_store::applied(
+        projects::share_resource(
+            &mut c,
+            &ctx(&f.actor, "share-chat"),
+            ResourceKind::Conversation,
+            chat.id,
+            &Grantee::User(reader.user.clone()),
+            ResourceAccess::Read,
+        )
+        .await,
+    );
+    let reader = authz_store::principal(&db, &reader).await;
+    let retry_intent = Intent {
+        expected_head_message_id: Some(ANSWER),
+        operation: Operation::Retry { target: ANSWER },
+        ..intent
+    };
+    let append_intent = Intent {
+        source_branch_id: &fork,
+        expected_head_message_id: Some(ANSWER),
+        operation: Operation::Append(UserInput {
+            id: NEXT,
+            parts: &parts[..1],
+        }),
+        ..intent
+    };
+    for (principal, can_read_artifact) in [(&actor, true), (&reader, false)] {
+        let input = branches::history(&mut c, principal, chat, &retry.branch_id, NOW)
+            .await
+            .unwrap()
+            .unwrap();
+        let value = &input.turns[0].parts[1].value;
+        if can_read_artifact {
+            assert!(matches!(value, PartContent::RetainedAttachment(id) if id == &revision));
+        } else {
+            assert!(matches!(value, PartContent::UnavailableAttachment));
+        }
+        assert!(matches!(
+            Snapshots::encode(&retry_intent, &input, &catalog, &cfg),
+            Err(openmettle_core::model_config::Error::Invalid(
+                "input attachment"
+            ))
+        ));
+
+        let history = branches::history(&mut c, principal, chat, &fork, NOW)
+            .await
+            .unwrap()
+            .unwrap();
+        let bytes = Snapshots::encode(&append_intent, &history, &catalog, &cfg)
+            .unwrap()
+            .input;
+        assert!(!std::str::from_utf8(&bytes).unwrap().contains(&revision));
+        let pinned: branches::snapshot::InputSnapshot = serde_json::from_slice(&bytes).unwrap();
+        let omitted = &pinned.path[2].attachments;
+        assert_eq!(omitted.len(), 1);
+        assert_eq!((omitted[0].ordinal, &omitted[0].revision_id), (1, &None));
+    }
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18"]
+async fn prepare_turn_validates_actor_and_expected_head_before_locking() {
+    let db = TestDb::migrated().await;
+    let f = Fixture::new(&db).await;
+    let mut c = api(&db).await;
+    let valid = ctx(&f.actor, "submit");
+    let invalid = openmettle_core::authz::store::AuditContext {
+        actor_user_id: "invalid",
+        ..valid
+    };
+    let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+    for (ctx, expected, field) in [
+        (&invalid, None, "actor_user_id"),
+        (&valid, Some("invalid"), "expected_head_message_id"),
+    ] {
+        let result = branches::prepare_turn(
+            &mut tx,
+            ctx,
+            f.chat(),
+            &f.root.branch_id,
+            expected,
+            Operation::Append(UserInput {
+                id: INPUT,
+                parts: &[Part::Text("fixture".into())],
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(StoreError::InvalidInput(name)) if name == field));
+    }
+    let locked: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT FROM pg_locks WHERE pid=pg_backend_pid()
+          AND relation IN ('openmettle.users'::regclass, 'openmettle.branch_heads'::regclass))",
+    )
+    .fetch_one(tx.connection().unwrap())
+    .await
+    .unwrap();
+    assert!(!locked);
+    tx.rollback().await.unwrap();
 }
 
 #[tokio::test]
@@ -672,6 +784,21 @@ async fn graph_column_grants_and_sealed_content() {
     .unwrap();
     assert!(same_predicate);
     assert_eq!(key, "branch_id");
+    let (full_index, conversation, head): (bool, String, String) = sqlx::query_as(
+        "SELECT indpred IS NULL AND indnkeyatts=2,
+                pg_get_indexdef(indexrelid, 1, true), pg_get_indexdef(indexrelid, 2, true)
+           FROM pg_index
+          WHERE indexrelid='openmettle.branch_heads_conversation_idx'::regclass
+            AND indrelid='openmettle.branch_heads'::regclass",
+    )
+    .fetch_one(&mut c)
+    .await
+    .unwrap();
+    assert!(full_index);
+    assert_eq!(
+        (conversation.as_str(), head.as_str()),
+        ("conversation_id", "head_message_id")
+    );
 
     // Check every column, including the default-generated part ID and the hidden blocks.
     let grants=sqlx::query("SELECT c.relname,a.attname,r.rolname,
@@ -713,6 +840,13 @@ async fn graph_column_grants_and_sealed_content() {
         "42501",
     )
     .await;
+    expect_state(&mut c, "SELECT * FROM openmettle.message_turns", "42501").await;
+    expect_state(
+        &mut c,
+        "INSERT INTO openmettle.message_turns (scope_id,conversation_id,message_id,author_user_id)
+         VALUES (gen_random_uuid(),gen_random_uuid(),gen_random_uuid(),gen_random_uuid()) RETURNING *",
+        "42501",
+    ).await;
     expect_state(
         &mut c,
         "INSERT INTO openmettle.message_turns (run_id) VALUES (gen_random_uuid())",
@@ -758,9 +892,9 @@ async fn cross_scope_parents_and_revisions_and_incomplete_publications_are_refus
     let mut owner = connect(&db.0, OWNER).await;
     let other = authz_store::account(&mut owner, PROVIDER, true, FUTURE).await;
     let scope = personal_of(&db, &other).await;
-    let other_root = branches::create_conversation(&mut c, &ctx(&other, "other-chat"), &scope)
-        .await
-        .unwrap();
+    let other_root = authz_store::applied(
+        branches::create_conversation(&mut c, &ctx(&other, "other-chat"), &scope).await,
+    );
     let other_fixture = Fixture {
         actor: other,
         scope,
@@ -869,10 +1003,10 @@ async fn archived_project_allows_authorized_create_replay_and_refuses_new_graph_
         .unwrap();
     let defaults = Selection::project(&settings).unwrap();
     assert_eq!(defaults.preset.as_deref(), Some("study"));
-    let root =
+    let root = authz_store::applied(
         branches::create_conversation(&mut c, &ctx(&f.actor, "project-chat"), &settings.scope_id)
-            .await
-            .unwrap();
+            .await,
+    );
     let chat = Conversation {
         scope: &settings.scope_id,
         id: &root.conversation_id,
@@ -902,12 +1036,14 @@ async fn archived_project_allows_authorized_create_replay_and_refuses_new_graph_
     projects::archive_project(&mut c, &ctx(&f.actor, "archive"), &project)
         .await
         .unwrap();
-    assert_eq!(
+    let WriteOutcome::Replayed { target_id } =
         branches::create_conversation(&mut c, &ctx(&f.actor, "project-chat"), chat.scope)
             .await
-            .unwrap(),
-        root
-    );
+            .unwrap()
+    else {
+        panic!("expected archived conversation replay")
+    };
+    assert_eq!(target_id, root);
     assert_eq!(
         branches::create_branch(&mut c, &ctx(&f.actor, "project-fork"), chat, source)
             .await

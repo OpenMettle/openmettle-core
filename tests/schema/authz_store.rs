@@ -120,7 +120,7 @@ pub(super) fn denied<T: std::fmt::Debug>(result: Result<T, StoreError>) -> Denia
     }
 }
 
-pub(super) fn applied(result: Result<WriteOutcome, StoreError>) -> String {
+pub(super) fn applied<T: std::fmt::Debug>(result: Result<WriteOutcome<T>, StoreError>) -> T {
     match result {
         Ok(WriteOutcome::Applied { target_id }) => target_id,
         other => panic!("expected an applied change, got {other:?}"),

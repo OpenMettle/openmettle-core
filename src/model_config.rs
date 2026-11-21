@@ -206,17 +206,14 @@ impl Catalog {
         let preset = preset_id
             .map(|id| self.preset(id).ok_or(Error::Invalid("preset")))
             .transpose()?;
-        let inherited_model = if let Some(p) = &project.preset {
-            Some(
-                &self
-                    .preset(p)
-                    .ok_or(Error::Invalid("project preset"))?
-                    .model,
-            )
+        // Only the model paired with the selected preset must match its base. A request
+        // can switch the target model while inheriting a project's preset defaults.
+        let paired_model = if request.preset.is_some() {
+            request.model.as_ref()
         } else {
             project.model.as_ref()
         };
-        if let (Some(id), Some(p)) = (&request.model, request.preset.as_ref().and(preset))
+        if let (Some(id), Some(p)) = (paired_model, preset)
             && id != &p.model
         {
             return Err(Error::Invalid("preset base model"));
@@ -231,8 +228,12 @@ impl Catalog {
             return Err(Error::Unauthorized);
         }
         let p = self.model(model_id).ok_or(Error::Invalid("model"))?;
-        let switched = inherited_model.is_some_and(|id| id != model_id)
-            && (request.model.is_some() || request.preset.is_some());
+        let inherited_model = match &project.preset {
+            Some(id) => self.preset(id).map(|p| &p.model),
+            None => project.model.as_ref(),
+        };
+        let switched = (request.model.is_some() || request.preset.is_some())
+            && inherited_model.is_none_or(|id| id != model_id);
         let mut e = Effective {
             catalog_revision: self.0.revision.clone(),
             model: model_id.clone(),
@@ -470,7 +471,7 @@ impl Effective {
         }
         if let Some(window) = c.context_window
             && let Some(limit) = supported(
-                self.ceiling.value,
+                p.context_window.or(p.conservative_ceiling),
                 drop_unsupported,
                 "context_window",
                 source,

@@ -209,6 +209,107 @@ fn omission_explicit_default_unsupported_controls_and_switches() {
 }
 
 #[test]
+fn request_window_can_replace_a_preset_limit_within_the_target_profile() {
+    let c = catalog(|d| {
+        d["presets"]["compact"] = json!({
+            "model":"a", "revision":"compact/1", "defaults":{"controls":{"context_window":4096}}
+        });
+    })
+    .unwrap();
+    let project = selection(json!({"preset":"compact"}));
+    let mut request = selection(json!({"layer":{"controls":{"context_window":6144}}}));
+    let e = c.resolve(&project, &request, None, permit).unwrap();
+    assert_eq!(
+        (e.context_window.value, e.context_window.source),
+        (Some(6144), Source::Request)
+    );
+    assert_eq!(
+        (e.ceiling.value, e.ceiling.source),
+        (Some(6144), Source::Request)
+    );
+
+    request.model = Some("b".into());
+    request.layer.controls.context_window = Some(5000);
+    let e = c.resolve(&project, &request, None, permit).unwrap();
+    assert_eq!(
+        (e.model.as_str(), e.preset.as_deref()),
+        ("b", Some("compact"))
+    );
+    assert_eq!(e.context_window.value, None);
+    assert_eq!(
+        (e.ceiling.value, e.ceiling.source),
+        (Some(5000), Source::Request)
+    );
+    request.layer.controls.context_window = Some(6145);
+    assert!(matches!(
+        c.resolve(&project, &request, None, permit),
+        Err(Error::Invalid("context_window"))
+    ));
+}
+
+#[test]
+fn request_preset_can_replace_a_retired_project_preset() {
+    let c = Catalog::load(FIXTURE).unwrap();
+    let project = selection(
+        json!({"preset":"retired_preset", "layer":{"controls":{"reasoning_effort":"retired_level"}}}),
+    );
+    let e = c
+        .resolve(&project, &study(), None, |model, preset| {
+            model == "a" && preset == Some("study")
+        })
+        .unwrap();
+    assert_eq!(e.preset_source, Some(Source::Request));
+    assert_eq!(e.reasoning_effort.value, None);
+    assert_eq!(e.omissions.len(), 1);
+    assert_eq!(
+        (e.omissions[0].source, e.omissions[0].control.as_str()),
+        (Source::Project, "reasoning_effort")
+    );
+    for request in [Selection::default(), selection(json!({"model":"b"}))] {
+        assert!(matches!(
+            c.resolve(&project, &request, None, permit),
+            Err(Error::Invalid("preset"))
+        ));
+    }
+}
+
+#[test]
+fn explicit_selection_omits_unsupported_unpinned_project_controls() {
+    let c = catalog(|d| {
+        d["presets"]["b-preset"] = json!({"model":"b","revision":"b/1","defaults":{}});
+    })
+    .unwrap();
+    let project = selection(json!({"layer":{"controls":{"temperature":0.5}}}));
+    for request in [
+        selection(json!({"model":"b"})),
+        selection(json!({"preset":"b-preset"})),
+    ] {
+        let e = c.resolve(&project, &request, None, permit).unwrap();
+        assert_eq!(e.temperature.value, None);
+        assert_eq!(e.omissions.len(), 1);
+        let omission = &e.omissions[0];
+        assert_eq!(
+            (
+                omission.source,
+                omission.control.as_str(),
+                omission.reason.as_str()
+            ),
+            (Source::Project, "temperature", "unsupported_by_target")
+        );
+    }
+}
+
+#[test]
+fn inherited_preset_requires_a_matching_project_model() {
+    let c = Catalog::load(FIXTURE).unwrap();
+    let project = selection(json!({"preset":"study","model":"b"}));
+    assert!(matches!(
+        c.resolve(&project, &Selection::default(), None, permit),
+        Err(Error::Invalid("preset base model"))
+    ));
+}
+
+#[test]
 fn capacity_reserve_qualified_estimates_and_exact_fit() {
     let empty = Selection::default();
     for (window, safe, usable) in [
