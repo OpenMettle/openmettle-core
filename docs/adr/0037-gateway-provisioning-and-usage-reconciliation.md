@@ -15,22 +15,32 @@ It needs no Open WebUI account, forwarded user header or upstream login token.
 [Architecture baseline](../../ARCHITECTURE-v1.md#identity-privacy-and-configuration)
 and [gateway boundary source pin](../../SOURCE-REFERENCES.md#s01).
 
-The requirement `users.approval_status = 'approved'` maps to existing authority rows.
-On the primary, verify that the **exact** `local_identity_approvals` row belongs to the
-user's identity and is active and unexpired at database time. Require a current provider
-and `users.disabled_at IS NULL`. Rehydrate current
-grants, mapped membership evidence and platform/user denies under ADR 0027. Pending,
-rejected, withdrawn, expired or disabled identities cannot create a principal, budget or
-key. Successful OIDC verification, a pending invitation and an account-admin role each
-confer no inference entitlement. Start onboarding only after admission commits.
+`openmettle.users` has five columns (`id`, `created_at`, `disabled_at`,
+`session_generation`, `lock_guard`) and no `approval_status` column. On the primary,
+verify that the exact `local_identity_approvals` row belongs to the user's identity,
+is active and is unexpired at database time. Require a current provider and
+`users.disabled_at IS NULL`. Rehydrate grants, mapped membership evidence and
+platform/user denies for that approval and request under ADR 0027.
+
+Use live schema states in admission tests. “Pending” means an unredeemed
+`home_invitations` row with `approval_id IS NULL`, `withdrawn_at IS NULL` and no
+matching approval. Exercise “rejected” with a withdrawn invitation
+(`approval_id IS NULL`, `withdrawn_at IS NOT NULL`) and with an existing
+`local_identity_approvals.active = false`. Also exercise an absent approval, an expired
+approval and a disabled user (`users.disabled_at IS NOT NULL`). None authorizes
+provisioning under that identity. OIDC verification or account administration alone
+confers no inference entitlement. Start onboarding only after admission commits.
 [Managed login](0011-managed-provider-keys.md) and [authorization](0027-authorization-and-private-projects.md).
 
-One gateway principal per (gateway installation, user) has one stable budget binding across
-renewals and rotations. Pin the exact approval and grant cycles used for each authorized
-request. Keep project and capability checks scoped to that request, including when the
-user has another linked identity. Virtual keys stay server-side. For
-client-owned completions the API sends a short-lived, audience-bound service authorization
-for the checked actor, scope and request. The gateway resolves the principal internally.
+One gateway principal per (gateway installation, user) keeps one budget binding across
+renewals and rotations. Both inference callers send that user's virtual key as the bearer
+on the pinned inference route. For a caller-owned completion, the API derives the actor
+from the validated session. For each server-owned run round, the run worker derives the
+actor from the admitted run and rechecks its live lease. Both resolve the credential at
+dispatch for the exact approval, grant cycles, scope and model, including when the user
+has another linked identity. The key stays server-side.
+[Inference adapter (ADR 0038)](https://github.com/OpenMettle/openmettle-core/pull/118).
+
 The application maps effective grants to allowed models and capabilities. The gateway
 intersects them with the child's configured switches and its
 quiet/study schedule at request time. Quiet hours refuse inference. Study hours admit only
@@ -41,19 +51,24 @@ effect even during a worker outage. Require this enforcement before enabling the
 ## Reconcile one principal
 
 Keep desired revision, observed revision, credential generation, expiry and unresolved
-operation identity durable. The worker sweeps due or changed bindings in bounded batches,
-including newly eligible accounts with no binding. Application grant and policy writers
-record a reconciliation request in the change transaction. Expiry and operator changes
-are also discovered from current authority by the sweep.
+operation identity durable. The dedicated reconciliation worker (`openmettle_gateway`)
+sweeps due or changed bindings in bounded batches, including newly eligible accounts
+without a binding. API-layer grant and policy writers record a reconciliation hint in the
+change transaction, outside `grants::change_grant`. OIDC membership sync calls that same
+grant writer as `openmettle_issuance`. The scheduled sweep discovers issuance-time mapped
+membership changes and newly redeemed invitations, as well as expiry and operator changes.
+Issuance needs no gateway privileges. [Membership sync](../../src/membership.rs) and
+[issuance boundary](0030-session-issuance-database-boundary.md).
+
 Repeated wakes, sign-ins and replica restarts converge on the same binding. Recheck the
 primary before each enabling step, when publishing its result and at inference dispatch.
 Use the gateway's observed revision and expiry to establish readiness.
 
-| Trigger and state | Worker transition and condition for use |
+| Trigger and binding state | Reconciliation worker action and condition for use |
 | --- | --- |
 | First eligible grant, `absent → provisioning` | After endpoint readiness, ensure the stable principal, attach its budget and apply the model/capability and family-policy binding. Issue the first key only against that binding. Read back principal, policy, budget, key handle and expiry before marking the generation `ready`. |
-| Grant, family mapping or gateway policy changes, `ready → syncing` | Diff against the current authoritative policy. Apply the current desired revision conditionally, then read it back. Block affected use immediately on a restriction. An added entitlement becomes usable only after confirmation. An identical revision and effective payload require no write. |
-| Renewal or rotation, scheduled before expiry or requested on demand, `ready → renewing` | Authorize the request and coalesce triggers for the same change. Renewal may extend the identified key in place. Rotation stages one successor on the **same budget**. Confirm its restrictions and expiry, seal it, then atomically switch the local active reference. Retire the identified predecessor with its own operation and confirm retirement. Bound overlap by the predecessor's expiry. An expired key cannot serve traffic. |
+| Grant, family mapping or gateway policy changes | Diff against the current authoritative policy. Apply the current desired revision conditionally, then read it back. Block affected use immediately on a restriction. An added entitlement becomes usable only after confirmation. An identical revision and effective payload require no write. |
+| Renewal or rotation of a `ready` generation, before expiry or on demand | Authorize the request and coalesce triggers for the same change. Renewal may extend the identified key in place. Rotation stages one successor on the **same budget**. Confirm its restrictions and expiry, seal it, then atomically switch the local active reference. Retire the identified predecessor with its own operation and confirm retirement. Bound overlap by the predecessor's expiry. An expired key cannot serve traffic. |
 | Disable, approval withdrawal/expiry, or loss of a required grant, any state → `suspended` for the affected authority | The committed change or expiry immediately bars new local use under that authority, even with the worker down. Give remote suspension/restriction priority, including for staged keys. Remove the affected rights. With no remaining eligible authority, disable the principal and revoke all its generations. Mark `revoked` only on gateway confirmation. Re-admission requires fresh authority and a new generation. |
 | Outcome unknown or operator intervention required | Keep the intent and every known handle. Withhold readiness for the affected operation. Resolve uncertain effects by lookup. A failed replacement can use its predecessor only while independently confirmed current, permitted and unexpired. Explicit compromise suspends use immediately. |
 
@@ -97,29 +112,55 @@ and [lease recovery](0033-worker-leases-deadlines-and-restart-recovery.md).
 
 ### Process, secret and lock boundaries
 
-| Actor | Access for this design |
+| Process and PostgreSQL role | Gateway privileges and credential mounts |
 | --- | --- |
-| `openmettle-api` / `openmettle_api` | Authorize requests and policy changes. Write only authorized desired inputs or a reconciliation request and admission reservation identity. Read scoped, non-secret status and usage projections. No admin endpoint, admin token, wrapping key, ciphertext read or settlement write. |
-| `openmettle-worker` / `openmettle_worker` | Read current authority. Permit column-scoped inserts of intents, envelopes, reports and audit observations, and guarded updates of claims, binding state and settlement totals. Run the admin client only in a dedicated reconciliation worker deployment with a gateway credential restricted to its managed principals, keys, budget attachments, policy bindings and usage. Keep that credential out of API, run executors, model/tool contexts and clients. |
-| Migrator | Version-gate the additive tables, constraints and column grants in `src/boundaries.sql`. Neither runtime role owns tables or has DDL, grant options or audit deletion rights. Issuance and PUBLIC gain no gateway access. |
+| Caller-owned completions · `openmettle-api` / `openmettle_api` | Authorize desired inputs, write API reconciliation hints and create the caller's reservation. Insert the per-call request identity before send. Execute the scoped lookup and proven-unsent release. Mount `gateway_keys` for unseal only. Read scoped status and usage projections. |
+| Server-owned runs · `openmettle-worker` / `openmettle_worker` | Insert the per-round request identity against the run reservation before send. Execute the same lookup and proven-unsent release for the leased run. Mount `gateway_keys` for unseal only. |
+| Dedicated reconciliation and settlement process · `openmettle_gateway` | Read current authority on the primary. Reserve nonces and append audit observations with `INSERT` only. Sole runtime role with column-scoped `INSERT` and guarded `UPDATE` on gateway admin intents and claims, sealed virtual-key envelopes, `gateway_bindings` lifecycle state (`provisioning`, `ready`, `suspended`, `revoked`), usage reports and settled totals. Only this process holds the outbound gateway admin service credential and mounts `gateway_keys` for both seal and unseal. Limit the credential to managed principals, keys, budget attachments, policy bindings and usage. |
+| Migrator | Own the lookup and version-gate the new role, tables, grants and function privileges in `src/boundaries.sql`. Require disjoint runtime logins, with no ownership, DDL or grant options, following [ADR 0030](0030-session-issuance-database-boundary.md) and [migration 18](../../migrations/0018_session_issuance_role.sql). Revoke default function execution from `PUBLIC`. Grant no gateway access to `PUBLIC` or `openmettle_issuance`. |
 
-PR2 adds gateway key protection through [`src/provider_keys.rs`](../../src/provider_keys.rs).
-Today that module manages OIDC verification keys and passes `login::KeyRing` into login
-operations. The existing AES-256-GCM envelope and nonce reservation are in
-[`src/login.rs`](../../src/login.rs) and [ADR 0009](0009-protected-login-transactions.md).
-Reuse that pattern with a separate gateway-only ring and versioned domain. Authenticate
-installation, user, principal handle, credential generation, purpose, format and wrapping
-key ID as associated data. Reserve a unique 96-bit nonce per wrapping key in an acknowledged
-transaction before each seal. Store only the version, key ID, nonce, ciphertext/tag and
-non-secret references. Mount wrapping keys separately from PostgreSQL only in workers that
-must seal or resolve virtual keys. New writes use the active key. Retain previous keys
-until all live envelopes are rewrapped with fresh nonces. After loss of nonce history,
-switch wrapping keys before another seal. Missing keys or tag failures block use and raise
-an operator error. No plaintext in SQL, snapshots, clients, audit, logs or spans.
+Both inference roles have zero direct `SELECT` on the raw envelope table or ciphertext
+column and zero `INSERT` or `UPDATE` on binding state or settled usage. Neither receives
+the admin credential. Grant them `EXECUTE` on one migration-owned `SECURITY DEFINER`
+envelope lookup with `SET search_path = pg_catalog` and schema-qualified relations.
+Bind the lookup to one pre-send request and reservation. For the API, verify possession
+of the live session credential. For the run worker, verify the current fenced lease for
+that round. Derive `actor_user_id` from the session or run and require the request's
+actor, scope and exact approval to match. Recheck current authority for the requested model and
+capability. Return at most that actor's active envelope and its authenticated metadata,
+only for `gateway_bindings.state = 'ready'`, a confirmed applicable policy revision and
+an unexpired generation. A supplied user ID alone cannot authorize lookup. Provide no
+enumeration or batch lookup.
+
+PR2 adds gateway key protection through [provider keys](../../src/provider_keys.rs).
+Reuse the AES-256-GCM envelope and nonce reservation pattern from login in a separate
+versioned domain. Bind the associated data (AAD) to `(user_id, binding_id, key_generation)`,
+installation, principal handle, purpose, format and wrapping key ID.
+Before sealing, the reconciliation worker commits a unique 96-bit nonce reservation
+under the active wrapping key. Store only the version, key ID, nonce, ciphertext/tag
+and non-secret references. At dispatch, unseal into a `Zeroizing` buffer, construct one
+internal bearer `Authorization` header with `HeaderValue::set_sensitive(true)` and drop the buffer as
+soon as the header is built. Keep plaintext out of SQL, snapshots, clients, audit, logs
+and spans. [Login envelope](../../src/login.rs) and [ADR 0009](0009-protected-login-transactions.md).
+
+PR2 extends offline configuration validation to `gateway_keys`. Store each key as
+exactly 32 raw bytes in a mounted file referenced by absolute path. Environment
+variables cannot supply key material. Allow one active generation and up to three
+previous keys for unseal. Inference processes expose only the unseal operation and have
+no nonce allocation grant. Reject duplicate IDs or material within the ring. In the
+offline deployment check, compare every gateway key with every configured login,
+cursor and BYOK/connector key using `subtle::ConstantTimeEq`. Reject shared material
+before rollout without mounting unrelated rings in the reconciliation worker. Rewrap
+live envelopes with fresh nonces before retiring old keys. Rotate the wrapping key after
+loss of nonce history and before another seal. A missing key or failed tag blocks use
+and raises an operator error. [Offline configuration checks](0015-offline-auth-config-check.md).
 
 Use bounded READ COMMITTED transactions on the primary. Keep the established order
 `account_admin_lock → projects → users → runs → branch_heads`, taking only necessary
-locks, with ascending IDs within a class. Acquire the gateway binding, its operation and
+locks, with ascending IDs within a class. PostgreSQL requires an `UPDATE` privilege
+for `FOR SHARE` and `FOR NO KEY UPDATE`. Where the reconciliation worker locks an
+authority row, grant `openmettle_gateway` only `UPDATE (lock_guard)` for that lock and
+record the grant in `src/boundaries.sql`. Acquire the gateway binding, its operation and
 the request reservation/settlement rows after applicable existing locks, in that order.
 Claim due work with a bounded `SKIP LOCKED` transaction, then commit. A subsequent
 transaction that needs authority locks starts at the beginning of the order. Append the
@@ -131,29 +172,46 @@ and [graph lock order](0036-conversation-branches-presets-and-effective-model-co
 
 ### Endpoint readiness and refusal
 
-Use a gateway-specific client over [`provider_http::transport`](../../src/provider_http.rs).
-Pin each operation's HTTPS destination, method and trust in deployment configuration. Only
-the admin adapter may attach its credential to that destination. The existing OIDC client
-refuses caller-supplied authorization headers. Preserve address validation for every DNS
-answer, private-range opt-in, TLS verification, response framing/size caps and cancellation.
-Use a dedicated bounded DNS pool, a 5-second setup and 10-second total ceiling per call,
-and a finite batch deadline covering readiness and backoff. Probe the configured endpoint
-before mutation. No redirects, proxies or transport retries. After transient connectivity
-failure, defer to a later bounded sweep with backoff and jitter. Policy and HTTP 4xx
-refusals stop automatic retries until the relevant inputs change or an operator repairs
-the cause. Failed readiness or gateway admission stops every dependent destructive step,
-including retiring a working predecessor. [Transport contract](0010-provider-http-transport.md).
+Use a gateway-specific client over the [bounded HTTP transport](../../src/provider_http/transport.rs).
+Pin the HTTPS destination, method and trust for each operation. PR2 extends only the
+admin route to construct its internal `Authorization` and idempotency headers and to
+admit the methods and bounded pagination query parameters the pinned admin API requires.
+Keep OIDC and OTLP header, method and URL admission unchanged. Validate every resolved
+address, require opt-in for private ranges, verify TLS, cap response framing and size,
+and support cancellation. Use a dedicated bounded DNS pool, a 5-second setup and
+10-second total ceiling per admin call, and a finite batch deadline. Probe readiness
+before mutation. Disable redirects, proxies and transport retries.
+[Transport contract](0010-provider-http-transport.md).
 
-| Evidence | Application response and operator evidence |
-| --- | --- |
-| Inactive caller or hidden target | Apply ADR 0027 first. Return `401 unauthenticated` or concealed `404 not_found`. Do not probe another account. |
-| Admitted caller, visible target, known missing model grant or family restriction | `403 policy`. Give the caller the applicable action, such as “Ask your account administrator to enable model access” or “Try again after quiet hours.” |
-| Admitted, entitled caller whose account binding is confirmed absent or awaiting initial sync | `503 provisioning`. “Gateway access for your account is being set up. If this persists, contact your account administrator.” Check this before default model selection to prevent `Model '' was not found` (#254). |
-| Service credential refused on the admin endpoint (including 401/403), endpoint unreachable, or unverified gateway response | `503 unavailable` for affected requests. “Gateway access is unavailable. Contact the operator with the request ID.” Record the failed step and cause. This failure takes precedence over an incomplete binding. An unexplained upstream 401/403 supplies no evidence of missing user entitlement. |
+Defer transient connectivity failures, upstream `503`, `408 Request Timeout` and
+`429 Too Many Requests` to a later sweep with bounded backoff and jitter. Honor a
+single valid integer `Retry-After` of 0–86400 seconds by scheduling the next attempt
+after the delay, outside the batch deadline if necessary. Keep the original intent and
+resolve uncertain effects before replay. Permanent 4xx policy, credential and validation
+refusals stop automatic reconciliation until inputs change or an operator repairs the
+cause. Failed readiness or admission blocks every dependent destructive step, including
+retirement of a working predecessor.
+
+Apply these ADR 0007 mappings before response headers. After streaming starts, signal
+failure in the active protocol. Check visibility and local entitlement first. For an
+entitled caller, a known failure affecting dispatch or provisioning takes precedence
+over an incomplete binding. Use fixed public text and record the failed step and cause
+internally. Discard upstream error text. [Application errors](0007-application-api-contract.md#errors)
+and [inference errors (ADR 0038)](https://github.com/OpenMettle/openmettle-core/pull/118).
+
+| Evidence | Response and fixed public text | Internal cause |
+| --- | --- | --- |
+| Inactive caller or hidden target | Apply ADR 0027 first. Return `401 unauthenticated` or concealed `404 not_found`. | Do not probe another account. |
+| Visible target and missing model grant, or active family restriction (quiet hours, study hours or per-child switch) | `403 policy` · “Account policy does not permit this model request. Ask your account administrator about access.” | `policy`. Accept a gateway inference 403 as policy only if the pinned profile has a verified typed refusal for that restriction. |
+| Entitled actor whose binding is absent, not yet `ready` or awaiting initial sync | `503 provisioning` · “Gateway access for your account is being set up. If this persists, contact your account administrator.” | Check readiness before default model selection to prevent `Model '' was not found` (#254). |
+| Admin/service credential refused (401/403), unexplained upstream 401/403, or invalid/bad-gateway response | `502 provider_failure` · “Gateway request failed. Contact the operator with the request ID.” | `service_auth` for confirmed credential refusal, `unknown` for unexplained 401/403, `protocol` for malformed responses or bad gateway. |
+| Endpoint unreachable (DNS/connect/TLS refusal) or upstream 503 | `503 unavailable` · “Gateway access is unavailable. Contact the operator with the request ID.” | `transport` |
+| Caller-facing gateway deadline expired | `504 timeout` · “The gateway request timed out.” | `timeout` |
+| Inference rate limited by the gateway | `429 rate_limited` · “The gateway request was rate limited.” | Forward only a validated bounded retry delay. Do not replay inference. |
 
 Retain #255 (identify the failed step), #258 (stop the transition) and #259 (bounded
 readiness) from the [delivery index](https://github.com/OpenMettle/openmettle-core/issues/1).
-Use the existing [application problem codes](0007-application-api-contract.md). Record
+Record
 restricted append-only audit rows with the internal binding/operation reference, desired
 revision, timestamp, step and outcome. For telemetry use the closed step vocabulary
 `readiness`, `principal`, `budget`, `policy`, `key`, `revoke` and `usage`. Classify causes
@@ -166,14 +224,22 @@ telemetry. [Redaction](0024-process-telemetry-and-redaction.md) and
 
 ## Request reservations and measured usage
 
-At admission, bind the reservation to the ADR 0032 run, actor and accounting scope in
-the same transaction. Exact admission replay reuses it. Before each billable call, persist
-a distinct request identity (including the round) against that reservation and pass it
-through the gateway. Allocate each call its own portion of the run hold before send.
-Moving a portion to a request leaves the total held unchanged. Release unallocated units
-when no further calls can start. A client-owned completion without a run uses the same
-authorized request/reservation binding. One run can incur several charges. Never join by time,
-model name or the user's current key. Keep attribution across key rotation and revocation.
+For a server-owned run, bind the reservation to the ADR 0032 run, actor and accounting
+scope in the admission transaction. Exact admission replay reuses it. For a caller-owned
+completion, the API binds its reservation to the authorized actor and scope without a
+run. Grant both inference roles column-scoped `INSERT` on the billable request identity
+(request ID, reservation, actor, scope, and run/round when applicable). Each caller must
+commit its distinct identity and allocated hold before sending the request ID through
+the gateway. A failed or unacknowledged commit bars dispatch. Allocating a portion of a
+run hold to a round leaves the total held unchanged.
+
+Give each caller a guarded release for its own proven-unsent pre-send abort. Serialize
+release with the transition that hands the request to the transport. Release once only
+while the caller can prove no bytes left the process and dispatch cannot subsequently
+start. After a possible send or ambiguous handoff, retain the hold for gateway settlement.
+Release unallocated run units when no further calls can start. Attribute each charge to
+the original request through rotation, revocation and later rounds. Never join by time,
+model name or the user's current key.
 
 For each request designate one authoritative gateway/provider reporting source through the
 qualified profile. Bind its request handle to the original installation, principal, scope
@@ -207,12 +273,15 @@ and [quota contract](https://github.com/OpenMettle/openmettle-core/issues/17).
 | Slice | Required evidence |
 | --- | --- |
 | PR1 · design | This decision and the forward pointer in ADR 0011. Review against #7 and the four historical failures. Run repository hygiene and offline application contract fixtures. |
-| PR2 · additive schema and store | Fresh and populated PostgreSQL 18 upgrade, previous writer compatibility, scoped FKs, unique principal/budget/key and operation identity. Race duplicate intents and stale generations. Assert role-specific SQL grants and refusals, including API ciphertext denial. Test nonce collisions, wrong binding/tag, wrapping-key rollover and missing keys. |
-| PR2 · gateway admin client | Synthetic TLS fixture counts wire requests. Exercise refused addresses, redirects, TLS, stalled readiness, 4xx and response limits. Drop the reply after committing each create. Restart and recover the original budget/key and usable sealed secret. Verify zero extra creates, zero dependent destructive calls and no secret in diagnostics. |
-| PR3 · reconciliation sweep and error mapping | Race workers, renewal and disable/withdrawal. Exercise approved, pending, rejected, expired and disabled identities, grant loss, schedule boundaries and per-child switches. Assert immediate local refusal, remote convergence, bounded lag, unchanged budget on rotation and no stale reactivation. Drive the four regression cases through the caller and verify status, action, failed step and redaction. |
+| PR2 · additive schema and store | On fresh and populated PostgreSQL 18, verify previous-writer compatibility, scoped foreign keys and unique principal, budget, generation and intent. Race duplicate intents and stale generations. Assert the gateway-only lifecycle, audit and settlement grants, minimal authority lock grants, and denial for missing or overlapping roles. Issuance can still sync membership and redeem invitations with zero gateway privileges. |
+| PR2 · inference roles and dispatch | Under each actual login, commit a per-call identity and reservation before observed HTTP send. Exercise caller-owned completions and leased run rounds. Verify single-envelope lookup for the checked actor, denial for cross-actor/scope, revoked authority, stale lease/session and non-ready binding. Deny direct ciphertext reads and binding or settled-usage writes. Verify exactly one proven-unsent release, refusal after possible send, and no send after unacknowledged commit. |
+| PR2 · keys and transport | Check offline key length, ring size, duplicate and cross-ring material, and role-specific seal/unseal access. Test nonce collisions, wrong user/binding/generation AAD, wrong tag, rollover and missing keys. Capture the per-user bearer on both inference paths. Only the reconciliation process can use the admin credential. Verify redaction and unchanged OIDC/OTLP admission. |
+| PR2 · gateway admin client | Count requests on synthetic TLS. Exercise pinned methods and pagination, refused addresses, redirects, TLS, readiness stalls and response limits. Contrast bounded 408/429 retries (valid and invalid retry delays) with permanent 4xx refusal. Drop each create reply after remote commit. Recover the same budget, key and usable envelope with zero extra creates or dependent destructive calls. |
+| PR3 · reconciliation sweep | Race reconcilers, renewal and disablement/withdrawal. Sweep committed membership changes and invitation redemption without API hints. Exercise the admission states above and grant loss. Verify immediate local refusal, remote convergence, bounded lag, stable budget and no stale reactivation. |
+| PR3 · policy and error mapping | Test per-child switches and quiet/study boundaries in the configured family time zone across the spring-forward gap and both occurrences of the fall-back hour. Drive each error row through the caller and assert fixed text, status, internal step/cause and redaction. Verify the pinned route's typed family-policy refusal and an unexplained 403 that yields `502 provider_failure`. |
 | PR3 · usage settlement | On PostgreSQL 18 race duplicate reports with cancellation and crash after commit. Deliver final before partial, corrected final, partial/unknown usage, delayed backfill and confirmed no-charge. Assert exact measured/held totals, cross-scope refusal, no duplicate debit, independent multi-round and final-turn counts, and identical results after restart. |
 
 PR2 takes the next available additive migration after coordination with concurrent tracks.
 PR3 exercises the worker and settlement against synthetic gateway evidence. Enabling a
 selected gateway requires evidence for its pinned admin, family-policy and reporting
-contracts. Those gates and V1-17 quota enforcement remain open after PR1.
+contracts, including the typed refusal and daylight-saving boundary cases above. Those gates and V1-17 quota enforcement remain open after PR1.
