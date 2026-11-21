@@ -117,6 +117,13 @@ def database_url(role: str, password: str) -> str:
     return f"postgres://openmettle_{role}:{password}@{host}:5432/fixture?sslmode=disable"
 
 
+def process_settings(role: str) -> dict:
+    settings = dict(FIXTURE_SETTINGS[role])
+    if role == "worker":
+        settings["SWEEP_MS"] = "1000"
+    return settings
+
+
 def render_manifests(contract: dict, images: dict, passwords: dict, run_id: str) -> dict:
     """Return a kubectl List. passwords holds synthetic per-run values for admin/api/worker."""
     labels = {"openmettle.dev/environment": "dev", "openmettle.dev/qualification-run": run_id}
@@ -185,7 +192,7 @@ def render_manifests(contract: dict, images: dict, passwords: dict, run_id: str)
         env = [{"name": f"{prefix}BIND", "value": f"0.0.0.0:{spec['port']}"},
                {"name": f"{prefix}DATABASE_URL", "valueFrom": {"secretKeyRef": {
                    "name": f"{name}-database", "key": "url"}}}]
-        env += [{"name": prefix + k, "value": v} for k, v in FIXTURE_SETTINGS[role].items()]
+        env += [{"name": prefix + k, "value": v} for k, v in process_settings(role).items()]
         items += [
             {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
              "metadata": {"name": f"{name}-database", "namespace": APP_NAMESPACE},
@@ -478,10 +485,17 @@ class Qualification:
     def deploy(self):
         passwords = {k: secrets.token_hex(16) for k in ("admin", *ROLES)}
         manifests = render_manifests(self.contract, self.images, passwords, self.run_id)
+        # Applying a Deployment starts its pods immediately, before rollout status is checked.
+        applications = [item for item in manifests["items"]
+                        if item["metadata"].get("namespace") == APP_NAMESPACE]
+        bootstrap = [item for item in manifests["items"]
+                     if item["metadata"].get("namespace") != APP_NAMESPACE]
         self.verify_identity()
-        self.kube("apply", "--filename", "-", input=json.dumps(manifests))
+        self.kube("apply", "--filename", "-", input=json.dumps({**manifests, "items": bootstrap}))
         self.kube("--namespace", DB_NAMESPACE, "rollout", "status", "deployment/postgres",
                   "--timeout=300s", timeout=330)
+        self.prepare_sweeps()
+        self.kube("apply", "--filename", "-", input=json.dumps({**manifests, "items": applications}))
         for role in ROLES:
             self.kube("--namespace", APP_NAMESPACE, "rollout", "status",
                       f"deployment/openmettle-{role}", "--timeout=180s", timeout=210)
@@ -539,7 +553,7 @@ class Qualification:
                     f"{role} process has no database URL")
         settings = {k[len(spec["configurationPrefix"]):]: env[k] for k in configured
                     if not k.endswith("DATABASE_URL")}
-        self.expect(settings == {"BIND": f"0.0.0.0:{spec['port']}", **FIXTURE_SETTINGS[role]},
+        self.expect(settings == {"BIND": f"0.0.0.0:{spec['port']}", **process_settings(role)},
                     f"{role} process settings differ: {settings}")
         uid = re.search(r"^Uid:\s+\d+\s+(\d+)", self.exec(pod_name, "cat", "/proc/1/status"),
                         re.MULTILINE)
@@ -597,6 +611,68 @@ class Qualification:
                       lambda: not self.pods(role, include_terminating=True), timeout=60)
         return exits
 
+    def fixture_sql(self, sql: str, phase=""):
+        return self.kube("--namespace", DB_NAMESPACE, "exec", "-i", "deployment/postgres", "--",
+                         "psql", "-XqAt", "-v", "ON_ERROR_STOP=1", "-v", f"phase={phase}",
+                         "-U", "fixture_admin", "-d", "fixture", input=sql).stdout.strip()
+
+    def prepare_sweeps(self):
+        # Use the release schema and its worker grants inside this disposable database.
+        self.fixture_sql("CREATE ROLE openmettle_owner; CREATE ROLE openmettle_issuance;"
+                         "ALTER DATABASE fixture OWNER TO openmettle_owner;"
+                         "SET ROLE openmettle_owner; CREATE SCHEMA openmettle;"
+                         "SET search_path TO pg_catalog,pg_temp;\n" + "\n".join(
+                             p.read_text() for p in sorted((ROOT / "migrations").glob("*.sql"))))
+
+    def seed_sweeps(self, phase: str):
+        self.fixture_sql((Path(__file__).with_name("sweep-runs.sql")).read_text(), phase)
+
+    def assert_sweeps(self, phase: str):
+        sql = """SELECT r.idempotency_key, r.state, e.format, convert_from(e.payload, 'UTF8')
+                   FROM openmettle.runs r JOIN openmettle.run_events e ON e.run_id = r.id
+                  WHERE r.idempotency_key IN (:'phase' || '-queued', :'phase' || '-running')
+                    AND e.append_key = 'run-terminal' ORDER BY r.idempotency_key"""
+        expected = [f"{phase}-queued|failed|openmettle.run-expired|{{}}",
+                    f'{phase}-running|failed|openmettle.run-failed|{{"reason":"deadline_exceeded"}}']
+        self.wait_for(f"both worker sweeps after {phase}",
+                      lambda: self.fixture_sql(sql, phase).splitlines() == expected)
+        self.passed("worker settled both deadlines", phase=phase)
+
+    def forced_worker_recovery(self):
+        self.verify_identity()
+        [pod] = self.pods("worker")
+        node = pod["spec"]["nodeName"]
+        [status] = pod["status"]["containerStatuses"]
+        old = status["containerID"]
+        self.expect(node == f"{self.name}-control-plane"
+                    and re.fullmatch(r"containerd://[0-9a-f]{64}", old) and status["name"] == "worker",
+                    "unexpected worker container or node")
+        task = old.removeprefix("containerd://")
+        # Signal from the parent PID namespace. Freeze the sole worker before inserting due
+        # rows so only the restarted container can settle them.
+        cmd = ["docker", "exec", node, "ctr", "--namespace", "k8s.io", "tasks", "kill", "--signal"]
+        self.run([*cmd, "SIGSTOP", task])
+        self.wait_for("stopped worker process", lambda: re.search(
+            r"^State:\s+T", self.exec(pod["metadata"]["name"], "cat", "/proc/1/status"), re.MULTILINE))
+        self.seed_sweeps("forced")
+        self.run([*cmd, "SIGKILL", task])
+
+        def restarted():
+            current = self.kube_json(["--namespace", APP_NAMESPACE, "get", "pod",
+                                      pod["metadata"]["name"], "--output=json"])
+            for c in current["status"].get("containerStatuses", []):
+                if (c["name"] == "worker" and c.get("ready") and c.get("containerID") != old
+                        and c["restartCount"] == status["restartCount"] + 1
+                        and c.get("lastState", {}).get("terminated", {}).get("exitCode") == 137):
+                    return c
+            return None
+
+        replacement = self.wait_for("worker restarted after SIGKILL with exit 137", restarted)
+        self.assert_sweeps("forced")
+        self.passed("worker recovered after SIGKILL",
+                    exit_code=replacement["lastState"]["terminated"]["exitCode"],
+                    restarts=replacement["restartCount"])
+
     def scenario(self):
         api, worker = self.contract["api"], self.contract["worker"]
         baseline = {role: self.observe_process(role) for role in ROLES}
@@ -612,6 +688,8 @@ class Qualification:
                          if e.get("conditions", {}).get("ready")]
         self.expect(ready_targets == [api_pod], f"API Service endpoints: {ready_targets}")
         self.passed("API Service routes to ready API pod", endpoints=ready_targets)
+
+        self.forced_worker_recovery()
 
         # Stop every worker while continuously probing the API.
         forward = PortForward(self.kubectl, self.env, f"pod/{api_pod}", api["port"])
@@ -646,12 +724,14 @@ class Qualification:
                     api_readiness_probes=len(results), api_ready_replicas=api_ready)
 
         # Independent scaling: worker to 2 while the API stays at 1.
+        self.seed_sweeps("graceful")
         self.scale("worker", 2)
         self.kube("--namespace", APP_NAMESPACE, "rollout", "status", "deployment/openmettle-worker",
                   "--timeout=180s", timeout=210)
         counts = {role: self.deployment(role)["status"].get("readyReplicas") for role in ROLES}
         self.expect(counts == {"api": 1, "worker": 2}, f"independent scale not observed: {counts}")
         self.observe_process("worker")
+        self.assert_sweeps("graceful")
         self.passed("independent scaling", ready_replicas=counts)
 
         # Database loss affects readiness, not liveness; recovery needs no restart.

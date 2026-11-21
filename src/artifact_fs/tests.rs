@@ -156,10 +156,10 @@ async fn publish_syncs_and_renames_into_revisions() {
     let published = store.revisions.join(RESERVATION);
     assert_eq!(fs::read(&published).unwrap(), b"hello world");
     assert_eq!(mode(&published), 0o600);
-    store.remove(RESERVATION).await.unwrap();
+    store.remove(RESERVATION).unwrap();
     assert!(!published.exists());
     // Removing absent files is not an error.
-    store.remove(RESERVATION).await.unwrap();
+    store.remove(RESERVATION).unwrap();
 }
 
 #[tokio::test]

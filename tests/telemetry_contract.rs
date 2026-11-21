@@ -250,7 +250,7 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
         other => panic!("expected Sum for openmettle.telemetry.dropped, got {other:?}"),
     }
 
-    // Exhaust every single enum combination across all 8 metrics.
+    // Exhaust every single enum combination across all metrics.
     for &m in telemetry::Method::ALL {
         for &r in RouteClass::ALL {
             for &s in StatusClass::ALL {
@@ -270,6 +270,10 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
         for &o in StorageOutcome::ALL {
             store.record_storage(op, o);
         }
+    }
+    use openmettle_core::authz::leases::CancelReason;
+    for reason in [CancelReason::Requested, CancelReason::Revoked] {
+        store.record_cancellation(reason);
     }
     for &sig in DroppedSignal::ALL {
         store.record_dropped(sig, 1);

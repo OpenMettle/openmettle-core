@@ -1,6 +1,6 @@
 """Cluster-free tests for the Kubernetes qualification guards and contract-derived fixtures.
 
-These cover refusal paths and manifest derivation only. Passing them is not qualification;
+These cover refusal paths, manifests and recovery assertions. Passing them is not qualification;
 the qualification evidence is the kind run in .github/workflows/kubernetes.yml.
 """
 import copy
@@ -102,6 +102,13 @@ class ManifestTests(unittest.TestCase):
             account = self.find("ServiceAccount", spec["serviceAccountName"])
             self.assertIs(account["automountServiceAccountToken"], False)
 
+    def test_only_worker_uses_fast_maintenance_sweeps(self):
+        for role in qualify.ROLES:
+            pod = self.find("Deployment", f"openmettle-{role}")["spec"]["template"]["spec"]
+            env = {v["name"]: v.get("value") for v in pod["containers"][0]["env"]}
+            self.assertEqual(env.get("OPENMETTLE_WORKER_SWEEP_MS"), "1000" if role == "worker" else None)
+            self.assertNotIn("OPENMETTLE_WORKER_RUN_SLOTS", env)
+
     def test_processes_use_separate_credentials(self):
         for role in qualify.ROLES:
             url = self.find("Secret", f"openmettle-{role}-database")["stringData"]["url"]
@@ -114,6 +121,68 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(labels["pod-security.kubernetes.io/enforce"], "restricted")
         self.assertEqual(labels["openmettle.dev/environment"], "dev")
         self.assertEqual(labels["openmettle.dev/qualification-run"], "0123abcd")
+
+
+class WorkerRecoveryTests(unittest.TestCase):
+    def test_schema_is_ready_before_applying_the_worker_deployment(self):
+        q = qualify.Qualification(qualify.load_contract(), OPTED_IN, None, Path("/tmp"))
+        events = []
+
+        def kube(*args, **kwargs):
+            if args[0] == "apply":
+                deployments = [i["metadata"]["name"] for i in json.loads(kwargs["input"])["items"]
+                               if i["kind"] == "Deployment"]
+                events.append(("apply", deployments))
+            else:
+                events.append(("ready", args[4]))
+
+        q.verify_identity = Mock()
+        q.kube = kube
+        q.prepare_sweeps = lambda: events.append(("schema",))
+        q.deploy()
+        self.assertEqual(events[:4], [
+            ("apply", ["postgres"]), ("ready", "deployment/postgres"), ("schema",),
+            ("apply", ["openmettle-api", "openmettle-worker"]),
+        ])
+
+    def test_sigkill_targets_only_observed_worker_and_waits_for_a_new_ready_container(self):
+        q = qualify.Qualification(qualify.load_contract(), OPTED_IN, None, Path("/tmp"))
+        node = q.name + "-control-plane"
+        old = "containerd://" + "a" * 64
+        status = {"name": "worker", "ready": True, "restartCount": 0, "containerID": old}
+        pod = {"metadata": {"name": "synthetic-worker"}, "spec": {"nodeName": node},
+               "status": {"containerStatuses": [status]}}
+        q.pods = Mock(return_value=[pod])
+        q.verify_identity = Mock()
+        q.exec = Mock(return_value="State:\tT (stopped)")
+        q.run, q.seed_sweeps, q.assert_sweeps = Mock(), Mock(), Mock()
+        new = {**status, "containerID": "containerd://" + "b" * 64, "restartCount": 1,
+               "lastState": {"terminated": {"exitCode": 137}}}
+        q.kube_json = Mock(side_effect=[
+            {"status": {"containerStatuses": [sample]}} for sample in
+            (status, {**new, "ready": False}, {**new, "lastState": {"terminated": {"exitCode": 0}}}, new)])
+        with patch.object(qualify.time, "sleep"):
+            q.forced_worker_recovery()
+        cmd = ["docker", "exec", node, "ctr", "--namespace", "k8s.io", "tasks", "kill", "--signal"]
+        self.assertEqual([call.args[0] for call in q.run.call_args_list],
+                         [[*cmd, sig, "a" * 64] for sig in ("SIGSTOP", "SIGKILL")])
+        self.assertEqual(q.kube_json.call_count, 4)
+        q.seed_sweeps.assert_called_once_with("forced")
+        q.assert_sweeps.assert_called_once_with("forced")
+        pod["spec"]["nodeName"] = "foreign-node"
+        with self.assertRaises(qualify.QualificationFailure):
+            q.forced_worker_recovery()
+        self.assertEqual(q.run.call_count, 2)
+
+    def test_requires_both_terminal_events_and_payloads(self):
+        q = qualify.Qualification(qualify.load_contract(), OPTED_IN, None, Path("/tmp"))
+        queued = "graceful-queued|failed|openmettle.run-expired|{}"
+        running = 'graceful-running|failed|openmettle.run-failed|{"reason":"deadline_exceeded"}'
+        q.fixture_sql = Mock(side_effect=[queued, queued + "\n" + running.replace("failed", "cancelled"),
+                                          queued + "\n" + running])
+        with patch.object(qualify.time, "sleep"):
+            q.assert_sweeps("graceful")
+        self.assertEqual(q.fixture_sql.call_count, 3)
 
 
 class GuardTests(unittest.TestCase):

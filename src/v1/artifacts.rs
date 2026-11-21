@@ -17,7 +17,7 @@ use super::{
     response_headers, single_header, timestamp,
 };
 use crate::{
-    artifact_fs,
+    artifact_fs::{self, UPLOAD_TIMEOUT},
     authz::{
         Action, DenialReason,
         projects::{self, hex},
@@ -35,13 +35,10 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::PgConnection;
-use std::{fmt::Write as _, time::Duration};
+use std::fmt::Write as _;
 
 /// The largest file one upload may carry, and the default reservation ceiling.
 pub const MAX_UPLOAD_BYTES: i64 = 64 * 1024 * 1024;
-/// Longest upload, from authorization to settlement. `artifact_fs::reconcile_expired` must use
-/// a longer `older_than`.
-pub const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
 const TOO_LARGE: Problem = problem(
     StatusCode::BAD_REQUEST,

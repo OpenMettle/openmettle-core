@@ -22,6 +22,7 @@ pub mod sessions;
 pub mod storage;
 pub mod telemetry;
 pub mod v1;
+pub mod worker;
 
 use axum::{Router, extract::State, http::StatusCode, routing::get};
 use browser_auth::{
@@ -40,7 +41,92 @@ pub enum Role {
     Worker,
 }
 
+/// Validated ADR 0033 settings. The library runner can accept a run policy with an executor.
+#[derive(Clone, Copy, Debug)]
+pub struct WorkerSettings {
+    sweep: Duration,
+    poll: Duration,
+    policy: Option<RunPolicy>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RunPolicy {
+    slots: usize,
+    leases: authz::leases::LeaseSettings,
+    limits: authz::runs::ClaimLimits,
+}
+
+const WORKER_KEYS: [&str; 7] = [
+    "SWEEP_MS",
+    "POLL_MS",
+    "RUN_SLOTS",
+    "LEASE_MS",
+    "EXECUTION_TIMEOUT_MS",
+    "EXECUTING_PER_ACTOR",
+    "EXECUTING_PER_SCOPE",
+];
+
+impl WorkerSettings {
+    /// Read unprefixed worker keys from the supplied configuration source.
+    pub fn parse(
+        db_timeout: Duration,
+        get: impl Fn(&str) -> Result<Option<String>, &'static str>,
+    ) -> Result<Self, &'static str> {
+        let number = |key, min, max| -> Result<Option<u32>, &'static str> {
+            get(key)?
+                .map(|s| {
+                    s.parse()
+                        .ok()
+                        .filter(|n| (min..=max).contains(n))
+                        .ok_or(key)
+                })
+                .transpose()
+        };
+        let [sweep, poll, slots, lease, execution, actor, scope] = WORKER_KEYS;
+        let millis = |n: u32| Duration::from_millis(n.into());
+        let sweep = millis(number(sweep, 1000, 3_600_000)?.unwrap_or(60_000));
+        let poll = millis(number(poll, 100, 60_000)?.unwrap_or(1000));
+        let policy = match (
+            number(slots, 1, 256)?,
+            number(lease, 30_000, 600_000)?,
+            number(execution, 60_000, 86_400_000)?,
+            number(actor, 1, 1024)?,
+            number(scope, 1, 1024)?,
+        ) {
+            (None, None, None, None, None) => None,
+            (None, ..) => return Err("lease and claim settings require RUN_SLOTS"),
+            (Some(slots), Some(lease), Some(execution), Some(actor), Some(scope)) => {
+                let leases = authz::leases::LeaseSettings {
+                    lease: millis(lease),
+                    execution_timeout: millis(execution),
+                };
+                if leases.lease / 6 < db_timeout {
+                    return Err("LEASE_MS must cover six DB_TIMEOUT_MS");
+                }
+                if leases.validate().is_err() {
+                    return Err("EXECUTION_TIMEOUT_MS must cover two leases");
+                }
+                Some(RunPolicy {
+                    slots: slots as usize,
+                    leases,
+                    limits: authz::runs::ClaimLimits {
+                        executing_per_actor: actor,
+                        executing_per_scope: scope,
+                    },
+                })
+            }
+            _ => return Err("RUN_SLOTS requires lease and claim settings"),
+        };
+        Ok(Self {
+            sweep,
+            poll,
+            policy,
+        })
+    }
+}
+
 struct Config {
+    worker: Option<WorkerSettings>,
     bind: SocketAddr,
     database: PgConnectOptions,
     connections: u32,
@@ -127,7 +213,27 @@ impl Config {
                 "OPENMETTLE_WORKER"
             }
         };
-        Self::parse(role, |key| env_var(prefix, key))
+        let mut config = Self::parse(role, |key| env_var(prefix, key))?;
+        match role {
+            Role::Api => {
+                if WORKER_KEYS.iter().any(|key| {
+                    ["OPENMETTLE_WORKER", prefix]
+                        .iter()
+                        .any(|p| std::env::var_os(format!("{p}_{key}")).is_some())
+                }) {
+                    return Err("worker scheduling settings are refused on the API");
+                }
+            }
+            Role::Worker => {
+                let settings =
+                    WorkerSettings::parse(config.database_timeout, |key| env_var(prefix, key))?;
+                if settings.policy.is_some() {
+                    return Err("RUN_SLOTS requires a worker executor");
+                }
+                config.worker = Some(settings);
+            }
+        }
+        Ok(config)
     }
 
     fn parse(
@@ -201,6 +307,7 @@ impl Config {
             },
         };
         Ok(Self {
+            worker: None,
             bind,
             database,
             connections,
@@ -377,7 +484,7 @@ pub async fn run(role: Role) -> u8 {
     // The same holds for the browser sign-in settings: refused before telemetry is installed
     // or the listener opens, with the offline check's fixed category line (ADRs 0015, 0025).
     let pool = pool(&config);
-    let (app, issuance) = match app(&config, &pool, artifacts) {
+    let (app, issuance) = match app(&config, &pool, artifacts.clone()) {
         Ok(built) => built,
         Err(error) => {
             eprintln!("auth configuration error: {error}");
@@ -392,7 +499,17 @@ pub async fn run(role: Role) -> u8 {
         }
     };
     let (drain, flush) = shutdown_budget(config.shutdown_timeout);
-    let code = match serve(config.bind, app, pool, issuance, process, drain).await {
+    let code = match serve(
+        config.bind,
+        app,
+        pool,
+        issuance,
+        process,
+        drain,
+        config.worker.map(|settings| (settings, artifacts)),
+    )
+    .await
+    {
         Ok(()) => {
             telemetry::process_stopped(process);
             0
@@ -438,6 +555,7 @@ async fn serve(
     issuance: Option<PgPool>,
     process: Process,
     drain: Duration,
+    worker: Option<(WorkerSettings, Option<artifact_fs::Store>)>,
 ) -> Result<(), ProcessFailure> {
     // Install signal handlers before opening the listener.
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -457,7 +575,19 @@ async fn serve(
     let server = std::future::IntoFuture::into_future(server);
     tokio::pin!(server);
     telemetry::process_started(process);
+    // Dropping maintenance at the signal stops polling and rolls back in-flight transactions.
+    let http_budget = if worker.is_some() {
+        drain - drain / 2
+    } else {
+        drain
+    };
     let signal = tokio::select! {
+        _ = async {
+            if let Some((settings, store)) = worker {
+                worker::maintenance(&pool, store.as_ref(), settings.sweep).await;
+            }
+            std::future::pending::<()>().await
+        } => unreachable!(),
         result = &mut server => return result.map_err(|_| ProcessFailure::Server),
         _ = terminate.recv() => Signal::Terminate,
         _ = interrupt.recv() => Signal::Interrupt,
@@ -465,7 +595,7 @@ async fn serve(
     telemetry::process_stopping(process, signal);
     stream_stop.send_replace(true);
     let _ = stop_tx.send(());
-    tokio::time::timeout(drain, async {
+    tokio::time::timeout(http_budget, async {
         server.await.map_err(|_| ProcessFailure::Shutdown)?;
         // Both pools close within the deadline, so idle connections end cleanly before the
         // runtime is shut down.

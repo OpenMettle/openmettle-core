@@ -206,6 +206,16 @@ class SeriesValidationAndParserTests(unittest.TestCase):
         self.assertEqual(summary["instances_by_job"]["openmettle-api"], [self.uuid_api])
         self.assertEqual(summary["instances_by_job"]["openmettle-worker"], [self.uuid_worker])
 
+    def test_cancellation_counter_allows_only_the_two_reasons(self):
+        metric = {"__name__": "openmettle_runs_cancellations_total", "job": "openmettle-worker",
+                  "instance": self.uuid_worker}
+        for reason in ("requested", "revoked"):
+            series = [{"metric": {**metric, "reason": reason}, "value": [1, "1"]}]
+            self.assertEqual(qualify.validate_prometheus_series(series, self.contract)["series_count"], 1)
+        series[0]["metric"]["reason"] = "unknown"
+        with self.assertRaises(qualify.QualificationFailure):
+            qualify.validate_prometheus_series(series, self.contract)
+
     def test_rejects_disallowed_label_substring(self):
         bad = [{
             "metric": {

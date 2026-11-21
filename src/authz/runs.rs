@@ -293,26 +293,61 @@ pub async fn recheck_leased(
     r: &RunRecheckRequest<'_>,
     settings: &LeaseSettings,
 ) -> Result<RunRecheckOutcome, LeaseError> {
-    settings.validate()?;
     r.validate()?;
     if (r.scope_id, r.run_id) != (lease.scope_id, lease.run_id) {
         return Err(StoreError::InvalidInput("lease target").into());
     }
+    let denied = recheck_step(c, lease, r.actor_approval_id, Some(r), settings).await?;
+    Ok(match denied {
+        None => RunRecheckOutcome::Continue,
+        Some((reason, _)) => RunRecheckOutcome::Invalidated(reason),
+    })
+}
+
+/// Recheck a worker dispatch at database time. A denied step is already settled, and
+/// the runner needs its disposition to release a reconciling lease after drain.
+pub(crate) async fn recheck_claim(
+    c: &mut PgConnection,
+    claim: &ClaimedRun,
+    settings: &LeaseSettings,
+) -> Result<Option<leases::Settled>, LeaseError> {
+    let denied = recheck_step(c, &claim.lease(), &claim.actor_approval_id, None, settings).await?;
+    Ok(denied.map(|(_, settled)| settled))
+}
+
+async fn recheck_step(
+    c: &mut PgConnection,
+    lease: &Lease<'_>,
+    actor_approval_id: &str,
+    request: Option<&RunRecheckRequest<'_>>,
+    settings: &LeaseSettings,
+) -> Result<Option<(DenialReason, leases::Settled)>, LeaseError> {
+    settings.validate()?;
     leases::fenced(c, lease, Fence::Step, async |tx, held| {
         let c = tx.connection()?;
-        let (owner, conversation, approval): (String, String, String) = sqlx::query_as(
-            "SELECT actor_user_id::text, conversation_id::text, actor_approval_id::text
+        let (owner, conversation, approval, now_ms): (String, String, String, i64) =
+            sqlx::query_as(
+                "SELECT actor_user_id::text, conversation_id::text, actor_approval_id::text,
+                    floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
              FROM openmettle.runs WHERE scope_id = $1::uuid AND id = $2::uuid",
-        )
-        .bind(r.scope_id)
-        .bind(r.run_id)
-        .fetch_one(&mut *c)
-        .await?;
-        if approval != r.actor_approval_id {
+            )
+            .bind(lease.scope_id)
+            .bind(lease.run_id)
+            .fetch_one(&mut *c)
+            .await?;
+        if approval != actor_approval_id {
             return Err(StoreError::InvalidInput("actor_approval_id"));
         }
-        match recheck_decision(c, r, &owner, &conversation).await? {
-            RunContinuation::Continue => Ok(RunRecheckOutcome::Continue),
+        let r = request.copied().unwrap_or(RunRecheckRequest {
+            scope_id: lease.scope_id,
+            run_id: lease.run_id,
+            actor_approval_id,
+            capabilities: &[],
+            extra_target: None,
+            now_ms,
+        });
+        match recheck_decision(c, &r, &owner, &conversation).await? {
+            RunContinuation::Continue => Ok(None),
             RunContinuation::Invalidate(reason) => {
                 sqlx::query(
                     "UPDATE openmettle.runs SET cancel_reason = coalesce(cancel_reason, 'revoked')
@@ -322,7 +357,7 @@ pub async fn recheck_leased(
                 .bind(r.run_id)
                 .execute(&mut *c)
                 .await?;
-                leases::settle_locked(
+                let settled = leases::settle_locked(
                     c,
                     lease,
                     held.state,
@@ -331,7 +366,7 @@ pub async fn recheck_leased(
                     leases::Settle::Stopped,
                 )
                 .await?;
-                Ok(RunRecheckOutcome::Invalidated(reason))
+                Ok(Some((reason, settled)))
             }
         }
     })
@@ -477,7 +512,11 @@ async fn cancel_event(
             bytes: reason.payload(),
         },
     )
-    .await
+    .await?;
+    if state == "cancelled" {
+        crate::telemetry::metrics::global().record_cancellation(reason);
+    }
+    Ok(())
 }
 
 async fn terminal_events(

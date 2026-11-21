@@ -16,8 +16,8 @@
       "logs_days": 7,
       "metrics_days": 14
     },
-    "max_data_point_streams": 357,
-    "max_prometheus_series_per_process": 1020,
+    "max_data_point_streams": 359,
+    "max_prometheus_series_per_process": 1022,
     "disallowed_metric_label_substrings": [
       "user_id",
       "scope_id",
@@ -72,6 +72,11 @@
       "dropped_metric_exports"
     ],
     "events": [
+      {
+        "name": "worker.sweep.failed",
+        "levels": ["warn"],
+        "fields": ["event", "role", "error.type"]
+      },
       {
         "name": "http.request.completed",
         "levels": ["debug", "warn"],
@@ -239,11 +244,21 @@
       "labels": {
         "signal": ["log_lines", "trace_spans", "metric_exports"]
       }
+    },
+    {
+      "name": "openmettle.runs.cancellations",
+      "prometheus_name": "openmettle_runs_cancellations_total",
+      "kind": "counter",
+      "unit": "{run}",
+      "semantics": "terminal_events_appended_before_commit",
+      "max_series": 2,
+      "labels": {
+        "reason": ["requested", "revoked"]
+      }
     }
   ],
   "reserved_signals": [
     {"name": "openmettle.runs.queue.age", "owner_ticket": "V1-10", "status": "planned"},
-    {"name": "openmettle.runs.cancellations", "owner_ticket": "V1-11", "status": "planned"},
     {"name": "openmettle.capacity.grants", "owner_ticket": "V1-17", "status": "planned"},
     {"name": "openmettle.storage.quota.drift", "owner_ticket": "V1-18", "status": "planned"},
     {"name": "openmettle.backup.runs", "owner_ticket": "V1-30", "status": "planned"}

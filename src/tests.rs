@@ -1041,3 +1041,35 @@ async fn v1_sessions_are_validated_on_the_primary_and_native_needs_its_profile()
         assert_eq!(database.accept().is_ok(), status == 503, "{channel}");
     }
 }
+
+#[test]
+fn worker_library_settings_accept_endpoints_and_default_to_maintenance() {
+    let default = WorkerSettings::parse(Duration::from_secs(2), |_| Ok(None)).unwrap();
+    assert_eq!(default.sweep, Duration::from_secs(60));
+    assert_eq!(default.poll, Duration::from_secs(1));
+    assert!(default.policy.is_none());
+    for values in [
+        ["1000", "100", "1", "30000", "60000", "1", "1"],
+        [
+            "3600000", "60000", "256", "600000", "86400000", "1024", "1024",
+        ],
+    ] {
+        let settings = WorkerSettings::parse(Duration::from_secs(5), |key| {
+            Ok(WORKER_KEYS
+                .iter()
+                .position(|&k| k == key)
+                .map(|i| values[i].to_string()))
+        })
+        .unwrap();
+        let policy = settings.policy.unwrap();
+        assert_eq!(policy.slots, values[2].parse::<usize>().unwrap());
+        assert_eq!(
+            policy.leases.lease.as_millis(),
+            values[3].parse::<u128>().unwrap()
+        );
+        assert_eq!(
+            policy.limits.executing_per_actor,
+            values[5].parse::<u32>().unwrap()
+        );
+    }
+}

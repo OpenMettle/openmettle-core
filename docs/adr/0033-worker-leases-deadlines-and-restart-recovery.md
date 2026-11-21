@@ -261,7 +261,7 @@ today: `Requested { state }`, `Terminal { state }`, or not found.
 The API therefore never makes an executing run terminal. Moving `running` to `cancelling`
 changes no executing count, so it needs no dispatch lock (ADR 0032).
 
-`recheck_leased(c, &Lease, &RunRecheckRequest) -> Result<RunRecheckOutcome, LeaseError>` is the
+`recheck_leased(c, &Lease, &RunRecheckRequest, &LeaseSettings) -> Result<RunRecheckOutcome, LeaseError>` is the
 worker's recheck before dispatch and before every model or tool step. It runs the ADR 0027
 decision after a `Step` fence, in the same transaction. On `Invalidate` it sets
 `cancel_reason = coalesce(cancel_reason, 'revoked')` and applies `settle(Stopped)` (below)
@@ -478,7 +478,10 @@ execution deadline sets it sends `Stop::Deadline`. A `Cancelling` state from ren
 `JoinSet::abort_all` and awaits `join_next` for the rest of the window. Then:
 
 - `LeaseLost`: write nothing more. Recovery owns the run.
-- Otherwise `settle(Stopped)`, or `settle(Succeeded)` if the step returned `Finished`.
+- If the step returned `Finished`, call `settle(Succeeded)`. On a conflict, retry with
+  `settle(Stopped)` so unresolved operations enter reconciliation or interruption.
+- If the step returned `Failed(reason)`, call `settle(Failed(reason))`. Other stopped work
+  uses `settle(Stopped)` or the shutdown handover below.
 
 Adapters must not swallow cancellation or timeouts (PLAN-08): a stopped call returns `Stopped`,
 never `Continue`, `Finished` or a generic failure, and a timeout after dispatch records
@@ -510,10 +513,12 @@ lookup. `begin_purge` and `confirm_purge` are idempotent for a revision already 
 `purged`.
 
 **Shutdown.** `SIGTERM` or `SIGINT` stops claiming and sweeping, then sends `Stop::Shutdown` to
-every run while renewal continues. A drained `running` or `cancelling` run with a cancellation or
-an unresolved operation is settled with `settle(Stopped)` (rule 6 leaves an uncertain run
-`reconciling` for another worker). A `reconciling` run whose pass did not finish, and any other
-run, calls `release_lease` so another worker re-claims it at once. Runs get half of the ADR 0002
+every run while renewal continues. A step that returns `Finished` or `Failed(reason)` during
+drain settles as above. A completed reconciliation pass settles with `Stopped`. For unfinished
+work, the holder checks cancellation and unresolved operations under the run lock. It settles a
+pending cancellation or unresolved effect with `Stopped` and releases any resulting reconciling
+lease. It also releases an unfinished reconciliation pass or a run ready to resume, so another
+worker can claim it immediately. Runs get half of the ADR 0002
 drain budget, and their drain window is the smaller of `L/6` and that share; HTTP drain and
 `PgPool::close` get the rest. A run still draining at its deadline is dropped and its lease
 lapses: recovery handles it as after a crash. With the 5 s default `SHUTDOWN_TIMEOUT_MS` most
