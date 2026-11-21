@@ -362,6 +362,22 @@ impl Route<'_> {
         {
             return Err(Error::Destination);
         }
+        let outbound = self.request(method, headers, body)?;
+        let tls = self.connect(setup).await?;
+        tokio::time::timeout_at(
+            total,
+            self.exchange(tls, outbound, total, limits, |response| {
+                read(response, limits.response_body)
+            }),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
+    }
+
+    pub(super) async fn connect(
+        &self,
+        setup: Instant,
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, Error> {
         let answers = self.resolve(setup).await?;
         // Alternate only on TCP failure, before any TLS or HTTP bytes; connect to validated
         // addresses only, so a later DNS answer cannot redirect this request.
@@ -381,16 +397,13 @@ impl Route<'_> {
         // Certificate validation uses the configured host name, never the connected address.
         let name =
             ServerName::try_from(self.endpoint.host.clone()).map_err(|_| Error::Configuration)?;
-        let tls = tokio::time::timeout_at(
+        tokio::time::timeout_at(
             setup,
             tokio_rustls::TlsConnector::from(self.tls.clone()).connect(name, tcp),
         )
         .await
         .map_err(|_| Error::Timeout)?
-        .map_err(|_| Error::Tls)?;
-        tokio::time::timeout_at(total, self.exchange(tls, method, headers, body, limits))
-            .await
-            .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::Tls)
     }
 
     fn address_permitted(&self, ip: IpAddr) -> bool {
@@ -440,21 +453,12 @@ impl Route<'_> {
         Ok(answers)
     }
 
-    async fn exchange(
+    pub(super) fn request(
         &self,
-        tls: tokio_rustls::client::TlsStream<TcpStream>,
         method: http::Method,
         headers: &http::HeaderMap,
         body: Vec<u8>,
-        limits: &Limits,
-    ) -> Result<HttpResponse, Error> {
-        let (mut sender, connection) = http1::Builder::new()
-            .max_headers(limits.response_headers)
-            .max_header_size(limits.response_header_bytes)
-            .max_buf_size(MAX_READ_BUFFER)
-            .handshake::<_, Full<Bytes>>(TokioIo::new(tls))
-            .await
-            .map_err(|_| Error::Protocol)?;
+    ) -> Result<http::Request<Full<Bytes>>, Error> {
         let mut outbound = http::Request::builder()
             .method(method)
             .uri(self.endpoint.path.as_str())
@@ -463,13 +467,33 @@ impl Route<'_> {
         for (name, value) in headers {
             outbound = outbound.header(name, value);
         }
-        let outbound = outbound
+        outbound
             .body(Full::new(Bytes::from(body)))
-            .map_err(|_| Error::Destination)?;
+            .map_err(|_| Error::Destination)
+    }
+
+    pub(super) async fn exchange<T, E: From<Error>, F: Future<Output = Result<T, E>>>(
+        &self,
+        tls: tokio_rustls::client::TlsStream<TcpStream>,
+        outbound: http::Request<Full<Bytes>>,
+        header_deadline: Instant,
+        limits: &Limits,
+        consume: impl FnOnce(hyper::Response<hyper::body::Incoming>) -> F,
+    ) -> Result<T, E> {
+        let (mut sender, connection) = http1::Builder::new()
+            .max_headers(limits.response_headers)
+            .max_header_size(limits.response_header_bytes)
+            .max_buf_size(MAX_READ_BUFFER)
+            .handshake::<_, Full<Bytes>>(TokioIo::new(tls))
+            .await
+            .map_err(|_| Error::Protocol)?;
         // Driven here, never spawned: the connection lives exactly as long as this future.
         let response = async {
-            let response = sender.send_request(outbound).await.map_err(hyper_error)?;
-            read(response, limits.response_body).await
+            let response = tokio::time::timeout_at(header_deadline, sender.send_request(outbound))
+                .await
+                .map_err(|_| Error::Timeout)?
+                .map_err(hyper_error)?;
+            consume(response).await
         };
         tokio::pin!(connection, response);
         let mut driving = true;
@@ -498,6 +522,42 @@ async fn read(
     max_body: usize,
 ) -> Result<HttpResponse, Error> {
     let (parts, body) = response.into_parts();
+    let length = framed_length(&parts, max_body)?;
+    let headers = &parts.headers;
+    let mut collected = Vec::with_capacity(length.unwrap_or(0) as usize);
+    let mut body = Limited::new(body, max_body);
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| {
+            if e.is::<http_body_util::LengthLimitError>() {
+                Error::TooLarge
+            } else {
+                match e.downcast::<hyper::Error>() {
+                    Ok(e) => hyper_error(*e),
+                    Err(_) => Error::Protocol,
+                }
+            }
+        })?;
+        match frame.into_data() {
+            Ok(data) => collected.extend_from_slice(&data),
+            Err(_) => return Err(Error::Protocol),
+        }
+    }
+    if length.is_some_and(|n| n != collected.len() as u64) {
+        return Err(Error::Protocol);
+    }
+    let mut out = http::Response::builder()
+        .status(parts.status)
+        .version(parts.version);
+    for (name, value) in headers {
+        out = out.header(name, value);
+    }
+    out.body(collected).map_err(|_| Error::Protocol)
+}
+
+pub(super) fn framed_length(
+    parts: &http::response::Parts,
+    max_body: usize,
+) -> Result<Option<u64>, Error> {
     let headers = &parts.headers;
     let count = |name| headers.get_all(name).iter().count();
     if count(header::CONTENT_TYPE) > 1
@@ -533,35 +593,9 @@ async fn read(
     if length.is_some_and(|n| n > max_body as u64) {
         return Err(Error::TooLarge);
     }
-    let mut collected = Vec::with_capacity(length.unwrap_or(0) as usize);
-    let mut body = Limited::new(body, max_body);
-    while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|e| {
-            if e.is::<http_body_util::LengthLimitError>() {
-                Error::TooLarge
-            } else {
-                match e.downcast::<hyper::Error>() {
-                    Ok(e) => hyper_error(*e),
-                    Err(_) => Error::Protocol,
-                }
-            }
-        })?;
-        match frame.into_data() {
-            Ok(data) => collected.extend_from_slice(&data),
-            Err(_) => return Err(Error::Protocol),
-        }
-    }
-    if length.is_some_and(|n| n != collected.len() as u64) {
-        return Err(Error::Protocol);
-    }
-    let mut out = http::Response::builder()
-        .status(parts.status)
-        .version(parts.version);
-    for (name, value) in headers {
-        out = out.header(name, value);
-    }
-    out.body(collected).map_err(|_| Error::Protocol)
+    Ok(length)
 }
 
 #[cfg(test)]
+#[path = "transport/tests.rs"]
 mod tests;
