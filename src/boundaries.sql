@@ -2,9 +2,9 @@
 -- any schema or history object, and again after migrations. It returns one row per violation.
 -- $1: the highest successfully applied migration version (0 before migration 1). Migration 1
 -- revokes the PUBLIC database/public-schema defaults, which are tolerated only before that.
--- Version 22 adds effect approval requests, decisions and worker session checks.
+-- Version 23 adds gateway reconciliation, request holds and one-call inference grants.
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
--- Principals are openmettle_api, openmettle_issuance, openmettle_worker, every role that is
+-- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
 -- They may hold only the privileges in `contract`, CONNECT on the database and USAGE on schema
 -- openmettle. openmettle_issuance (ADR 0030) is required from version 18; before that an
@@ -12,7 +12,7 @@
 WITH RECURSIVE
 privilege_roles AS (
     SELECT oid FROM pg_roles
-    WHERE rolname IN ('openmettle_api', 'openmettle_issuance', 'openmettle_worker')
+    WHERE rolname IN ('openmettle_api', 'openmettle_issuance', 'openmettle_worker', 'openmettle_gateway')
 ),
 owner_role AS (
     SELECT oid FROM pg_roles WHERE rolname = 'openmettle_owner'
@@ -41,6 +41,37 @@ effect_columns (relation, attribute, role, privilege) AS (
             'issued_client','issued_epoch','provider_generation','approval_generation','user_generation',
             'created_ms','expires_ms','revoked'])
     ) AS t(relation,role,privilege,columns), unnest(columns) attribute WHERE $1 >= 22
+),
+gateway_columns (relation,attribute,role,privilege) AS (
+    SELECT relation, attribute, role, privilege FROM (VALUES
+        ('account_admin_lock','openmettle_gateway','UPDATE',ARRAY['lock_guard']),
+        ('projects','openmettle_gateway','UPDATE',ARRAY['lock_guard']),
+        ('users','openmettle_gateway','UPDATE',ARRAY['lock_guard']),
+        ('login_providers','openmettle_gateway','UPDATE',ARRAY['lock_guard']),
+        ('local_identity_approvals','openmettle_gateway','UPDATE',ARRAY['lock_guard']),
+        ('gateway_nonces','openmettle_gateway','INSERT',ARRAY['key_fingerprint','nonce']),
+        ('gateway_bindings','openmettle_gateway','INSERT',ARRAY['installation','user_id','principal','budget']),
+        ('gateway_bindings','openmettle_gateway','UPDATE',ARRAY['desired_revision','observed_revision','state','active_generation']),
+        ('gateway_generations','openmettle_gateway','INSERT',ARRAY['binding_id','generation','remote_key','expires_at','key_id','key_fingerprint','nonce','ciphertext']),
+        ('gateway_generations','openmettle_gateway','UPDATE',ARRAY['expires_at','key_id','key_fingerprint','nonce','ciphertext']),
+        ('gateway_policy','openmettle_gateway','INSERT',ARRAY['binding_id','revision','scope_id','approval_id','model','report_source','provider_generation','approval_generation','user_generation','grant_cycle','capabilities']),
+        ('gateway_intents','openmettle_gateway','INSERT',ARRAY['binding_id','desired_revision','generation','action','expected_revision','parameters']),
+        ('gateway_intents','openmettle_gateway','UPDATE',ARRAY['claim','due_at','complete']),
+        ('gateway_audit','openmettle_gateway','INSERT',ARRAY['binding_id','desired_revision','operation_id','step','outcome','remote_handle','remote_revision']),
+        ('gateway_usage_reports','openmettle_gateway','INSERT',ARRAY['request_id','source','report_id','revision','final','prompt_tokens','completion_tokens','reasoning_tokens','reasoning_included','cost','unit']),
+        ('gateway_settlements','openmettle_gateway','INSERT',ARRAY['request_id','revision','final','measured','outstanding']),
+        ('gateway_settlements','openmettle_gateway','UPDATE',ARRAY['revision','final','measured','outstanding']),
+        ('gateway_reservations','openmettle_api','INSERT',ARRAY['id','scope_id','actor_user_id','approval_id','run_id','units']),
+        ('gateway_requests','openmettle_api','INSERT',ARRAY['id','reservation_id','scope_id','actor_user_id','approval_id','installation','model','units','dispatch_hash','session_id']),
+        ('gateway_requests','openmettle_worker','INSERT',ARRAY['id','reservation_id','scope_id','actor_user_id','approval_id','installation','model','units','dispatch_hash','run_id','round'])
+    ) AS t(relation,role,privilege,columns), unnest(columns) attribute WHERE $1 >= 23
+),
+gateway_functions (signature,definer,inference) AS (
+    SELECT * FROM (VALUES ('openmettle.gateway_allocate()',true,false), ('openmettle.gateway_run_hold()',true,false),
+        ('openmettle.gateway_advance_settlement()',false,false),
+        ('openmettle.gateway_mark_settled_final()',true,false),
+        ('openmettle.gateway_handoff(uuid,bytea,bytea,bytea,uuid)',true,true),
+        ('openmettle.gateway_release(uuid,bytea)',true,true)) AS f WHERE $1 >= 23
 ),
 contract (relation, role, privilege) AS (
     VALUES
@@ -139,6 +170,16 @@ contract (relation, role, privilege) AS (
     UNION ALL
     SELECT relation, role, 'SELECT' FROM (VALUES ('run_approvals'), ('run_approval_decisions')) AS g(relation),
         (VALUES ('openmettle_api'), ('openmettle_worker')) AS r(role) WHERE $1 >= 22
+
+    UNION ALL
+    SELECT unnest(ARRAY[
+        'gateway_bindings','gateway_generations','gateway_policy','gateway_intents',
+        'gateway_audit','gateway_reservations','gateway_requests','gateway_usage_reports',
+        'gateway_settlements','account_admin_lock','projects','users',
+        'user_identities','scopes','local_identity_approvals','login_providers',
+        'login_provider_revisions','grant_assignments','grant_changes','local_groups',
+        'local_group_memberships','membership_observations','grant_mapping_rules','grant_mapping_revisions',
+        'project_settings','platform_capability_denies','user_capability_denies','user_capability_grants']), 'openmettle_gateway', 'SELECT' WHERE $1 >= 23
 ),
 column_contract (relation, attribute, role, privilege) AS (
     VALUES ('users', 'disabled_at', 'openmettle_api', 'UPDATE')
@@ -199,6 +240,8 @@ column_contract (relation, attribute, role, privilege) AS (
         ('openmettle_worker', 'INSERT', ARRAY['scope_id','conversation_id','message_id','run_id',
             'reasoning_blocks','reasoning_bytes','input_count','output_count'])
     ) AS t(role,privilege,columns), unnest(columns) attribute WHERE $1 >= 21
+    UNION ALL
+    SELECT * FROM gateway_columns
     UNION ALL
     SELECT * FROM effect_columns
     UNION ALL
@@ -505,7 +548,7 @@ violations (violation) AS (
     UNION ALL
     SELECT format('role %s is missing', r)
     FROM unnest(ARRAY['openmettle_owner', 'openmettle_api', 'openmettle_worker',
-                      CASE WHEN $1 >= 18 THEN 'openmettle_issuance' END]) AS r
+                      CASE WHEN $1 >= 18 THEN 'openmettle_issuance' END, CASE WHEN $1 >= 23 THEN 'openmettle_gateway' END]) AS r
     WHERE r IS NOT NULL AND NOT EXISTS (SELECT FROM pg_roles WHERE rolname = r)
     UNION ALL
     -- Role attributes of the owner and every application principal.
@@ -530,8 +573,8 @@ violations (violation) AS (
       AND m.roleid NOT IN (SELECT oid FROM application)
     UNION ALL
     -- Disjoint login roles: each reaches at most one application role.
-    SELECT format('role %s reaches more than one of openmettle_api, openmettle_issuance and '
-                  'openmettle_worker', pg_get_userbyid(oid))
+    SELECT format('role %s reaches more than one of openmettle_api, openmettle_issuance, '
+                  'openmettle_worker and openmettle_gateway', pg_get_userbyid(oid))
     FROM application
     GROUP BY oid
     HAVING count(DISTINCT base) > 1
@@ -541,7 +584,9 @@ violations (violation) AS (
                   CASE g.grantee WHEN 0 THEN 'PUBLIC' ELSE pg_get_userbyid(g.grantee) END,
                   g.privilege, g.target)
     FROM grants AS g
-    WHERE g.grantee IN (SELECT oid FROM principals)
+    WHERE (g.grantee IN (SELECT oid FROM principals)
+           OR ($1 >= 23 AND g.schema_name='openmettle' AND g.kind IN ('relation','column')
+               AND g.object_name LIKE 'gateway\_%' AND g.grantee NOT IN (SELECT oid FROM owner_role)))
       AND NOT (g.kind = 'database' AND g.grantee <> 0 AND g.privilege = 'CONNECT')
       AND NOT (g.kind = 'database' AND g.grantee = 0 AND $1 < 1
                AND g.privilege IN ('CONNECT', 'TEMPORARY'))
@@ -564,21 +609,39 @@ violations (violation) AS (
                         = 'function openmettle.redeem_home_invitation(uuid,text,text,text,bigint)')
                     OR ($1 >= 13 AND g.target
                         = 'function openmettle.redeem_home_invitation(uuid,text,text,text,bigint,bytea)')))
+      AND NOT (g.kind='function' AND g.privilege='EXECUTE'
+               AND pg_get_userbyid(g.grantee) IN ('openmettle_api','openmettle_worker')
+               AND EXISTS (SELECT FROM gateway_functions f WHERE f.inference AND g.target='function ' || f.signature))
       AND NOT (g.kind = 'column' AND g.schema_name = 'openmettle'
                AND (g.object_name::text, g.column_name::text,
                     pg_get_userbyid(g.grantee)::text, g.privilege)
                    IN (SELECT relation, attribute, role, privilege FROM column_contract))
     UNION ALL
     SELECT format('%s lacks %s on openmettle.%s.%s', c.role, c.privilege, c.relation, c.attribute)
-    FROM effect_columns c WHERE NOT EXISTS (
+    FROM (SELECT * FROM effect_columns UNION ALL SELECT * FROM gateway_columns) c WHERE NOT EXISTS (
         SELECT FROM grants g WHERE g.kind='column' AND g.schema_name='openmettle'
           AND g.object_name=c.relation AND g.column_name=c.attribute
           AND pg_get_userbyid(g.grantee)=c.role AND g.privilege=c.privilege)
     UNION ALL
     SELECT format('%s lacks SELECT on openmettle.%s', c.role, c.relation) FROM contract c
-    WHERE c.relation IN ('run_approvals','run_approval_decisions') AND NOT EXISTS (
+    WHERE (c.role='openmettle_gateway' OR c.relation IN ('run_approvals','run_approval_decisions')) AND NOT EXISTS (
         SELECT FROM grants g WHERE g.kind='relation' AND g.schema_name='openmettle'
           AND g.object_name=c.relation AND pg_get_userbyid(g.grantee)=c.role AND g.privilege=c.privilege)
+    UNION ALL
+    SELECT format('unsafe or missing gateway function %s', f.signature)
+    FROM gateway_functions f LEFT JOIN pg_proc p ON p.oid=to_regprocedure(f.signature)
+    WHERE p.oid IS NULL OR p.prosecdef <> f.definer OR pg_get_userbyid(p.proowner)<>'openmettle_owner'
+       OR p.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog']
+       OR EXISTS (SELECT FROM aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a
+                  WHERE a.grantee<>p.proowner AND (NOT f.inference OR a.is_grantable OR
+                    a.grantee NOT IN (SELECT oid FROM pg_roles WHERE rolname IN ('openmettle_api','openmettle_worker'))))
+       OR (f.inference AND EXISTS (SELECT FROM pg_roles r WHERE r.rolname IN ('openmettle_api','openmettle_worker')
+            AND NOT has_function_privilege(r.oid,p.oid,'EXECUTE')))
+    UNION ALL
+    SELECT 'openmettle_gateway lacks CONNECT or schema USAGE'
+    FROM pg_roles r WHERE $1>=23 AND r.rolname='openmettle_gateway'
+      AND (NOT has_database_privilege(r.oid,current_database(),'CONNECT')
+           OR NOT has_schema_privilege(r.oid,'openmettle','USAGE'))
     UNION ALL
     -- Even permitted privileges must not be delegable to another application principal.
     SELECT format('%s has grant option for %s on %s',

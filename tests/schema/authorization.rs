@@ -294,7 +294,7 @@ async fn migration_15_grants_exactly_the_contract() {
     .unwrap()
     .into_iter()
     .collect();
-    let expected: BTreeSet<(String, String, String, String)> = API_COLUMNS
+    let mut expected: BTreeSet<(String, String, String, String)> = API_COLUMNS
         .iter()
         .flat_map(|(table, privilege, columns)| {
             columns.iter().map(move |column| {
@@ -307,6 +307,12 @@ async fn migration_15_grants_exactly_the_contract() {
             })
         })
         .collect();
+    expected.insert((
+        "account_admin_lock".into(),
+        "lock_guard".into(),
+        pg::GATEWAY.into(),
+        "UPDATE".into(),
+    ));
     assert_eq!(observed, expected);
     // Both roles may change only a run's lifecycle columns, never ownership or input.
     let run_columns = [
@@ -441,6 +447,11 @@ async fn migration_15_grants_exactly_the_contract() {
             "GRANT UPDATE (scope_id) ON openmettle.runs TO openmettle_worker",
             "REVOKE UPDATE (scope_id) ON openmettle.runs FROM openmettle_worker",
             "openmettle_worker has UPDATE on openmettle.runs.scope_id",
+        ),
+        (
+            "GRANT UPDATE (settled_final) ON openmettle.gateway_requests TO openmettle_gateway",
+            "REVOKE UPDATE (settled_final) ON openmettle.gateway_requests FROM openmettle_gateway",
+            "openmettle_gateway has UPDATE on openmettle.gateway_requests.settled_final",
         ),
     ] {
         owner.execute(grant).await.unwrap();

@@ -618,7 +618,7 @@ class Qualification:
 
     def prepare_sweeps(self):
         # Use the release schema and its worker grants inside this disposable database.
-        self.fixture_sql("CREATE ROLE openmettle_owner; CREATE ROLE openmettle_issuance;"
+        self.fixture_sql("CREATE ROLE openmettle_owner; CREATE ROLE openmettle_issuance; CREATE ROLE openmettle_gateway;"
                          "ALTER DATABASE fixture OWNER TO openmettle_owner;"
                          "SET ROLE openmettle_owner; CREATE SCHEMA openmettle;"
                          "SET search_path TO pg_catalog,pg_temp;\n" + "\n".join(

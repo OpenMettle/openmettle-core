@@ -24,6 +24,7 @@ use crate::{
     sessions,
 };
 use ring::hmac;
+use rustls::crypto::SharedSecret;
 use serde_json::{Map, Value, error::Category};
 use std::{
     collections::HashSet,
@@ -74,6 +75,7 @@ pub enum Error {
     CursorKeyFile,
     /// Invalid cursor key count, identifier or key separation.
     CursorKeyRing,
+    GatewayKeyRing,
     Catalog,
     AdmissionLimits,
     /// No provider, or more than the configured manager capacity.
@@ -118,6 +120,7 @@ impl fmt::Display for Error {
             Self::CursorKeyFile => {
                 "a cursor key is not a readable regular file of exactly 32 bytes"
             }
+            Self::GatewayKeyRing => "gateway key files, identifiers or key separation are invalid",
             Self::Catalog => "model catalog is unreadable or invalid",
             Self::AdmissionLimits => "run admission limits are invalid",
             Self::CursorKeyRing => "cursor key count, identifiers or key separation are invalid",
@@ -224,15 +227,25 @@ impl CursorKeys {
     }
 }
 
+fn shared_key_material(left: &[(String, SharedSecret)], right: &[(String, SharedSecret)]) -> bool {
+    let mut shared = subtle::Choice::from(0);
+    for (_, key) in left {
+        for (_, other) in right {
+            shared |= key.secret_bytes().ct_eq(other.secret_bytes());
+        }
+    }
+    bool::from(shared)
+}
+
 struct CursorFiles {
     active: KeyFile,
     verify_only: Vec<KeyFile>,
 }
 impl CursorFiles {
-    fn parse(mut keys: Object) -> Result<Self, Error> {
+    fn parse(mut keys: Object, previous: &str) -> Result<Self, Error> {
         let active = KeyFile::parse(keys.take("active")?)?;
         let verify_only = keys
-            .array("verify_only")?
+            .array(previous)?
             .into_iter()
             .map(KeyFile::parse)
             .collect::<Result<_, _>>()?;
@@ -243,26 +256,32 @@ impl CursorFiles {
         })
     }
 
-    fn load(&self, login: &[(String, [u8; KEY_BYTES])]) -> Result<CursorKeys, Error> {
+    fn load(
+        &self,
+        login: &[(String, SharedSecret)],
+        gateway: &[(String, SharedSecret)],
+    ) -> Result<CursorKeys, Error> {
         let keys = key_material(&self.active, &self.verify_only).map_err(|error| match error {
             Error::KeyRing => Error::CursorKeyRing,
             Error::KeyFile => Error::CursorKeyFile,
             other => other,
         })?;
+        if shared_key_material(&keys, gateway) {
+            return Err(Error::GatewayKeyRing);
+        }
         for (i, (id, material)) in keys.iter().enumerate() {
             if !CursorKeys::valid_id(id)
                 || keys[..i].iter().any(|(other, _)| other == id)
-                || login
-                    .iter()
-                    .chain(&keys[..i])
-                    .any(|(_, other)| bool::from(material.ct_eq(other)))
+                || login.iter().chain(&keys[..i]).any(|(_, other)| {
+                    bool::from(material.secret_bytes().ct_eq(other.secret_bytes()))
+                })
             {
                 return Err(Error::CursorKeyRing);
             }
         }
         let mut keys = keys
             .into_iter()
-            .map(|(id, bytes)| (id, hmac::Key::new(hmac::HMAC_SHA256, &bytes)));
+            .map(|(id, bytes)| (id, hmac::Key::new(hmac::HMAC_SHA256, bytes.secret_bytes())));
         Ok(CursorKeys {
             active: keys.next().ok_or(Error::CursorKeyRing)?,
             verify_only: keys.collect(),
@@ -495,6 +514,7 @@ struct Document {
     login_lifetime_seconds: u64,
     active_key: KeyFile,
     cursor_keys: Option<CursorFiles>,
+    gateway_keys: Option<CursorFiles>,
     catalog_file: Option<String>,
     admission_limits: Option<crate::authz::runs::AdmissionLimits>,
     decrypt_only_keys: Vec<KeyFile>,
@@ -601,7 +621,14 @@ impl Document {
             cursor_keys: match version {
                 VERSION_2 => root
                     .optional_object("cursor_keys")?
-                    .map(CursorFiles::parse)
+                    .map(|keys| CursorFiles::parse(keys, "verify_only"))
+                    .transpose()?,
+                _ => None,
+            },
+            gateway_keys: match version {
+                VERSION_2 => root
+                    .optional_object("gateway_keys")?
+                    .map(|keys| CursorFiles::parse(keys, "decrypt_only"))
                     .transpose()?,
                 _ => None,
             },
@@ -643,10 +670,14 @@ fn read(path: &Path, limit: usize, refusal: Error) -> Result<Vec<u8>, Error> {
     if !file.metadata().is_ok_and(bounded) {
         return Err(refusal);
     }
-    let mut bytes = Vec::new();
+    // A raw key and the oversize sentinel fit without reallocating secret bytes.
+    let mut bytes = Vec::with_capacity(limit.min(KEY_BYTES) + 1);
     match file.take(limit as u64 + 1).read_to_end(&mut bytes) {
         Ok(length) if length <= limit => Ok(bytes),
-        _ => Err(refusal),
+        _ => {
+            drop(SharedSecret::from(bytes));
+            Err(refusal)
+        }
     }
 }
 
@@ -655,16 +686,18 @@ fn read(path: &Path, limit: usize, refusal: Error) -> Result<Vec<u8>, Error> {
 fn key_material(
     active: &KeyFile,
     decrypt_only: &[KeyFile],
-) -> Result<Vec<(String, [u8; KEY_BYTES])>, Error> {
+) -> Result<Vec<(String, SharedSecret)>, Error> {
     if decrypt_only.len() >= login::MAX_KEYS {
         return Err(Error::KeyRing);
     }
     std::iter::once(active)
         .chain(decrypt_only)
         .map(|key| {
-            let bytes = read(Path::new(&key.path), KEY_BYTES, Error::KeyFile)?;
-            let material = bytes.try_into().map_err(|_| Error::KeyFile)?;
-            Ok((key.id.clone(), material))
+            let bytes = SharedSecret::from(read(Path::new(&key.path), KEY_BYTES, Error::KeyFile)?);
+            if bytes.secret_bytes().len() != KEY_BYTES {
+                return Err(Error::KeyFile);
+            }
+            Ok((key.id.clone(), bytes))
         })
         .collect()
 }
@@ -675,6 +708,7 @@ pub struct AuthConfig {
     pub(crate) catalog: Option<crate::model_config::Catalog>,
     pub(crate) admission_limits: Option<crate::authz::runs::AdmissionLimits>,
     pub(crate) cursor_keys: Option<CursorKeys>,
+    pub gateway_keys: Option<provider_keys::gateway::GatewayKeys>,
     keys: KeyRing,
     login_lifetime: Duration,
     token_policy: auth::Policy,
@@ -735,6 +769,7 @@ impl AuthConfig {
             manager,
             providers,
             cursor_keys: None,
+            gateway_keys: None,
             catalog: None,
             admission_limits: None,
             browser: None,
@@ -786,12 +821,43 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
     }
 
     let material = key_material(&document.active_key, &document.decrypt_only_keys)?;
+    // The login ring protects session handoff and cookie material in this config version.
+    // Compare raw material before it is consumed by the AEAD and cursor HMAC constructors.
+    let gateway_material = document
+        .gateway_keys
+        .as_ref()
+        .map(|files| {
+            key_material(&files.active, &files.verify_only).map_err(|_| Error::GatewayKeyRing)
+        })
+        .transpose()?;
+    let gateway_keys = gateway_material
+        .as_deref()
+        .map(|gateway| {
+            if shared_key_material(gateway, &material) {
+                return Err(Error::GatewayKeyRing);
+            }
+            provider_keys::gateway::GatewayKeys::from_bytes(
+                gateway.iter().map(|(id, key)| (id, key.secret_bytes())),
+            )
+            .map_err(|_| Error::GatewayKeyRing)
+        })
+        .transpose()?;
     let cursor_keys = document
         .cursor_keys
         .as_ref()
-        .map(|files| files.load(&material))
+        .map(|files| files.load(&material, gateway_material.as_deref().unwrap_or_default()))
         .transpose()?;
-    let keys = KeyRing::new(material).map_err(|_| Error::KeyRing)?;
+    drop(gateway_material);
+    let login_keys = material
+        .into_iter()
+        .map(|(id, key)| {
+            (
+                id,
+                key.secret_bytes().try_into().expect("validated key length"),
+            )
+        })
+        .collect();
+    let keys = KeyRing::new(login_keys).map_err(|_| Error::KeyRing)?;
 
     let manager = ProviderManager::new(refresh_policy);
     let mut seen = HashSet::new();
@@ -860,6 +926,7 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
         catalog,
         admission_limits: document.admission_limits,
         cursor_keys,
+        gateway_keys,
         keys,
         login_lifetime,
         token_policy,

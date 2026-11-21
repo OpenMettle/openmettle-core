@@ -136,6 +136,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "approvals and effect ledger",
         sql: include_str!("../migrations/0022_approvals_and_effect_ledger.sql"),
     },
+    Source {
+        version: 23,
+        description: "gateway provisioning and reservations",
+        sql: include_str!("../migrations/0023_gateway_provisioning_and_reservations.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

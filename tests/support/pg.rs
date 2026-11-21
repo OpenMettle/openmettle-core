@@ -13,6 +13,7 @@ pub(crate) const OWNER: &str = "openmettle_owner";
 pub(crate) const API: &str = "openmettle_api";
 /// Session issuance (ADR 0030); required from migration 18.
 pub(crate) const ISSUANCE: &str = "openmettle_issuance";
+pub(crate) const GATEWAY: &str = "openmettle_gateway";
 pub(crate) const WORKER: &str = "openmettle_worker";
 /// Synthetic test-only role with a low connection limit, member of `openmettle_api`.
 pub(crate) const CAPPED: &str = "openmettle_fixture_capped";
@@ -91,7 +92,7 @@ pub(crate) async fn ensure_roles(admin: &mut PgConnection, with_capped: bool) {
         .execute(&mut *admin)
         .await
         .unwrap();
-    for role in [OWNER, API, ISSUANCE, WORKER] {
+    for role in [OWNER, API, ISSUANCE, WORKER, GATEWAY] {
         ensure_role(admin, role, -1).await;
     }
     if with_capped {
@@ -145,7 +146,6 @@ impl DisposableDb {
         options: &str,
     ) -> Self {
         let mut admin = admin(None).await;
-        ensure_roles(&mut admin, with_capped).await;
         let lock = if exclusive_roles {
             "SELECT pg_advisory_lock($1)"
         } else {
@@ -156,6 +156,7 @@ impl DisposableDb {
             .execute(&mut admin)
             .await
             .unwrap();
+        ensure_roles(&mut admin, with_capped).await;
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()

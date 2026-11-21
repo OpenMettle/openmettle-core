@@ -587,28 +587,23 @@ fn login_keys_are_ordered_bounded_and_distinct() {
         path: fixture.dir.path(name),
     };
     // Active first, then decrypt-only keys in document order, regardless of name order.
-    assert_eq!(
-        key_material(
-            &key("login-b", "login-key-b"),
-            &[key("login-a", "login-key-a")]
-        )
-        .unwrap(),
-        [
-            ("login-b".to_owned(), [0xb1; 32]),
-            ("login-a".to_owned(), [0xa0; 32])
-        ]
-    );
-    assert_eq!(
-        key_material(
-            &key("login-a", "login-key-a"),
-            &[key("login-b", "login-key-b")]
-        )
-        .unwrap(),
-        [
-            ("login-a".to_owned(), [0xa0; 32]),
-            ("login-b".to_owned(), [0xb1; 32])
-        ]
-    );
+    for (active, previous) in [
+        (
+            ("login-b", "login-key-b", 0xb1),
+            ("login-a", "login-key-a", 0xa0),
+        ),
+        (
+            ("login-a", "login-key-a", 0xa0),
+            ("login-b", "login-key-b", 0xb1),
+        ),
+    ] {
+        let keys = key_material(&key(active.0, active.1), &[key(previous.0, previous.1)]).unwrap();
+        assert_eq!(keys.len(), 2);
+        for ((id, bytes), expected) in keys.iter().zip([active, previous]) {
+            assert_eq!(id, expected.0);
+            assert!(bytes.secret_bytes() == [expected.2; KEY_BYTES]);
+        }
+    }
 
     let entry = |id: &str, path: &str| json!({"id": id, "path": path});
     let (active, old) = (
@@ -1952,4 +1947,40 @@ fn cursor_ring_requires_distinct_file_backed_keys_in_v2() {
     let mut old = Fixture::new();
     old.document["cursor_keys"] = support::cursor_keys(&old.dir);
     assert_eq!(refusal(old.load()), Error::UnknownField);
+}
+
+#[test]
+fn gateway_ring_checks_all_mounted_generations_offline() {
+    let mut f = Fixture::v2();
+    f.document["cursor_keys"] = support::cursor_keys(&f.dir);
+    let active = json!({"id":"g2","path":f.dir.write("g2",&[17;32])});
+    let old = json!({"id":"g1","path":f.dir.write("g1",&[16;32])});
+    f.document["gateway_keys"] = json!({"active":active,"decrypt_only":[old]});
+    assert!(f.load().unwrap().gateway_keys.is_some());
+    for path in [
+        "/login/keys/active/path",
+        "/login/keys/decrypt_only/0/path",
+        "/cursor_keys/active/path",
+        "/cursor_keys/verify_only/0/path",
+        "/gateway_keys/active/path",
+    ] {
+        assert_eq!(
+            f.with(
+                "/gateway_keys/decrypt_only/0/path",
+                f.document.pointer(path).unwrap().clone()
+            ),
+            Error::GatewayKeyRing
+        );
+    }
+    for (path, value) in [
+        ("/gateway_keys/decrypt_only/0/id", json!("g2")),
+        ("/gateway_keys/active/id", json!("bad id")),
+        (
+            "/gateway_keys/active/path",
+            json!(f.dir.write("short", &[0; 31])),
+        ),
+        ("/gateway_keys/decrypt_only", json!(vec![old; 4])),
+    ] {
+        assert_eq!(f.with(path, value), Error::GatewayKeyRing);
+    }
 }
