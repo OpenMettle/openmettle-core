@@ -1,14 +1,18 @@
 # OpenMettle core
 
-Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker runs scheduled maintenance. Model and tool execution belongs to V1-07. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, immutable message turns, branch heads, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures. Internal managed login, an owner-configured outstanding-login cap, local identity approval and opaque-session primitives are implemented, with an offline check for mounted browser-auth settings, an internal pooled browser-auth service, and an Axum router for the same-origin browser login handoff, session check and local logout. The API loads those settings and mounts that router only when `OPENMETTLE_API_AUTH_CONFIG` is set; by default it does neither. With that setting it also mounts the authenticated `/v1` capability, project, conversation and artifact routes, which enforce per-user authorization on every request (ADR 0027), including streaming artifact uploads and byte-range downloads when `OPENMETTLE_API_ARTIFACTS_DIR` is also set (ADR 0031). With cursor keys configured, clients can also read run snapshots and replay durable run events (ADR 0034). Runtime qualification and deployment acceptance remain separate gates.
+Rust API, worker and migration processes for OpenMettle. By default, `openmettle-api` and `openmettle-worker` serve CPU-only `/healthz` and PostgreSQL `/readyz` probes and answer `404` on sign-in and `/v1/*` paths.
+
+- **`openmettle-api`**: When `OPENMETTLE_API_AUTH_CONFIG` (a version-2 settings document) and `OPENMETTLE_API_ISSUANCE_DATABASE_URL` are set, mounts same-origin browser sign-in/session/logout routes ([ADR 0025](docs/adr/0025-browser-auth-runtime-mounting.md), [ADR 0030](docs/adr/0030-session-issuance-database-boundary.md)), optional native sign-in routes (`native` profile, [ADR 0029](docs/adr/0029-native-sign-in-mounting-and-session-context.md)), and the authenticated `/v1/*` routes marked `"x-openmettle-implementation": "implemented"` in [`contracts/openapi/openmettle-v1.json`](contracts/openapi/openmettle-v1.json) (enforcing per-request authorization under [ADR 0027](docs/adr/0027-authorization-and-private-projects.md)). Optional version-2 settings enable catalog/branch/run-admission routes (`catalog_file`, `admission_limits`, [ADR 0032](docs/adr/0032-durable-run-admission-and-fair-work-queue.md), [ADR 0036](docs/adr/0036-conversation-branches-presets-and-effective-model-config.md)) and run snapshots/SSE replay (`cursor_keys`, [ADR 0034](docs/adr/0034-ordered-events-and-replayable-sse.md)); `OPENMETTLE_API_ARTIFACTS_DIR` enables streaming artifact uploads and byte-range downloads ([ADR 0031](docs/adr/0031-filesystem-artifact-storage-and-streaming-multipart.md)).
+- **`openmettle-worker`**: Runs scheduled maintenance sweeps for expired queued runs, expired approval waits (`authz::approvals::expire_waits`, [ADR 0035](docs/adr/0035-approvals-permitted-yolo-and-effect-ledger.md)), and expired executing runs ([ADR 0033](docs/adr/0033-worker-leases-deadlines-and-restart-recovery.md)), plus abandoned-upload reconciliation and retained-revision purges when `OPENMETTLE_WORKER_ARTIFACTS_DIR` is set. Live model and tool turn execution belongs to V1-07 (`provider_http::inference` provides the bounded gateway conformance adapter under [ADR 0038](docs/adr/0038-sglang-and-external-provider-conformance-adapter.md)).
+- **`openmettle-migrate`**: One-shot PostgreSQL 18 schema migrator owning identities, scopes, projects, conversations, managed branches, immutable message turns, runs/events/operations, scoped approvals and receipts (Migration 22, [ADR 0035](docs/adr/0035-approvals-permitted-yolo-and-effect-ledger.md)), artifact revisions and storage accounting, and typed grants ([ADR 0003](docs/adr/0003-schema-migrations.md)–[ADR 0006](docs/adr/0006-grant-persistence.md)).
+
+Runtime qualification and deployment acceptance remain separate gates.
 
 ## Start here
 
 - [Accepted architecture v1](ARCHITECTURE-v1.md), including service diagrams and all 43 delivery tickets.
-- [Repository boundaries](REPOSITORIES.md), [decisions](DECISIONS.md) and [provenance](UPSTREAM.md).
+- [Repository boundaries](REPOSITORIES.md), [decisions index (ADRs 0001–0038)](DECISIONS.md) and [provenance](UPSTREAM.md).
 - [Live delivery tracker](https://github.com/orgs/OpenMettle/projects/1/views/1?filterQuery=%5BV1-00%5D&pane=issue&itemId=307308630).
-
-Migration 21 adds managed conversation branches. Existing branch IDs and run inputs remain valid. History stays unavailable for legacy branch IDs. An authorized writer can create a separate empty managed root in the same conversation. The Rust library resolves model, preset, project and request settings and budgets the selected branch using a versioned catalog. PR2 verification uses synthetic profiles. HTTP submission and live provider qualification have separate delivery gates. [ADR 0036](docs/adr/0036-conversation-branches-presets-and-effective-model-config.md)
 
 ## Development
 
@@ -62,7 +66,7 @@ In another terminal, `curl --fail http://127.0.0.1:8080/healthz` returns `ok`. `
 
 The worker uses `OPENMETTLE_WORKER_DATABASE_URL` and port 8081. Every setting is independent: `BIND`, `DATABASE_URL`, `DB_MAX_CONNECTIONS`, `DB_TIMEOUT_MS` and `SHUTDOWN_TIMEOUT_MS` use the corresponding `OPENMETTLE_API_` or `OPENMETTLE_WORKER_` prefix. Defaults bind loopback; containers bind all interfaces unless overridden. Send SIGTERM or SIGINT to drain and stop. Invalid configuration exits 78; runtime failures or shutdown deadline expiry exit 1. Correct configuration and restart after these errors. Database failures affect readiness, not liveness.
 
-The worker sweeps expired queued and executing runs in batches of 100. With `OPENMETTLE_WORKER_ARTIFACTS_DIR` set to the same payload directory used by the API, it also releases abandoned uploads older than 900 seconds and purges due retained revisions. Artifact sweeps skip locked reservations and continue through the batch after an item fails. Each scheduled sweep has a 15-second budget. A failure or timeout emits `worker.sweep.failed` with the sweep category, and the worker moves on to the next sweep. On shutdown, the worker reserves half the process drain budget for run handover and the rest for HTTP and database shutdown.
+The worker sweeps expired queued runs, expired approval waits (`authz::approvals::expire_waits`, [ADR 0035](docs/adr/0035-approvals-permitted-yolo-and-effect-ledger.md)), and expired executing runs in batches of 100. With `OPENMETTLE_WORKER_ARTIFACTS_DIR` set to the same payload directory used by the API, it also schedules `artifact_fs::reconcile_expired` (releasing abandoned uploads older than 900 seconds) and `artifact_fs::purge_due` (purging due retained revisions). Artifact sweeps skip locked reservations and continue through the batch after an item fails. Each scheduled sweep has a 15-second budget. A failure or timeout emits `worker.sweep.failed` with the sweep category (both queue and approval-wait expiry report under `expire_queued`), and the worker moves on to the next sweep. On shutdown, the worker reserves half the process drain budget for run handover and the rest for HTTP and database shutdown.
 
 | Worker setting (`OPENMETTLE_WORKER_` prefix) | Range | Default |
 | --- | --- | --- |
@@ -113,7 +117,7 @@ Unset, no exporter, task, DNS slot or socket exists and the process behaves exac
 
 ### Artifact storage directory (off by default)
 
-[ADR 0031](docs/adr/0031-filesystem-artifact-storage-and-streaming-multipart.md) adds one setting for the API and the worker, under their own prefix. The migrator never reads it. The API's [artifact upload and download routes](#authenticated-application-routes) use it; unset, they answer `503 provisioning` and the other routes are unaffected. The worker validates its own value but has no artifact work yet.
+[ADR 0031](docs/adr/0031-filesystem-artifact-storage-and-streaming-multipart.md) adds one setting for the API and the worker, under their own prefix. The migrator never reads it. The API's [artifact upload and download routes](#authenticated-application-routes) use it; unset, they answer `503 provisioning` and the other routes are unaffected. When `OPENMETTLE_WORKER_ARTIFACTS_DIR` is set, `openmettle-worker` schedules `artifact_fs::reconcile_expired` and `artifact_fs::purge_due` on its maintenance loop.
 
 | Setting | Default | Values |
 | --- | --- | --- |
@@ -122,7 +126,7 @@ Unset, no exporter, task, DNS slot or socket exists and the process behaves exac
 Unset, the process opens no directory and starts exactly as before. Set, it creates `staging/` and `revisions/` (mode 0700) inside the directory if they are absent, before telemetry or the listener starts. Any refusal (empty, relative, missing, a file, a symbolic-link leaf, or a subdirectory that cannot be created or is not a real directory) exits 78 with exactly `configuration error: invalid ARTIFACTS_DIR`, never the path.
 
 - **Layout.** `staging/<reservation_id>` holds an upload in progress (mode 0600, created exclusively); `revisions/<reservation_id>` holds a published payload. The name is always the server-generated reservation UUID, never a client file name, which is kept only as the revision's display name.
-- **Durability.** A payload is `fsync`ed, renamed into `revisions/` and the directory `fsync`ed before the database records the revision. Refused, truncated or cancelled uploads leave no staging file, and their reservation is released, or released later by `artifact_fs::reconcile_expired`. A crashed process leaves its staging file and reservation until that reconciler runs; until then a retry with the same key is `409 conflict`. `artifact_fs::purge_due` deletes expired retained payloads before confirming the purge. Nothing schedules either helper yet: an operator or a later worker increment must call them, `reconcile_expired` with an age longer than the 600 s upload limit.
+- **Durability.** A payload is `fsync`ed, renamed into `revisions/` and the directory `fsync`ed before the database records the revision. Refused, truncated or cancelled uploads leave no staging file, and their reservation is released, or released later by `artifact_fs::reconcile_expired`. A crashed process leaves its staging file and reservation until that reconciler runs; until then a retry with the same key is `409 conflict`. `artifact_fs::purge_due` deletes expired retained payloads before confirming the purge. When `OPENMETTLE_WORKER_ARTIFACTS_DIR` is set, `openmettle-worker` schedules both helpers in batches of 100 with a 15-second budget: `artifact_fs::reconcile_expired` releases uploads older than 900 seconds (300 s beyond the 600 s upload limit), and `artifact_fs::purge_due` removes due retained revisions.
 - **Topology.** Every API and worker replica that writes or purges payloads must see the same directory. Use a `ReadWriteOnce` volume with all those pods on one node, or a `ReadWriteMany` storage class qualified for POSIX `rename`, exclusive creation and `fsync`. Back up PostgreSQL and the volume together.
 
 ### Browser sign-in routes (off by default)
@@ -157,13 +161,14 @@ No line carries a path, value, URL, identifier or parser message. Run `--check-a
 
 ### Authenticated application routes
 
-With `OPENMETTLE_API_AUTH_CONFIG` set, the API also serves the 21 operations of the [application API contract](#application-api-contract) marked `implemented`: `GET /v1/capabilities` (an empty, core-only list), project, membership, conversation and artifact access and sharing ([ADR 0027](docs/adr/0027-authorization-and-private-projects.md) PR4b), and artifact uploads, revision metadata and downloads ([ADR 0031](docs/adr/0031-filesystem-artifact-storage-and-streaming-multipart.md)). The two run reads follow [ADR 0034](docs/adr/0034-ordered-events-and-replayable-sse.md).
+With `OPENMETTLE_API_AUTH_CONFIG` set, the API serves the operations of the [application API contract](#application-api-contract) marked `"x-openmettle-implementation": "implemented"` in `contracts/openapi/openmettle-v1.json`: `GET /v1/capabilities` (an empty, core-only list), projects, membership, conversation and artifact access and sharing ([ADR 0027](docs/adr/0027-authorization-and-private-projects.md)), managed conversations, branches, models, presets, effective-configuration previews and run admission/cancellation ([ADR 0032](docs/adr/0032-durable-run-admission-and-fair-work-queue.md), [ADR 0036](docs/adr/0036-conversation-branches-presets-and-effective-model-config.md)), run snapshots and replayable SSE event streams when `cursor_keys` are configured ([ADR 0034](docs/adr/0034-ordered-events-and-replayable-sse.md)), and artifact uploads, revision metadata and downloads when `OPENMETTLE_API_ARTIFACTS_DIR` is set ([ADR 0031](docs/adr/0031-filesystem-artifact-storage-and-streaming-multipart.md)).
 
 - **Sessions.** Each request presents exactly one OpenMettle session: the browser cookie `__Host-openmettle-session`, or `Authorization: Bearer` with a native credential when the document has a native profile. A browser write needs exactly one `Origin` equal to the configured `browser.origin`; a browser read may omit `Origin`. Both channels at once, a repeated field or a refused `Origin` is `401`, decided before any database work.
 - **Authorization.** The session, the caller's principal and every project, conversation and artifact are read from the primary for each request, so disablement, logout, group, membership and share changes apply on the next request. Items are private to their creator until shared. A target the caller may not know about is `404`; an account administrator gains no access.
 - **Writes** need an `Idempotency-Key` (1–128 visible ASCII characters). Repeating it with the same request on the same operation and target replays the result; another request with it is `409 idempotency_conflict`. Every write is recorded in the append-only authorization audit.
 - **Lifecycle.** An archived project stays readable, and member and share revocations, restore and delete remain available; settings, new roles and new shares are `409`. A deleted project is `404`, except that repeating the delete with its key returns `204` again.
 - **Bounds.** At most 256 unary or artifact requests and 128 event streams in flight per process (`503` beyond), the sign-in routes' header ceilings, JSON bodies of at most 64 KiB read within 2 s, and a 10 s database phase (`504`). Every response carries `OpenMettle-API-Version: 1.0` and `Cache-Control: no-store`; every error is an `application/problem+json` problem with a fixed message and the logged request ID.
+- **Conversations, branches, catalog and run admission.** `/v1/conversations`, `/v1/conversations/{conversation_id}/branches` (plus `messages` and `effective-configuration`), `/v1/models`, `/v1/presets`, `POST /v1/runs` and `POST /v1/runs/{run_id}/cancel` enforce per-user authorization on every request. Migration 21 adds managed conversation branches while keeping legacy branch IDs and run inputs valid (history stays unavailable for legacy branch IDs; an authorized writer can create an empty managed root). Catalog, preview and admission endpoints require optional `catalog_file` and `admission_limits` in the version-2 auth settings (`503 provisioning` when omitted).
 - **Run replay.** Read `GET /v1/runs/{run_id}` for the state, last sequence, resume cursor and terminal event. Connect to `GET /v1/runs/{run_id}/events?after=<resume_cursor>` for later events, or omit the cursor to replay from creation. On reconnect, `Last-Event-ID` takes precedence. Apply each sequence once. Events remain available for the life of the run. After `400 invalid_cursor`, discard local run state and fetch a fresh snapshot. A terminal snapshot needs no stream. A reconnect at the final sequence returns `204`. The stream checks conversation access before each delivery and periodically while idle.
 - **Artifact uploads.** `POST /v1/artifacts` (into the caller's personal scope, or `?scope_id=` a project where the caller is an editor) and `POST /v1/artifacts/{artifact_id}/revisions` (needs write access) take `multipart/form-data` with one `file` part, whose `Content-Type` becomes the revision's media type and whose optional file name becomes its display name, and one `metadata` part holding `{}`, in either order. The target is authorized before anything is reserved or written. The file is streamed to the artifacts directory with bounded memory and must not exceed `?max_bytes=` (default and maximum 64 MiB), which is charged against storage quotas until the upload settles. An upload must finish within 600 s and holds one in-flight slot meanwhile. Retrying with the same key and file, even with another boundary or part order, returns the same revision and charges once. Quota exhaustion is `429 quota`; unconfigured storage limits, or no `ARTIFACTS_DIR`, is `503 provisioning`.
 - **Artifact downloads.** `GET /v1/artifacts/{artifact_id}/revisions/{revision_id}` returns a revision's metadata; `GET …/content` streams an active revision's bytes in 64 KiB reads, with its media type, `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff` and `Accept-Ranges: bytes`. One `Range` is served as `206`; a range outside the content is `416` with `Content-Range: bytes */<size>`; a list of ranges is `400`. `HEAD` returns the same headers without a body. Access is checked on the primary for every request, so a revoked share or membership stops the next download.
@@ -183,7 +188,7 @@ Build separate images with `docker build --target api -t openmettle-api:test .` 
 
 ## Application API contract
 
-[ADR 0007](docs/adr/0007-application-api-contract.md) defines the v1 HTTP/JSON contract in [contracts/](contracts/README.md): one canonical OpenAPI 3.2.1 document, fixtures generated from its examples and offline compatibility checks that need no Flutter client. It specifies errors, pagination, idempotency, run-event SSE items and capabilities with independent installed, authorization and readiness dimensions. Every operation is marked `x-openmettle-implementation: implemented`; an API started without `OPENMETTLE_API_AUTH_CONFIG` still returns 404 for each. The `browserSession` and `nativeSession` schemes describe the settled V1-04 transports. After editing the document, run `python3 scripts/contract_fixtures.py` and commit the regenerated fixtures. `cargo test --test contract` validates the document against the vendored official OpenAPI 3.2 schema, checks every fixture with a JSON Schema 2020-12 validator (a development-only dependency), decodes fixtures with an independent typed consumer and validates the problems a mounted API returns without a database.
+[ADR 0007](docs/adr/0007-application-api-contract.md) defines the v1 HTTP/JSON contract in [contracts/](contracts/README.md): one canonical OpenAPI 3.2.1 document, fixtures generated from its examples and offline compatibility checks that need no Flutter client. It specifies errors, pagination, idempotency, run-event SSE items and capabilities with independent installed, authorization and readiness dimensions. Operations marked `x-openmettle-implementation: implemented` are served when `OPENMETTLE_API_AUTH_CONFIG` is configured; an API started without `OPENMETTLE_API_AUTH_CONFIG` returns 404 for every `/v1/*` path. The `browserSession` and `nativeSession` schemes describe the settled V1-04 transports. After editing the document, run `python3 scripts/contract_fixtures.py` and commit the regenerated fixtures. `cargo test --test contract` validates the document against the vendored official OpenAPI 3.2 schema, checks every fixture with a JSON Schema 2020-12 validator (a development-only dependency), decodes fixtures with an independent typed consumer and validates the problems a mounted API returns without a database.
 
 The internal evaluator in `src/capabilities.rs` keeps installation, supplied caller decisions and observed readiness separate. Hidden entries are omitted; absent, disabled and non-authorized entries never call the observer. Failures map to a bounded unavailable reason; timeouts remain unknown. No authorization policy or HTTP serialization is implemented. Isolation currently holds because no runtime path calls the evaluator. The ignored runtime suite guards the real PostgreSQL `/readyz` against regression while optional evaluation runs separately in the test harness. CI uses isolated PostgreSQL; the test does not inject providers into the API. The first V1-04/05 handler that hosts an observer must qualify isolation within that process. See ADR 0007 for the acceptance evidence and limits.
 
@@ -197,8 +202,8 @@ The internal evaluator in `src/capabilities.rs` keeps installation, supplied cal
 separately committed AEAD nonce reservations and single-use callback consumption.
 An exchange permit owns the callback code and trusted configuration and reaches the
 library exchange only after commit acknowledgement. An injected fake transport exercises
-code/challenge/client/callback binding. The production transport is described below; there
-is no login route.
+code/challenge/client/callback binding. The production transport is described below; the
+browser and native login routes are off by default until `OPENMETTLE_API_AUTH_CONFIG` is set.
 The nonce verifier accepts stored digests without weakening the existing token checks.
 From migration 13 the sealed value also carries an optional home invitation code, at one
 fixed length (ADR 0022). Logins sealed before that migration still complete.
@@ -208,8 +213,10 @@ The browser cookie handoff below is mounted only when `OPENMETTLE_API_AUTH_CONFI
 (ADR 0029). Key files are read only by the offline check below and by `openmettle-api` at startup when `OPENMETTLE_API_AUTH_CONFIG` is set. Internal local approval and sessions are described below. The outstanding-login
 cap below is not a rate limit. The login router below adds per-process request,
 rate and concurrency bounds; public exposure remains blocked on ingress
-transport limits, operated cleanup and retired-key reservation reclamation. After database restore, invalidate pending login transactions and
-rotate the active login encryption key before any encryption; never resume restored logins.
+transport limits, operated cleanup and retired-key reservation reclamation. After database restore,
+follow the [Database backup restore](#database-backup-restore-pre-worker-checklist) checklist:
+invalidate pending login transactions and rotate the active login encryption key before any
+encryption, and never resume restored logins.
 These are deployment requirements, not provided recovery commands. Lost/ambiguous logins
 restart rather than retrying single-use authorization codes.
 
@@ -229,8 +236,20 @@ retries, pools connections or reads proxy environment variables. Abandoned OS DN
 the only work that can outlive a dropped request, limited to 8 process-wide slots.
 
 Deployments behind an egress proxy are unsupported. Network policy remains a deployment
-control. Managed discovery/JWKS support is described below. Runtime configuration loading and routes
-remain unimplemented, and no real provider has been qualified.
+control. Managed discovery/JWKS support is described below; runtime configuration loading
+and sign-in routes are enabled via `OPENMETTLE_API_AUTH_CONFIG` ([ADR 0025](docs/adr/0025-browser-auth-runtime-mounting.md)).
+Stock Keycloak 26.8.2 is qualified in CI ([Hosted Keycloak 26.8.2 CI qualification](#hosted-keycloak-2682-ci-qualification));
+owner provider registrations and other OIDC providers remain unqualified.
+
+### Gateway inference conformance adapter
+
+[ADR 0038](docs/adr/0038-sglang-and-external-provider-conformance-adapter.md) adds
+`src/provider_http/inference/` (`provider_http::inference`, V1-08 PR2), a bounded gateway
+inference conformance adapter built over the same HTTP/1.1 TLS transport core
+(`src/provider_http/transport.rs`). It validates explicit requests against pinned model
+capability profiles, streams visible text deltas while buffering and validating complete
+tool calls, and includes wire conformance fixtures. Live deployed profile qualification
+belongs to V1-08 PR3.
 
 ## Managed discovery and signing keys
 
@@ -261,8 +280,9 @@ that refuses caching, set `provider_refresh.uncacheable_reuse_seconds` explicitl
 offline check then requires it to be at least the cooldown, so the documents do not expire
 while a refresh is still blocked unless the response carries `Age`. Provider Age,
 short cache lifetimes and clock skew can reduce availability; qualify policy values against
-actual provider behavior. The offline check below validates configuration files; the running API
-does not load them.
+actual provider behavior. The offline check below validates configuration files;
+`openmettle-api` loads a version-2 document at startup only when `OPENMETTLE_API_AUTH_CONFIG`
+is set.
 The managed provider returns a sealed proof to the internal session consumer described below. `cargo test --lib provider_keys --locked --offline` exercises isolated TLS,
 rotation, cancellation, capacity and freshness behavior without PostgreSQL.
 
@@ -283,8 +303,9 @@ in-flight exchanges on every replica at their next authority read. Release linea
 read snapshot; a change committed after that snapshot is ordered after the release. After an
 upgrade the tables are empty and managed login fails closed until providers are recorded.
 
-After restoring the database, append the current revision for every provider and rotate the
-ADR 0009 login key before reopening. Authority reads must use the primary, and acknowledged
+After restoring the database, follow the [Database backup restore](#database-backup-restore-pre-worker-checklist)
+checklist (including appending the current revision for every provider and rotating the
+ADR 0009 login key) before reopening. Authority reads must use the primary, and acknowledged
 commits must survive failover; lagging standbys and asynchronous failover are unsupported.
 The database stores revisions, not full configuration: keep configuration identical across
 replicas for the same revision. `cargo test --locked --offline --lib provider_keys::tests::postgres -- --ignored --skip provider_keys::tests::postgres::browser::`
@@ -315,11 +336,12 @@ old sessions. Follow ADR 0013's updated owner write protocol, including the prov
 epoch allocation. Owners create an approval with the
 [first local identity approval procedure](docs/operator/first-identity-approval.md) and change
 it with the [approval change procedure](docs/operator/identity-approval-change.md).
-On schema 10 or later, owners can perform an [audited restoration of a retired provider](docs/operator/restore-login-provider.md) during an OIDC outage. Fresh login still requires a successful provider exchange and current local approval.
+On schema version 10 or later, owners can perform an [audited restoration of a retired provider](docs/operator/restore-login-provider.md) during an OIDC outage. Fresh login still requires a successful provider exchange and current local approval.
 Validation and logout use the primary database without provider network access.
-Session context does not grant resource access; V1-05 checks remain required before exposure.
-Schema 15 stores V1-05 authorization state (project settings, local groups, account
-administrators, capability denies and an append-only audit) without any route using it yet.
+Session context alone grants no resource access: schema 15 stores V1-05 authorization state
+(project settings, local groups, account administrators, capability denies and an append-only
+audit), enforced per request on every authenticated `/v1` route when `OPENMETTLE_API_AUTH_CONFIG`
+is configured ([ADR 0027](docs/adr/0027-authorization-and-private-projects.md)).
 Owners designate the first or a break-glass `account_admin` with the
 [account administrator procedure](docs/operator/account-admin-recovery.md).
 
@@ -440,7 +462,26 @@ material for every cursor and login key. For rotation, first distribute the new 
 (up to three keys). Remove the old key when clients may resynchronize from a snapshot.
 At each step, run `openmettle-api --check-auth-config /etc/openmettle/auth/auth.json`
 against the mounted files before restarting the replicas. After a database restore, replace
-all pre-restore cursor keys before reopening the API.
+all pre-restore cursor keys before reopening the API (see [Database backup restore](#database-backup-restore-pre-worker-checklist)).
+
+### Model catalog and run admission limits (version 2)
+
+Version 2 adds two optional top-level fields used by the catalog, branch preview and run
+admission routes ([ADR 0032](docs/adr/0032-durable-run-admission-and-fair-work-queue.md),
+[ADR 0036](docs/adr/0036-conversation-branches-presets-and-effective-model-config.md)).
+Version 1 must not contain either field.
+
+- `catalog_file`: optional absolute path to a regular JSON catalog file validated by
+  `--check-auth-config` and loaded once at startup. If invalid or unreadable, startup and
+  `--check-auth-config` exit 78 with `auth configuration error: model catalog is unreadable or invalid`.
+  When omitted, `/v1/models`, `/v1/presets`, `effective-configuration` and `POST /v1/runs`
+  answer `503 provisioning`.
+- `admission_limits`: optional object setting the admission bounds for `POST /v1/runs`:
+  `live_per_actor` (1–1,000), `live_per_scope` (1–10,000), `queued_in_instance` (1–10,000),
+  `queue_timeout_seconds` (1–86,400) and `round_cap` (1–1,000). If any field is missing,
+  unknown or out of range, startup and `--check-auth-config` exit 78 with
+  `auth configuration error: run admission limits are invalid`. When omitted, `POST /v1/runs`
+  answers `503 provisioning`.
 
 ### Browser-routing profile (version 2)
 
@@ -551,9 +592,10 @@ until expiry or revocation.
 
 Before exposure, remaining work includes broader browser qualification, trusted ingress
 routing for the application origin and redaction of request targets and cookies in
-telemetry; ingress transport limits; operated cleanup and retired-key reservation
-reclamation; and runtime enablement. The router below supplies per-process request, rate and
-concurrency bounds, and the unmounted session check and logout routes. `cargo test --locked --offline --lib handoff` runs the tests that need no database;
+ingress/proxy telemetry, ingress transport limits, and operated cleanup and retired-key
+reservation reclamation. The router below supplies per-process request, rate and
+concurrency bounds, plus the optional off-by-default session check and logout routes
+(mounted only when `OPENMETTLE_API_AUTH_CONFIG` is configured). `cargo test --locked --offline --lib handoff` runs the tests that need no database;
 the end-to-end test runs only in isolated CI under the existing
 `provider_keys::tests::postgres` filter.
 
@@ -637,7 +679,7 @@ valid`. A browser applies `Set-Cookie` in response processing order. A logout de
 remove a new cookie set in another tab while that new session stays valid in the database.
 ADR 0019 describes these orderings and the per-process budget limits.
 
-Cross-browser qualification, runtime enablement, ingress limits and telemetry redaction remain
+Cross-browser qualification, ingress limits and ingress/proxy telemetry redaction remain
 outstanding. `cargo test --locked --offline --lib provider_keys::tests::session_routes`
 runs the loopback tests. The PostgreSQL case
 `provider_keys::tests::postgres::handoff::issued_cookies_validate_and_logout_revokes_without_current_eligibility`
@@ -740,13 +782,24 @@ export OPENMETTLE_MIGRATE_DATABASE_URL='postgres://openmettle_owner:<password>@1
 cargo run --locked --bin openmettle-migrate
 ```
 
-Give the API `openmettle_api` credentials and, when sign-in is mounted, `openmettle_issuance` credentials as its issuance URL; give the worker `openmettle_worker` credentials. Never give a process the owner's, and never mount the issuance credential into the worker or migrator. These roles bound each process, not each user: both can read every scope's rows. Per-user authorization (V1-05) is required before any product endpoint uses this data.
+Give the API `openmettle_api` credentials and, when sign-in is mounted, `openmettle_issuance` credentials as its issuance URL; give the worker `openmettle_worker` credentials. Never give a process the owner's, and never mount the issuance credential into the worker or migrator. These roles bound each process, not each user: per-user authorization (V1-05, [ADR 0027](docs/adr/0027-authorization-and-private-projects.md)) is enforced on every authenticated `/v1` route. Migration 22 ([ADR 0035](docs/adr/0035-approvals-permitted-yolo-and-effect-ledger.md)) adds scoped approval requests (`openmettle.run_approvals`), human decision receipts (`openmettle.run_approval_decisions`), admission/YOLO evidence columns on `openmettle.runs`, and a 13-column non-secret `SELECT` grant on `openmettle.local_sessions` for `openmettle_worker` so workers verify session authority without access to credential digests.
 
 Storage limits are durable deployment inputs that only `openmettle_owner` sets, in the single `openmettle.storage_instance` row: `instance_budget_bytes` (the logical ceiling left after operational headroom, not measured disk capacity), `personal_limit_bytes` and `project_limit_bytes`. Migrations install them as NULL, which refuses every new storage reservation until the deployment configures them; see [ADR 0005](docs/adr/0005-artifact-storage-accounting.md#limits). Lowering a limit preserves existing data and reservations and refuses only new reservations.
 
 Connection budget: `api_replicas × (API DB_MAX_CONNECTIONS + ISSUANCE_DB_MAX_CONNECTIONS) + worker_replicas × worker DB_MAX_CONNECTIONS + 1 migrator + admin/backup headroom` must not exceed `max_connections − superuser_reserved_connections − reserved_connections`. Count surge replicas during a rolling update. For example, 2 × (4 + 2) + 2 × 4 + 1 + 3 = 24. Enforce each process's share with its login role's `CONNECTION LIMIT`. These figures are illustrative, not qualified sizing.
 
-The schema tests also require `OLD_BINARY_DIR` pointing to binaries built from release `18f52463c9d6bc12dda4bd1558e4597e067018f8` and `V3_BINARY_DIR` pointing to binaries built from release `2f1be947aa933177c2e407cd7290bf9909bd08ca`; CI builds those exact archives for compatibility checks. Set `V4_BINARY_DIR` to binaries built from `d80e37819f847072dfa272bdddcc1fbee6d622ef` for migration 5 compatibility; CI builds that archive too. Set `V5_BINARY_DIR` to authentic binaries from `4a51242839e16e1d7b8ad3538887bf8e41081e6e` for migration 6 compatibility, and `V6_BINARY_DIR` to authentic binaries from `3978dff2864488bbdd9e748afd7116f39683f129` for migration 7 compatibility. `V7_BINARY_DIR` (`5ff1d2a8ed5e7424be006e78c16f0c30e784336d`) and `V8_BINARY_DIR` (`e55aff07527ad6452f8a0d49953b3fc2ffc51352`) cover migrations 8 and 9. Set `V9_BINARY_DIR` to binaries built from `940b8c2032d863e29fd04ad7c6357ad8cacc42fc` for migration 10. Set `V10_BINARY_DIR` to binaries built from `05dd18489242e545e3529b4e3750c74837b05638` for migration 11, and `V11_BINARY_DIR` to binaries built from `0ab3401714762f28a730eae4cd7c91052648dabd` for migration 12. Set `V12_BINARY_DIR` to binaries built from `4441b4236ad0dd1ea868d507bb10b50d9b0ddb6f` for migration 13. The ADR 0014 operator-script tests also need `POSTGRES_CONTAINER`, the isolated CI PostgreSQL service container whose `psql` runs them. Do not substitute the current binary with a truncated migration list.
+### Database backup restore (pre-worker checklist)
+
+After restoring PostgreSQL from a backup, complete all steps below while authentication remains closed and before starting `openmettle-worker` (this is separate from [retired login-provider recovery](docs/operator/restore-login-provider.md)):
+
+1. Invalidate pending login transactions, rotate the active login encryption key ([ADR 0009](docs/adr/0009-protected-login-transactions.md)), replace all pre-restore cursor keys ([ADR 0034](docs/adr/0034-ordered-events-and-replayable-sse.md)), and append the current provider revision for every configured login provider ([ADR 0012](docs/adr/0012-login-provider-authority.md)). Never resume restored logins.
+2. Reconcile restored pending home invitations against current operator records and withdraw stale decisions ([home invitations](docs/operator/home-invitations.md)).
+3. Revoke restored bound sessions and cancel parked `waiting` approvals (`openmettle.run_approvals`) before enabling workers ([ADR 0035](docs/adr/0035-approvals-permitted-yolo-and-effect-ledger.md)).
+4. Inspect committed effect-ledger intents (`openmettle.operations`) through read-only reconciliation while worker dispatch remains disabled, then start `openmettle-worker` ([ADR 0035](docs/adr/0035-approvals-permitted-yolo-and-effect-ledger.md)).
+
+### Schema compatibility tests
+
+The schema tests require authentic historical release binaries via `OLD_BINARY_DIR` (schema 2, `18f52463c9d6bc12dda4bd1558e4597e067018f8`), `V3_BINARY_DIR` (`2f1be947aa933177c2e407cd7290bf9909bd08ca`), `V4_BINARY_DIR` (`d80e37819f847072dfa272bdddcc1fbee6d622ef`), `V5_BINARY_DIR` (`4a51242839e16e1d7b8ad3538887bf8e41081e6e`), `V6_BINARY_DIR` (`3978dff2864488bbdd9e748afd7116f39683f129`), `V7_BINARY_DIR` (`5ff1d2a8ed5e7424be006e78c16f0c30e784336d`), `V8_BINARY_DIR` (`e55aff07527ad6452f8a0d49953b3fc2ffc51352`), `V9_BINARY_DIR` (`940b8c2032d863e29fd04ad7c6357ad8cacc42fc`), `V10_BINARY_DIR` (`05dd18489242e545e3529b4e3750c74837b05638`), `V11_BINARY_DIR` (`0ab3401714762f28a730eae4cd7c91052648dabd`), `V12_BINARY_DIR` (`4441b4236ad0dd1ea868d507bb10b50d9b0ddb6f`), and `V13_BINARY_DIR` (`615dcffc93af18ab0db40a7a2fafc3c0752d4c77`). See [`.github/workflows/checks.yml`](.github/workflows/checks.yml) and [`tests/schema/grants.rs`](tests/schema/grants.rs) for the canonical release pins and upgrade checks. The ADR 0014 operator-script tests also need `POSTGRES_CONTAINER`, the isolated CI PostgreSQL service container whose `psql` runs them. Do not substitute the current binary with a truncated migration list.
 
 The schema tests need a superuser on an isolated, disposable PostgreSQL 18 service. They create synthetic `openmettle_*` cluster roles with a test-only password and one database per test. Never point them at a shared server.
 
@@ -784,11 +837,13 @@ the configuration, evidence profile and recovery boundaries.
 policy evaluator for V1-05: strict grant vocabulary, `Owner`/`Editor`/`Viewer` project roles,
 private-by-default conversations, artifacts and memory, sharing that requires active project
 membership, platform and user capability denies, last-owner and last-admin refusals and an
-execution-time run recheck. `account_admin` never grants content access. Nothing calls it
-yet: it adds no migration, route or enforcement, and inputs must be hydrated from the primary
-database by later increments.
+execution-time run recheck. `account_admin` never grants content access.
 
-A validated browser or native session now also reports the approval it was issued under and
-the primary database's millisecond clock at which it was checked
-(`sessions::Context::{approval_id, observed_ms}`, [ADR 0029](docs/adr/0029-native-sign-in-mounting-and-session-context.md)),
-the inputs `authz::store::hydrate_api_principal` takes. No route hydrates a principal yet.
+A validated browser or native session reports the approval it was issued under and the
+primary database's millisecond clock at which it was checked
+(`sessions::Context::{approval_id, observed_ms}`, [ADR 0029](docs/adr/0029-native-sign-in-mounting-and-session-context.md)).
+When `OPENMETTLE_API_AUTH_CONFIG` is configured, every authenticated `/v1` route hydrates
+the caller's principal from the primary via `authz::store::hydrate_api_principal` and
+enforces these rules per request; `openmettle-worker` rechecks execution authority on the
+primary before claiming runs and dispatching fenced effects ([ADR 0027](docs/adr/0027-authorization-and-private-projects.md),
+[ADR 0035](docs/adr/0035-approvals-permitted-yolo-and-effect-ledger.md)).

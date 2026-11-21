@@ -3,7 +3,7 @@
 Use this procedure to designate the first `account_admin` of an installation, or to restore
 administration when no trusted enabled administrator remains (break-glass). Both are the same
 owner command: it makes one enabled user an active `account_admin` and records an immutable
-audit row. It requires schema version 15, a direct primary connection as `openmettle_owner`
+audit row. It requires schema version 15 or later, a direct primary connection as `openmettle_owner`
 and the deployment's normal controls for using that account. The application API cannot
 perform it, and directory roles never map to `account_admin` (ADR 0027).
 
@@ -30,9 +30,9 @@ opt-in capability such as `runs.use_yolo`.
     WHERE a.active ORDER BY a.user_id;
    ```
 
-3. Stop if the account is missing or disabled. This command never re-enables a user: restore
+3. If the account is missing or disabled, stop. This command never re-enables a user: restore
    the account under the deployment's owner change control first, or choose another enabled
-   user. Stop if the user is already an active administrator; there is nothing to do.
+   user. If the user is already an active administrator, stop; there is nothing to do.
 4. Assign a fresh request UUID and record it with a deployment-assigned opaque operator UUID,
    the reason and the inspected rows in the deployment change record. Keep credentials,
    names and identity claims out of these inputs. The reason (1 to 512 bytes) is stored.

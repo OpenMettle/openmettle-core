@@ -1,6 +1,6 @@
 # Hosted Keycloak 26.8.2 sign-in qualification fixture
 
-V1-04 ([#5](https://github.com/OpenMettle/openmettle-core/issues/5)) fixture for qualifying OpenMettle's unmounted browser login and session lifecycle (`src/browser_auth/`) against a real pinned stock Keycloak 26.8.2 container over HTTPS in CI.
+V1-04 ([#5](https://github.com/OpenMettle/openmettle-core/issues/5)) fixture for qualifying OpenMettle's browser login and session lifecycle (`src/browser_auth/`), optional off-by-default routes mounted via `OPENMETTLE_API_AUTH_CONFIG` and exercised directly in this harness, against a real pinned stock Keycloak 26.8.2 container over HTTPS in CI.
 
 ## Scope and boundaries
 
