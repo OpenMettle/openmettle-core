@@ -10,6 +10,8 @@ provisioning. Migrations 1 and 2 are unchanged.
 > migration 19 adds their columns. [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md)
 > specifies the V1-11 worker fencing required below: leases, execution deadlines, cooperative
 > cancellation, settlement from the operations ledger and restart recovery (migration 20).
+> [ADR 0035](0035-approvals-permitted-yolo-and-effect-ledger.md) specifies approval waits,
+> permitted YOLO and the authorization and endpoint evidence recorded with an operation intent.
 
 ## Scope and identities
 
@@ -21,8 +23,10 @@ owner. Neither a project scope nor a valid foreign key grants access to another 
 V1-05 authorization is required before exposing this data. RLS remains a future decision.
 
 Runs store immutable input/configuration bytes, format/version, identity and digest. Callers
-must include all effective execution choices and pinned profile/policy revisions in those
-bytes. Credentials must not be included. Snapshot interpretation is not implemented. Tenant
+must include all effective execution choices and pinned profile/policy revisions that form
+part of the request in those bytes. Under ADR 0035 this includes the requested execution
+mode. The server captures its admission evidence separately under the admission locks.
+Credentials must not be included. Snapshot interpretation is not implemented. Tenant
 indexes support scope/conversation runs, scope/run events and operations; actor lookup has a
 separate index. Foreign keys use NO ACTION. There is no retention or deletion job.
 
