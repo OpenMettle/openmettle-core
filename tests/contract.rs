@@ -1091,7 +1091,10 @@ fn configured_run_reads_reach_primary_session_validation() {
 
 #[test]
 fn serialized_lifecycle_replays_to_the_snapshot() {
-    let example = &contract()["components"]["examples"]["RunLifecycleStream"];
+    let example = pointer_get(
+        contract(),
+        "#/components/mediaTypes/RunEventStream/examples/lifecycle",
+    );
     let frames: Vec<_> = example["serializedValue"]
         .as_str()
         .unwrap()

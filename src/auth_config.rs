@@ -216,10 +216,7 @@ pub(crate) struct CursorKeys {
 
 impl CursorKeys {
     pub(crate) fn valid_id(id: &str) -> bool {
-        (1..=64).contains(&id.len())
-            && id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+        (1..=64).contains(&id.len()) && id.bytes().all(login::url_safe_byte)
     }
 }
 

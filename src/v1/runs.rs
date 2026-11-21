@@ -109,13 +109,6 @@ impl Binding<'_> {
 
 /// Parse both sources structurally. Only the selected cursor needs a current key and MAC.
 fn request_cursor(parts: &Parts) -> Result<Option<Cursor>, Problem> {
-    let header = single_header(
-        &parts.headers,
-        HeaderName::from_static("last-event-id"),
-        INVALID,
-    )?
-    .map(|v| v.to_str().map_err(|_| INVALID_CURSOR))
-    .transpose()?;
     let mut after = None;
     for pair in parts.uri.query().into_iter().flat_map(|q| q.split('&')) {
         match pair.split_once('=') {
@@ -123,6 +116,13 @@ fn request_cursor(parts: &Parts) -> Result<Option<Cursor>, Problem> {
             _ => return Err(INVALID),
         }
     }
+    let header = single_header(
+        &parts.headers,
+        HeaderName::from_static("last-event-id"),
+        INVALID,
+    )?
+    .map(|v| v.to_str().map_err(|_| INVALID_CURSOR))
+    .transpose()?;
     let after = after.map(Cursor::parse).transpose()?;
     let header = header.map(Cursor::parse).transpose()?;
     Ok(header.or(after))
@@ -373,6 +373,7 @@ impl Api {
             Body::empty()
         } else {
             let (tx, rx) = mpsc::channel(CHANNEL_FRAMES);
+            let id = parts.extensions.get::<RequestId>().copied();
             tokio::spawn(async move {
                 let _permit = permit;
                 tokio::select! {
@@ -381,7 +382,7 @@ impl Api {
                     _ = tx.closed() => (),
                     result = stream.deliver(first, &tx) => {
                         if result == Err(INTERNAL) {
-                            tracing::error!(target: crate::telemetry::TARGET, event="run.stream.ended", error.type="internal");
+                            crate::telemetry::run_stream_failed(id);
                         }
                     }
                 }
@@ -479,7 +480,7 @@ impl Subscription {
                 }
                 self.position = sequence;
             }
-            if batch.terminal && self.position == batch.last {
+            if batch.terminal && (self.position >= batch.last || !full) {
                 return Ok(());
             }
             if last_write.elapsed() >= HEARTBEAT_INTERVAL {
@@ -597,6 +598,25 @@ mod tests {
             assert_eq!(
                 request_cursor(&parts).map(|cursor| cursor.map(|c| c.sequence)),
                 expected
+            );
+        }
+    }
+
+    #[test]
+    fn query_shape_errors_take_precedence_over_malformed_header_bytes() {
+        for (uri, expected) in [
+            ("/events?cursor=x", INVALID),
+            ("/events?after=x&after=y", INVALID),
+            ("/events", INVALID_CURSOR),
+        ] {
+            let request = Request::builder()
+                .uri(uri)
+                .header("last-event-id", &[0xff][..])
+                .body(())
+                .unwrap();
+            assert_eq!(
+                request_cursor(&request.into_parts().0).err(),
+                Some(expected)
             );
         }
     }
