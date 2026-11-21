@@ -693,6 +693,39 @@ async fn concurrent_and_crashed_uploads_are_reconciled_without_uncharged_files()
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
+async fn expired_reservations_skip_locks_and_continue_after_an_unlink_error() {
+    let f = Fixture::new().await;
+    let doc = new_uuid(&f.db).await;
+    let locked = f.reserve("locked", &doc, 100).await;
+    let broken = f.reserve("broken", &doc, 100).await;
+    f.reserve("healthy", &doc, 100).await;
+    let bad_path = f.root.join("staging").join(&broken);
+    fs::create_dir(&bad_path).unwrap();
+
+    let mut conn = f.db.admin().await;
+    let mut lock = WriteTransaction::begin(&mut conn).await.unwrap();
+    sqlx::query("SELECT FROM openmettle.storage_reservations WHERE id = $1::uuid FOR UPDATE")
+        .bind(locked)
+        .execute(lock.connection().unwrap())
+        .await
+        .unwrap();
+    let sweep = || artifact_fs::reconcile_expired(&f.api, &f.store, Duration::ZERO, 10);
+    let result = tokio::time::timeout(Duration::from_secs(5), sweep())
+        .await
+        .unwrap();
+    assert!(matches!(result, Err(artifact_fs::Error::Io)));
+    assert_eq!(f.state("healthy").await.as_deref(), Some("released"));
+    assert_eq!(f.state("broken").await.as_deref(), Some("reserved"));
+    fs::remove_dir(bad_path).unwrap();
+    assert_eq!(sweep().await.unwrap(), 1);
+    assert_eq!(f.state("locked").await.as_deref(), Some("reserved"));
+    lock.rollback().await.unwrap();
+    assert_eq!(sweep().await.unwrap(), 1);
+    assert_totals(&f.db).await;
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
 async fn purge_unlinks_the_payload_before_confirming() {
     let f = Fixture::new().await;
     let doc = new_uuid(&f.db).await;
@@ -794,6 +827,75 @@ async fn assert_swept(f: &Fixture, ids: &[String; 2]) {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn worker_purges_unlocked_revisions_and_sweeps_runs_while_a_revision_stays_locked() {
+    let f = Fixture::new().await;
+    let body = form("x", &[METADATA, file(None, b"payload")], true);
+    let mut revisions = Vec::new();
+    let mut api = connect(&f.db.0, API).await;
+    for key in ["locked", "healthy"] {
+        let doc = new_uuid(&f.db).await;
+        let stored = f
+            .upload(key, &doc, 100, "x", chunked(&body, 16), true)
+            .await
+            .unwrap();
+        let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+        storage::retain_revision(&mut tx, &f.c.scope, &stored.revision, 1)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        revisions.push(stored);
+    }
+    let mut conn = f.db.admin().await;
+    let mut lock = WriteTransaction::begin(&mut conn).await.unwrap();
+    sqlx::query("SELECT FROM openmettle.artifact_revisions WHERE id = $1::uuid FOR UPDATE")
+        .bind(&revisions[0].revision)
+        .execute(lock.connection().unwrap())
+        .await
+        .unwrap();
+
+    let mut process = sweep_process(&f, true);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while account(&f.db, &f.c.scope).await != (0, 7, 0) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the later revision was not purged");
+    assert_eq!(f.files("revisions"), [revisions[0].reservation.as_str()]);
+    // These deadlines arrived after the first purge. The next maintenance tick must run
+    // both deadline sweeps even though the oldest revision is still locked.
+    let mut owner = f.db.admin().await;
+    let mut seed = WriteTransaction::begin(&mut owner).await.unwrap();
+    let ids = expired_runs(&f, &mut seed, "during-purge").await;
+    seed.commit().await.unwrap();
+    assert_swept(&f, &ids).await;
+
+    signal(&process.0, "-TERM");
+    assert!(process.0.wait().unwrap().success());
+    let mut logs = String::new();
+    process
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut logs)
+        .unwrap();
+    assert!(
+        logs.lines()
+            .any(|line| line.contains("worker.sweep.failed") && line.contains("purge_due"))
+    );
+    lock.rollback().await.unwrap();
+    assert_eq!(
+        artifact_fs::purge_due(&pool(&f.db, WORKER).await, &f.store, 10)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_totals(&f.db).await;
 }
 
 #[tokio::test]

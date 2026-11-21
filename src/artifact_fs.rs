@@ -19,7 +19,7 @@ use axum::body::{Bytes, HttpBody};
 use http_body_util::BodyExt;
 use hyper::body::{Frame, SizeHint};
 use sha2::{Digest as _, Sha256};
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use std::{
     fmt, fs,
     future::Future,
@@ -205,15 +205,10 @@ impl Store {
     }
 
     /// Unlinks both payload paths of `reservation` (absent is fine) and syncs the directories.
-    async fn remove(&self, reservation: &str) -> Result<(), Error> {
+    fn remove(&self, reservation: &str) -> Result<(), Error> {
         let (staging, revision) = self.paths(reservation)?;
-        let dirs = (self.staging.clone(), self.revisions.clone());
-        blocking(move || {
-            remove(&staging, &dirs.0)?;
-            remove(&revision, &dirs.1)
-        })
-        .await
-        .map_err(|_| Error::Io)
+        remove(&staging, &self.staging).map_err(|_| Error::Io)?;
+        remove(&revision, &self.revisions).map_err(|_| Error::Io)
     }
 }
 
@@ -604,6 +599,24 @@ fn batch(limit: i64) -> Result<(), Error> {
     }
 }
 
+/// Count completed items and surface the first error after attempting the entire batch.
+async fn sweep_items<T, F: Future<Output = Result<bool, Error>>>(
+    candidates: Vec<T>,
+    process: impl Fn(T) -> F,
+) -> Result<usize, Error> {
+    let mut count = 0;
+    let mut first_error = None;
+    for candidate in candidates {
+        match process(candidate).await {
+            Ok(done) => count += usize::from(done),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    first_error.map_or(Ok(count), Err)
+}
+
 /// Releases up to `limit` upload reservations (no run link) still `reserved` more than
 /// `older_than` after creation, oldest first. Under the reservation's row lock it unlinks any
 /// `staging/` or `revisions/` file first, so no uncharged payload remains. `older_than` must
@@ -618,6 +631,7 @@ pub async fn reconcile_expired(
 ) -> Result<usize, Error> {
     batch(limit)?;
     let age = i64::try_from(older_than.as_millis()).map_err(|_| runs::Error::Invalid)?;
+    let mut scan = WriteTransaction::begin_bounded_pool(pool, true).await?;
     let candidates: Vec<(String, String)> = sqlx::query_as(
         "SELECT scope_id::text, id::text FROM openmettle.storage_reservations
           WHERE state = 'reserved' AND run_id IS NULL
@@ -626,30 +640,36 @@ pub async fn reconcile_expired(
     )
     .bind(age)
     .bind(limit)
-    .fetch_all(pool)
+    .fetch_all(scan.connection()?)
     .await?;
-    let mut released = 0;
-    for (scope, reservation) in candidates {
-        let done = committed(pool, async |tx| {
-            let state: Option<String> = sqlx::query_scalar(
-                "SELECT state FROM openmettle.storage_reservations
-                  WHERE scope_id = $1::uuid AND id = $2::uuid FOR UPDATE",
-            )
-            .bind(&scope)
-            .bind(&reservation)
-            .fetch_optional(tx.connection()?)
-            .await?;
-            if state.as_deref() != Some("reserved") {
-                return Ok::<_, Error>(false);
-            }
-            store.remove(&reservation).await?;
-            storage::release(tx, &scope, &reservation).await?;
-            Ok(true)
-        })
+    scan.commit().await?;
+    sweep_items(candidates, |(scope, reservation)| async move {
+        let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
+        let locked = sqlx::query(
+            "SELECT FROM openmettle.storage_reservations
+              WHERE scope_id = $1::uuid AND id = $2::uuid AND state = 'reserved'
+              FOR UPDATE SKIP LOCKED",
+        )
+        .bind(&scope)
+        .bind(&reservation)
+        .fetch_optional(tx.connection()?)
         .await?;
-        released += usize::from(done);
-    }
-    Ok(released)
+        if locked.is_none() {
+            return Ok(false);
+        }
+        // Keep the row locked until both unlinks finish, even if the sweep times out.
+        let store = store.clone();
+        let (mut tx, reservation) = tokio::task::spawn_blocking(move || {
+            store.remove(&reservation)?;
+            Ok::<_, Error>((tx, reservation))
+        })
+        .await
+        .map_err(|_| Error::Io)??;
+        storage::release(&mut tx, &scope, &reservation).await?;
+        tx.commit().await?;
+        Ok(true)
+    })
+    .await
 }
 
 /// Purges up to `limit` revisions: expired `retained` ones are claimed with `begin_purge`, and
@@ -658,27 +678,23 @@ pub async fn reconcile_expired(
 /// grants). Returns the number confirmed.
 pub async fn purge_due(pool: &PgPool, store: &Store, limit: i64) -> Result<usize, Error> {
     batch(limit)?;
-    let due = sqlx::query(
+    let mut scan = WriteTransaction::begin_bounded_pool(pool, true).await?;
+    let due: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT scope_id::text, id::text, reservation_id::text FROM openmettle.artifact_revisions
           WHERE (state = 'retained' AND purge_after <= now()) OR state = 'purging'
           ORDER BY purge_after LIMIT $1",
     )
     .bind(limit)
-    .fetch_all(pool)
+    .fetch_all(scan.connection()?)
     .await?;
-    let mut purged = 0;
-    for row in due {
-        let (scope, revision, reservation): (String, String, String) =
-            (row.try_get(0)?, row.try_get(1)?, row.try_get(2)?);
+    scan.commit().await?;
+    sweep_items(due, |(scope, revision, reservation)| async move {
         // A claim must be committed before its confirmation (ADR 0005). A revision restored
         // since the scan is no longer eligible and is skipped.
-        match committed(pool, async |tx| {
-            storage::begin_purge(tx, &scope, &revision).await
-        })
-        .await
-        {
-            Ok(()) => {}
-            Err(runs::Error::NotEligible) => continue,
+        let mut claim = WriteTransaction::begin_bounded_pool(pool, false).await?;
+        match storage::begin_purge(&mut claim, &scope, &revision).await {
+            Ok(()) => claim.commit().await?,
+            Err(runs::Error::NotEligible) => return Ok(false),
             Err(error) => return Err(error.into()),
         }
         let (_, path) = store.paths(&reservation)?;
@@ -686,13 +702,12 @@ pub async fn purge_due(pool: &PgPool, store: &Store, limit: i64) -> Result<usize
         blocking(move || remove(&path, &dir))
             .await
             .map_err(|_| Error::Io)?;
-        committed::<_, runs::Error>(pool, async |tx| {
-            storage::confirm_purge(tx, &scope, &revision).await
-        })
-        .await?;
-        purged += 1;
-    }
-    Ok(purged)
+        let mut confirm = WriteTransaction::begin_bounded_pool(pool, false).await?;
+        storage::confirm_purge(&mut confirm, &scope, &revision).await?;
+        confirm.commit().await?;
+        Ok(true)
+    })
+    .await
 }
 
 #[cfg(test)]

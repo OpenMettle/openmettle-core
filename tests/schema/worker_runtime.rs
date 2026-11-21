@@ -153,6 +153,81 @@ async fn wait_terminal(f: &Fixture, id: &str, format: &str, bytes: &[u8]) {
     terminal(&f.db, id, format, bytes).await;
 }
 
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn finished_during_cancel_drain_wins_over_the_request() {
+    let f = Fixture::new().await;
+    let id = f.admit("finish-during-cancel").await;
+    let mut w = Worker::start(&f.db).await;
+    let mut step = w.step().await;
+    f.cancel(&step.claim).await;
+    assert_eq!(stopped(&mut step.cx).await, Stop::Cancel);
+    step.reply.send(StepResult::Finished).ok().unwrap();
+    wait_terminal(&f, &id, "openmettle.run-succeeded", b"{}").await;
+    w.shutdown.send(()).unwrap();
+    bounded(w.task).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn shutdown_drain_settles_finished_and_failed_steps_once() {
+    let f = Fixture::new().await;
+    for (key, result, format, payload) in [
+        (
+            "finished",
+            StepResult::Finished,
+            "openmettle.run-succeeded",
+            b"{}".as_slice(),
+        ),
+        (
+            "failed",
+            StepResult::Failed(FailReason::StepFailed),
+            "openmettle.run-failed",
+            br#"{"reason":"step_failed"}"#,
+        ),
+    ] {
+        let id = f.admit(key).await;
+        let mut w = Worker::start(&f.db).await;
+        let mut step = w.step().await;
+        w.shutdown.send(()).unwrap();
+        assert_eq!(stopped(&mut step.cx).await, Stop::Shutdown);
+        step.reply.send(result).ok().unwrap();
+        bounded(w.task).await.unwrap();
+        terminal(&f.db, &id, format, payload).await;
+        assert!(
+            reclaim_next(&mut worker(&f.db).await, &LEASES)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn finished_with_an_unresolved_intent_falls_back_to_reconciliation() {
+    let f = Fixture::new().await;
+    let id = f.admit("unresolved-finish").await;
+    let mut w = Worker::start(&f.db).await;
+    let step = w.step().await;
+    let op = intent(&mut worker(&f.db).await, &step.claim.lease(), "lookup")
+        .await
+        .unwrap();
+    step.reply.send(StepResult::Finished).ok().unwrap();
+    let lookup = w.lookup().await;
+    assert_eq!(lookup.op, op);
+    lookup.reply.send(None).ok().unwrap();
+    wait_terminal(
+        &f,
+        &id,
+        "openmettle.run-interrupted",
+        br#"{"unresolved":1}"#,
+    )
+    .await;
+    w.shutdown.send(()).unwrap();
+    bounded(w.task).await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn ignored_cancel_aborts_step_and_fences_blocking_child_then_reconciles_once() {
@@ -328,30 +403,39 @@ async fn interrupted_reconciliation_is_released_and_evidence_recorded_by_new_hol
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
-async fn execution_deadline_stops_a_step_even_if_it_returns_continue() {
+async fn execution_deadline_drains_the_final_step() {
     let f = Fixture::new().await;
-    let id = f.admit("deadline").await;
     let mut w = Worker::start(&f.db).await;
-    let mut step = w.step().await;
-    // Renewal reads the shortened execution allowance from the primary. Its local
-    // stop point leaves a full settlement margin before the durable deadline.
-    owner_exec(
-        &f.db,
-        "UPDATE openmettle.runs SET lease_expires_at = now() + interval '22 seconds',
+    for (key, result, format, payload) in [
+        (
+            "deadline-continue",
+            StepResult::Continue,
+            "openmettle.run-failed",
+            br#"{"reason":"deadline_exceeded"}"#.as_slice(),
+        ),
+        (
+            "deadline-finish",
+            StepResult::Finished,
+            "openmettle.run-succeeded",
+            b"{}",
+        ),
+    ] {
+        let id = f.admit(key).await;
+        let mut step = w.step().await;
+        // Renewal reads the shortened execution allowance from the primary. Its local
+        // stop point leaves a full settlement margin before the durable deadline.
+        owner_exec(
+            &f.db,
+            "UPDATE openmettle.runs SET lease_expires_at = now() + interval '22 seconds',
         execution_expires_at = now() + interval '22 seconds' WHERE id = $1::uuid",
-        &id,
-    )
-    .await;
-    assert_eq!(stopped(&mut step.cx).await, Stop::Deadline);
-    step.reply.send(StepResult::Continue).ok().unwrap();
-    wait_terminal(
-        &f,
-        &id,
-        "openmettle.run-failed",
-        br#"{"reason":"deadline_exceeded"}"#,
-    )
-    .await;
-    assert!(w.steps.try_recv().is_err());
+            &id,
+        )
+        .await;
+        assert_eq!(stopped(&mut step.cx).await, Stop::Deadline);
+        step.reply.send(result).ok().unwrap();
+        wait_terminal(&f, &id, format, payload).await;
+        assert!(w.steps.try_recv().is_err());
+    }
     w.shutdown.send(()).unwrap();
     bounded(w.task).await.unwrap();
 }
@@ -363,6 +447,9 @@ async fn rechecks_authority_before_the_next_step_and_first_dispatch() {
     let first = f.admit("revoked-after-step").await;
     let mut w = Worker::start(&f.db).await;
     let step = w.step().await;
+    let op = intent(&mut worker(&f.db).await, &step.claim.lease(), "lookup")
+        .await
+        .unwrap();
     let second = f.admit("revoked-before-dispatch").await;
     sqlx::query(
         "UPDATE openmettle.local_identity_approvals SET active = false WHERE id = $1::uuid",
@@ -372,6 +459,24 @@ async fn rechecks_authority_before_the_next_step_and_first_dispatch() {
     .await
     .unwrap();
     step.reply.send(StepResult::Continue).ok().unwrap();
+    // The denied recheck moved the run to reconciling. The next holder can observe the
+    // outstanding operation as soon as the invalidated holder finishes draining.
+    let lookup = tokio::time::timeout(Duration::from_secs(5), w.lookup())
+        .await
+        .unwrap();
+    assert_eq!(lookup.op, op);
+    lookup
+        .reply
+        .send(Some(OwnedObservation {
+            key: "revocation-lookup".into(),
+            outcome: "succeeded".into(),
+            handle: None,
+            format: EVIDENCE.format.into(),
+            version: 1,
+            evidence: b"{}".into(),
+        }))
+        .ok()
+        .unwrap();
     for id in [&first, &second] {
         wait_terminal(
             &f,

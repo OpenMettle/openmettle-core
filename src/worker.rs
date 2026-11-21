@@ -6,7 +6,7 @@ use crate::{
             self, ExecState, FailReason, Fence, LeaseError, LeaseSettings, Settle, Settled,
             UnresolvedOperation,
         },
-        runs::{self as queue, ClaimedRun, RunRecheckOutcome, RunRecheckRequest},
+        runs::{self as queue, ClaimedRun},
         store::StoreError,
     },
     runs::{Observation, Payload, record_observation},
@@ -22,7 +22,7 @@ use std::{
 use tokio::{
     sync::watch,
     task::JoinSet,
-    time::{Instant, sleep, sleep_until, timeout_at},
+    time::{Instant, sleep, sleep_until, timeout, timeout_at},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +107,12 @@ fn jitter(base: Duration) -> Duration {
     base + base * u32::from(byte[0]) / (255 * 5)
 }
 
+async fn sweep<T, E>(category: Sweep, work: impl Future<Output = Result<T, E>>) {
+    if !matches!(timeout(Duration::from_secs(15), work).await, Ok(Ok(_))) {
+        sweep_failed(category);
+    }
+}
+
 pub(crate) async fn maintenance(
     pool: &PgPool,
     store: Option<&artifact_fs::Store>,
@@ -114,29 +120,22 @@ pub(crate) async fn maintenance(
 ) {
     loop {
         sleep(jitter(period)).await;
-        if async { queue::expire_queued(&mut *connection(pool).await?, 100).await }
-            .await
-            .is_err()
-        {
-            sweep_failed(Sweep::Queue);
-        }
-        if async { leases::settle_expired(&mut *connection(pool).await?, 100).await }
-            .await
-            .is_err()
-        {
-            sweep_failed(Sweep::Execution);
-        }
+        sweep(Sweep::Queue, async {
+            queue::expire_queued(&mut *connection(pool).await?, 100).await
+        })
+        .await;
+        sweep(Sweep::Execution, async {
+            leases::settle_expired(&mut *connection(pool).await?, 100).await
+        })
+        .await;
         if let Some(store) = store {
             let age = artifact_fs::UPLOAD_TIMEOUT + Duration::from_secs(300);
-            if artifact_fs::reconcile_expired(pool, store, age, 100)
-                .await
-                .is_err()
-            {
-                sweep_failed(Sweep::Uploads);
-            }
-            if artifact_fs::purge_due(pool, store, 100).await.is_err() {
-                sweep_failed(Sweep::Retention);
-            }
+            sweep(
+                Sweep::Uploads,
+                artifact_fs::reconcile_expired(pool, store, age, 100),
+            )
+            .await;
+            sweep(Sweep::Retention, artifact_fs::purge_due(pool, store, 100)).await;
         }
     }
 }
@@ -299,28 +298,6 @@ async fn monitor(
     }
 }
 
-async fn recheck(
-    pool: &PgPool,
-    run: &ActiveRun,
-    settings: &LeaseSettings,
-) -> Result<RunRecheckOutcome, LeaseError> {
-    let mut c = connection(pool).await?;
-    let now_ms =
-        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
-            .fetch_one(&mut *c)
-            .await
-            .map_err(StoreError::from)?;
-    let request = RunRecheckRequest {
-        scope_id: &run.claim.scope_id,
-        run_id: &run.claim.run_id,
-        actor_approval_id: &run.claim.actor_approval_id,
-        capabilities: &[],
-        extra_target: None,
-        now_ms,
-    };
-    queue::recheck_leased(&mut c, &run.claim.lease(), &request, settings).await
-}
-
 struct RunContext {
     deadline: watch::Receiver<(Instant, Stop)>,
     stop: watch::Receiver<Option<Stop>>,
@@ -353,6 +330,9 @@ async fn reconcile<E: Executor>(
     let lease = run.claim.lease();
     let mut after = None;
     loop {
+        if let Some(why) = context.stopped() {
+            return Ok(WorkEnd::Stop(why));
+        }
         let page =
             leases::unresolved_after(&mut *connection(pool).await?, &lease, 100, after.as_deref())
                 .await?;
@@ -397,9 +377,9 @@ async fn reconcile<E: Executor>(
     }
 }
 
-#[derive(Clone, Copy)]
 enum WorkEnd {
     Complete(Settle),
+    Invalidated(Settled),
     Stop(Stop),
     Incomplete,
 }
@@ -427,9 +407,10 @@ async fn execute<E: Executor>(
         if let Some(why) = context.stopped() {
             return Ok(WorkEnd::Stop(why));
         }
-        if recheck(pool, run, settings).await? != RunRecheckOutcome::Continue {
-            // Invalidated was already settled in the recheck transaction.
-            return Ok(WorkEnd::Stop(Stop::LeaseLost));
+        if let Some(settled) =
+            queue::recheck_claim(&mut *connection(pool).await?, &run.claim, settings).await?
+        {
+            return Ok(WorkEnd::Invalidated(settled));
         }
         if let Some(why) = context.stopped() {
             return Ok(WorkEnd::Stop(why));
@@ -481,6 +462,7 @@ async fn run_one<E: Executor>(
         end = &mut work => {
             let why = match end {
                 WorkEnd::Stop(why) => Some(why),
+                WorkEnd::Invalidated(_) => Some(Stop::Cancel),
                 _ => context.stopped(),
             };
             (why, Some(end))
@@ -523,27 +505,39 @@ async fn run_one<E: Executor>(
     };
     // Cancel any pending renewal and return its connection before settling.
     drop(renewal);
-    if cause == Some(Stop::LeaseLost) || matches!(end, WorkEnd::Stop(Stop::LeaseLost)) {
+    if cause == Some(Stop::LeaseLost)
+        || matches!(
+            end,
+            WorkEnd::Stop(Stop::LeaseLost) | WorkEnd::Invalidated(Settled::Terminal { .. })
+        )
+    {
         return;
     }
     let Ok(mut c) = connection(pool).await else {
         return;
     };
-    let reconciled =
-        run.state == ExecState::Reconciling && matches!(end, WorkEnd::Complete(Settle::Stopped));
-    if cause == Some(Stop::Shutdown) && !reconciled {
-        let _ = leases::handoff(&mut c, &lease, &settings).await;
-        return;
-    }
     let input = match end {
-        WorkEnd::Complete(Settle::Succeeded) if cause.is_some() => Settle::Stopped,
-        WorkEnd::Complete(input) => input,
-        WorkEnd::Stop(_) | WorkEnd::Incomplete => Settle::Stopped,
+        WorkEnd::Invalidated(_) => {
+            let _ = leases::release_lease(&mut c, &lease).await;
+            return;
+        }
+        WorkEnd::Complete(input @ (Settle::Succeeded | Settle::Failed(_))) => input,
+        WorkEnd::Complete(Settle::Stopped) if run.state == ExecState::Reconciling => {
+            Settle::Stopped
+        }
+        _ if cause == Some(Stop::Shutdown) => {
+            let _ = leases::handoff(&mut c, &lease, &settings).await;
+            return;
+        }
+        _ => Settle::Stopped,
     };
-    if matches!(
-        leases::settle(&mut c, &lease, &settings, input).await,
-        Ok(Settled::Reconciling { .. })
-    ) {
+    let mut settled = leases::settle(&mut c, &lease, &settings, input).await;
+    if input == Settle::Succeeded
+        && matches!(settled, Err(LeaseError::Store(StoreError::Conflict(_))))
+    {
+        settled = leases::settle(&mut c, &lease, &settings, Settle::Stopped).await;
+    }
+    if matches!(settled, Ok(Settled::Reconciling { .. })) {
         let _ = leases::release_lease(&mut c, &lease).await;
     }
 }

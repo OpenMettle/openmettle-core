@@ -485,10 +485,17 @@ class Qualification:
     def deploy(self):
         passwords = {k: secrets.token_hex(16) for k in ("admin", *ROLES)}
         manifests = render_manifests(self.contract, self.images, passwords, self.run_id)
+        # Applying a Deployment starts its pods immediately, before rollout status is checked.
+        applications = [item for item in manifests["items"]
+                        if item["metadata"].get("namespace") == APP_NAMESPACE]
+        bootstrap = [item for item in manifests["items"]
+                     if item["metadata"].get("namespace") != APP_NAMESPACE]
         self.verify_identity()
-        self.kube("apply", "--filename", "-", input=json.dumps(manifests))
+        self.kube("apply", "--filename", "-", input=json.dumps({**manifests, "items": bootstrap}))
         self.kube("--namespace", DB_NAMESPACE, "rollout", "status", "deployment/postgres",
                   "--timeout=300s", timeout=330)
+        self.prepare_sweeps()
+        self.kube("apply", "--filename", "-", input=json.dumps({**manifests, "items": applications}))
         for role in ROLES:
             self.kube("--namespace", APP_NAMESPACE, "rollout", "status",
                       f"deployment/openmettle-{role}", "--timeout=180s", timeout=210)
@@ -682,7 +689,6 @@ class Qualification:
         self.expect(ready_targets == [api_pod], f"API Service endpoints: {ready_targets}")
         self.passed("API Service routes to ready API pod", endpoints=ready_targets)
 
-        self.prepare_sweeps()
         self.forced_worker_recovery()
 
         # Stop every worker while continuously probing the API.

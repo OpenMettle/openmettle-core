@@ -3,7 +3,7 @@
 //! Cancellation drops that transaction and leaves WriteTransaction unusable. Only the caller
 //! can commit; ordinary errors restore the owner after successful savepoint rollback.
 use sha2::{Digest, Sha256};
-use sqlx::{Acquire, Connection, PgConnection, Postgres, Row, Transaction};
+use sqlx::{Acquire, Connection, PgConnection, PgPool, Postgres, Row, Transaction};
 
 pub enum Error {
     Invalid,
@@ -118,7 +118,21 @@ impl<'c> WriteTransaction<'c> {
         connection: &'c mut PgConnection,
         read_only: bool,
     ) -> Result<Self, Error> {
-        let mut tx = Self::begin(connection).await?;
+        Self::begin(connection).await?.with_bounds(read_only).await
+    }
+    /// Own the pool connection so a blocking filesystem operation can keep its row lock
+    /// until the operation finishes, even if the caller drops the sweep.
+    pub(crate) async fn begin_bounded_pool(
+        pool: &PgPool,
+        read_only: bool,
+    ) -> Result<WriteTransaction<'static>, Error> {
+        WriteTransaction {
+            inner: Some(pool.begin().await?),
+        }
+        .with_bounds(read_only)
+        .await
+    }
+    async fn with_bounds(mut self, read_only: bool) -> Result<Self, Error> {
         let setup: &[&'static str] = if read_only {
             &[
                 "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY",
@@ -134,12 +148,12 @@ impl<'c> WriteTransaction<'c> {
             ]
         };
         for &sql in setup {
-            if let Err(error) = sqlx::query(sql).execute(tx.connection()?).await {
-                tx.rollback().await?;
+            if let Err(error) = sqlx::query(sql).execute(self.connection()?).await {
+                self.rollback().await?;
                 return Err(error.into());
             }
         }
-        Ok(tx)
+        Ok(self)
     }
     // SQLx can lose its root depth when a raw borrowed savepoint is cancelled. Never
     // turn that state into a no-op successful commit or let a helper open a new root.

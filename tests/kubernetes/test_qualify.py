@@ -124,6 +124,27 @@ class ManifestTests(unittest.TestCase):
 
 
 class WorkerRecoveryTests(unittest.TestCase):
+    def test_schema_is_ready_before_applying_the_worker_deployment(self):
+        q = qualify.Qualification(qualify.load_contract(), OPTED_IN, None, Path("/tmp"))
+        events = []
+
+        def kube(*args, **kwargs):
+            if args[0] == "apply":
+                deployments = [i["metadata"]["name"] for i in json.loads(kwargs["input"])["items"]
+                               if i["kind"] == "Deployment"]
+                events.append(("apply", deployments))
+            else:
+                events.append(("ready", args[4]))
+
+        q.verify_identity = Mock()
+        q.kube = kube
+        q.prepare_sweeps = lambda: events.append(("schema",))
+        q.deploy()
+        self.assertEqual(events[:4], [
+            ("apply", ["postgres"]), ("ready", "deployment/postgres"), ("schema",),
+            ("apply", ["openmettle-api", "openmettle-worker"]),
+        ])
+
     def test_sigkill_targets_only_observed_worker_and_waits_for_a_new_ready_container(self):
         q = qualify.Qualification(qualify.load_contract(), OPTED_IN, None, Path("/tmp"))
         node = q.name + "-control-plane"
