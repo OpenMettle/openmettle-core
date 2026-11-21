@@ -321,6 +321,12 @@ async fn published_paths_replay_revisions_and_budget_survive_forks() {
         .await
         .unwrap()
         .unwrap();
+    for unprepared in [&empty, &original] {
+        assert!(matches!(
+            Snapshots::encode(&intent, unprepared, &catalog, &cfg),
+            Err(openmettle_core::model_config::Error::Invalid("input turn"))
+        ));
+    }
     assert!(original.turns[0].parts.is_empty());
     let original_parts = &original.turns[1].parts;
     for (i, part) in original_parts.iter().enumerate() {

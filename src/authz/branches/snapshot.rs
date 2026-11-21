@@ -57,6 +57,13 @@ impl Snapshots {
         catalog: &Catalog,
         config: &ConfigSnapshot,
     ) -> Result<Self, Error> {
+        if history
+            .turns
+            .first()
+            .is_none_or(|turn| turn.author_user_id.is_none())
+        {
+            return Err(Error::Invalid("input turn"));
+        }
         let target = catalog.target(&config.effective)?;
         let mut path = Vec::with_capacity(history.turns.len());
         for (depth, turn) in history.turns.iter().enumerate() {

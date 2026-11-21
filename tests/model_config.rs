@@ -1,6 +1,8 @@
 use openmettle_core::{
     authz::projects::ProjectSettings,
-    model_config::{Catalog, Error, PathTurn, PromptEstimate, ReplaySource, Selection, Source},
+    model_config::{
+        Catalog, Effective, Error, PathTurn, PromptEstimate, ReplaySource, Selection, Source,
+    },
 };
 use serde_json::{Value, json};
 
@@ -19,6 +21,13 @@ fn study() -> Selection {
 }
 fn permit(_: &str, _: Option<&str>) -> bool {
     true
+}
+
+fn omissions(e: &Effective) -> Vec<(Source, &str, &str)> {
+    e.omissions
+        .iter()
+        .map(|o| (o.source, o.control.as_str(), o.reason.as_str()))
+        .collect()
 }
 
 #[test]
@@ -104,6 +113,12 @@ fn sources_instructions_selection_and_typed_project_settings() {
         c.resolve(&project, &request, None, |_, _| false),
         Err(Error::Unauthorized)
     ));
+    let mut invalid = project.clone();
+    invalid.layer.instructions = Some("invalid\0instruction".into());
+    assert!(matches!(
+        c.resolve(&invalid, &request, None, permit),
+        Err(Error::Invalid("instructions"))
+    ));
     assert!(
         c.resolve(
             &project,
@@ -177,13 +192,10 @@ fn omission_explicit_default_unsupported_controls_and_switches() {
         .resolve(&project, &selection(json!({"model":"b"})), None, permit)
         .unwrap();
     assert_eq!(
-        e.omissions
-            .iter()
-            .map(|o| (o.control.as_str(), o.source, o.reason.as_str()))
-            .collect::<Vec<_>>(),
+        omissions(&e),
         [
-            ("temperature", Source::Preset, "unsupported_by_target"),
-            ("reasoning_effort", Source::Project, "unsupported_by_target")
+            (Source::Preset, "temperature", "unsupported_by_target"),
+            (Source::Project, "reasoning_effort", "unsupported_by_target")
         ]
     );
     for control in [
@@ -206,6 +218,121 @@ fn omission_explicit_default_unsupported_controls_and_switches() {
     assert!(c.resolve(&empty, &r, None, permit).is_err());
     r.layer.controls.top_p = Some(f64::NAN);
     assert!(c.resolve(&empty, &r, None, permit).is_err());
+}
+
+#[test]
+fn model_switch_validates_only_winning_values_against_target_bounds() {
+    let c = catalog(|d| {
+        let b = &mut d["models"]["b"];
+        b["temperature"] = json!({"min":0.0,"max":1.0});
+        b["top_p"] = json!({"min":0.1,"max":0.8});
+        b["joint_sampling"] = json!(true);
+    })
+    .unwrap();
+    let inherited = json!({
+        "temperature":1.5, "top_p":0.9, "context_window":7000, "output_reserve":3000
+    });
+    let project = selection(json!({"model":"a","layer":{"controls":inherited}}));
+    c.resolve(&project, &Selection::default(), None, permit)
+        .unwrap();
+    let request = selection(json!({"model":"b","layer":{"controls":{
+        "temperature":0.7, "top_p":0.6, "context_window":5000, "output_reserve":1024
+    }}}));
+    let e = c.resolve(&project, &request, None, permit).unwrap();
+    assert_eq!(
+        (e.temperature.value, e.temperature.source),
+        (Some(0.7), Source::Request)
+    );
+    assert_eq!(
+        (e.top_p.value, e.top_p.source),
+        (Some(0.6), Source::Request)
+    );
+    assert_eq!(
+        (e.ceiling.value, e.ceiling.source),
+        (Some(5000), Source::Request)
+    );
+    assert_eq!(e.context_window.value, None);
+    assert_eq!(
+        (e.output_reserve.value, e.output_reserve.source),
+        (Some(1024), Source::Request)
+    );
+    assert!(e.omissions.is_empty());
+
+    let switch = selection(json!({"model":"b"}));
+    for control in ["temperature", "top_p", "context_window", "output_reserve"] {
+        let project =
+            selection(json!({"model":"a","layer":{"controls":{(control):inherited[control]}}}));
+        assert_eq!(
+            c.resolve(&project, &switch, None, permit).err(),
+            Some(Error::Invalid(control))
+        );
+    }
+}
+
+#[test]
+fn model_switch_omits_unsupported_effort_only_until_a_layer_supplies_it() {
+    let c = catalog(|d| {
+        d["models"]["b"]["efforts"] = json!(["low", "medium"]);
+        d["models"]["b"]["defaults"]["controls"] = json!({"reasoning_effort":"low"});
+        d["presets"]["high-a"] = json!({"model":"a", "revision":"a/1",
+            "defaults":{"controls":{"reasoning_effort":"high"}}});
+        d["presets"]["medium-b"] = json!({"model":"b", "revision":"b/1",
+            "defaults":{"controls":{"reasoning_effort":"medium"}}});
+    })
+    .unwrap();
+    let project =
+        selection(json!({"preset":"high-a","layer":{"controls":{"reasoning_effort":"high"}}}));
+    let dropped = |source| (source, "reasoning_effort", "unsupported_by_target");
+    for (request, effort, source, expected_omissions) in [
+        (
+            json!({"model":"b","layer":{"controls":{"reasoning_effort":"low"}}}),
+            "low",
+            Source::Request,
+            vec![],
+        ),
+        (
+            json!({"preset":"medium-b"}),
+            "medium",
+            Source::Preset,
+            vec![dropped(Source::Project)],
+        ),
+        (
+            json!({"model":"b"}),
+            "low",
+            Source::Model,
+            vec![dropped(Source::Preset), dropped(Source::Project)],
+        ),
+    ] {
+        let e = c
+            .resolve(&project, &selection(request), None, permit)
+            .unwrap();
+        assert_eq!(
+            (
+                e.reasoning_effort.value.as_deref(),
+                e.reasoning_effort.source
+            ),
+            (Some(effort), source)
+        );
+        assert_eq!(omissions(&e), expected_omissions);
+    }
+}
+
+#[test]
+fn model_switch_to_unknown_capacity_omits_only_inherited_window() {
+    let c = catalog(|d| d["models"]["b"]["conservative_ceiling"] = Value::Null).unwrap();
+    let project = selection(json!({"model":"a","layer":{"controls":{"context_window":7000}}}));
+    let mut request = selection(json!({"model":"b"}));
+    let e = c.resolve(&project, &request, None, permit).unwrap();
+    assert_eq!((e.context_window.value, e.ceiling.value), (None, None));
+    assert_eq!(
+        omissions(&e),
+        [(Source::Project, "context_window", "unsupported_by_target")]
+    );
+    request.layer.controls.context_window = Some(5000);
+    assert!(matches!(
+        c.resolve(&project, &request, None, permit),
+        Err(Error::Invalid("context_window"))
+    ));
 }
 
 #[test]

@@ -257,7 +257,7 @@ impl Catalog {
             project_revision,
             reasoning_format: p.reasoning_format.clone(),
             context_window: Field::from_model(p.context_window),
-            ceiling: Field::from_model(p.context_window.or(p.conservative_ceiling)),
+            ceiling: Field::default(),
             output_reserve: Field::default(),
             instructions: Vec::new(),
             omissions: Vec::new(),
@@ -265,20 +265,36 @@ impl Catalog {
             top_p: Field::default(),
             reasoning_effort: Field::default(),
         };
-        for (source, layer) in [
+        let layers = [
             (Source::Model, Some(&p.defaults)),
             (Source::Preset, preset.map(|p| &p.defaults)),
             (Source::Project, Some(&project.layer)),
             (Source::Request, Some(&request.layer)),
-        ] {
-            if let Some(layer) = layer {
-                let drop_unsupported = switched
-                    && (source == Source::Project
-                        || (source == Source::Preset
-                            && preset.is_some_and(|s| s.model != *model_id)));
-                e.apply(p, layer, source, drop_unsupported)?;
+        ]
+        .into_iter()
+        .filter_map(|(source, layer)| Some((source, layer?)));
+        for (source, layer) in layers.clone() {
+            if let Some(text) = &layer.instructions {
+                if text.contains('\0') {
+                    return Err(Error::Invalid("instructions"));
+                }
+                e.instructions.push(Instruction {
+                    source,
+                    text: text.clone(),
+                });
             }
         }
+        for (source, layer) in layers.rev() {
+            let drop_unsupported = switched
+                && (source == Source::Project
+                    || (source == Source::Preset && preset.is_some_and(|s| s.model != *model_id)));
+            e.apply_controls(p, &layer.controls, source, drop_unsupported)?;
+        }
+        if e.ceiling.value.is_none() {
+            e.ceiling = Field::from_model(p.context_window.or(p.conservative_ceiling));
+        }
+        // Snapshots list preset omissions before project omissions, in control order within each.
+        e.omissions.sort_by_key(|o| o.source == Source::Project);
         if !p.joint_sampling && e.temperature.value.is_some() && e.top_p.value.is_some() {
             return Err(Error::Invalid("sampling combination"));
         }
@@ -412,23 +428,13 @@ fn supported<T>(
 }
 
 impl Effective {
-    fn apply(
+    fn apply_controls(
         &mut self,
         p: &Profile,
-        layer: &Layer,
+        c: &Controls,
         source: Source,
         drop_unsupported: bool,
     ) -> Result<(), Error> {
-        if let Some(text) = &layer.instructions {
-            if text.contains('\0') {
-                return Err(Error::Invalid("instructions"));
-            }
-            self.instructions.push(Instruction {
-                source,
-                text: text.clone(),
-            });
-        }
-        let c = &layer.controls;
         for (control, value, range, field) in [
             (
                 "temperature",
@@ -438,7 +444,8 @@ impl Effective {
             ),
             ("top_p", c.top_p, p.top_p, &mut self.top_p),
         ] {
-            if let Some(value) = value
+            if field.value.is_none()
+                && let Some(value) = value
                 && let Some(r) = supported(
                     range,
                     drop_unsupported,
@@ -453,7 +460,9 @@ impl Effective {
                 field.set(value, source);
             }
         }
-        if let Some(effort) = &c.reasoning_effort {
+        if self.reasoning_effort.value.is_none()
+            && let Some(effort) = &c.reasoning_effort
+        {
             let level = if effort == "default" {
                 p.default_effort.as_ref()
             } else {
@@ -469,7 +478,8 @@ impl Effective {
                 self.reasoning_effort.set(level.clone(), source);
             }
         }
-        if let Some(window) = c.context_window
+        if self.ceiling.value.is_none()
+            && let Some(window) = c.context_window
             && let Some(limit) = supported(
                 p.context_window.or(p.conservative_ceiling),
                 drop_unsupported,
@@ -486,7 +496,8 @@ impl Effective {
                 self.context_window.set(window, source);
             }
         }
-        if let Some(reserve) = c.output_reserve
+        if self.output_reserve.value.is_none()
+            && let Some(reserve) = c.output_reserve
             && let Some(limit) = supported(
                 p.output_limit,
                 drop_unsupported,
