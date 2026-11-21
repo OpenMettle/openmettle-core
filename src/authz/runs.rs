@@ -255,7 +255,7 @@ async fn recheck_locked(
     Ok(RunRecheckOutcome::Continue)
 }
 
-async fn recheck_decision(
+pub(super) async fn recheck_decision(
     c: &mut PgConnection,
     r: &RunRecheckRequest<'_>,
     owner: &str,
@@ -375,7 +375,7 @@ async fn recheck_step(
 
 /// The run's own scope, hydrated independently of its target so that a target outside it is
 /// concealed. `None` if the scope row is missing or names neither a user nor a project.
-async fn run_scope(
+pub(super) async fn run_scope(
     c: &mut PgConnection,
     scope_id: &str,
     now_ms: i64,
@@ -471,7 +471,7 @@ async fn cancel_revoked(
     Ok(rows.len() as u64)
 }
 
-async fn cancel_one(
+pub(super) async fn cancel_one(
     c: &mut PgConnection,
     scope: &str,
     id: &str,
@@ -791,11 +791,35 @@ pub async fn admit_run(
     request: &RunAdmission<'_>,
     limits: &AdmissionLimits,
 ) -> Result<Admission, StoreError> {
+    admit(tx, request, limits, None).await
+}
+
+/// Capture ADR 0035 evidence under the admission locks. The mode comes from the immutable
+/// configuration snapshot. The caller supplies the locator from its authenticated session.
+pub async fn admit_run_with_mode(
+    tx: &mut WriteTransaction<'_>,
+    request: &RunAdmission<'_>,
+    limits: &AdmissionLimits,
+    session: &super::approvals::EffectSession,
+) -> Result<Admission, StoreError> {
+    if request.input.actor != session.context().user_id()
+        || request.actor_approval_id != session.context().approval_id()
+    {
+        return Err(StoreError::Denied(DenialReason::NotFound));
+    }
+    admit(tx, request, limits, Some(session.locator())).await
+}
+
+async fn admit(
+    tx: &mut WriteTransaction<'_>,
+    request: &RunAdmission<'_>,
+    limits: &AdmissionLimits,
+    session: Option<&str>,
+) -> Result<Admission, StoreError> {
     limits.validate()?;
     request.validate()?;
     let round_limit = effective_round_limit(request.requested_rounds, limits.round_cap)?;
     let r = &request.input;
-    let now = request.now_ms;
     let c = tx.connection()?;
     // Exact limits rely on each statement after a lock seeing every earlier commit.
     let (_, _, isolation): (String, String, String) = sqlx::query_as(
@@ -808,6 +832,10 @@ pub async fn admit_run(
         return Err(StoreError::InvalidInput("transaction isolation"));
     }
     let (personal_owner, project_id) = lock_scope_actor(c, r.scope, r.actor).await?;
+    let now = match session {
+        Some(locator) => super::approvals::admission_time(c, request, locator).await?,
+        None => request.now_ms,
+    };
     // Step 3: authorize after the locks with the recheck's decision.
     let principal =
         store::hydrate_api_principal(c, r.actor, request.actor_approval_id, now).await?;
@@ -874,6 +902,19 @@ pub async fn admit_run(
             return Ok(Admission::Refused(refusal));
         }
     }
+    let effect = match session {
+        Some(session) => Some(
+            super::approvals::admission(
+                c,
+                request,
+                session,
+                principal.as_ref().ok_or(StoreError::NotFound)?,
+                &platform,
+            )
+            .await?,
+        ),
+        None => None,
+    };
     // Step 7: the new row is the reservation of the run slot.
     let columns = AdmissionColumns {
         approval: request.actor_approval_id,
@@ -881,11 +922,12 @@ pub async fn admit_run(
         // At most 24 hours, validated above.
         queue_timeout_ms: limits.queue_timeout.as_millis() as i64,
     };
-    let (run_id, inserted) = match durable::insert_run(tx, r, Some(&columns)).await {
-        Ok(inserted) => inserted,
-        Err(durable::Error::Conflict) => return Err(StoreError::Conflict(KEY_REUSED)),
-        Err(error) => return Err(error.into()),
-    };
+    let (run_id, inserted) =
+        match durable::insert_admitted(tx, r, Some(&columns), effect.as_ref()).await {
+            Ok(inserted) => inserted,
+            Err(durable::Error::Conflict) => return Err(StoreError::Conflict(KEY_REUSED)),
+            Err(error) => return Err(error.into()),
+        };
     if !inserted {
         // Only a writer outside these locks (bare `create_run`) can have recorded the key.
         let replay = lookup(tx.connection()?, r.scope, r.actor, r.key).await?;
@@ -1059,27 +1101,39 @@ const CLAIM: &str = concat!(
        SELECT actor_user_id, count(*) AS n FROM executing GROUP BY actor_user_id
      ), scope_load AS (
        SELECT scope_id, count(*) AS n FROM executing GROUP BY scope_id
-     ), next AS (
-       SELECT r.id, clock_timestamp() AS t FROM openmettle.runs r
+     ), locked AS MATERIALIZED (
+       SELECT r.id, r.state, r.queue_expires_at, p.approval_expires_at,
+              p.resume_execution_expires_at FROM openmettle.runs r
+         LEFT JOIN openmettle.run_approvals p ON p.id = r.approval_wait_id
+         LEFT JOIN openmettle.run_approval_decisions d ON d.approval_id = p.id
          LEFT JOIN actor_load a ON a.actor_user_id = r.actor_user_id
          LEFT JOIN scope_load s ON s.scope_id = r.scope_id
         WHERE r.",
     non_terminal!(),
     "
-          AND r.state = 'queued'
-          AND r.queue_expires_at > clock_timestamp()
+          AND r.cancel_reason IS NULL AND (
+              (r.state = 'queued' AND r.queue_expires_at > clock_timestamp())
+              OR (r.state = 'waiting' AND r.wait_reason = 'approval' AND d.decision = 'approve'
+                  AND p.approval_expires_at > clock_timestamp()))
           AND coalesce(a.n, 0) < $1
           AND coalesce(s.n, 0) < $2
         ORDER BY coalesce(a.n, 0), r.created_at, r.id
         LIMIT 1
         FOR NO KEY UPDATE OF r SKIP LOCKED
+     ), next AS MATERIALIZED (
+       SELECT locked.*, clock_timestamp() AS t FROM locked
+     ), eligible AS (
+       SELECT *, CASE WHEN state = 'waiting' THEN resume_execution_expires_at
+                      ELSE t + $4::bigint * interval '1 millisecond' END AS deadline FROM next
+        WHERE (state = 'queued' AND t < queue_expires_at)
+           OR (state = 'waiting' AND t < approval_expires_at AND t < resume_execution_expires_at)
      )
      UPDATE openmettle.runs r
-        SET state = 'running', claim_token = gen_random_uuid(), claimed_at = next.t,
-            lease_expires_at = next.t + $3::bigint * interval '1 millisecond',
-            execution_expires_at = next.t + $4::bigint * interval '1 millisecond'
-       FROM next WHERE r.id = next.id
-     RETURNING r.scope_id::text, r.id::text, r.claim_token::text,
+        SET state = 'running', wait_reason = NULL, claim_token = gen_random_uuid(), claimed_at = e.t,
+            lease_expires_at = least(e.t + $3::bigint * interval '1 millisecond', e.deadline),
+            execution_expires_at = e.deadline
+       FROM eligible e WHERE r.id = e.id
+     RETURNING r.scope_id::text, r.id::text, r.claim_token::text, e.state = 'waiting' AS resumed,
                r.actor_approval_id::text, r.round_limit, ",
     leases::remaining_sql!()
 );
@@ -1110,7 +1164,15 @@ pub async fn claim_next(
         };
         let run = ClaimedRun::from_row(&row)?;
         let key = format!("claim:{}", run.claim_token);
-        append(c, &run.scope_id, &run.run_id, &key, CLAIMED).await?;
+        let event = if row.try_get("resumed")? {
+            Payload {
+                format: "openmettle.run-resumed",
+                ..CLAIMED
+            }
+        } else {
+            CLAIMED
+        };
+        append(c, &run.scope_id, &run.run_id, &key, event).await?;
         Ok(Some(run))
     })
     .await
@@ -1706,7 +1768,9 @@ mod tests {
         assert!(LIVE_COUNTS.contains(" AND state = 'queued' LIMIT $5"));
         assert_eq!(CLAIM.matches(live).count(), 2);
         assert!(CLAIM.contains("state IN ('running', 'cancelling', 'reconciling')"));
-        assert!(!CLAIM.contains("'waiting'"));
+        assert!(CLAIM.contains(
+            "r.state = 'waiting' AND r.wait_reason = 'approval' AND d.decision = 'approve'"
+        ));
         assert!(CLAIM.contains("ORDER BY coalesce(a.n, 0), r.created_at, r.id"));
         assert!(CLAIM.contains("FOR NO KEY UPDATE OF r SKIP LOCKED"));
         assert!(CLAIM.contains("r.queue_expires_at > clock_timestamp()"));

@@ -269,6 +269,11 @@ before returning `Invalidated`. Rechecks happen between steps, when the holder h
 so this normally ends `cancelled` with `{"reason":"revoked"}`. A lapsed or stale holder gets
 `LeaseError` and changes nothing; it does not reach the decision.
 
+[ADR 0035](0035-approvals-permitted-yolo-and-effect-ledger.md) amends the unresolved-write rule below.
+Park, settlement, expired-run settlement and reconciliation count `idempotent`, `lookup` and
+`non_repeatable` operations with outcome `intent` or `outcome_unknown`. Only
+`repeatable_read` is exempt. Endpoint deduplication cannot establish a write's outcome.
+
 ### Settlement
 
 `settle(c, &Lease, &LeaseSettings, Settle) -> Result<Settled, LeaseError>`, after a `Hold` fence:
@@ -504,9 +509,13 @@ batch of 100, logs a failure as a fixed category and continues next tick:
 | Sweep | Call | Notes |
 | --- | --- | --- |
 | Queue deadline | `authz::runs::expire_queued(c, 100)` | ADR 0032 |
+| Approval and legacy waits | `authz::approvals::expire_waits(c, 100)` | ADR 0035 |
 | Execution deadline | `settle_expired(c, 100)` | Above |
 | Abandoned uploads | `artifact_fs::reconcile_expired(pool, store, UPLOAD_TIMEOUT + 300 s, 100)` | Only with `OPENMETTLE_WORKER_ARTIFACTS_DIR`; 900 s exceeds the 600 s upload deadline plus settlement (ADR 0031) |
 | Retained revisions | `artifact_fs::purge_due(pool, store, 100)` | Only with `ARTIFACTS_DIR` |
+
+The queue and wait sweeps each have a 15-second budget. The worker attempts both on every
+tick and reports one `expire_queued` failure if either fails or times out.
 
 Every sweep locks rows and re-checks, so concurrent replicas are safe and at worst repeat a
 lookup. `begin_purge` and `confirm_purge` are idempotent for a revision already `purging` or

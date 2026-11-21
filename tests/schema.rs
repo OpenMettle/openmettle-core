@@ -518,6 +518,42 @@ const ADDITIVE_COLUMNS: &[AdditiveColumn] = &[
         column: "cancel_reason",
         default: ColumnDefault::Null,
     },
+    AdditiveColumn {
+        since: 22,
+        table: "runs",
+        column: "execution_mode",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 22,
+        table: "runs",
+        column: "originating_session_id",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 22,
+        table: "runs",
+        column: "admission_evidence",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 22,
+        table: "runs",
+        column: "approval_wait_id",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 22,
+        table: "operations",
+        column: "approval_id",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 22,
+        table: "operations",
+        column: "approval_decision",
+        default: ColumnDefault::Null,
+    },
 ];
 
 /// Single declarative registry of every table added after migration 14, ordered by `since`
@@ -586,6 +622,16 @@ const ADDITIVE_TABLES: &[AdditiveTable] = &[
     AdditiveTable {
         since: 21,
         table: "message_turns",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 22,
+        table: "run_approvals",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 22,
+        table: "run_approval_decisions",
         seed_row: None,
     },
 ];
@@ -746,6 +792,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "93686928e8f33f08c340f6dbe6348727a1f9abb4c44c0e68061d10578d181e59",
         "a4a226cb408141a41dfb7e174646d7027af6d34c34020d6ba8401aa6dfad7116",
         "47ee7ed667d0f65034e4b9ea8315f66807ae8ed5a4428f3afc1763d205c8bc00",
+        "e9221570f5187a4fc2d666d3724d8646d6d4236d3cb7997538e80ec10355be57",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
@@ -871,7 +918,7 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
     let after_14: Vec<(&str, Option<&str>)> = expected_added_tables_since(14)
         .map(|e| (e.table, e.seed_row))
         .collect();
-    assert_eq!(after_14.len(), 13);
+    assert_eq!(after_14.len(), 15);
     assert!(after_14.contains(&("account_admin_lock", Some(SINGLETON_LOCK_SEED))));
     assert!(after_14.contains(&("run_dispatch_lock", Some(SINGLETON_LOCK_SEED))));
     let after_18: Vec<(&str, Option<&str>)> = expected_added_tables_since(18)
@@ -883,7 +930,9 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
             ("run_dispatch_lock", Some(SINGLETON_LOCK_SEED)),
             ("branch_heads", None),
             ("message_parts", None),
-            ("message_turns", None)
+            ("message_turns", None),
+            ("run_approvals", None),
+            ("run_approval_decisions", None),
         ]
     );
 
@@ -2410,3 +2459,6 @@ mod consumer;
 
 #[path = "schema/branches.rs"]
 mod branches;
+
+#[path = "schema/approvals.rs"]
+mod approvals;

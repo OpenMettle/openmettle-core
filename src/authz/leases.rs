@@ -309,9 +309,11 @@ pub enum Settled {
 
 macro_rules! unresolved {
     () => {
-        "outcome IN ('intent', 'outcome_unknown') AND capability IN ('lookup', 'non_repeatable')"
+        "outcome IN ('intent', 'outcome_unknown') AND capability IN ('idempotent', 'lookup', 'non_repeatable')"
     };
 }
+
+pub(super) use unresolved;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct UnresolvedOperation {

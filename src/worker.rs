@@ -2,6 +2,7 @@
 use crate::{
     RunPolicy, WorkerSettings, artifact_fs,
     authz::{
+        approvals::{self, EffectPolicy, IntentResult, Proposal, Review},
         leases::{
             self, ExecState, FailReason, Fence, LeaseError, LeaseSettings, Settle, Settled,
             UnresolvedOperation,
@@ -41,12 +42,58 @@ pub struct StepContext {
     pub tasks: TaskHandle,
 }
 
-type Children = Mutex<Option<JoinSet<()>>>;
+#[derive(Default)]
+struct ChildSet {
+    tasks: JoinSet<()>,
+    closed: bool,
+}
+type Children = Mutex<Option<ChildSet>>;
 
 /// A weak handle cannot keep the run's tasks alive after the worker is dropped.
 #[derive(Clone)]
 pub struct TaskHandle(Weak<Children>);
+/// Owns a step's child tasks. Closing an empty set prevents another spawn racing park.
+pub struct StepTasks(Arc<Children>);
+impl Default for StepTasks {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(Some(ChildSet::default()))))
+    }
+}
+impl StepTasks {
+    pub fn handle(&self) -> TaskHandle {
+        TaskHandle(Arc::downgrade(&self.0))
+    }
+}
+/// Owns the temporary closure of a drained task set while the park transaction is prepared.
+pub(crate) struct ParkGuard(Option<Arc<Children>>);
+impl ParkGuard {
+    pub(crate) fn keep_closed(mut self) {
+        self.0 = None;
+    }
+}
+impl Drop for ParkGuard {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.0
+            && let Some(set) = owner.lock().unwrap().as_mut()
+        {
+            set.closed = false;
+        }
+    }
+}
 impl TaskHandle {
+    pub(crate) fn close_if_drained(&self) -> Option<ParkGuard> {
+        let owner = self.0.upgrade()?;
+        let mut owned = owner.lock().unwrap();
+        let set = owned.as_mut()?;
+        while set.tasks.try_join_next().is_some() {}
+        if set.closed || !set.tasks.is_empty() {
+            return None;
+        }
+        set.closed = true;
+        drop(owned);
+        Some(ParkGuard(Some(owner)))
+    }
+
     /// Returns false once the runner has closed this run's task set.
     pub fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) -> bool {
         let Some(owner) = self.0.upgrade() else {
@@ -56,8 +103,11 @@ impl TaskHandle {
         let Some(set) = set.as_mut() else {
             return false;
         };
-        while set.try_join_next().is_some() {}
-        set.spawn(task);
+        if set.closed {
+            return false;
+        }
+        while set.tasks.try_join_next().is_some() {}
+        set.tasks.spawn(task);
         true
     }
 }
@@ -97,6 +147,36 @@ pub trait Executor: Send + Sync + 'static {
     ) -> impl Future<Output = Option<OwnedObservation>> + Send;
 }
 
+/// A reviewed adapter receives only committed bytes. It records observations with a Hold fence.
+pub trait ApprovedAdapter: Send + Sync {
+    fn send<'a>(
+        &'a self,
+        run: &'a ActiveRun,
+        operation_id: String,
+        request: Vec<u8>,
+        step: StepContext,
+    ) -> std::pin::Pin<Box<dyn Future<Output = StepResult> + Send + 'a>>;
+}
+
+pub struct ApprovedEffects {
+    pub policy: Arc<dyn EffectPolicy + Send + Sync>,
+    pub adapter: Arc<dyn ApprovedAdapter>,
+}
+
+impl EffectPolicy for Option<&ApprovedEffects> {
+    fn review(&self, scope: &str, run: &str, p: &Proposal) -> Result<Option<Review>, StoreError> {
+        match self {
+            Some(effects) => effects.policy.review(scope, run, p),
+            None => Ok(None),
+        }
+    }
+}
+
+struct Adapters<'a, E> {
+    executor: &'a E,
+    approved: Option<&'a ApprovedEffects>,
+}
+
 async fn connection(pool: &PgPool) -> Result<PoolConnection<Postgres>, StoreError> {
     Ok(pool.acquire().await?)
 }
@@ -107,10 +187,8 @@ fn jitter(base: Duration) -> Duration {
     base + base * u32::from(byte[0]) / (255 * 5)
 }
 
-async fn sweep<T, E>(category: Sweep, work: impl Future<Output = Result<T, E>>) {
-    if !matches!(timeout(Duration::from_secs(15), work).await, Ok(Ok(_))) {
-        sweep_failed(category);
-    }
+async fn sweep<T, E>(work: impl Future<Output = Result<T, E>>) -> bool {
+    matches!(timeout(Duration::from_secs(15), work).await, Ok(Ok(_)))
 }
 
 pub(crate) async fn maintenance(
@@ -120,22 +198,27 @@ pub(crate) async fn maintenance(
 ) {
     loop {
         sleep(jitter(period)).await;
-        sweep(Sweep::Queue, async {
-            queue::expire_queued(&mut *connection(pool).await?, 100).await
-        })
-        .await;
-        sweep(Sweep::Execution, async {
-            leases::settle_expired(&mut *connection(pool).await?, 100).await
-        })
-        .await;
+        let queued =
+            sweep(async { queue::expire_queued(&mut *connection(pool).await?, 100).await }).await;
+        let waits =
+            sweep(async { approvals::expire_waits(&mut *connection(pool).await?, 100).await })
+                .await;
+        // Queue maintenance has one failure event per tick and a separate budget for each sweep.
+        if !queued || !waits {
+            sweep_failed(Sweep::Queue);
+        }
+        if !sweep(async { leases::settle_expired(&mut *connection(pool).await?, 100).await }).await
+        {
+            sweep_failed(Sweep::Execution);
+        }
         if let Some(store) = store {
             let age = artifact_fs::UPLOAD_TIMEOUT + Duration::from_secs(300);
-            sweep(
-                Sweep::Uploads,
-                artifact_fs::reconcile_expired(pool, store, age, 100),
-            )
-            .await;
-            sweep(Sweep::Retention, artifact_fs::purge_due(pool, store, 100)).await;
+            if !sweep(artifact_fs::reconcile_expired(pool, store, age, 100)).await {
+                sweep_failed(Sweep::Uploads);
+            }
+            if !sweep(artifact_fs::purge_due(pool, store, 100)).await {
+                sweep_failed(Sweep::Retention);
+            }
         }
     }
 }
@@ -178,6 +261,19 @@ pub async fn run<E: Executor>(
     shutdown: impl Future<Output = ()>,
     run_budget: Duration,
 ) {
+    run_with_approvals(pool, store, settings, executor, None, shutdown, run_budget).await
+}
+
+/// Run the same worker with an optional reviewed adapter for resumed effects.
+pub async fn run_with_approvals<E: Executor>(
+    pool: &PgPool,
+    store: Option<&artifact_fs::Store>,
+    settings: WorkerSettings,
+    executor: Arc<E>,
+    approved: Option<Arc<ApprovedEffects>>,
+    shutdown: impl Future<Output = ()>,
+    run_budget: Duration,
+) {
     let mut runs = JoinSet::new();
     let (shutdown_tx, shutdown_rx) = watch::channel(None);
     let claiming = async {
@@ -197,10 +293,14 @@ pub async fn run<E: Executor>(
                 if let Ok(Some((active, sent, recovered))) = claim(pool, policy).await {
                     let (pool, executor, shutdown) =
                         (pool.clone(), executor.clone(), stopping.clone());
+                    let approved = approved.clone();
                     runs.spawn(async move {
                         run_one(
                             &pool,
-                            executor.as_ref(),
+                            Adapters {
+                                executor: executor.as_ref(),
+                                approved: approved.as_deref(),
+                            },
                             active,
                             sent,
                             recovered,
@@ -386,14 +486,14 @@ enum WorkEnd {
 
 async fn execute<E: Executor>(
     pool: &PgPool,
-    executor: &E,
+    adapters: Adapters<'_, E>,
     run: &ActiveRun,
     recovered: bool,
     settings: &LeaseSettings,
     context: &RunContext,
 ) -> Result<WorkEnd, LeaseError> {
     if run.state == ExecState::Reconciling {
-        return reconcile(pool, run, executor, context).await;
+        return reconcile(pool, run, adapters.executor, context).await;
     }
     if run.state == ExecState::Cancelling
         || (recovered
@@ -415,7 +515,43 @@ async fn execute<E: Executor>(
         if let Some(why) = context.stopped() {
             return Ok(WorkEnd::Stop(why));
         }
-        match executor.step(run, context.step()).await {
+        let pending =
+            approvals::pending_effect(&mut *connection(pool).await?, &run.claim.lease()).await?;
+        if let Some(why) = context.stopped() {
+            return Ok(WorkEnd::Stop(why));
+        }
+        let result = if let Some((id, proposal)) = pending {
+            let intent = approvals::record_fenced_intent(
+                &mut *connection(pool).await?,
+                &run.claim.lease(),
+                &proposal,
+                Some(&id),
+                &adapters.approved,
+                settings,
+            )
+            .await?;
+            match intent {
+                IntentResult::Applied(intent) => {
+                    let mut step = context.step();
+                    let operation = intent.operation_id.clone();
+                    let Some((request, deadline)) = intent.start(&step) else {
+                        return Ok(WorkEnd::Complete(Settle::Stopped));
+                    };
+                    step.deadline = deadline;
+                    adapters
+                        .approved
+                        .ok_or(StoreError::Conflict("approval adapter"))?
+                        .adapter
+                        .send(run, operation, request, step)
+                        .await
+                }
+                IntentResult::Invalidated(settled) => return Ok(WorkEnd::Invalidated(settled)),
+                _ => return Ok(WorkEnd::Complete(Settle::Stopped)),
+            }
+        } else {
+            adapters.executor.step(run, context.step()).await
+        };
+        match result {
             StepResult::Continue => continue,
             StepResult::Finished => return Ok(WorkEnd::Complete(Settle::Succeeded)),
             StepResult::Failed(reason) => return Ok(WorkEnd::Complete(Settle::Failed(reason))),
@@ -426,7 +562,7 @@ async fn execute<E: Executor>(
 
 async fn run_one<E: Executor>(
     pool: &PgPool,
-    executor: &E,
+    adapters: Adapters<'_, E>,
     run: ActiveRun,
     sent: Instant,
     recovered: bool,
@@ -434,7 +570,7 @@ async fn run_one<E: Executor>(
     mut shutdown: watch::Receiver<Option<Instant>>,
 ) {
     let lease = run.claim.lease();
-    let children = Arc::new(Mutex::new(Some(JoinSet::new())));
+    let children = StepTasks::default();
     let (stop, rx) = watch::channel(None);
     let (deadline, current) = watch::channel(stop_point(
         sent,
@@ -446,10 +582,10 @@ async fn run_one<E: Executor>(
     let context = RunContext {
         deadline: current,
         stop: rx,
-        tasks: TaskHandle(Arc::downgrade(&children)),
+        tasks: children.handle(),
     };
     let mut work = Box::pin(async {
-        match execute(pool, executor, &run, recovered, &settings, &context).await {
+        match execute(pool, adapters, &run, recovered, &settings, &context).await {
             Ok(end) => end,
             Err(LeaseError::Stopping(_)) => WorkEnd::Stop(Stop::Cancel),
             Err(_) => WorkEnd::Stop(Stop::LeaseLost),
@@ -484,7 +620,13 @@ async fn run_one<E: Executor>(
         };
         drop(work);
         // Close spawning before aborting, including spawns racing the end of drain.
-        let mut owned = children.lock().unwrap().take().unwrap();
+        let mut owned = children
+            .0
+            .lock()
+            .unwrap()
+            .take()
+            .expect("runner owns child set")
+            .tasks;
         owned.abort_all();
         let _ = timeout_at(until, async { while owned.join_next().await.is_some() {} }).await;
         end
