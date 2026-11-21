@@ -22,8 +22,11 @@ Update, 21 November 2026 (V1-12 PR2). The mounted API serves `getRun` and `strea
 authorization during replay and snapshot resynchronization.
 
 V1-07 PR1 proposes branch history, preset and effective-configuration reads, and turn
-submission and cancellation using the existing `Run` snapshot. The operations and their
-delivery gates are specified in [ADR 0036](0036-conversation-branches-presets-and-effective-model-config.md).
+submission and cancellation using the existing `Run` snapshot. The proposed JSON request
+body ceiling is 128 KiB (131,072 bytes) for `POST /v1/runs` and
+`POST /v1/conversations/{conversation_id}/branches/{branch_id}/effective-configuration`.
+All other JSON routes retain the 64 KiB ceiling. The combined persisted run input and
+configuration snapshots remain limited to 256 KiB. [ADR 0036](0036-conversation-branches-presets-and-effective-model-config.md).
 
 ## Canonical source and versions
 

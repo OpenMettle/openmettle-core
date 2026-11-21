@@ -29,18 +29,35 @@ IDs and references are UUIDs. Foreign keys use `NO ACTION`.
 
 | Relation and columns | Keys and invariants |
 | --- | --- |
-| `branch_heads(scope_id, conversation_id, branch_id, parent_branch_id, head_message_id)` | Primary key `branch_id`. Both branch references use the existing scoped branch triple. The head references `messages(conversation_id, id)`. One root per conversation (unique where `parent_branch_id IS NULL`). Only the head can change. A new child records its source branch permanently and starts at its immutable `fork_message_id`. A null head is the empty path. |
-| `message_turns(scope_id, conversation_id, message_id, author_user_id, run_id, reasoning_blocks, input_count, output_count)` | Primary key `message_id`. Add `UNIQUE (scope_id, conversation_id, id)` to `messages` and `runs` for the scoped FKs. Exactly one of `author_user_id` (FK to `users.id`, role `user`) and `run_id` (role `assistant`) is set. Unique `run_id` permits one final answer per run. Only assistant rows may carry a bounded array of structured reasoning blocks or nullable, nonnegative bigint provider counts. The run pins the producing profile and the input to which the assistant replies. |
+| `branch_heads(scope_id, conversation_id, branch_id, parent_branch_id, head_message_id)` | Primary key `branch_id`. Both branch references use the existing scoped branch triple. `CHECK (parent_branch_id <> branch_id)` excludes a self-parent. The head references `messages(conversation_id, id)`. One root per conversation (unique where `parent_branch_id IS NULL`). Only the head can change. A new child records its source branch permanently and starts at its immutable `fork_message_id`. A null head is the empty path. |
+| `message_turns(scope_id, conversation_id, message_id, author_user_id, run_id, reasoning_blocks, reasoning_bytes, input_count, output_count)` | Primary key `message_id`. Add `UNIQUE (scope_id, conversation_id, id)` to `messages` and `runs` for the scoped FKs. Exactly one of `author_user_id` (FK to `users.id`, role `user`) and `run_id` (role `assistant`) is set. Unique `run_id` permits one final answer per run. Only assistant rows may carry a bounded array of structured reasoning blocks or nullable, nonnegative bigint provider counts. The run pins the producing profile and the input to which the assistant replies. |
 | `message_parts(id, scope_id, conversation_id, message_id, ordinal, kind, text_value, artifact_revision_id)` | Primary key `id` defaults to a random UUID. Unique `(message_id, ordinal)` preserves visible part order. A scoped FK to `message_turns(scope_id, conversation_id, message_id)` uses a matching unique key. A `text` part carries only bounded UTF-8 text. An `attachment` carries only a revision, with FK `(scope_id, artifact_revision_id)` to `artifact_revisions(scope_id, id)`. Check the discriminator, exclusive payloads and nonnegative ordinal in SQL. |
 
 Use integer ordinals 0–127, text for the part kind and value, and JSONB for reasoning.
-Limit visible text to 64 KiB per message and the serialized reasoning array to 64 KiB and
-128 blocks. These are storage bounds. A user turn needs nonempty text or an attachment.
+Limit visible UTF-8 text to 64 KiB in total per message and the reasoning array to 128
+blocks. Store absent reasoning as SQL NULL. The `message_turns` constraint checks the
+byte count against PostgreSQL's text representation of the stored JSONB.
+
+```sql
+reasoning_bytes integer NOT NULL DEFAULT 0,
+CHECK ((reasoning_blocks IS NULL AND reasoning_bytes = 0)
+    OR (reasoning_blocks IS NOT NULL AND reasoning_bytes = octet_length(reasoning_blocks::text)
+        AND reasoning_bytes BETWEEN 1 AND 65536))
+```
+
+A user turn needs nonempty text or an attachment.
 The writer inserts the message, turn and all parts in one transaction with contiguous
 ordinals from zero. Publishing the head seals the turn. Each new parent link must point to
 an existing ancestor on the selected path. The FKs enforce scope and conversation. The
 writer enforces ancestry, acyclicity and complete publication. Tool calls and outcomes
 keep their own ADR 0004 operation records.
+
+PR2's additive migration indexes only nonterminal runs for the branch append check.
+
+```sql
+CREATE INDEX runs_branch_live_idx ON openmettle.runs (branch_id)
+WHERE state NOT IN ('succeeded','failed','cancelled','interrupted');
+```
 
 Creating a conversation creates its empty root. A branch without a `branch_heads` row
 predates managed history. Preserve that ID, its fork, messages and run references. Report
@@ -58,10 +75,15 @@ For example, editing U in `P → U → A` yields `P → U′` on a second branch
 yields a third branch at U. Both paths through U reference the same U, part IDs and revision
 IDs. An explicitly retained attachment on U′ has a new part ID and the original revision ID.
 No bytes move and no second storage charge accrues. Resolve the owning artifact from the
-revision, check the actor's current artifact access and require `active` for attachment or
-provider input. Reject a foreign scope even if the actor can read both. Recheck on history
-projection, download and execution. Conceal inaccessible references and metadata. A visible
-retained revision can show its state but cannot supply bytes. [ADR 0005](0005-artifact-storage-accounting.md)
+revision and require current read access and an `active` revision for attachment or
+provider input. Reject a foreign scope even if the actor can read both. On retry, revalidate
+U's attachments as current input. Refuse the retry if a revision is inactive (including
+`retained` or `purged`) or access was revoked. The actor can edit U on a fork to remove
+that attachment. On earlier completed turns, omit unavailable attachments from provider
+context and record each omission deterministically in part order. Continue the new turn.
+Recheck access and state on history projection, download and execution. Conceal inaccessible
+references and metadata, including in omission reports. A visible retained revision can
+show its state but cannot supply bytes. [ADR 0005](0005-artifact-storage-accounting.md)
 and [ADR 0031](0031-filesystem-artifact-storage-and-streaming-multipart.md).
 
 Keep structured reasoning exclusively in `reasoning_blocks` with its versioned block format
@@ -84,15 +106,26 @@ reasoning or let an old writer forge its producer.
 | Relation | `openmettle_api` | `openmettle_worker` |
 | --- | --- | --- |
 | `branch_heads` | SELECT, INSERT on the five named columns, UPDATE only `head_message_id` | SELECT, UPDATE only `head_message_id` for fenced completion |
-| `message_turns` | SELECT all listed columns except `reasoning_blocks` by column. INSERT only `scope_id, conversation_id, message_id, author_user_id` | SELECT. INSERT only `scope_id, conversation_id, message_id, run_id, reasoning_blocks, input_count, output_count` |
+| `message_turns` | Column-level SELECT on all listed columns except `reasoning_blocks`, including `reasoning_bytes`. INSERT only `scope_id, conversation_id, message_id, author_user_id` | SELECT. INSERT only `scope_id, conversation_id, message_id, run_id, reasoning_blocks, reasoning_bytes, input_count, output_count` |
 | `message_parts` | SELECT, INSERT only `scope_id, conversation_id, message_id, ordinal, kind, text_value, artifact_revision_id` | Same, for assistant output |
 
 Neither runtime role gets UPDATE on turn content or parts, DELETE, DDL or grant options.
 The issuance role and PUBLIC need no new privileges. Reuse the existing API-only project-settings
-reader and the existing artifact, run and event grants. Extend the `authorization_audit`
-action check for `conversation.create` and `branch.create`. Use the existing user-actor
-request key, conversation target, fixed reason, request fingerprint and resulting branch ID
-to replay standalone creates. No audit row stores message or preset contents.
+reader and the existing artifact, run and event grants. Keep `reasoning_bytes` internal
+to storage and budget estimation. Exclude it from every wire response and telemetry event.
+
+PR2 extends two `authorization_audit` constraints. The `action` check gains
+`conversation.create` and `branch.create`. The `target_kind` check gains `branch`.
+For each standalone create, call
+`authz::store::record` in the graph transaction with the actor's request key, a fixed
+reason and `target_id = None`. The store generates the target UUID on apply and returns
+the recorded UUID on replay. It compares `details` for exact JSONB equality. Use only
+the fields below, with a deterministic digest of the normalized request.
+
+| Action | Audit target kind and details | Apply or replay |
+| --- | --- | --- |
+| `conversation.create` | `conversation`, `{scope_id, request_digest}` | Use the returned `target_id` as `conversation_id`. On apply, create the conversation and its root. On replay, read the root's `branch_id` from `openmettle.branch_heads WHERE conversation_id = $target_id AND parent_branch_id IS NULL`. |
+| `branch.create` | `branch`, `{conversation_id, request_digest}` | Use the returned `target_id` as `branch_id`. On apply, create that branch. On replay, return the recorded branch without a graph write. |
 
 ### Catalog, presets and context budget
 
@@ -105,14 +138,19 @@ study preset uses this same representation. Selecting it grants no tool, model o
 policy permission. PR2 uses synthetic catalog fixtures. V1-08 supplies qualified profiles.
 
 1. Select the requested preset/model, falling back to the project selection. A preset
-   supplies its base model. Reject a mismatched explicit model, missing descriptor or
-   unauthorized selection. Apply each field in order **model → preset → project → request**.
-   An absent field inherits. Read project overrides from a typed `defaults.model_config`
-   object in `project_settings`. Absence means empty overrides, including pre-0015 projects.
-   Preserve unrelated defaults. Project owners maintain these fields through the existing
-   settings operation. Compose instructions in layer order using the existing project
-   `instructions` column, and pin their order and revisions.
-2. Validate each selected control against that descriptor. For example, accept
+   supplies its base model. If the request explicitly names both a preset and a model,
+   require them to match. Reject a missing descriptor or unauthorized selection. Apply each
+   field in order **model → preset → project → request**. An absent field inherits. Read
+   project overrides from the typed `project_settings.defaults.model_config` object.
+   Absence means empty overrides, including pre-0015 projects. In PR3, `createProject`
+   and `updateProjectSettings` validate `defaults.model_config` when present and preserve
+   sibling keys in `defaults`. Project owners maintain these fields. Compose instructions
+   in layer order using the existing project `instructions` column, and pin their order
+   and revisions.
+2. When a request selects a different target model, drop inherited preset or project
+   controls that the target does not support. For each omission, report the control, its
+   source layer and the reason. An unsupported control supplied by the request returns
+   `400 validation`. Validate each remaining control against the target descriptor. Accept
    `temperature` and `top_p` only when declared, finite and within their declared bounds.
    Validate combinations, reasoning effort levels and output ceilings. Profiles with
    unknown support cannot accept an explicit control. Never infer support from a model ID
@@ -140,11 +178,12 @@ policy permission. PR2 uses synthetic catalog fixtures. V1-08 supplies qualified
    across turns. Missing usage stays null. Separately report the current assembled prompt's
    count as `estimated` with the estimator revision, or `unknown` when unavailable.
    Budget for instructions, history, eligible replay, tool declarations and attachment
-   inputs. For opaque blocks the estimator may use the per-message storage bound and the
-   qualified target encoding's worst-case overhead. A measurement for an earlier prompt
-   stays labeled with that turn. Admit only if a profile-qualified count or conservative
-   upper bound fits `usable_input`. An over-budget request fails validation. An unknown
-   bound cannot authorize dispatch. Preview never truncates history silently.
+   inputs. For each replay-eligible turn, `reasoning_bytes = 0` contributes zero replay
+   tokens. For a positive count, use that turn's `reasoning_bytes` and the qualified
+   target encoding's worst-case overhead to bound its replay cost. A measurement for an
+   earlier prompt stays labeled with that turn. Admit only if a profile-qualified count
+   or conservative upper bound fits `usable_input`. An over-budget request fails validation.
+   An unknown bound cannot authorize dispatch. Preview never truncates history silently.
 
 For a synthetic model with an 8,192-token window and a preset reserving 1,024 for output,
 the preview returns 8,192 (`model`), 1,024 (`preset`) and 7,168 usable input tokens.
@@ -168,6 +207,12 @@ The following are PR3 operations. `C` denotes `/v1/conversations/{conversation_i
 | `POST /v1/runs` | Submit an append, edit or retry. `201` on admission, `200` on exact replay. Both return `Run`. |
 | `POST /v1/runs/{run_id}/cancel` | Actor cancellation with an empty body. `200` or `202` with `Run` as specified below. |
 
+For `POST /v1/runs` and `POST B/effective-configuration`, bound the complete JSON body
+at 128 KiB (131,072 bytes) before decoding. Count JSON escapes, field names, attachment
+IDs and overrides. Reject an oversized body with `400 validation`. All other JSON routes
+retain ADR 0007's 64 KiB limit. Independently enforce the 64 KiB decoded visible-text limit
+per message and the 256 KiB limit on the combined snapshots persisted in `runs`.
+
 Keep the existing `GET C` (`ConversationAccess`), share/revoke, `getRun` and
 `streamRunEvents` contracts. Use browser or native sessions, the existing Origin rule,
 version and no-store headers, closed bounded request objects and extensible response objects
@@ -189,36 +234,55 @@ current grants on every request. Use `401 unauthenticated` for inactive sessions
 target with insufficient permission. Authorized new writes to an archived project get
 `409 conflict`. [ADR 0027](0027-authorization-and-private-projects.md).
 
+The global row-lock order is `account_admin_lock -> projects -> users -> runs -> branch_heads`.
+Each transaction takes only the locks it needs. For `POST /v1/conversations` and
+`POST C/branches`, lock the project row (`FOR SHARE` suffices for a scope check,
+`FOR NO KEY UPDATE` for a serialized writer) or the single personal-owner `users` row
+before any `branch_heads` lock or graph write. Under the scope lock, recheck current
+authority, including active membership and unarchived state for a new project-scoped write.
+
 ### Atomic admission and cancellation
 
 1. Require one ADR 0007 `Idempotency-Key` for each mutation. Derive its stored key with
-   the operation and authorized target. Resolve the scope, actor and approval on the server.
+   the operation and authorized target. For `POST /v1/conversations` the digest target is the
+   effective `scope_id`, as for `createArtifact`. For `POST /v1/runs` it is the authorized
+   `conversation_id`. Resolve the scope, actor and approval on the server.
    Require validated admission limits for the create route and a configured ADR 0034
    signing key before a run mutation can return a snapshot. Open one bounded READ COMMITTED
-   `WriteTransaction`. Take ADR 0032's scope lock, then the actor lock, before branch locks
-   or writes. Recheck access and call `find_run` on that connection **before** allocating
-   a branch or inserting a message.
+   `WriteTransaction` for admission. Follow the lock order in `admit_run`. In project
+   scope, lock the `projects` row then the actor's `users` row, both `FOR NO KEY UPDATE`.
+   In personal scope, lock only the personal owner's `users` row `FOR NO KEY UPDATE`.
+   Only that owner can execute. Recheck access and call `find_run` on that connection **before**
+   taking branch locks, allocating a branch or inserting a message.
 2. Store the normalized client intent in the versioned input snapshot (operation mode,
-   source branch, expected head, edit/retry target, ordered input, requested model/preset,
-   overrides and requested rounds). Preserve a client-chosen input UUID on append/edit
-   across retries. Pin the effective branch path and attachment revision IDs. Reference
+   source branch, expected head, edit/retry target, client-chosen `input_message_id` on
+   append/edit, ordered input, requested model/preset, overrides and requested rounds).
+   Reuse that UUID across retries. Pin the effective branch path and attachment revision IDs. Reference
    reasoning by its immutable message ID so the API never needs to read the blocks. The config
-   snapshot pins the effective fields, sources, instruction bytes, omission decisions and
-   profile/policy revisions. Use one deterministic encoding per version and enforce the
-   existing combined 256 KiB bound. Keep credentials out of both. On a hit compare the
-   submitted intent, reuse the stored branch, input UUID and original snapshot bytes, and
-   pass that identity through `admit_run` for its locked authorization and replay check.
+   snapshot pins the effective fields, sources, instruction bytes, omission decisions,
+   required capabilities and profile/policy revisions. Use one deterministic encoding per
+   version and enforce the combined 256 KiB bound. Keep credentials out of both. PR2 extends
+   `authz::runs::find_run` and `RunReplay` to return `snapshot_format`, `snapshot_version`,
+   `input_snapshot` and `config_snapshot` alongside `branch_id` and `input_message_id`.
+   On a hit, decode the stored version to compare normalized client intent and recover the
+   pinned capabilities. Pass the original branch, input UUID, snapshot format, version and
+   unmodified snapshot bytes to `admit_run` for its locked authorization and replay check.
    Changed intent is `409 idempotency_conflict`. An exact replay survives changed defaults,
    limits, head movement or archive while the caller retains authority for the pinned
    capabilities. Recheck those capabilities on replay.
 3. On a miss lock the source head, verify the expected head and target ancestry, and
    validate the proposed input, attachments, effective configuration and budget. Refuse a
    stale head, or an append to a branch with a nonterminal run, with `409 conflict`.
-   Apply the graph operation above. Build `RunAdmission` with the destination branch and
-   stable user input, session approval, required capabilities and requested rounds, then
-   call `admit_run` in the same transaction. It repeats the replay
-   lookup under its locks. Commit **only** `Admission::Admitted` with the graph writes,
-   queued run and sequence-one `run-created` event. Roll back the whole transaction on
+   Check for a nonterminal run with a **non-locking `SELECT`** at READ COMMITTED after
+   acquiring the head. Appends on the branch serialize on `branch_heads`. Taking a row
+   lock on an existing run here would invert the worker's lock order. Apply the graph
+   operation. If an append or edit under a fresh key reuses an existing `messages.id`,
+   roll back and map SQLSTATE `23505` on `messages_pkey` to `409 conflict`.
+   Build `RunAdmission` with the destination branch, stable user input, session approval,
+   required capabilities and requested rounds. Call `admit_run` in the same transaction.
+   It repeats the replay lookup under the locks already held. Commit **only**
+   `Admission::Admitted` with the graph writes, queued run and sequence-one `run-created`
+   event. Roll back the whole transaction on
    replay, refusal, conflict or error. An uncertain commit is retried with the original
    intent and key. Actor/scope limits map to `429 rate_limited`, a full queue to
    `503 unavailable` with `Retry-After`. [ADR 0032](0032-durable-run-admission-and-fair-work-queue.md).
@@ -233,15 +297,30 @@ target with insufficient permission. Authorized new writes to an archived projec
    `branch_id` and `input_message_id` to that schema so a caller can select a fork.
    [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md).
 
+### Worker settlement
+
+PR4 publishes the answer inside the same fenced `leases` transaction that settles the
+run as succeeded. With the run row locked and the claim validated, insert the assistant
+message, turn (including reasoning and usage) and parts. Advance the head only if it
+still points to the run's input message.
+
+```sql
+UPDATE openmettle.branch_heads SET head_message_id = $assistant_id
+WHERE branch_id = $branch_id AND head_message_id = $input_message_id;
+```
+
+Require exactly one updated row. If the head moved, the lease is lost or settlement fails,
+roll back the entire transaction, including the answer and head update.
+
 ## Delivery and verification
 
 | Slice | Evidence required |
 | --- | --- |
 | PR1 (this record) | ADR 0036 and the pointer in ADR 0007. Existing contract and hygiene checks only. |
-| PR2 · persistence and resolver | Apply the new migration on fresh and populated PostgreSQL 18. Exercise old writers and pre-migration skeletons. Test root/append/edit/retry, shared ancestry, ordered parts, stable revision IDs and unchanged charges. Reject foreign parents, revisions and forged producers. Exercise actual allowed and denied SQL under both roles, including API reasoning reads and content updates. Race two writers at one head. |
+| PR2 · persistence and resolver | Apply the new migration on fresh and populated PostgreSQL 18. Exercise old writers and pre-migration skeletons. Test root/append/edit/retry, shared ancestry, ordered parts, stable revision IDs and unchanged charges. Reject self-parents, foreign parents or revisions, forged producers and incorrect reasoning byte counts. Exercise allowed and denied SQL under both roles, including API byte-count reads, blocked reasoning-content reads and blocked content updates. Verify that `find_run` returns the stored snapshot format, version and exact bytes. Race two writers at one head. |
 | PR2 · configuration fixtures | Check inheritance at all four layers, study instructions, source attribution, explicit default effort versus omission, undeclared effort/sampling, inherited and unknown capacity with/without a qualified ceiling, reserve exhaustion and exact-fit input. Fork a measured path, change profile and append an unmeasured turn. Verify measured, estimated and unknown fields independently. Exercise the replay decision with a qualified fixture, a mismatched format and an undeclared target. |
 | PR3 · API and contract | Serve the operations, supply admission limits, update OpenAPI 3.2.1, regenerate fixtures and exercise the independent consumer. Test both session channels, concealment before/after revocation, personal Write versus RunExecute, stale/tampered cursors, ordered history, extensible responses and redaction canaries. Concurrent identical and changed submissions, a lost response, changed defaults, archive, actor/scope limits, a full queue and cancellation must yield the specified statuses, graph and event counts on PostgreSQL 18. |
-| PR4 · live turn executor | After V1-08 supplies a qualified gateway/provider adapter and ADR 0033's worker loop lands, wire the model/tool turn into `src/worker.rs`. Use the pinned snapshot, recheck current authority before every provider/tool step, honor cancellation and deadlines, and fence result writes on the live claim. Atomically publish the assistant child, parts, reasoning, usage and head advance with successful settlement. A lost lease or failed settlement cannot publish an answer. Test restart and cancellation races, reasoning-only output, qualified and refused replay, and actual provider usage. |
+| PR4 · live turn executor | After V1-08 supplies a qualified gateway/provider adapter and ADR 0033's worker loop lands, wire the model/tool turn into `src/worker.rs`. Use the pinned snapshot, recheck current authority before every provider/tool step, and honor cancellation and deadlines. Exercise fenced settlement with a moved head, lost lease, restart and cancellation races. Test reasoning-only output, qualified and refused replay, and actual provider usage. |
 
 V1-07 PR2/PR3 use fixtures and durable admission without a live provider. V1-08 owns
 protocol translation, conformance fixtures and qualification of the pinned SGLang and
