@@ -69,16 +69,26 @@ yet expose HTTP endpoints to demote an administrator or disable a user account (
 immediately today, run **`withdraw`** on **every** approval held by the compromised account
 using the [local identity approval change procedure](identity-approval-change.md) (which
 advances each approval's `access_generation` and sets `active = false`, stopping existing
-sessions immediately and refusing new logins), or perform a controlled account-wide
-disablement under [ADR 0013's user disablement protocol](../adr/0013-local-identity-sessions.md#user-disablement-and-re-enable)
-(which atomically sets `disabled_at` and advances `session_generation` on `openmettle.users`).
-Do **not** rely on `revoke` or the [session cleanup procedure](session-cleanup.md) alone to
-cut off a compromised administrator: `revoke` and session cleanup end or remove current
-sessions without blocking immediate re-authentication under an unexpired approval. Use the
-[session cleanup procedure](session-cleanup.md) afterwards to remove expired or revoked
-session rows as needed, and record any direct owner SQL demotion or account disablement under
-deployment change controls. Review the `openmettle.authorization_audit` rows of the affected
-period afterwards.
+sessions immediately and refusing new logins), or perform a controlled owner account-wide
+disablement under [ADR 0013's user disablement protocol](../adr/0013-local-identity-sessions.md#user-disablement-and-re-enable).
+ADR 0013's standalone disablement SQL predates schema 15's `account_admin_lock` and locks
+only the target user row, so on schema 15 or later you must first lock the single
+`openmettle.account_admin_lock` row `FOR UPDATE` before locking the target `openmettle.users`
+row `FOR UPDATE` (matching the `account_admin_lock` -> `users` lock order used by
+`authz::store` and [`grant-account-admin.psql`](grant-account-admin.psql)), and verify in the
+**same transaction** that at least one other active `openmettle.account_admins` row belongs to
+an enabled user (`disabled_at IS NULL`) before setting `disabled_at` and advancing
+`session_generation` on `openmettle.users`—otherwise a concurrent administrator demotion could
+leave zero enabled administrators. Do **not** rely on `revoke` or the
+[session cleanup procedure](session-cleanup.md) to cut off a compromised administrator:
+`revoke` advances an approval's `access_generation` to end existing sessions for that approval
+while leaving an unexpired approval eligible for immediate re-sign-in, whereas
+[`session-cleanup.psql`](session-cleanup.psql) deletes only explicitly revoked or expired
+`openmettle.local_sessions` rows and leaves unexpired, unrevoked sessions untouched and
+usable. Use the [session cleanup procedure](session-cleanup.md) afterwards to remove expired or
+revoked session rows as needed, and record any direct owner SQL demotion or account
+disablement under deployment change controls. Review the `openmettle.authorization_audit` rows
+of the affected period afterwards.
 
 ## Resolve an uncertain outcome
 
