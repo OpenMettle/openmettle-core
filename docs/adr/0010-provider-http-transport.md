@@ -26,6 +26,9 @@ keeps its stricter admission, its limits and the process-wide pool described bel
 configured client, such as an OTLP exporter, supplies its own pool and cannot consume
 provider DNS slots.
 
+V1-08 proposes a gateway-only bearer and streaming path over this transport for model
+inference. [ADR 0038](0038-sglang-and-external-provider-conformance-adapter.md).
+
 Not implemented: discovery, JWKS fetch or refresh, configuration loading, routes, cookies,
 sessions, admission, confidential clients, HTTP/2, proxies and real-provider qualification.
 
