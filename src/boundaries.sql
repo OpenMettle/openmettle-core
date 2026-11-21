@@ -2,6 +2,7 @@
 -- any schema or history object, and again after migrations. It returns one row per violation.
 -- $1: the highest successfully applied migration version (0 before migration 1). Migration 1
 -- revokes the PUBLIC database/public-schema defaults, which are tolerated only before that.
+-- Version 20 adds worker lease deadlines and cooperative cancellation.
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -219,7 +220,7 @@ column_contract (relation, attribute, role, privilege) AS (
         ('authorization_audit','details','INSERT')
     ) AS authz(relation, attribute, privilege) WHERE $1 >= 15
     UNION ALL
-    -- Immediate run invalidation by share, revoke and disable transactions and the recheck.
+    -- Run state transitions by revocation, cancellation and the authorization recheck.
     SELECT 'runs', attribute, role, 'UPDATE'
     FROM (VALUES ('state'), ('wait_reason')) AS lifecycle(attribute),
          (VALUES ('openmettle_api'), ('openmettle_worker')) AS r(role)
@@ -234,6 +235,13 @@ column_contract (relation, attribute, role, privilege) AS (
     WHERE $1 >= r.since
     UNION ALL
     SELECT 'projects', 'lock_guard', 'openmettle_api', 'UPDATE' WHERE $1 >= 16
+    UNION ALL
+    SELECT * FROM (VALUES
+        ('runs', 'lease_expires_at', 'openmettle_worker', 'UPDATE'),
+        ('runs', 'execution_expires_at', 'openmettle_worker', 'UPDATE'),
+        ('runs', 'cancel_reason', 'openmettle_worker', 'UPDATE'),
+        ('runs', 'cancel_reason', 'openmettle_api', 'UPDATE')
+    ) AS leases(relation, attribute, role, privilege) WHERE $1 >= 20
     UNION ALL
     -- V1-10 (ADR 0032): admission decisions are inserted once with the run by the API; only
     -- the worker records a claim and locks the dispatch row.

@@ -120,6 +120,9 @@ fn shipped_sql(name: &str) -> String {
     };
     let macro_at = SOURCE.find("macro_rules! non_terminal").unwrap();
     let (non_terminal, _) = literal(&SOURCE[macro_at..]);
+    const LEASE_SOURCE: &str = include_str!("../../src/authz/leases.rs");
+    let (remaining, _) =
+        literal(&LEASE_SOURCE[LEASE_SOURCE.find("macro_rules! remaining_sql").unwrap()..]);
     let start = SOURCE
         .find(&format!("const {name}: &str = concat!("))
         .unwrap_or_else(|| panic!("{name} not found"));
@@ -133,6 +136,9 @@ fn shipped_sql(name: &str) -> String {
         }
         if let Some(after) = rest.strip_prefix("non_terminal!()") {
             sql.push_str(&non_terminal);
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix("leases::remaining_sql!()") {
+            sql.push_str(&remaining);
             rest = after;
         } else {
             assert!(rest.starts_with('"'), "unexpected token in {name}");
@@ -323,7 +329,7 @@ async fn calibrate(db: &TestDb, actors: &[Actor], hot_project: &str, limits: Cla
     let options = role_options(&db.0, WORKER);
     let claim = tokio::spawn(async move {
         let mut c = PgConnection::connect_with(&options).await.unwrap();
-        queue::claim_next(&mut c, &limits).await.unwrap()
+        queue::claim_next(&mut c, &limits, &LEASES).await.unwrap()
     });
     wait_for_lock_waiters(db, 3).await;
     assert_eq!(
@@ -457,7 +463,7 @@ async fn measure_queue_contention_and_plans(db: &TestDb, profile: &Profile) -> V
             barrier.wait().await;
             loop {
                 let begun = Instant::now();
-                let claimed = queue::claim_next(&mut c, &limits).await.unwrap();
+                let claimed = queue::claim_next(&mut c, &limits, &LEASES).await.unwrap();
                 let took = begun.elapsed();
                 let Some(run) = claimed else {
                     empty += 1;
@@ -480,17 +486,11 @@ async fn measure_queue_contention_and_plans(db: &TestDb, profile: &Profile) -> V
                 times.push(took);
                 claimed_ids.lock().unwrap().push(run.run_id.clone());
                 tokio::time::sleep(hold).await;
-                // Stands in for the V1-11 executor, which owns the real terminal transition.
-                let finished = sqlx::query(
-                    "UPDATE openmettle.runs SET state = 'succeeded'
-                      WHERE id = $1::uuid AND claim_token = $2::uuid AND state = 'running'",
-                )
-                .bind(&run.run_id)
-                .bind(&run.claim_token)
-                .execute(&mut c)
-                .await
-                .unwrap();
-                if finished.rows_affected() != 1 {
+                // A request received after dispatch still allows completed work to succeed.
+                if !matches!(
+                    leases::settle(&mut c, &run.lease(), &LEASES, leases::Settle::Succeeded).await,
+                    Ok(leases::Settled::Terminal { state: "succeeded" })
+                ) {
                     lost += 1;
                 }
             }
@@ -594,7 +594,7 @@ async fn measure_queue_contention_and_plans(db: &TestDb, profile: &Profile) -> V
     }
     let mut w = worker(db).await;
     for _ in 0..profile.claimers {
-        if queue::claim_next(&mut w, &profile.claim)
+        if queue::claim_next(&mut w, &profile.claim, &LEASES)
             .await
             .unwrap()
             .is_none()
@@ -638,6 +638,8 @@ async fn measure_queue_contention_and_plans(db: &TestDb, profile: &Profile) -> V
         vec![
             Bind::Int(profile.claim.executing_per_actor.into()),
             Bind::Int(profile.claim.executing_per_scope.into()),
+            Bind::Int(LEASES.lease.as_millis() as i64),
+            Bind::Int(LEASES.execution_timeout.as_millis() as i64),
         ],
     )
     .await;
@@ -803,11 +805,7 @@ fn shipped_statements_are_rebuilt_from_the_store_source() {
     assert_eq!(claim.matches(LIVE).count(), 2);
     assert!(claim.starts_with("WITH executing AS ("));
     assert!(claim.contains("FOR NO KEY UPDATE OF r SKIP LOCKED"));
-    assert!(
-        claim
-            .trim_end()
-            .ends_with("r.actor_approval_id::text, r.round_limit")
-    );
+    assert!(claim.trim_end().ends_with("::bigint AS execution_ms"));
 }
 
 #[test]

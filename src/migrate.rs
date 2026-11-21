@@ -121,6 +121,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "run admission and queue",
         sql: include_str!("../migrations/0019_run_admission_and_queue.sql"),
     },
+    Source {
+        version: 20,
+        description: "worker leases and deadlines",
+        sql: include_str!("../migrations/0020_worker_leases_and_deadlines.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

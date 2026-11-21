@@ -11,6 +11,7 @@ use super::*;
 use openmettle_core::{
     authz::{
         DenialReason, Grantee, Principal, ProjectRole,
+        leases::{self, LeaseSettings},
         projects::{self, ProjectSettingsInput},
         runs::{
             self as queue, Admission, AdmissionLimits, CancelOutcome, ClaimLimits, ClaimedRun,
@@ -33,7 +34,11 @@ const LIMITS: AdmissionLimits = AdmissionLimits {
     queue_timeout: Duration::from_secs(3600),
     round_cap: 50,
 };
-const OPEN: ClaimLimits = ClaimLimits {
+pub(super) const LEASES: LeaseSettings = LeaseSettings {
+    lease: Duration::from_secs(30),
+    execution_timeout: Duration::from_secs(180),
+};
+pub(super) const OPEN: ClaimLimits = ClaimLimits {
     executing_per_actor: 1024,
     executing_per_scope: 1024,
 };
@@ -42,7 +47,7 @@ const EXPIRED: (&str, &[u8]) = ("openmettle.run-expired", b"{}");
 
 /// One admission request: a conversation, its branch and input message, and a key.
 #[derive(Clone)]
-struct Request {
+pub(super) struct Request {
     scope: String,
     actor: Account,
     conversation: String,
@@ -77,16 +82,22 @@ impl Request {
     }
 }
 
-async fn api(db: &TestDb) -> PgConnection {
+pub(super) async fn api(db: &TestDb) -> PgConnection {
     connect(&db.0, API).await
 }
 
-async fn worker(db: &TestDb) -> PgConnection {
+pub(super) async fn worker(db: &TestDb) -> PgConnection {
     connect(&db.0, WORKER).await
 }
 
 /// A request on a new conversation, branch and input message of `actor` in `scope`.
-async fn request(db: &TestDb, scope: &str, kind: &str, actor: &Account, key: &str) -> Request {
+pub(super) async fn request(
+    db: &TestDb,
+    scope: &str,
+    kind: &str,
+    actor: &Account,
+    key: &str,
+) -> Request {
     let conversation = chat(db, scope, kind, actor).await;
     let mut c = api(db).await;
     let message = message(&mut c, scope, &conversation, None).await.unwrap();
@@ -138,7 +149,7 @@ async fn admit(db: &TestDb, r: &Request) -> Result<Admission, StoreError> {
     admit_on(&mut api(db).await, r, &LIMITS, None).await
 }
 
-async fn admitted(db: &TestDb, r: &Request) -> String {
+pub(super) async fn admitted(db: &TestDb, r: &Request) -> String {
     match admit(db, r).await {
         Ok(Admission::Admitted { run_id, .. }) => run_id,
         other => panic!("expected an admission, got {other:?}"),
@@ -185,7 +196,7 @@ fn tally(outcomes: &[Result<Admission, StoreError>], limit: RunLimit) -> (usize,
 }
 
 /// A run written by bare `create_run`, without admission columns.
-async fn bare_run(db: &TestDb, r: &Request) -> String {
+pub(super) async fn bare_run(db: &TestDb, r: &Request) -> String {
     let mut c = api(db).await;
     let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
     let run = runs::create_run(&mut tx, &r.input()).await.unwrap();
@@ -194,7 +205,7 @@ async fn bare_run(db: &TestDb, r: &Request) -> String {
 }
 
 /// (project ID, scope ID) of a project created by `owner` through the PR4a store.
-async fn new_project(db: &TestDb, owner: &Account, key: &str) -> (String, String) {
+pub(super) async fn new_project(db: &TestDb, owner: &Account, key: &str) -> (String, String) {
     let defaults = json!({});
     let settings = ProjectSettingsInput {
         name: "Synthetic project",
@@ -228,7 +239,7 @@ async fn editor(db: &TestDb, owner: &Account, project: &str, member: &Account) {
 }
 
 async fn claim_with(db: &TestDb, limits: &ClaimLimits) -> Option<ClaimedRun> {
-    queue::claim_next(&mut worker(db).await, limits)
+    queue::claim_next(&mut worker(db).await, limits, &LEASES)
         .await
         .unwrap()
 }
@@ -243,7 +254,7 @@ async fn expire(db: &TestDb, limit: u32) -> Vec<String> {
         .unwrap()
 }
 
-async fn owner_exec(db: &TestDb, sql: &str, run_id: &str) {
+pub(super) async fn owner_exec(db: &TestDb, sql: &str, run_id: &str) {
     sqlx::query(AssertSqlSafe(sql.to_owned()))
         .bind(run_id)
         .execute(&mut connect(&db.0, OWNER).await)
@@ -253,13 +264,16 @@ async fn owner_exec(db: &TestDb, sql: &str, run_id: &str) {
 
 async fn set_state(db: &TestDb, run_id: &str, state: &str) {
     let wait = (state == "waiting").then_some("synthetic-wait");
-    sqlx::query("UPDATE openmettle.runs SET state = $2, wait_reason = $3 WHERE id = $1::uuid")
-        .bind(run_id)
-        .bind(state)
-        .bind(wait)
-        .execute(&mut connect(&db.0, OWNER).await)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE openmettle.runs SET state = $2, wait_reason = $3,
+            cancel_reason = CASE WHEN $2 = 'cancelling' THEN 'requested' END WHERE id = $1::uuid",
+    )
+    .bind(run_id)
+    .bind(state)
+    .bind(wait)
+    .execute(&mut connect(&db.0, OWNER).await)
+    .await
+    .unwrap();
 }
 
 /// Move the run's queue deadline into the past (it stays after `created_at`).
@@ -285,7 +299,7 @@ async fn scalar(db: &TestDb, sql: &str) -> i64 {
 }
 
 /// Every event of the run: (sequence, append key, format, payload).
-async fn events(db: &TestDb, run_id: &str) -> Vec<(i64, String, String, Vec<u8>)> {
+pub(super) async fn events(db: &TestDb, run_id: &str) -> Vec<(i64, String, String, Vec<u8>)> {
     sqlx::query_as(
         "SELECT sequence, append_key, format, payload FROM openmettle.run_events
           WHERE run_id = $1::uuid ORDER BY sequence",
@@ -322,7 +336,7 @@ async fn expired_once(db: &TestDb, run_id: &str) {
     );
 }
 
-async fn recheck(db: &TestDb, claim: &ClaimedRun) -> RunRecheckOutcome {
+async fn recheck(db: &TestDb, claim: &ClaimedRun) -> Result<RunRecheckOutcome, leases::LeaseError> {
     let request = RunRecheckRequest {
         scope_id: &claim.scope_id,
         run_id: &claim.run_id,
@@ -331,9 +345,7 @@ async fn recheck(db: &TestDb, claim: &ClaimedRun) -> RunRecheckOutcome {
         extra_target: None,
         now_ms: NOW,
     };
-    queue::recheck_run(&mut worker(db).await, &request)
-        .await
-        .unwrap()
+    queue::recheck_leased(&mut worker(db).await, &claim.lease(), &request, &LEASES).await
 }
 
 // --- admission ---------------------------------------------------------------------------------
@@ -748,7 +760,7 @@ async fn admission_racing_archive_delete_or_disable_never_leaves_a_live_run() {
 
 #[tokio::test]
 #[ignore = "isolated CI PostgreSQL 18 required"]
-async fn callers_cancel_only_their_own_queued_runs_exactly_once() {
+async fn callers_cancel_only_their_own_runs_exactly_once() {
     let db = TestDb::migrated().await;
     let mut owner = connect(&db.0, OWNER).await;
     providers(&mut owner).await;
@@ -798,21 +810,31 @@ async fn callers_cancel_only_their_own_queued_runs_exactly_once() {
     cancelled_once(&db, &run, "requested").await;
     assert_eq!(events(&db, &run).await.len(), 2);
 
-    // Started work is unchanged (cooperative cancellation is V1-11); terminal runs too.
-    for (i, current) in ["running", "waiting", "cancelling", "reconciling"]
-        .into_iter()
-        .enumerate()
+    for (i, (current, expected)) in [
+        ("running", "cancelling"),
+        ("waiting", "cancelled"),
+        ("cancelling", "cancelling"),
+        ("reconciling", "reconciling"),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let id = admitted(&db, &r.keyed(&format!("started-{i}"))).await;
         set_state(&db, &id, current).await;
-        assert_eq!(
-            cancel(&alice_p, &scope, &id).await.unwrap(),
-            CancelOutcome::Executing {
-                state: current.into()
-            }
-        );
-        assert_eq!(state(&db, &id).await, current);
-        assert!(terminal_events(&db, &id).await.is_empty());
+        let outcome = cancel(&alice_p, &scope, &id).await.unwrap();
+        if current == "waiting" {
+            assert_eq!(outcome, CancelOutcome::Cancelled);
+            cancelled_once(&db, &id, "requested").await;
+        } else {
+            assert_eq!(
+                outcome,
+                CancelOutcome::Requested {
+                    state: expected.into()
+                }
+            );
+            assert!(terminal_events(&db, &id).await.is_empty());
+        }
+        assert_eq!(state(&db, &id).await, expected);
     }
     for (i, ended) in ["succeeded", "failed", "interrupted"]
         .into_iter()
@@ -894,7 +916,7 @@ async fn expired_and_unadmitted_runs_are_never_claimed_and_fail_exactly_once() {
         tokio::time::sleep(Duration::from_millis(14 + round)).await;
         let (mut w1, mut w2) = (worker(&db).await, worker(&db).await);
         let (claimed, swept) = tokio::join!(
-            queue::claim_next(&mut w1, &OPEN),
+            queue::claim_next(&mut w1, &OPEN, &LEASES),
             queue::expire_queued(&mut w2, 10),
         );
         let claimed = claimed.unwrap();
@@ -961,7 +983,7 @@ async fn concurrent_claimers_never_share_a_run_or_exceed_the_executing_limits() 
                 let mut w = PgConnection::connect_with(&options).await.unwrap();
                 barrier.wait().await;
                 let mut claims = Vec::new();
-                while let Some(claim) = queue::claim_next(&mut w, &limits).await.unwrap() {
+                while let Some(claim) = queue::claim_next(&mut w, &limits, &LEASES).await.unwrap() {
                     claims.push(claim);
                 }
                 claims
@@ -1100,7 +1122,10 @@ async fn the_recheck_after_a_claim_cancels_revoked_runs_with_one_terminal_event(
     assert_eq!(bob_claim.actor_approval_id, bob.approval);
     assert_eq!(carol_claim.actor_approval_id, carol.approval);
     for claim in [bob_claim, carol_claim] {
-        assert_eq!(recheck(&db, claim).await, RunRecheckOutcome::Continue);
+        assert_eq!(
+            recheck(&db, claim).await.unwrap(),
+            RunRecheckOutcome::Continue
+        );
     }
 
     // Membership revocation, which the API cannot see in the run, is caught after the claim.
@@ -1125,16 +1150,13 @@ async fn the_recheck_after_a_claim_cancels_revoked_runs_with_one_terminal_event(
         (carol_claim, DenialReason::InactivePrincipal),
     ] {
         assert_eq!(
-            recheck(&db, claim).await,
+            recheck(&db, claim).await.unwrap(),
             RunRecheckOutcome::Invalidated(reason)
         );
         assert_eq!(state(&db, &claim.run_id).await, "cancelled");
         cancelled_once(&db, &claim.run_id, "revoked").await;
-        assert_eq!(
-            recheck(&db, claim).await,
-            RunRecheckOutcome::Terminal {
-                state: "cancelled".into()
-            }
+        assert!(
+            matches!(recheck(&db, claim).await, Err(leases::LeaseError::Terminal { state }) if state == "cancelled")
         );
         // created, claimed, cancelled: nothing more.
         assert_eq!(events(&db, &claim.run_id).await.len(), 3);

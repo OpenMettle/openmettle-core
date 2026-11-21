@@ -1,9 +1,10 @@
 //! Worker execution-time recheck and live run invalidation (ADR 0027 PR5), and durable run
-//! admission, the fair work-queue claim, caller cancellation and queue expiry (ADR 0032).
+//! admission, fair dispatch and queue expiry (ADR 0032), with cooperative cancellation and
+//! leased authorization rechecks (ADR 0033).
 //!
 //! [`recheck_run`] works as `openmettle_worker` or `openmettle_api`. In one READ COMMITTED
 //! transaction it locks the run row, re-hydrates the run owner from the primary, decides with
-//! [`super::authorize_run_continuation`] and, on a denial, moves the run to `cancelled`. It never
+//! [`super::authorize_run_continuation`] and, on a denial, cancels or requests a cooperative stop. It never
 //! reads `account_admins`, `project_settings`, `authorization_audit` or any session or secret
 //! column. Logging out never cancels a run: the originating session is not consulted.
 //!
@@ -31,11 +32,13 @@
 //! `run-terminal`, in the transaction that sets the state.
 use super::{
     CapabilityGate, DenialReason, PlatformPolicy, Principal, Resource, ResourceKind, RunAuthority,
-    RunContinuation, Scope, projects,
+    RunContinuation, Scope,
+    leases::{self, CancelReason, Fence, Lease, LeaseError, LeaseSettings},
+    projects,
     store::{self, KEY_REUSED, StoreError, uuid},
 };
 use crate::runs::{self as durable, AdmissionColumns, Payload, RunInput, WriteTransaction};
-use sqlx::PgConnection;
+use sqlx::{PgConnection, Row, postgres::PgRow};
 use std::time::Duration;
 
 /// Run states after which no recheck or cancellation changes the row (ADR 0004 vocabulary).
@@ -56,48 +59,56 @@ macro_rules! non_terminal {
 const LOCK_RUN: &str = "SELECT actor_user_id::text, conversation_id::text, state
    FROM openmettle.runs WHERE scope_id = $1::uuid AND id = $2::uuid FOR NO KEY UPDATE";
 
+// All cancellation paths use the same transition. A reason on an executing run is immutable.
+macro_rules! cancel_set {
+    ($reason:literal) => {
+        concat!(
+            "SET state = CASE WHEN state IN ('queued', 'waiting') THEN 'cancelled'
+                                  WHEN state = 'running' THEN 'cancelling' ELSE state END,
+                     wait_reason = NULL, cancel_reason = coalesce(cancel_reason, ",
+            $reason,
+            ")"
+        )
+    };
+}
+macro_rules! cancellable {
+    () => {
+        concat!(
+            non_terminal!(),
+            " AND (state IN ('queued', 'waiting') OR cancel_reason IS NULL)"
+        )
+    };
+}
 const CANCEL_ONE: &str = concat!(
-    "UPDATE openmettle.runs SET state = 'cancelled', wait_reason = NULL
-      WHERE scope_id = $1::uuid AND id = $2::uuid AND ",
-    non_terminal!()
+    "UPDATE openmettle.runs ",
+    cancel_set!("$3"),
+    " WHERE scope_id = $1::uuid AND id = $2::uuid AND ",
+    cancellable!(),
+    " RETURNING state"
 );
 
-// The materialized CTE locks every affected row in ascending ID order before any is updated.
-// Both bulk statements return the cancelled `(scope_id, id)` pairs for their terminal events.
-const CANCEL_SCOPE: &str = concat!(
-    "WITH doomed AS MATERIALIZED (
-       SELECT id FROM openmettle.runs WHERE scope_id = $1::uuid AND ",
-    non_terminal!(),
-    " ORDER BY id FOR NO KEY UPDATE)
-     UPDATE openmettle.runs r SET state = 'cancelled', wait_reason = NULL
-       FROM doomed WHERE r.id = doomed.id AND r.",
-    non_terminal!(),
-    " RETURNING r.scope_id::text, r.id::text"
-);
-
-const CANCEL_USER: &str = concat!(
-    "WITH doomed AS MATERIALIZED (
-       SELECT id FROM openmettle.runs WHERE actor_user_id = $1::uuid AND ",
-    non_terminal!(),
-    " ORDER BY id FOR NO KEY UPDATE)
-     UPDATE openmettle.runs r SET state = 'cancelled', wait_reason = NULL
-       FROM doomed WHERE r.id = doomed.id AND r.",
-    non_terminal!(),
-    " RETURNING r.scope_id::text, r.id::text"
-);
+// Lock all affected runs in the same order across archive, delete and disable.
+macro_rules! cancel_bulk {
+    ($column:literal) => {
+        concat!(
+            "WITH doomed AS MATERIALIZED (SELECT id FROM openmettle.runs WHERE ",
+            $column,
+            " = $1::uuid AND ",
+            cancellable!(),
+            " ORDER BY id FOR NO KEY UPDATE)
+                UPDATE openmettle.runs r ",
+            cancel_set!("'revoked'"),
+            " FROM doomed WHERE r.id = doomed.id AND ",
+            cancellable!(),
+            " RETURNING r.scope_id::text, r.id::text, r.state"
+        )
+    };
+}
+const CANCEL_SCOPE: &str = cancel_bulk!("scope_id");
+const CANCEL_USER: &str = cancel_bulk!("actor_user_id");
 
 /// The append key of the one terminal event a run may have (ADR 0032).
-const TERMINAL_KEY: &str = "run-terminal";
-const CANCEL_REQUESTED: Payload<'static> = Payload {
-    format: "openmettle.run-cancelled",
-    version: 1,
-    bytes: br#"{"reason":"requested"}"#,
-};
-const CANCEL_REVOKED: Payload<'static> = Payload {
-    format: "openmettle.run-cancelled",
-    version: 1,
-    bytes: br#"{"reason":"revoked"}"#,
-};
+pub(super) const TERMINAL_KEY: &str = "run-terminal";
 const EXPIRED: Payload<'static> = Payload {
     format: "openmettle.run-expired",
     version: 1,
@@ -158,7 +169,7 @@ impl RunRecheckRequest<'_> {
 pub enum RunRecheckOutcome {
     /// Authorized at this observation; the run row is unchanged. Recheck at the next step.
     Continue,
-    /// This recheck moved the run to `cancelled` with no wait reason. It is not retried.
+    /// Authority was lost. The run is cancelled or its executing holder must stop.
     Invalidated(DenialReason),
     /// The run was already terminal, for example cancelled by the API. Nothing changed.
     Terminal { state: String },
@@ -176,7 +187,7 @@ pub async fn recheck_run(
 
 /// One bounded READ COMMITTED transaction ([`store::begin`]): commit on success, roll back
 /// otherwise.
-async fn transaction<T>(
+pub(super) async fn transaction<T>(
     c: &mut PgConnection,
     body: impl AsyncFnOnce(&mut PgConnection) -> Result<T, StoreError>,
 ) -> Result<T, StoreError> {
@@ -199,7 +210,7 @@ async fn transaction<T>(
 
 /// Append an event to a run whose row this transaction holds. `Conflict` means a different
 /// event is already recorded under `key`.
-async fn append(
+pub(super) async fn append(
     c: &mut PgConnection,
     scope_id: &str,
     run_id: &str,
@@ -236,12 +247,26 @@ async fn recheck_locked(
     if is_terminal(&state) {
         return Ok(RunRecheckOutcome::Terminal { state });
     }
+    let decision = recheck_decision(c, r, &owner, &conversation).await?;
+    if let RunContinuation::Invalidate(reason) = decision {
+        cancel_one(c, r.scope_id, r.run_id, CancelReason::Revoked).await?;
+        return Ok(RunRecheckOutcome::Invalidated(reason));
+    }
+    Ok(RunRecheckOutcome::Continue)
+}
+
+async fn recheck_decision(
+    c: &mut PgConnection,
+    r: &RunRecheckRequest<'_>,
+    owner: &str,
+    conversation: &str,
+) -> Result<RunContinuation, StoreError> {
     let principal =
-        store::hydrate_worker_principal(c, &owner, r.actor_approval_id, r.now_ms).await?;
+        store::hydrate_worker_principal(c, owner, r.actor_approval_id, r.now_ms).await?;
     let platform = store::load_platform_capabilities(c).await?;
     let scope = run_scope(c, r.scope_id, r.now_ms).await?;
     let target =
-        projects::hydrate_resource(c, ResourceKind::Conversation, &conversation, r.now_ms).await?;
+        projects::hydrate_resource(c, ResourceKind::Conversation, conversation, r.now_ms).await?;
     let extra = match r.extra_target {
         Some((kind, id)) => Some(projects::hydrate_resource(c, kind, id, r.now_ms).await?),
         None => None,
@@ -251,25 +276,66 @@ async fn recheck_locked(
         .iter()
         .map(|c| (c.name.to_owned(), c.gate))
         .collect();
-    let decision = evaluate(
+    Ok(evaluate(
         principal.as_ref(),
         &platform,
         scope,
         target,
         extra,
         capabilities,
-    );
-    let RunContinuation::Invalidate(reason) = decision else {
-        return Ok(RunRecheckOutcome::Continue);
-    };
-    // The row is locked and non-terminal, so exactly this run changes.
-    sqlx::query(CANCEL_ONE)
+    ))
+}
+
+/// Recheck the claimed run before dispatch. A denial settles stopped work under the same fence.
+pub async fn recheck_leased(
+    c: &mut PgConnection,
+    lease: &Lease<'_>,
+    r: &RunRecheckRequest<'_>,
+    settings: &LeaseSettings,
+) -> Result<RunRecheckOutcome, LeaseError> {
+    settings.validate()?;
+    r.validate()?;
+    if (r.scope_id, r.run_id) != (lease.scope_id, lease.run_id) {
+        return Err(StoreError::InvalidInput("lease target").into());
+    }
+    leases::fenced(c, lease, Fence::Step, async |tx, held| {
+        let c = tx.connection()?;
+        let (owner, conversation, approval): (String, String, String) = sqlx::query_as(
+            "SELECT actor_user_id::text, conversation_id::text, actor_approval_id::text
+             FROM openmettle.runs WHERE scope_id = $1::uuid AND id = $2::uuid",
+        )
         .bind(r.scope_id)
         .bind(r.run_id)
-        .execute(&mut *c)
+        .fetch_one(&mut *c)
         .await?;
-    terminal_event(c, r.scope_id, r.run_id, CANCEL_REVOKED).await?;
-    Ok(RunRecheckOutcome::Invalidated(reason))
+        if approval != r.actor_approval_id {
+            return Err(StoreError::InvalidInput("actor_approval_id"));
+        }
+        match recheck_decision(c, r, &owner, &conversation).await? {
+            RunContinuation::Continue => Ok(RunRecheckOutcome::Continue),
+            RunContinuation::Invalidate(reason) => {
+                sqlx::query(
+                    "UPDATE openmettle.runs SET cancel_reason = coalesce(cancel_reason, 'revoked')
+                             WHERE scope_id = $1::uuid AND id = $2::uuid",
+                )
+                .bind(r.scope_id)
+                .bind(r.run_id)
+                .execute(&mut *c)
+                .await?;
+                leases::settle_locked(
+                    c,
+                    lease,
+                    held.state,
+                    Some(CancelReason::Revoked),
+                    settings,
+                    leases::Settle::Stopped,
+                )
+                .await?;
+                Ok(RunRecheckOutcome::Invalidated(reason))
+            }
+        }
+    })
+    .await
 }
 
 /// The run's own scope, hydrated independently of its target so that a target outside it is
@@ -338,9 +404,8 @@ fn evaluate(
     }
 }
 
-/// Cancel every non-terminal run in one scope, as `openmettle_api`, each with its terminal
-/// event. Call it as the last statement of a project archive or delete, after the project row
-/// lock.
+/// Record cancellation for live runs in one scope. Archive and delete call this after locking
+/// the project.
 pub(super) async fn cancel_scope_runs(
     c: &mut PgConnection,
     scope_id: &str,
@@ -348,9 +413,8 @@ pub(super) async fn cancel_scope_runs(
     cancel_revoked(c, CANCEL_SCOPE, scope_id).await
 }
 
-/// Cancel every non-terminal run the user owns, as `openmettle_api`, each with its terminal
-/// event. Call it as the last statement of a user disablement, after `account_admin_lock` and
-/// the user row lock.
+/// Record cancellation for live runs the user owns. Disablement calls this after locking
+/// `account_admin_lock` and the user.
 pub(super) async fn cancel_user_runs(
     c: &mut PgConnection,
     user_id: &str,
@@ -358,15 +422,62 @@ pub(super) async fn cancel_user_runs(
     cancel_revoked(c, CANCEL_USER, user_id).await
 }
 
-/// Append one terminal event per cancelled run, in ascending run ID order. The statement already
-/// holds every returned row, so the appends take no new run lock.
 async fn cancel_revoked(
     c: &mut PgConnection,
     sql: &'static str,
     id: &str,
 ) -> Result<u64, StoreError> {
-    let cancelled: Vec<(String, String)> = sqlx::query_as(sql).bind(id).fetch_all(&mut *c).await?;
-    terminal_events(c, cancelled, CANCEL_REVOKED).await
+    let mut rows: Vec<(String, String, String)> =
+        sqlx::query_as(sql).bind(id).fetch_all(&mut *c).await?;
+    rows.sort_by(|a, b| a.1.cmp(&b.1));
+    for (scope, id, state) in &rows {
+        cancel_event(c, scope, id, state, CancelReason::Revoked).await?;
+    }
+    Ok(rows.len() as u64)
+}
+
+async fn cancel_one(
+    c: &mut PgConnection,
+    scope: &str,
+    id: &str,
+    reason: CancelReason,
+) -> Result<Option<String>, StoreError> {
+    let state: Option<String> = sqlx::query_scalar(CANCEL_ONE)
+        .bind(scope)
+        .bind(id)
+        .bind(reason.as_str())
+        .fetch_optional(&mut *c)
+        .await?;
+    if let Some(state) = &state {
+        cancel_event(c, scope, id, state, reason).await?;
+    }
+    Ok(state)
+}
+
+async fn cancel_event(
+    c: &mut PgConnection,
+    scope: &str,
+    id: &str,
+    state: &str,
+    reason: CancelReason,
+) -> Result<(), StoreError> {
+    let (key, format) = if state == "cancelled" {
+        (TERMINAL_KEY, "openmettle.run-cancelled")
+    } else {
+        ("cancel-requested", "openmettle.run-cancel-requested")
+    };
+    append(
+        c,
+        scope,
+        id,
+        key,
+        Payload {
+            format,
+            version: 1,
+            bytes: reason.payload(),
+        },
+    )
+    .await
 }
 
 async fn terminal_events(
@@ -748,16 +859,15 @@ fn replayed(replay: RunReplay, input: &RunInput<'_>) -> Result<Admission, StoreE
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CancelOutcome {
-    /// This call moved the queued run to `cancelled` with its terminal event.
+    /// This call moved the queued or waiting run to `cancelled` with its terminal event.
     Cancelled,
     /// Already terminal and unchanged, so repeating a cancel is idempotent.
     Terminal { state: String },
-    /// Started (`running`, `waiting`, `cancelling` or `reconciling`) and unchanged:
-    /// cooperative cancellation of started work is V1-11.
-    Executing { state: String },
+    /// The executing holder must stop. The first cancellation reason is preserved.
+    Requested { state: String },
 }
 
-/// Cancel a queued run of `principal`, hydrated by the route for this request, as
+/// Cancel a run of `principal`, hydrated by the route for this request, as
 /// `openmettle_api`. A missing run or another actor's run is concealed (`Denied(NotFound)`).
 pub async fn cancel_run(
     c: &mut PgConnection,
@@ -780,16 +890,14 @@ pub async fn cancel_run(
         if is_terminal(&state) {
             return Ok(CancelOutcome::Terminal { state });
         }
-        if state != "queued" {
-            return Ok(CancelOutcome::Executing { state });
-        }
-        sqlx::query(CANCEL_ONE)
-            .bind(scope_id)
-            .bind(run_id)
-            .execute(&mut *c)
-            .await?;
-        terminal_event(c, scope_id, run_id, CANCEL_REQUESTED).await?;
-        Ok(CancelOutcome::Cancelled)
+        let state = cancel_one(c, scope_id, run_id, CancelReason::Requested)
+            .await?
+            .unwrap_or(state);
+        Ok(if state == "cancelled" {
+            CancelOutcome::Cancelled
+        } else {
+            CancelOutcome::Requested { state }
+        })
     })
     .await
 }
@@ -850,7 +958,7 @@ impl ClaimLimits {
     }
 }
 
-/// A run this claim moved to `running`. It executes nothing until [`recheck_run`] with
+/// A claimed run. It executes nothing until [`recheck_leased`] with
 /// `actor_approval_id` returns `Continue`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaimedRun {
@@ -859,6 +967,30 @@ pub struct ClaimedRun {
     pub claim_token: String,
     pub actor_approval_id: String,
     pub round_limit: i32,
+    pub lease_remaining: Duration,
+    pub execution_remaining: Duration,
+}
+
+impl ClaimedRun {
+    pub fn lease(&self) -> Lease<'_> {
+        Lease {
+            scope_id: &self.scope_id,
+            run_id: &self.run_id,
+            claim_token: &self.claim_token,
+        }
+    }
+
+    pub(super) fn from_row(row: &PgRow) -> Result<Self, StoreError> {
+        Ok(Self {
+            scope_id: row.try_get("scope_id")?,
+            run_id: row.try_get("id")?,
+            claim_token: row.try_get("claim_token")?,
+            actor_approval_id: row.try_get("actor_approval_id")?,
+            round_limit: row.try_get("round_limit")?,
+            lease_remaining: leases::remaining(row, "lease_ms")?,
+            execution_remaining: leases::remaining(row, "execution_ms")?,
+        })
+    }
 }
 
 // Executing means holding a worker: `running`, `cancelling` or `reconciling`, not `waiting`.
@@ -875,7 +1007,7 @@ const CLAIM: &str = concat!(
      ), scope_load AS (
        SELECT scope_id, count(*) AS n FROM executing GROUP BY scope_id
      ), next AS (
-       SELECT r.id FROM openmettle.runs r
+       SELECT r.id, clock_timestamp() AS t FROM openmettle.runs r
          LEFT JOIN actor_load a ON a.actor_user_id = r.actor_user_id
          LEFT JOIN scope_load s ON s.scope_id = r.scope_id
         WHERE r.",
@@ -890,10 +1022,13 @@ const CLAIM: &str = concat!(
         FOR NO KEY UPDATE OF r SKIP LOCKED
      )
      UPDATE openmettle.runs r
-        SET state = 'running', claim_token = gen_random_uuid(), claimed_at = clock_timestamp()
+        SET state = 'running', claim_token = gen_random_uuid(), claimed_at = next.t,
+            lease_expires_at = next.t + $3::bigint * interval '1 millisecond',
+            execution_expires_at = next.t + $4::bigint * interval '1 millisecond'
        FROM next WHERE r.id = next.id
      RETURNING r.scope_id::text, r.id::text, r.claim_token::text,
-               r.actor_approval_id::text, r.round_limit"
+               r.actor_approval_id::text, r.round_limit, ",
+    leases::remaining_sql!()
 );
 
 /// Claim the next queued run fairly in one short transaction, as `openmettle_worker`, with its
@@ -901,30 +1036,29 @@ const CLAIM: &str = concat!(
 pub async fn claim_next(
     c: &mut PgConnection,
     limits: &ClaimLimits,
+    settings: &LeaseSettings,
 ) -> Result<Option<ClaimedRun>, StoreError> {
     limits.validate()?;
+    settings.validate()?;
     transaction(c, async |c| {
         // Claims serialize here, so the next statement's snapshot includes every earlier claim.
         sqlx::query("SELECT FROM openmettle.run_dispatch_lock FOR NO KEY UPDATE")
             .execute(&mut *c)
             .await?;
-        let claimed: Option<(String, String, String, String, i32)> = sqlx::query_as(CLAIM)
+        let Some(row) = sqlx::query(CLAIM)
             .bind(i64::from(limits.executing_per_actor))
             .bind(i64::from(limits.executing_per_scope))
+            .bind(settings.lease.as_millis() as i64)
+            .bind(settings.execution_timeout.as_millis() as i64)
             .fetch_optional(&mut *c)
-            .await?;
-        let Some((scope_id, run_id, claim_token, actor_approval_id, round_limit)) = claimed else {
+            .await?
+        else {
             return Ok(None);
         };
-        let key = format!("claim:{claim_token}");
-        append(c, &scope_id, &run_id, &key, CLAIMED).await?;
-        Ok(Some(ClaimedRun {
-            scope_id,
-            run_id,
-            claim_token,
-            actor_approval_id,
-            round_limit,
-        }))
+        let run = ClaimedRun::from_row(&row)?;
+        let key = format!("claim:{}", run.claim_token);
+        append(c, &run.scope_id, &run.run_id, &key, CLAIMED).await?;
+        Ok(Some(run))
     })
     .await
 }
@@ -1039,7 +1173,8 @@ mod tests {
         }
         for sql in [CANCEL_ONE, CANCEL_SCOPE, CANCEL_USER] {
             assert!(
-                sql.contains("state = 'cancelled', wait_reason = NULL"),
+                sql.contains("WHEN state IN ('queued', 'waiting') THEN 'cancelled'")
+                    && sql.contains("OR cancel_reason IS NULL"),
                 "{sql}"
             );
         }
@@ -1521,9 +1656,9 @@ mod tests {
         assert!(EXPIRE.contains(live));
         assert!(EXPIRE.contains("ORDER BY id LIMIT $1 FOR NO KEY UPDATE SKIP LOCKED"));
         assert!(EXPIRE.contains("queue_expires_at IS NULL"));
-        for sql in [CANCEL_SCOPE, CANCEL_USER, EXPIRE] {
+        for sql in [CANCEL_SCOPE, CANCEL_USER] {
             assert!(
-                sql.ends_with("RETURNING r.scope_id::text, r.id::text"),
+                sql.ends_with("RETURNING r.scope_id::text, r.id::text, r.state"),
                 "{sql}"
             );
         }
@@ -1531,18 +1666,16 @@ mod tests {
 
     #[test]
     fn terminal_payloads_are_fixed_json() {
-        for (payload, json) in [
-            (CANCEL_REQUESTED, r#"{"reason":"requested"}"#),
-            (CANCEL_REVOKED, r#"{"reason":"revoked"}"#),
-            (EXPIRED, "{}"),
-            (CLAIMED, "{}"),
-        ] {
+        for (payload, json) in [(EXPIRED, "{}"), (CLAIMED, "{}")] {
             assert_eq!(payload.version, 1);
             assert_eq!(payload.bytes, json.as_bytes());
             assert!(serde_json::from_slice::<serde_json::Value>(payload.bytes).is_ok());
         }
-        assert_eq!(CANCEL_REQUESTED.format, "openmettle.run-cancelled");
-        assert_eq!(CANCEL_REVOKED.format, "openmettle.run-cancelled");
+        assert_eq!(
+            CancelReason::Requested.payload(),
+            br#"{"reason":"requested"}"#
+        );
+        assert_eq!(CancelReason::Revoked.payload(), br#"{"reason":"revoked"}"#);
         assert_eq!(EXPIRED.format, "openmettle.run-expired");
         assert_eq!(CLAIMED.format, "openmettle.run-claimed");
         assert_eq!(TERMINAL_KEY, "run-terminal");
