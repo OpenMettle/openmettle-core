@@ -1,13 +1,13 @@
 //! ADR 0035 store and privilege gates on isolated PostgreSQL 18.1.
 use super::{
-    authz_runs::{chat, personal_of, seeded_session},
-    authz_store::{Account, FUTURE, PROVIDER, account, providers},
+    authz_runs::{chat, framed_digest, personal_of, seeded_session},
+    authz_store::{Account, FUTURE, PROVIDER, account, providers, wait_for_lock_waiters},
     run_admission::{LEASES, OPEN, api, events, worker},
     *,
 };
 use openmettle_core::{
     authz::{
-        CapabilityGate,
+        CapabilityGate, DenialReason,
         approvals::*,
         leases::{self, Fence, Settle},
         runs::{self as queue, Admission, AdmissionLimits, ClaimedRun, RunAdmission},
@@ -231,6 +231,62 @@ async fn session(db: &TestDb, actor: &Account, n: u8) -> EffectSession {
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18.1"]
+async fn deciding_session_lapse_preserves_the_originators_wait() {
+    let f = Fixture::new().await;
+    let r = f.claim("decision-lapse", "ordinary").await;
+    let parked = f.park(&r, "pending").await;
+    let history = events(&f.db, &r.run_id).await;
+    let i = f.input(&r, &parked, HumanDecision::Approve, "decide");
+    let policy = Policy::default();
+    let mut c = api(&f.db).await;
+    let mut owner = connect(&f.db.0, OWNER).await;
+    for (n, lapse) in [
+        (
+            2,
+            "UPDATE openmettle.local_sessions SET revoked=true WHERE id=$1",
+        ),
+        (
+            3,
+            "UPDATE openmettle.local_sessions SET expires_ms=created_ms+1 WHERE id=$1",
+        ),
+    ] {
+        let deciding = session(&f.db, &f.actor, n).await;
+        let mut hold = owner.begin().await.unwrap();
+        hold.execute("LOCK openmettle.run_approval_decisions IN SHARE MODE")
+            .await
+            .unwrap();
+        let (result, ()) = tokio::join!(decide(&mut c, &deciding, &i, &policy), async {
+            // Receipt reads and the first authorization pass. Only the final INSERT blocks.
+            wait_for_lock_waiters(&f.db, 1).await;
+            sqlx::query(AssertSqlSafe(lapse))
+                .bind(deciding.locator())
+                .execute(&mut *hold)
+                .await
+                .unwrap();
+            hold.commit().await.unwrap();
+        });
+        assert!(matches!(
+            result,
+            Err(StoreError::Denied(DenialReason::Unauthenticated))
+        ));
+        assert!(matches!(
+            f.admit(&deciding, "lapsed", "ordinary", &LIMITS).await,
+            Err(StoreError::Denied(DenialReason::Unauthenticated))
+        ));
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM openmettle.runs WHERE id=$1::uuid")
+                .bind(&r.run_id)
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+        assert_eq!(state, "waiting");
+        assert_eq!(history, events(&f.db, &r.run_id).await);
+    }
+    decide(&mut c, &f.user, &i, &policy).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18.1"]
 async fn human_park_decision_resume_and_committed_intent_recovery() {
     let f = Fixture::new().await;
     let r = f.claim("human", "ordinary").await;
@@ -340,7 +396,10 @@ async fn human_park_decision_resume_and_committed_intent_recovery() {
         &recovered.lease(),
         &p,
         Some(&a.approval_id),
-        &policy,
+        &Policy {
+            class: EffectClass::Prohibited,
+            ..Policy::default()
+        },
         &LEASES,
     )
     .await
@@ -623,6 +682,154 @@ async fn expired_endpoint_key_and_mismatched_ledger_evidence_cannot_start_a_writ
     assert_eq!(count, 1);
 }
 
+// Seed a valid persisted human binding whose approval outlives the endpoint key.
+// The current park writer normally caps the two at the earlier timestamp.
+async fn extend_fixture_approval(
+    owner: &mut PgConnection,
+    actor: &str,
+    r: &ClaimedRun,
+    p: &Proposal,
+    parked: &mut Parked,
+) {
+    use sha2::{Digest, Sha256};
+    let evidence: Vec<u8> = sqlx::query_scalar(
+        "SELECT authority_evidence FROM openmettle.run_approvals WHERE id=$1::uuid",
+    )
+    .bind(&parked.approval_id)
+    .fetch_one(&mut *owner)
+    .await
+    .unwrap();
+    parked.expires_us += 60_000_000;
+    let hash = framed_digest(
+        b"openmettle/effect-approval/1\0",
+        &[
+            r.scope_id.as_bytes(),
+            r.run_id.as_bytes(),
+            p.logical_key.as_bytes(),
+            actor.as_bytes(),
+            p.tool.as_bytes(),
+            p.version.as_bytes(),
+            &Sha256::digest(p.arguments().to_string()),
+            p.destination().as_bytes(),
+            &parked.expires_us.to_be_bytes(),
+            &Sha256::digest(evidence),
+        ],
+    );
+    parked.binding_digest = sqlx::query_scalar(
+        "UPDATE openmettle.run_approvals SET
+        approval_expires_at=timestamptz 'epoch'+($2::bigint::text || ' microseconds')::interval,
+        binding_digest=$3 WHERE id=$1::uuid RETURNING encode(binding_digest, 'hex')",
+    )
+    .bind(&parked.approval_id)
+    .bind(parked.expires_us)
+    .bind(hash)
+    .fetch_one(owner)
+    .await
+    .unwrap();
+}
+
+async fn wait_until_key_expires(c: &mut PgConnection, expires_us: i64) {
+    sqlx::query("SELECT pg_sleep_until(timestamptz 'epoch'+($1::bigint::text || ' microseconds')::interval)")
+        .bind(expires_us).execute(c).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18.1"]
+async fn human_endpoint_expiry_guards_decision_intent_and_send() {
+    let f = Fixture::new().await;
+    let mut owner = connect(&f.db.0, OWNER).await;
+    let mut w = worker(&f.db).await;
+    let mut c = api(&f.db).await;
+    for boundary in ["decision", "intent", "start"] {
+        let r = f.claim(boundary, "ordinary").await;
+        let p = proposal(boundary);
+        let endpoint_expires_us = sqlx::query_scalar(
+            "SELECT (extract(epoch FROM clock_timestamp())*1000000)::bigint + 1500000",
+        )
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        let policy = Policy {
+            endpoint_expires_us,
+            ..Policy::default()
+        };
+        let mut parked = park(
+            &mut w,
+            &r.lease(),
+            &StepTasks::default().handle(),
+            &p,
+            &policy,
+            &LEASES,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        extend_fixture_approval(&mut owner, &f.actor.user, &r, &p, &mut parked).await;
+        assert!(endpoint_expires_us < parked.expires_us);
+        let i = f.input(&r, &parked, HumanDecision::Approve, "yes");
+        if boundary == "decision" {
+            let mut hold = owner.begin().await.unwrap();
+            hold.execute("LOCK openmettle.run_approval_decisions IN SHARE MODE")
+                .await
+                .unwrap();
+            let (decision, ()) = tokio::join!(decide(&mut c, &f.user, &i, &policy), async {
+                wait_for_lock_waiters(&f.db, 1).await;
+                wait_until_key_expires(&mut hold, endpoint_expires_us).await;
+                hold.commit().await.unwrap();
+            });
+            assert!(matches!(decision, Err(StoreError::Conflict("approval"))));
+            super::authz_runs::cancelled_once(&f.db, &r.run_id, "revoked").await;
+            continue;
+        }
+        decide(&mut c, &f.user, &i, &policy).await.unwrap();
+        let resumed = f.next().await.unwrap();
+        let lease = resumed.lease();
+        let intent = record_fenced_intent(
+            &mut w,
+            &lease,
+            &p,
+            Some(&parked.approval_id),
+            &policy,
+            &LEASES,
+        );
+        if boundary == "intent" {
+            let mut hold = owner.begin().await.unwrap();
+            hold.execute("LOCK openmettle.operations IN SHARE MODE")
+                .await
+                .unwrap();
+            let (result, ()) = tokio::join!(intent, async {
+                wait_for_lock_waiters(&f.db, 1).await;
+                wait_until_key_expires(&mut hold, endpoint_expires_us).await;
+                hold.commit().await.unwrap();
+            });
+            assert!(matches!(
+                result.unwrap(),
+                IntentResult::Invalidated(leases::Settled::Terminal { state: "cancelled" })
+            ));
+            let count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM openmettle.operations WHERE run_id=$1::uuid",
+            )
+            .bind(&r.run_id)
+            .fetch_one(&mut w)
+            .await
+            .unwrap();
+            assert_eq!(count, 0);
+        } else {
+            let IntentResult::Applied(committed) = intent.await.unwrap() else {
+                panic!("expected human intent")
+            };
+            wait_until_key_expires(&mut owner, endpoint_expires_us).await;
+            let (_, stop) = tokio::sync::watch::channel(None);
+            let step = StepContext {
+                stop,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(30),
+                tasks: StepTasks::default().handle(),
+            };
+            assert!(committed.start(&step).is_none());
+        }
+    }
+}
+
 async fn raw_operation(
     c: &mut PgConnection,
     r: &ClaimedRun,
@@ -633,6 +840,51 @@ async fn raw_operation(
         (scope_id,run_id,logical_key,target,capability,format,format_version,request,request_identity,request_digest,approval_id)
         VALUES($1::uuid,$2::uuid,$3,'fixture','lookup','legacy',1,''::bytea,''::bytea,sha256(''::bytea),$4::uuid) RETURNING id::text")
         .bind(&r.scope_id).bind(&r.run_id).bind(key).bind(approval).fetch_one(c).await
+}
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18.1"]
+async fn invalidated_intent_preserves_reconciliation_for_another_unresolved_write() {
+    let f = Fixture::new().await;
+    let r = f.claim("reconcile", "ordinary").await;
+    let parked = f.park(&r, "effect").await;
+    let mut w = worker(&f.db).await;
+    let policy = Policy::default();
+    decide(
+        &mut api(&f.db).await,
+        &f.user,
+        &f.input(&r, &parked, HumanDecision::Approve, "yes"),
+        &policy,
+    )
+    .await
+    .unwrap();
+    let resumed = f.next().await.unwrap();
+    let op = raw_operation(&mut w, &resumed, "other", None)
+        .await
+        .unwrap();
+    let result = record_fenced_intent(
+        &mut w,
+        &resumed.lease(),
+        &proposal("effect"),
+        Some(&parked.approval_id),
+        &Policy {
+            class: EffectClass::Prohibited,
+            ..policy
+        },
+        &LEASES,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        result,
+        IntentResult::Invalidated(leases::Settled::Reconciling { unresolved: 1 })
+    ));
+    assert_eq!(
+        leases::unresolved_operations(&mut w, &resumed.lease(), 1)
+            .await
+            .unwrap()[0]
+            .id,
+        op
+    );
 }
 fn fk<T>(result: Result<T, sqlx::Error>) {
     assert!(matches!(result,Err(sqlx::Error::Database(e)) if e.code().as_deref()==Some("23503")));
@@ -873,6 +1125,7 @@ async fn park_refuses_work_and_unresolved_writes_but_allows_reads_on_another_key
         .await
         .is_err()
     );
+    assert!(tasks.handle().spawn(async {}));
     leases::release_lease(&mut w, &r.lease()).await.unwrap();
     assert!(matches!(
         park(
@@ -905,7 +1158,18 @@ async fn park_refuses_work_and_unresolved_writes_but_allows_reads_on_another_key
         .await,
         Err(leases::LeaseError::StaleClaim)
     ));
-    f.park(&new, "new").await;
+    park(
+        &mut w,
+        &new.lease(),
+        &tasks.handle(),
+        &proposal("new"),
+        &policy,
+        &LEASES,
+        ttl,
+    )
+    .await
+    .unwrap();
+    assert!(!tasks.handle().spawn(async {}));
 }
 
 #[tokio::test]
@@ -1299,7 +1563,7 @@ async fn withdrawn_sessions_revisions_substitutions_and_expiry_never_dispatch() 
             )
             .await
             .unwrap(),
-            IntentResult::Invalidated
+            IntentResult::Invalidated(leases::Settled::Terminal { .. })
         ));
         let history = events(&f.db, &r.run_id).await;
         assert_eq!(history.iter().filter(|e| e.1 == "run-terminal").count(), 1);
@@ -1436,7 +1700,7 @@ async fn project_grants_membership_revision_and_visibility_replay() {
             )
             .await
             .unwrap(),
-            IntentResult::Invalidated
+            IntentResult::Invalidated(leases::Settled::Terminal { .. })
         ));
     }
     let mut f = Fixture::new().await;
@@ -1480,6 +1744,42 @@ async fn project_grants_membership_revision_and_visibility_replay() {
         decide(&mut c, &other, &i, &policy).await,
         Err(StoreError::Denied(_) | StoreError::NotFound)
     ));
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18.1"]
+async fn new_decision_settles_a_stale_wait_in_an_archived_project() {
+    use super::authz_store::ctx;
+    use openmettle_core::authz::{Grantee, ProjectRole, projects};
+    let mut f = Fixture::new().await;
+    let (project, manager) = f.project().await;
+    let mut c = api(&f.db).await;
+    projects::set_project_member_role(
+        &mut c,
+        &ctx(&manager, "editor"),
+        &project,
+        &Grantee::User(f.actor.user.clone()),
+        ProjectRole::Editor,
+    )
+    .await
+    .unwrap();
+    let pending = f.claim("pending-at-archive", "ordinary").await;
+    let undecided = f.park(&pending, "pending").await;
+    // Seed an archived project with a stale waiting run. The normal archive writer also
+    // cancels all runs, which would mask the new-decision archive check.
+    sqlx::query("UPDATE openmettle.project_settings SET archived_at=clock_timestamp() WHERE project_id=$1::uuid")
+        .bind(&project).execute(&mut connect(&f.db.0, OWNER).await).await.unwrap();
+    assert!(matches!(
+        decide(
+            &mut c,
+            &f.user,
+            &f.input(&pending, &undecided, HumanDecision::Approve, "late"),
+            &Policy::default()
+        )
+        .await,
+        Err(StoreError::Conflict("approval"))
+    ));
+    super::authz_runs::cancelled_once(&f.db, &pending.run_id, "revoked").await;
 }
 
 #[tokio::test]

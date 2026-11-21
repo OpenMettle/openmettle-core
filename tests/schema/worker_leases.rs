@@ -131,6 +131,54 @@ async fn terminal(db: &TestDb, id: &str, format: &str, bytes: &[u8]) {
 
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL for isolated PostgreSQL 18"]
+async fn worker_expires_waits_when_the_queued_sweep_fails() {
+    let f = Fixture::new().await;
+    let bare = request(&f.db, &f.scope, "personal", &f.actor, "broken-queue").await;
+    let queued = bare_run(&f.db, &bare).await;
+    let waiting = f.admit("legacy-wait").await;
+    let mut owner = connect(&f.db.0, OWNER).await;
+    sqlx::query("UPDATE openmettle.runs SET state='waiting' WHERE id=$1::uuid")
+        .bind(&waiting)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    // A conflicting terminal event rolls back every attempt to expire the queued row.
+    let mut tx = WriteTransaction::begin(&mut owner).await.unwrap();
+    durable::append_event(&mut tx, &f.scope, &queued, "run-terminal", EVIDENCE)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(matches!(
+        queue::expire_queued(&mut worker(&f.db).await, 100).await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    let _worker = Process(
+        binary("worker")
+            .env("OPENMETTLE_WORKER_DATABASE_URL", f.db.url(WORKER))
+            .env("OPENMETTLE_WORKER_BIND", address())
+            .env("OPENMETTLE_WORKER_SWEEP_MS", "1000")
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while terminal_events(&f.db, &waiting).await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("worker did not settle the waiting run");
+    terminal(
+        &f.db,
+        &waiting,
+        "openmettle.run-invalid-wait",
+        br#"{"reason":"invalid_wait"}"#,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL for isolated PostgreSQL 18"]
 async fn duplicate_claims_and_reclaims_emit_one_event_per_token() {
     let f = Fixture::new().await;
     let id = f.admit("only").await;

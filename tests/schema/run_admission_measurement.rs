@@ -21,11 +21,12 @@ const EXECUTING: &str = "state IN ('running', 'cancelling', 'reconciling')";
 /// The live predicate of the partial indexes, so the sampler's own reads stay off run history.
 const LIVE: &str = "state NOT IN ('succeeded', 'failed', 'cancelled', 'interrupted')";
 /// The partial indexes over live rows; plans may also use `runs_pkey` for the claim's `UPDATE`.
-const LIVE_INDEXES: [&str; 4] = [
+const LIVE_INDEXES: [&str; 5] = [
     "runs_live_actor_idx",
     "runs_live_scope_idx",
     "runs_dispatch_idx",
     "runs_branch_live_idx",
+    "runs_wait_sweep_idx",
 ];
 
 struct Profile {
@@ -109,8 +110,7 @@ struct Actor {
     hot: bool,
 }
 
-/// The SQL text of a `concat!` constant in `src/authz/runs.rs`, rebuilt from the source so the
-/// harness explains exactly the statement the store ships.
+/// Rebuild the statement from the store source so the harness explains the shipped SQL.
 fn shipped_sql(name: &str) -> String {
     const SOURCE: &str = include_str!("../../src/authz/runs.rs");
     let literal = |text: &str| -> (String, usize) {
@@ -119,6 +119,12 @@ fn shipped_sql(name: &str) -> String {
         assert!(!body[..end].contains('\\'), "escape in {name}");
         (body[..end].to_owned(), text.len() - body.len() + end + 1)
     };
+    if name == "LOCK_DUE_WAITS" {
+        let (_, body) = include_str!("../../src/authz/approvals.rs")
+            .split_once("const LOCK_DUE_WAITS: &str = ")
+            .unwrap();
+        return literal(body).0;
+    }
     let macro_at = SOURCE.find("macro_rules! non_terminal").unwrap();
     let (non_terminal, _) = literal(&SOURCE[macro_at..]);
     const LEASE_SOURCE: &str = include_str!("../../src/authz/leases.rs");
@@ -828,6 +834,50 @@ fn latency_summary_uses_nearest_rank_percentiles() {
         })
     );
     assert_eq!(latency(Vec::new()), json!({ "count": 0 }));
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn wait_sweep_uses_the_partial_index_over_populated_history() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let actor = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let scope = personal_of(&db, &actor).await;
+    let template = request(&db, &scope, "personal", &actor, "sweep").await;
+    seed_history(&mut owner, &template, 8192).await;
+    // Retained approvals and terminal runs both outnumber the sweep's bounded batch.
+    owner.execute("INSERT INTO openmettle.run_approvals
+        (scope_id,run_id,actor_user_id,logical_key,tool_id,tool_version,canonical_arguments,destination,
+         authority_evidence,binding_digest,approval_expires_at,resume_execution_expires_at)
+        SELECT scope_id,id,actor_user_id,'key','mail','1','{}','fixture','proof',sha256('proof'),now(),now()
+        FROM openmettle.runs").await.unwrap();
+    owner.execute("UPDATE openmettle.runs r SET state='waiting',wait_reason='approval',approval_wait_id=a.id
+        FROM (SELECT id,run_id FROM openmettle.run_approvals ORDER BY id LIMIT 512) a WHERE r.id=a.run_id").await.unwrap();
+    owner
+        .execute("ANALYZE openmettle.run_approvals")
+        .await
+        .unwrap();
+    owner.execute("ANALYZE openmettle.runs").await.unwrap();
+    let partial: bool = sqlx::query_scalar(
+        "SELECT indpred IS NOT NULL FROM pg_index WHERE indexrelid='openmettle.runs_wait_sweep_idx'::regclass",
+    ).fetch_one(&mut owner).await.unwrap();
+    assert!(partial);
+    let sweep = explain(
+        &mut worker(&db).await,
+        &shipped_sql("LOCK_DUE_WAITS"),
+        vec![Bind::Int(100)],
+    )
+    .await;
+    assert_eq!(sweep["plan"]["Actual Rows"], 100.0);
+    assert_eq!(sweep["seq_scans"], json!([]), "{sweep}");
+    assert!(
+        sweep["index_names"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("runs_wait_sweep_idx")),
+        "{sweep}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

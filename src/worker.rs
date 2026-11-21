@@ -64,21 +64,34 @@ impl StepTasks {
         TaskHandle(Arc::downgrade(&self.0))
     }
 }
+/// Owns the temporary closure of a drained task set while the park transaction is prepared.
+pub(crate) struct ParkGuard(Option<Arc<Children>>);
+impl ParkGuard {
+    pub(crate) fn keep_closed(mut self) {
+        self.0 = None;
+    }
+}
+impl Drop for ParkGuard {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.0
+            && let Some(set) = owner.lock().unwrap().as_mut()
+        {
+            set.closed = false;
+        }
+    }
+}
 impl TaskHandle {
-    pub(crate) fn close_if_drained(&self) -> bool {
-        let Some(owner) = self.0.upgrade() else {
-            return false;
-        };
+    pub(crate) fn close_if_drained(&self) -> Option<ParkGuard> {
+        let owner = self.0.upgrade()?;
         let mut owned = owner.lock().unwrap();
-        let Some(set) = owned.as_mut() else {
-            return false;
-        };
+        let set = owned.as_mut()?;
         while set.tasks.try_join_next().is_some() {}
-        if !set.tasks.is_empty() {
-            return false;
+        if set.closed || !set.tasks.is_empty() {
+            return None;
         }
         set.closed = true;
-        true
+        drop(owned);
+        Some(ParkGuard(Some(owner)))
     }
 
     /// Returns false once the runner has closed this run's task set.
@@ -174,10 +187,8 @@ fn jitter(base: Duration) -> Duration {
     base + base * u32::from(byte[0]) / (255 * 5)
 }
 
-async fn sweep<T, E>(category: Sweep, work: impl Future<Output = Result<T, E>>) {
-    if !matches!(timeout(Duration::from_secs(15), work).await, Ok(Ok(_))) {
-        sweep_failed(category);
-    }
+async fn sweep<T, E>(work: impl Future<Output = Result<T, E>>) -> bool {
+    matches!(timeout(Duration::from_secs(15), work).await, Ok(Ok(_)))
 }
 
 pub(crate) async fn maintenance(
@@ -187,24 +198,27 @@ pub(crate) async fn maintenance(
 ) {
     loop {
         sleep(jitter(period)).await;
-        sweep(Sweep::Queue, async {
-            let mut c = connection(pool).await?;
-            queue::expire_queued(&mut c, 100).await?;
-            approvals::expire_waits(&mut c, 100).await
-        })
-        .await;
-        sweep(Sweep::Execution, async {
-            leases::settle_expired(&mut *connection(pool).await?, 100).await
-        })
-        .await;
+        let queued =
+            sweep(async { queue::expire_queued(&mut *connection(pool).await?, 100).await }).await;
+        let waits =
+            sweep(async { approvals::expire_waits(&mut *connection(pool).await?, 100).await })
+                .await;
+        // Queue maintenance has one failure event per tick and a separate budget for each sweep.
+        if !queued || !waits {
+            sweep_failed(Sweep::Queue);
+        }
+        if !sweep(async { leases::settle_expired(&mut *connection(pool).await?, 100).await }).await
+        {
+            sweep_failed(Sweep::Execution);
+        }
         if let Some(store) = store {
             let age = artifact_fs::UPLOAD_TIMEOUT + Duration::from_secs(300);
-            sweep(
-                Sweep::Uploads,
-                artifact_fs::reconcile_expired(pool, store, age, 100),
-            )
-            .await;
-            sweep(Sweep::Retention, artifact_fs::purge_due(pool, store, 100)).await;
+            if !sweep(artifact_fs::reconcile_expired(pool, store, age, 100)).await {
+                sweep_failed(Sweep::Uploads);
+            }
+            if !sweep(artifact_fs::purge_due(pool, store, 100)).await {
+                sweep_failed(Sweep::Retention);
+            }
         }
     }
 }
@@ -531,7 +545,7 @@ async fn execute<E: Executor>(
                         .send(run, operation, request, step)
                         .await
                 }
-                IntentResult::Invalidated => return Ok(WorkEnd::Stop(Stop::LeaseLost)),
+                IntentResult::Invalidated(settled) => return Ok(WorkEnd::Invalidated(settled)),
                 _ => return Ok(WorkEnd::Complete(Settle::Stopped)),
             }
         } else {

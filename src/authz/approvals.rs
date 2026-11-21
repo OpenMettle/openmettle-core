@@ -3,7 +3,7 @@
 use super::{
     CapabilityGate, DenialReason, PlatformPolicy, Principal, ResourceKind, RunContinuation,
     authorize_capability,
-    leases::{self, CancelReason, Fence, Lease, LeaseError, LeaseSettings},
+    leases::{self, CancelReason, Fence, Lease, LeaseError, LeaseSettings, Settled},
     projects,
     runs::{self, CapabilityUse, RunAdmission, RunRecheckRequest},
     store::{self, StoreError},
@@ -15,7 +15,7 @@ use crate::{
     sessions,
     worker::StepContext,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{
     AssertSqlSafe, PgConnection, Postgres, Row,
@@ -165,7 +165,7 @@ impl Proposal {
 
 /// Immutable server-reviewed policy classes. Account/platform changes, credential export,
 /// self-grant and isolation escape all use Prohibited. Sharing always requires a human.
-#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EffectClass {
     Prohibited,
@@ -175,7 +175,7 @@ pub enum EffectClass {
     Read,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "support")]
 pub enum EndpointKey {
     Supported {
@@ -191,7 +191,7 @@ pub enum EndpointKey {
 
 /// Supplied by trusted server code for the exact tool, schema, destination and resource.
 /// Unavailable policy, an unpinned destination, or an unsupported quota returns no review.
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Review {
     pub class: EffectClass,
     pub capability: String,
@@ -207,7 +207,7 @@ pub struct Review {
     pub reservation: Option<StorageReservation>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct StorageReservation {
     pub id: String,
     pub required_bytes: i64,
@@ -327,7 +327,7 @@ const AUTH: &str = concat!(
          AND g.id IN (SELECT grantee_local_group_id FROM targets)
      ), mapped AS (
        SELECT m.approval_id,m.config_revision,m.rule_revision,m.issued_ms,m.epoch,(m.observation).change_id,
-              least(m.expires_ms,m.issued_ms+1000::bigint*m.max_age_seconds) AS until_ms,v.claim_value,m.rule_id
+              least(m.expires_ms,m.issued_ms+1000::bigint*m.max_age_seconds) AS until_ms,v.claim_value,m.rule_id,v.selector_kind
        FROM openmettle.membership_observations m JOIN openmettle.grant_mapping_revisions v ON
          (v.rule_id,v.revision)=(m.rule_id,m.rule_revision)
        JOIN openmettle.local_identity_approvals mref ON mref.id=m.approval_id
@@ -341,7 +341,7 @@ const AUTH: &str = concat!(
      ), grants AS (
        SELECT g.* FROM targets g WHERE (g.mapping_rule_id IS NULL OR g.cycle_id IN (SELECT change_id FROM mapped))
        AND (g.grantee_user_id=$3::uuid OR g.grantee_kind='project' OR g.grantee_local_group_id IN (SELECT id FROM groups)
-           OR g.grantee_oidc_group_id IN (SELECT claim_value FROM mapped WHERE approval_id=$4::uuid))
+           OR g.grantee_oidc_group_id IN (SELECT claim_value FROM mapped WHERE approval_id=$4::uuid AND selector_kind='group'))
      ), caps AS (
        SELECT k, jsonb_build_array(k,p.revision,p.denied,d.revision,d.denied,g.revision,g.granted) AS proof,
            coalesce(g.granted,false) AND NOT coalesce(p.denied,false) AND NOT coalesce(d.denied,false) AS allowed
@@ -355,8 +355,8 @@ const AUTH: &str = concat!(
            jsonb_build_array('v1',origin.proof,
               ARRAY(SELECT jsonb_build_array(id,member_revision,revision) FROM groups WHERE id IN
                   (SELECT grantee_local_group_id FROM grants WHERE target_kind='project' OR target_id=$6::uuid) ORDER BY id),
-              ARRAY(SELECT to_jsonb(m) FROM mapped m WHERE EXISTS (SELECT FROM grants g
-                  WHERE (g.target_kind='project' OR g.target_id=$6::uuid) AND (g.cycle_id=m.change_id OR g.grantee_oidc_group_id=m.claim_value))
+              ARRAY(SELECT to_jsonb(m) - 'selector_kind' FROM mapped m WHERE EXISTS (SELECT FROM grants g
+                  WHERE (g.target_kind='project' OR g.target_id=$6::uuid) AND (g.cycle_id=m.change_id OR (m.selector_kind='group' AND g.grantee_oidc_group_id=m.claim_value)))
                   ORDER BY approval_id),
               ARRAY(SELECT jsonb_build_array(id,cycle_id,last_revision) FROM grants WHERE target_kind='project' OR target_id=$6::uuid ORDER BY id))::text AS base,
            (SELECT proof::text FROM caps WHERE k='runs.use_yolo') AS yolo,
@@ -366,8 +366,8 @@ const AUTH: &str = concat!(
               ARRAY(SELECT jsonb_build_array(id,cycle_id,last_revision) FROM grants WHERE target_id=$7::uuid ORDER BY id),
               ARRAY(SELECT jsonb_build_array(id,member_revision,revision) FROM groups WHERE id IN
                   (SELECT grantee_local_group_id FROM grants WHERE target_id=$7::uuid) ORDER BY id),
-              ARRAY(SELECT to_jsonb(m) FROM mapped m WHERE EXISTS (SELECT FROM grants g WHERE g.target_id=$7::uuid AND
-                  (g.cycle_id=m.change_id OR g.grantee_oidc_group_id=m.claim_value)) ORDER BY approval_id),
+              ARRAY(SELECT to_jsonb(m) - 'selector_kind' FROM mapped m WHERE EXISTS (SELECT FROM grants g WHERE g.target_id=$7::uuid AND
+                  (g.cycle_id=m.change_id OR (m.selector_kind='group' AND g.grantee_oidc_group_id=m.claim_value))) ORDER BY approval_id),
               quota.id,quota.max_bytes)::text AS tool
        FROM t JOIN live origin ON origin.id=$2 LEFT JOIN live decider ON decider.id=$9
        LEFT JOIN openmettle.storage_reservations quota ON quota.id=$10::uuid AND quota.state='reserved'
@@ -408,7 +408,7 @@ impl<'a> Proof<'a> {
             .query(&sql)
             .fetch_optional(c)
             .await?
-            .ok_or(DENIED)?
+            .ok_or(StoreError::Denied(DenialReason::Unauthenticated))?
             .try_get("ms")?)
     }
     async fn snapshot(&self, c: &mut PgConnection) -> Result<Snapshot, StoreError> {
@@ -779,10 +779,10 @@ pub async fn park(
     if ttl.as_micros() == 0 || ttl > settings.execution_timeout {
         return Err(StoreError::InvalidInput("approval TTL").into());
     }
-    if !tasks.close_if_drained() {
-        return Err(StoreError::Conflict("owned child work").into());
-    }
-    leases::fenced(c, lease, Fence::Step, async |tx, _| {
+    let guard = tasks
+        .close_if_drained()
+        .ok_or(StoreError::Conflict("owned child work"))?;
+    leases::fenced(c, lease, Fence::Step, async move |tx, _| {
         let c = tx.connection()?;
         let run = sqlx::query(RUN)
             .bind(lease.run_id)
@@ -860,6 +860,8 @@ pub async fn park(
             event("openmettle.run-waiting", br#"{"reason":"approval"}"#),
         )
         .await?;
+        // A lost commit reply requires recovery. Keep spawning closed from this point.
+        guard.keep_closed();
         Ok(Parked {
             approval_id: id,
             binding_digest: projects::hex(&binding.hash),
@@ -921,9 +923,11 @@ async fn fail(
     runs::append(c, scope, run, runs::TERMINAL_KEY, reason).await
 }
 
+// Probe each waiting row's single approval by primary key as the ordered sweep advances.
 const LOCK_DUE_WAITS: &str = "WITH locked AS MATERIALIZED (
             SELECT r.id,r.scope_id,r.state,r.wait_reason,r.approval_wait_id,a.approval_expires_at FROM openmettle.runs r
-            LEFT JOIN openmettle.run_approvals a ON a.id=r.approval_wait_id
+            LEFT JOIN LATERAL (SELECT approval_expires_at FROM openmettle.run_approvals
+                WHERE id=r.approval_wait_id LIMIT 1) a ON true
             WHERE r.state='waiting' AND (r.approval_wait_id IS NULL OR r.wait_reason IS DISTINCT FROM 'approval'
                 OR a.approval_expires_at<=clock_timestamp()) ORDER BY r.id LIMIT $1 FOR NO KEY UPDATE OF r SKIP LOCKED)
             SELECT scope_id::text,id::text,approval_wait_id IS NOT NULL AND wait_reason IS NOT DISTINCT FROM 'approval'
@@ -1063,13 +1067,8 @@ pub async fn decide(
             conversation: conv,
             session: session.locator(),
         };
-        let now = session_proof(&reader)
-            .session_time(c)
-            .await
-            .map_err(|e| match e {
-                StoreError::Denied(_) => StoreError::Denied(DenialReason::Unauthenticated),
-                _ => e,
-            })?;
+        let caller = session_proof(&reader);
+        let now = caller.session_time(c).await?;
         let principal = store::hydrate_api_principal(c, actor, reader.approval, now)
             .await?
             .ok_or(HIDDEN)?;
@@ -1125,6 +1124,9 @@ pub async fn decide(
         }
         let p = stored_proposal(&a)?;
         let attempt = async {
+            if view.project_id.is_some() && view.access != super::ResourceAccess::Write {
+                return Err(DENIED);
+            }
             let review = reviewed(policy, &s, &p)?;
             let proof = proof(&s, &review, Some(session.locator()));
             let snap = authorized(c, &proof, &review).await?;
@@ -1142,7 +1144,7 @@ pub async fn decide(
                 .bind(&binding.hash)
                 .bind(i.decision.text())
                 .bind(&key)
-                .bind(expires)
+                .bind(expires.min(validity(&snap, &review)))
                 .bind(&snap.base)
                 .bind(&snap.tool)
                 .fetch_optional(&mut *c)
@@ -1155,6 +1157,7 @@ pub async fn decide(
         let decided_us = match attempt {
             Ok(time) => time,
             Err(StoreError::Denied(_)) => {
+                caller.session_time(c).await?;
                 invalidate_wait(c, i.scope, i.run, expires).await?;
                 return Ok(None);
             }
@@ -1187,7 +1190,7 @@ pub enum IntentResult {
     Applied(CommittedIntent),
     Replayed(String),
     ApprovalRequired,
-    Invalidated,
+    Invalidated(Settled),
 }
 pub struct CommittedIntent {
     pub operation_id: String,
@@ -1214,8 +1217,9 @@ async fn invalidate_running(
     if !live {
         return Err(CONFLICT);
     }
-    if db_time(c).await? >= expires {
+    let settled = if db_time(c).await? >= expires {
         fail(c, lease.scope_id, lease.run_id, EXPIRED).await?;
+        Settled::Terminal { state: "failed" }
     } else {
         sqlx::query("UPDATE openmettle.runs SET cancel_reason='revoked' WHERE id=$1::uuid")
             .bind(lease.run_id)
@@ -1229,9 +1233,9 @@ async fn invalidate_running(
             settings,
             leases::Settle::Stopped,
         )
-        .await?;
-    }
-    Ok(IntentResult::Invalidated)
+        .await?
+    };
+    Ok(IntentResult::Invalidated(settled))
 }
 
 const PENDING_EFFECT: &str = "SELECT a.id::text,a.logical_key,a.tool_id,a.tool_version,a.canonical_arguments,a.destination
@@ -1287,7 +1291,7 @@ pub async fn record_fenced_intent(
         // Once an intent exists, compare against its original envelope. Expiry or revocation can
         // never convert the replay into a send or erase an observation.
         if let Some(old) = sqlx::query(
-            "SELECT request FROM openmettle.operations WHERE run_id=$1::uuid AND logical_key=$2",
+            "SELECT request,capability FROM openmettle.operations WHERE run_id=$1::uuid AND logical_key=$2",
         )
         .bind(lease.run_id)
         .bind(&p.logical_key)
@@ -1307,14 +1311,19 @@ pub async fn record_fenced_intent(
                 expires,
                 evidence,
             };
-            let review = reviewed(policy, &s, p)?;
+            let review: Review = serde_json::from_value(envelope["endpoint"].clone())
+                .map_err(|_| CONFLICT)?;
+            let capability: &str = old.try_get("capability")?;
+            if review.capability_class() != capability {
+                return Err(CONFLICT);
+            }
             let rebuilt = binding.envelope(p, &s, &review, approval)?;
             let intent = Intent {
                 scope: s.scope,
                 run: lease.run_id,
                 key: &p.logical_key,
                 target: &p.destination,
-                capability: review.capability_class(),
+                capability,
                 request: Payload {
                     format: "openmettle.effect",
                     version: 1,
@@ -1374,7 +1383,8 @@ pub async fn record_fenced_intent(
                 r.try_get::<i64, _>("execution_us")?
                     .min(validity(&snap, &review)),
             );
-            if snap.now >= expires.min(validity(&snap, &review)) {
+            let effective_until = expires.min(validity(&snap, &review));
+            if snap.now >= effective_until {
                 return Err(DENIED);
             }
             let binding = Binding::new(p, &s, &snap, &review, expires, auto)?;
@@ -1409,7 +1419,7 @@ pub async fn record_fenced_intent(
                 .bind(digest(&id))
                 .bind(approval)
                 .bind(lease.claim_token)
-                .bind(expires)
+                .bind(effective_until)
                 .bind(&snap.base)
                 .bind(&snap.tool)
                 .bind(auto)
@@ -1421,7 +1431,7 @@ pub async fn record_fenced_intent(
             durable::intent_event(c, &intent, &op, &id).await?;
             let margin = settings.lease / 3;
             let remaining =
-                Duration::from_micros((expires.min(snap.until) - snap.now).max(0) as u64).min(
+                Duration::from_micros((effective_until - snap.now).max(0) as u64).min(
                     held.lease_remaining
                         .min(held.execution_remaining)
                         .saturating_sub(margin),

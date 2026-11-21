@@ -57,7 +57,7 @@ ALTER TABLE openmettle.runs
     ADD FOREIGN KEY (scope_id, id, approval_wait_id) REFERENCES openmettle.run_approvals (scope_id, run_id, id),
     ADD CHECK ((wait_reason IS NOT DISTINCT FROM 'approval') = (state = 'waiting' AND approval_wait_id IS NOT NULL)
            AND (wait_reason IS DISTINCT FROM 'approval' OR claim_token IS NULL));
-CREATE INDEX runs_wait_sweep_idx ON openmettle.runs ((state = 'waiting'), id);
+CREATE INDEX runs_wait_sweep_idx ON openmettle.runs (id) WHERE state = 'waiting';
 
 ALTER TABLE openmettle.operations
     ADD COLUMN approval_id uuid UNIQUE,
