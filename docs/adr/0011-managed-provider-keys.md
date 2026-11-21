@@ -7,6 +7,9 @@ and makes identical re-registration a no-op; the rest of this record still appli
 The [amendment of 19 November 2026](#amendment-19-nov-2026) replaces the token-endpoint
 authentication rule and the treatment of `no-store` and `no-cache` responses.
 
+After local identity admission, [ADR 0037](0037-gateway-provisioning-and-usage-reconciliation.md)
+governs per-user gateway credentials, entitlement changes and inference usage reconciliation.
+
 ## Boundary
 
 `provider_keys` connects configured discovery and signing-key refresh to the existing
