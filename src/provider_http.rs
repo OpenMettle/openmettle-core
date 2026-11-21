@@ -21,6 +21,7 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
+pub mod inference;
 pub(crate) mod transport;
 use transport::{Endpoint, Limits, Lookup, Range, Route, endpoint, private_range};
 // Names the existing provider tests reach through `use super::*`.
@@ -40,7 +41,7 @@ pub const MAX_RESPONSE_HEADER_BYTES: usize = 8 * 1024;
 /// Library request bounds: code, verifier, client and callback after form encoding.
 pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024;
 const MAX_REQUEST_HEADERS: usize = 4;
-const MAX_REQUEST_HEADER_BYTES: usize = 1024;
+pub const MAX_REQUEST_HEADER_BYTES: usize = 1024;
 /// More answers than this fail the request instead of being truncated.
 pub const MAX_ADDRESSES: usize = 64;
 pub const MAX_PRIVATE_RANGES: usize = 32;
@@ -346,3 +347,7 @@ pub(crate) mod fixture;
 #[cfg(test)]
 #[path = "../tests/provider_http_support/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/provider_inference/redaction.rs"]
+mod inference_redaction;
