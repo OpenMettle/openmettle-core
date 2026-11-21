@@ -63,9 +63,16 @@ request UUID this operator already used for a different change.
 ## Break-glass recovery
 
 When every remaining administrator is disabled, unavailable or untrusted, grant a trusted
-enabled user with this procedure. That administrator then demotes or disables compromised
-administrators through the application, which enforces the last-enabled-administrator rule
-and records its own audit rows. Review the audit rows of the affected period afterwards.
+enabled user with this procedure first so an enabled administrator remains. `/v1` does not
+yet expose HTTP endpoints to demote an administrator or disable a user account (the
+`authz::store` functions are internal-only). To cut off a compromised administrator
+immediately today, withdraw or revoke that identity's approval with the
+[local identity approval change procedure](identity-approval-change.md) (which advances its
+`access_generation` so existing sessions stop validating immediately and `withdraw` refuses
+new logins), use the [session cleanup procedure](session-cleanup.md) to remove expired or
+revoked session rows as needed, and record any direct owner SQL demotion or account
+disablement under deployment change controls. Review the `openmettle.authorization_audit`
+rows of the affected period afterwards.
 
 ## Resolve an uncertain outcome
 

@@ -126,7 +126,7 @@ Unset, no exporter, task, DNS slot or socket exists and the process behaves exac
 Unset, the process opens no directory and starts exactly as before. Set, it creates `staging/` and `revisions/` (mode 0700) inside the directory if they are absent, before telemetry or the listener starts. Any refusal (empty, relative, missing, a file, a symbolic-link leaf, or a subdirectory that cannot be created or is not a real directory) exits 78 with exactly `configuration error: invalid ARTIFACTS_DIR`, never the path.
 
 - **Layout.** `staging/<reservation_id>` holds an upload in progress (mode 0600, created exclusively); `revisions/<reservation_id>` holds a published payload. The name is always the server-generated reservation UUID, never a client file name, which is kept only as the revision's display name.
-- **Durability.** A payload is `fsync`ed, renamed into `revisions/` and the directory `fsync`ed before the database records the revision. Refused, truncated or cancelled uploads leave no staging file, and their reservation is released, or released later by `artifact_fs::reconcile_expired`. A crashed process leaves its staging file and reservation until that reconciler runs; until then a retry with the same key is `409 conflict`. `artifact_fs::purge_due` deletes expired retained payloads before confirming the purge. When `OPENMETTLE_WORKER_ARTIFACTS_DIR` is set, `openmettle-worker` schedules both helpers in batches of 100 with a 15-second budget: `artifact_fs::reconcile_expired` releases uploads older than 900 seconds (300 s beyond the 600 s upload limit), and `artifact_fs::purge_due` removes due retained revisions.
+- **Durability.** A payload is `fsync`ed, renamed into `revisions/` and the directory `fsync`ed before the database records the revision. Refused, truncated or cancelled uploads leave no staging file, and their reservation is released, or released later by `artifact_fs::reconcile_expired`. A crashed process before the rename leaves its orphaned staging file and reservation until that reconciler runs, and a retry with the same key returns `409 conflict` while that staging file exists; a crash after the rename into `revisions/` but before database settlement can replace the unsettled file and settle on retry. `artifact_fs::purge_due` deletes expired retained payloads before confirming the purge. When `OPENMETTLE_WORKER_ARTIFACTS_DIR` is set, `openmettle-worker` schedules both helpers in batches of 100 with a 15-second budget: `artifact_fs::reconcile_expired` releases uploads older than 900 seconds (300 s beyond the 600 s upload limit), and `artifact_fs::purge_due` removes due retained revisions.
 - **Topology.** Every API and worker replica that writes or purges payloads must see the same directory. Use a `ReadWriteOnce` volume with all those pods on one node, or a `ReadWriteMany` storage class qualified for POSIX `rename`, exclusive creation and `fsync`. Back up PostgreSQL and the volume together.
 
 ### Browser sign-in routes (off by default)
@@ -161,14 +161,14 @@ No line carries a path, value, URL, identifier or parser message. Run `--check-a
 
 ### Authenticated application routes
 
-With `OPENMETTLE_API_AUTH_CONFIG` set, the API serves the operations of the [application API contract](#application-api-contract) marked `"x-openmettle-implementation": "implemented"` in `contracts/openapi/openmettle-v1.json`: `GET /v1/capabilities` (an empty, core-only list), projects, membership, conversation and artifact access and sharing ([ADR 0027](docs/adr/0027-authorization-and-private-projects.md)), managed conversations, branches, models, presets, effective-configuration previews and run admission/cancellation ([ADR 0032](docs/adr/0032-durable-run-admission-and-fair-work-queue.md), [ADR 0036](docs/adr/0036-conversation-branches-presets-and-effective-model-config.md)), run snapshots and replayable SSE event streams when `cursor_keys` are configured ([ADR 0034](docs/adr/0034-ordered-events-and-replayable-sse.md)), and artifact uploads, revision metadata and downloads when `OPENMETTLE_API_ARTIFACTS_DIR` is set ([ADR 0031](docs/adr/0031-filesystem-artifact-storage-and-streaming-multipart.md)).
+With `OPENMETTLE_API_AUTH_CONFIG` set, the API serves the operations of the [application API contract](#application-api-contract) marked `"x-openmettle-implementation": "implemented"` in `contracts/openapi/openmettle-v1.json`: `GET /v1/capabilities` (an empty, core-only list), projects, membership, conversation and artifact access and sharing ([ADR 0027](docs/adr/0027-authorization-and-private-projects.md)), managed conversations, branches, models, presets, effective-configuration previews and run admission/cancellation ([ADR 0032](docs/adr/0032-durable-run-admission-and-fair-work-queue.md), [ADR 0036](docs/adr/0036-conversation-branches-presets-and-effective-model-config.md)), run snapshots and replayable SSE event streams when `cursor_keys` are configured ([ADR 0034](docs/adr/0034-ordered-events-and-replayable-sse.md)), artifact and revision metadata routes (which read from PostgreSQL even when `OPENMETTLE_API_ARTIFACTS_DIR` is unset), and artifact payload uploads and downloads when `OPENMETTLE_API_ARTIFACTS_DIR` is set (`503 provisioning` when unset, [ADR 0031](docs/adr/0031-filesystem-artifact-storage-and-streaming-multipart.md)).
 
 - **Sessions.** Each request presents exactly one OpenMettle session: the browser cookie `__Host-openmettle-session`, or `Authorization: Bearer` with a native credential when the document has a native profile. A browser write needs exactly one `Origin` equal to the configured `browser.origin`; a browser read may omit `Origin`. Both channels at once, a repeated field or a refused `Origin` is `401`, decided before any database work.
 - **Authorization.** The session, the caller's principal and every project, conversation and artifact are read from the primary for each request, so disablement, logout, group, membership and share changes apply on the next request. Items are private to their creator until shared. A target the caller may not know about is `404`; an account administrator gains no access.
-- **Writes** need an `Idempotency-Key` (1–128 visible ASCII characters). Repeating it with the same request on the same operation and target replays the result; another request with it is `409 idempotency_conflict`. Every write is recorded in the append-only authorization audit.
+- **Writes** need an `Idempotency-Key` (1–128 visible ASCII characters). Repeating it with the same request on the same operation and target replays the result; another request with it is `409 idempotency_conflict`. Authorization, project, membership, share, conversation and branch creation writes are recorded in the append-only `openmettle.authorization_audit` table, while run admission and cancellation append durable `openmettle.run_events` rows.
 - **Lifecycle.** An archived project stays readable, and member and share revocations, restore and delete remain available; settings, new roles and new shares are `409`. A deleted project is `404`, except that repeating the delete with its key returns `204` again.
-- **Bounds.** At most 256 unary or artifact requests and 128 event streams in flight per process (`503` beyond), the sign-in routes' header ceilings, JSON bodies of at most 64 KiB read within 2 s, and a 10 s database phase (`504`). Every response carries `OpenMettle-API-Version: 1.0` and `Cache-Control: no-store`; every error is an `application/problem+json` problem with a fixed message and the logged request ID.
-- **Conversations, branches, catalog and run admission.** `/v1/conversations`, `/v1/conversations/{conversation_id}/branches` (plus `messages` and `effective-configuration`), `/v1/models`, `/v1/presets`, `POST /v1/runs` and `POST /v1/runs/{run_id}/cancel` enforce per-user authorization on every request. Migration 21 adds managed conversation branches while keeping legacy branch IDs and run inputs valid (history stays unavailable for legacy branch IDs; an authorized writer can create an empty managed root). Catalog, preview and admission endpoints require optional `catalog_file` and `admission_limits` in the version-2 auth settings (`503 provisioning` when omitted).
+- **Bounds.** At most 256 unary or artifact requests and 128 event streams in flight per process (`503` beyond), the sign-in routes' header ceilings, JSON bodies read within 2 s of at most 128 KiB for `POST /v1/runs` and `POST …/effective-configuration` preview or 64 KiB for other JSON writes, and a 10 s database phase (`504`). Every response carries `OpenMettle-API-Version: 1.0` and `Cache-Control: no-store`; every error is an `application/problem+json` problem with a fixed message and the logged request ID.
+- **Conversations, branches, catalog and run admission.** `/v1/conversations`, `/v1/conversations/{conversation_id}/branches` (plus `messages` and `effective-configuration`), `/v1/models`, `/v1/presets`, `POST /v1/runs` and `POST /v1/runs/{run_id}/cancel` enforce per-user authorization on every request. Migration 21 adds managed conversation branches while keeping legacy branch IDs and run inputs valid (history stays unavailable for legacy branch IDs; an authorized writer can create an empty managed root). Without `catalog_file`, authorized first-page `GET /v1/models` and `GET /v1/presets` return `200` with empty `items: []`, and `GET /v1/presets/{preset_id}` returns `404 not_found`. `POST …/effective-configuration` preview requires `catalog_file` (`503 provisioning` when omitted; it does not require `admission_limits`). Fresh `POST /v1/runs` admission requires `catalog_file`, `admission_limits` and `cursor_keys` (`503 provisioning` when missing; an exact idempotent replay can return its stored projection without `catalog_file`), and `POST /v1/runs/{run_id}/cancel` requires `cursor_keys`.
 - **Run replay.** Read `GET /v1/runs/{run_id}` for the state, last sequence, resume cursor and terminal event. Connect to `GET /v1/runs/{run_id}/events?after=<resume_cursor>` for later events, or omit the cursor to replay from creation. On reconnect, `Last-Event-ID` takes precedence. Apply each sequence once. Events remain available for the life of the run. After `400 invalid_cursor`, discard local run state and fetch a fresh snapshot. A terminal snapshot needs no stream. A reconnect at the final sequence returns `204`. The stream checks conversation access before each delivery and periodically while idle.
 - **Artifact uploads.** `POST /v1/artifacts` (into the caller's personal scope, or `?scope_id=` a project where the caller is an editor) and `POST /v1/artifacts/{artifact_id}/revisions` (needs write access) take `multipart/form-data` with one `file` part, whose `Content-Type` becomes the revision's media type and whose optional file name becomes its display name, and one `metadata` part holding `{}`, in either order. The target is authorized before anything is reserved or written. The file is streamed to the artifacts directory with bounded memory and must not exceed `?max_bytes=` (default and maximum 64 MiB), which is charged against storage quotas until the upload settles. An upload must finish within 600 s and holds one in-flight slot meanwhile. Retrying with the same key and file, even with another boundary or part order, returns the same revision and charges once. Quota exhaustion is `429 quota`; unconfigured storage limits, or no `ARTIFACTS_DIR`, is `503 provisioning`.
 - **Artifact downloads.** `GET /v1/artifacts/{artifact_id}/revisions/{revision_id}` returns a revision's metadata; `GET …/content` streams an active revision's bytes in 64 KiB reads, with its media type, `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff` and `Accept-Ranges: bytes`. One `Range` is served as `206`; a range outside the content is `416` with `Content-Range: bytes */<size>`; a list of ranges is `400`. `HEAD` returns the same headers without a body. Access is checked on the primary for every request, so a revoked share or membership stops the next download.
@@ -355,7 +355,7 @@ The operator sets a limit of 1–1000 rows per batch. Session deletion
 preserves issuance markers and nonce reservations. See the
 [session and login-gate cleanup procedure](docs/operator/session-cleanup.md).
 
-There is no tenant/group qualification or reconciliation; the cookie handoff below is mounted only on request (ADR 0025) and the native handoff only with a native profile (ADR 0029).
+For enrolled approvals, session issuance reconciles mapped project group memberships (`membership::reconcile`, [ADR 0021](docs/adr/0021-project-membership.md)); broader tenant/group qualification remains outside this core increment. The cookie handoff below is mounted only on request (ADR 0025) and the native handoff only with a native profile (ADR 0029).
 Run the managed PostgreSQL tests only in isolated CI with the explicit module filter above;
 normal workspace tests leave them ignored. Migration 8 and authentic v7 compatibility are CI gates.
 
@@ -439,8 +439,10 @@ runs the loader tests without PostgreSQL or network access.
 
 ### Run cursor keys (version 2)
 
-Add the optional top-level `cursor_keys` object to enable both run reads. If omitted, the
-API starts and those requests receive `503 provisioning`. Generate 32 fresh random bytes
+Add the optional top-level `cursor_keys` object to enable run reads (`GET /v1/runs/{run_id}`,
+`GET /v1/runs/{run_id}/events`), run admission/cancellation (`POST /v1/runs`,
+`POST /v1/runs/{run_id}/cancel`), and paginated list cursors. If omitted, the API starts and
+requests that require cursor keys receive `503 provisioning`. Generate 32 fresh random bytes
 for each key in a private deployment directory. For example, for a new file:
 
 ```sh
@@ -472,16 +474,26 @@ admission routes ([ADR 0032](docs/adr/0032-durable-run-admission-and-fair-work-q
 Version 1 must not contain either field.
 
 - `catalog_file`: optional absolute path to a regular JSON catalog file validated by
-  `--check-auth-config` and loaded once at startup. If invalid or unreadable, startup and
-  `--check-auth-config` exit 78 with `auth configuration error: model catalog is unreadable or invalid`.
-  When omitted, `/v1/models`, `/v1/presets`, `effective-configuration` and `POST /v1/runs`
-  answer `503 provisioning`.
+  `--check-auth-config` and loaded once at startup. A relative path exits 78 with
+  `auth configuration error: a path is not absolute`, while an unreadable or invalid catalog
+  file exits 78 with `auth configuration error: model catalog is unreadable or invalid`.
+  When omitted, authorized first-page `GET /v1/models` and `GET /v1/presets` return `200`
+  with empty `items: []`, `GET /v1/presets/{preset_id}` returns `404 not_found`, and
+  `POST …/effective-configuration` and fresh `POST /v1/runs` admissions answer
+  `503 provisioning` (an exact idempotent `POST /v1/runs` replay can still return its stored
+  projection without `catalog_file`; `POST …/effective-configuration` does not require
+  `admission_limits`).
 - `admission_limits`: optional object setting the admission bounds for `POST /v1/runs`:
   `live_per_actor` (1–1,000), `live_per_scope` (1–10,000), `queued_in_instance` (1–10,000),
-  `queue_timeout_seconds` (1–86,400) and `round_cap` (1–1,000). If any field is missing,
-  unknown or out of range, startup and `--check-auth-config` exit 78 with
+  `queue_timeout_seconds` (1–86,400) and `round_cap` (1–1,000). Missing, unknown or
+  wrong-type fields exit 78 with
+  `auth configuration error: configuration lacks a required field`,
+  `auth configuration error: configuration has an unknown field`, or
+  `auth configuration error: a configuration field has the wrong type or keyword`, whereas
+  out-of-range numeric bounds exit 78 with
   `auth configuration error: run admission limits are invalid`. When omitted, `POST /v1/runs`
-  answers `503 provisioning`.
+  answers `503 provisioning` (fresh `POST /v1/runs` also requires `catalog_file` and
+  `cursor_keys`, and `POST /v1/runs/{run_id}/cancel` requires `cursor_keys`).
 
 ### Browser-routing profile (version 2)
 
@@ -790,12 +802,12 @@ Connection budget: `api_replicas × (API DB_MAX_CONNECTIONS + ISSUANCE_DB_MAX_CO
 
 ### Database backup restore (pre-worker checklist)
 
-After restoring PostgreSQL from a backup, complete all steps below while authentication remains closed and before starting `openmettle-worker` (this is separate from [retired login-provider recovery](docs/operator/restore-login-provider.md)):
+After restoring PostgreSQL from a backup, complete all steps below while authentication remains closed and before reopening authentication or starting `openmettle-worker` (this is separate from [retired login-provider recovery](docs/operator/restore-login-provider.md)):
 
-1. Invalidate pending login transactions, rotate the active login encryption key ([ADR 0009](docs/adr/0009-protected-login-transactions.md)), replace all pre-restore cursor keys ([ADR 0034](docs/adr/0034-ordered-events-and-replayable-sse.md)), and append the current provider revision for every configured login provider ([ADR 0012](docs/adr/0012-login-provider-authority.md)). Never resume restored logins.
-2. Reconcile restored pending home invitations against current operator records and withdraw stale decisions ([home invitations](docs/operator/home-invitations.md)).
-3. Revoke restored bound sessions and cancel parked `waiting` approvals (`openmettle.run_approvals`) before enabling workers ([ADR 0035](docs/adr/0035-approvals-permitted-yolo-and-effect-ledger.md)).
-4. Inspect committed effect-ledger intents (`openmettle.operations`) through read-only reconciliation while worker dispatch remains disabled, then start `openmettle-worker` ([ADR 0035](docs/adr/0035-approvals-permitted-yolo-and-effect-ledger.md)).
+1. **Invalidate all restored sessions and pending logins:** Execute [ADR 0013](docs/adr/0013-local-identity-sessions.md)'s full session-revocation protocol across every configured login provider. Advance each provider's `access_generation` via the owner revocation protocol and append fresh non-retirement epochs under [ADR 0012](docs/adr/0012-login-provider-authority.md); appending a non-retirement revision alone fences pending logins, not existing ordinary sessions. Rotate the active login encryption key ([ADR 0009](docs/adr/0009-protected-login-transactions.md)), replace all pre-restore cursor keys ([ADR 0034](docs/adr/0034-ordered-events-and-replayable-sse.md)), and never resume restored logins.
+2. **Reconcile identity approvals, account disablement, home invitations and login admission limits:** Reconcile restored local identity approvals and user account disablement against known newer revocation records. If post-backup revocation evidence is unavailable, keep authentication closed ([ADR 0013](docs/adr/0013-local-identity-sessions.md)). Reconcile restored pending home invitations against current operator records and withdraw stale decisions ([home invitations](docs/operator/home-invitations.md)). Review the restored login-admission ceiling before reopening; restored unexpired login rows continue counting toward it until they expire or are cleaned up ([ADR 0014](docs/adr/0014-login-admission.md)).
+3. **Align `ARTIFACTS_DIR` payload volume before starting the worker:** When artifact storage is enabled, restore PostgreSQL and its matching `ARTIFACTS_DIR` filesystem payload volume to the same recovery point before starting `openmettle-worker` maintenance. Otherwise, mismatched database reservation or revision state allows `reconcile_expired` or `purge_due` to unlink staging or published payload files ([ADR 0031](docs/adr/0031-filesystem-artifact-storage-and-streaming-multipart.md)).
+4. **Cancel parked `waiting` runs and reconcile effect intents before enabling workers:** Cancel parked `waiting` runs on `openmettle.runs`. That transition marks each run `cancelled` and appends its cancellation event while preserving immutable `openmettle.run_approvals` and `openmettle.run_approval_decisions` history. Inspect committed effect-ledger intents (`openmettle.operations`) through read-only reconciliation while worker dispatch remains disabled, then start `openmettle-worker` ([ADR 0035](docs/adr/0035-approvals-permitted-yolo-and-effect-ledger.md)).
 
 ### Schema compatibility tests
 
@@ -844,6 +856,10 @@ primary database's millisecond clock at which it was checked
 (`sessions::Context::{approval_id, observed_ms}`, [ADR 0029](docs/adr/0029-native-sign-in-mounting-and-session-context.md)).
 When `OPENMETTLE_API_AUTH_CONFIG` is configured, every authenticated `/v1` route hydrates
 the caller's principal from the primary via `authz::store::hydrate_api_principal` and
-enforces these rules per request; `openmettle-worker` rechecks execution authority on the
-primary before claiming runs and dispatching fenced effects ([ADR 0027](docs/adr/0027-authorization-and-private-projects.md),
+enforces these rules per request. The `openmettle-worker` binary currently runs periodic
+maintenance sweeps and refuses `OPENMETTLE_WORKER_RUN_SLOTS`; when library callers invoke
+`worker::run` or `worker::run_with_approvals` with an `Executor`, the runner claims a run
+first (`claim_next` / `reclaim_next`) and then rechecks current execution authority on the
+primary (`recheck_claim`) before each step and before dispatching fenced effects
+([ADR 0027](docs/adr/0027-authorization-and-private-projects.md),
 [ADR 0035](docs/adr/0035-approvals-permitted-yolo-and-effect-ledger.md)).

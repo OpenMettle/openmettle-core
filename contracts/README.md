@@ -3,9 +3,9 @@
 `contracts/openapi/openmettle-v1.json` defines the `/v1/*` application API. Operations marked
 `"x-openmettle-implementation": "implemented"` are served by `openmettle-api` when
 `OPENMETTLE_API_AUTH_CONFIG` is configured, covering `/v1/capabilities`, `/v1/projects`,
-`/v1/conversations`, `/v1/branches`, `/v1/models`, `/v1/presets`, `/v1/runs`, and
-`/v1/artifacts` families. Without `OPENMETTLE_API_AUTH_CONFIG`, `openmettle-api` serves
-`/healthz` and `/readyz` only and answers `404` on `/v1/*` paths. Read
+`/v1/conversations` (including `/v1/conversations/{conversation_id}/branches`), `/v1/models`,
+`/v1/presets`, `/v1/runs`, and `/v1/artifacts` families. Without `OPENMETTLE_API_AUTH_CONFIG`,
+`openmettle-api` serves `/healthz` and `/readyz` only and answers `404` on `/v1/*` paths. Read
 [ADR 0007](../docs/adr/0007-application-api-contract.md) for wire rules, versioning and limits.
 
 | Path | Purpose |
