@@ -750,18 +750,37 @@ async fn slow_reader_times_out_releases_capacity_and_resumes_without_loss() {
     assert_eq!(f.snapshot()["last_sequence"], total.to_string());
     drop(idle);
     let mut observer = admin(Some(&f.db.0)).await;
-    eventually(async || {
-        let idle_count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity
-            WHERE datname=current_database() AND usename=$1 AND state='idle'",
-        )
-        .bind(API)
-        .fetch_one(&mut observer)
-        .await
-        .unwrap();
-        idle_count == 1
+    // On quiet HTTP/1.1 streams, the first Linux TCP write after FIN can elicit RST.
+    // EPIPE may surface on the second heartbeat, over 30s after disconnect.
+    tokio::time::timeout(Duration::from_secs(45), async {
+        let mut empty_since: Option<Instant> = None;
+        loop {
+            let (total_count, stale_idle_count): (i64, i64) = sqlx::query_as(
+                "SELECT count(*),
+                        count(*) FILTER (WHERE state='idle' AND state_change <= now() - interval '1 second')
+                 FROM pg_stat_activity WHERE datname=current_database() AND usename=$1",
+            )
+            .bind(API)
+            .fetch_one(&mut observer)
+            .await
+            .unwrap();
+            if (total_count, stale_idle_count) == (1, 1) {
+                break;
+            }
+            // Cancellation can close the sole connection. Wait through two 500ms polls
+            // so a surviving stream has time to reconnect.
+            if total_count == 0 {
+                if empty_since.get_or_insert_with(Instant::now).elapsed() >= Duration::from_secs(1) {
+                    break;
+                }
+            } else {
+                empty_since = None;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     })
-    .await;
+    .await
+    .expect("API pool did not stay idle after the quiet streams disconnected");
 
     let mut sequence = 1;
     while let Some((id, event)) = stalled.next().await {
