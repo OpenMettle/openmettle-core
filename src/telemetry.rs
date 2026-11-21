@@ -590,6 +590,16 @@ fn request_completed(
     }
 }
 
+/// An internal error stopped delivery on an open run event stream.
+pub(crate) fn run_stream_failed(id: Option<RequestId>) {
+    tracing::error!(
+        target: TARGET,
+        event = "run.stream.ended",
+        request_id = id.map(display),
+        "error.type" = "internal",
+    );
+}
+
 /// The listener is bound and the process is serving.
 pub fn process_started(role: Process) {
     tracing::info!(target: TARGET, event = "process.started", role = role.as_str());

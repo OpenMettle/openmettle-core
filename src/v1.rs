@@ -1,4 +1,4 @@
-//! Authenticated application API routes under `/v1` (ADR 0007; ADR 0027 PR4b; ADR 0031 PR2).
+//! Authenticated application API routes under `/v1` (ADR 0007; ADRs 0027, 0031 and 0034).
 //!
 //! **Off by default.** `crate::app` mounts [`router`] beside the browser sign-in routes only
 //! when `OPENMETTLE_API_AUTH_CONFIG` names a version-2 settings document (ADR 0025). Without it
@@ -9,7 +9,8 @@
 //! 1. Route and method. An operation the contract does not define is `404 not_found`.
 //! 2. Bounds on the parsed head: the browser router's target, header-count and header-byte
 //!    ceilings.
-//! 3. One of [`MAX_IN_FLIGHT`] permits, never awaited. None free is `503 unavailable`.
+//! 3. Acquire a permit immediately. Event streams have a separate 128-slot limit.
+//!    Exhaustion returns `503 unavailable`.
 //! 4. The session channel. Exactly one of the `__Host-openmettle-session` cookie (ADR 0019),
 //!    with the configured `Origin` on an unsafe method and on any request that sends one, or
 //!    one `Authorization: Bearer` native credential (ADR 0029). Both, neither, a repeated
@@ -19,7 +20,7 @@
 //!    [`BODY_READ_TIMEOUT`]. A refusal is `400 validation`. An artifact upload instead checks
 //!    its query and multipart `Content-Type`, and its body is streamed later; a download checks
 //!    its `Range`. An artifact payload operation without `ARTIFACTS_DIR` is then
-//!    `503 provisioning` (see [`artifacts`]).
+//!    `503 provisioning` (see [`artifacts`]). Run reads require cursor keys (ADR 0034).
 //! 6. Session validation on the primary, then the operation within [`OPERATION_TIMEOUT`]. The
 //!    principal and every target are hydrated on the primary for this request alone and
 //!    decided by `crate::authz`; nothing is cached across requests.
@@ -211,12 +212,29 @@ fn respond(status: StatusCode, media: Option<&'static str>, body: Value) -> Resp
     };
     *response.status_mut() = status;
     let headers = response.headers_mut();
-    headers.insert(VERSION_HEADER, HeaderValue::from_static(API_VERSION));
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response_headers(headers);
     if let Some(media) = media {
         headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(media));
     }
     response
+}
+
+fn response_headers(headers: &mut HeaderMap) {
+    headers.insert(VERSION_HEADER, HeaderValue::from_static(API_VERSION));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+}
+
+fn single_header(
+    headers: &HeaderMap,
+    name: HeaderName,
+    duplicate: Problem,
+) -> Result<Option<&HeaderValue>, Problem> {
+    let mut values = headers.get_all(name).iter();
+    let first = values.next();
+    if values.next().is_some() {
+        return Err(duplicate);
+    }
+    Ok(first)
 }
 
 fn reply(status: StatusCode, body: Value) -> Response {
@@ -227,9 +245,11 @@ fn no_content() -> Response {
     respond(StatusCode::NO_CONTENT, None, Value::Null)
 }
 
-/// The fifteen operations of contract 1.0, each named by its `operationId`.
+/// The mounted application operations, each named by its `operationId`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Op {
+    GetRun,
+    StreamRunEvents,
     ListCapabilities,
     CreateProject,
     GetProject,
@@ -253,6 +273,8 @@ impl Op {
     fn id(self) -> &'static str {
         use ResourceKind::Conversation;
         match self {
+            Self::GetRun => "getRun",
+            Self::StreamRunEvents => "streamRunEvents",
             Self::ListCapabilities => "listCapabilities",
             Self::CreateProject => "createProject",
             Self::GetProject => "getProject",
@@ -277,7 +299,9 @@ impl Op {
     fn reads(self) -> bool {
         matches!(
             self,
-            Self::ListCapabilities
+            Self::GetRun
+                | Self::StreamRunEvents
+                | Self::ListCapabilities
                 | Self::GetProject
                 | Self::GetResource(_)
                 | Self::GetArtifactRevision
@@ -622,9 +646,9 @@ fn resource_json(kind: ResourceKind, id: &str, view: &ResourceView) -> Result<Va
 // --- the router -------------------------------------------------------------------------------
 
 /// The authenticated session channel of one request, before validation.
-enum Session<'a> {
-    Browser(&'a str),
-    Native(&'a NativeAuth, &'a str),
+enum Session {
+    Browser(String),
+    Native(Arc<NativeAuth>, String),
 }
 
 struct Api {
@@ -637,6 +661,7 @@ struct Api {
     /// The validated `ARTIFACTS_DIR` (ADR 0031); `None` refuses the payload operations.
     artifacts: Option<artifact_fs::Store>,
     in_flight: Semaphore,
+    streams: Arc<Semaphore>,
 }
 
 /// Builds the `/v1` routes over the mounted browser service, the optional native service, the
@@ -658,6 +683,7 @@ pub fn router(
         pool,
         artifacts,
         in_flight: Semaphore::new(MAX_IN_FLIGHT),
+        streams: Arc::new(Semaphore::new(runs::SSE_MAX_IN_FLIGHT)),
     });
     let mut router = Router::new();
     // Every other path under the prefix also answers with a versioned problem.
@@ -679,11 +705,16 @@ pub fn router(
 }
 
 /// Every contract path template with its operations, by method.
-fn routes() -> [(&'static str, Vec<(Method, Op)>); 17] {
+fn routes() -> [(&'static str, Vec<(Method, Op)>); 19] {
     use Op::*;
     use ResourceKind::{Artifact, Conversation};
     let (get, put, post) = (Method::GET, Method::PUT, Method::POST);
     [
+        ("/v1/runs/{run_id}", vec![(get.clone(), GetRun)]),
+        (
+            "/v1/runs/{run_id}/events",
+            vec![(get.clone(), StreamRunEvents)],
+        ),
         ("/v1/capabilities", vec![(get.clone(), ListCapabilities)]),
         ("/v1/projects", vec![(post.clone(), CreateProject)]),
         (
@@ -759,7 +790,7 @@ fn request_id(extensions: &axum::http::Extensions) -> Option<RequestId> {
 }
 
 impl Api {
-    async fn serve(&self, operations: &[(Method, Op)], request: Request) -> Response {
+    async fn serve(self: &Arc<Self>, operations: &[(Method, Op)], request: Request) -> Response {
         let head = request.method() == Method::HEAD;
         let id = request_id(request.extensions());
         let mut response = self
@@ -773,7 +804,7 @@ impl Api {
     }
 
     async fn handle(
-        &self,
+        self: &Arc<Self>,
         operations: &[(Method, Op)],
         request: Request,
     ) -> Result<Response, Problem> {
@@ -796,6 +827,14 @@ impl Api {
         }
         // `try_acquire` never waits. The permit is released when this future completes or is
         // dropped, including on client disconnect.
+        if op == Op::StreamRunEvents {
+            let permit = self
+                .streams
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| UNAVAILABLE)?;
+            return self.stream_events(parts, body, permit).await;
+        }
         let Ok(_permit) = self.in_flight.try_acquire() else {
             return Err(UNAVAILABLE);
         };
@@ -817,8 +856,11 @@ impl Api {
         if matches!(op, Op::GetArtifactRevision | Op::DownloadArtifactRevision) {
             return self.revision(op, &parts, session, target).await;
         }
+        if op == Op::GetRun {
+            return self.snapshot(&parts, session, target).await;
+        }
         let (input, reason) = decode(op, &body)?;
-        let context = self.authenticate(session).await?;
+        let context = self.authenticate(&session).await?;
         let call = Call {
             op,
             context: &context,
@@ -830,7 +872,7 @@ impl Api {
     }
 
     /// Selects one session channel from the head alone, before any database work.
-    fn session<'a>(&'a self, parts: &'a Parts) -> Result<Session<'a>, Problem> {
+    fn session(&self, parts: &Parts) -> Result<Session, Problem> {
         let headers = &parts.headers;
         let cookie = handoff::cookie_values(headers, handoff::SESSION_COOKIE)
             .next()
@@ -840,7 +882,7 @@ impl Api {
             (true, None, _) if self.same_origin(parts) => {
                 handoff::single_cookie(headers, handoff::SESSION_COOKIE)
                     .filter(|c| sessions::well_formed(c).is_ok())
-                    .map(Session::Browser)
+                    .map(|cookie| Session::Browser(cookie.to_owned()))
                     .ok_or(UNAUTHENTICATED)
             }
             (false, Some(value), None) => {
@@ -849,8 +891,10 @@ impl Api {
                     .ok()
                     .and_then(|v| v.strip_prefix("Bearer "))
                     .filter(|c| sessions::well_formed(c).is_ok());
-                match (self.native.as_deref(), bearer) {
-                    (Some(native), Some(bearer)) => Ok(Session::Native(native, bearer)),
+                match (self.native.as_ref(), bearer) {
+                    (Some(native), Some(bearer)) => {
+                        Ok(Session::Native(native.clone(), bearer.to_owned()))
+                    }
                     _ => Err(UNAUTHENTICATED),
                 }
             }
@@ -870,7 +914,7 @@ impl Api {
         }
     }
 
-    async fn authenticate(&self, session: Session<'_>) -> Result<sessions::Context, Problem> {
+    async fn authenticate(&self, session: &Session) -> Result<sessions::Context, Problem> {
         let result = match session {
             Session::Browser(cookie) => {
                 self.browser
@@ -1090,6 +1134,7 @@ async fn read_project(
 }
 
 mod artifacts;
+mod runs;
 
 #[cfg(test)]
 mod tests;

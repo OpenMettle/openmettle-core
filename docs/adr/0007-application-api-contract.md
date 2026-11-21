@@ -17,10 +17,9 @@ Update, 20 November 2026 (V1-15 PR2, ADR 0031): four artifact operations add mul
 revision metadata and byte-range downloads, and the `416 range_not_satisfiable` problem. See
 [Artifact payload operations](#artifact-payload-operations-v1-15-pr2).
 
-Update, 20 November 2026 (V1-12 PR1): [ADR 0034](0034-ordered-events-and-replayable-sse.md)
-proposes the run snapshot and event stream operations, wire event types, cursor MACs, replay
-retention, resynchronization and authorization during replay, and proposes replacing the
-`Last-Event-ID`/`after` conflict rule below with header precedence. Nothing is served yet.
+Update, 21 November 2026 (V1-12 PR2). The mounted API serves `getRun` and `streamRunEvents`.
+[ADR 0034](0034-ordered-events-and-replayable-sse.md) specifies cursor MACs, retention,
+authorization during replay and snapshot resynchronization.
 
 ## Canonical source and versions
 
@@ -32,13 +31,13 @@ source parseable by the Python standard library and serde_json without another p
 
 OpenAPI 3.2 is selected for native sequential media types: `itemSchema` describes each parsed
 `text/event-stream` item, and `components.mediaTypes` holds the reusable stream description
-without adding an operation. The OpenAPI version does not prevent breaking changes to this
+used by `streamRunEvents`. The OpenAPI version does not prevent breaking changes to this
 application API. Compatibility comes from the additive v1 policy below and the executable
 compatibility tests.
 
 Generated fixtures live in `contracts/fixtures/`; do not edit them by hand. Regenerate them with
 `python3 scripts/contract_fixtures.py`. Consumers pin a core commit, as REPOSITORIES.md requires.
-`info.version` is `1.0.0-draft.1` until the owner releases a contract.
+`info.version` identifies the current contract draft until the owner releases it.
 
 ## Scope of the published contract
 
@@ -49,12 +48,11 @@ Generated fixtures live in `contracts/fixtures/`; do not edit them by hand. Rege
 | Errors | RFC 9457 `Problem` with code/status binding | Runtime mapping and redaction are implemented for `/v1` (ADR 0027 PR4b) |
 | Pagination | `cursor`/`limit` parameters and `PageInfo` | Cursor issuance, binding and MAC; no list operation |
 | Idempotency | `Idempotency-Key` parameter and `idempotency_conflict` | Implemented for the V1-05 writes through the authorization audit; run request identity storage (V1-10) |
-| Events | `RunEvent` envelope, `RunEventItem` and `RunEventStream` media type, `Last-Event-ID`/`after` | SSE endpoint, retention, resync (V1-12) |
+| Events | `getRun` snapshot, `streamRunEvents` replay with `Last-Event-ID` or `after`, retention for the life of the run | Ingress qualification (#63) |
 | Capabilities | `CapabilityList`, `Capability`, `Readiness` | Provider adapters, authenticated serving and authorization (V1-04/05) |
 
 Run states, wait reasons, persistence identity digests, grant assignment formats and other
-storage vocabulary from ADRs 0004–0006 are not wire policy. Run resources are excluded until
-their lifecycle is agreed. No voice, provider-compatibility or MCP endpoint is defined.
+storage vocabulary from ADRs 0004–0006 are not wire policy. Run responses use the projections specified in ADR 0034. No voice, provider-compatibility or MCP endpoint is defined.
 
 ## Wire rules
 
@@ -107,21 +105,19 @@ runs.
 
 Cursors are opaque, unpadded base64url strings up to 512 characters. A cursor is valid only for
 the caller, operation, filters and sort order that produced it. Malformed, foreign, expired or
-tampered cursors fail with 400 `invalid_cursor`. Binding will need server-side integrity
-protection. No MAC or signature is implemented or claimed here, and cursors must not be plain
-encodings of internal identifiers or of the caller's identity.
+tampered cursors fail with 400 `invalid_cursor`. Run-event cursors use the dedicated HMAC key ring defined by ADR 0034.
 
 ## Events and replay
 
 Each SSE item has an opaque `id` (the resume cursor) and a `data` string containing one JSON
 `RunEvent`: `run_id`, `sequence`, `type`, `type_version`, `occurred_at` and an object `data`.
 `contentSchema` is not asserted automatically, so consumers and the contract tests decode `data`
-and validate it explicitly. This revision defines no event types. Clients ignore event types they
-do not recognize but still advance their cursor; they ignore sequences they have already applied.
-A client resumes with `Last-Event-ID` or `after`. If both are present and differ, the request is
-invalid (`validation`); ADR 0034 proposes replacing this with `Last-Event-ID` precedence.
-Retention, expired-cursor resynchronization, snapshots, buffering and authorization during
-replay belong to V1-12 (ADR 0034).
+and validate it explicitly. The server projects creation, start, cancellation and queue expiry into
+`run.created`, `run.started`, `run.cancelled` and `run.failed`. Consumers advance past
+unknown types and ignore sequences already applied. On reconnect, `Last-Event-ID` selects
+the resume cursor when both it and `after` are present. Each source may appear once and
+`after` must match the cursor syntax. On `invalid_cursor`, fetch a new run snapshot and
+resume from its cursor. A terminal run returns `204` at its last sequence.
 
 ## Errors
 

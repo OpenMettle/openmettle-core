@@ -1,6 +1,6 @@
 # OpenMettle core
 
-Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures. Internal managed login, an owner-configured outstanding-login cap, local identity approval and opaque-session primitives are implemented, with an offline check for mounted browser-auth settings, an internal pooled browser-auth service, and an Axum router for the same-origin browser login handoff, session check and local logout. The API loads those settings and mounts that router only when `OPENMETTLE_API_AUTH_CONFIG` is set; by default it does neither. With that setting it also mounts the authenticated `/v1` capability, project, conversation and artifact routes, which enforce per-user authorization on every request (ADR 0027), including streaming artifact uploads and byte-range downloads when `OPENMETTLE_API_ARTIFACTS_DIR` is also set (ADR 0031). No message, run or event-streaming route, and no GPU orchestration, is exposed. Runtime qualification and deployment acceptance remain separate gates.
+Rust API and worker foundation for OpenMettle. Both processes serve CPU-only health and PostgreSQL readiness endpoints. The worker does not execute jobs yet. A separate one-shot migrate process creates identities, ownership scopes, projects, conversations, a message graph skeleton, branch identities, run/event/operation persistence, artifact revision and storage-accounting persistence, and typed grant assignments with immutable provenance and revision-guarded history. A versioned application API contract is published with generated consumer fixtures. Internal managed login, an owner-configured outstanding-login cap, local identity approval and opaque-session primitives are implemented, with an offline check for mounted browser-auth settings, an internal pooled browser-auth service, and an Axum router for the same-origin browser login handoff, session check and local logout. The API loads those settings and mounts that router only when `OPENMETTLE_API_AUTH_CONFIG` is set; by default it does neither. With that setting it also mounts the authenticated `/v1` capability, project, conversation and artifact routes, which enforce per-user authorization on every request (ADR 0027), including streaming artifact uploads and byte-range downloads when `OPENMETTLE_API_ARTIFACTS_DIR` is also set (ADR 0031). With cursor keys configured, clients can also read run snapshots and replay durable run events (ADR 0034). Runtime qualification and deployment acceptance remain separate gates.
 
 ## Start here
 
@@ -142,13 +142,14 @@ No line carries a path, value, URL, identifier or parser message. Run `--check-a
 
 ### Authenticated application routes
 
-With `OPENMETTLE_API_AUTH_CONFIG` set, the API also serves the 19 operations of the [application API contract](#application-api-contract) marked `implemented`: `GET /v1/capabilities` (an empty, core-only list), project, membership, conversation and artifact access and sharing ([ADR 0027](docs/adr/0027-authorization-and-private-projects.md) PR4b), and artifact uploads, revision metadata and downloads ([ADR 0031](docs/adr/0031-filesystem-artifact-storage-and-streaming-multipart.md)). There are no list, message, run or event-streaming routes yet.
+With `OPENMETTLE_API_AUTH_CONFIG` set, the API also serves the 21 operations of the [application API contract](#application-api-contract) marked `implemented`: `GET /v1/capabilities` (an empty, core-only list), project, membership, conversation and artifact access and sharing ([ADR 0027](docs/adr/0027-authorization-and-private-projects.md) PR4b), and artifact uploads, revision metadata and downloads ([ADR 0031](docs/adr/0031-filesystem-artifact-storage-and-streaming-multipart.md)). The two run reads follow [ADR 0034](docs/adr/0034-ordered-events-and-replayable-sse.md).
 
 - **Sessions.** Each request presents exactly one OpenMettle session: the browser cookie `__Host-openmettle-session`, or `Authorization: Bearer` with a native credential when the document has a native profile. A browser write needs exactly one `Origin` equal to the configured `browser.origin`; a browser read may omit `Origin`. Both channels at once, a repeated field or a refused `Origin` is `401`, decided before any database work.
 - **Authorization.** The session, the caller's principal and every project, conversation and artifact are read from the primary for each request, so disablement, logout, group, membership and share changes apply on the next request. Items are private to their creator until shared. A target the caller may not know about is `404`; an account administrator gains no access.
 - **Writes** need an `Idempotency-Key` (1–128 visible ASCII characters). Repeating it with the same request on the same operation and target replays the result; another request with it is `409 idempotency_conflict`. Every write is recorded in the append-only authorization audit.
 - **Lifecycle.** An archived project stays readable, and member and share revocations, restore and delete remain available; settings, new roles and new shares are `409`. A deleted project is `404`, except that repeating the delete with its key returns `204` again.
-- **Bounds.** At most 256 requests in flight (`503` beyond), the sign-in routes' header ceilings, JSON bodies of at most 64 KiB read within 2 s, and a 10 s database phase (`504`). Every response carries `OpenMettle-API-Version: 1.0` and `Cache-Control: no-store`; every error is an `application/problem+json` problem with a fixed message and the logged request ID.
+- **Bounds.** At most 256 unary or artifact requests and 128 event streams in flight per process (`503` beyond), the sign-in routes' header ceilings, JSON bodies of at most 64 KiB read within 2 s, and a 10 s database phase (`504`). Every response carries `OpenMettle-API-Version: 1.0` and `Cache-Control: no-store`; every error is an `application/problem+json` problem with a fixed message and the logged request ID.
+- **Run replay.** Read `GET /v1/runs/{run_id}` for the state, last sequence, resume cursor and terminal event. Connect to `GET /v1/runs/{run_id}/events?after=<resume_cursor>` for later events, or omit the cursor to replay from creation. On reconnect, `Last-Event-ID` takes precedence. Apply each sequence once. Events remain available for the life of the run. After `400 invalid_cursor`, discard local run state and fetch a fresh snapshot. A terminal snapshot needs no stream. A reconnect at the final sequence returns `204`. The stream checks conversation access before each delivery and periodically while idle.
 - **Artifact uploads.** `POST /v1/artifacts` (into the caller's personal scope, or `?scope_id=` a project where the caller is an editor) and `POST /v1/artifacts/{artifact_id}/revisions` (needs write access) take `multipart/form-data` with one `file` part, whose `Content-Type` becomes the revision's media type and whose optional file name becomes its display name, and one `metadata` part holding `{}`, in either order. The target is authorized before anything is reserved or written. The file is streamed to the artifacts directory with bounded memory and must not exceed `?max_bytes=` (default and maximum 64 MiB), which is charged against storage quotas until the upload settles. An upload must finish within 600 s and holds one in-flight slot meanwhile. Retrying with the same key and file, even with another boundary or part order, returns the same revision and charges once. Quota exhaustion is `429 quota`; unconfigured storage limits, or no `ARTIFACTS_DIR`, is `503 provisioning`.
 - **Artifact downloads.** `GET /v1/artifacts/{artifact_id}/revisions/{revision_id}` returns a revision's metadata; `GET …/content` streams an active revision's bytes in 64 KiB reads, with its media type, `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff` and `Accept-Ranges: bytes`. One `Range` is served as `206`; a range outside the content is `416` with `Content-Range: bytes */<size>`; a list of ranges is `400`. `HEAD` returns the same headers without a body. Access is checked on the primary for every request, so a revoked share or membership stops the next download.
 
@@ -372,7 +373,7 @@ loads platform roots and honors `SSL_CERT_FILE` and `SSL_CERT_DIR` under ADR 001
 gives the version-1 shape with synthetic values. Version 2 adds one required browser-routing
 profile, described below.
 
-- Every setting is required, with its unit in the field name, except
+- In the base profile, every setting is required, with its unit in the field name, except
   `provider_refresh.uncacheable_reuse_seconds`. That one is optional: the reuse window for
   provider documents that refuse caching, 60 seconds when absent. An explicit value must be
   1–300 seconds, at least `cooldown_seconds` and at most `freshness_seconds`. No other
@@ -398,6 +399,33 @@ ADR 0012, and the ADR 0014 limit must be set. Keep the document, keys and bundle
 on every replica for a revision. Follow ADR 0015 for login-key rotation, provider revision
 changes and the unchanged restore requirements. `cargo test --locked --offline --lib auth_config`
 runs the loader tests without PostgreSQL or network access.
+
+### Run cursor keys (version 2)
+
+Add the optional top-level `cursor_keys` object to enable both run reads. If omitted, the
+API starts and those requests receive `503 provisioning`. Generate 32 fresh random bytes
+for each key in a private deployment directory. For example, for a new file:
+
+```sh
+(umask 077; set -C; openssl rand 32 > cursor-b)
+```
+
+Mount the raw file read-only on every API replica and reference its absolute path:
+
+```json
+"cursor_keys": {
+  "active": {"id": "cursor-b", "path": "/etc/openmettle/auth-keys/cursor-b"},
+  "verify_only": []
+}
+```
+
+Use distinct identifiers of 1–64 ASCII letters, digits, hyphens or underscores. Use separate
+material for every cursor and login key. For rotation, first distribute the new key in
+`verify_only` on every replica. Then activate it and move the old key to `verify_only`
+(up to three keys). Remove the old key when clients may resynchronize from a snapshot.
+At each step, run `openmettle-api --check-auth-config /etc/openmettle/auth/auth.json`
+against the mounted files before restarting the replicas. After a database restore, replace
+all pre-restore cursor keys before reopening the API.
 
 ### Browser-routing profile (version 2)
 

@@ -3,8 +3,8 @@
   "jsonSchemaDialect": "https://spec.openapis.org/oas/3.2/dialect/2026-02-26",
   "info": {
     "title": "OpenMettle application API",
-    "version": "1.0.0-draft.3",
-    "summary": "Versioned application contract (V1-03), with the project, conversation and artifact operations of V1-05 and the artifact uploads and downloads of V1-15.",
+    "version": "1.0.0-draft.4",
+    "summary": "Versioned application contract for capabilities, projects, conversations, artifacts and durable run replay.",
     "description": "Canonical source for the OpenMettle v1 application API contract. Wire rules, compatibility policy and limits are recorded in docs/adr/0007-application-api-contract.md; authorization and project lifecycle in docs/adr/0027-authorization-and-private-projects.md. Every operation carries x-openmettle-implementation: `implemented` operations are served by an API started with OPENMETTLE_API_AUTH_CONFIG, and `not-implemented` operations are not served. An API started without OPENMETTLE_API_AUTH_CONFIG serves no operation; without OPENMETTLE_API_ARTIFACTS_DIR the artifact upload and download operations answer 503 provisioning. Artifact storage is described in docs/adr/0031-filesystem-artifact-storage-and-streaming-multipart.md. Fixtures under contracts/fixtures are generated from the examples in this document by scripts/contract_fixtures.py.",
     "license": {
       "name": "MIT",
@@ -1445,6 +1445,159 @@
           }
         }
       }
+    },
+    "/v1/runs/{run_id}": {
+      "get": {
+        "operationId": "getRun",
+        "summary": "Read a run snapshot",
+        "description": "Read state, sequence and terminal event together. Conversation read access is required. Without cursor_keys this operation returns 503 provisioning.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RunId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current run state and resume cursor.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              },
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Run"
+                },
+                "examples": {
+                  "snapshot": {
+                    "$ref": "#/components/examples/RunSnapshot"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/runs/{run_id}/events": {
+      "get": {
+        "operationId": "streamRunEvents",
+        "summary": "Replay and follow ordered run events",
+        "description": "Events are retained for the life of the run. No cursor replays from the beginning. On invalid_cursor discard derived state, fetch the snapshot and resume with its cursor. The stream ends after terminal delivery or loss of access. Without cursor_keys this operation returns 503 provisioning.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RunId"
+          },
+          {
+            "$ref": "#/components/parameters/LastEventId"
+          },
+          {
+            "$ref": "#/components/parameters/After"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Ordered visible events after the selected cursor.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              },
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Accel-Buffering": {
+                "required": true,
+                "schema": {
+                  "const": "no"
+                }
+              }
+            },
+            "content": {
+              "text/event-stream": {
+                "$ref": "#/components/mediaTypes/RunEventStream"
+              }
+            }
+          },
+          "204": {
+            "description": "The cursor is at the last sequence of a terminal run. Stop reconnecting.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              },
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1550,7 +1703,7 @@
       "LastEventId": {
         "name": "Last-Event-ID",
         "in": "header",
-        "description": "SSE resume cursor, as sent automatically by EventSource clients. If both Last-Event-ID and after are present they must be identical; differing values fail with validation.",
+        "description": "Resume after the last event received by EventSource. Last-Event-ID takes precedence over after. Each may appear once. An unused after must still be a well-formed run cursor. Only the selected cursor is authenticated.",
         "schema": {
           "$ref": "#/components/schemas/Cursor"
         }
@@ -1558,7 +1711,7 @@
       "After": {
         "name": "after",
         "in": "query",
-        "description": "Explicit SSE resume cursor for clients that cannot set Last-Event-ID. Must equal Last-Event-ID when both are sent.",
+        "description": "Resume after this opaque cursor when opening a stream. Last-Event-ID takes precedence over after. Each may appear once. An unused after must still be a well-formed run cursor. Only the selected cursor is authenticated.",
         "schema": {
           "$ref": "#/components/schemas/Cursor"
         }
@@ -1627,6 +1780,15 @@
           "minLength": 7,
           "maxLength": 128
         }
+      },
+      "RunId": {
+        "name": "run_id",
+        "in": "path",
+        "required": true,
+        "description": "Canonical run UUID. A missing run or a run in an unreadable conversation returns not_found.",
+        "schema": {
+          "$ref": "#/components/schemas/Uuid"
+        }
       }
     },
     "mediaTypes": {
@@ -1635,8 +1797,23 @@
           "$ref": "#/components/schemas/RunEventItem"
         },
         "examples": {
-          "note": {
-            "$ref": "#/components/examples/RunEventItemNote"
+          "lifecycle": {
+            "summary": "Heartbeat, creation, start and terminal cancellation",
+            "dataValue": [
+              {
+                "id": "AQdleGFtcGxlAAAAAAAAAAHXBFWcYsjByle7Zs_Z0F_WLcnXhDi6vaoX9SuNLMJ9Pw",
+                "data": "{\"run_id\":\"0f0e0d0c-0b0a-4908-8706-050403020100\",\"sequence\":\"1\",\"type\":\"run.created\",\"type_version\":1,\"occurred_at\":\"2026-11-20T09:00:01.000000Z\",\"data\":{}}"
+              },
+              {
+                "id": "AQdleGFtcGxlAAAAAAAAAALdVUFmeuBEkIyAf6nRl9t599RVMC4__bRB6c6uTbrviQ",
+                "data": "{\"run_id\":\"0f0e0d0c-0b0a-4908-8706-050403020100\",\"sequence\":\"2\",\"type\":\"run.started\",\"type_version\":1,\"occurred_at\":\"2026-11-20T09:00:02.000000Z\",\"data\":{}}"
+              },
+              {
+                "id": "AQdleGFtcGxlAAAAAAAAAAPX4G_25L6evhHoy1RVdAyip9DN9oR5tDgnPL_6AVB-OQ",
+                "data": "{\"run_id\":\"0f0e0d0c-0b0a-4908-8706-050403020100\",\"sequence\":\"3\",\"type\":\"run.cancelled\",\"type_version\":1,\"occurred_at\":\"2026-11-20T09:00:03.000000Z\",\"data\":{\"reason\":\"requested\"}}"
+              }
+            ],
+            "serializedValue": ": heartbeat\n\nid: AQdleGFtcGxlAAAAAAAAAAHXBFWcYsjByle7Zs_Z0F_WLcnXhDi6vaoX9SuNLMJ9Pw\ndata: {\"run_id\":\"0f0e0d0c-0b0a-4908-8706-050403020100\",\"sequence\":\"1\",\"type\":\"run.created\",\"type_version\":1,\"occurred_at\":\"2026-11-20T09:00:01.000000Z\",\"data\":{}}\n\nid: AQdleGFtcGxlAAAAAAAAAALdVUFmeuBEkIyAf6nRl9t599RVMC4__bRB6c6uTbrviQ\ndata: {\"run_id\":\"0f0e0d0c-0b0a-4908-8706-050403020100\",\"sequence\":\"2\",\"type\":\"run.started\",\"type_version\":1,\"occurred_at\":\"2026-11-20T09:00:02.000000Z\",\"data\":{}}\n\nid: AQdleGFtcGxlAAAAAAAAAAPX4G_25L6evhHoy1RVdAyip9DN9oR5tDgnPL_6AVB-OQ\ndata: {\"run_id\":\"0f0e0d0c-0b0a-4908-8706-050403020100\",\"sequence\":\"3\",\"type\":\"run.cancelled\",\"type_version\":1,\"occurred_at\":\"2026-11-20T09:00:03.000000Z\",\"data\":{\"reason\":\"requested\"}}\n\n"
           }
         }
       }
@@ -1909,7 +2086,7 @@
         "pattern": "^[!-~]{1,128}$"
       },
       "Cursor": {
-        "description": "Opaque, server-issued cursor in unpadded base64url characters. Clients store and return it unchanged and never parse it. Binding cursors to the caller and request context is a runtime obligation; this contract does not claim an implemented signature or MAC.",
+        "description": "Opaque server-issued cursor in unpadded base64url characters. Store it unchanged. A run cursor authenticates the sequence, operation, run, scope and caller.",
         "type": "string",
         "minLength": 1,
         "maxLength": 512,
@@ -2403,7 +2580,7 @@
         }
       },
       "RunEvent": {
-        "description": "Persisted run event envelope. sequence is monotonic per run. type is an open vocabulary; this contract defines no event types yet and consumers must ignore types they do not recognize.",
+        "description": "Persisted event in ascending per-run sequence. Consumers advance past unknown types and versions and tolerate unknown reason codes.",
         "type": "object",
         "required": [
           "run_id",
@@ -2437,7 +2614,121 @@
           "data": {
             "type": "object"
           }
-        }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "run.created"
+                },
+                "type_version": {
+                  "const": 1
+                }
+              },
+              "required": [
+                "type",
+                "type_version"
+              ]
+            },
+            "then": {
+              "properties": {
+                "data": {
+                  "type": "object",
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "run.started"
+                },
+                "type_version": {
+                  "const": 1
+                }
+              },
+              "required": [
+                "type",
+                "type_version"
+              ]
+            },
+            "then": {
+              "properties": {
+                "data": {
+                  "type": "object",
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "run.cancelled"
+                },
+                "type_version": {
+                  "const": 1
+                }
+              },
+              "required": [
+                "type",
+                "type_version"
+              ]
+            },
+            "then": {
+              "properties": {
+                "data": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "reason"
+                  ],
+                  "properties": {
+                    "reason": {
+                      "$ref": "#/components/schemas/Code"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "run.failed"
+                },
+                "type_version": {
+                  "const": 1
+                }
+              },
+              "required": [
+                "type",
+                "type_version"
+              ]
+            },
+            "then": {
+              "properties": {
+                "data": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "reason"
+                  ],
+                  "properties": {
+                    "reason": {
+                      "$ref": "#/components/schemas/Code"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
       },
       "ProjectName": {
         "description": "1 to 256 bytes, no leading or trailing whitespace and no control character.",
@@ -3038,6 +3329,52 @@
           },
           "created_at": {
             "$ref": "#/components/schemas/Timestamp"
+          }
+        }
+      },
+      "Run": {
+        "description": "Consistent run snapshot. A terminal event is null for a live run or a terminal run that predates terminal events. Resume after last_sequence with resume_cursor.",
+        "type": "object",
+        "required": [
+          "run_id",
+          "conversation_id",
+          "state",
+          "created_at",
+          "last_sequence",
+          "resume_cursor",
+          "terminal"
+        ],
+        "properties": {
+          "run_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "conversation_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "state": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "description": "Open state vocabulary. During reconciliation the wire state is running."
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "last_sequence": {
+            "$ref": "#/components/schemas/PositiveSequence"
+          },
+          "resume_cursor": {
+            "$ref": "#/components/schemas/Cursor"
+          },
+          "terminal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEvent"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         }
       }
@@ -4694,6 +5031,133 @@
                 "instancePath": "/status",
                 "keyword": "const"
               }
+            }
+          ]
+        }
+      },
+      "RunEventCreated": {
+        "summary": "Parsed run.created event",
+        "dataValue": {
+          "id": "AQdleGFtcGxlAAAAAAAAAAHXBFWcYsjByle7Zs_Z0F_WLcnXhDi6vaoX9SuNLMJ9Pw",
+          "data": "{\"run_id\":\"0f0e0d0c-0b0a-4908-8706-050403020100\",\"sequence\":\"1\",\"type\":\"run.created\",\"type_version\":1,\"occurred_at\":\"2026-11-20T09:00:01.000000Z\",\"data\":{}}"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/RunEventItem",
+          "direction": "response",
+          "mutations": []
+        }
+      },
+      "RunEventStarted": {
+        "summary": "Parsed run.started event",
+        "dataValue": {
+          "id": "AQdleGFtcGxlAAAAAAAAAALdVUFmeuBEkIyAf6nRl9t599RVMC4__bRB6c6uTbrviQ",
+          "data": "{\"run_id\":\"0f0e0d0c-0b0a-4908-8706-050403020100\",\"sequence\":\"2\",\"type\":\"run.started\",\"type_version\":1,\"occurred_at\":\"2026-11-20T09:00:02.000000Z\",\"data\":{}}"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/RunEventItem",
+          "direction": "response",
+          "mutations": []
+        }
+      },
+      "RunEventCancelled": {
+        "summary": "Parsed run.cancelled event",
+        "dataValue": {
+          "id": "AQdleGFtcGxlAAAAAAAAAAPX4G_25L6evhHoy1RVdAyip9DN9oR5tDgnPL_6AVB-OQ",
+          "data": "{\"run_id\":\"0f0e0d0c-0b0a-4908-8706-050403020100\",\"sequence\":\"3\",\"type\":\"run.cancelled\",\"type_version\":1,\"occurred_at\":\"2026-11-20T09:00:03.000000Z\",\"data\":{\"reason\":\"requested\"}}"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/RunEventItem",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "missing-reason",
+              "op": "remove",
+              "class": "invalid",
+              "path": "/data#/data/reason",
+              "expect": {
+                "content": "/data",
+                "instancePath": "/data",
+                "keyword": "required"
+              }
+            },
+            {
+              "name": "unknown-reason",
+              "op": "set",
+              "class": "compat",
+              "path": "/data#/data/reason",
+              "value": "future_reason"
+            }
+          ]
+        }
+      },
+      "RunEventFailed": {
+        "summary": "Parsed run.failed event",
+        "dataValue": {
+          "id": "AQdleGFtcGxlAAAAAAAAAALdVUFmeuBEkIyAf6nRl9t599RVMC4__bRB6c6uTbrviQ",
+          "data": "{\"run_id\":\"0f0e0d0c-0b0a-4908-8706-050403020100\",\"sequence\":\"2\",\"type\":\"run.failed\",\"type_version\":1,\"occurred_at\":\"2026-11-20T09:00:02.000000Z\",\"data\":{\"reason\":\"queue_expired\"}}"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/RunEventItem",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "missing-reason",
+              "op": "remove",
+              "class": "invalid",
+              "path": "/data#/data/reason",
+              "expect": {
+                "content": "/data",
+                "instancePath": "/data",
+                "keyword": "required"
+              }
+            },
+            {
+              "name": "unknown-reason",
+              "op": "set",
+              "class": "compat",
+              "path": "/data#/data/reason",
+              "value": "future_reason"
+            }
+          ]
+        }
+      },
+      "RunSnapshot": {
+        "summary": "Snapshot at terminal cancellation",
+        "dataValue": {
+          "run_id": "0f0e0d0c-0b0a-4908-8706-050403020100",
+          "conversation_id": "0f0e0d0c-0b0a-4908-8706-050403020101",
+          "state": "cancelled",
+          "created_at": "2026-11-20T09:00:01.000000Z",
+          "last_sequence": "3",
+          "resume_cursor": "AQdleGFtcGxlAAAAAAAAAAPX4G_25L6evhHoy1RVdAyip9DN9oR5tDgnPL_6AVB-OQ",
+          "terminal": {
+            "run_id": "0f0e0d0c-0b0a-4908-8706-050403020100",
+            "sequence": "3",
+            "type": "run.cancelled",
+            "type_version": 1,
+            "occurred_at": "2026-11-20T09:00:03.000000Z",
+            "data": {
+              "reason": "requested"
+            }
+          }
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/Run",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "legacy-terminal",
+              "op": "set",
+              "class": "valid",
+              "path": "/terminal",
+              "value": null
+            },
+            {
+              "name": "future-state",
+              "op": "set",
+              "class": "compat",
+              "path": "/state",
+              "value": "future_state"
             }
           ]
         }

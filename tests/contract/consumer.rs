@@ -294,10 +294,25 @@ pub fn decode_page(value: &Value) -> Result<Option<String>, String> {
 pub struct RunEvent {
     pub run_id: String,
     pub sequence: i64,
-    /// No event types are defined by this contract revision; every type is surfaced as
-    /// unrecognized and ignored by presentation.
-    pub unrecognized_type: String,
+    pub kind: EventKind,
     pub data: Map<String, Value>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum EventKind {
+    Created,
+    Started,
+    Cancelled(Reason),
+    Failed(Reason),
+    Unknown(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Reason {
+    Requested,
+    Revoked,
+    QueueExpired,
+    Unknown(String),
 }
 
 #[derive(Deserialize)]
@@ -312,11 +327,95 @@ struct WireRunEvent {
     sequence: String,
     #[serde(rename = "type")]
     kind: String,
-    #[allow(dead_code)]
     type_version: u32,
     #[allow(dead_code)]
     occurred_at: String,
     data: Map<String, Value>,
+}
+
+impl WireRunEvent {
+    fn decode(self) -> Result<RunEvent, String> {
+        let kind = match (self.kind.as_str(), self.type_version) {
+            ("run.created", 1) => EventKind::Created,
+            ("run.started", 1) => EventKind::Started,
+            ("run.cancelled" | "run.failed", 1) => {
+                let value = self
+                    .data
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .ok_or("missing event reason")?;
+                let reason = match value {
+                    "requested" => Reason::Requested,
+                    "revoked" => Reason::Revoked,
+                    "queue_expired" => Reason::QueueExpired,
+                    other => Reason::Unknown(other.to_owned()),
+                };
+                if self.kind == "run.failed" {
+                    EventKind::Failed(reason)
+                } else {
+                    EventKind::Cancelled(reason)
+                }
+            }
+            _ => EventKind::Unknown(self.kind),
+        };
+        Ok(RunEvent {
+            sequence: parse_decimal(&self.sequence, false)?,
+            run_id: self.run_id,
+            kind,
+            data: self.data,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct WireRun {
+    run_id: String,
+    conversation_id: String,
+    state: String,
+    created_at: String,
+    last_sequence: String,
+    resume_cursor: String,
+    #[serde(deserialize_with = "required_nullable")]
+    terminal: Option<WireRunEvent>,
+}
+
+pub struct Run {
+    pub run_id: String,
+    pub conversation_id: String,
+    pub state: String,
+    pub created_at: String,
+    pub last_sequence: i64,
+    pub resume_cursor: String,
+    pub terminal: Option<RunEvent>,
+}
+
+pub fn decode_run(value: &Value) -> Result<Run, String> {
+    let wire: WireRun = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    Ok(Run {
+        run_id: wire.run_id,
+        conversation_id: wire.conversation_id,
+        state: wire.state,
+        created_at: wire.created_at,
+        last_sequence: parse_decimal(&wire.last_sequence, false)?,
+        resume_cursor: wire.resume_cursor,
+        terminal: wire.terminal.map(WireRunEvent::decode).transpose()?,
+    })
+}
+
+/// One SSE dispatch block. Comments and unknown fields have no UI effect.
+pub fn sse_item(block: &str) -> Option<Value> {
+    let mut id = "";
+    let mut data = Vec::new();
+    for line in block.lines() {
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        match field {
+            "id" => id = value,
+            "data" => data.push(value),
+            _ => (),
+        }
+    }
+    (!data.is_empty()).then(|| serde_json::json!({"id": id, "data": data.join("\n")}))
 }
 
 #[derive(Debug)]
@@ -339,18 +438,14 @@ impl EventCursor {
     pub fn apply(&mut self, item: &Value) -> Result<Applied, String> {
         let item: WireItem = serde_json::from_value(item.clone()).map_err(|e| e.to_string())?;
         let event: WireRunEvent = serde_json::from_str(&item.data).map_err(|e| e.to_string())?;
-        let sequence = parse_decimal(&event.sequence, false)?;
-        self.last_id = Some(item.id);
+        let event = event.decode()?;
+        let sequence = event.sequence;
         if self.last_sequence.is_some_and(|last| sequence <= last) {
             return Ok(Applied::Duplicate);
         }
+        self.last_id = Some(item.id);
         self.last_sequence = Some(sequence);
-        Ok(Applied::New(RunEvent {
-            run_id: event.run_id,
-            sequence,
-            unrecognized_type: event.kind,
-            data: event.data,
-        }))
+        Ok(Applied::New(event))
     }
 }
 

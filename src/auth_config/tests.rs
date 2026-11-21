@@ -1883,3 +1883,73 @@ fn serving_load_retains_the_native_profile() {
         Err(native_refusal(native::SettingsError::InFlight))
     );
 }
+
+#[test]
+fn cursor_ring_requires_distinct_file_backed_keys_in_v2() {
+    let mut f = Fixture::v2();
+    assert!(f.load().unwrap().cursor_keys.is_none());
+    f.document["cursor_keys"] = support::cursor_keys(&f.dir);
+    assert_eq!(f.load().unwrap().cursor_keys.unwrap().active.0, "cursor-b");
+    let key = &f.document["cursor_keys"]["active"];
+    for (ptr, value, error) in [
+        ("/cursor_keys/active/id", json!(""), Error::CursorKeyRing),
+        (
+            "/cursor_keys/active/id",
+            json!("a".repeat(65)),
+            Error::CursorKeyRing,
+        ),
+        ("/cursor_keys/active/id", json!("a.b"), Error::CursorKeyRing),
+        (
+            "/cursor_keys/verify_only/0/id",
+            key["id"].clone(),
+            Error::CursorKeyRing,
+        ),
+        (
+            "/cursor_keys/verify_only/0/path",
+            key["path"].clone(),
+            Error::CursorKeyRing,
+        ),
+        (
+            "/cursor_keys/active/path",
+            f.document["login"]["keys"]["active"]["path"].clone(),
+            Error::CursorKeyRing,
+        ),
+        (
+            "/cursor_keys/verify_only/0/path",
+            f.document["login"]["keys"]["decrypt_only"][0]["path"].clone(),
+            Error::CursorKeyRing,
+        ),
+        (
+            "/cursor_keys/active/path",
+            json!(f.dir.write("short", &[0; 31])),
+            Error::CursorKeyFile,
+        ),
+        (
+            "/cursor_keys/active/path",
+            json!(f.dir.write("long", &[0; 33])),
+            Error::CursorKeyFile,
+        ),
+        ("/cursor_keys/active/path", json!("relative"), Error::Path),
+        (
+            "/cursor_keys/active/path",
+            json!(f.dir.path("")),
+            Error::CursorKeyFile,
+        ),
+        (
+            "/cursor_keys/verify_only",
+            json!([key, key, key, key]),
+            Error::CursorKeyRing,
+        ),
+        (
+            "/cursor_keys",
+            json!({"verify_only":[]}),
+            Error::MissingField,
+        ),
+        ("/cursor_keys", Value::Null, Error::Field),
+    ] {
+        assert_eq!(f.with(ptr, value), error, "{ptr}");
+    }
+    let mut old = Fixture::new();
+    old.document["cursor_keys"] = support::cursor_keys(&old.dir);
+    assert_eq!(refusal(old.load()), Error::UnknownField);
+}

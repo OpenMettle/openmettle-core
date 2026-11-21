@@ -1,8 +1,8 @@
-//! Shared operational contract and persistence primitives; no worker queue yet. The API can
-//! also mount the browser sign-in routes, beside them the native sign-in routes, and the
-//! authenticated `/v1` project, conversation and artifact routes (ADRs 0025, 0029, 0027 PR4b
-//! and 0031), all off by default: without `OPENMETTLE_API_AUTH_CONFIG` it serves `/healthz`
-//! and `/readyz` only. Artifact uploads and downloads also need `OPENMETTLE_API_ARTIFACTS_DIR`.
+//! Shared runtime, persistence and authenticated application routes. By default the API
+//! serves only `/healthz` and `/readyz`. A version-2 `OPENMETTLE_API_AUTH_CONFIG` mounts
+//! browser sign-in, optional native sign-in, and the authenticated `/v1` routes.
+//! Artifact payloads require `OPENMETTLE_API_ARTIFACTS_DIR` (ADR 0031). Run snapshots
+//! and replayable event streams require cursor keys in the auth document (ADR 0034).
 pub mod artifact_fs;
 pub mod auth;
 pub mod auth_config;
@@ -252,7 +252,8 @@ fn app(
     else {
         return Ok((operational, None));
     };
-    let (settings, profile) = auth_config::load_browser(path)?;
+    let (mut settings, profile) = auth_config::load_browser(path)?;
+    let cursor_keys = settings.cursor_keys.take();
     let native = settings.native().cloned();
     let issuance = lazy_pool(issuance, *connections, config.database_timeout);
     let service = Arc::new(BrowserAuth::new(settings, pool.clone(), issuance.clone()));
@@ -274,10 +275,11 @@ fn app(
         bearer = Some(auth);
     }
     let origin = profile.handoff().origin;
-    Ok((
-        app.merge(v1::router(service, bearer, origin, pool.clone(), artifacts)),
-        Some(issuance),
-    ))
+    let mut v1 = v1::router(service, bearer, origin, pool.clone(), artifacts);
+    if let Some(keys) = cursor_keys {
+        v1 = v1.layer(axum::Extension(Arc::new(keys)));
+    }
+    Ok((app.merge(v1), Some(issuance)))
 }
 
 #[derive(Clone)]
@@ -446,7 +448,8 @@ async fn serve(
         .await
         .map_err(|_| ProcessFailure::Bind)?;
     // After every route is added, so the sign-in routes are observed like the probes.
-    let app = telemetry::observe(app);
+    let (stream_stop, stopping) = tokio::sync::watch::channel(false);
+    let app = telemetry::observe(app.layer(axum::Extension(stopping)));
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let server = axum::serve(listener, app).with_graceful_shutdown(async {
         let _ = stop_rx.await;
@@ -460,6 +463,7 @@ async fn serve(
         _ = interrupt.recv() => Signal::Interrupt,
     };
     telemetry::process_stopping(process, signal);
+    stream_stop.send_replace(true);
     let _ = stop_tx.send(());
     tokio::time::timeout(drain, async {
         server.await.map_err(|_| ProcessFailure::Shutdown)?;

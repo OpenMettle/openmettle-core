@@ -956,7 +956,8 @@ fn auth_config_check_succeeds_offline_without_serving_settings() {
     let v1 = auth_config_support::document(&dir, &bundle);
     let v2 = auth_config_support::document_v2(&dir, &bundle);
     // ADR 0029: the optional native profile is checked by the same command.
-    let native = auth_config_support::document_v2_native(&dir, &bundle);
+    let mut native = auth_config_support::document_v2_native(&dir, &bundle);
+    native["cursor_keys"] = auth_config_support::cursor_keys(&dir);
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
     for (document, serving_settings) in [
         (&v1, false),
@@ -1153,6 +1154,13 @@ fn auth_config_check_rejects_with_fixed_redacted_categories() {
         *document.pointer_mut(pointer).unwrap() = value;
         cases.push((document.to_string().into_bytes(), category));
     }
+    let mut reused = native;
+    reused["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+    reused["cursor_keys"]["active"]["path"] = reused["login"]["keys"]["active"]["path"].clone();
+    cases.push((
+        reused.to_string().into_bytes(),
+        "cursor key count, identifiers or key separation are invalid",
+    ));
     for (bytes, category) in cases {
         let path = dir.write("synthetic-secret.json", &bytes);
         let output = command(false)
