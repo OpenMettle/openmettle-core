@@ -79,7 +79,35 @@ row `FOR UPDATE` (matching the `account_admin_lock` -> `users` lock order used b
 **same transaction** that at least one other active `openmettle.account_admins` row belongs to
 an enabled user (`disabled_at IS NULL`) before setting `disabled_at` and advancing
 `session_generation` on `openmettle.users`—otherwise a concurrent administrator demotion could
-leave zero enabled administrators. Do **not** rely on `revoke` or the
+leave zero enabled administrators.
+
+Unlike `authz::store::disable_user` (which calls `authz::runs::cancel_user_runs` in the same
+transaction), ADR 0013's standalone owner disablement SQL updates only `openmettle.users`
+(`disabled_at` and `session_generation`) and does **not** cancel or fence the user's
+non-terminal `openmettle.runs` rows, so a `queued` or `waiting` run could otherwise remain
+non-terminal and resume if the account were later re-enabled. As part of the same owner
+disablement recovery procedure, cancel or fence every non-terminal `openmettle.runs` row for
+that `actor_user_id` (`state NOT IN ('succeeded', 'failed', 'cancelled', 'interrupted')`
+where `state IN ('queued', 'waiting') OR cancel_reason IS NULL`), matching
+`authz::store::disable_user` and `authz::runs::cancel_user_runs` lock order and semantics:
+lock affected `openmettle.runs` rows in ascending `id` order (`ORDER BY id FOR NO KEY UPDATE`)
+**after** locking `openmettle.account_admin_lock` and `openmettle.users`; transition `queued`
+and `waiting` runs directly to `state = 'cancelled'` with `wait_reason = NULL` and
+`cancel_reason = coalesce(cancel_reason, 'revoked')`, appending the terminal
+`openmettle.run_events` row (`append_key = 'run-terminal'`, `format = 'openmettle.run-cancelled'`,
+`format_version = 1`, payload `{"reason":"revoked"}`, advancing `last_event_sequence` with
+matching ADR 0004 `identity` and `digest`); transition `running` runs to `state = 'cancelling'`
+and leave `reconciling` runs in `state = 'reconciling'`, in both cases clearing
+`wait_reason = NULL`, setting `cancel_reason = coalesce(cancel_reason, 'revoked')`, and
+appending the cancellation-request event (`append_key = 'cancel-requested'`,
+`format = 'openmettle.run-cancel-requested'`, `format_version = 1`, payload
+`{"reason":"revoked"}`) so leased workers stop and settle in-flight work rather than
+overwriting an executing run directly to `cancelled`. Wait for any `cancelling` or
+`reconciling` runs to settle and verify that **zero** non-terminal `openmettle.runs` rows
+(`state NOT IN ('succeeded', 'failed', 'cancelled', 'interrupted')`) remain for that
+`actor_user_id` before re-enabling the account.
+
+Do **not** rely on `revoke` or the
 [session cleanup procedure](session-cleanup.md) to cut off a compromised administrator:
 `revoke` advances an approval's `access_generation` to end existing sessions for that approval
 while leaving an unexpired approval eligible for immediate re-sign-in, whereas
