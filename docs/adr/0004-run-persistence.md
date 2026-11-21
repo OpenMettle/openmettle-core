@@ -10,6 +10,8 @@ provisioning. Migrations 1 and 2 are unchanged.
 > migration 19 adds their columns. [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md)
 > specifies the V1-11 worker fencing required below: leases, execution deadlines, cooperative
 > cancellation, settlement from the operations ledger and restart recovery (migration 20).
+> [ADR 0035](0035-approvals-permitted-yolo-and-effect-ledger.md) specifies approval waits,
+> permitted YOLO and the authorization and endpoint evidence recorded with an operation intent.
 
 ## Scope and identities
 
