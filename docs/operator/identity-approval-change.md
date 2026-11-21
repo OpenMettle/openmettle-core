@@ -48,7 +48,7 @@ Supply every variable. There are no defaults.
 | `expected_revision` | The revision you inspected: plain decimal, 1 to 9223372036854775807. |
 | `expected_generation` | The access generation you inspected: plain decimal, 0 to 9223372036854775807. |
 | `action` | `routine`, `revoke`, `withdraw` or `restore`, in lowercase. |
-| `expires_ms` | Unix milliseconds, 1 to 9223372036854775807 in plain decimal without a leading zero. For `routine` and `restore`, supply a future expiry. For `revoke` and `withdraw`, you can pass the current expiry. These actions preserve it. |
+| `expires_ms` | Unix milliseconds, 1 to 9223372036854775807 in plain decimal without a leading zero. If `action` is `routine` or `restore`, supply a future timestamp after the primary database clock; the script writes this value as the new expiry. If `action` is `revoke` or `withdraw`, supply any valid timestamp in range (such as the current expiry); those actions preserve the stored expiry unchanged. |
 | `actor`, `reason` | Operator identifier (1–128 bytes) and change reason (1–512 bytes). |
 
 `actor`, `reason` and the change time are latest-change provenance. The next change

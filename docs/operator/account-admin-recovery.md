@@ -3,7 +3,7 @@
 Use this procedure to designate the first `account_admin` of an installation, or to restore
 administration when no trusted enabled administrator remains (break-glass). Both are the same
 owner command: it makes one enabled user an active `account_admin` and records an immutable
-audit row. It requires schema version 15, a direct primary connection as `openmettle_owner`
+audit row. It requires schema version 15 or later, a direct primary connection as `openmettle_owner`
 and the deployment's normal controls for using that account. The application API cannot
 perform it, and directory roles never map to `account_admin` (ADR 0027).
 
@@ -30,9 +30,9 @@ opt-in capability such as `runs.use_yolo`.
     WHERE a.active ORDER BY a.user_id;
    ```
 
-3. Stop if the account is missing or disabled. This command never re-enables a user: restore
+3. If the account is missing or disabled, stop. This command never re-enables a user: restore
    the account under the deployment's owner change control first, or choose another enabled
-   user. Stop if the user is already an active administrator; there is nothing to do.
+   user. If the user is already an active administrator, stop; there is nothing to do.
 4. Assign a fresh request UUID and record it with a deployment-assigned opaque operator UUID,
    the reason and the inspected rows in the deployment change record. Keep credentials,
    names and identity claims out of these inputs. The reason (1 to 512 bytes) is stored.
@@ -63,9 +63,68 @@ request UUID this operator already used for a different change.
 ## Break-glass recovery
 
 When every remaining administrator is disabled, unavailable or untrusted, grant a trusted
-enabled user with this procedure. That administrator then demotes or disables compromised
-administrators through the application, which enforces the last-enabled-administrator rule
-and records its own audit rows. Review the audit rows of the affected period afterwards.
+enabled user with this procedure first so an enabled administrator remains. `/v1` does not
+yet expose HTTP endpoints to demote an administrator or disable a user account (the
+`authz::store` functions are internal-only). To cut off a compromised administrator
+immediately today, run **`withdraw`** on **every** approval held by the compromised account
+using the [local identity approval change procedure](identity-approval-change.md) (which
+advances each approval's `access_generation` and sets `active = false`, stopping existing
+sessions immediately and refusing new logins), or perform a controlled owner account-wide
+disablement under [ADR 0013's user disablement protocol](../adr/0013-local-identity-sessions.md#user-disablement-and-re-enable).
+ADR 0013's standalone disablement SQL predates schema 15's `account_admin_lock` and locks
+only the target user row, so on schema 15 or later you must first lock the single
+`openmettle.account_admin_lock` row `FOR UPDATE` before locking the target `openmettle.users`
+row `FOR UPDATE` (matching the `account_admin_lock` -> `users` lock order used by
+`authz::store` and [`grant-account-admin.psql`](grant-account-admin.psql)), and verify in the
+**same transaction** that at least one other active `openmettle.account_admins` row belongs to
+an enabled user (`disabled_at IS NULL`) before setting `disabled_at` and advancing
+`session_generation` on `openmettle.users`—otherwise a concurrent administrator demotion could
+leave zero enabled administrators.
+
+Unlike `authz::store::disable_user` (which calls `authz::runs::cancel_user_runs` in the same
+transaction), ADR 0013's standalone owner disablement SQL updates only `openmettle.users`
+(`disabled_at` and `session_generation`) and does **not** cancel or fence the user's
+non-terminal `openmettle.runs` rows, so a `queued` or `waiting` run could otherwise remain
+non-terminal and resume if the account were later re-enabled. On **schema version 20 or later**
+(where `openmettle.runs.cancel_reason` exists; `wait_reason` exists from schema 3 and clearing
+`wait_reason = NULL` also satisfies schema 22's approval-wait check constraint when
+transitioning out of `waiting`), cancel or fence every non-terminal `openmettle.runs` row for
+that `actor_user_id` (`state NOT IN ('succeeded', 'failed', 'cancelled', 'interrupted')` where
+`state IN ('queued', 'waiting') OR cancel_reason IS NULL`) in the same disablement transaction,
+matching `authz::store::disable_user` and `authz::runs::cancel_user_runs` lock order and
+semantics: lock affected `openmettle.runs` rows in ascending `id` order
+(`ORDER BY id FOR NO KEY UPDATE`) **after** locking `openmettle.account_admin_lock` and
+`openmettle.users`; transition `queued` and `waiting` runs directly to `state = 'cancelled'`
+with `wait_reason = NULL` and `cancel_reason = coalesce(cancel_reason, 'revoked')`, appending
+the terminal `openmettle.run_events` row (`append_key = 'run-terminal'`,
+`format = 'openmettle.run-cancelled'`, `format_version = 1`, payload `{"reason":"revoked"}`,
+advancing `last_event_sequence` with matching ADR 0004 `identity` and `digest`); transition
+`running` runs to `state = 'cancelling'` and leave `reconciling` runs in
+`state = 'reconciling'`, in both cases clearing `wait_reason = NULL`, setting
+`cancel_reason = coalesce(cancel_reason, 'revoked')`, and appending the cancellation-request
+event (`append_key = 'cancel-requested'`, `format = 'openmettle.run-cancel-requested'`,
+`format_version = 1`, payload `{"reason":"revoked"}`) so leased workers stop and settle
+in-flight work rather than overwriting an executing run directly to `cancelled`. **Commit
+(`COMMIT`)** the `openmettle.users` update, `openmettle.runs` transitions, and
+`openmettle.run_events` appends together first so the `openmettle.runs` row locks are released
+and leased workers can acquire those rows to settle. **After that commit**, wait for any
+`cancelling` or `reconciling` runs to settle and verify in a **fresh transaction** that
+**zero** non-terminal `openmettle.runs` rows
+(`state NOT IN ('succeeded', 'failed', 'cancelled', 'interrupted')`) remain for that
+`actor_user_id` before re-enabling the account. On earlier schemas (15–19), before
+`cancel_reason` existed, use the runbook and schema procedure matching your deployed schema
+version rather than referencing columns introduced in later migrations.
+
+Do **not** rely on `revoke` or the
+[session cleanup procedure](session-cleanup.md) to cut off a compromised administrator:
+`revoke` advances an approval's `access_generation` to end existing sessions for that approval
+while leaving an unexpired approval eligible for immediate re-sign-in, whereas
+[`session-cleanup.psql`](session-cleanup.psql) deletes only explicitly revoked or expired
+`openmettle.local_sessions` rows and leaves unexpired, unrevoked sessions untouched and
+usable. Use the [session cleanup procedure](session-cleanup.md) afterwards to remove expired or
+revoked session rows as needed, and record any direct owner SQL demotion or account
+disablement under deployment change controls. Review the `openmettle.authorization_audit` rows
+of the affected period afterwards.
 
 ## Resolve an uncertain outcome
 

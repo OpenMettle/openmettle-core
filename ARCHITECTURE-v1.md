@@ -727,7 +727,7 @@ New tickets carry stage, priority, dependencies and measurable acceptance. Exist
 | 1 | [V1-01 Rust workspace with independently deployable API and workers](https://github.com/orgs/OpenMettle/projects/1/views/1?filterQuery=%5BV1-01%5D&pane=issue&itemId=307313330) | Baseline |
 | 1 | [V1-02 PostgreSQL domain schema and migration ownership](https://github.com/orgs/OpenMettle/projects/1/views/1?filterQuery=%5BV1-02%5D&pane=issue&itemId=307313986) | V1-01 |
 | 1 | [V1-03 Versioned application API and capability contracts](https://github.com/orgs/OpenMettle/projects/1/views/1?filterQuery=%5BV1-03%5D&pane=issue&itemId=307315439) | V1-01, V1-02 |
-| 1 | [V1-04 OIDC admission, sessions and account lifecycle](https://github.com/orgs/OpenMettle/projects/1/views/1?filterQuery=%5BV1-03%5D&pane=issue&itemId=307316230) | V1-02, V1-03 |
+| 1 | [V1-04 OIDC admission, sessions and account lifecycle](https://github.com/orgs/OpenMettle/projects/1/views/1?filterQuery=%5BV1-04%5D&pane=issue&itemId=307316230) | V1-02, V1-03 |
 | 1 | [V1-05 Private projects and resource authorization](https://github.com/orgs/OpenMettle/projects/1/views/1?filterQuery=%5BV1-05%5D&pane=issue&itemId=307318409) | V1-04 |
 | 1 | [V1-06 Application-owned gateway provisioning and usage reconciliation](https://github.com/orgs/OpenMettle/projects/1/views/1?filterQuery=%5BV1-06%5D&pane=issue&itemId=307319359) | V1-04, V1-05 |
 | 1 | [V1-07 Conversation branches, presets and effective model configuration](https://github.com/orgs/OpenMettle/projects/1/views/1?filterQuery=%5BV1-07%5D&pane=issue&itemId=307321002) | V1-03, V1-05 |

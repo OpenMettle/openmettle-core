@@ -1,10 +1,11 @@
 # 0033 — Worker leases, deadlines, fencing and restart recovery
 
 Status: proposed V1-11 design (PR1), 20 November 2026. Agent-authored; owner approval,
-independent review and CI acceptance are separate gates. Refs #11; Refs #15. PR1 is this
-document and a pointer from ADR 0004. Nothing here is implemented yet: PR2 adds the schema and
-store functions, PR3 the worker loop and sweeps ([Delivery](#delivery-and-evidence)). #11 and
-#15 remain open.
+independent review and CI acceptance are separate gates. Refs #11; Refs #15. PR1 recorded this
+design and a pointer from ADR 0004. Implementation status: PR2 (migration 0020 and lease store
+functions) and PR3 (worker loop and sweeps; [Delivery](#delivery-and-evidence)) are implemented
+on `main`; ADR 0035 later amended unresolved-write rules and added approval wait expiry sweeps.
+#11 and #15 remain open.
 
 ## Problem
 

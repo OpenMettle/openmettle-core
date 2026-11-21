@@ -9,19 +9,31 @@ requires version 9 or later. Each script commits its own batch.
 
 | Step | Script | Deletes | Never deletes |
 | --- | --- | --- | --- |
-| 1 | [`session-cleanup.psql`](session-cleanup.psql) | Sessions that are revoked, or whose `expires_ms` is at or before the primary clock | Unexpired, unrevoked sessions; locked sessions; any other table |
+| 1 | [`session-cleanup.psql`](session-cleanup.psql) | Sessions that are revoked, or whose `expires_ms` is at or before the primary clock (from schema version 14, deleting a native session cascades to its linked `openmettle.native_handoffs` row) | Unexpired, unrevoked sessions; locked sessions; login gates, approvals, users, providers, nonce reservations, or run/approval receipts |
 | 2 | [`login-gate-cleanup.psql`](login-gate-cleanup.psql) | Login gates whose original expiry has passed and that no session references | Unexpired gates; referenced gates; locked gates; nonce reservations |
 
-Step 1 changes only `openmettle.local_sessions`. It never changes login gates or their
-`session_issued` markers, approvals, users, provider rows or generations, or AEAD nonce
-reservations. Validation accepts a session only while `expires_ms` is after the primary
-clock, so step 1 never removes a session that validation would accept.
+Step 1 targets only `openmettle.local_sessions`; from schema version 14, deleting a native
+session also removes its linked `openmettle.native_handoffs` row via `ON DELETE CASCADE`.
+It never changes login gates or their `session_issued` markers, approvals, users, provider
+rows or generations, or AEAD nonce reservations, and `openmettle.runs` and
+`openmettle.run_approval_decisions` have no foreign key to `local_sessions` so their
+receipts are preserved. Validation accepts a session only while `expires_ms` is after the
+primary clock, so step 1 never removes a session that validation would accept.
 
-A deleted session is refused exactly like an unknown credential. The unmounted logout route
+**Never delete active-key nonce reservations.** Reclaiming retired-key reservations has no
+supported procedure yet (ADR 0014).
+
+A deleted session is refused exactly like an unknown credential. The logout route
 answers `403 session not valid` for it instead of an acknowledgement (ADR 0019). Deleting rows frees
 the user's retained-session allowance, which counts expired and revoked rows until they are
 removed. Deleted rows are not archived. Retain any evidence your deployment requires before
 running the procedure.
+
+Deleting revoked or expired `openmettle.local_sessions` rows does not break
+`openmettle.runs` or `openmettle.run_approval_decisions` receipts: those tables hold session
+locators without a foreign key to `local_sessions`, and missing sessions fail effect checks
+closed (ADR 0035). Cleanup runs safely alongside `openmettle_worker`'s non-secret `SELECT`
+reads on `openmettle.local_sessions`.
 
 ## Run one cleanup pass
 
@@ -69,8 +81,7 @@ skipped rather than awaited.
 The interval between the steps is safe for replay. Issuance requires the original gate,
 consumed, without an issuance marker and before its original expiry. A retained gate with its
 marker refuses a second issuance, and a missing gate refuses it too. Neither script recreates
-a gate, clears a marker or deletes a nonce reservation. **Never delete active-key nonce reservations.**
-Reclaiming retired-key reservations has no supported procedure yet (ADR 0014).
+a gate, clears a marker or deletes a nonce reservation.
 
 ## Evidence and limits
 

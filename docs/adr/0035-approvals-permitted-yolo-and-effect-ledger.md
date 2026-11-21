@@ -1,9 +1,11 @@
 # 0035 — Approvals, permitted YOLO and the effect ledger
 
 Status: proposed V1-13 design (PR1), 21 November 2026. Refs #13. The base is schema 20
-at `5cae93b1265183f58aed30858f738922a2661915`. PR2 and PR3 own implementation and
-qualification. The [v1 architecture](../../ARCHITECTURE-v1.md#tool-permissions-and-yolo-mode)
-defines the run mode and its limits.
+at `5cae93b1265183f58aed30858f738922a2661915`. Implementation status: PR2 (migration 0022,
+scoped approval requests, human receipts, admission/YOLO evidence, and `authz::approvals::expire_waits`
+worker sweep) is merged on `main`; PR3 owns HTTP/SSE approval endpoints and qualification. The
+[v1 architecture](../../ARCHITECTURE-v1.md#tool-permissions-and-yolo-mode) defines the run mode
+and its limits.
 
 ## Decision
 
