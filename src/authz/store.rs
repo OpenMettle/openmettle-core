@@ -261,7 +261,7 @@ fn capability(name: &str) -> Result<(), StoreError> {
     }
 }
 
-fn unique(error: sqlx::Error, constraint: &str, conflict: &'static str) -> StoreError {
+pub(super) fn unique(error: sqlx::Error, constraint: &str, conflict: &'static str) -> StoreError {
     match &error {
         sqlx::Error::Database(e) if e.constraint() == Some(constraint) => {
             StoreError::Conflict(conflict)

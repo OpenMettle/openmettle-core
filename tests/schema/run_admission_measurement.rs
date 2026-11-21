@@ -21,10 +21,11 @@ const EXECUTING: &str = "state IN ('running', 'cancelling', 'reconciling')";
 /// The live predicate of the partial indexes, so the sampler's own reads stay off run history.
 const LIVE: &str = "state NOT IN ('succeeded', 'failed', 'cancelled', 'interrupted')";
 /// The partial indexes over live rows; plans may also use `runs_pkey` for the claim's `UPDATE`.
-const LIVE_INDEXES: [&str; 3] = [
+const LIVE_INDEXES: [&str; 4] = [
     "runs_live_actor_idx",
     "runs_live_scope_idx",
     "runs_dispatch_idx",
+    "runs_branch_live_idx",
 ];
 
 struct Profile {
@@ -768,7 +769,7 @@ fn verify(report: &Value) {
     let plans = &report["plans"];
     for (name, expected) in [
         ("live_counts", &LIVE_INDEXES[..2]),
-        ("claim", &LIVE_INDEXES[2..]),
+        ("claim", &LIVE_INDEXES[2..3]),
     ] {
         let plan = &plans[name];
         for key in ["execution_time_ms", "planning_time_ms"] {

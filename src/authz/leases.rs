@@ -148,7 +148,11 @@ const LOCK: &str = concat!(
     " FROM locked"
 );
 
-async fn lock(c: &mut PgConnection, lease: &Lease<'_>, fence: Fence) -> Result<Held, LeaseError> {
+pub(super) async fn lock(
+    c: &mut PgConnection,
+    lease: &Lease<'_>,
+    fence: Fence,
+) -> Result<Held, LeaseError> {
     let row = sqlx::query(LOCK)
         .bind(lease.scope_id)
         .bind(lease.run_id)

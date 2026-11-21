@@ -220,6 +220,8 @@ pub struct RunInput<'a> {
     pub input: &'a [u8],
     pub config: &'a [u8],
 }
+pub const MAX_SNAPSHOT_BYTES: usize = 256 * 1024;
+
 /// The ADR 0004 run identity; also validates the input.
 pub(crate) fn run_identity(r: &RunInput<'_>) -> Result<Vec<u8>, Error> {
     for id in [r.scope, r.actor, r.conversation, r.branch, r.message] {
@@ -228,7 +230,7 @@ pub(crate) fn run_identity(r: &RunInput<'_>) -> Result<Vec<u8>, Error> {
     if !bounded(r.key, 128)
         || !bounded(r.format, 128)
         || r.version <= 0
-        || r.input.len().saturating_add(r.config.len()) > 262144
+        || r.input.len().saturating_add(r.config.len()) > MAX_SNAPSHOT_BYTES
     {
         return Err(Error::Invalid);
     }

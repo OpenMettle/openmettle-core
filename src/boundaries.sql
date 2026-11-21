@@ -2,7 +2,7 @@
 -- any schema or history object, and again after migrations. It returns one row per violation.
 -- $1: the highest successfully applied migration version (0 before migration 1). Migration 1
 -- revokes the PUBLIC database/public-schema defaults, which are tolerated only before that.
--- Version 20 adds worker lease deadlines and cooperative cancellation.
+-- Version 21 adds branch heads, turns and ordered message parts.
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -116,6 +116,11 @@ contract (relation, role, privilege) AS (
     UNION ALL
     -- V1-10 (ADR 0032): the claim's dispatch lock row.
     SELECT 'run_dispatch_lock', 'openmettle_worker', 'SELECT' WHERE $1 >= 19
+    UNION ALL
+    SELECT relation, role, 'SELECT' FROM (VALUES ('branch_heads'), ('message_parts')) AS g(relation),
+        (VALUES ('openmettle_api'), ('openmettle_worker')) AS r(role) WHERE $1 >= 21
+    UNION ALL
+    SELECT 'message_turns', 'openmettle_worker', 'SELECT' WHERE $1 >= 21
 ),
 column_contract (relation, attribute, role, privilege) AS (
     VALUES ('users', 'disabled_at', 'openmettle_api', 'UPDATE')
@@ -158,6 +163,24 @@ column_contract (relation, attribute, role, privilege) AS (
         ('native_handoffs','challenge','INSERT', 14), ('native_handoffs','sealed','INSERT', 14),
         ('native_handoffs','expires_ms','INSERT', 14)
     ) AS issuance(relation,attribute,privilege,since) WHERE $1 >= since
+    UNION ALL
+    SELECT 'branch_heads', attribute, 'openmettle_api', 'INSERT' FROM unnest(ARRAY[
+        'scope_id','conversation_id','branch_id','parent_branch_id','head_message_id']) attribute WHERE $1 >= 21
+    UNION ALL
+    SELECT 'branch_heads', 'head_message_id', role, 'UPDATE' FROM
+        (VALUES ('openmettle_api'), ('openmettle_worker')) AS r(role) WHERE $1 >= 21
+    UNION ALL
+    SELECT 'message_parts', attribute, role, 'INSERT' FROM unnest(ARRAY[
+        'scope_id','conversation_id','message_id','ordinal','kind','text_value','artifact_revision_id']) attribute,
+        (VALUES ('openmettle_api'), ('openmettle_worker')) AS r(role) WHERE $1 >= 21
+    UNION ALL
+    SELECT 'message_turns', attribute, role, privilege FROM (VALUES
+        ('openmettle_api', 'SELECT', ARRAY['scope_id','conversation_id','message_id','author_user_id',
+            'run_id','reasoning_bytes','input_count','output_count']),
+        ('openmettle_api', 'INSERT', ARRAY['scope_id','conversation_id','message_id','author_user_id']),
+        ('openmettle_worker', 'INSERT', ARRAY['scope_id','conversation_id','message_id','run_id',
+            'reasoning_blocks','reasoning_bytes','input_count','output_count'])
+    ) AS t(role,privilege,columns), unnest(columns) attribute WHERE $1 >= 21
     UNION ALL
     -- Migration 18's inert guards for the issuance role's row locks.
     SELECT relation, 'lock_guard', 'openmettle_issuance', 'UPDATE' FROM (VALUES

@@ -644,7 +644,7 @@ pub enum Admission {
 }
 
 /// The recorded run of one actor's idempotency key in one scope.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RunReplay {
     pub run_id: String,
     pub state: String,
@@ -653,8 +653,20 @@ pub struct RunReplay {
     pub branch_id: String,
     /// Reuse it on retry: the input message is part of the run identity (ADR 0004).
     pub input_message_id: String,
+    pub snapshot_format: String,
+    pub snapshot_version: i32,
+    pub input_snapshot: Vec<u8>,
+    pub config_snapshot: Vec<u8>,
     request_identity: Vec<u8>,
     request_digest: Vec<u8>,
+}
+
+impl std::fmt::Debug for RunReplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunReplay")
+            .field("run_id", &self.run_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RunReplay {
@@ -683,26 +695,16 @@ pub async fn find_run(
     lookup(c, scope_id, actor_user_id, idempotency_key).await
 }
 
-type ReplayRow = (
-    String,
-    String,
-    Option<i32>,
-    String,
-    String,
-    String,
-    Vec<u8>,
-    Vec<u8>,
-);
-
 async fn lookup(
     c: &mut PgConnection,
     scope_id: &str,
     actor_user_id: &str,
     idempotency_key: &str,
 ) -> Result<Option<RunReplay>, StoreError> {
-    let row: Option<ReplayRow> = sqlx::query_as(
+    let row = sqlx::query(
         "SELECT id::text, state, round_limit, conversation_id::text, branch_id::text,
-                input_message_id::text, request_identity, request_digest
+                input_message_id::text, request_identity, request_digest,
+                snapshot_format, snapshot_version, input_snapshot, config_snapshot
            FROM openmettle.runs
           WHERE scope_id = $1::uuid AND actor_user_id = $2::uuid AND idempotency_key = $3",
     )
@@ -711,18 +713,23 @@ async fn lookup(
     .bind(idempotency_key)
     .fetch_optional(c)
     .await?;
-    Ok(row.map(
-        |(run_id, state, round_limit, conversation, branch, message, i, d)| RunReplay {
-            run_id,
-            state,
-            round_limit,
-            conversation_id: conversation,
-            branch_id: branch,
-            input_message_id: message,
-            request_identity: i,
-            request_digest: d,
-        },
-    ))
+    row.map(|row| {
+        Ok(RunReplay {
+            run_id: row.try_get("id")?,
+            state: row.try_get("state")?,
+            round_limit: row.try_get("round_limit")?,
+            conversation_id: row.try_get("conversation_id")?,
+            branch_id: row.try_get("branch_id")?,
+            input_message_id: row.try_get("input_message_id")?,
+            request_identity: row.try_get("request_identity")?,
+            request_digest: row.try_get("request_digest")?,
+            snapshot_format: row.try_get("snapshot_format")?,
+            snapshot_version: row.try_get("snapshot_version")?,
+            input_snapshot: row.try_get("input_snapshot")?,
+            config_snapshot: row.try_get("config_snapshot")?,
+        })
+    })
+    .transpose()
 }
 
 // Each bounded count repeats its partial index predicate verbatim.
@@ -742,6 +749,34 @@ const LIVE_COUNTS: &str = concat!(
 );
 
 const LOCK_USER: &str = "SELECT FROM openmettle.users WHERE id = $1::uuid FOR NO KEY UPDATE";
+
+/// Scope and actor locks shared with graph writers. Acquire these before a run or branch head.
+pub(crate) async fn lock_scope_actor(
+    c: &mut PgConnection,
+    scope: &str,
+    actor: &str,
+) -> Result<(Option<String>, Option<String>), StoreError> {
+    let (personal_owner, project_id): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT personal_user_id::text, project_id::text FROM openmettle.scopes
+          WHERE id = $1::uuid",
+    )
+    .bind(scope)
+    .fetch_optional(&mut *c)
+    .await?
+    .unwrap_or_default();
+    // Steps 1 and 2: the scope row, then the actor's row. In a personal scope the owner is the
+    // only actor `RunExecute` admits, so the first lock covers both.
+    if let Some(owner) = &personal_owner {
+        sqlx::query(LOCK_USER).bind(owner).execute(&mut *c).await?;
+    } else if let Some(project) = &project_id {
+        sqlx::query("SELECT FROM openmettle.projects WHERE id = $1::uuid FOR NO KEY UPDATE")
+            .bind(project)
+            .execute(&mut *c)
+            .await?;
+        sqlx::query(LOCK_USER).bind(actor).execute(&mut *c).await?;
+    }
+    Ok((personal_owner, project_id))
+}
 
 /// Admit one run in the caller's READ COMMITTED transaction (ADR 0032): lock the scope and the
 /// actor, authorize, replay, check the lifecycle and the limits, then insert the `queued` run
@@ -772,28 +807,7 @@ pub async fn admit_run(
     if isolation != "read committed" {
         return Err(StoreError::InvalidInput("transaction isolation"));
     }
-    let (personal_owner, project_id): (Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT personal_user_id::text, project_id::text FROM openmettle.scopes
-          WHERE id = $1::uuid",
-    )
-    .bind(r.scope)
-    .fetch_optional(&mut *c)
-    .await?
-    .unwrap_or_default();
-    // Steps 1 and 2: the scope row, then the actor's row. In a personal scope the owner is the
-    // only actor `RunExecute` admits, so the first lock covers both.
-    if let Some(owner) = &personal_owner {
-        sqlx::query(LOCK_USER).bind(owner).execute(&mut *c).await?;
-    } else if let Some(project) = &project_id {
-        sqlx::query("SELECT FROM openmettle.projects WHERE id = $1::uuid FOR NO KEY UPDATE")
-            .bind(project)
-            .execute(&mut *c)
-            .await?;
-        sqlx::query(LOCK_USER)
-            .bind(r.actor)
-            .execute(&mut *c)
-            .await?;
-    }
+    let (personal_owner, project_id) = lock_scope_actor(c, r.scope, r.actor).await?;
     // Step 3: authorize after the locks with the recheck's decision.
     let principal =
         store::hydrate_api_principal(c, r.actor, request.actor_approval_id, now).await?;
@@ -1665,6 +1679,10 @@ mod tests {
             conversation_id: ID.into(),
             branch_id: ID.into(),
             input_message_id: ID.into(),
+            snapshot_format: original.format.into(),
+            snapshot_version: original.version,
+            input_snapshot: original.input.into(),
+            config_snapshot: original.config.into(),
             request_digest: durable::digest(&identity),
             request_identity: identity,
         };
