@@ -1,4 +1,6 @@
 //! Cooperative, fenced worker execution and scheduled maintenance (ADR 0033).
+pub mod turns;
+
 use crate::{
     RunPolicy, WorkerSettings, artifact_fs,
     authz::{
@@ -113,6 +115,12 @@ impl TaskHandle {
 }
 
 pub enum StepResult {
+    /// A model answer awaiting publication under the run fence.
+    Answer(turns::FinalAnswer),
+    /// Model-visible output of an observed, reviewed tool operation.
+    ToolOutput(String),
+    /// A fenced authority check already invalidated the run.
+    Invalidated,
     Continue,
     Finished,
     Failed(FailReason),
@@ -140,6 +148,11 @@ pub struct OwnedObservation {
 /// capability or another target must recheck those permissions before using them.
 pub trait Executor: Send + Sync + 'static {
     fn step(&self, run: &ActiveRun, cx: StepContext) -> impl Future<Output = StepResult> + Send;
+    /// A resumed approval can predate this claim. An executor that needs an unavailable
+    /// continuation must reject it before the runner records an intent or sends any bytes.
+    fn can_resume_approved(&self, _proposal: &Proposal) -> bool {
+        true
+    }
     fn reconcile(
         &self,
         operation: &UnresolvedOperation,
@@ -478,8 +491,9 @@ async fn reconcile<E: Executor>(
 }
 
 enum WorkEnd {
+    Answer(turns::FinalAnswer),
     Complete(Settle),
-    Invalidated(Settled),
+    Invalidated,
     Stop(Stop),
     Incomplete,
 }
@@ -507,10 +521,11 @@ async fn execute<E: Executor>(
         if let Some(why) = context.stopped() {
             return Ok(WorkEnd::Stop(why));
         }
-        if let Some(settled) =
-            queue::recheck_claim(&mut *connection(pool).await?, &run.claim, settings).await?
+        if queue::recheck_claim(&mut *connection(pool).await?, &run.claim, settings)
+            .await?
+            .is_some()
         {
-            return Ok(WorkEnd::Invalidated(settled));
+            return Ok(WorkEnd::Invalidated);
         }
         if let Some(why) = context.stopped() {
             return Ok(WorkEnd::Stop(why));
@@ -521,6 +536,9 @@ async fn execute<E: Executor>(
             return Ok(WorkEnd::Stop(why));
         }
         let result = if let Some((id, proposal)) = pending {
+            if !adapters.executor.can_resume_approved(&proposal) {
+                return Ok(WorkEnd::Complete(Settle::Failed(FailReason::StepFailed)));
+            }
             let intent = approvals::record_fenced_intent(
                 &mut *connection(pool).await?,
                 &run.claim.lease(),
@@ -545,13 +563,18 @@ async fn execute<E: Executor>(
                         .send(run, operation, request, step)
                         .await
                 }
-                IntentResult::Invalidated(settled) => return Ok(WorkEnd::Invalidated(settled)),
+                IntentResult::Invalidated(_) => return Ok(WorkEnd::Invalidated),
                 _ => return Ok(WorkEnd::Complete(Settle::Stopped)),
             }
         } else {
             adapters.executor.step(run, context.step()).await
         };
         match result {
+            StepResult::Invalidated => return Ok(WorkEnd::Invalidated),
+            StepResult::Answer(answer) => return Ok(WorkEnd::Answer(answer)),
+            StepResult::ToolOutput(_) => {
+                return Ok(WorkEnd::Complete(Settle::Failed(FailReason::StepFailed)));
+            }
             StepResult::Continue => continue,
             StepResult::Finished => return Ok(WorkEnd::Complete(Settle::Succeeded)),
             StepResult::Failed(reason) => return Ok(WorkEnd::Complete(Settle::Failed(reason))),
@@ -598,7 +621,7 @@ async fn run_one<E: Executor>(
         end = &mut work => {
             let why = match end {
                 WorkEnd::Stop(why) => Some(why),
-                WorkEnd::Invalidated(_) => Some(Stop::Cancel),
+                WorkEnd::Invalidated => Some(Stop::Cancel),
                 _ => context.stopped(),
             };
             (why, Some(end))
@@ -647,19 +670,21 @@ async fn run_one<E: Executor>(
     };
     // Cancel any pending renewal and return its connection before settling.
     drop(renewal);
-    if cause == Some(Stop::LeaseLost)
-        || matches!(
-            end,
-            WorkEnd::Stop(Stop::LeaseLost) | WorkEnd::Invalidated(Settled::Terminal { .. })
-        )
-    {
+    if cause == Some(Stop::LeaseLost) || matches!(end, WorkEnd::Stop(Stop::LeaseLost)) {
         return;
     }
     let Ok(mut c) = connection(pool).await else {
         return;
     };
     let input = match end {
-        WorkEnd::Invalidated(_) => {
+        WorkEnd::Answer(answer) if cause.is_none() => {
+            let result = turns::publish(&mut c, &lease, &settings, answer).await;
+            if matches!(result, Ok(Settled::Reconciling { .. })) {
+                let _ = leases::release_lease(&mut c, &lease).await;
+            }
+            return;
+        }
+        WorkEnd::Invalidated => {
             let _ = leases::release_lease(&mut c, &lease).await;
             return;
         }

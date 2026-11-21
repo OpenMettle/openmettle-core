@@ -501,12 +501,12 @@ pub async fn publish_answer(
     use super::leases::{self, Fence};
     let c = tx.connection().map_err(StoreError::from)?;
     leases::lock(c, lease, Fence::Step).await?;
-    publish_locked_answer(tx, lease.scope_id, lease.run_id, answer).await?;
+    publish_locked_answer(c, lease.scope_id, lease.run_id, answer).await?;
     Ok(())
 }
 
-async fn publish_locked_answer(
-    tx: &mut WriteTransaction<'_>,
+pub(super) async fn publish_locked_answer(
+    c: &mut PgConnection,
     scope: &str,
     run: &str,
     answer: &Answer<'_>,
@@ -520,7 +520,6 @@ async fn publish_locked_answer(
     {
         return Err(StoreError::InvalidInput("assistant turn"));
     }
-    let c = tx.connection()?;
     let row = sqlx::query(
         "SELECT conversation_id::text, branch_id::text, input_message_id::text, actor_user_id::text,
                 actor_approval_id::text, floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint AS now_ms
@@ -725,4 +724,204 @@ pub(crate) async fn path_turns(
         });
     }
     Ok(turns)
+}
+
+/// Read the immutable path anchored by the admitted input, including worker-only replay data.
+/// Never substitute a newer branch head or a newly available attachment for a pinned omission.
+pub(crate) struct WorkerPrompt {
+    pub actor: String,
+    pub config: crate::model_config::ConfigSnapshot,
+    pub history: Vec<crate::provider_http::inference::History>,
+}
+
+pub(crate) async fn worker_prompt(
+    c: &mut PgConnection,
+    claim: &runs::ClaimedRun,
+    catalog: &crate::model_config::Catalog,
+    artifacts: Option<&crate::artifact_fs::Store>,
+) -> Result<WorkerPrompt, StoreError> {
+    use crate::model_config::{ConfigSnapshot, SNAPSHOT_FORMAT, SNAPSHOT_VERSION};
+    use crate::provider_http::inference::{History, Reasoning};
+    let invalid = || StoreError::InvalidInput("stored conversation snapshot");
+    let r = sqlx::query("SELECT r.actor_user_id::text,r.conversation_id::text,r.input_message_id::text,
+          r.snapshot_format,r.snapshot_version,r.input_snapshot,r.config_snapshot,
+          floor(extract(epoch FROM clock_timestamp())*1000)::bigint AS now_ms
+        FROM openmettle.runs r JOIN openmettle.branch_heads h USING (scope_id, conversation_id, branch_id)
+        WHERE r.id=$1::uuid AND r.scope_id=$2::uuid AND r.claim_token=$3::uuid
+          AND h.head_message_id=r.input_message_id")
+        .bind(&claim.run_id).bind(&claim.scope_id).bind(&claim.claim_token)
+        .fetch_optional(&mut *c).await?.ok_or_else(invalid)?;
+    if r.try_get::<&str, _>("snapshot_format")? != SNAPSHOT_FORMAT
+        || r.try_get::<i32, _>("snapshot_version")? != SNAPSHOT_VERSION
+    {
+        return Err(invalid());
+    }
+    let config: ConfigSnapshot =
+        serde_json::from_slice(r.try_get("config_snapshot")?).map_err(|_| invalid())?;
+    let input: snapshot::InputSnapshot =
+        serde_json::from_slice(r.try_get("input_snapshot")?).map_err(|_| invalid())?;
+    let target = catalog.target(&config.effective).map_err(|_| invalid())?;
+    if config.effective.reasoning_format != target.reasoning_format
+        || config.effective.usable_input().is_none()
+    {
+        return Err(invalid());
+    }
+    let now = r.try_get("now_ms")?;
+    let actor_id: String = r.try_get("actor_user_id")?;
+    let actor = store::hydrate_worker_principal(c, &actor_id, &claim.actor_approval_id, now)
+        .await?
+        .ok_or(HIDDEN)?;
+    let chat = Conversation {
+        scope: &claim.scope_id,
+        id: r.try_get("conversation_id")?,
+    };
+    let start: &str = r.try_get("input_message_id")?;
+    // One extra ancestor detects an incomplete pin without reading an unbounded legacy path.
+    let turns = path_turns(
+        c,
+        &actor,
+        chat,
+        Some(start),
+        input.path.len() as i32 + 1,
+        now,
+    )
+    .await?;
+    if input.path.len() != turns.len()
+        || turns.first().is_none_or(|t| t.author_user_id.is_none())
+        || turns.last().is_some_and(|t| t.parent_message_id.is_some())
+    {
+        return Err(invalid());
+    }
+    let mut history = Vec::with_capacity(turns.len());
+    let mut remaining_image_bytes = 1536 * 1024;
+    for (turn, pin) in turns.into_iter().zip(input.path).rev() {
+        let meta = turn.metadata;
+        if meta.message_id != pin.message_id {
+            return Err(invalid());
+        }
+        let mut text = Vec::new();
+        let mut pins = pin.attachments.iter();
+        let mut image = None;
+        for part in turn.parts {
+            if let PartContent::Available(Part::Text(s)) = part.value {
+                // The qualified image adapter encodes text followed by one image.
+                if image.is_some() && !s.is_empty() {
+                    return Err(StoreError::InvalidInput("attachment order"));
+                }
+                text.push(s);
+                continue;
+            }
+            let attachment = pins
+                .next()
+                .filter(|a| a.ordinal == part.ordinal)
+                .ok_or_else(invalid)?;
+            match (attachment.revision_id.as_deref(), part.value) {
+                (Some(id), PartContent::Available(Part::Attachment(current))) => {
+                    if id != current || image.is_some() || turn.author_user_id.is_none() {
+                        return Err(invalid());
+                    }
+                    image = Some(
+                        worker_image(
+                            c,
+                            chat.scope,
+                            id,
+                            artifacts.ok_or_else(invalid)?,
+                            &mut remaining_image_bytes,
+                        )
+                        .await?,
+                    );
+                }
+                // Historical revisions may have lost access since admission. Never send their ID.
+                _ if meta.message_id != start => (),
+                _ => return Err(HIDDEN),
+            }
+        }
+        if pins.next().is_some() {
+            return Err(invalid());
+        }
+        if turn.author_user_id.is_some() {
+            let text = text.concat();
+            if let Some((media, bytes)) = image {
+                history.push(History::UserImage { text, media, bytes });
+            } else if !text.is_empty() {
+                history.push(History::User(text));
+            }
+        } else {
+            let reasoning = if let Some(rule) = meta
+                .replay_rule(target)
+                .filter(|_| pin.replay_reasoning && meta.reasoning_bytes > 0)
+            {
+                let json: String = sqlx::query_scalar(
+                    "SELECT reasoning_blocks::text FROM openmettle.message_turns
+                    WHERE scope_id=$1::uuid AND conversation_id=$2::uuid AND message_id=$3::uuid",
+                )
+                .bind(chat.scope)
+                .bind(chat.id)
+                .bind(&meta.message_id)
+                .fetch_one(&mut *c)
+                .await?;
+                Some(Reasoning {
+                    source: Box::new(rule.source.clone()),
+                    blocks: serde_json::from_str(&json).map_err(|_| invalid())?,
+                    storage_bytes: meta.reasoning_bytes as usize,
+                })
+            } else {
+                None
+            };
+            if !text.is_empty() || reasoning.is_some() {
+                history.push(History::Assistant {
+                    parts: text,
+                    reasoning,
+                    calls: vec![],
+                });
+            }
+        }
+    }
+    Ok(WorkerPrompt {
+        actor: actor_id,
+        config,
+        history,
+    })
+}
+
+async fn worker_image(
+    c: &mut PgConnection,
+    scope: &str,
+    id: &str,
+    store: &crate::artifact_fs::Store,
+    remaining: &mut i64,
+) -> Result<(crate::provider_http::inference::ImageType, Vec<u8>), StoreError> {
+    use crate::provider_http::inference::ImageType;
+    use http_body_util::BodyExt;
+    let (reservation, size, media): (String, i64, String) = sqlx::query_as(
+        "SELECT reservation_id::text,size_bytes,media_type FROM openmettle.artifact_revisions
+         WHERE scope_id=$1::uuid AND id=$2::uuid AND state='active'",
+    )
+    .bind(scope)
+    .bind(id)
+    .fetch_optional(c)
+    .await?
+    .ok_or(HIDDEN)?;
+    let media = match media.as_str() {
+        "image/jpeg" => ImageType::Jpeg,
+        "image/png" => ImageType::Png,
+        _ => return Err(StoreError::InvalidInput("unsupported attachment")),
+    };
+    // The inference transport bounds the whole request to 2 MiB after base64 encoding.
+    if !(1..=*remaining).contains(&size) {
+        return Err(StoreError::InvalidInput("attachment size"));
+    }
+    *remaining -= size;
+    let body = store
+        .read(&reservation, size, 0, size as u64)
+        .await
+        .map_err(|_| HIDDEN)?;
+    Ok((
+        media,
+        body.collect()
+            .await
+            .map_err(|_| HIDDEN)?
+            .to_bytes()
+            .to_vec(),
+    ))
 }

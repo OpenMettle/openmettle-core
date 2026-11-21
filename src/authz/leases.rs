@@ -1,6 +1,7 @@
 //! Worker ownership and recovery store (ADR 0033). All times come from the primary.
 //! Anchor remaining durations at the instant the request was sent.
 use super::{
+    branches::{self, Answer},
     runs::{ClaimedRun, TERMINAL_KEY, append, is_terminal, transaction},
     store::{self, StoreError},
 };
@@ -547,13 +548,74 @@ pub(super) async fn settle_locked(
     settings: &LeaseSettings,
     input: Settle,
 ) -> Result<Settled, StoreError> {
+    let (n, time) = settlement_inputs(c, lease, settings).await?;
+    let resolution = decide(state, cancel, input, n, time)?;
+    finish_resolution(c, lease, resolution).await
+}
+
+async fn settlement_inputs(
+    c: &mut PgConnection,
+    lease: &Lease<'_>,
+    settings: &LeaseSettings,
+) -> Result<(u32, bool), StoreError> {
     let (n, time): (i64, bool) = sqlx::query_as(SETTLEMENT_INPUTS)
         .bind(lease.scope_id)
         .bind(lease.run_id)
         .bind(settings.lease.as_millis() as i64)
         .fetch_one(&mut *c)
         .await?;
-    let resolution = decide(state, cancel, input, operation_count(n)?, time)?;
+    Ok((operation_count(n)?, time))
+}
+
+/// Publish and settle under one run lock. A conflict rolls back all graph writes before
+/// trying the terminal failure under a fresh fence (a new holder may already own the run).
+pub async fn settle_answer(
+    c: &mut PgConnection,
+    lease: &Lease<'_>,
+    settings: &LeaseSettings,
+    answer: &Answer<'_>,
+) -> Result<Settled, LeaseError> {
+    settings.validate()?;
+    let result = fenced(c, lease, Fence::Hold, async |tx, held| {
+        let c = tx.connection()?;
+        let (unresolved, time) = settlement_inputs(c, lease, settings).await?;
+        if held.state != ExecState::Running || held.cancel.is_some() || unresolved != 0 {
+            let disposition = decide(held.state, held.cancel, Settle::Stopped, unresolved, time)?;
+            return finish_resolution(c, lease, disposition).await;
+        }
+        branches::publish_locked_answer(c, lease.scope_id, lease.run_id, answer).await?;
+        let settled = finish_resolution(c, lease, Resolution::Succeeded).await?;
+        // Lock waits in publication or event append count against both clocks.
+        let live: bool = sqlx::query_scalar(
+            "SELECT least(lease_expires_at, execution_expires_at)
+            > clock_timestamp() FROM openmettle.runs WHERE scope_id=$1::uuid AND id=$2::uuid",
+        )
+        .bind(lease.scope_id)
+        .bind(lease.run_id)
+        .fetch_one(c)
+        .await?;
+        if !live {
+            return Err(StoreError::Conflict("answer lease expired"));
+        }
+        Ok(settled)
+    })
+    .await;
+    match result {
+        Err(LeaseError::Store(StoreError::Conflict(branches::HEAD_MISMATCH))) => {
+            settle(c, lease, settings, Settle::Failed(FailReason::StepFailed)).await
+        }
+        Err(LeaseError::Store(StoreError::Conflict("answer lease expired"))) => {
+            Err(LeaseError::Expired)
+        }
+        other => other,
+    }
+}
+
+async fn finish_resolution(
+    c: &mut PgConnection,
+    lease: &Lease<'_>,
+    resolution: Resolution,
+) -> Result<Settled, StoreError> {
     sqlx::query("UPDATE openmettle.runs SET state = $3, wait_reason = NULL WHERE scope_id = $1::uuid AND id = $2::uuid")
         .bind(lease.scope_id)
         .bind(lease.run_id)
