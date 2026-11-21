@@ -85,27 +85,35 @@ Unlike `authz::store::disable_user` (which calls `authz::runs::cancel_user_runs`
 transaction), ADR 0013's standalone owner disablement SQL updates only `openmettle.users`
 (`disabled_at` and `session_generation`) and does **not** cancel or fence the user's
 non-terminal `openmettle.runs` rows, so a `queued` or `waiting` run could otherwise remain
-non-terminal and resume if the account were later re-enabled. As part of the same owner
-disablement recovery procedure, cancel or fence every non-terminal `openmettle.runs` row for
-that `actor_user_id` (`state NOT IN ('succeeded', 'failed', 'cancelled', 'interrupted')`
-where `state IN ('queued', 'waiting') OR cancel_reason IS NULL`), matching
-`authz::store::disable_user` and `authz::runs::cancel_user_runs` lock order and semantics:
-lock affected `openmettle.runs` rows in ascending `id` order (`ORDER BY id FOR NO KEY UPDATE`)
-**after** locking `openmettle.account_admin_lock` and `openmettle.users`; transition `queued`
-and `waiting` runs directly to `state = 'cancelled'` with `wait_reason = NULL` and
-`cancel_reason = coalesce(cancel_reason, 'revoked')`, appending the terminal
-`openmettle.run_events` row (`append_key = 'run-terminal'`, `format = 'openmettle.run-cancelled'`,
-`format_version = 1`, payload `{"reason":"revoked"}`, advancing `last_event_sequence` with
-matching ADR 0004 `identity` and `digest`); transition `running` runs to `state = 'cancelling'`
-and leave `reconciling` runs in `state = 'reconciling'`, in both cases clearing
-`wait_reason = NULL`, setting `cancel_reason = coalesce(cancel_reason, 'revoked')`, and
-appending the cancellation-request event (`append_key = 'cancel-requested'`,
-`format = 'openmettle.run-cancel-requested'`, `format_version = 1`, payload
-`{"reason":"revoked"}`) so leased workers stop and settle in-flight work rather than
-overwriting an executing run directly to `cancelled`. Wait for any `cancelling` or
-`reconciling` runs to settle and verify that **zero** non-terminal `openmettle.runs` rows
+non-terminal and resume if the account were later re-enabled. On **schema version 20 or later**
+(where `openmettle.runs.cancel_reason` exists; `wait_reason` exists from schema 3 and clearing
+`wait_reason = NULL` also satisfies schema 22's approval-wait check constraint when
+transitioning out of `waiting`), cancel or fence every non-terminal `openmettle.runs` row for
+that `actor_user_id` (`state NOT IN ('succeeded', 'failed', 'cancelled', 'interrupted')` where
+`state IN ('queued', 'waiting') OR cancel_reason IS NULL`) in the same disablement transaction,
+matching `authz::store::disable_user` and `authz::runs::cancel_user_runs` lock order and
+semantics: lock affected `openmettle.runs` rows in ascending `id` order
+(`ORDER BY id FOR NO KEY UPDATE`) **after** locking `openmettle.account_admin_lock` and
+`openmettle.users`; transition `queued` and `waiting` runs directly to `state = 'cancelled'`
+with `wait_reason = NULL` and `cancel_reason = coalesce(cancel_reason, 'revoked')`, appending
+the terminal `openmettle.run_events` row (`append_key = 'run-terminal'`,
+`format = 'openmettle.run-cancelled'`, `format_version = 1`, payload `{"reason":"revoked"}`,
+advancing `last_event_sequence` with matching ADR 0004 `identity` and `digest`); transition
+`running` runs to `state = 'cancelling'` and leave `reconciling` runs in
+`state = 'reconciling'`, in both cases clearing `wait_reason = NULL`, setting
+`cancel_reason = coalesce(cancel_reason, 'revoked')`, and appending the cancellation-request
+event (`append_key = 'cancel-requested'`, `format = 'openmettle.run-cancel-requested'`,
+`format_version = 1`, payload `{"reason":"revoked"}`) so leased workers stop and settle
+in-flight work rather than overwriting an executing run directly to `cancelled`. **Commit
+(`COMMIT`)** the `openmettle.users` update, `openmettle.runs` transitions, and
+`openmettle.run_events` appends together first so the `openmettle.runs` row locks are released
+and leased workers can acquire those rows to settle. **After that commit**, wait for any
+`cancelling` or `reconciling` runs to settle and verify in a **fresh transaction** that
+**zero** non-terminal `openmettle.runs` rows
 (`state NOT IN ('succeeded', 'failed', 'cancelled', 'interrupted')`) remain for that
-`actor_user_id` before re-enabling the account.
+`actor_user_id` before re-enabling the account. On earlier schemas (15–19), before
+`cancel_reason` existed, use the runbook and schema procedure matching your deployed schema
+version rather than referencing columns introduced in later migrations.
 
 Do **not** rely on `revoke` or the
 [session cleanup procedure](session-cleanup.md) to cut off a compromised administrator:
