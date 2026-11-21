@@ -1121,6 +1121,20 @@ pub async fn authorize_create_in_scope(
     scope_id: &str,
     now_ms: i64,
 ) -> Result<(), StoreError> {
+    if authorized_create_scope_is_archived(c, principal, scope_id, now_ms).await? {
+        return Err(ARCHIVED);
+    }
+    Ok(())
+}
+
+/// Check current create authority before an audit replay. A caller may return a recorded
+/// target in an archived project, but must roll back a new write there.
+pub(super) async fn authorized_create_scope_is_archived(
+    c: &mut PgConnection,
+    principal: &Principal,
+    scope_id: &str,
+    now_ms: i64,
+) -> Result<bool, StoreError> {
     active(principal)?;
     uuid(scope_id, "scope_id")?;
     let owner: Option<(Option<String>, Option<String>)> = sqlx::query_as(
@@ -1152,10 +1166,7 @@ pub async fn authorize_create_in_scope(
         &scope,
         Action::CreateInScope,
     ))?;
-    if archived {
-        return Err(ARCHIVED);
-    }
-    Ok(())
+    Ok(archived)
 }
 
 /// Read one conversation or artifact for `principal` with [`super::authorize_resource`]. An

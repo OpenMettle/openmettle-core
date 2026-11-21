@@ -672,7 +672,8 @@ pub struct PlatformPolicy {
 }
 
 /// Whether a capability is available unless denied, or requires an explicit assignment.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CapabilityGate {
     OnByDefault,
     /// For example `runs.use_yolo`: off unless assigned to the user.
@@ -754,6 +755,7 @@ pub fn authorize_run_continuation(
     }
 }
 
+pub mod branches;
 pub mod leases;
 pub mod projects;
 pub mod runs;

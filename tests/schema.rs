@@ -573,6 +573,21 @@ const ADDITIVE_TABLES: &[AdditiveTable] = &[
         table: "run_dispatch_lock",
         seed_row: Some(SINGLETON_LOCK_SEED),
     },
+    AdditiveTable {
+        since: 21,
+        table: "branch_heads",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 21,
+        table: "message_parts",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 21,
+        table: "message_turns",
+        seed_row: None,
+    },
 ];
 
 fn additive_columns_since(base_version: i64) -> impl Iterator<Item = &'static AdditiveColumn> {
@@ -730,6 +745,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "26a9aff24fdead77748763b8e73ecf834faddfcfa5b0c3b70eebc5dd624000db",
         "93686928e8f33f08c340f6dbe6348727a1f9abb4c44c0e68061d10578d181e59",
         "a4a226cb408141a41dfb7e174646d7027af6d34c34020d6ba8401aa6dfad7116",
+        "47ee7ed667d0f65034e4b9ea8315f66807ae8ed5a4428f3afc1763d205c8bc00",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
@@ -855,7 +871,7 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
     let after_14: Vec<(&str, Option<&str>)> = expected_added_tables_since(14)
         .map(|e| (e.table, e.seed_row))
         .collect();
-    assert_eq!(after_14.len(), 10);
+    assert_eq!(after_14.len(), 13);
     assert!(after_14.contains(&("account_admin_lock", Some(SINGLETON_LOCK_SEED))));
     assert!(after_14.contains(&("run_dispatch_lock", Some(SINGLETON_LOCK_SEED))));
     let after_18: Vec<(&str, Option<&str>)> = expected_added_tables_since(18)
@@ -863,7 +879,12 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
         .collect();
     assert_eq!(
         after_18,
-        vec![("run_dispatch_lock", Some(SINGLETON_LOCK_SEED))]
+        vec![
+            ("run_dispatch_lock", Some(SINGLETON_LOCK_SEED)),
+            ("branch_heads", None),
+            ("message_parts", None),
+            ("message_turns", None)
+        ]
     );
 
     // `normalize_upgraded_row` strips only columns added after `base_version` when they hold
@@ -2386,3 +2407,6 @@ mod ca;
 #[allow(dead_code)]
 #[path = "contract/consumer.rs"]
 mod consumer;
+
+#[path = "schema/branches.rs"]
+mod branches;

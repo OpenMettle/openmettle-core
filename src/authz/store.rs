@@ -196,7 +196,7 @@ pub struct AuditContext<'a> {
 }
 
 impl AuditContext<'_> {
-    fn validate(&self) -> Result<(), StoreError> {
+    pub(super) fn validate(&self) -> Result<(), StoreError> {
         uuid(self.actor_user_id, "actor_user_id")?;
         uuid(self.actor_approval_id, "actor_approval_id")?;
         // PostgreSQL text cannot hold NUL, so it is refused here rather than by the database.
@@ -211,11 +211,24 @@ impl AuditContext<'_> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WriteOutcome {
+pub enum WriteOutcome<T = String> {
     /// The change was applied and audited in one committed transaction.
-    Applied { target_id: String },
+    Applied { target_id: T },
     /// The request key already recorded this exact change; nothing was written.
-    Replayed { target_id: String },
+    Replayed { target_id: T },
+}
+
+impl<T> WriteOutcome<T> {
+    pub(super) fn map<U>(self, f: impl FnOnce(T) -> U) -> WriteOutcome<U> {
+        match self {
+            Self::Applied { target_id } => WriteOutcome::Applied {
+                target_id: f(target_id),
+            },
+            Self::Replayed { target_id } => WriteOutcome::Replayed {
+                target_id: f(target_id),
+            },
+        }
+    }
 }
 
 impl WriteOutcome {
@@ -261,7 +274,7 @@ fn capability(name: &str) -> Result<(), StoreError> {
     }
 }
 
-fn unique(error: sqlx::Error, constraint: &str, conflict: &'static str) -> StoreError {
+pub(super) fn unique(error: sqlx::Error, constraint: &str, conflict: &'static str) -> StoreError {
     match &error {
         sqlx::Error::Database(e) if e.constraint() == Some(constraint) => {
             StoreError::Conflict(conflict)

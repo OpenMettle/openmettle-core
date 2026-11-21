@@ -418,7 +418,12 @@ async fn identical_admissions_admit_once_and_replays_keep_the_original_admission
         ),
         (run.as_str(), "queued", Some(50))
     );
+    assert_eq!(found.branch_id, r.branch);
     assert_eq!(found.input_message_id, r.message);
+    assert_eq!(found.snapshot_format, r.input().format);
+    assert_eq!(found.snapshot_version, r.input().version);
+    assert_eq!(found.input_snapshot, r.input().input);
+    assert_eq!(found.config_snapshot, r.input().config);
     assert!(found.matches(&r.input()));
     let changed = Request {
         input: b"changed input".to_vec(),
