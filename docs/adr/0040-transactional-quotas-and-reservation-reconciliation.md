@@ -12,9 +12,9 @@ POSIX `dirfd` dependency**: `rustix` (`default-features = false, features = ["fs
 `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`, `https://github.com/bytecodealliance/rustix`;
 `bitflags`, `cfg-if`, `errno` and `libc` are already locked in `Cargo.lock`) so all
 directory-relative `openat`, `fstat`, `statat(..., AtFlags::SYMLINK_NOFOLLOW)`, `linkat`,
-`renameat_with(..., RenameFlags::NOREPLACE)`, `unlinkat` and `fsync` operations compile safely with
-zero `unsafe` in `openmettle-core` (updating the `Cargo.lock` distribution-blocker count per
-[ADR 0007](0007-application-api-contract.md) and [ADR 0010](0010-provider-http-transport.md)).
+`unlinkat` and `fsync` operations compile safely with zero `unsafe` in `openmettle-core` (updating
+the `Cargo.lock` distribution-blocker count per [ADR 0007](0007-application-api-contract.md) and
+[ADR 0010](0010-provider-http-transport.md)).
 
 ## Decision
 
@@ -30,10 +30,10 @@ reservation exactly once internally.
 
 | Existing boundary | V1-17 addition |
 | --- | --- |
-| [ADR 0005](0005-artifact-storage-accounting.md), [`src/storage.rs`](../../src/storage.rs) | Keep `storage_instance`, `storage_accounts`, `storage_reservations` and `artifact_revisions` as the single storage ledger. Add `storage_instance.volume_id`, `storage_instance.bootstrap_auto_pin_allowed`, nullable **`storage_instance.adoption_run_id uuid`** (`DEFAULT NULL`), per-scope overrides, fail-closed rolling-upgrade PostgreSQL ledger backstop triggers on `storage_accounts` (`OMQ01`), on `storage_reservations`/`artifact_revisions` for unpinned or adopting runtime releases/purges (**`SECURITY INVOKER`** `enforce_runtime_storage_volume_pinned()`, `OMQ03`, acquiring `SELECT 1 FROM openmettle.storage_instance WHERE id FOR SHARE` before checking `volume_id IS NULL OR adoption_run_id IS NOT NULL` across both `INHERIT` and `NOINHERIT`/`SET ROLE` logins so in-flight `storage::release` strictly serializes with adoption Step 1b's `FOR UPDATE`), **`SECURITY INVOKER` `enforce_storage_reservation_monotonic_guards()`** (`OMQ03`, preventing any non-`openmettle_owner` role from clearing `adoption_unverified`, mutating or clearing non-null `payload_ino`, or clearing `stage_claimed`), `storage_reservations_tool_spill_binding_guard` (`23514`) enforcing `run_id IS NOT NULL AND operation_id IS NOT NULL` for all new/updated `tool-spill:*` rows, warning thresholds, reservation `lease_expires_at`, **`stage_claimed boolean NOT NULL DEFAULT false`** (`CHECK (payload_ino IS NULL OR stage_claimed)`), nullable **`payload_ino numeric(20, 0)`** (`CHECK (payload_ino IS NULL OR payload_ino >= 0)`, exact unsigned 64-bit `u64` `MetadataExt::ino()`, dropping host-local `payload_dev` because Linux NFS assigns client-local anonymous `st_dev` via `get_anon_bdev`; verified locally per host via `file_meta.dev() == dir_fd_meta.dev() == root_fd_meta.dev()` plus role-tagged sentinels and `file_meta.ino() == payload_ino`, write-once and **never** cleared to `NULL`, retained on `'settled'` and `'released'` rows, and backfilled by adoption Step 3 on all verified `'reserved'` and `'active'`/`'retained'` `'settled'` rows), **`publish_pending`** (`CHECK (NOT publish_pending OR (state = 'reserved' AND payload_ino IS NOT NULL))`, committed `true` strictly before `renameat_with(..., RenameFlags::NOREPLACE)` and cleared `false` by `storage::settle` or on transition to `reclaim_state = 'truncated'`), unified 3-state cleaner lease **`reclaim_state text NOT NULL DEFAULT 'none' CHECK (reclaim_state IN ('none', 'claiming', 'truncated'))`**, **`reclaim_claim_token uuid`**, **`reclaim_lease_until timestamptz`** (`CHECK (state = 'reserved' OR reclaim_state = 'none')`, `CHECK ((reclaim_state = 'none' AND reclaim_claim_token IS NULL AND reclaim_lease_until IS NULL) OR (reclaim_state IN ('claiming', 'truncated') AND reclaim_claim_token IS NOT NULL AND reclaim_lease_until IS NOT NULL))`, `CHECK (reclaim_state <> 'truncated' OR NOT publish_pending)`), `adoption_unverified` (`CHECK (NOT adoption_unverified OR state IN ('reserved', 'released'))`, cleared **solely** by `openmettle_owner` reconciliation or verified `openmettle-admin` adoption, enforced in PostgreSQL by `enforce_storage_reservation_monotonic_guards()`), and DB-plus-filesystem drift verification (with concurrent `begin_purge` re-query and post-pinning `payload_ino IS NULL` hard failure). |
-| [ADR 0031](0031-filesystem-artifact-storage-and-streaming-multipart.md), [`src/artifact_fs.rs`](../../src/artifact_fs.rs) | Bind upload reservations (`run_id IS NULL`) to `lease_expires_at` within the 600 s upload timeout plus 300 s settlement margin. Retain `Arc`-shared verified directory descriptors (`root_fd`, `staging_dir_fd`, `revisions_dir_fd`: `OwnedFd` via `rustix::fs::openat` with `OFlags::RDONLY \| OFlags::DIRECTORY \| OFlags::NOFOLLOW`) across `artifact_fs::Store` and execute **all** writer, reader and cleaner operations strictly relative to those verified directory FDs. Enforce the **unified rollout rule**: HTTP `Store::stage` and `Store::publish` (`openmettle_api`) succeed when `adoption_run_id IS NULL` both when `volume_id IS NOT NULL` (verifying role-tagged sentinels) and during mixed-version rolling upgrade while `volume_id IS NULL` (skipping sentinel reads while still setting `stage_claimed = true` and binding `payload_ino = staged_ino`), whereas ADR 0039 worker `publish_bytes` spills and all 4 cleaners strictly require `volume_id IS NOT NULL AND adoption_run_id IS NULL`. `Store::stage` executes **Step 1a** (short lock-ordered `FOR UPDATE` tx + `storage_instance FOR SHARE` committing `SET stage_claimed = true` strictly BEFORE touching disk), **Step 1b** (re-verify directory FDs + sentinels when `volume_id IS NOT NULL`, `openat(&staging_dir_fd, id, OFlags::CREATE \| OFlags::EXCL \| OFlags::RDWR \| OFlags::NOFOLLOW)` `0` bytes -> `LOCK_SH` `try_lock_shared()` -> verify `file_meta` vs `statat` `S_ISREG` + local `st_dev` + `staged_ino = file_meta.ino()` -> **`fsync(&staging_dir_fd)`** crash-durable strictly BEFORE binding `payload_ino`), and **Step 1c** (short lock-ordered `FOR UPDATE` tx + `storage_instance FOR SHARE` committing `SET payload_ino = staged_ino` where `state = 'reserved' AND NOT adoption_unverified AND stage_claimed AND payload_ino IS NULL AND reclaim_state = 'none'`). **`StagedFile::drop` (and all writer error/cancellation paths in `Store::stage`, `Store::publish`, and ADR 0039 `publish_bytes`) is 100% non-destructive — it NEVER calls `set_len(0)` and NEVER calls `unlinkat`, ONLY closing the file descriptor (releasing `LOCK_SH`)**; on ambiguous `storage::settle` commit, callers never call `artifact_fs::abort` blindly and first inspect `storage_reservations.state` under `(runs FOR NO KEY UPDATE ->) storage_reservations FOR UPDATE` (if `'settled'`, publication succeeded). `Store::publish` and `publish_bytes` commit `SET publish_pending = true` under `FOR UPDATE` (`state = 'reserved' AND NOT adoption_unverified AND payload_ino = staged_ino AND reclaim_state = 'none'`) strictly before publishing exclusively via **`rustix::fs::renameat_with(&staging_dir_fd, id, &revisions_dir_fd, id, RenameFlags::NOREPLACE)`** (`Errno::EXIST` leaves any foreign `revisions/<id>` untouched and quarantines `adoption_unverified = true, publish_pending = false`), re-verify directory FDs + sentinels + `statat(&revisions_dir_fd, id)` matching `staged_ino` and `size_bytes` post-rename and pre-commit, and commit `storage::settle` requiring `state = 'reserved' AND NOT adoption_unverified AND payload_ino = staged_ino AND reclaim_state = 'none'` while **retaining `payload_ino`**. **`Store::read`** joins `storage_reservations` (`storage::read_revision`) to load `(r.size_bytes, sr.payload_ino, sr.adoption_unverified)`, rejects `sr.adoption_unverified = true` (`Error::Io`), re-verifies `<root>` and `"revisions"` pathname-to-FD `(st_dev, st_ino)` (+ `:root`/`:revisions` sentinels when `volume_id IS NOT NULL`), opens `revisions/<id>` (`OFlags::RDONLY \| OFlags::NOFOLLOW \| OFlags::NONBLOCK`), verifies `S_ISREG`, local `file_meta.dev() == revisions_dir_fd_dev`, `file_meta.len() == expected_size`, AND requires `file_meta.ino() == sr.payload_ino` whenever `sr.payload_ino IS NOT NULL` (allowing `sr.payload_ino IS NULL` **ONLY** during pre-adoption rolling upgrade while `volume_id IS NULL AND adoption_run_id IS NULL`, failing closed `Error::Io` once `volume_id IS NOT NULL`). Enforce **one unified 3-step reclamation protocol** across all 4 cleaners (`artifact_fs::abort`, non-run `reconcile_expired`, generic run-linked recovery, and ADR 0039 `reconcile_run_spills`) with **ZERO filesystem I/O inside Step 1 or Step 3 DB transactions**: **Step 1** serialized DB claim under `(runs FOR NO KEY UPDATE [SKIP LOCKED] ->) storage_reservations FOR UPDATE [SKIP LOCKED]` + `storage_instance FOR SHARE` (`volume_id = $expected_volume_id AND adoption_run_id IS NULL`) setting `reclaim_state = CASE WHEN reclaim_state = 'truncated' THEN 'truncated' ELSE 'claiming' END, reclaim_claim_token = $my_token, reclaim_lease_until = clock_timestamp() + interval '60 seconds'`; **Step 2** outside DB tx: in **Case 1 (`payload_ino IS NOT NULL`)**, foreign/non-regular/different-local-`st_dev`/`st_ino != payload_ino` (in BOTH `'claiming'` and `'truncated'`) OR dual `ENOENT` while `'claiming'` performs **zero `set_len(0)` / `unlinkat`** and quarantines (`adoption_unverified = true, publish_pending = false, reclaim_state = 'none', reclaim_claim_token = NULL, reclaim_lease_until = NULL`) under `reclaim_claim_token = $my_token` guard; dual `ENOENT` while `'truncated'` runs dual `fsync` -> Step 3; on exact `st_ino == payload_ino` under `LOCK_EX`, `'claiming'` executes **`probe_file.set_len(0)?` + `probe_file.sync_all()?`** -> short `FOR UPDATE` tx committing **`reclaim_state = 'truncated', publish_pending = false`** (retaining `payload_ino` non-null!) -> `unlinkat` -> `drop` -> dual `fsync(&staging_dir_fd)` & `fsync(&revisions_dir_fd)`; in **Case 2 (`payload_ino IS NULL`)**, any `revisions/<id>` or non-regular/different-local-`st_dev`/`st_size > 0` `staging/<id>` quarantines untouched, `0`-byte regular `staging/<id>` unlinks under `LOCK_EX`, then dual `fsync`; **Step 3** locks `(runs ->) storage_reservations` + `storage_instance FOR SHARE` with **ZERO FS I/O**, requires `state = 'reserved' AND NOT adoption_unverified AND NOT publish_pending AND reclaim_claim_token = $my_token AND (payload_ino IS NULL OR reclaim_state = 'truncated')`, clears `reclaim_*`, and commits `storage::release` (**retaining `payload_ino`** on `'released'`). Pin durable artifact volume identity (`storage_instance.volume_id` <-> role-tagged sentinels `<root>/.openmettle-volume-id`, `<root>/revisions/.openmettle-volume-id`, `<root>/staging/.openmettle-volume-id` via safe `rustix` `dirfd` ops, unique `.tmp.<128bit_random_hex>` + `fsync` + `linkat` + `fsync(root_fd)` barrier before child sentinels); serialize adoption via unique `my_adoption_run_id = uuid_v4()` in **Step 1b** (`SELECT ... FROM storage_instance WHERE id FOR UPDATE`, rejecting non-null `adoption_run_id` with `OMQ03` unless `--replace-adoption-run <stale_uuid>` matches), Step 2 scan (failure clears `adoption_run_id = NULL` only `WHERE id AND adoption_run_id = $my_adoption_run_id`), and **Step 3** (`storage_reservations -> artifact_revisions -> storage_accounts -> storage_instance FOR UPDATE`, requiring `adoption_run_id = $my_adoption_run_id`, backfilling `payload_ino` on all verified `'reserved'` and `'active'`/`'retained'` `'settled'` rows, quarantining unaccounted `'reserved'` rows, pinning `volume_id`, and clearing `adoption_run_id = NULL`); qualify `O_CREAT \| O_EXCL \| O_NOFOLLOW`, `RenameFlags::NOREPLACE`, file+dir `fsync`, AND on `ReadWriteMany` shared volumes both two-client `flock(2)` coherence and stable 64-bit `st_ino` coherence + second-client recovery; gate all `N` cleaners (`purge_due` unconditionally `fsync`ing `revisions_dir_fd` even on `ENOENT`, `reconcile_expired`, run-linked recovery, `StagingSweepState`) on `volume_id IS NOT NULL AND adoption_run_id IS NULL`. |
+| [ADR 0005](0005-artifact-storage-accounting.md), [`src/storage.rs`](../../src/storage.rs) | Keep `storage_instance`, `storage_accounts`, `storage_reservations` and `artifact_revisions` as the single storage ledger, adding `warn_pct_1`, `warn_pct_2`, and `config_revision` on `storage_instance`, plus a dedicated 1-row read-mostly control table **`openmettle.storage_volume_control (id, volume_id, bootstrap_auto_pin_allowed, adoption_run_id)`** (eliminating `storage_instance` `FOR SHARE` -> `FOR NO KEY UPDATE` deadlocks with `storage::adjust` in `src/storage.rs:289-310`, because runtime `reserve`/`settle`/`release`/`purge` ONLY ever acquire `FOR SHARE` on `storage_volume_control` and NEVER `UPDATE` it while `storage_instance` is updated strictly after `storage_accounts`). Add per-scope overrides, fail-closed rolling-upgrade PostgreSQL ledger backstop triggers on `storage_accounts` (`OMQ01`), on `storage_reservations`/`artifact_revisions` for unpinned or adopting runtime releases/purges (**`SECURITY INVOKER`** `enforce_runtime_storage_volume_pinned()`, `OMQ03`, acquiring `SELECT volume_id, adoption_run_id INTO v_vol, v_adopt FROM openmettle.storage_volume_control WHERE id FOR SHARE` and failing closed on `NOT FOUND OR v_vol IS NULL OR v_adopt IS NOT NULL` across both `INHERIT` and `NOINHERIT`/`SET ROLE` logins so in-flight `storage::release` strictly serializes with adoption Step 1b's `FOR UPDATE` on `storage_volume_control` with zero deadlock), **`SECURITY INVOKER` `enforce_storage_reservation_monotonic_guards()`** (`OMQ03`, preventing any non-`openmettle_owner` role from clearing `adoption_unverified`, mutating or clearing non-null `payload_ino`, or clearing `stage_claimed`), `storage_reservations_tool_spill_binding_guard` (`23514`) enforcing `run_id IS NOT NULL AND operation_id IS NOT NULL` for all new/updated `tool-spill:*` rows, warning thresholds, reservation `lease_expires_at`, **`stage_claimed boolean NOT NULL DEFAULT false`** (`CHECK (payload_ino IS NULL OR stage_claimed)`), nullable **`payload_ino numeric(20, 0)`** (`CHECK (payload_ino IS NULL OR payload_ino >= 0)`, exact unsigned 64-bit `u64` `MetadataExt::ino()`, dropping host-local `payload_dev` because Linux NFS assigns client-local anonymous `st_dev` via `get_anon_bdev`; verified locally per host via `file_meta.dev() == dir_fd_meta.dev() == root_fd_meta.dev()` plus role-tagged sentinels and `file_meta.ino() == payload_ino`, write-once and **never** cleared to `NULL`, retained on `'settled'` and `'released'` rows, and backfilled by adoption Step 3 **only in the success branch** on verified `'reserved'` and `'active'`/`'retained'` `'settled'` rows), **`publish_pending`** (`CHECK (NOT publish_pending OR (state = 'reserved' AND payload_ino IS NOT NULL))`, committed `true` strictly before `linkat` publication and cleared `false` by `storage::settle` or on transition to `reclaim_state = 'truncated'`), unified 4-state cleaner lease **`reclaim_state text NOT NULL DEFAULT 'none' CHECK (reclaim_state IN ('none', 'claiming', 'truncated', 'anchor_pending_unlink'))`**, **`reclaim_claim_token uuid`**, **`reclaim_lease_until timestamptz`** (`CHECK ((state = 'reserved' AND reclaim_state IN ('none', 'claiming', 'truncated')) OR (state = 'released' AND reclaim_state IN ('none', 'anchor_pending_unlink')) OR (state = 'settled' AND reclaim_state = 'none'))`, `CHECK ((reclaim_state IN ('claiming', 'truncated') AND reclaim_claim_token IS NOT NULL AND reclaim_lease_until IS NOT NULL) OR (reclaim_state IN ('none', 'anchor_pending_unlink') AND reclaim_claim_token IS NULL AND reclaim_lease_until IS NULL))`, `CHECK (reclaim_state NOT IN ('truncated', 'anchor_pending_unlink') OR NOT publish_pending)`), tightened **`adoption_unverified` (`CHECK (NOT adoption_unverified OR state = 'reserved')`)** so combined with `enforce_storage_reservation_monotonic_guards()` **no non-owner role can EVER transition a quarantined `'reserved'` row to `'released'` or `'settled'`** (cleared **solely** by `openmettle_owner` reconciliation or verified `openmettle-admin` adoption), and DB-plus-filesystem drift verification (with concurrent `begin_purge` re-query, `staging/.reclaim.<id>` anchor recognition, and post-pinning `payload_ino IS NULL` hard failure). |
+| [ADR 0031](0031-filesystem-artifact-storage-and-streaming-multipart.md), [`src/artifact_fs.rs`](../../src/artifact_fs.rs) | Bind upload reservations (`run_id IS NULL`) to `lease_expires_at` within the 600 s upload timeout plus 300 s settlement margin. Retain `Arc`-shared verified directory descriptors (`root_fd`, `staging_dir_fd`, `revisions_dir_fd`: `OwnedFd` via `rustix::fs::openat` with `OFlags::RDONLY \| OFlags::DIRECTORY \| OFlags::NOFOLLOW`) across `artifact_fs::Store` and execute **all** writer, reader and cleaner operations strictly relative to those verified directory FDs. Enforce the **unified rollout rule**: HTTP `Store::stage` and `Store::publish` (`openmettle_api`) succeed when `storage_volume_control.adoption_run_id IS NULL` both when `volume_id IS NOT NULL` (verifying role-tagged sentinels) and during mixed-version rolling upgrade while `volume_id IS NULL` (skipping sentinel reads while still setting `stage_claimed = true` and binding `payload_ino = staged_ino`), whereas ADR 0039 worker `publish_bytes` spills and all 4 cleaners strictly require `storage_volume_control.volume_id IS NOT NULL AND adoption_run_id IS NULL`. `Store::stage` executes **Step 1a** (short lock-ordered `FOR UPDATE` tx + `storage_volume_control FOR SHARE` committing `SET stage_claimed = true` strictly BEFORE touching disk), **Step 1b** (re-verify directory FDs + sentinels when `volume_id IS NOT NULL`, `openat(&staging_dir_fd, id, OFlags::CREATE \| OFlags::EXCL \| OFlags::RDWR \| OFlags::NOFOLLOW)` `0` bytes -> `LOCK_SH` `try_lock_shared()` -> verify `file_meta` vs `statat` `S_ISREG` + local `st_dev` + `staged_ino = file_meta.ino()` -> **`fsync(&staging_dir_fd)`** crash-durable strictly BEFORE binding `payload_ino`), and **Step 1c** (short lock-ordered `FOR UPDATE` tx + `storage_volume_control FOR SHARE` committing `SET payload_ino = staged_ino` where `state = 'reserved' AND NOT adoption_unverified AND stage_claimed AND payload_ino IS NULL AND reclaim_state = 'none'`). **`StagedFile::drop` (and all writer error/cancellation paths in `Store::stage`, `Store::publish`, and ADR 0039 `publish_bytes`) is 100% non-destructive — it NEVER calls `set_len(0)` and NEVER calls `unlinkat`, ONLY closing the file descriptor (releasing `LOCK_SH`)**; on ambiguous `storage::settle` commit, callers never call `artifact_fs::abort` blindly and first inspect `storage_reservations.state` under `(runs FOR NO KEY UPDATE ->) storage_reservations FOR UPDATE` (if `'settled'`, publication succeeded). `Store::publish` and `publish_bytes` commit `SET publish_pending = true` under `FOR UPDATE` (`state = 'reserved' AND NOT adoption_unverified AND payload_ino = staged_ino AND reclaim_state = 'none'`) strictly before publishing exclusively via **`rustix::fs::linkat(&staging_dir_fd, id, &revisions_dir_fd, id, AtFlags::empty())`** (mandatory POSIX/NFS `LINK` that **atomically fails with `Errno::EXIST` (`EEXIST`) without overwriting any existing `revisions/<id>`** AND **keeps `staging/<id>` present on disk throughout the entire unsettled `state = 'reserved'` window** so any mixed-version same-key retry routed to an `N-1` API replica hits `OpenOptions::create_new(true)` -> `AlreadyExists` -> `Err(Error::InProgress)` (`src/artifact_fs.rs:474-475`) without staging or replacing `revisions/<id>`!), call `fsync(&revisions_dir_fd)` + post-`linkat` re-verify (`<root>`, `"staging"`, `"revisions"` + sentinels when pinned + `statat(&revisions_dir_fd, id)` matching `S_ISREG`, local `st_dev`, `st_ino == staged_ino`, `st_size == size_bytes`), commit `storage::settle` (`state = 'settled', publish_pending = false`, **retaining `payload_ino`**), and **post-`commit`** while still holding `LOCK_SH` on `StagedFile` best-effort detach `staging/<id>` (`unlinkat(&staging_dir_fd, id, AtFlags::empty())` after verifying both `staging/<id>` and `revisions/<id>` have `st_ino == staged_ino`, **NEVER `set_len(0)`!**) -> `drop(file)` -> `fsync(&staging_dir_fd)`. **`Store::read`** joins `storage_reservations` (`storage::read_revision`) to load `(r.size_bytes, sr.payload_ino, sr.adoption_unverified)`, rejects `sr.adoption_unverified = true` (`Error::Io`), re-verifies `<root>` and `"revisions"` pathname-to-FD `(st_dev, st_ino)` (+ `:root`/`:revisions` sentinels when `volume_id IS NOT NULL`), opens `revisions/<id>` (`OFlags::RDONLY \| OFlags::NOFOLLOW \| OFlags::NONBLOCK`), verifies `S_ISREG`, local `file_meta.dev() == revisions_dir_fd_dev`, `file_meta.len() == expected_size`, AND requires `file_meta.ino() == sr.payload_ino` whenever `sr.payload_ino IS NOT NULL` (allowing `sr.payload_ino IS NULL` **ONLY** during pre-adoption rolling upgrade while `volume_id IS NULL AND adoption_run_id IS NULL`, failing closed `Error::Io` once `volume_id IS NOT NULL`). Enforce **one unified 4-step reclamation protocol with `staging/.reclaim.<id>` link anchor** across all 4 cleaners (`artifact_fs::abort`, non-run `reconcile_expired`, generic run-linked recovery, and ADR 0039 `reconcile_run_spills`) with **ZERO filesystem I/O inside Step 1 or Step 3 DB transactions** so **`payload_ino` NEVER drops to `nlink = 0` before Step 3 commits**: **Step 1** serialized DB claim under `(runs FOR NO KEY UPDATE [SKIP LOCKED] ->) storage_reservations FOR UPDATE [SKIP LOCKED] -> storage_volume_control FOR SHARE` (`volume_id = $expected_volume_id AND adoption_run_id IS NULL`) setting `reclaim_state = CASE WHEN reclaim_state = 'truncated' THEN 'truncated' ELSE 'claiming' END, reclaim_claim_token = $my_token, reclaim_lease_until = clock_timestamp() + interval '60 seconds'`; **Step 2** outside DB tx: in **Case 1a (`payload_ino IS NOT NULL`, `'claiming'`)**, probe `staging/<id>`, `revisions/<id>`, and `staging/.reclaim.<id>` (any foreign/non-regular/different-local-`st_dev`/`st_ino != payload_ino` or all-three `ENOENT` -> ZERO `set_len(0)`/`unlinkat`, quarantine under `reclaim_claim_token = $my_token` guard; matched `st_ino == payload_ino` under `LOCK_EX` -> `probe_file.set_len(0)?` + `probe_file.sync_all()?` -> create/verify hard-link anchor `staging/.reclaim.<id>` via `linkat` + `fsync(&staging_dir_fd)` BEFORE unlinking `<id>` in `revisions/<id>` & `staging/<id>` + dual `fsync` -> while still holding `LOCK_EX` on `probe_file`, commit short `FOR UPDATE` tx setting `reclaim_state = 'truncated', publish_pending = false`); in **Case 1b (`payload_ino IS NOT NULL`, `'truncated'`)**, **NEVER touch `staging/<id>` or `revisions/<id>`**, probe **`staging/.reclaim.<id>` ONLY** (`S_ISREG`, local `st_dev`, `st_ino == payload_ino`, `st_size == 0`, else quarantine) -> `LOCK_EX` -> dual `fsync` -> Step 3; in **Case 2 (`payload_ino IS NULL`)**, quarantine any `revisions/<id>` or non-`0`-byte `staging/<id>`, unlink `0`-byte `staging/<id>` under `LOCK_EX`, then dual `fsync`; **Step 3** locks `(runs ->) storage_reservations` with **ZERO FS I/O**, sets `reclaim_state = CASE WHEN payload_ino IS NOT NULL THEN 'anchor_pending_unlink' ELSE 'none' END, reclaim_claim_token = NULL, reclaim_lease_until = NULL`, and commits `storage::release` (trigger takes `storage_volume_control FOR SHARE`, `adjust` updates `storage_accounts -> storage_instance`, **retaining `payload_ino`** on `'released'`); **Step 4** (post-release detach when `payload_ino IS NOT NULL`, still holding `LOCK_EX` on `probe_file`) verifies `staging/.reclaim.<id>` (`st_ino == payload_ino`, `st_size == 0`) -> `unlinkat(&staging_dir_fd, &reclaim_name, AtFlags::empty())` -> `drop(probe_file)` -> `fsync(&staging_dir_fd)` -> best-effort `SET reclaim_state = 'none' WHERE state = 'released' AND reclaim_state = 'anchor_pending_unlink'`. Pin durable artifact volume identity (`storage_volume_control.volume_id` <-> role-tagged sentinels `<root>/.openmettle-volume-id`, `<root>/revisions/.openmettle-volume-id`, `<root>/staging/.openmettle-volume-id` via safe `rustix` `dirfd` ops, unique `.tmp.<128bit_random_hex>` + `fsync` + `linkat` + `fsync(root_fd)` barrier before child sentinels); serialize adoption via unique `my_adoption_run_id = uuid_v4()` in **Step 1b** (`SELECT ... INTO STRICT ... FROM storage_volume_control WHERE id FOR UPDATE`, rejecting non-null `adoption_run_id` with `OMQ03` unless `--replace-adoption-run <stale_uuid>` matches), Step 2 scan (failure clears `storage_volume_control.adoption_run_id = NULL` only `WHERE id AND adoption_run_id = $my_adoption_run_id`), and **Step 3** (`storage_reservations -> artifact_revisions -> storage_volume_control -> storage_accounts -> storage_instance FOR UPDATE`, requiring `adoption_run_id = $my_adoption_run_id`, positively preserving verified `'truncated'` holds with `staging/.reclaim.<id>` (`st_ino == payload_ino`, `st_size == 0`, expiring `reclaim_lease_until = clock_timestamp()`), evaluating all revisions & volume checks BEFORE writing `payload_ino` and committing `payload_ino` backfills **ONLY in the success branch**, quarantining missing/mismatched `'reserved'` rows, pinning `volume_id`, and clearing `adoption_run_id = NULL`); qualify `O_CREAT \| O_EXCL \| O_NOFOLLOW`, `linkat(..., AtFlags::empty())`, file+dir `fsync`, AND on `ReadWriteMany` shared volumes both two-client `flock(2)` coherence and stable 64-bit `st_ino` coherence + second-client recovery; gate all `N` cleaners (`purge_due` joining `storage_reservations` in `begin_purge` to require `NOT sr.adoption_unverified AND sr.payload_ino IS NOT NULL`, verifying `revisions/<id>` leaf `st_ino == payload_ino` before `set_len(0)`/`unlinkat` + detaching any `staging/<id>` alias with `st_ino == payload_ino` + unconditionally calling BOTH `fsync(&revisions_dir_fd)` and `fsync(&staging_dir_fd)` strictly before `storage::confirm_purge`, `reconcile_expired`, run-linked recovery, `StagingSweepState`) on `storage_volume_control.volume_id IS NOT NULL AND adoption_run_id IS NULL`. |
 | [ADR 0032](0032-durable-run-admission-and-fair-work-queue.md) and [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md), [`src/authz/runs.rs`](../../src/authz/runs.rs) | Keep exact partial-index counts on `runs` for live and executing runs. Resolve per-scope overrides for live caps and `round_cap` (`1..=1000`) at admission, and serialize `executing_runs_*` cap changes with `claim_next` (including approval resume) via `run_dispatch_lock`. Compose usage and device holds inside admission and renew run-bound holds on the worker lease cadence. |
-| [ADR 0035](0035-approvals-permitted-yolo-and-effect-ledger.md), [`src/authz/approvals.rs`](../../src/authz/approvals.rs) | Keep `StorageReservation` for run-bound artifact and tool-result spills (including V1-14 (`#14`) bounded outputs, while narrowing ADR 0040's generic run-linked cleaner predicate to **`run_id IS NOT NULL AND (operation_id IS NULL OR idempotency_key NOT LIKE 'tool-spill:%')`** — the exact logical complement of [ADR 0039](0039-scoped-mcp-adapter-and-bounded-tool-results.md)'s `operation_id IS NOT NULL AND idempotency_key LIKE 'tool-spill:%'` `reconcile_run_spills` — backed by `storage_reservations_tool_spill_binding_guard` rejecting any new/updated `tool-spill:*` row with `run_id IS NULL OR operation_id IS NULL`). Align parked reservation expiry with `resume_execution_expires_at`. Require configured `ARTIFACTS_DIR`, verified non-null pinned `storage_instance.volume_id` (`AND adoption_run_id IS NULL`) <-> role-tagged `.openmettle-volume-id` sentinels in `<root>`, `<root>/revisions`, and `<root>/staging` (`O_RDONLY \| O_NOFOLLOW \| O_NONBLOCK` + `fstat` `S_ISREG`, matching local `st_dev` across open directory FDs, bounded `<= 64`-byte read), `NOT adoption_unverified`, and the unified 3-step durable-identity (`payload_ino`, `reclaim_state`/`reclaim_claim_token`/`reclaim_lease_until`) reclamation contract (**Step 1** DB claim with zero FS I/O; **Step 2** outside DB tx: Case 1 `payload_ino IS NOT NULL` quarantining foreign/non-regular/different-local-`st_dev`/`st_ino != payload_ino` or `'claiming'` dual-`ENOENT` with zero `set_len(0)`/`unlinkat` under `reclaim_claim_token` guard, and on `st_ino == payload_ino` under `LOCK_EX` executing `probe_file.set_len(0)?` + `probe_file.sync_all()?` -> `'truncated'` keeping `payload_ino` non-null -> `unlinkat` + `drop` + dual `fsync`; Case 2 `payload_ino IS NULL` quarantining any `revisions/<id>` or `st_size > 0`/non-regular `staging/<id>`, unlinking `0`-byte `staging/<id>` under `LOCK_EX`, then dual `fsync`; **Step 3** `storage::release` with **zero FS I/O** retaining `payload_ino` on `'released'`), plus retryable staging cleanup via persistent `StagingSweepState` (`Idle`/`Open`/`InFlight`/`InvalidatedInFlight`/`DrainingEof` + `pending_names` held outside `worker::sweep`'s 15 s `tokio::time::timeout`, retaining an open `dir_fd` across `Open`/`InFlight`/`DrainingEof` until `pending_names` is empty, verifying `volume_id IS NOT NULL AND adoption_run_id IS NULL`, skipping `adoption_unverified = true`, requiring non-blocking `LOCK_EX` + verified local `st_dev` & `st_ino`, on `state = 'released'` skipping if `payload_ino IS NOT NULL AND staging_ino != payload_ino` or `payload_ino IS NULL AND staging_size > 0` else `set_len(0)` -> `sync_all()` -> `unlinkat` -> `drop` -> `fsync(&staging_dir_fd)`, on `state = 'settled'` skipping if `adoption_unverified = true` or `payload_ino IS NULL` and under `LOCK_EX` calling `unlinkat` only (never `set_len(0)`) when `staging_ino == payload_ino` ONLY if `revisions/<id>` is `S_ISREG` on same local `st_dev` with `rev_stat.st_ino as u64 == payload_ino` (preserving both untouched on `ENOENT` or `rev_ino != payload_ino`), or `set_len(0)` -> `sync_all()` -> `unlinkat` when `staging_ino != payload_ino` ONLY if `revisions/<id>` is `S_ISREG` on same local `st_dev` with `rev_stat.st_ino as u64 == payload_ino` OR (`revisions/<id>` is `ENOENT` AND fresh `artifact_revisions.state = 'purged'`), preserving both untouched on `rev_ino != payload_ino`, and for zero-row orphans requiring `st_mtime > 900 s` on both startup and sweep plus a `storage_instance FOR UPDATE` serialized zero-row recheck while holding `LOCK_EX`); never release or unlink when `adoption_unverified = true`, when `volume_id IS NULL OR adoption_run_id IS NOT NULL`, or when volume identity/sentinel/`revisions/` verification fails. |
+| [ADR 0035](0035-approvals-permitted-yolo-and-effect-ledger.md), [`src/authz/approvals.rs`](../../src/authz/approvals.rs) | Keep `StorageReservation` for run-bound artifact and tool-result spills (including V1-14 (`#14`) bounded outputs, while narrowing ADR 0040's generic run-linked cleaner predicate to **`run_id IS NOT NULL AND (operation_id IS NULL OR idempotency_key NOT LIKE 'tool-spill:%')`** — the exact logical complement of [ADR 0039](0039-scoped-mcp-adapter-and-bounded-tool-results.md)'s `operation_id IS NOT NULL AND idempotency_key LIKE 'tool-spill:%'` `reconcile_run_spills` — backed by `storage_reservations_tool_spill_binding_guard` rejecting any new/updated `tool-spill:*` row with `run_id IS NULL OR operation_id IS NULL`). Align parked reservation expiry with `resume_execution_expires_at`. Require configured `ARTIFACTS_DIR`, verified non-null pinned `storage_volume_control.volume_id` (`AND adoption_run_id IS NULL`) <-> role-tagged `.openmettle-volume-id` sentinels in `<root>`, `<root>/revisions`, and `<root>/staging` (`O_RDONLY \| O_NOFOLLOW \| O_NONBLOCK` + `fstat` `S_ISREG`, matching local `st_dev` across open directory FDs, bounded `<= 64`-byte read), `NOT adoption_unverified`, and the unified 4-step durable-identity (`payload_ino`, 4-state `reclaim_state`/`reclaim_claim_token`/`reclaim_lease_until`, `staging/.reclaim.<id>` link anchor) reclamation contract (**Step 1** DB claim with zero FS I/O; **Step 2** outside DB tx: Case 1a `payload_ino IS NOT NULL` `'claiming'` quarantining foreign/all-three-`ENOENT` untouched, else under `LOCK_EX` executing `probe_file.set_len(0)?` + `probe_file.sync_all()?` -> `linkat` anchor `staging/.reclaim.<id>` + `fsync(&staging_dir_fd)` BEFORE unlinking `<id>` + dual `fsync` -> committing `'truncated'` keeping `payload_ino` non-null; Case 1b `'truncated'` probing `staging/.reclaim.<id>` ONLY and NEVER touching `staging/<id>` or `revisions/<id>`; Case 2 `payload_ino IS NULL` quarantining any `revisions/<id>` or `st_size > 0`/non-regular `staging/<id>`, unlinking `0`-byte `staging/<id>` under `LOCK_EX`, then dual `fsync`; **Step 3** `storage::release` with **zero FS I/O** setting `reclaim_state = CASE WHEN payload_ino IS NOT NULL THEN 'anchor_pending_unlink' ELSE 'none' END` and retaining `payload_ino` on `'released'`; **Step 4** post-release `unlinkat` of `staging/.reclaim.<id>` under `LOCK_EX` -> `drop` -> `fsync(&staging_dir_fd)` -> `SET reclaim_state = 'none'`), plus retryable staging cleanup via persistent `StagingSweepState` (`Idle`/`Open`/`InFlight`/`InvalidatedInFlight`/`DrainingEof` + `pending_names` held outside `worker::sweep`'s 15 s `tokio::time::timeout`, retaining an open `dir_fd` across `Open`/`InFlight`/`DrainingEof` until `pending_names` is empty, verifying `storage_volume_control.volume_id IS NOT NULL AND adoption_run_id IS NULL`, skipping `adoption_unverified = true`, **NEVER calling `set_len(0)` on `'settled'`, `'released'`, or `.reclaim.<id>`**: on `'settled'` preserving `staging/<id>` 100% untouched whenever `adoption_unverified = true`, `payload_ino IS NULL`, OR `staging_ino != payload_ino`, and when `staging_ino == payload_ino` calling `unlinkat` ONLY under `LOCK_EX` iff `revisions/<id>` matches `st_ino == payload_ino` OR (`revisions/<id>` is `ENOENT` AND fresh `artifact_revisions.state = 'purged'`); on `'released'` NEVER touching `staging/<id>` when `payload_ino IS NOT NULL` and unlinking `0`-byte `staging/<id>` under `LOCK_EX` when `payload_ino IS NULL`; on `staging/.reclaim.<id>` unlinking under `LOCK_EX` (`st_size == 0`, `st_ino == payload_ino`) ONLY when `state = 'released' AND reclaim_state = 'anchor_pending_unlink'` -> `SET reclaim_state = 'none'`; and for zero-row orphans requiring `st_mtime > 900 s` on both startup and sweep plus `storage_volume_control FOR SHARE -> storage_instance FOR UPDATE` serialized zero-row recheck while holding `LOCK_EX`); never release or unlink when `adoption_unverified = true`, when `storage_volume_control.volume_id IS NULL OR adoption_run_id IS NOT NULL`, or when volume identity/sentinel/`revisions/` verification fails. |
 | [ADR 0037](0037-gateway-provisioning-and-usage-reconciliation.md) | Reconcile local token and cost budget holds strictly from authoritative `openmettle_gateway` settlement reports (`openmettle.gateway_usage_reports` and `openmettle.gateway_settlements` in Migration `0023`, widening `openmettle.gateway_settlements.measured` to `numeric(38, 0)` in PR2's migration with zero edits to frozen `0023`, recording every accepted `(request_id, revision, final)` in append-only **`openmettle.quota_accepted_gateway_reports`** via `SECURITY DEFINER` `AFTER INSERT OR UPDATE OF revision, final` trigger `quota_record_accepted_gateway_settlement` on `gateway_settlements`, binding `quota_reconciliations` via composite FK `(gateway_request_id, source_revision) REFERENCES openmettle.quota_accepted_gateway_reports (request_id, revision)`, verifying exact acceptance in `quota_settle_gateway_usage` via `EXISTS (SELECT 1 FROM openmettle.quota_accepted_gateway_reports a WHERE a.request_id = qr.gateway_request_id AND a.revision = p_source_revision)` and **deterministically folding all unapplied accepted revisions `a.revision` in `(coalesce(qr.accepted_source_revision, -1), p_source_revision]` in ascending `ORDER BY a.revision ASC` order** — plus ascending worker catch-up iteration — while **unconditionally advancing `qr.accepted_source_revision = p_source_revision`** on every processed accepted revision even on `0`-delta/no-op/other-resource reports, writing `quota_reconciliations` and adjusting `quota_budgets` iff `(new_state, new_settled, new_held) IS DISTINCT FROM (old_state, old_settled, old_held)` so out-of-order replay such as `rev 2` before `rev 1` converges to the exact same state and `pending_gateway_reconciliations` simplifies cleanly to `a.revision > coalesce(qr.accepted_source_revision, -1)` without aging no-op reports forever; eliminating settlement/recovery lock cycles by requiring **every** `openmettle_gateway` transaction inserting or updating `openmettle.gateway_settlements` — **both** settlement-only transactions **and** combined single-transaction writes — to call `openmettle.quota_lock_gateway_request_for_settlement(p_request_id)` (`gateway_requests FOR NO KEY UPDATE`) strictly before `INSERT`/`UPDATE` on `gateway_settlements` and keeping `quota_settle_gateway_usage` strictly `gateway_requests FOR KEY SHARE -> quota_reservations (ORDER BY resource ASC FOR UPDATE) -> quota_budgets FOR NO KEY UPDATE` without locking `runs` or `gateway_reservations`; and enforcing strict per-resource authoritative evidence for `usage_cost_micros` (`r_step.cost IS NOT NULL`, deterministic `ceil(r_step.cost)::numeric(38, 0)`) vs `usage_tokens` with **included reasoning tokens as a non-double-counted lower bound on completion** (`K_known = CASE WHEN rev_R >= rev_K THEN greatest(K_raw, R_latest) ELSE K_raw END` and `X_known = 0` when `inc_latest IS TRUE`, vs `K_known = K_raw, X_known = R_latest` when `inc_latest IS FALSE`, so `reasoning_tokens = 150, reasoning_included = true` with `completion_tokens = NULL` immediately charges `C_floor = 150` while keeping `is_complete_tokens = false`, `completion_tokens = 200, reasoning_tokens = 150, reasoning_included = true` charges `200` with zero double-counting, and a newer complete `rev_K > rev_R` honors `K_raw`; closing `state = 'settled'` only when `is_complete_tokens = true AND r_step.final = true`, and monotonically applying `C_effective = greatest(settled, C_floor)` on incomplete reports) into widened `numeric(38, 0)` aggregate/settlement accumulators, with `quota_verify_accounting_drift()` replaying the exact same ascending fold and joining `gateway_settlements gs` to `gateway_usage_reports r_curr` strictly on `(gs.request_id = r_curr.request_id AND gs.revision = r_curr.revision AND gs.final = r_curr.final)` reading `r_curr.source` and `r_curr.report_id`) via narrow `SECURITY DEFINER` transitions. Introduce in-transaction `authz::gateway` helpers (`reserve_in`, `handoff_in`, `release_in`) so inserting `'reserved'` `openmettle.gateway_requests` and creating all metered `openmettle.quota_reservations` holds execute atomically in one `WriteTransaction`, backed by a two-phase ADR 0003 rolling-upgrade activation gate (`openmettle.quota_enforcement.metering_enforced`, seeded `true` **only** on genuine fresh-from-zero installs where `src/migrate.rs` observed `applied == 0` AND all core/storage/gateway tables are empty, and `false` on **every** upgrade `applied >= 1` — including unused upgrades with empty tables — until flipped irreversibly `false -> true` in a standalone single-statement transaction by `openmettle_owner`) plus a `DEFERRABLE INITIALLY DEFERRED` commit-time `CONSTRAINT TRIGGER quota_enforce_gateway_handoff_holds` (`openmettle.enforce_gateway_handoff_holds()`, recording handoff-time obligations in `openmettle.quota_gateway_handoffs` **before** acquiring `quota_enforcement FOR SHARE` as the final sink lock and verifying exact `usage_tokens` hold equality `qr.reserved_units = NEW.units AND qr.held_units = NEW.units AND qr.settled_units = 0 AND qr.accepted_source_revision IS NULL` plus ownership match, `OMQ04`, zero edits to frozen `0023`), lease-generation-fenced successor-worker unwind `openmettle.quota_unwind_superseded_round(...)` (checking `quota_reservations.allocating_claim_token` so replay never unwinds the successor's own attempt, and cleanly unwinding unbound `N-1` `'reserved'` rounds), lazy idempotent once-per-run parent hold initialization (`openmettle.quota_ensure_legacy_run_holds`, executed inside the round-allocation `WriteTransaction` strictly **before** `authz::gateway::reserve_in` under `runs` + `gateway_reservations FOR NO KEY UPDATE` reading `units - allocated`) when an `N` worker claims or reclaims an `N-1`-admitted run, and bounded raw index-key paging with a constant clamped age cutoff in `quota_release_orphan_gateway_requests` for pre-V1-17 orphan `'reserved'` rows. Enforce scope-pinned composite FK `(scope_id, gateway_request_id) REFERENCES openmettle.gateway_requests (scope_id, id)`, unique `(gateway_request_id, resource_kind)`, strict `quota_reservations` state `CHECK` constraints (`settled_units = 0 AND accepted_source_revision IS NULL` while `'held'`), a `SECURITY DEFINER` `BEFORE INSERT OR UPDATE` gateway-binding guard trigger enforcing exact `usage_tokens` hold size equality (`reserved_units = req.units`, pre-settlement `settled_units = 0 AND accepted_source_revision IS NULL AND held_units = req.units`, and exact membership in `quota_accepted_gateway_reports` for every `accepted_source_revision IS NOT NULL` alongside `held_units = greatest(0, req.units - settled_units)` on partial `handoff_committed`, `23514`) alongside `quota_reserve`/`quota_allocate_round`, 32-byte `p_dispatch` secret verification (`dispatch_hash = sha256(p_dispatch)`), ownership recheck under sweep locks, composite FKs to `quota_accepted_gateway_reports` and `gateway_usage_reports`, nullable `accepted_source_revision` supporting `revision >= 0` (including `revision = 0`), run-to-round `held` allocation coupled atomically with `openmettle.gateway_handoff` / `openmettle.gateway_release`, caller-scoped `SECURITY DEFINER` `openmettle.quota_recover_lost_handoff` for lost commit-ack recovery (without granting `SELECT` on `gateway_requests`, validating against recorded handoff-time obligations in `quota_gateway_handoffs` and recognizing `'handoff_committed'` and `'settled'` holds across activation), atomic stale-sweep closure of `'reserved'` `gateway_requests` (`'reserved' -> 'released'` + `gateway_reservations` restoration), signed partial corrections and SQL-enforced `BEFORE INSERT OR UPDATE OR DELETE` deployment denomination immutability (`OMQ02`) with the seeded `('instance', 'usage_cost_micros')` row strictly `UPDATE`-only after migration (serialized via `quota_cost_unit_lock` with zero lock cycle alongside a `BEFORE INSERT` guard trigger on `gateway_usage_reports` (`cost IS NOT NULL`, zero edits to frozen `0023`)). |
 | [ADR 0007](0007-application-api-contract.md) and [ADR 0027](0027-authorization-and-private-projects.md) | Expose authenticated `/v1` effective-quota projections (including active threshold warnings, keeping `NonNegativeDecimal` (`0..=9223372036854775807`) for `bigint` fields and introducing dedicated `WideNonNegativeDecimal` (`0..=10^38 - 1`, `maxLength: 38`) for wide `numeric(38, 0)` `QuotaSummary` counters), audited `ManageQuotas` override routes backed by `SECURITY DEFINER` functions and privacy-safe `429 quota` / `429 rate_limited` / `503 provisioning` RFC 9457 problems. |
 | V1-18 (`#18`) shared capacity controller | Separate user and project concurrent device-slot quotas (`window_kind = 'concurrent'`) from GPU VRAM allocation. Gate admission in PostgreSQL, reject run-linked `device_reservations` holds in generic `quota_commit_handoff`, require lease-fenced `openmettle_worker` handoff of run device holds exclusively via `quota_commit_device_handoff`, and release device quota holds only after durable V1-18 confirmation of backend release or non-allocation. |
@@ -196,15 +196,30 @@ is additive and preserves all migration 4 storage rows.
 
 ```sql
 ALTER TABLE openmettle.storage_instance
-    ADD COLUMN volume_id uuid,
-    ADD COLUMN bootstrap_auto_pin_allowed boolean NOT NULL DEFAULT false,
-    ADD COLUMN adoption_run_id uuid,
     ADD COLUMN warn_pct_1 smallint NOT NULL DEFAULT 80 CHECK (warn_pct_1 BETWEEN 1 AND 99),
     ADD COLUMN warn_pct_2 smallint NOT NULL DEFAULT 90
         CHECK (warn_pct_2 BETWEEN 1 AND 99 AND warn_pct_2 > warn_pct_1),
-    ADD COLUMN config_revision bigint NOT NULL DEFAULT 1 CHECK (config_revision >= 1),
-    ADD CONSTRAINT storage_instance_auto_pin_check
-        CHECK (volume_id IS NULL OR NOT bootstrap_auto_pin_allowed);
+    ADD COLUMN config_revision bigint NOT NULL DEFAULT 1 CHECK (config_revision >= 1);
+
+-- Dedicated 1-row read-mostly volume control table separated from storage_instance
+-- (whose counters are updated FOR NO KEY UPDATE on every storage::adjust in
+-- src/storage.rs:289-310). Runtime reserve, settle, release, and purge ONLY ever
+-- acquire FOR SHARE on storage_volume_control and NEVER UPDATE it (only
+-- openmettle-admin adoption Steps 1b/3 and one-time empty-ledger Store::open
+-- bootstrap acquire FOR UPDATE), eliminating FOR SHARE -> FOR NO KEY UPDATE
+-- deadlocks between concurrent releases/reserves while strictly serializing
+-- against adoption Step 1b.
+CREATE TABLE openmettle.storage_volume_control (
+    id boolean PRIMARY KEY DEFAULT true CHECK (id),
+    volume_id uuid,
+    bootstrap_auto_pin_allowed boolean NOT NULL DEFAULT false,
+    adoption_run_id uuid,
+    CONSTRAINT storage_volume_control_auto_pin_check
+        CHECK (volume_id IS NULL OR NOT bootstrap_auto_pin_allowed)
+);
+INSERT INTO openmettle.storage_volume_control (id) VALUES (true);
+GRANT SELECT ON openmettle.storage_volume_control TO openmettle_api, openmettle_worker;
+GRANT UPDATE (volume_id, bootstrap_auto_pin_allowed) ON openmettle.storage_volume_control TO openmettle_api;
 
 ALTER TABLE openmettle.storage_reservations
     ADD COLUMN lease_expires_at timestamptz,
@@ -213,30 +228,36 @@ ALTER TABLE openmettle.storage_reservations
     ADD COLUMN payload_ino numeric(20, 0),
     ADD COLUMN publish_pending boolean NOT NULL DEFAULT false,
     ADD COLUMN reclaim_state text NOT NULL DEFAULT 'none'
-        CHECK (reclaim_state IN ('none', 'claiming', 'truncated')),
+        CHECK (reclaim_state IN ('none', 'claiming', 'truncated', 'anchor_pending_unlink')),
     ADD COLUMN reclaim_claim_token uuid,
     ADD COLUMN reclaim_lease_until timestamptz,
     ADD CONSTRAINT storage_reservations_lease_check
         CHECK (lease_expires_at IS NULL OR lease_expires_at > created_at),
     ADD CONSTRAINT storage_reservations_adoption_unverified_check
-        CHECK (NOT adoption_unverified OR state IN ('reserved', 'released')),
+        CHECK (NOT adoption_unverified OR state = 'reserved'),
     ADD CONSTRAINT storage_reservations_payload_ino_nonneg_check
         CHECK (payload_ino IS NULL OR payload_ino >= 0),
     ADD CONSTRAINT storage_reservations_stage_claimed_check
         CHECK (payload_ino IS NULL OR stage_claimed),
     ADD CONSTRAINT storage_reservations_publish_pending_check
         CHECK (NOT publish_pending OR (state = 'reserved' AND payload_ino IS NOT NULL)),
-    ADD CONSTRAINT storage_reservations_reclaim_state_reserved_check
-        CHECK (state = 'reserved' OR reclaim_state = 'none'),
+    ADD CONSTRAINT storage_reservations_reclaim_state_check
+        CHECK (
+            (state = 'reserved' AND reclaim_state IN ('none', 'claiming', 'truncated'))
+            OR (state = 'released' AND reclaim_state IN ('none', 'anchor_pending_unlink'))
+            OR (state = 'settled' AND reclaim_state = 'none')
+        ),
     ADD CONSTRAINT storage_reservations_reclaim_lease_check
         CHECK (
-            (reclaim_state = 'none' AND reclaim_claim_token IS NULL AND reclaim_lease_until IS NULL)
-            OR (reclaim_state IN ('claiming', 'truncated')
+            (reclaim_state IN ('claiming', 'truncated')
                 AND reclaim_claim_token IS NOT NULL
                 AND reclaim_lease_until IS NOT NULL)
+            OR (reclaim_state IN ('none', 'anchor_pending_unlink')
+                AND reclaim_claim_token IS NULL
+                AND reclaim_lease_until IS NULL)
         ),
     ADD CONSTRAINT storage_reservations_reclaim_truncated_publish_check
-        CHECK (reclaim_state <> 'truncated' OR NOT publish_pending);
+        CHECK (reclaim_state NOT IN ('truncated', 'anchor_pending_unlink') OR NOT publish_pending);
 
 -- Exact unsigned 64-bit u64 MetadataExt::ino() (0..=18446744073709551615) stored
 -- in numeric(20, 0) (zero signed-i64 cast ambiguity; mapped via sqlx ::text <-> u64).
@@ -412,10 +433,10 @@ seed_enforcement AS (
     SELECT true, is_fresh_bootstrap, CASE WHEN is_fresh_bootstrap THEN clock_timestamp() END
       FROM fresh
 )
-UPDATE openmettle.storage_instance si
+UPDATE openmettle.storage_volume_control svc
    SET bootstrap_auto_pin_allowed = fresh.is_fresh_bootstrap
   FROM fresh
- WHERE si.id;
+ WHERE svc.id;
 
 -- Records exact handoff-time metering obligations at COMMIT inside
 -- enforce_gateway_handoff_holds() (zero schema edits to frozen Migration 0023's
@@ -1017,44 +1038,49 @@ CREATE TRIGGER storage_reservations_tool_spill_binding_guard
     FOR EACH ROW EXECUTE FUNCTION openmettle.enforce_tool_spill_reservation_binding();
 
 -- Added in PR2's migration. PostgreSQL ledger defense-in-depth backstop while
--- storage_instance.volume_id IS NULL OR storage_instance.adoption_run_id IS NOT NULL:
--- SECURITY INVOKER (Migration 0004 already grants SELECT on storage_instance to
--- openmettle_api and openmettle_worker) evaluating current_user so BOTH INHERIT
--- logins AND NOINHERIT logins assuming SET ROLE openmettle_api / openmettle_worker
--- (even if the login holds non-inherited membership elsewhere) fail closed with
--- OMQ03 on storage_reservations reserved -> released and artifact_revisions
--- -> purging/purged, while active openmettle_owner reconciliation succeeds.
--- In src/storage.rs:496-505, storage::release locks storage_reservations FOR UPDATE
--- and runs UPDATE storage_reservations SET state = 'released' BEFORE adjust
--- (storage_accounts -> storage_instance). Acquiring storage_instance FOR SHARE
--- inside the trigger preserves canonical lock order (runs -> storage_reservations ->
--- artifacts -> artifact_revisions -> storage_accounts -> storage_instance) and
--- conflicts directly with adoption Step 1b's storage_instance FOR UPDATE (which
--- locks only storage_instance, so zero deadlock cycle is possible): any in-flight
--- storage::release either finishes its entire transaction strictly BEFORE Step 1b
--- acquires FOR UPDATE, OR blocks on Step 1b's FOR UPDATE and fails closed with OMQ03
--- once Step 1b commits adoption_run_id. Normal storage::reserve and storage::settle
--- remain unaffected. NOT a substitute for quiescing N-1 worker cleaners before
--- migration because N-1 workers unlink before mutating PostgreSQL.
+-- storage_volume_control.volume_id IS NULL, storage_volume_control.adoption_run_id
+-- IS NOT NULL, or the singleton row is missing: SECURITY INVOKER (PR2 grants SELECT
+-- on storage_volume_control to openmettle_api and openmettle_worker) evaluating
+-- current_user so BOTH INHERIT logins AND NOINHERIT logins assuming SET ROLE
+-- openmettle_api / openmettle_worker (even if the login holds non-inherited
+-- membership elsewhere) fail closed with OMQ03 on storage_reservations
+-- reserved -> released and artifact_revisions -> purging/purged, while active
+-- openmettle_owner reconciliation succeeds.
+-- In src/storage.rs:289-310 and 496-505, storage::release locks
+-- storage_reservations FOR UPDATE and runs UPDATE storage_reservations
+-- SET state = 'released' BEFORE adjust() updates storage_accounts ->
+-- storage_instance (FOR NO KEY UPDATE). Acquiring FOR SHARE on the dedicated
+-- read-mostly storage_volume_control singleton (NEVER updated by runtime ops!)
+-- strictly preserves canonical storage lock order (runs -> storage_reservations ->
+-- artifacts -> artifact_revisions -> storage_volume_control -> storage_accounts ->
+-- storage_instance), eliminates FOR SHARE -> FOR NO KEY UPDATE deadlocks between
+-- concurrent releases/reserves, fails closed if the singleton row is missing
+-- (NOT FOUND), and conflicts directly with adoption Step 1b's
+-- storage_volume_control FOR UPDATE (which locks ONLY storage_volume_control, so
+-- zero deadlock cycle is possible): any in-flight storage::release either finishes
+-- its entire transaction strictly BEFORE Step 1b acquires FOR UPDATE, OR blocks on
+-- Step 1b's FOR UPDATE and fails closed with OMQ03 once Step 1b commits
+-- adoption_run_id. Normal storage::reserve and storage::settle remain unaffected.
+-- NOT a substitute for quiescing N-1 worker cleaners before migration because N-1
+-- workers unlink before mutating PostgreSQL.
 CREATE FUNCTION openmettle.enforce_runtime_storage_volume_pinned()
 RETURNS trigger
 LANGUAGE plpgsql
 SECURITY INVOKER
 SET search_path = pg_catalog
 AS $$
+DECLARE
+    v_vol uuid;
+    v_adopt uuid;
 BEGIN
     IF NOT pg_catalog.pg_has_role(current_user, 'openmettle_owner', 'USAGE') THEN
-        PERFORM 1
-          FROM openmettle.storage_instance
+        SELECT volume_id, adoption_run_id
+          INTO v_vol, v_adopt
+          FROM openmettle.storage_volume_control
          WHERE id
            FOR SHARE;
-        IF EXISTS (
-            SELECT 1
-              FROM openmettle.storage_instance
-             WHERE id
-               AND (volume_id IS NULL OR adoption_run_id IS NOT NULL)
-        ) THEN
-            RAISE EXCEPTION 'runtime storage release and purge require pinned, non-adopting storage_instance.volume_id'
+        IF NOT FOUND OR v_vol IS NULL OR v_adopt IS NOT NULL THEN
+            RAISE EXCEPTION 'runtime storage release and purge require pinned, non-adopting storage_volume_control.volume_id'
                 USING ERRCODE = 'OMQ03';
         END IF;
     END IF;
@@ -1077,7 +1103,12 @@ CREATE TRIGGER artifact_revisions_runtime_volume_pin_guard
 -- PostgreSQL for openmettle_api and openmettle_worker (SECURITY INVOKER evaluating
 -- current_user across both INHERIT and NOINHERIT/SET ROLE logins):
 --   1. Only openmettle_owner (or verified openmettle-admin adoption) may clear
---      adoption_unverified = true -> false.
+--      adoption_unverified = true -> false. Combined with CHECK (NOT
+--      adoption_unverified OR state = 'reserved'), NO non-owner role can EVER
+--      transition a quarantined 'reserved' row to 'released' or 'settled'
+--      (neither keeping adoption_unverified = true nor clearing it to false),
+--      while openmettle_owner releases a quarantined row cleanly in one UPDATE
+--      setting state = 'released', adoption_unverified = false.
 --   2. Once bound, payload_ino is strictly write-once and NEVER mutated or cleared
 --      to NULL (retained across 'reserved' -> 'settled' and 'reserved' -> 'released').
 --   3. Once claimed, stage_claimed is strictly write-once (true -> false forbidden).
@@ -1177,7 +1208,7 @@ CREATE TRIGGER storage_reservations_monotonic_guards
   `gateway_requests`. The singleton `openmettle.quota_enforcement.metering_enforced` (`SELECT`-granted
   to runtime roles, write-once `false -> true` by `openmettle_owner` in a standalone
   single-statement transaction holding zero other locks, enforced by
-  `quota_enforcement_write_once`) and `openmettle.storage_instance.bootstrap_auto_pin_allowed`
+  `quota_enforcement_write_once`) and `openmettle.storage_volume_control.bootstrap_auto_pin_allowed`
   seed `true` **iff `is_fresh_bootstrap`**, and `false` on **every** upgrade (`applied >= 1` —
   even an existing deployment that has never created users, artifacts or gateway rows yet!) so
   `N-1` replicas drain cleanly before `openmettle_owner` (`openmettle-admin`) flips
@@ -1206,59 +1237,62 @@ CREATE TRIGGER storage_reservations_monotonic_guards
   `REVOKE ALL FROM PUBLIC`, zero direct DML grants to runtime roles) preserves exact handoff-time
   obligations so post-commit recovery (`quota_recover_lost_handoff`) validates against
   handoff-time obligations rather than live `quota_enforcement` or live `quota_defaults`.
-- **Mandatory pre-migration `N-1` cleaner quiescence + serialized unpinned/adopting runtime
-  storage volume backstop & monotonic reservation guards (`OMQ03`).** On **every** upgrade
-  (`applied >= 1`, even with empty `storage_*` tables),
-  `storage_instance.bootstrap_auto_pin_allowed` seeds `false`, `storage_instance.adoption_run_id`
-  defaults `NULL`, and `storage_instance.volume_id` stays `NULL` across the **entire `N-1 -> N`
-  binary replacement** (until zero `N-1` worker or API processes remain running). Because `N-1`'s
-  `artifact_fs::reconcile_expired` unlinks both payload paths *before* calling `storage::release`
-  (`src/artifact_fs.rs:660-669`) and `N-1`'s `artifact_fs::purge_due` skips any `UPDATE` in
-  `storage::begin_purge` for an already-`'purging'` revision (`src/storage.rs:628-636`) and unlinks
-  `revisions/<reservation>` *before* `confirm_purge` executes (`src/artifact_fs.rs:694-707`),
-  **operators MUST quiesce all `N-1` worker artifact cleaners (unset
-  `OPENMETTLE_WORKER_ARTIFACTS_DIR` across all `N-1` workers and drain all in-flight
-  `worker::maintenance` sweeps to completion) BEFORE running `openmettle-migrate`**. Furthermore,
-  an `N-1` `openmettle_api` replica's unconditional `artifact_fs::abort()`
-  (`src/artifact_fs.rs:584-591`) ignores errors from `storage::release` (`let _ = committed(pool,
-  async |tx| storage::release(...)).await; error`) and could otherwise release a post-rename
-  `revisions/<id>` charge on a failed same-key upload retry during rolling upgrade; and during
-  `openmettle-admin` adoption's Step 2 pre-scan on an already-pinned volume,
-  `storage_instance.adoption_run_id = $my_adoption_run_id` (committed in Step 1b under explicit
-  `storage_instance FOR UPDATE` strictly before Step 2 starts, rejecting any concurrent second
-  adopter unless `--replace-adoption-run <stale_uuid>` matches, and cleared atomically in Step 3's
-  final commit) must strictly serialize against any in-flight `storage::release` or purge.
-  Therefore, **`SECURITY INVOKER`** `BEFORE UPDATE` trigger
+- **Mandatory pre-migration `N-1` cleaner quiescence + dedicated read-mostly
+  `openmettle.storage_volume_control` singleton + serialized unpinned/adopting runtime storage
+  volume backstop & monotonic reservation guards (`OMQ03`).** Keeping `(volume_id,
+  bootstrap_auto_pin_allowed, adoption_run_id)` on dedicated 1-row read-mostly control table
+  **`openmettle.storage_volume_control`** (`GRANT SELECT` to `openmettle_api, openmettle_worker`;
+  `GRANT UPDATE (volume_id, bootstrap_auto_pin_allowed)` to `openmettle_api`) instead of
+  `openmettle.storage_instance` eliminates any lock-upgrade deadlock with `storage::adjust`
+  (`src/storage.rs:289-310`), which updates `storage_accounts -> storage_instance` (`FOR NO KEY
+  UPDATE`) on every `reserve`, `settle`, `release`, and `confirm_purge`: runtime `reserve`,
+  `settle`, `release`, and `purge` **ONLY ever acquire `FOR SHARE` on `storage_volume_control`**
+  and **NEVER `UPDATE` `storage_volume_control`** (only `openmettle-admin` adoption Steps 1b/3 and
+  one-time empty-ledger `Store::open` bootstrap acquire `FOR UPDATE` on `storage_volume_control`).
+  On **every** upgrade (`applied >= 1`, even with empty `storage_*` tables),
+  `storage_volume_control.bootstrap_auto_pin_allowed` seeds `false`,
+  `storage_volume_control.adoption_run_id` defaults `NULL`, and `storage_volume_control.volume_id`
+  stays `NULL` across the **entire `N-1 -> N` binary replacement** (until zero `N-1` worker or API
+  processes remain running). Because `N-1`'s `artifact_fs::reconcile_expired` unlinks both payload
+  paths *before* calling `storage::release` (`src/artifact_fs.rs:660-669`) and `N-1`'s
+  `artifact_fs::purge_due` skips any `UPDATE` in `storage::begin_purge` for an already-`'purging'`
+  revision (`src/storage.rs:628-636`) and unlinks `revisions/<reservation>` *before*
+  `confirm_purge` executes (`src/artifact_fs.rs:694-707`), **operators MUST quiesce all `N-1`
+  worker artifact cleaners (unset `OPENMETTLE_WORKER_ARTIFACTS_DIR` across all `N-1` workers and
+  drain all in-flight `worker::maintenance` sweeps to completion) BEFORE running
+  `openmettle-migrate`**. Furthermore, an `N-1` `openmettle_api` replica's unconditional
+  `artifact_fs::abort()` (`src/artifact_fs.rs:584-591`) ignores errors from `storage::release`
+  (`let _ = committed(pool, async |tx| storage::release(...)).await; error`) and could otherwise
+  release a post-publication `revisions/<id>` charge on a failed same-key upload retry during
+  rolling upgrade; and during `openmettle-admin` adoption's Step 2 pre-scan on an already-pinned
+  volume, `storage_volume_control.adoption_run_id = $my_adoption_run_id` (committed in Step 1b
+  under explicit `storage_volume_control FOR UPDATE` strictly before Step 2 starts, rejecting any
+  concurrent second adopter unless `--replace-adoption-run <stale_uuid>` matches, and cleared
+  atomically in Step 3's final commit) must strictly serialize against any in-flight
+  `storage::release` or purge. Therefore, **`SECURITY INVOKER`** `BEFORE UPDATE` trigger
   `openmettle.enforce_runtime_storage_volume_pinned()` (`SET search_path = pg_catalog`, `OMQ03`,
-  using Migration `0004`'s table-level `SELECT` on `openmettle.storage_instance`) on both
-  `openmettle.storage_reservations` (`OLD.state = 'reserved' AND NEW.state = 'released'`) and
-  `openmettle.artifact_revisions` (`NEW.state IN ('purging', 'purged')`) checks `NOT
-  pg_catalog.pg_has_role(current_user, 'openmettle_owner', 'USAGE')`, **executes `PERFORM 1 FROM
-  openmettle.storage_instance WHERE id FOR SHARE;`**, and then raises `OMQ03` whenever `volume_id
-  IS NULL OR adoption_run_id IS NOT NULL`: because `FOR SHARE` conflicts directly with Step 1b's
-  `storage_instance FOR UPDATE` (and Step 1b locks *only* `storage_instance`, preserving strict
-  canonical lock order `runs -> storage_reservations -> artifacts -> artifact_revisions ->
-  storage_accounts -> storage_instance` with zero deadlock cycle), any in-flight `storage::release`
-  either completes its entire transaction strictly before Step 1b acquires `FOR UPDATE` OR blocks on
-  Step 1b's `FOR UPDATE` and fails closed with `OMQ03` once Step 1b commits `adoption_run_id`!
+  using `SELECT` on `openmettle.storage_volume_control`) on both `openmettle.storage_reservations`
+  (`OLD.state = 'reserved' AND NEW.state = 'released'`) and `openmettle.artifact_revisions`
+  (`NEW.state IN ('purging', 'purged')`) checks `NOT pg_catalog.pg_has_role(current_user,
+  'openmettle_owner', 'USAGE')`, executes `SELECT volume_id, adoption_run_id INTO v_vol, v_adopt
+  FROM openmettle.storage_volume_control WHERE id FOR SHARE;`, and raises `OMQ03` whenever **`NOT
+  FOUND OR v_vol IS NULL OR v_adopt IS NOT NULL`** (failing closed even if the singleton row is
+  missing!): because `FOR SHARE` on `storage_volume_control` is 100% mutually compatible across
+  concurrent runtime reserves/releases/purges, conflicts directly with Step 1b's standalone
+  `storage_volume_control FOR UPDATE`, and sits strictly before `storage_accounts ->
+  storage_instance` in canonical storage lock order (`runs -> storage_reservations -> artifacts ->
+  artifact_revisions -> storage_volume_control -> storage_accounts -> storage_instance`),
+  concurrent releases/reserves/purges **NEVER deadlock**, and any in-flight `storage::release`
+  either completes its entire transaction strictly before Step 1b acquires `FOR UPDATE` OR blocks
+  on Step 1b's `FOR UPDATE` and fails closed with `OMQ03` once Step 1b commits `adoption_run_id`.
   Because `SECURITY INVOKER` evaluates `current_user` as the active effective role executing the
   `UPDATE`, both `INHERIT` runtime logins AND `NOINHERIT` logins assuming `SET ROLE openmettle_api`
   or `SET ROLE openmettle_worker` fail closed with `OMQ03`, while active `openmettle_owner`
   reconciliation succeeds. Companion **`SECURITY INVOKER`** `BEFORE UPDATE` trigger
   `openmettle.enforce_storage_reservation_monotonic_guards()` (`SET search_path = pg_catalog`,
-  `OMQ03`) additionally enforces directly in PostgreSQL that no non-`openmettle_owner` role can
-  clear `adoption_unverified` (`true -> false`), mutate or clear a non-null `payload_ino`, or clear
-  `stage_claimed` (`true -> false`). Normal `N-1` and `N` HTTP uploads (`storage::reserve`,
-  `Store::stage`, `Store::publish`, `storage::settle`) continue uninterrupted while `volume_id IS
-  NULL AND adoption_run_id IS NULL` (whereas ADR 0039 worker `publish_bytes` spills and all four
-  cleaners strictly require `volume_id IS NOT NULL AND adoption_run_id IS NULL`), and any failed
-  upload's `abort()` receives `OMQ03` (preserving the `'reserved'` charge and any published
-  `revisions/<id>` until post-adoption `N` `reconcile_expired` completes verified cleanup on the
-  pinned volume). This trigger is a PostgreSQL ledger defense-in-depth backstop — explicitly **NOT**
-  a substitute for pre-migration `N-1` worker cleaner quiescence. Verified volume adoption pins
-  `storage_instance.volume_id` only after 100% of `N-1` API and worker replicas are replaced by `N`
-  binaries; starting or resuming any `N-1` replica after pinning is strictly forbidden by the
-  rollout contract.
+  `OMQ03`) combined with tightened `storage_reservations_adoption_unverified_check` (`CHECK (NOT
+  adoption_unverified OR state = 'reserved')`) additionally enforces directly in PostgreSQL that
+  no non-`openmettle_owner` role can EVER transition a quarantined `'reserved'` row (`adoption_unverified = true`) to `'released'` or `'settled'` (neither keeping `adoption_unverified = true` nor clearing it `true -> false`), mutate or clear a non-null `payload_ino`, or clear `stage_claimed` (`true -> false`), while `openmettle_owner` releases a quarantined row cleanly in one `UPDATE` setting `state = 'released', adoption_unverified = false`. Normal `N-1` and `N` HTTP uploads (`storage::reserve`, `Store::stage`, `Store::publish`, `storage::settle`) continue uninterrupted while `volume_id IS NULL AND adoption_run_id IS NULL` (whereas ADR 0039 worker `publish_bytes` spills and all four cleaners strictly require `volume_id IS NOT NULL AND adoption_run_id IS NULL`), and any failed upload's `abort()` receives `OMQ03` (preserving the `'reserved'` charge and any published `revisions/<id>` until post-adoption `N` `reconcile_expired` completes verified cleanup on the pinned volume). This trigger is a PostgreSQL ledger defense-in-depth backstop — explicitly **NOT** a substitute for pre-migration `N-1` worker cleaner quiescence. Verified volume adoption pins `storage_volume_control.volume_id` only after 100% of `N-1` API and worker replicas are replaced by `N` binaries; starting or resuming any `N-1` replica after pinning is strictly forbidden by the rollout contract.
 - **Immutable deployment cost denomination with concurrent `0023` serialization (zero lock cycle).**
   PR2 seeds the singleton `('instance', 'usage_cost_micros')` row in `quota_defaults`
   (`cost_denomination = NULL`) *before* attaching `quota_defaults_cost_denomination_immutable` and
@@ -1367,6 +1401,9 @@ account_admin_lock -> run_dispatch_lock -> projects -> users -> runs -> branch_h
   -> quota_defaults (openmettle_owner only) -> quota_cost_unit_lock (trigger serialization only)
   -> quota_reservations (parent before child) / storage_reservations
   -> artifacts (upload settlement only) / artifact_revisions (retention/purge only)
+  -> storage_volume_control (FOR SHARE in runtime reserve/settle/release/purge & StagingSweepState;
+                             FOR UPDATE ONLY in openmettle-admin adoption Steps 1b/3 and
+                             one-time empty-ledger Store::open bootstrap)
   -> quota_budgets (FOR NO KEY UPDATE: scope rows asc (scope_id, resource_kind, window_start, id),
                     then instance rows asc (resource_kind, window_start, id))
   -> storage_accounts (asc scope_id) -> storage_instance (singleton instance row last)
@@ -1392,11 +1429,11 @@ account_admin_lock -> run_dispatch_lock -> projects -> users -> runs -> branch_h
 | Gateway cost report insert & first `cost_denomination` configuration | `openmettle_owner` configures `('instance', 'usage_cost_micros')` in `quota_defaults` solely via direct `UPDATE` (never `INSERT ... ON CONFLICT`). `enforce_cost_denomination_immutability()` rejects `INSERT` (including `INSERT ... ON CONFLICT`), `DELETE`, and rename into/out of `('instance', 'usage_cost_micros')` with `OMQ02` **without acquiring `quota_cost_unit_lock`**, acquiring `quota_cost_unit_lock` (`FOR UPDATE`) exclusively under `BEFORE UPDATE` after PostgreSQL already holds the `quota_defaults` row lock (`quota_defaults` -> `quota_cost_unit_lock`). `openmettle_gateway` inserting `gateway_usage_reports` (`WHEN NEW.cost IS NOT NULL`) fires `BEFORE INSERT` trigger `enforce_gateway_report_cost_unit()` (`SECURITY DEFINER`), which performs a non-locking `SELECT` on `quota_defaults` (never locking `quota_defaults`) and, when `cost_denomination IS NULL`, locks `quota_cost_unit_lock` (`FOR UPDATE`) before re-checking `quota_defaults` and `gateway_usage_reports` — serializing both commit orders and concurrent unconfigured cost reports with zero lock cycle. |
 | Gateway usage settlement or correction (`openmettle_gateway`, via `quota_settle_gateway_usage`) | **Every** `openmettle_gateway` write transaction that inserts or updates `openmettle.gateway_settlements` — **both** settlement-only transactions **and** combined single-transaction (`gateway_settlements` upsert + `quota_settle_gateway_usage`) writes — MUST call **`openmettle.quota_lock_gateway_request_for_settlement(p_request_id)`** (`FOR NO KEY UPDATE` on `gateway_requests`, and if any caller ever touches upstream rows, `(runs ->) gateway_reservations` BEFORE `gateway_requests`) **strictly BEFORE** `INSERT`/`UPDATE` on `openmettle.gateway_settlements` (whose `AFTER INSERT OR UPDATE` trigger `quota_record_accepted_gateway_settlement` appends `(NEW.request_id, NEW.revision, NEW.final)` to `openmettle.quota_accepted_gateway_reports`, establishing the strictly acyclic global DAG `runs -> gateway_reservations -> gateway_requests -> gateway_settlements -> quota_accepted_gateway_reports -> quota_reservations -> quota_budgets` with zero cycles across settlement-only writers, combined writers, `gateway_mark_settled_final`, and worker recovery). Inside `quota_settle_gateway_usage` (`SECURITY DEFINER`), holds must already be in `state IN ('handoff_committed', 'settled')` (so `gateway_requests.state = 'handed_off'`); the function **never locks `runs`, `gateway_bindings`, `gateway_reservations`, or `gateway_settlements`** — its lock sequence is strictly **`gateway_requests` (`FOR KEY SHARE`, non-conflicting with `FOR NO KEY UPDATE`) -> `quota_reservations` (`ORDER BY resource_kind ASC FOR UPDATE`) -> charged `quota_budgets` (`FOR NO KEY UPDATE`, scope rows asc, instance row last)**, verifying `(p_report_source, p_report_id, p_source_revision)` matches `openmettle.gateway_usage_reports` and `EXISTS (SELECT 1 FROM openmettle.quota_accepted_gateway_reports a WHERE a.request_id = qr.gateway_request_id AND a.revision = p_source_revision)`. When `qr.accepted_source_revision IS NOT NULL AND p_source_revision <= qr.accepted_source_revision`, it returns an idempotent no-op; otherwise it **deterministically folds every unapplied accepted revision `a.revision` in `(coalesce(qr.accepted_source_revision, -1), p_source_revision]` in ascending `ORDER BY a.revision ASC`** (applying included-reasoning lower bound `K_known = CASE WHEN rev_R >= rev_K THEN greatest(K_raw, R_latest) ELSE K_raw END` when `inc_latest IS TRUE`, complete-evidence close gate, and monotonic lower bound on incomplete reports), **unconditionally advancing `qr.accepted_source_revision = p_source_revision`** on `openmettle.quota_reservations` (writing `quota_reconciliations` and adjusting `quota_budgets` + `quota_warning_events` iff `(new_state, new_settled, new_held) IS DISTINCT FROM (old_state, old_settled, old_held)`). |
 | Pre-send abort, stale release, orphan `'reserved'` gateway sweep or V1-18 device release (via `quota_release_unsent` / `quota_release_orphan_gateway_requests` / `quota_release_device_slot`) | **One reservation/request per short transaction, locks acquired inside `SECURITY DEFINER`:** `runs` (if run-linked: `FOR NO KEY UPDATE SKIP LOCKED` in stale/orphan sweep, `FOR NO KEY UPDATE` on explicit abort/release) -> if bound to `gateway_request_id`, `gateway_reservations` -> `gateway_requests` (explicit pre-send unwind couples with `authz::gateway::release_in(&mut tx, ...)` / `openmettle.gateway_release(p_request, p_dispatch)` after locking `runs`, or verifies `gateway_requests.state = 'released'` from a prior `gateway_release` commit; sweep mode acquires `FOR NO KEY UPDATE SKIP LOCKED` on `gateway_reservations` then `gateway_requests`, proceeds if `gateway_requests.state = 'released'`, **atomically transitions stale `'reserved'` `gateway_requests` to `'released'` and restores `gateway_reservations.allocated`** when expiry/terminal preconditions hold, and leaves `'handed_off'` or locked rows untouched) -> parent `quota_reservations` (if child, `FOR NO KEY UPDATE SKIP LOCKED` in sweep / `FOR NO KEY UPDATE` on explicit release) -> target `quota_reservations` (`FOR NO KEY UPDATE SKIP LOCKED` in stale sweep, `FOR NO KEY UPDATE` on explicit abort/release). Whenever `gateway_request_id IS NOT NULL`, `quota_release_unsent` **explicitly re-verifies `(q.scope_id, q.actor_user_id) = (qr.scope_id, qr.actor_user_id) AND q.run_id IS NOT DISTINCT FROM qr.run_id` under lock before mutating either ledger** (raising an invariant error and mutating neither ledger on mismatch). If unwinding an unsent child hold back to an active `held` parent run hold, transfer `held_units` back to parent (`quota_budgets` delta = `0`); otherwise lock charged `quota_budgets` via `quota_reservation_charges` (scope rows asc, instance row last) -> insert `quota_reconciliations` -> update reservation (`closed_at = clock_timestamp()`) and budget balances. Separately, `openmettle.quota_release_orphan_gateway_requests(...)` captures `v_age_cutoff := clock_timestamp() - p_max_reserved_age` once in PL/pgSQL, clamps scalar `v_upper_created_at` and `v_upper_id` via `IF (p_pass_upper_created_at, p_pass_upper_id) <= (v_age_cutoff, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid) THEN ... ELSE ... END IF;`, materializes a bounded page of at most `p_page_size` raw `(created_at, id)` index keys from `gateway_requests_reserved_idx` using only constant PL/pgSQL bounds (zero `clock_timestamp()` inside the `SELECT`), filters binding absence and run eligibility only on those keys, locks `(runs ->) gateway_reservations -> gateway_requests` (`FOR NO KEY UPDATE SKIP LOCKED`) for eligible orphans, and advances the persistent cursor across pages even when a page contains zero orphans. |
-| Storage upload reservation (`openmettle_api` / `openmettle_worker`) | `runs` (if run-linked) -> `storage_accounts` (`FOR UPDATE`) -> non-locking `SELECT` on `storage_reservations`, `artifacts`, `quota_overrides` -> `storage_instance` (`FOR UPDATE`) -> insert `storage_reservations` (setting `lease_expires_at` and optionally `stage_claimed = true`) -> update `storage_accounts` then `storage_instance` -> call `quota_record_storage_warning(...)`. |
-| Storage staging, pre-`renameat_with` mark & upload settlement (`Store::stage`, `stage_claimed`, `payload_ino`, `publish_pending`, `storage::settle`) | **Step 1a (`Store::stage` DB stage claim strictly BEFORE touching disk):** short lock-ordered primary tx `(runs FOR NO KEY UPDATE ->) storage_reservations FOR UPDATE` + `storage_instance FOR SHARE` (checking `adoption_run_id IS NULL` and `volume_id = $expected` when non-null) commits `UPDATE openmettle.storage_reservations SET stage_claimed = true WHERE scope_id = $1 AND id = $2 AND state = 'reserved' AND NOT adoption_unverified AND NOT stage_claimed AND payload_ino IS NULL AND reclaim_state = 'none'` (zero disk files created if rejected). **Step 1b (Create & durably sync `staging/<id>` BEFORE binding `payload_ino`):** re-verify `<root>`, `"staging"`, `"revisions"` directory FDs (+ sentinels when `volume_id IS NOT NULL`), `openat(&staging_dir_fd, id, OFlags::CREATE \| OFlags::EXCL \| OFlags::RDWR \| OFlags::NOFOLLOW)` (`0` bytes) -> `LOCK_SH` (`try_lock_shared()`) -> verify `file_meta` vs `statat` (`S_ISREG`, local `st_dev` match, `staged_ino = file_meta.ino()`) -> **`fsync(&staging_dir_fd)`** (crash-durable BEFORE `payload_ino` can commit in PostgreSQL). **Step 1c (DB bind `payload_ino`):** short lock-ordered `FOR UPDATE` tx (`storage_instance FOR SHARE` checking `adoption_run_id IS NULL` and `volume_id = $expected` when non-null) commits `UPDATE openmettle.storage_reservations SET payload_ino = $3::text::numeric(20, 0) WHERE scope_id = $1 AND id = $2 AND state = 'reserved' AND NOT adoption_unverified AND stage_claimed AND payload_ino IS NULL AND reclaim_state = 'none'`. `StagedFile::drop` (and all writer error/cancellation paths in `Store::stage`, `Store::publish`, and ADR 0039 `publish_bytes`) is **100% non-destructive** (NEVER calls `set_len(0)` or `unlinkat` — only closes the FD, releasing `LOCK_SH`). **Pre-`renameat_with` publication marker:** short lock-ordered primary tx `(runs FOR NO KEY UPDATE ->) storage_reservations FOR UPDATE` verifying `state = 'reserved' AND NOT adoption_unverified AND payload_ino = $staged_ino AND reclaim_state = 'none'` commits `SET publish_pending = true`, then publishes exclusively via **`rustix::fs::renameat_with(&staging_dir_fd, id, &revisions_dir_fd, id, RenameFlags::NOREPLACE)`** (`Errno::EXIST` leaves any foreign `revisions/<id>` untouched and quarantines `adoption_unverified = true, publish_pending = false`). **Settlement (`storage::settle`, while `StagedFile` retains `LOCK_SH` through `renameat_with` + `fsync` + `tx.commit()`):** `projects` (if authorized in tx) -> `storage_reservations` (`FOR UPDATE`, requiring `state = 'reserved' AND NOT adoption_unverified AND payload_ino = $staged_ino AND reclaim_state = 'none'`) -> `artifacts` (`FOR UPDATE`) -> insert `artifact_revisions` -> update `storage_reservations` (`SET state = 'settled', publish_pending = false`, **retaining `payload_ino`** on `'settled'`; DB trigger `enforce_storage_reservation_monotonic_guards()` prevents non-owners from mutating `payload_ino` or clearing `adoption_unverified`/`stage_claimed`) -> `storage_accounts` -> `storage_instance`. On ambiguous `storage::settle` commit, NEVER call `artifact_fs::abort` blindly; inspect `storage_reservations.state` under `(runs FOR NO KEY UPDATE ->) storage_reservations FOR UPDATE` first (if `'settled'`, publication succeeded). |
-| Storage retention and purge confirmation (`storage::retain_revision`, `restore_revision`, `confirm_purge`; and `begin_purge`) | `storage::retain_revision`, `restore_revision`, and `confirm_purge`: `artifact_revisions` (`FOR UPDATE`) -> `storage_accounts` -> `storage_instance`. `storage::begin_purge` updates only `artifact_revisions` (firing `enforce_runtime_storage_volume_pinned()`, which acquires `storage_instance FOR SHARE`) without locking `storage_accounts` (`src/storage.rs`). |
-| Storage release (`artifact_fs::abort`, non-run `reconcile_expired`, generic run-linked `storage_reservations` recovery, and ADR 0039 `reconcile_run_spills`) | **Unified 3-step reclamation protocol shared by ALL 4 cleaners (ZERO filesystem I/O inside DB transactions in Step 1 and Step 3):** **Step 1 (Serialized DB Claim):** lock `(runs FOR NO KEY UPDATE [SKIP LOCKED] ->) storage_reservations FOR UPDATE [SKIP LOCKED]` + `SELECT volume_id, adoption_run_id FROM openmettle.storage_instance WHERE id FOR SHARE` (`volume_id = $expected_volume_id AND adoption_run_id IS NULL`), requiring `state = 'reserved' AND NOT adoption_unverified AND (reclaim_state = 'none' OR reclaim_lease_until <= clock_timestamp())` (+ path preconditions), and commit `reclaim_state = CASE WHEN reclaim_state = 'truncated' THEN 'truncated' ELSE 'claiming' END, reclaim_claim_token = $my_token, reclaim_lease_until = clock_timestamp() + interval '60 seconds'` (resolving any in-flight `storage::settle` before Step 2 and blocking `Store::stage`, `publish_bytes`, `storage::settle`, and rival cleaners; in `abort`, an unexpired rival lease returns untouched). **Step 2 (Filesystem check, durable `set_len(0)` + `sync_all()`, and `LOCK_EX` `unlinkat` — outside DB tx, NEVER clearing `payload_ino`):** verify pinned three-directory sentinels + local `st_dev` (`root_fd`, `staging_dir_fd`, `revisions_dir_fd`). *Case 1 (`payload_ino IS NOT NULL`):* foreign/non-regular/different-local-`st_dev`/`st_ino != payload_ino` (in BOTH `'claiming'` and `'truncated'`) OR dual `ENOENT` in `'claiming'` -> **ZERO `set_len(0)` and ZERO `unlinkat`**, commit quarantine (`adoption_unverified = true, publish_pending = false, reclaim_state = 'none', reclaim_claim_token = NULL, reclaim_lease_until = NULL`) under lock-ordered `FOR UPDATE` re-verifying `state = 'reserved' AND NOT adoption_unverified AND reclaim_claim_token = $my_token AND reclaim_state = $observed_state AND payload_ino = $expected_ino` (+ `storage_instance FOR SHARE`); dual `ENOENT` in `'truncated'` -> dual `fsync(&staging_dir_fd)` + `fsync(&revisions_dir_fd)` -> Step 3; matched `S_ISREG` + local `st_dev` + `st_ino == payload_ino` -> open `OFlags::RDWR \| OFlags::NOFOLLOW` -> `try_lock()` (`LOCK_EX \| LOCK_NB`; `WouldBlock` aborts Step 2 untouched) -> re-verify `probe_file.metadata()` and `statat` -> if `'claiming'`, call `probe_file.set_len(0)?` + `probe_file.sync_all()?`, then while still holding `LOCK_EX` (re-checking `statat.st_ino == payload_ino`) commit short lock-ordered `FOR UPDATE` tx setting `reclaim_state = 'truncated', publish_pending = false` (`payload_ino` stays non-null!) -> in `'truncated'`, `unlinkat` -> `drop(probe_file)` -> unconditional `fsync(&staging_dir_fd)` + `fsync(&revisions_dir_fd)` -> Step 3. *Case 2 (`payload_ino IS NULL`):* any `revisions/<id>` or non-regular/different-local-`st_dev`/`st_size > 0` `staging/<id>` -> ZERO `set_len(0)`/`unlinkat`, quarantine under `FOR UPDATE` verifying `reclaim_claim_token = $my_token AND payload_ino IS NULL`; `0`-byte regular `staging/<id>` -> `LOCK_EX` -> re-verify -> `unlinkat` -> `drop`; unconditional `fsync(&staging_dir_fd)` + `fsync(&revisions_dir_fd)` -> Step 3. **Step 3 (Final `storage::release` — ZERO filesystem I/O inside DB tx):** lock `(runs FOR NO KEY UPDATE [SKIP LOCKED] ->) storage_reservations FOR UPDATE [SKIP LOCKED]` + `storage_instance FOR SHARE` (`volume_id = $expected_volume_id AND adoption_run_id IS NULL`), require `state = 'reserved' AND NOT adoption_unverified AND NOT publish_pending AND reclaim_claim_token = $my_token AND (payload_ino IS NULL OR reclaim_state = 'truncated')` (+ path preconditions), clear `reclaim_state = 'none', reclaim_claim_token = NULL, reclaim_lease_until = NULL`, and commit `storage::release` (`storage_accounts -> storage_instance`, **retaining `payload_ino` on `'released'`**). |
-| Storage volume adoption, fresh-bootstrap auto-pinning & `StagingSweepState` orphan recheck (`openmettle-admin` / `Store::open` / `openmettle_worker`) | For `openmettle-admin` adoption (on **both** initial unpinned `volume_id IS NULL` and already-pinned `volume_id IS NOT NULL` runs): mint unique `my_adoption_run_id = uuid_v4()` per invocation. **Step 1b (strictly BEFORE Step 2 pre-scan):** commit a short `openmettle_owner` tx acquiring **`SELECT volume_id, adoption_run_id FROM openmettle.storage_instance WHERE id FOR UPDATE`** (which locks *only* `storage_instance` — zero deadlock cycle — and conflicts directly with `enforce_runtime_storage_volume_pinned()`'s `FOR SHARE` so any in-flight `storage::release` either finishes its entire transaction strictly before Step 1b acquires `FOR UPDATE`, or blocks on Step 1b and fails closed with `OMQ03` once Step 1b commits). If `adoption_run_id IS NOT NULL`, fail closed (`OMQ03`) without modifying `adoption_run_id` unless `--replace-adoption-run <stale_uuid>` matches `adoption_run_id = $stale_uuid`. Set `UPDATE openmettle.storage_instance SET adoption_run_id = $my_adoption_run_id WHERE id` and commit Step 1b. **Step 2:** scan `<root>/revisions` and `<root>/staging` outside DB locks; on Step 2 failure, clear `adoption_run_id = NULL` **only `WHERE id AND adoption_run_id = $my_adoption_run_id`** under `FOR UPDATE`. **Step 3:** lock **`storage_reservations` (`ORDER BY id ASC FOR UPDATE`) -> `artifact_revisions` (`ORDER BY id ASC FOR UPDATE`) -> `storage_accounts` (`ORDER BY scope_id ASC FOR UPDATE`) -> `SELECT volume_id, adoption_run_id FROM openmettle.storage_instance WHERE id FOR UPDATE`** (canonical order, zero locks after `storage_instance`), **require `adoption_run_id = $my_adoption_run_id`** (aborting `OMQ03` if displaced), **backfill `payload_ino` on every positively verified on-disk `'reserved'` and `'active'`/`'retained'` `'settled'` row**, quarantine missing/mismatched `'reserved'` rows (`adoption_unverified = true, publish_pending = false, reclaim_state = 'none', reclaim_claim_token = NULL, reclaim_lease_until = NULL`), publish sentinels (`fsync(root_fd)` before `:revisions`/`:staging`, then `fsync(revisions_dir_fd)` + `fsync(staging_dir_fd)`), pin `volume_id`, and **atomically clear `adoption_run_id = NULL` in the exact same commit** (or commit quarantine + clear `adoption_run_id = NULL` before returning `OMQ03`). For `Store::open` fresh-bootstrap auto-pinning: `storage_instance` (`FOR UPDATE`) -> non-locking empty-ledger re-check -> atomic sentinel publication -> `storage_pin_volume_id(sentinel_uuid)` in the same transaction. For `StagingSweepState` zero-row orphan `staging/<id>` verification: while holding non-blocking `LOCK_EX` on the verified `(st_dev, st_ino)` file (`st_mtime > 900 s`), run a short primary DB tx acquiring `storage_instance` (`FOR UPDATE`, verifying `volume_id = $expected_volume_id AND adoption_run_id IS NULL`) -> non-locking `NOT EXISTS (SELECT 1 FROM openmettle.storage_reservations WHERE id = $1::uuid)` -> end DB tx before `set_len(0)` -> `sync_all()` -> `unlinkat` -> `drop` -> `fsync(staging_dir_fd)`. All three serialize cleanly with zero deadlock. |
+| Storage upload reservation (`openmettle_api` / `openmettle_worker`) | `runs` (if run-linked, `FOR NO KEY UPDATE`) -> `storage_volume_control` (`FOR SHARE`) -> `storage_accounts` (`FOR UPDATE`) -> non-locking `SELECT` on `storage_reservations`, `artifacts`, `quota_overrides` -> `storage_instance` (`FOR UPDATE`) -> insert `storage_reservations` (setting `lease_expires_at` and optionally `stage_claimed = true`) -> update `storage_accounts` then `storage_instance` -> call `quota_record_storage_warning(...)`. |
+| Storage staging, `linkat` publication & upload settlement (`Store::stage`, `stage_claimed`, `payload_ino`, `publish_pending`, `storage::settle`) | **Step 1a (`Store::stage` DB stage claim strictly BEFORE touching disk):** short lock-ordered primary tx `(runs FOR NO KEY UPDATE ->) storage_reservations FOR UPDATE` -> `storage_volume_control FOR SHARE` (checking `adoption_run_id IS NULL` and `volume_id = $expected` when non-null) commits `UPDATE openmettle.storage_reservations SET stage_claimed = true WHERE scope_id = $1 AND id = $2 AND state = 'reserved' AND NOT adoption_unverified AND NOT stage_claimed AND payload_ino IS NULL AND reclaim_state = 'none'` (zero disk files created if rejected). **Step 1b (Create & durably sync `staging/<id>` BEFORE binding `payload_ino`):** re-verify `<root>`, `"staging"`, `"revisions"` directory FDs (+ sentinels when `volume_id IS NOT NULL`), `openat(&staging_dir_fd, id, OFlags::CREATE \| OFlags::EXCL \| OFlags::RDWR \| OFlags::NOFOLLOW)` (`0` bytes) -> `LOCK_SH` (`try_lock_shared()`) -> verify `file_meta` vs `statat` (`S_ISREG`, local `st_dev` match, `staged_ino = file_meta.ino()`) -> **`fsync(&staging_dir_fd)`** (crash-durable BEFORE `payload_ino` can commit in PostgreSQL). **Step 1c (DB bind `payload_ino`):** short lock-ordered `FOR UPDATE` tx (`storage_reservations FOR UPDATE` -> `storage_volume_control FOR SHARE` checking `adoption_run_id IS NULL` and `volume_id = $expected` when non-null) commits `UPDATE openmettle.storage_reservations SET payload_ino = $3::text::numeric(20, 0) WHERE scope_id = $1 AND id = $2 AND state = 'reserved' AND NOT adoption_unverified AND stage_claimed AND payload_ino IS NULL AND reclaim_state = 'none'`. `StagedFile::drop` (and all writer error/cancellation paths in `Store::stage`, `Store::publish`, and ADR 0039 `publish_bytes`) is **100% non-destructive** (NEVER calls `set_len(0)` or `unlinkat` — only closes the FD, releasing `LOCK_SH`). **Pre-`linkat` publication marker & `linkat` no-replace publication:** short lock-ordered primary tx `(runs FOR NO KEY UPDATE ->) storage_reservations FOR UPDATE` verifying `state = 'reserved' AND NOT adoption_unverified AND payload_ino = $staged_ino AND reclaim_state = 'none'` commits `SET publish_pending = true`, then publishes exclusively via **`rustix::fs::linkat(&staging_dir_fd, id, &revisions_dir_fd, id, AtFlags::empty())`** (mandatory POSIX/NFS `LINK` that atomically fails with `Errno::EXIST` without overwriting any foreign `revisions/<id>` — quarantining `adoption_unverified = true, publish_pending = false` on `EEXIST` — **AND keeps `staging/<id>` present on disk throughout the entire unsettled `state = 'reserved'` window** so any mixed-version `N-1` API same-key retry hits `OpenOptions::create_new(true)` -> `Err(Error::InProgress)` at `src/artifact_fs.rs:474-475` without staging or calling replacing `fs::rename`!) -> `fsync(&revisions_dir_fd)` -> post-`linkat` re-verify (`<root>`, `"staging"`, `"revisions"` + sentinels when pinned + `statat(&revisions_dir_fd, id)` matches `S_ISREG`, local `st_dev`, `st_ino == staged_ino`, `st_size == size_bytes`). **Settlement (`storage::settle`, while `StagedFile` retains `LOCK_SH` through `linkat` + `fsync` + `tx.commit()`):** `projects` (if authorized in tx) -> `storage_reservations` (`FOR UPDATE`, requiring `state = 'reserved' AND NOT adoption_unverified AND payload_ino = $staged_ino AND reclaim_state = 'none'`) -> `artifacts` (`FOR UPDATE`) -> insert `artifact_revisions` -> update `storage_reservations` (`SET state = 'settled', publish_pending = false`, **retaining `payload_ino`** on `'settled'`; DB trigger `enforce_storage_reservation_monotonic_guards()` prevents non-owners from mutating `payload_ino` or clearing `adoption_unverified`/`stage_claimed`) -> `storage_accounts` -> `storage_instance`. **Post-`commit` best-effort detach of `staging/<id>` alias:** while still holding `LOCK_SH` on `StagedFile`, verify `statat(&staging_dir_fd, id).st_ino == staged_ino` AND `statat(&revisions_dir_fd, id).st_ino == staged_ino`, call `unlinkat(&staging_dir_fd, id, AtFlags::empty())` (**NEVER `set_len(0)`!**) -> `drop(file)` -> `fsync(&staging_dir_fd)`. On ambiguous `storage::settle` commit, NEVER call `artifact_fs::abort` blindly; inspect `storage_reservations.state` under `(runs FOR NO KEY UPDATE ->) storage_reservations FOR UPDATE` first (if `'settled'`, publication succeeded). |
+| Storage retention and purge confirmation (`storage::retain_revision`, `restore_revision`, `confirm_purge`; and `begin_purge`) | `storage::retain_revision` and `restore_revision`: `artifact_revisions` (`FOR UPDATE`) -> `storage_accounts` (`FOR UPDATE`) -> `storage_instance` (`FOR UPDATE`). `storage::begin_purge` joins `storage_reservations` (loading `payload_ino` and `adoption_unverified`, requiring `NOT adoption_unverified AND payload_ino IS NOT NULL`) and updates `artifact_revisions` (firing `enforce_runtime_storage_volume_pinned()`, which acquires `storage_volume_control FOR SHARE`) without locking `storage_accounts` (`src/storage.rs`). `storage::confirm_purge`: `artifact_revisions` (`FOR UPDATE`, firing `enforce_runtime_storage_volume_pinned()` taking `storage_volume_control FOR SHARE`) -> `storage_accounts` (`FOR UPDATE`) -> `storage_instance` (`FOR UPDATE`). |
+| Storage release (`artifact_fs::abort`, non-run `reconcile_expired`, generic run-linked `storage_reservations` recovery, and ADR 0039 `reconcile_run_spills`) | **Unified 4-step reclamation protocol with `staging/.reclaim.<id>` anchor shared by ALL 4 cleaners (ZERO filesystem I/O inside DB transactions in Steps 1 and 3; `payload_ino` NEVER drops to `nlink = 0` before Step 3 commits):** **Step 1 (Serialized DB Claim):** lock `(runs FOR NO KEY UPDATE [SKIP LOCKED] ->) storage_reservations FOR UPDATE [SKIP LOCKED] -> storage_volume_control FOR SHARE` (`NOT FOUND OR v_vol IS DISTINCT FROM $expected_volume_id OR v_adopt IS NOT NULL` -> abort), requiring `state = 'reserved' AND NOT adoption_unverified AND (reclaim_state = 'none' OR reclaim_lease_until <= clock_timestamp())` (+ path preconditions), and commit `reclaim_state = CASE WHEN reclaim_state = 'truncated' THEN 'truncated' ELSE 'claiming' END, reclaim_claim_token = $my_token, reclaim_lease_until = clock_timestamp() + interval '60 seconds'`. **Step 2 (Durable `0`-Byte Truncation & `staging/.reclaim.<id>` Link Anchor — outside DB tx, NEVER clearing `payload_ino`):** verify pinned three-directory sentinels + local `st_dev` (`root_fd`, `staging_dir_fd`, `revisions_dir_fd`). *Case 1a (`payload_ino IS NOT NULL`, `reclaim_state = 'claiming'`):* probe `staging/<id>`, `revisions/<id>`, and `staging/.reclaim.<id>`: any foreign/non-regular/different-local-`st_dev`/`st_ino != payload_ino` OR all-three `ENOENT` -> **ZERO `set_len(0)` and ZERO `unlinkat`**, commit quarantine (`adoption_unverified = true, publish_pending = false, reclaim_state = 'none', reclaim_claim_token = NULL, reclaim_lease_until = NULL`) under lock-ordered `FOR UPDATE` re-verifying `reclaim_claim_token = $my_token AND reclaim_state = 'claiming' AND payload_ino = $expected_ino` (+ `storage_volume_control FOR SHARE`); exact match (`st_ino == payload_ino`) -> open `OFlags::RDWR \| OFlags::NOFOLLOW` -> `try_lock()` (`LOCK_EX \| LOCK_NB`; `WouldBlock` aborts Step 2 untouched) -> re-verify `probe_file.metadata().ino() == payload_ino` and `statat` -> (1) `probe_file.set_len(0)?` + `probe_file.sync_all()?` -> (2) create/verify hard-link anchor `staging/.reclaim.<id>` via `linkat(&src_dir_fd, src_name, &staging_dir_fd, &reclaim_name, AtFlags::empty())` + `fsync(&staging_dir_fd)` BEFORE unlinking `<id>` -> (3) while `staging/.reclaim.<id>` holds `nlink >= 1` and `probe_file` holds `LOCK_EX`, unlink any existing `<id>` in `revisions/<id>` and `staging/<id>` (re-verifying `st_ino == payload_ino`) + `fsync(&revisions_dir_fd)` + `fsync(&staging_dir_fd)` -> (4) still holding `LOCK_EX` on `probe_file` (anchored at `staging/.reclaim.<id>`), commit short lock-ordered `FOR UPDATE` tx setting `reclaim_state = 'truncated', publish_pending = false`. *Case 1b (`payload_ino IS NOT NULL`, `reclaim_state = 'truncated'`):* **NEVER touch `staging/<id>` or `revisions/<id>`!** Probe `staging/.reclaim.<id>` ONLY (`S_ISREG`, same local `st_dev`, `st_ino == payload_ino`, `st_size == 0`; else quarantine under `reclaim_claim_token = $my_token AND reclaim_state = 'truncated' AND payload_ino = $expected_ino`) -> open -> `LOCK_EX` -> re-verify -> `fsync(&staging_dir_fd)` + `fsync(&revisions_dir_fd)` -> proceed to Step 3 keeping `probe_file` open with `LOCK_EX`. *Case 2 (`payload_ino IS NULL`):* any `revisions/<id>` or non-regular/different-local-`st_dev`/`st_size > 0` `staging/<id>` -> ZERO `set_len(0)`/`unlinkat`, quarantine under `reclaim_claim_token = $my_token AND payload_ino IS NULL`; `0`-byte regular `staging/<id>` -> `LOCK_EX` -> re-verify -> `unlinkat` -> `drop`; dual `fsync` -> Step 3. **Step 3 (Final `storage::release` — ZERO FS I/O inside DB tx):** lock `(runs FOR NO KEY UPDATE [SKIP LOCKED] ->) storage_reservations FOR UPDATE [SKIP LOCKED]`, verify `state = 'reserved' AND NOT adoption_unverified AND NOT publish_pending AND reclaim_claim_token = $my_token AND (payload_ino IS NULL OR reclaim_state = 'truncated')` (+ path preconditions), set `reclaim_state = CASE WHEN payload_ino IS NOT NULL THEN 'anchor_pending_unlink' ELSE 'none' END, reclaim_claim_token = NULL, reclaim_lease_until = NULL`, and commit `storage::release` (`UPDATE storage_reservations` fires `enforce_runtime_storage_volume_pinned()` taking `storage_volume_control FOR SHARE` -> `adjust()` updates `storage_accounts FOR UPDATE -> storage_instance FOR UPDATE`, **retaining `payload_ino`**). **Step 4 (Post-release detach of `staging/.reclaim.<id>`):** when `payload_ino IS NOT NULL` (still holding `probe_file` with `LOCK_EX`), verify `statat(&staging_dir_fd, &reclaim_name)` matches `st_ino == payload_ino` and `st_size == 0`, call `unlinkat(&staging_dir_fd, &reclaim_name, AtFlags::empty())` -> `drop(probe_file)` -> `fsync(&staging_dir_fd)` -> commit best-effort `UPDATE openmettle.storage_reservations SET reclaim_state = 'none' WHERE id = $1::uuid AND state = 'released' AND reclaim_state = 'anchor_pending_unlink'`. |
+| Storage volume adoption, fresh-bootstrap auto-pinning & `StagingSweepState` orphan recheck (`openmettle-admin` / `Store::open` / `openmettle_worker`) | For `openmettle-admin` adoption (on **both** initial unpinned `volume_id IS NULL` and already-pinned `volume_id IS NOT NULL` runs): mint unique `my_adoption_run_id = uuid_v4()` per invocation. **Step 1b (strictly BEFORE Step 2 pre-scan):** commit a short `openmettle_owner` tx locking ONLY **`SELECT volume_id, adoption_run_id INTO STRICT ... FROM openmettle.storage_volume_control WHERE id FOR UPDATE`** (zero deadlock cycle; conflicts directly with runtime `storage_volume_control FOR SHARE` so any in-flight `storage::release`/`reserve`/`purge` either completes strictly before Step 1b acquires `FOR UPDATE`, or blocks on Step 1b and fails closed with `OMQ03` once Step 1b commits). If `adoption_run_id IS NOT NULL`, fail closed (`OMQ03`) without modifying `adoption_run_id` unless `--replace-adoption-run <stale_uuid>` matches `adoption_run_id = $stale_uuid`. Set `UPDATE openmettle.storage_volume_control SET adoption_run_id = $my_adoption_run_id WHERE id` and commit Step 1b. **Step 2:** scan `<root>/revisions` and `<root>/staging` outside DB locks; on Step 2 failure, clear `adoption_run_id = NULL` **only `WHERE id AND adoption_run_id = $my_adoption_run_id`** under `FOR UPDATE`. **Step 3:** lock **`storage_reservations` (`ORDER BY id ASC FOR UPDATE`) -> `artifact_revisions` (`ORDER BY id ASC FOR UPDATE`) -> `storage_volume_control` (`WHERE id FOR UPDATE`) -> `storage_accounts` (`ORDER BY scope_id ASC FOR UPDATE`) -> `storage_instance` (`WHERE id FOR UPDATE`)** (exact canonical order), **require `adoption_run_id = $my_adoption_run_id`** (aborting `OMQ03` if displaced), evaluate ALL `'active'`/`'retained'`/`'purging'` revisions and volume checks **BEFORE** writing `payload_ino`, preserve verified `'truncated'` holds whose `staging/.reclaim.<id>` exists as `S_ISREG` with `st_ino == payload_ino` and `st_size == 0` (expiring `reclaim_lease_until = clock_timestamp()` so the next cleaner tick finishes Step 3 -> Step 4), and **ONLY in the success branch** commit `payload_ino` backfills (`WHERE payload_ino IS NULL`), quarantine missing/mismatched `'reserved'` rows (`adoption_unverified = true, publish_pending = false, reclaim_state = 'none', reclaim_claim_token = NULL, reclaim_lease_until = NULL`), publish sentinels (`fsync(root_fd)` before `:revisions`/`:staging`, then `fsync(revisions_dir_fd)` + `fsync(staging_dir_fd)`), pin `storage_volume_control.volume_id`, and **atomically clear `adoption_run_id = NULL`**; if volume verification fails, **roll back / omit ALL `payload_ino` backfills** (committing ONLY `adoption_unverified = true` on missing/mismatched `'reserved'` rows when `volume_id IS NOT NULL` and clearing `storage_volume_control.adoption_run_id = NULL WHERE id AND adoption_run_id = $my_adoption_run_id` before returning `OMQ03`). For `Store::open` fresh-bootstrap auto-pinning: `storage_volume_control` (`FOR UPDATE`) -> non-locking empty-ledger re-check -> atomic sentinel publication -> `storage_pin_volume_id(sentinel_uuid)` in the same transaction. For `StagingSweepState` zero-row orphan `staging/<id>` verification: while holding non-blocking `LOCK_EX` on the verified `(st_dev, st_ino)` file (`st_mtime > 900 s`), run a short primary DB tx acquiring `storage_volume_control` (`FOR SHARE`, verifying `volume_id = $expected_volume_id AND adoption_run_id IS NULL`) -> `storage_instance` (`FOR UPDATE`) -> non-locking `NOT EXISTS (SELECT 1 FROM openmettle.storage_reservations WHERE id = $1::uuid)` -> end DB tx before `set_len(0)` -> `sync_all()` -> `unlinkat` -> `drop` -> `fsync(staging_dir_fd)`. All three serialize cleanly with zero deadlock. |
 | Override write (`openmettle_api` via `quota_upsert_scope_override` / `quota_revoke_scope_override`, `ManageQuotas`) | Inside `SECURITY DEFINER`: if `resource_kind IN ('executing_runs_per_actor', 'executing_runs_per_scope')`, acquire `run_dispatch_lock` (`FOR NO KEY UPDATE`) first -> target entity row (`projects` `FOR NO KEY UPDATE` for project scopes; personal owner `users` `FOR NO KEY UPDATE` for personal/actor scopes) -> if `storage_bytes`, `storage_accounts` (`FOR UPDATE`); if metered usage/device, current active `quota_budgets` (`FOR NO KEY UPDATE`, ascending) -> upsert/revoke `quota_overrides` (incrementing `revision` to re-arm warning watermarks); then caller inserts `authorization_audit` in the same transaction. Live-run and round-cap kinds (`live_runs_*`, `round_cap`) serialize on `projects`/`users` matching `lock_scope_actor`; `openmettle_owner` updates to `executing_runs_*` rows in `quota_defaults` also acquire `run_dispatch_lock` (`FOR NO KEY UPDATE`) first so default cap changes serialize with `claim_next`. |
 
 During `quota_reserve` and `quota_ensure_legacy_run_holds`, the idempotency / existing-parent
@@ -1419,36 +1456,45 @@ UPDATE` trigger appends to `quota_accepted_gateway_reports`), so Migration `0023
 `gateway_mark_settled_final()` (`UPDATE gateway_requests SET settled_final = true`) re-uses the
 already-held `FOR NO KEY UPDATE` lock on `gateway_requests`, eliminating any lock cycle across
 settlement-only writers, combined writers, and `runs -> gateway_reservations -> gateway_requests`
-recovery. Storage volume adoption (Step 1b `storage_instance FOR UPDATE` alone; Step 3
-`storage_reservations` ascending `id` -> `artifact_revisions` ascending `id` -> `storage_accounts`
-ascending `scope_id` -> `storage_instance FOR UPDATE`), fresh-bootstrap auto-pinning
-(`storage_instance` only), and `StagingSweepState` zero-row orphan verification (`storage_instance`
-only) acquire zero row locks after `storage_instance FOR UPDATE`.
+recovery. Storage operations follow the strict canonical lock order `runs -> storage_reservations
+-> artifacts -> artifact_revisions -> storage_volume_control -> storage_accounts ->
+storage_instance`: runtime `reserve`, `settle`, `release`, `purge`, and `StagingSweepState` **ONLY
+ever acquire `FOR SHARE` on `openmettle.storage_volume_control` and NEVER `UPDATE`
+`storage_volume_control`**, while `storage::adjust` (`src/storage.rs:289-310`) updates
+`storage_accounts -> storage_instance` (`FOR NO KEY UPDATE`) strictly afterward without any prior
+`FOR SHARE` on `storage_instance` — so concurrent releases, reserves, and purges **NEVER
+deadlock**. Only `openmettle-admin` adoption (Step 1b locking ONLY `storage_volume_control FOR
+UPDATE`; Step 3 locking `storage_reservations` ascending `id` -> `artifact_revisions` ascending
+`id` -> `storage_volume_control FOR UPDATE` -> `storage_accounts` ascending `scope_id` ->
+`storage_instance FOR UPDATE`) and one-time empty-ledger `Store::open` fresh-bootstrap auto-pinning
+(`storage_volume_control FOR UPDATE` only) acquire `FOR UPDATE` on `storage_volume_control`.
 `enforce_cost_denomination_immutability` never acquires `quota_cost_unit_lock` during `INSERT` or
 rename (only under `BEFORE UPDATE` after the `quota_defaults` row lock is already held),
 `enforce_gateway_report_cost_unit` never locks `quota_defaults` (only `quota_cost_unit_lock`),
 `SECURITY INVOKER` `enforce_runtime_storage_volume_pinned` acquires **`FOR SHARE`** on singleton
-`openmettle.storage_instance` while the caller holds `storage_reservations` or `artifact_revisions`
-`FOR UPDATE` (strictly preserving canonical lock order `... -> storage_reservations /
-artifact_revisions -> storage_accounts -> storage_instance` and serializing directly against Step
-1b's standalone `storage_instance FOR UPDATE` with zero deadlock cycle; `enforce_storage_reservation_monotonic_guards`
-acquires zero additional locks), and `enforce_gateway_handoff_holds()` inserts into
-`openmettle.quota_gateway_handoffs` (referencing the already-`FOR UPDATE`-locked
-`gateway_requests` row) **before** acquiring **`FOR SHARE`** on `openmettle.quota_enforcement` as
-the final table/row lock of the transaction (updating only its own uncommitted
-`quota_gateway_handoffs` tuple with zero additional locks when `metering_enforced = true`), while
-`openmettle_owner` flips `openmettle.quota_enforcement` in a **standalone single-statement
-transaction** holding zero other locks — strictly matching `... -> quota_gateway_handoffs ->
-quota_enforcement` and making `quota_enforcement` a genuine pure sink/leaf in the lock graph so no
-path holding `quota_enforcement` ever waits on another lock. Likewise, no path holding a
-`quota_reservations`, `quota_budgets`, `storage_*` or `quota_overrides` lock waits on
-`quota_defaults` or `quota_cost_unit_lock`; no path holding a `projects`, `users`, `runs`, quota or
-storage lock waits on `run_dispatch_lock`; and no path holding a quota or storage lock waits on
-`projects`, `users`, `runs`, `gateway_bindings`, `gateway_intents`, `gateway_reservations`,
-`gateway_requests`, `gateway_settlements` or `quota_accepted_gateway_reports`, making the global
-lock graph strictly acyclic. If a caller composes multiple unrelated owners and PostgreSQL reports
-SQLSTATE `40P01`, the caller rolls back the whole transaction and retries with identical
-idempotency keys.
+`openmettle.storage_volume_control` while the caller holds `storage_reservations` or
+`artifact_revisions` `FOR UPDATE` (strictly preserving canonical lock order `... ->
+storage_reservations / artifact_revisions -> storage_volume_control -> storage_accounts ->
+storage_instance`, failing closed with `OMQ03` on missing singleton row or `volume_id IS NULL OR
+adoption_run_id IS NOT NULL`, and serializing directly against Step 1b's standalone
+`storage_volume_control FOR UPDATE` with zero deadlock cycle;
+`enforce_storage_reservation_monotonic_guards` acquires zero additional locks), and
+`enforce_gateway_handoff_holds()` inserts into `openmettle.quota_gateway_handoffs` (referencing
+the already-`FOR UPDATE`-locked `gateway_requests` row) **before** acquiring **`FOR SHARE`** on
+`openmettle.quota_enforcement` as the final table/row lock of the transaction (updating only its
+own uncommitted `quota_gateway_handoffs` tuple with zero additional locks when `metering_enforced
+= true`), while `openmettle_owner` flips `openmettle.quota_enforcement` in a **standalone
+single-statement transaction** holding zero other locks — strictly matching `... ->
+quota_gateway_handoffs -> quota_enforcement` and making `quota_enforcement` a genuine pure
+sink/leaf in the lock graph so no path holding `quota_enforcement` ever waits on another lock.
+Likewise, no path holding a `quota_reservations`, `quota_budgets`, `storage_*` or `quota_overrides`
+lock waits on `quota_defaults` or `quota_cost_unit_lock`; no path holding a `projects`, `users`,
+`runs`, quota or storage lock waits on `run_dispatch_lock`; and no path holding a quota or storage
+lock waits on `projects`, `users`, `runs`, `gateway_bindings`, `gateway_intents`,
+`gateway_reservations`, `gateway_requests`, `gateway_settlements` or
+`quota_accepted_gateway_reports`, making the global lock graph strictly acyclic. If a caller
+composes multiple unrelated owners and PostgreSQL reports SQLSTATE `40P01`, the caller rolls back
+the whole transaction and retries with identical idempotency keys.
 
 ### Exact-once internal reconciliation
 
@@ -1614,7 +1660,9 @@ r_step.revision` in `quota_settle_gateway_usage` (and replayed identically in
   )
   ```
   (Migration `0023` already enforces `r_step.reasoning_tokens IS NULL OR r_step.reasoning_included IS
-  NOT NULL`.) Evaluating each folded step `r_step` at `r_eval_rev` follows three disjoint cases
+  NOT NULL`.) Normatively, `prompt_tokens` and `completion_tokens` **MUST both be explicitly
+  non-null on `r_step` itself** (never pieced together across separate partial and incomplete-final
+  revisions!). Evaluating each folded step `r_step` at `r_eval_rev` follows three disjoint cases
   (while always advancing `qr.accepted_source_revision = p_source_revision` at the end of the fold):
   1. *Zero token components on `r_step` (`r_step.prompt_tokens IS NULL AND r_step.completion_tokens
      IS NULL AND r_step.reasoning_tokens IS NULL`, e.g., a pure cost-only partial, final, or
@@ -1647,12 +1695,16 @@ r_step.revision` in `quota_settle_gateway_usage` (and replayed identically in
        'handoff_committed'`, adding `+50` `active_used` exposure — while retaining `reserved_units -
        C_effective` unresolved `held_units` exposure whenever below the hold, e.g., `hold = 200`
        with `prompt_tokens = 60, completion_tokens = NULL, final = true` sets `settled_units = 60,
-       held_units = 140, state = 'handoff_committed'` and **requires complete final evidence to
-       close `state = 'settled'`**!). Likewise, if `revision = 1` confirmed `prompt_tokens = 120,
-       completion_tokens = 30` (`settled_units = 150, held_units = 0`) and `revision = 2` omits
-       `prompt_tokens` (`NULL`, `completion_tokens = 30`), `P_known = 120`, `K_known = 30`,
-       `C_floor = 150`, and `C_effective = 150`, preserving all `150` confirmed units without
-       erasing confirmed overage exposure!
+       held_units = 140, state = 'handoff_committed'`, and on a `200`-token hold, a prompt-only
+       partial (`rev 0: prompt_tokens = 60, completion_tokens = NULL, final = false`) followed by a
+       completion-only final (`rev 1: prompt_tokens = NULL, completion_tokens = 25, final = true`)
+       has **`is_complete_tokens(rev 1) = false`** and produces **`85 settled, 115 held, state =
+       'handoff_committed'`** — requiring both `prompt_tokens` and `completion_tokens` explicitly
+       non-null on a single `final = true` `r_step` itself to close `state = 'settled'`!). Likewise,
+       if `revision = 1` confirmed `prompt_tokens = 120, completion_tokens = 30` (`settled_units =
+       150, held_units = 0`) and `revision = 2` omits `prompt_tokens` (`NULL`, `completion_tokens =
+       30`), `P_known = 120`, `K_known = 30`, `C_floor = 150`, and `C_effective = 150`, preserving all
+       `150` confirmed units without erasing confirmed overage exposure!
      - If `state = 'settled'` already: advance `settled_units = C_effective` (`held_units = 0`)
        when `C_effective > cur_settled` (charging any confirmed monotonic increase immediately,
        while **never** decreasing `settled_units` without complete authoritative token evidence),
@@ -1670,8 +1722,8 @@ r_step.revision` in `quota_settle_gateway_usage` (and replayed identically in
 | Open partial gateway report or signed partial correction (ADR 0037 / Migration `0023`) | **Every** `openmettle_gateway` transaction upserting/advancing `openmettle.gateway_settlements` (both settlement-only and combined writes) calls `openmettle.quota_lock_gateway_request_for_settlement(p_request_id)` strictly before `INSERT`/`UPDATE` on `gateway_settlements` (`measured` widened to `numeric(38, 0)`), which durably appends `(NEW.request_id, NEW.revision, NEW.final)` to `openmettle.quota_accepted_gateway_reports`. `quota_settle_gateway_usage` locks strictly `gateway_requests` (`FOR KEY SHARE`) -> `quota_reservations` (`ORDER BY resource_kind ASC FOR UPDATE`) -> `quota_budgets` (`FOR NO KEY UPDATE`), verifies `(p_report_source, p_report_id, p_source_revision)` matches `openmettle.gateway_usage_reports` AND **`EXISTS (SELECT 1 FROM openmettle.quota_accepted_gateway_reports a WHERE a.request_id = qr.gateway_request_id AND a.revision = p_source_revision)`** (rejecting any late partial stored in `gateway_usage_reports` but rejected by `gateway_settlements`), verifies `qr.state IN ('handoff_committed', 'settled')` and immutable deployment `cost_denomination` against `r_step.unit` (when `r_step.cost IS NOT NULL`), returns an idempotent no-op if `qr.accepted_source_revision IS NOT NULL AND p_source_revision <= qr.accepted_source_revision` (accepting valid `revision = 0` initial reports cleanly), and otherwise **deterministically folds all unapplied accepted revisions `a.revision` in `(coalesce(qr.accepted_source_revision, -1), p_source_revision]` in ascending `ORDER BY a.revision ASC`**. For each folded step `r_step`: `usage_cost_micros` computes `C_cost = ceil(r_step.cost)::numeric(38, 0)` when `r_step.cost IS NOT NULL` (leaving balances unchanged when `r_step.cost IS NULL`); `usage_tokens` (1) leaves balances unchanged when all three token columns on `r_step` are `NULL`, (2) when `is_complete_tokens = true` (`NOT r_step.final`), sets `C_tokens = P_known + K_known + X_known` (allowing signed downward partial corrections while keeping `state = 'handoff_committed'`), and (3) when `NOT is_complete_tokens` with `>= 1` non-null token component on `r_step`, computes `C_floor = P_known + K_known + X_known` (including `K_known = CASE WHEN rev_R >= rev_K THEN greatest(K_raw, R_latest) ELSE K_raw END` when `inc_latest IS TRUE`) and `C_effective = greatest(cur_settled, C_floor)` — immediately charging confirmed overage (e.g., `hold = 100` with `prompt_tokens = 150, completion_tokens = NULL` OR `reasoning_tokens = 150, reasoning_included = true` immediately sets `settled_units = 150, held_units = 0, state = 'handoff_committed'`) while keeping `state = 'handoff_committed'` and never erasing prior confirmed usage. Comparing the final folded `(new_state, new_settled, new_held)` against prior `(old_state, S, H)`: `quota_settle_gateway_usage` **unconditionally advances `qr.accepted_source_revision = p_source_revision`** on `openmettle.quota_reservations`, and writes a composite-FK `quota_reconciliations` row (`delta_active = new_settled - S`, signed `delta_reserved = (new_held - H)::numeric(38, 0)`) and adjusts `quota_budgets` + `quota_warning_events` + `revision = revision + 1` **iff `(new_state, new_settled, new_held) IS DISTINCT FROM (old_state, S, H)`**. Example: on a `100`-token hold (`accepted_source_revision IS NULL`) where `revision = 0` reports complete `prompt_tokens = 40, completion_tokens = 20` partial (`60` measured, `40` held, `accepted_source_revision = 0`), an authoritative complete `revision = 1` partial correction to `prompt_tokens = 15, completion_tokens = 5` applies `delta_active = -40` and `delta_reserved = +40` (`20` measured, `80` held, `accepted_source_revision = 1`, preserving `100` total exposure while open); whereas on a `100`-token hold where `revision = 0` reports `reasoning_tokens = 150, reasoning_included = true` (`prompt_tokens = NULL, completion_tokens = NULL`), `K_known = greatest(0, 150) = 150, X_known = 0, C_floor = 150` immediately charges `settled_units = 150, held_units = 0` (`+50` active exposure) while remaining `'handoff_committed'`. |
 | Authoritative final gateway report (including overage, explicit zero charge, multi-revision catch-up, out-of-order call, or `revision = 0` final) | Verifies `(p_report_source, p_report_id, p_source_revision)` matches `openmettle.gateway_usage_reports` AND **`EXISTS (SELECT 1 FROM openmettle.quota_accepted_gateway_reports a WHERE a.request_id = qr.gateway_request_id AND a.revision = p_source_revision)`**, returns an idempotent no-op if `qr.accepted_source_revision IS NOT NULL AND p_source_revision <= qr.accepted_source_revision` (accepting immediate `revision = 0` finals cleanly), and otherwise **folds all unapplied accepted revisions `a.revision` in `(coalesce(qr.accepted_source_revision, -1), p_source_revision]` in deterministic `ORDER BY a.revision ASC`**. Consequently, even if `gateway_settlements` has already advanced from token-only final `rev 1` to cost-only final `rev 2`, or a caller invokes `quota_settle_gateway_usage(..., rev 2)` before `rev 1` (e.g., `H = 200`, `rev 1`: `prompt = 60, completion = 20, final = true`; `rev 2`: `prompt = NULL, completion = 25, final = true`), the ascending fold processes `[1, 2]` in exact order: step `1` closes `usage_tokens` to `('settled', 80, 0)`, step `2` applies the monotonic post-final upward adjustment to `('settled', 85, 0)`, and a subsequent `rev 1` call (`1 <= 2`) is an idempotent no-op! For each folded step `r_step` with `r_step.final = true`: `usage_cost_micros` closes to `'settled'` only when `r_step.cost IS NOT NULL` (`C_cost = ceil(r_step.cost)::numeric(38, 0)`); `usage_tokens` (1) leaves balances unchanged when all three token columns are `NULL`, (2) when **`is_complete_tokens = true`**, transitions `handoff_committed -> settled` (`settled_units = C_tokens = P_known + K_known + X_known`, `held_units = 0`, `closed_at = coalesce(closed_at, now())`, including explicit `prompt_tokens = 0, completion_tokens = 0` zero-token final proof when no prior non-included reasoning tokens were omitted; and with `completion_tokens = 200, reasoning_tokens = 150, reasoning_included = true` computing `K_known = greatest(200, 150) = 200, X_known = 0` with zero double-counting), and (3) when **`NOT is_complete_tokens`** with `>= 1` non-null token component on `r_step` (**even though `r_step.final = true`!**), computes `C_effective = greatest(cur_settled, C_floor)`, sets `settled_units = C_effective`, `held_units = greatest(0::numeric(38, 0), qr.reserved_units::numeric(38, 0) - C_effective)::bigint`, and **keeps `state = 'handoff_committed'`** (e.g., `hold = 200` + `prompt_tokens = 60, completion_tokens = NULL, reasoning_tokens = 150, reasoning_included = true, final = true` charges `210` and stays `'handoff_committed'` until explicit `completion_tokens IS NOT NULL` arrives). Always advances `qr.accepted_source_revision = p_source_revision`; writes `quota_reconciliations` and adjusts `quota_budgets` iff `(new_state, new_settled, new_held) IS DISTINCT FROM (old_state, old_settled, old_held)`. |
 | Post-final authoritative correction | Processed by the **same deterministic ascending fold** over `(coalesce(qr.accepted_source_revision, -1), p_source_revision]` inside `quota_settle_gateway_usage(...)`. When `state = 'settled'` already and a folded `r_step` (`final = true`) arrives: `usage_cost_micros` updates `settled_units = ceil(r_step.cost)::numeric(38, 0)` when `r_step.cost IS NOT NULL` (leaving balances unchanged when `r_step.cost IS NULL`); `usage_tokens` (1) leaves balances unchanged when all three token columns on `r_step` are `NULL`, (2) when `is_complete_tokens = true`, updates `settled_units = C_tokens` with signed `delta_active = C_tokens - S` (`delta_reserved = 0`, rejecting negative `active_used`, and honoring a newer complete revision `rev_K > rev_R` such as `completion_tokens = 120, reasoning_tokens = NULL` with `K_known = 120`), and (3) when `NOT is_complete_tokens` with `>= 1` non-null token component on `r_step`, advances `settled_units = C_effective = greatest(cur_settled, C_floor)` (`held_units = 0`) when `C_effective > cur_settled` (never decreasing `settled_units` without complete authoritative token evidence!). Crucially, **even on a 0-delta / no-op post-final correction** (such as an unchanged incomplete `completion_tokens = 25` repeat where `C_effective <= cur_settled`, or an other-resource report), `quota_settle_gateway_usage` **still unconditionally advances `qr.accepted_source_revision = p_source_revision`** on `openmettle.quota_reservations` (writing `quota_reconciliations` and incrementing `revision` iff `(new_state, new_settled, new_held) IS DISTINCT FROM (old_state, old_settled, old_held)`), clearing `pending_gateway_reconciliations` immediately! Fractional cost sequence `0.4 -> 0.8 -> 1.2` final -> `0.5` post-final correction -> `0` settles cumulative `ceil(r.cost)::numeric(38, 0)` values `1 -> 1 -> 2 -> 1 -> 0` with zero accumulated rounding drift. Same-revision duplicates with identical values are no-ops; differing values at an already accepted revision or mismatched `unit` denominations quarantine under ADR 0037 without mutating balances. |
-| Failed upload, interrupted write or retention purge | All `artifact_fs::Store` writer and reader operations execute strictly relative to `Arc`-shared verified directory descriptors (`root_fd`, `staging_dir_fd`, `revisions_dir_fd`), verifying local same-mount equality (`file_meta.dev() == dir_fd_meta.dev() == root_fd_meta.dev()`) without storing client-local NFS `st_dev` in PostgreSQL (`payload_dev` is dropped; only unsigned 64-bit **`payload_ino numeric(20, 0)`** is stored). **Unified rollout rule:** HTTP `Store::stage` and `Store::publish` (`openmettle_api`) succeed when `adoption_run_id IS NULL` both when `volume_id IS NOT NULL` (verifying role-tagged sentinels) and during mixed-version rolling upgrade while `volume_id IS NULL` (skipping sentinel reads while still setting `stage_claimed = true` and binding `payload_ino = staged_ino`), whereas ADR 0039 worker `publish_bytes` spills and all 4 cleaners strictly require `volume_id IS NOT NULL AND adoption_run_id IS NULL`. **`Store::stage` (`openmettle_api`):** (Step 1a) short lock-ordered primary tx `(runs FOR NO KEY UPDATE ->) storage_reservations FOR UPDATE` + `storage_instance FOR SHARE` (`adoption_run_id IS NULL` and `volume_id = $expected` when non-null) commits `SET stage_claimed = true WHERE scope_id = $1 AND id = $2 AND state = 'reserved' AND NOT adoption_unverified AND NOT stage_claimed AND payload_ino IS NULL AND reclaim_state = 'none'` (zero disk files created if rejected); (Step 1b) re-verify `<root>`, `"staging"`, `"revisions"` FDs (+ sentinels when `volume_id IS NOT NULL`), `openat(&staging_dir_fd, id, OFlags::CREATE \| OFlags::EXCL \| OFlags::RDWR \| OFlags::NOFOLLOW)` (`0` bytes) -> `LOCK_SH` (`try_lock_shared()`) -> verify `file_meta` vs `statat` (`S_ISREG`, local `st_dev` match, `staged_ino = file_meta.ino()`) -> **`fsync(&staging_dir_fd)`** (crash-durable BEFORE `payload_ino` can commit in PostgreSQL!); (Step 1c) short lock-ordered `FOR UPDATE` tx (`storage_instance FOR SHARE`) commits `SET payload_ino = $3::text::numeric(20, 0) WHERE scope_id = $1 AND id = $2 AND state = 'reserved' AND NOT adoption_unverified AND stage_claimed AND payload_ino IS NULL AND reclaim_state = 'none'`. **100% non-destructive `Drop` & writer error handling:** `StagedFile::drop` (and all writer error/cancellation paths in `Store::stage`, `Store::publish`, and ADR 0039 `publish_bytes`) **NEVER calls `set_len(0)` and NEVER calls `unlinkat` — it ONLY closes the FD (releasing `LOCK_SH`)!** If Step 1c commits in PostgreSQL and the ack is lost, `staging/<id>` (`st_ino == payload_ino`) remains durably linked on disk so `reconcile_expired` / `abort` cleanly reclaims it with zero false quarantine; if `storage::settle` commits and the ack is lost or the future is cancelled, dropping `StagedFile` never zeroes published `revisions/<id>`. On ambiguous `storage::settle` commit, NEVER call `artifact_fs::abort` blindly; inspect `storage_reservations.state` under `(runs FOR NO KEY UPDATE ->) storage_reservations FOR UPDATE` first (if `'settled'`, publication succeeded). **No-replace publication (`Store::publish` & `publish_bytes`):** commit `publish_pending = true` under `FOR UPDATE` (`state = 'reserved' AND NOT adoption_unverified AND payload_ino = $staged_ino AND reclaim_state = 'none'`), then publish exclusively via **`rustix::fs::renameat_with(&staging_dir_fd, id, &revisions_dir_fd, id, RenameFlags::NOREPLACE)`** (`Errno::EXIST` leaves any foreign `revisions/<id>` untouched and quarantines `adoption_unverified = true, publish_pending = false`). `storage::settle` (`Reserved` branch) requires `state = 'reserved' AND NOT adoption_unverified AND payload_ino = $staged_ino AND reclaim_state = 'none'`, moves actual bytes to `active_bytes`, and sets `state = 'settled', publish_pending = false` while **retaining `payload_ino`** on `'settled'`. **`Store::read`:** `storage::read_revision` joins `storage_reservations sr ON sr.scope_id = r.scope_id AND sr.id = r.reservation_id` to load `(r.size_bytes, sr.payload_ino, sr.adoption_unverified)`; rejects `sr.adoption_unverified = true` (`Error::Io`); verifies `<root>`/`"revisions"` FDs + sentinels (when `volume_id IS NOT NULL`), opens `revisions/<id>` (`OFlags::RDONLY \| OFlags::NOFOLLOW \| OFlags::NONBLOCK`), verifies `S_ISREG`, `file_meta.dev() == revisions_dir_fd_dev`, `file_meta.len() == expected_size`, AND requires `file_meta.ino() == sr.payload_ino` whenever `sr.payload_ino IS NOT NULL`; **`sr.payload_ino IS NULL` is permitted ONLY while `storage_instance.volume_id IS NULL AND adoption_run_id IS NULL`** (legacy pre-adoption rolling-upgrade window) and fails closed (`Error::Io`) once `storage_instance.volume_id IS NOT NULL`. **Unified 3-step reclamation protocol across ALL 4 cleaners (`artifact_fs::abort`, non-run `reconcile_expired`, generic run-linked cleaner, ADR 0039 `reconcile_run_spills`) with ZERO filesystem I/O in Step 1 & Step 3:** (Step 1) lock `(runs FOR NO KEY UPDATE [SKIP LOCKED] ->) storage_reservations FOR UPDATE [SKIP LOCKED]` + `storage_instance FOR SHARE` (`volume_id = $expected_volume_id AND adoption_run_id IS NULL`), require `state = 'reserved' AND NOT adoption_unverified AND (reclaim_state = 'none' OR reclaim_lease_until <= clock_timestamp())` (+ path preconditions), commit `reclaim_state = CASE WHEN reclaim_state = 'truncated' THEN 'truncated' ELSE 'claiming' END, reclaim_claim_token = $my_token, reclaim_lease_until = clock_timestamp() + interval '60 seconds'` (`abort` returns untouched on an active rival lease); (Step 2, outside DB tx, NEVER clearing `payload_ino`) *Case 1 (`payload_ino IS NOT NULL`):* foreign/non-regular/different-local-`st_dev`/`st_ino != payload_ino` (in BOTH `'claiming'` and `'truncated'`) OR dual `ENOENT` in `'claiming'` -> ZERO `set_len(0)`/`unlinkat`, quarantine (`adoption_unverified = true, publish_pending = false, reclaim_state = 'none', reclaim_claim_token = NULL, reclaim_lease_until = NULL`) under `FOR UPDATE` re-verifying `state = 'reserved' AND NOT adoption_unverified AND reclaim_claim_token = $my_token AND reclaim_state = $observed_state AND payload_ino = $expected_ino` (+ `storage_instance FOR SHARE`); dual `ENOENT` in `'truncated'` -> dual `fsync` -> Step 3; matched regular `st_ino == payload_ino` -> `LOCK_EX` (`WouldBlock` aborts untouched) -> re-verify -> if `'claiming'`, `probe_file.set_len(0)?` + `probe_file.sync_all()?` -> short `FOR UPDATE` tx setting `reclaim_state = 'truncated', publish_pending = false` (`payload_ino` retained!) -> in `'truncated'`, `unlinkat` -> `drop` -> dual `fsync(&staging_dir_fd)` + `fsync(&revisions_dir_fd)` -> Step 3; *Case 2 (`payload_ino IS NULL`):* any `revisions/<id>` or non-regular/different-local-`st_dev`/`st_size > 0` `staging/<id>` -> ZERO `set_len(0)`/`unlinkat`, quarantine under `reclaim_claim_token = $my_token AND payload_ino IS NULL`; `0`-byte regular `staging/<id>` -> `LOCK_EX` -> re-verify -> `unlinkat` -> `drop`; dual `fsync` -> Step 3; (Step 3, ZERO FS I/O inside DB tx) lock `(runs ->) storage_reservations` + `storage_instance FOR SHARE`, require `state = 'reserved' AND NOT adoption_unverified AND NOT publish_pending AND reclaim_claim_token = $my_token AND (payload_ino IS NULL OR reclaim_state = 'truncated')` (+ path preconditions), clear `reclaim_state = 'none', reclaim_claim_token = NULL, reclaim_lease_until = NULL`, and commit `storage::release` (retaining `payload_ino` on `'released'`). **`enforce_storage_reservation_monotonic_guards()` (`SECURITY INVOKER`)** enforces in PostgreSQL that non-`openmettle_owner` roles can NEVER clear `adoption_unverified`, mutate/clear non-null `payload_ino`, or clear `stage_claimed`. **`artifact_fs::purge_due` unconditionally calls `fsync(revisions_dir_fd)` (`Ok(())` required) strictly before committing `storage::confirm_purge` — explicitly including when `unlinkat` returns `ENOENT`** (ADR 0005, ADR 0031). **PR2 updates ADR 0031's post-rename `reconcile_expired` behavior** (and `tests/schema/artifact_fs.rs`'s `renamed` test case). On **every** upgrade (`applied >= 1`), operators **MUST quiesce all `N-1` worker artifact cleaners BEFORE running `openmettle-migrate`**, `storage_instance.bootstrap_auto_pin_allowed` seeds `false`, and `storage_instance.volume_id` stays `NULL` throughout 100% `N-1 -> N` replacement (with `SECURITY INVOKER` `enforce_runtime_storage_volume_pinned()` using serialized `FOR SHARE` on `storage_instance` checking `volume_id IS NULL OR adoption_run_id IS NOT NULL`). `openmettle-admin` adoption mints `my_adoption_run_id = uuid_v4()`, acquires `storage_instance FOR UPDATE` in Step 1b (`OMQ03` if another `adoption_run_id` is set unless `--replace-adoption-run <stale_uuid>` matches), scans in Step 2 (clearing `adoption_run_id` on failure only `WHERE id AND adoption_run_id = $my_adoption_run_id`), and in Step 3 locks `storage_reservations -> artifact_revisions -> storage_accounts -> storage_instance`, backfills `payload_ino` on all positively verified on-disk `'reserved'` and `'active'`/`'retained'` `'settled'` rows, quarantines missing/mismatched `'reserved'` rows, pins `volume_id`, and clears `adoption_run_id = NULL`. ADR 0040's generic run-linked cleaner owns `run_id IS NOT NULL AND (operation_id IS NULL OR idempotency_key NOT LIKE 'tool-spill:%')` — exact logical complement of ADR 0039 `reconcile_run_spills` (`operation_id IS NOT NULL AND idempotency_key LIKE 'tool-spill:%'`). Shared `ReadWriteMany` deployments must qualify `O_CREAT \| O_EXCL \| O_NOFOLLOW`, `RenameFlags::NOREPLACE`, file+dir `fsync`, two-client `flock(2)` coherence, AND stable 64-bit `st_ino` coherence + second-client recovery across clients and remounts. `StagingSweepState` requires `volume_id IS NOT NULL AND adoption_run_id IS NULL`: on `'released'`, skips `adoption_unverified = true`, `payload_ino IS NOT NULL AND staging_ino != payload_ino`, or `payload_ino IS NULL AND staging_size > 0`, else under `LOCK_EX` runs `set_len(0) -> sync_all() -> unlinkat -> drop -> fsync(&staging_dir_fd)`; on `'settled'`, skips `adoption_unverified = true` or `payload_ino IS NULL`, and under `LOCK_EX` calls `unlinkat` ONLY (never `set_len(0)`) when `staging_ino == payload_ino` AND `revisions/<id>` is `S_ISREG` on same local `st_dev` with `rev_stat.st_ino as u64 == payload_ino`, or runs `set_len(0) -> sync_all() -> unlinkat` when `staging_ino != payload_ino` AND either `revisions/<id>` matches `S_ISREG`/local `st_dev`/`rev_ino == payload_ino` OR (`revisions/<id>` is `ENOENT` AND fresh `artifact_revisions.state = 'purged'`), preserving both entries untouched on `rev_ino != payload_ino`; for zero-row orphans requires `st_mtime > 900 s` and `storage_instance FOR UPDATE` serialized zero-row recheck under `LOCK_EX`. |
-| Terminal failed, cancelled or interrupted run | Unallocated `held` parent, standalone or unsent child quota holds release once. `handoff_committed` usage holds stay held until `openmettle_gateway` supplies an authoritative final report (including explicit zero-token / zero-cost final proof; partial/incomplete token reports charge `C_effective = greatest(cur_settled, C_floor)` immediately — including `reasoning_included = true` lower bound — while keeping `state = 'handoff_committed'` until complete final evidence arrives). `handoff_committed` device holds stay held until durable V1-18 confirmation of release or non-allocation. Run-linked `storage_reservations` stay held while any linked operation is `intent` or `outcome_unknown`, while `adoption_unverified = true`, while `storage_instance.adoption_run_id IS NOT NULL`, while `payload_ino IS NOT NULL` with a foreign/replacement leaf or `'claiming'` dual `ENOENT` (which promotes to `adoption_unverified = true, publish_pending = false, reclaim_state = 'none', reclaim_claim_token = NULL, reclaim_lease_until = NULL` rather than releasing), or while an active publisher holds `LOCK_SH` on `staging/<id>` / `revisions/<id>` awaiting SQL settlement (`operation_id IS NOT NULL AND idempotency_key LIKE 'tool-spill:%'` rows are owned solely by ADR 0039 `reconcile_run_spills`, while the exact logical complement `run_id IS NOT NULL AND (operation_id IS NULL OR idempotency_key NOT LIKE 'tool-spill:%')` is owned by ADR 0040). |
+| Failed upload, interrupted write or retention purge | All `artifact_fs::Store` writer and reader operations execute strictly relative to `Arc`-shared verified directory descriptors (`root_fd`, `staging_dir_fd`, `revisions_dir_fd`), verifying local same-mount equality (`file_meta.dev() == dir_fd_meta.dev() == root_fd_meta.dev()`) without storing client-local NFS `st_dev` in PostgreSQL (`payload_dev` is dropped; only unsigned 64-bit **`payload_ino numeric(20, 0)`** is stored). **Unified rollout rule:** HTTP `Store::stage` and `Store::publish` (`openmettle_api`) succeed when `storage_volume_control.adoption_run_id IS NULL` both when `storage_volume_control.volume_id IS NOT NULL` (verifying role-tagged sentinels) and during mixed-version rolling upgrade while `volume_id IS NULL` (skipping sentinel reads while still setting `stage_claimed = true` and binding `payload_ino = staged_ino`), whereas ADR 0039 worker `publish_bytes` spills and all 4 cleaners strictly require `volume_id IS NOT NULL AND adoption_run_id IS NULL`. **`Store::stage` (`openmettle_api`):** (Step 1a) short lock-ordered primary tx `(runs FOR NO KEY UPDATE ->) storage_reservations FOR UPDATE -> storage_volume_control FOR SHARE` (`adoption_run_id IS NULL` and `volume_id = $expected` when non-null) commits `SET stage_claimed = true WHERE scope_id = $1 AND id = $2 AND state = 'reserved' AND NOT adoption_unverified AND NOT stage_claimed AND payload_ino IS NULL AND reclaim_state = 'none'` (zero disk files created if rejected); (Step 1b) re-verify `<root>`, `"staging"`, `"revisions"` FDs (+ sentinels when `volume_id IS NOT NULL`), `openat(&staging_dir_fd, id, OFlags::CREATE \| OFlags::EXCL \| OFlags::RDWR \| OFlags::NOFOLLOW)` (`0` bytes) -> `LOCK_SH` (`try_lock_shared()`) -> verify `file_meta` vs `statat` (`S_ISREG`, local `st_dev` match, `staged_ino = file_meta.ino()`) -> **`fsync(&staging_dir_fd)`** (crash-durable BEFORE `payload_ino` can commit in PostgreSQL!); (Step 1c) short lock-ordered `FOR UPDATE` tx (`storage_reservations FOR UPDATE -> storage_volume_control FOR SHARE`) commits `SET payload_ino = $3::text::numeric(20, 0) WHERE scope_id = $1 AND id = $2 AND state = 'reserved' AND NOT adoption_unverified AND stage_claimed AND payload_ino IS NULL AND reclaim_state = 'none'`. **100% non-destructive `Drop` & writer error handling:** `StagedFile::drop` (and all writer error/cancellation paths in `Store::stage`, `Store::publish`, and ADR 0039 `publish_bytes`) **NEVER calls `set_len(0)` and NEVER calls `unlinkat` — it ONLY closes the FD (releasing `LOCK_SH`)!** If Step 1c commits in PostgreSQL and the ack is lost, `staging/<id>` (`st_ino == payload_ino`) remains durably linked on disk so `reconcile_expired` / `abort` cleanly reclaims it with zero false quarantine; if `storage::settle` commits and the ack is lost or the future is cancelled, dropping `StagedFile` never zeroes published `revisions/<id>`. On ambiguous `storage::settle` commit, NEVER call `artifact_fs::abort` blindly; inspect `storage_reservations.state` under `(runs FOR NO KEY UPDATE ->) storage_reservations FOR UPDATE` first (if `'settled'`, publication succeeded). **`linkat` no-replace publication (`Store::publish` & `publish_bytes`):** (1) commit `publish_pending = true` under `FOR UPDATE` (`state = 'reserved' AND NOT adoption_unverified AND payload_ino = $staged_ino AND reclaim_state = 'none'`); (2) publish exclusively via **`rustix::fs::linkat(&staging_dir_fd, id, &revisions_dir_fd, id, AtFlags::empty())`** (atomically fails with `Errno::EXIST` without overwriting any foreign `revisions/<id>` — quarantining `adoption_unverified = true, publish_pending = false` on `EEXIST` — **AND keeps `staging/<id>` present on disk until `storage::settle` commits**, so any mixed-version `N-1` API same-key retry hits `OpenOptions::create_new(true)` -> `Err(Error::InProgress)` at `src/artifact_fs.rs:474-475` without calling `abort()`, staging a replacement, or calling replacing `fs::rename`!) + `fsync(&revisions_dir_fd)` + post-`linkat` re-verify (`<root>`, `"staging"`, `"revisions"` + sentinels when pinned + `statat(&revisions_dir_fd, id)` matches `S_ISREG`, local `st_dev`, `st_ino == staged_ino`, `st_size == size_bytes`); (3) commit `storage::settle` (`state = 'settled', publish_pending = false`, **retaining `payload_ino`**); (4) **post-commit best-effort detach of `staging/<id>` alias** while still holding `LOCK_SH` on `StagedFile`: verify both `staging/<id>` and `revisions/<id>` have `st_ino == staged_ino`, call `unlinkat(&staging_dir_fd, id, AtFlags::empty())` (**NEVER `set_len(0)`!**) -> `drop(file)` -> `fsync(&staging_dir_fd)`. **`Store::read`:** `storage::read_revision` joins `storage_reservations sr ON sr.scope_id = r.scope_id AND sr.id = r.reservation_id` to load `(r.size_bytes, sr.payload_ino, sr.adoption_unverified)`; rejects `sr.adoption_unverified = true` (`Error::Io`); verifies `<root>`/`"revisions"` FDs + sentinels (when `volume_id IS NOT NULL`), opens `revisions/<id>` (`OFlags::RDONLY \| OFlags::NOFOLLOW \| OFlags::NONBLOCK`), verifies `S_ISREG`, `file_meta.dev() == revisions_dir_fd_dev`, `file_meta.len() == expected_size`, AND requires `file_meta.ino() == sr.payload_ino` whenever `sr.payload_ino IS NOT NULL`; **`sr.payload_ino IS NULL` is permitted ONLY while `storage_volume_control.volume_id IS NULL AND storage_volume_control.adoption_run_id IS NULL`** (legacy pre-adoption rolling-upgrade window) and fails closed (`Error::Io`) once `storage_volume_control.volume_id IS NOT NULL`. **Unified 4-step reclamation protocol with `staging/.reclaim.<id>` anchor across ALL 4 cleaners (`artifact_fs::abort`, non-run `reconcile_expired`, generic run-linked cleaner, ADR 0039 `reconcile_run_spills`) with ZERO filesystem I/O in Steps 1 & 3 (`payload_ino` NEVER drops to `nlink = 0` before Step 3 commits):** (Step 1) lock `(runs FOR NO KEY UPDATE [SKIP LOCKED] ->) storage_reservations FOR UPDATE [SKIP LOCKED] -> storage_volume_control FOR SHARE` (`NOT FOUND OR v_vol IS DISTINCT FROM $expected_volume_id OR v_adopt IS NOT NULL` -> abort), require `state = 'reserved' AND NOT adoption_unverified AND (reclaim_state = 'none' OR reclaim_lease_until <= clock_timestamp())` (+ path preconditions), commit `reclaim_state = CASE WHEN reclaim_state = 'truncated' THEN 'truncated' ELSE 'claiming' END, reclaim_claim_token = $my_token, reclaim_lease_until = clock_timestamp() + interval '60 seconds'` (`abort` returns untouched on an active rival lease); (Step 2, outside DB tx, NEVER clearing `payload_ino`) *Case 1a (`payload_ino IS NOT NULL`, `'claiming'`):* probe `staging/<id>`, `revisions/<id>`, and `staging/.reclaim.<id>`; any foreign/non-regular/different-local-`st_dev`/`st_ino != payload_ino` OR all-three `ENOENT` -> ZERO `set_len(0)`/`unlinkat`, quarantine (`adoption_unverified = true, publish_pending = false, reclaim_state = 'none', reclaim_claim_token = NULL, reclaim_lease_until = NULL`) under `FOR UPDATE` verifying `reclaim_claim_token = $my_token AND reclaim_state = 'claiming' AND payload_ino = $expected_ino` (+ `storage_volume_control FOR SHARE`); exact match (`st_ino == payload_ino`) -> open `OFlags::RDWR \| OFlags::NOFOLLOW` -> `LOCK_EX` (`WouldBlock` aborts untouched) -> re-verify -> (1) `probe_file.set_len(0)?` + `probe_file.sync_all()?` -> (2) create/verify hard-link anchor `staging/.reclaim.<id>` via `linkat` + `fsync(&staging_dir_fd)` BEFORE unlinking `<id>` -> (3) unlink any existing `<id>` in `revisions/<id>` and `staging/<id>` (re-verifying `st_ino == payload_ino`) + dual `fsync` -> (4) still holding `LOCK_EX` on `probe_file`, commit short `FOR UPDATE` tx setting `reclaim_state = 'truncated', publish_pending = false`; *Case 1b (`payload_ino IS NOT NULL`, `'truncated'`):* **NEVER touch `staging/<id>` or `revisions/<id>`!** Probe `staging/.reclaim.<id>` ONLY (`S_ISREG`, same local `st_dev`, `st_ino == payload_ino`, `st_size == 0`; else quarantine) -> open -> `LOCK_EX` -> re-verify -> dual `fsync` -> Step 3 keeping `probe_file` open with `LOCK_EX`; *Case 2 (`payload_ino IS NULL`):* any `revisions/<id>` or non-regular/different-local-`st_dev`/`st_size > 0` `staging/<id>` -> ZERO `set_len(0)`/`unlinkat`, quarantine under `reclaim_claim_token = $my_token AND payload_ino IS NULL`; `0`-byte regular `staging/<id>` -> `LOCK_EX` -> re-verify -> `unlinkat` -> `drop`; dual `fsync` -> Step 3; (Step 3, ZERO FS I/O inside DB tx) lock `(runs ->) storage_reservations`, require `state = 'reserved' AND NOT adoption_unverified AND NOT publish_pending AND reclaim_claim_token = $my_token AND (payload_ino IS NULL OR reclaim_state = 'truncated')` (+ path preconditions), set `reclaim_state = CASE WHEN payload_ino IS NOT NULL THEN 'anchor_pending_unlink' ELSE 'none' END, reclaim_claim_token = NULL, reclaim_lease_until = NULL`, and commit `storage::release` (firing `enforce_runtime_storage_volume_pinned()` taking `storage_volume_control FOR SHARE`, then `adjust()` on `storage_accounts -> storage_instance`, retaining `payload_ino` on `'released'`); (Step 4) when `payload_ino IS NOT NULL` (still holding `probe_file` with `LOCK_EX`), verify `staging/.reclaim.<id>` (`st_ino == payload_ino`, `st_size == 0`) -> `unlinkat(&staging_dir_fd, &reclaim_name, AtFlags::empty())` -> `drop(probe_file)` -> `fsync(&staging_dir_fd)` -> best-effort `SET reclaim_state = 'none' WHERE id = $1::uuid AND state = 'released' AND reclaim_state = 'anchor_pending_unlink'`. **`enforce_storage_reservation_monotonic_guards()` (`SECURITY INVOKER`)** combined with tightened **`CHECK (NOT adoption_unverified OR state = 'reserved')`** enforces in PostgreSQL that non-`openmettle_owner` roles can NEVER release or settle a quarantined row, clear `adoption_unverified`, mutate/clear non-null `payload_ino`, or clear `stage_claimed`. **`artifact_fs::purge_due`:** `storage::begin_purge` joins `storage_reservations` to load `(payload_ino, adoption_unverified)`, requiring `NOT adoption_unverified AND payload_ino IS NOT NULL`; before `storage::confirm_purge`, `purge_due` verifies **both** `revisions/<id>` (stopping immediately with ZERO `set_len(0)`/`unlinkat` and NOT calling `confirm_purge` if `revisions/<id>` exists with non-regular/wrong `st_dev`/`st_ino != payload_ino`; else under `LOCK_EX` `set_len(0)` + `sync_all()` + `unlinkat`, accepting `ENOENT` as resumable mid-purge) AND `staging/<id>` (detaching via `LOCK_EX` `set_len(0)` + `sync_all()` + `unlinkat` when `S_ISREG`, same local `st_dev`, `st_ino == payload_ino`, leaving foreign `staging/<id>` untouched), and unconditionally executes **BOTH `fsync(&revisions_dir_fd)` AND `fsync(&staging_dir_fd)`** strictly before `storage::confirm_purge` (ADR 0005, ADR 0031). **PR2 updates ADR 0031's post-publication `reconcile_expired` behavior** (and `tests/schema/artifact_fs.rs`'s `renamed` test case). On **every** upgrade (`applied >= 1`), operators **MUST quiesce all `N-1` worker artifact cleaners BEFORE running `openmettle-migrate`**, `storage_volume_control.bootstrap_auto_pin_allowed` seeds `false`, and `storage_volume_control.volume_id` stays `NULL` throughout 100% `N-1 -> N` replacement (with `SECURITY INVOKER` `enforce_runtime_storage_volume_pinned()` taking `FOR SHARE` on `storage_volume_control` and failing closed with `OMQ03` on missing singleton row or `volume_id IS NULL OR adoption_run_id IS NOT NULL`). `openmettle-admin` adoption mints `my_adoption_run_id = uuid_v4()`, locks ONLY `storage_volume_control FOR UPDATE` in Step 1b (`OMQ03` if another `adoption_run_id` is set unless `--replace-adoption-run <stale_uuid>` matches), scans in Step 2, and in Step 3 locks `storage_reservations -> artifact_revisions -> storage_volume_control -> storage_accounts -> storage_instance`, preserves verified `'truncated'` holds with `staging/.reclaim.<id>` (expiring `reclaim_lease_until = clock_timestamp()`), evaluates all revisions/volume checks BEFORE writing `payload_ino`, and commits `payload_ino` backfills ONLY in the success branch (omitting/rolling back all `payload_ino` backfills on failed verification). ADR 0040's generic run-linked cleaner owns `run_id IS NOT NULL AND (operation_id IS NULL OR idempotency_key NOT LIKE 'tool-spill:%')` — exact logical complement of ADR 0039 `reconcile_run_spills` (`operation_id IS NOT NULL AND idempotency_key LIKE 'tool-spill:%'`). Shared `ReadWriteMany` deployments must qualify `O_CREAT \| O_EXCL \| O_NOFOLLOW`, `linkat(..., AtFlags::empty())`, file+dir `fsync`, two-client `flock(2)` coherence, AND stable 64-bit `st_ino` coherence + second-client recovery across clients and remounts. **`StagingSweepState`** requires `volume_id IS NOT NULL AND adoption_run_id IS NULL` and **NEVER calls `set_len(0)` on `'settled'`, `'released'`, or `.reclaim.<id>` rows**: on `staging/<id>` with `state = 'settled'`, skips untouched if `adoption_unverified = true`, `payload_ino IS NULL`, or `staging_ino != payload_ino`, and when `staging_ino == payload_ino` calls `unlinkat` ONLY under `LOCK_EX` iff (`revisions/<id>` matches `S_ISREG`/local `st_dev`/`rev_ino == payload_ino`) OR (`revisions/<id>` is `ENOENT` AND fresh `artifact_revisions.state = 'purged'`); on `staging/<id>` with `state = 'released'`, NEVER touches `staging/<id>` when `payload_ino IS NOT NULL`, and unlinks (never `set_len(0)`) `0`-byte regular `staging/<id>` under `LOCK_EX` when `payload_ino IS NULL AND NOT adoption_unverified`; on `staging/.reclaim.<id>`, unlinks (never `set_len(0)`) under `LOCK_EX` requiring `st_size == 0` and `st_ino == payload_ino` ONLY when `state = 'released' AND reclaim_state = 'anchor_pending_unlink' AND NOT adoption_unverified AND payload_ino IS NOT NULL` -> `fsync(&staging_dir_fd)` -> `SET reclaim_state = 'none'`; for zero-row orphans requires `st_mtime > 900 s` and `storage_volume_control FOR SHARE -> storage_instance FOR UPDATE` serialized zero-row recheck under `LOCK_EX`. |
+| Terminal failed, cancelled or interrupted run | Unallocated `held` parent, standalone or unsent child quota holds release once. `handoff_committed` usage holds stay held until `openmettle_gateway` supplies an authoritative final report (including explicit zero-token / zero-cost final proof; partial/incomplete token reports charge `C_effective = greatest(cur_settled, C_floor)` immediately — including `reasoning_included = true` lower bound — while keeping `state = 'handoff_committed'` until complete final evidence arrives). `handoff_committed` device holds stay held until durable V1-18 confirmation of release or non-allocation. Run-linked `storage_reservations` stay held while any linked operation is `intent` or `outcome_unknown`, while `adoption_unverified = true`, while `storage_volume_control.adoption_run_id IS NOT NULL`, while `payload_ino IS NOT NULL` with a foreign/replacement leaf or `'claiming'` all-three `ENOENT` or `'truncated'` missing/mismatched `staging/.reclaim.<id>` (which promotes to `adoption_unverified = true, publish_pending = false, reclaim_state = 'none', reclaim_claim_token = NULL, reclaim_lease_until = NULL` rather than releasing), or while an active publisher holds `LOCK_SH` on `staging/<id>` / `revisions/<id>` awaiting SQL settlement (`operation_id IS NOT NULL AND idempotency_key LIKE 'tool-spill:%'` rows are owned solely by ADR 0039 `reconcile_run_spills`, while the exact logical complement `run_id IS NOT NULL AND (operation_id IS NULL OR idempotency_key NOT LIKE 'tool-spill:%')` is owned by ADR 0040). |
 
 **Independent drift verification and restore validation.** PR2 adds a read-only
 `verify_accounting_drift` check that workers run on a bounded maintenance interval and operators
@@ -1690,23 +1742,23 @@ pending-catch-up lag, and hard-mismatch summaries without exposing raw gateway r
    `reserved_bytes`) against sums recomputed from `artifact_revisions` (`state = 'active'` and
    `state IN ('retained', 'purging')`) and `storage_reservations` (`state = 'reserved'`, including
    any `adoption_unverified = true`, `publish_pending = true`, or `reclaim_state <> 'none'` rows
-   whose `max_bytes` remain charged). Once `storage_instance.volume_id IS NOT NULL`, also verifies
-   that **zero** `'active'` or `'retained'` `artifact_revisions` join to a `storage_reservations`
-   row with `payload_ino IS NULL` (failing hard if any post-adoption `'active'`/`'retained'`
-   revision lacks a backfilled `payload_ino`).
+   whose `max_bytes` remain charged). Once `storage_volume_control.volume_id IS NOT NULL`, also
+   verifies that **zero** `'active'` or `'retained'` `artifact_revisions` join to a
+   `storage_reservations` row with `payload_ino IS NULL` (failing hard if any post-adoption
+   `'active'`/`'retained'` revision lacks a backfilled `payload_ino`).
 2. **Storage DB-to-filesystem verification (`artifact_fs`):** when `ARTIFACTS_DIR` is unset (per
    ADR 0031, both `OPENMETTLE_API_ARTIFACTS_DIR`/`OPENMETTLE_ARTIFACTS_DIR` and
-   `OPENMETTLE_WORKER_ARTIFACTS_DIR` unset), `storage_instance.volume_id IS NULL`, AND both
+   `OPENMETTLE_WORKER_ARTIFACTS_DIR` unset), `storage_volume_control.volume_id IS NULL`, AND both
    `storage_reservations` and `artifact_revisions` contain `0` rows, filesystem sentinel checks are
    cleanly skipped as unconfigured. Otherwise — whenever `ARTIFACTS_DIR` is configured OR any row
-   exists in `storage_reservations` / `artifact_revisions` — `storage_instance.volume_id IS NULL`
-   remains a hard failure, and verification first opens `<root>`, `<root>/revisions` and
+   exists in `storage_reservations` / `artifact_revisions` — `storage_volume_control.volume_id IS
+   NULL` remains a hard failure, and verification first opens `<root>`, `<root>/revisions` and
    `<root>/staging` (`O_RDONLY | O_DIRECTORY | O_NOFOLLOW`), verifies equal local `st_dev` across
    all three FDs, and verifies via `openat(..., O_RDONLY | O_NOFOLLOW | O_NONBLOCK)` + `fstat` on
    each FD that its `.openmettle-volume-id` file is a regular file (`S_ISREG` — rejecting FIFOs,
    sockets, device nodes, directories and symlinks immediately without blocking) on that same local
    `st_dev` whose bounded (`<= 64`-byte) content matches non-null pinned
-   `storage_instance.volume_id` AND its exact `:root`, `:revisions`, or `:staging` role tag
+   `storage_volume_control.volume_id` AND its exact `:root`, `:revisions`, or `:staging` role tag
    (failing restore validation immediately on `volume_id IS NULL` or on missing, mismatched,
    wrong-role, non-regular/FIFO/symlink or different-`st_dev` sentinels):
    - *Active and retained revisions (concurrent `begin_purge`-safe, strict `payload_ino` match):*
@@ -1726,35 +1778,49 @@ pending-catch-up lag, and hard-mismatch summaries without exposing raw gateway r
      revision committed into a displaced old `revisions/` directory during a live host directory
      replacement — is a **hard drift failure** that fails restore validation.
    - *Mid-purge crash state (`state = 'purging'`):* because `artifact_fs::purge_due` commits
-     `storage::begin_purge` (`state = 'purging'`), unlinks `revisions/<reservation_id>` on disk,
-     unconditionally `fsync`s `revisions_dir_fd` (including on `ENOENT`), and confirms
-     `storage::confirm_purge` (`state = 'purged'`) in a second transaction
-     ([`src/artifact_fs.rs`](../../src/artifact_fs.rs)), `revisions/<reservation_id>` being absent
-     (`ENOENT` / `NotFound`) for a `purging` revision is recognized as a **valid mid-purge crash
-     state**, not a hard restore failure. Restore validation verifies that any still-present file
-     for a `purging` row is a regular file of `size_bytes` (matching `sr.payload_ino` when
-     non-null) and reports `ENOENT` `purging` rows as resumable pending-confirmation purges so
-     `purge_due` / `confirm_purge` can finish decrementing `retained_bytes` and re-verify storage
-     accounting rather than blocking restore.
-   - *Unsettled published payloads, adoption-unverified holds and orphan scan:* any
-     `revisions/<id>` paired with unflagged `storage_reservations.state = 'reserved'` (`NOT
-     adoption_unverified`, post-rename, pre-settlement crash window — for both non-run uploads and
-     run-linked spills) is reported explicitly as an unsettled payload awaiting deterministic retry
-     settlement or explicit `openmettle_owner` reconciliation; any `storage_reservations` row marked
-     `adoption_unverified = true` while `state = 'reserved'` (and any `payload_ino IS NOT NULL` or
-     `publish_pending = true` row with `reclaim_state <> 'truncated'` lacking its matching
-     `payload_ino` on-disk payload) is reported explicitly as a quarantined hold requiring **explicit
-     `openmettle_owner` reconciliation (or a subsequent verified `openmettle-admin` adoption run on
-     the restored original directory tree where `revisions/<id>` or `staging/<id>` is positively
-     verified under lock)** — never cleared by runtime roles (`enforce_storage_reservation_monotonic_guards()`
-     blocks non-owner clearance in PostgreSQL) and never silently unlinked or released by automatic
-     workers or `artifact_fs::abort`. Ignoring the verified `.openmettle-volume-id` sentinel file
-     (strictly disjoint from canonical lowercase UUID payload filenames per `src/artifact_fs.rs`),
-     any payload file in `revisions/` lacking a matching `active`/`retained`/`purging` revision or
+     `storage::begin_purge` (`state = 'purging'`, loading `(payload_ino, adoption_unverified)`),
+     verifies `revisions/<reservation_id>` matches `sr.payload_ino` before truncating and unlinking
+     (stopping immediately without touching disk or calling `confirm_purge` on any foreign
+     replacement leaf), detaches any hard-link alias `staging/<reservation_id>` matching
+     `sr.payload_ino`, unconditionally calls **both** `fsync(&revisions_dir_fd)` and
+     `fsync(&staging_dir_fd)` (including on `ENOENT`), and confirms `storage::confirm_purge`
+     (`state = 'purged'`) in a second transaction ([`src/artifact_fs.rs`](../../src/artifact_fs.rs)),
+     `revisions/<reservation_id>` being absent (`ENOENT` / `NotFound`) for a `purging` revision is
+     recognized as a **valid mid-purge crash state**, not a hard restore failure. Restore validation
+     verifies that any still-present file for a `purging` row is a regular file of `size_bytes`
+     matching `sr.payload_ino` (failing hard if a foreign wrong-inode replacement file occupies
+     `revisions/<reservation_id>`) and reports `ENOENT` `purging` rows as resumable
+     pending-confirmation purges so `purge_due` / `confirm_purge` can finish decrementing
+     `retained_bytes` and re-verify storage accounting rather than blocking restore.
+   - *Unsettled published payloads, adoption-unverified holds, valid `.reclaim.<id>` anchors, and
+     orphan scan:* any `revisions/<id>` paired with unflagged `storage_reservations.state =
+     'reserved'` (`NOT adoption_unverified`, post-`linkat`, pre-settlement crash window — for both
+     non-run uploads and run-linked spills) is reported explicitly as an unsettled payload awaiting
+     deterministic retry settlement or explicit `openmettle_owner` reconciliation; any
+     `storage_reservations` row marked `adoption_unverified = true` while `state = 'reserved'` (and
+     any `payload_ino IS NOT NULL` or `publish_pending = true` row with `reclaim_state <>
+     'truncated'` lacking its matching `payload_ino` on-disk payload) is reported explicitly as a
+     quarantined hold requiring **explicit `openmettle_owner` reconciliation (or a subsequent
+     verified `openmettle-admin` adoption run on the restored original directory tree where
+     `revisions/<id>` or `staging/<id>` is positively verified under lock)** — never cleared by
+     runtime roles (`enforce_storage_reservation_monotonic_guards()` and `CHECK (NOT
+     adoption_unverified OR state = 'reserved')` block non-owner release/clearance in PostgreSQL)
+     and never silently unlinked or released by automatic workers or `artifact_fs::abort`. A
+     `staging/.reclaim.<id>` regular file on the same local `st_dev` with **`st_size == 0` and
+     `st_ino == payload_ino`** paired with a `storage_reservations` row in **`(state = 'reserved'
+     AND reclaim_state = 'truncated')` OR `(state = 'released' AND reclaim_state =
+     'anchor_pending_unlink')`** is recognized explicitly as a **valid reclamation anchor** rather
+     than an unreferenced orphan (whereas any `.reclaim.<id>` with `st_size > 0`, wrong `st_ino`,
+     or lacking a matching `'truncated'`/`'anchor_pending_unlink'` row is flagged as an orphan /
+     drift failure!). Ignoring the verified `.openmettle-volume-id` sentinel file (strictly disjoint
+     from canonical lowercase UUID and `.reclaim.<uuid>` filenames per `src/artifact_fs.rs`), any
+     payload file in `revisions/` lacking a matching `active`/`retained`/`purging` revision or
      `reserved` reservation, and any payload file in `staging/` lacking a matching `reserved`
-     reservation (after worker startup/retryable cleanup of `released` rows, `payload_ino`-guarded
-     hard-link-safe and `'purged'`-aware `settled` cleanup, and `LOCK_EX` + `st_mtime > 900 s`
-     orphan verification), fails as an unreferenced orphan.
+     reservation or valid reclamation anchor (including any foreign-inode `staging/<id>` preserved
+     by non-truncating `StagingSweepState` on a `'settled'` or `'released'` row, after worker
+     cleanup of valid `staging/.reclaim.<id>` anchors, `payload_ino`-matched `'settled'` aliases,
+     `0`-byte `payload_ino IS NULL` `'released'` entries, and `LOCK_EX` + `st_mtime > 900 s` orphan
+     verification), fails as an unreferenced orphan.
 3. **Usage and device budget verification (inside `quota_verify_accounting_drift()`):**
    - *Local balance verification strictly against each reservation's applied
      `qr.accepted_source_revision` via exact ascending-fold replay (zero false hard drift during
@@ -1962,8 +2028,8 @@ candidate scanning from **one-reservation-per-transaction** settlement:
      keys were returned and all keys in that partial page were inspected, or when the cursor
      reaches `(v_upper_created_at, v_upper_id)`).
 2. **Storage holds (`storage_reservations`) and retention purges (`artifact_revisions`).**
-   - *Durable artifact volume identity (`storage_instance.volume_id` <-> role-tagged sentinels in
-     `<root>`, `<root>/revisions`, and `<root>/staging`):*
+   - *Durable artifact volume identity (`storage_volume_control.volume_id` <-> role-tagged sentinels
+     in `<root>`, `<root>/revisions`, and `<root>/staging`):*
      If the artifact volume unmounts, an ordinary empty `revisions/` directory can remain at the
      mount point — or `Store::open` ([`src/artifact_fs.rs`](../../src/artifact_fs.rs)) can create
      empty `staging/` and `revisions/` directories on worker restart, or an operator/script can
@@ -1979,14 +2045,32 @@ candidate scanning from **one-reservation-per-transaction** settlement:
      unlinks `revisions/<reservation>` *before* `confirm_purge` executes
      (`src/artifact_fs.rs:694-707`), meaning a PostgreSQL trigger alone rolls back the DB update
      *after* an `N-1` worker has already deleted the file. PR2 closes every layer with:
+     - **Dedicated read-mostly 1-row `openmettle.storage_volume_control` singleton (eliminating
+       `FOR SHARE -> FOR NO KEY UPDATE` deadlocks on `storage_instance`):** Because
+       `storage::adjust` (`src/storage.rs:289-310`) updates `storage_accounts -> storage_instance`
+       (`FOR NO KEY UPDATE`) on every `reserve`, `settle`, `release`, and `confirm_purge`, placing
+       `(volume_id, bootstrap_auto_pin_allowed, adoption_run_id)` on `storage_instance` and taking
+       `storage_instance FOR SHARE` earlier in `reserve` or inside
+       `enforce_runtime_storage_volume_pinned()` would cause two concurrent releases or reserves to
+       hold `FOR SHARE` and deadlock upgrading `storage_instance` to `FOR NO KEY UPDATE` (while also
+       locking `storage_instance` before `storage_accounts`). PR2 therefore keeps only
+       `(warn_pct_1, warn_pct_2, config_revision)` on `openmettle.storage_instance` and stores
+       `(volume_id, bootstrap_auto_pin_allowed, adoption_run_id)` on dedicated 1-row
+       **`openmettle.storage_volume_control`**. Runtime `reserve`, `settle`, `release`, and `purge`
+       **ONLY ever acquire `FOR SHARE` on `storage_volume_control`** and **NEVER `UPDATE`
+       `storage_volume_control`** (only `openmettle-admin` adoption Steps 1b/3 and one-time
+       empty-ledger `Store::open` bootstrap acquire `FOR UPDATE` on `storage_volume_control`), so
+       canonical lock order `runs -> storage_reservations -> artifacts -> artifact_revisions ->
+       storage_volume_control -> storage_accounts -> storage_instance` has zero lock upgrades and
+       concurrent releases, reserves, and purges never deadlock.
      - **Role-tagged sentinels across all three directories (namespace-disjoint from payloads,
        nonblocking safe `dirfd` verification via `rustix`):** Because payload filenames in
        `staging/` and `revisions/` are strictly canonical lowercase UUIDs (`runs::uuid` in
        `src/artifact_fs.rs:134-135`, never starting with `.`), `.openmettle-volume-id` (and
        temporary `.openmettle-volume-id.tmp.*`) is 100% namespace-disjoint from payload files and
-       ignored by `StagingSweepState` UUID filtering and orphan scans. PR2 binds
-       `openmettle.storage_instance.volume_id` **plus explicit directory role** across **all three
-       directories** (regular files, mode `0600`), opening **every** `.openmettle-volume-id`
+       `.reclaim.<uuid>` anchors, and is ignored by `StagingSweepState` and orphan scans. PR2 binds
+       `openmettle.storage_volume_control.volume_id` **plus explicit directory role** across **all
+       three directories** (regular files, mode `0600`), opening **every** `.openmettle-volume-id`
        sentinel across `Store::open`, all worker cleaners, `verify_accounting_drift`,
        fresh-bootstrap auto-pinning and `openmettle-admin` adoption via `rustix`
        `openat(..., OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK)` (`O_RDONLY |
@@ -2000,33 +2084,34 @@ candidate scanning from **one-reservation-per-transaction** settlement:
        Replacing `<root>/revisions` or `<root>/staging` (or swapping them) even on the exact same
        filesystem (`st_dev`) immediately fails closed with zero unlinks and zero DB mutations.
      - **Automatic bootstrap pinning gated strictly on `src/migrate.rs` fresh-from-zero history
-       (`applied == 0`, `storage_instance.bootstrap_auto_pin_allowed = true`) AND empty storage
-       ledger (serialized under `storage_instance FOR UPDATE` BEFORE any sentinel write):** In
-       PR2's migration, `storage_instance.bootstrap_auto_pin_allowed` seeds `true` **ONLY when
-       `is_fresh_bootstrap` holds** (`openmettle.bootstrap_from_zero = 'true'` set by
-       `src/migrate.rs` when `applied == 0` in `openmettle._sqlx_migrations`, AND all core,
+       (`applied == 0`, `storage_volume_control.bootstrap_auto_pin_allowed = true`) AND empty
+       storage ledger (serialized under `storage_volume_control FOR UPDATE` BEFORE any sentinel
+       write):** In PR2's migration, `storage_volume_control.bootstrap_auto_pin_allowed` seeds
+       `true` **ONLY when `is_fresh_bootstrap` holds** (`openmettle.bootstrap_from_zero = 'true'`
+       set by `src/migrate.rs` when `applied == 0` in `openmettle._sqlx_migrations`, AND all core,
        storage and gateway tables are empty) and `false` on **EVERY** upgrade (`applied >= 1`,
        even an existing unused deployment with zero `users`, `storage_*`, or `gateway_*` rows!).
        `openmettle.storage_pin_volume_id(uuid)` and `Store::open` bootstrap auto-pinning are
        permitted **ONLY when `volume_id IS NULL AND bootstrap_auto_pin_allowed = true` AND BOTH
        `NOT EXISTS (SELECT 1 FROM openmettle.storage_reservations)` AND `NOT EXISTS (SELECT 1 FROM
        openmettle.artifact_revisions)`** — atomically setting `volume_id = p_volume_id,
-       bootstrap_auto_pin_allowed = false` (enforced by `CHECK (volume_id IS NULL OR NOT
-       bootstrap_auto_pin_allowed)`). On a genuine fresh-from-zero installation, `Store::open` opens
-       `<root>`, `<root>/revisions`, and `<root>/staging` (`O_RDONLY | O_DIRECTORY | O_NOFOLLOW`,
-       equal `st_dev`) and executes the unified `storage_instance FOR UPDATE`-first protocol in
-       step 3 below **before** creating, writing, or linking any `.openmettle-volume-id` file or
-       cleaning up stale `.tmp.*` files: if a concurrent replica already committed `volume_id IS
-       NOT NULL`, `Store::open` **never writes any sentinel** and strictly verifies all three
-       existing role-tagged sentinels against `storage_instance.volume_id` (so two concurrent
-       fresh-bootstrap publishers starting simultaneously on an empty volume both succeed cleanly
-       with zero `EEXIST` failure or `.tmp.*` deletion race); while `volume_id IS NULL`, it
-       publishes and `fsync`s all three role-tagged sentinels atomically via the crash-safe
-       `linkat` protocol below (adopting any winning valid `:root` UUID on `EEXIST`) and pins
-       `sentinel_uuid` write-once via `openmettle.storage_pin_volume_id(sentinel_uuid)` in the
-       **same transaction** before committing. On **every** upgrade (`bootstrap_auto_pin_allowed =
-       false`) or whenever any row exists in `openmettle.storage_reservations` or
-       `openmettle.artifact_revisions` while `storage_instance.volume_id IS NULL`:
+       bootstrap_auto_pin_allowed = false` (enforced by `storage_volume_control_auto_pin_check`:
+       `CHECK (volume_id IS NULL OR NOT bootstrap_auto_pin_allowed)`). On a genuine fresh-from-zero
+       installation, `Store::open` opens `<root>`, `<root>/revisions`, and `<root>/staging`
+       (`O_RDONLY | O_DIRECTORY | O_NOFOLLOW`, equal `st_dev`) and executes the unified
+       `storage_volume_control FOR UPDATE`-first protocol in step 3 below **before** creating,
+       writing, or linking any `.openmettle-volume-id` file or cleaning up stale `.tmp.*` files: if
+       a concurrent replica already committed `volume_id IS NOT NULL`, `Store::open` **never writes
+       any sentinel** and strictly verifies all three existing role-tagged sentinels against
+       `storage_volume_control.volume_id` (so two concurrent fresh-bootstrap publishers starting
+       simultaneously on an empty volume both succeed cleanly with zero `EEXIST` failure or `.tmp.*`
+       deletion race); while `volume_id IS NULL`, it publishes and `fsync`s all three role-tagged
+       sentinels atomically via the crash-safe `linkat` protocol below (adopting any winning valid
+       `:root` UUID on `EEXIST`) and pins `sentinel_uuid` write-once via
+       `openmettle.storage_pin_volume_id(sentinel_uuid)` in the **same transaction** before
+       committing. On **every** upgrade (`bootstrap_auto_pin_allowed = false`) or whenever any row
+       exists in `openmettle.storage_reservations` or `openmettle.artifact_revisions` while
+       `storage_volume_control.volume_id IS NULL`:
        1. `openmettle.storage_pin_volume_id(uuid)` refuses with `ERRCODE = 'OMQ03'` and
           `Store::open` **MUST NOT** write any `.openmettle-volume-id` sentinel on an unverified
           directory.
@@ -2035,12 +2120,13 @@ candidate scanning from **one-reservation-per-transaction** settlement:
           `reconcile_run_spills`, and `staging/` `ReadDir` cleanup — plus ADR 0039 worker
           `publish_bytes` spills **remain disabled (fail closed with zero unlinks, zero released
           holds, and zero `begin_purge`/`confirm_purge` transitions)** while
-          `storage_instance.volume_id IS NULL OR storage_instance.adoption_run_id IS NOT NULL`
-          (while HTTP `Store::stage` and `Store::publish` (`openmettle_api`) continue succeeding
-          when `adoption_run_id IS NULL` both when `volume_id IS NOT NULL` — verifying role-tagged
-          sentinels — and during mixed-version rolling upgrade while `volume_id IS NULL`, skipping
-          sentinel reads while still setting `stage_claimed = true` and binding `payload_ino =
-          staged_ino`).
+          `storage_volume_control` is missing or `storage_volume_control.volume_id IS NULL OR
+          storage_volume_control.adoption_run_id IS NOT NULL` (while HTTP `Store::stage` and
+          `Store::publish` (`openmettle_api`) continue succeeding when `storage_volume_control` is
+          present and `adoption_run_id IS NULL` both when `volume_id IS NOT NULL` — verifying
+          role-tagged sentinels — and during mixed-version rolling upgrade while `volume_id IS
+          NULL`, skipping sentinel reads while still setting `stage_claimed = true` and binding
+          `payload_ino = staged_ino`).
        3. **Strict 4-step mandatory upgrade sequence (pre-migration `N-1` cleaner quiescence ->
           migration -> 100% `N-1 -> N` replacement -> verified adoption & activation):**
           - *Step 1 (Before migration — MANDATORY `N-1` cleaner quiescence & in-flight sweep
@@ -2055,145 +2141,165 @@ candidate scanning from **one-reservation-per-transaction** settlement:
             runtime logins **and** `NOINHERIT` logins executing `SET ROLE openmettle_api` or `SET
             ROLE openmettle_worker` fail closed!) on `openmettle.storage_reservations` (`WHEN
             (OLD.state = 'reserved' AND NEW.state = 'released')`) and
-            `openmettle.artifact_revisions` (`WHEN (NEW.state IN ('purging', 'purged'))`) acquires
-            a serialized **`FOR SHARE`** lock on `openmettle.storage_instance WHERE id` and guards
-            **BOTH `openmettle_worker` AND `openmettle_api`** whenever **`storage_instance.volume_id
-            IS NULL OR storage_instance.adoption_run_id IS NOT NULL`**: it blocks `N-1`
-            `openmettle_api`'s unconditional `abort()` (`src/artifact_fs.rs:584-591` executes `let _
-            = committed(pool, async |tx| storage::release(tx, scope, reservation).await).await;
-            error`, ignoring the `OMQ03` release error and returning the upload error while leaving
-            the `'reserved'` row intact so a failed same-key upload retry during rolling upgrade can
-            never release published `revisions/<id>` bytes; normal `N-1` and `N` `reserve` +
-            `settle` uploads continue succeeding without interruption, and any failed upload's
-            `'reserved'` row is cleanly reconciled by post-adoption `N` `reconcile_expired` once
-            reclaimed on the pinned volume), serializes strictly against `openmettle-admin` Step
-            1b's `storage_instance FOR UPDATE` barrier so zero in-flight `storage::release` can pass
-            the trigger before Step 1b and commit during Step 2, and serves as a **PostgreSQL ledger
-            defense-in-depth backstop** for `openmettle_worker` — **NOT** a substitute for
-            pre-migration `N-1` worker cleaner quiescence because `N-1` workers unlink payload files
-            before mutating PostgreSQL.
-          - *Step 2 (Migration):* Run `openmettle-migrate` (`storage_instance.volume_id IS NULL`,
-            `storage_instance.adoption_run_id IS NULL`,
-            `storage_instance.bootstrap_auto_pin_allowed = false`,
+            `openmettle.artifact_revisions` (`WHEN (NEW.state IN ('purging', 'purged'))`) executes
+            `SELECT volume_id, adoption_run_id INTO v_vol, v_adopt FROM
+            openmettle.storage_volume_control WHERE id FOR SHARE;` and fails closed with `OMQ03`
+            whenever **`NOT FOUND OR v_vol IS NULL OR v_adopt IS NOT NULL`** (failing closed on a
+            missing singleton row too!), guarding **BOTH `openmettle_worker` AND `openmettle_api`**:
+            it blocks `N-1` `openmettle_api`'s unconditional `abort()` (`src/artifact_fs.rs:584-591`
+            executes `let _ = committed(pool, async |tx| storage::release(tx, scope,
+            reservation).await).await; error`, ignoring the `OMQ03` release error and returning the
+            upload error while leaving the `'reserved'` row intact so a failed same-key upload retry
+            during rolling upgrade can never release published `revisions/<id>` bytes; normal `N-1`
+            and `N` `reserve` + `settle` uploads continue succeeding without interruption, and any
+            failed upload's `'reserved'` row is cleanly reconciled by post-adoption `N`
+            `reconcile_expired` once reclaimed on the pinned volume), serializes strictly against
+            `openmettle-admin` Step 1b's `storage_volume_control FOR UPDATE` barrier so zero
+            in-flight `storage::release` can pass the trigger before Step 1b and commit during Step
+            2 (with zero deadlock against `storage_accounts -> storage_instance` updates in
+            `storage::adjust`!), and serves as a **PostgreSQL ledger defense-in-depth backstop** for
+            `openmettle_worker` — **NOT** a substitute for pre-migration `N-1` worker cleaner
+            quiescence because `N-1` workers unlink payload files before mutating PostgreSQL.
+          - *Step 2 (Migration):* Run `openmettle-migrate` (`storage_volume_control.volume_id IS
+            NULL`, `storage_volume_control.adoption_run_id IS NULL`,
+            `storage_volume_control.bootstrap_auto_pin_allowed = false`,
             `quota_enforcement.metering_enforced = false` on every upgrade where `applied >= 1`).
           - *Step 3 (100% `N-1 -> N` binary replacement):* Roll 100% of `openmettle-api` and
             `openmettle-worker` replicas from `N-1` to `N` (`N` workers may have
             `OPENMETTLE_WORKER_ARTIFACTS_DIR` configured because `N` cleaners and ADR 0039
-            `publish_bytes` spills verify non-null pinned `volume_id AND adoption_run_id IS NULL` +
-            all three role-tagged directory sentinels/local `st_dev` *before* touching any
-            filesystem path, failing closed with zero unlinks while `volume_id IS NULL` or
-            `adoption_run_id IS NOT NULL`; meanwhile `N` HTTP `Store::stage` and `Store::publish`
-            continue operating smoothly while `adoption_run_id IS NULL`, setting `stage_claimed =
-            true` and binding `payload_ino = staged_ino` even before `volume_id` is pinned).
-            Confirm **zero `N-1` replicas remain running**.
+            `publish_bytes` spills verify non-null pinned `storage_volume_control.volume_id AND
+            adoption_run_id IS NULL` + all three role-tagged directory sentinels/local `st_dev`
+            *before* touching any filesystem path, failing closed with zero unlinks while
+            `volume_id IS NULL` or `adoption_run_id IS NOT NULL`; meanwhile `N` HTTP `Store::stage`
+            and `Store::publish` continue operating smoothly while `adoption_run_id IS NULL`,
+            setting `stage_claimed = true`, binding `payload_ino = staged_ino`, and publishing via
+            `linkat` so `staging/<id>` stays present on disk until `storage::settle` commits and any
+            mixed-version `N-1` same-key retry hits `OpenOptions::create_new(true)` ->
+            `Err(Error::InProgress)` without replacing `revisions/<id>`). Confirm **zero `N-1`
+            replicas remain running**.
           - *Step 4 (Verified adoption, pin & activation — with storage-disabled bypass per ADR
             0031):* **Only after zero `N-1` replicas remain**, on storage-enabled installations run
             `openmettle-admin` verified volume adoption (minting `my_adoption_run_id = uuid_v4()`,
-            acquiring `storage_instance FOR UPDATE` in Step 1b to set `adoption_run_id =
-            $my_adoption_run_id` strictly before Step 2 pre-scan, scanning outside DB locks in Step
-            2, and in Step 3 locking `storage_reservations (ORDER BY id ASC FOR UPDATE) ->
-            artifact_revisions (ORDER BY id ASC FOR UPDATE) -> storage_accounts (ORDER BY scope_id
-            ASC FOR UPDATE) -> storage_instance FOR UPDATE`, verifying `adoption_run_id =
-            $my_adoption_run_id`, **backfilling `payload_ino` on every positively verified on-disk
-            `'reserved'` and `'active'`/`'retained'` `'settled'` row**, quarantining missing or
-            mismatched `'reserved'` rows with `adoption_unverified = true, publish_pending = false,
-            reclaim_state = 'none', reclaim_claim_token = NULL, reclaim_lease_until = NULL`,
+            acquiring `storage_volume_control WHERE id FOR UPDATE` in Step 1b to set
+            `adoption_run_id = $my_adoption_run_id` strictly before Step 2 pre-scan, scanning
+            outside DB locks in Step 2, and in Step 3 locking `storage_reservations (ORDER BY id ASC
+            FOR UPDATE) -> artifact_revisions (ORDER BY id ASC FOR UPDATE) ->
+            storage_volume_control (WHERE id FOR UPDATE) -> storage_accounts (ORDER BY scope_id ASC
+            FOR UPDATE) -> storage_instance (WHERE id FOR UPDATE)`, verifying `adoption_run_id =
+            $my_adoption_run_id`, evaluating ALL `'active'`/`'retained'`/`'purging'` revisions and
+            volume checks **BEFORE** writing any `payload_ino`, preserving verified `'truncated'`
+            holds anchored at `staging/.reclaim.<id>`, committing `payload_ino` backfills **ONLY in
+            the success branch** when volume verification completely succeeds, quarantining missing
+            or mismatched `'reserved'` rows with `adoption_unverified = true, publish_pending =
+            false, reclaim_state = 'none', reclaim_claim_token = NULL, reclaim_lease_until = NULL`,
             publishing and `fsync`ing all three role-tagged sentinels atomically via `linkat`,
-            pinning `volume_id`, and clearing `adoption_run_id = NULL` in the exact same commit —
-            or committing quarantine + clearing `adoption_run_id = NULL` before returning `OMQ03` on
-            post-sentinel verification failure), then run the pre-upgrade orphan gateway sweep
+            pinning `storage_volume_control.volume_id`, and clearing `adoption_run_id = NULL` in the
+            exact same commit — or omitting/rolling back ALL `payload_ino` backfills and committing
+            ONLY `adoption_unverified = true` on missing/mismatched `'reserved'` rows when
+            `volume_id IS NOT NULL` plus clearing `adoption_run_id = NULL` before returning `OMQ03`
+            on verification failure), then run the pre-upgrade orphan gateway sweep
             (`quota_release_orphan_gateway_requests`) and flip `quota_enforcement.metering_enforced
             = true` in a standalone single-statement transaction. On **storage-disabled
             installations** (both `OPENMETTLE_API_ARTIFACTS_DIR`/`OPENMETTLE_ARTIFACTS_DIR` and
             `OPENMETTLE_WORKER_ARTIFACTS_DIR` unset per
             [ADR 0031](0031-filesystem-artifact-storage-and-streaming-multipart.md) AND `0` rows in
             both `storage_reservations` and `artifact_revisions`), Step 4 **skips volume adoption**
-            — leaving `storage_instance.volume_id IS NULL`, `bootstrap_auto_pin_allowed = false`,
-            and all storage cleaners disabled — and proceeds directly after 100% `N-1 -> N` binary
-            replacement to run `quota_release_orphan_gateway_requests` and flip
+            — leaving `storage_volume_control.volume_id IS NULL`, `bootstrap_auto_pin_allowed =
+            false`, and all storage cleaners disabled — and proceeds directly after 100% `N-1 -> N`
+            binary replacement to run `quota_release_orphan_gateway_requests` and flip
             `quota_enforcement.metering_enforced = true`. If artifact storage is provisioned later,
             operators run `openmettle-admin` verified volume adoption before enabling
             `OPENMETTLE_WORKER_ARTIFACTS_DIR`. **Starting, rolling back to, or resuming any `N-1`
-            worker binary after `storage_instance.volume_id` is pinned is strictly forbidden by the
-            rollout contract**, because `N-1` workers lack Rust role-tagged `.openmettle-volume-id`
-            / `payload_ino` / `RenameFlags::NOREPLACE` verification and unlink before mutating
-            PostgreSQL.
+            worker binary after `storage_volume_control.volume_id` is pinned is strictly forbidden
+            by the rollout contract**, because `N-1` workers lack Rust role-tagged
+            `.openmettle-volume-id` / `payload_ino` / `linkat` verification and unlink before
+            mutating PostgreSQL.
      - **Verified, idempotent volume adoption required on every storage-enabled upgrade
-       (`storage_instance.volume_id IS NULL` with `bootstrap_auto_pin_allowed = false`, run ONLY
-       after zero `N-1` replicas remain):** Enabling storage cleaners on an upgraded installation
-       requires an explicit verified volume-adoption step (executed by `openmettle_owner` /
-       operator CLI `openmettle-admin` procedure documented in PR2's operator runbook update)
-       **before** `Store::open` directory creation. Every invocation — **both initial unpinned run
-       and any already-pinned operator retry/re-verification after a crash or lost DB commit
-       acknowledgement** — mints a unique **`my_adoption_run_id = uuid_v4()`**, executes Step 1a,
-       commits Step 1b's exclusive **`adoption_run_id = $my_adoption_run_id` pre-scan barrier**
-       strictly before Step 2 begins, executes Step 2 pre-scan unconditionally outside DB locks
-       **before** Step 3 locks `storage_reservations -> artifact_revisions -> storage_accounts ->
-       storage_instance` in canonical order, backfills `payload_ino` on all positively verified
-       on-disk `'reserved'` and `'active'`/`'retained'` `'settled'` rows, verifies or publishes any
-       `.openmettle-volume-id`, and atomically clears `adoption_run_id = NULL` in Step 3's exact
-       commit that completes adoption OR durably quarantines (`adoption_unverified = true`) every
-       unaccounted `'reserved'` row BEFORE returning `OMQ03` on any post-sentinel verification
-       failure:
+       (`storage_volume_control.volume_id IS NULL` with `bootstrap_auto_pin_allowed = false`, run
+       ONLY after zero `N-1` replicas remain):** Enabling storage cleaners on an upgraded
+       installation requires an explicit verified volume-adoption step (executed by
+       `openmettle_owner` / operator CLI `openmettle-admin` procedure documented in PR2's operator
+       runbook update) **before** `Store::open` directory creation. Every invocation — **both
+       initial unpinned run and any already-pinned operator retry/re-verification after a crash or
+       lost DB commit acknowledgement** — mints a unique **`my_adoption_run_id = uuid_v4()`**,
+       executes Step 1a, commits Step 1b's exclusive **`storage_volume_control.adoption_run_id =
+       $my_adoption_run_id` pre-scan barrier** strictly before Step 2 begins, executes Step 2
+       pre-scan unconditionally outside DB locks **before** Step 3 locks `storage_reservations ->
+       artifact_revisions -> storage_volume_control -> storage_accounts -> storage_instance` in
+       canonical order, evaluates ALL `'active'`/`'retained'`/`'purging'` revision and volume checks
+       **BEFORE** writing any `payload_ino`, preserves verified `'truncated'` holds anchored at
+       `staging/.reclaim.<id>`, commits `payload_ino` backfills **ONLY in the success branch** when
+       volume verification completely succeeds (omitting/rolling back ALL `payload_ino` backfills on
+       failed adoption!), verifies or publishes `.openmettle-volume-id`, and atomically clears
+       `adoption_run_id = NULL` in Step 3's exact commit that completes adoption OR (on verification
+       failure) omits all `payload_ino` backfills, durably quarantines unaccounted `'reserved'` rows
+       when `volume_id IS NOT NULL`, and clears `adoption_run_id = NULL` BEFORE returning `OMQ03`:
        1. *Step 1a — Pre-existing directory, filesystem capability & single-device pre-check (no DB
           lock held):* Open `<root>`, `<root>/staging`, and `<root>/revisions` with `O_RDONLY |
           O_DIRECTORY | O_NOFOLLOW` (never auto-creating directories during adoption), verify local
           same-mount equality (`root_fd_meta.dev() == staging_dir_fd_meta.dev() ==
           revisions_dir_fd_meta.dev()`), qualify mandatory filesystem capabilities (`O_CREAT |
-          O_EXCL | O_NOFOLLOW`, `rustix::fs::renameat_with(..., RenameFlags::NOREPLACE)` rejecting
+          O_EXCL | O_NOFOLLOW`, `rustix::fs::linkat(..., AtFlags::empty())` rejecting
           `ENOSYS`/`EOPNOTSUPP`/`EINVAL` fail-closed and verifying `Errno::EXIST` on an existing
           target without overwriting it, plus file and directory `fsync`), and capture
           `fstat(revisions_dir_fd)`'s exact `(st_dev, st_ino)`. Also inspect
-          `storage_instance.volume_id`: if `volume_id IS NOT NULL`, validate all three existing
-          role-tagged `.openmettle-volume-id` sentinels (`:root`, `:revisions`, `:staging` via
-          `OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK` + `fstat` `S_ISREG`, local
-          `st_dev` match, bounded `<= 64`-byte read) against `volume_id` up front (failing
-          immediately with `OMQ03` without mutating DB if sentinels do not match the pinned volume).
-       2. *Step 1b — Serialized exclusive adoption-ownership barrier (`storage_instance.adoption_run_id
-          = $my_adoption_run_id`, committed strictly BEFORE Step 2 begins on BOTH unpinned AND
-          already-pinned runs):* Mint unique `my_adoption_run_id = uuid_v4()`. Open a short
-          `openmettle_owner` transaction locking **ONLY** `storage_instance`: **`SELECT volume_id,
-          adoption_run_id FROM openmettle.storage_instance WHERE id FOR UPDATE`** (because Step 1b
-          locks *only* `storage_instance`, zero deadlock cycle is possible!). If `adoption_run_id
-          IS NOT NULL`, **fail closed (`OMQ03`) without modifying `adoption_run_id`** unless the
-          operator explicitly passed **`--replace-adoption-run <stale_uuid>`** matching
-          `adoption_run_id = $stale_uuid` — guaranteeing two concurrent adopters can NEVER both
-          enter Step 2 or clear each other's barrier! Execute **`UPDATE openmettle.storage_instance
-          SET adoption_run_id = $my_adoption_run_id WHERE id`** and commit Step 1b immediately
-          **before** Step 2 starts scanning the filesystem or ledger. Because
-          `enforce_runtime_storage_volume_pinned()` acquires **`FOR SHARE`** on
-          `openmettle.storage_instance WHERE id` (which conflicts directly with Step 1b's **`FOR
-          UPDATE`**):
+          `storage_volume_control.volume_id` (failing closed with `OMQ03` if the singleton row is
+          missing): if `volume_id IS NOT NULL`, validate all three existing role-tagged
+          `.openmettle-volume-id` sentinels (`:root`, `:revisions`, `:staging` via `OFlags::RDONLY |
+          OFlags::NOFOLLOW | OFlags::NONBLOCK` + `fstat` `S_ISREG`, local `st_dev` match, bounded
+          `<= 64`-byte read) against `volume_id` up front (failing immediately with `OMQ03` without
+          mutating DB if sentinels do not match the pinned volume).
+       2. *Step 1b — Serialized exclusive adoption-ownership barrier
+          (`storage_volume_control.adoption_run_id = $my_adoption_run_id`, committed strictly BEFORE
+          Step 2 begins on BOTH unpinned AND already-pinned runs):* Mint unique `my_adoption_run_id
+          = uuid_v4()`. Open a short `openmettle_owner` transaction locking **ONLY**
+          `storage_volume_control`: **`SELECT volume_id, adoption_run_id INTO STRICT ... FROM
+          openmettle.storage_volume_control WHERE id FOR UPDATE`** (failing closed on a missing
+          singleton row; because Step 1b locks *only* `storage_volume_control`, zero deadlock cycle
+          is possible!). If `adoption_run_id IS NOT NULL`, **fail closed (`OMQ03`) without modifying
+          `adoption_run_id`** unless the operator explicitly passed **`--replace-adoption-run
+          <stale_uuid>`** matching `adoption_run_id = $stale_uuid` — guaranteeing two concurrent
+          adopters can NEVER both enter Step 2 or clear each other's barrier! Execute **`UPDATE
+          openmettle.storage_volume_control SET adoption_run_id = $my_adoption_run_id WHERE id`**
+          and commit Step 1b immediately **before** Step 2 starts scanning the filesystem or ledger.
+          Because `enforce_runtime_storage_volume_pinned()` acquires **`FOR SHARE`** on
+          `openmettle.storage_volume_control WHERE id` (which conflicts directly with Step 1b's
+          **`FOR UPDATE`**, while never touching `storage_instance`!):
           - **Strict serialization with in-flight `storage::release` / `begin_purge` /
             `confirm_purge`:** Any in-flight runtime `storage::release` (or purge) either finishes
-            its entire transaction (including `storage_instance` counter adjustment) and commits
-            strictly **BEFORE** Step 1b acquires `FOR UPDATE`, OR blocks on Step 1b's `FOR UPDATE`
-            and fails closed with `OMQ03` once Step 1b commits `adoption_run_id =
-            $my_adoption_run_id` — **zero release can ever pass the trigger before Step 1b and
-            commit during Step 2!**
+            its entire transaction (including `storage_accounts -> storage_instance` counter
+            adjustment) and commits strictly **BEFORE** Step 1b acquires `FOR UPDATE`, OR blocks on
+            Step 1b's `FOR UPDATE` and fails closed with `OMQ03` once Step 1b commits
+            `adoption_run_id = $my_adoption_run_id` — **zero release can ever pass the trigger
+            before Step 1b and commit during Step 2, and zero deadlock occurs!**
           - From the instant Step 1b commits until Step 3's final commit clears `adoption_run_id =
             NULL`, **`SECURITY INVOKER` `openmettle.enforce_runtime_storage_volume_pinned()`**
-            (`OMQ03`) blocks every runtime `storage_reservations` `'reserved' -> 'released'`
-            transition and every runtime `artifact_revisions` `'-> purging/purged'` transition
-            across both `openmettle_worker` and `openmettle_api` (covering `INHERIT` and
-            `NOINHERIT`/`SET ROLE` logins), **and** all runtime cleaners (`reconcile_expired`,
-            run-linked recovery, ADR 0039 `reconcile_run_spills`, `purge_due`, `StagingSweepState`),
-            `artifact_fs::abort`, `Store::stage`, `Store::publish`, and ADR 0039 `publish_bytes`
-            check `adoption_run_id IS NULL` under `storage_instance FOR SHARE`!
-          - Normal `storage::reserve` remains allowed; if a new `'reserved'` row commits during
-            Step 2, Step 3 locks every `'reserved'` row in canonical ascending `id` order before
-            `storage_instance FOR UPDATE` and classifies it under lock.
+            (`OMQ03`, failing closed on `NOT FOUND OR v_vol IS NULL OR v_adopt IS NOT NULL`) blocks
+            every runtime `storage_reservations` `'reserved' -> 'released'` transition and every
+            runtime `artifact_revisions` `'-> purging/purged'` transition across both
+            `openmettle_worker` and `openmettle_api` (covering `INHERIT` and `NOINHERIT`/`SET ROLE`
+            logins), **and** all runtime cleaners (`reconcile_expired`, run-linked recovery, ADR
+            0039 `reconcile_run_spills`, `purge_due`, `StagingSweepState`), `artifact_fs::abort`,
+            `Store::stage`, `Store::publish`, and ADR 0039 `publish_bytes` check
+            `storage_volume_control.adoption_run_id IS NULL` under `storage_volume_control FOR
+            SHARE`!
+          - Normal `storage::reserve` remains allowed (`storage_volume_control FOR SHARE ->
+            storage_accounts FOR UPDATE -> storage_instance FOR UPDATE -> INSERT
+            storage_reservations`); if a new `'reserved'` row commits during Step 2, Step 3 locks
+            every `'reserved'` row in canonical ascending `id` order before `storage_volume_control
+            FOR UPDATE` and classifies it under lock.
           - If `openmettle-admin` fails with an I/O or pre-Step-3 error during Step 2, its cleanup
             handler clears `adoption_run_id = NULL` **ONLY `WHERE id AND adoption_run_id =
-            $my_adoption_run_id`** under `SELECT adoption_run_id FROM openmettle.storage_instance
-            WHERE id FOR UPDATE` (never clearing another adopter's run ID!); if `openmettle-admin`
-            hard-crashes (`SIGKILL`) mid-Step-2, `adoption_run_id` stays `$my_adoption_run_id`
-            fail-closed until the operator explicitly re-runs with `--replace-adoption-run
-            <stale_uuid>`.
+            $my_adoption_run_id`** under `SELECT adoption_run_id INTO STRICT ... FROM
+            openmettle.storage_volume_control WHERE id FOR UPDATE` (never clearing another adopter's
+            run ID!); if `openmettle-admin` hard-crashes (`SIGKILL`) mid-Step-2, `adoption_run_id`
+            stays `$my_adoption_run_id` fail-closed until the operator explicitly re-runs with
+            `--replace-adoption-run <stale_uuid>`.
        3. *Step 2 — Unconditional ledger payload & volume identity pre-scan (executed outside DB
-          locks under Step 1b's `adoption_run_id = $my_adoption_run_id` barrier; defers
-          post-sentinel `OMQ03` failure until Step 3's quarantine transaction has durably flagged
-          unaccounted `'reserved'` rows and cleared `adoption_run_id = NULL`):*
+          locks under Step 1b's `storage_volume_control.adoption_run_id = $my_adoption_run_id`
+          barrier; defers post-sentinel `OMQ03` failure until Step 3 has cleared `adoption_run_id =
+          NULL` and — when `volume_id IS NOT NULL` — durably quarantined unaccounted `'reserved'`
+          rows while omitting all `payload_ino` backfills):*
           Record the verified row set, the per-reservation on-disk verification result and verified
           on-disk `st_ino` for every `'reserved'` and `'active'`/`'retained'` `'settled'` row,
           whether the ledger was empty on the current snapshot, and any post-sentinel verification
@@ -2204,20 +2310,21 @@ candidate scanning from **one-reservation-per-transaction** settlement:
             `bootstrap_auto_pin_allowed = false`), Step 2 records `empty_ledger = true` and
             proceeds to Step 3 **without requiring `--expected-fs-uuid` /
             `--expected-revisions-inode` for nonexistent ledger rows** — subject to mandatory
-            re-verification of ledger emptiness under `storage_instance FOR UPDATE` in Step 3
+            re-verification of ledger emptiness under `storage_volume_control FOR UPDATE` in Step 3
             before any sentinel is written.
           - **Published and purging revisions (`artifact_revisions`):** Every
             `openmettle.artifact_revisions` row in `state IN ('active', 'retained')` **MUST**
             exist relative to `<root>/revisions` (`AT_SYMLINK_NOFOLLOW` regular file on
             `revisions_dir_fd`'s local `st_dev` with exact `size_bytes`, matching `sr.payload_ino`
             whenever already non-null, plus sampled SHA-256 `content_digest` verification —
-            capturing its verified `file_meta.ino()` for Step 3 `payload_ino` backfill!). Every
-            `state = 'purging'` row whose `<root>/revisions/<id>` file is still present on disk is
-            likewise verified as a non-symlink regular file with exact `size_bytes` and
-            `content_digest` (while missing `purging` files remain allowed once volume identity is
-            established, retaining their byte charges until `purge_due` confirms `state = 'purged'`
-            after adoption completes). **In-flight `begin_purge` handling on already-pinned retries
-            (`volume_id IS NOT NULL`):** although Step 1b's `FOR UPDATE` barrier serialized every
+            capturing its verified `file_meta.ino()` in memory for Step 3's **success-only**
+            `payload_ino` backfill!). Every `state = 'purging'` row whose
+            `<root>/revisions/<id>` file is still present on disk is likewise verified as a
+            non-symlink regular file with exact `size_bytes` and `content_digest` (while missing
+            `purging` files remain allowed once volume identity is established, retaining their byte
+            charges until `purge_due` confirms `state = 'purged'` after adoption completes).
+            **In-flight `begin_purge` handling on already-pinned retries (`volume_id IS NOT NULL`):**
+            although Step 1b's `storage_volume_control FOR UPDATE` barrier serialized every
             in-flight `begin_purge` / `confirm_purge` strictly before Step 2 started, a `purge_due`
             worker that had already committed `begin_purge` (`'retained' -> 'purging'`) immediately
             *before* Step 1b acquired `FOR UPDATE` may finish unlinking `revisions/<id>`
@@ -2227,33 +2334,49 @@ candidate scanning from **one-reservation-per-transaction** settlement:
             it transitioned to `state IN ('purging', 'purged')`, `ENOENT` is accepted as valid
             concurrent `purge_due` progress; if it remains `state IN ('active', 'retained')`, record
             a post-sentinel `OMQ03` verification failure (to be returned strictly after Step 3
-            quarantines any unaccounted `'reserved'` rows and clears `adoption_run_id = NULL`).
-            (During initial adoption while `volume_id IS NULL`, `N-1` cleaners are quiesced and `N`
-            cleaners + `enforce_runtime_storage_volume_pinned()` (`OMQ03`) forbid `begin_purge`, so
-            zero concurrent `begin_purge` can occur and any missing `'active'`/`'retained'` file
-            records an unconditional post-sentinel `OMQ03` failure.)
-          - **Outstanding reservations (`storage_reservations` in `state = 'reserved'`) and
-            per-reservation individual accounting guard:** Inspect **every individual**
-            `storage_reservations` row in `state = 'reserved'` relative to `revisions_dir_fd` and
-            `staging_dir_fd` (`AT_SYMLINK_NOFOLLOW` regular file, same local `st_dev`, `size <=
-            max_bytes`, matching `payload_ino` when non-null). Track both the exact set of
-            `'reserved'` rows where **neither** `revisions/<id>` **nor** `staging/<id>` is
-            positively verified on disk AND every positively verified `'reserved'` row's on-disk
-            `st_ino` (for Step 3 `payload_ino` backfill and optional un-quarantine on a passing
-            verified run). If **zero** digest-bearing revisions (`active`, `retained`, or
-            still-present `purging`) were positively verified on disk AND `state = 'reserved'` rows
-            exist while **neither** `revisions/<id>` nor `staging/<id>` exists on disk for any
-            `'reserved'` row, default adoption **MUST fail closed (`OMQ03` / CLI error)** unless
-            `--confirm-no-on-disk-payloads` is supplied alongside both `--expected-fs-uuid` and
-            `--expected-revisions-inode` — **AND MUST NOT return that `OMQ03` early before Step 3
-            durably commits `adoption_unverified = true` and clears `adoption_run_id = NULL`**!
-            Moreover — **even when digest-bearing revisions or other `'reserved'` rows (e.g., `R1`
-            in `staging/`) are present on disk, or when `--expected-fs-uuid` and
-            `--expected-revisions-inode` are supplied** — any individual `'reserved'` row (such as
-            `R2`, renamed into an original `revisions/` before same-filesystem replacement) where
-            neither `revisions/<id>` nor `staging/<id>` is positively verified on disk at adoption
-            commit time is marked **`adoption_unverified = true`** in Step 3 so automatic worker
-            cleaners can never silently release its `max_bytes` charge!
+            omits all `payload_ino` backfills, quarantines any unaccounted `'reserved'` rows when
+            `volume_id IS NOT NULL`, and clears `adoption_run_id = NULL`). (During initial adoption
+            while `volume_id IS NULL`, `N-1` cleaners are quiesced and `N` cleaners +
+            `enforce_runtime_storage_volume_pinned()` (`OMQ03`) forbid `begin_purge`, so zero
+            concurrent `begin_purge` can occur and any missing `'active'`/`'retained'` file records
+            an unconditional post-sentinel `OMQ03` failure.)
+          - **Outstanding reservations (`storage_reservations` in `state = 'reserved'`), preserving
+            verified `'truncated'` holds anchored at `staging/.reclaim.<id>`, and per-reservation
+            individual accounting guard:** Inspect **every individual** `storage_reservations` row
+            in `state = 'reserved'`:
+            - **Verified `'truncated'` hold preservation:** If `reclaim_state = 'truncated'`, probe
+              **`staging/.reclaim.<id>`** (`reclaim_name = format!(".reclaim.{id}")`) via
+              `statat(&staging_dir_fd, &reclaim_name, AtFlags::SYMLINK_NOFOLLOW)`: if
+              `staging/.reclaim.<id>` exists as `S_ISREG` on `staging_dir_fd`'s local `st_dev` with
+              **`st_ino as u64 == payload_ino` AND `st_size == 0`**, Step 2 **positively verifies
+              this `'truncated'` hold** so Step 3 **PRESERVES `reclaim_state = 'truncated'`** (and
+              expires `reclaim_lease_until = clock_timestamp()` so the next cleaner tick finishes
+              Step 3 -> Step 4 cleanly instead of falsely quarantining!). Only if
+              `staging/.reclaim.<id>` is missing, non-regular, wrong local `st_dev`, `st_ino !=
+              payload_ino`, or `st_size != 0` is the `'truncated'` row classified for quarantine
+              (`adoption_unverified = true`).
+            - **Non-`'truncated'` `'reserved'` holds (`reclaim_state IN ('none', 'claiming')`):**
+              Inspect relative to `revisions_dir_fd` and `staging_dir_fd` (`AT_SYMLINK_NOFOLLOW`
+              regular file, same local `st_dev`, `size <= max_bytes`, matching `payload_ino` when
+              non-null; if `reclaim_state = 'claiming'` and `staging/.reclaim.<id>` already exists
+              matching `payload_ino` with `st_size == 0`, count it as verified on-disk too). Track
+              both the exact set of `'reserved'` rows that are NOT positively verified on disk AND
+              every positively verified `'reserved'` row's on-disk `st_ino` in memory (for Step 3's
+              **success-only** `payload_ino` backfill and optional un-quarantine on a passing
+              verified run). If **zero** digest-bearing revisions (`active`, `retained`, or
+              still-present `purging`) were positively verified on disk AND `state = 'reserved'`
+              rows exist while zero `'reserved'` rows are positively verified on disk, default
+              adoption **MUST fail closed (`OMQ03` / CLI error)** unless
+              `--confirm-no-on-disk-payloads` is supplied alongside both `--expected-fs-uuid` and
+              `--expected-revisions-inode` — **AND MUST NOT return that `OMQ03` early before Step 3
+              clears `adoption_run_id = NULL` (and commits `adoption_unverified = true` when
+              `volume_id IS NOT NULL`, omitting all `payload_ino` backfills)**! Moreover — **even
+              when digest-bearing revisions or other `'reserved'` rows (e.g., `R1` in `staging/`)
+              are present on disk, or when `--expected-fs-uuid` and `--expected-revisions-inode` are
+              supplied** — any individual `'reserved'` row (such as `R2`, renamed into an original
+              `revisions/` before same-filesystem replacement) that is NOT positively verified on
+              disk at adoption commit time is marked **`adoption_unverified = true`** in Step 3 so
+              automatic worker cleaners can never silently release its `max_bytes` charge!
           - **General zero-verified-revision rule for populated ledgers (covering mixed
             reservation-only ledgers, missing-file `purging`-only ledgers, and historical
             `released`/`purged`-only ledgers, on both initial run and retry):** Whenever `>= 1`
@@ -2273,194 +2396,205 @@ candidate scanning from **one-reservation-per-transaction** settlement:
             `--expected-revisions-inode` for the rare case where every
             `'reserved'`/`'purging'`/`'purged'` row genuinely has zero surviving files on the real
             volume. Whenever this rule fails, Step 2 **records the post-sentinel `OMQ03` error and
-            still enters Step 3's quarantine transaction first** (protected throughout by Step 1b's
-            `adoption_run_id = $my_adoption_run_id` barrier!) so every unaccounted `'reserved'` row
-            is durably marked `adoption_unverified = true` in the exact same commit that clears
-            `adoption_run_id = NULL` BEFORE returning `OMQ03`.
+            still enters Step 3 first** (protected throughout by Step 1b's `adoption_run_id =
+            $my_adoption_run_id` barrier!) so Step 3 omits all `payload_ino` backfills, commits
+            `adoption_unverified = true` on unaccounted `'reserved'` rows when `volume_id IS NOT
+            NULL`, and clears `adoption_run_id = NULL` BEFORE returning `OMQ03`.
        4. *Step 3 — Canonical full-ledger lock (`storage_reservations -> artifact_revisions ->
-          storage_accounts -> storage_instance`), `adoption_run_id = $my_adoption_run_id` ownership
-          check, `payload_ino` backfill on all positively verified `'reserved'` and
-          `'active'`/`'retained'` `'settled'` rows, quarantine commit, sentinel publication via
-          `linkat`, and atomic `adoption_run_id = NULL` clear (unified protocol for BOTH
-          `openmettle-admin` adoption AND `Store::open` fresh-bootstrap auto-pinning):*
+          storage_volume_control -> storage_accounts -> storage_instance`), `adoption_run_id =
+          $my_adoption_run_id` ownership check, verification-first gating, success-only `payload_ino`
+          backfill, verified `'truncated'` preservation, sentinel publication via `linkat`, and
+          atomic `adoption_run_id = NULL` clear (unified protocol for BOTH `openmettle-admin`
+          adoption AND `Store::open` fresh-bootstrap auto-pinning):*
           Open an `openmettle_owner` (adoption) or `openmettle_api`/`openmettle_worker`
           (fresh-bootstrap auto-pinning, committing through `openmettle.storage_pin_volume_id`
           `SECURITY DEFINER` in the same transaction) transaction. On `openmettle-admin` adoption,
           acquire locks in strict canonical order:
           1. `SELECT id FROM openmettle.storage_reservations ORDER BY id ASC FOR UPDATE`
           2. `SELECT id FROM openmettle.artifact_revisions ORDER BY id ASC FOR UPDATE`
-          3. `SELECT scope_id FROM openmettle.storage_accounts ORDER BY scope_id ASC FOR UPDATE`
-          4. `SELECT volume_id, bootstrap_auto_pin_allowed, adoption_run_id FROM
-             openmettle.storage_instance WHERE id FOR UPDATE` **strictly before creating, writing,
-             or linking any `.openmettle-volume-id` file or unlinking any `.tmp.*` file** (on
-             fresh-bootstrap auto-pinning, the storage ledger is empty, so `Store::open` locks
-             `storage_instance FOR UPDATE` directly and acquires zero row locks afterward).
+          3. `SELECT volume_id, bootstrap_auto_pin_allowed, adoption_run_id INTO STRICT ... FROM
+             openmettle.storage_volume_control WHERE id FOR UPDATE` **strictly before creating,
+             writing, or linking any `.openmettle-volume-id` file or unlinking any `.tmp.*` file**
+             (on fresh-bootstrap auto-pinning, the storage ledger is empty, so `Store::open` locks
+             `storage_volume_control WHERE id FOR UPDATE` directly and acquires zero row locks
+             afterward)
+          4. `SELECT scope_id FROM openmettle.storage_accounts ORDER BY scope_id ASC FOR UPDATE`
+          5. `SELECT id FROM openmettle.storage_instance WHERE id FOR UPDATE`
           **Immediately assert `adoption_run_id = $my_adoption_run_id`** (aborting with `OMQ03` and
           zero writes if displaced by an operator `--replace-adoption-run`!). Because
           `storage::reserve`, `storage::settle`, `storage::release`, `retain_revision`,
           `restore_revision`, and `confirm_purge` in `src/storage.rs` respect this exact canonical
-          DAG (`storage_reservations -> artifact_revisions -> storage_accounts -> storage_instance`)
-          and Step 3 acquires zero row locks after `storage_instance FOR UPDATE`, this serializes
-          cleanly against every concurrent storage operation with zero deadlock:
-          - **Common locked path on BOTH unpinned (`volume_id IS NULL`) AND already-pinned
-            (`volume_id IS NOT NULL`) `openmettle-admin` adoption/verification runs (strictly
-            BEFORE any sentinel write, idempotent success return, OR post-sentinel `OMQ03` error
-            return):**
+          DAG (`runs -> storage_reservations -> artifacts -> artifact_revisions ->
+          storage_volume_control -> storage_accounts -> storage_instance`), this serializes cleanly
+          against every concurrent storage operation with zero deadlock:
+          - **Phase 3A — Evaluate ALL sentinel, fresh-row, revision, and volume verification checks
+            BEFORE writing ANY `payload_ino`:**
             - Verify sentinel preconditions under lock: if `volume_id IS NOT NULL`, re-verify all
               three existing `.openmettle-volume-id` sentinels (`:root`, `:revisions`, `:staging`
               via `openat(..., O_RDONLY | O_NOFOLLOW | O_NONBLOCK)` + `fstat` `S_ISREG` and local
               `st_dev` match, bounded `<= 64`-byte read) match `volume_id` — if any sentinel is
               missing, mismatched, wrong-role, non-regular (including FIFO/symlink), or on a
               different local `st_dev`, roll back immediately with `OMQ03` without writing any
-              sentinel (clearing `adoption_run_id = NULL` only `WHERE id AND adoption_run_id =
-              $my_adoption_run_id` or leaving fail-closed until the valid tree is restored).
-            - Re-check under `storage_instance FOR UPDATE` for any `storage_reservations` or
-              `artifact_revisions` rows committed since Step 2. If **any** newly committed
-              `'reserved'` or `'active'`/`'retained'` row exists outside the locked set, roll back
-              strictly before any sentinel write (keeping `adoption_run_id = $my_adoption_run_id`
-              across the retry!) and retry from Step 2/Step 3 so every row is locked and classified
-              under lock.
-            - **Backfill `payload_ino` on EVERY positively verified on-disk `'reserved'` and
-              `'active'`/`'retained'` `'settled'` row (`openmettle_owner` privilege):** For every
-              locked `'active'`/`'retained'` `artifact_revisions` row verified on disk at
-              `revisions/<reservation_id>` (`S_ISREG`, same local `st_dev`, exact `size_bytes`),
-              verify `sr.payload_ino IS NULL OR sr.payload_ino = file_ino` (recording a
-              post-sentinel `OMQ03` failure if already non-null and mismatched!) and backfill
-              `UPDATE openmettle.storage_reservations SET stage_claimed = true, payload_ino =
-              $file_ino::text::numeric(20, 0) WHERE id = $reservation_id AND payload_ino IS NULL`.
-              For every locked `'reserved'` row positively verified on disk at `revisions/<id>` or
-              `staging/<id>` (`S_ISREG`, same local `st_dev`, `size <= max_bytes`, matching
-              `payload_ino` when non-null), backfill `UPDATE openmettle.storage_reservations SET
-              stage_claimed = true, payload_ino = $file_ino::text::numeric(20, 0) WHERE id = $id
-              AND state = 'reserved' AND payload_ino IS NULL` (ensuring zero post-adoption
-              `'active'`/`'retained'` revision or on-disk `'reserved'` hold lacks a verified
-              `payload_ino`, so `Store::read` and `verify_accounting_drift` can enforce
-              `payload_ino IS NOT NULL` fail-closed as soon as `volume_id` is pinned!).
-            - **Quarantine missing/mismatched `'reserved'` rows:** On **both** initial unpinned
-              adoption (`volume_id IS NULL`) **and** already-pinned (`volume_id IS NOT NULL`)
-              adoption/verification runs — **including when `deferred_verification_error` is set**
-              — execute **`UPDATE openmettle.storage_reservations SET adoption_unverified = true,
-              publish_pending = false, reclaim_state = 'none', reclaim_claim_token = NULL,
-              reclaim_lease_until = NULL WHERE id = ANY($unaccounted_or_mismatched_reserved_ids)
-              AND state = 'reserved' AND NOT adoption_unverified`** for every locked `'reserved'`
-              row where neither `revisions/<id>` nor `staging/<id>` is positively verified on disk
-              (or where an on-disk candidate mismatches an existing non-null `payload_ino` or
-              exceeds `max_bytes`). Conversely, when **all** volume/sentinel/revision verification
-              checks pass (i.e., `deferred_verification_error` is NOT set), any locked `'reserved'`
-              row previously marked `adoption_unverified = true` whose `revisions/<id>` or
-              `staging/<id>` IS now positively verified on disk (matching `payload_ino` when
-              non-null) on the restored original directory tree may be explicitly un-quarantined
-              (`SET adoption_unverified = false`) by `openmettle-admin` adoption (`openmettle_owner`)
-              in this locked transaction.
-            - **Mandatory fail-closed quarantine commit + atomic `adoption_run_id = NULL` clear
-              BEFORE returning `OMQ03`:** If any post-sentinel verification check failed (missing
-              `--expected-fs-uuid` / `--expected-revisions-inode` / `--confirm-no-on-disk-payloads`
-              when `0` digest-bearing revisions are verified on disk, or missing/mismatched
-              `'active'`/`'retained'` revision payloads), execute **`UPDATE
-              openmettle.storage_instance SET adoption_run_id = NULL WHERE id AND adoption_run_id =
-              $my_adoption_run_id`** and **commit this short lock-ordered transaction** (atomically
-              persisting `adoption_unverified = true` on every unaccounted/mismatched `'reserved'`
-              row AND clearing `adoption_run_id = NULL` in the exact same commit while writing
-              **zero** sentinels and leaving `storage_instance.volume_id` unchanged!) and **then
-              return `OMQ03`**. That quarantine keeps `max_bytes` charged and blocks runtime roles
-              (`enforce_storage_reservation_monotonic_guards()` prevents any non-`openmettle_owner`
-              role from clearing `adoption_unverified = true` in PostgreSQL!) from touching or
-              releasing those unverified holds even when adoption aborts with `OMQ03`.
-          - **Already-pinned branch (`volume_id IS NOT NULL` — lost commit-ack retry or
-            re-verification, when all verification checks passed):** **NEVER create, write, or link
-            any missing sentinel.** Having already verified under lock that **all three** existing
-            `.openmettle-volume-id` sentinels (`:root`, `:revisions`, `:staging`) match
-            `storage_instance.volume_id` paired with their exact role tag, execute **`UPDATE
-            openmettle.storage_instance SET adoption_run_id = NULL WHERE id AND adoption_run_id =
-            $my_adoption_run_id`** alongside the common-path `payload_ino` backfill and
-            `adoption_unverified` updates, commit atomically, and return idempotent success.
-          - **Unpinned branch (`volume_id IS NULL`) — ledger re-verification strictly BEFORE
-            publishing any sentinel:**
-            - On fresh-bootstrap auto-pinning (`Store::open`), require `bootstrap_auto_pin_allowed
-              = true` AND `adoption_run_id IS NULL` AND `NOT EXISTS (SELECT 1 FROM
-              openmettle.storage_reservations) AND NOT EXISTS (SELECT 1 FROM
-              openmettle.artifact_revisions)` under `storage_instance FOR UPDATE`, failing closed
-              with `OMQ03` and writing zero sentinels otherwise.
-            - On `openmettle-admin` adoption, if Step 2 used the empty-ledger branch (`0` rows in
-              both `storage_reservations` and `artifact_revisions` without `--expected-fs-uuid` /
-              `--expected-revisions-inode`), re-check `EXISTS (SELECT 1 FROM
-              openmettle.storage_reservations) OR EXISTS (SELECT 1 FROM
-              openmettle.artifact_revisions)` under `storage_instance FOR UPDATE`. If any row
-              committed between Step 2 and `storage_instance FOR UPDATE`, the empty-ledger waiver
-              is stale — **do NOT publish any sentinel**; roll back (keeping `adoption_run_id =
-              $my_adoption_run_id`) and re-run Step 2's populated-ledger rules against the newly
-              committed row(s). On a populated ledger, re-verify `--expected-fs-uuid` and
-              `--expected-revisions-inode` whenever `0` digest-bearing revisions are verified.
-          - **Crash-safe, race-free sentinel publication with root `fsync` barrier (only while
-            `volume_id IS NULL` under `storage_instance FOR UPDATE`):** Never create
-            `.openmettle-volume-id` directly with `O_CREAT | O_EXCL` before writing its payload (a
-            crash between `openat` and `write` would leave a 0-byte sentinel that causes every
-            retry to fail permanently). Instead:
-            - *No live-peer `.tmp.*` interference:* Publishers **NEVER** run an uncoordinated
-              wildcard unlink of `.openmettle-volume-id.tmp.*`. Each publisher creates a unique
-              `.openmettle-volume-id.tmp.<128bit_random_hex>` (`OFlags::WRONLY | OFlags::CREATE |
-              OFlags::EXCL | OFlags::NOFOLLOW`, `Mode::RUSR | Mode::WUSR`) and unlinks **only its
-              own `tmp_name`** in an unconditional cleanup guard after `linkat` or error; leftover
-              `.openmettle-volume-id.tmp.*` files from a prior `SIGKILL` are unlinked **only while
-              holding `storage_instance FOR UPDATE`** when `rustix::fs::statat(...,
-              AtFlags::SYMLINK_NOFOLLOW)` shows `st_mtime` older than `300 s`.
-            - *Winning `:root` UUID adoption & mandatory `fsync(root_fd)` barrier before child
-              sentinels:* Before generating a UUID, inspect `<root>/.openmettle-volume-id` via
-              `openat(root_fd, ".openmettle-volume-id", OFlags::RDONLY | OFlags::NOFOLLOW |
-              OFlags::NONBLOCK)` + `fstat` (`S_ISREG` on `<root>`'s local `st_dev`, bounded `<=
-              64`-byte read) — if present, verify it contains valid `"<existing_uuid>:root\n"` and
-              adopt `sentinel_uuid = existing_uuid` (failing closed with `OMQ03` if symlinked,
-              FIFO/non-regular, wrong local `st_dev`, or malformed); otherwise generate a fresh
-              canonical lowercase v4 UUID. Publish `(root_fd, "root")` **first**: create unique
-              `tmp_name = ".openmettle-volume-id.tmp.<128bit_random_hex>"` relative to `root_fd`
-              (`OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW`, `Mode::RUSR |
-              Mode::WUSR`), write the complete `"<sentinel_uuid>:root\n"` payload, **`fsync` the
-              temp FD**, close it, publish via **`linkat(root_fd, tmp_name, root_fd,
-              ".openmettle-volume-id", AtFlags::empty())`** (POSIX atomic hard-link creation, which
-              never exposes a 0-byte or partial `.openmettle-volume-id` and fails with `EEXIST`
-              without overwriting any existing sentinel), and unconditionally unlink **only its own
-              `tmp_name`** in the cleanup guard. If `linkat` on `<root>/.openmettle-volume-id`
-              returns `EEXIST`, re-open and validate `<root>/.openmettle-volume-id` (`OFlags::RDONLY
-              | OFlags::NOFOLLOW | OFlags::NONBLOCK` + `fstat` `S_ISREG` on `<root>`'s local
-              `st_dev`, bounded `<= 64`-byte read, `"<winning_uuid>:root\n"`) and **adopt
-              `sentinel_uuid = winning_uuid`** (verifying `volume_id IS NULL OR volume_id =
-              winning_uuid`). **Immediately after publishing (or adopting on `EEXIST`) `(root_fd,
-              "root")`, call and require `Ok(())` from `fsync(root_fd)` strictly BEFORE creating or
-              linking either child sentinel (`(revisions_dir_fd, "revisions")` or `(staging_dir_fd,
-              "staging")`)** — preventing a storage-host crash from persisting a child sentinel
-              while losing `<root>/.openmettle-volume-id`. Only after `fsync(root_fd)` succeeds,
-              publish `(revisions_dir_fd, "revisions")` and `(staging_dir_fd, "staging")` via the
-              exact same unique `tmp_name` + `fsync(tmp_fd)` + `linkat` + own-`tmp_name` `unlinkat`
-              protocol (on `EEXIST`, validating exact `"<sentinel_uuid>:<role>\n"` via
-              `OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK` + `fstat` `S_ISREG` on the
-              same local `st_dev`, failing closed with `OMQ03` on mismatch/wrong-role/corruption),
-              and then **call and require `Ok(())` from `fsync(revisions_dir_fd)` and
-              `fsync(staging_dir_fd)` strictly BEFORE updating `storage_instance.volume_id`**.
-            - Still inside the same `storage_instance FOR UPDATE` transaction (alongside the
-              common-path `payload_ino` backfill and `adoption_unverified` updates), set
-              **`volume_id = sentinel_uuid, bootstrap_auto_pin_allowed = false, adoption_run_id =
-              NULL`** (`WHERE id AND adoption_run_id = $my_adoption_run_id` for adoption as
-              `openmettle_owner`, or via `openmettle.storage_pin_volume_id(sentinel_uuid)` for
-              fresh-bootstrap auto-pinning) and commit atomically.
+              sentinel or `payload_ino` (clearing `adoption_run_id = NULL` only `WHERE id AND
+              adoption_run_id = $my_adoption_run_id` or leaving fail-closed until the valid tree is
+              restored).
+            - Re-check under lock for any `storage_reservations` or `artifact_revisions` rows
+              committed since Step 2. If **any** newly committed `'reserved'` or
+              `'active'`/`'retained'` row exists outside the locked set (or if Step 2 used the
+              empty-ledger waiver while `volume_id IS NULL` and any row now exists), roll back
+              strictly before any sentinel or `payload_ino` write (keeping `adoption_run_id =
+              $my_adoption_run_id` across the retry!) and retry from Step 2/Step 3 so every row is
+              locked and classified under lock.
+            - Evaluate EVERY `'active'`/`'retained'`/`'purging'` revision check (including confirming
+              every locked `'active'`/`'retained'` row's `sr.payload_ino IS NULL OR sr.payload_ino =
+              file_ino`) AND every volume-identity check (`--expected-fs-uuid`,
+              `--expected-revisions-inode`, `--confirm-no-on-disk-payloads` when `0` digest-bearing
+              revisions are verified) **BEFORE mutating any `payload_ino` column**!
+          - **Phase 3B — Failure branch (`deferred_verification_error` is set — NEVER commit
+            `payload_ino` backfills on failed adoption!):**
+            - **Omit / roll back ALL `payload_ino` backfills!** Never write `payload_ino` from an
+              unverified or failed tree (for example, an unpinned copied partial tree containing a
+              copy of legacy revision `A` with a new inode and missing revision `B`), so retrying
+              adoption on the real original directory tree succeeds cleanly with `A`'s real inode!
+            - If `volume_id IS NOT NULL` (already-pinned verification failure on a volume whose
+              three role-tagged sentinels matched `volume_id`), commit ONLY `UPDATE
+              openmettle.storage_reservations SET adoption_unverified = true, publish_pending =
+              false, reclaim_state = 'none', reclaim_claim_token = NULL, reclaim_lease_until = NULL
+              WHERE id = ANY($unaccounted_or_mismatched_reserved_ids) AND state = 'reserved' AND NOT
+              adoption_unverified` together with **`UPDATE openmettle.storage_volume_control SET
+              adoption_run_id = NULL WHERE id AND adoption_run_id = $my_adoption_run_id`** (writing
+              zero sentinels and zero `payload_ino` backfills!), commit, and return `OMQ03`.
+            - If `volume_id IS NULL` (initial unpinned adoption failed verification — e.g., wrong or
+              partial copied tree), commit ONLY **`UPDATE openmettle.storage_volume_control SET
+              adoption_run_id = NULL WHERE id AND adoption_run_id = $my_adoption_run_id`** (zero
+              sentinels written, zero `payload_ino` backfills, leaving `volume_id IS NULL` so all
+              cleaners stay disabled until the operator points adoption at the genuine tree!), and
+              return `OMQ03`.
+          - **Phase 3C — Success branch (ALL sentinel, revision, and volume verification checks
+            passed!):**
+            - **Success-only `payload_ino` backfill (`openmettle_owner` privilege):** Commit
+              `payload_ino` backfills (`WHERE payload_ino IS NULL`) **ONLY here in the success
+              branch**:
+              - For every locked `'active'`/`'retained'` `artifact_revisions` row positively
+                verified on disk at `revisions/<reservation_id>` (`S_ISREG`, same local `st_dev`,
+                exact `size_bytes`), execute `UPDATE openmettle.storage_reservations SET stage_claimed
+                = true, payload_ino = $file_ino::text::numeric(20, 0) WHERE id = $reservation_id AND
+                payload_ino IS NULL`.
+              - For every locked non-`'truncated'` `'reserved'` row positively verified on disk at
+                `revisions/<id>` or `staging/<id>` (`S_ISREG`, same local `st_dev`, `size <=
+                max_bytes`, matching `payload_ino` when non-null), execute `UPDATE
+                openmettle.storage_reservations SET stage_claimed = true, payload_ino =
+                $file_ino::text::numeric(20, 0) WHERE id = $id AND state = 'reserved' AND
+                payload_ino IS NULL`.
+            - **Preserve verified `'truncated'` holds:** For every locked `'reserved'` row with
+              `reclaim_state = 'truncated'` whose `staging/.reclaim.<id>` was positively verified
+              (`S_ISREG`, same local `st_dev`, `st_ino == payload_ino`, `st_size == 0`), **PRESERVE
+              `reclaim_state = 'truncated'`** and expire its lease (`UPDATE
+              openmettle.storage_reservations SET reclaim_lease_until = clock_timestamp() WHERE id =
+              $id AND state = 'reserved' AND reclaim_state = 'truncated'`) so the next cleaner tick
+              finishes Step 3 -> Step 4 cleanly instead of quarantining!
+            - **Quarantine missing/mismatched `'reserved'` rows (and optionally un-quarantine
+              positively verified previously-quarantined rows):** Execute **`UPDATE
+              openmettle.storage_reservations SET adoption_unverified = true, publish_pending =
+              false, reclaim_state = 'none', reclaim_claim_token = NULL, reclaim_lease_until = NULL
+              WHERE id = ANY($unaccounted_or_mismatched_reserved_ids) AND state = 'reserved' AND NOT
+              adoption_unverified`** for every locked `'reserved'` row that was NOT positively
+              verified on disk (including any `'truncated'` row whose `staging/.reclaim.<id>` was
+              missing or mismatched). Conversely, any locked `'reserved'` row previously marked
+              `adoption_unverified = true` that IS now positively verified on disk (matching
+              `payload_ino` when non-null) on the restored original directory tree may be explicitly
+              un-quarantined (`SET adoption_unverified = false`) by `openmettle-admin` adoption
+              (`openmettle_owner`) in this locked success transaction.
+            - **Already-pinned success sub-branch (`volume_id IS NOT NULL` — lost commit-ack retry
+              or re-verification):** **NEVER create, write, or link any missing sentinel.** Having
+              already verified all three existing `.openmettle-volume-id` sentinels (`:root`,
+              `:revisions`, `:staging`) match `storage_volume_control.volume_id`, execute **`UPDATE
+              openmettle.storage_volume_control SET adoption_run_id = NULL WHERE id AND
+              adoption_run_id = $my_adoption_run_id`** alongside the success-branch updates above,
+              commit atomically, and return idempotent success.
+            - **Unpinned success sub-branch (`volume_id IS NULL`) — crash-safe, race-free sentinel
+              publication with root `fsync` barrier (only while `volume_id IS NULL` under
+              `storage_volume_control FOR UPDATE`):**
+              - On fresh-bootstrap auto-pinning (`Store::open`), require `bootstrap_auto_pin_allowed
+                = true` AND `adoption_run_id IS NULL` AND `NOT EXISTS (SELECT 1 FROM
+                openmettle.storage_reservations) AND NOT EXISTS (SELECT 1 FROM
+                openmettle.artifact_revisions)` under `storage_volume_control FOR UPDATE`, failing
+                closed with `OMQ03` and writing zero sentinels otherwise.
+              - Never create `.openmettle-volume-id` directly with `O_CREAT | O_EXCL` before writing
+                its payload (a crash between `openat` and `write` would leave a 0-byte sentinel that
+                causes every retry to fail permanently). Instead:
+                - *No live-peer `.tmp.*` interference:* Publishers **NEVER** run an uncoordinated
+                  wildcard unlink of `.openmettle-volume-id.tmp.*`. Each publisher creates a unique
+                  `.openmettle-volume-id.tmp.<128bit_random_hex>` (`OFlags::WRONLY | OFlags::CREATE |
+                  OFlags::EXCL | OFlags::NOFOLLOW`, `Mode::RUSR | Mode::WUSR`) and unlinks **only its
+                  own `tmp_name`** in an unconditional cleanup guard after `linkat` or error;
+                  leftover `.openmettle-volume-id.tmp.*` files from a prior `SIGKILL` are unlinked
+                  **only while holding `storage_volume_control FOR UPDATE`** when
+                  `rustix::fs::statat(..., AtFlags::SYMLINK_NOFOLLOW)` shows `st_mtime` older than
+                  `300 s`.
+                - *Winning `:root` UUID adoption & mandatory `fsync(root_fd)` barrier before child
+                  sentinels:* Before generating a UUID, inspect `<root>/.openmettle-volume-id` via
+                  `openat(root_fd, ".openmettle-volume-id", OFlags::RDONLY | OFlags::NOFOLLOW |
+                  OFlags::NONBLOCK)` + `fstat` (`S_ISREG` on `<root>`'s local `st_dev`, bounded `<=
+                  64`-byte read) — if present, verify it contains valid `"<existing_uuid>:root\n"`
+                  and adopt `sentinel_uuid = existing_uuid` (failing closed with `OMQ03` if
+                  symlinked, FIFO/non-regular, wrong local `st_dev`, or malformed); otherwise
+                  generate a fresh canonical lowercase v4 UUID. Publish `(root_fd, "root")` **first**:
+                  create unique `tmp_name = ".openmettle-volume-id.tmp.<128bit_random_hex>"` relative
+                  to `root_fd` (`OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW`,
+                  `Mode::RUSR | Mode::WUSR`), write the complete `"<sentinel_uuid>:root\n"` payload,
+                  **`fsync` the temp FD**, close it, publish via **`linkat(root_fd, tmp_name,
+                  root_fd, ".openmettle-volume-id", AtFlags::empty())`** (POSIX atomic hard-link
+                  creation, which never exposes a 0-byte or partial `.openmettle-volume-id` and fails
+                  with `EEXIST` without overwriting any existing sentinel), and unconditionally
+                  unlink **only its own `tmp_name`** in the cleanup guard. If `linkat` on
+                  `<root>/.openmettle-volume-id` returns `EEXIST`, re-open and validate
+                  `<root>/.openmettle-volume-id` (`OFlags::RDONLY | OFlags::NOFOLLOW |
+                  OFlags::NONBLOCK` + `fstat` `S_ISREG` on `<root>`'s local `st_dev`, bounded `<=
+                  64`-byte read, `"<winning_uuid>:root\n"`) and **adopt `sentinel_uuid =
+                  winning_uuid`** (verifying `volume_id IS NULL OR volume_id = winning_uuid`).
+                  **Immediately after publishing (or adopting on `EEXIST`) `(root_fd, "root")`, call
+                  and require `Ok(())` from `fsync(root_fd)` strictly BEFORE creating or linking
+                  either child sentinel (`(revisions_dir_fd, "revisions")` or `(staging_dir_fd,
+                  "staging")`)** — preventing a storage-host crash from persisting a child sentinel
+                  while losing `<root>/.openmettle-volume-id`. Only after `fsync(root_fd)` succeeds,
+                  publish `(revisions_dir_fd, "revisions")` and `(staging_dir_fd, "staging")` via the
+                  exact same unique `tmp_name` + `fsync(tmp_fd)` + `linkat` + own-`tmp_name`
+                  `unlinkat` protocol (on `EEXIST`, validating exact `"<sentinel_uuid>:<role>\n"` via
+                  `OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK` + `fstat` `S_ISREG` on the
+                  same local `st_dev`, failing closed with `OMQ03` on mismatch/wrong-role/corruption),
+                  and then **call and require `Ok(())` from `fsync(revisions_dir_fd)` and
+                  `fsync(staging_dir_fd)` strictly BEFORE updating
+                  `storage_volume_control.volume_id`**.
+                - Still inside the same `storage_volume_control FOR UPDATE` transaction (alongside
+                  the success-branch `payload_ino` backfills, verified `'truncated'` lease expiry,
+                  and `adoption_unverified` updates), set **`volume_id = sentinel_uuid,
+                  bootstrap_auto_pin_allowed = false, adoption_run_id = NULL`** (`WHERE id AND
+                  adoption_run_id = $my_adoption_run_id` for adoption as `openmettle_owner`, or via
+                  `openmettle.storage_pin_volume_id(sentinel_uuid)` for fresh-bootstrap auto-pinning)
+                  and commit atomically.
      - **Unified rollout rule, directory-descriptor binding across ALL `artifact_fs::Store`
        operations, durable `Store::stage` (Steps 1a/1b/1c with `fsync` before `payload_ino`),
-       100% non-destructive `Drop`, `RenameFlags::NOREPLACE` publication, `Store::read`
-       `payload_ino` verification, filesystem & `ReadWriteMany` qualification, and unified 3-step
-       reclamation across ALL 4 cleaners (`abort`, `reconcile_expired`, generic run-linked
-       recovery, ADR 0039 `reconcile_run_spills`):**
+       100% non-destructive `Drop`, `linkat` no-replace publication keeping `staging/<id>` present
+       until `storage::settle` commits (closing mixed-version `N-1` HTTP retry replacement),
+       `Store::read` `payload_ino` verification, filesystem & `ReadWriteMany` qualification, and
+       unified 4-step reclamation with `staging/.reclaim.<id>` anchor across ALL 4 cleaners
+       (`abort`, `reconcile_expired`, generic run-linked recovery, ADR 0039
+       `reconcile_run_spills`):**
        Existing [`src/artifact_fs.rs`](../../src/artifact_fs.rs) stores `PathBuf`s, re-resolves
        `<root>/revisions` by pathname at `rename` time, drops its staging sink (unlinking by
        pathname) before DB locking, and unconditionally releases reservations inside `abort()`
        (`src/artifact_fs.rs:505-520, 584-591`). PR2 closes every one of these windows:
        - **Unified rollout rule (synchronized verbatim with ADR 0039):** HTTP `Store::stage` and
-         `Store::publish` (`openmettle_api`) succeed when `adoption_run_id IS NULL` both when
-         `volume_id IS NOT NULL` (verifying role-tagged sentinels) and during mixed-version rolling
-         upgrade while `volume_id IS NULL` (skipping sentinel reads while still setting
-         `stage_claimed = true` and binding `payload_ino = staged_ino`), whereas ADR 0039 worker
-         `publish_bytes` spills and all 4 cleaners (`artifact_fs::abort`, non-run
-         `reconcile_expired`, generic run-linked recovery, ADR 0039 `reconcile_run_spills`) plus
-         `artifact_fs::purge_due` and `StagingSweepState` strictly require **`volume_id IS NOT NULL
-         AND adoption_run_id IS NULL`**!
+         `Store::publish` (`openmettle_api`) succeed when `storage_volume_control` is present and
+         `adoption_run_id IS NULL` both when `volume_id IS NOT NULL` (verifying role-tagged
+         sentinels) and during mixed-version rolling upgrade while `volume_id IS NULL` (skipping
+         sentinel reads while still setting `stage_claimed = true` and binding `payload_ino =
+         staged_ino`), whereas ADR 0039 worker `publish_bytes` spills and all 4 cleaners
+         (`artifact_fs::abort`, non-run `reconcile_expired`, generic run-linked recovery, ADR 0039
+         `reconcile_run_spills`) plus `artifact_fs::purge_due` and `StagingSweepState` strictly
+         require **`storage_volume_control` present AND `volume_id IS NOT NULL AND adoption_run_id
+         IS NULL`**!
        - **Directory-descriptor binding & local-only `st_dev` verification (`payload_dev` dropped;
          only unsigned 64-bit `payload_ino numeric(20, 0)` stored in PostgreSQL):** Because Linux
          NFS assigns client-local anonymous `st_dev` via `get_anon_bdev` (causing cross-node false
@@ -2471,16 +2605,17 @@ candidate scanning from **one-reservation-per-transaction** settlement:
          OFlags::NOFOLLOW` plus their host-local `(st_dev, st_ino)` pairs), verifies host-local
          same-mount equality (`file_meta.dev() == dir_fd_meta.dev() == root_fd_meta.dev()`) using
          only that host's open FDs, verifies role-tagged `.openmettle-volume-id` sentinels when
-         `volume_id IS NOT NULL`, compares `file_meta.ino() == payload_ino`, and executes **ALL**
-         `Store` filesystem operations strictly relative to those verified directory descriptors.
+         `storage_volume_control.volume_id IS NOT NULL`, compares `file_meta.ino() == payload_ino`,
+         and executes **ALL** `Store` filesystem operations strictly relative to those verified
+         directory descriptors.
        - **Filesystem & `ReadWriteMany` shared-volume qualification (`O_CREAT | O_EXCL | O_NOFOLLOW`,
-         `RenameFlags::NOREPLACE`, file + directory `fsync`, cross-client `flock(2)`, AND stable
-         64-bit `st_ino` coherence + second-client recovery):** Startup (`Store::open`), adoption
-         (Step 1a), and shared-volume qualification probe and require:
+         `linkat`, file + directory `fsync`, cross-client `flock(2)`, AND stable 64-bit `st_ino`
+         coherence + second-client recovery):** Startup (`Store::open`), adoption (Step 1a), and
+         shared-volume qualification probe and require:
          1. `O_CREAT | O_EXCL | O_NOFOLLOW`,
-         2. **`rustix::fs::renameat_with(..., RenameFlags::NOREPLACE)`** (`RENAME_NOREPLACE` on
-            Linux, `RENAME_EXCL` on macOS — rejecting `ENOSYS`/`EOPNOTSUPP`/`EINVAL` fail-closed
-            and verifying `Errno::EXIST` on an existing target without overwriting it!),
+         2. **`rustix::fs::linkat(..., AtFlags::empty())`** (mandatory POSIX/NFS `LINK` — rejecting
+            `ENOSYS`/`EOPNOTSUPP`/`EINVAL` fail-closed and verifying `Errno::EXIST` on an existing
+            target without overwriting it!),
          3. file and directory `fsync` (`sync_all`), AND
          4. for multi-node `ReadWriteMany` shared volumes (POSIX/NFS mounts shared across API and
             worker replicas): **BOTH** two-client / separate-mount `flock(2)` (`LOCK_SH` vs
@@ -2492,12 +2627,12 @@ candidate scanning from **one-reservation-per-transaction** settlement:
          binding `payload_ino`, and 100% non-destructive `Drop`):**
          1. *Step 1a (DB Stage Claim strictly BEFORE touching disk):* Run a short lock-ordered
             primary DB transaction (`(runs FOR NO KEY UPDATE ->) storage_reservations FOR UPDATE` +
-            `SELECT volume_id, adoption_run_id FROM openmettle.storage_instance WHERE id FOR SHARE`,
-            checking `adoption_run_id IS NULL` and `volume_id = $expected` when non-null) committing:
-            `UPDATE openmettle.storage_reservations SET stage_claimed = true WHERE scope_id = $1
-            AND id = $2 AND state = 'reserved' AND NOT adoption_unverified AND NOT stage_claimed
-            AND payload_ino IS NULL AND reclaim_state = 'none'`. If rejected (0 rows updated),
-            **zero disk files are created**!
+            `SELECT volume_id, adoption_run_id FROM openmettle.storage_volume_control WHERE id FOR
+            SHARE`, failing closed if missing or `adoption_run_id IS NOT NULL` and verifying
+            `volume_id = $expected` when non-null) committing: `UPDATE openmettle.storage_reservations
+            SET stage_claimed = true WHERE scope_id = $1 AND id = $2 AND state = 'reserved' AND NOT
+            adoption_unverified AND NOT stage_claimed AND payload_ino IS NULL AND reclaim_state =
+            'none'`. If rejected (0 rows updated), **zero disk files are created**!
          2. *Step 1b (Create & durably sync `staging/<id>` strictly BEFORE binding `payload_ino`):*
             Re-verify `<root>`, `"staging"`, and `"revisions"` directory FDs via fresh pathname
             re-open (`OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW`, equal local `(st_dev,
@@ -2514,69 +2649,91 @@ candidate scanning from **one-reservation-per-transaction** settlement:
             in PostgreSQL**!
          3. *Step 1c (DB Bind `payload_ino`):* While holding `LOCK_SH`, run a short lock-ordered
             `FOR UPDATE` transaction (`(runs FOR NO KEY UPDATE ->) storage_reservations FOR UPDATE`
-            + `storage_instance FOR SHARE` checking `adoption_run_id IS NULL` and `volume_id =
-            $expected` when non-null) committing `UPDATE openmettle.storage_reservations SET
-            payload_ino = $3::text::numeric(20, 0) WHERE scope_id = $1 AND id = $2 AND state =
-            'reserved' AND NOT adoption_unverified AND stage_claimed AND payload_ino IS NULL AND
-            reclaim_state = 'none'`.
+            + `storage_volume_control FOR SHARE` checking row present, `adoption_run_id IS NULL`,
+            and `volume_id = $expected` when non-null) committing `UPDATE
+            openmettle.storage_reservations SET payload_ino = $3::text::numeric(20, 0) WHERE
+            scope_id = $1 AND id = $2 AND state = 'reserved' AND NOT adoption_unverified AND
+            stage_claimed AND payload_ino IS NULL AND reclaim_state = 'none'`.
          4. *100% Non-Destructive `Drop` & Writer Error Handling (zero `set_len(0)` or `unlinkat`
             on `Drop`; ambiguous `storage::settle` inspection):* **`StagedFile::drop` (and all
             writer error/cancellation paths in `Store::stage`, `Store::publish`, and ADR 0039
             `publish_bytes`) NEVER calls `set_len(0)` and NEVER calls `unlinkat` — it ONLY closes
             the file descriptor (releasing `LOCK_SH`)!** `StagedFile` retains `LOCK_SH`
-            continuously through `Store::publish`, `renameat_with(..., RenameFlags::NOREPLACE)`,
-            directory `fsync`, AND `storage::settle`'s `tx.commit()`:
+            continuously through `Store::publish`, `linkat`, directory `fsync`, `storage::settle`'s
+            `tx.commit()`, AND the post-`commit` `staging/<id>` alias detach:
             - If Step 1c commits in PostgreSQL and the client loses the commit acknowledgement,
               `staging/<id>` (`st_ino == payload_ino`, already `fsync`ed in Step 1b!) remains
               durably linked on disk so `reconcile_expired` / `artifact_fs::abort` cleanly reclaims
               it with **zero false quarantine**!
             - If `storage::settle` commits in PostgreSQL and the client loses the commit
               acknowledgement or cancels the future, dropping `StagedFile` **NEVER zeroes published
-              `revisions/<id>`**!
+              `revisions/<id>`** (and any remaining `staging/<id>` alias sharing `payload_ino` is
+              cleanly detached by `StagingSweepState` without `set_len(0)`)!
             - On an ambiguous `storage::settle` commit outcome (`UnknownCommit`), callers **MUST
               NEVER invoke `artifact_fs::abort` blindly**: inspect `storage_reservations.state`
               under `(runs FOR NO KEY UPDATE ->) storage_reservations FOR UPDATE` first — if `state
               = 'settled'`, publication succeeded!
-       - **No-replace publication (`Store::publish` & ADR 0039 `publish_bytes` — `publish_pending =
-         true`, `RenameFlags::NOREPLACE`, and `storage::settle` retaining `payload_ino`):**
-         1. *Pre-`renameat_with` verification & durable `publish_pending = true` commit:* While
+       - **No-replace `linkat` publication keeping `staging/<id>` present until `storage::settle`
+         commits (`Store::publish` & ADR 0039 `publish_bytes` — closing mixed-version `N-1` HTTP
+         retry replacement):**
+         1. *Pre-`linkat` verification & durable `publish_pending = true` commit:* While
             `StagedFile` holds `LOCK_SH`, re-verify `<root>`, `"staging"`, and `"revisions"` FDs
             via fresh pathname re-open (`OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW`,
             matching local `(st_dev, st_ino)` + role-tagged sentinels when `volume_id IS NOT NULL`)
             and verify `statat(&staging_dir_fd, id, AtFlags::SYMLINK_NOFOLLOW)` is `S_ISREG` on
             `staging_dir_fd`'s local `st_dev` with `st_ino as u64 == staged_ino` and `st_size ==
             size_bytes`. Commit a short lock-ordered primary DB transaction (`(runs FOR NO KEY
-            UPDATE ->) storage_reservations FOR UPDATE` + `storage_instance FOR SHARE` verifying
-            `adoption_run_id IS NULL` and `volume_id = $expected` when non-null) setting **`UPDATE
-            openmettle.storage_reservations SET publish_pending = true WHERE scope_id = $1 AND id =
-            $2 AND state = 'reserved' AND NOT adoption_unverified AND payload_ino =
-            $3::text::numeric(20, 0) AND reclaim_state = 'none'`** (`CHECK (NOT publish_pending OR
-            (state = 'reserved' AND payload_ino IS NOT NULL))`).
-         2. *Atomic no-replace rename (`RenameFlags::NOREPLACE`):* Publish exclusively via
-            **`rustix::fs::renameat_with(&staging_dir_fd, id, &revisions_dir_fd, id,
-            RenameFlags::NOREPLACE)`**! If a foreign file already sits at `revisions/<id>`,
-            `renameat_with(..., RenameFlags::NOREPLACE)` fails atomically with **`Errno::EXIST`
-            (`EEXIST`) without replacing or modifying `revisions/<id>`**, and the publisher commits
-            quarantine (`UPDATE openmettle.storage_reservations SET adoption_unverified = true,
-            publish_pending = false WHERE scope_id = $1 AND id = $2 AND state = 'reserved'`) before
-            returning `Error::Io` (keeping `revisions/<id>` 100% untouched and `reserved_bytes`
-            100% charged!).
-         3. *Post-`renameat_with` `fsync` & `storage::settle` (`Reserved` branch):* Call and
-            require `Ok(())` from `fsync(&revisions_dir_fd)` and `fsync(&staging_dir_fd)`, re-verify
-            `<root>`, `"staging"`, `"revisions"` FDs (+ sentinels when pinned) and
-            `statat(&revisions_dir_fd, id, AtFlags::SYMLINK_NOFOLLOW)` (`S_ISREG`, local `st_dev`
-            match, `st_ino as u64 == staged_ino`, `st_size == size_bytes`) strictly before
-            `tx.commit()` of `storage::settle`. `storage::settle`'s `Reserved` branch requires
+            UPDATE ->) storage_reservations FOR UPDATE` + `storage_volume_control FOR SHARE`
+            verifying row present, `adoption_run_id IS NULL`, and `volume_id = $expected` when
+            non-null) setting **`UPDATE openmettle.storage_reservations SET publish_pending = true
+            WHERE scope_id = $1 AND id = $2 AND state = 'reserved' AND NOT adoption_unverified AND
+            payload_ino = $3::text::numeric(20, 0) AND reclaim_state = 'none'`** (`CHECK (NOT
+            publish_pending OR (state = 'reserved' AND payload_ino IS NOT NULL))`).
+         2. *Atomic no-replace hard-link (`linkat`) keeping `staging/<id>` present:* Publish
+            exclusively via **`rustix::fs::linkat(&staging_dir_fd, id, &revisions_dir_fd, id,
+            AtFlags::empty())`**!
+            - If a foreign file already sits at `revisions/<id>`, `linkat` fails atomically with
+              **`Errno::EXIST` (`EEXIST`) without overwriting or modifying `revisions/<id>`**, and
+              the publisher commits quarantine (`UPDATE openmettle.storage_reservations SET
+              adoption_unverified = true, publish_pending = false WHERE scope_id = $1 AND id = $2
+              AND state = 'reserved'`) before returning `Error::Io` (keeping `revisions/<id>` 100%
+              untouched and `reserved_bytes` 100% charged!).
+            - **Mixed-version `N-1` HTTP retry safety:** Because `linkat` **keeps `staging/<id>`
+              present on disk throughout the entire unsettled `state = 'reserved'` window** (even if
+              the `N` writer crashes right after `linkat` and before `storage::settle` commits!),
+              any same-key retry routed to an **`N-1` API replica** hits `store.stage(&id)` ->
+              `OpenOptions::create_new(true)` (`src/artifact_fs.rs:474`) -> `AlreadyExists` ->
+              **`Err(Error::InProgress)` (`src/artifact_fs.rs:475`)** and returns immediately
+              **without** calling `abort()`, **without** staging a replacement file, and **without**
+              calling replacing `fs::rename`!
+         3. *Post-`linkat` `fsync` & `storage::settle` (`Reserved` branch):* Call and require
+            `Ok(())` from `fsync(&revisions_dir_fd)`, re-verify `<root>`, `"staging"`, `"revisions"`
+            FDs (+ sentinels when pinned) and `statat(&revisions_dir_fd, id,
+            AtFlags::SYMLINK_NOFOLLOW)` (`S_ISREG`, local `st_dev` match, `st_ino as u64 ==
+            staged_ino`, `st_size == size_bytes`) strictly before `tx.commit()` of `storage::settle`.
+            `storage::settle`'s `Reserved` branch locks `(runs FOR NO KEY UPDATE ->)
+            storage_reservations FOR UPDATE -> artifacts -> artifact_revisions ->
+            storage_volume_control (FOR SHARE) -> storage_accounts -> storage_instance`, requires
             **`state = 'reserved' AND NOT adoption_unverified AND payload_ino = $staged_ino AND
             reclaim_state = 'none'`**, inserts `artifact_revisions`, and atomically commits **`SET
             state = 'settled', publish_pending = false` while retaining `payload_ino`** on the
             `'settled'` row (`enforce_storage_reservation_monotonic_guards()` prevents any
             non-`openmettle_owner` role from clearing or mutating `payload_ino` or clearing
-            `adoption_unverified` / `stage_claimed`). On post-`renameat_with` pre-`commit`
-            displacement, rolling back `storage::settle` leaves `(payload_ino, publish_pending =
-            true)` already durable in PostgreSQL, and the publisher best-effort commits
-            `adoption_unverified = true, publish_pending = false` before returning `Error::Io`.
-         4. *Narrowed guarantee & fail-closed recovery for live host directory replacement AFTER
+            `adoption_unverified` / `stage_claimed`). On post-`linkat` pre-`commit` displacement,
+            rolling back `storage::settle` leaves `(payload_ino, publish_pending = true)` already
+            durable in PostgreSQL, and the publisher best-effort commits `adoption_unverified =
+            true, publish_pending = false` before returning `Error::Io`.
+         4. *Post-`commit` best-effort detach of `staging/<id>` alias (strictly AFTER
+            `storage::settle` commits):* While still holding `LOCK_SH` on `StagedFile` (so neither
+            `StagingSweepState` nor `purge_due` can acquire `LOCK_EX`, while `state = 'settled'` and
+            `stage_claimed = true` prevent any `N-1` or `N` writer from staging), verify
+            `statat(&staging_dir_fd, id, AtFlags::SYMLINK_NOFOLLOW).st_ino as u64 == staged_ino`
+            AND `statat(&revisions_dir_fd, id, AtFlags::SYMLINK_NOFOLLOW).st_ino as u64 ==
+            staged_ino`, call **`unlinkat(&staging_dir_fd, id, AtFlags::empty())`** (**NEVER
+            `set_len(0)`!**) -> `drop(file)` -> `fsync(&staging_dir_fd)`. (If the process crashes
+            after `storage::settle` commits and before detaching `staging/<id>`, `StagingSweepState`
+            or `purge_due` cleanly detaches the matching `payload_ino` alias.)
+         5. *Narrowed guarantee & fail-closed recovery for live host directory replacement AFTER
             the final pre-`commit` check:* Live host replacement of `<root>`, `<root>/staging`, or
             `<root>/revisions` is forbidden by operational contract and caught fail-closed: any
             fresh replacement directory lacks `<volume_id>:revisions`, failing every subsequent
@@ -2594,34 +2751,41 @@ candidate scanning from **one-reservation-per-transaction** settlement:
            re-opens `<root>` and `"revisions"` by configured pathname (`OFlags::RDONLY |
            OFlags::DIRECTORY | OFlags::NOFOLLOW`) verifying local `(st_dev, st_ino)` match
            `(root_fd, revisions_dir_fd)` (+ `:root`/`:revisions` `.openmettle-volume-id` sentinels
-           when `storage_instance.volume_id IS NOT NULL`), opens `revisions/<id>` relative to
+           when `storage_volume_control.volume_id IS NOT NULL`), opens `revisions/<id>` relative to
            `revisions_dir_fd` (`OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK`), verifies
            `S_ISREG`, `file_meta.dev() == revisions_dir_fd_dev`, and `file_meta.len() ==
            expected_size`, AND:
            - Whenever **`sr.payload_ino IS NOT NULL`**: **requires `file_meta.ino() ==
              sr.payload_ino`** (rejecting any same-sized replacement file with `Error::Io`!).
            - **Explicit legacy-row rule (`sr.payload_ino IS NULL`):** Permitted **ONLY** while
-             `storage_instance.volume_id IS NULL AND adoption_run_id IS NULL` (pre-adoption
-             rolling-upgrade window for legacy revisions settled by `N-1` binaries before
-             `openmettle-admin` adoption runs). Because `openmettle-admin` adoption Step 3
-             backfills `payload_ino` on all verified `'active'` and `'retained'` revisions before
-             pinning `volume_id`, once `storage_instance.volume_id IS NOT NULL`, **any
+             `storage_volume_control` is present AND `volume_id IS NULL AND adoption_run_id IS
+             NULL` (pre-adoption rolling-upgrade window for legacy revisions settled by `N-1`
+             binaries before `openmettle-admin` adoption runs). Because `openmettle-admin` adoption
+             Step 3 backfills `payload_ino` on all verified `'active'` and `'retained'` revisions
+             before pinning `volume_id`, once `storage_volume_control.volume_id IS NOT NULL`, **any
              `'active'`/`'retained'` revision with `sr.payload_ino IS NULL` fails closed
              (`Error::Io`) in `Store::read` and fails hard in `verify_accounting_drift`**!
-       - **Unified 3-step reclamation protocol across ALL FOUR storage release paths
+       - **Unified 4-step reclamation protocol preserving `payload_ino` allocation via
+         `staging/.reclaim.<id>` + `anchor_pending_unlink` across ALL FOUR storage release paths
          (`artifact_fs::abort`, non-run `reconcile_expired`, generic run-linked
          `storage_reservations` recovery, AND ADR 0039 `reconcile_run_spills`) — ZERO filesystem
          I/O inside DB transactions in Step 1 and Step 3:**
-         All four cleaners share the exact same 3-state lease (`reclaim_state IN ('none',
-         'claiming', 'truncated')`, `reclaim_claim_token uuid`, `reclaim_lease_until timestamptz`)
-         and execute the exact same 3-step protocol without ever clearing `payload_ino`:
+         Unlinking the last hard link and closing the FD before Step 3 commits would free
+         `payload_ino` and allow the filesystem to reuse the same `st_ino` for a newly created
+         foreign file at `<id>`, which a `'truncated'` retry or `'released'` sweep could then
+         unlink. All four cleaners therefore share the exact same 4-state lease (`reclaim_state IN
+         ('none', 'claiming', 'truncated', 'anchor_pending_unlink')`, `reclaim_claim_token uuid`,
+         `reclaim_lease_until timestamptz`) and execute the exact same 4-step protocol keeping
+         `payload_ino` anchored (`nlink >= 1`) at `staging/.reclaim.<id>` until AFTER Step 3 commits
+         `state = 'released'`, without ever clearing `payload_ino`:
          - **Step 1 (Serialized DB Claim strictly BEFORE any truncation/unlink — ZERO filesystem
            I/O inside DB tx):**
            Lock `(runs FOR NO KEY UPDATE [SKIP LOCKED] ->) storage_reservations FOR UPDATE [SKIP
-           LOCKED]` + `SELECT volume_id, adoption_run_id FROM openmettle.storage_instance WHERE id
-           FOR SHARE` (requiring **`volume_id = $expected_volume_id AND adoption_run_id IS NULL`**),
-           requiring **`state = 'reserved' AND NOT adoption_unverified AND (reclaim_state = 'none'
-           OR reclaim_lease_until <= clock_timestamp())`** (plus path-specific preconditions: expiry
+           LOCKED] -> storage_volume_control FOR SHARE` (`SELECT volume_id, adoption_run_id FROM
+           openmettle.storage_volume_control WHERE id FOR SHARE`; abort immediately if **`NOT FOUND
+           OR v_vol IS DISTINCT FROM $expected_volume_id OR v_adopt IS NOT NULL`**), requiring
+           **`state = 'reserved' AND NOT adoption_unverified AND (reclaim_state = 'none' OR
+           reclaim_lease_until <= clock_timestamp())`** (plus path-specific preconditions: expiry
            for `reconcile_expired`, expiry + terminal run + zero `'intent'`/`'outcome_unknown'`
            operations + `(operation_id IS NULL OR idempotency_key NOT LIKE 'tool-spill:%')` for
            generic run-linked recovery, or ADR 0039's spill preconditions). Commit:
@@ -2644,57 +2808,76 @@ candidate scanning from **one-reservation-per-transaction** settlement:
            `storage::settle`, and any second healthy cleaner! (In `artifact_fs::abort`, if another
            cleaner holds an unexpired `reclaim_lease_until > clock_timestamp()`, `abort` returns
            without touching disk or quarantining.)
-         - **Step 2 (Filesystem check, crash-durable `set_len(0)` + `sync_all()`, and `LOCK_EX`
-           `unlinkat` — strictly outside DB release locks, NEVER clearing `payload_ino`):**
+         - **Step 2 (Durable `0`-Byte Truncation & `staging/.reclaim.<id>` Hard-Link Anchor —
+           `payload_ino` NEVER drops to `nlink = 0` before Step 3 commits!):**
            Verify pinned three-directory `.openmettle-volume-id` sentinels (`:root`, `:revisions`,
            `:staging` via `openat(..., OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK)` +
            `fstat` `S_ISREG`, local `st_dev` match, bounded `<= 64`-byte read) and host-local
-           same-mount `st_dev` across `(root_fd, staging_dir_fd, revisions_dir_fd)`. Branch
-           strictly on `payload_ino`:
-           - **Case 1 (`payload_ino IS NOT NULL`):**
-             Probe **both** `staging/<id>` (via `staging_dir_fd`) and `revisions/<id>` (via
-             `revisions_dir_fd`) using `rustix::fs::statat(..., AtFlags::SYMLINK_NOFOLLOW)`:
-             1. *Foreign / mismatched entry (in BOTH `'claiming'` AND `'truncated'`!):* If either
-                exists and is non-regular, has a different host-local `st_dev`, or has **`st_ino as
-                u64 != payload_ino`**: **ZERO `set_len(0)` and ZERO `unlinkat`**; commit quarantine
-                (`SET adoption_unverified = true, publish_pending = false, reclaim_state = 'none',
-                reclaim_claim_token = NULL, reclaim_lease_until = NULL`) under lock-ordered
-                `FOR UPDATE` **re-verifying `state = 'reserved' AND NOT adoption_unverified AND
-                reclaim_claim_token = $my_token AND reclaim_state = $observed_state AND payload_ino
-                = $expected_ino`** (+ `storage_instance FOR SHARE` active check)!
-             2. *Dual `ENOENT` in `'claiming'`:* If **both** return `ENOENT` while **`reclaim_state
-                = 'claiming'`**: commit quarantine (`adoption_unverified = true, publish_pending =
-                false, reclaim_state = 'none', reclaim_claim_token = NULL, reclaim_lease_until =
-                NULL`) ONLY under the exact same `FOR UPDATE` guard **`state = 'reserved' AND NOT
-                adoption_unverified AND reclaim_claim_token = $my_token AND reclaim_state =
-                'claiming' AND payload_ino = $expected_ino`** (+ `storage_instance FOR SHARE`)!
-             3. *Dual `ENOENT` in `'truncated'`:* If **both** return `ENOENT` while
-                **`reclaim_state = 'truncated'`** (the payload was already durably `0`-byte synced
-                before `'truncated'` committed, e.g., a prior cleaner crashed after `unlinkat`!):
-                execute unconditional **`fsync(&staging_dir_fd)` + `fsync(&revisions_dir_fd)`** and
-                proceed directly to Step 3!
-             4. *Matched `payload_ino` (`S_ISREG`, same local `st_dev`, `st_ino == payload_ino`):*
-                For each matched candidate, open via `rustix::fs::openat(&dir_fd, id, OFlags::RDWR
-                | OFlags::NOFOLLOW)` -> `std::fs::File::from(owned_fd)` -> **`probe_file.try_lock()`**
-                (`LOCK_EX | LOCK_NB`; on `WouldBlock`, abort Step 2 immediately with zero
-                truncation and zero unlink!) -> re-verify both `probe_file.metadata()` and
-                `statat(&dir_fd, id, AtFlags::SYMLINK_NOFOLLOW)` match `S_ISREG`, same local
-                `st_dev`, and `st_ino == payload_ino`:
-                - If **`reclaim_state = 'claiming'`**: call **`probe_file.set_len(0)?`** AND
-                  **`probe_file.sync_all()?`** (`fsync` on the open file descriptor so the `0`-byte
-                  truncation is crash-durable on disk FIRST!), then while still holding `LOCK_EX`
-                  (and re-checking `statat(&dir_fd, id, AtFlags::SYMLINK_NOFOLLOW).st_ino as u64 ==
-                  payload_ino`), commit a short lock-ordered `FOR UPDATE` tx setting
-                  **`reclaim_state = 'truncated', publish_pending = false`** (`WHERE scope_id = $1
-                  AND id = $2 AND state = 'reserved' AND NOT adoption_unverified AND
-                  reclaim_claim_token = $my_token AND reclaim_state = 'claiming' AND payload_ino =
-                  $expected_ino`, with `storage_instance FOR SHARE` active check — **`payload_ino`
-                  stays non-null!**).
-                - In **`reclaim_state = 'truncated'`** (still holding `LOCK_EX` and re-checking
-                  `statat(&dir_fd, id, AtFlags::SYMLINK_NOFOLLOW).st_ino as u64 == payload_ino`):
-                  call **`unlinkat(&dir_fd, id, AtFlags::empty())`** -> `drop(probe_file)` ->
-                  unconditional **`fsync(&staging_dir_fd)` + `fsync(&revisions_dir_fd)`** ->
-                  proceed to Step 3!
+           same-mount `st_dev` across `(root_fd, staging_dir_fd, revisions_dir_fd)`. Let
+           `reclaim_name = format!(".reclaim.{id}")`. Branch strictly on `(payload_ino,
+           reclaim_state)`:
+           - **Case 1a (`payload_ino IS NOT NULL` and `reclaim_state = 'claiming'`):**
+             Probe **`staging/<id>`**, **`revisions/<id>`**, AND **`staging/.reclaim.<id>`** using
+             `rustix::fs::statat(..., AtFlags::SYMLINK_NOFOLLOW)`:
+             1. *Foreign / mismatched entry:* If ANY existing entry among `staging/<id>`,
+                `revisions/<id>`, or `staging/.reclaim.<id>` is non-regular, has a different
+                host-local `st_dev`, or has **`st_ino as u64 != payload_ino`**: **ZERO
+                `set_len(0)` and ZERO `unlinkat`**; commit quarantine (`SET adoption_unverified =
+                true, publish_pending = false, reclaim_state = 'none', reclaim_claim_token = NULL,
+                reclaim_lease_until = NULL`) under lock-ordered `FOR UPDATE` **re-verifying `state
+                = 'reserved' AND NOT adoption_unverified AND reclaim_claim_token = $my_token AND
+                reclaim_state = 'claiming' AND payload_ino = $expected_ino`** (+
+                `storage_volume_control FOR SHARE` active check)!
+             2. *All three `ENOENT`:* If all three return `ENOENT`: commit quarantine
+                (`adoption_unverified = true, publish_pending = false, reclaim_state = 'none',
+                reclaim_claim_token = NULL, reclaim_lease_until = NULL`) ONLY under the exact same
+                `FOR UPDATE` guard **`state = 'reserved' AND NOT adoption_unverified AND
+                reclaim_claim_token = $my_token AND reclaim_state = 'claiming' AND payload_ino =
+                $expected_ino`** (+ `storage_volume_control FOR SHARE`)!
+             3. *Exact match (`S_ISREG`, same local `st_dev`, `st_ino == payload_ino`):* Open the
+                matched entry (`src_dir_fd`, `src_name`) via `rustix::fs::openat(&src_dir_fd,
+                src_name, OFlags::RDWR | OFlags::NOFOLLOW)` -> `std::fs::File::from(owned_fd)` ->
+                **`probe_file.try_lock()`** (`LOCK_EX | LOCK_NB`; on `WouldBlock`, abort Step 2
+                immediately with zero truncation and zero unlink!) -> re-verify both
+                `probe_file.metadata().ino() == payload_ino` and `statat(&src_dir_fd, src_name,
+                AtFlags::SYMLINK_NOFOLLOW)` match `S_ISREG`, same local `st_dev`, and `st_ino ==
+                payload_ino`:
+                1. Call **`probe_file.set_len(0)?`** AND **`probe_file.sync_all()?`** (`0` bytes
+                   durable on disk!).
+                2. Create/verify hard-link anchor **`staging/.reclaim.<id>`**: if
+                   `staging/.reclaim.<id>` was `ENOENT`, call **`rustix::fs::linkat(&src_dir_fd,
+                   src_name, &staging_dir_fd, &reclaim_name, AtFlags::empty())`** +
+                   **`fsync(&staging_dir_fd)`** (`nlink` increases BEFORE `<id>` is unlinked, so
+                   **`payload_ino` NEVER hits `nlink = 0` and CANNOT be reused by the filesystem!**).
+                3. While `staging/.reclaim.<id>` holds `nlink >= 1` and `probe_file` holds
+                   `LOCK_EX`: unlink any existing `<id>` entry in `revisions/<id>` and
+                   `staging/<id>` (re-verifying `statat(&dir_fd, id,
+                   AtFlags::SYMLINK_NOFOLLOW).st_ino as u64 == payload_ino` right before each
+                   `unlinkat`) + **`fsync(&revisions_dir_fd)`** + **`fsync(&staging_dir_fd)`**.
+                4. Still holding `LOCK_EX` on `probe_file` (anchored at `staging/.reclaim.<id>`!),
+                   commit a short lock-ordered `FOR UPDATE` tx setting **`reclaim_state =
+                   'truncated', publish_pending = false`** (`WHERE scope_id = $1 AND id = $2 AND
+                   state = 'reserved' AND NOT adoption_unverified AND reclaim_claim_token =
+                   $my_token AND reclaim_state = 'claiming' AND payload_ino = $expected_ino`, with
+                   `storage_volume_control FOR SHARE` active check — **`payload_ino` stays
+                   non-null!**), and keep `probe_file` open with `LOCK_EX` into Step 3!
+           - **Case 1b (`payload_ino IS NOT NULL` and `reclaim_state = 'truncated'` — crash
+             recovery before Step 3):**
+             - **NEVER truncate or unlink `staging/<id>` or `revisions/<id>` in `'truncated'`!**
+               Any entry appearing at `staging/<id>` or `revisions/<id>` after `'truncated'` is
+               preserved 100% untouched!
+             - Probe **`staging/.reclaim.<id>` ONLY** via `statat(&staging_dir_fd, &reclaim_name,
+               AtFlags::SYMLINK_NOFOLLOW)`: it **MUST** exist, be `S_ISREG`, on `staging_dir_fd`'s
+               local `st_dev`, with **`st_ino as u64 == payload_ino` AND `st_size == 0`**!
+               (Otherwise — missing, non-regular, wrong `st_dev`, `st_ino != payload_ino`, or
+               `st_size != 0` — commit quarantine under lock-ordered `FOR UPDATE` verifying
+               `reclaim_claim_token = $my_token AND reclaim_state = 'truncated' AND payload_ino =
+               $expected_ino` + `storage_volume_control FOR SHARE`!)
+             - Open `staging/.reclaim.<id>` (`OFlags::RDWR | OFlags::NOFOLLOW`) ->
+               `probe_file.try_lock()` (`LOCK_EX | LOCK_NB`; abort on `WouldBlock`) -> re-verify
+               `st_ino == payload_ino` and `st_size == 0` -> unconditional **`fsync(&staging_dir_fd)`
+               + `fsync(&revisions_dir_fd)`** -> proceed to Step 3 keeping `probe_file` open with
+               `LOCK_EX`!
            - **Case 2 (`payload_ino IS NULL` — reservation never bound a writer inode; adoption
              backfilled all on-disk upgrade rows and `reclaim_state != 'none'` blocks
              `Store::stage`):**
@@ -2704,7 +2887,7 @@ candidate scanning from **one-reservation-per-transaction** settlement:
                false, reclaim_state = 'none', reclaim_claim_token = NULL, reclaim_lease_until =
                NULL`) under lock-ordered `FOR UPDATE` verifying `state = 'reserved' AND NOT
                adoption_unverified AND reclaim_claim_token = $my_token AND payload_ino IS NULL` (+
-               `storage_instance FOR SHARE`).
+               `storage_volume_control FOR SHARE`).
              - If `staging/<id>` is a `0`-byte regular file (`st_size == 0`, same local `st_dev`):
                open `OFlags::RDWR | OFlags::NOFOLLOW` -> `probe_file.try_lock()` (`LOCK_EX |
                LOCK_NB`; on `WouldBlock`, abort Step 2 untouched) -> re-verify `S_ISREG`, same
@@ -2718,60 +2901,103 @@ candidate scanning from **one-reservation-per-transaction** settlement:
            `publish_bytes`, and `storage::settle` from creating or settling any file for `<id>`,
            **ALL 4 cleaners perform ZERO filesystem I/O (`statat`, `openat`, `unlinkat`, `fsync`)
            inside Step 3's DB release transaction!** Step 3 locks `(runs FOR NO KEY UPDATE [SKIP
-           LOCKED] ->) storage_reservations FOR UPDATE [SKIP LOCKED]` + `SELECT volume_id,
-           adoption_run_id FROM openmettle.storage_instance WHERE id FOR SHARE` (`volume_id =
-           $expected_volume_id AND adoption_run_id IS NULL`), requires **`state = 'reserved' AND
-           NOT adoption_unverified AND NOT publish_pending AND reclaim_claim_token = $my_token AND
-           (payload_ino IS NULL OR reclaim_state = 'truncated')`** (plus path-specific
-           preconditions), clears `reclaim_state = 'none', reclaim_claim_token = NULL,
-           reclaim_lease_until = NULL`, and commits `storage::release` (`storage_accounts ->
-           storage_instance`, **retaining `payload_ino` on the `'released'` row**)!
-       - Once `storage_instance.volume_id` is non-null in PostgreSQL, `Store::open` and **every**
-         worker cleaner — explicitly including **`artifact_fs::purge_due`**,
+           LOCKED] ->) storage_reservations FOR UPDATE [SKIP LOCKED]`, verifies **`state =
+           'reserved' AND NOT adoption_unverified AND NOT publish_pending AND reclaim_claim_token =
+           $my_token AND (payload_ino IS NULL OR reclaim_state = 'truncated')`** (plus path-specific
+           preconditions), sets **`reclaim_state = CASE WHEN payload_ino IS NOT NULL THEN
+           'anchor_pending_unlink' ELSE 'none' END, reclaim_claim_token = NULL, reclaim_lease_until
+           = NULL`**, and commits `storage::release` (firing `enforce_runtime_storage_volume_pinned()`
+           taking `storage_volume_control FOR SHARE` -> `adjust()` updating `storage_accounts ->
+           storage_instance` with zero deadlock, **retaining `payload_ino` on the `'released'`
+           row**)!
+         - **Step 4 (Post-release detach of `staging/.reclaim.<id>` strictly AFTER Step 3 commits):**
+           When `payload_ino IS NOT NULL` (still holding `probe_file` with `LOCK_EX`): verify
+           `statat(&staging_dir_fd, &reclaim_name, AtFlags::SYMLINK_NOFOLLOW)` has `S_ISREG`, same
+           local `st_dev`, **`st_ino as u64 == payload_ino`**, and **`st_size == 0`**, call
+           **`unlinkat(&staging_dir_fd, &reclaim_name, AtFlags::empty())`** (**never `set_len(0)`**)
+           -> `drop(probe_file)` -> `fsync(&staging_dir_fd)` -> commit best-effort **`UPDATE
+           openmettle.storage_reservations SET reclaim_state = 'none' WHERE id = $1::uuid AND state
+           = 'released' AND reclaim_state = 'anchor_pending_unlink'`** (if the process crashes
+           before completing Step 4, `StagingSweepState` finishes detaching `staging/.reclaim.<id>`
+           and setting `reclaim_state = 'none'`).
+       - Once `storage_volume_control.volume_id` is non-null in PostgreSQL, `Store::open` and
+         **every** worker cleaner — explicitly including **`artifact_fs::purge_due`**,
          `artifact_fs::reconcile_expired`, run-linked storage recovery, ADR 0039
          `reconcile_run_spills`, and `staging/` `ReadDir` cleanup — **MUST refuse to initialize a
          fresh sentinel** (and must not accept a newly created or empty replacement directory) and
          **MUST verify BEFORE touching any payload path or mutating PostgreSQL** that: (a)
-         `storage_instance.volume_id IS NOT NULL AND adoption_run_id IS NULL`, (b) `<root>`,
-         `revisions_dir_fd` (`<root>/revisions`), and `staging_dir_fd` (`<root>/staging`) all open
-         with `OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW` and share the exact same
-         host-local `st_dev`, and (c) `.openmettle-volume-id` opened via `openat(..., OFlags::RDONLY
-         | OFlags::NOFOLLOW | OFlags::NONBLOCK)` + `fstat` on **each** of `<root>`,
-         `revisions_dir_fd`, and `staging_dir_fd` is a regular file (`S_ISREG` — rejecting FIFOs,
-         sockets, device nodes, directories and symlinks immediately without blocking) on that
-         exact same local `st_dev` whose bounded (`<= 64`-byte) content contains non-null pinned
-         `storage_instance.volume_id` paired with its exact `:root`, `:revisions`, or `:staging`
-         role tag. If `adoption_run_id IS NOT NULL`, `volume_id IS NULL`, or any sentinel fails
-         verification, startup (on sentinel mismatch) and all cleaners **fail closed immediately**
-         with **zero unlinked files, zero released holds, and zero confirmed purges**.
+         `storage_volume_control` is present AND `volume_id IS NOT NULL AND adoption_run_id IS
+         NULL`, (b) `<root>`, `revisions_dir_fd` (`<root>/revisions`), and `staging_dir_fd`
+         (`<root>/staging`) all open with `OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW`
+         and share the exact same host-local `st_dev`, and (c) `.openmettle-volume-id` opened via
+         `openat(..., OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK)` + `fstat` on **each**
+         of `<root>`, `revisions_dir_fd`, and `staging_dir_fd` is a regular file (`S_ISREG` —
+         rejecting FIFOs, sockets, device nodes, directories and symlinks immediately without
+         blocking) on that exact same local `st_dev` whose bounded (`<= 64`-byte) content contains
+         non-null pinned `storage_volume_control.volume_id` paired with its exact `:root`,
+         `:revisions`, or `:staging` role tag. If `storage_volume_control` is missing,
+         `adoption_run_id IS NOT NULL`, `volume_id IS NULL`, or any sentinel fails verification,
+         startup (on sentinel mismatch) and all cleaners **fail closed immediately** with **zero
+         unlinked files, zero released holds, and zero confirmed purges**.
    - *Non-run uploads (`run_id IS NULL`, `artifact_fs::reconcile_expired`) and retention purges
      (`artifact_fs::purge_due`):*
      Non-run uploads continue through `artifact_fs::reconcile_expired` and retention purges
      continue through `artifact_fs::purge_due` — **both** requiring configured
-     `OPENMETTLE_WORKER_ARTIFACTS_DIR`, verified **`storage_instance.volume_id IS NOT NULL AND
-     adoption_run_id IS NULL`**, and verified non-null pinned volume identity across all three
-     role-tagged `.openmettle-volume-id` sentinels and host-local same-mount `st_dev`.
-     - **Mandatory `fsync(revisions_dir_fd)` durability barrier on `artifact_fs::purge_due`
-       (including `ENOENT` retries):** PR2 requires `artifact_fs::purge_due` (after verifying
-       `volume_id IS NOT NULL AND adoption_run_id IS NULL` and pinned three-directory volume
-       sentinels) to execute `unlinkat(&revisions_dir_fd, reservation_id, AtFlags::empty())` and
-       **unconditionally call and require `Ok(())` from `fsync(&revisions_dir_fd)` strictly BEFORE
-       committing `storage::confirm_purge` — explicitly including when `unlinkat` returns `ENOENT`**.
+     `OPENMETTLE_WORKER_ARTIFACTS_DIR`, verified **`storage_volume_control` present AND
+     `volume_id IS NOT NULL AND adoption_run_id IS NULL`**, and verified non-null pinned volume
+     identity across all three role-tagged `.openmettle-volume-id` sentinels and host-local
+     same-mount `st_dev`.
+     - **Leaf `payload_ino` verification, `staging/<id>` hard-link alias detach, and mandatory dual
+       `fsync` on `artifact_fs::purge_due` (BEFORE `storage::confirm_purge`):**
+       `storage::begin_purge` joins `openmettle.storage_reservations sr ON sr.scope_id = r.scope_id
+       AND sr.id = r.reservation_id` to load **`(r.reservation_id, r.size_bytes, sr.payload_ino,
+       sr.adoption_unverified)`**, requiring **`NOT sr.adoption_unverified AND sr.payload_ino IS NOT
+       NULL`** (failing closed without touching disk or calling `confirm_purge` otherwise). After
+       verifying `storage_volume_control` pinned state and all three role-tagged sentinels, and
+       strictly BEFORE calling `storage::confirm_purge`, `purge_due` verifies **BOTH**
+       `revisions/<id>` AND `staging/<id>`:
+       1. *Leaf `payload_ino` verification on `revisions/<id>`:* Probe
+          `rustix::fs::statat(&revisions_dir_fd, id, AtFlags::SYMLINK_NOFOLLOW)`. If
+          `revisions/<id>` exists and is non-regular, on a different host-local `st_dev`, or has
+          **`rev_stat.st_ino as u64 != payload_ino`** (a foreign replacement regular file inside
+          the genuine `revisions/` directory!): **STOP IMMEDIATELY with ZERO `set_len(0)`, ZERO
+          `unlinkat`, and DO NOT call `storage::confirm_purge`** (leaving
+          `artifact_revisions.state = 'purging'` and `retained_bytes` 100% charged for
+          `verify_accounting_drift` and `openmettle_owner` reconciliation!). When `rev_stat.st_ino
+          as u64 == payload_ino`, open `revisions/<id>` (`OFlags::RDWR | OFlags::NOFOLLOW`) ->
+          `LOCK_EX` (`try_lock()`, aborting on `WouldBlock`) -> re-verify `st_ino == payload_ino`
+          -> `set_len(0)?` + `sync_all()?` -> `unlinkat(&revisions_dir_fd, id, AtFlags::empty())`
+          -> `drop`. (`Errno::NOENT` on `revisions/<id>` is valid resumable mid-purge.)
+       2. *Hard-link alias detach on `staging/<id>`:* Probe `rustix::fs::statat(&staging_dir_fd,
+          id, AtFlags::SYMLINK_NOFOLLOW)`. If `staging/<id>` exists as `S_ISREG` on the same
+          host-local `st_dev` with **`staging_stat.st_ino as u64 == payload_ino`** (e.g.,
+          `purge_due` running *before* `StagingSweepState` after a post-`settle` crash!), open
+          `staging/<id>` (`OFlags::RDWR | OFlags::NOFOLLOW`) -> `LOCK_EX` (`try_lock()`, aborting
+          on `WouldBlock`) -> re-verify `st_ino == payload_ino` -> `set_len(0)?` + `sync_all()?`
+          -> **`unlinkat(&staging_dir_fd, id, AtFlags::empty())`** -> `drop`! (If `staging/<id>`
+          exists with `staging_ino != payload_ino`, leave foreign `staging/<id>` 100% untouched!)
+       3. *Mandatory dual directory `fsync` barrier:* Unconditionally call and require `Ok(())`
+          from **BOTH `fsync(&revisions_dir_fd)` AND `fsync(&staging_dir_fd)`** strictly BEFORE
+          committing `storage::confirm_purge` — explicitly including when `revisions/<id>` returned
+          `ENOENT` on retry!
      - **PR2 updates [ADR 0031](0031-filesystem-artifact-storage-and-streaming-multipart.md)'s
        `reconcile_expired` behavior (and `tests/schema/artifact_fs.rs`'s `renamed` test case) to
-       execute the unified 3-step reclamation protocol above:** For each expired `state =
+       execute the unified 4-step reclamation protocol above:** For each expired `state =
        'reserved' AND run_id IS NULL AND NOT adoption_unverified` candidate from the raw-key pass
        below, run Step 1 (serialized DB lease claim `reclaim_state = 'claiming' | 'truncated'`,
-       zero FS I/O) -> Step 2 (outside DB tx: Case 1 `payload_ino IS NOT NULL` or Case 2
-       `payload_ino IS NULL`, durable `set_len(0)` + `sync_all()` -> `'truncated'` keeping
-       `payload_ino` non-null -> `unlinkat` -> dual `fsync`) -> Step 3 (`storage::release` with
-       ZERO FS I/O inside DB tx, retaining `payload_ino` on `'released'`). A cancelled mid-stream
-       `StagedFile` whose non-destructive `Drop` closed its FD without unlinking leaves its
-       `st_ino == payload_ino` file at `staging/<id>`, and a crashed post-`renameat_with`
-       unsettled file leaves `st_ino == payload_ino` at `revisions/<id>` — both are cleanly
-       reclaimed by Case 1 with zero false quarantine, while any foreign replacement leaf or
-       `'claiming'` dual `ENOENT` quarantines to `adoption_unverified = true` with zero truncation
-       or unlink!
+       zero FS I/O) -> Step 2 (outside DB tx: Case 1a/1b `payload_ino IS NOT NULL` with durable
+       `set_len(0)` + `sync_all()` -> `linkat` anchor `staging/.reclaim.<id>` + `fsync` -> unlink
+       `<id>` + dual `fsync` -> `'truncated'` keeping `payload_ino` non-null and `nlink >= 1`, or
+       Case 2 `payload_ino IS NULL`) -> Step 3 (`storage::release` with ZERO FS I/O inside DB tx,
+       setting `reclaim_state = 'anchor_pending_unlink'` when `payload_ino IS NOT NULL` and
+       retaining `payload_ino` on `'released'`) -> Step 4 (post-release `unlinkat` of
+       `staging/.reclaim.<id>` + `fsync(&staging_dir_fd)` + best-effort `reclaim_state = 'none'`).
+       A cancelled mid-stream `StagedFile` whose non-destructive `Drop` closed its FD without
+       unlinking leaves its `st_ino == payload_ino` file at `staging/<id>`, and a crashed
+       post-`linkat` unsettled file leaves `st_ino == payload_ino` hard-linked at both
+       `staging/<id>` and `revisions/<id>` — both are cleanly reclaimed by Case 1a with zero false
+       quarantine, while any foreign replacement leaf or `'claiming'` all-three `ENOENT`
+       quarantines to `adoption_unverified = true` with zero truncation or unlink!
      - **Two-step raw-index-key paging for `reconcile_expired` (100% `IMMUTABLE` plain-column
        partial B-tree indexes):** Scan two independent bounded raw-key passes per sweep cycle with
        zero joins or `clock_timestamp()` inside the scan query: (a) modern rows with
@@ -2784,7 +3010,7 @@ candidate scanning from **one-reservation-per-transaction** settlement:
        AND NOT adoption_unverified`, constant upper bound `(v_now - interval '900 seconds',
        max_uuid)`). Each pass materializes at most `batch_size` raw `(expiry_col, id)` keys using
        only `(expiry_col, id) > last_attempted AND (expiry_col, id) <= pass_upper_bound ORDER BY
-       expiry_col ASC, id ASC LIMIT batch_size`, runs the unified 3-step reclamation protocol on
+       expiry_col ASC, id ASC LIMIT batch_size`, runs the unified 4-step reclamation protocol on
        those `<= batch_size` keys, advances `last_attempted` across **every inspected raw key**
        (including 100%-ineligible pages), and wraps only when the raw key page returns `<
        batch_size` rows or reaches `pass_upper_bound`.
@@ -2792,23 +3018,24 @@ candidate scanning from **one-reservation-per-transaction** settlement:
      NULL OR idempotency_key NOT LIKE 'tool-spill:%')`):*
      **Single cleanup owner for `tool-spill:*` reservations with zero ownership gap:**
      [ADR 0039](0039-scoped-mcp-adapter-and-bounded-tool-results.md) (`V1-14` PR2, sequenced on
-     `V1-17` PR2's `volume_id`/`dirfd`/`payload_ino`/3-step-cleaner foundation)
+     `V1-17` PR2's `storage_volume_control`/`dirfd`/`payload_ino`/4-step-cleaner foundation)
      `reconcile_run_spills` **exclusively owns `operation_id IS NOT NULL AND idempotency_key LIKE
-     'tool-spill:%'`** (executing the exact same unified 3-step reclamation protocol with ZERO
-     filesystem I/O in Step 1 and Step 3, and requiring `volume_id IS NOT NULL AND adoption_run_id
-     IS NULL` for both `publish_bytes` and `reconcile_run_spills`), while ADR 0040's generic
-     run-linked cleaner **exclusively owns the exact logical complement `run_id IS NOT NULL AND
-     (operation_id IS NULL OR idempotency_key NOT LIKE 'tool-spill:%')`** in **both** partial index
-     `WHERE` clauses AND Step 1 / Step 3 under-lock eligibility checks (so any pre-existing row
-     with `run_id IS NOT NULL AND operation_id IS NULL AND idempotency_key LIKE 'tool-spill:%'` is
-     cleanly owned by ADR 0040's generic cleaner with zero unowned gap, and
-     `storage_reservations_tool_spill_binding_guard` (`23514`) enforces for all new/updated rows
-     that `idempotency_key LIKE 'tool-spill:%'` requires BOTH `run_id IS NOT NULL AND operation_id
-     IS NOT NULL`). For all run-linked holds in ADR 0040's complement partition, recovery requires
-     configured `OPENMETTLE_WORKER_ARTIFACTS_DIR` (`ARTIFACTS_DIR`, `artifact_fs::Store`) with
-     verified **`storage_instance.volume_id IS NOT NULL AND adoption_run_id IS NULL`** and all
-     three role-tagged directory sentinels (skipping cleanly with zero unlinks or releases if
-     unavailable or unverified). Otherwise, run **two-step raw-index-key paging** across two
+     'tool-spill:%'`** (executing the exact same unified 4-step reclamation protocol with ZERO
+     filesystem I/O in Step 1 and Step 3, and requiring `storage_volume_control` present AND
+     `volume_id IS NOT NULL AND adoption_run_id IS NULL` for both `publish_bytes` and
+     `reconcile_run_spills`), while ADR 0040's generic run-linked cleaner **exclusively owns the
+     exact logical complement `run_id IS NOT NULL AND (operation_id IS NULL OR idempotency_key NOT
+     LIKE 'tool-spill:%')`** in **both** partial index `WHERE` clauses AND Step 1 / Step 3
+     under-lock eligibility checks (so any pre-existing row with `run_id IS NOT NULL AND
+     operation_id IS NULL AND idempotency_key LIKE 'tool-spill:%'` is cleanly owned by ADR 0040's
+     generic cleaner with zero unowned gap, and `storage_reservations_tool_spill_binding_guard`
+     (`23514`) enforces for all new/updated rows that `idempotency_key LIKE 'tool-spill:%'`
+     requires BOTH `run_id IS NOT NULL AND operation_id IS NOT NULL`). For all run-linked holds in
+     ADR 0040's complement partition, recovery requires configured
+     `OPENMETTLE_WORKER_ARTIFACTS_DIR` (`ARTIFACTS_DIR`, `artifact_fs::Store`) with verified
+     **`storage_volume_control` present AND `volume_id IS NOT NULL AND adoption_run_id IS NULL`**
+     and all three role-tagged directory sentinels (skipping cleanly with zero unlinks or releases
+     if unavailable or unverified). Otherwise, run **two-step raw-index-key paging** across two
      independent bounded passes backed by 100% `IMMUTABLE` plain-column partial B-tree indexes —
      **zero joins, zero `EXISTS`, and zero `clock_timestamp()` calls before `LIMIT`**: (a) modern
      rows with `lease_expires_at IS NOT NULL` over `storage_reservations_run_expiry_idx` (`ON
@@ -2824,20 +3051,23 @@ candidate scanning from **one-reservation-per-transaction** settlement:
      linked run, zero `'intent'`/`'outcome_unknown'` operations, and legacy terminal-run grace rule
      when `lease_expires_at IS NULL`) only on those `<= batch_size` keys, advances `last_attempted`
      across every inspected raw key across `SWEEP_MS` ticks (60 s default interval, 15 s per-sweep
-     budget), and processes **one eligible reservation per unified 3-step reclamation cycle**
-     (Step 1 DB lease claim -> Step 2 outside-DB-tx Case 1 / Case 2 `LOCK_EX` + `set_len(0)` +
-     `sync_all()` -> `'truncated'` -> `unlinkat` + dual `fsync` -> Step 3 zero-FS-IO
-     `storage::release` retaining `payload_ino` on `'released'`).
-   - *Retryable `staging/` cleanup after post-release crashes (persistent `StagingSweepState` across
-     `worker::sweep`'s 15 s outer `tokio::time::timeout`, retaining open `dir_fd` through EOF
-     drain, with `LOCK_EX`, `adoption_unverified` skip, and synchronized `payload_ino` rules on
-     `'released'`, `'settled'`, and zero-row orphans):*
-     Because a worker may crash after committing `storage::release` (`state = 'released'`) or
-     `storage::settle` (`state = 'settled'`) with a stranded retry `staging/<id>` file, a sweep
+     budget), and processes **one eligible reservation per unified 4-step reclamation cycle**
+     (Step 1 DB lease claim -> Step 2 outside-DB-tx Case 1a/1b / Case 2 `LOCK_EX` + `set_len(0)` +
+     `sync_all()` -> `linkat` `staging/.reclaim.<id>` -> unlink `<id>` -> `'truncated'` -> Step 3
+     zero-FS-IO `storage::release` setting `'anchor_pending_unlink'` and retaining `payload_ino` on
+     `'released'` -> Step 4 post-release `unlinkat` of `staging/.reclaim.<id>` + `fsync` +
+     `reclaim_state = 'none'`).
+   - *Retryable `staging/` cleanup after post-release / post-`settle` crashes (persistent
+     `StagingSweepState` across `worker::sweep`'s 15 s outer `tokio::time::timeout`, retaining open
+     `dir_fd` through EOF drain, with `LOCK_EX`, `adoption_unverified` skip, ZERO `set_len(0)` on
+     `'settled'`/`'released'`/`.reclaim.<id>`, and synchronized `payload_ino` rules):*
+     Because a worker or API replica may crash after committing `storage::release` (`state =
+     'released'`, `reclaim_state = 'anchor_pending_unlink'`) or `storage::settle` (`state =
+     'settled'`) with a stranded `staging/.reclaim.<id>` anchor or `staging/<id>` alias, a sweep
      querying only `state = 'reserved'` would skip that row permanently and leave an orphan
-     `staging/<id>` file that fails `verify_accounting_drift`. Conversely, reading an entire large
-     or slow `staging/` directory into memory and sorting it before applying a filename cursor
-     could exhaust the entire 15 s sweep budget before advancing — and in
+     `staging/` entry that fails `verify_accounting_drift`. Conversely, reading an entire large or
+     slow `staging/` directory into memory and sorting it before applying a filename cursor could
+     exhaust the entire 15 s sweep budget before advancing — and in
      [`src/worker.rs`](../../src/worker.rs), `worker::sweep` wraps each tick's future in
      `tokio::time::timeout(Duration::from_secs(15), work)`. On startup recovery and during bounded
      worker storage sweeps, `worker::maintenance` therefore holds a persistent
@@ -2847,24 +3077,24 @@ candidate scanning from **one-reservation-per-transaction** settlement:
      directory) across all active states — **`Idle`**, **`Open { dir_fd, dir_dev, dir_ino, reader
      }`**, **`InFlight { dir_fd, dir_dev, dir_ino, handle }`**, **`InvalidatedInFlight { handle
      }`**, and **`DrainingEof { dir_fd, dir_dev, dir_ino }`** (where `handle` is the sole
-     `JoinHandle<io::Result<(ReadDir, Vec<String>, bool)>>` returning only canonical lowercase UUID
-     names and ignoring `.openmettle-volume-id*`) — plus a **`VecDeque<String>` of undrained
-     `pending_names`**, dropping `dir_fd` **only when `pending_names.is_empty()` and the state
-     transitions to `Idle` (or when invalidated into `InvalidatedInFlight` / `Idle` after clearing
-     `pending_names`)**:
+     `JoinHandle<io::Result<(ReadDir, Vec<StagingEntry>, bool)>>` returning **both** canonical
+     lowercase UUID names `<id>` **and** `.reclaim.<id>` anchor names, while ignoring
+     `.openmettle-volume-id*`) — plus a **`VecDeque<StagingEntry>` of undrained `pending_names`**,
+     dropping `dir_fd` **only when `pending_names.is_empty()` and the state transitions to `Idle`
+     (or when invalidated into `InvalidatedInFlight` / `Idle` after clearing `pending_names`)**:
      - At the start of each tick, open `<root>`, `<root>/revisions`, and `<root>/staging`
-       (`OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW`), verify **`storage_instance.volume_id
-       IS NOT NULL AND adoption_run_id IS NULL`**, equal host-local `st_dev` across all three FDs,
-       and valid role-tagged `.openmettle-volume-id` sentinels (`:root`, `:revisions`, `:staging`
-       via `openat(..., OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK)` + `fstat` `S_ISREG`
-       on each FD, bounded `<= 64`-byte read), and inspect `<root>/staging`'s live `(cur_dev,
-       cur_ino)`:
-       - *If `volume_id IS NULL`, `adoption_run_id IS NOT NULL`, or volume sentinel/local `st_dev`
-         verification fails:* clear `pending_names` with zero unlinks; if `StagingSweepState` is
-         `InFlight { handle, .. }`, drop `dir_fd` and transition to **`InvalidatedInFlight { handle
-         }`** (never dropping the running `handle` into `Idle`); if `Open` or `DrainingEof`, drop
-         `dir_fd` and transition to `Idle`; and fail closed for the tick without spawning any new
-         reader.
+       (`OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW`), verify **`storage_volume_control`
+       present AND `volume_id IS NOT NULL AND adoption_run_id IS NULL`**, equal host-local `st_dev`
+       across all three FDs, and valid role-tagged `.openmettle-volume-id` sentinels (`:root`,
+       `:revisions`, `:staging` via `openat(..., OFlags::RDONLY | OFlags::NOFOLLOW |
+       OFlags::NONBLOCK)` + `fstat` `S_ISREG` on each FD, bounded `<= 64`-byte read), and inspect
+       `<root>/staging`'s live `(cur_dev, cur_ino)`:
+       - *If `storage_volume_control` is missing, `volume_id IS NULL`, `adoption_run_id IS NOT
+         NULL`, or volume sentinel/local `st_dev` verification fails:* clear `pending_names` with
+         zero unlinks; if `StagingSweepState` is `InFlight { handle, .. }`, drop `dir_fd` and
+         transition to **`InvalidatedInFlight { handle }`** (never dropping the running `handle`
+         into `Idle`); if `Open` or `DrainingEof`, drop `dir_fd` and transition to `Idle`; and fail
+         closed for the tick without spawning any new reader.
        - *If `(cur_dev, cur_ino)` changed against parked `Open`, `InFlight`, or `DrainingEof`:*
          clear `pending_names` with zero unlinks; drop `dir_fd` and transition `Open` or
          `DrainingEof` to `Idle`; and drop `dir_fd` while transitioning `InFlight { handle, .. }`
@@ -2876,59 +3106,74 @@ candidate scanning from **one-reservation-per-transaction** settlement:
      - If `StagingSweepState` is **`InFlight { dir_fd, dir_dev, dir_ino, handle }`** (with verified
        matching `(cur_dev, cur_ino) == (dir_dev, dir_ino)`), **first await the parked `&mut
        handle`** (never spawning a second concurrent `ReadDir` task). When `handle` resolves,
-       append its returned canonical UUIDs to `pending_names` and transition to `Open { dir_fd,
-       dir_dev, dir_ino, reader }` when `eof == false`, or drop `reader` while **retaining
-       `dir_fd`** and transition to **`DrainingEof { dir_fd, dir_dev, dir_ino }`** when `eof ==
-       true`.
+       append its returned entries to `pending_names` and transition to `Open { dir_fd, dir_dev,
+       dir_ino, reader }` when `eof == false`, or drop `reader` while **retaining `dir_fd`** and
+       transition to **`DrainingEof { dir_fd, dir_dev, dir_ino }`** when `eof == true`.
      - Drain `pending_names` in bounded batches against `openmettle.storage_reservations`
-       (**`SELECT id, state, adoption_unverified, payload_ino FROM openmettle.storage_reservations
-       WHERE id = ANY($1)`**) **exactly once** (popping entries only as processed, checking
-       `Instant::now() < sweep_deadline` and `inspected_entries < batch_size`, and **skipping any
-       row with `adoption_unverified = true`**!). Confirm `<root>/staging` still has `(cur_dev,
-       cur_ino) == (dir_dev, dir_ino)` and valid `"<volume_uuid>:staging\n"`. **NEVER unlink any
-       `staging/<id>` without holding non-blocking exclusive flock `LOCK_EX | LOCK_NB` on the
-       verified `(staging_dev, staging_ino)` regular file** (open via `rustix::fs::openat(&dir_fd,
-       id, OFlags::RDWR | OFlags::NOFOLLOW)` -> `std::fs::File::from(owned_fd)` ->
-       `file.try_lock()`, skipping immediately on `WouldBlock`, and re-verifying local `st_dev`,
-       `staging_ino`, `staging_size`, and `S_ISREG` via `statat(&dir_fd, id,
-       AtFlags::SYMLINK_NOFOLLOW)` against `fstat(&file)`):
-       - *On `state = 'released'` (synchronized verbatim with ADR 0039):* **skip untouched** if
-         `adoption_unverified = true`, or **`payload_ino IS NOT NULL AND staging_ino !=
-         payload_ino`**, or **`payload_ino IS NULL AND staging_size > 0`**; otherwise under
-         `LOCK_EX` execute **`file.set_len(0)` -> `file.sync_all()` -> `unlinkat(&dir_fd, id,
-         AtFlags::empty())` -> `drop(file)` -> `fsync(&staging_dir_fd)`**.
-       - *On `state = 'settled'` (synchronized verbatim with ADR 0039 — `payload_ino`-guarded
-         hard-link alias & `'purged'` resolution):* **skip untouched** if `adoption_unverified =
-         true` or **`payload_ino IS NULL`**. Under `LOCK_EX`, inspect `revisions/<id>` via
-         `rustix::fs::statat(&revisions_dir_fd, id, AtFlags::SYMLINK_NOFOLLOW)`:
-         - If **`staging_ino == payload_ino`** (hard-link alias to settled payload): call
-           **`unlinkat(&dir_fd, id, AtFlags::empty())` ONLY (NEVER `set_len(0)`)** **ONLY** when
-           `revisions/<id>` is `S_ISREG` on the same host-local `st_dev` with **`rev_stat.st_ino as
-           u64 == payload_ino`** -> `drop(file)` -> `fsync(&staging_dir_fd)` (preserving both
-           entries untouched on `ENOENT`, non-regular, or `rev_ino != payload_ino`!).
-         - If **`staging_ino != payload_ino`** (distinct candidate): execute **`file.set_len(0)` ->
-           `file.sync_all()` -> `unlinkat(&dir_fd, id, AtFlags::empty())` -> `drop(file)` ->
-           `fsync(&staging_dir_fd)`** **ONLY** when **either** `revisions/<id>` is `S_ISREG` on the
-           same host-local `st_dev` with **`rev_stat.st_ino as u64 == payload_ino`** **OR**
-           (`revisions/<id>` returns `Errno::NOENT` AND a fresh `READ COMMITTED` `SELECT state FROM
+       (**`SELECT id, state, adoption_unverified, payload_ino, reclaim_state FROM
+       openmettle.storage_reservations WHERE id = ANY($1)`**) **exactly once** (popping entries
+       only as processed, checking `Instant::now() < sweep_deadline` and `inspected_entries <
+       batch_size`, and **skipping any row with `adoption_unverified = true`**!). Confirm
+       `<root>/staging` still has `(cur_dev, cur_ino) == (dir_dev, dir_ino)` and valid
+       `"<volume_uuid>:staging\n"`. **NEVER unlink any `staging/` entry without holding
+       non-blocking exclusive flock `LOCK_EX | LOCK_NB` on the verified `(staging_dev, staging_ino)`
+       regular file** (open via `rustix::fs::openat(&dir_fd, entry_name, OFlags::RDWR |
+       OFlags::NOFOLLOW)` -> `std::fs::File::from(owned_fd)` -> `file.try_lock()`, skipping
+       immediately on `WouldBlock`, and re-verifying local `st_dev`, `staging_ino`, `staging_size`,
+       and `S_ISREG` via `statat(&dir_fd, entry_name, AtFlags::SYMLINK_NOFOLLOW)` against
+       `fstat(&file)`). **`StagingSweepState` NEVER calls `set_len(0)` on `'settled'`, `'released'`,
+       or `.reclaim.<id>` rows (synchronized verbatim with ADR 0039):**
+       - *On `staging/<id>` with `state = 'settled'`:*
+         - If `adoption_unverified = true` OR `payload_ino IS NULL` OR **`staging_ino !=
+           payload_ino`**: **PRESERVE `staging/<id>` 100% UNTOUCHED (ZERO `set_len(0)`, ZERO
+           `unlinkat`!)** — for example, if `staging/A` is hard-linked to active `revisions/B`
+           while `revisions/A` matches `A.payload_ino`, `staging/A` has `staging_ino ==
+           B.payload_ino != A.payload_ino`, so `StagingSweepState` preserves both `staging/A` and
+           `revisions/B` untouched (`B`'s bytes remain intact, and `verify_accounting_drift` flags
+           `staging/A`)!
+         - When **`staging_ino == payload_ino`** (hard-link alias to `<id>`'s own settled payload):
+           under `LOCK_EX` (re-verifying `statat(&dir_fd, id, AtFlags::SYMLINK_NOFOLLOW).st_ino as
+           u64 == payload_ino`), call **`unlinkat(&dir_fd, id, AtFlags::empty())`** (**NEVER
+           `set_len(0)`!**) -> `drop(file)` -> `fsync(&staging_dir_fd)` **ONLY** when **EITHER**
+           (i) `revisions/<id>` is `S_ISREG` on the same host-local `st_dev` with
+           **`rev_stat.st_ino as u64 == payload_ino`**, **OR** (ii) `revisions/<id>` returns
+           `Errno::NOENT` AND a fresh `READ COMMITTED` `SELECT state FROM
            openmettle.artifact_revisions WHERE reservation_id = $1::uuid` executed *after*
-           observing `ENOENT` returns **`state = 'purged'`**), preserving both entries untouched on
-           `rev_ino != payload_ino`, non-regular, or non-`'purged'` `ENOENT`!
+           observing `ENOENT` returns **`state = 'purged'`** (preserving untouched otherwise!).
+       - *On `staging/<id>` with `state = 'released'`:*
+         - **If `payload_ino IS NOT NULL`: NEVER truncate or unlink `staging/<id>`!** (Every
+           `payload_ino IS NOT NULL` reservation moved `<id>` to `staging/.reclaim.<id>` before
+           `'released'` committed, so any file at `staging/<id>` — even if reusing a freed inode
+           number — is foreign and preserved 100% untouched!)
+         - If `payload_ino IS NULL` and `NOT adoption_unverified` and `staging_size == 0`: under
+           `LOCK_EX` (re-verifying `statat == file` and `st_size == 0`), call **`unlinkat(&dir_fd,
+           id, AtFlags::empty())`** (**NEVER `set_len(0)`!**) -> `drop(file)` ->
+           `fsync(&staging_dir_fd)`. (Skip untouched if `staging_size > 0`!)
+       - *On `staging/.reclaim.<id>` (`reclaim_name = format!(".reclaim.{id}")`):*
+         - Clean **ONLY** when `state = 'released' AND reclaim_state = 'anchor_pending_unlink' AND
+           NOT adoption_unverified AND payload_ino IS NOT NULL`: under `LOCK_EX` (re-verifying
+           `S_ISREG`, same local `st_dev`, **`st_ino == payload_ino`**, and **`st_size == 0`**!),
+           call **`unlinkat(&dir_fd, &reclaim_name, AtFlags::empty())`** (**NEVER `set_len(0)`!**)
+           -> `drop(file)` -> `fsync(&staging_dir_fd)` -> `UPDATE openmettle.storage_reservations
+           SET reclaim_state = 'none' WHERE id = $1::uuid AND state = 'released' AND reclaim_state
+           = 'anchor_pending_unlink'` (or clear `reclaim_state = 'none'` if already `ENOENT`). Once
+           `reclaim_state = 'none'`, skip untouched!
        - *Zero-row (`absent` in `storage_reservations`) orphan `staging/<id>` file:* require
          `st_mtime` age **`> 900 s`** on **both** startup recovery and periodic sweep, acquire
          non-blocking `LOCK_EX` (`file.try_lock()`, skipping on `WouldBlock`), re-verify local
          `st_dev`, `staging_ino`, and `S_ISREG` via `statat`, then — **while still holding
-         `LOCK_EX`** — open a short primary DB transaction acquiring **`SELECT volume_id,
-         adoption_run_id FROM openmettle.storage_instance WHERE id FOR UPDATE`** (serializing
-         against every concurrent `storage::reserve` and verifying `volume_id = $expected_volume_id
-         AND adoption_run_id IS NULL`) and verifying **`NOT EXISTS (SELECT 1 FROM
-         openmettle.storage_reservations WHERE id = $1::uuid)`**, end the DB transaction, and
-         **only if zero rows exist** call `file.set_len(0)` -> `file.sync_all()` ->
-         `unlinkat(&dir_fd, id, AtFlags::empty())` -> `drop(file)` -> `fsync(&dir_fd)`.
-       Never unlink a `staging/<id>` file whose `storage_reservations` row is still `state =
-       'reserved'` (or has `adoption_unverified = true`) outside the verified 3-step reclamation
-       paths. When `StagingSweepState` is **`DrainingEof { dir_fd, dir_dev, dir_ino }`**, drop
-       `dir_fd` and transition to `Idle` **only once `pending_names.is_empty()`**.
+         `LOCK_EX`** — open a short primary DB transaction in canonical lock order acquiring
+         **`SELECT volume_id, adoption_run_id FROM openmettle.storage_volume_control WHERE id FOR
+         SHARE`** (aborting if `NOT FOUND OR v_vol IS DISTINCT FROM $expected_volume_id OR v_adopt
+         IS NOT NULL`) -> **`SELECT id FROM openmettle.storage_instance WHERE id FOR UPDATE`**
+         (serializing against every concurrent `storage::reserve`!) and verifying **`NOT EXISTS
+         (SELECT 1 FROM openmettle.storage_reservations WHERE id = $1::uuid)`**, end the DB
+         transaction, and **only if zero rows exist** call `file.set_len(0)` -> `file.sync_all()`
+         -> `unlinkat(&dir_fd, id, AtFlags::empty())` -> `drop(file)` -> `fsync(&dir_fd)`.
+       Never unlink a `staging/<id>` or `staging/.reclaim.<id>` file whose `storage_reservations`
+       row is still `state = 'reserved'` (or has `adoption_unverified = true`) outside the verified
+       4-step reclamation paths. When `StagingSweepState` is **`DrainingEof { dir_fd, dir_dev,
+       dir_ino }`**, drop `dir_fd` and transition to `Idle` **only once `pending_names.is_empty()`**.
      - Only once `pending_names` is empty, `StagingSweepState` is `Idle` or `Open`, and budget
        remains (`Instant::now() < sweep_deadline` and `inspected_entries < batch_size`), open a
        verified `dir_fd` (`OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW`) plus a fresh
@@ -2973,30 +3218,32 @@ handoff hold verification, `quota_gateway_handoffs` recording before `quota_enfo
 locking inside `quota_enforce_gateway_handoff_holds` / `enforce_gateway_handoff_holds()`,
 `tool-spill:%` namespace binding inside `enforce_tool_spill_reservation_binding()`, lazy legacy-run
 parent hold initialization inside `quota_ensure_legacy_run_holds()`, and fresh-bootstrap-only
-`storage_instance.volume_id` auto-pinning) run strictly inside narrow `openmettle_owner`-owned
+`storage_volume_control.volume_id` auto-pinning) run strictly inside narrow `openmettle_owner`-owned
 `SECURITY DEFINER` functions with `SET search_path = pg_catalog`, schema-qualified relations,
 `REVOKE ALL ON FUNCTION ... FROM PUBLIC` and exact `oid::regprocedure` signatures audited in
 `src/boundaries.sql` (following [ADR 0030](0030-session-issuance-database-boundary.md) and ADR
 0037). By contrast, PostgreSQL ledger backstop guarding for unpinned or adopting runtime storage
-mutations (`openmettle.enforce_runtime_storage_volume_pinned()`, `OMQ03`, using a serialized
-`PERFORM 1 FROM openmettle.storage_instance WHERE id FOR SHARE;` read before rejecting
-`volume_id IS NULL OR adoption_run_id IS NOT NULL`) and monotonic storage-reservation column
-guards (`openmettle.enforce_storage_reservation_monotonic_guards()`, `OMQ03`, prohibiting
-non-`openmettle_owner` roles from clearing `adoption_unverified`, mutating or clearing non-null
-`payload_ino`, or clearing `stage_claimed`) run strictly as **`SECURITY INVOKER`** (`SET
-search_path = pg_catalog`, reading `openmettle.storage_instance` using Migration `0004`'s
-table-level `SELECT` grant to `openmettle_api` and `openmettle_worker`) so `NOT
-pg_catalog.pg_has_role(current_user, 'openmettle_owner', 'USAGE')` evaluates the active effective
-role across **both** `INHERIT` logins and `NOINHERIT` logins executing `SET ROLE openmettle_api` /
-`SET ROLE openmettle_worker`! Neither `openmettle_api` nor `openmettle_worker` receives direct
-`SELECT` privileges on Migration `0023`'s `openmettle.gateway_requests` or
-`openmettle.gateway_usage_reports` (or other gateway tables): lost commit-ack handoff recovery runs
-solely through `openmettle.quota_recover_lost_handoff(...)`, lazy legacy-run parent hold backfill
-runs solely through `openmettle.quota_ensure_legacy_run_holds(...)`, fenced successor-worker
-superseded-round unwind runs solely through `openmettle.quota_unwind_superseded_round(...)`,
-pre-upgrade orphan `'reserved'` gateway sweep runs solely through
-`openmettle.quota_release_orphan_gateway_requests(...)`, and SQL drift verification runs solely
-through `openmettle.quota_verify_accounting_drift()`.
+mutations (`openmettle.enforce_runtime_storage_volume_pinned()`, `OMQ03`, executing `SELECT
+volume_id, adoption_run_id INTO v_vol, v_adopt FROM openmettle.storage_volume_control WHERE id FOR
+SHARE;` and failing closed whenever `NOT FOUND OR v_vol IS NULL OR v_adopt IS NOT NULL`) and
+monotonic storage-reservation column guards
+(`openmettle.enforce_storage_reservation_monotonic_guards()`, `OMQ03`, paired with tightened
+`storage_reservations_adoption_unverified_check`: `CHECK (NOT adoption_unverified OR state =
+'reserved')` so non-`openmettle_owner` roles can never clear `adoption_unverified`, release a
+quarantined reservation, mutate or clear non-null `payload_ino`, or clear `stage_claimed`) run
+strictly as **`SECURITY INVOKER`** (`SET search_path = pg_catalog`, reading
+`openmettle.storage_volume_control` using PR2's `GRANT SELECT ON openmettle.storage_volume_control
+TO openmettle_api, openmettle_worker`) so `NOT pg_catalog.pg_has_role(current_user,
+'openmettle_owner', 'USAGE')` evaluates the active effective role across **both** `INHERIT` logins
+and `NOINHERIT` logins executing `SET ROLE openmettle_api` / `SET ROLE openmettle_worker`! Neither
+`openmettle_api` nor `openmettle_worker` receives direct `SELECT` privileges on Migration `0023`'s
+`openmettle.gateway_requests` or `openmettle.gateway_usage_reports` (or other gateway tables): lost
+commit-ack handoff recovery runs solely through `openmettle.quota_recover_lost_handoff(...)`, lazy
+legacy-run parent hold backfill runs solely through `openmettle.quota_ensure_legacy_run_holds(...)`,
+fenced successor-worker superseded-round unwind runs solely through
+`openmettle.quota_unwind_superseded_round(...)`, pre-upgrade orphan `'reserved'` gateway sweep runs
+solely through `openmettle.quota_release_orphan_gateway_requests(...)`, and SQL drift verification
+runs solely through `openmettle.quota_verify_accounting_drift()`.
 
 | Object or `SECURITY DEFINER` entrypoint | `openmettle_api` | `openmettle_worker` | `openmettle_gateway` (Migration `0023`) | `openmettle_issuance` (ADR 0030) |
 | --- | --- | --- | --- | --- |
@@ -3007,7 +3254,7 @@ through `openmettle.quota_verify_accounting_drift()`.
 | `quota_accepted_gateway_reports` | None | None (read internally by `SECURITY DEFINER` `quota_verify_accounting_drift()`) | None (populated automatically by `SECURITY DEFINER` `AFTER INSERT OR UPDATE OF revision, final` trigger `quota_record_accepted_gateway_settlement` on `gateway_settlements`; read internally by `SECURITY DEFINER` `quota_settle_gateway_usage()` and `enforce_quota_reservation_gateway_binding()`) | None |
 | `quota_overrides` | `SELECT` only | `SELECT` only | `SELECT` only | None |
 | `quota_budgets`, `quota_reservations`, `quota_reservation_charges`, `quota_reconciliations`, `quota_warning_events` | `SELECT` only | `SELECT` only | `SELECT` only | None |
-| `openmettle.storage_pin_volume_id(uuid)` | `EXECUTE` (invoked by `Store::open` inside the same transaction that already holds `SELECT volume_id, bootstrap_auto_pin_allowed, adoption_run_id FROM openmettle.storage_instance WHERE id FOR UPDATE` before any sentinel write or stale `.tmp.*` cleanup; permits write-once `volume_id` auto-pinning **only** while `volume_id IS NULL AND adoption_run_id IS NULL AND bootstrap_auto_pin_allowed = true` AND BOTH `NOT EXISTS (SELECT 1 FROM openmettle.storage_reservations)` AND `NOT EXISTS (SELECT 1 FROM openmettle.artifact_revisions)`, atomically setting `volume_id = p_volume_id` and clearing `bootstrap_auto_pin_allowed = false`; refuses every upgraded deployment (`bootstrap_auto_pin_allowed = false`, even with empty storage tables) and every populated ledger with `OMQ03`; never modifies or clears a non-null `volume_id`) | `EXECUTE` (same) | None | None |
+| `openmettle.storage_pin_volume_id(uuid)` | `EXECUTE` (invoked by `Store::open` inside the same transaction that already holds `SELECT volume_id, bootstrap_auto_pin_allowed, adoption_run_id INTO STRICT ... FROM openmettle.storage_volume_control WHERE id FOR UPDATE` before any sentinel write or stale `.tmp.*` cleanup; permits write-once `volume_id` auto-pinning **only** while `volume_id IS NULL AND adoption_run_id IS NULL AND bootstrap_auto_pin_allowed = true` AND BOTH `NOT EXISTS (SELECT 1 FROM openmettle.storage_reservations)` AND `NOT EXISTS (SELECT 1 FROM openmettle.artifact_revisions)`, atomically setting `volume_id = p_volume_id` and clearing `bootstrap_auto_pin_allowed = false`; refuses every upgraded deployment (`bootstrap_auto_pin_allowed = false`, even with empty storage tables), missing singleton row, and every populated ledger with `OMQ03`; never modifies or clears a non-null `volume_id`) | `EXECUTE` (same) | None | None |
 | `openmettle.quota_upsert_scope_override(...)` and `openmettle.quota_revoke_scope_override(...)` | `EXECUTE` (validates caller role & scope/kind/bounds invariants, requiring `('instance', 'usage_cost_micros').cost_denomination IS NOT NULL` for `usage_cost_micros`; locks `run_dispatch_lock` for `executing_runs_*`, `projects`/`users`, and `storage_accounts` or active `quota_budgets` in canonical order; upserts/revokes `quota_overrides` and increments `revision` to re-arm warning watermarks) | None | None | None |
 | `openmettle.quota_reserve(...)` | `EXECUTE` (tags `origin_role = 'api'`; when `gateway_request_id IS NOT NULL`, executes in the same `WriteTransaction` as `authz::gateway::reserve_in`, verifying `gateway_requests` ownership `(scope_id, actor_user_id, run_id IS NULL)`, `state = 'reserved'`, 32-byte `p_dispatch` matching `dispatch_hash = sha256(p_dispatch)`, and exact `usage_tokens` hold equality `reserved_units = q.units` (`23514`), reinforced by `quota_reservations_gateway_binding_guard`; locks `quota_budgets` internally and records `quota_warning_events`) | `EXECUTE` (tags `origin_role = 'worker'`; locks `quota_budgets` internally and records `quota_warning_events`) | None | None |
 | `openmettle.quota_ensure_legacy_run_holds(...)` | None | `EXECUTE` (lazy, idempotent once-per-run parent hold backfill for a live leased `N-1`-admitted run `(scope_id, run_id)` that lacks run-level parent `quota_reservations` holds; **MUST execute inside the round-allocation `WriteTransaction` strictly BEFORE `authz::gateway::reserve_in(&mut tx, ...)`** (after any `quota_unwind_superseded_round` of a crashed predecessor); acquires locks in canonical `runs` (`FOR NO KEY UPDATE`, verifying active `Step` lease) -> non-locking check for existing run-level parent hold -> `gateway_reservations` (`FOR NO KEY UPDATE`, matching `gateway_allocate` so the immediately following `reserve_in` performs zero lock upgrade, reading Migration `0023`'s `units - allocated`) -> charged `quota_budgets` (`FOR NO KEY UPDATE`) order before locking any `quota_reservations` row; inserts missing run-level parent hold(s) (`usage_tokens` for `units - allocated` plus applicable `usage_cost_micros` ceiling, `origin_role = 'worker'`, deterministic idempotency key `("legacy-run-parent", run_id, resource_kind)`), enforcing active `quota_budgets` hard limits (`OMQ01`) and returning immediately on retries/subsequent rounds once present) | None | None |
@@ -3020,12 +3267,13 @@ through `openmettle.quota_verify_accounting_drift()`.
 | `openmettle.quota_release_unsent(...)` | `EXECUTE` (own `origin_role = 'api'` `held` rows only; explicit pre-send unwind couples with `authz::gateway::release_in` / `openmettle.gateway_release` / requires `gateway_requests.state = 'released'` for gateway-bound holds; re-verifies `(q.scope_id, q.actor_user_id) = (qr.scope_id, qr.actor_user_id) AND q.run_id IS NOT DISTINCT FROM qr.run_id` under lock before mutating either ledger; locks internally and sets `closed_at`) | `EXECUTE` (own `origin_role = 'worker'` `held` or eligible stale/terminal-run `held` rows; explicit pre-send unwind couples with `authz::gateway::release_in` / `openmettle.gateway_release` / verifies `gateway_requests.state = 'released'` and returns round capacity to an active `held` parent or releases on terminal runs; sweep mode locks `(runs ->) gateway_reservations -> gateway_requests -> (parent ->) quota_reservations` with `FOR NO KEY UPDATE SKIP LOCKED`; **explicitly re-verifies `(q.scope_id, q.actor_user_id) = (qr.scope_id, qr.actor_user_id) AND q.run_id IS NOT DISTINCT FROM qr.run_id` under lock** raising an invariant error without mutating either ledger on mismatch; proceeds if `gateway_requests.state = 'released'`, **atomically transitions stale `'reserved'` `gateway_requests` to `'released'` and restores `gateway_reservations.allocated` in the same transaction** when expiry/terminal preconditions hold, leaves `'handed_off'` or locked rows untouched, and sets `closed_at`) | None | None |
 | `openmettle.quota_release_orphan_gateway_requests(interval, timestamptz, uuid, timestamptz, uuid, integer)` | None | `EXECUTE` (bounded defense-in-depth sweep capturing `v_age_cutoff := clock_timestamp() - p_max_reserved_age` once in PL/pgSQL, clamping scalar `v_upper_created_at` and `v_upper_id` via a PostgreSQL 18 `IF (p_pass_upper_created_at, p_pass_upper_id) <= (v_age_cutoff, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid) THEN ... ELSE ... END IF;` block, and materializing at most `p_page_size` raw `(created_at, id)` keys from `gateway_requests_reserved_idx` using only constant PL/pgSQL bounds — zero `clock_timestamp()` inside the `SELECT` — before testing `NOT EXISTS` bound `quota_reservations` and run-lease/terminal eligibility; locks `(runs ->) gateway_reservations -> gateway_requests` with `FOR NO KEY UPDATE SKIP LOCKED`, transitions `'reserved' -> 'released'`, restores `gateway_reservations.allocated`, and always advances the persistent cursor past inspected pages even on zero-orphan pages) | None | None |
 | `openmettle.quota_lock_gateway_request_for_settlement(uuid)` | None | None | `EXECUTE` (**unconditionally** called strictly BEFORE `INSERT`/`UPDATE` on `openmettle.gateway_settlements` by **every** `openmettle_gateway` write transaction — **both** settlement-only transactions **and** combined single-transaction writes (`gateway_settlements` upsert + `quota_settle_gateway_usage`); acquires `SELECT 1 FROM openmettle.gateway_requests WHERE id = $1::uuid FOR NO KEY UPDATE` so `gateway_mark_settled_final` never upgrades locks and every settlement writer follows the strictly acyclic global DAG `runs -> gateway_reservations -> gateway_requests -> gateway_settlements -> quota_accepted_gateway_reports -> quota_reservations -> quota_budgets` with zero cycles across settlement-only writers, combined writers, and worker recovery) | None |
-| `openmettle.quota_settle_gateway_usage(...)` | None | None | `EXECUTE` (`usage_tokens`/`usage_cost_micros` only; operates strictly on `state IN ('handoff_committed', 'settled')` holds and **never locks `runs` or `gateway_reservations`**; requires `openmettle_gateway` to have already advanced `openmettle.gateway_settlements` (with `measured` widened to `numeric(38, 0)` in PR2's migration, preceded by `quota_lock_gateway_request_for_settlement` and triggering `quota_record_accepted_gateway_settlement` into `quota_accepted_gateway_reports`) in the same tx or a prior commit; locks `gateway_requests FOR KEY SHARE` -> `quota_reservations (ORDER BY resource ASC FOR UPDATE)` -> `quota_budgets FOR NO KEY UPDATE`, verifying `(p_report_source, p_report_id, p_source_revision)` matches `openmettle.gateway_usage_reports` (`revision >= 0`, immutable `cost_denomination` vs `unit`) and `EXISTS (SELECT 1 FROM openmettle.quota_accepted_gateway_reports a WHERE a.request_id = qr.gateway_request_id AND a.revision = p_source_revision)`; returns idempotent no-op when `qr.accepted_source_revision IS NOT NULL AND p_source_revision <= qr.accepted_source_revision`; otherwise **folds ALL unapplied accepted revisions `a.revision` in `(coalesce(qr.accepted_source_revision, -1), p_source_revision]` sequentially in `ORDER BY a.revision ASC`** so out-of-order invocations such as `rev 2` before `rev 1` converge to the exact same state as ascending order; at each folded step `r_step`, enforces strict per-resource authoritative evidence rules: for `usage_cost_micros`, applies `C_cost = ceil(r_step.cost)::numeric(38, 0)` when `r_step.cost IS NOT NULL` (closing `'settled'` iff `r_step.final = true`) and leaves balance/state unchanged when `r_step.cost IS NULL`; for `usage_tokens`, computes cumulative `P_known`, `K_raw`/`rev_K`, and `(R_latest, inc_latest, rev_R)` across accepted revisions `<= r_step.revision`, setting `K_known = K_raw, X_known = R_latest` when `inc_latest IS FALSE` and **`K_known = CASE WHEN rev_R >= rev_K THEN greatest(K_raw, R_latest) ELSE K_raw END, X_known = 0`** when `inc_latest IS TRUE` (protecting included reasoning tokens as a lower bound on completion without double-counting): (1) zero token components on `r_step` -> leave balance/state unchanged; (2) complete authoritative token evidence `is_complete_tokens = true` (`P_known` and `K_raw` both explicitly reported across `<= r_step.revision`) -> apply exact `C_tokens = P_known + K_known + X_known`, closing `state = 'settled'` (`held_units = 0`) iff `r_step.final = true`; (3) partial/incomplete token evidence with `>= 1` non-null token component on `r_step` (even when `r_step.final = true`) -> apply monotonic lower bound `C_effective = greatest(settled_units, P_known + K_known + X_known)`, immediately charging confirmed overage while keeping `state = 'handoff_committed'` until complete final evidence arrives (or advancing `settled_units` monotonically if already `'settled'`); **unconditionally advances `qr.accepted_source_revision = p_source_revision` on every processed accepted revision (including `0`-delta / no-op / other-resource revisions)**, writing composite-FK `quota_reconciliations` (referencing BOTH `gateway_usage_reports` and `quota_accepted_gateway_reports`), adjusting `quota_budgets`, and recording `quota_warning_events` iff `(new_state, new_settled, new_held) IS DISTINCT FROM (old_state, old_settled, old_held)`) | None |
+| `openmettle.quota_settle_gateway_usage(...)` | None | None | `EXECUTE` (`usage_tokens`/`usage_cost_micros` only; operates strictly on `state IN ('handoff_committed', 'settled')` holds and **never locks `runs` or `gateway_reservations`**; requires `openmettle_gateway` to have already advanced `openmettle.gateway_settlements` (with `measured` widened to `numeric(38, 0)` in PR2's migration, preceded by `quota_lock_gateway_request_for_settlement` and triggering `quota_record_accepted_gateway_settlement` into `quota_accepted_gateway_reports`) in the same tx or a prior commit; locks `gateway_requests FOR KEY SHARE` -> `quota_reservations (ORDER BY resource ASC FOR UPDATE)` -> `quota_budgets FOR NO KEY UPDATE`, verifying `(p_report_source, p_report_id, p_source_revision)` matches `openmettle.gateway_usage_reports` (`revision >= 0`, immutable `cost_denomination` vs `unit`) and `EXISTS (SELECT 1 FROM openmettle.quota_accepted_gateway_reports a WHERE a.request_id = qr.gateway_request_id AND a.revision = p_source_revision)`; returns idempotent no-op when `qr.accepted_source_revision IS NOT NULL AND p_source_revision <= qr.accepted_source_revision`; otherwise **folds ALL unapplied accepted revisions `a.revision` in `(coalesce(qr.accepted_source_revision, -1), p_source_revision]` sequentially in `ORDER BY a.revision ASC`** so out-of-order invocations such as `rev 2` before `rev 1` converge to the exact same state as ascending order; at each folded step `r_step`, enforces strict per-resource authoritative evidence rules: for `usage_cost_micros`, applies `C_cost = ceil(r_step.cost)::numeric(38, 0)` when `r_step.cost IS NOT NULL` (closing `'settled'` iff `r_step.final = true`) and leaves balance/state unchanged when `r_step.cost IS NULL`; for `usage_tokens`, computes cumulative `P_known`, `K_raw`/`rev_K`, and `(R_latest, inc_latest, rev_R)` across accepted revisions `<= r_step.revision`, setting `K_known = K_raw, X_known = R_latest` when `inc_latest IS FALSE` and **`K_known = CASE WHEN rev_R >= rev_K THEN greatest(K_raw, R_latest) ELSE K_raw END, X_known = 0`** when `inc_latest IS TRUE` (protecting included reasoning tokens as a lower bound on completion without double-counting): (1) zero token components on `r_step` -> leave balance/state unchanged; (2) complete authoritative token evidence **`is_complete_tokens(r_step) = true`** (**iff on `r_step` itself, `r_step.prompt_tokens IS NOT NULL AND r_step.completion_tokens IS NOT NULL` AND (`r_step.reasoning_tokens IS NOT NULL` whenever any earlier accepted revision `< r_step.revision` reported `reasoning_tokens IS NOT NULL AND reasoning_included = false`)** — `prompt_tokens` and `completion_tokens` MUST both be explicitly non-null **on `r_step` itself**, never pieced together from separate partial + incomplete-final revisions; e.g., on a `200`-token hold, `rev 0: prompt_tokens = 60, completion_tokens = NULL, final = false` followed by `rev 1: prompt_tokens = NULL, completion_tokens = 25, final = true` has `is_complete_tokens(rev 1) = false` and produces **`85 settled, 115 held, state = 'handoff_committed'`**) -> apply exact `C_tokens = P_known + K_known + X_known`, closing `state = 'settled'` (`held_units = 0`) iff `r_step.final = true`; (3) partial/incomplete token evidence with `>= 1` non-null token component on `r_step` (even when `r_step.final = true`) -> apply monotonic lower bound `C_effective = greatest(settled_units, P_known + K_known + X_known)`, immediately charging confirmed overage while keeping `state = 'handoff_committed'` until complete final evidence arrives (or advancing `settled_units` monotonically if already `'settled'`); **unconditionally advances `qr.accepted_source_revision = p_source_revision` on every processed accepted revision (including `0`-delta / no-op / other-resource revisions)**, writing composite-FK `quota_reconciliations` (referencing BOTH `gateway_usage_reports` and `quota_accepted_gateway_reports`), adjusting `quota_budgets`, and recording `quota_warning_events` iff `(new_state, new_settled, new_held) IS DISTINCT FROM (old_state, old_settled, old_held)`) | None |
 | `openmettle.quota_release_device_slot(...)` | None | `EXECUTE` (`device_reservations` `handoff_committed` only; verifies durable V1-18 release/non-allocation record; sets `closed_at`) | None | None |
 | `openmettle.quota_record_storage_warning(...)` | `EXECUTE` (evaluates storage threshold crossing from locked `storage_accounts`/`storage_instance` and records deduplicated `quota_warning_events`) | `EXECUTE` (same) | None | None |
-| `openmettle.quota_verify_accounting_drift()` (`STABLE`) | None | `EXECUTE` (read-only aggregate, pending-catch-up lag, and hard-mismatch summaries across `storage_*`, `quota_*`, `quota_accepted_gateway_reports`, and Migration `0023`'s `gateway_reservations`/`gateway_requests`/`gateway_usage_reports`/`gateway_settlements` — (1) verifying each `quota_reservations` row (`settled_units`, `held_units`, `state`) strictly against its **applied `qr.accepted_source_revision`** by replaying the **exact same ascending fold across `a.revision <= qr.accepted_source_revision` (`ORDER BY a.revision ASC`)** from `(state = 'handoff_committed', held = qr.reserved_units, settled = 0)` (including `K_known`/`X_known` included reasoning lower bound, requiring `qr.state = 'settled'` iff **at least one** `final = true` accepted revision `<= qr.accepted_source_revision` established complete authoritative evidence for that resource so subsequent no-op/other-resource revisions advancing `accepted_source_revision` verify with zero false drift, and producing zero hard drift during healthy split-commit catch-up); (2) reporting unapplied accepted revisions via `EXISTS (SELECT 1 FROM openmettle.quota_accepted_gateway_reports a WHERE a.request_id = qr.gateway_request_id AND a.revision > coalesce(qr.accepted_source_revision, -1))` in a distinct **`pending_gateway_reconciliations`** operational lag summary with age (cleared immediately whenever `accepted_source_revision` advances, even on `0`-delta no-op post-final corrections); (3) validating widened `gateway_settlements.measured` (`numeric(38, 0)`) strictly against its **own `gs.revision`** row `r_curr` in `gateway_usage_reports` joined strictly on **`(gs.request_id = r_curr.request_id AND gs.revision = r_curr.revision AND gs.final = r_curr.final)`** reading `r_curr.source` and `r_curr.report_id` from `r_curr` (`gs.measured IS NULL` valid when `r_curr` has no measured token total, e.g., cost-only `rev 2` after token-only `rev 1`) without `bigint` overflow; and (4) once `storage_instance.volume_id IS NOT NULL`, failing hard on any `'active'`/`'retained'` revision whose `storage_reservations.payload_ino IS NULL` — without granting raw table `SELECT` on `gateway_usage_reports` or `quota_accepted_gateway_reports`; also callable by `openmettle_owner` during restore validation) | None | None |
-| `storage_reservations.lease_expires_at`, `storage_reservations.adoption_unverified`, `storage_reservations.stage_claimed`, `storage_reservations.payload_ino`, `storage_reservations.publish_pending`, `storage_reservations.reclaim_state`, `storage_reservations.reclaim_claim_token`, `storage_reservations.reclaim_lease_until` | `INSERT (lease_expires_at, stage_claimed)`, `UPDATE (lease_expires_at, adoption_unverified, stage_claimed, payload_ino, publish_pending, reclaim_state, reclaim_claim_token, reclaim_lease_until)` (with migration 4 grants; `reserved -> released` guarded by **`SECURITY INVOKER` `enforce_runtime_storage_volume_pinned()`** (`OMQ03`, executing serialized `PERFORM 1 FROM openmettle.storage_instance WHERE id FOR SHARE;` and rejecting `volume_id IS NULL OR adoption_run_id IS NOT NULL` for non-`openmettle_owner` across both `INHERIT` and `NOINHERIT`/`SET ROLE` logins); monotonic guards enforced in PostgreSQL by **`SECURITY INVOKER` `enforce_storage_reservation_monotonic_guards()`** (`OMQ03`: owner-only `adoption_unverified` clearance, write-once never-cleared `payload_ino`, and monotonic `stage_claimed`); `storage_reservations_tool_spill_binding_guard` (`23514`) forbids `tool-spill:%` without `run_id` and `operation_id`; `payload_dev` is NOT stored (cross-node NFS `st_dev` varies per mount); `payload_ino numeric(20, 0)` (`CHECK (payload_ino IS NULL OR payload_ino >= 0)`), `stage_claimed` (`CHECK (payload_ino IS NULL OR stage_claimed)`), `publish_pending` (`CHECK (NOT publish_pending OR (state = 'reserved' AND payload_ino IS NOT NULL))`), and 3-state cleaner lease (`reclaim_state IN ('none', 'claiming', 'truncated')`, `reclaim_claim_token`, `reclaim_lease_until`); under the unified rollout rule, HTTP `Store::stage`/`Store::publish` succeed when `adoption_run_id IS NULL` both pinned (`volume_id IS NOT NULL`) and during rolling upgrade (`volume_id IS NULL`, skipping sentinels while setting `stage_claimed = true` -> creating `staging/<id>` + `fsync(&staging_dir_fd)` -> binding `payload_ino = staged_ino`); `StagedFile::drop` is **100% non-destructive** (NEVER `set_len(0)` or `unlinkat`); `Store::publish` commits `publish_pending = true` before `rustix::fs::renameat_with(..., RenameFlags::NOREPLACE)` (quarantining `Errno::EXIST` without overwriting `revisions/<id>`) and `storage::settle` commits `state = 'settled', publish_pending = false` while **retaining `payload_ino`**; `Store::read` verifies `file_meta.ino() == payload_ino` whenever non-null (allowing `payload_ino IS NULL` legacy rows ONLY while `volume_id IS NULL AND adoption_run_id IS NULL`); `artifact_fs::abort` requires `volume_id IS NOT NULL AND adoption_run_id IS NULL` and executes the unified 3-step reclamation protocol with ZERO filesystem I/O inside DB Steps 1 and 3) | `INSERT (lease_expires_at, stage_claimed)`, `UPDATE (lease_expires_at, adoption_unverified, stage_claimed, payload_ino, publish_pending, reclaim_state, reclaim_claim_token, reclaim_lease_until)` (with migration 4 grants; guarded by BOTH **`SECURITY INVOKER` `enforce_runtime_storage_volume_pinned()`** (`OMQ03`, serialized `FOR SHARE` on `storage_instance` rejecting `volume_id IS NULL OR adoption_run_id IS NOT NULL`) AND **`SECURITY INVOKER` `enforce_storage_reservation_monotonic_guards()`** (`OMQ03`, enforcing owner-only `adoption_unverified` clearance, write-once `payload_ino`, and monotonic `stage_claimed`); `storage_reservations_tool_spill_binding_guard` (`23514`) forbids `tool-spill:%` without `run_id` and `operation_id`; under the unified rollout rule, ADR 0039 worker `publish_bytes` spills and ALL 4 cleaners (`artifact_fs::abort`, `reconcile_expired`, generic run-linked cleaner, ADR 0039 `reconcile_run_spills`) strictly require `volume_id IS NOT NULL AND adoption_run_id IS NULL`; all 4 cleaners execute the unified 3-step reclamation protocol — Step 1 serialized DB claim (`reclaim_state = 'claiming'`, zero FS I/O) -> Step 2 outside-DB probe/quarantine or `LOCK_EX` durable `set_len(0) + sync_all()` -> short DB commit `reclaim_state = 'truncated', publish_pending = false` (retaining `payload_ino`!) -> `unlinkat` + `drop` + dual `fsync` -> Step 3 final `storage::release` with **ZERO filesystem I/O inside DB tx** (retaining `payload_ino` on `'released'`); `StagingSweepState` `'released'`/`'settled'` rules strictly verify `payload_ino`; generic run-linked cleaner owns exact complement `run_id IS NOT NULL AND (operation_id IS NULL OR idempotency_key NOT LIKE 'tool-spill:%')` while ADR 0039 `reconcile_run_spills` owns `operation_id IS NOT NULL AND idempotency_key LIKE 'tool-spill:%'` with zero gap; **`adoption_unverified = true` is cleared solely by `openmettle_owner` reconciliation or verified `openmettle-admin` adoption**) | None | None |
-| `storage_instance`, `storage_accounts`, `artifacts`, `artifact_revisions` | Existing migration 4 grants (`volume_id`, `bootstrap_auto_pin_allowed`, `adoption_run_id`, `warn_pct_*`, `config_revision` `SELECT` only; `artifact_revisions` transitions to `'purging'`/`'purged'` guarded by **`SECURITY INVOKER` `enforce_runtime_storage_volume_pinned()`** (`OMQ03`, serialized `FOR SHARE` on `storage_instance` covering `INHERIT` and `NOINHERIT`/`SET ROLE` logins) whenever `volume_id IS NULL OR adoption_run_id IS NOT NULL`) | Existing migration 4 grants (`volume_id`, `bootstrap_auto_pin_allowed`, `adoption_run_id`, `warn_pct_*`, `config_revision` `SELECT` only; `artifact_revisions` transitions to `'purging'`/`'purged'` guarded by **`SECURITY INVOKER` `enforce_runtime_storage_volume_pinned()`** (`OMQ03`, serialized `FOR SHARE` on `storage_instance` covering `INHERIT` and `NOINHERIT`/`SET ROLE` logins) whenever `volume_id IS NULL OR adoption_run_id IS NOT NULL`) | None | None |
+| `openmettle.quota_verify_accounting_drift()` (`STABLE`) | None | `EXECUTE` (read-only aggregate, pending-catch-up lag, and hard-mismatch summaries across `storage_*`, `quota_*`, `quota_accepted_gateway_reports`, and Migration `0023`'s `gateway_reservations`/`gateway_requests`/`gateway_usage_reports`/`gateway_settlements` — (1) verifying each `quota_reservations` row (`settled_units`, `held_units`, `state`) strictly against its **applied `qr.accepted_source_revision`** by replaying the **exact same ascending fold across `a.revision <= qr.accepted_source_revision` (`ORDER BY a.revision ASC`)** from `(state = 'handoff_committed', held = qr.reserved_units, settled = 0)` (including `K_known`/`X_known` included reasoning lower bound and requiring `is_complete_tokens(r_step)` to verify `r_step.prompt_tokens IS NOT NULL AND r_step.completion_tokens IS NOT NULL` on `r_step` itself plus `r_step.reasoning_tokens IS NOT NULL` whenever an earlier accepted revision had `reasoning_included = false`, requiring `qr.state = 'settled'` iff **at least one** `final = true` accepted revision `<= qr.accepted_source_revision` established complete authoritative evidence for that resource so subsequent no-op/other-resource revisions advancing `accepted_source_revision` verify with zero false drift, and producing zero hard drift during healthy split-commit catch-up); (2) reporting unapplied accepted revisions via `EXISTS (SELECT 1 FROM openmettle.quota_accepted_gateway_reports a WHERE a.request_id = qr.gateway_request_id AND a.revision > coalesce(qr.accepted_source_revision, -1))` in a distinct **`pending_gateway_reconciliations`** operational lag summary with age (cleared immediately whenever `accepted_source_revision` advances, even on `0`-delta no-op post-final corrections); (3) validating widened `gateway_settlements.measured` (`numeric(38, 0)`) strictly against its **own `gs.revision`** row `r_curr` in `gateway_usage_reports` joined strictly on **`(gs.request_id = r_curr.request_id AND gs.revision = r_curr.revision AND gs.final = r_curr.final)`** reading `r_curr.source` and `r_curr.report_id` from `r_curr` (`gs.measured IS NULL` valid when `r_curr` has no measured token total, e.g., cost-only `rev 2` after token-only `rev 1`) without `bigint` overflow; and (4) once `storage_volume_control.volume_id IS NOT NULL`, failing hard on any `'active'`/`'retained'` revision whose `storage_reservations.payload_ino IS NULL`, while recognizing `staging/.reclaim.<id>` (`st_size == 0`, `st_ino == payload_ino`) paired with `(state = 'reserved' AND reclaim_state = 'truncated')` or `(state = 'released' AND reclaim_state = 'anchor_pending_unlink')` as a valid reclamation anchor in the companion orphan scan — without granting raw table `SELECT` on `gateway_usage_reports` or `quota_accepted_gateway_reports`; also callable by `openmettle_owner` during restore validation) | None | None |
+| `storage_reservations.lease_expires_at`, `storage_reservations.adoption_unverified`, `storage_reservations.stage_claimed`, `storage_reservations.payload_ino`, `storage_reservations.publish_pending`, `storage_reservations.reclaim_state`, `storage_reservations.reclaim_claim_token`, `storage_reservations.reclaim_lease_until` | `INSERT (lease_expires_at, stage_claimed)`, `UPDATE (lease_expires_at, adoption_unverified, stage_claimed, payload_ino, publish_pending, reclaim_state, reclaim_claim_token, reclaim_lease_until)` (with migration 4 grants; `reserved -> released` guarded by **`SECURITY INVOKER` `enforce_runtime_storage_volume_pinned()`** (`OMQ03`, executing serialized `SELECT volume_id, adoption_run_id INTO v_vol, v_adopt FROM openmettle.storage_volume_control WHERE id FOR SHARE;` and failing closed on `NOT FOUND OR v_vol IS NULL OR v_adopt IS NOT NULL` for non-`openmettle_owner` across both `INHERIT` and `NOINHERIT`/`SET ROLE` logins, never taking `FOR SHARE` on `storage_instance`); tightened **`CHECK (NOT adoption_unverified OR state = 'reserved')`** combined with **`SECURITY INVOKER` `enforce_storage_reservation_monotonic_guards()`** (`OMQ03`: owner-only `adoption_unverified` clearance, write-once never-cleared `payload_ino`, and monotonic `stage_claimed`) prevents any non-owner role from ever transitioning an `adoption_unverified = true` `'reserved'` row to `'released'` or `'settled'` while `openmettle_owner` releases cleanly in one `UPDATE`; `storage_reservations_tool_spill_binding_guard` (`23514`) forbids `tool-spill:%` without `run_id` and `operation_id`; `payload_dev` is NOT stored (cross-node NFS `st_dev` varies per mount); `payload_ino numeric(20, 0)` (`CHECK (payload_ino IS NULL OR payload_ino >= 0)`), `stage_claimed` (`CHECK (payload_ino IS NULL OR stage_claimed)`), `publish_pending` (`CHECK (NOT publish_pending OR (state = 'reserved' AND payload_ino IS NOT NULL))`), and 4-state cleaner lease (`reclaim_state IN ('none', 'claiming', 'truncated', 'anchor_pending_unlink')`, `reclaim_claim_token`, `reclaim_lease_until`); under the unified rollout rule, HTTP `Store::stage`/`Store::publish` succeed when `storage_volume_control.adoption_run_id IS NULL` both pinned (`volume_id IS NOT NULL`) and during rolling upgrade (`volume_id IS NULL`, skipping sentinels while setting `stage_claimed = true` -> creating `staging/<id>` + `fsync(&staging_dir_fd)` -> binding `payload_ino = staged_ino`); `StagedFile::drop` is **100% non-destructive** (NEVER `set_len(0)` or `unlinkat`); `Store::publish` commits `publish_pending = true` before **`rustix::fs::linkat(&staging_dir_fd, id, &revisions_dir_fd, id, AtFlags::empty())`** (failing `Errno::EXIST` without overwriting `revisions/<id>` AND keeping `staging/<id>` present until `storage::settle` commits so `N-1` API retries hit `OpenOptions::create_new(true)` -> `Err(Error::InProgress)` without replacing `revisions/<id>`), `storage::settle` commits `state = 'settled', publish_pending = false` while **retaining `payload_ino`**, and post-commit best-effort detaches `staging/<id>` (`unlinkat`, never `set_len(0)`); `Store::read` verifies `file_meta.ino() == payload_ino` whenever non-null (allowing `payload_ino IS NULL` legacy rows ONLY while `storage_volume_control.volume_id IS NULL AND adoption_run_id IS NULL`); `artifact_fs::abort` requires `storage_volume_control.volume_id IS NOT NULL AND adoption_run_id IS NULL` and executes the unified 4-step reclamation protocol with `staging/.reclaim.<id>` anchor and ZERO filesystem I/O inside DB Steps 1 and 3) | `INSERT (lease_expires_at, stage_claimed)`, `UPDATE (lease_expires_at, adoption_unverified, stage_claimed, payload_ino, publish_pending, reclaim_state, reclaim_claim_token, reclaim_lease_until)` (with migration 4 grants; guarded by BOTH **`SECURITY INVOKER` `enforce_runtime_storage_volume_pinned()`** (`OMQ03`, serialized `FOR SHARE` on `storage_volume_control` rejecting `NOT FOUND OR v_vol IS NULL OR v_adopt IS NOT NULL`) AND **`SECURITY INVOKER` `enforce_storage_reservation_monotonic_guards()`** (`OMQ03`, plus `CHECK (NOT adoption_unverified OR state = 'reserved')` blocking non-owner `reserved -> released` on quarantined rows, write-once `payload_ino`, and monotonic `stage_claimed`); `storage_reservations_tool_spill_binding_guard` (`23514`) forbids `tool-spill:%` without `run_id` and `operation_id`; under the unified rollout rule, ADR 0039 worker `publish_bytes` spills (using the same `linkat` + post-commit detach protocol) and ALL 4 cleaners (`artifact_fs::abort`, `reconcile_expired`, generic run-linked cleaner, ADR 0039 `reconcile_run_spills`) strictly require `storage_volume_control.volume_id IS NOT NULL AND adoption_run_id IS NULL`; all 4 cleaners execute the unified 4-step reclamation protocol — Step 1 serialized DB claim (`reclaim_state = 'claiming'`, zero FS I/O) -> Step 2 outside-DB probe/quarantine or `LOCK_EX` durable `set_len(0) + sync_all()` -> `linkat` hard-link anchor `staging/.reclaim.<id>` + `fsync(&staging_dir_fd)` -> `unlinkat` `<id>` from `revisions/`/`staging/` + dual `fsync` -> short DB commit `reclaim_state = 'truncated', publish_pending = false` (retaining `payload_ino`! `'truncated'` crash recovery probes ONLY `staging/.reclaim.<id>` and never touches `staging/<id>`/`revisions/<id>`) -> Step 3 final `storage::release` with **ZERO filesystem I/O inside DB tx** (`reclaim_state = 'anchor_pending_unlink'` when `payload_ino IS NOT NULL`, retaining `payload_ino`) -> Step 4 post-release `unlinkat` of `staging/.reclaim.<id>` + `fsync(&staging_dir_fd)` + best-effort `reclaim_state = 'none'`; `StagingSweepState` NEVER calls `set_len(0)` on `'settled'`, `'released'`, or `staging/.reclaim.<id>`, preserves foreign-inode `staging/<id>` untouched, never touches `staging/<id>` on `'released'` when `payload_ino IS NOT NULL`, and cleans `staging/.reclaim.<id>` only when `state = 'released' AND reclaim_state = 'anchor_pending_unlink'`; `artifact_fs::purge_due` verifies leaf `payload_ino` on `revisions/<id>` (stopping with zero `set_len(0)`/`unlinkat` and without calling `confirm_purge` on mismatch), detaches any `staging/<id>` hard-link alias with `st_ino == payload_ino`, and calls BOTH `fsync(&revisions_dir_fd)` and `fsync(&staging_dir_fd)` strictly before `confirm_purge`; generic run-linked cleaner owns exact complement `run_id IS NOT NULL AND (operation_id IS NULL OR idempotency_key NOT LIKE 'tool-spill:%')` while ADR 0039 `reconcile_run_spills` owns `operation_id IS NOT NULL AND idempotency_key LIKE 'tool-spill:%'` with zero gap; **`adoption_unverified = true` is cleared solely by `openmettle_owner` reconciliation or verified `openmettle-admin` adoption**) | None | None |
+| `storage_volume_control` | `SELECT`, `UPDATE (volume_id, bootstrap_auto_pin_allowed)` (dedicated 1-row read-mostly volume-identity singleton separating `(volume_id, bootstrap_auto_pin_allowed, adoption_run_id)` from frequently-updated `storage_instance`; runtime `reserve`, `settle`, `release`, and `purge` **ONLY ever acquire `FOR SHARE` on `storage_volume_control`** and **NEVER `UPDATE` `storage_volume_control`**, eliminating `FOR SHARE -> FOR NO KEY UPDATE` deadlocks under concurrent releases/reserves; narrow column `UPDATE` is strictly for one-time empty-ledger `Store::open` bootstrap via `storage_pin_volume_id`, with `adoption_run_id` writable solely by `openmettle_owner`) | `SELECT` only (runtime cleaners/workers ONLY acquire `FOR SHARE` on `storage_volume_control` directly or via `enforce_runtime_storage_volume_pinned()`, never `UPDATE`) | None | None |
+| `storage_instance`, `storage_accounts`, `artifacts`, `artifact_revisions` | Existing migration 4 grants (`storage_instance` retains only `warn_pct_*`, `config_revision`, and capacity limits — `SELECT` only on `warn_pct_*`/`config_revision`, updated strictly after `storage_accounts` with zero prior `FOR SHARE`; `artifact_revisions` transitions to `'purging'`/`'purged'` guarded by **`SECURITY INVOKER` `enforce_runtime_storage_volume_pinned()`** (`OMQ03`, serialized `FOR SHARE` on `storage_volume_control` failing closed on `NOT FOUND OR v_vol IS NULL OR v_adopt IS NOT NULL` across `INHERIT` and `NOINHERIT`/`SET ROLE` logins)) | Existing migration 4 grants (`storage_instance` retains only `warn_pct_*`, `config_revision`, and capacity limits — `SELECT` only on `warn_pct_*`/`config_revision`, updated strictly after `storage_accounts` with zero prior `FOR SHARE`; `artifact_revisions` transitions to `'purging'`/`'purged'` guarded by **`SECURITY INVOKER` `enforce_runtime_storage_volume_pinned()`** (`OMQ03`, serialized `FOR SHARE` on `storage_volume_control` failing closed on `NOT FOUND OR v_vol IS NULL OR v_adopt IS NOT NULL` across `INHERIT` and `NOINHERIT`/`SET ROLE` logins)) | None | None |
 
 Only `openmettle_owner` writes `quota_defaults` (updating the migration-seeded `('instance',
 'usage_cost_micros')` row strictly via direct `UPDATE` — never `INSERT ... ON CONFLICT` — subject
@@ -3033,25 +3281,32 @@ to `quota_defaults_cost_denomination_immutable` (`OMQ02`) serialized with `quota
 and acquiring `SELECT FROM openmettle.run_dispatch_lock FOR NO KEY UPDATE` before modifying
 `executing_runs_*` defaults), `quota_enforcement` (flipping `metering_enforced` write-once `false
 -> true` via `openmettle-admin` in a standalone single-statement transaction holding zero other
-locks, subject to `quota_enforcement_write_once` (`OMQ04`)), and `storage_instance` limits,
-warning thresholds, `bootstrap_auto_pin_allowed`, `adoption_run_id` (nullable `uuid` set to a
-unique per-invocation `my_adoption_run_id = uuid_v4()` in Step 1b under `SELECT volume_id,
-adoption_run_id FROM openmettle.storage_instance WHERE id FOR UPDATE` — strictly serialized
-against `enforce_runtime_storage_volume_pinned()`'s `FOR SHARE`, refusing concurrent adopters
-with `OMQ03` unless `--replace-adoption-run <stale_uuid>` matches `adoption_run_id`, cleared on
-Step 2 failure only `WHERE id AND adoption_run_id = $my_adoption_run_id`, and atomically cleared
-to `NULL` in Step 3's commit requiring `adoption_run_id = $my_adoption_run_id` that either
-completes adoption with `payload_ino` backfilled on all verified `'reserved'` and
-`'active'`/`'retained'` `'settled'` rows or commits `adoption_unverified = true` quarantine before
-`OMQ03`) and `config_revision` (with `storage_instance.volume_id` auto-pinned write-once from
-`NULL` via `storage_pin_volume_id` strictly when `bootstrap_auto_pin_allowed = true` on a fresh
-`applied == 0` bootstrap with an empty storage ledger under `storage_instance FOR UPDATE`, or
-pinned via `openmettle_owner` idempotent verified volume adoption on every storage-enabled upgrade
-**only after mandatory pre-migration `N-1` cleaner quiescence and 100% `N-1 -> N` replacement
-confirm zero `N-1` worker processes remain running**, while storage-disabled installations with
-both `ARTIFACTS_DIR` env vars unset and empty storage tables leave `volume_id IS NULL` and
-`bootstrap_auto_pin_allowed = false`). `openmettle_issuance` receives zero quota or storage
-privileges. No runtime role receives `DELETE`, `TRUNCATE`, DDL or grant options.
+locks, subject to `quota_enforcement_write_once` (`OMQ04`)), `storage_instance` limits, warning
+thresholds, and `config_revision`, and `storage_volume_control`'s `bootstrap_auto_pin_allowed` and
+`adoption_run_id` (nullable `uuid` set to a unique per-invocation `my_adoption_run_id = uuid_v4()`
+in Step 1b under `SELECT volume_id, adoption_run_id INTO STRICT ... FROM
+openmettle.storage_volume_control WHERE id FOR UPDATE` — strictly serialized against
+`enforce_runtime_storage_volume_pinned()`'s `FOR SHARE` on `storage_volume_control`, refusing
+concurrent adopters with `OMQ03` unless `--replace-adoption-run <stale_uuid>` matches
+`adoption_run_id`, cleared on Step 2 failure only `WHERE id AND adoption_run_id =
+$my_adoption_run_id`, and atomically cleared to `NULL` in Step 3's commit requiring
+`adoption_run_id = $my_adoption_run_id` that evaluates all `'active'`/`'retained'`/`'purging'`
+revisions and volume checks **BEFORE** writing any `payload_ino`, committing `payload_ino`
+backfills (`WHERE payload_ino IS NULL`) **ONLY in the success branch** while positively verifying
+and preserving `reclaim_state = 'truncated'` holds with matching `staging/.reclaim.<id>` —
+expiring their `reclaim_lease_until = clock_timestamp()` — and on failed adoption **omitting /
+rolling back ALL `payload_ino` backfills** while committing only `adoption_unverified = true`
+quarantine on missing `'reserved'` rows when `volume_id IS NOT NULL` and clearing
+`adoption_run_id = NULL` before returning `OMQ03`). `storage_volume_control.volume_id` is
+auto-pinned write-once from `NULL` via `storage_pin_volume_id` strictly when
+`bootstrap_auto_pin_allowed = true` on a fresh `applied == 0` bootstrap with an empty storage
+ledger under `storage_volume_control FOR UPDATE`, or pinned via `openmettle_owner` idempotent
+verified volume adoption on every storage-enabled upgrade **only after mandatory pre-migration
+`N-1` cleaner quiescence and 100% `N-1 -> N` replacement confirm zero `N-1` worker processes
+remain running**, while storage-disabled installations with both `ARTIFACTS_DIR` env vars unset
+and empty storage tables leave `volume_id IS NULL` and `bootstrap_auto_pin_allowed = false`.
+`openmettle_issuance` receives zero quota or storage privileges. No runtime role receives `DELETE`,
+`TRUNCATE`, DDL or grant options.
 
 **Rolling-upgrade safety (ADR 0003).** Mixed-version deployments running `N-1` API/worker binaries
 against the V1-17 PR2 schema are protected across four fail-closed database and rollout gates:
@@ -3119,16 +3374,20 @@ against the V1-17 PR2 schema are protected across four fail-closed database and 
    writer, operators MUST drain all un-prelocked writers before running
    `quota_lock_gateway_request_for_settlement` / combined writers so `gateway_requests ->
    gateway_settlements` and `gateway_settlements -> gateway_requests` lock orders never overlap.
-3. **Mandatory pre-migration `N-1` cleaner quiescence, deployment-history auto-pin gating,
-   serialized adoption ownership (`adoption_run_id`), write-once inode identity (`payload_ino`),
-   DB-enforced monotonic guards (`enforce_storage_reservation_monotonic_guards()`), unified 3-step
-   cleaner lease (`reclaim_state`, `reclaim_claim_token`, `reclaim_lease_until`), and verified
-   three-directory adoption (`OMQ03`).** On **every** upgrade (`applied >= 1`, including
+3. **Mandatory pre-migration `N-1` cleaner quiescence, dedicated read-mostly
+   `storage_volume_control`, deployment-history auto-pin gating, serialized adoption ownership
+   (`adoption_run_id`), write-once inode identity (`payload_ino`), DB-enforced monotonic &
+   quarantined-release guards (`enforce_storage_reservation_monotonic_guards()` + `CHECK (NOT
+   adoption_unverified OR state = 'reserved')`), `linkat` no-replace publication, unified 4-step
+   cleaner lease (`reclaim_state`, `reclaim_claim_token`, `reclaim_lease_until`,
+   `staging/.reclaim.<id>`), non-truncating `StagingSweepState`, leaf-verified `purge_due`, and
+   verified three-directory adoption (`OMQ03`).** On **every** upgrade (`applied >= 1`, including
    completely unused installations with empty `storage_*` tables),
-   `storage_instance.bootstrap_auto_pin_allowed` seeds `false`, `storage_instance.adoption_run_id`
-   defaults `NULL`, and `storage_instance.volume_id` **MUST remain `NULL`** across the entire
-   `N-1 -> N` binary replacement so no `N` replica can auto-pin the volume while `N-1` workers
-   remain alive. Operators follow the mandatory four-step upgrade sequence:
+   `storage_volume_control.bootstrap_auto_pin_allowed` seeds `false`,
+   `storage_volume_control.adoption_run_id` defaults `NULL`, and `storage_volume_control.volume_id`
+   **MUST remain `NULL`** across the entire `N-1 -> N` binary replacement so no `N` replica can
+   auto-pin the volume while `N-1` workers remain alive. Operators follow the mandatory four-step
+   upgrade sequence:
    - **Step 1 (Mandatory — before migration):** Quiesce all `N-1` legacy artifact cleaners by
      unsetting `OPENMETTLE_WORKER_ARTIFACTS_DIR` across all `N-1` worker replicas (rolling restart
      with `OPENMETTLE_WORKER_ARTIFACTS_DIR` unset, or scaling `openmettle-worker` to `0`) and
@@ -3137,9 +3396,10 @@ against the V1-17 PR2 schema are protected across four fail-closed database and 
      paths before calling `storage::release` and an already-`'purging'` revision passes
      `begin_purge` without an `UPDATE` so `N-1` `purge_due` unlinks the file before `confirm_purge`
      fires `OMQ03`, **`SECURITY INVOKER` `enforce_runtime_storage_volume_pinned()` (`OMQ03`,
-     acquiring `PERFORM 1 FROM openmettle.storage_instance WHERE id FOR SHARE;` and checking
-     `volume_id IS NULL OR adoption_run_id IS NOT NULL` whenever `NOT
-     pg_catalog.pg_has_role(current_user, 'openmettle_owner', 'USAGE')`) covers EVERY
+     acquiring `SELECT volume_id, adoption_run_id INTO v_vol, v_adopt FROM
+     openmettle.storage_volume_control WHERE id FOR SHARE;` and failing closed on `NOT FOUND OR
+     v_vol IS NULL OR v_adopt IS NOT NULL` whenever `NOT pg_catalog.pg_has_role(current_user,
+     'openmettle_owner', 'USAGE')`, never locking `storage_instance FOR SHARE`) covers EVERY
      non-`openmettle_owner` role across both `INHERIT` and `NOINHERIT` / `SET ROLE` logins
      (`openmettle_worker` AND `openmettle_api`)**: it blocks `N-1` `openmettle_api`'s
      unconditional `abort()` (`src/artifact_fs.rs:584-591`, leaving the `'reserved'` row intact
@@ -3147,89 +3407,121 @@ against the V1-17 PR2 schema are protected across four fail-closed database and 
      uploads continue succeeding!) and acts as a **PostgreSQL ledger defense-in-depth backstop**
      for `openmettle_worker` — **NOT** a substitute for pre-migration `N-1` worker cleaner
      quiescence.
-   - **Step 2:** Run `openmettle-migrate` (`volume_id IS NULL`, `bootstrap_auto_pin_allowed =
-     false`, `adoption_run_id IS NULL`, `metering_enforced = false`).
+   - **Step 2:** Run `openmettle-migrate` (`storage_volume_control.volume_id IS NULL`,
+     `bootstrap_auto_pin_allowed = false`, `adoption_run_id IS NULL`, `metering_enforced = false`).
    - **Step 3:** Roll 100% of `openmettle-api` and `openmettle-worker` replicas from `N-1` to `N`
      and confirm zero `N-1` replicas remain. Under the **unified rollout rule** (synchronized
      verbatim with ADR 0039), HTTP `Store::stage` and `Store::publish` (`openmettle_api`) succeed
-     when `adoption_run_id IS NULL` both when `volume_id IS NOT NULL` (verifying role-tagged
-     sentinels) and during mixed-version rolling upgrade while `volume_id IS NULL` (skipping
-     sentinel reads while still setting `stage_claimed = true` and binding `payload_ino =
-     staged_ino`), whereas ADR 0039 worker `publish_bytes` spills and all 4 cleaners strictly
-     require `volume_id IS NOT NULL AND adoption_run_id IS NULL` (so `N` workers may already have
-     `OPENMETTLE_WORKER_ARTIFACTS_DIR` configured during rollout while failing closed until Step 4
-     pins `volume_id`). All `N` `artifact_fs::Store` writers and readers execute strictly relative
-     to verified `Arc`-shared `root_fd`, `staging_dir_fd`, and `revisions_dir_fd` (verifying local
-     same-mount `st_dev` equality without persisting `payload_dev`): `Store::stage` executes Step
-     1a (commit `stage_claimed = true` under `(runs FOR NO KEY UPDATE ->) storage_reservations FOR
-     UPDATE` + `storage_instance FOR SHARE` BEFORE touching disk), Step 1b (`openat` `OFlags::RDWR
-     | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW` + `LOCK_SH` + verify `S_ISREG` & local
-     `st_dev` + **`fsync(&staging_dir_fd)`** BEFORE binding `payload_ino`), and Step 1c (commit
-     `payload_ino = staged_ino` under `FOR UPDATE` + `storage_instance FOR SHARE`).
-     **`StagedFile::drop` and all writer error/cancellation paths are 100% non-destructive** — they
-     NEVER call `set_len(0)` and NEVER call `unlinkat`, only closing the FD (releasing `LOCK_SH`)
-     so lost Step 1c acks reclaim cleanly with zero false quarantine and lost `storage::settle`
-     acks never zero published `revisions/<id>`. `Store::publish` commits `publish_pending = true`
-     under `FOR UPDATE`, publishes exclusively via **`rustix::fs::renameat_with(&staging_dir_fd,
-     id, &revisions_dir_fd, id, RenameFlags::NOREPLACE)`** (quarantining `Errno::EXIST` to
-     `adoption_unverified = true, publish_pending = false` without overwriting foreign
-     `revisions/<id>`), and `storage::settle` commits `state = 'settled', publish_pending = false`
-     while **retaining `payload_ino`**. **`Store::read`** verifies `NOT sr.adoption_unverified`,
-     re-verifies `<root>`/`"revisions"` FDs + sentinels (when pinned), checks `S_ISREG`, local
-     `st_dev`, `st_size == expected_size`, and `file_meta.ino() == sr.payload_ino` whenever
-     non-null — permitting legacy `sr.payload_ino IS NULL` rows **ONLY** while `volume_id IS NULL
-     AND adoption_run_id IS NULL` (failing closed with `Error::Io` once `volume_id IS NOT NULL`).
-     Startup / adoption / shared-volume qualification probes and requires `O_CREAT | O_EXCL |
-     O_NOFOLLOW`, `RenameFlags::NOREPLACE` (rejecting `ENOSYS`/`EOPNOTSUPP`/`EINVAL` and verifying
-     `Errno::EXIST` without overwriting), file + directory `fsync`, AND for `ReadWriteMany` shared
-     volumes **both** two-client / separate-mount `flock(2)` (`LOCK_SH` vs `LOCK_EX | LOCK_NB`
-     `WouldBlock`) coherence **and** stable 64-bit `st_ino` coherence + second-client recovery
-     across clients and remounts!
+     when `storage_volume_control.adoption_run_id IS NULL` both when `volume_id IS NOT NULL`
+     (verifying role-tagged sentinels) and during mixed-version rolling upgrade while `volume_id
+     IS NULL` (skipping sentinel reads while still setting `stage_claimed = true` and binding
+     `payload_ino = staged_ino`), whereas ADR 0039 worker `publish_bytes` spills and all 4 cleaners
+     strictly require `storage_volume_control.volume_id IS NOT NULL AND adoption_run_id IS NULL`
+     (so `N` workers may already have `OPENMETTLE_WORKER_ARTIFACTS_DIR` configured during rollout
+     while failing closed until Step 4 pins `volume_id`). All `N` `artifact_fs::Store` writers and
+     readers execute strictly relative to verified `Arc`-shared `root_fd`, `staging_dir_fd`, and
+     `revisions_dir_fd` (verifying local same-mount `st_dev` equality without persisting
+     `payload_dev`): `Store::stage` executes Step 1a (commit `stage_claimed = true` under `(runs
+     FOR NO KEY UPDATE ->) storage_reservations FOR UPDATE` + `storage_volume_control FOR SHARE`
+     BEFORE touching disk), Step 1b (`openat` `OFlags::RDWR | OFlags::CREATE | OFlags::EXCL |
+     OFlags::NOFOLLOW` + `LOCK_SH` + verify `S_ISREG` & local `st_dev` +
+     **`fsync(&staging_dir_fd)`** BEFORE binding `payload_ino`), and Step 1c (commit `payload_ino =
+     staged_ino` under `FOR UPDATE` + `storage_volume_control FOR SHARE`). **`StagedFile::drop` and
+     all writer error/cancellation paths are 100% non-destructive** — they NEVER call `set_len(0)`
+     and NEVER call `unlinkat`, only closing the FD (releasing `LOCK_SH`) so lost Step 1c acks
+     reclaim cleanly with zero false quarantine and lost `storage::settle` acks never zero
+     published `revisions/<id>`. `Store::publish` commits `publish_pending = true` under `FOR
+     UPDATE`, publishes exclusively via **`rustix::fs::linkat(&staging_dir_fd, id,
+     &revisions_dir_fd, id, AtFlags::empty())`** + `fsync(&revisions_dir_fd)` + post-`linkat`
+     re-verify — which atomically fails `Errno::EXIST` without overwriting foreign `revisions/<id>`
+     (quarantining to `adoption_unverified = true, publish_pending = false`) **AND keeps
+     `staging/<id>` present on disk until `storage::settle` commits `state = 'settled'`** so even
+     if an `N` writer crashes post-`linkat` before `storage::settle` commits, any same-key retry
+     routed to an `N-1` API replica hits `store.stage(&id)` -> `OpenOptions::create_new(true)` ->
+     `AlreadyExists` -> **`Err(Error::InProgress)` (`src/artifact_fs.rs:474-475`)** without calling
+     `abort()`, without staging a replacement, and without calling replacing `fs::rename`! Then
+     `storage::settle` commits `state = 'settled', publish_pending = false` while **retaining
+     `payload_ino`**, followed by post-commit best-effort detach of the `staging/<id>` alias while
+     still holding `LOCK_SH` (`unlinkat(&staging_dir_fd, id, AtFlags::empty())`, **NEVER
+     `set_len(0)`** -> `drop` -> `fsync(&staging_dir_fd)`). **`Store::read`** verifies `NOT
+     sr.adoption_unverified`, re-verifies `<root>`/`"revisions"` FDs + sentinels (when pinned),
+     checks `S_ISREG`, local `st_dev`, `st_size == expected_size`, and `file_meta.ino() ==
+     sr.payload_ino` whenever non-null — permitting legacy `sr.payload_ino IS NULL` rows **ONLY**
+     while `storage_volume_control.volume_id IS NULL AND adoption_run_id IS NULL` (failing closed
+     with `Error::Io` once `volume_id IS NOT NULL`). Startup / adoption / shared-volume
+     qualification probes and requires `O_CREAT | O_EXCL | O_NOFOLLOW`, `rustix::fs::linkat(...,
+     AtFlags::empty())` (rejecting `ENOSYS`/`EOPNOTSUPP`/`EINVAL` and verifying `Errno::EXIST`
+     without overwriting and shared `st_ino` between both names), file + directory `fsync`, AND for
+     `ReadWriteMany` shared volumes **both** two-client / separate-mount `flock(2)` (`LOCK_SH` vs
+     `LOCK_EX | LOCK_NB` `WouldBlock`) coherence **and** stable 64-bit `st_ino` coherence +
+     second-client recovery across clients and remounts!
    - **Step 4:** **Only after zero `N-1` workers remain**:
      - On **storage-disabled installations** (both `OPENMETTLE_API_ARTIFACTS_DIR` /
        `OPENMETTLE_ARTIFACTS_DIR` and `OPENMETTLE_WORKER_ARTIFACTS_DIR` unset per ADR 0031 AND `0`
        rows in both `storage_reservations` and `artifact_revisions`), skip volume adoption —
-       leaving `storage_instance.volume_id IS NULL`, `bootstrap_auto_pin_allowed = false`,
+       leaving `storage_volume_control.volume_id IS NULL`, `bootstrap_auto_pin_allowed = false`,
        `adoption_run_id IS NULL`, and all storage cleaners disabled — and proceed directly to
        `quota_release_orphan_gateway_requests` and flipping `quota_enforcement.metering_enforced =
        true`. If artifact storage is provisioned later, run `openmettle-admin` verified volume
        adoption before enabling `OPENMETTLE_WORKER_ARTIFACTS_DIR`.
      - On **storage-enabled installations** (any `ARTIFACTS_DIR` configured or any row in
        `storage_reservations` / `artifact_revisions`), operators run `openmettle-admin` verified
-       volume adoption: mint `my_adoption_run_id = uuid_v4()`; **Step 1b** acquires `SELECT
-       volume_id, adoption_run_id FROM openmettle.storage_instance WHERE id FOR UPDATE` (strictly
-       serialized against `enforce_runtime_storage_volume_pinned()`'s `FOR SHARE`, refusing any
-       concurrent adopter with `OMQ03` unless `--replace-adoption-run <stale_uuid>` matches
-       `adoption_run_id`) and commits `SET adoption_run_id = $my_adoption_run_id`; **Step 2** scans
-       `<root>/revisions` and `<root>/staging` outside DB locks (clearing `adoption_run_id = NULL`
-       on Step 2 failure ONLY `WHERE id AND adoption_run_id = $my_adoption_run_id` under `FOR
-       UPDATE`, requiring both `--expected-fs-uuid <fs_uuid>` AND `--expected-revisions-inode
-       <dev>:<ino>` whenever a non-empty ledger has zero digest-bearing revisions verified on disk,
-       and linking cleanly without those flags on an empty ledger); **Step 3** locks
-       `storage_reservations (ORDER BY id ASC FOR UPDATE) -> artifact_revisions (ORDER BY id ASC
-       FOR UPDATE) -> storage_accounts (ORDER BY scope_id ASC FOR UPDATE) -> storage_instance FOR
-       UPDATE`, **requires `adoption_run_id = $my_adoption_run_id`** (aborting `OMQ03` if
-       displaced), **backfills `payload_ino` on every positively verified on-disk `'reserved'` and
-       `'active'`/`'retained'` `'settled'` row**, quarantines missing/mismatched `'reserved'` rows
-       (`adoption_unverified = true`) on BOTH initial unpinned and already-pinned runs, pins
-       `volume_id` (after publishing role-tagged sentinels with `fsync(root_fd)` strictly before
-       `:revisions`/`:staging`), and atomically clears `adoption_run_id = NULL`. Pinning enables
-       all PR2 (`N`) worker cleaners (`artifact_fs::purge_due` — unconditionally calling
-       `fsync(revisions_dir_fd)` strictly before `storage::confirm_purge` including on `ENOENT` —
-       `reconcile_expired`, generic run-linked recovery owning exact logical complement `run_id IS
-       NOT NULL AND (operation_id IS NULL OR idempotency_key NOT LIKE 'tool-spill:%')`, ADR 0039
-       `reconcile_run_spills` owning `operation_id IS NOT NULL AND idempotency_key LIKE
-       'tool-spill:%'`, and `StagingSweepState`), all executing the unified **3-step reclamation
-       protocol** with **ZERO filesystem I/O inside DB Steps 1 and 3** (`reclaim_state = 'claiming'`
-       -> durable `set_len(0) + sync_all()` -> `'truncated'` retaining `payload_ino` -> `unlinkat`
-       + dual `fsync` -> Step 3 `storage::release` retaining `payload_ino` on `'released'`) and
-       `StagingSweepState`'s `payload_ino` verification rules; then run the gateway orphan sweep
-       and flip `metering_enforced = true`.
+       volume adoption: mint `my_adoption_run_id = uuid_v4()`; **Step 1b** acquires ONLY `SELECT
+       volume_id, adoption_run_id INTO STRICT ... FROM openmettle.storage_volume_control WHERE id
+       FOR UPDATE` (strictly serialized against `enforce_runtime_storage_volume_pinned()`'s `FOR
+       SHARE` on `storage_volume_control`, refusing any concurrent adopter with `OMQ03` unless
+       `--replace-adoption-run <stale_uuid>` matches `adoption_run_id`) and commits `SET
+       adoption_run_id = $my_adoption_run_id`; **Step 2** scans `<root>/revisions` and
+       `<root>/staging` outside DB locks (clearing `adoption_run_id = NULL` on Step 2 failure ONLY
+       `WHERE id AND adoption_run_id = $my_adoption_run_id` under `FOR UPDATE`, requiring both
+       `--expected-fs-uuid <fs_uuid>` AND `--expected-revisions-inode <dev>:<ino>` whenever a
+       non-empty ledger has zero digest-bearing revisions verified on disk, and linking cleanly
+       without those flags on an empty ledger); **Step 3** locks `storage_reservations (ORDER BY id
+       ASC FOR UPDATE) -> artifact_revisions (ORDER BY id ASC FOR UPDATE) -> storage_volume_control
+       (WHERE id FOR UPDATE) -> storage_accounts (ORDER BY scope_id ASC FOR UPDATE) ->
+       storage_instance (WHERE id FOR UPDATE)`, **requires `adoption_run_id =
+       $my_adoption_run_id`** (aborting `OMQ03` if displaced), evaluates ALL
+       `'active'`/`'retained'`/`'purging'` revisions and volume checks **BEFORE** writing any
+       `payload_ino`: on **failure**, omits / rolls back ALL `payload_ino` backfills (committing
+       only `adoption_unverified = true` quarantine on missing `'reserved'` rows when `volume_id IS
+       NOT NULL` and clearing `adoption_run_id = NULL WHERE id AND adoption_run_id =
+       $my_adoption_run_id` before returning `OMQ03` so retrying on the real directory tree
+       succeeds cleanly with true inodes); on **success**, commits `payload_ino` backfills (`WHERE
+       payload_ino IS NULL`) on every positively verified on-disk `'reserved'` and
+       `'active'`/`'retained'` `'settled'` row, **positively verifies and PRESERVES `reclaim_state
+       = 'truncated'` holds whose `staging/.reclaim.<id>` exists as `S_ISREG` with `st_ino ==
+       payload_ino` and `st_size == 0`** (expiring `reclaim_lease_until = clock_timestamp()` so the
+       next cleaner tick finishes Step 3 -> Step 4 cleanly instead of quarantining!), quarantines
+       missing/mismatched `'reserved'` rows (`adoption_unverified = true`, which non-owner roles
+       can never transition to `'released'` or `'settled'` under tightened `CHECK (NOT
+       adoption_unverified OR state = 'reserved')` + `enforce_storage_reservation_monotonic_guards()`),
+       pins `storage_volume_control.volume_id` (after publishing role-tagged sentinels with
+       `fsync(root_fd)` strictly before `:revisions`/`:staging`), and atomically clears
+       `adoption_run_id = NULL`. Pinning enables all PR2 (`N`) worker cleaners (`artifact_fs::purge_due`
+       — verifying leaf `revisions/<id>` `st_ino == payload_ino` so any foreign replacement file
+       stops immediately with zero `set_len(0)`/`unlinkat` and without calling `confirm_purge`,
+       detaching any `staging/<id>` hard-link alias with `st_ino == payload_ino`, and
+       unconditionally calling BOTH `fsync(&revisions_dir_fd)` AND `fsync(&staging_dir_fd)`
+       strictly before `storage::confirm_purge` — `reconcile_expired`, generic run-linked recovery
+       owning exact logical complement `run_id IS NOT NULL AND (operation_id IS NULL OR
+       idempotency_key NOT LIKE 'tool-spill:%')`, ADR 0039 `reconcile_run_spills` owning
+       `operation_id IS NOT NULL AND idempotency_key LIKE 'tool-spill:%'`, and non-truncating
+       `StagingSweepState`), all executing the unified **4-step reclamation protocol** with **ZERO
+       filesystem I/O inside DB Steps 1 and 3** (`reclaim_state = 'claiming'` -> durable
+       `set_len(0) + sync_all()` -> `linkat` anchor `staging/.reclaim.<id>` +
+       `fsync(&staging_dir_fd)` -> `unlinkat` `<id>` from `revisions/`/`staging/` + dual `fsync` ->
+       `'truncated'` retaining `payload_ino` (`'truncated'` crash recovery probes ONLY
+       `staging/.reclaim.<id>` and never touches `staging/<id>`/`revisions/<id>`) -> Step 3
+       `storage::release` setting `reclaim_state = 'anchor_pending_unlink'` when `payload_ino IS
+       NOT NULL` and retaining `payload_ino` -> Step 4 post-release `unlinkat` of
+       `staging/.reclaim.<id>` + `fsync(&staging_dir_fd)` + best-effort `reclaim_state = 'none'`)
+       and `StagingSweepState`'s non-truncating `payload_ino` verification rules; then run the
+       gateway orphan sweep and flip `metering_enforced = true`.
    - **Starting, rolling back to, or resuming any `N-1` worker binary after
-     `storage_instance.volume_id` is pinned is strictly forbidden by the rollout contract**,
+     `storage_volume_control.volume_id` is pinned is strictly forbidden by the rollout contract**,
      because `N-1` lacks Rust `.openmettle-volume-id` / local `st_dev` / `payload_ino` /
-     `stage_claimed` / `publish_pending` / `reclaim_state` / `adoption_run_id` /
-     `RenameFlags::NOREPLACE` checks and unlinks files before mutating PostgreSQL.
+     `stage_claimed` / `publish_pending` / `reclaim_state` / `adoption_run_id` / `linkat` checks
+     and unlinks files before mutating PostgreSQL.
 4. **Lowered `storage_bytes` overrides (`enforce_storage_override()`, `OMQ01`).** Older API and
    worker binaries running `src/storage.rs` read only `storage_instance.personal_limit_bytes` /
    `project_limit_bytes` and would ignore a lowered `quota_overrides` row for `storage_bytes`
@@ -3248,10 +3540,10 @@ against the V1-17 PR2 schema are protected across four fail-closed database and 
    quota`) cleanly. Legacy binaries also safely ignore `storage_reservations.lease_expires_at`
    (leaving it `NULL`), `storage_reservations.adoption_unverified` (defaulting `false`),
    `storage_reservations.stage_claimed` (defaulting `false`), `storage_reservations.payload_ino`
-   (leaving it `NULL`, backfilled on adoption Step 3 for verified on-disk payloads),
+   (leaving it `NULL`, backfilled on adoption Step 3 success for verified on-disk payloads),
    `storage_reservations.publish_pending` (defaulting `false`), `storage_reservations.reclaim_state`
    (defaulting `'none'`, with `reclaim_claim_token` and `reclaim_lease_until` `NULL`), and
-   `storage_instance.adoption_run_id` (defaulting `NULL`).
+   `storage_volume_control` (`volume_id IS NULL`, `adoption_run_id IS NULL`).
 
 
 ## Authenticated visibility and refusal contract
@@ -3340,15 +3632,18 @@ Every quota refusal and warning stays redacted under
 | Slice | Deliverable | Required evidence |
 | --- | --- | --- |
 | PR1 (this record) | ADR 0040 only. | Review against `#17`, `ARCHITECTURE-v1.md`, ADRs 0005/0007/0027/0031–0033/0035–0037, `ai-guardrails docs audit` (`0` findings) and `scripts/check_repository.py`. |
-| PR2 · schema, store and worker recovery | Additive PostgreSQL 18 migration (after Migration `0023`, zero edits to frozen `0023`), including `ALTER TABLE openmettle.gateway_settlements ALTER COLUMN measured TYPE numeric(38, 0)` (preserving `CHECK (measured >= 0)` and nullable `measured = NULL` for cost-only reports so 3-column token sums up to `3 * (2^63 - 1)` never overflow `bigint`), append-only `openmettle.quota_accepted_gateway_reports` ledger (owned by `openmettle_owner`, zero direct DML or `SELECT` grants to runtime roles, populated automatically by `SECURITY DEFINER` `AFTER INSERT OR UPDATE OF revision, final` trigger `quota_record_accepted_gateway_settlement` on `openmettle.gateway_settlements`, with historical backfill and composite FK `(gateway_request_id, source_revision) REFERENCES openmettle.quota_accepted_gateway_reports (request_id, revision)` on `openmettle.quota_reconciliations`), `rustix` minimal safe POSIX `dirfd` dependency (`default-features = false, features = ["fs", "std"]`, `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`; `Cargo.lock` distribution-blocker count updated per ADR 0007/0010 so all `openat`/`fstat`/`statat`/`renameat_with(..., RenameFlags::NOREPLACE)`/`linkat`/`unlinkat`/`fsync` calls using verified `rustix 1.1.6` `OFlags::CREATE` / `OFlags::RDONLY` / `OFlags::RDWR` / `OFlags::EXCL` / `OFlags::DIRECTORY` / `OFlags::NOFOLLOW` / `OFlags::NONBLOCK`, `RenameFlags::NOREPLACE`, `AtFlags::SYMLINK_NOFOLLOW`, `AtFlags::empty()`, and `Mode::RUSR \| Mode::WUSR` compile safely under `Cargo.toml`'s `unsafe_code = "forbid"` on Rust 1.100), `src/migrate.rs` (`migrate_within_boundaries` capturing `applied = coalesce(max(version), 0)` once under SQLx's advisory lock and setting `openmettle.bootstrap_from_zero` via `pg_catalog.set_config` after each `RESET ALL` before every `migrator.run_to(version, ...)`), `storage_instance.volume_id`, `storage_instance.bootstrap_auto_pin_allowed`, and nullable **`storage_instance.adoption_run_id uuid DEFAULT NULL`** (`CHECK (volume_id IS NULL OR NOT bootstrap_auto_pin_allowed)`, seeded `true` iff `is_fresh_bootstrap` — requiring both `openmettle.bootstrap_from_zero = 'true'` and empty core/storage/gateway tables — and `false` on every upgrade `applied >= 1`), `storage_reservations.adoption_unverified` (`boolean NOT NULL DEFAULT false CHECK (NOT adoption_unverified OR state IN ('reserved', 'released'))`, cleared solely by `openmettle_owner` reconciliation or verified `openmettle-admin` adoption; enforced in PostgreSQL by `SECURITY INVOKER` `enforce_storage_reservation_monotonic_guards()` (`OMQ03`)), **`storage_reservations.stage_claimed boolean NOT NULL DEFAULT false`** (`CHECK (payload_ino IS NULL OR stage_claimed)`), **`storage_reservations.payload_ino numeric(20, 0)`** (`CHECK (payload_ino IS NULL OR payload_ino >= 0)`, exact unsigned 64-bit `u64` `MetadataExt::ino()`, dropping cross-node-unsafe NFS `payload_dev` completely and verifying same-mount `file_meta.dev() == dir_fd_meta.dev() == root_fd_meta.dev()` locally per host), `storage_reservations.publish_pending` (`boolean NOT NULL DEFAULT false CHECK (NOT publish_pending OR (state = 'reserved' AND payload_ino IS NOT NULL))`), the unified 3-state cleaner lease on `openmettle.storage_reservations` (**`reclaim_state text NOT NULL DEFAULT 'none' CHECK (reclaim_state IN ('none', 'claiming', 'truncated'))`**, **`reclaim_claim_token uuid`**, **`reclaim_lease_until timestamptz`**, with `CHECK (state = 'reserved' OR reclaim_state = 'none')`, `CHECK ((reclaim_state = 'none' AND reclaim_claim_token IS NULL AND reclaim_lease_until IS NULL) OR (reclaim_state IN ('claiming', 'truncated') AND reclaim_claim_token IS NOT NULL AND reclaim_lease_until IS NOT NULL))`, and `CHECK (reclaim_state <> 'truncated' OR NOT publish_pending)`), narrow runtime grants `GRANT INSERT (lease_expires_at, stage_claimed)` and `GRANT UPDATE (lease_expires_at, adoption_unverified, stage_claimed, payload_ino, publish_pending, reclaim_state, reclaim_claim_token, reclaim_lease_until)` on `openmettle.storage_reservations` to `openmettle_api, openmettle_worker`, 100% `IMMUTABLE` PostgreSQL 18 plain-column partial B-tree indexes for two-step raw-index-key stale-hold paging (`quota_reservations_held_expiry_idx`, `storage_reservations_run_expiry_idx` and `storage_reservations_run_legacy_expiry_idx` both narrowed to `(operation_id IS NULL OR idempotency_key NOT LIKE 'tool-spill:%')` — exact logical complement of ADR 0039 `reconcile_run_spills` — `storage_reservations_upload_expiry_idx`, `storage_reservations_upload_legacy_expiry_idx`), `BEFORE INSERT OR UPDATE OF idempotency_key, run_id, operation_id` trigger `storage_reservations_tool_spill_binding_guard` (`23514`, rejecting `idempotency_key LIKE 'tool-spill:%' AND (run_id IS NULL OR operation_id IS NULL)`), strengthened `quota_reservations` state `CHECK` constraints prohibiting `settled_units > 0` or `accepted_source_revision IS NOT NULL` while `state = 'held'` or unaccepted `handoff_committed`, exact `numeric(38, 0)` aggregate and settlement accumulators (`quota_budgets.active_used`, `quota_budgets.reserved_held`, `quota_reservations.settled_units`, `quota_reconciliations.cumulative_units`, `delta_active`, `delta_reserved`, mapped in Rust via `sqlx` `::text` <-> `u128`/`i128` canonical base-10 strings with zero new crates), `quota_enforcement` singleton control table (`metering_enforced`, write-once `false -> true`, seeded `true` iff `is_fresh_bootstrap` and `false` on every upgrade `applied >= 1`), `quota_gateway_handoffs` handoff-time obligation ledger (`gateway_request_id` PK referencing `gateway_requests(id) ON DELETE CASCADE`, `metering_enforced`, `cost_required`, `committed_at`, zero direct DML grants to runtime roles), `quota_reservations.allocating_claim_token` (`CHECK (parent_reservation_id IS NULL OR allocating_claim_token IS NOT NULL)`), seeded strictly-`UPDATE`-only `('instance', 'usage_cost_micros')` default row and `quota_cost_unit_lock`, scope-pinned composite FK `(scope_id, gateway_request_id) REFERENCES openmettle.gateway_requests (scope_id, id)`, `SECURITY DEFINER` transition, bootstrap, override, recovery and drift functions (`storage_pin_volume_id`, `quota_upsert_scope_override`, `quota_revoke_scope_override`, `quota_reserve` and `quota_allocate_round` enforcing exact `usage_tokens` hold equality `reserved_units = q.units` / `slice_units = q.units` (`23514`), `quota_ensure_legacy_run_holds` — running strictly before `authz::gateway::reserve_in` in the round-allocation `WriteTransaction` while locking `gateway_reservations FOR NO KEY UPDATE` and reading `units - allocated` — `quota_commit_handoff`, `quota_recover_lost_handoff`, `quota_commit_device_handoff`, `quota_renew_lease`, `quota_release_unsent`, `quota_unwind_superseded_round`, `quota_release_orphan_gateway_requests`, `quota_lock_gateway_request_for_settlement(uuid)` (`EXECUTE` to `openmettle_gateway` only, called unconditionally strictly BEFORE **every** `openmettle_gateway` `INSERT`/`UPDATE` on `openmettle.gateway_settlements` — both settlement-only transactions and combined single-transaction writes — to guarantee the globally acyclic lock DAG `runs -> gateway_reservations -> gateway_requests -> gateway_settlements -> quota_accepted_gateway_reports -> quota_reservations -> quota_budgets`), `quota_settle_gateway_usage` operating strictly on `state IN ('handoff_committed', 'settled')` holds without locking `runs` or `gateway_reservations` (`gateway_requests FOR KEY SHARE -> quota_reservations (ORDER BY resource ASC FOR UPDATE) -> quota_budgets FOR NO KEY UPDATE`), verifying exact `EXISTS` acceptance membership in `quota_accepted_gateway_reports`, **folding all unapplied accepted revisions `a.revision` in `(coalesce(qr.accepted_source_revision, -1), p_source_revision]` sequentially in `ORDER BY a.revision ASC`** (making settlement order-independent across out-of-order invocations such as `rev 2` before `rev 1`, with worker catch-up also iterating in `ORDER BY a.revision ASC`), enforcing per-resource authoritative evidence rules for `usage_cost_micros` (`r_step.cost IS NOT NULL`, `C_cost = ceil(r_step.cost)::numeric(38, 0)`) and `usage_tokens` (computing cumulative `P_known`, `K_raw`/`rev_K`, and `(R_latest, inc_latest, rev_R)` across accepted revisions `<= r_step.revision`, setting `K_known = K_raw, X_known = R_latest` when `inc_latest IS FALSE` and **`K_known = CASE WHEN rev_R >= rev_K THEN greatest(K_raw, R_latest) ELSE K_raw END, X_known = 0`** when `inc_latest IS TRUE` so included reasoning tokens act as a lower bound on completion without double-counting, while `is_complete_tokens` still requires explicit non-null `prompt_tokens` and `completion_tokens`), and **unconditionally advancing `qr.accepted_source_revision = p_source_revision`** on every processed accepted revision including `0`-delta / no-op / other-resource revisions while writing `quota_reconciliations` and adjusting `quota_budgets` iff `(new_state, new_settled, new_held) IS DISTINCT FROM (old_state, old_settled, old_held)`, `quota_release_device_slot`, `quota_record_storage_warning`, `quota_verify_accounting_drift` replaying the exact same ascending fold across `a.revision <= qr.accepted_source_revision` (`ORDER BY a.revision ASC`, including `K_known`/`X_known` included reasoning lower bound, requiring `qr.state = 'settled'` iff at least one `final = true` accepted revision `<= qr.accepted_source_revision` established complete authoritative evidence for that resource), reporting unapplied accepted revisions via `EXISTS (SELECT 1 FROM openmettle.quota_accepted_gateway_reports a WHERE a.request_id = qr.gateway_request_id AND a.revision > coalesce(qr.accepted_source_revision, -1))` in `pending_gateway_reconciliations`, validating widened `gateway_settlements.measured` (`numeric(38, 0)`) joined to `openmettle.gateway_usage_reports r_curr` strictly on **`(gs.request_id = r_curr.request_id AND gs.revision = r_curr.revision AND gs.final = r_curr.final)`** reading `r_curr.source` and `r_curr.report_id` from `r_curr`, and failing hard once `storage_instance.volume_id IS NOT NULL` on any `'active'`/`'retained'` revision with `payload_ino IS NULL`), `enforce_storage_override`, `quota_enforcement_write_once` (`OMQ04`), `SECURITY DEFINER` `DEFERRABLE INITIALLY DEFERRED` `CONSTRAINT TRIGGER quota_enforce_gateway_handoff_holds` (`OMQ04`), **`SECURITY INVOKER`** `BEFORE UPDATE` `enforce_runtime_storage_volume_pinned` triggers (`SET search_path = pg_catalog`, executing serialized `PERFORM 1 FROM openmettle.storage_instance WHERE id FOR SHARE;` and rejecting `volume_id IS NULL OR adoption_run_id IS NOT NULL` with `OMQ03` for non-`openmettle_owner` across both `INHERIT` and `NOINHERIT`/`SET ROLE` logins), **`SECURITY INVOKER`** `BEFORE UPDATE` `enforce_storage_reservation_monotonic_guards` trigger (`SET search_path = pg_catalog`, raising `OMQ03` for non-`openmettle_owner` clearing `adoption_unverified`, mutating/clearing non-null `payload_ino`, or clearing `stage_claimed`), `SECURITY DEFINER` `BEFORE INSERT OR UPDATE` `enforce_quota_reservation_gateway_binding` (`23514`), `BEFORE INSERT OR UPDATE OR DELETE` `enforce_cost_denomination_immutability` (`OMQ02`) and `SECURITY DEFINER` `BEFORE INSERT` `enforce_gateway_report_cost_unit` triggers, versioned `src/boundaries.sql` entries, `authz::gateway::{reserve_in, handoff_in, release_in}` in-transaction helpers, `src/quotas.rs` store, `storage::reserve` override integration, `artifact_fs::Store` retaining `Arc`-shared verified directory descriptors (`root_fd`, `staging_dir_fd`, `revisions_dir_fd`) with startup/adoption capability probes (`O_CREAT \| O_EXCL \| O_NOFOLLOW`, `RenameFlags::NOREPLACE` rejecting `ENOSYS`/`EOPNOTSUPP`/`EINVAL` and verifying `Errno::EXIST` without overwriting, file+dir `fsync`, plus `ReadWriteMany` two-client `flock(2)` AND stable 64-bit `st_ino` coherence + second-client recovery qualification), unified rollout rule (`Store::stage`/`Store::publish` succeeding when `adoption_run_id IS NULL` both pinned and while `volume_id IS NULL`, while ADR 0039 worker `publish_bytes` and all 4 cleaners strictly require `volume_id IS NOT NULL AND adoption_run_id IS NULL`), `Store::stage` Steps 1a/1b/1c (`stage_claimed = true` before disk write -> `openat` + `LOCK_SH` + `fsync(&staging_dir_fd)` BEFORE binding `payload_ino` -> commit `payload_ino = staged_ino`), **100% non-destructive `StagedFile::drop` and writer error/cancellation paths** (NEVER calling `set_len(0)` or `unlinkat`; ambiguous `storage::settle` inspecting `storage_reservations.state` under `FOR UPDATE` before `abort`), `Store::publish` committing `publish_pending = true` before **`rustix::fs::renameat_with(&staging_dir_fd, id, &revisions_dir_fd, id, RenameFlags::NOREPLACE)`** (quarantining `Errno::EXIST` without overwriting foreign `revisions/<id>`) and `storage::settle` committing `state = 'settled', publish_pending = false` while **retaining `payload_ino`**, **`Store::read`** joining `storage_reservations` to verify `NOT sr.adoption_unverified` and `file_meta.ino() == sr.payload_ino` (permitting legacy `payload_ino IS NULL` ONLY while `volume_id IS NULL AND adoption_run_id IS NULL`, failing closed with `Error::Io` once `volume_id IS NOT NULL`), `Store::open` fresh-bootstrap-only (`bootstrap_auto_pin_allowed = true` + empty ledger) three-directory role-tagged volume sentinel pinning (`:root` + `fsync(root_fd)` strictly before `:revisions`/`:staging`), unified **3-step reclamation protocol** across ALL 4 cleaners (`artifact_fs::abort`, `reconcile_expired` updating ADR 0031 & `tests/schema/artifact_fs.rs`'s `renamed` test case, generic run-linked recovery narrowed to `(operation_id IS NULL OR idempotency_key NOT LIKE 'tool-spill:%')`, and ADR 0039 `reconcile_run_spills`) with **ZERO filesystem I/O inside DB Steps 1 and 3** (`reclaim_state = 'claiming'` -> outside-DB probe/quarantine or `LOCK_EX` `set_len(0) + sync_all()` -> short DB commit `reclaim_state = 'truncated', publish_pending = false` retaining `payload_ino` -> `unlinkat` + `drop` + dual `fsync` -> Step 3 final `storage::release` retaining `payload_ino` on `'released'`), `artifact_fs::purge_due` unconditionally calling `fsync(revisions_dir_fd)` before `storage::confirm_purge` including on `ENOENT`, and `StagingSweepState` `'released'`/`'settled'` `payload_ino` rules, idempotent `purging`-tolerant `openmettle-admin` verified volume adoption CLI procedure (`my_adoption_run_id = uuid_v4()`, Step 1b `storage_instance FOR UPDATE` serialized against trigger `FOR SHARE` with `--replace-adoption-run <stale_uuid>`, Step 2 outside-DB scan clearing `adoption_run_id = NULL` on failure only `WHERE id AND adoption_run_id = $my_adoption_run_id`, Step 3 canonical lock order `storage_reservations -> artifact_revisions -> storage_accounts -> storage_instance FOR UPDATE` requiring `adoption_run_id = $my_adoption_run_id`, backfilling `payload_ino` on all verified `'reserved'` and `'active'`/`'retained'` `'settled'` rows, quarantining missing/mismatched `'reserved'` rows, pinning `volume_id`, and clearing `adoption_run_id = NULL`) and operator runbook update mandating the 4-step upgrade sequence, `claim_next` executing-cap override evaluation, DB-plus-filesystem `verify_accounting_drift`, bounded two-step raw-index-key paging across `quota_release_orphan_gateway_requests`, `quota_reservations`, run-linked `storage_reservations`, and non-run `reconcile_expired`, and `SKIP LOCKED` one-per-tx `reconcile_stale_quotas` with persistent 5-state `StagingSweepState` held outside `worker::sweep`'s 15 s `tokio::time::timeout` in `src/worker.rs`. | PostgreSQL 18 tests in `tests/schema/grants.rs`, `tests/schema/artifact_fs.rs`, and `tests/schema/quotas.rs` executing all override, reservation, legacy-run-hold-backfill, device-handoff, lost-handoff-recovery, superseded-round-unwind, orphan-gateway-sweep, gateway-settlement, drift-verification and stale-sweep paths **connected as the actual runtime roles** (`openmettle_api`, `openmettle_worker`, `openmettle_gateway`, `openmettle_issuance`) and asserting denial of direct `INSERT`/`UPDATE`/`DELETE`/`SELECT ... FOR NO KEY UPDATE` on all `quota_*` tables (plus zero privileges on `quota_cost_unit_lock`, `quota_gateway_handoffs`, and `quota_accepted_gateway_reports`, `SELECT`-only on `quota_enforcement`, `storage_instance.volume_id`, `storage_instance.bootstrap_auto_pin_allowed`, and `storage_instance.adoption_run_id`, plus `INSERT (lease_expires_at, stage_claimed)` and `UPDATE (lease_expires_at, adoption_unverified, stage_claimed, payload_ino, publish_pending, reclaim_state, reclaim_claim_token, reclaim_lease_until)` on `storage_reservations` for `openmettle_api`/`openmettle_worker`, plus schema tests for `payload_ino` non-negative CHECK, `CHECK (payload_ino IS NULL OR stage_claimed)`, `CHECK (NOT publish_pending OR (state = 'reserved' AND payload_ino IS NOT NULL))`, all three `reclaim_state`/`reclaim_claim_token`/`reclaim_lease_until` CHECK constraints, AND **`SECURITY INVOKER` `enforce_storage_reservation_monotonic_guards()` assumed-role tests under BOTH `openmettle_api` and `openmettle_worker` (both `INHERIT` and `NOINHERIT`/`SET ROLE` logins) proving `OMQ03` on clearing `adoption_unverified`, mutating or clearing non-null `payload_ino`, or clearing `stage_claimed` while `openmettle_owner` succeeds**), denial of direct `SELECT` by `openmettle_api` and `openmettle_worker` on `openmettle.gateway_requests` and `openmettle.gateway_usage_reports` while qualifying `openmettle.quota_verify_accounting_drift()`, `openmettle.quota_ensure_legacy_run_holds(...)`, `openmettle.quota_unwind_superseded_round(...)` and `openmettle.quota_release_orphan_gateway_requests(...)` as `openmettle_worker` (and denying `EXECUTE` to `openmettle_api`, `openmettle_gateway` and `openmettle_issuance`), qualifying `openmettle.quota_lock_gateway_request_for_settlement(uuid)` strictly as `openmettle_gateway` (and denying `EXECUTE` to all other runtime roles), and qualifying `openmettle.quota_recover_lost_handoff(...)` as `openmettle_api` (`p_run_id IS NULL`) and `openmettle_worker` (`p_run_id IS NOT NULL`) while denying `openmettle_gateway` and `openmettle_issuance`, denial of `openmettle_api` calling either `quota_commit_handoff` or `quota_commit_device_handoff` on a run-linked `device_reservations` hold, denial of `openmettle_worker` calling generic `quota_commit_handoff` on a run-linked `device_reservations` hold, and denial of cross-role/unleased calls; N-way concurrent admission non-oversubscription across distinct project/actor/instance windows; non-windowed `device_reservations` surviving UTC rollover and `api`-admitted run device handoff exclusively via `quota_commit_device_handoff` under active `claim_token` lease (plus refusal for wrong resource kind or stale/unleased/cancelled run); cross-scope lock-order race with zero deadlocks; concurrent `executing_runs_per_actor` / `executing_runs_per_scope` cap lowering racing `claim_next` (and approval resume) serialized on `run_dispatch_lock` with zero overshoot; exact-once reconciliation across exact replay (recovering server-chosen windows), unique `(gateway_request_id, resource_kind)` enforcement rejecting duplicate keys, scope-pinned composite FK `(scope_id, gateway_request_id) REFERENCES openmettle.gateway_requests (scope_id, id)` and composite FKs to `gateway_usage_reports` (`(request_id, revision)` and `(source, report_id, revision)`) and `quota_accepted_gateway_reports` (`(request_id, revision)`), **single-transaction atomic `authz::gateway::reserve_in` + `quota_reserve` / `quota_allocate_round` rollback test proving that when any metered quota hold fails or the transaction aborts before commit, neither `gateway_requests`, `gateway_reservations.allocated`, nor `quota_reservations` persists (and `gateway_requests_run_round_active_idx` is not stranded)**, **exact `usage_tokens` hold-size equality and pre-handoff `settled_units > 0` schema guard tests exercising mismatched amounts (`<` and `>` `gateway_requests.units`) on BOTH standalone (`run_id IS NULL`) and run-round (`run_id IS NOT NULL`) requests AND attempting `INSERT` and `UPDATE` in `state = 'held'` (and unaccepted `state = 'handoff_committed'` with `accepted_source_revision IS NULL`) with `settled_units > 0` and reduced `held_units`, proving deterministic rejection across `quota_reservations` `CHECK` constraints, `quota_reserve` / `quota_allocate_round` / `enforce_quota_reservation_gateway_binding` (`23514`), and `enforce_gateway_handoff_holds` (`OMQ04`)**, **deployment-history fresh-vs-upgrade seeding and `0023` rolling-upgrade activation tests across `openmettle.bootstrap_from_zero`, `quota_enforcement.metering_enforced`, and `storage_instance.bootstrap_auto_pin_allowed`: (a) fresh `applied == 0` bootstrap via `migrate_within_boundaries` auto-seeds `metering_enforced = true` and `bootstrap_auto_pin_allowed = true` (permitting `Store::open` auto-pinning once and clearing `bootstrap_auto_pin_allowed = false`); (b) an existing, completely unused `0001..0023` installation (`applied = 23`, zero rows in `users`, `scopes`, `projects`, `runs`, `storage_*`, and `gateway_*`) upgraded to `0024` via `migrate_within_boundaries` seeds `metering_enforced = false`, `bootstrap_auto_pin_allowed = false`, and `volume_id IS NULL`, proving legacy `0023` handoff succeeds during rollout, `N` startup (`Store::open` / `storage_pin_volume_id`) refuses to auto-pin (`OMQ03`), and post-replacement `openmettle-admin` adoption (cleanly linking all three role-tagged sentinels without `--expected-fs-uuid` / `--expected-revisions-inode` on the empty storage ledger) plus `metering_enforced = true` activation completes cleanly; (c) storage-disabled installation activation test (both `OPENMETTLE_API_ARTIFACTS_DIR` / `OPENMETTLE_ARTIFACTS_DIR` and `OPENMETTLE_WORKER_ARTIFACTS_DIR` unset and `0` rows in `storage_reservations` and `artifact_revisions`) proving Step 4 skips volume adoption cleanly (`volume_id IS NULL`, `bootstrap_auto_pin_allowed = false`, cleaners disabled), runs `quota_release_orphan_gateway_requests`, flips `metering_enforced = true`, and passes `verify_accounting_drift` (while `verify_accounting_drift` still fails hard whenever `ARTIFACTS_DIR` is configured or any storage row exists with `volume_id IS NULL`); (d) Step 1 pre-migration `N-1` `worker::maintenance` sweep-drain test proving an in-flight `N-1` sweep finishes cleanly before `openmettle-migrate` starts; (e) populated upgrades (including an existing `openmettle.gateway_reservations` row with zero `gateway_bindings`/`gateway_requests` rows) seed `false` so `N-1` `0023`-only handoff succeeds during rolling deploy and `quota_recover_lost_handoff` reports `'unmetered_legacy_handoff'` while suppressing HTTP dispatch, whereas any bound `'held'`/`'released'` quota hold still fails at `COMMIT` with `OMQ04`; flipping write-once `metering_enforced = true` as `openmettle_owner` in a standalone single-statement transaction — rejecting `true -> false` with `OMQ04` — causes `0023`-only handoffs to fail at `COMMIT` with `OMQ04` and roll back `gateway_requests` to `'reserved'`, requiring both bound `'handoff_committed'` `usage_tokens` (exact `reserved_units = NEW.units AND held_units = NEW.units AND settled_units = 0 AND accepted_source_revision IS NULL` + ownership match) and applicable `usage_cost_micros` holds (`settled_units = 0 AND accepted_source_revision IS NULL`); PLUS (f) a two-connection concurrency test covering both commit orders between an unmetered `0023` `gateway_handoff` commit (inserting `quota_gateway_handoffs` first and then locking `quota_enforcement FOR SHARE` as the final lock) and `openmettle_owner`'s `metering_enforced = true` activation (`FOR NO KEY UPDATE`), proving zero deadlock, strict lock-order serialization, and that an unmetered handoff can never observe `metering_enforced = false` and commit after activation**, **rolling-upgrade legacy-run reclaim and pre-`reserve_in` lazy parent-hold initialization test (`quota_unwind_superseded_round` -> `quota_ensure_legacy_run_holds` -> `authz::gateway::reserve_in` -> `quota_allocate_round`) where an `N-1` API replica admits a run (`runs` + `gateway_reservations` with `units = 100`, zero parent `quota_reservations`) and an `N-1` worker commits an unbound `'reserved'` round before crashing, and an `N` worker reclaims the run, cleanly unwinds the unbound legacy `'reserved'` round via `quota_unwind_superseded_round` (with zero parent `quota_reservations` present, freeing `gateway_requests_run_round_active_idx` and restoring `gateway_reservations.allocated = 0`), then inside the single round-allocation `WriteTransaction` executes `quota_ensure_legacy_run_holds` strictly BEFORE `authz::gateway::reserve_in` (locking `gateway_reservations FOR NO KEY UPDATE` with zero lock upgrade before `reserve_in` and reading `units - allocated = 100`, initializing the parent hold to `100`, enforcing `quota_budgets` hard limits with `OMQ01` when over budget and staying idempotent across retries and subsequent rounds), followed by a `60`-unit `reserve_in` + `quota_allocate_round` proving the child slices `60` without double-subtraction, `40` remains `held_units` on the parent, and settlement completes cleanly**, **fenced successor-worker unwind test (`openmettle.quota_unwind_superseded_round`) simulating worker process death immediately between `(reserve_in + quota_allocate_round)` commit and handoff, lease expiry + `leases::reclaim_next` by a successor worker, fenced unwind transitioning `gateway_requests` to `'released'`, restoring `gateway_reservations.allocated` and parent run `quota_reservations` capacity (`allocated_units`/`held_units`) while releasing child holds and freeing `gateway_requests_run_round_active_idx`, clean retry of the same round, and a replay test calling `quota_unwind_superseded_round` again with the same live `claim_token` after the successor worker has already unwound the predecessor and reserved the same `round` again (proving the successor's replacement `'reserved'` request and child holds carrying `allocating_claim_token = p_claim_token` remain intact and `false` is returned, plus `'handed_off'` left untouched returning `false`, and stale `claim_token` / non-worker calls refused)**, **pre-upgrade orphan `'reserved'` `gateway_requests` sweep test via `openmettle.quota_release_orphan_gateway_requests(...)` (using valid scalar PostgreSQL 18 `IF` upper-bound clamping) connected as `openmettle_worker` releasing aged unbound `'reserved'` rows while restoring `gateway_reservations.allocated`, freeing `gateway_requests_run_round_active_idx`, and skipping active leased runs or bound requests, PLUS (a) a bounded raw index-key paging test with a multi-page prefix of aged legitimately bound `'reserved'` requests ahead of a trailing orphan proving each call inspects at most `p_page_size` raw `(created_at, id)` keys from `gateway_requests_reserved_idx`, advances the persistent cursor across zero-orphan pages without exhausting sweep budget, and releases the trailing orphan on a subsequent page, and (b) a large all-young `'reserved'` tail test verifying bounded index buffer/key touches (`raw_keys_scanned = 0` past `v_age_cutoff`) with zero per-row `clock_timestamp()` filtering**, **negative binding and ownership-recheck tests proving cross-scope, cross-actor, cross-run, non-`'reserved'` state, or wrong-`p_dispatch`-secret bind attempts in `quota_reserve` / `quota_allocate_round` (and `quota_reservations_gateway_binding_guard`) are rejected and that `quota_release_unsent` ownership rechecks fail closed with an invariant error mutating neither ledger on mismatch**, run-to-round `held` allocation without double-debit coupled atomically with `authz::gateway::handoff_in` (`openmettle.gateway_handoff`) + `quota_commit_handoff` (rolling back both on pre-commit refusal), **lost commit acknowledgement (`UnknownCommit`) integration tests connected directly as unprivileged `openmettle_api` and `openmettle_worker` logins exercising all `openmettle.quota_recover_lost_handoff(...)` outcomes — `'handoff_committed'` (preserving durable `gateway_requests.state = 'handed_off'` + all required `'handoff_committed'`/`'settled'` quota holds recorded in `quota_gateway_handoffs`, including a test where `quota_settle_gateway_usage` has already moved bound holds to `'settled'` before recovery runs, asserting zero bound holds remain `'held'`/`'released'`, suppressing HTTP dispatch for gateway reconciliation), `'unmetered_legacy_handoff'` (including a pre-activation unmetered handoff committed while `metering_enforced = false` and recovered via `quota_recover_lost_handoff` *after* live `metering_enforced` flipped `true`, still returning `'unmetered_legacy_handoff'` with zero `OMQ04` and suppressing HTTP dispatch), and `'unwound_unsent'` (atomically unwinding `'reserved'`/`'released'` `gateway_requests`, restoring `gateway_reservations.allocated`, and releasing bound `'held'` holds to an active parent or `quota_budgets`) plus wrong-role/wrong-secret/mismatched-ownership/missing-required-hold (`OMQ04`) refusals**, pre-send unwind via `authz::gateway::release_in` (`openmettle.gateway_release`) + `quota_release_unsent` returning capacity to an active parent run hold (or releasing on terminal runs), **stale sweep atomically transitioning a stale `'reserved'` `gateway_requests` row to `'released'` and restoring `gateway_reservations.allocated` in the same `SECURITY DEFINER` transaction as releasing `quota_reservations` (proving a delayed `openmettle.gateway_handoff` with the original dispatch secret fails closed while `'handed_off'` rows remain untouched)**, cancellation, pre-send abort (with `closed_at`), valid `revision = 0` initial partial and final reports accepted when `accepted_source_revision IS NULL` (persisting `accepted_source_revision = 0` and rejecting subsequent `revision <= 0`), signed downward partial correction (`delta_reserved > 0`), **per-resource complete authoritative evidence and incomplete-component deferral tests exercising (a) an explicit zero-token final report (`prompt_tokens = 0, completion_tokens = 0`) settling `usage_tokens` to `'settled'` (`settled_units = 0, held_units = 0`) and releasing the token hold, (b) a cost-only final report (`cost` present, token columns `NULL`) settling `usage_cost_micros` to `'settled'` while keeping `usage_tokens` in `handoff_committed` with full `held_units` and last confirmed `settled_units` untouched (never turning `NULL` tokens into `0`), (c) a cost-only post-final correction updating `usage_cost_micros` without erasing `usage_tokens.settled_units` or altering `usage_tokens.accepted_source_revision`, (d) a token-only report (`r.cost IS NULL`) skipping `usage_cost_micros` completely, and (e) component-aware `C_floor` and complete-evidence close-gate tests proving (i) `hold = 100` + `prompt_tokens = 150, completion_tokens = NULL` immediately sets `settled_units = 150, held_units = 0` (`+50` confirmed overage exposure) in BOTH `quota_settle_gateway_usage` and `quota_verify_accounting_drift()` while keeping `state = 'handoff_committed'`, (ii) `hold = 200` + `prompt_tokens = 60, completion_tokens = NULL, final = true` keeps `settled_units = 60, held_units = 140, state = 'handoff_committed'` (refusing to close `'settled'` without complete evidence) until complete final `prompt_tokens = 60, completion_tokens = 20` settles `80` (`held_units = 0, state = 'settled'`), (iii) `revision = 1` (`120 + 30 = 150`) followed by `revision = 2` (`prompt_tokens = NULL, completion_tokens = 30`, plus omitting a previously-confirmed non-included `reasoning_tokens`) preserves `settled_units = 150` (`0` confirmed exposure lost) across both settlement and drift verification until complete authoritative `revision = 3` resolves it, (iv) **included reasoning tokens lower-bound tests (`reasoning_included = true`) proving (1) `hold = 100` + `prompt_tokens = NULL, completion_tokens = NULL, reasoning_tokens = 150, reasoning_included = true` immediately charges `settled_units = 150, held_units = 0` (`+50` confirmed overage) while keeping `is_complete_tokens = false` / `state = 'handoff_committed'`, (2) `final = true, prompt_tokens = 60, completion_tokens = NULL, reasoning_tokens = 150, reasoning_included = true` charges `210` and stays `handoff_committed` until explicit `completion_tokens IS NOT NULL` arrives, (3) `completion_tokens = 200, reasoning_tokens = 150, reasoning_included = true` yields `K_known = greatest(200, 150) = 200, X_known = 0` with zero double-counting (and malformed `completion_tokens = 100 < reasoning_tokens = 150, reasoning_included = true` yields `K_known = 150`), and (4) a newer complete revision (`rev_K > rev_R`) with `completion_tokens = 120, reasoning_tokens = NULL` honors `K_known = 120`**, (v) **out-of-order ascending revision fold test (`H = 200`, `rev 1`: `prompt_tokens = 60, completion_tokens = 20, final = true`; `rev 2`: `prompt_tokens = NULL, completion_tokens = 25, final = true`) calling `quota_settle_gateway_usage(..., 2)` BEFORE `rev 1` and proving it folds `[1, 2]` in `ORDER BY a.revision ASC` to the exact same `('settled', 85, 0, accepted_source_revision = 2)` as `rev 1` then `rev 2` (with subsequent `rev 1` returning idempotent no-op)**, and (vi) **unchanged incomplete post-final correction test (`completion_tokens = 25 -> 25`) proving `qr.accepted_source_revision` advances unconditionally with zero `quota_reconciliations` row, zero budget delta, zero hard drift, and `pending_gateway_reconciliations = 0`** (and `quota_verify_accounting_drift()` joining `openmettle.gateway_settlements gs` to `openmettle.gateway_usage_reports r_curr` strictly on `(gs.request_id = r_curr.request_id AND gs.revision = r_curr.revision AND gs.final = r_curr.final)` reading `r_curr.source` and `r_curr.report_id` from `r_curr`)**, **`quota_accepted_gateway_reports` historical catch-up, rejected-revision guard, and zero-deadlock concurrency tests covering (a) `revision = 1` (complete token-only final) AND `revision = 2` (cost-only final) both committing in `gateway_settlements` before local catch-up runs, proving `quota_accepted_gateway_reports` durably records both `(request_id, 1, true)` and `(request_id, 2, true)` so local catch-up settles `usage_tokens` from `revision = 1` and `usage_cost_micros` from `revision = 2` cleanly without stranding the token hold, (b) `tests/schema/gateway.rs`'s `revision = 1 (partial) -> 2 (final) -> 3 (late partial stored in gateway_usage_reports, rejected by gateway_settlements) -> 4 (final correction)` against a lagging `handoff_committed` hold proving `revision = 3` is absent from `quota_accepted_gateway_reports` and rejected by BOTH `quota_settle_gateway_usage` and `enforce_quota_reservation_gateway_binding` (`23514`) while `revision = 2` and `revision = 4` settle cleanly, AND (c) racing settlement-only (`quota_lock_gateway_request_for_settlement` -> `gateway_settlements` upsert), combined single-transaction (`quota_lock_gateway_request_for_settlement` -> `gateway_settlements` upsert -> `quota_record_accepted_gateway_settlement` -> `quota_settle_gateway_usage`), and worker recovery (`quota_release_unsent` / `quota_release_orphan_gateway_requests`) transactions concurrently on the same `request_id`, proving unconditional `quota_lock_gateway_request_for_settlement` maintains the globally acyclic lock order with zero deadlock**, **fractional `usage_cost_micros` cumulative `ceil(r.cost)::numeric(38, 0)` rounding and correction test across integer boundaries (`0.4 -> 0.8 -> 1.2` final -> `0.5` post-final correction -> `0`, proving `settled_units` / `active_used` track `1 -> 1 -> 2 -> 1 -> 0` with zero accumulated rounding drift and matching `quota_verify_accounting_drift()`)**, **`numeric(38, 0)` DB-to-Rust end-to-end oversized 3-column token and multi-report aggregate overflow test exercising BOTH multiple large overage reports AND a single oversized 3-column token report (`prompt_tokens + completion_tokens + reasoning_tokens > 9_223_372_036_854_775_807`) all the way through widened `openmettle.gateway_settlements.measured` (`numeric(38, 0)`), `quota_accepted_gateway_reports`, `quota_settle_gateway_usage`, `quota_verify_accounting_drift()`, Rust `u128`/`i128` decoding and canonical base-10 string formatting, and subsequent `429 quota` refusal without `22003` overflow** (with `/v1` HTTP `QuotaSummary` route and OpenAPI `WideNonNegativeDecimal` schema validation owned by PR3), `BEFORE INSERT OR UPDATE OR DELETE` `cost_denomination` immutability trigger (`OMQ02`, proving `INSERT` — including `INSERT ... ON CONFLICT DO UPDATE` — `DELETE`, and rename into/out of the seeded `('instance', 'usage_cost_micros')` row unconditionally fail with `OMQ02` without acquiring `quota_cost_unit_lock`, eliminating any AB/BA lock cycle) plus `BEFORE INSERT` `gateway_usage_reports_cost_unit_guard` serialized via `quota_cost_unit_lock` with **explicit concurrency tests covering both commit orders with different units (direct `UPDATE quota_defaults` vs `openmettle_gateway` `INSERT INTO gateway_usage_reports` with `cost IS NOT NULL`, plus two concurrent `gateway_usage_reports` inserts with different units while `cost_denomination IS NULL`)** and mismatch quarantine, final overage settlement plus subsequent refusal, upload abort and `confirm_purge`; override raise/lower/expiry and `hard_limit = 0` preserving data and deletion grace; `round_cap` `1..=1000` validation; **two-step raw-index-key paging and `tool-spill:*` ownership-partition tests across `quota_reservations`, run-linked `storage_reservations` (proving `operation_id IS NOT NULL AND idempotency_key LIKE 'tool-spill:%'` rows remain exclusively owned by ADR 0039 `reconcile_run_spills`, a pre-existing `run_id IS NOT NULL AND operation_id IS NULL AND idempotency_key LIKE 'tool-spill:%'` row is cleanly owned and recovered by ADR 0040's generic cleaner via the exact logical complement `(operation_id IS NULL OR idempotency_key NOT LIKE 'tool-spill:%')`, and `storage_reservations_tool_spill_binding_guard` rejects any new/updated `tool-spill:%` row lacking `run_id` or `operation_id` with `23514`), and non-run `reconcile_expired` exercising a full page containing ONLY ineligible expired holds (non-terminal runs, unresolved operations, `adoption_unverified = true`, or `LOCK_SH`-active `staging/<id>` / `revisions/<id>` files) followed by eligible holds on the next page, proving zero joins/`EXISTS`/`clock_timestamp()` before `LIMIT`, exact advancement of `last_attempted` across 100%-ineligible pages without wrapping prematurely, `FOR NO KEY UPDATE SKIP LOCKED` skipping contended rows without stalling, and release of eligible holds on the next page across `SWEEP_MS` ticks (60 s default interval, 15 s budget)**; **unified 3-step reclamation protocol, `stage_claimed`, write-once `payload_ino`, `RenameFlags::NOREPLACE`, non-destructive `StagedFile::drop`, `Store::read` inode verification, and writer-admission race tests across `Store::stage`, `Store::publish`, `Store::read`, `artifact_fs::abort`, `reconcile_expired`, generic run-linked recovery, and ADR 0039 `reconcile_run_spills` covering (a) startup/adoption capability probe tests verifying `O_CREAT \| O_EXCL \| O_NOFOLLOW`, `rustix::fs::renameat_with(..., RenameFlags::NOREPLACE)` (rejecting `ENOSYS`/`EOPNOTSUPP`/`EINVAL` fail-closed and verifying `Errno::EXIST` on an existing target without overwriting), and file + directory `fsync`, (b) `Store::stage` Steps 1a/1b/1c tests proving `stage_claimed = true` commits BEFORE disk creation (zero file created if rejected), `fsync(&staging_dir_fd)` completes BEFORE binding `payload_ino`, lost Step 1c ack leaves `staging/<id>` (`st_ino == payload_ino`) durably on disk and cleanly reclaimed by `reconcile_expired`/`abort` with zero false quarantine, and unified rollout rule permits HTTP `Store::stage`/`Store::publish` while `volume_id IS NULL AND adoption_run_id IS NULL` (setting `stage_claimed` + `payload_ino`) while rejecting ADR 0039 worker `publish_bytes` and all 4 cleaners until `volume_id IS NOT NULL`, (c) **100% non-destructive `StagedFile::drop` & ambiguous `storage::settle` tests** proving `StagedFile::drop` and all writer error/cancellation paths NEVER call `set_len(0)` and NEVER call `unlinkat` (lost `storage::settle` ack or cancelled future never zeroes published `revisions/<id>`, and ambiguous `storage::settle` inspects `storage_reservations.state` under `(runs FOR NO KEY UPDATE ->) storage_reservations FOR UPDATE` before calling `abort`), (d) **`Store::publish` `RenameFlags::NOREPLACE` `Errno::EXIST` quarantine test** placing a foreign file at `revisions/<id>` and proving `renameat_with(..., RenameFlags::NOREPLACE)` fails atomically with `Errno::EXIST` leaving foreign `revisions/<id>` bytes untouched and quarantining the reservation (`adoption_unverified = true, publish_pending = false`), (e) **`Store::read` `payload_ino` & explicit legacy-row tests** proving `Store::read` rejects `adoption_unverified = true`, rejects a same-sized foreign replacement file (`file_meta.ino() != sr.payload_ino`) with `Error::Io`, permits legacy `sr.payload_ino IS NULL` rows ONLY while `volume_id IS NULL AND adoption_run_id IS NULL`, and fails closed (`Error::Io` in `Store::read` and hard drift in `verify_accounting_drift`) on any `'active'`/`'retained'` revision with `payload_ino IS NULL` once `volume_id IS NOT NULL`, (f) updating `tests/schema/artifact_fs.rs`'s `renamed` test case and exercising ALL 4 cleaners (`artifact_fs::abort`, `reconcile_expired`, generic run-linked cleaner, ADR 0039 `reconcile_run_spills`) through the **unified 3-step reclamation protocol with ZERO filesystem I/O inside DB Steps 1 and 3**: proving Step 1 (`reclaim_state = 'claiming'`) resolves any in-flight `storage::settle` BEFORE Step 2 can truncate and blocks concurrent writers/cleaners (`abort` yields cleanly on an unexpired peer lease), Step 2 executes `LOCK_EX` (`WouldBlock` skips live `LOCK_SH` publishers) -> `probe_file.set_len(0)?` + `probe_file.sync_all()?` -> short DB commit `reclaim_state = 'truncated', publish_pending = false` (**retaining `payload_ino`**!) -> `unlinkat` + `drop` + dual `fsync(&staging_dir_fd)` & `fsync(&revisions_dir_fd)`, crash recovery across BOTH `'claiming'` (dual `ENOENT` -> quarantine guarded by `reclaim_claim_token = $my_token`; foreign inode -> quarantine with ZERO `set_len(0)`/`unlinkat`) AND `'truncated'` (dual `ENOENT` -> dual `fsync` -> Step 3; foreign inode -> quarantine with ZERO `set_len(0)`/`unlinkat`), Case 2 (`payload_ino IS NULL`) quarantining `revisions/<id>` or non-zero `staging/<id>` while cleaning `0`-byte `staging/<id>` under `LOCK_EX`, and Step 3 executing final `storage::release` with **ZERO filesystem I/O inside the DB transaction** while retaining `payload_ino` on `'released'`, AND (g) live directory-displacement tests covering displacement between `Store::stage` and `Store::publish`, post-`renameat_with`/pre-`commit` displacement + hard crash after rollback (exercising BOTH dual `ENOENT` and foreign replacement regular file subcases, proving foreign replacement files are NEVER truncated/unlinked and `reserved_bytes` stays 100% charged under `adoption_unverified = true`), and `Store::read` pathname-to-FD re-verification failing closed (`Error::Io`) on displacement**; **mandatory `ReadWriteMany` shared-volume qualification tests covering BOTH two-client / separate-mount `flock(2)` (`LOCK_SH` vs `LOCK_EX \| LOCK_NB` `WouldBlock`, rejecting `-o local_lock=flock`/`local_lock=all`) AND stable 64-bit `st_ino` coherence + second-client recovery across clients and remounts (explicitly exercising differing client-local `st_dev` values to confirm zero `payload_dev` cross-node dependency)**; **directory `fsync` durability barrier tests verifying (a) sentinel publication calls `fsync(root_fd)` strictly BEFORE creating/linking either `:revisions` or `:staging` (and `fsync(revisions_dir_fd)` / `fsync(staging_dir_fd)` before updating `storage_instance.volume_id`), (b) `Store::stage` Step 1b calls `fsync(&staging_dir_fd)` strictly BEFORE Step 1c binds `payload_ino`, and (c) `artifact_fs::purge_due` unconditionally calls `fsync(revisions_dir_fd)` strictly BEFORE `storage::confirm_purge` — explicitly including when `unlinkat(revisions_dir_fd, id, AtFlags::empty())` returns `ENOENT`**; **unpinned/adopting DB-guard (`enforce_runtime_storage_volume_pinned`, `OMQ03`), serialized `adoption_run_id` race, and `N` cleaner pre-unlink safety tests covering (a) exercising BOTH `openmettle_worker` (`reconcile_expired` and `purge_due`) AND `openmettle_api` (`N-1`'s unconditional `storage::release` `abort()`) — explicitly including `NOINHERIT` logins executing under `SET ROLE openmettle_api` and `SET ROLE openmettle_worker` — while `storage_instance.volume_id IS NULL OR adoption_run_id IS NOT NULL`, proving `SECURITY INVOKER` `enforce_runtime_storage_volume_pinned()` (`PERFORM 1 FROM openmettle.storage_instance WHERE id FOR SHARE;`) blocks release/purge with `OMQ03` while normal `reserve` + `settle` uploads and active `openmettle_owner` reconciliation succeed, (b) **adoption Step 1b concurrency race tests exercising BOTH (i) a cleaner entering `storage::release` while Step 1b holds `storage_instance FOR UPDATE` uncommitted (proving strict `FOR SHARE` vs `FOR UPDATE` serialization with zero release passing the trigger before Step 1b and committing during Step 2, zero rows escaping Step 3's `'reserved'` set), AND (ii) a concurrent second adopter failing closed (`OMQ03`) during Step 2 without clearing Adopter 1's `adoption_run_id` (plus `--replace-adoption-run <stale_uuid>` stale recovery and Step 2 failure clearing `adoption_run_id = NULL` only `WHERE id AND adoption_run_id = $my_adoption_run_id`)**, AND (c) `N` cleaners run against existing on-disk payloads and empty replacement mounts while `volume_id IS NULL` or when any directory sentinel is missing/mismatched/FIFO/wrong-role/different-`st_dev`, failing closed with zero unlinks and zero DB mutations**; **post-pinning same-filesystem subdirectory-replacement & writerless FIFO `.openmettle-volume-id` sentinel tests proving `Store::open`, `openmettle-admin` adoption, `verify_accounting_drift`, and all worker cleaners open sentinels with `OFlags::RDONLY \| OFlags::NOFOLLOW \| OFlags::NONBLOCK` + `fstat` (`S_ISREG`) and fail closed immediately without blocking or unlinking**; **sentinel atomic `linkat` concurrency, crash/interruption, concurrent `begin_purge` retry, Step 3 `payload_ino` backfill, and populated-upgrade adoption tests covering (a) lost commit-ack adoption retry after replacing `<root>/revisions` (never writing a missing sentinel when `volume_id IS NOT NULL`, failing closed with `OMQ03`), (b) Step 3 canonical lock order (`storage_reservations -> artifact_revisions -> storage_accounts -> storage_instance FOR UPDATE`) requiring `adoption_run_id = $my_adoption_run_id`, backfilling `payload_ino` on every positively verified on-disk `'reserved'` and `'active'`/`'retained'` `'settled'` row, quarantining missing/mismatched `'reserved'` rows (`adoption_unverified = true`) on BOTH initial unpinned and already-pinned runs, pinning `volume_id`, and clearing `adoption_run_id = NULL`, (c) concurrent `begin_purge` (`'retained' -> 'purging'` + unlink) during already-pinned adoption retry (fresh `READ COMMITTED` re-query accepting `'purging'`/`'purged'`), (d) `storage::reserve` racing Step 2 empty-ledger check -> Step 3 `storage_instance FOR UPDATE`, (e) two concurrent fresh-bootstrap `Store::open` publishers serializing on `storage_instance FOR UPDATE`, (f) crash after `.openmettle-volume-id.tmp.<128bit_random_hex>` or subset sentinel linking recovering idempotently, and (g) populated-upgrade, mixed-reservation (`--expected-fs-uuid` + `--expected-revisions-inode`), and reservation-only (`--confirm-no-on-disk-payloads`) acceptance tests proving quarantined `adoption_unverified = true` rows stay charged and excluded from all cleaners until `openmettle_owner` reconciliation or verified adoption on the restored tree**; **persistent 5-state `StagingSweepState` `ReadDir` `staging/` cleanup tests covering (a) multi-tick enumeration resuming from parked open `dir_fd`, verifying `'released'` rows skip untouched when `adoption_unverified = true`, `payload_ino IS NOT NULL AND staging_ino != payload_ino`, or `payload_ino IS NULL AND staging_size > 0`, and otherwise execute `LOCK_EX` -> `set_len(0)` -> `sync_all()` -> `unlinkat` -> `drop` -> `fsync(&staging_dir_fd)`, (b) `'settled'` `payload_ino` rules skipping `adoption_unverified = true` or `payload_ino IS NULL`, verifying under `LOCK_EX` that (i) hard-link alias `staging_ino == payload_ino` calls `unlinkat` ONLY (NEVER `set_len(0)`) strictly when `revisions/<id>` is `S_ISREG` on same local `st_dev` with `rev_stat.st_ino as u64 == payload_ino` (preserving both untouched on `ENOENT` or `rev_ino != payload_ino`), and (ii) distinct inode `staging_ino != payload_ino` executes `set_len(0)` -> `sync_all()` -> `unlinkat` ONLY when `revisions/<id>` has `rev_stat.st_ino as u64 == payload_ino` OR (`ENOENT` AND fresh `READ COMMITTED` `artifact_revisions.state = 'purged'`), preserving both untouched on `rev_ino != payload_ino` or missing `'active'` revision, (c) `LOCK_SH`-held active pre-commit `staging/<id>` skip + `st_mtime > 900 s` + `storage_instance FOR UPDATE` serialized zero-row orphan recheck, (d) `spawn_blocking` slice exceeding 15 s `tokio::time::timeout` parking `InFlight` cleanly across ticks, and (e) `<root>/staging` replacement during `InFlight` (`InvalidatedInFlight`) and `DrainingEof` preventing inode reuse via retained open `dir_fd`**; restore and periodic drift verification (`verify_accounting_drift` + `openmettle.quota_verify_accounting_drift()`) **including concurrent `begin_purge` interleaving (fresh `READ COMMITTED` re-query yielding zero false hard drift), failing hard once `storage_instance.volume_id IS NOT NULL` on any `'active'`/`'retained'` revision with `payload_ino IS NULL` or on-disk `payload_ino` mismatch, recognizing `'purging'` `ENOENT` as valid, skipping filesystem checks on storage-disabled installations (`ARTIFACTS_DIR` unset, `volume_id IS NULL`, `0` storage rows), and validating DB/`0023` drift via the exact ascending fold across `a.revision <= qr.accepted_source_revision` (`ORDER BY a.revision ASC`, `K_known`/`X_known` included reasoning lower bound, `numeric(38, 0)` past `bigint` max), simplified `pending_gateway_reconciliations`, and `gateway_settlements` joined to `gateway_usage_reports` strictly on `(gs.request_id = r_curr.request_id AND gs.revision = r_curr.revision AND gs.final = r_curr.final)` reading `r_curr.source` and `r_curr.report_id` from `r_curr`**; and populated previous-writer rolling-upgrade test with a lowered `storage_bytes` override proving fail-closed refusal (`OMQ01`) on old `storage::reserve` while `settle`/`release`/`retain`/`purge` succeed. |
+| PR2 · schema, store and worker recovery | Additive PostgreSQL 18 migration (after Migration `0023`, zero edits to frozen `0023`), including `ALTER TABLE openmettle.gateway_settlements ALTER COLUMN measured TYPE numeric(38, 0)` (preserving `CHECK (measured >= 0)` and nullable `measured = NULL` for cost-only reports so 3-column token sums up to `3 * (2^63 - 1)` never overflow `bigint`), append-only `openmettle.quota_accepted_gateway_reports` ledger (owned by `openmettle_owner`, zero direct DML or `SELECT` grants to runtime roles, populated automatically by `SECURITY DEFINER` `AFTER INSERT OR UPDATE OF revision, final` trigger `quota_record_accepted_gateway_settlement` on `openmettle.gateway_settlements`, with historical backfill and composite FK `(gateway_request_id, source_revision) REFERENCES openmettle.quota_accepted_gateway_reports (request_id, revision)` on `openmettle.quota_reconciliations`), `rustix` minimal safe POSIX `dirfd` dependency (`default-features = false, features = ["fs", "std"]`, `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`; `Cargo.lock` distribution-blocker count updated per ADR 0007/0010 so all `openat`/`fstat`/`statat`/`linkat`/`unlinkat`/`fsync` calls using verified `rustix 1.1.6` `OFlags::CREATE` / `OFlags::RDONLY` / `OFlags::RDWR` / `OFlags::EXCL` / `OFlags::DIRECTORY` / `OFlags::NOFOLLOW` / `OFlags::NONBLOCK`, `AtFlags::SYMLINK_NOFOLLOW`, `AtFlags::empty()`, and `Mode::RUSR \| Mode::WUSR` compile safely under `Cargo.toml`'s `unsafe_code = "forbid"` on Rust 1.100), `src/migrate.rs` (`migrate_within_boundaries` capturing `applied = coalesce(max(version), 0)` once under SQLx's advisory lock and setting `openmettle.bootstrap_from_zero` via `pg_catalog.set_config` after each `RESET ALL` before every `migrator.run_to(version, ...)`), dedicated 1-row read-mostly volume-identity singleton **`openmettle.storage_volume_control (id boolean PRIMARY KEY DEFAULT true CHECK (id), volume_id uuid, bootstrap_auto_pin_allowed boolean NOT NULL DEFAULT false, adoption_run_id uuid, CONSTRAINT storage_volume_control_auto_pin_check CHECK (volume_id IS NULL OR NOT bootstrap_auto_pin_allowed))`** (`GRANT SELECT` to `openmettle_api, openmettle_worker`; `GRANT UPDATE (volume_id, bootstrap_auto_pin_allowed)` to `openmettle_api`; seeded `bootstrap_auto_pin_allowed = true` iff `is_fresh_bootstrap` — requiring both `openmettle.bootstrap_from_zero = 'true'` and empty core/storage/gateway tables — and `false` on every upgrade `applied >= 1`; keeping only `warn_pct_1`, `warn_pct_2`, `config_revision` on `openmettle.storage_instance` so runtime `reserve`/`settle`/`release`/`purge` ONLY ever acquire `FOR SHARE` on `storage_volume_control` and NEVER `UPDATE` it, eliminating `FOR SHARE -> FOR NO KEY UPDATE` deadlocks on `storage_instance`), `storage_reservations.adoption_unverified` (`boolean NOT NULL DEFAULT false` with tightened **`CHECK (NOT adoption_unverified OR state = 'reserved')`**, combined with `SECURITY INVOKER` `enforce_storage_reservation_monotonic_guards()` (`OMQ03`) preventing any non-owner role from ever transitioning a quarantined `'reserved'` row to `'released'` or `'settled'` while `openmettle_owner` releases cleanly in one `UPDATE` setting `state = 'released', adoption_unverified = false`), **`storage_reservations.stage_claimed boolean NOT NULL DEFAULT false`** (`CHECK (payload_ino IS NULL OR stage_claimed)`), **`storage_reservations.payload_ino numeric(20, 0)`** (`CHECK (payload_ino IS NULL OR payload_ino >= 0)`, exact unsigned 64-bit `u64` `MetadataExt::ino()`, dropping cross-node-unsafe NFS `payload_dev` completely and verifying same-mount `file_meta.dev() == dir_fd_meta.dev() == root_fd_meta.dev()` locally per host), `storage_reservations.publish_pending` (`boolean NOT NULL DEFAULT false CHECK (NOT publish_pending OR (state = 'reserved' AND payload_ino IS NOT NULL))`), the unified **4-state** cleaner lease on `openmettle.storage_reservations` (**`reclaim_state text NOT NULL DEFAULT 'none' CHECK (reclaim_state IN ('none', 'claiming', 'truncated', 'anchor_pending_unlink'))`**, **`reclaim_claim_token uuid`**, **`reclaim_lease_until timestamptz`**, with `CHECK ((state = 'reserved' AND reclaim_state IN ('none', 'claiming', 'truncated')) OR (state = 'released' AND reclaim_state IN ('none', 'anchor_pending_unlink')) OR (state = 'settled' AND reclaim_state = 'none'))`, `CHECK ((reclaim_state IN ('claiming', 'truncated') AND reclaim_claim_token IS NOT NULL AND reclaim_lease_until IS NOT NULL) OR (reclaim_state IN ('none', 'anchor_pending_unlink') AND reclaim_claim_token IS NULL AND reclaim_lease_until IS NULL))`, and `CHECK (reclaim_state NOT IN ('truncated', 'anchor_pending_unlink') OR NOT publish_pending)`), narrow runtime grants `GRANT INSERT (lease_expires_at, stage_claimed)` and `GRANT UPDATE (lease_expires_at, adoption_unverified, stage_claimed, payload_ino, publish_pending, reclaim_state, reclaim_claim_token, reclaim_lease_until)` on `openmettle.storage_reservations` to `openmettle_api, openmettle_worker`, 100% `IMMUTABLE` PostgreSQL 18 plain-column partial B-tree indexes for two-step raw-index-key stale-hold paging (`quota_reservations_held_expiry_idx`, `storage_reservations_run_expiry_idx` and `storage_reservations_run_legacy_expiry_idx` both narrowed to `(operation_id IS NULL OR idempotency_key NOT LIKE 'tool-spill:%')` — exact logical complement of ADR 0039 `reconcile_run_spills` — `storage_reservations_upload_expiry_idx`, `storage_reservations_upload_legacy_expiry_idx`), `BEFORE INSERT OR UPDATE OF idempotency_key, run_id, operation_id` trigger `storage_reservations_tool_spill_binding_guard` (`23514`, rejecting `idempotency_key LIKE 'tool-spill:%' AND (run_id IS NULL OR operation_id IS NULL)`), strengthened `quota_reservations` state `CHECK` constraints prohibiting `settled_units > 0` or `accepted_source_revision IS NOT NULL` while `state = 'held'` or unaccepted `handoff_committed`, exact `numeric(38, 0)` aggregate and settlement accumulators (`quota_budgets.active_used`, `quota_budgets.reserved_held`, `quota_reservations.settled_units`, `quota_reconciliations.cumulative_units`, `delta_active`, `delta_reserved`, mapped in Rust via `sqlx` `::text` <-> `u128`/`i128` canonical base-10 strings with zero new crates), `quota_enforcement` singleton control table (`metering_enforced`, write-once `false -> true`, seeded `true` iff `is_fresh_bootstrap` and `false` on every upgrade `applied >= 1`), `quota_gateway_handoffs` handoff-time obligation ledger (`gateway_request_id` PK referencing `gateway_requests(id) ON DELETE CASCADE`, `metering_enforced`, `cost_required`, `committed_at`, zero direct DML grants to runtime roles), `quota_reservations.allocating_claim_token` (`CHECK (parent_reservation_id IS NULL OR allocating_claim_token IS NOT NULL)`), seeded strictly-`UPDATE`-only `('instance', 'usage_cost_micros')` default row and `quota_cost_unit_lock`, scope-pinned composite FK `(scope_id, gateway_request_id) REFERENCES openmettle.gateway_requests (scope_id, id)`, `SECURITY DEFINER` transition, bootstrap, override, recovery and drift functions (`storage_pin_volume_id`, `quota_upsert_scope_override`, `quota_revoke_scope_override`, `quota_reserve` and `quota_allocate_round` enforcing exact `usage_tokens` hold equality `reserved_units = q.units` / `slice_units = q.units` (`23514`), `quota_ensure_legacy_run_holds` — running strictly before `authz::gateway::reserve_in` in the round-allocation `WriteTransaction` while locking `gateway_reservations FOR NO KEY UPDATE` and reading `units - allocated` — `quota_commit_handoff`, `quota_recover_lost_handoff`, `quota_commit_device_handoff`, `quota_renew_lease`, `quota_release_unsent`, `quota_unwind_superseded_round`, `quota_release_orphan_gateway_requests`, `quota_lock_gateway_request_for_settlement(uuid)` (`EXECUTE` to `openmettle_gateway` only, called unconditionally strictly BEFORE **every** `openmettle_gateway` `INSERT`/`UPDATE` on `openmettle.gateway_settlements` — both settlement-only transactions and combined single-transaction writes — to guarantee the globally acyclic lock DAG `runs -> gateway_reservations -> gateway_requests -> gateway_settlements -> quota_accepted_gateway_reports -> quota_reservations -> quota_budgets`), `quota_settle_gateway_usage` operating strictly on `state IN ('handoff_committed', 'settled')` holds without locking `runs` or `gateway_reservations` (`gateway_requests FOR KEY SHARE -> quota_reservations (ORDER BY resource ASC FOR UPDATE) -> quota_budgets FOR NO KEY UPDATE`), verifying exact `EXISTS` acceptance membership in `quota_accepted_gateway_reports`, **folding all unapplied accepted revisions `a.revision` in `(coalesce(qr.accepted_source_revision, -1), p_source_revision]` sequentially in `ORDER BY a.revision ASC`** (making settlement order-independent across out-of-order invocations such as `rev 2` before `rev 1`, with worker catch-up also iterating in `ORDER BY a.revision ASC`), enforcing per-resource authoritative evidence rules for `usage_cost_micros` (`r_step.cost IS NOT NULL`, `C_cost = ceil(r_step.cost)::numeric(38, 0)`) and `usage_tokens` (computing cumulative `P_known`, `K_raw`/`rev_K`, and `(R_latest, inc_latest, rev_R)` across accepted revisions `<= r_step.revision`, setting `K_known = K_raw, X_known = R_latest` when `inc_latest IS FALSE` and **`K_known = CASE WHEN rev_R >= rev_K THEN greatest(K_raw, R_latest) ELSE K_raw END, X_known = 0`** when `inc_latest IS TRUE` so included reasoning tokens act as a lower bound on completion without double-counting, while **`is_complete_tokens(r_step)` is `true` iff on `r_step` itself, `r_step.prompt_tokens IS NOT NULL AND r_step.completion_tokens IS NOT NULL` AND (`r_step.reasoning_tokens IS NOT NULL` whenever any earlier accepted revision `< r_step.revision` reported `reasoning_tokens IS NOT NULL AND reasoning_included = false`)** — never pieced together from separate partial + incomplete-final revisions), and **unconditionally advancing `qr.accepted_source_revision = p_source_revision`** on every processed accepted revision including `0`-delta / no-op / other-resource revisions while writing `quota_reconciliations` and adjusting `quota_budgets` iff `(new_state, new_settled, new_held) IS DISTINCT FROM (old_state, old_settled, old_held)`, `quota_release_device_slot`, `quota_record_storage_warning`, `quota_verify_accounting_drift` replaying the exact same ascending fold across `a.revision <= qr.accepted_source_revision` (`ORDER BY a.revision ASC`, including `K_known`/`X_known` included reasoning lower bound, requiring `qr.state = 'settled'` iff at least one `final = true` accepted revision `<= qr.accepted_source_revision` established complete authoritative evidence for that resource), reporting unapplied accepted revisions via `EXISTS (SELECT 1 FROM openmettle.quota_accepted_gateway_reports a WHERE a.request_id = qr.gateway_request_id AND a.revision > coalesce(qr.accepted_source_revision, -1))` in `pending_gateway_reconciliations`, validating widened `gateway_settlements.measured` (`numeric(38, 0)`) joined to `openmettle.gateway_usage_reports r_curr` strictly on **`(gs.request_id = r_curr.request_id AND gs.revision = r_curr.revision AND gs.final = r_curr.final)`** reading `r_curr.source` and `r_curr.report_id` from `r_curr`, and failing hard once `storage_volume_control.volume_id IS NOT NULL` on any `'active'`/`'retained'` revision with `payload_ino IS NULL`), `enforce_storage_override`, `quota_enforcement_write_once` (`OMQ04`), `SECURITY DEFINER` `DEFERRABLE INITIALLY DEFERRED` `CONSTRAINT TRIGGER quota_enforce_gateway_handoff_holds` (`OMQ04`), **`SECURITY INVOKER`** `BEFORE UPDATE` `enforce_runtime_storage_volume_pinned` triggers (`SET search_path = pg_catalog`, executing serialized `SELECT volume_id, adoption_run_id INTO v_vol, v_adopt FROM openmettle.storage_volume_control WHERE id FOR SHARE;` and failing closed on `NOT FOUND OR v_vol IS NULL OR v_adopt IS NOT NULL` with `OMQ03` for non-`openmettle_owner` across both `INHERIT` and `NOINHERIT`/`SET ROLE` logins, never locking `storage_instance FOR SHARE`), **`SECURITY INVOKER`** `BEFORE UPDATE` `enforce_storage_reservation_monotonic_guards` trigger (`SET search_path = pg_catalog`, raising `OMQ03` for non-`openmettle_owner` clearing `adoption_unverified`, mutating/clearing non-null `payload_ino`, or clearing `stage_claimed`), `SECURITY DEFINER` `BEFORE INSERT OR UPDATE` `enforce_quota_reservation_gateway_binding` (`23514`), `BEFORE INSERT OR UPDATE OR DELETE` `enforce_cost_denomination_immutability` (`OMQ02`) and `SECURITY DEFINER` `BEFORE INSERT` `enforce_gateway_report_cost_unit` triggers, versioned `src/boundaries.sql` entries, `authz::gateway::{reserve_in, handoff_in, release_in}` in-transaction helpers, `src/quotas.rs` store, `storage::reserve` override integration, `artifact_fs::Store` retaining `Arc`-shared verified directory descriptors (`root_fd`, `staging_dir_fd`, `revisions_dir_fd`) with startup/adoption capability probes (`O_CREAT \| O_EXCL \| O_NOFOLLOW`, `rustix::fs::linkat(..., AtFlags::empty())` rejecting `ENOSYS`/`EOPNOTSUPP`/`EINVAL` and verifying `Errno::EXIST` without overwriting and shared `st_ino`, file+dir `fsync`, plus `ReadWriteMany` two-client `flock(2)` AND stable 64-bit `st_ino` coherence + second-client recovery qualification), unified rollout rule (`Store::stage`/`Store::publish` succeeding when `storage_volume_control.adoption_run_id IS NULL` both pinned and while `volume_id IS NULL`, while ADR 0039 worker `publish_bytes` and all 4 cleaners strictly require `storage_volume_control.volume_id IS NOT NULL AND adoption_run_id IS NULL`), `Store::stage` Steps 1a/1b/1c (`stage_claimed = true` before disk write -> `openat` + `LOCK_SH` + `fsync(&staging_dir_fd)` BEFORE binding `payload_ino` -> commit `payload_ino = staged_ino`), **100% non-destructive `StagedFile::drop` and writer error/cancellation paths** (NEVER calling `set_len(0)` or `unlinkat`; ambiguous `storage::settle` inspecting `storage_reservations.state` under `FOR UPDATE` before `abort`), `Store::publish` committing `publish_pending = true` before **`rustix::fs::linkat(&staging_dir_fd, id, &revisions_dir_fd, id, AtFlags::empty())`** + `fsync(&revisions_dir_fd)` + post-`linkat` re-verify (quarantining `Errno::EXIST` without overwriting foreign `revisions/<id>` AND keeping `staging/<id>` present on disk until `storage::settle` commits so `N-1` API retries hit `OpenOptions::create_new(true)` -> `Err(Error::InProgress)`), `storage::settle` committing `state = 'settled', publish_pending = false` while **retaining `payload_ino`**, and post-commit best-effort detach of `staging/<id>` while holding `LOCK_SH` (`unlinkat`, never `set_len(0)` -> `drop` -> `fsync(&staging_dir_fd)`), **`Store::read`** joining `storage_reservations` to verify `NOT sr.adoption_unverified` and `file_meta.ino() == sr.payload_ino` (permitting legacy `payload_ino IS NULL` ONLY while `storage_volume_control.volume_id IS NULL AND adoption_run_id IS NULL`, failing closed with `Error::Io` once `volume_id IS NOT NULL`), `Store::open` fresh-bootstrap-only (`bootstrap_auto_pin_allowed = true` + empty ledger under `storage_volume_control FOR UPDATE`) three-directory role-tagged volume sentinel pinning (`:root` + `fsync(root_fd)` strictly before `:revisions`/`:staging`), unified **4-step reclamation protocol** across ALL 4 cleaners (`artifact_fs::abort`, `reconcile_expired` updating ADR 0031 & `tests/schema/artifact_fs.rs`'s `renamed` test case, generic run-linked recovery narrowed to `(operation_id IS NULL OR idempotency_key NOT LIKE 'tool-spill:%')`, and ADR 0039 `reconcile_run_spills`) with **ZERO filesystem I/O inside DB Steps 1 and 3** (`reclaim_state = 'claiming'` -> outside-DB probe/quarantine or `LOCK_EX` `set_len(0) + sync_all()` -> `linkat` hard-link anchor `staging/.reclaim.<id>` + `fsync(&staging_dir_fd)` -> `unlinkat` `<id>` from `revisions/`/`staging/` + dual `fsync` -> short DB commit `reclaim_state = 'truncated', publish_pending = false` retaining `payload_ino`, with `'truncated'` crash recovery probing ONLY `staging/.reclaim.<id>` and never touching `staging/<id>`/`revisions/<id>` -> Step 3 final `storage::release` setting `reclaim_state = 'anchor_pending_unlink'` when `payload_ino IS NOT NULL` and retaining `payload_ino` -> Step 4 post-release `unlinkat` of `staging/.reclaim.<id>` + `fsync(&staging_dir_fd)` + best-effort `reclaim_state = 'none'`), `artifact_fs::purge_due` joining `storage_reservations` to verify leaf `revisions/<id>` `st_ino == payload_ino` (stopping immediately with zero `set_len(0)`/`unlinkat` and NOT calling `confirm_purge` on mismatch), detaching any `staging/<id>` hard-link alias with `st_ino == payload_ino`, and unconditionally calling BOTH `fsync(&revisions_dir_fd)` and `fsync(&staging_dir_fd)` strictly before `storage::confirm_purge`, and non-truncating `StagingSweepState` (`'settled'`, `'released'`, and `staging/.reclaim.<id>` rules never calling `set_len(0)`), idempotent `purging`-tolerant `openmettle-admin` verified volume adoption CLI procedure (`my_adoption_run_id = uuid_v4()`, Step 1b locking ONLY `storage_volume_control WHERE id FOR UPDATE` serialized against trigger `FOR SHARE` with `--replace-adoption-run <stale_uuid>`, Step 2 outside-DB scan clearing `adoption_run_id = NULL` on failure only `WHERE id AND adoption_run_id = $my_adoption_run_id`, Step 3 canonical lock order `storage_reservations -> artifact_revisions -> storage_volume_control -> storage_accounts -> storage_instance FOR UPDATE` requiring `adoption_run_id = $my_adoption_run_id`, evaluating all `'active'`/`'retained'`/`'purging'` revisions and volume checks BEFORE writing any `payload_ino`, committing `payload_ino` backfills ONLY in the success branch while positively verifying & preserving `'truncated'` holds with `staging/.reclaim.<id>`, omitting/rolling back ALL `payload_ino` backfills on failed adoption, quarantining missing/mismatched `'reserved'` rows, pinning `storage_volume_control.volume_id`, and clearing `adoption_run_id = NULL`) and operator runbook update mandating the 4-step upgrade sequence, `claim_next` executing-cap override evaluation, DB-plus-filesystem `verify_accounting_drift`, bounded two-step raw-index-key paging across `quota_release_orphan_gateway_requests`, `quota_reservations`, run-linked `storage_reservations`, and non-run `reconcile_expired`, and `SKIP LOCKED` one-per-tx `reconcile_stale_quotas` with persistent 5-state `StagingSweepState` held outside `worker::sweep`'s 15 s `tokio::time::timeout` in `src/worker.rs`. | PostgreSQL 18 tests in `tests/schema/grants.rs`, `tests/schema/artifact_fs.rs`, and `tests/schema/quotas.rs` executing all override, reservation, legacy-run-hold-backfill, device-handoff, lost-handoff-recovery, superseded-round-unwind, orphan-gateway-sweep, gateway-settlement, drift-verification and stale-sweep paths **connected as the actual runtime roles** (`openmettle_api`, `openmettle_worker`, `openmettle_gateway`, `openmettle_issuance`) and asserting denial of direct `INSERT`/`UPDATE`/`DELETE`/`SELECT ... FOR NO KEY UPDATE` on all `quota_*` tables (plus zero privileges on `quota_cost_unit_lock`, `quota_gateway_handoffs`, and `quota_accepted_gateway_reports`, `SELECT`-only on `quota_enforcement`, `SELECT` on `storage_volume_control` for `openmettle_worker` and `SELECT, UPDATE (volume_id, bootstrap_auto_pin_allowed)` on `storage_volume_control` for `openmettle_api` (with `adoption_run_id` writable solely by `openmettle_owner`), plus `INSERT (lease_expires_at, stage_claimed)` and `UPDATE (lease_expires_at, adoption_unverified, stage_claimed, payload_ino, publish_pending, reclaim_state, reclaim_claim_token, reclaim_lease_until)` on `storage_reservations` for `openmettle_api`/`openmettle_worker`, plus schema tests for `payload_ino` non-negative CHECK, `CHECK (payload_ino IS NULL OR stage_claimed)`, `CHECK (NOT publish_pending OR (state = 'reserved' AND payload_ino IS NOT NULL))`, all three `reclaim_state`/`reclaim_claim_token`/`reclaim_lease_until` CHECK constraints, AND **`SECURITY INVOKER` `enforce_storage_reservation_monotonic_guards()` assumed-role tests under BOTH `openmettle_api` and `openmettle_worker` (both `INHERIT` and `NOINHERIT`/`SET ROLE` logins) proving `OMQ03` on clearing `adoption_unverified`, mutating or clearing non-null `payload_ino`, or clearing `stage_claimed` while `openmettle_owner` succeeds**), denial of direct `SELECT` by `openmettle_api` and `openmettle_worker` on `openmettle.gateway_requests` and `openmettle.gateway_usage_reports` while qualifying `openmettle.quota_verify_accounting_drift()`, `openmettle.quota_ensure_legacy_run_holds(...)`, `openmettle.quota_unwind_superseded_round(...)` and `openmettle.quota_release_orphan_gateway_requests(...)` as `openmettle_worker` (and denying `EXECUTE` to `openmettle_api`, `openmettle_gateway` and `openmettle_issuance`), qualifying `openmettle.quota_lock_gateway_request_for_settlement(uuid)` strictly as `openmettle_gateway` (and denying `EXECUTE` to all other runtime roles), and qualifying `openmettle.quota_recover_lost_handoff(...)` as `openmettle_api` (`p_run_id IS NULL`) and `openmettle_worker` (`p_run_id IS NOT NULL`) while denying `openmettle_gateway` and `openmettle_issuance`, denial of `openmettle_api` calling either `quota_commit_handoff` or `quota_commit_device_handoff` on a run-linked `device_reservations` hold, denial of `openmettle_worker` calling generic `quota_commit_handoff` on a run-linked `device_reservations` hold, and denial of cross-role/unleased calls; N-way concurrent admission non-oversubscription across distinct project/actor/instance windows; non-windowed `device_reservations` surviving UTC rollover and `api`-admitted run device handoff exclusively via `quota_commit_device_handoff` under active `claim_token` lease (plus refusal for wrong resource kind or stale/unleased/cancelled run); cross-scope lock-order race with zero deadlocks; concurrent `executing_runs_per_actor` / `executing_runs_per_scope` cap lowering racing `claim_next` (and approval resume) serialized on `run_dispatch_lock` with zero overshoot; exact-once reconciliation across exact replay (recovering server-chosen windows), unique `(gateway_request_id, resource_kind)` enforcement rejecting duplicate keys, scope-pinned composite FK `(scope_id, gateway_request_id) REFERENCES openmettle.gateway_requests (scope_id, id)` and composite FKs to `gateway_usage_reports` (`(request_id, revision)` and `(source, report_id, revision)`) and `quota_accepted_gateway_reports` (`(request_id, revision)`), **single-transaction atomic `authz::gateway::reserve_in` + `quota_reserve` / `quota_allocate_round` rollback test proving that when any metered quota hold fails or the transaction aborts before commit, neither `gateway_requests`, `gateway_reservations.allocated`, nor `quota_reservations` persists (and `gateway_requests_run_round_active_idx` is not stranded)**, **exact `usage_tokens` hold-size equality and pre-handoff `settled_units > 0` schema guard tests exercising mismatched amounts (`<` and `>` `gateway_requests.units`) on BOTH standalone (`run_id IS NULL`) and run-round (`run_id IS NOT NULL`) requests AND attempting `INSERT` and `UPDATE` in `state = 'held'` (and unaccepted `state = 'handoff_committed'` with `accepted_source_revision IS NULL`) with `settled_units > 0` and reduced `held_units`, proving deterministic rejection across `quota_reservations` `CHECK` constraints, `quota_reserve` / `quota_allocate_round` / `enforce_quota_reservation_gateway_binding` (`23514`), and `enforce_gateway_handoff_holds` (`OMQ04`)**, **deployment-history fresh-vs-upgrade seeding and `0023` rolling-upgrade activation tests across `openmettle.bootstrap_from_zero`, `quota_enforcement.metering_enforced`, and `storage_volume_control.bootstrap_auto_pin_allowed`: (a) fresh `applied == 0` bootstrap via `migrate_within_boundaries` auto-seeds `metering_enforced = true` and `bootstrap_auto_pin_allowed = true` (permitting `Store::open` auto-pinning once and clearing `bootstrap_auto_pin_allowed = false`); (b) an existing, completely unused `0001..0023` installation (`applied = 23`, zero rows in `users`, `scopes`, `projects`, `runs`, `storage_*`, and `gateway_*`) upgraded to `0024` via `migrate_within_boundaries` seeds `metering_enforced = false`, `bootstrap_auto_pin_allowed = false`, and `volume_id IS NULL`, proving legacy `0023` handoff succeeds during rollout, `N` startup (`Store::open` / `storage_pin_volume_id`) refuses to auto-pin (`OMQ03`), and post-replacement `openmettle-admin` adoption (cleanly linking all three role-tagged sentinels without `--expected-fs-uuid` / `--expected-revisions-inode` on the empty storage ledger) plus `metering_enforced = true` activation completes cleanly; (c) storage-disabled installation activation test (both `OPENMETTLE_API_ARTIFACTS_DIR` / `OPENMETTLE_ARTIFACTS_DIR` and `OPENMETTLE_WORKER_ARTIFACTS_DIR` unset and `0` rows in `storage_reservations` and `artifact_revisions`) proving Step 4 skips volume adoption cleanly (`volume_id IS NULL`, `bootstrap_auto_pin_allowed = false`, cleaners disabled), runs `quota_release_orphan_gateway_requests`, flips `metering_enforced = true`, and passes `verify_accounting_drift` (while `verify_accounting_drift` still fails hard whenever `ARTIFACTS_DIR` is configured or any storage row exists with `volume_id IS NULL`); (d) Step 1 pre-migration `N-1` `worker::maintenance` sweep-drain test proving an in-flight `N-1` sweep finishes cleanly before `openmettle-migrate` starts; (e) populated upgrades (including an existing `openmettle.gateway_reservations` row with zero `gateway_bindings`/`gateway_requests` rows) seed `false` so `N-1` `0023`-only handoff succeeds during rolling deploy and `quota_recover_lost_handoff` reports `'unmetered_legacy_handoff'` while suppressing HTTP dispatch, whereas any bound `'held'`/`'released'` quota hold still fails at `COMMIT` with `OMQ04`; flipping write-once `metering_enforced = true` as `openmettle_owner` in a standalone single-statement transaction — rejecting `true -> false` with `OMQ04` — causes `0023`-only handoffs to fail at `COMMIT` with `OMQ04` and roll back `gateway_requests` to `'reserved'`, requiring both bound `'handoff_committed'` `usage_tokens` (exact `reserved_units = NEW.units AND held_units = NEW.units AND settled_units = 0 AND accepted_source_revision IS NULL` + ownership match) and applicable `usage_cost_micros` holds (`settled_units = 0 AND accepted_source_revision IS NULL`); PLUS (f) a two-connection concurrency test covering both commit orders between an unmetered `0023` `gateway_handoff` commit (inserting `quota_gateway_handoffs` first and then locking `quota_enforcement FOR SHARE` as the final lock) and `openmettle_owner`'s `metering_enforced = true` activation (`FOR NO KEY UPDATE`), proving zero deadlock, strict lock-order serialization, and that an unmetered handoff can never observe `metering_enforced = false` and commit after activation**, **rolling-upgrade legacy-run reclaim and pre-`reserve_in` lazy parent-hold initialization test (`quota_unwind_superseded_round` -> `quota_ensure_legacy_run_holds` -> `authz::gateway::reserve_in` -> `quota_allocate_round`) where an `N-1` API replica admits a run (`runs` + `gateway_reservations` with `units = 100`, zero parent `quota_reservations`) and an `N-1` worker commits an unbound `'reserved'` round before crashing, and an `N` worker reclaims the run, cleanly unwinds the unbound legacy `'reserved'` round via `quota_unwind_superseded_round` (with zero parent `quota_reservations` present, freeing `gateway_requests_run_round_active_idx` and restoring `gateway_reservations.allocated = 0`), then inside the single round-allocation `WriteTransaction` executes `quota_ensure_legacy_run_holds` strictly BEFORE `authz::gateway::reserve_in` (locking `gateway_reservations FOR NO KEY UPDATE` with zero lock upgrade before `reserve_in` and reading `units - allocated = 100`, initializing the parent hold to `100`, enforcing `quota_budgets` hard limits with `OMQ01` when over budget and staying idempotent across retries and subsequent rounds), followed by a `60`-unit `reserve_in` + `quota_allocate_round` proving the child slices `60` without double-subtraction, `40` remains `held_units` on the parent, and settlement completes cleanly**, **fenced successor-worker unwind test (`openmettle.quota_unwind_superseded_round`) simulating worker process death immediately between `(reserve_in + quota_allocate_round)` commit and handoff, lease expiry + `leases::reclaim_next` by a successor worker, fenced unwind transitioning `gateway_requests` to `'released'`, restoring `gateway_reservations.allocated` and parent run `quota_reservations` capacity (`allocated_units`/`held_units`) while releasing child holds and freeing `gateway_requests_run_round_active_idx`, clean retry of the same round, and a replay test calling `quota_unwind_superseded_round` again with the same live `claim_token` after the successor worker has already unwound the predecessor and reserved the same `round` again (proving the successor's replacement `'reserved'` request and child holds carrying `allocating_claim_token = p_claim_token` remain intact and `false` is returned, plus `'handed_off'` left untouched returning `false`, and stale `claim_token` / non-worker calls refused)**, **pre-upgrade orphan `'reserved'` `gateway_requests` sweep test via `openmettle.quota_release_orphan_gateway_requests(...)` (using valid scalar PostgreSQL 18 `IF` upper-bound clamping) connected as `openmettle_worker` releasing aged unbound `'reserved'` rows while restoring `gateway_reservations.allocated`, freeing `gateway_requests_run_round_active_idx`, and skipping active leased runs or bound requests, PLUS (a) a bounded raw index-key paging test with a multi-page prefix of aged legitimately bound `'reserved'` requests ahead of a trailing orphan proving each call inspects at most `p_page_size` raw `(created_at, id)` keys from `gateway_requests_reserved_idx`, advances the persistent cursor across zero-orphan pages without exhausting sweep budget, and releases the trailing orphan on a subsequent page, and (b) a large all-young `'reserved'` tail test verifying bounded index buffer/key touches (`raw_keys_scanned = 0` past `v_age_cutoff`) with zero per-row `clock_timestamp()` filtering**, **negative binding and ownership-recheck tests proving cross-scope, cross-actor, cross-run, non-`'reserved'` state, or wrong-`p_dispatch`-secret bind attempts in `quota_reserve` / `quota_allocate_round` (and `quota_reservations_gateway_binding_guard`) are rejected and that `quota_release_unsent` ownership rechecks fail closed with an invariant error mutating neither ledger on mismatch**, run-to-round `held` allocation without double-debit coupled atomically with `authz::gateway::handoff_in` (`openmettle.gateway_handoff`) + `quota_commit_handoff` (rolling back both on pre-commit refusal), **lost commit acknowledgement (`UnknownCommit`) integration tests connected directly as unprivileged `openmettle_api` and `openmettle_worker` logins exercising all `openmettle.quota_recover_lost_handoff(...)` outcomes — `'handoff_committed'` (preserving durable `gateway_requests.state = 'handed_off'` + all required `'handoff_committed'`/`'settled'` quota holds recorded in `quota_gateway_handoffs`, including a test where `quota_settle_gateway_usage` has already moved bound holds to `'settled'` before recovery runs, asserting zero bound holds remain `'held'`/`'released'`, suppressing HTTP dispatch for gateway reconciliation), `'unmetered_legacy_handoff'` (including a pre-activation unmetered handoff committed while `metering_enforced = false` and recovered via `quota_recover_lost_handoff` *after* live `metering_enforced` flipped `true`, still returning `'unmetered_legacy_handoff'` with zero `OMQ04` and suppressing HTTP dispatch), and `'unwound_unsent'` (atomically unwinding `'reserved'`/`'released'` `gateway_requests`, restoring `gateway_reservations.allocated`, and releasing bound `'held'` holds to an active parent or `quota_budgets`) plus wrong-role/wrong-secret/mismatched-ownership/missing-required-hold (`OMQ04`) refusals**, pre-send unwind via `authz::gateway::release_in` (`openmettle.gateway_release`) + `quota_release_unsent` returning capacity to an active parent run hold (or releasing on terminal runs), **stale sweep atomically transitioning a stale `'reserved'` `gateway_requests` row to `'released'` and restoring `gateway_reservations.allocated` in the same `SECURITY DEFINER` transaction as releasing `quota_reservations` (proving a delayed `openmettle.gateway_handoff` with the original dispatch secret fails closed while `'handed_off'` rows remain untouched)**, cancellation, pre-send abort (with `closed_at`), valid `revision = 0` initial partial and final reports accepted when `accepted_source_revision IS NULL` (persisting `accepted_source_revision = 0` and rejecting subsequent `revision <= 0`), signed downward partial correction (`delta_reserved > 0`), **per-resource complete authoritative evidence and incomplete-component deferral tests exercising (a) an explicit zero-token final report (`prompt_tokens = 0, completion_tokens = 0`) settling `usage_tokens` to `'settled'` (`settled_units = 0, held_units = 0`) and releasing the token hold, (b) a cost-only final report (`cost` present, token columns `NULL`) settling `usage_cost_micros` to `'settled'` while keeping `usage_tokens` in `handoff_committed` with full `held_units` and last confirmed `settled_units` untouched (never turning `NULL` tokens into `0`), (c) a cost-only post-final correction updating `usage_cost_micros` without erasing `usage_tokens.settled_units` or altering `usage_tokens.accepted_source_revision`, (d) a token-only report (`r.cost IS NULL`) skipping `usage_cost_micros` completely, and (e) component-aware `C_floor` and complete-evidence close-gate tests proving (i) `hold = 100` + `prompt_tokens = 150, completion_tokens = NULL` immediately sets `settled_units = 150, held_units = 0` (`+50` confirmed overage exposure) in BOTH `quota_settle_gateway_usage` and `quota_verify_accounting_drift()` while keeping `state = 'handoff_committed'`, (ii) `hold = 200` + `prompt_tokens = 60, completion_tokens = NULL, final = true` keeps `settled_units = 60, held_units = 140, state = 'handoff_committed'` (refusing to close `'settled'` without complete evidence) until complete final `prompt_tokens = 60, completion_tokens = 20` settles `80` (`held_units = 0, state = 'settled'`), (iii) `revision = 1` (`120 + 30 = 150`) followed by `revision = 2` (`prompt_tokens = NULL, completion_tokens = 30`, plus omitting a previously-confirmed non-included `reasoning_tokens`) preserves `settled_units = 150` (`0` confirmed exposure lost) across both settlement and drift verification until complete authoritative `revision = 3` resolves it, (iv) **included reasoning tokens lower-bound tests (`reasoning_included = true`) proving (1) `hold = 100` + `prompt_tokens = NULL, completion_tokens = NULL, reasoning_tokens = 150, reasoning_included = true` immediately charges `settled_units = 150, held_units = 0` (`+50` confirmed overage) while keeping `is_complete_tokens = false` / `state = 'handoff_committed'`, (2) `final = true, prompt_tokens = 60, completion_tokens = NULL, reasoning_tokens = 150, reasoning_included = true` charges `210` and stays `handoff_committed` until explicit `completion_tokens IS NOT NULL` arrives, (3) `completion_tokens = 200, reasoning_tokens = 150, reasoning_included = true` yields `K_known = greatest(200, 150) = 200, X_known = 0` with zero double-counting (and malformed `completion_tokens = 100 < reasoning_tokens = 150, reasoning_included = true` yields `K_known = 150`), and (4) a newer complete revision (`rev_K > rev_R`) with `completion_tokens = 120, reasoning_tokens = NULL` honors `K_known = 120`**, (v) **out-of-order ascending revision fold test (`H = 200`, `rev 1`: `prompt_tokens = 60, completion_tokens = 20, final = true`; `rev 2`: `prompt_tokens = NULL, completion_tokens = 25, final = true`) calling `quota_settle_gateway_usage(..., 2)` BEFORE `rev 1` and proving it folds `[1, 2]` in `ORDER BY a.revision ASC` to the exact same `('settled', 85, 0, accepted_source_revision = 2)` as `rev 1` then `rev 2` (with subsequent `rev 1` returning idempotent no-op)**, (vi) **unchanged incomplete post-final correction test (`completion_tokens = 25 -> 25`) proving `qr.accepted_source_revision` advances unconditionally with zero `quota_reconciliations` row, zero budget delta, zero hard drift, and `pending_gateway_reconciliations = 0`**, and (vii) **split-report `is_complete_tokens(r_step)` non-stitching test (`200`-token hold: `rev 0: prompt_tokens = 60, completion_tokens = NULL, final = false` followed by `rev 1: prompt_tokens = NULL, completion_tokens = 25, final = true`) proving `is_complete_tokens(rev 1) = false` (both `prompt_tokens` and `completion_tokens` must be non-null on `r_step` itself) and producing `85 settled, 115 held, state = 'handoff_committed'`** (and `quota_verify_accounting_drift()` joining `openmettle.gateway_settlements gs` to `openmettle.gateway_usage_reports r_curr` strictly on `(gs.request_id = r_curr.request_id AND gs.revision = r_curr.revision AND gs.final = r_curr.final)` reading `r_curr.source` and `r_curr.report_id` from `r_curr`)**, **`quota_accepted_gateway_reports` historical catch-up, rejected-revision guard, and zero-deadlock concurrency tests covering (a) `revision = 1` (complete token-only final) AND `revision = 2` (cost-only final) both committing in `gateway_settlements` before local catch-up runs, proving `quota_accepted_gateway_reports` durably records both `(request_id, 1, true)` and `(request_id, 2, true)` so local catch-up settles `usage_tokens` from `revision = 1` and `usage_cost_micros` from `revision = 2` cleanly without stranding the token hold, (b) `tests/schema/gateway.rs`'s `revision = 1 (partial) -> 2 (final) -> 3 (late partial stored in gateway_usage_reports, rejected by gateway_settlements) -> 4 (final correction)` against a lagging `handoff_committed` hold proving `revision = 3` is absent from `quota_accepted_gateway_reports` and rejected by BOTH `quota_settle_gateway_usage` and `enforce_quota_reservation_gateway_binding` (`23514`) while `revision = 2` and `revision = 4` settle cleanly, AND (c) racing settlement-only (`quota_lock_gateway_request_for_settlement` -> `gateway_settlements` upsert), combined single-transaction (`quota_lock_gateway_request_for_settlement` -> `gateway_settlements` upsert -> `quota_record_accepted_gateway_settlement` -> `quota_settle_gateway_usage`), and worker recovery (`quota_release_unsent` / `quota_release_orphan_gateway_requests`) transactions concurrently on the same `request_id`, proving unconditional `quota_lock_gateway_request_for_settlement` maintains the globally acyclic lock order with zero deadlock**, **fractional `usage_cost_micros` cumulative `ceil(r.cost)::numeric(38, 0)` rounding and correction test across integer boundaries (`0.4 -> 0.8 -> 1.2` final -> `0.5` post-final correction -> `0`, proving `settled_units` / `active_used` track `1 -> 1 -> 2 -> 1 -> 0` with zero accumulated rounding drift and matching `quota_verify_accounting_drift()`)**, **`numeric(38, 0)` DB-to-Rust end-to-end oversized 3-column token and multi-report aggregate overflow test exercising BOTH multiple large overage reports AND a single oversized 3-column token report (`prompt_tokens + completion_tokens + reasoning_tokens > 9_223_372_036_854_775_807`) all the way through widened `openmettle.gateway_settlements.measured` (`numeric(38, 0)`), `quota_accepted_gateway_reports`, `quota_settle_gateway_usage`, `quota_verify_accounting_drift()`, Rust `u128`/`i128` decoding and canonical base-10 string formatting, and subsequent `429 quota` refusal without `22003` overflow** (with `/v1` HTTP `QuotaSummary` route and OpenAPI `WideNonNegativeDecimal` schema validation owned by PR3), `BEFORE INSERT OR UPDATE OR DELETE` `cost_denomination` immutability trigger (`OMQ02`, proving `INSERT` — including `INSERT ... ON CONFLICT DO UPDATE` — `DELETE`, and rename into/out of the seeded `('instance', 'usage_cost_micros')` row unconditionally fail with `OMQ02` without acquiring `quota_cost_unit_lock`, eliminating any AB/BA lock cycle) plus `BEFORE INSERT` `gateway_usage_reports_cost_unit_guard` serialized via `quota_cost_unit_lock` with **explicit concurrency tests covering both commit orders with different units (direct `UPDATE quota_defaults` vs `openmettle_gateway` `INSERT INTO gateway_usage_reports` with `cost IS NOT NULL`, plus two concurrent `gateway_usage_reports` inserts with different units while `cost_denomination IS NULL`)** and mismatch quarantine, final overage settlement plus subsequent refusal, upload abort and `confirm_purge`; override raise/lower/expiry and `hard_limit = 0` preserving data and deletion grace; `round_cap` `1..=1000` validation; **two-step raw-index-key paging and `tool-spill:*` ownership-partition tests across `quota_reservations`, run-linked `storage_reservations` (proving `operation_id IS NOT NULL AND idempotency_key LIKE 'tool-spill:%'` rows remain exclusively owned by ADR 0039 `reconcile_run_spills`, a pre-existing `run_id IS NOT NULL AND operation_id IS NULL AND idempotency_key LIKE 'tool-spill:%'` row is cleanly owned and recovered by ADR 0040's generic cleaner via the exact logical complement `(operation_id IS NULL OR idempotency_key NOT LIKE 'tool-spill:%')`, and `storage_reservations_tool_spill_binding_guard` rejects any new/updated `tool-spill:%` row lacking `run_id` or `operation_id` with `23514`), and non-run `reconcile_expired` exercising a full page containing ONLY ineligible expired holds (non-terminal runs, unresolved operations, `adoption_unverified = true`, or `LOCK_SH`-active `staging/<id>` / `revisions/<id>` files) followed by eligible holds on the next page, proving zero joins/`EXISTS`/`clock_timestamp()` before `LIMIT`, exact advancement of `last_attempted` across 100%-ineligible pages without wrapping prematurely, `FOR NO KEY UPDATE SKIP LOCKED` skipping contended rows without stalling, and release of eligible holds on the next page across `SWEEP_MS` ticks (60 s default interval, 15 s budget)**; **unified 4-step reclamation protocol (`staging/.reclaim.<id>` + `anchor_pending_unlink`), `stage_claimed`, write-once `payload_ino`, `linkat` no-replace publication, non-destructive `StagedFile::drop`, `Store::read` inode verification, and writer-admission race tests across `Store::stage`, `Store::publish`, `Store::read`, `artifact_fs::abort`, `reconcile_expired`, generic run-linked recovery, and ADR 0039 `reconcile_run_spills` covering (a) startup/adoption capability probe tests verifying `O_CREAT \| O_EXCL \| O_NOFOLLOW`, `rustix::fs::linkat(..., AtFlags::empty())` (rejecting `ENOSYS`/`EOPNOTSUPP`/`EINVAL` fail-closed and verifying `Errno::EXIST` on an existing target without overwriting and shared `st_ino` between both names), and file + directory `fsync`, (b) `Store::stage` Steps 1a/1b/1c tests proving `stage_claimed = true` commits BEFORE disk creation (zero file created if rejected), `fsync(&staging_dir_fd)` completes BEFORE binding `payload_ino`, lost Step 1c ack leaves `staging/<id>` (`st_ino == payload_ino`) durably on disk and cleanly reclaimed by `reconcile_expired`/`abort` with zero false quarantine, and unified rollout rule permits HTTP `Store::stage`/`Store::publish` while `storage_volume_control.volume_id IS NULL AND adoption_run_id IS NULL` (setting `stage_claimed` + `payload_ino`) while rejecting ADR 0039 worker `publish_bytes` and all 4 cleaners until `volume_id IS NOT NULL`, (c) **100% non-destructive `StagedFile::drop` & ambiguous `storage::settle` tests** proving `StagedFile::drop` and all writer error/cancellation paths NEVER call `set_len(0)` and NEVER call `unlinkat` (lost `storage::settle` ack or cancelled future never zeroes published `revisions/<id>`, and ambiguous `storage::settle` inspects `storage_reservations.state` under `(runs FOR NO KEY UPDATE ->) storage_reservations FOR UPDATE` before calling `abort`), (d) **`Store::publish` `linkat` `Errno::EXIST` quarantine, `N` post-`linkat` crash + `N-1` same-key HTTP retry interleaving, and post-commit detach tests**: placing a foreign file at `revisions/<id>` proves `linkat` fails atomically with `Errno::EXIST` leaving foreign `revisions/<id>` bytes untouched and quarantining (`adoption_unverified = true, publish_pending = false`); crashing an `N` writer right after `linkat` before `storage::settle` commits leaves `staging/<id>` present on disk so a same-key retry routed to an **`N-1` API replica** hits `store.stage(&id)` -> `OpenOptions::create_new(true)` -> `AlreadyExists` -> **`Err(Error::InProgress)` (`src/artifact_fs.rs:474-475`)** without calling `abort()`, without staging a replacement file, and without calling replacing `fs::rename`; and post-commit detach under `LOCK_SH` unlinks `staging/<id>` (`unlinkat`, never `set_len(0)`) -> `drop` -> `fsync(&staging_dir_fd)`, (e) **`Store::read` `payload_ino` & explicit legacy-row tests** proving `Store::read` rejects `adoption_unverified = true`, rejects a same-sized foreign replacement file (`file_meta.ino() != sr.payload_ino`) with `Error::Io`, permits legacy `sr.payload_ino IS NULL` rows ONLY while `storage_volume_control.volume_id IS NULL AND adoption_run_id IS NULL`, and fails closed (`Error::Io` in `Store::read` and hard drift in `verify_accounting_drift`) on any `'active'`/`'retained'` revision with `payload_ino IS NULL` once `volume_id IS NOT NULL`, (f) updating `tests/schema/artifact_fs.rs`'s `renamed` test case and exercising ALL 4 cleaners (`artifact_fs::abort`, `reconcile_expired`, generic run-linked cleaner, ADR 0039 `reconcile_run_spills`) through the **unified 4-step reclamation protocol with `staging/.reclaim.<id>` anchor and ZERO filesystem I/O inside DB Steps 1 and 3**: proving Step 1 (`reclaim_state = 'claiming'`) resolves any in-flight `storage::settle` BEFORE Step 2 can truncate and blocks concurrent writers/cleaners (`abort` yields cleanly on an unexpired peer lease), Step 2 executes `LOCK_EX` (`WouldBlock` skips live `LOCK_SH` publishers) -> `probe_file.set_len(0)?` + `probe_file.sync_all()?` -> `linkat` anchor `staging/.reclaim.<id>` + `fsync(&staging_dir_fd)` (so `payload_ino` NEVER drops to `nlink = 0` before Step 3 commits!) -> `unlinkat` `<id>` from `revisions/`/`staging/` + dual `fsync` -> short DB commit `reclaim_state = 'truncated', publish_pending = false` (**retaining `payload_ino`**!), crash recovery across BOTH `'claiming'` (all-three `ENOENT` -> quarantine guarded by `reclaim_claim_token = $my_token`; foreign inode -> quarantine with ZERO `set_len(0)`/`unlinkat`) AND `'truncated'` (probing ONLY `staging/.reclaim.<id>` and NEVER touching any file at `staging/<id>` or `revisions/<id>`; missing/mismatched `.reclaim.<id>` -> quarantine), Case 2 (`payload_ino IS NULL`) quarantining `revisions/<id>` or non-zero `staging/<id>` while cleaning `0`-byte `staging/<id>` under `LOCK_EX`, Step 3 executing final `storage::release` with **ZERO filesystem I/O inside the DB transaction** setting `reclaim_state = 'anchor_pending_unlink'` when `payload_ino IS NOT NULL` while retaining `payload_ino`, and Step 4 detaching `staging/.reclaim.<id>` (`unlinkat`, never `set_len(0)`) -> `drop` -> `fsync(&staging_dir_fd)` -> best-effort `reclaim_state = 'none'`, AND (g) live directory-displacement tests covering displacement between `Store::stage` and `Store::publish`, post-`linkat`/pre-`commit` displacement + hard crash after rollback (exercising BOTH all-three `ENOENT` and foreign replacement regular file subcases, proving foreign replacement files are NEVER truncated/unlinked and `reserved_bytes` stays 100% charged under `adoption_unverified = true`), and `Store::read` pathname-to-FD re-verification failing closed (`Error::Io`) on displacement**; **mandatory `ReadWriteMany` shared-volume qualification tests covering BOTH two-client / separate-mount `flock(2)` (`LOCK_SH` vs `LOCK_EX \| LOCK_NB` `WouldBlock`, rejecting `-o local_lock=flock`/`local_lock=all`) AND stable 64-bit `st_ino` coherence + second-client recovery across clients and remounts (explicitly exercising differing client-local `st_dev` values to confirm zero `payload_dev` cross-node dependency)**; **directory `fsync` durability barrier and `artifact_fs::purge_due` leaf-verification + hard-link detach tests verifying (a) sentinel publication calls `fsync(root_fd)` strictly BEFORE creating/linking either `:revisions` or `:staging` (and `fsync(revisions_dir_fd)` / `fsync(staging_dir_fd)` before updating `storage_volume_control.volume_id`), (b) `Store::stage` Step 1b calls `fsync(&staging_dir_fd)` strictly BEFORE Step 1c binds `payload_ino`, (c) `artifact_fs::purge_due` foreign replacement regular file test at `revisions/<id>` (`st_ino != payload_ino`) proving `purge_due` stops immediately with ZERO `set_len(0)`, ZERO `unlinkat`, and WITHOUT calling `storage::confirm_purge` (leaving `artifact_revisions.state = 'purging'` and `retained_bytes` 100% charged for `verify_accounting_drift` and `openmettle_owner` reconciliation), (d) `artifact_fs::purge_due` running *before* `StagingSweepState` when `staging/<id>` and `revisions/<id>` share `payload_ino` proving both `revisions/<id>` and the `staging/<id>` hard-link alias are truncated/unlinked (while any foreign `staging/<id>` with `staging_ino != payload_ino` is left untouched) followed unconditionally by BOTH `fsync(&revisions_dir_fd)` AND `fsync(&staging_dir_fd)` strictly BEFORE `storage::confirm_purge` — explicitly including when `revisions/<id>` returns `ENOENT`**; **unpinned/adopting DB-guard (`enforce_runtime_storage_volume_pinned`, `OMQ03`), zero-deadlock `storage_volume_control` concurrency, missing-row fail-closed, non-owner quarantined-release guard, serialized `adoption_run_id` race, and `N` cleaner pre-unlink safety tests covering (a) **concurrent two-release + two-reserve execution test** proving zero deadlock under `storage_volume_control (FOR SHARE) -> storage_accounts (FOR UPDATE) -> storage_instance (FOR UPDATE)` (runtime operations never `UPDATE` `storage_volume_control` and never take `storage_instance FOR SHARE`), (b) **missing `storage_volume_control` singleton row fail-closed test** proving `enforce_runtime_storage_volume_pinned()` raises `OMQ03` when `storage_volume_control` has `0` rows, (c) **non-owner `reserved -> released` guard test on an `adoption_unverified = true` row** proving both keeping `adoption_unverified = true` (`CHECK (NOT adoption_unverified OR state = 'reserved')`) and clearing `adoption_unverified = false` (`enforce_storage_reservation_monotonic_guards()`, `OMQ03`) fail closed for `openmettle_api` and `openmettle_worker` while `openmettle_owner` releases cleanly in one `UPDATE` setting `state = 'released', adoption_unverified = false`, (d) exercising BOTH `openmettle_worker` (`reconcile_expired` and `purge_due`) AND `openmettle_api` (`N-1`'s unconditional `storage::release` `abort()`) — explicitly including `NOINHERIT` logins executing under `SET ROLE openmettle_api` and `SET ROLE openmettle_worker` — while `storage_volume_control.volume_id IS NULL OR adoption_run_id IS NOT NULL`, proving `SECURITY INVOKER` `enforce_runtime_storage_volume_pinned()` (`SELECT volume_id, adoption_run_id INTO v_vol, v_adopt FROM openmettle.storage_volume_control WHERE id FOR SHARE;`) blocks release/purge with `OMQ03` while normal `reserve` + `settle` uploads and active `openmettle_owner` reconciliation succeed, (e) **adoption Step 1b concurrency race tests exercising BOTH (i) a cleaner entering `storage::release` while Step 1b holds `storage_volume_control FOR UPDATE` uncommitted (proving strict `FOR SHARE` vs `FOR UPDATE` serialization with zero release passing the trigger before Step 1b and committing during Step 2, zero rows escaping Step 3's `'reserved'` set), AND (ii) a concurrent second adopter failing closed (`OMQ03`) during Step 2 without clearing Adopter 1's `adoption_run_id` (plus `--replace-adoption-run <stale_uuid>` stale recovery and Step 2 failure clearing `adoption_run_id = NULL` only `WHERE id AND adoption_run_id = $my_adoption_run_id`)**, AND (f) `N` cleaners run against existing on-disk payloads and empty replacement mounts while `volume_id IS NULL` or when any directory sentinel is missing/mismatched/FIFO/wrong-role/different-`st_dev`, failing closed with zero unlinks and zero DB mutations**; **post-pinning same-filesystem subdirectory-replacement & writerless FIFO `.openmettle-volume-id` sentinel tests proving `Store::open`, `openmettle-admin` adoption, `verify_accounting_drift`, and all worker cleaners open sentinels with `OFlags::RDONLY \| OFlags::NOFOLLOW \| OFlags::NONBLOCK` + `fstat` (`S_ISREG`) and fail closed immediately without blocking or unlinking**; **sentinel atomic `linkat` concurrency, crash/interruption, concurrent `begin_purge` retry, Step 3 `payload_ino` backfill, and populated-upgrade adoption tests covering (a) lost commit-ack adoption retry after replacing `<root>/revisions` (never writing a missing sentinel when `volume_id IS NOT NULL`, failing closed with `OMQ03`), (b) Step 3 canonical lock order (`storage_reservations -> artifact_revisions -> storage_volume_control -> storage_accounts -> storage_instance FOR UPDATE`) requiring `adoption_run_id = $my_adoption_run_id`, evaluating all `'active'`/`'retained'`/`'purging'` revisions and volume checks BEFORE writing any `payload_ino`, committing `payload_ino` backfills (`WHERE payload_ino IS NULL`) ONLY in the success branch, quarantining missing/mismatched `'reserved'` rows (`adoption_unverified = true`) on BOTH initial unpinned and already-pinned runs, pinning `storage_volume_control.volume_id`, and clearing `adoption_run_id = NULL`, (c) **adoption running while a hold is in `reclaim_state = 'truncated'` with `staging/.reclaim.<id>` (`S_ISREG`, `st_ino == payload_ino`, `st_size == 0`)** proving Step 3 positively verifies and PRESERVES `reclaim_state = 'truncated'` (expiring `reclaim_lease_until = clock_timestamp()` so the next cleaner tick finishes Step 3 -> Step 4 cleanly instead of quarantining!), (d) **failed unpinned adoption on a partial copied tree** (containing legacy revision A's copy with a new inode and missing revision B) proving ALL `payload_ino` backfills are omitted/rolled back so retrying adoption on the real original directory tree succeeds cleanly with A's real inode, (e) concurrent `begin_purge` (`'retained' -> 'purging'` + unlink) during already-pinned adoption retry (fresh `READ COMMITTED` re-query accepting `'purging'`/`'purged'`), (f) `storage::reserve` racing Step 2 empty-ledger check -> Step 3 `storage_volume_control FOR UPDATE`, (g) two concurrent fresh-bootstrap `Store::open` publishers serializing on `storage_volume_control FOR UPDATE`, (h) crash after `.openmettle-volume-id.tmp.<128bit_random_hex>` or subset sentinel linking recovering idempotently, and (i) populated-upgrade, mixed-reservation (`--expected-fs-uuid` + `--expected-revisions-inode`), and reservation-only (`--confirm-no-on-disk-payloads`) acceptance tests proving quarantined `adoption_unverified = true` rows stay charged and excluded from all cleaners until `openmettle_owner` reconciliation or verified adoption on the restored tree**; **persistent 5-state non-truncating `StagingSweepState` `ReadDir` `staging/` cleanup tests covering (a) multi-tick enumeration resuming from parked open `dir_fd`, verifying `StagingSweepState` NEVER calls `set_len(0)` on `'settled'`, `'released'`, or `staging/.reclaim.<id>`: on `'released'` `staging/<id>`, skipping 100% untouched whenever `payload_ino IS NOT NULL` (even if an inode number is reused!), `adoption_unverified = true`, or `st_size > 0`, and calling `LOCK_EX` -> `unlinkat` ONLY (never `set_len(0)`) -> `drop` -> `fsync(&staging_dir_fd)` when `payload_ino IS NULL AND NOT adoption_unverified AND st_size == 0`; on `staging/.reclaim.<id>`, calling `LOCK_EX` -> `unlinkat` ONLY (never `set_len(0)`) -> `drop` -> `fsync(&staging_dir_fd)` -> `reclaim_state = 'none'` strictly when `state = 'released' AND reclaim_state = 'anchor_pending_unlink' AND NOT adoption_unverified AND payload_ino IS NOT NULL` with `st_size == 0` and `st_ino == payload_ino` (clearing `reclaim_state = 'none'` on `ENOENT`, and skipping untouched once `reclaim_state = 'none'`), (b) **two-artifact hard-link & `'settled'` `payload_ino` tests**: placing `staging/A` hard-linked to active `revisions/B` while `revisions/A` matches `A.payload_ino` proves `staging_ino == B.payload_ino != A.payload_ino` causes `StagingSweepState` to preserve BOTH `staging/A` and `revisions/B` 100% untouched with ZERO `set_len(0)` and ZERO `unlinkat` (`B`'s bytes remain intact, and `verify_accounting_drift` flags `staging/A`); skipping `adoption_unverified = true` or `payload_ino IS NULL`; and when `staging_ino == payload_ino`, calling `LOCK_EX` -> `unlinkat` ONLY (NEVER `set_len(0)`) -> `drop` -> `fsync(&staging_dir_fd)` strictly when `revisions/<id>` is `S_ISREG` on same local `st_dev` with `rev_stat.st_ino as u64 == payload_ino` OR (`ENOENT` AND fresh `READ COMMITTED` `artifact_revisions.state = 'purged'`), preserving untouched otherwise, (c) `LOCK_SH`-held active pre-commit `staging/<id>` skip + `st_mtime > 900 s` + `storage_volume_control FOR SHARE -> storage_instance FOR UPDATE` serialized zero-row orphan recheck, (d) `spawn_blocking` slice exceeding 15 s `tokio::time::timeout` parking `InFlight` cleanly across ticks, and (e) `<root>/staging` replacement during `InFlight` (`InvalidatedInFlight`) and `DrainingEof` preventing inode reuse via retained open `dir_fd`**; restore and periodic drift verification (`verify_accounting_drift` + `openmettle.quota_verify_accounting_drift()`) **including concurrent `begin_purge` interleaving (fresh `READ COMMITTED` re-query yielding zero false hard drift), failing hard once `storage_volume_control.volume_id IS NOT NULL` on any `'active'`/`'retained'` revision with `payload_ino IS NULL` or on-disk `payload_ino` mismatch, recognizing `'purging'` `ENOENT` and `staging/.reclaim.<id>` (`st_size == 0`, `st_ino == payload_ino`, paired with `('reserved', 'truncated')` or `('released', 'anchor_pending_unlink')`) as valid, skipping filesystem checks on storage-disabled installations (`ARTIFACTS_DIR` unset, `volume_id IS NULL`, `0` storage rows), and validating DB/`0023` drift via the exact ascending fold across `a.revision <= qr.accepted_source_revision` (`ORDER BY a.revision ASC`, `K_known`/`X_known` included reasoning lower bound, `numeric(38, 0)` past `bigint` max), simplified `pending_gateway_reconciliations`, and `gateway_settlements` joined to `gateway_usage_reports` strictly on `(gs.request_id = r_curr.request_id AND gs.revision = r_curr.revision AND gs.final = r_curr.final)` reading `r_curr.source` and `r_curr.report_id` from `r_curr`**; and populated previous-writer rolling-upgrade test with a lowered `storage_bytes` override proving fail-closed refusal (`OMQ01`) on old `storage::reserve` while `settle`/`release`/`retain`/`purge` succeed. |
 | PR3 · `/v1` API, OpenAPI and wired enforcement | `/v1` quota read (with `warnings` projection) and `ManageQuotas` routes (gated on rolling-upgrade completion), OpenAPI 3.2.1 schemas (defining dedicated `WideNonNegativeDecimal` — `type: "string"`, `minLength: 1`, `maxLength: 38`, `pattern: "^(?:0\|[1-9][0-9]{0,37})$"` — for `QuotaSummary`'s wide `numeric(38, 0)` counters while keeping `NonNegativeDecimal` `0..=9223372036854775807` untouched for `bigint` fields) and regenerated `contracts/fixtures/`, independent consumer decoding, and wired quota enforcement in `src/v1/artifacts.rs`, `admit_run`, `claim_next` and ADR 0037 settlement paths. | Contract validation (`tests/contract.rs`) and PostgreSQL 18 HTTP tests on both session channels covering **end-to-end `/v1` `QuotaSummary` HTTP route + OpenAPI `WideNonNegativeDecimal` (`^(?:0\|[1-9][0-9]{0,37})$`) schema validation on an oversized 3-column token report (`prompt_tokens + completion_tokens + reasoning_tokens > 9_223_372_036_854_775_807`, while keeping `NonNegativeDecimal` `i64::MAX` bounds intact)**, effective limits/usage/reservations/warnings visibility, warning deduplication and re-arming on override/config edits, concurrent `/v1` `setQuotaOverride` lowering of `executing_runs_*` caps racing `claim_next`, `404` concealment for non-members and non-member admins, audited override changes and replay conflicts, safe `429 quota` / `429 rate_limited` / `503 provisioning` RFC 9457 problems with redaction canaries, and allowed reads, downloads, cancellations and deletions at hard limit. |
 
 **Boundaries.** V1-15 (`#15`) and V1-16 (`#16`) own artifact payload transport, retention
 policies and deletion journals. V1-06 (`#7`, ADR 0037) owns Migration `0023`, gateway admin
 provisioning and authoritative usage feed ingestion. V1-14 (`#14`, ADR 0039) owns MCP tool
-schemas, spill triggers, and exclusive automatic cleanup of `operation_id IS NOT NULL AND
-idempotency_key LIKE 'tool-spill:%'` `storage_reservations` rows via `reconcile_run_spills`
-(sequenced on V1-17 PR2's `volume_id` / `dirfd` foundation, while ADR 0040's generic run-linked
-cleaner owns the exact logical complement `(operation_id IS NULL OR idempotency_key NOT LIKE
+schemas, spill triggers, companion 1-row `openmettle.runtime_feature_gates (id boolean PRIMARY
+KEY DEFAULT true CHECK (id), two_phase_effect_intents_enabled boolean NOT NULL DEFAULT false)`
+(`GRANT SELECT` to `openmettle_api, openmettle_worker`), and exclusive automatic cleanup of
+`operation_id IS NOT NULL AND idempotency_key LIKE 'tool-spill:%'` `storage_reservations` rows
+via `reconcile_run_spills` (sequenced on V1-17 PR2's `storage_volume_control` / `dirfd` /
+`payload_ino` / `linkat` / 4-step cleaner foundation, while ADR 0040's generic run-linked cleaner
+owns the exact logical complement `(operation_id IS NULL OR idempotency_key NOT LIKE
 'tool-spill:%')`). V1-18 (`#18`) owns the active GPU controller, DRA claims and physical VRAM
 handoffs. V1-29 (`#26`) owns telemetry contract updates when PR2/PR3 register quota metrics.
