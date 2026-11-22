@@ -4,23 +4,15 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use tokio::time::timeout;
 
-fn status(status: u16, h: &HeaderMap) -> Error {
-    match status {
-        429 => {
-            let values = h.get_all(header::RETRY_AFTER);
-            let delay = if values.iter().count() == 1 {
-                h.get(header::RETRY_AFTER)
-                    .and_then(|v| v.to_str().ok())
-                    .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .filter(|n| *n <= 86400)
-            } else {
-                None
-            };
-            Error::RateLimited(delay)
-        }
-        503 => Error::Unavailable,
-        504 => Error::Timeout,
+fn status(code: u16, headers: &HeaderMap, qualified: bool) -> Error {
+    let problem = GatewayProblem::from_inference(code, headers, qualified);
+    if qualified {
+        return Error::Gateway(problem);
+    }
+    match problem {
+        GatewayProblem::RateLimited(delay) => Error::RateLimited(delay),
+        GatewayProblem::Unavailable => Error::Unavailable,
+        GatewayProblem::Timeout => Error::Timeout,
         _ => Error::Provider,
     }
 }
@@ -53,16 +45,21 @@ fn media(h: &HeaderMap, stream: bool) -> Result<(), Error> {
 
 pub(super) async fn receive<F: Future<Output = ()>>(
     response: hyper::Response<Incoming>,
-    q: &Qualification,
+    gateway: &Gateway,
     p: &Profile,
     request: &Request,
     server: bool,
-    idle: Duration,
     mut visible: impl FnMut(VisibleDelta) -> F,
 ) -> Result<Turn, Error> {
+    let q = &gateway.qualification;
+    let idle = gateway.timeouts.idle;
     let (head, mut body) = response.into_parts();
     if !head.status.is_success() {
-        return Err(status(head.status.as_u16(), &head.headers));
+        return Err(status(
+            head.status.as_u16(),
+            &head.headers,
+            gateway.family_policy_v1,
+        ));
     }
     let length = transport::framed_length(&head, BODY)?;
     media(&head.headers, request.stream)?;

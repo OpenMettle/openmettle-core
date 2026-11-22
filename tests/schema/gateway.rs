@@ -53,6 +53,22 @@ async fn sweeps_can_read_only_pending_rows_in_age_order() {
             "{plan}"
         );
     }
+    let plan = sqlx::query_scalar::<_, String>(concat!(
+        "EXPLAIN (COSTS OFF) ",
+        include_str!("../../src/authz/gateway/backfill.sql")
+    ))
+    .bind(INSTALL)
+    .bind(None::<String>)
+    .bind(None::<String>)
+    .bind(4_i64)
+    .fetch_all(&mut c)
+    .await
+    .unwrap()
+    .join("\n");
+    assert!(
+        plan.contains("quota_reservations_overdue_handoff_idx"),
+        "{plan}"
+    );
 }
 
 use openmettle_core::{
@@ -1146,4 +1162,378 @@ async fn missing_overlapping_or_overprivileged_gateway_is_refused() {
         admin.execute(revoke).await.unwrap();
     }
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn family_wall_clock_policy_covers_gap_fold_midnight_and_child_switch() {
+    use gateway::family::{FamilyPolicy, Hours};
+    let db = TestDb::migrated().await;
+    let mut c = connect(&db.0, pg::GATEWAY).await;
+    let mut f = FamilyPolicy {
+        revision: 1,
+        zone: "America/New_York".into(),
+        quiet: Some(Hours {
+            start_minute: 90,
+            end_minute: 180,
+        }),
+        study: Some(Hours {
+            start_minute: 23 * 60,
+            end_minute: 60,
+        }),
+        study_models: ["school".into()].into(),
+        disabled_models: ["disabled".into()].into(),
+    };
+    for (utc, model, allowed) in [
+        ("2026-03-08T06:29:59Z", "a", true),
+        ("2026-03-08T06:30:00Z", "a", false),
+        ("2026-03-08T06:59:59Z", "a", false),
+        ("2026-03-08T07:00:00Z", "a", true),
+        ("2026-11-01T05:29:59Z", "a", true),
+        ("2026-11-01T05:30:00Z", "a", false),
+        ("2026-11-01T06:29:59Z", "a", true),
+        ("2026-11-01T06:30:00Z", "a", false),
+        ("2026-11-01T07:59:59Z", "a", false),
+        ("2026-11-01T08:00:00Z", "a", true),
+        ("2026-11-01T03:10:00Z", "a", false),
+        ("2026-11-01T04:30:00Z", "school", true),
+        ("2026-11-01T08:00:00Z", "disabled", false),
+    ] {
+        let at = chrono::DateTime::parse_from_rfc3339(utc)
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            f.permits(&mut c, model, Some(at)).await.unwrap(),
+            allowed,
+            "{utc}"
+        );
+    }
+    f.zone = "Unknown/Zone".into();
+    assert_eq!(
+        f.permits(&mut c, "a", None).await,
+        Err(gateway::Error::Refused)
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn discovery_rehydrates_committed_group_observations_without_a_hint() {
+    use gateway::reconcile::{ModelRequest, Profile, Sweep};
+    use openmettle_core::{
+        authz::{Grantee, ProjectRole, projects},
+        model_config::Catalog,
+        provider_http::gateway::problem::{Access, Problem},
+    };
+    let db = TestDb::migrated().await;
+    let mut c = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut c).await;
+    let actor =
+        authz_store::account(&mut c, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let owner =
+        authz_store::account(&mut c, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let (project, scope) = run_admission::new_project(&db, &owner, "family-project").await;
+    authz_store::applied(
+        projects::set_project_member_role(
+            &mut run_admission::api(&db).await,
+            &authz_store::ctx(&owner, "family-grant"),
+            &project,
+            &Grantee::OidcGroup("synthetic-team".into()),
+            ProjectRole::Editor,
+        )
+        .await,
+    );
+    let now: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint")
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+    let mut owner = authz_store::present_membership_at(&db, &actor, now).await;
+    let catalog =
+        Catalog::load(include_bytes!("../fixtures/conversation-catalog-v1.json")).unwrap();
+    let profile = Profile {
+        installation: INSTALL,
+        report_source: PRINCIPAL,
+        revision: 1,
+        rotation_epoch: 0,
+        renew_before: Duration::from_secs(30),
+        catalog: &catalog,
+        families: &Default::default(),
+    };
+    let g = pool(&db, pg::GATEWAY);
+    let mut s = Sweep::default();
+    let revision = || {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT desired_revision FROM openmettle.gateway_bindings WHERE user_id=$1::uuid",
+        )
+        .bind(&actor.user)
+        .fetch_one(&g)
+    };
+    let request = || ModelRequest {
+        access: Access::Entitled,
+        user: &actor.user,
+        scope: &scope,
+        approval: &actor.approval,
+        model: None,
+    };
+    s.discover(&g, &profile, 64).await.unwrap();
+    assert_eq!(revision().await.unwrap(), 1);
+    assert_eq!(
+        profile
+            .select_model(&g, request(), None, || panic!("binding precedes selection"))
+            .await,
+        Err(Problem::Provisioning)
+    );
+    owner
+        .execute("UPDATE openmettle.membership_observations SET observation.state='absent'")
+        .await
+        .unwrap();
+    assert_eq!(
+        profile.select_model(&g, request(), None, || panic!()).await,
+        Err(Problem::Policy)
+    );
+    s.discover(&g, &profile, 64).await.unwrap();
+    assert_eq!(revision().await.unwrap(), 2);
+    s.discover(&g, &profile, 64).await.unwrap();
+    assert_eq!(revision().await.unwrap(), 2);
+    owner
+        .execute("UPDATE openmettle.membership_observations SET observation.state='present'")
+        .await
+        .unwrap();
+    s.discover(&g, &profile, 64).await.unwrap();
+    assert_eq!(revision().await.unwrap(), 3);
+    sqlx::query("UPDATE openmettle.local_identity_approvals SET active=false WHERE id=$1::uuid")
+        .bind(&actor.approval)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    s.discover(&g, &profile, 64).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM openmettle.gateway_bindings WHERE user_id=$1::uuid"
+        )
+        .bind(&actor.user)
+        .fetch_one(&g)
+        .await
+        .unwrap(),
+        "suspended"
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn unknown_child_zone_suspends_only_that_binding_and_advances_discovery() {
+    use gateway::{
+        family::FamilyPolicy,
+        reconcile::{Profile, Sweep},
+    };
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut owner).await;
+    let a =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let b =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let (first, last) = if a.user < b.user { (a, b) } else { (b, a) };
+    let catalog = openmettle_core::model_config::Catalog::load(include_bytes!(
+        "../fixtures/conversation-catalog-v1.json"
+    ))
+    .unwrap();
+    let mut families = openmettle_core::provider_http::gateway::FamilyDirectory {
+        revision: 1,
+        ..Default::default()
+    };
+    let g = pool(&db, pg::GATEWAY);
+    let profile = Profile {
+        installation: INSTALL,
+        report_source: PRINCIPAL,
+        revision: 1,
+        rotation_epoch: 0,
+        renew_before: Duration::from_secs(60),
+        catalog: &catalog,
+        families: &families,
+    };
+    let mut sweep = Sweep::default();
+    // Commit the earlier child first. The unprocessed later account has no intents yet.
+    assert_eq!(sweep.discover(&g, &profile, 1).await.unwrap(), 1);
+    families.revision = 2;
+    families.children.insert(
+        first.user.clone(),
+        FamilyPolicy {
+            revision: 1,
+            zone: "Unknown/Zone".into(),
+            quiet: None,
+            study: None,
+            study_models: Default::default(),
+            disabled_models: Default::default(),
+        },
+    );
+    let profile = Profile {
+        installation: INSTALL,
+        report_source: PRINCIPAL,
+        revision: 1,
+        rotation_epoch: 0,
+        renew_before: Duration::from_secs(60),
+        catalog: &catalog,
+        families: &families,
+    };
+    let mut sweep = Sweep::default();
+    assert_eq!(sweep.discover(&g, &profile, 1).await.unwrap(), 1);
+    assert_eq!(sweep.discover(&g, &profile, 1).await.unwrap(), 1);
+    let bindings: Vec<(String, String)> = sqlx::query_as(
+        "SELECT user_id::text,state FROM openmettle.gateway_bindings ORDER BY user_id",
+    )
+    .fetch_all(&g)
+    .await
+    .unwrap();
+    assert_eq!(
+        bindings,
+        vec![
+            (first.user, "suspended".into()),
+            (last.user, "provisioning".into())
+        ]
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn unmetered_handoff_replays_only_accepted_token_components_after_upgrade() {
+    use gateway::settlement::{Outcome, ingest};
+    use openmettle_core::provider_http::gateway::UsageReport;
+    let db = TestDb::new().await;
+    let settings = db.settings(Duration::from_secs(5));
+    migrate::apply(&settings, &MIGRATIONS[..23]).await.unwrap();
+    let mut owner = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut owner).await;
+    let actor =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let scope = authz_runs::personal_of(&db, &actor).await;
+    let credential = authz_runs::seeded_session(&db, &actor, 4, None).await;
+    let api = pool(&db, API);
+    let g = pool(&db, pg::GATEWAY);
+    let binding: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.gateway_bindings(installation,user_id,principal,budget)
+        VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid) RETURNING id::text",
+    )
+    .bind(INSTALL)
+    .bind(&actor.user)
+    .bind(PRINCIPAL)
+    .bind(BUDGET)
+    .fetch_one(&g)
+    .await
+    .unwrap();
+    let (finger, e) = GatewaySealer::new(keys(), g.clone())
+        .seal(
+            &Context {
+                installation: INSTALL,
+                user_id: &actor.user,
+                binding_id: &binding,
+                principal: PRINCIPAL,
+                generation: 1,
+            },
+            &Bearer::generate().unwrap(),
+        )
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO openmettle.gateway_generations (binding_id,generation,remote_key,expires_at,key_id,key_fingerprint,nonce,ciphertext)
+        VALUES ($1::uuid,1,gen_random_uuid(),now()+interval '1 hour',$2,$3,$4,$5)").bind(&binding).bind(e.key_id).bind(finger.as_slice())
+        .bind(e.nonce.as_slice()).bind(e.ciphertext).execute(&g).await.unwrap();
+    sqlx::query("INSERT INTO openmettle.gateway_policy(binding_id,revision,scope_id,approval_id,model,report_source,
+        provider_generation,approval_generation,user_generation,capabilities) VALUES ($1::uuid,1,$2::uuid,$3::uuid,'a',$4::uuid,0,0,0,'{}')")
+        .bind(&binding).bind(&scope).bind(&actor.approval).bind(LEASE).execute(&g).await.unwrap();
+    g.execute("UPDATE openmettle.gateway_bindings SET state='ready',observed_revision=1,active_generation=1").await.unwrap();
+    let request = uuid(&mut owner).await;
+    let reservation = uuid(&mut owner).await;
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_reservations(id,scope_id,actor_user_id,approval_id,units)
+        VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,100)",
+    )
+    .bind(&reservation)
+    .bind(&scope)
+    .bind(&actor.user)
+    .bind(&actor.approval)
+    .execute(&api)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO openmettle.gateway_requests(id,reservation_id,scope_id,actor_user_id,approval_id,session_id,installation,model,units,dispatch_hash)
+        VALUES($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6,$7::uuid,'a',100,sha256($8))")
+        .bind(&request).bind(&reservation).bind(&scope).bind(&actor.user).bind(&actor.approval).bind(&credential[..43]).bind(INSTALL)
+        .bind([8_u8;32].as_slice()).execute(&api).await.unwrap();
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT FROM openmettle.gateway_handoff($1::uuid,$2,$3,NULL,NULL))"
+        )
+        .bind(&request)
+        .bind([8_u8; 32].as_slice())
+        .bind([104_u8; 32].as_slice())
+        .fetch_one(&api)
+        .await
+        .unwrap()
+    );
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+    let mut r = UsageReport {
+        request,
+        scope,
+        source: LEASE.into(),
+        installation: INSTALL.into(),
+        principal: PRINCIPAL.into(),
+        report_id: uuid(&mut owner).await,
+        revision: 0,
+        r#final: false,
+        prompt_tokens: None,
+        completion_tokens: None,
+        reasoning_tokens: None,
+        reasoning_included: None,
+        cost: None,
+        unit: None,
+    };
+    let request = r.request.clone();
+    let balance = || {
+        sqlx::query_as::<_,(Option<String>,i64)>("SELECT measured::text,outstanding FROM openmettle.gateway_settlements WHERE request_id=$1::uuid").bind(&request).fetch_one(&g)
+    };
+    for (rev, prompt, completion, reasoning, included, final_report, raw, held) in [
+        (1, Some(20), Some(10), Some(5), false, false, Some(35), 65),
+        (3, None, Some(15), None, false, false, Some(15), 60),
+        (4, Some(10), Some(5), None, false, true, Some(15), 60),
+        (5, None, None, None, false, true, None, 60),
+        (6, Some(2), Some(1), Some(5), true, true, Some(7), 0),
+        (7, Some(0), Some(0), Some(0), true, true, Some(0), 0),
+    ] {
+        r.revision = rev;
+        r.prompt_tokens = prompt;
+        r.completion_tokens = completion;
+        r.reasoning_tokens = reasoning;
+        r.reasoning_included = Some(included);
+        r.r#final = final_report;
+        assert_eq!(ingest(&g, &r).await, Ok(Outcome::Applied));
+        assert_eq!(balance().await.unwrap(), (raw.map(|n| n.to_string()), held));
+        let reference: i64 = sqlx::query_scalar(
+            "SELECT held FROM openmettle.quota_gateway_fold($1::uuid,'usage_tokens',100,$2)
+            ORDER BY rev DESC LIMIT 1",
+        )
+        .bind(&request)
+        .bind(rev)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(held, reference);
+        let (key, candidate_age): (String, Option<i64>) =
+            sqlx::query_as(include_str!("../../src/authz/gateway/legacy_backfill.sql"))
+                .bind(None::<String>)
+                .bind(1_i64)
+                .bind(INSTALL)
+                .fetch_one(&g)
+                .await
+                .unwrap();
+        assert_eq!(key, request);
+        assert_eq!(candidate_age.is_some(), final_report && held > 0);
+        if rev == 3 {
+            let mut superseded = r.clone();
+            superseded.revision = 2;
+            superseded.prompt_tokens = Some(i64::MAX);
+            assert_eq!(ingest(&g, &superseded).await, Ok(Outcome::Superseded));
+        }
+    }
+    let drift:(i64,i64,i64,i64)=sqlx::query_as("SELECT storage_mismatches,budget_mismatches,settlement_mismatches,pending_gateway_reconciliations
+        FROM openmettle.quota_verify_accounting_drift()").fetch_one(&mut owner).await.unwrap();
+    assert_eq!(drift, (0, 0, 0, 0));
 }

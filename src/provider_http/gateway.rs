@@ -1,5 +1,11 @@
 //! Synthetic ADR 0037 admin profile. A deployment must qualify its exact remote
 //! contract before enabling it. No public API accepts an arbitrary method, URL or headers.
+#[path = "gateway/problem.rs"]
+pub mod problem;
+#[path = "gateway/profile.rs"]
+mod profile;
+pub use profile::{Action, FamilyDirectory, Mutation, Receipt, UsageReport};
+
 use super::{Trust, transport};
 use crate::provider_keys::gateway::Bearer;
 use hyper::{
@@ -18,6 +24,13 @@ use tokio::{sync::Semaphore, time::Instant};
 static DNS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(2)));
 const MAX_PAGES: u16 = 32;
 const PAGE_SIZE: usize = 64;
+
+pub fn retry_backoff() -> Duration {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut jitter = [0; 1];
+    let _ = SystemRandom::new().fill(&mut jitter);
+    Duration::from_millis(1000 + u64::from(jitter[0]) * 4)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -103,6 +116,12 @@ struct Observed<'a> {
     intent: Create,
     bearer: Option<&'a str>,
 }
+/// Evidence of a successful probe on this client. Consumed by one reconciliation step.
+pub struct Ready<'a> {
+    admin: &'a Admin,
+    deadline: Instant,
+}
+
 pub struct Admin {
     origin: transport::Endpoint,
     allowed: Vec<transport::Range>,
@@ -146,7 +165,7 @@ impl Admin {
         &self,
         method: Method,
         path: String,
-        intent: Option<&Create>,
+        mutation: Option<(&str, Vec<u8>)>,
         deadline: Instant,
     ) -> Result<hyper::Response<SharedSecret>, Error> {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -175,21 +194,21 @@ impl Admin {
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, self.admin.clone());
         headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
-        let body = if let Some(i) = intent {
+        let body = if let Some((operation, body)) = mutation {
             headers.insert(header::IF_NONE_MATCH, HeaderValue::from_static("*"));
             headers.insert(
                 "idempotency-key",
-                HeaderValue::from_str(&i.operation).map_err(|_| Error::Protocol)?,
+                HeaderValue::from_str(operation).map_err(|_| Error::Protocol)?,
             );
             headers.insert(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json"),
             );
-            serde_json::to_vec(i).map_err(|_| Error::Protocol)?
+            body
         } else {
             Vec::new()
         };
-        let conditional_put = method == Method::PUT && intent.is_some();
+        let conditional_put = method == Method::PUT && !body.is_empty();
         let res = tokio::time::timeout_at(
             deadline,
             route.send_admitted(method, &headers, body, &limits),
@@ -200,23 +219,11 @@ impl Admin {
         let status = res.status();
         match status.as_u16() {
             408 | 429 | 503 => {
-                let mut delays = res.headers().get_all(header::RETRY_AFTER).iter();
-                let valid = delays
-                    .next()
-                    .and_then(|v| v.to_str().ok())
-                    .filter(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()))
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .filter(|n| *n <= 86400);
-                let valid = valid.filter(|_| delays.next().is_none());
+                let valid = problem::retry_delay(res.headers());
                 // A later sweep owns the retry. No sleep or replay inside a batch.
                 let delay = valid
                     .map(|n| Duration::from_secs(n.into()))
-                    .unwrap_or_else(|| {
-                        use ring::rand::{SecureRandom, SystemRandom};
-                        let mut jitter = [0; 1];
-                        let _ = SystemRandom::new().fill(&mut jitter);
-                        Duration::from_millis(1000 + u64::from(jitter[0]) * 4)
-                    });
+                    .unwrap_or_else(retry_backoff);
                 Err(Error::Deferred(delay))
             }
             412 if conditional_put => Ok(res),
@@ -226,7 +233,7 @@ impl Admin {
         }
     }
 
-    async fn ready(&self, deadline: Instant) -> Result<(), Error> {
+    pub async fn ready(&self, deadline: Instant) -> Result<Ready<'_>, Error> {
         let res = self
             .request(Method::GET, "/admin/v1/ready".into(), None, deadline)
             .await?;
@@ -239,7 +246,10 @@ impl Admin {
         if res.status() == 200
             && serde_json::from_slice::<Readiness>(res.body().secret_bytes()).is_ok_and(|r| r.ready)
         {
-            Ok(())
+            Ok(Ready {
+                admin: self,
+                deadline,
+            })
         } else {
             Err(Error::Protocol)
         }
@@ -256,7 +266,15 @@ impl Admin {
         let mut res = self.request(Method::GET, i.path(), None, deadline).await?;
         if res.status() == 404 {
             res = self
-                .request(Method::PUT, i.path(), Some(i), deadline)
+                .request(
+                    Method::PUT,
+                    i.path(),
+                    Some((
+                        &i.operation,
+                        serde_json::to_vec(i).map_err(|_| Error::Protocol)?,
+                    )),
+                    deadline,
+                )
                 .await?;
             if !matches!(res.status().as_u16(), 200 | 201 | 412) {
                 return Err(Error::Protocol);

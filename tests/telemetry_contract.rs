@@ -251,6 +251,14 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
     }
 
     // An overdue handoff can be observed again on a later sweep.
+    for step in metrics::GatewayStep::ALL {
+        for cause in metrics::GatewayCause::ALL {
+            store.record_gateway_failure(step, cause);
+        }
+    }
+    for age in [0, 60, 3600] {
+        store.record_gateway_lag(age);
+    }
     store.record_overdue_handoffs(3);
     store.record_overdue_handoffs(2);
 

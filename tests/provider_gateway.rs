@@ -1,5 +1,5 @@
 //! Build the admin route with the same cfg(test)-only DNS and loopback seam as inference.
-use openmettle_core::provider_keys;
+use openmettle_core::{authz, provider_keys, telemetry};
 mod runs {
     pub(super) fn is_canonical_uuid(value: &str) -> bool {
         // The public vocabulary validates its member key with runs::is_canonical_uuid.
@@ -329,6 +329,45 @@ async fn readiness_header_and_body_stalls_and_response_ceiling() {
 }
 
 #[tokio::test]
+async fn family_directory_quarantines_only_children_with_malformed_schedules() {
+    let ca = Ca::new();
+    let installation = intent(Resource::Principal).installation;
+    let pin = installation.clone();
+    let peer = Server::start(ca.leaf(fixture::HOST, false), move |_| {
+        let mut children = Vec::new();
+        for (n, zone, start, end) in [
+            (1, "X".repeat(129), 30, 45),
+            (2, "UTC".into(), 1440, 30),
+            (3, "UTC".into(), 30, 1440),
+            (4, "UTC".into(), 30, 30),
+            (5, "Europe/London".into(), 1380, 60),
+        ] {
+            children.push(json!({"user":format!("00000000-0000-4000-8000-{n:012}"),
+                "policy":{"revision":1,"zone":zone,"quiet":{"start_minute":start,"end_minute":end},
+                "study":null,"study_models":[],"disabled_models":[]}}));
+        }
+        Reply::Bytes(fixture::json(
+            &serde_json::to_vec(
+                &json!({"installation":pin,"revision":1,"children":children,"more":false}),
+            )
+            .unwrap(),
+        ))
+    })
+    .await;
+    let directory = client(&peer, &ca)
+        .family_directory(&installation, deadline())
+        .await
+        .unwrap();
+    assert_eq!(directory.invalid_children.len(), 4);
+    assert_eq!(directory.children.len(), 1);
+    assert!(
+        directory
+            .children
+            .contains_key("00000000-0000-4000-8000-000000000005")
+    );
+}
+
+#[tokio::test]
 async fn pagination_has_fixed_origin_page_size_and_page_count() {
     for more_forever in [false, true] {
         let ca = Ca::new();
@@ -393,4 +432,132 @@ async fn dropping_an_admin_call_closes_its_stalled_connection() {
         }
         assert_eq!(server.requests.load(Ordering::SeqCst), 1);
     }
+}
+
+#[test]
+fn public_problems_conceal_first_and_classify_only_qualified_refusals() {
+    use admin::problem::{Access, Problem as P, select};
+    use hyper::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+    use telemetry::metrics::GatewayCause as Cause;
+    let canary = "synthetic-secret-child-prompt-id.example.test";
+    let mut h = HeaderMap::new();
+    h.insert("x-upstream-error", HeaderValue::from_static(canary));
+    h.insert(
+        "openmettle-policy-refusal",
+        HeaderValue::from_static("family-policy-v1"),
+    );
+    let auth = P::from_admin(admin::Error::Refused(401));
+    assert_eq!(
+        Some(auth),
+        select(Access::Entitled, Some(auth), false, || panic!()).err()
+    );
+    for (access, expected) in [
+        (Access::Inactive, P::Unauthenticated),
+        (Access::Hidden, P::Hidden),
+        (Access::Denied, P::Policy),
+    ] {
+        assert_eq!(
+            select::<()>(access, Some(auth), false, || panic!()),
+            Err(expected)
+        );
+    }
+    assert_eq!(
+        select(Access::Entitled, None, false, || panic!()),
+        Err(P::Provisioning)
+    );
+    assert_eq!(
+        select(Access::Entitled, None, true, || "default"),
+        Ok("default")
+    );
+    for (p, status, code, message) in [
+        (
+            P::Unauthenticated,
+            401,
+            "unauthenticated",
+            "A valid OpenMettle application session is required.",
+        ),
+        (
+            P::Hidden,
+            404,
+            "not_found",
+            "The resource does not exist or is not visible to the caller.",
+        ),
+        (
+            P::from_inference(403, &h, true),
+            403,
+            "policy",
+            "Account policy does not permit this model request. Ask your account administrator about access.",
+        ),
+        (
+            P::Provisioning,
+            503,
+            "provisioning",
+            "Gateway access for your account is being set up. If this persists, contact your account administrator.",
+        ),
+        (
+            auth,
+            502,
+            "provider_failure",
+            "Gateway request failed. Contact the operator with the request ID.",
+        ),
+        (
+            P::from_inference(503, &h, true),
+            503,
+            "unavailable",
+            "Gateway access is unavailable. Contact the operator with the request ID.",
+        ),
+        (
+            P::from_inference(504, &h, true),
+            504,
+            "timeout",
+            "The gateway request timed out.",
+        ),
+        (
+            P::from_inference(429, &h, true),
+            429,
+            "rate_limited",
+            "The gateway request was rate limited.",
+        ),
+    ] {
+        assert_eq!(p.public(), (status, code, message));
+        assert!(!format!("{p:?} {message}").contains(canary));
+    }
+    for status in [401, 403] {
+        assert_eq!(
+            P::from_admin(admin::Error::Refused(status)),
+            P::Failure(Cause::ServiceAuth)
+        );
+        assert_eq!(
+            P::from_inference(status, &h, false),
+            P::Failure(Cause::Unknown)
+        );
+    }
+    h.insert(
+        "openmettle-policy-refusal",
+        HeaderValue::from_static(canary),
+    );
+    assert_eq!(P::from_inference(403, &h, true), P::Failure(Cause::Unknown));
+    assert_eq!(
+        P::from_admin(admin::Error::Protocol),
+        P::Failure(Cause::Protocol)
+    );
+    for e in [Error::Tls, Error::Connect, Error::Resolve] {
+        assert_eq!(P::from_admin(admin::Error::Transport(e)), P::Unavailable);
+    }
+    assert_eq!(
+        P::from_admin(admin::Error::Transport(Error::Timeout)),
+        P::Timeout
+    );
+    for (value, n) in [
+        ("0", Some(0)),
+        ("86400", Some(86400)),
+        ("86401", None),
+        ("-1", None),
+        ("1.5", None),
+    ] {
+        h.insert(RETRY_AFTER, HeaderValue::from_static(value));
+        assert_eq!(P::from_inference(429, &h, true), P::RateLimited(n));
+    }
+    h.append(RETRY_AFTER, HeaderValue::from_static("2"));
+    assert_eq!(P::from_inference(429, &h, true), P::RateLimited(None));
 }

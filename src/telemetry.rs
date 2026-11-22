@@ -66,6 +66,7 @@ pub const FIELDS: &[&str] = &[
     "resource_kind",
     "threshold_pct",
     "dedupe_bucket",
+    "gateway.step",
 ];
 
 /// The only field names [`SpanGuard`] admits: the request span's. `otel.kind` is consumed by
@@ -744,3 +745,8 @@ pub fn migration_interrupted(signal: Signal) {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+pub fn gateway_failure(step: metrics::GatewayStep, cause: metrics::GatewayCause) {
+    metrics::global().record_gateway_failure(step, cause);
+    tracing::warn!(target: TARGET, event="gateway.failed", "gateway.step"=step.as_str(), "error.type"=cause.as_str());
+}

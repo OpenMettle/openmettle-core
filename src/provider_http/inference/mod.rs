@@ -14,6 +14,7 @@ pub use schema::SchemaSubset;
 pub use turn::{Answer, Call, CallGroup, Reasoning, ToolError, Turn, Usage, VisibleDelta};
 
 use super::{Trust, transport};
+use crate::authz::gateway::problem::{Cause, GatewayStep, Problem as GatewayProblem};
 use crate::{
     authz::leases::FailReason,
     model_config::{Catalog, Effective, ProfilePin},
@@ -71,6 +72,7 @@ pub struct Timeouts {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
+    Gateway(GatewayProblem),
     Validation,
     Provisioning,
     Credential,
@@ -88,6 +90,7 @@ impl Error {
     /// Fixed application projection. A timeout after headers uses the same code in the active stream.
     pub fn problem(self) -> (u16, &'static str, &'static str) {
         match self {
+            Self::Gateway(p) => p.public(),
             Self::Validation => (
                 400,
                 "validation",
@@ -113,6 +116,29 @@ impl Error {
             Protocol::Chat => json!({"error":{"code":code,"message":message}}),
             Protocol::Responses => json!({"type":"error","code":code,"message":message}),
         }
+    }
+    fn for_profile(self, qualified: bool) -> Self {
+        if !qualified {
+            return self;
+        }
+        let problem = match self {
+            Self::Gateway(p) => p,
+            Self::Credential => GatewayProblem::Failure(Cause::Protection),
+            Self::Provisioning => GatewayProblem::Provisioning,
+            Self::RateLimited(delay) => GatewayProblem::RateLimited(delay),
+            Self::Unavailable => GatewayProblem::Unavailable,
+            Self::Timeout => GatewayProblem::Timeout,
+            Self::Malformed | Self::Incomplete | Self::Provider => {
+                GatewayProblem::Failure(Cause::Protocol)
+            }
+            Self::Filtered | Self::Stopped(_) | Self::Validation => return self,
+        };
+        problem.record(match problem {
+            GatewayProblem::Policy => GatewayStep::Policy,
+            GatewayProblem::Failure(Cause::Unknown | Cause::Protection) => GatewayStep::Key,
+            _ => GatewayStep::Readiness,
+        });
+        Self::Gateway(problem)
     }
     pub fn step_result(self) -> StepResult {
         match self {
@@ -171,6 +197,7 @@ pub struct Gateway {
     tls: Arc<rustls::ClientConfig>,
     lookup: transport::Lookup,
     qualification: Qualification,
+    family_policy_v1: bool,
     timeouts: Timeouts,
     #[cfg(test)]
     loopback: bool,
@@ -199,10 +226,18 @@ impl Gateway {
             tls: transport::client_config(transport::roots(trust)?)?,
             lookup: Arc::new(transport::system_lookup),
             qualification,
+            family_policy_v1: false,
             timeouts,
             #[cfg(test)]
             loopback: false,
         })
+    }
+
+    /// Enable ADR 0037 error semantics on this exact HTTPS route after qualifying its
+    /// family-policy-v1 refusal header. Generic external provider profiles retain ADR 0038.
+    pub fn with_family_policy_v1(mut self) -> Self {
+        self.family_policy_v1 = true;
+        self
     }
 
     /// The facade captures its tool list at entry. It may forward visible deltas under
@@ -218,6 +253,7 @@ impl Gateway {
     ) -> Result<Turn, Error> {
         self.complete(catalog, effective, request, credential, None, visible)
             .await
+            .map_err(|e| e.for_profile(self.family_policy_v1))
     }
     /// One model step after the executor's leased authority check. The executor owns
     /// rounds, approvals, fenced effects and publication. Map an error with `step_result`.
@@ -232,6 +268,7 @@ impl Gateway {
     ) -> Result<Turn, Error> {
         self.complete(catalog, effective, request, credential, Some(run), visible)
             .await
+            .map_err(|e| e.for_profile(self.family_policy_v1))
     }
 
     async fn complete<F: Future<Output = ()>>(
@@ -246,6 +283,8 @@ impl Gateway {
         let start = Instant::now();
         let server = run.is_some();
         let dispatch = async {
+            // Provisioning or a broken credential takes precedence over model selection.
+            let headers = headers(credential, request.stream)?;
             // The catalog checks both snapshot revision and profile pin, even for a caller
             // with unknown capacity. Admission owns the populated path and prompt estimate.
             catalog
@@ -260,7 +299,6 @@ impl Gateway {
                 })
                 .ok_or(Error::Validation)?;
             let body = request.encode(&self.qualification, profile, effective, server)?;
-            let headers = headers(credential, request.stream)?;
             let route = transport::Route {
                 endpoint: &self.endpoint,
                 allowed: &self.allowed,
@@ -291,24 +329,22 @@ impl Gateway {
             if header_bytes > super::MAX_REQUEST_HEADER_BYTES {
                 return Err(Error::Credential);
             }
-            let tls = route.connect(start + self.timeouts.setup).await?;
+            let tls = route
+                .connect(start + self.timeouts.setup)
+                .await
+                .map_err(|e| match e {
+                    super::Error::Tls | super::Error::Address if self.family_policy_v1 => {
+                        Error::Unavailable
+                    }
+                    e => Error::from(e),
+                })?;
             route
                 .exchange(
                     tls,
                     outbound,
                     Instant::now() + self.timeouts.idle,
                     &limits,
-                    |response| {
-                        decode::receive(
-                            response,
-                            &self.qualification,
-                            profile,
-                            request,
-                            server,
-                            self.timeouts.idle,
-                            visible,
-                        )
-                    },
+                    |response| decode::receive(response, self, profile, request, server, visible),
                 )
                 .await
         };

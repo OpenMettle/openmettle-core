@@ -16,8 +16,8 @@
       "logs_days": 7,
       "metrics_days": 14
     },
-    "max_data_point_streams": 360,
-    "max_prometheus_series_per_process": 1023,
+    "max_data_point_streams": 412,
+    "max_prometheus_series_per_process": 1075,
     "disallowed_metric_label_substrings": [
       "user_id",
       "scope_id",
@@ -74,9 +74,15 @@
       "scope_kind",
       "resource_kind",
       "threshold_pct",
-      "dedupe_bucket"
+      "dedupe_bucket",
+      "gateway.step"
     ],
     "events": [
+      {
+        "name": "gateway.failed",
+        "levels": ["warn"],
+        "fields": ["event", "gateway.step", "error.type"]
+      },
       {
         "name": "quota.warning",
         "levels": ["warn"],
@@ -274,6 +280,25 @@
       "semantics": "overdue_committed_handoffs_observed_per_bounded_sweep",
       "max_series": 1,
       "labels": {}
+    },
+    {
+      "name": "openmettle.gateway.failures",
+      "prometheus_name": "openmettle_gateway_failures_total",
+      "kind": "counter",
+      "unit": "{failure}",
+      "max_series": 49,
+      "labels": {
+        "step": ["readiness", "principal", "budget", "policy", "key", "revoke", "usage"],
+        "cause": ["policy", "service_auth", "transport", "timeout", "protocol", "protection", "unknown"]
+      }
+    },
+    {
+      "name": "openmettle.gateway.backfill.age",
+      "prometheus_name": "openmettle_gateway_backfill_age_total",
+      "kind": "counter",
+      "unit": "{observation}",
+      "max_series": 3,
+      "labels": {"lag": ["under_minute", "under_hour", "hour_or_more"]}
     }
   ],
   "reserved_signals": [
