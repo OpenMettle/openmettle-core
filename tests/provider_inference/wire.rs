@@ -30,6 +30,7 @@ async fn terminal_state_machines_fail_closed_in_json_and_sse() {
         }
         for (status, error) in [
             ("failed", Error::Provider),
+            ("cancelled", Error::Provider),
             ("incomplete", Error::Incomplete),
             ("unknown", Error::Malformed),
         ] {
@@ -567,4 +568,547 @@ async fn nested_duplicates_in_otherwise_schema_valid_arguments_fail_every_mode()
             mock.assert_inference_only(1);
         }
     }
+}
+
+#[tokio::test]
+async fn responses_reasoning_block_bounds_normalized_jsonb_bytes() {
+    let overhead =
+        r#"[{"id": "why", "type": "reasoning", "summary": [{"text": "", "type": "summary_text"}]}]"#
+            .len();
+    let sse_reply = |body: &str| {
+        fixture::response(
+            200,
+            &[("content-type", "text/event-stream")],
+            body.as_bytes(),
+        )
+    };
+    let streamed_reasoning = |done_item: &Value, text: &str| {
+        let mut added = json!({
+            "type": "reasoning",
+            "id": "why",
+            "status": Value::Null,
+            "summary": [],
+            "upstream_seq": 7
+        });
+        if let Some(enc) = done_item.get("encrypted_content") {
+            added["encrypted_content"] = enc.clone();
+        }
+        let body = event(json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": added
+        })) + &event(json!({
+            "type": "response.reasoning_summary_part.added",
+            "output_index": 0,
+            "item_id": "why",
+            "summary_index": 0,
+            "part": {
+                "type": "summary_text",
+                "text": "",
+                "index": 0,
+                "annotations": Value::Null,
+                "cached": false
+            }
+        })) + &event(json!({
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": 0,
+            "item_id": "why",
+            "summary_index": 0,
+            "delta": text
+        })) + &event(json!({
+            "type": "response.reasoning_summary_part.done",
+            "output_index": 0,
+            "item_id": "why",
+            "summary_index": 0,
+            "part": done_item["summary"][0]
+        })) + &event(json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": done_item
+        })) + &event(json!({
+            "type": "response.completed",
+            "response": completed(vec![done_item.clone()])
+        }));
+        sse_reply(&body)
+    };
+
+    for stream in [false, true] {
+        // Extra numeric/null/boolean and >64 KiB metadata fields on raw summary items must not
+        // falsely reject a valid normalized reasoning block.
+        let padded_short = json!({
+            "type": "reasoning",
+            "id": "why",
+            "status": Value::Null,
+            "summary": [{
+                "type": "summary_text",
+                "text": THINK,
+                "index": 0,
+                "annotations": Value::Null,
+                "cached": false,
+                "provider_metadata": "p".repeat(70_000)
+            }]
+        });
+        let raw = if stream {
+            streamed_reasoning(&padded_short, THINK)
+        } else {
+            fixture::json(completed(vec![padded_short.clone()]).to_string().as_bytes())
+        };
+        let reasoning = once(Protocol::Responses, stream, raw)
+            .await
+            .unwrap()
+            .answers
+            .remove(0)
+            .reasoning
+            .unwrap();
+        assert_eq!(
+            reasoning.blocks,
+            vec![json!({
+                "type": "reasoning",
+                "id": "why",
+                "summary": [{"type": "summary_text", "text": THINK}]
+            })]
+        );
+        assert_eq!(reasoning.storage_bytes, overhead + THINK.len());
+
+        // Exact 65,536-byte normalized block with extra raw metadata fits; +1 byte fails closed.
+        for extra in ["", "x"] {
+            let text = "x".repeat(65536 - overhead) + extra;
+            let item = json!({
+                "type": "reasoning",
+                "id": "why",
+                "summary": [{
+                    "type": "summary_text",
+                    "text": text,
+                    "index": 0,
+                    "annotations": Value::Null,
+                    "provider_metadata": "m".repeat(1024)
+                }]
+            });
+            let raw = if stream {
+                streamed_reasoning(&item, &text)
+            } else {
+                fixture::json(completed(vec![item]).to_string().as_bytes())
+            };
+            let res = once(Protocol::Responses, stream, raw).await;
+            if extra.is_empty() {
+                assert_eq!(
+                    res.unwrap().answers[0]
+                        .reasoning
+                        .as_ref()
+                        .unwrap()
+                        .storage_bytes,
+                    65536
+                );
+            } else {
+                assert_eq!(res.err(), Some(Error::Malformed));
+            }
+        }
+
+        // Encrypted content pushing the normalized block over 65,536 pg_bytes fails closed
+        // even when only attached at output_item.done / response.completed.
+        let near_limit = "x".repeat(65536 - overhead - 4);
+        let encrypted_overflow = json!({
+            "type": "reasoning",
+            "id": "why",
+            "encrypted_content": "abc",
+            "summary": [{"type": "summary_text", "text": near_limit}]
+        });
+        let raw = if stream {
+            let body = event(json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "reasoning", "id": "why", "summary": []}
+            })) + &event(json!({
+                "type": "response.reasoning_summary_text.delta",
+                "output_index": 0,
+                "item_id": "why",
+                "summary_index": 0,
+                "delta": near_limit
+            })) + &event(json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": encrypted_overflow
+            })) + &event(json!({
+                "type": "response.completed",
+                "response": completed(vec![encrypted_overflow.clone()])
+            }));
+            sse_reply(&body)
+        } else {
+            fixture::json(completed(vec![encrypted_overflow]).to_string().as_bytes())
+        };
+        assert_eq!(
+            once(Protocol::Responses, stream, raw).await.err(),
+            Some(Error::Malformed)
+        );
+    }
+}
+
+#[tokio::test]
+async fn responses_output_item_null_status_and_streamed_cancelled_parity() {
+    use crate::{authz::leases::FailReason, worker::StepResult};
+
+    for stream in [false, true] {
+        let mut r_item = reasoning(THINK);
+        r_item["status"] = Value::Null;
+        let mut m_item = message("ok");
+        m_item["status"] = Value::Null;
+        let mut f_item = function("c1", "left", r#"{"v":"one"}"#);
+        f_item["status"] = Value::Null;
+
+        let raw = if stream {
+            let body = event(json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "reasoning", "id": "why", "status": Value::Null, "summary": []}
+            })) + &event(json!({
+                "type": "response.reasoning_summary_text.delta",
+                "output_index": 0,
+                "item_id": "why",
+                "summary_index": 0,
+                "delta": THINK
+            })) + &event(json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": r_item
+            })) + &event(json!({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {"type": "message", "id": "msg", "role": "assistant", "status": Value::Null, "content": []}
+            })) + &event(json!({
+                "type": "response.output_text.delta",
+                "output_index": 1,
+                "item_id": "msg",
+                "content_index": 0,
+                "delta": "ok"
+            })) + &event(json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": m_item
+            })) + &event(json!({
+                "type": "response.output_item.added",
+                "output_index": 2,
+                "item": {"type": "function_call", "id": "item-c1", "call_id": "c1", "name": "left", "arguments": "", "status": Value::Null}
+            })) + &event(json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 2,
+                "item_id": "item-c1",
+                "delta": r#"{"v":"one"}"#
+            })) + &event(json!({
+                "type": "response.output_item.done",
+                "output_index": 2,
+                "item": f_item
+            })) + &event(json!({
+                "type": "response.completed",
+                "response": completed(vec![r_item, m_item, f_item])
+            }));
+            sse(&body)
+        } else {
+            fixture::json(
+                completed(vec![r_item, m_item, f_item])
+                    .to_string()
+                    .as_bytes(),
+            )
+        };
+        let answer = once(Protocol::Responses, stream, raw)
+            .await
+            .unwrap()
+            .answers
+            .remove(0);
+        assert_eq!(answer.parts, ["ok"]);
+        assert!(answer.reasoning.is_some());
+        assert!(matches!(answer.calls, CallGroup::Valid(ref c) if c.len() == 1));
+
+        // Non-null non-completed output item statuses still fail closed.
+        for (status, details, expected) in [
+            ("incomplete".into(), None, Error::Incomplete),
+            (
+                "incomplete".into(),
+                Some(json!({"reason": "content_filter"})),
+                Error::Filtered,
+            ),
+            ("failed".into(), None, Error::Provider),
+            ("cancelled".into(), None, Error::Provider),
+            ("in_progress".into(), None, Error::Malformed),
+            (json!(123), None, Error::Malformed),
+            (json!(true), None, Error::Malformed),
+        ] {
+            let mut item = message("partial");
+            item["status"] = status;
+            if let Some(d) = details {
+                item["incomplete_details"] = d;
+            }
+            let raw = wire(
+                Protocol::Responses,
+                stream,
+                Value::Null,
+                Value::Null,
+                vec![item],
+            );
+            assert_eq!(
+                once(Protocol::Responses, stream, raw).await.err(),
+                Some(expected)
+            );
+        }
+
+        // Top-level response status still cannot be null.
+        let top_null = json!({"status": Value::Null, "output": [message("ok")]});
+        let raw = if stream {
+            sse(&event(json!({
+                "type": "response.completed",
+                "response": top_null
+            })))
+        } else {
+            fixture::json(top_null.to_string().as_bytes())
+        };
+        assert_eq!(
+            once(Protocol::Responses, stream, raw).await.err(),
+            Some(Error::Malformed)
+        );
+    }
+
+    // Streamed response.cancelled (including after partial text deltas and with SSE event name)
+    // yields Error::Provider for both caller and server (never Error::Stopped when RunStop is clear).
+    let partial_then_cancelled = event(json!({"type": "response.created"}))
+        + &event(json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "message", "id": "msg", "role": "assistant", "content": []}
+        }))
+        + &event(json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "item_id": "msg",
+            "content_index": 0,
+            "delta": "partial"
+        }))
+        + "event: response.cancelled\r\n"
+        + &event(json!({
+            "type": "response.cancelled",
+            "response": {"status": "cancelled", "output": [message("partial")]}
+        }));
+    let bytes = sse(&partial_then_cancelled);
+    let mock = Mock::new(Protocol::Responses, move |_| Reply::Bytes(bytes.clone())).await;
+    let c = catalog(Protocol::Responses, true);
+    let e = effective(&c, false);
+    let g = mock.gateway(&e, NORMAL);
+    let r = request(true);
+    assert_eq!(
+        g.caller(&c, &e, &r, Credential::Bearer(TOKEN), |_| async {})
+            .await
+            .err(),
+        Some(Error::Provider)
+    );
+    let (_tx, stop) = run_stop(Instant::now() + Duration::from_secs(5));
+    let server_err = g
+        .server(&c, &e, &r, Credential::Bearer(TOKEN), stop, |_| async {})
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(server_err, Error::Provider);
+    assert!(matches!(
+        server_err.step_result(),
+        StepResult::Failed(FailReason::StepFailed)
+    ));
+    mock.assert_inference_only(2);
+}
+
+#[tokio::test]
+async fn responses_streamed_done_and_completed_treat_null_and_omitted_status_equally() {
+    let stream_pair = |done_item: Value, completed_item: Value| {
+        sse(&(event(json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "message", "id": "msg", "role": "assistant", "content": []}
+        })) + &event(json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "item_id": "msg",
+            "content_index": 0,
+            "delta": "ok"
+        })) + &event(json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": done_item
+        })) + &event(json!({
+            "type": "response.completed",
+            "response": completed(vec![completed_item])
+        }))))
+    };
+
+    let with_null = json!({
+        "type": "message",
+        "id": "msg",
+        "role": "assistant",
+        "status": Value::Null,
+        "content": [{"type": "output_text", "text": "ok"}]
+    });
+    let omitted = json!({
+        "type": "message",
+        "id": "msg",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "ok"}]
+    });
+    let with_completed = message("ok");
+    let mut with_extra_null = omitted.clone();
+    with_extra_null["extra"] = Value::Null;
+
+    // Both orderings of null vs omitted top-level item status must succeed.
+    for (done_item, completed_item) in [
+        (with_null.clone(), omitted.clone()),
+        (omitted.clone(), with_null.clone()),
+    ] {
+        let turn = once(
+            Protocol::Responses,
+            true,
+            stream_pair(done_item, completed_item),
+        )
+        .await
+        .unwrap();
+        assert_eq!(turn.answers[0].parts, ["ok"]);
+    }
+
+    // Non-null status mismatches and non-status null field mismatches still fail closed.
+    for (done_item, completed_item) in [
+        (with_completed.clone(), omitted.clone()),
+        (with_completed.clone(), with_null.clone()),
+        (omitted.clone(), with_completed.clone()),
+        (with_null, with_completed),
+        (with_extra_null, omitted),
+    ] {
+        assert_eq!(
+            once(
+                Protocol::Responses,
+                true,
+                stream_pair(done_item, completed_item),
+            )
+            .await
+            .err(),
+            Some(Error::Malformed)
+        );
+    }
+}
+
+#[tokio::test]
+async fn chat_non_streamed_tool_call_arguments_require_json_string() {
+    let valid_msg = json!({
+        "role": "assistant",
+        "tool_calls": [{
+            "id": "c1",
+            "type": "function",
+            "function": {"name": "left", "arguments": r#"{"v":"ok"}"#}
+        }]
+    });
+    let turn = once(
+        Protocol::Chat,
+        false,
+        fixture::json(
+            chat_json(valid_msg, "tool_calls".into())
+                .to_string()
+                .as_bytes(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(&turn.answers[0].calls, CallGroup::Valid(c) if c.len() == 1 && c[0].arguments == json!({"v": "ok"}))
+    );
+
+    // Non-string wire shapes (object, null, omitted, array, number, boolean) must fail with
+    // Error::Malformed in both caller and server modes rather than coercing or treating as empty.
+    for raw_function in [
+        json!({"name": "left", "arguments": {"v": "ok"}}),
+        json!({"name": "left", "arguments": Value::Null}),
+        json!({"name": "left"}),
+        json!({"name": "left", "arguments": ["ok"]}),
+        json!({"name": "left", "arguments": 123}),
+        json!({"name": "left", "arguments": true}),
+    ] {
+        let body = chat_json(
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": raw_function
+                }]
+            }),
+            "tool_calls".into(),
+        );
+        let bytes = fixture::json(body.to_string().as_bytes());
+        let mock = Mock::new(Protocol::Chat, move |_| Reply::Bytes(bytes.clone())).await;
+        let c = catalog(Protocol::Chat, true);
+        let e = effective(&c, false);
+        let g = mock.gateway(&e, NORMAL);
+        let r = request(false);
+        assert_eq!(
+            g.caller(&c, &e, &r, Credential::Bearer(TOKEN), |_| async {})
+                .await
+                .err(),
+            Some(Error::Malformed)
+        );
+        let (_tx, stop) = run_stop(Instant::now() + Duration::from_secs(5));
+        assert_eq!(
+            g.server(&c, &e, &r, Credential::Bearer(TOKEN), stop, |_| async {})
+                .await
+                .err(),
+            Some(Error::Malformed)
+        );
+        mock.assert_inference_only(2);
+    }
+
+    // Invalid JSON strings on non-streamed Chat tool calls are rejected for caller.
+    for bad_args in ["{", "[1]", r#"{"v":"a","v":"b"}"#] {
+        let body = chat_json(
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "left", "arguments": bad_args}
+                }]
+            }),
+            "tool_calls".into(),
+        );
+        assert_eq!(
+            once(
+                Protocol::Chat,
+                false,
+                fixture::json(body.to_string().as_bytes())
+            )
+            .await
+            .err(),
+            Some(Error::Malformed)
+        );
+    }
+
+    // Streamed Chat tool call deltas may omit or send null arguments before string fragments,
+    // while still rejecting non-string non-null arguments.
+    let streamed_ok = delta(
+        json!({
+            "role": "assistant",
+            "tool_calls": [{"index": 0, "id": "c1", "type": "function", "function": {"name": "left", "arguments": Value::Null}}]
+        }),
+        Value::Null,
+    ) + &delta(
+        json!({
+            "tool_calls": [{"index": 0, "function": {"arguments": r#"{"v":"ok"}"#}}]
+        }),
+        "tool_calls".into(),
+    ) + "data: [DONE]\r\n\r\n";
+    let streamed_turn = once(Protocol::Chat, true, sse(&streamed_ok)).await.unwrap();
+    assert!(
+        matches!(&streamed_turn.answers[0].calls, CallGroup::Valid(c) if c.len() == 1 && c[0].arguments == json!({"v": "ok"}))
+    );
+
+    let streamed_bad = delta(
+        json!({
+            "role": "assistant",
+            "tool_calls": [{"index": 0, "id": "c1", "type": "function", "function": {"name": "left", "arguments": {"v": "ok"}}}]
+        }),
+        "tool_calls".into(),
+    ) + "data: [DONE]\r\n\r\n";
+    assert_eq!(
+        once(Protocol::Chat, true, sse(&streamed_bad)).await.err(),
+        Some(Error::Malformed)
+    );
 }
