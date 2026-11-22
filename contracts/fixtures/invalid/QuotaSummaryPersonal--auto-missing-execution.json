@@ -1,0 +1,101 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "QuotaSummaryPersonal--auto-missing-execution",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "device_capacity": {
+      "active_reservations": {
+        "limit": "2",
+        "limit_source": "default",
+        "override_expires_at": null,
+        "reserved_held": "1",
+        "status": "ok",
+        "warn_thresholds": [
+          80,
+          90
+        ]
+      }
+    },
+    "observed_at": "2026-11-20T12:00:00.000000Z",
+    "scope_id": "10111213-1415-4617-8819-1a1b1c1d1e1f",
+    "scope_kind": "personal",
+    "storage": {
+      "active_bytes": "4096",
+      "charged_bytes": "5120",
+      "limit_bytes": "1073741824",
+      "limit_source": "default",
+      "override_expires_at": null,
+      "remaining_bytes": "1073736704",
+      "reserved_bytes": "0",
+      "retained_bytes": "1024",
+      "status": "ok",
+      "warn_thresholds": [
+        80,
+        90
+      ]
+    },
+    "usage": [
+      {
+        "active_used": "27670116110564327421",
+        "authoritative_source": "gateway",
+        "last_reconciled_at": "2026-11-20T11:59:00.000000Z",
+        "limit": "1000000",
+        "limit_source": "override",
+        "override_expires_at": "2026-12-01T00:00:00.000000Z",
+        "remaining": "0",
+        "reserved_held": "0",
+        "resource_kind": "usage_tokens",
+        "status": "hard_limit",
+        "unit": "tokens",
+        "warn_thresholds": [
+          80,
+          90
+        ],
+        "window_end": "2026-11-21T00:00:00.000000Z",
+        "window_kind": "windowed",
+        "window_start": "2026-11-20T00:00:00.000000Z"
+      },
+      {
+        "active_used": "4250000",
+        "authoritative_source": "gateway",
+        "last_reconciled_at": "2026-11-20T11:59:00.000000Z",
+        "limit": "5000000",
+        "limit_source": "default",
+        "override_expires_at": null,
+        "remaining": "750000",
+        "reserved_held": "0",
+        "resource_kind": "usage_cost_micros",
+        "status": "warning",
+        "unit": "usd_micros",
+        "warn_thresholds": [
+          80,
+          90
+        ],
+        "window_end": null,
+        "window_kind": "static",
+        "window_start": "1970-01-01T00:00:00.000000Z"
+      }
+    ],
+    "warnings": [
+      {
+        "dedupe_bucket": "2026-11-20T00:00:00.000000Z",
+        "resource_kind": "usage_cost_micros",
+        "threshold_pct": 80,
+        "triggered_at": "2026-11-20T11:59:00.000000Z"
+      }
+    ]
+  },
+  "mutation": {
+    "name": "auto-missing-execution",
+    "op": "remove",
+    "path": "/execution"
+  },
+  "schema": "#/components/schemas/QuotaSummary",
+  "source": "#/components/examples/QuotaSummaryPersonal"
+}

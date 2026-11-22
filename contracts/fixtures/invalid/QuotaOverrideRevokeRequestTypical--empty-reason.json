@@ -1,0 +1,22 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "/reason",
+    "keyword": "minLength",
+    "valid": false
+  },
+  "fixture": "QuotaOverrideRevokeRequestTypical--empty-reason",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "reason": ""
+  },
+  "mutation": {
+    "name": "empty-reason",
+    "op": "set",
+    "path": "/reason",
+    "value": ""
+  },
+  "schema": "#/components/schemas/QuotaOverrideRevokeRequest",
+  "source": "#/components/examples/QuotaOverrideRevokeRequestTypical"
+}

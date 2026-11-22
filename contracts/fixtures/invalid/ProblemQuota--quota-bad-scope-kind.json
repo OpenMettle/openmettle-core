@@ -1,0 +1,34 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "/quota/scope_kind",
+    "keyword": "enum",
+    "valid": false
+  },
+  "fixture": "ProblemQuota--quota-bad-scope-kind",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "code": "quota",
+    "detail": "A usage quota for this account has been reached.",
+    "quota": {
+      "resource_kind": "storage_bytes",
+      "scope_kind": "global"
+    },
+    "request_id": "3e4f5a6b-7c8d-4e9f-8a1b-2c3d4e5f6a7b",
+    "status": 429,
+    "title": "Too Many Requests",
+    "type": "about:blank"
+  },
+  "mutation": {
+    "name": "quota-bad-scope-kind",
+    "op": "set",
+    "path": "/quota",
+    "value": {
+      "resource_kind": "storage_bytes",
+      "scope_kind": "global"
+    }
+  },
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemQuota"
+}

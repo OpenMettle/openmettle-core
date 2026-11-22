@@ -27,7 +27,7 @@ fn routes_are_the_implemented_contract_operations() {
         }
     }
     assert_eq!(served, documented);
-    assert_eq!(served.len(), 35);
+    assert_eq!(served.len(), 39);
     for (path, _) in routes() {
         assert_eq!(
             crate::telemetry::metrics::RouteClass::of(path),
@@ -594,4 +594,110 @@ async fn managed_routes_keep_request_values_out_of_logs_and_exported_spans() {
     finish(exporter).await;
     assert_eq!(collector.spans().len(), 3);
     collector.assert_absent(&[b"CANARY", id.as_bytes()]);
+}
+
+#[test]
+fn quota_override_bodies_and_problem_extensions_are_validated_and_closed() {
+    use crate::quotas::QuotaResourceKind as K;
+
+    let (limit, exp, reason) = quotas::parse_set_override(
+        K::UsageTokens,
+        br#"{"hard_limit":"500000","expires_at":"2026-12-31T23:59:59.000000Z","reason":"cohort"}"#,
+    )
+    .unwrap();
+    assert_eq!(limit, 500_000);
+    assert_eq!(exp.as_deref(), Some("2026-12-31T23:59:59.000000Z"));
+    assert_eq!(reason, "cohort");
+
+    let (limit, exp, reason) = quotas::parse_set_override(
+        K::StorageBytes,
+        br#"{"hard_limit":"0","reason":"freeze uploads"}"#,
+    )
+    .unwrap();
+    assert_eq!((limit, exp, reason.as_str()), (0, None, "freeze uploads"));
+
+    // round_cap requires 1..=1000.
+    assert_eq!(
+        quotas::parse_set_override(K::RoundCap, br#"{"hard_limit":"1","reason":"min"}"#)
+            .unwrap()
+            .0,
+        1
+    );
+    assert_eq!(
+        quotas::parse_set_override(K::RoundCap, br#"{"hard_limit":"1000","reason":"max"}"#)
+            .unwrap()
+            .0,
+        1000
+    );
+    for bad in [
+        (K::RoundCap, br#"{"hard_limit":"0","reason":"low"}"#.as_slice()),
+        (K::RoundCap, br#"{"hard_limit":"1001","reason":"high"}"#.as_slice()),
+        (K::UsageTokens, br#"{"hard_limit":"01","reason":"leading zero"}"#.as_slice()),
+        (
+            K::UsageTokens,
+            br#"{"hard_limit":"9223372036854775808","reason":"overflow"}"#.as_slice(),
+        ),
+        (K::UsageTokens, br#"{"hard_limit":10,"reason":"number"}"#.as_slice()),
+        (
+            K::UsageTokens,
+            br#"{"hard_limit":"10","expires_at":"2026-12-31T23:59:59Z","reason":"bad ts"}"#.as_slice(),
+        ),
+        (
+            K::UsageTokens,
+            br#"{"hard_limit":"10","expires_at":"2026-12-31T23:59:59.000000+00:00","reason":"offset"}"#.as_slice(),
+        ),
+        (K::UsageTokens, br#"{"hard_limit":"10","reason":""}"#.as_slice()),
+        (
+            K::UsageTokens,
+            br#"{"hard_limit":"10","reason":"ok","extra":1}"#.as_slice(),
+        ),
+        (
+            K::UsageTokens,
+            br#"{"hard_limit":"10","hard_limit":"20","reason":"dup"}"#.as_slice(),
+        ),
+    ] {
+        assert_eq!(
+            quotas::parse_set_override(bad.0, bad.1).unwrap_err().code,
+            "validation"
+        );
+    }
+
+    assert_eq!(
+        quotas::parse_revoke_override(br#"{"reason":"reset"}"#).unwrap(),
+        "reset"
+    );
+    for bad in [
+        br#"{"reason":""}"#.as_slice(),
+        br#"{"reason":"ok","extra":true}"#.as_slice(),
+        br#"{}"#.as_slice(),
+    ] {
+        assert_eq!(
+            quotas::parse_revoke_override(bad).unwrap_err().code,
+            "validation"
+        );
+    }
+
+    // Request key scoping isolates set vs revoke, scope_id, and resource_kind.
+    let s1 = "0f0e0d0c-0b0a-4908-8706-050403020100";
+    let k1 = request_key(Op::SetQuotaOverride, &format!("{s1}/usage_tokens"), "k");
+    let k2 = request_key(Op::RevokeQuotaOverride, &format!("{s1}/usage_tokens"), "k");
+    let k3 = request_key(Op::SetQuotaOverride, &format!("{s1}/storage_bytes"), "k");
+    assert_ne!(k1, k2);
+    assert_ne!(k1, k3);
+
+    // Closed quota extension serializes only resource_kind and scope_kind.
+    let p = quota_problem(
+        StatusCode::TOO_MANY_REQUESTS,
+        "quota",
+        "The usage budget does not allow this request.",
+        "usage_tokens",
+        "personal",
+    );
+    assert_eq!(
+        p.quota,
+        Some(QuotaDetail {
+            resource_kind: "usage_tokens",
+            scope_kind: "personal",
+        })
+    );
 }

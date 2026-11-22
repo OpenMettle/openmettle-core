@@ -1,0 +1,26 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "additionalProperties",
+    "valid": false
+  },
+  "fixture": "QuotaOverrideSetRequestTypical--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "expires_at": "2026-12-31T23:59:59.000000Z",
+    "hard_limit": "500000",
+    "reason": "Increase budget for evaluation cohort",
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/QuotaOverrideSetRequest",
+  "source": "#/components/examples/QuotaOverrideSetRequestTypical"
+}

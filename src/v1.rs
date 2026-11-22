@@ -73,12 +73,20 @@ const IDEMPOTENCY_DOMAIN: &[u8] = b"openmettle/v1-idempotency/1\0";
 /// Request ID of a problem when the operating system's random source failed.
 const NIL_REQUEST_ID: &str = "00000000-0000-0000-0000-000000000000";
 
+/// Additive closed low-cardinality quota refusal metadata (ADR 0040).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QuotaDetail {
+    resource_kind: &'static str,
+    scope_kind: &'static str,
+}
+
 /// One ADR 0007 problem category: a status, a stable code and a fixed, safe detail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Problem {
     status: StatusCode,
     code: &'static str,
     detail: &'static str,
+    quota: Option<QuotaDetail>,
 }
 
 const fn problem(status: StatusCode, code: &'static str, detail: &'static str) -> Problem {
@@ -86,6 +94,25 @@ const fn problem(status: StatusCode, code: &'static str, detail: &'static str) -
         status,
         code,
         detail,
+        quota: None,
+    }
+}
+
+const fn quota_problem(
+    status: StatusCode,
+    code: &'static str,
+    detail: &'static str,
+    resource_kind: &'static str,
+    scope_kind: &'static str,
+) -> Problem {
+    Problem {
+        status,
+        code,
+        detail,
+        quota: Some(QuotaDetail {
+            resource_kind,
+            scope_kind,
+        }),
     }
 }
 
@@ -162,7 +189,7 @@ const PROVISIONING: Problem = problem(
 
 impl Problem {
     fn response(self, id: Option<RequestId>) -> Response {
-        let body = json!({
+        let mut body = json!({
             "type": "about:blank",
             "title": self.status.canonical_reason().unwrap_or("Error"),
             "status": self.status.as_u16(),
@@ -170,6 +197,12 @@ impl Problem {
             "detail": self.detail,
             "request_id": id.map_or_else(|| NIL_REQUEST_ID.to_owned(), |id| id.to_string()),
         });
+        if let Some(quota) = self.quota {
+            body["quota"] = json!({
+                "resource_kind": quota.resource_kind,
+                "scope_kind": quota.scope_kind,
+            });
+        }
         let mut response = respond(self.status, Some("application/problem+json"), body);
         if self == submission::QUEUE_FULL {
             response
@@ -288,6 +321,10 @@ enum Op {
     CreateArtifactRevision,
     GetArtifactRevision,
     DownloadArtifactRevision,
+    GetPersonalQuotas,
+    GetProjectQuotas,
+    SetQuotaOverride,
+    RevokeQuotaOverride,
 }
 
 impl Op {
@@ -330,6 +367,10 @@ impl Op {
             Self::CreateArtifactRevision => "createArtifactRevision",
             Self::GetArtifactRevision => "getArtifactRevision",
             Self::DownloadArtifactRevision => "downloadArtifactRevision",
+            Self::GetPersonalQuotas => "getPersonalQuotas",
+            Self::GetProjectQuotas => "getProjectQuotas",
+            Self::SetQuotaOverride => "setQuotaOverride",
+            Self::RevokeQuotaOverride => "revokeQuotaOverride",
         }
     }
     fn reads(self) -> bool {
@@ -351,6 +392,8 @@ impl Op {
                 | Self::GetResource(_)
                 | Self::GetArtifactRevision
                 | Self::DownloadArtifactRevision
+                | Self::GetPersonalQuotas
+                | Self::GetProjectQuotas
         )
     }
     /// Streams a `multipart/form-data` artifact upload (ADR 0031).
@@ -372,6 +415,8 @@ impl Op {
                 | Self::RevokeProjectMember
                 | Self::ShareResource(_)
                 | Self::RevokeResourceShare(_)
+                | Self::SetQuotaOverride
+                | Self::RevokeQuotaOverride
         )
     }
     /// Names its target by a UUID in the third path segment.
@@ -387,6 +432,9 @@ impl Op {
                 | Self::ListCapabilities
                 | Self::CreateProject
                 | Self::CreateArtifact
+                | Self::GetPersonalQuotas
+                | Self::SetQuotaOverride
+                | Self::RevokeQuotaOverride
         )
     }
 }
@@ -786,7 +834,7 @@ pub fn router(
 }
 
 /// Every contract path template with its operations, by method.
-fn routes() -> [(&'static str, Vec<(Method, Op)>); 31] {
+fn routes() -> [(&'static str, Vec<(Method, Op)>); 35] {
     use Op::*;
     use ResourceKind::{Artifact, Conversation};
     let (get, put, post) = (Method::GET, Method::PUT, Method::POST);
@@ -877,7 +925,7 @@ fn routes() -> [(&'static str, Vec<(Method, Op)>); 31] {
         ),
         (
             "/v1/artifacts/{artifact_id}/shares",
-            vec![(put, ShareResource(Artifact))],
+            vec![(put.clone(), ShareResource(Artifact))],
         ),
         (
             "/v1/artifacts/{artifact_id}/shares/revoke",
@@ -885,7 +933,7 @@ fn routes() -> [(&'static str, Vec<(Method, Op)>); 31] {
         ),
         (
             "/v1/artifacts/{artifact_id}/revisions",
-            vec![(post, CreateArtifactRevision)],
+            vec![(post.clone(), CreateArtifactRevision)],
         ),
         (
             "/v1/artifacts/{artifact_id}/revisions/{revision_id}",
@@ -893,7 +941,23 @@ fn routes() -> [(&'static str, Vec<(Method, Op)>); 31] {
         ),
         (
             "/v1/artifacts/{artifact_id}/revisions/{revision_id}/content",
-            vec![(get, DownloadArtifactRevision)],
+            vec![(get.clone(), DownloadArtifactRevision)],
+        ),
+        (
+            "/v1/quotas/personal",
+            vec![(get.clone(), GetPersonalQuotas)],
+        ),
+        (
+            "/v1/projects/{project_id}/quotas",
+            vec![(get, GetProjectQuotas)],
+        ),
+        (
+            "/v1/admin/scopes/{scope_id}/quotas/{resource_kind}",
+            vec![(put, SetQuotaOverride)],
+        ),
+        (
+            "/v1/admin/scopes/{scope_id}/quotas/{resource_kind}/revoke",
+            vec![(post, RevokeQuotaOverride)],
         ),
     ]
 }
@@ -970,6 +1034,17 @@ impl Api {
             false => Some(idempotency_key(&parts.headers)?.to_owned()),
         };
         let body = read_body(op, &parts.headers, body).await?;
+        if matches!(
+            op,
+            Op::GetPersonalQuotas
+                | Op::GetProjectQuotas
+                | Op::SetQuotaOverride
+                | Op::RevokeQuotaOverride
+        ) {
+            return self
+                .quota_operation(op, &parts, session, target, key.as_deref(), &body)
+                .await;
+        }
         if matches!(op, Op::GetArtifactRevision | Op::DownloadArtifactRevision) {
             return self.revision(op, &parts, session, target).await;
         }
@@ -1326,6 +1401,7 @@ mod artifacts;
 mod catalog;
 mod conversations;
 mod pagination;
+mod quotas;
 mod runs;
 mod submission;
 

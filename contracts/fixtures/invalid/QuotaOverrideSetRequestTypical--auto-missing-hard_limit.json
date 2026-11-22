@@ -1,0 +1,22 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "QuotaOverrideSetRequestTypical--auto-missing-hard_limit",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "expires_at": "2026-12-31T23:59:59.000000Z",
+    "reason": "Increase budget for evaluation cohort"
+  },
+  "mutation": {
+    "name": "auto-missing-hard_limit",
+    "op": "remove",
+    "path": "/hard_limit"
+  },
+  "schema": "#/components/schemas/QuotaOverrideSetRequest",
+  "source": "#/components/examples/QuotaOverrideSetRequestTypical"
+}

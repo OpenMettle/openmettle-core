@@ -434,6 +434,26 @@ pub(super) async fn submit(
             "A live run limit has been reached.",
         )),
         Admission::Refused(RunLimit::QueueFull) => Err(QUEUE_FULL),
+        Admission::Refused(RunLimit::Quota {
+            resource_kind,
+            scope_kind,
+        }) => Err(quota_problem(
+            StatusCode::TOO_MANY_REQUESTS,
+            "quota",
+            "The usage budget does not allow this request.",
+            resource_kind,
+            scope_kind,
+        )),
+        Admission::Refused(RunLimit::QuotaUnconfigured {
+            resource_kind,
+            scope_kind,
+        }) => Err(quota_problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provisioning",
+            "Quota limits are not configured for this resource.",
+            resource_kind,
+            scope_kind,
+        )),
     }
 }
 pub(super) const QUEUE_FULL: Problem = problem(

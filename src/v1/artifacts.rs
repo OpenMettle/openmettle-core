@@ -13,8 +13,8 @@
 //!   artifact on every request, then only an `active` revision streams from the store.
 use super::{
     Api, BODY, CONFLICT, INTERNAL, INVALID, KEY_CONFLICT, NOT_FOUND, Op, PROVISIONING, Problem,
-    Session, TIMEOUT, UNAVAILABLE, path_id, principal, problem, reply, request_id, request_key,
-    response_headers, single_header, timestamp,
+    Session, TIMEOUT, UNAVAILABLE, path_id, principal, problem, quota_problem, reply, request_id,
+    request_key, response_headers, single_header, timestamp,
 };
 use crate::{
     artifact_fs::{self, UPLOAD_TIMEOUT},
@@ -225,6 +225,34 @@ fn ingest_problem(error: artifact_fs::Error) -> Problem {
     }
 }
 
+/// Attaches the closed ADR 0040 `quota` extension to storage upload refusals.
+fn upload_problem(error: artifact_fs::Error, scope_kind: &'static str) -> Problem {
+    match error {
+        artifact_fs::Error::Storage(runs::Error::OwnerLimit) => quota_problem(
+            StatusCode::TOO_MANY_REQUESTS,
+            "quota",
+            "The storage quota does not allow this upload.",
+            "storage_bytes",
+            scope_kind,
+        ),
+        artifact_fs::Error::Storage(runs::Error::InstanceLimit) => quota_problem(
+            StatusCode::TOO_MANY_REQUESTS,
+            "quota",
+            "The storage quota does not allow this upload.",
+            "storage_bytes",
+            "instance",
+        ),
+        artifact_fs::Error::Storage(runs::Error::LimitUnconfigured) => quota_problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provisioning",
+            "Quota limits are not configured for this resource.",
+            "storage_bytes",
+            scope_kind,
+        ),
+        other => ingest_problem(other),
+    }
+}
+
 /// ADR 0005 refusals of an upload. A reservation or settlement conflict is a changed request
 /// (or a spent key) under the same `Idempotency-Key`.
 fn storage_problem(error: runs::Error) -> Problem {
@@ -280,8 +308,13 @@ impl Api {
         let store = self.artifacts.as_ref().ok_or(PROVISIONING)?;
         let context = self.authenticate(&session).await?;
         let (actor, now) = (context.user_id(), context.observed_ms());
-        let (scope, key, artifact) = if op == Op::CreateArtifact {
+        let (scope, scope_kind, key, artifact) = if op == Op::CreateArtifact {
             let scope = query.scope.unwrap_or(context.personal_scope_id());
+            let scope_kind = if scope == context.personal_scope_id() {
+                "personal"
+            } else {
+                "project"
+            };
             let key = request_key(op, scope, client_key);
             let artifact = self
                 .database(async |c| {
@@ -290,7 +323,7 @@ impl Api {
                     Ok(storage::upload_artifact(c, scope, actor, &key).await?)
                 })
                 .await?;
-            (scope.to_owned(), key, artifact)
+            (scope.to_owned(), scope_kind, key, artifact)
         } else {
             let located = self
                 .database(async |c| {
@@ -298,8 +331,13 @@ impl Api {
                     projects::authorize_artifact(c, &principal, target, Action::Write, now).await
                 })
                 .await?;
+            let scope_kind = if located.project_id.is_some() {
+                "project"
+            } else {
+                "personal"
+            };
             let key = request_key(op, target, client_key);
-            (located.scope_id, key, target.to_owned())
+            (located.scope_id, scope_kind, key, target.to_owned())
         };
         let upload = artifact_fs::Upload {
             scope: &scope,
@@ -315,7 +353,7 @@ impl Api {
         let stored = tokio::time::timeout(UPLOAD_TIMEOUT, ingest)
             .await
             .map_err(|_| TIMEOUT)?
-            .map_err(ingest_problem)?;
+            .map_err(|error| upload_problem(error, scope_kind))?;
         let revision = self
             .database(async |c| read_revision(c, &artifact, &stored.revision).await)
             .await?;

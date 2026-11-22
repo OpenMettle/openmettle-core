@@ -701,6 +701,10 @@ fn consumer_decodes_every_valid_and_newer_compatible_response() {
         consumer::parse_decimal(f.instance.as_str().unwrap(), true)
             .unwrap_or_else(|e| panic!("{}: {e}", f.path));
     }
+    for f in fixtures_for("#/components/schemas/WideNonNegativeDecimal", &["valid"]) {
+        consumer::parse_wide_decimal(f.instance.as_str().unwrap())
+            .unwrap_or_else(|e| panic!("{}: {e}", f.path));
+    }
     for (schema, decode) in v1_decoders() {
         for f in fixtures_for(schema, &["valid", "compat"]) {
             decode(&f.instance).unwrap_or_else(|e| panic!("{}: {e}", f.path));
@@ -710,8 +714,8 @@ fn consumer_decodes_every_valid_and_newer_compatible_response() {
 
 type Decode = fn(&Value) -> Result<(), String>;
 
-/// The consumer's decoders of the V1-05 project, conversation and artifact responses.
-fn v1_decoders() -> [(&'static str, Decode); 7] {
+/// The consumer's decoders of the V1-05 project, conversation, artifact and V1-17 quota responses.
+fn v1_decoders() -> [(&'static str, Decode); 9] {
     [
         ("#/components/schemas/Run", |v| {
             consumer::decode_run(v).map(drop)
@@ -733,6 +737,12 @@ fn v1_decoders() -> [(&'static str, Decode); 7] {
         }),
         ("#/components/schemas/ArtifactRevision", |v| {
             consumer::decode_revision(v).map(drop)
+        }),
+        ("#/components/schemas/QuotaSummary", |v| {
+            consumer::decode_quota_summary(v).map(drop)
+        }),
+        ("#/components/schemas/QuotaOverride", |v| {
+            consumer::decode_quota_override(v).map(drop)
         }),
     ]
 }
@@ -1324,7 +1334,9 @@ fn mounted_api_problems_conform_to_the_contract() {
             .replace("artifact_id", id)
             .replace("revision_id", id)
             .replace("run_id", id)
-            .replace("approval_id", id);
+            .replace("approval_id", id)
+            .replace("scope_id", id)
+            .replace("resource_kind", "storage_bytes");
         for method in item.as_object().unwrap().keys() {
             let method = method.to_ascii_uppercase();
             cases.push((
@@ -1382,6 +1394,30 @@ fn mounted_api_problems_conform_to_the_contract() {
         ),
         (format!("GET {revision}/content HTTP/1.1\r\n{bearer}\r\n"), Provisioning),
         (format!("GET {revision} HTTP/1.1\r\n{bearer}\r\n"), Unavailable),
+        // Quota routes: pre-DB path, query, idempotency-key and body validation.
+        (format!("GET /v1/quotas/personal?extra=1 HTTP/1.1\r\n{bearer}\r\n"), Validation),
+        (format!("GET /v1/projects/CANARY-id/quotas HTTP/1.1\r\n{bearer}\r\n"), Validation),
+        (
+            format!("PUT /v1/admin/scopes/CANARY-id/quotas/usage_tokens HTTP/1.1\r\n{bearer}{key}{json}content-length: 40\r\n\r\n{{\"hard_limit\":\"10\",\"reason\":\"CANARY-r\"}}"),
+            Validation,
+        ),
+        (
+            format!("PUT /v1/admin/scopes/{id}/quotas/CANARY_res HTTP/1.1\r\n{bearer}{key}{json}content-length: 40\r\n\r\n{{\"hard_limit\":\"10\",\"reason\":\"CANARY-r\"}}"),
+            Validation,
+        ),
+        (
+            format!("PUT /v1/admin/scopes/{id}/quotas/round_cap HTTP/1.1\r\n{bearer}{key}{json}content-length: 42\r\n\r\n{{\"hard_limit\":\"1001\",\"reason\":\"CANARY-r\"}}"),
+            Validation,
+        ),
+        (
+            format!("PUT /v1/admin/scopes/{id}/quotas/usage_tokens HTTP/1.1\r\n{bearer}{json}content-length: 40\r\n\r\n{{\"hard_limit\":\"10\",\"reason\":\"CANARY-r\"}}"),
+            Validation,
+        ),
+        (
+            format!("POST /v1/admin/scopes/{id}/quotas/usage_tokens/revoke HTTP/1.1\r\n{bearer}{key}{json}content-length: 13\r\n\r\n{{\"reason\":\"\"}}"),
+            Validation,
+        ),
+        (format!("GET /v1/quotas/personal HTTP/1.1\r\n{bearer}\r\n"), Unavailable),
         // Paths and methods the contract does not define.
         ("GET /v1/CANARY-path HTTP/1.1\r\n\r\n".into(), NotFound),
         ("DELETE /v1/capabilities HTTP/1.1\r\n\r\n".into(), NotFound),
@@ -1608,4 +1644,115 @@ fn consumer_recognizes_the_approval_lifecycle() {
         };
         assert_eq!(event.kind, kind);
     }
+}
+
+#[test]
+fn consumer_decodes_wide_quota_counters_overrides_and_closed_problem_quota() {
+    use consumer::{Category, ProblemQuota, QuotaStatus};
+
+    // WideNonNegativeDecimal accepts 3-column > i64::MAX sums while NonNegativeDecimal refuses them.
+    let wide_validator = validator_for("#/components/schemas/WideNonNegativeDecimal");
+    let narrow_validator = validator_for("#/components/schemas/NonNegativeDecimal");
+    let three_col = json!("27670116110564327421");
+    assert!(wide_validator.is_valid(&three_col));
+    assert!(!narrow_validator.is_valid(&three_col));
+    assert_eq!(
+        consumer::parse_wide_decimal("27670116110564327421"),
+        Ok(27_670_116_110_564_327_421u128)
+    );
+    assert_eq!(
+        consumer::parse_wide_decimal(&"9".repeat(38)),
+        Ok(99_999_999_999_999_999_999_999_999_999_999_999_999u128)
+    );
+    for bad in ["100000000000000000000000000000000000000", "01", "-1", ""] {
+        assert!(consumer::parse_wide_decimal(bad).is_err(), "{bad}");
+    }
+
+    let personal = consumer::decode_quota_summary(&fixture("QuotaSummaryPersonal")).unwrap();
+    assert_eq!(personal.scope_id, "10111213-1415-4617-8819-1a1b1c1d1e1f");
+    assert_eq!(personal.scope_kind, "personal");
+    assert!(personal.has_actor_execution);
+    assert_eq!(personal.round_cap_limit, Some(25));
+    assert_eq!(personal.storage.limit_bytes, Some(1_073_741_824));
+    assert_eq!(personal.storage.limit_source, "default");
+    assert_eq!(
+        (
+            personal.storage.active_bytes,
+            personal.storage.retained_bytes,
+            personal.storage.reserved_bytes,
+            personal.storage.charged_bytes,
+            personal.storage.remaining_bytes,
+        ),
+        (4096, 1024, 0, 5120, Some(1_073_736_704))
+    );
+    assert_eq!(personal.storage.status, QuotaStatus::Ok);
+    assert_eq!(personal.usage[0].resource_kind, "usage_tokens");
+    assert_eq!(personal.usage[0].window_kind, "windowed");
+    assert_eq!(personal.usage[0].limit, Some(1_000_000));
+    assert_eq!(personal.usage[0].limit_source, "override");
+    assert_eq!(
+        personal.usage[0].active_used,
+        27_670_116_110_564_327_421u128
+    );
+    assert_eq!(personal.usage[0].reserved_held, 0);
+    assert_eq!(personal.usage[0].remaining, Some(0));
+    assert_eq!(personal.usage[0].status, QuotaStatus::HardLimit);
+    assert_eq!(personal.usage[1].unit.as_deref(), Some("usd_micros"));
+    assert_eq!(personal.device_reservations.reserved_held, 1);
+    assert_eq!(personal.device_reservations.limit, Some(2));
+    assert_eq!(personal.device_reservations.status, QuotaStatus::Ok);
+    assert_eq!(personal.warnings.len(), 1);
+    assert_eq!(personal.warnings[0].resource_kind, "usage_cost_micros");
+    assert_eq!(personal.warnings[0].threshold_pct, 80);
+    assert_eq!(
+        personal.warnings[0].dedupe_bucket,
+        "2026-11-20T00:00:00.000000Z"
+    );
+    assert_eq!(
+        personal.warnings[0].triggered_at,
+        "2026-11-20T11:59:00.000000Z"
+    );
+
+    let project = consumer::decode_quota_summary(&fixture("QuotaSummaryProject")).unwrap();
+    assert_eq!(project.scope_kind, "project");
+    assert!(!project.has_actor_execution);
+    assert_eq!(project.storage.status, QuotaStatus::Unconfigured);
+    assert!(project.warnings.is_empty());
+
+    let compat =
+        consumer::decode_quota_summary(&fixture("QuotaSummaryPersonal--unrecognized-status"))
+            .unwrap();
+    assert_eq!(
+        compat.storage.status,
+        QuotaStatus::Unrecognized("soft_grace".into())
+    );
+
+    let active = consumer::decode_quota_override(&fixture("QuotaOverrideActive")).unwrap();
+    assert_eq!(active.scope_id, "10111213-1415-4617-8819-1a1b1c1d1e1f");
+    assert_eq!(active.scope_kind, "personal");
+    assert_eq!(active.resource_kind, "usage_tokens");
+    assert_eq!((active.hard_limit, active.revision), (500_000, 1));
+    assert_eq!(
+        active.expires_at.as_deref(),
+        Some("2026-12-31T23:59:59.000000Z")
+    );
+    assert!(active.revoked_at.is_none());
+    assert_eq!(active.updated_at, "2026-11-20T12:00:00.000000Z");
+
+    let revoked = consumer::decode_quota_override(&fixture("QuotaOverrideRevoked")).unwrap();
+    assert_eq!(revoked.revision, 2);
+    assert!(revoked.revoked_at.is_some());
+
+    let with_quota =
+        consumer::decode_problem(&fixture("ProblemQuota--with-quota-extension")).unwrap();
+    assert_eq!(with_quota.category, Category::Quota);
+    assert_eq!(
+        with_quota.quota,
+        Some(ProblemQuota {
+            resource_kind: "usage_tokens".into(),
+            scope_kind: "personal".into(),
+        })
+    );
+    assert!(consumer::decode_problem(&fixture("ProblemQuota--quota-unknown-field")).is_err());
+    assert!(consumer::decode_problem(&fixture("ProblemQuota--quota-bad-scope-kind")).is_err());
 }

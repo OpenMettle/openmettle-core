@@ -1,0 +1,29 @@
+{
+  "class": "compat",
+  "direction": "response",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "QuotaOverrideRevoked--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "expires_at": "2026-12-31T23:59:59.000000Z",
+    "hard_limit": "500000",
+    "resource_kind": "usage_tokens",
+    "revision": "2",
+    "revoked_at": "2026-11-20T12:05:00.000000Z",
+    "scope_id": "10111213-1415-4617-8819-1a1b1c1d1e1f",
+    "scope_kind": "personal",
+    "updated_at": "2026-11-20T12:05:00.000000Z",
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/QuotaOverride",
+  "source": "#/components/examples/QuotaOverrideRevoked"
+}

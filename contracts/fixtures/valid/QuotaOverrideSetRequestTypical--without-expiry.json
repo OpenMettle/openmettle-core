@@ -1,0 +1,20 @@
+{
+  "class": "valid",
+  "direction": "request",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "QuotaOverrideSetRequestTypical--without-expiry",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "hard_limit": "500000",
+    "reason": "Increase budget for evaluation cohort"
+  },
+  "mutation": {
+    "name": "without-expiry",
+    "op": "remove",
+    "path": "/expires_at"
+  },
+  "schema": "#/components/schemas/QuotaOverrideSetRequest",
+  "source": "#/components/examples/QuotaOverrideSetRequestTypical"
+}

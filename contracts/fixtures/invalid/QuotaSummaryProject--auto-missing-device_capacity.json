@@ -1,0 +1,100 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "QuotaSummaryProject--auto-missing-device_capacity",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "execution": {
+      "executing_runs_per_scope": {
+        "current": "0",
+        "limit": null,
+        "limit_source": "unconfigured",
+        "override_expires_at": null
+      },
+      "live_runs_per_scope": {
+        "current": "0",
+        "limit": null,
+        "limit_source": "unconfigured",
+        "override_expires_at": null
+      },
+      "round_cap": {
+        "limit": null,
+        "limit_source": "unconfigured",
+        "override_expires_at": null
+      }
+    },
+    "observed_at": "2026-11-20T12:00:00.000000Z",
+    "scope_id": "20212223-2425-4627-8829-2a2b2c2d2e2f",
+    "scope_kind": "project",
+    "storage": {
+      "active_bytes": "0",
+      "charged_bytes": "0",
+      "limit_bytes": null,
+      "limit_source": "unconfigured",
+      "override_expires_at": null,
+      "remaining_bytes": null,
+      "reserved_bytes": "0",
+      "retained_bytes": "0",
+      "status": "unconfigured",
+      "warn_thresholds": [
+        80,
+        90
+      ]
+    },
+    "usage": [
+      {
+        "active_used": "0",
+        "authoritative_source": "gateway",
+        "last_reconciled_at": null,
+        "limit": null,
+        "limit_source": "unconfigured",
+        "override_expires_at": null,
+        "remaining": null,
+        "reserved_held": "0",
+        "resource_kind": "usage_tokens",
+        "status": "unconfigured",
+        "unit": "tokens",
+        "warn_thresholds": [
+          80,
+          90
+        ],
+        "window_end": null,
+        "window_kind": "static",
+        "window_start": "1970-01-01T00:00:00.000000Z"
+      },
+      {
+        "active_used": "0",
+        "authoritative_source": "gateway",
+        "last_reconciled_at": null,
+        "limit": null,
+        "limit_source": "unconfigured",
+        "override_expires_at": null,
+        "remaining": null,
+        "reserved_held": "0",
+        "resource_kind": "usage_cost_micros",
+        "status": "unconfigured",
+        "unit": null,
+        "warn_thresholds": [
+          80,
+          90
+        ],
+        "window_end": null,
+        "window_kind": "static",
+        "window_start": "1970-01-01T00:00:00.000000Z"
+      }
+    ],
+    "warnings": []
+  },
+  "mutation": {
+    "name": "auto-missing-device_capacity",
+    "op": "remove",
+    "path": "/device_capacity"
+  },
+  "schema": "#/components/schemas/QuotaSummary",
+  "source": "#/components/examples/QuotaSummaryProject"
+}

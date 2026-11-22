@@ -1596,5 +1596,903 @@ async fn interrupted_uploads_leave_nothing_after_reconciliation() {
     assert_eq!(charged(&db, &personal).await, (4096, 0, 0));
 }
 
+fn validate_openapi_schema(pointer: &str, instance: &Value) -> bool {
+    let mut doc: Value =
+        serde_json::from_str(include_str!("../../contracts/openapi/openmettle-v1.json")).unwrap();
+    doc["$ref"] = json!(pointer);
+    let validator = jsonschema::draft202012::options()
+        .should_validate_formats(true)
+        .build(&doc)
+        .unwrap();
+    validator.is_valid(instance)
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn quota_summary_wide_counters_privacy_warnings_and_hard_limit_reads_work_on_both_channels() {
+    let (db, api) = mounted().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let bob = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &admin).await;
+
+    let (a_b, a_n) = (browser(&db, &alice, 1).await, native(&db, &alice, 2).await);
+    let (b_b, b_n) = (browser(&db, &bob, 3).await, native(&db, &bob, 4).await);
+    let (adm_b, adm_n) = (browser(&db, &admin, 5).await, native(&db, &admin, 6).await);
+    let (alice_b, alice_n) = (As::Browser(&a_b), As::Native(&a_n));
+    let (bob_b, bob_n) = (As::Browser(&b_b), As::Native(&b_n));
+    let (admin_b, admin_n) = (As::Browser(&adm_b), As::Native(&adm_n));
+
+    let alice_scope = personal_of(&db, &alice).await;
+    let proj = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/projects",
+            Some("quota-proj"),
+            Some(&json!({"name": "Alpha Quotas"})),
+        ),
+        201,
+    );
+    let proj_id = proj["project_id"].as_str().unwrap();
+    let proj_path = format!("/v1/projects/{proj_id}/quotas");
+
+    // 1. Project quota concealment: non-member and non-member account_admin receive 404 not_found.
+    for who in [bob_b, bob_n, admin_b, admin_n] {
+        refused(
+            api.call(who, "GET", &proj_path, None, None),
+            404,
+            "not_found",
+        );
+    }
+
+    // 2. Oversized > i64::MAX 3-column token settlement read via GET /v1/quotas/personal.
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 1000), ('instance', 'usage_tokens', 10000000000)",
+        )
+        .await
+        .unwrap();
+    super::quotas::settle_oversized_three_column_tokens(&db, &alice, &alice_scope, &a_b).await;
+
+    for who in [alice_b, alice_n] {
+        let summary = success(api.call(who, "GET", "/v1/quotas/personal", None, None), 200);
+        assert!(
+            validate_openapi_schema("#/components/schemas/QuotaSummary", &summary),
+            "QuotaSummary schema rejected wide counter response: {summary}"
+        );
+        let wide_val = &summary["usage"][0]["active_used"];
+        assert_eq!(wide_val, "27670116110564327421");
+        assert!(validate_openapi_schema(
+            "#/components/schemas/WideNonNegativeDecimal",
+            wide_val
+        ));
+        assert!(!validate_openapi_schema(
+            "#/components/schemas/NonNegativeDecimal",
+            wide_val
+        ));
+        let decoded = consumer::decode_quota_summary(&summary).unwrap();
+        assert_eq!(decoded.usage[0].active_used, 27_670_116_110_564_327_421u128);
+        assert_eq!(decoded.usage[0].remaining, Some(0));
+        assert_eq!(decoded.usage[0].status, consumer::QuotaStatus::HardLimit);
+        assert!(decoded.has_actor_execution);
+    }
+
+    // Project summary never leaks member's personal usage or per-actor execution fields.
+    let proj_summary = success(api.call(alice_n, "GET", &proj_path, None, None), 200);
+    assert!(validate_openapi_schema(
+        "#/components/schemas/QuotaSummary",
+        &proj_summary
+    ));
+    let decoded_proj = consumer::decode_quota_summary(&proj_summary).unwrap();
+    assert_eq!(decoded_proj.scope_kind, "project");
+    assert!(!decoded_proj.has_actor_execution);
+    assert_eq!(decoded_proj.usage[0].active_used, 0);
+
+    // Deleted project becomes 404 even for its owner.
+    let del_proj = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/projects",
+            Some("quota-del-proj"),
+            Some(&json!({"name": "Soon Deleted"})),
+        ),
+        201,
+    );
+    let del_id = del_proj["project_id"].as_str().unwrap();
+    success(
+        api.call(
+            alice_b,
+            "DELETE",
+            &format!("/v1/projects/{del_id}"),
+            Some("del-now"),
+            None,
+        ),
+        204,
+    );
+    refused(
+        api.call(
+            alice_n,
+            "GET",
+            &format!("/v1/projects/{del_id}/quotas"),
+            None,
+            None,
+        ),
+        404,
+        "not_found",
+    );
+
+    // 3. Cross-tenant privacy: remaining_bytes never leaks instance headroom consumed by bob.
+    owner
+        .execute(
+            "UPDATE openmettle.storage_instance
+                SET instance_budget_bytes = 12000, personal_limit_bytes = 10000, project_limit_bytes = 10000",
+        )
+        .await
+        .unwrap();
+    let payload_9k = "b".repeat(9_000);
+    let bob_up = form(
+        "bob9k",
+        &[
+            file_part(Some("bob.bin"), "application/octet-stream", &payload_9k),
+            metadata_part("{}"),
+        ],
+        true,
+    );
+    success(
+        api.upload(bob_n, "/v1/artifacts?max_bytes=9000", "bob-9k", &bob_up),
+        201,
+    );
+    let payload_1k = "a".repeat(1_000);
+    let alice_up = form(
+        "alice1k",
+        &[
+            file_part(Some("alice.txt"), "text/plain", &payload_1k),
+            metadata_part("{}"),
+        ],
+        true,
+    );
+    let alice_rev = success(
+        api.upload(
+            alice_b,
+            "/v1/artifacts?max_bytes=1000",
+            "alice-1k",
+            &alice_up,
+        ),
+        201,
+    );
+    let alice_summary = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    // Instance only has 2000 bytes left, yet alice sees 9000 = max(0, 10000 - 1000).
+    assert_eq!(alice_summary["storage"]["charged_bytes"], "1000");
+    assert_eq!(alice_summary["storage"]["remaining_bytes"], "9000");
+
+    // Exceeding instance headroom yields 429 quota with closed quota:{storage_bytes,instance} and no counts.
+    let payload_4k = "x".repeat(4_000);
+    let too_much = form(
+        "alice4k",
+        &[
+            file_part(Some("big.txt"), "text/plain", &payload_4k),
+            metadata_part("{}"),
+        ],
+        true,
+    );
+    let (status, prob) = api.upload(
+        alice_n,
+        "/v1/artifacts?max_bytes=4000",
+        "alice-4k",
+        &too_much,
+    );
+    assert_eq!(status, 429, "{prob}");
+    assert_eq!(prob["code"], "quota");
+    assert_eq!(
+        prob["quota"],
+        json!({"resource_kind": "storage_bytes", "scope_kind": "instance"})
+    );
+    let prob_text = prob.to_string();
+    assert!(
+        !prob_text.contains("9000")
+            && !prob_text.contains("12000")
+            && !prob_text.contains(&bob.user)
+    );
+
+    // 4. Warning deduplication & re-arming across override edit/revoke and config edit.
+    limits(&db, Some(2_000), Some(100_000)).await;
+    // Alice already has 1000 bytes; upload 700 -> 1700/2000 = 85% -> crosses 80% once.
+    let payload_700 = "w".repeat(700);
+    let warn_up = form(
+        "warn700",
+        &[
+            file_part(Some("w.txt"), "text/plain", &payload_700),
+            metadata_part("{}"),
+        ],
+        true,
+    );
+    success(
+        api.upload(
+            alice_b,
+            "/v1/artifacts?max_bytes=700",
+            "alice-warn-1",
+            &warn_up,
+        ),
+        201,
+    );
+    let s1 = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    let storage_warns = |s: &Value| -> Vec<i64> {
+        s["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|w| w["resource_kind"] == "storage_bytes")
+            .map(|w| w["threshold_pct"].as_i64().unwrap())
+            .collect()
+    };
+    assert_eq!(storage_warns(&s1), vec![80]);
+    // Bob's summary must not show Alice's warnings or instance warnings.
+    let bob_s = success(
+        api.call(bob_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert!(
+        bob_s["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|w| w["resource_kind"] != "usage_tokens")
+    );
+    // Edit Alice's storage_bytes override -> bumps limit_revision -> clears old 80% warning & re-arms.
+    let ov_path = format!("/v1/admin/scopes/{alice_scope}/quotas/storage_bytes");
+    success(
+        api.call(
+            admin_b,
+            "PUT",
+            &ov_path,
+            Some("ov-rearm-1"),
+            Some(&json!({"hard_limit": "2200", "reason": "CANARY-override-reason"})),
+        ),
+        200,
+    );
+    let s2 = success(
+        api.call(alice_n, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert!(storage_warns(&s2).is_empty());
+    assert!(!s2.to_string().contains("CANARY-override-reason"));
+
+    // Cross 80% under the new override revision (1700 + 200 = 1900 / 2200 = 86%).
+    let payload_200 = "z".repeat(200);
+    let warn_up2 = form(
+        "warn200",
+        &[
+            file_part(Some("z.txt"), "text/plain", &payload_200),
+            metadata_part("{}"),
+        ],
+        true,
+    );
+    success(
+        api.upload(
+            alice_b,
+            "/v1/artifacts?max_bytes=200",
+            "alice-warn-2",
+            &warn_up2,
+        ),
+        201,
+    );
+    let s3 = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(storage_warns(&s3), vec![80]);
+
+    // Revoke override -> bumps limit_revision -> clears warning again.
+    success(
+        api.call(
+            admin_n,
+            "POST",
+            &format!("{ov_path}/revoke"),
+            Some("ov-rearm-rev"),
+            Some(&json!({"reason": "re-arm check"})),
+        ),
+        200,
+    );
+    let s4 = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert!(storage_warns(&s4).is_empty());
+
+    // Config edit (storage_instance.config_revision bump) re-arms warnings for the new threshold.
+    limits(&db, Some(2_500), Some(100_000)).await;
+    // Alice currently has 1900 bytes; upload 200 -> 2100/2500 = 84% -> triggers 80% under current config_revision.
+    success(
+        api.upload(
+            alice_b,
+            "/v1/artifacts?max_bytes=200",
+            "alice-warn-cfg-1",
+            &warn_up2,
+        ),
+        201,
+    );
+    let s_cfg1 = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(storage_warns(&s_cfg1), vec![80]);
+    // Flapping another small upload within the same UTC day deduplicates the 80% warning (no duplicate entry).
+    let tiny = form(
+        "tiny10",
+        &[
+            file_part(Some("t.txt"), "text/plain", "1234567890"),
+            metadata_part("{}"),
+        ],
+        true,
+    );
+    success(
+        api.upload(
+            alice_b,
+            "/v1/artifacts?max_bytes=10",
+            "alice-warn-flap",
+            &tiny,
+        ),
+        201,
+    );
+    let s_flap = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(storage_warns(&s_flap), vec![80]);
+    owner
+        .execute("UPDATE openmettle.storage_instance SET warn_pct_1 = 75 WHERE id")
+        .await
+        .unwrap();
+    let s_cfg2 = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert!(storage_warns(&s_cfg2).is_empty());
+
+    // 5. Hard limit = 0: new upload fails 429 quota, while reads, downloads, retention & quota reads succeed!
+    success(
+        api.call(
+            admin_b,
+            "PUT",
+            &ov_path,
+            Some("ov-zero"),
+            Some(&json!({"hard_limit": "0", "reason": "freeze"})),
+        ),
+        200,
+    );
+    let (status, prob) = api.upload(
+        alice_b,
+        "/v1/artifacts?max_bytes=10",
+        "blocked-zero",
+        &warn_up2,
+    );
+    assert_eq!(status, 429, "{prob}");
+    assert_eq!(
+        prob["quota"],
+        json!({"resource_kind": "storage_bytes", "scope_kind": "personal"})
+    );
+
+    // Quota summary read, artifact read, revision metadata, and content download all stay allowed.
+    let s_zero = success(
+        api.call(alice_n, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(s_zero["storage"]["status"], "hard_limit");
+    assert_eq!(s_zero["storage"]["remaining_bytes"], "0");
+
+    let art_id = alice_rev["artifact_id"].as_str().unwrap();
+    let rev_id = alice_rev["revision_id"].as_str().unwrap();
+    success(
+        api.call(
+            alice_b,
+            "GET",
+            &format!("/v1/artifacts/{art_id}"),
+            None,
+            None,
+        ),
+        200,
+    );
+    success(
+        api.call(
+            alice_n,
+            "GET",
+            &format!("/v1/artifacts/{art_id}/revisions/{rev_id}"),
+            None,
+            None,
+        ),
+        200,
+    );
+    let (dl_status, _, dl_bytes) = api.download(
+        alice_b,
+        "GET",
+        &format!("/v1/artifacts/{art_id}/revisions/{rev_id}/content"),
+        None,
+    );
+    assert_eq!((dl_status, dl_bytes.len()), (200, 1000));
+
+    // Retention remains permitted at hard_limit = 0.
+    let mut c = connect(&db.0, API).await;
+    let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+    storage::retain_revision(&mut tx, &alice_scope, rev_id, 3600)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // Run cancellation remains permitted even when usage_tokens is over limit and live_runs_per_actor = 0.
+    let live_ov = format!("/v1/admin/scopes/{alice_scope}/quotas/live_runs_per_actor");
+    success(
+        api.call(
+            admin_b,
+            "PUT",
+            &live_ov,
+            Some("live-zero"),
+            Some(&json!({"hard_limit": "0", "reason": "freeze runs"})),
+        ),
+        200,
+    );
+    let conv_id = chat(&db, &alice_scope, "personal", &alice).await;
+    let msg_id = message(&mut c, &alice_scope, &conv_id, None).await.unwrap();
+    let branch_id: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.conversation_branches (scope_id, conversation_id)
+         VALUES ($1::uuid, $2::uuid) RETURNING id::text",
+    )
+    .bind(&alice_scope)
+    .bind(&conv_id)
+    .fetch_one(&mut c)
+    .await
+    .unwrap();
+    let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+    let run_id = openmettle_core::runs::create_run(
+        &mut tx,
+        &openmettle_core::runs::RunInput {
+            scope: &alice_scope,
+            actor: &alice.user,
+            conversation: &conv_id,
+            branch: &branch_id,
+            message: &msg_id,
+            key: "cancel-at-hard-limit",
+            format: "openmettle.synthetic-run",
+            version: 1,
+            input: b"{}",
+            config: b"{}",
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    // Restart API with cursor_keys so cancelRun can return its Run snapshot.
+    let dir = auth_config_support::Dir::new();
+    let mut doc = auth_config_support::document_v2_native(&dir, &ca::Ca::new().pem());
+    doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+    let api_with_keys = Api::configured(&db, dir, doc, 4);
+    let cancelled = success(
+        api_with_keys.call(
+            alice_b,
+            "POST",
+            &format!("/v1/runs/{run_id}/cancel"),
+            Some("cancel-ok"),
+            None,
+        ),
+        200,
+    );
+    assert_eq!(cancelled["state"], "cancelled");
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn create_run_distinguishes_rate_limited_quota_and_provisioning_refusals_over_http() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &admin).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let (a_b, adm_n) = (browser(&db, &alice, 1).await, native(&db, &admin, 2).await);
+    let (alice_b, admin_n) = (As::Browser(&a_b), As::Native(&adm_n));
+    let alice_scope = personal_of(&db, &alice).await;
+
+    let dir = auth_config_support::Dir::new();
+    let mut doc = auth_config_support::document_v2_native(&dir, &ca::Ca::new().pem());
+    doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+    let mut catalog: Value =
+        serde_json::from_slice(include_bytes!("../fixtures/conversation-catalog-v1.json")).unwrap();
+    catalog["models"]["a"]["prompt_bound"] = json!({
+        "fixed_tokens": 4,
+        "tokens_per_turn": 4,
+        "tokens_per_part": 2,
+        "tokens_per_byte": 1,
+        "tokens_per_attachment": 10
+    });
+    doc["catalog_file"] = json!(dir.write("catalog.json", &serde_json::to_vec(&catalog).unwrap()));
+    doc["admission_limits"] = json!({
+        "live_per_actor": 4,
+        "live_per_scope": 8,
+        "queued_in_instance": 32,
+        "queue_timeout_seconds": 300,
+        "round_cap": 10
+    });
+    let api = Api::configured(&db, dir, doc, 4);
+
+    let root = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/conversations",
+            Some("conv-q"),
+            Some(&json!({})),
+        ),
+        201,
+    );
+    let conv_id = root["conversation_id"].as_str().unwrap();
+    let branch_id = root["branch_id"].as_str().unwrap();
+    let run_body = |msg_id: &str| {
+        json!({
+            "conversation_id": conv_id,
+            "branch_id": branch_id,
+            "proposal": {
+                "expected_head_message_id": null,
+                "turn": {
+                    "mode": "append",
+                    "input_message_id": msg_id,
+                    "parts": [{"text": "hello"}]
+                },
+                "selection": {"preset": "study"}
+            }
+        })
+    };
+
+    // 1. Overridden live_runs_per_actor = 0 -> 429 rate_limited (distinct from quota).
+    success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/live_runs_per_actor"),
+            Some("rl-zero"),
+            Some(&json!({"hard_limit": "0", "reason": "test rate limit"})),
+        ),
+        200,
+    );
+    let (status, rl) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("run-rl"),
+        Some(&run_body("00000000-0000-4000-8000-00000000a001")),
+    );
+    assert_eq!(status, 429, "{rl}");
+    assert_eq!(rl["code"], "rate_limited");
+    assert!(rl.get("quota").is_none());
+
+    // Revoke live_runs_per_actor override, set usage_tokens override to 0 -> 429 quota with closed metadata.
+    success(
+        api.call(
+            admin_n,
+            "POST",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/live_runs_per_actor/revoke"),
+            Some("rl-rev"),
+            Some(&json!({"reason": "restore"})),
+        ),
+        200,
+    );
+    success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/usage_tokens"),
+            Some("tok-zero"),
+            Some(&json!({"hard_limit": "0", "reason": "CANARY-secret-reason"})),
+        ),
+        200,
+    );
+    let (status, q) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("run-q"),
+        Some(&run_body("00000000-0000-4000-8000-00000000a002")),
+    );
+    assert_eq!(status, 429, "{q}");
+    assert_eq!(q["code"], "quota");
+    assert_eq!(
+        q["quota"],
+        json!({"resource_kind": "usage_tokens", "scope_kind": "personal"})
+    );
+    assert!(!q.to_string().contains("CANARY-secret-reason"));
+    assert!(validate_openapi_schema("#/components/schemas/Problem", &q));
+
+    // Revoke personal override while keeping instance usage_tokens default -> 503 provisioning.
+    success(
+        api.call(
+            admin_n,
+            "POST",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/usage_tokens/revoke"),
+            Some("tok-rev"),
+            Some(&json!({"reason": "remove override"})),
+        ),
+        200,
+    );
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('instance', 'usage_tokens', 100000)",
+        )
+        .await
+        .unwrap();
+    let (status, prov) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("run-prov"),
+        Some(&run_body("00000000-0000-4000-8000-00000000a003")),
+    );
+    assert_eq!(status, 503, "{prov}");
+    assert_eq!(prov["code"], "provisioning");
+    assert_eq!(
+        prov["quota"],
+        json!({"resource_kind": "usage_tokens", "scope_kind": "personal"})
+    );
+    assert!(validate_openapi_schema(
+        "#/components/schemas/Problem",
+        &prov
+    ));
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn manage_quotas_overrides_enforce_admin_upgrade_gate_idempotency_and_validation() {
+    let (db, api) = mounted().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    let admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &admin).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let (adm_b, adm_n) = (browser(&db, &admin, 1).await, native(&db, &admin, 2).await);
+    let (a_b, a_n) = (browser(&db, &alice, 3).await, native(&db, &alice, 4).await);
+    let (admin_b, admin_n) = (As::Browser(&adm_b), As::Native(&adm_n));
+    let (alice_b, alice_n) = (As::Browser(&a_b), As::Native(&a_n));
+    let alice_scope = personal_of(&db, &alice).await;
+    let proj = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/projects",
+            Some("proj-for-admin"),
+            Some(&json!({"name": "Admin Quota Target"})),
+        ),
+        201,
+    );
+    let proj_scope = proj["scope_id"].as_str().unwrap();
+
+    let tok_path = format!("/v1/admin/scopes/{alice_scope}/quotas/usage_tokens");
+    let cost_path = format!("/v1/admin/scopes/{alice_scope}/quotas/usage_cost_micros");
+    let missing_path = "/v1/admin/scopes/00000000-0000-4000-8000-000000009999/quotas/usage_tokens";
+
+    // Non-admin refused with 403 policy on both channels.
+    for who in [alice_b, alice_n] {
+        refused(
+            api.call(
+                who,
+                "PUT",
+                &tok_path,
+                Some("non-admin-set"),
+                Some(&json!({"hard_limit": "100", "reason": "nope"})),
+            ),
+            403,
+            "policy",
+        );
+        refused(
+            api.call(
+                who,
+                "POST",
+                &format!("{tok_path}/revoke"),
+                Some("non-admin-rev"),
+                Some(&json!({"reason": "nope"})),
+            ),
+            403,
+            "policy",
+        );
+    }
+
+    // Missing scope -> 404; per-actor on project scope -> 400; OMQ02 -> 503 provisioning.
+    refused(
+        api.call(
+            admin_b,
+            "PUT",
+            missing_path,
+            Some("missing-1"),
+            Some(&json!({"hard_limit": "100", "reason": "missing"})),
+        ),
+        404,
+        "not_found",
+    );
+    refused(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{proj_scope}/quotas/live_runs_per_actor"),
+            Some("bad-per-actor"),
+            Some(&json!({"hard_limit": "2", "reason": "invalid target"})),
+        ),
+        400,
+        "validation",
+    );
+    let (status, omq02) = api.call(
+        admin_b,
+        "PUT",
+        &cost_path,
+        Some("omq02-1"),
+        Some(&json!({"hard_limit": "1000", "reason": "no denom"})),
+    );
+    assert_eq!(status, 503, "{omq02}");
+    assert_eq!(omq02["code"], "provisioning");
+    assert_eq!(
+        omq02["quota"],
+        json!({"resource_kind": "usage_cost_micros", "scope_kind": "instance"})
+    );
+
+    // Adoption in progress gates override writes with 503 unavailable.
+    owner
+        .execute("UPDATE openmettle.storage_volume_control SET adoption_run_id = gen_random_uuid() WHERE id")
+        .await
+        .unwrap();
+    refused(
+        api.call(
+            admin_b,
+            "PUT",
+            &tok_path,
+            Some("during-adoption"),
+            Some(&json!({"hard_limit": "50000", "reason": "blocked"})),
+        ),
+        503,
+        "unavailable",
+    );
+    owner
+        .execute("UPDATE openmettle.storage_volume_control SET adoption_run_id = NULL WHERE id")
+        .await
+        .unwrap();
+
+    // Audited set, exact replay preserving recorded revision even after a later update, and 409 conflict.
+    let body1 = json!({
+        "hard_limit": "50000",
+        "expires_at": "2028-01-01T00:00:00.000000Z",
+        "reason": "CANARY-secret-admin-note"
+    });
+    let r1 = success(
+        api.call(admin_b, "PUT", &tok_path, Some("set-k1"), Some(&body1)),
+        200,
+    );
+    assert!(validate_openapi_schema(
+        "#/components/schemas/QuotaOverride",
+        &r1
+    ));
+    let dec1 = consumer::decode_quota_override(&r1).unwrap();
+    assert_eq!((dec1.hard_limit, dec1.revision), (50_000, 1));
+    assert!(dec1.revoked_at.is_none());
+    assert!(!r1.to_string().contains("CANARY-secret-admin-note"));
+
+    // Exact replay returns identical revision 1 without bumping revision.
+    let r1_replay = success(
+        api.call(admin_n, "PUT", &tok_path, Some("set-k1"), Some(&body1)),
+        200,
+    );
+    assert_eq!(r1_replay, r1);
+
+    // Second write advances revision to 2; replaying set-k1 still returns original revision 1.
+    let body2 = json!({"hard_limit": "75000", "reason": "second bump"});
+    let r2 = success(
+        api.call(admin_n, "PUT", &tok_path, Some("set-k2"), Some(&body2)),
+        200,
+    );
+    assert_eq!(r2["revision"], "2");
+    assert_eq!(
+        success(
+            api.call(admin_b, "PUT", &tok_path, Some("set-k1"), Some(&body1)),
+            200,
+        ),
+        r1
+    );
+
+    // Mismatched payload on set-k1 -> 409 idempotency_conflict.
+    refused(
+        api.call(
+            admin_b,
+            "PUT",
+            &tok_path,
+            Some("set-k1"),
+            Some(&json!({"hard_limit": "99999", "reason": "CANARY-secret-admin-note"})),
+        ),
+        409,
+        "idempotency_conflict",
+    );
+
+    // Reusing set-k1 on revoke is a distinct operation (ADR 0007 key scoping).
+    let rev_body = json!({"reason": "return to defaults"});
+    let rev = success(
+        api.call(
+            admin_b,
+            "POST",
+            &format!("{tok_path}/revoke"),
+            Some("set-k1"),
+            Some(&rev_body),
+        ),
+        200,
+    );
+    assert!(validate_openapi_schema(
+        "#/components/schemas/QuotaOverride",
+        &rev
+    ));
+    let dec_rev = consumer::decode_quota_override(&rev).unwrap();
+    assert_eq!(dec_rev.revision, 3);
+    assert!(dec_rev.revoked_at.is_some());
+
+    // Exact replay of revoke returns identical revision 3; changed reason conflicts; new key returns 409 conflict.
+    assert_eq!(
+        success(
+            api.call(
+                admin_n,
+                "POST",
+                &format!("{tok_path}/revoke"),
+                Some("set-k1"),
+                Some(&rev_body),
+            ),
+            200,
+        ),
+        rev
+    );
+    refused(
+        api.call(
+            admin_n,
+            "POST",
+            &format!("{tok_path}/revoke"),
+            Some("set-k1"),
+            Some(&json!({"reason": "different"})),
+        ),
+        409,
+        "idempotency_conflict",
+    );
+    refused(
+        api.call(
+            admin_n,
+            "POST",
+            &format!("{tok_path}/revoke"),
+            Some("rev-again"),
+            Some(&rev_body),
+        ),
+        409,
+        "conflict",
+    );
+    // Revoking a resource with no override row returns 404 not_found.
+    refused(
+        api.call(
+            admin_n,
+            "POST",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/device_reservations/revoke"),
+            Some("rev-none"),
+            Some(&rev_body),
+        ),
+        404,
+        "not_found",
+    );
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM openmettle.authorization_audit
+          WHERE actor_user_id = $1::uuid
+            AND action IN ('quota.override.set', 'quota.override.revoke')",
+    )
+    .bind(&admin.user)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert!(audit_count >= 3);
+}
+
 #[path = "run_events_http.rs"]
 mod run_events_http;

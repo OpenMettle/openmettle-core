@@ -1386,3 +1386,339 @@ async fn populated_upgrade_from_version_18_leaves_existing_runs_unadmitted() {
     let fresh = admitted(&db, &r.keyed("after")).await;
     assert_eq!(claim(&db).await.unwrap().run_id, fresh);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn quota_overrides_and_metered_budgets_enforce_admission_and_claim_limits_atomically() {
+    use openmettle_core::{
+        authz::store::AuditContext,
+        quotas::{self, QuotaResourceKind as K},
+    };
+
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &admin).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let scope = personal_of(&db, &alice).await;
+    let (_, proj_scope) = {
+        let mut c = api(&db).await;
+        let p = projects::create_project(
+            &mut c,
+            &ctx(&alice, "proj-quota-admit"),
+            &ProjectSettingsInput {
+                name: "Quota Admit",
+                instructions: "",
+                defaults: &json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let sc: String = sqlx::query_scalar(
+            "SELECT id::text FROM openmettle.scopes WHERE project_id = $1::uuid",
+        )
+        .bind(p.target_id())
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        (p.target_id().to_owned(), sc)
+    };
+
+    let admin_ctx = |key| AuditContext {
+        actor_user_id: &admin.user,
+        actor_approval_id: &admin.approval,
+        now_ms: NOW,
+        request_key: key,
+        reason: "run admission quota test",
+    };
+
+    // 1. Override round_cap to 7 and verify both default and capped requested_rounds.
+    let mut c_admin = api(&db).await;
+    quotas::set_scope_override(
+        &mut c_admin,
+        &admin_ctx("rc-7"),
+        &scope,
+        K::RoundCap,
+        7,
+        None,
+    )
+    .await
+    .unwrap();
+    let r1 = request(&db, &scope, "personal", &alice, "rc-default").await;
+    let mut c = api(&db).await;
+    let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+    let res = queue::admit_run(
+        &mut tx,
+        &RunAdmission {
+            input: r1.input(),
+            actor_approval_id: &alice.approval,
+            capabilities: &[],
+            requested_rounds: Some(25),
+            now_ms: NOW,
+        },
+        &LIMITS,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let run1 = match res {
+        Admission::Admitted {
+            run_id,
+            round_limit,
+        } => {
+            assert_eq!(round_limit, 7);
+            run_id
+        }
+        other => panic!("expected Admitted with round_limit=7, got {other:?}"),
+    };
+
+    // 2. Lower live_runs_per_actor to 1 -> second live run refused with ActorLimit, replay succeeds!
+    quotas::set_scope_override(
+        &mut c_admin,
+        &admin_ctx("live-actor-1"),
+        &scope,
+        K::LiveRunsPerActor,
+        1,
+        None,
+    )
+    .await
+    .unwrap();
+    let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+    let replay = queue::admit_run(
+        &mut tx,
+        &RunAdmission {
+            input: r1.input(),
+            actor_approval_id: &alice.approval,
+            capabilities: &[],
+            requested_rounds: Some(25),
+            now_ms: NOW,
+        },
+        &LIMITS,
+    )
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
+    assert!(matches!(replay, Admission::Replayed { ref run_id, .. } if run_id == &run1));
+
+    let r2 = r1.keyed("second-live");
+    let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+    let refused = queue::admit_run(
+        &mut tx,
+        &RunAdmission {
+            input: r2.input(),
+            actor_approval_id: &alice.approval,
+            capabilities: &[],
+            requested_rounds: None,
+            now_ms: NOW,
+        },
+        &LIMITS,
+    )
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
+    assert_eq!(refused, Admission::Refused(RunLimit::ActorLimit));
+
+    // Raise live_runs_per_actor and cancel run1; test live_runs_per_scope = 0 on project scope.
+    quotas::revoke_scope_override(
+        &mut c_admin,
+        &admin_ctx("live-actor-rev"),
+        &scope,
+        K::LiveRunsPerActor,
+    )
+    .await
+    .unwrap();
+    quotas::set_scope_override(
+        &mut c_admin,
+        &admin_ctx("live-proj-0"),
+        &proj_scope,
+        K::LiveRunsPerScope,
+        0,
+        None,
+    )
+    .await
+    .unwrap();
+    let rp = request(&db, &proj_scope, "project", &alice, "proj-zero").await;
+    let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+    let refused = queue::admit_run(
+        &mut tx,
+        &RunAdmission {
+            input: rp.input(),
+            actor_approval_id: &alice.approval,
+            capabilities: &[],
+            requested_rounds: None,
+            now_ms: NOW,
+        },
+        &LIMITS,
+    )
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
+    assert_eq!(refused, Admission::Refused(RunLimit::ScopeLimit));
+    quotas::revoke_scope_override(
+        &mut c_admin,
+        &admin_ctx("live-proj-rev"),
+        &proj_scope,
+        K::LiveRunsPerScope,
+    )
+    .await
+    .unwrap();
+
+    // 3. Metered usage_tokens admission enforcement (QuotaUnconfigured vs Quota).
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('project', 'usage_tokens', 100)",
+        )
+        .await
+        .unwrap();
+    // Project limit without personal limit fails closed with QuotaUnconfigured (503 provisioning).
+    let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+    let unconf = queue::admit_run(
+        &mut tx,
+        &RunAdmission {
+            input: rp.input(),
+            actor_approval_id: &alice.approval,
+            capabilities: &[],
+            requested_rounds: None,
+            now_ms: NOW,
+        },
+        &LIMITS,
+    )
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        unconf,
+        Admission::Refused(RunLimit::QuotaUnconfigured {
+            resource_kind: "usage_tokens",
+            scope_kind: "personal",
+        })
+    );
+
+    // Configure personal usage_tokens = 0 -> refused with 429 Quota on personal scope.
+    quotas::set_scope_override(
+        &mut c_admin,
+        &admin_ctx("tok-zero"),
+        &scope,
+        K::UsageTokens,
+        0,
+        None,
+    )
+    .await
+    .unwrap();
+    let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+    let quota_ref = queue::admit_run(
+        &mut tx,
+        &RunAdmission {
+            input: rp.input(),
+            actor_approval_id: &alice.approval,
+            capabilities: &[],
+            requested_rounds: None,
+            now_ms: NOW,
+        },
+        &LIMITS,
+    )
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        quota_ref,
+        Admission::Refused(RunLimit::Quota {
+            resource_kind: "usage_tokens",
+            scope_kind: "personal",
+        })
+    );
+
+    // Raise personal tokens above 0 and clean up usage_tokens default so admission proceeds for claim race.
+    quotas::set_scope_override(
+        &mut c_admin,
+        &admin_ctx("tok-ok"),
+        &scope,
+        K::UsageTokens,
+        10_000,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // 4. Concurrent executing_runs_per_actor lowering racing claim_next (serialized on run_dispatch_lock).
+    let p = principal(&db, &alice).await;
+    queue::cancel_run(&mut c, &p, &scope, &run1).await.unwrap();
+    quotas::set_scope_override(
+        &mut c_admin,
+        &admin_ctx("exec-start-4"),
+        &scope,
+        K::ExecutingRunsPerActor,
+        4,
+        None,
+    )
+    .await
+    .unwrap();
+    for i in 0..6 {
+        admitted(&db, &r1.keyed(&format!("race-{i}"))).await;
+    }
+    let lower_db = db.0.clone();
+    let lower_scope = scope.clone();
+    let lower_admin = admin.clone();
+    let lower = tokio::spawn(async move {
+        let mut conn = connect(&lower_db, API).await;
+        let ctx = AuditContext {
+            actor_user_id: &lower_admin.user,
+            actor_approval_id: &lower_admin.approval,
+            now_ms: NOW,
+            request_key: "exec-lower-1",
+            reason: "lower executing cap",
+        };
+        quotas::set_scope_override(
+            &mut conn,
+            &ctx,
+            &lower_scope,
+            K::ExecutingRunsPerActor,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+    let mut workers = Vec::new();
+    for _ in 0..4 {
+        let wdb = db.0.clone();
+        workers.push(tokio::spawn(async move {
+            let mut w = connect(&wdb, WORKER).await;
+            queue::claim_next(&mut w, &OPEN, &LEASES).await.unwrap()
+        }));
+    }
+    lower.await.unwrap();
+    for w in workers {
+        let _ = w.await.unwrap();
+    }
+    // After the override to 1 commits, no further claim may succeed while >= 1 run executes.
+    let executing: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM openmettle.runs
+          WHERE actor_user_id = $1::uuid AND state IN ('running', 'cancelling', 'reconciling')",
+    )
+    .bind(&alice.user)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert!((1..=4).contains(&executing), "executing={executing}");
+    assert_eq!(claim(&db).await, None);
+
+    // Lowering executing_runs_per_actor to 0 also blocks approval resume.
+    owner
+        .execute("UPDATE openmettle.runs SET state='cancelled' WHERE state='running'")
+        .await
+        .unwrap();
+    quotas::set_scope_override(
+        &mut c_admin,
+        &admin_ctx("exec-zero"),
+        &scope,
+        K::ExecutingRunsPerActor,
+        0,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(claim(&db).await, None);
+}

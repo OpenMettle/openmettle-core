@@ -1241,3 +1241,42 @@ async fn a_held_recheck_never_blocks_on_and_never_deadlocks_with_bulk_cancellati
         }
     }
 }
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn cancel_and_recheck_remain_allowed_when_scope_is_at_zero_hard_limit() {
+    use openmettle_core::{
+        authz::runs::{CancelOutcome, cancel_run},
+        quotas::{self, QuotaResourceKind as K},
+    };
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &admin).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let scope = personal_of(&db, &alice).await;
+    let conv = chat(&db, &scope, "personal", &alice).await;
+    let run = start(&db, &scope, &conv, &alice).await;
+
+    let mut c = api(&db).await;
+    for (key, kind) in [
+        ("zero-live", K::LiveRunsPerActor),
+        ("zero-tok", K::UsageTokens),
+        ("zero-storage", K::StorageBytes),
+    ] {
+        quotas::set_scope_override(&mut c, &ctx(&admin, key), &scope, kind, 0, None)
+            .await
+            .unwrap();
+    }
+    let mut worker = connect(&db.0, WORKER).await;
+    assert_eq!(
+        recheck_on(&mut worker, &run, &[], None, NOW).await.unwrap(),
+        CONTINUE
+    );
+    let p = authz_store::principal(&db, &alice).await;
+    assert_eq!(
+        cancel_run(&mut c, &p, &scope, &run.id).await.unwrap(),
+        CancelOutcome::Cancelled
+    );
+}

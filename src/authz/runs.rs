@@ -622,6 +622,16 @@ pub enum RunLimit {
     ScopeLimit,
     /// The instance queue is full (503 `unavailable`).
     QueueFull,
+    /// A metered usage budget (`usage_tokens` or `usage_cost_micros`) is exhausted (429 `quota`).
+    Quota {
+        resource_kind: &'static str,
+        scope_kind: &'static str,
+    },
+    /// Metered usage enforcement requires a limit or denomination that is not configured (503 `provisioning`).
+    QuotaUnconfigured {
+        resource_kind: &'static str,
+        scope_kind: &'static str,
+    },
 }
 
 /// Commit the caller's transaction only after `Admitted`, and roll it back otherwise: a replay
@@ -818,7 +828,8 @@ async fn admit(
 ) -> Result<Admission, StoreError> {
     limits.validate()?;
     request.validate()?;
-    let round_limit = effective_round_limit(request.requested_rounds, limits.round_cap)?;
+    // Validate requested_rounds before any database work; final capping uses effective round_cap.
+    let _ = effective_round_limit(request.requested_rounds, limits.round_cap)?;
     let r = &request.input;
     let c = tx.connection()?;
     // Exact limits rely on each statement after a lock seeing every earlier commit.
@@ -832,6 +843,11 @@ async fn admit(
         return Err(StoreError::InvalidInput("transaction isolation"));
     }
     let (personal_owner, project_id) = lock_scope_actor(c, r.scope, r.actor).await?;
+    let scope_kind = if personal_owner.is_some() {
+        "personal"
+    } else {
+        "project"
+    };
     let now = match session {
         Some(locator) => super::approvals::admission_time(c, request, locator).await?,
         None => request.now_ms,
@@ -885,22 +901,71 @@ async fn admit(
     if archived {
         return Err(projects::ARCHIVED);
     }
+    let actor_scope_id = principal
+        .as_ref()
+        .ok_or(StoreError::NotFound)?
+        .personal_scope_id
+        .clone();
+    let (eff_live_actor, eff_live_scope, eff_round_cap): (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+           coalesce(
+             (SELECT o.hard_limit FROM openmettle.quota_overrides o
+               WHERE o.scope_id = $1::uuid AND o.resource_kind = 'live_runs_per_actor'
+                 AND o.revoked_at IS NULL AND (o.expires_at IS NULL OR o.expires_at > clock_timestamp())),
+             (SELECT d.hard_limit FROM openmettle.quota_defaults d
+               WHERE d.scope_kind = 'personal' AND d.resource_kind = 'live_runs_per_actor'),
+             $4
+           ),
+           coalesce(
+             (SELECT o.hard_limit FROM openmettle.quota_overrides o
+               WHERE o.scope_id = $2::uuid AND o.resource_kind = 'live_runs_per_scope'
+                 AND o.revoked_at IS NULL AND (o.expires_at IS NULL OR o.expires_at > clock_timestamp())),
+             (SELECT d.hard_limit FROM openmettle.quota_defaults d
+               WHERE d.scope_kind = $3 AND d.resource_kind = 'live_runs_per_scope'),
+             $5
+           ),
+           coalesce(
+             (SELECT o.hard_limit FROM openmettle.quota_overrides o
+               WHERE o.scope_id = $2::uuid AND o.resource_kind = 'round_cap'
+                 AND o.revoked_at IS NULL AND (o.expires_at IS NULL OR o.expires_at > clock_timestamp())),
+             (SELECT d.hard_limit FROM openmettle.quota_defaults d
+               WHERE d.scope_kind = $3 AND d.resource_kind = 'round_cap'),
+             $6
+           )",
+    )
+    .bind(&actor_scope_id)
+    .bind(r.scope)
+    .bind(scope_kind)
+    .bind(i64::from(limits.live_per_actor))
+    .bind(i64::from(limits.live_per_scope))
+    .bind(i64::from(limits.round_cap))
+    .fetch_one(&mut *c)
+    .await?;
+    let round_cap = i32::try_from(eff_round_cap).unwrap_or(limits.round_cap);
+    let round_limit = effective_round_limit(request.requested_rounds, round_cap)?;
     let (actor_live, scope_live, queued): (i64, i64, i64) = sqlx::query_as(LIVE_COUNTS)
         .bind(r.actor)
         .bind(r.scope)
-        .bind(i64::from(limits.live_per_actor))
-        .bind(i64::from(limits.live_per_scope))
+        .bind(eff_live_actor)
+        .bind(eff_live_scope)
         .bind(i64::from(limits.queued_in_instance))
         .fetch_one(&mut *c)
         .await?;
     for (count, limit, refusal) in [
-        (actor_live, limits.live_per_actor, RunLimit::ActorLimit),
-        (scope_live, limits.live_per_scope, RunLimit::ScopeLimit),
-        (queued, limits.queued_in_instance, RunLimit::QueueFull),
+        (actor_live, eff_live_actor, RunLimit::ActorLimit),
+        (scope_live, eff_live_scope, RunLimit::ScopeLimit),
+        (
+            queued,
+            i64::from(limits.queued_in_instance),
+            RunLimit::QueueFull,
+        ),
     ] {
-        if count >= i64::from(limit) {
+        if count >= limit {
             return Ok(Admission::Refused(refusal));
         }
+    }
+    if let Some(refusal) = check_metered_admission(c, r.scope, scope_kind, &actor_scope_id).await? {
+        return Ok(Admission::Refused(refusal));
     }
     let effect = match session {
         Some(session) => Some(
@@ -948,6 +1013,130 @@ fn replayed(replay: RunReplay, input: &RunInput<'_>) -> Result<Admission, StoreE
         state: replay.state,
         round_limit: replay.round_limit,
     })
+}
+
+/// Check configured metered usage budgets (`usage_tokens`, `usage_cost_micros`) at run admission
+/// once `quota_enforcement.metering_enforced = true` (ADR 0040).
+async fn check_metered_admission(
+    c: &mut PgConnection,
+    scope_id: &str,
+    scope_kind: &'static str,
+    actor_scope_id: &str,
+) -> Result<Option<RunLimit>, StoreError> {
+    let enforced: bool =
+        sqlx::query_scalar("SELECT metering_enforced FROM openmettle.quota_enforcement WHERE id")
+            .fetch_one(&mut *c)
+            .await?;
+    if !enforced {
+        return Ok(None);
+    }
+    let cost_denomination: Option<String> = sqlx::query_scalar(
+        "SELECT cost_denomination FROM openmettle.quota_defaults
+          WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'",
+    )
+    .fetch_optional(&mut *c)
+    .await?
+    .flatten();
+
+    for resource in ["usage_tokens", "usage_cost_micros"] {
+        let personal_default_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM openmettle.quota_defaults
+                  WHERE scope_kind = 'personal' AND resource_kind = $1
+             )",
+        )
+        .bind(resource)
+        .fetch_one(&mut *c)
+        .await?;
+
+        let rows: Vec<(String, Option<i64>, String, String)> = sqlx::query_as(
+            "WITH stamp AS (SELECT clock_timestamp() AS now),
+             tiers(ord, scope_id, scope_kind) AS (
+                 SELECT 1, $1::uuid, $2::text
+                 UNION ALL
+                 SELECT 2, $3::uuid, 'personal'::text WHERE $1::uuid <> $3::uuid
+                 UNION ALL
+                 SELECT 3, NULL::uuid, 'instance'::text
+             ),
+             cfg AS (
+                 SELECT t.ord,
+                        t.scope_id,
+                        t.scope_kind,
+                        coalesce(
+                            CASE WHEN o.revoked_at IS NULL
+                                  AND (o.expires_at IS NULL OR o.expires_at > (SELECT now FROM stamp))
+                                 THEN o.hard_limit END,
+                            d.hard_limit
+                        ) AS hard_limit,
+                        CASE WHEN d.window_seconds IS NULL THEN 'static' ELSE 'windowed' END AS window_kind,
+                        CASE WHEN d.window_seconds IS NULL THEN 'epoch'::timestamptz
+                             ELSE date_bin(make_interval(secs => d.window_seconds), (SELECT now FROM stamp), 'epoch')
+                        END AS window_start
+                   FROM tiers t
+                   LEFT JOIN openmettle.quota_defaults d
+                     ON d.scope_kind = t.scope_kind AND d.resource_kind = $4
+                   LEFT JOIN openmettle.quota_overrides o
+                     ON o.scope_id = t.scope_id AND o.resource_kind = $4
+             )
+             SELECT cfg.scope_kind,
+                    cfg.hard_limit,
+                    coalesce(b.active_used, 0)::text,
+                    coalesce(b.reserved_held, 0)::text
+               FROM cfg
+               LEFT JOIN openmettle.quota_budgets b
+                 ON b.target_kind = CASE WHEN cfg.scope_id IS NULL THEN 'instance' ELSE 'scope' END
+                AND b.scope_id IS NOT DISTINCT FROM cfg.scope_id
+                AND b.resource_kind = $4
+                AND b.window_kind = cfg.window_kind
+                AND b.window_start = cfg.window_start
+              ORDER BY cfg.ord",
+        )
+        .bind(scope_id)
+        .bind(scope_kind)
+        .bind(actor_scope_id)
+        .bind(resource)
+        .fetch_all(&mut *c)
+        .await?;
+
+        let any_configured = personal_default_exists || rows.iter().any(|r| r.1.is_some());
+        if !any_configured {
+            continue;
+        }
+        if resource == "usage_cost_micros" && cost_denomination.is_none() {
+            return Ok(Some(RunLimit::QuotaUnconfigured {
+                resource_kind: resource,
+                scope_kind: "instance",
+            }));
+        }
+        let personal_limit = rows.iter().find(|r| r.0 == "personal").and_then(|r| r.1);
+        if personal_limit.is_none() {
+            return Ok(Some(RunLimit::QuotaUnconfigured {
+                resource_kind: resource,
+                scope_kind: "personal",
+            }));
+        }
+        for (tier_kind, limit, used_text, held_text) in rows {
+            let Some(limit) = limit else { continue };
+            let used: u128 = used_text.parse().map_err(|_| {
+                StoreError::Database(sqlx::Error::Protocol("invalid quota counter".into()))
+            })?;
+            let held: u128 = held_text.parse().map_err(|_| {
+                StoreError::Database(sqlx::Error::Protocol("invalid quota counter".into()))
+            })?;
+            if limit <= 0 || used.saturating_add(held) >= limit as u128 {
+                let tier_scope = match tier_kind.as_str() {
+                    "personal" => "personal",
+                    "project" => "project",
+                    _ => "instance",
+                };
+                return Ok(Some(RunLimit::Quota {
+                    resource_kind: resource,
+                    scope_kind: tier_scope,
+                }));
+            }
+        }
+    }
+    Ok(None)
 }
 
 // --- caller cancellation and queue expiry (ADR 0032) -------------------------------------------
@@ -1138,6 +1327,78 @@ const CLAIM: &str = concat!(
     leases::remaining_sql!()
 );
 
+// Executing claim with per-scope and per-actor quota overrides/defaults applied under
+// `run_dispatch_lock`. Used whenever any executing-run override or default is active;
+// `CLAIM` stays unchanged for deployments without overrides so partial-index plans are preserved.
+const CLAIM_WITH_QUOTAS: &str = concat!(
+    "WITH executing AS (
+       SELECT actor_user_id, scope_id FROM openmettle.runs
+        WHERE ",
+    non_terminal!(),
+    "
+          AND state IN ('running', 'cancelling', 'reconciling')
+     ), actor_load AS (
+       SELECT actor_user_id, count(*) AS n FROM executing GROUP BY actor_user_id
+     ), scope_load AS (
+       SELECT scope_id, count(*) AS n FROM executing GROUP BY scope_id
+     ), locked AS MATERIALIZED (
+       SELECT r.id, r.state, r.queue_expires_at, p.approval_expires_at,
+              p.resume_execution_expires_at FROM openmettle.runs r
+         JOIN openmettle.scopes sc_target ON sc_target.id = r.scope_id
+         JOIN openmettle.scopes sc_actor
+           ON sc_actor.personal_user_id = r.actor_user_id AND sc_actor.kind = 'personal'
+         LEFT JOIN openmettle.run_approvals p ON p.id = r.approval_wait_id
+         LEFT JOIN openmettle.run_approval_decisions d ON d.approval_id = p.id
+         LEFT JOIN actor_load a ON a.actor_user_id = r.actor_user_id
+         LEFT JOIN scope_load s ON s.scope_id = r.scope_id
+        WHERE r.",
+    non_terminal!(),
+    "
+          AND r.cancel_reason IS NULL AND (
+              (r.state = 'queued' AND r.queue_expires_at > clock_timestamp())
+              OR (r.state = 'waiting' AND r.wait_reason = 'approval' AND d.decision = 'approve'
+                  AND p.approval_expires_at > clock_timestamp()))
+          AND coalesce(a.n, 0) < coalesce(
+              (SELECT o.hard_limit FROM openmettle.quota_overrides o
+                WHERE o.scope_id = sc_actor.id
+                  AND o.resource_kind = 'executing_runs_per_actor'
+                  AND o.revoked_at IS NULL
+                  AND (o.expires_at IS NULL OR o.expires_at > clock_timestamp())),
+              (SELECT qd.hard_limit FROM openmettle.quota_defaults qd
+                WHERE qd.scope_kind = 'personal'
+                  AND qd.resource_kind = 'executing_runs_per_actor'),
+              $1)
+          AND coalesce(s.n, 0) < coalesce(
+              (SELECT o.hard_limit FROM openmettle.quota_overrides o
+                WHERE o.scope_id = r.scope_id
+                  AND o.resource_kind = 'executing_runs_per_scope'
+                  AND o.revoked_at IS NULL
+                  AND (o.expires_at IS NULL OR o.expires_at > clock_timestamp())),
+              (SELECT qd.hard_limit FROM openmettle.quota_defaults qd
+                WHERE qd.scope_kind = sc_target.kind
+                  AND qd.resource_kind = 'executing_runs_per_scope'),
+              $2)
+        ORDER BY coalesce(a.n, 0), r.created_at, r.id
+        LIMIT 1
+        FOR NO KEY UPDATE OF r SKIP LOCKED
+     ), next AS MATERIALIZED (
+       SELECT locked.*, clock_timestamp() AS t FROM locked
+     ), eligible AS (
+       SELECT *, CASE WHEN state = 'waiting' THEN resume_execution_expires_at
+                      ELSE t + $4::bigint * interval '1 millisecond' END AS deadline FROM next
+        WHERE (state = 'queued' AND t < queue_expires_at)
+           OR (state = 'waiting' AND t < approval_expires_at AND t < resume_execution_expires_at)
+     )
+     UPDATE openmettle.runs r
+        SET state = 'running', wait_reason = NULL, claim_token = gen_random_uuid(), claimed_at = e.t,
+            lease_expires_at = least(e.t + $3::bigint * interval '1 millisecond', e.deadline),
+            execution_expires_at = e.deadline
+       FROM eligible e WHERE r.id = e.id
+     RETURNING r.scope_id::text, r.id::text, r.claim_token::text, e.state = 'waiting' AS resumed,
+               r.actor_approval_id::text, r.round_limit, ",
+    leases::remaining_sql!()
+);
+
 /// Claim the next queued run fairly in one short transaction, as `openmettle_worker`, with its
 /// `openmettle.run-claimed` event under `claim:<claim_token>`. `None` when no run qualifies.
 pub async fn claim_next(
@@ -1148,11 +1409,31 @@ pub async fn claim_next(
     limits.validate()?;
     settings.validate()?;
     transaction(c, async |c| {
-        // Claims serialize here, so the next statement's snapshot includes every earlier claim.
+        // Claims serialize here, so the next statement's snapshot includes every earlier claim
+        // and any concurrent `executing_runs_*` quota override write (ADR 0040).
         sqlx::query("SELECT FROM openmettle.run_dispatch_lock FOR NO KEY UPDATE")
             .execute(&mut *c)
             .await?;
-        let Some(row) = sqlx::query(CLAIM)
+        let has_quota_rules: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM openmettle.quota_defaults
+                  WHERE resource_kind IN ('executing_runs_per_actor', 'executing_runs_per_scope')
+                    AND hard_limit IS NOT NULL
+             ) OR EXISTS (
+                 SELECT 1 FROM openmettle.quota_overrides
+                  WHERE resource_kind IN ('executing_runs_per_actor', 'executing_runs_per_scope')
+                    AND revoked_at IS NULL
+                    AND (expires_at IS NULL OR expires_at > clock_timestamp())
+             )",
+        )
+        .fetch_one(&mut *c)
+        .await?;
+        let sql = if has_quota_rules {
+            CLAIM_WITH_QUOTAS
+        } else {
+            CLAIM
+        };
+        let Some(row) = sqlx::query(sql)
             .bind(i64::from(limits.executing_per_actor))
             .bind(i64::from(limits.executing_per_scope))
             .bind(settings.lease.as_millis() as i64)

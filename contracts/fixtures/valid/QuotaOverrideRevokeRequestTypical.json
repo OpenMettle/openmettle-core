@@ -1,0 +1,15 @@
+{
+  "class": "valid",
+  "direction": "request",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "QuotaOverrideRevokeRequestTypical",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "reason": "Return scope to deployment defaults"
+  },
+  "mutation": null,
+  "schema": "#/components/schemas/QuotaOverrideRevokeRequest",
+  "source": "#/components/examples/QuotaOverrideRevokeRequestTypical"
+}

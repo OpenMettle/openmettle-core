@@ -1,0 +1,27 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "QuotaOverrideActive--auto-missing-scope_id",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "expires_at": "2026-12-31T23:59:59.000000Z",
+    "hard_limit": "500000",
+    "resource_kind": "usage_tokens",
+    "revision": "1",
+    "revoked_at": null,
+    "scope_kind": "personal",
+    "updated_at": "2026-11-20T12:00:00.000000Z"
+  },
+  "mutation": {
+    "name": "auto-missing-scope_id",
+    "op": "remove",
+    "path": "/scope_id"
+  },
+  "schema": "#/components/schemas/QuotaOverride",
+  "source": "#/components/examples/QuotaOverrideActive"
+}
