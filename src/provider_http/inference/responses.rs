@@ -368,7 +368,7 @@ impl Item {
     fn verify(&self, v: &Value) -> Result<(), Error> {
         if v["id"] != self.id
             || v["type"] != self.kind
-            || self.done.as_ref().is_some_and(|s| s != v)
+            || self.done.as_ref().is_some_and(|s| !same_snapshot(s, v))
         {
             return Err(Error::Malformed);
         }
@@ -393,6 +393,20 @@ impl Item {
             }
         }
         Ok(())
+    }
+}
+
+fn same_snapshot(a: &Value, b: &Value) -> bool {
+    match (a.as_object(), b.as_object()) {
+        (Some(a), Some(b)) => {
+            a.iter().all(|(k, v)| match b.get(k) {
+                Some(other) => v == other,
+                None => k == "status" && v.is_null(),
+            }) && b
+                .iter()
+                .all(|(k, v)| a.contains_key(k) || k == "status" && v.is_null())
+        }
+        _ => a == b,
     }
 }
 

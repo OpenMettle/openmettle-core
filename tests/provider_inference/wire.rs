@@ -913,6 +913,82 @@ async fn responses_output_item_null_status_and_streamed_cancelled_parity() {
 }
 
 #[tokio::test]
+async fn responses_streamed_done_and_completed_treat_null_and_omitted_status_equally() {
+    let stream_pair = |done_item: Value, completed_item: Value| {
+        sse(&(event(json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "message", "id": "msg", "role": "assistant", "content": []}
+        })) + &event(json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "item_id": "msg",
+            "content_index": 0,
+            "delta": "ok"
+        })) + &event(json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": done_item
+        })) + &event(json!({
+            "type": "response.completed",
+            "response": completed(vec![completed_item])
+        }))))
+    };
+
+    let with_null = json!({
+        "type": "message",
+        "id": "msg",
+        "role": "assistant",
+        "status": Value::Null,
+        "content": [{"type": "output_text", "text": "ok"}]
+    });
+    let omitted = json!({
+        "type": "message",
+        "id": "msg",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "ok"}]
+    });
+    let with_completed = message("ok");
+    let mut with_extra_null = omitted.clone();
+    with_extra_null["extra"] = Value::Null;
+
+    // Both orderings of null vs omitted top-level item status must succeed.
+    for (done_item, completed_item) in [
+        (with_null.clone(), omitted.clone()),
+        (omitted.clone(), with_null.clone()),
+    ] {
+        let turn = once(
+            Protocol::Responses,
+            true,
+            stream_pair(done_item, completed_item),
+        )
+        .await
+        .unwrap();
+        assert_eq!(turn.answers[0].parts, ["ok"]);
+    }
+
+    // Non-null status mismatches and non-status null field mismatches still fail closed.
+    for (done_item, completed_item) in [
+        (with_completed.clone(), omitted.clone()),
+        (with_completed.clone(), with_null.clone()),
+        (omitted.clone(), with_completed.clone()),
+        (with_null, with_completed),
+        (with_extra_null, omitted),
+    ] {
+        assert_eq!(
+            once(
+                Protocol::Responses,
+                true,
+                stream_pair(done_item, completed_item),
+            )
+            .await
+            .err(),
+            Some(Error::Malformed)
+        );
+    }
+}
+
+#[tokio::test]
 async fn chat_non_streamed_tool_call_arguments_require_json_string() {
     let valid_msg = json!({
         "role": "assistant",
