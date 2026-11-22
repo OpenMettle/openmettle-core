@@ -251,6 +251,7 @@ impl UsageReport {
 #[derive(Default)]
 pub struct FamilyDirectory {
     pub revision: i64,
+    pub invalid_children: std::collections::BTreeSet<String>,
     pub children: std::collections::BTreeMap<String, crate::authz::gateway::family::FamilyPolicy>,
 }
 impl Admin {
@@ -266,7 +267,8 @@ impl Admin {
         #[serde(deny_unknown_fields)]
         struct Child {
             user: String,
-            policy: crate::authz::gateway::family::FamilyPolicy,
+            #[serde(default)]
+            policy: serde_json::Value,
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -299,13 +301,20 @@ impl Admin {
             directory.revision = page.revision;
             for child in page.children {
                 if !is_canonical_uuid(&child.user)
-                    || child.policy.revision < 1
-                    || directory
-                        .children
-                        .insert(child.user, child.policy)
-                        .is_some()
+                    || directory.children.contains_key(&child.user)
+                    || directory.invalid_children.contains(&child.user)
                 {
                     return Err(Error::Protocol);
+                }
+                match serde_json::from_value::<crate::authz::gateway::family::FamilyPolicy>(
+                    child.policy,
+                ) {
+                    Ok(policy) if policy.valid() => {
+                        directory.children.insert(child.user, policy);
+                    }
+                    _ => {
+                        directory.invalid_children.insert(child.user);
+                    }
                 }
             }
             if !page.more {

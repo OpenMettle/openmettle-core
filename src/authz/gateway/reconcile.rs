@@ -49,6 +49,9 @@ struct Grant {
 struct Desired {
     admitted: BTreeSet<String>,
     grants: Vec<Grant>,
+    family_minute: Option<u16>,
+    family_signature: String,
+    family_member: bool,
     policy: Value,
     signature: String,
     configuration: String,
@@ -89,6 +92,19 @@ async fn desired(c: &mut PgConnection, p: &Profile<'_>, user: &str) -> Result<De
         .await
         .map_err(|_| Error::Database)?;
     let family = p.families.children.get(user);
+    let family_minute = match family {
+        Some(policy) => match policy.local_minute(c, Some(now)).await {
+            Ok(minute) => Some(minute),
+            Err(Error::Refused) => None,
+            Err(error) => return Err(error),
+        },
+        None => None,
+    };
+    let invalid_child =
+        p.families.invalid_children.contains(user) || family.is_some() && family_minute.is_none();
+    if invalid_child {
+        gateway_failure(Step::Policy, GatewayCause::Protocol);
+    }
     let mut admitted = BTreeSet::new();
     let mut grants = Vec::new();
     let mut models = BTreeMap::new();
@@ -103,6 +119,9 @@ async fn desired(c: &mut PgConnection, p: &Profile<'_>, user: &str) -> Result<De
             continue;
         }
         admitted.insert(approval.clone());
+        if invalid_child {
+            continue;
+        }
         let groups = Vec::from_iter(actor.local_groups.iter().cloned());
         let oidc = Vec::from_iter(actor.oidc_groups.iter().cloned());
         let mut scopes:Vec<(String,Option<String>)>=sqlx::query_as("SELECT DISTINCT ON (p.scope_id) p.scope_id::text,h.cycle_id::text
@@ -142,15 +161,10 @@ async fn desired(c: &mut PgConnection, p: &Profile<'_>, user: &str) -> Result<De
             }
         }
     }
-    if !grants.is_empty()
-        && let Some(f) = family
-    {
-        f.local_minute(c, Some(now)).await?;
-    }
-    // Bind the current gateway-owned policy. The remote must reject a mismatched revision
-    // and continue enforcing any newer schedule while this worker is offline.
-    let policy = json!({"models":models,"family":family,"directory_revision":p.families.revision});
-    let bytes = serde_json::to_vec(&(&grants, &policy, p.report_source, p.rotation_epoch))
+    // Only this user's effective policy belongs in the authorization signature. An
+    // installation directory revision and a key rotation are independent watermarks.
+    let policy = json!({"models":models,"family":family});
+    let bytes = serde_json::to_vec(&(&grants, &policy, invalid_child, p.report_source))
         .map_err(|_| Error::Conflict)?;
     let requirements: BTreeMap<_, _> = p
         .catalog
@@ -158,10 +172,15 @@ async fn desired(c: &mut PgConnection, p: &Profile<'_>, user: &str) -> Result<De
         .iter()
         .map(|(name, m)| (name, &m.required_capabilities))
         .collect();
-    let config = serde_json::to_vec(&(requirements, family, p.report_source, p.rotation_epoch))
-        .map_err(|_| Error::Conflict)?;
+    let config =
+        serde_json::to_vec(&(requirements, p.report_source)).map_err(|_| Error::Conflict)?;
+    let family_config =
+        serde_json::to_vec(&(family, invalid_child)).map_err(|_| Error::Conflict)?;
     Ok(Desired {
         admitted,
+        family_minute,
+        family_signature: format!("{:x}", Sha256::digest(family_config)),
+        family_member: family.is_some() || invalid_child,
         grants,
         policy,
         configuration: format!("{:x}", Sha256::digest(config)),
@@ -193,70 +212,147 @@ fn step(action: Action) -> Step {
     }
 }
 
+/// Identity of the immutable remote plan, validated against primary authority under
+/// the binding lock. Unrelated directory edits can retain an older, identical plan.
+struct Plan {
+    revision: i64,
+    profile: i64,
+    directory: i64,
+    desired: Desired,
+}
+
+enum Refresh {
+    Current(Plan),
+    Fenced,
+    Idle,
+}
+
 impl Profile<'_> {
-    async fn refresh(&self, c: &mut PgConnection, user: &str) -> Result<Desired, Error> {
+    async fn refresh(&self, c: &mut PgConnection, user: &str) -> Result<Refresh, Error> {
         let d = desired(c, self, user).await?;
         if !d.grants.is_empty() {
             sqlx::query("INSERT INTO openmettle.gateway_bindings (installation,user_id,principal,budget)
                 VALUES ($1::uuid,$2::uuid,gen_random_uuid(),gen_random_uuid()) ON CONFLICT DO NOTHING")
                 .bind(self.installation).bind(user).execute(&mut *c).await?;
         }
-        // Re-read the plan in a fresh READ COMMITTED snapshot after a competing planner.
+        // Re-read the newest plan (including a staged successor) after acquiring the lock.
         sqlx::query("SELECT id FROM openmettle.gateway_bindings WHERE installation=$1::uuid AND user_id=$2::uuid FOR UPDATE")
             .bind(self.installation).bind(user).execute(&mut *c).await?;
-        let row = sqlx::query("SELECT b.id::text,b.principal::text,b.budget::text,b.desired_revision,b.active_generation,b.state,
-            EXISTS (SELECT FROM openmettle.gateway_intents i WHERE i.binding_id=b.id AND i.desired_revision=b.desired_revision) AS planned,
-            e.remote_key::text AS previous_key, e.expires_at<=clock_timestamp()+$3*interval '1 second' AS renew,
-            old.parameters->>'signature' AS signature,old.parameters->>'configuration' AS configuration,(old.parameters->>'directory_revision')::bigint AS directory_revision,(old.parameters->>'profile_revision')::bigint AS profile_revision,
-            (old.parameters->>'rotation_epoch')::bigint AS rotation_epoch
+        let row = sqlx::query("SELECT b.id::text,b.principal::text,b.budget::text,b.desired_revision,b.state,
+            e.remote_key::text AS previous_key, e.expires_at>clock_timestamp() AS usable,
+            e.expires_at<=clock_timestamp()+$3*interval '1 second' AS renew,
+            old.desired_revision AS planned,old.operation_id::text,old.parameters->>'signature' AS signature,
+            (old.parameters->>'family_member')::boolean AS family_member,old.parameters->>'family_signature' AS family_signature,old.parameters->>'configuration' AS configuration,(old.parameters->>'directory_revision')::bigint AS directory_revision,
+            (old.parameters->>'profile_revision')::bigint AS profile_revision,(old.parameters->>'rotation_epoch')::bigint AS rotation_epoch,
+            (SELECT max(a.remote_revision) FROM openmettle.gateway_audit a WHERE a.operation_id=old.operation_id
+                AND a.step='policy' AND a.outcome='confirmed' AND a.remote_handle IS NULL) AS seen_directory,
+            (SELECT i.parameters->>'signature' FROM openmettle.gateway_intents i WHERE i.binding_id=b.id
+                AND i.desired_revision=b.observed_revision AND i.action='policy' AND i.complete LIMIT 1) AS active_signature
             FROM openmettle.gateway_bindings b LEFT JOIN openmettle.gateway_generations e ON (e.binding_id,e.generation)=(b.id,b.active_generation)
-            LEFT JOIN LATERAL (SELECT parameters FROM openmettle.gateway_intents i WHERE i.binding_id=b.id AND i.desired_revision=b.desired_revision
-                AND parameters ? 'signature' LIMIT 1) old ON true
+            LEFT JOIN LATERAL (SELECT operation_id,desired_revision,parameters FROM openmettle.gateway_intents i WHERE i.binding_id=b.id
+                ORDER BY desired_revision DESC,generation,action LIMIT 1) old ON true
             WHERE b.installation=$1::uuid AND b.user_id=$2::uuid")
             .bind(self.installation).bind(user).bind(self.renew_before.as_secs_f64()).fetch_optional(&mut *c).await?;
-        let Some(r) = row else { return Ok(d) };
-        let old: Option<String> = r.try_get("signature")?;
-        let old_profile: Option<i64> = r.try_get("profile_revision")?;
-        let directory_revision = r.try_get::<Option<i64>, _>("directory_revision")?;
-        if old_profile.is_some_and(|v| v > self.revision)
-            || directory_revision.is_some_and(|v| v > self.families.revision)
-        {
-            // A newer configuration owns the binding. The claim check will fence this worker,
-            // while still recording a late readback under its original operation.
-            return Ok(d);
-        }
-        if old_profile == Some(self.revision)
-            && directory_revision == Some(self.families.revision)
-            && r.try_get::<Option<&str>, _>("configuration")?
-                .is_some_and(|v| v != d.configuration)
-        {
-            return Err(Error::Conflict);
-        }
-        let renew = r.try_get::<&str, _>("state")? == "ready"
-            && r.try_get::<Option<bool>, _>("renew")? == Some(true);
-        if old.as_ref() == Some(&d.signature) && old_profile == Some(self.revision) && !renew {
-            return Ok(d);
-        }
+        let Some(r) = row else {
+            return Ok(Refresh::Idle);
+        };
+        let planned: Option<i64> = r.try_get("planned")?;
+        let active: i64 = r.try_get("desired_revision")?;
+        let prev = active.max(planned.unwrap_or(active));
+        let state: &str = r.try_get("state")?;
         let id: String = r.try_get("id")?;
-        let previous_key: Option<String> = r.try_get("previous_key")?;
-        let prev: i64 = r.try_get("desired_revision")?;
-        let revision = if !r.try_get::<bool, _>("planned")?
-            && r.try_get::<&str, _>("state")? == "provisioning"
-            && previous_key.is_none()
+        let old_profile: Option<i64> = r.try_get("profile_revision")?;
+        let directory: Option<i64> = r.try_get("directory_revision")?;
+        let seen = directory.max(r.try_get("seen_directory")?);
+        let old_epoch: Option<i64> = r.try_get("rotation_epoch")?;
+        let member = r.try_get::<Option<bool>, _>("family_member")?;
+        if old_profile.is_some_and(|v| v > self.revision)
+            || old_epoch.is_some_and(|v| v > self.rotation_epoch)
+            || (d.family_member || member != Some(false))
+                && seen.is_some_and(|v| v > self.families.revision)
+            || member.is_some()
+                && old_profile == Some(self.revision)
+                && r.try_get::<Option<&str>, _>("configuration")? != Some(&d.configuration)
+            || seen == Some(self.families.revision)
+                && r.try_get::<Option<&str>, _>("family_signature")?
+                    .is_some_and(|v| v != d.family_signature)
         {
+            return Ok(Refresh::Fenced);
+        }
+        let plan_directory = seen.unwrap_or_default().max(self.families.revision);
+        let renew = state == "ready" && r.try_get::<Option<bool>, _>("renew")? == Some(true);
+        let same_signature = r.try_get::<Option<&str>, _>("signature")? == Some(&d.signature);
+        let same_epoch = old_epoch == Some(self.rotation_epoch);
+        if same_signature
+            && old_profile == Some(self.revision)
+            && same_epoch
+            && (!renew || prev > active)
+        {
+            // Remember that an unchanged plan was validated at the newer directory watermark.
+            // This also fences a delayed snapshot in which an adult was still a child.
+            if seen.is_some_and(|v| v < self.families.revision) {
+                sqlx::query("INSERT INTO openmettle.gateway_audit(binding_id,desired_revision,operation_id,step,outcome,remote_revision)
+                    VALUES ($1::uuid,$2,$3::uuid,'policy','confirmed',$4)")
+                    .bind(&id).bind(prev).bind(r.try_get::<&str,_>("operation_id")?)
+                    .bind(self.families.revision).execute(&mut *c).await?;
+            }
+            if state == "revoked" {
+                return Ok(Refresh::Idle);
+            }
+            return Ok(Refresh::Current(Plan {
+                revision: prev,
+                profile: self.revision,
+                directory: directory.ok_or(Error::Conflict)?,
+                desired: d,
+            }));
+        }
+        let previous_key: Option<String> = r.try_get("previous_key")?;
+        let revision = if planned.is_none() && state == "provisioning" && previous_key.is_none() {
             prev
         } else {
             prev.checked_add(1).ok_or(Error::Conflict)?
         };
+        let identity = json!({"signature":d.signature, "configuration":d.configuration,
+            "profile_revision":self.revision, "rotation_epoch":self.rotation_epoch,
+            "directory_revision":plan_directory, "family_signature":d.family_signature,
+            "family_member":d.family_member});
+        if state == "revoked" && d.grants.is_empty() {
+            // The remote tombstone already satisfies this policy. Persist the new
+            // identity under the binding lock so an older profile cannot regrant
+            // after a disabled user returns. No remote revision advance is required.
+            let operation: String = sqlx::query_scalar(
+                "INSERT INTO openmettle.gateway_intents
+                (binding_id,desired_revision,generation,action,expected_revision,parameters)
+                VALUES ($1::uuid,$2,0,'policy',$3,$4::jsonb) RETURNING operation_id::text",
+            )
+            .bind(&id)
+            .bind(revision)
+            .bind(prev)
+            .bind(identity.to_string())
+            .fetch_one(&mut *c)
+            .await?;
+            sqlx::query(
+                "UPDATE openmettle.gateway_intents SET complete=true WHERE operation_id=$1::uuid",
+            )
+            .bind(&operation)
+            .execute(&mut *c)
+            .await?;
+            sqlx::query("INSERT INTO openmettle.gateway_audit(binding_id,desired_revision,operation_id,step,outcome,remote_revision)
+                VALUES ($1::uuid,$2,$3::uuid,'policy','confirmed',$4)")
+                .bind(&id).bind(revision).bind(operation).bind(plan_directory).execute(&mut *c).await?;
+            return Ok(Refresh::Idle);
+        }
         let enabled = !d.grants.is_empty();
-        sqlx::query(
-            "UPDATE openmettle.gateway_bindings SET state=$2,desired_revision=$3 WHERE id=$1::uuid",
-        )
-        .bind(&id)
-        .bind(if enabled { "provisioning" } else { "suspended" })
-        .bind(revision)
-        .execute(&mut *c)
-        .await?;
+        // A key-only successor has its own remote revision. Keep the published policy
+        // and envelope paired until both successor policy and key are confirmed.
+        let keep_ready = enabled
+            && state == "ready"
+            && r.try_get::<Option<bool>, _>("usable")? == Some(true)
+            && r.try_get::<Option<&str>, _>("active_signature")? == Some(&d.signature);
+        if !keep_ready {
+            sqlx::query("UPDATE openmettle.gateway_bindings SET state=$2,desired_revision=$3 WHERE id=$1::uuid")
+                .bind(&id).bind(if enabled { "provisioning" } else { "suspended" }).bind(revision).execute(&mut *c).await?;
+        }
         // Superseded claims may still return evidence, but no longer own publication.
         sqlx::query("UPDATE openmettle.gateway_intents SET complete=true,claim=NULL WHERE binding_id=$1::uuid AND desired_revision<$2 AND NOT complete")
             .bind(&id).bind(revision).execute(&mut *c).await?;
@@ -311,8 +407,12 @@ impl Profile<'_> {
             ]);
         }
         for (order, (action, target, generation)) in steps.into_iter().enumerate() {
-            let params = json!({"target":target,"order":order,"directory_revision":self.families.revision,"configuration":d.configuration,"signature":d.signature,"profile_revision":self.revision,
-                "rotation_epoch":self.rotation_epoch,"policy":(action==Action::Policy).then_some(&d.policy)});
+            let mut params = identity.clone();
+            params["order"] = json!(order);
+            params["target"] = json!(target);
+            if action == Action::Policy {
+                params["policy"] = d.policy.clone();
+            }
             let expected = if order == 0 { revision - 1 } else { revision };
             sqlx::query("INSERT INTO openmettle.gateway_intents (binding_id,desired_revision,generation,action,expected_revision,parameters)
                 VALUES ($1::uuid,$2,$3,$4,$5,$6::jsonb)")
@@ -324,7 +424,12 @@ impl Profile<'_> {
                 .bind(params.to_string())
                 .execute(&mut *c).await?;
         }
-        Ok(d)
+        Ok(Refresh::Current(Plan {
+            revision,
+            profile: self.revision,
+            directory: plan_directory,
+            desired: d,
+        }))
     }
 }
 
@@ -397,35 +502,68 @@ impl Sweep {
             let p = &current;
             self.discover(pool, p, limit).await?;
             let mut visited = Vec::new();
+            let mut executed = 0;
             while visited.len() < usize::from(limit) {
-                let Some(w) = claim(pool, p, &visited).await? else {
+                let Some(w) = claim(pool, p, &mut visited, usize::from(limit)).await? else {
                     break;
                 };
                 execute(pool, admin, sealer, p, &w, deadline).await?;
-                visited.push(w.mutation.operation);
+                executed += 1;
             }
-            Ok(visited.len())
+            Ok(executed)
         })
         .await
         .map_err(|_| Error::Database)?
     }
 }
 
-async fn claim(pool: &PgPool, p: &Profile<'_>, visited: &[String]) -> Result<Option<Work>, Error> {
-    let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
-    let row = sqlx::query("WITH due AS (SELECT i.operation_id,b.principal,b.budget,b.user_id FROM openmettle.gateway_intents i
-        JOIN openmettle.gateway_bindings b ON b.id=i.binding_id AND b.desired_revision=i.desired_revision
-        WHERE NOT i.complete AND i.due_at<=clock_timestamp() AND b.installation=$1::uuid AND i.parameters ? 'order'
-          AND (i.parameters->>'profile_revision')::bigint=$2 AND NOT (i.operation_id::text=ANY($3)) AND NOT EXISTS
-          (SELECT FROM openmettle.gateway_intents pre WHERE pre.binding_id=i.binding_id AND pre.desired_revision=i.desired_revision
-            AND NOT pre.complete AND (pre.parameters->>'order')::int<(i.parameters->>'order')::int)
-        ORDER BY (b.state='suspended') DESC,i.due_at,i.operation_id LIMIT 1 FOR UPDATE OF i SKIP LOCKED)
-        UPDATE openmettle.gateway_intents i SET claim=gen_random_uuid(),due_at=clock_timestamp()+interval '45 seconds'
-        FROM due WHERE i.operation_id=due.operation_id RETURNING i.binding_id::text,due.principal::text,due.budget::text,due.user_id::text,i.claim::text,
-        i.operation_id::text,i.desired_revision,i.expected_revision,i.generation,i.action,i.parameters::text")
-        .bind(p.installation).bind(p.revision).bind(visited).fetch_optional(tx.connection()?).await?;
-    tx.commit().await?;
-    let Some(r) = row else { return Ok(None) };
+async fn claim(
+    pool: &PgPool,
+    p: &Profile<'_>,
+    visited: &mut Vec<String>,
+    limit: usize,
+) -> Result<Option<Work>, Error> {
+    // Pick without locking, then acquire authority and binding locks in writer order.
+    // The conditional lease acquisition arbitrates contenders in the same transaction.
+    while visited.len() < limit {
+        let candidate: Option<(String,String)> = sqlx::query_as("SELECT i.operation_id::text,b.user_id::text FROM openmettle.gateway_intents i
+            JOIN openmettle.gateway_bindings b ON b.id=i.binding_id
+            WHERE NOT i.complete AND i.parameters ? 'order' AND i.due_at<=clock_timestamp() AND b.installation=$1::uuid
+              AND (i.parameters->>'profile_revision')::bigint=$2 AND ((i.parameters->>'directory_revision')::bigint<=$3 OR i.parameters->>'family_member'='false')
+              AND NOT (i.operation_id::text=ANY($4)) AND NOT EXISTS
+              (SELECT FROM openmettle.gateway_intents pre WHERE pre.binding_id=i.binding_id AND pre.desired_revision=i.desired_revision
+                AND NOT pre.complete AND (pre.parameters->>'order')::int<(i.parameters->>'order')::int)
+            ORDER BY (b.state='suspended') DESC,i.due_at,i.operation_id LIMIT 1")
+            .bind(p.installation).bind(p.revision).bind(p.families.revision).bind(&*visited).fetch_optional(pool).await?;
+        let Some((operation, user)) = candidate else {
+            break;
+        };
+        visited.push(operation.clone());
+        let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
+        let c = tx.connection()?;
+        let Refresh::Current(plan) = p.refresh(c, &user).await? else {
+            tx.commit().await?;
+            continue;
+        };
+        let row = sqlx::query("WITH due AS (SELECT operation_id FROM openmettle.gateway_intents
+            WHERE operation_id=$1::uuid AND NOT complete AND due_at<=clock_timestamp() FOR UPDATE SKIP LOCKED)
+            UPDATE openmettle.gateway_intents i SET claim=gen_random_uuid(),due_at=clock_timestamp()+interval '45 seconds'
+            FROM due,openmettle.gateway_bindings b WHERE i.operation_id=due.operation_id AND i.binding_id=b.id AND i.desired_revision=$2
+            AND i.parameters->>'signature'=$3 AND (i.parameters->>'profile_revision')::bigint=$4
+            AND (i.parameters->>'directory_revision')::bigint=$5 AND NOT i.complete AND i.due_at<=clock_timestamp()
+            RETURNING i.binding_id::text,b.principal::text,b.budget::text,b.user_id::text,i.claim::text,
+            i.operation_id::text,i.desired_revision,i.expected_revision,i.generation,i.action,i.parameters::text")
+            .bind(operation).bind(plan.revision).bind(&plan.desired.signature).bind(plan.profile).bind(plan.directory)
+            .fetch_optional(c).await?;
+        tx.commit().await?;
+        if let Some(row) = row {
+            return work(row, p).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn work(r: sqlx::postgres::PgRow, p: &Profile<'_>) -> Result<Work, Error> {
     let params: Value =
         serde_json::from_str(r.try_get("parameters")?).map_err(|_| Error::Conflict)?;
     let binding = Binding {
@@ -447,12 +585,12 @@ async fn claim(pool: &PgPool, p: &Profile<'_>, visited: &[String]) -> Result<Opt
             .map_err(|_| Error::Conflict)?,
         policy: params.get("policy").filter(|v| !v.is_null()).cloned(),
     };
-    Ok(Some(Work {
+    Ok(Work {
         binding,
         user: r.try_get("user_id")?,
         claim: r.try_get("claim")?,
         mutation: m,
-    }))
+    })
 }
 
 async fn audit(
@@ -468,14 +606,28 @@ async fn audit(
         .bind(observed.then_some(&w.mutation.target)).bind(observed.then_some(w.binding.revision)).execute(c).await?;
     Ok(())
 }
-async fn live(c: &mut PgConnection, w: &Work) -> Result<bool, Error> {
-    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT FROM openmettle.gateway_intents i JOIN openmettle.gateway_bindings b
-        ON b.id=i.binding_id AND b.desired_revision=i.desired_revision WHERE i.operation_id=$1::uuid AND i.claim=$2::uuid
+async fn live(c: &mut PgConnection, w: &Work, plan: &Plan) -> Result<bool, Error> {
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT FROM openmettle.gateway_intents i
+        WHERE i.operation_id=$1::uuid AND i.claim=$2::uuid AND i.desired_revision=$3 AND i.parameters->>'signature'=$4
+        AND (i.parameters->>'profile_revision')::bigint=$5 AND (i.parameters->>'directory_revision')::bigint=$6
         AND NOT i.complete AND i.due_at>clock_timestamp() FOR UPDATE OF i)")
-        .bind(&w.mutation.operation).bind(&w.claim).fetch_one(c).await?)
+        .bind(&w.mutation.operation).bind(&w.claim).bind(plan.revision).bind(&plan.desired.signature)
+        .bind(plan.profile).bind(plan.directory).fetch_one(c).await?)
 }
 
 async fn failed(pool: &PgPool, w: &Work, step: Step, error: AdminError) -> Result<(), Error> {
+    let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
+    record_failure(tx.connection()?, w, step, error).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn record_failure(
+    c: &mut PgConnection,
+    w: &Work,
+    step: Step,
+    error: AdminError,
+) -> Result<(), Error> {
     let cause = error.cause();
     gateway_failure(step, cause);
     let retry = match error {
@@ -490,8 +642,6 @@ async fn failed(pool: &PgPool, w: &Work, step: Step, error: AdminError) -> Resul
         }
         _ => None,
     };
-    let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
-    let c = tx.connection()?;
     audit(
         c,
         w,
@@ -508,7 +658,6 @@ async fn failed(pool: &PgPool, w: &Work, step: Step, error: AdminError) -> Resul
     .await?;
     sqlx::query("UPDATE openmettle.gateway_intents SET claim=NULL,due_at=coalesce(clock_timestamp()+$3*interval '1 second','9999-12-31'::timestamptz)
         WHERE operation_id=$1::uuid AND claim=$2::uuid").bind(&w.mutation.operation).bind(&w.claim).bind(retry.map(|d|d.as_secs_f64().max(0.001))).execute(c).await?;
-    tx.commit().await?;
     Ok(())
 }
 
@@ -525,8 +674,10 @@ async fn execute(
         Err(e) => return failed(pool, w, Step::Readiness, e).await,
     };
     let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
-    p.refresh(tx.connection()?, &w.user).await?;
-    let current = live(tx.connection()?, w).await?;
+    let current = match p.refresh(tx.connection()?, &w.user).await? {
+        Refresh::Current(plan) => live(tx.connection()?, w, &plan).await?,
+        Refresh::Idle | Refresh::Fenced => false,
+    };
     audit(tx.connection()?, w, Step::Readiness, "confirmed", false).await?;
     tx.commit().await?;
     if !current {
@@ -538,6 +689,14 @@ async fn execute(
         Err(e) => return failed(pool, w, step(action), e).await,
     };
     let sealed = if let Some(key) = receipt.key {
+        let unexpired: bool =
+            sqlx::query_scalar("SELECT to_timestamp($1::bigint/1000.0)>clock_timestamp()")
+                .bind(receipt.expires_ms.ok_or(Error::Conflict)?)
+                .fetch_one(pool)
+                .await?;
+        if !unexpired {
+            return failed(pool, w, Step::Key, AdminError::Protocol).await;
+        }
         let ctx = Context {
             installation: p.installation,
             user_id: &w.user,
@@ -554,13 +713,29 @@ async fn execute(
     };
     let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
     let c = tx.connection()?;
-    let d = p.refresh(c, &w.user).await?;
-    audit(c, w, step(action), "confirmed", true).await?;
-    if live(c, w).await? {
-        publish(c, w, &d, p.report_source, sealed, receipt.expires_ms).await?;
+    if let Refresh::Current(plan) = p.refresh(c, &w.user).await?
+        && live(c, w, &plan).await?
+    {
+        if !publish(
+            c,
+            w,
+            &plan.desired,
+            p.report_source,
+            sealed,
+            receipt.expires_ms,
+        )
+        .await?
+        {
+            // It expired between the pre-seal clock check and the guarded INSERT.
+            // Park the immutable receipt with its refusal in this transaction.
+            record_failure(c, w, Step::Key, AdminError::Protocol).await?;
+            tx.commit().await?;
+            return Ok(());
+        }
         sqlx::query("UPDATE openmettle.gateway_intents SET complete=true,claim=NULL WHERE operation_id=$1::uuid AND claim=$2::uuid")
-            .bind(&w.mutation.operation).bind(&w.claim).execute(c).await?;
+            .bind(&w.mutation.operation).bind(&w.claim).execute(&mut *c).await?;
     }
+    audit(c, w, step(action), "confirmed", true).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -572,7 +747,7 @@ async fn publish(
     source: &str,
     sealed: Option<Sealed>,
     expiry: Option<i64>,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     let b = &w.binding;
     match w.mutation.action {
         Action::Policy => {
@@ -593,11 +768,14 @@ async fn publish(
                 .bind(&b.id).bind(w.mutation.generation).bind(&w.mutation.target).bind(expiry).bind(env.key_id)
                 .bind(fp.as_slice()).bind(env.nonce.as_slice()).bind(env.ciphertext).execute(&mut *c).await?;
             if inserted.rows_affected() != 1 {
+                return Ok(false);
+            }
+            let activated=sqlx::query("UPDATE openmettle.gateway_bindings SET state='ready',observed_revision=$3,desired_revision=$3,active_generation=$2
+                WHERE id=$1::uuid AND desired_revision<=$3 AND state IN ('ready','provisioning')")
+                .bind(&b.id).bind(w.mutation.generation).bind(b.revision).execute(c).await?;
+            if activated.rows_affected() != 1 {
                 return Err(Error::Conflict);
             }
-            sqlx::query("UPDATE openmettle.gateway_bindings SET state='ready',observed_revision=desired_revision,active_generation=$2
-                WHERE id=$1::uuid AND desired_revision=$3 AND state='provisioning'")
-                .bind(&b.id).bind(w.mutation.generation).bind(b.revision).execute(c).await?;
         }
         Action::Revoke if w.mutation.target == b.principal => {
             sqlx::query("UPDATE openmettle.gateway_bindings SET state='revoked',active_generation=NULL,observed_revision=desired_revision
@@ -605,7 +783,7 @@ async fn publish(
         }
         _ => {}
     }
-    Ok(())
+    Ok(true)
 }
 
 /// A caller's already authenticated identity and visibility decision. The dedicated
@@ -643,11 +821,7 @@ impl Profile<'_> {
             .filter(|g| g.scope == r.scope && g.approval == r.approval)
             .map(|g| g.model.as_str())
             .collect();
-        if let Some(f) = self.families.children.get(r.user) {
-            let minute = f
-                .local_minute(c, None)
-                .await
-                .map_err(|_| Problem::Unavailable)?;
+        if let (Some(f), Some(minute)) = (self.families.children.get(r.user), d.family_minute) {
             allowed.retain(|model| f.permits_minute(model, minute));
         }
         if allowed.is_empty() || r.model.is_some_and(|m| !allowed.contains(m)) {
@@ -657,11 +831,10 @@ impl Profile<'_> {
             JOIN openmettle.gateway_generations k ON (k.binding_id,k.generation)=(b.id,b.active_generation)
             JOIN openmettle.gateway_intents i ON i.binding_id=b.id AND i.desired_revision=b.observed_revision AND i.action='policy' AND i.complete
             WHERE b.installation=$1::uuid AND b.user_id=$2::uuid AND b.state='ready' AND k.expires_at>clock_timestamp()
-             AND i.parameters->>'signature'=$3 AND (i.parameters->>'profile_revision')::bigint=$4)")
+             AND i.parameters->>'signature'=$3)")
             .bind(self.installation)
             .bind(r.user)
             .bind(d.signature)
-            .bind(self.revision)
             .fetch_one(c).await.map_err(|_|Problem::Unavailable)?;
         tx.commit().await.map_err(|_| Problem::Unavailable)?;
         let model = select(Access::Entitled, known, ready, || {

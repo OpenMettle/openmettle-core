@@ -329,6 +329,45 @@ async fn readiness_header_and_body_stalls_and_response_ceiling() {
 }
 
 #[tokio::test]
+async fn family_directory_quarantines_only_children_with_malformed_schedules() {
+    let ca = Ca::new();
+    let installation = intent(Resource::Principal).installation;
+    let pin = installation.clone();
+    let peer = Server::start(ca.leaf(fixture::HOST, false), move |_| {
+        let mut children = Vec::new();
+        for (n, zone, start, end) in [
+            (1, "X".repeat(129), 30, 45),
+            (2, "UTC".into(), 1440, 30),
+            (3, "UTC".into(), 30, 1440),
+            (4, "UTC".into(), 30, 30),
+            (5, "Europe/London".into(), 1380, 60),
+        ] {
+            children.push(json!({"user":format!("00000000-0000-4000-8000-{n:012}"),
+                "policy":{"revision":1,"zone":zone,"quiet":{"start_minute":start,"end_minute":end},
+                "study":null,"study_models":[],"disabled_models":[]}}));
+        }
+        Reply::Bytes(fixture::json(
+            &serde_json::to_vec(
+                &json!({"installation":pin,"revision":1,"children":children,"more":false}),
+            )
+            .unwrap(),
+        ))
+    })
+    .await;
+    let directory = client(&peer, &ca)
+        .family_directory(&installation, deadline())
+        .await
+        .unwrap();
+    assert_eq!(directory.invalid_children.len(), 4);
+    assert_eq!(directory.children.len(), 1);
+    assert!(
+        directory
+            .children
+            .contains_key("00000000-0000-4000-8000-000000000005")
+    );
+}
+
+#[tokio::test]
 async fn pagination_has_fixed_origin_page_size_and_page_count() {
     for more_forever in [false, true] {
         let ca = Ca::new();

@@ -1,7 +1,7 @@
 //! Apply evidence to the original handoff, independently of the current run, key or policy.
 use super::Error;
 use crate::{
-    provider_http::gateway::{Admin, UsageReport},
+    provider_http::gateway::{Admin, Error as AdminError, UsageReport},
     runs::WriteTransaction,
 };
 use sqlx::{PgConnection, PgPool, Row};
@@ -64,6 +64,125 @@ async fn settle_quota(c: &mut PgConnection, r: &UsageReport) -> Result<(), Error
         .execute(c)
         .await?;
     Ok(())
+}
+
+/// Replay accepted token components for pre-metering handoffs. PostgreSQL's drift
+/// verifier checks the settlement's measured column against the latest raw report;
+/// the cumulative measurement drives outstanding, just as it drives held_units.
+#[derive(Default)]
+struct TokenFold {
+    prompt: i128,
+    completion: i128,
+    reasoning: i128,
+    separate: bool,
+    separate_seen: bool,
+    reasoning_current: bool,
+    settled: i128,
+    closed: bool,
+}
+
+impl TokenFold {
+    fn observe(&mut self, row: &sqlx::postgres::PgRow) -> Result<(), Error> {
+        let prompt_tokens: Option<i64> = row.try_get("prompt_tokens")?;
+        let completion_tokens: Option<i64> = row.try_get("completion_tokens")?;
+        let reasoning_tokens: Option<i64> = row.try_get("reasoning_tokens")?;
+        let reasoning_included: Option<bool> = row.try_get("reasoning_included")?;
+        if let Some(prompt) = prompt_tokens {
+            self.prompt = prompt.into();
+        }
+        if let Some(completion) = completion_tokens {
+            self.completion = completion.into();
+            self.reasoning_current = false;
+        }
+        if let Some(reasoning) = reasoning_tokens {
+            self.reasoning = reasoning.into();
+            self.separate = reasoning_included == Some(false);
+            self.separate_seen |= self.separate;
+            self.reasoning_current = true;
+        }
+        if prompt_tokens.is_none() && completion_tokens.is_none() && reasoning_tokens.is_none() {
+            return Ok(());
+        }
+        let measured = self.prompt
+            + if self.separate {
+                self.completion + self.reasoning
+            } else if self.reasoning_current {
+                self.completion.max(self.reasoning)
+            } else {
+                self.completion
+            };
+        let complete = prompt_tokens.is_some()
+            && completion_tokens.is_some()
+            && (reasoning_tokens.is_some() || !self.separate_seen);
+        self.settled = if complete {
+            measured
+        } else {
+            self.settled.max(measured)
+        };
+        self.closed |= complete && row.try_get::<bool, _>("final")?;
+        Ok(())
+    }
+}
+
+async fn legacy_outstanding(
+    c: &mut PgConnection,
+    r: &UsageReport,
+    units: i64,
+) -> Result<i64, Error> {
+    let mut fold = TokenFold::default();
+    let mut after = -1_i64;
+    loop {
+        let rows = sqlx::query("SELECT revision,report_id::text,final,
+            prompt_tokens,completion_tokens,reasoning_tokens,reasoning_included FROM openmettle.gateway_usage_reports
+            WHERE request_id=$1::uuid AND revision>$2 AND revision<=$3 ORDER BY revision LIMIT 64")
+            .bind(&r.request).bind(after).bind(r.revision).fetch_all(&mut *c).await?;
+        let count = rows.len();
+        for row in rows {
+            after = row.try_get("revision")?;
+            if after != r.revision {
+                // The gateway login can replay accepted reports but cannot read the
+                // private acceptance ledger. A superseded raw report fails this check.
+                sqlx::query("SAVEPOINT accepted_report")
+                    .execute(&mut *c)
+                    .await?;
+                let check = sqlx::query(
+                    "SELECT openmettle.quota_settle_gateway_usage($1::uuid,$2::uuid,$3::uuid,$4)",
+                )
+                .bind(&r.request)
+                .bind(&r.source)
+                .bind(row.try_get::<&str, _>("report_id")?)
+                .bind(after)
+                .execute(&mut *c)
+                .await;
+                if let Err(error) = check {
+                    if !error.as_database_error().is_some_and(|e| {
+                        e.is_check_violation() && e.message() == "unknown accepted report"
+                    }) {
+                        return Err(error.into());
+                    }
+                    sqlx::query("ROLLBACK TO SAVEPOINT accepted_report")
+                        .execute(&mut *c)
+                        .await?;
+                    sqlx::query("RELEASE SAVEPOINT accepted_report")
+                        .execute(&mut *c)
+                        .await?;
+                    continue;
+                }
+                sqlx::query("RELEASE SAVEPOINT accepted_report")
+                    .execute(&mut *c)
+                    .await?;
+            }
+            fold.observe(&row)?;
+        }
+        if count < 64 {
+            break;
+        }
+    }
+    Ok(if fold.closed {
+        0
+    } else {
+        (i128::from(units) - fold.settled).max(0) as i64
+    })
 }
 
 /// The caller supplies evidence from the authenticated reporting profile. Verify all routing
@@ -129,23 +248,16 @@ pub async fn ingest(pool: &PgPool, r: &UsageReport) -> Result<Outcome, Error> {
         }
     } else {
         let units = row.try_get::<i64, _>("units")?;
-        let measured = r.measured();
+        let amount = r.measured().map(|n| n.to_string());
+        // Acceptance by the settlement trigger precedes the privileged quota fold.
+        // Stage a projection, then republish atomically if the folded hold differs.
         let previous = row
             .try_get::<Option<i64>, _>("outstanding")?
             .unwrap_or(units);
-        let estimate = match measured {
-            Some(_) if r.r#final && r.prompt_tokens.is_some() && r.completion_tokens.is_some() => 0,
-            Some(n) => previous.min((i128::from(units) - n).max(0) as i64),
-            None => previous,
-        };
-        // The quota fold is privileged and accepts only revisions already referenced by the
-        // settlement trigger. Its held result can differ when a report omits components or
-        // corrects an earlier cumulative total. Republish inside this transaction in that case.
         sqlx::query("SAVEPOINT gateway_fold")
             .execute(&mut *c)
             .await?;
-        let amount = measured.map(|n| n.to_string());
-        apply(c, r, amount.clone(), estimate).await?;
+        apply(c, r, amount.clone(), previous).await?;
         let actual: Option<i64> = sqlx::query_scalar(
             "SELECT held_units FROM openmettle.quota_reservations
             WHERE gateway_request_id=$1::uuid AND resource_kind='usage_tokens'",
@@ -153,7 +265,11 @@ pub async fn ingest(pool: &PgPool, r: &UsageReport) -> Result<Outcome, Error> {
         .bind(&r.request)
         .fetch_optional(&mut *c)
         .await?;
-        if let Some(held) = actual.filter(|v| *v != estimate) {
+        let held = match actual {
+            Some(held) => held,
+            None => legacy_outstanding(c, r, units).await?,
+        };
+        if held != previous {
             sqlx::query("ROLLBACK TO SAVEPOINT gateway_fold")
                 .execute(&mut *c)
                 .await?;
@@ -175,6 +291,9 @@ pub async fn ingest(pool: &PgPool, r: &UsageReport) -> Result<Outcome, Error> {
 pub struct Backfill {
     // Keyset position is exclusive, and restarts deliberately overlap committed work.
     after: Option<(String, String)>,
+    // PR2 requests can have a final report with unknown components and no metered hold.
+    #[serde(default)]
+    legacy_after: Option<String>,
 }
 
 impl Backfill {
@@ -192,83 +311,99 @@ impl Backfill {
         }
         let deadline = deadline.min(Instant::now() + Duration::from_secs(30));
         let work = async {
-            // Final evidence can settle just one resource. Its token or cost hold may
-            // still require lookup after the normal outstanding index stops listing it.
-            let rows: Vec<(String,String,i64)> = sqlx::query_as("WITH cursor AS (
-                SELECT coalesce($2::text::timestamptz,'-infinity') AS at, coalesce($3::uuid,'00000000-0000-0000-0000-000000000000') AS id
-            ), candidates AS (
-                (SELECT q.created_at AS position,q.id,q.created_at FROM openmettle.gateway_requests q,cursor c
-                 WHERE q.installation=$1::uuid AND q.state='handed_off' AND NOT q.settled_final
-                   AND (q.created_at,q.id)>(c.at,c.id)
-                   AND NOT EXISTS (SELECT FROM openmettle.gateway_settlements s WHERE s.request_id=q.id)
-                 ORDER BY q.created_at,q.id LIMIT $4)
-                UNION ALL
-                (SELECT s.updated_at,q.id,q.created_at FROM openmettle.gateway_settlements s
-                 JOIN openmettle.gateway_requests q ON q.id=s.request_id CROSS JOIN cursor c
-                 WHERE NOT s.final AND q.installation=$1::uuid AND (s.updated_at,s.request_id)>(c.at,c.id)
-                 ORDER BY s.updated_at,s.request_id LIMIT $4)
-                UNION ALL
-                (SELECT q.created_at,q.id,q.created_at FROM openmettle.gateway_requests q
-                 JOIN openmettle.gateway_settlements s ON s.request_id=q.id CROSS JOIN cursor c
-                 WHERE q.installation=$1::uuid AND q.settled_final AND (s.outstanding>0 OR EXISTS
-                     (SELECT FROM openmettle.quota_reservations h WHERE h.gateway_request_id=q.id AND h.state='handoff_committed'))
-                   AND (q.created_at,q.id)>(c.at,c.id)
-                 ORDER BY q.created_at,q.id LIMIT $4))
-                SELECT position::text,id::text,greatest(0,extract(epoch FROM clock_timestamp()-created_at))::bigint
-                FROM candidates ORDER BY candidates.position,candidates.id LIMIT $4")
+            let rows: Vec<(String, String, i64)> = sqlx::query_as(include_str!("backfill.sql"))
                 .bind(installation)
                 .bind(self.after.as_ref().map(|v| &v.0))
                 .bind(self.after.as_ref().map(|v| &v.1))
-                .bind(i64::from(limit)).fetch_all(pool).await?;
+                .bind(i64::from(limit))
+                .fetch_all(pool)
+                .await?;
             let count = rows.len();
             for (position, request, age) in rows {
-                use crate::telemetry::{
-                    gateway_failure,
-                    metrics::{GatewayCause, GatewayStep},
-                };
-                crate::telemetry::metrics::global().record_gateway_lag(age);
-                let outcome = match admin.usage(&request, deadline).await {
-                    Ok(Some(r)) if r.installation == installation && r.request == request => {
-                        match ingest(pool, &r).await {
-                            Ok(_) => None,
-                            Err(Error::Refused | Error::Conflict) => {
-                                Some(("refused", Some(GatewayCause::Protocol)))
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    Ok(Some(_)) => Some(("refused", Some(GatewayCause::Protocol))),
-                    Ok(None) => Some(("deferred", None)),
-                    Err(e) => {
-                        gateway_failure(GatewayStep::Usage, e.cause());
-                        if matches!(e, crate::provider_http::gateway::Error::Protocol) {
-                            Some(("refused", None))
-                        } else {
-                            return Err(Error::Database);
-                        }
-                    }
-                };
-                if let Some((outcome, cause)) = outcome {
-                    if let Some(c) = cause {
-                        gateway_failure(GatewayStep::Usage, c);
-                    }
-                    // Old PR2 bindings may predate policy intents. Their original request
-                    // remains in the outstanding scan even without an audit parent.
-                    sqlx::query("INSERT INTO openmettle.gateway_audit(binding_id,desired_revision,operation_id,step,outcome,remote_handle)
-                        SELECT i.binding_id,i.desired_revision,i.operation_id,'usage',$2,q.id
-                        FROM openmettle.gateway_requests q JOIN openmettle.gateway_intents i ON i.binding_id=q.binding_id
-                         AND i.desired_revision=q.policy_revision AND i.action='policy' WHERE q.id=$1::uuid LIMIT 1")
-                        .bind(&request).bind(outcome).execute(pool).await?;
-                }
+                lookup(pool, admin, installation, &request, age, deadline).await?;
                 self.after = Some((position, request));
             }
-            if count < usize::from(limit) {
-                self.after = None;
+            if count == usize::from(limit) {
+                return Ok(count);
             }
-            Ok(count)
+            self.after = None;
+            // The normal work queue has room. Legacy incomplete finals have neither
+            // a nonfinal index entry nor a quota hold. Limit the primary-key walk
+            // *before* checking eligibility and resume after every inspected key.
+            let room = usize::from(limit) - count;
+            let legacy: Vec<(String, Option<i64>)> =
+                sqlx::query_as(include_str!("legacy_backfill.sql"))
+                    .bind(&self.legacy_after)
+                    .bind(room as i64)
+                    .bind(installation)
+                    .fetch_all(pool)
+                    .await?;
+            let wrap = legacy.len() < room;
+            let mut looked_up = count;
+            for (request, age) in legacy {
+                if let Some(age) = age {
+                    lookup(pool, admin, installation, &request, age, deadline).await?;
+                    looked_up += 1;
+                }
+                self.legacy_after = Some(request);
+            }
+            if wrap {
+                self.legacy_after = None;
+            }
+            Ok(looked_up)
         };
         tokio::time::timeout_at(deadline, work)
             .await
             .map_err(|_| Error::Database)?
     }
+}
+
+async fn lookup(
+    pool: &PgPool,
+    admin: &Admin,
+    installation: &str,
+    request: &str,
+    age: i64,
+    deadline: Instant,
+) -> Result<(), Error> {
+    use crate::telemetry::{
+        gateway_failure,
+        metrics::{GatewayCause, GatewayStep},
+    };
+    crate::telemetry::metrics::global().record_gateway_lag(age);
+    let outcome = match admin.usage(request, deadline).await {
+        Ok(Some(r)) if r.installation == installation && r.request == request => {
+            match ingest(pool, &r).await {
+                Ok(_) => None,
+                Err(Error::Refused | Error::Conflict) => {
+                    Some(("refused", Some(GatewayCause::Protocol)))
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(Some(_)) => Some(("refused", Some(GatewayCause::Protocol))),
+        Ok(None) => Some(("deferred", None)),
+        Err(
+            e @ (AdminError::Refused(401 | 403)
+            | AdminError::Deferred(_)
+            | AdminError::Transport(_)),
+        ) => {
+            gateway_failure(GatewayStep::Usage, e.cause());
+            return Err(Error::Database);
+        }
+        Err(e) => Some(("refused", Some(e.cause()))),
+    };
+    if let Some((outcome, cause)) = outcome {
+        if let Some(c) = cause {
+            gateway_failure(GatewayStep::Usage, c);
+        }
+        // Old PR2 bindings may predate policy intents. Their original request
+        // remains in the outstanding scan even without an audit parent.
+        sqlx::query("INSERT INTO openmettle.gateway_audit(binding_id,desired_revision,operation_id,step,outcome,remote_handle)
+            SELECT i.binding_id,i.desired_revision,i.operation_id,'usage',$2,q.id
+            FROM openmettle.gateway_requests q JOIN openmettle.gateway_intents i ON i.binding_id=q.binding_id
+             AND i.desired_revision=q.policy_revision AND i.action='policy' WHERE q.id=$1::uuid LIMIT 1")
+            .bind(request).bind(outcome).execute(pool).await?;
+    }
+    Ok(())
 }

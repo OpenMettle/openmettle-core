@@ -359,6 +359,13 @@ async fn reconciliation_discovers_redemption_and_fences_inflight_renewal_on_gran
         json!({"installation":INSTALL,"revision":1,"children":[],"more":false}),
     ));
     let family = directory.clone();
+    let expire_next_key = Arc::new(AtomicBool::new(false));
+    let expire = expire_next_key.clone();
+    let block_next_policy = Arc::new(AtomicBool::new(false));
+    let block_policy = block_next_policy.clone();
+    let policy_entered = Arc::new(Notify::new());
+    let policy_resume = Arc::new(Notify::new());
+    let (policy_gate, policy_release) = (policy_entered.clone(), policy_resume.clone());
     let peer=tls::Server::start(ca.leaf(tls::HOST,false),move |r|{
         let line:Vec<_>=r.head.lines().next().unwrap().split_whitespace().collect();
         if line[1]==format!("/admin/v1/family/{INSTALL}?page=1&limit=64") {
@@ -385,9 +392,13 @@ async fn reconciliation_discovers_redemption_and_fences_inflight_renewal_on_gran
         }
         *fence=rev;
         let is_key=matches!(m["action"].as_str(),Some("issue"|"renew"|"rotate"));
-        let reply=json!({"applied":m,"bearer":is_key.then_some(USER),"expires_ms":is_key.then_some(4102444800000_i64)});
+        let expiry = if is_key && expire.swap(false,Ordering::SeqCst) { 1 } else { 4102444800000_i64 };
+        let reply=json!({"applied":m,"bearer":is_key.then_some(USER),"expires_ms":is_key.then_some(expiry)});
         assert!(db.insert(path.into(),reply).is_none());
         if m["action"]=="issue" && drop_first.swap(false,Ordering::SeqCst){return tls::Reply::Close;}
+        if m["action"]=="policy" && block_policy.swap(false,Ordering::SeqCst) {
+            policy_gate.notify_one(); return tls::Reply::Gate(policy_release.clone(),tls::response(201,&[],b""));
+        }
         if m["action"]=="renew"{entered.notify_one();return tls::Reply::Gate(resume.clone(),tls::response(201,&[],b""));}
         tls::Reply::Bytes(tls::response(201,&[],b""))
     }).await;
@@ -498,9 +509,85 @@ async fn reconciliation_discovers_redemption_and_fences_inflight_renewal_on_gran
         .unwrap();
     pending.handoff(&api, &keys()).await.unwrap();
 
+    let child = |user: &str, revision: i64, zone: &str, disabled: &[&str]| {
+        json!({"user":user,
+        "policy":{"revision":revision,"zone":zone,"quiet":null,"study":null,"study_models":[],"disabled_models":disabled}})
+    };
+    let snapshot = |revision: i64, children: Vec<Value>| json!({"installation":INSTALL,"revision":revision,"more":false,"children":children});
+    // A different child's schedule changes. This adult keeps exactly the original plan.
+    *directory.lock().unwrap() = snapshot(2, vec![child(TARGET, 1, "Europe/London", &["a"])]);
+    assert_eq!(
+        s.page(&g, &admin, &sealer, &profile, 16, until())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(state().await.unwrap(), ("ready".into(), budget.clone(), 1));
+
     // An explicit rotation keeps the budget and retires the identified predecessor.
     profile.rotation_epoch = 1;
     profile.revision += 1;
+    readiness.store(false, Ordering::SeqCst);
+    s.page(&g, &admin, &sealer, &profile, 16, until())
+        .await
+        .unwrap();
+    assert_eq!(state().await.unwrap(), ("ready".into(), budget.clone(), 1));
+    assert_eq!(
+        profile
+            .select_model(
+                &g,
+                gateway::reconcile::ModelRequest {
+                    access: crate::provider_http::gateway::problem::Access::Entitled,
+                    user: &actor,
+                    scope: &scope,
+                    approval: &approval,
+                    model: Some("a")
+                },
+                None,
+                || panic!("explicit model")
+            )
+            .await
+            .unwrap(),
+        "a"
+    );
+    let fallback_id = id(&api).await;
+    let fallback = gateway::reserve_with_cost(
+        &api,
+        Call {
+            installation: INSTALL,
+            model: "a",
+            units: 10,
+            reservation: Reservation {
+                id: &fallback_id,
+                scope_id: &scope,
+                actor: &actor,
+                approval: &approval,
+            },
+            authority: Authority::Session {
+                credential: credential.expose(),
+                native_audience: None,
+            },
+        },
+        Some(1),
+    )
+    .await
+    .unwrap();
+    fallback.handoff(&api, &keys()).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT generation FROM openmettle.gateway_requests WHERE id=$1::uuid"
+        )
+        .bind(&fallback.id)
+        .fetch_one(&g)
+        .await
+        .unwrap(),
+        1
+    );
+    readiness.store(true, Ordering::SeqCst);
+    sqlx::query("UPDATE openmettle.gateway_intents SET due_at=now() WHERE NOT complete")
+        .execute(&g)
+        .await
+        .unwrap();
     s.page(&g, &admin, &sealer, &profile, 16, until())
         .await
         .unwrap();
@@ -533,6 +620,7 @@ async fn reconciliation_discovers_redemption_and_fences_inflight_renewal_on_gran
         tokio::time::timeout(Duration::from_secs(10), renew.notified())
             .await
             .unwrap();
+        assert_eq!(state().await.unwrap(), ("ready".into(), budget.clone(), 2));
         sqlx::query("UPDATE openmettle.user_capability_grants SET granted=false")
             .execute(&mut f.owner)
             .await
@@ -593,14 +681,95 @@ async fn reconciliation_discovers_redemption_and_fences_inflight_renewal_on_gran
     s2.page(&replica, &admin, &sealer, &profile, 16, until())
         .await
         .unwrap();
-    assert_eq!(state().await.unwrap(), ("revoked".into(), budget, 6));
-    // A new gateway-owned restriction arrives without an application configuration change.
+    assert_eq!(
+        state().await.unwrap(),
+        ("revoked".into(), budget.clone(), 6)
+    );
+    // While the actor is disabled, learn that the previously adult account is
+    // now a restricted child. Re-enablement must not let an old adult snapshot regrant.
+    *directory.lock().unwrap() = snapshot(3, vec![child(&actor, 2, "UTC", &["a"])]);
+
+    assert_eq!(
+        s.page(&g, &admin, &sealer, &profile, 16, until())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        state().await.unwrap(),
+        ("revoked".into(), budget.clone(), 6)
+    );
+
+    // Replica A reads the old unrestricted policy. While its PUT is in flight,
+    // replica B discovers a newer child restriction at the same profile revision.
     sqlx::query("UPDATE openmettle.users SET disabled_at=NULL")
         .execute(&mut f.owner)
         .await
         .unwrap();
-    *directory.lock().unwrap() = json!({"installation":INSTALL,"revision":2,"more":false,"children":[{"user":actor,
-        "policy":{"revision":3,"zone":"Europe/London","quiet":null,"study":null,"study_models":[],"disabled_models":["a"]}}]});
+    *directory.lock().unwrap() = snapshot(2, vec![]);
+    assert_eq!(
+        s2.page(&replica, &admin, &sealer, &profile, 16, until())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        state().await.unwrap(),
+        ("revoked".into(), budget.clone(), 6)
+    );
+    let restricted = snapshot(5, vec![child(&actor, 3, "Europe/London", &["a"])]);
+    *directory.lock().unwrap() = restricted.clone();
+    let newer = admin.family_directory(INSTALL, until()).await.unwrap();
+    *directory.lock().unwrap() = snapshot(4, vec![]);
+    block_next_policy.store(true, Ordering::SeqCst);
+    let supersede = async {
+        tokio::time::timeout(Duration::from_secs(10), policy_entered.notified())
+            .await
+            .unwrap();
+        *directory.lock().unwrap() = restricted.clone();
+        s2.discover(
+            &replica,
+            &Profile {
+                families: &newer,
+                ..profile
+            },
+            16,
+        )
+        .await
+        .unwrap();
+        policy_resume.notify_one();
+    };
+    let (applied, ()) = tokio::join!(
+        s.page(&g, &admin, &sealer, &profile, 16, until()),
+        supersede
+    );
+    applied.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM openmettle.gateway_policy WHERE revision=8"
+        )
+        .fetch_one(&g)
+        .await
+        .unwrap(),
+        0
+    );
+    // Step the new plan through attach, then offer the due policy intent to a stale replica.
+    assert_eq!(
+        s.page(&g, &admin, &sealer, &profile, 3, until())
+            .await
+            .unwrap(),
+        3
+    );
+    *directory.lock().unwrap() = snapshot(4, vec![]);
+    assert_eq!(
+        s2.page(&replica, &admin, &sealer, &profile, 16, until())
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(!sqlx::query_scalar::<_,bool>("SELECT complete FROM openmettle.gateway_intents WHERE desired_revision=9 AND action='policy'")
+        .fetch_one(&g).await.unwrap());
+    *directory.lock().unwrap() = restricted;
     s.page(&g, &admin, &sealer, &profile, 16, until())
         .await
         .unwrap();
@@ -612,6 +781,51 @@ async fn reconciliation_discovers_redemption_and_fences_inflight_renewal_on_gran
     .await
     .unwrap();
     assert!(!models.is_empty() && !models.iter().any(|m| m == "a"));
+    *directory.lock().unwrap() = snapshot(
+        6,
+        vec![
+            child(&actor, 3, "Europe/London", &["a"]),
+            child(TARGET, 2, "UTC", &[]),
+        ],
+    );
+    assert_eq!(
+        s.page(&g, &admin, &sealer, &profile, 16, until())
+            .await
+            .unwrap(),
+        0
+    );
+    // A bad immutable key receipt must be parked before it consumes a nonce.
+    let nonce_reader = pooled::one_slot(f.db.options(pg::OWNER));
+    let nonce_count = || {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM openmettle.gateway_nonces")
+            .fetch_one(&nonce_reader)
+    };
+    let before = nonce_count().await.unwrap();
+    expire_next_key.store(true, Ordering::SeqCst);
+    profile.rotation_epoch += 1;
+    s.page(&g, &admin, &sealer, &profile, 16, until())
+        .await
+        .unwrap();
+    assert_eq!(state().await.unwrap(), ("ready".into(), budget.clone(), 9));
+    assert_eq!(
+        s.page(&g, &admin, &sealer, &profile, 16, until())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(nonce_count().await.unwrap(), before);
+    let parked: bool = sqlx::query_scalar("SELECT EXISTS (SELECT FROM openmettle.gateway_intents i
+        JOIN openmettle.gateway_audit a USING (operation_id) WHERE i.action='rotate' AND NOT i.complete AND i.claim IS NULL
+        AND i.due_at>now()+interval '1 year' AND a.step='key' AND a.outcome='refused')").fetch_one(&g).await.unwrap();
+    assert!(parked);
+
+    // A newer authenticated but unrecognised zone withholds this child's existing grant.
+    *directory.lock().unwrap() = snapshot(7, vec![child(&actor, 4, "Invalid/Zone", &[])]);
+    s.page(&g, &admin, &sealer, &profile, 16, until())
+        .await
+        .unwrap();
+    assert_eq!(state().await.unwrap(), ("revoked".into(), budget, 11));
+
     let principal: String =
         sqlx::query_scalar("SELECT principal::text FROM openmettle.gateway_bindings")
             .fetch_one(&g)
@@ -792,7 +1006,27 @@ async fn backfill_after_cancellation(f: &mut Flow, g: &PgPool, run: &str) {
     proxy.close().await;
     assert_eq!(ingest(g, &r).await, Ok(Outcome::Duplicate));
     let total = reports.len() as i64;
-    let served = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let outstanding: Vec<String> = sqlx::query_scalar(
+        "SELECT id::text FROM openmettle.gateway_requests
+        WHERE state='handed_off' AND NOT settled_final ORDER BY created_at,id",
+    )
+    .fetch_all(g)
+    .await
+    .unwrap();
+    assert!(outstanding.len() >= 3);
+    // A final with unknown token components drops out of the requests index.
+    // Its open metered hold must still bring it back on the mixed result page.
+    let mut incomplete = reports[&outstanding[2]].clone();
+    incomplete.revision = 1;
+    incomplete.prompt_tokens = None;
+    incomplete.completion_tokens = None;
+    assert_eq!(ingest(g, &incomplete).await, Ok(Outcome::Applied));
+    let refused = outstanding[0].clone();
+    let missing = outstanding[1].clone();
+    sqlx::query("INSERT INTO openmettle.gateway_intents(binding_id,desired_revision,generation,action,expected_revision,parameters)
+        SELECT id,observed_revision,1,'policy',observed_revision,'{}'::jsonb FROM openmettle.gateway_bindings")
+        .execute(g).await.unwrap();
+    let served = Arc::new(std::sync::atomic::AtomicU16::new(0));
     let available = served.clone();
     let ca = tls::Ca::new();
     let peer = tls::Server::start(ca.leaf(tls::HOST, false), move |r| {
@@ -802,8 +1036,13 @@ async fn backfill_after_cancellation(f: &mut Flow, g: &PgPool, run: &str) {
             .unwrap()
             .strip_suffix(" HTTP/1.1")
             .unwrap();
-        if !available.load(Ordering::SeqCst) {
-            return tls::Reply::Bytes(tls::response(404, &[], b""));
+        match available.load(Ordering::SeqCst) {
+            0 => return tls::Reply::Bytes(tls::response(404, &[], b"")),
+            1 if request == refused => {
+                return tls::Reply::Bytes(tls::response(422, &[], b"refusal canary"));
+            }
+            1 if request == missing => return tls::Reply::Bytes(tls::response(404, &[], b"")),
+            _ => {}
         }
         tls::Reply::Bytes(tls::json(&serde_json::to_vec(&reports[request]).unwrap()))
     })
@@ -822,7 +1061,17 @@ async fn backfill_after_cancellation(f: &mut Flow, g: &PgPool, run: &str) {
         backfill.page(g, &admin, INSTALL, 1, until()).await.unwrap(),
         1
     );
-    served.store(true, Ordering::SeqCst);
+    served.store(1, Ordering::SeqCst);
+    let mut mixed = Backfill::default();
+    assert_eq!(
+        mixed.page(g, &admin, INSTALL, 64, until()).await.unwrap(),
+        outstanding.len()
+    );
+    assert!(sqlx::query_scalar::<_,bool>("SELECT EXISTS (SELECT FROM openmettle.gateway_settlements WHERE request_id=$1::uuid AND final AND revision=2)")
+        .bind(&outstanding[2]).fetch_one(g).await.unwrap());
+    assert!(sqlx::query_scalar::<_,bool>("SELECT EXISTS (SELECT FROM openmettle.gateway_audit WHERE step='usage' AND outcome='refused' AND remote_handle=$1::uuid)")
+        .bind(&outstanding[0]).fetch_one(g).await.unwrap());
+    served.store(2, Ordering::SeqCst);
     let mut restart = Backfill::default();
     for _ in 0..total {
         restart.page(g, &admin, INSTALL, 1, until()).await.unwrap();

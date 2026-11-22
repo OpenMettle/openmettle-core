@@ -31,20 +31,27 @@ pub struct FamilyPolicy {
     pub disabled_models: BTreeSet<String>,
 }
 impl FamilyPolicy {
+    pub fn valid(&self) -> bool {
+        self.revision > 0
+            && (1..=128).contains(&self.zone.len())
+            && self
+                .zone
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'+' | b'-' | b'_' | b'.'))
+            && [self.quiet.as_ref(), self.study.as_ref()]
+                .into_iter()
+                .flatten()
+                .all(|h| {
+                    h.start_minute < 1440 && h.end_minute < 1440 && h.start_minute != h.end_minute
+                })
+    }
+
     pub(super) async fn local_minute(
         &self,
         c: &mut PgConnection,
         instant_ms: Option<i64>,
     ) -> Result<u16, Error> {
-        if self.revision < 1
-            || self.zone.len() > 128
-            || [self.quiet.as_ref(), self.study.as_ref()]
-                .into_iter()
-                .flatten()
-                .any(|h| {
-                    h.start_minute >= 1440 || h.end_minute >= 1440 || h.start_minute == h.end_minute
-                })
-        {
+        if !self.valid() {
             return Err(Error::Refused);
         }
         let minute: i32 = sqlx::query_scalar("SELECT extract(hour FROM local_time)::int*60+extract(minute FROM local_time)::int
