@@ -16,7 +16,7 @@ use tokio::net::TcpSocket;
 
 fn replica(db: &TestDb, configure: impl FnOnce(&mut Value)) -> Api {
     let dir = auth_config_support::Dir::new();
-    fs::create_dir(dir.path("artifacts")).unwrap();
+    // Event-stream replicas do not serve artifact payloads.
     let mut doc = auth_config_support::document_v2_native(&dir, &ca::Ca::new().pem());
     doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
     configure(&mut doc["cursor_keys"]);

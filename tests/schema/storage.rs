@@ -16,7 +16,21 @@ fn code(error: &Error) -> String {
 }
 
 /// Owner-only configuration, as an operator would apply it.
-pub(super) async fn configure(
+async fn configure(db: &TestDb, budget: Option<i64>, personal: Option<i64>, project: Option<i64>) {
+    configure_limits(db, budget, personal, project).await;
+    // Ledger-only tests use a synthetic owner-adopted volume. File tests initialize real sentinels.
+    if db.exists("openmettle.storage_volume_control").await {
+        db.admin()
+            .await
+            .execute(
+                "UPDATE openmettle.storage_volume_control SET volume_id=gen_random_uuid(),
+            bootstrap_auto_pin_allowed=false WHERE id AND volume_id IS NULL",
+            )
+            .await
+            .unwrap();
+    }
+}
+pub(super) async fn configure_limits(
     db: &TestDb,
     budget: Option<i64>,
     personal: Option<i64>,
@@ -109,6 +123,7 @@ async fn settle(
     media: &str,
 ) -> Result<String, Error> {
     let mut cn = connect(&db.0, API).await;
+    crate::mark_storage_payload_published(&mut cn, reservation).await;
     let mut tx = WriteTransaction::begin(&mut cn).await.unwrap();
     let digest = sha(body);
     let result = storage::settle(
@@ -815,6 +830,7 @@ async fn cancellation_and_unknown_commit_never_double_charge() {
     let pending = reserve(&db, API, &input(&c.scope, &c.actor, "pending", &doc, 100))
         .await
         .unwrap();
+    crate::mark_storage_payload_published(&mut db.admin().await, &pending.id).await;
     let to_release = reserve(&db, API, &input(&c.scope, &c.actor, "release", &doc, 100))
         .await
         .unwrap();

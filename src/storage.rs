@@ -119,6 +119,10 @@ async fn reserve_inner(
     let result = async {
         let kind: String = sqlx::query_scalar("SELECT kind FROM openmettle.scopes WHERE id=$1::uuid")
             .bind(r.scope).fetch_optional(&mut *sp).await?.ok_or(Error::NotFound)?;
+        // On a pinned deployment serialize acquisition with adoption before locking counters.
+        // Existing unpinned HTTP uploads can proceed while the fleet is being replaced.
+        sqlx::query("SELECT openmettle.storage_lock_pinned_volume() FROM openmettle.storage_volume_control
+            WHERE id AND (volume_id IS NOT NULL OR adoption_run_id IS NOT NULL)").execute(&mut *sp).await?;
         sqlx::query("INSERT INTO openmettle.storage_accounts(scope_id) VALUES ($1::uuid) ON CONFLICT DO NOTHING")
             .bind(r.scope).execute(&mut *sp).await?;
         let account = sqlx::query("SELECT active_bytes,retained_bytes,reserved_bytes FROM openmettle.storage_accounts
@@ -152,11 +156,14 @@ async fn reserve_inner(
         let instance = sqlx::query("SELECT instance_budget_bytes,personal_limit_bytes,project_limit_bytes,
              active_bytes,retained_bytes,reserved_bytes FROM openmettle.storage_instance FOR UPDATE")
             .fetch_optional(&mut *sp).await?.ok_or(Error::LimitUnconfigured)?;
-        let owner_limit: Option<i64> = instance.get(if kind == "personal" {
+        let override_limit:Option<i64>=sqlx::query_scalar("SELECT hard_limit FROM openmettle.quota_overrides WHERE
+            scope_id=$1::uuid AND resource_kind='storage_bytes' AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>clock_timestamp())")
+            .bind(r.scope).fetch_optional(&mut *sp).await?;
+        let owner_limit: Option<i64> = override_limit.or(instance.get(if kind == "personal" {
             "personal_limit_bytes"
         } else {
             "project_limit_bytes"
-        });
+        }));
         let budget: Option<i64> = instance.get("instance_budget_bytes");
         let (Some(owner_limit), Some(budget)) = (owner_limit, budget) else {
             return Err(Error::LimitUnconfigured);
@@ -175,11 +182,16 @@ async fn reserve_inner(
             return Err(Error::InstanceLimit);
         }
         let reservation: String = sqlx::query_scalar("INSERT INTO openmettle.storage_reservations
-             (scope_id,actor_user_id,idempotency_key,artifact_id,max_bytes,run_id,operation_id,request_identity,request_digest)
-             VALUES ($1::uuid,$2::uuid,$3,$4::uuid,$5,$6::uuid,$7::uuid,$8,$9) RETURNING id::text")
+             (scope_id,actor_user_id,idempotency_key,artifact_id,max_bytes,run_id,operation_id,request_identity,request_digest,lease_expires_at)
+             VALUES ($1::uuid,$2::uuid,$3,$4::uuid,$5,$6::uuid,$7::uuid,$8,$9,
+                 CASE WHEN $6::uuid IS NULL THEN clock_timestamp()+interval '900 seconds'
+                      ELSE (SELECT greatest(clock_timestamp()+interval '1 second',coalesce(execution_expires_at,queue_expires_at)+interval '60 seconds')
+                            FROM openmettle.runs WHERE id=$6::uuid) END) RETURNING id::text")
             .bind(r.scope).bind(r.actor).bind(r.key).bind(r.artifact).bind(r.max_bytes).bind(r.run).bind(r.operation)
             .bind(&id).bind(&hash).fetch_one(&mut *sp).await?;
         adjust(&mut sp, r.scope, 0, 0, r.max_bytes).await?;
+        sqlx::query("SELECT openmettle.quota_record_storage_warning($1::uuid,$2)")
+            .bind(r.scope).bind(r.max_bytes).execute(&mut *sp).await?;
         Ok(Reservation { id: reservation, state: ReservationState::Reserved })
     }
     .await;
@@ -286,6 +298,12 @@ async fn adjust(
     retained: i64,
     reserved: i64,
 ) -> Result<(), Error> {
+    sqlx::query(
+        "SELECT openmettle.storage_lock_pinned_volume() FROM openmettle.storage_volume_control
+        WHERE id AND (volume_id IS NOT NULL OR adoption_run_id IS NOT NULL)",
+    )
+    .execute(&mut **tx)
+    .await?;
     let updated = sqlx::query(
         "UPDATE openmettle.storage_accounts SET active_bytes=active_bytes+$2,
          retained_bytes=retained_bytes+$3,reserved_bytes=reserved_bytes+$4 WHERE scope_id=$1::uuid",
@@ -353,7 +371,8 @@ async fn settle_inner(tx: &mut WriteTransaction<'_>, s: &Settlement<'_>) -> Resu
     let mut outer = tx.take_active()?;
     let mut sp = outer.begin().await?;
     let result = async {
-        let row = sqlx::query("SELECT actor_user_id::text,artifact_id::text,max_bytes,state FROM openmettle.storage_reservations
+        let row = sqlx::query("SELECT actor_user_id::text,artifact_id::text,max_bytes,state,reclaim_state,adoption_unverified,
+            payload_ino IS NOT NULL AS bound,publish_pending FROM openmettle.storage_reservations
              WHERE scope_id=$1::uuid AND id=$2::uuid FOR UPDATE")
             .bind(s.scope).bind(s.reservation).fetch_optional(&mut *sp).await?.ok_or(Error::NotFound)?;
         let actor: String = row.get("actor_user_id");
@@ -378,6 +397,10 @@ async fn settle_inner(tx: &mut WriteTransaction<'_>, s: &Settlement<'_>) -> Resu
                 return Ok(rev.get("id"));
             }
             ReservationState::Reserved => {}
+        }
+        if row.get::<bool,_>("adoption_unverified") || row.get::<&str,_>("reclaim_state") != "none"
+            || !row.get::<bool,_>("bound") || !row.get::<bool,_>("publish_pending") {
+            return Err(Error::Conflict);
         }
         if s.size_bytes > max {
             return Err(Error::Invalid);
@@ -412,7 +435,7 @@ async fn settle_inner(tx: &mut WriteTransaction<'_>, s: &Settlement<'_>) -> Resu
             insert = insert.bind(name);
         }
         let revision: String = insert.fetch_one(&mut *sp).await?;
-        sqlx::query("UPDATE openmettle.storage_reservations SET state='settled',settled_bytes=$3,closed_at=now()
+        sqlx::query("UPDATE openmettle.storage_reservations SET state='settled',publish_pending=false,settled_bytes=$3,closed_at=now()
              WHERE scope_id=$1::uuid AND id=$2::uuid")
             .bind(s.scope).bind(s.reservation).bind(s.size_bytes).execute(&mut *sp).await?;
         adjust(&mut sp, s.scope, s.size_bytes, 0, -max).await?;
@@ -436,7 +459,19 @@ pub async fn release(
 ) -> Result<(), Error> {
     record(
         StorageOperation::Release,
-        release_inner(tx, scope, reservation).await,
+        release_inner(tx, scope, reservation, None).await,
+    )
+}
+
+pub(crate) async fn release_claimed(
+    tx: &mut WriteTransaction<'_>,
+    scope: &str,
+    reservation: &str,
+    claim: &str,
+) -> Result<(), Error> {
+    record(
+        StorageOperation::Release,
+        release_inner(tx, scope, reservation, Some(claim)).await,
     )
 }
 
@@ -444,6 +479,7 @@ async fn release_inner(
     tx: &mut WriteTransaction<'_>,
     scope: &str,
     reservation: &str,
+    claim: Option<&str>,
 ) -> Result<(), Error> {
     uuid(scope)?;
     uuid(reservation)?;
@@ -466,7 +502,8 @@ async fn release_inner(
             lock_run(&mut sp, scope, run).await?;
         }
         let row = sqlx::query(
-            "SELECT state,max_bytes FROM openmettle.storage_reservations
+            "SELECT state,max_bytes,stage_claimed,payload_ino IS NOT NULL AS bound,adoption_unverified,
+             publish_pending,reclaim_state,reclaim_claim_token::text AS token FROM openmettle.storage_reservations
              WHERE scope_id=$1::uuid AND id=$2::uuid FOR UPDATE",
         )
         .bind(scope)
@@ -478,6 +515,15 @@ async fn release_inner(
             ReservationState::Settled => return Err(Error::Conflict),
             ReservationState::Reserved => {}
         }
+        let reclaim: &str = row.get("reclaim_state");
+        let bound: bool = row.get("bound");
+        if row.get::<bool,_>("adoption_unverified") || row.get::<bool,_>("publish_pending")
+            || row.get::<Option<&str>,_>("token") != claim
+            || match claim {
+                Some(_) => if bound { reclaim != "truncated" } else { reclaim != "claiming" },
+                None => bound || row.get::<bool,_>("stage_claimed") || reclaim != "none",
+            }
+        {return Err(Error::NotEligible);}
         if let Some(run) = &run {
             let unresolved: bool = sqlx::query_scalar(
                 "SELECT EXISTS (SELECT FROM openmettle.operations
@@ -494,7 +540,9 @@ async fn release_inner(
             }
         }
         sqlx::query(
-            "UPDATE openmettle.storage_reservations SET state='released',closed_at=now()
+            "UPDATE openmettle.storage_reservations SET state='released',closed_at=now(),
+             reclaim_state=CASE WHEN reclaim_state='truncated' THEN 'anchor_pending_unlink' ELSE 'none' END,
+             reclaim_claim_token=NULL,reclaim_lease_until=NULL
              WHERE scope_id=$1::uuid AND id=$2::uuid",
         )
         .bind(scope)
@@ -626,6 +674,11 @@ pub async fn begin_purge(
         scope,
         revision,
         async |sp| {
+            let verified: bool = sqlx::query_scalar("SELECT NOT s.adoption_unverified AND s.payload_ino IS NOT NULL
+                FROM openmettle.storage_reservations s JOIN openmettle.artifact_revisions r
+                ON r.scope_id=s.scope_id AND s.id=r.reservation_id WHERE r.scope_id=$1::uuid AND r.id=$2::uuid")
+                .bind(scope).bind(revision).fetch_optional(&mut **sp).await?.ok_or(Error::NotFound)?;
+            if !verified { return Err(Error::NotEligible); }
             let (state, _, _, _, due, _) = lock_revision(sp, scope, revision).await?;
             match state.as_str() {
                 "purging" | "purged" => return Ok(()),
@@ -667,7 +720,7 @@ pub async fn confirm_purge(
                 _ => return Err(Error::NotEligible),
             }
             sqlx::query(
-                "UPDATE openmettle.artifact_revisions SET state='purged',purged_at=now()
+                "UPDATE openmettle.artifact_revisions SET state='purged',purged_at=now(),purge_stage='anchor_pending_unlink'
                  WHERE scope_id=$1::uuid AND id=$2::uuid",
             )
             .bind(scope)

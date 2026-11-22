@@ -22,10 +22,17 @@ path = "src/bin/worker.rs"
 name = "openmettle-migrate"
 path = "src/bin/migrate.rs"
 
+[[bin]]
+name = "openmettle-admin"
+path = "src/bin/admin.rs"
+
 [lints.rust]
 unsafe_code = "forbid"
 
 [dependencies]
+# Safe directory-relative filesystem operations. Origin: github.com/bytecodealliance/rustix
+# Licence: Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT.
+rustix = { version = "=1.1.6", default-features = false, features = ["fs", "std"] }
 # `matched-path` adds no crate; it lets telemetry record the route template, never the target.
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "matched-path", "tokio"] }
 tokio = { version = "=1.54.1", default-features = false, features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }

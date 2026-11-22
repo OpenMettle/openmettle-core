@@ -106,6 +106,7 @@ impl<R: TurnRoutes> TurnExecutor<R> {
         }
     }
     pub fn with_artifacts(mut self, store: artifact_fs::Store) -> Self {
+        store.attach(&self.pool);
         self.artifacts = Some(store);
         self
     }

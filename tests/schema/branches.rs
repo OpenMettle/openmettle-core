@@ -95,6 +95,7 @@ async fn revision(c: &mut PgConnection, f: &Fixture) -> String {
     )
     .await
     .unwrap();
+    crate::mark_storage_payload_published(tx.connection().unwrap(), &reservation.id).await;
     let id = storage::settle(
         &mut tx,
         &Settlement {

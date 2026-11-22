@@ -18,6 +18,7 @@ pub mod model_config;
 pub mod multipart;
 pub mod provider_http;
 pub mod provider_keys;
+pub mod quotas;
 pub mod runs;
 pub mod sessions;
 pub mod storage;
@@ -493,6 +494,19 @@ pub async fn run(role: Role) -> u8 {
     // The same holds for the browser sign-in settings: refused before telemetry is installed
     // or the listener opens, with the offline check's fixed category line (ADRs 0015, 0025).
     let pool = pool(&config);
+    if let Some(store) = &artifacts {
+        store.attach(&pool);
+        // Liveness is available during DB outages. Each operation rechecks the pin before use.
+        if let Ok(Err(artifact_fs::Error::Io | artifact_fs::Error::Missing)) = tokio::time::timeout(
+            config.database_timeout,
+            store.verify_startup(&pool, matches!(role, Role::Api)),
+        )
+        .await
+        {
+            eprintln!("configuration error: invalid ARTIFACTS_DIR");
+            return 78;
+        }
+    }
     let (app, issuance) = match app(&config, &pool, artifacts.clone()) {
         Ok(built) => built,
         Err(error) => {

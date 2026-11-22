@@ -30,8 +30,11 @@ impl fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 impl From<sqlx::Error> for Error {
-    fn from(_: sqlx::Error) -> Self {
-        Self::Database
+    fn from(error: sqlx::Error) -> Self {
+        match error.as_database_error().and_then(|e| e.code()).as_deref() {
+            Some("OMQ01") => Self::Refused,
+            _ => Self::Database,
+        }
     }
 }
 impl From<crate::runs::Error> for Error {
@@ -53,6 +56,16 @@ pub async fn hold(
     run: Option<&str>,
     units: i64,
 ) -> Result<(), Error> {
+    hold_with_cost(tx, r, run, units, None).await
+}
+/// Reserve a run with an independently denominated maximum cost in deployment micro-units.
+pub async fn hold_with_cost(
+    tx: &mut WriteTransaction<'_>,
+    r: &Reservation<'_>,
+    run: Option<&str>,
+    units: i64,
+    cost_ceiling: Option<i64>,
+) -> Result<(), Error> {
     sqlx::query("INSERT INTO openmettle.gateway_reservations (id,scope_id,actor_user_id,approval_id,run_id,units)
         VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6)")
         .bind(r.id)
@@ -63,6 +76,17 @@ pub async fn hold(
         .bind(units)
         .execute(tx.connection()?)
         .await?;
+    if let Some(run) = run {
+        let cost = crate::quotas::cost_ceiling(tx, r, cost_ceiling).await?;
+        for (resource, amount) in [("usage_cost_micros", cost), ("usage_tokens", Some(units))] {
+            if let Some(amount) = amount {
+                sqlx::query("SELECT openmettle.quota_reserve($1::uuid,$2::uuid,$3,$4,$5,$6::uuid,NULL,NULL,
+                    (SELECT coalesce(queue_expires_at,clock_timestamp())+interval '60 seconds' FROM openmettle.runs WHERE id=$6::uuid))")
+                    .bind(r.scope_id).bind(r.actor).bind(resource).bind(amount).bind(format!("run:{run}")).bind(run)
+                    .execute(tx.connection()?).await?;
+            }
+        }
+    }
     Ok(())
 }
 pub enum Authority<'a> {
@@ -92,6 +116,32 @@ pub struct Pending<'a> {
     call: Call<'a>,
 }
 pub async fn reserve<'a>(pool: &PgPool, call: Call<'a>) -> Result<Pending<'a>, Error> {
+    reserve_with_cost(pool, call, None).await
+}
+/// Reserve a dispatch with a qualified ceiling independent of its token envelope.
+pub async fn reserve_with_cost<'a>(
+    pool: &PgPool,
+    call: Call<'a>,
+    cost_ceiling: Option<i64>,
+) -> Result<Pending<'a>, Error> {
+    let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
+    crate::quotas::prepare_round(&mut tx, &call).await?;
+    let pending = reserve_in(&mut tx, call).await?;
+    crate::quotas::bind_request(
+        &mut tx,
+        &pending.call,
+        &pending.id,
+        &pending.secret,
+        cost_ceiling,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(pending)
+}
+async fn reserve_in<'a>(
+    tx: &mut WriteTransaction<'_>,
+    call: Call<'a>,
+) -> Result<Pending<'a>, Error> {
     if let Authority::Session { credential, .. } = call.authority {
         crate::sessions::well_formed(credential).map_err(|_| Error::Refused)?;
     }
@@ -99,14 +149,13 @@ pub async fn reserve<'a>(pool: &PgPool, call: Call<'a>) -> Result<Pending<'a>, E
     SystemRandom::new()
         .fill(&mut secret)
         .map_err(|_| Error::Protection)?;
-    let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
     let id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
         .fetch_one(tx.connection()?)
         .await?;
     let r = &call.reservation;
     let sql = match call.authority {
         Authority::Session { .. } => {
-            hold(&mut tx, r, None, call.units).await?;
+            hold(tx, r, None, call.units).await?;
             "INSERT INTO openmettle.gateway_requests (id,reservation_id,scope_id,actor_user_id,approval_id,installation,model,units,dispatch_hash,session_id)
              VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6::uuid,$7,$8,$9,$10)"
         }
@@ -130,7 +179,6 @@ pub async fn reserve<'a>(pool: &PgPool, call: Call<'a>) -> Result<Pending<'a>, E
     }
     .execute(tx.connection()?)
     .await?;
-    tx.commit().await?;
     Ok(Pending { id, secret, call })
 }
 /// Single-use credential for the pinned inference client. The caller cannot construct it.
@@ -144,15 +192,64 @@ pub struct Dispatch {
 impl Pending<'_> {
     pub async fn release(&self, pool: &PgPool) -> Result<bool, Error> {
         let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
+        let released = self.release_in(&mut tx).await?;
+        tx.commit().await?;
+        Ok(released)
+    }
+    async fn release_in(&self, tx: &mut WriteTransaction<'_>) -> Result<bool, Error> {
+        if let Authority::Lease { run, .. } = self.call.authority {
+            sqlx::query("SELECT FROM openmettle.runs WHERE id=$1::uuid FOR NO KEY UPDATE")
+                .bind(run)
+                .execute(tx.connection()?)
+                .await?;
+        }
         let released = sqlx::query_scalar("SELECT openmettle.gateway_release($1::uuid,$2)")
             .bind(&self.id)
             .bind(self.secret.as_slice())
             .fetch_one(tx.connection()?)
             .await?;
-        tx.commit().await?;
+        if released {
+            self.recover_in(tx).await?;
+        }
         Ok(released)
     }
     pub async fn handoff(&self, pool: &PgPool, keys: &GatewayKeys) -> Result<Dispatch, Error> {
+        let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
+        let dispatch = self.handoff_in(&mut tx, keys).await?;
+        sqlx::query("SELECT openmettle.quota_commit_handoff($1::uuid,$2::bytea)")
+            .bind(&self.id)
+            .bind(self.secret.as_slice())
+            .execute(tx.connection()?)
+            .await?;
+        if tx.commit().await.is_err() {
+            let mut recovery = WriteTransaction::begin_bounded_pool(pool, false).await?;
+            self.recover_in(&mut recovery).await?;
+            recovery.commit().await?;
+            return Err(Error::Database);
+        }
+        Ok(dispatch)
+    }
+    async fn recover_in(&self, tx: &mut WriteTransaction<'_>) -> Result<String, Error> {
+        let run = match self.call.authority {
+            Authority::Lease { run, .. } => Some(run),
+            _ => None,
+        };
+        Ok(sqlx::query_scalar(
+            "SELECT openmettle.quota_recover_lost_handoff($1::uuid,$2,$3::uuid,$4::uuid,$5::uuid)",
+        )
+        .bind(&self.id)
+        .bind(self.secret.as_slice())
+        .bind(self.call.reservation.scope_id)
+        .bind(self.call.reservation.actor)
+        .bind(run)
+        .fetch_one(tx.connection()?)
+        .await?)
+    }
+    async fn handoff_in(
+        &self,
+        tx: &mut WriteTransaction<'_>,
+        keys: &GatewayKeys,
+    ) -> Result<Dispatch, Error> {
         let (proof, audience, lease) = match self.call.authority {
             Authority::Session {
                 credential,
@@ -168,7 +265,6 @@ impl Pending<'_> {
             ),
             Authority::Lease { token, .. } => (None, None, Some(token)),
         };
-        let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
         let row =
             sqlx::query("SELECT * FROM openmettle.gateway_handoff($1::uuid,$2,$3,$4,$5::uuid)")
                 .bind(&self.id)
@@ -198,7 +294,6 @@ impl Pending<'_> {
             .open(&ctx, &envelope)
             .map_err(|_| Error::Protection)?
             .authorization();
-        tx.commit().await?;
         Ok(Dispatch {
             id: self.id.clone(),
             installation: self.call.installation.into(),

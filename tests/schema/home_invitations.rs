@@ -118,24 +118,11 @@ async fn upgrades_preserve_state_and_allow_exactly_one_redemption_signature_per_
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
     assert_eq!(MIGRATIONS[INVITATIONS].version, 13);
     let current = first_approval::everything(&db).await;
-    // Migration 18 adds only the inert users.lock_guard, false on every earlier row.
-    let without_guard = |rows: &BTreeSet<String>| -> BTreeSet<String> {
-        rows.iter()
-            .map(|row| {
-                let mut row: serde_json::Value = serde_json::from_str(row).unwrap();
-                let object = row.as_object_mut().unwrap();
-                if let Some(guard) = object.remove("lock_guard") {
-                    assert_eq!(guard, serde_json::json!(false));
-                }
-                row.to_string()
-            })
-            .collect()
-    };
     for (table, rows) in previous {
         if table != "_sqlx_migrations" {
             assert_eq!(
-                without_guard(&rows),
-                without_guard(&current[&table]),
+                crate::normalize_upgraded_rows(&table, 12, &rows),
+                crate::normalize_upgraded_rows(&table, 12, &current[&table]),
                 "{table}"
             );
         }

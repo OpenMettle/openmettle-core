@@ -1,6 +1,6 @@
 //! ADR 0031: migration 17 and the filesystem artifact engine over isolated PostgreSQL 18 and a
 //! per-test temporary directory. Every value is synthetic.
-use super::storage::{account, assert_totals, configure, new_uuid};
+use super::storage::{account, assert_totals, configure_limits as configure, new_uuid};
 use super::*;
 use crate::auth_config_support::Dir;
 use axum::body::{Bytes, HttpBody};
@@ -118,6 +118,7 @@ impl Fixture {
         let root = PathBuf::from(dir.path("artifacts"));
         fs::create_dir(&root).unwrap();
         let store = Store::open(&root).unwrap();
+        store.initialize_api(&api).await.unwrap();
         Self {
             db,
             c,
@@ -156,6 +157,7 @@ impl Fixture {
         let mut names: Vec<String> = fs::read_dir(self.root.join(sub))
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n != ".openmettle-volume-id")
             .collect();
         names.sort();
         names
@@ -195,6 +197,66 @@ impl Fixture {
     }
 }
 
+async fn insert_legacy_revision(
+    api: &mut PgConnection,
+    c: &Context,
+    doc: &str,
+) -> (String, String, Vec<u8>) {
+    let mut tx = api.begin().await.unwrap();
+    sqlx::query("INSERT INTO openmettle.storage_accounts(scope_id) VALUES($1::uuid)")
+        .bind(&c.scope)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let reserved:String=sqlx::query_scalar("INSERT INTO openmettle.storage_reservations
+        (scope_id,actor_user_id,idempotency_key,artifact_id,max_bytes,request_identity,request_digest)
+        VALUES($1::uuid,$2::uuid,'v16',$3::uuid,10,'legacy',sha256('legacy'::bytea)) RETURNING id::text")
+        .bind(&c.scope).bind(&c.actor).bind(doc).fetch_one(&mut *tx).await.unwrap();
+    sqlx::query("UPDATE openmettle.storage_accounts SET reserved_bytes=10 WHERE scope_id=$1::uuid")
+        .bind(&c.scope)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE openmettle.storage_instance SET reserved_bytes=10")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let digest = Sha256::digest(b"v16").to_vec();
+    sqlx::query(
+        "INSERT INTO openmettle.artifacts (id, scope_id, scope_kind, owner_user_id)
+         VALUES ($1::uuid, $2::uuid, 'personal', $3::uuid)",
+    )
+    .bind(doc)
+    .bind(&c.scope)
+    .bind(&c.actor)
+    .execute(&mut *api)
+    .await
+    .unwrap();
+    let old: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.artifact_revisions (scope_id, artifact_id, revision, reservation_id,
+             size_bytes, content_digest, media_type, created_by_user_id)
+         VALUES ($1::uuid, $2::uuid, 1, $3::uuid, 3, $4, 'text/plain', $5::uuid) RETURNING id::text",
+    )
+    .bind(&c.scope)
+    .bind(doc)
+    .bind(&reserved)
+    .bind(&digest)
+    .bind(&c.actor)
+    .fetch_one(&mut *api)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE openmettle.storage_reservations SET state = 'settled', settled_bytes = 3,
+             closed_at = now() WHERE id = $1::uuid",
+    )
+    .bind(&reserved)
+    .execute(&mut *api)
+    .await
+    .unwrap();
+    (old, reserved, digest)
+}
+
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn migration_17_adds_a_bounded_immutable_display_name() {
@@ -206,54 +268,7 @@ async fn migration_17_adds_a_bounded_immutable_display_name() {
     let doc = new_uuid(&db).await;
     // A version-16 revision, written with the version-4 column grants as a released binary does.
     let mut api = connect(&db.0, API).await;
-    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
-    let reserved = storage::reserve(
-        &mut tx,
-        &ReservationInput {
-            scope: &c.scope,
-            actor: &c.actor,
-            key: "v16",
-            artifact: &doc,
-            max_bytes: 10,
-            run: None,
-            operation: None,
-        },
-    )
-    .await
-    .unwrap();
-    tx.commit().await.unwrap();
-    let digest = Sha256::digest(b"v16").to_vec();
-    sqlx::query(
-        "INSERT INTO openmettle.artifacts (id, scope_id, scope_kind, owner_user_id)
-         VALUES ($1::uuid, $2::uuid, 'personal', $3::uuid)",
-    )
-    .bind(&doc)
-    .bind(&c.scope)
-    .bind(&c.actor)
-    .execute(&mut api)
-    .await
-    .unwrap();
-    let old: String = sqlx::query_scalar(
-        "INSERT INTO openmettle.artifact_revisions (scope_id, artifact_id, revision, reservation_id,
-             size_bytes, content_digest, media_type, created_by_user_id)
-         VALUES ($1::uuid, $2::uuid, 1, $3::uuid, 3, $4, 'text/plain', $5::uuid) RETURNING id::text",
-    )
-    .bind(&c.scope)
-    .bind(&doc)
-    .bind(&reserved.id)
-    .bind(&digest)
-    .bind(&c.actor)
-    .fetch_one(&mut api)
-    .await
-    .unwrap();
-    sqlx::query(
-        "UPDATE openmettle.storage_reservations SET state = 'settled', settled_bytes = 3,
-             closed_at = now() WHERE id = $1::uuid",
-    )
-    .bind(&reserved.id)
-    .execute(&mut api)
-    .await
-    .unwrap();
+    let (old, reserved, digest) = insert_legacy_revision(&mut api, &c, &doc).await;
     // The display-name column does not exist yet.
     assert_eq!(
         sqlstate(
@@ -284,7 +299,7 @@ async fn migration_17_adds_a_bounded_immutable_display_name() {
             &mut tx,
             &Settlement {
                 scope: &c.scope,
-                reservation: &reserved.id,
+                reservation: &reserved,
                 size_bytes: 3,
                 content_digest: &digest,
                 media_type: "text/plain",
@@ -661,6 +676,12 @@ async fn concurrent_and_crashed_uploads_are_reconciled_without_uncharged_files()
     // A crash after the rename but before settle leaves a revision file under a reservation.
     let renamed = f.reserve("renamed", &doc, 100).await;
     fs::write(f.root.join("revisions").join(&renamed), b"unsettled").unwrap();
+    use std::os::unix::fs::MetadataExt;
+    for (id, dir) in [(&held, "staging"), (&renamed, "revisions")] {
+        let ino = fs::metadata(f.root.join(dir).join(id)).unwrap().ino();
+        sqlx::query("UPDATE openmettle.storage_reservations SET stage_claimed=true,payload_ino=$2::text::numeric WHERE id=$1::uuid")
+            .bind(id).bind(ino.to_string()).execute(&mut f.db.admin().await).await.unwrap();
+    }
     // A recent reservation is not touched.
     let recent = |older_than| artifact_fs::reconcile_expired(&f.api, &f.store, older_than, 10);
     assert_eq!(recent(Duration::from_secs(3600)).await.unwrap(), 0);
@@ -669,25 +690,33 @@ async fn concurrent_and_crashed_uploads_are_reconciled_without_uncharged_files()
         artifact_fs::reconcile_expired(&f.api, &f.store, Duration::ZERO, 0).await,
         Err(artifact_fs::Error::Storage(Error::Invalid))
     ));
+    f.db.admin()
+        .await
+        .execute(
+            "UPDATE openmettle.storage_reservations SET created_at=now()-interval '901 seconds',
+        lease_expires_at=now()-interval '1 second' WHERE state='reserved'",
+        )
+        .await
+        .unwrap();
     // Bounded batches, oldest first.
     assert_eq!(recent(Duration::ZERO).await.unwrap(), 2);
     assert_eq!(f.state("held").await.as_deref(), Some("released"));
     assert_eq!(f.state("renamed").await.as_deref(), Some("released"));
     assert!(f.files("staging").is_empty() && f.files("revisions").is_empty());
     assert_eq!(recent(Duration::ZERO).await.unwrap(), 0);
-    // A retry of a crashed upload whose reservation is still reserved replaces the leftover.
+    // A foreign revision is never overwritten, even if the caller retries with the same key.
     let retried = f.reserve("retried", &doc, 100).await;
     fs::write(f.root.join("revisions").join(&retried), b"stale").unwrap();
-    let stored = f
-        .upload("retried", &doc, 100, "x", chunked(&body, 8), true)
-        .await
-        .unwrap();
-    assert_eq!(stored.reservation, retried);
+    assert!(
+        f.upload("retried", &doc, 100, "x", chunked(&body, 8), true)
+            .await
+            .is_err()
+    );
     assert_eq!(
         fs::read(f.root.join("revisions").join(&retried)).unwrap(),
-        b"payload"
+        b"stale"
     );
-    assert_eq!(account(&f.db, &f.c.scope).await, (7, 0, 0));
+    assert_eq!(account(&f.db, &f.c.scope).await, (0, 0, 100));
     assert_totals(&f.db).await;
 }
 
@@ -701,6 +730,14 @@ async fn expired_reservations_skip_locks_and_continue_after_an_unlink_error() {
     f.reserve("healthy", &doc, 100).await;
     let bad_path = f.root.join("staging").join(&broken);
     fs::create_dir(&bad_path).unwrap();
+    f.db.admin()
+        .await
+        .execute(
+            "UPDATE openmettle.storage_reservations SET created_at=now()-interval '901 seconds',
+        lease_expires_at=now()-interval '1 second' WHERE state='reserved'",
+        )
+        .await
+        .unwrap();
 
     let mut conn = f.db.admin().await;
     let mut lock = WriteTransaction::begin(&mut conn).await.unwrap();
@@ -717,7 +754,17 @@ async fn expired_reservations_skip_locks_and_continue_after_an_unlink_error() {
     assert_eq!(f.state("healthy").await.as_deref(), Some("released"));
     assert_eq!(f.state("broken").await.as_deref(), Some("reserved"));
     fs::remove_dir(bad_path).unwrap();
-    assert_eq!(sweep().await.unwrap(), 1);
+    // An unexpected non-regular leaf requires owner verification even after the path disappears.
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT adoption_unverified FROM openmettle.storage_reservations WHERE id=$1::uuid"
+        )
+        .bind(broken)
+        .fetch_one(&mut f.db.admin().await)
+        .await
+        .unwrap()
+    );
+    assert_eq!(sweep().await.unwrap(), 0);
     assert_eq!(f.state("locked").await.as_deref(), Some("reserved"));
     lock.rollback().await.unwrap();
     assert_eq!(sweep().await.unwrap(), 1);
@@ -859,7 +906,9 @@ async fn worker_purges_unlocked_revisions_and_sweeps_runs_while_a_revision_stays
 
     let mut process = sweep_process(&f, true);
     tokio::time::timeout(Duration::from_secs(10), async {
-        while account(&f.db, &f.c.scope).await != (0, 7, 0) {
+        while account(&f.db, &f.c.scope).await != (0, 7, 0)
+            || f.files("revisions") != [revisions[0].reservation.as_str()]
+        {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
@@ -901,14 +950,21 @@ async fn worker_purges_unlocked_revisions_and_sweeps_runs_while_a_revision_stays
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn worker_binary_sweeps_with_and_without_payloads_and_recovers_after_signals() {
-    use std::os::unix::process::ExitStatusExt;
+    use std::os::unix::{fs::MetadataExt, process::ExitStatusExt};
     let f = Fixture::new().await;
     let doc = new_uuid(&f.db).await;
     let old = f.reserve("abandoned", &doc, 100).await;
     let staged = f.root.join("staging").join(&old);
     fs::write(&staged, b"partial").unwrap();
-    sqlx::query("UPDATE openmettle.storage_reservations SET created_at = now() - interval '901 seconds' WHERE id = $1::uuid")
-        .bind(&old).execute(&mut f.db.admin().await).await.unwrap();
+    sqlx::query(
+        "UPDATE openmettle.storage_reservations SET created_at = now() - interval '901 seconds',lease_expires_at=now()-interval '1 second',
+        stage_claimed=true,payload_ino=$2::text::numeric WHERE id = $1::uuid",
+    )
+    .bind(&old)
+    .bind(fs::metadata(&staged).unwrap().ino().to_string())
+    .execute(&mut f.db.admin().await)
+    .await
+    .unwrap();
     let body = form("x", &[METADATA, file(None, b"retained")], true);
     let stored = f
         .upload("retained", &doc, 100, "x", chunked(&body, 16), true)
@@ -972,4 +1028,598 @@ async fn worker_binary_sweeps_with_and_without_payloads_and_recovers_after_signa
     assert!(replacement.0.wait().unwrap().success());
     assert_eq!(f.state("abandoned").await.as_deref(), Some("released"));
     assert_totals(&f.db).await;
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn adoption_detects_cross_reservation_alias_and_preserves_its_owner() {
+    use artifact_fs::adoption::{Options, adopt};
+    let f = Fixture::new().await;
+    let doc = new_uuid(&f.db).await;
+    let body = form("x", &[METADATA, file(None, b"original")], true);
+    let stored = f
+        .upload("B", &doc, 100, "x", chunked(&body, 8), true)
+        .await
+        .unwrap();
+    let other = f.reserve("A", &doc, 100).await;
+    let published = f.root.join("revisions").join(&stored.reservation);
+    let staged = f.root.join("staging").join(&other);
+    fs::hard_link(&published, &staged).unwrap();
+    let opts = Options {
+        root: &f.root,
+        replace: None,
+        expected_fs: None,
+        expected_directory: None,
+        confirm_absent: false,
+    };
+    let mut owner = connect(&f.db.0, OWNER).await;
+    for _ in 0..2 {
+        assert_eq!(
+            adopt(&mut owner, &opts).await.unwrap_err().0,
+            "cross_reservation_inode_alias"
+        );
+        let state:(bool,bool)=sqlx::query_as("SELECT adoption_unverified,payload_ino IS NULL FROM openmettle.storage_reservations WHERE id=$1::uuid")
+            .bind(&other).fetch_one(&mut owner).await.unwrap();
+        assert_eq!(state, (true, true));
+        assert_eq!(fs::read(&published).unwrap(), b"original");
+    }
+    fs::remove_file(&staged).unwrap();
+    fs::write(&staged, b"replacement").unwrap();
+    adopt(&mut owner, &opts).await.unwrap();
+    let state:(bool,bool)=sqlx::query_as("SELECT adoption_unverified,payload_ino IS NOT NULL FROM openmettle.storage_reservations WHERE id=$1::uuid")
+        .bind(&other).fetch_one(&mut owner).await.unwrap();
+    assert_eq!(state, (false, true));
+    let report = artifact_fs::verify_accounting_drift(&pool(&f.db, WORKER).await, Some(&f.store))
+        .await
+        .unwrap();
+    assert!(report.healthy(), "{report:?}");
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn generic_expiry_leaves_operation_bound_tool_spills_charged() {
+    let f = Fixture::new().await;
+    let run = f.c.run(&f.db, "cleanup-ownership").await;
+    let mut owner = connect(&f.db.0, OWNER).await;
+    let op: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.operations(scope_id,run_id,logical_key,target,capability,format,
+             format_version,request,request_identity,request_digest,outcome,revision,
+             observation_format,observation_version,evidence)
+         VALUES ($1::uuid,$2::uuid,'spill-fixture','fixture','lookup','v1',1,'q','i',
+             sha256('i'),'succeeded',1,'v1',1,'done') RETURNING id::text",
+    )
+    .bind(&f.c.scope)
+    .bind(&run)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    let doc = new_uuid(&f.db).await;
+    let mut api = connect(&f.db.0, API).await;
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    let mut input = ReservationInput {
+        scope: &f.c.scope,
+        actor: &f.c.actor,
+        key: "tool-spill:fixture",
+        artifact: &doc,
+        max_bytes: 100,
+        run: Some(&run),
+        operation: Some(&op),
+    };
+    let spill = storage::reserve(&mut tx, &input).await.unwrap();
+    input.key = "ordinary-operation";
+    storage::reserve(&mut tx, &input).await.unwrap();
+    tx.commit().await.unwrap();
+    let unbind = sqlx::query(
+        "UPDATE openmettle.storage_reservations SET operation_id=NULL WHERE id=$1::uuid",
+    )
+    .bind(&spill.id)
+    .execute(&mut owner)
+    .await;
+    assert_eq!(sqlstate(unbind), "23514");
+    sqlx::query("UPDATE openmettle.runs SET state='succeeded' WHERE id=$1::uuid")
+        .bind(&run)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE openmettle.storage_reservations SET created_at=now()-interval '2 hours',
+        lease_expires_at=now()-interval '1 hour' WHERE run_id=$1::uuid",
+    )
+    .bind(&run)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    let path = f.root.join("staging").join(&spill.id);
+    fs::write(&path, b"reserved spill bytes").unwrap();
+    let worker = pool(&f.db, WORKER).await;
+    assert_eq!(
+        artifact_fs::reconcile_expired(&worker, &f.store, Duration::ZERO, 10)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        f.state("ordinary-operation").await.as_deref(),
+        Some("released")
+    );
+    assert_eq!(
+        f.state("tool-spill:fixture").await.as_deref(),
+        Some("reserved")
+    );
+    assert_eq!(fs::read(path).unwrap(), b"reserved spill bytes");
+    assert_totals(&f.db).await;
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn expired_unbound_empty_staging_requires_exclusive_lock_before_inode_binding() {
+    use std::os::unix::fs::MetadataExt;
+    let f = Fixture::new().await;
+    let doc = new_uuid(&f.db).await;
+    let id = f.reserve("before-bind", &doc, 100).await;
+    let path = f.root.join("staging").join(&id);
+    let file = fs::File::create_new(&path).unwrap();
+    file.try_lock_shared().unwrap();
+    let ino = file.metadata().unwrap().ino();
+    let mut owner = connect(&f.db.0, OWNER).await;
+    sqlx::query("UPDATE openmettle.storage_reservations SET stage_claimed=true,created_at=now()-interval '901 seconds',
+        lease_expires_at=now()-interval '1 second' WHERE id=$1::uuid").bind(&id).execute(&mut owner).await.unwrap();
+    let w = pool(&f.db, WORKER).await;
+    let sweep = || artifact_fs::reconcile_expired(&w, &f.store, Duration::from_secs(900), 10);
+    assert!(matches!(sweep().await, Err(artifact_fs::Error::InProgress)));
+    assert_eq!(fs::metadata(&path).unwrap().ino(), ino);
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT payload_ino IS NULL FROM openmettle.storage_reservations WHERE id=$1::uuid"
+        )
+        .bind(&id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap()
+    );
+    drop(file);
+    sqlx::query("UPDATE openmettle.storage_reservations SET reclaim_lease_until=clock_timestamp() WHERE id=$1::uuid")
+        .bind(&id).execute(&mut owner).await.unwrap();
+    assert_eq!(sweep().await.unwrap(), 1);
+    let state:(String,String,String)=sqlx::query_as("SELECT state,reclaim_state,payload_ino::text FROM openmettle.storage_reservations WHERE id=$1::uuid")
+        .bind(&id).fetch_one(&mut owner).await.unwrap();
+    assert_eq!(state, ("released".into(), "none".into(), ino.to_string()));
+    assert!(f.files("staging").is_empty());
+    assert_totals(&f.db).await;
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn adoption_clears_detached_pending_anchors_even_after_inode_reuse() {
+    use artifact_fs::adoption::{Options, adopt};
+    use std::os::unix::fs::MetadataExt;
+
+    let f = Fixture::new().await;
+    let doc = new_uuid(&f.db).await;
+    let body = form("x", &[METADATA, file(None, b"surviving revision")], true);
+    let upload = |key| f.upload(key, &doc, 100, "x", chunked(&body, 8), true);
+    let current = upload("current").await.unwrap();
+    let old = upload("purged").await.unwrap();
+    let released = f.reserve("released", &doc, 100).await;
+    let mut api = connect(&f.db.0, API).await;
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    storage::release(&mut tx, &f.c.scope, &released)
+        .await
+        .unwrap();
+    storage::retain_revision(&mut tx, &f.c.scope, &old.revision, 1)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let worker = pool(&f.db, WORKER).await;
+    assert_eq!(
+        artifact_fs::purge_due(&worker, &f.store, 8).await.unwrap(),
+        1
+    );
+    let live = f.root.join("revisions").join(&current.reservation);
+    let ino = fs::metadata(&live).unwrap().ino().to_string();
+
+    // Reproduce the crash after the last unlink, then reuse that historical inode.
+    let mut owner = connect(&f.db.0, OWNER).await;
+    sqlx::query("UPDATE openmettle.storage_reservations SET stage_claimed=true,payload_ino=$3::text::numeric,
+        reclaim_state=CASE WHEN id=$1::uuid THEN 'anchor_pending_unlink' ELSE reclaim_state END
+        WHERE id IN ($1::uuid,$2::uuid)").bind(&released).bind(&old.reservation).bind(&ino).execute(&mut owner).await.unwrap();
+    sqlx::query("UPDATE openmettle.artifact_revisions SET purge_stage='anchor_pending_unlink' WHERE id=$1::uuid")
+        .bind(&old.revision).execute(&mut owner).await.unwrap();
+    adopt(
+        &mut owner,
+        &Options {
+            root: &f.root,
+            replace: None,
+            expected_fs: None,
+            expected_directory: None,
+            confirm_absent: false,
+        },
+    )
+    .await
+    .unwrap();
+    let stages: (String, String) = sqlx::query_as(
+        "SELECT reclaim_state,purge_stage FROM openmettle.storage_reservations s
+        CROSS JOIN openmettle.artifact_revisions r WHERE s.id=$1::uuid AND r.id=$2::uuid",
+    )
+    .bind(&released)
+    .bind(&old.revision)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(stages, ("none".into(), "none".into()));
+    assert_eq!(fs::read(live).unwrap(), b"surviving revision");
+    assert_totals(&f.db).await;
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn reclaim_recovers_each_durable_anchor_boundary_without_truncating_replacement_names() {
+    use std::os::unix::fs::MetadataExt;
+    let f = Fixture::new().await;
+    let doc = new_uuid(&f.db).await;
+    let mut owner = connect(&f.db.0, OWNER).await;
+    let worker = pool(&f.db, WORKER).await;
+    for (step, staged, published) in [
+        ("claiming", true, true),
+        ("claiming", false, true),
+        ("claiming", false, false),
+        ("truncated", false, false),
+    ] {
+        let key = format!("{step}-{staged}-{published}");
+        let id = f.reserve(&key, &doc, 10).await;
+        let anchor = f.root.join("staging").join(format!(".reclaim.{id}"));
+        let visible = f.root.join("staging").join(&id);
+        let revision = f.root.join("revisions").join(&id);
+        let file = fs::File::create_new(&anchor).unwrap();
+        let ino = file.metadata().unwrap().ino().to_string();
+        if staged {
+            fs::hard_link(&anchor, &visible).unwrap();
+        }
+        if published {
+            fs::hard_link(&anchor, &revision).unwrap();
+        }
+        if step == "truncated" {
+            fs::write(&visible, b"foreign").unwrap();
+        }
+        sqlx::query("UPDATE openmettle.storage_reservations SET stage_claimed=true,payload_ino=$2::text::numeric,
+            reclaim_state=$3,reclaim_claim_token=gen_random_uuid(),reclaim_lease_until=clock_timestamp(),
+            created_at=clock_timestamp()-interval '2 hours',lease_expires_at=clock_timestamp()-interval '1 hour'
+            WHERE id=$1::uuid").bind(&id).bind(ino).bind(step).execute(&mut owner).await.unwrap();
+        assert_eq!(
+            artifact_fs::reconcile_expired(&worker, &f.store, Duration::from_secs(900), 10)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!anchor.exists() && !revision.exists());
+        if step == "truncated" {
+            assert_eq!(fs::read(&visible).unwrap(), b"foreign");
+        } else {
+            assert!(!visible.exists());
+        }
+        assert_eq!(f.state(&key).await.as_deref(), Some("released"));
+        assert_totals(&f.db).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn admin_cli_adopts_populated_upgrade_only_after_verifying_the_original_payload() {
+    use std::os::unix::fs::MetadataExt;
+    let db = TestDb::new().await;
+    let settings = db.settings(Duration::from_secs(10));
+    migrate::apply(&settings, &MIGRATIONS[..23]).await.unwrap();
+    configure(&db, Some(1000), Some(1000), Some(1000)).await;
+    let c = Context::new(&db).await;
+    let doc = new_uuid(&db).await;
+    let mut api = connect(&db.0, API).await;
+    let (_, reserved, _) = insert_legacy_revision(&mut api, &c, &doc).await;
+    let mut owner = connect(&db.0, OWNER).await;
+    for sql in [
+        "UPDATE openmettle.storage_accounts SET active_bytes=3,reserved_bytes=0",
+        "UPDATE openmettle.storage_instance SET active_bytes=3,reserved_bytes=0",
+    ] {
+        owner.execute(sql).await.unwrap();
+    }
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+    // An operator must be able to diagnose a pinned ledger missing its inode bindings.
+    let mut pin = owner.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE openmettle.storage_volume_control SET volume_id=gen_random_uuid() WHERE id",
+    )
+    .execute(&mut *pin)
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT storage_mismatches FROM openmettle.quota_verify_accounting_drift()"
+        )
+        .fetch_one(&mut *pin)
+        .await
+        .unwrap(),
+        1
+    );
+    pin.rollback().await.unwrap();
+    let dir = Dir::new();
+    let root = dir.path("original");
+    let root = std::path::Path::new(&root);
+    fs::create_dir_all(root.join("revisions")).unwrap();
+    fs::create_dir(root.join("staging")).unwrap();
+    let payload = root.join("revisions").join(&reserved);
+    fs::write(&payload, b"bad").unwrap();
+    let admin = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_openmettle-admin"))
+            .env("OPENMETTLE_ADMIN_DATABASE_URL", db.url(OWNER))
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let path = root.to_str().unwrap();
+    let failed = admin(&["storage", "adopt", path]);
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("size_or_digest_mismatch"));
+    assert!(!root.join(".openmettle-volume-id").exists());
+    let untouched:bool = sqlx::query_scalar("SELECT volume_id IS NULL AND adoption_run_id IS NULL
+        AND NOT bootstrap_auto_pin_allowed AND NOT EXISTS (SELECT FROM openmettle.storage_reservations WHERE payload_ino IS NOT NULL)
+        FROM openmettle.storage_volume_control").fetch_one(&mut owner).await.unwrap();
+    assert!(untouched);
+    fs::write(&payload, b"v16").unwrap();
+    for args in [
+        vec!["storage", "adopt", path],
+        vec!["quota", "drain-orphans"],
+        vec!["quota", "activate"],
+        vec!["quota", "verify", path],
+    ] {
+        let result = admin(&args);
+        assert!(
+            result.status.success(),
+            "command {args:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let ino: String = sqlx::query_scalar(
+        "SELECT payload_ino::text FROM openmettle.storage_reservations WHERE id=$1::uuid",
+    )
+    .bind(&reserved)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(ino, fs::metadata(payload).unwrap().ino().to_string());
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn initial_adoption_blocks_new_storage_reservations_before_a_volume_is_pinned() {
+    let db = TestDb::migrated().await;
+    configure(&db, Some(1000), Some(1000), Some(1000)).await;
+    let c = Context::new(&db).await;
+    let mut owner = connect(&db.0, OWNER).await;
+    let doc = new_uuid(&db).await;
+    let mut api = connect(&db.0, API).await;
+    let input = ReservationInput {
+        scope: &c.scope,
+        actor: &c.actor,
+        key: "fenced",
+        artifact: &doc,
+        max_bytes: 15,
+        run: None,
+        operation: None,
+    };
+    owner
+        .execute("UPDATE openmettle.storage_volume_control SET adoption_run_id=gen_random_uuid()")
+        .await
+        .unwrap();
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    let err = storage::reserve(&mut tx, &input).await.unwrap_err();
+    assert!(
+        matches!(err, Error::Database(sqlx::Error::Database(e)) if e.code().as_deref()==Some("OMQ03"))
+    );
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM openmettle.storage_reservations")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap(),
+        0
+    );
+    owner
+        .execute("UPDATE openmettle.storage_volume_control SET adoption_run_id=NULL")
+        .await
+        .unwrap();
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    storage::reserve(&mut tx, &input).await.unwrap();
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn purge_advances_past_a_busy_payload_and_refuses_a_foreign_revision_alias() {
+    use std::os::unix::fs::MetadataExt;
+    let f = Fixture::new().await;
+    let worker = pool(&f.db, WORKER).await;
+    let mut api = connect(&f.db.0, API).await;
+    let mut owner = connect(&f.db.0, OWNER).await;
+    let body = form("x", &[METADATA, file(None, b"payload")], true);
+    let mut paths = Vec::new();
+    for (index, key) in ["busy", "due"].into_iter().enumerate() {
+        let doc = new_uuid(&f.db).await;
+        let stored = f
+            .upload(key, &doc, 100, "x", chunked(&body, 16), true)
+            .await
+            .unwrap();
+        let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+        storage::retain_revision(&mut tx, &f.c.scope, &stored.revision, 1)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        sqlx::query(
+            "UPDATE openmettle.artifact_revisions SET retained_at=now()-interval '1 day',
+            purge_after=now()-interval '1 hour'+$2*interval '1 minute' WHERE id=$1::uuid",
+        )
+        .bind(&stored.revision)
+        .bind(index as f64)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+        paths.push(f.root.join("revisions").join(stored.reservation));
+    }
+    let busy = fs::File::open(&paths[0]).unwrap();
+    busy.try_lock_shared().unwrap();
+    assert!(matches!(
+        artifact_fs::purge_due(&worker, &f.store, 1).await,
+        Err(artifact_fs::Error::InProgress)
+    ));
+    assert_eq!(
+        artifact_fs::purge_due(&worker, &f.store, 1).await.unwrap(),
+        1
+    );
+    assert!(!paths[1].exists());
+    let ino = busy.metadata().unwrap().ino();
+    drop(busy);
+    let id = paths[0].file_name().unwrap().to_str().unwrap();
+    let anchor = paths[0].with_file_name(format!(".purge.{id}"));
+    fs::rename(&paths[0], &anchor).unwrap();
+    fs::write(&paths[0], b"foreign").unwrap();
+    assert_ne!(fs::metadata(&paths[0]).unwrap().ino(), ino);
+    assert!(artifact_fs::purge_due(&worker, &f.store, 1).await.is_err());
+    assert_eq!(fs::read(&paths[0]).unwrap(), b"foreign");
+    assert_eq!(fs::read(anchor).unwrap(), b"payload");
+    assert_eq!(account(&f.db, &f.c.scope).await, (0, 7, 0));
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn drift_counts_an_unbound_revision_and_a_nonregular_orphan() {
+    let f = Fixture::new().await;
+    let doc = new_uuid(&f.db).await;
+    let id = f.reserve("unbound", &doc, 10).await;
+    fs::write(f.root.join("revisions").join(id), b"x").unwrap();
+    let orphan = new_uuid(&f.db).await;
+    std::os::unix::fs::symlink("missing", f.root.join("staging").join(orphan)).unwrap();
+    let report = artifact_fs::verify_accounting_drift(&pool(&f.db, WORKER).await, Some(&f.store))
+        .await
+        .unwrap();
+    assert_eq!(report.files, 2);
+    assert_eq!(report.unsettled_payloads, 0);
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn reclaim_rechecks_a_publication_alias_created_after_its_initial_probe() {
+    use std::os::unix::fs::MetadataExt;
+    let f = Fixture::new().await;
+    let doc = new_uuid(&f.db).await;
+    let id = f.reserve("publishing", &doc, 10).await;
+    let staged = f.root.join("staging").join(&id);
+    let revision = f.root.join("revisions").join(&id);
+    fs::write(&staged, b"payload").unwrap();
+    let mut owner = connect(&f.db.0, OWNER).await;
+    sqlx::query("UPDATE openmettle.storage_reservations SET stage_claimed=true,payload_ino=$2::text::numeric,
+        created_at=now()-interval '2 hours',lease_expires_at=now()-interval '1 hour' WHERE id=$1::uuid")
+        .bind(&id).bind(fs::metadata(&staged).unwrap().ino().to_string()).execute(&mut owner).await.unwrap();
+    // Stop the cleaner at renewal, after it selected the staging name but before it can truncate.
+    owner
+        .execute(
+            "CREATE FUNCTION openmettle.test_pause_renew() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN PERFORM pg_advisory_xact_lock(47121); RETURN NEW; END $$;
+        CREATE TRIGGER pause_renew BEFORE UPDATE ON openmettle.storage_reservations
+        FOR EACH ROW WHEN (OLD.reclaim_state='claiming' AND NEW.reclaim_state='claiming')
+        EXECUTE FUNCTION openmettle.test_pause_renew()",
+        )
+        .await
+        .unwrap();
+    let mut barrier = owner.begin().await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid() FROM pg_advisory_xact_lock(47121)")
+        .fetch_one(&mut *barrier)
+        .await
+        .unwrap();
+    let worker = pool(&f.db, WORKER).await;
+    let sweep = artifact_fs::reconcile_expired(&worker, &f.store, Duration::ZERO, 10);
+    let publish = async {
+        wait_for_blocked_peer(&f.db, pid).await;
+        fs::hard_link(&staged, &revision).unwrap();
+        barrier.commit().await.unwrap();
+    };
+    let (result, ()) = tokio::join!(sweep, publish);
+    assert_eq!(result.unwrap(), 1);
+    assert!(!revision.exists() && !staged.exists());
+    assert_eq!(f.state("publishing").await.as_deref(), Some("released"));
+    assert_totals(&f.db).await;
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn staging_sweep_drains_aged_orphans_and_skips_a_locked_reservation() {
+    use std::time::SystemTime;
+    let f = Fixture::new().await;
+    let dir = f.root.join("staging");
+    let doc = new_uuid(&f.db).await;
+    let id = f.reserve("locked-stage", &doc, 10).await;
+    let aged = SystemTime::now() - Duration::from_secs(1800);
+    for name in [&id[..], "orphan-a", "orphan-b"] {
+        let file = fs::File::create_new(dir.join(name)).unwrap();
+        file.set_modified(aged).unwrap();
+    }
+    std::os::unix::fs::symlink("missing", dir.join("malformed")).unwrap();
+    let mut owner = connect(&f.db.0, OWNER).await;
+    let mut lock = owner.begin().await.unwrap();
+    sqlx::query("SELECT FROM openmettle.storage_reservations WHERE id=$1::uuid FOR UPDATE")
+        .bind(&id)
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let worker = pool(&f.db, WORKER).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        artifact_fs::reconcile_expired(&worker, &f.store, Duration::from_secs(900), 50),
+    )
+    .await
+    .expect("sweep blocked on an active writer");
+    assert!(result.is_err(), "the nonregular entry must be reported");
+    assert!(!dir.join("orphan-a").exists() && !dir.join("orphan-b").exists());
+    assert!(dir.join(id).is_file());
+    lock.rollback().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn locked_adoption_discards_a_transient_pre_scan_digest_mismatch() {
+    use artifact_fs::adoption::{Options, adopt};
+    let f = Fixture::new().await;
+    let doc = new_uuid(&f.db).await;
+    let body = form("x", &[METADATA, file(None, b"original")], true);
+    let stored = f
+        .upload("repair", &doc, 100, "x", chunked(&body, 16), true)
+        .await
+        .unwrap();
+    let path = f.root.join("revisions").join(&stored.reservation);
+    fs::write(&path, b"incomplete").unwrap();
+    let mut owner = connect(&f.db.0, OWNER).await;
+    let mut fixture = f.db.admin().await;
+    let mut barrier = fixture.begin().await.unwrap();
+    let pid: i32 = sqlx::query_scalar(
+        "SELECT pg_backend_pid() FROM openmettle.artifact_revisions
+        WHERE id=$1::uuid FOR UPDATE",
+    )
+    .bind(&stored.revision)
+    .fetch_one(&mut *barrier)
+    .await
+    .unwrap();
+    let opts = Options {
+        root: &f.root,
+        replace: None,
+        expected_fs: None,
+        expected_directory: None,
+        confirm_absent: false,
+    };
+    let repair = async {
+        wait_for_blocked_peer(&f.db, pid).await;
+        // Preserve the pinned inode and restore its contents between the two inventories.
+        fs::write(&path, b"original").unwrap();
+        barrier.commit().await.unwrap();
+    };
+    let (result, ()) = tokio::join!(adopt(&mut owner, &opts), repair);
+    result.unwrap();
+    assert_eq!(fs::read(path).unwrap(), b"original");
 }

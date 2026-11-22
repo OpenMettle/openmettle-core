@@ -61,6 +61,11 @@ pub const FIELDS: &[&str] = &[
     "dropped_lines",
     "dropped_spans",
     "dropped_metric_exports",
+    "target_kind",
+    "scope_kind",
+    "resource_kind",
+    "threshold_pct",
+    "dedupe_bucket",
 ];
 
 /// The only field names [`SpanGuard`] admits: the request span's. `otel.kind` is consumed by
@@ -613,6 +618,28 @@ pub fn process_stopping(role: Process, signal: Signal) {
         role = role.as_str(),
         signal = signal.as_str(),
     );
+}
+
+/// The database supplies the durable crossing. Validate the bounded dimensions again before logging.
+pub(crate) fn quota_warning(
+    target: &str,
+    scope: &str,
+    resource: &str,
+    threshold: i16,
+    bucket: i64,
+) {
+    if !matches!(
+        (target, scope),
+        ("scope", "personal" | "project") | ("instance", "instance")
+    ) || !matches!(
+        resource,
+        "storage_bytes" | "usage_tokens" | "usage_cost_micros" | "device_reservations"
+    ) || !(1..=100).contains(&threshold)
+    {
+        return;
+    }
+    tracing::warn!(target: TARGET, event = "quota.warning", target_kind=target, scope_kind=scope,
+        resource_kind=resource, threshold_pct=threshold, dedupe_bucket=bucket);
 }
 
 /// Draining finished within the shutdown deadline.

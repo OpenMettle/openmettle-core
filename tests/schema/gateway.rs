@@ -384,6 +384,15 @@ async fn populated_upgrade_races_intents_and_fences_generations() {
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn handoff_rechecks_authority_and_only_a_released_run_round_can_retry() {
     let db = TestDb::migrated().await;
+    db.admin()
+        .await
+        .execute(
+            "INSERT INTO openmettle.quota_defaults(scope_kind,resource_kind,hard_limit)
+        VALUES('personal','usage_tokens',1000000),('project','usage_tokens',1000000)",
+        )
+        .await
+        .unwrap();
+
     let mut c = connect(&db.0, OWNER).await;
     authz_store::providers(&mut c).await;
     let actor =
@@ -674,17 +683,11 @@ async fn handoff_rechecks_authority_and_only_a_released_run_round_can_retry() {
         .await
         .unwrap()
     );
-    let p = gateway::reserve(&worker, round(1, LEASE)).await.unwrap();
-    assert!(matches!(
-        p.handoff(&worker, &ring).await,
-        Err(gateway::Error::Refused)
-    ));
-    assert!(p.release(&worker).await.unwrap());
-    let released = p.id;
+    assert!(gateway::reserve(&worker, round(1, LEASE)).await.is_err());
     let p = gateway::reserve(&worker, round(1, &claim.claim_token))
         .await
         .unwrap();
-    assert_ne!(p.id, released);
+    assert_ne!(p.id, first);
     assert_eq!(
         sqlstate(insert_round(&scope).execute(&worker).await),
         "23505"
@@ -711,6 +714,149 @@ async fn handoff_rechecks_authority_and_only_a_released_run_round_can_retry() {
     );
     check_settlement_finality(&g, &p.id, &pending.id).await;
 
+    // A metered but unsent request at the front of the index cannot hide an older-writer orphan.
+    let bound_reservation = uuid(&mut c).await;
+    let bound = gateway::reserve(
+        &api,
+        caller(&actor, &credential, &scope, &bound_reservation),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE openmettle.gateway_requests SET created_at='2000-01-01' WHERE id=$1::uuid")
+        .bind(&bound.id)
+        .execute(&mut c)
+        .await
+        .unwrap();
+    let legacy = uuid(&mut c).await;
+    let mut tx = WriteTransaction::begin(&mut api_c).await.unwrap();
+    gateway::hold(
+        &mut tx,
+        &caller(&actor, &credential, &scope, &legacy).reservation,
+        None,
+        10,
+    )
+    .await
+    .unwrap();
+    let orphan = uuid(&mut c).await;
+    sqlx::query("INSERT INTO openmettle.gateway_requests
+        (reservation_id,scope_id,actor_user_id,approval_id,installation,model,units,dispatch_hash,session_id,id)
+        VALUES($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,'a',10,sha256(repeat('x',32)::bytea),$6,$7::uuid)")
+        .bind(&legacy).bind(&scope).bind(&actor.user).bind(&actor.approval).bind(INSTALL).bind(&credential[..43]).bind(&orphan)
+        .execute(tx.connection().unwrap()).await.unwrap();
+    tx.commit().await.unwrap();
+    sqlx::query("UPDATE openmettle.gateway_requests SET created_at='2000-01-02' WHERE id=$1::uuid")
+        .bind(&orphan)
+        .execute(&mut c)
+        .await
+        .unwrap();
+    let page = |after, id| {
+        sqlx::query_as::<_,(String,String,i32,i32)>("SELECT next_created_at::text,
+        next_id::text,raw_keys_scanned,released_count FROM openmettle.quota_release_orphan_gateway_requests(
+        interval '15 minutes',$1::text::timestamptz,$2::uuid,'2000-01-03','ffffffff-ffff-ffff-ffff-ffffffffffff',1)")
+        .bind(after).bind(id)
+    };
+    let (at, id, raw, released) = page("-infinity", "00000000-0000-0000-0000-000000000000")
+        .fetch_one(&worker)
+        .await
+        .unwrap();
+    assert_eq!((id.as_str(), raw, released), (bound.id.as_str(), 1, 0));
+    let (_, id, raw, released) = page(&at, &id).fetch_one(&worker).await.unwrap();
+    assert_eq!((id, raw, released), (orphan, 1, 1));
+    assert!(bound.release(&api).await.unwrap());
+
+    c.execute(
+        "UPDATE openmettle.quota_defaults SET hard_limit=1000,cost_denomination='USD_MICROS'
+        WHERE scope_kind='instance' AND resource_kind='usage_cost_micros'",
+    )
+    .await
+    .unwrap();
+    c.execute(
+        "INSERT INTO openmettle.quota_defaults(scope_kind,resource_kind,hard_limit)
+        VALUES ('personal','usage_cost_micros',100)",
+    )
+    .await
+    .unwrap();
+    let cost_reservation = uuid(&mut c).await;
+    let cost_call = gateway::reserve_with_cost(
+        &api,
+        caller(&actor, &credential, &scope, &cost_reservation),
+        Some(80),
+    )
+    .await
+    .unwrap();
+    cost_call.handoff(&api, &ring).await.unwrap();
+    let request = &cost_call.id;
+    for (rev, tokens, cost, token_total, cost_total) in [
+        (0, Some(20_i64), None, "40", "0"),
+        (1, None, Some("79.12"), "40", "80"),
+        (2, None, Some("0"), "40", "0"),
+    ] {
+        sqlx::query("INSERT INTO openmettle.gateway_usage_reports
+            (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens,cost,unit)
+            SELECT id,report_source,gen_random_uuid(),$2,true,$3,$3,$4::text::numeric,
+            CASE WHEN $4::text IS NOT NULL THEN 'USD_MICROS' END FROM openmettle.gateway_requests WHERE id=$1::uuid")
+            .bind(request).bind(rev as i64).bind(tokens).bind(cost).execute(&g).await.unwrap();
+        let update = sqlx::query("INSERT INTO openmettle.gateway_settlements(request_id,revision,final,measured,outstanding)
+            VALUES($1::uuid,$2,true,$3::bigint,0) ON CONFLICT(request_id) DO UPDATE
+            SET revision=excluded.revision,measured=excluded.measured,final=true")
+            .bind(request).bind(rev as i64).bind(tokens.map(|n|n*2));
+        prelocked_settlement(&g, request, update).await.unwrap();
+        let settle = sqlx::query(
+            "SELECT openmettle.quota_settle_gateway_usage(request_id,source,report_id,revision)
+            FROM openmettle.gateway_usage_reports WHERE request_id=$1::uuid AND revision=$2",
+        )
+        .bind(request)
+        .bind(rev as i64);
+        if rev == 1 {
+            // This revision settles cost. Both requests charge the same cost and token budgets.
+            let other_id = uuid(&mut c).await;
+            let unsent = gateway::reserve_with_cost(
+                &api,
+                caller(&actor, &credential, &scope, &other_id),
+                Some(10),
+            )
+            .await
+            .unwrap();
+            let order: Vec<String> = sqlx::query_scalar(
+                "SELECT resource_kind FROM openmettle.quota_reservations
+                WHERE gateway_request_id=$1::uuid ORDER BY created_at",
+            )
+            .bind(&unsent.id)
+            .fetch_all(&g)
+            .await
+            .unwrap();
+            assert_eq!(order, ["usage_cost_micros", "usage_tokens"]);
+            let mut blocker = c.begin().await.unwrap();
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid() FROM openmettle.quota_reservations
+                WHERE gateway_request_id=$1::uuid AND resource_kind='usage_tokens' FOR NO KEY UPDATE")
+                .bind(&unsent.id).fetch_one(&mut *blocker).await.unwrap();
+            let release = unsent.release(&api);
+            let settle_while_unwind_waits = async {
+                wait_for_blocked_peer(&db, pid).await;
+                tokio::time::timeout(Duration::from_secs(5), settle.execute(&g))
+                    .await
+                    .expect("waiting unwind must leave the shared budgets available")
+                    .unwrap();
+                blocker.commit().await.unwrap();
+            };
+            let (released, ()) = tokio::join!(release, settle_while_unwind_waits);
+            assert!(released.unwrap());
+        } else {
+            settle.execute(&g).await.unwrap();
+        }
+        let values: Vec<String> = sqlx::query_scalar(
+            "SELECT settled_units::text FROM openmettle.quota_reservations
+            WHERE gateway_request_id=$1::uuid ORDER BY resource_kind",
+        )
+        .bind(request)
+        .fetch_all(&worker)
+        .await
+        .unwrap();
+        assert_eq!(values, [cost_total, token_total]);
+        let drift:(i64,i64)=sqlx::query_as("SELECT budget_mismatches,settlement_mismatches FROM openmettle.quota_verify_accounting_drift()")
+            .fetch_one(&worker).await.unwrap();
+        assert_eq!(drift, (0, 0));
+    }
     c.execute("CREATE TABLE openmettle.fixture_quota_refs (
         scope_id uuid, reservation_id uuid, request_id uuid,
         FOREIGN KEY (scope_id,reservation_id) REFERENCES openmettle.gateway_reservations (scope_id,id),
@@ -746,6 +892,20 @@ async fn handoff_rechecks_authority_and_only_a_released_run_round_can_retry() {
 
 // These requests have already handed off under two different callers. Only the
 // gateway login writes evidence or advances the settlement.
+async fn prelocked_settlement<'q>(
+    pool: &PgPool,
+    request: &str,
+    query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT openmettle.quota_lock_gateway_request_for_settlement($1::uuid)")
+        .bind(request)
+        .execute(&mut *tx)
+        .await?;
+    let result = query.execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(result)
+}
 async fn check_settlement_finality(g: &PgPool, run_request: &str, caller_request: &str) {
     let report = |request,
                   source,
@@ -813,7 +973,7 @@ async fn check_settlement_finality(g: &PgPool, run_request: &str, caller_request
     let settlement = |request, revision: i64, final_report| {
         sqlx::query(
         "INSERT INTO openmettle.gateway_settlements (request_id,revision,final,measured,outstanding)
-         VALUES ($1::uuid,$2,$3,5,0) ON CONFLICT (request_id) DO NOTHING")
+         VALUES ($1::uuid,$2,$3,(SELECT reasoning_tokens FROM openmettle.gateway_usage_reports WHERE request_id=$1::uuid AND revision=$2),0) ON CONFLICT (request_id) DO NOTHING")
         .bind(request).bind(revision).bind(final_report)
     };
     let update = |revision: i64, final_report| {
@@ -829,25 +989,39 @@ async fn check_settlement_finality(g: &PgPool, run_request: &str, caller_request
 
     assert!(unresolved(run_request).fetch_one(g).await.unwrap());
     assert_eq!(
-        sqlstate(settlement(run_request, 1, true).execute(g).await),
+        sqlstate(prelocked_settlement(g, run_request, settlement(run_request, 1, true)).await),
         "23503"
     );
-    settlement(run_request, 1, false).execute(g).await.unwrap();
+    prelocked_settlement(g, run_request, settlement(run_request, 1, false))
+        .await
+        .unwrap();
     assert_eq!(
-        settlement(run_request, 2, true)
-            .execute(g)
+        prelocked_settlement(g, run_request, settlement(run_request, 2, true))
             .await
             .unwrap()
             .rows_affected(),
         0
     );
     assert!(unresolved(run_request).fetch_one(g).await.unwrap());
-    assert_eq!(sqlstate(update(2, false).execute(g).await), "23503");
-    update(2, true).execute(g).await.unwrap();
+    assert_eq!(
+        sqlstate(prelocked_settlement(g, run_request, update(2, false)).await),
+        "23503"
+    );
+    prelocked_settlement(g, run_request, update(2, true))
+        .await
+        .unwrap();
     assert!(!unresolved(run_request).fetch_one(g).await.unwrap());
-    assert_eq!(sqlstate(update(3, false).execute(g).await), "23514");
-    update(4, true).execute(g).await.unwrap();
-    assert_eq!(sqlstate(update(2, true).execute(g).await), "23514");
+    assert_eq!(
+        sqlstate(prelocked_settlement(g, run_request, update(3, false)).await),
+        "23514"
+    );
+    prelocked_settlement(g, run_request, update(4, true))
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlstate(prelocked_settlement(g, run_request, update(2, true)).await),
+        "23514"
+    );
 
     // A request can also receive its first settlement as a final report.
     assert!(unresolved(caller_request).fetch_one(g).await.unwrap());
@@ -855,11 +1029,55 @@ async fn check_settlement_finality(g: &PgPool, run_request: &str, caller_request
         .execute(g)
         .await
         .unwrap();
-    settlement(caller_request, 1, true)
-        .execute(g)
+    prelocked_settlement(g, caller_request, settlement(caller_request, 1, true))
         .await
         .unwrap();
     assert!(!unresolved(caller_request).fetch_one(g).await.unwrap());
+
+    // Revision 3 was stored by the gateway but refused by the settlement ledger.
+    let reconcile = |rev: i64| {
+        sqlx::query(
+            "SELECT openmettle.quota_settle_gateway_usage(request_id,source,report_id,revision)
+            FROM openmettle.gateway_usage_reports WHERE request_id=$1::uuid AND revision=$2",
+        )
+        .bind(run_request)
+        .bind(rev)
+    };
+    assert_eq!(sqlstate(reconcile(3).execute(g).await), "23514");
+    assert_eq!(sqlstate(sqlx::query("SELECT openmettle.quota_settle_gateway_usage(request_id,source,gen_random_uuid(),revision)
+        FROM openmettle.gateway_usage_reports WHERE request_id=$1::uuid AND revision=1").bind(run_request).execute(g).await),"23514");
+    for rev in [4, 1, 2, 4] {
+        reconcile(rev).execute(g).await.unwrap();
+    }
+    let folded:(String,String,i64)=sqlx::query_as("SELECT state,settled_units::text,accepted_source_revision
+        FROM openmettle.quota_reservations WHERE gateway_request_id=$1::uuid AND resource_kind='usage_tokens'")
+        .bind(run_request).fetch_one(g).await.unwrap();
+    assert_eq!(folded, ("handoff_committed".into(), "5".into(), 4));
+    // A final total can exceed bigint. An evidence-free revision still advances the cursor.
+    for (rev, component, expected) in [
+        (5, Some(i64::MAX), "27670116110564327421"),
+        (6, None, "27670116110564327421"),
+        (7, Some(0), "0"),
+    ] {
+        sqlx::query("INSERT INTO openmettle.gateway_usage_reports
+            (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens,reasoning_tokens,reasoning_included)
+            SELECT id,report_source,gen_random_uuid(),$2,true,$3,$3,$3,
+            CASE WHEN $3::bigint IS NOT NULL THEN false END FROM openmettle.gateway_requests WHERE id=$1::uuid")
+            .bind(run_request).bind(rev as i64).bind(component).execute(g).await.unwrap();
+        let update = sqlx::query(
+            "UPDATE openmettle.gateway_settlements SET revision=$2,final=true,
+             measured=$3::text::numeric WHERE request_id=$1::uuid",
+        )
+        .bind(run_request)
+        .bind(rev as i64)
+        .bind(component.map(|_| expected));
+        prelocked_settlement(g, run_request, update).await.unwrap();
+        reconcile(rev as i64).execute(g).await.unwrap();
+        let recorded:(String,String,i64,i64)=sqlx::query_as("SELECT state,settled_units::text,held_units,accepted_source_revision
+            FROM openmettle.quota_reservations WHERE gateway_request_id=$1::uuid AND resource_kind='usage_tokens'")
+            .bind(run_request).fetch_one(g).await.unwrap();
+        assert_eq!(recorded, ("settled".into(), expected.into(), 0, rev as i64));
+    }
 }
 
 #[tokio::test]

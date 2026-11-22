@@ -242,6 +242,29 @@ impl TestDb {
     }
 }
 
+/// Wait for the operation under test to reach a lock held by the fixture.
+async fn wait_for_blocked_peer(db: &TestDb, holder: i32) {
+    let mut observer = db.admin().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT FROM pg_stat_activity WHERE datname=current_database()
+                    AND $1=ANY(pg_blocking_pids(pid)))",
+            )
+            .bind(holder)
+            .fetch_one(&mut observer)
+            .await
+            .unwrap();
+            if waiting {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("expected a peer to wait on the fixture lock");
+}
+
 fn sqlstate<T: std::fmt::Debug>(result: Result<T, sqlx::Error>) -> String {
     match result {
         Err(sqlx::Error::Database(e)) => e.code().unwrap_or_default().into_owned(),
@@ -259,6 +282,14 @@ async fn new_user(connection: &mut PgConnection) -> String {
         .fetch_one(connection)
         .await
         .unwrap()
+}
+
+// Model the publisher's committed inode binding and publication fence in ledger-only tests.
+async fn mark_storage_payload_published(c: &mut PgConnection, id: &str) {
+    sqlx::query("UPDATE openmettle.storage_reservations SET stage_claimed=true,
+        payload_ino=coalesce(payload_ino,abs(hashtextextended(id::text,0)::numeric)+1),publish_pending=true
+        WHERE id=$1::uuid AND state='reserved' AND NOT adoption_unverified AND reclaim_state='none'")
+        .bind(id).execute(c).await.unwrap();
 }
 
 async fn personal_scope(connection: &mut PgConnection, user: &str) -> String {
@@ -554,6 +585,78 @@ const ADDITIVE_COLUMNS: &[AdditiveColumn] = &[
         column: "approval_decision",
         default: ColumnDefault::Null,
     },
+    AdditiveColumn {
+        since: 24,
+        table: "storage_instance",
+        column: "warn_pct_1",
+        default: ColumnDefault::Int(80),
+    },
+    AdditiveColumn {
+        since: 24,
+        table: "storage_instance",
+        column: "warn_pct_2",
+        default: ColumnDefault::Int(90),
+    },
+    AdditiveColumn {
+        since: 24,
+        table: "storage_instance",
+        column: "config_revision",
+        default: ColumnDefault::Int(1),
+    },
+    AdditiveColumn {
+        since: 24,
+        table: "storage_reservations",
+        column: "lease_expires_at",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 24,
+        table: "storage_reservations",
+        column: "adoption_unverified",
+        default: ColumnDefault::Bool(false),
+    },
+    AdditiveColumn {
+        since: 24,
+        table: "storage_reservations",
+        column: "stage_claimed",
+        default: ColumnDefault::Bool(false),
+    },
+    AdditiveColumn {
+        since: 24,
+        table: "storage_reservations",
+        column: "payload_ino",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 24,
+        table: "storage_reservations",
+        column: "publish_pending",
+        default: ColumnDefault::Bool(false),
+    },
+    AdditiveColumn {
+        since: 24,
+        table: "storage_reservations",
+        column: "reclaim_state",
+        default: ColumnDefault::Str("none"),
+    },
+    AdditiveColumn {
+        since: 24,
+        table: "storage_reservations",
+        column: "reclaim_claim_token",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 24,
+        table: "storage_reservations",
+        column: "reclaim_lease_until",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 24,
+        table: "artifact_revisions",
+        column: "purge_stage",
+        default: ColumnDefault::Str("none"),
+    },
 ];
 
 /// Single declarative registry of every table added after migration 14, ordered by `since`
@@ -682,6 +785,70 @@ const ADDITIVE_TABLES: &[AdditiveTable] = &[
     AdditiveTable {
         since: 23,
         table: "gateway_settlements",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 24,
+        table: "storage_volume_control",
+        seed_row: Some(
+            r#"{"id":true,"volume_id":null,"bootstrap_auto_pin_allowed":false,"adoption_run_id":null}"#,
+        ),
+    },
+    AdditiveTable {
+        since: 24,
+        table: "quota_accepted_gateway_reports",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 24,
+        table: "quota_defaults",
+        seed_row: Some(
+            r#"{"scope_kind":"instance","resource_kind":"usage_cost_micros","hard_limit":null,"window_seconds":null,"cost_denomination":null,"warn_pct_1":80,"warn_pct_2":90,"config_revision":1}"#,
+        ),
+    },
+    AdditiveTable {
+        since: 24,
+        table: "quota_cost_unit_lock",
+        seed_row: Some(r#"{"id":true}"#),
+    },
+    AdditiveTable {
+        since: 24,
+        table: "quota_enforcement",
+        seed_row: Some(r#"{"id":true,"metering_enforced":false,"metering_enforced_at":null}"#),
+    },
+    AdditiveTable {
+        since: 24,
+        table: "quota_gateway_handoffs",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 24,
+        table: "quota_overrides",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 24,
+        table: "quota_budgets",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 24,
+        table: "quota_reservations",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 24,
+        table: "quota_reservation_charges",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 24,
+        table: "quota_reconciliations",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 24,
+        table: "quota_warning_events",
         seed_row: None,
     },
 ];
@@ -844,6 +1011,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "47ee7ed667d0f65034e4b9ea8315f66807ae8ed5a4428f3afc1763d205c8bc00",
         "e9221570f5187a4fc2d666d3724d8646d6d4236d3cb7997538e80ec10355be57",
         "275b395fab0a1e90fc6f9a3039d008adc138294af0cb0da9cb944df87b26ec1c",
+        "a6ea85d09af2c2aa7d267499623a46a3922e695b79bdf585cd8e2164d68e5d9a",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
@@ -969,7 +1137,7 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
     let after_14: Vec<(&str, Option<&str>)> = expected_added_tables_since(14)
         .map(|e| (e.table, e.seed_row))
         .collect();
-    assert_eq!(after_14.len(), 25);
+    assert_eq!(after_14.len(), 37);
     assert!(after_14.contains(&("account_admin_lock", Some(SINGLETON_LOCK_SEED))));
     assert!(after_14.contains(&("run_dispatch_lock", Some(SINGLETON_LOCK_SEED))));
     let after_18: Vec<(&str, Option<&str>)> = expected_added_tables_since(18)
@@ -994,6 +1162,31 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
             ("gateway_requests", None),
             ("gateway_usage_reports", None),
             ("gateway_settlements", None),
+            (
+                "storage_volume_control",
+                Some(
+                    r#"{"id":true,"volume_id":null,"bootstrap_auto_pin_allowed":false,"adoption_run_id":null}"#
+                )
+            ),
+            ("quota_accepted_gateway_reports", None),
+            (
+                "quota_defaults",
+                Some(
+                    r#"{"scope_kind":"instance","resource_kind":"usage_cost_micros","hard_limit":null,"window_seconds":null,"cost_denomination":null,"warn_pct_1":80,"warn_pct_2":90,"config_revision":1}"#
+                )
+            ),
+            ("quota_cost_unit_lock", Some(r#"{"id":true}"#)),
+            (
+                "quota_enforcement",
+                Some(r#"{"id":true,"metering_enforced":false,"metering_enforced_at":null}"#)
+            ),
+            ("quota_gateway_handoffs", None),
+            ("quota_overrides", None),
+            ("quota_budgets", None),
+            ("quota_reservations", None),
+            ("quota_reservation_charges", None),
+            ("quota_reconciliations", None),
+            ("quota_warning_events", None),
         ]
     );
 
@@ -2526,3 +2719,6 @@ mod approvals;
 
 #[path = "schema/gateway.rs"]
 mod gateway;
+
+#[path = "schema/quotas.rs"]
+mod quotas;

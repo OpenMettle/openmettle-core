@@ -519,6 +519,15 @@ pub const DESCRIPTORS: &[MetricDescriptor] = &[
         }],
         buckets: None,
     },
+    MetricDescriptor {
+        name: "openmettle.quota.overdue.handoffs",
+        prometheus_name: "openmettle_quota_overdue_handoffs_total",
+        kind: InstrumentKind::Counter,
+        unit: "{observation}",
+        description: "Overdue committed quota handoffs observed in bounded worker sweeps.",
+        labels: &[],
+        buckets: None,
+    },
 ];
 
 /// Sum of `max_series()` (OTLP data-point streams) across all v1 metrics.
@@ -600,6 +609,7 @@ pub struct Metrics {
     provider_requests: [AtomicU64; PROVIDER_SLOTS],
     provider_duration: [HistogramSlot; PROVIDER_SLOTS],
     storage_operations: [AtomicU64; STORAGE_SLOTS],
+    overdue_handoffs: AtomicU64,
     cancellations: [AtomicU64; CancelReason::NAMES.len()],
     telemetry_dropped: [AtomicU64; DROPPED_SLOTS],
 }
@@ -635,6 +645,7 @@ impl Metrics {
             provider_requests: std::array::from_fn(|_| AtomicU64::new(0)),
             provider_duration: std::array::from_fn(|_| HistogramSlot::new()),
             storage_operations: std::array::from_fn(|_| AtomicU64::new(0)),
+            overdue_handoffs: AtomicU64::new(0),
             cancellations: std::array::from_fn(|_| AtomicU64::new(0)),
             telemetry_dropped: std::array::from_fn(|_| AtomicU64::new(0)),
         }
@@ -675,6 +686,10 @@ impl Metrics {
     pub fn record_storage(&self, operation: StorageOperation, outcome: StorageOutcome) {
         let idx = operation.index() * StorageOutcome::NAMES.len() + outcome.index();
         self.storage_operations[idx].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_overdue_handoffs(&self, count: u64) {
+        self.overdue_handoffs.fetch_add(count, Ordering::Relaxed);
     }
 
     pub fn record_cancellation(&self, reason: CancelReason) {
@@ -855,6 +870,15 @@ impl Metrics {
         }
         push_counter(&mut metrics, &DESCRIPTORS[8], points);
 
+        let overdue = self.overdue_handoffs.load(Ordering::Relaxed);
+        if overdue > 0 || role == Process::Worker {
+            push_counter(
+                &mut metrics,
+                &DESCRIPTORS[9],
+                vec![counter_point(start, now, overdue, &[])],
+            );
+        }
+
         if metrics.is_empty() {
             return None;
         }
@@ -975,4 +999,8 @@ fn push_histogram(
             aggregation_temporality: AggregationTemporality::Cumulative as i32,
         })),
     });
+}
+
+pub(crate) fn quota_sweep_failed() {
+    tracing::warn!(target: super::TARGET, event="worker.sweep.failed", role="worker", "error.type"="reconcile_stale_quotas");
 }
