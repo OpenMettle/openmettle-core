@@ -70,7 +70,9 @@ impl Events {
         }
         let kind = string(v, "type")?;
         match kind {
-            "response.failed" | "error" | "response.error" => return Err(Error::Provider),
+            "response.failed" | "response.cancelled" | "error" | "response.error" => {
+                return Err(Error::Provider);
+            }
             "response.incomplete" => {
                 return Err(
                     if v.pointer("/response/incomplete_details/reason")
@@ -308,7 +310,7 @@ impl Events {
             if let Some(lane) = observed {
                 lane.verify(item)?;
             }
-            if item.get("status").is_some() {
+            if !item["status"].is_null() {
                 compatible_status(item)?;
             }
             match string(item, "type")? {
@@ -396,11 +398,18 @@ impl Item {
 
 pub(super) fn reasoning_block(item: &Value) -> Result<Value, Error> {
     let texts = item_texts(item, "summary", "summary_text")?;
-    // Keep only the declared replay representation. Bound it before copying string fields.
-    if pg_bytes(&item["summary"])? > MAX_TEXT {
-        return Err(Error::Malformed);
+    // Keep only the declared replay representation and bound the normalized jsonb::text size.
+    let mut summary_bytes = 0;
+    for text in &texts {
+        charge(&mut summary_bytes, escaped_bytes(text)?)?;
     }
-    let mut block = json!({"type":"reasoning","summary":texts.into_iter().map(|text|json!({"type":"summary_text","text":text})).collect::<Vec<_>>()});
+    let mut block = json!({
+        "type": "reasoning",
+        "summary": texts
+            .into_iter()
+            .map(|text| json!({"type": "summary_text", "text": text}))
+            .collect::<Vec<_>>()
+    });
     for key in ["id", "encrypted_content"] {
         if let Some(s) = optional(item, key)? {
             if escaped_bytes(s)? > MAX_TEXT {
@@ -408,6 +417,9 @@ pub(super) fn reasoning_block(item: &Value) -> Result<Value, Error> {
             }
             block[key] = s.into();
         }
+    }
+    if 2 + pg_bytes(&block)? > MAX_TEXT {
+        return Err(Error::Malformed);
     }
     Ok(block)
 }

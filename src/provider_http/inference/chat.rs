@@ -92,8 +92,12 @@ pub(super) fn accept(
                     return Err(Error::Malformed);
                 }
                 bind(&mut call.name, optional(f, "name")?)?;
-                if let Some(s) = optional(f, "arguments")? {
-                    call.fragment(s)?;
+                if stream {
+                    if let Some(s) = optional(f, "arguments")? {
+                        call.fragment(s)?;
+                    }
+                } else {
+                    call.fragment(string(f, "arguments")?)?;
                 }
             }
         }
