@@ -1667,8 +1667,9 @@ pub enum ReplayEffect {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum ReplayAction {
+pub(crate) enum ReplayAction {
     Inspect,
+    PrepareSpill,
     StartRead,
     RefreshUnstarted,
 }
@@ -1892,7 +1893,7 @@ async fn observed_output(
     ))
 }
 
-async fn check_operation(
+pub(crate) async fn check_operation(
     c: &mut PgConnection,
     lease: &Lease<'_>,
     operation: &str,
@@ -1984,7 +1985,8 @@ async fn check_operation(
                 if snap.now >= bound || live.hash != committed.hash || live.evidence != committed.evidence {
                     return Err(DENIED);
                 }
-                if p.tool == crate::mcp::READ_RANGE {
+                let outcome: &str = op.try_get("outcome")?;
+                if outcome == "succeeded" && p.tool == crate::mcp::READ_RANGE {
                     active_revision(
                         c,
                         &s,
@@ -1993,7 +1995,6 @@ async fn check_operation(
                     )
                     .await?;
                 }
-                let outcome: &str = op.try_get("outcome")?;
                 let observed = matches!(outcome, "succeeded" | "failed");
                 let output = if observed {
                     observed_output(c, &s, &op, snap.now / 1000).await?
@@ -2073,6 +2074,14 @@ async fn check_operation(
                 })
             }
             Err(StoreError::Denied(_) | StoreError::NotFound) => {
+                // Publication has a known response in hand. Record that write before
+                // settling the run, so revocation cannot turn success into uncertainty.
+                if action == ReplayAction::PrepareSpill
+                    && op.try_get::<&str, _>("outcome")? == "intent"
+                    && op.try_get::<&str, _>("capability")? != "repeatable_read"
+                {
+                    return Err(DENIED);
+                }
                 invalidate_post_intent(tx, lease, settings, &op, bound).await
             }
             Err(error) => Err(error),

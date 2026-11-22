@@ -17,7 +17,7 @@ pub(super) async fn read(
     .await
     .map_err(|_| ToolFault::Transient)?
     .filter(|r| r.scope_id == scope && r.state == "active")
-    .ok_or(ToolFault::TerminalRefusal)?;
+    .ok_or(ToolFault::Semantic)?;
     drop(c);
     let mut fields = rev.media_type.split(';').map(str::trim);
     let media = fields.next().unwrap_or_default().to_ascii_lowercase();

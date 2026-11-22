@@ -258,6 +258,12 @@ async fn spill_is_private_atomic_and_read_range_revalidates_cached_pages() {
          FROM openmettle.operations o WHERE o.run_id=$1::uuid AND logical_key='past-end'")
         .bind(&r.run_id).fetch_one(&mut owner).await.unwrap();
     assert_eq!((outcome.as_str(), attempts, reservations), ("failed", 1, 0));
+    let missing =
+        json!({"artifact_id":artifact,"revision_id":"00000000-0000-4000-8000-000000000011"});
+    assert_eq!(
+        output(invoke("missing", missing.to_string().as_bytes()).await),
+        fault
+    );
     let other = proposal("unconfigured");
     let other_op = intent(&f, &r, &other, &policy).await;
     let fallback = output(
@@ -306,10 +312,207 @@ async fn spill_is_private_atomic_and_read_range_revalidates_cached_pages() {
     assert_eq!(offset as usize, original.len());
     sqlx::query("UPDATE openmettle.artifact_revisions SET state='retained',retained_at=clock_timestamp(),purge_after=clock_timestamp()+interval '1 day' WHERE id=$1::uuid")
         .bind(revision).execute(&mut owner).await.unwrap();
+    // A fresh read of a retained revision and replay of a prior failure both stay recoverable.
+    assert_eq!(output(invoke("retained", first.as_bytes()).await), fault);
+    assert_eq!(output(invoke("past-end", beyond.as_bytes()).await), fault);
     assert!(matches!(
         invoke("page-0", first.as_bytes()).await,
         StepResult::Invalidated(leases::Settled::Terminal { state: "cancelled" })
     ));
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18"]
+async fn a_displaced_volume_creates_no_spill_reservation() {
+    let f = Fixture::new().await;
+    let r = f.claim("mount", "ordinary").await;
+    let policy = read_policy();
+    let proposal = proposal("displaced");
+    let op = intent(&f, &r, &proposal, &policy).await;
+    let pool = PgPool::connect(&f.db.url(WORKER)).await.unwrap();
+    let api = PgPool::connect(&f.db.url(API)).await.unwrap();
+    let dir = crate::auth_config_support::Dir::new();
+    let root = std::path::PathBuf::from(dir.path("volume"));
+    std::fs::create_dir(&root).unwrap();
+    let store = Store::open(&root).unwrap();
+    store.initialize_api(&api).await.unwrap();
+    let mut owner = connect(&f.db.0, OWNER).await;
+    sqlx::query("UPDATE openmettle.storage_instance SET personal_limit_bytes=100000,instance_budget_bytes=100000")
+        .execute(&mut owner).await.unwrap();
+    std::fs::rename(root.join("staging"), root.join("original-staging")).unwrap();
+    std::fs::create_dir(root.join("staging")).unwrap();
+    let (_sender, step) = step();
+    let cx = SpillContext {
+        pool: &pool,
+        lease: r.lease(),
+        proposal: &proposal,
+        operation: &op,
+        step: &step,
+    };
+    let response = output(
+        artifact_fs::publish_bytes(
+            &cx,
+            Some(&store),
+            &"x".repeat(mcp::INLINE_BYTES + 1),
+            &LEASES,
+            &policy,
+        )
+        .await,
+    );
+    assert_eq!(response["storage"], "truncated_no_spill");
+    assert_eq!(response["spill_error"], "storage_io");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM openmettle.storage_reservations WHERE operation_id=$1::uuid"
+        )
+        .bind(&op)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18"]
+async fn completed_non_repeatable_writes_preserve_success_when_authority_lapses() {
+    struct NonRepeatable;
+    impl EffectPolicy for NonRepeatable {
+        fn review(
+            &self,
+            scope: &str,
+            run: &str,
+            p: &Proposal,
+        ) -> Result<Option<Review>, StoreError> {
+            let mut review = Policy::default().review(scope, run, p)?;
+            if let Some(r) = &mut review {
+                r.endpoint_key = EndpointKey::Unsupported;
+                r.authoritative_lookup = false;
+            }
+            Ok(review)
+        }
+    }
+    let f = Fixture::new().await;
+    let pool = PgPool::connect(&f.db.url(WORKER)).await.unwrap();
+    let api_pool = PgPool::connect(&f.db.url(API)).await.unwrap();
+    let dir = crate::auth_config_support::Dir::new();
+    let root = std::path::PathBuf::from(dir.path("volume"));
+    std::fs::create_dir(&root).unwrap();
+    let store = Store::open(&root).unwrap();
+    store.initialize_api(&api_pool).await.unwrap();
+    let mut owner = connect(&f.db.0, OWNER).await;
+    sqlx::query("UPDATE openmettle.storage_instance SET personal_limit_bytes=100000,instance_budget_bytes=100000")
+        .execute(&mut owner).await.unwrap();
+    let mut w = worker(&f.db).await;
+    for (index, (large, expired)) in [(false, false), (false, true), (true, false), (true, true)]
+        .into_iter()
+        .enumerate()
+    {
+        let key = format!("write-{index}");
+        let p = proposal(&key);
+        let r = f.claim(&key, "ordinary").await;
+        let parked = park(
+            &mut w,
+            &r.lease(),
+            &StepTasks::default().handle(),
+            &p,
+            &NonRepeatable,
+            &LEASES,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        let decider = session(&f.db, &f.actor, 40 + index as u8).await;
+        decide(
+            &mut api(&f.db).await,
+            &decider,
+            &f.input(&r, &parked, HumanDecision::Approve, "approved"),
+            &NonRepeatable,
+        )
+        .await
+        .unwrap();
+        let r = f.next().await.unwrap();
+        let IntentResult::Applied(committed) = record_fenced_intent(
+            &mut w,
+            &r.lease(),
+            &p,
+            Some(&parked.approval_id),
+            &NonRepeatable,
+            &LEASES,
+        )
+        .await
+        .unwrap() else {
+            panic!("expected a committed write");
+        };
+        let op = committed.operation_id;
+        if expired {
+            sqlx::query("UPDATE openmettle.local_sessions SET expires_ms=floor(extract(epoch FROM clock_timestamp())*1000)::bigint WHERE id=$1")
+                .bind(decider.locator()).execute(&mut owner).await.unwrap();
+        } else {
+            sqlx::query("UPDATE openmettle.local_sessions SET revoked=true WHERE id=$1")
+                .bind(decider.locator())
+                .execute(&mut owner)
+                .await
+                .unwrap();
+        }
+        let (_sender, step) = step();
+        let cx = SpillContext {
+            pool: &pool,
+            lease: r.lease(),
+            proposal: &p,
+            operation: &op,
+            step: &step,
+        };
+        let text = if large {
+            "x".repeat(mcp::INLINE_BYTES + 1)
+        } else {
+            "completed".into()
+        };
+        let result =
+            artifact_fs::publish_bytes(&cx, Some(&store), &text, &LEASES, &NonRepeatable).await;
+        let StepResult::Invalidated(leases::Settled::Terminal { state }) = result else {
+            panic!("expected terminal invalidation without model output");
+        };
+        assert_eq!(state, if expired { "failed" } else { "cancelled" });
+        let (capability,outcome,revision,evidence,reservations):(String,String,i64,Vec<u8>,i64) = sqlx::query_as(
+            "SELECT capability,outcome,revision,evidence,(SELECT count(*) FROM openmettle.storage_reservations WHERE operation_id=o.id)
+             FROM openmettle.operations o WHERE o.id=$1::uuid")
+            .bind(&op).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            (
+                capability.as_str(),
+                outcome.as_str(),
+                revision,
+                reservations
+            ),
+            ("non_repeatable", "succeeded", 1, 0)
+        );
+        let evidence: Value = serde_json::from_slice(&evidence).unwrap();
+        assert_eq!(
+            evidence["storage"],
+            if large {
+                "truncated_no_spill"
+            } else {
+                "inline"
+            }
+        );
+        if large {
+            assert_eq!(evidence["spill_error"], "storage_io");
+        }
+        let events = super::super::authz_runs::terminal_events(&f.db, &r.run_id).await;
+        assert_eq!(events.len(), 1);
+        if expired {
+            assert_eq!(events[0].0, "openmettle.run-approval-expired");
+        } else {
+            assert_eq!(
+                events[0],
+                (
+                    "openmettle.run-cancelled".into(),
+                    br#"{"reason":"revoked"}"#.to_vec()
+                )
+            );
+        }
+    }
 }
 
 #[tokio::test]

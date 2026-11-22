@@ -142,6 +142,11 @@ async fn publish(
         .try_acquire_owned()
         .map_err(|_| SpillError::Saturated)?;
     let size = output.text.len() as i64;
+    let expected_pin = store
+        .prepare(cx.pool, false)
+        .await
+        .map_err(|_| SpillError::Storage)?
+        .ok_or(SpillError::Storage)?;
     // Commit quota and the stage claim before creating a filesystem entry. Derive the
     // owner from the run under its Step fence, never from the caller or tool response.
     let (pin, artifact, reservation) = cx.fenced(async |tx| {
@@ -151,6 +156,9 @@ async fn publish(
                  FROM openmettle.runs r JOIN openmettle.operations o ON o.run_id=r.id AND o.scope_id=r.scope_id
                  WHERE r.id=$1::uuid AND r.scope_id=$2::uuid AND o.id=$3::uuid AND o.logical_key=$4 AND o.revision=0 AND o.outcome='intent'")
                 .bind(cx.lease.run_id).bind(cx.lease.scope_id).bind(cx.operation).bind(&cx.proposal.logical_key).fetch_one(c).await?;
+        if pin != expected_pin {
+            return Err(runs::Error::Conflict);
+        }
         let key = format!("tool-spill:{}:{}", cx.operation, attempt);
         let reservation = match storage::reserve(
             tx,
@@ -350,7 +358,10 @@ pub async fn publish_bytes(
     policy: &impl crate::authz::approvals::EffectPolicy,
 ) -> crate::worker::StepResult {
     use crate::{
-        authz::approvals::{ReplayEffect, recheck_replay_effect_authority},
+        authz::{
+            approvals::{ReplayAction, ReplayEffect, check_operation},
+            store::StoreError,
+        },
         worker::{StepResult, turns::lease_step},
     };
     if *cx.step.stop.borrow() == Some(crate::worker::Stop::LeaseLost) {
@@ -363,19 +374,20 @@ pub async fn publish_bytes(
     let Ok(output) = Output::new(text) else {
         return fail;
     };
-    let recheck = async || {
+    let recheck = async |action| {
         let mut c = cx
             .pool
             .acquire()
             .await
             .map_err(crate::authz::store::StoreError::from)?;
-        recheck_replay_effect_authority(
+        check_operation(
             &mut c,
             &cx.lease,
             cx.operation,
             cx.proposal,
             settings,
             policy,
+            action,
         )
         .await
     };
@@ -394,28 +406,29 @@ pub async fn publish_bytes(
         Err(e) => lease_step(e),
         _ => StepResult::LeaseLost,
     };
-    let stopping = match recheck().await {
-        Ok(ReplayEffect::Pending) => false,
-        Err(LeaseError::Stopping(_)) => true,
-        r => return observed(r),
-    };
-    let fallback = match output.inline() {
-        Some(s) => Some(s),
-        None if stopping
-            || cx.step.stop.borrow().is_some()
-            || Instant::now() >= cx.step.deadline =>
-        {
-            Some(output.preview(cx.proposal, cx.operation, Err("storage_io")))
-        }
-        None => match store {
-            None => Some(output.preview(cx.proposal, cx.operation, Err("store_unconfigured"))),
-            Some(store) => match try_publish(cx, store, &output).await {
-                Ok(_) => None,
-                Err(SpillError::LeaseLost) => return StepResult::LeaseLost,
-                Err(error) => Some(output.preview(cx.proposal, cx.operation, Err(error.code()))),
+    let mut fallback = output.inline();
+    if fallback.is_none() {
+        let error = match recheck(ReplayAction::PrepareSpill).await {
+            Err(LeaseError::Stopping(_) | LeaseError::Store(StoreError::Denied(_))) => {
+                Some("storage_io")
+            }
+            Ok(ReplayEffect::Pending)
+                if cx.step.stop.borrow().is_some() || Instant::now() >= cx.step.deadline =>
+            {
+                Some("storage_io")
+            }
+            Ok(ReplayEffect::Pending) => match store {
+                None => Some("store_unconfigured"),
+                Some(store) => match try_publish(cx, store, &output).await {
+                    Ok(_) => None,
+                    Err(SpillError::LeaseLost) => return StepResult::LeaseLost,
+                    Err(error) => Some(error.code()),
+                },
             },
-        },
-    };
+            other => return observed(other),
+        };
+        fallback = error.map(|code| output.preview(cx.proposal, cx.operation, Err(code)));
+    }
     if *cx.step.stop.borrow() == Some(crate::worker::Stop::LeaseLost) {
         return StepResult::LeaseLost;
     }
@@ -431,7 +444,12 @@ pub async fn publish_bytes(
             mcp::observe_known(&mut c, &cx.lease, cx.step, cx.operation, true, &s).await
         };
         match timeout(Duration::from_secs(2), write).await {
-            Ok(Ok(_) | Err(LeaseError::Store(_))) => {}
+            Ok(Ok(())) => {}
+            Ok(Err(LeaseError::Store(StoreError::Conflict(_)))) => {
+                // A prior commit can have a different envelope for the same operation.
+                return observed(recheck(ReplayAction::PrepareSpill).await);
+            }
+            Ok(Err(LeaseError::Store(StoreError::Database(_)))) => return StepResult::LeaseLost,
             Ok(Err(e)) => return lease_step(e),
             Err(_) => return StepResult::LeaseLost,
         }
@@ -439,8 +457,5 @@ pub async fn publish_bytes(
     if let Some(stop) = *cx.step.stop.borrow() {
         return crate::worker::stopped_step(stop);
     }
-    if stopping {
-        return StepResult::Stopped;
-    }
-    observed(recheck().await)
+    observed(recheck(ReplayAction::Inspect).await)
 }

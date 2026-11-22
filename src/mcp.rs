@@ -260,6 +260,17 @@ struct ArtifactReader {
     pool: PgPool,
     store: Store,
 }
+
+async fn reader_stopped(
+    stop: &mut tokio::sync::watch::Receiver<Option<crate::worker::Stop>>,
+) -> StepResult {
+    stop.wait_for(Option::is_some)
+        .await
+        .ok()
+        .and_then(|signal| *signal)
+        .map_or(StepResult::LeaseLost, crate::worker::stopped_step)
+}
+
 impl ApprovedAdapter for ArtifactReader {
     fn send<'a>(
         &'a self,
@@ -289,7 +300,7 @@ impl ApprovedAdapter for ArtifactReader {
             let result = loop {
                 let result = tokio::select! {
                     biased;
-                    _=step.stop.wait_for(Option::is_some)=>return StepResult::Stopped,
+                    stopped=reader_stopped(&mut step.stop)=>return stopped,
                     result=tokio::time::timeout_at(step.deadline,range::read(&self.pool,&self.store,&env["arguments"],lease.scope_id))=>match result {
                         Ok(v)=>v, Err(_)=>return StepResult::Handoff,
                     },
@@ -312,7 +323,7 @@ impl ApprovedAdapter for ArtifactReader {
                 }
                 tokio::select! {
                     biased;
-                    _=step.stop.wait_for(Option::is_some)=>return StepResult::Stopped,
+                    stopped=reader_stopped(&mut step.stop)=>return stopped,
                     _=tokio::time::sleep_until(wake)=>{}
                 }
                 let Ok(mut c) = self.pool.acquire().await else {
@@ -414,6 +425,27 @@ impl ScopedAdapter {
 mod tests {
     use super::*;
     const ID: &str = "00000000-0000-0000-0000-000000000001";
+
+    #[tokio::test]
+    async fn reader_preserves_stop_cause_and_closed_channel_loses_lease() {
+        use crate::worker::Stop;
+        for signal in [
+            Some(Stop::LeaseLost),
+            Some(Stop::Shutdown),
+            Some(Stop::Cancel),
+            Some(Stop::Deadline),
+            None,
+        ] {
+            let (sender, mut receiver) = tokio::sync::watch::channel(signal);
+            drop(sender);
+            assert!(matches!(
+                (signal, reader_stopped(&mut receiver).await),
+                (None | Some(Stop::LeaseLost), StepResult::LeaseLost)
+                    | (Some(Stop::Shutdown), StepResult::Handoff)
+                    | (Some(Stop::Cancel | Stop::Deadline), StepResult::Stopped)
+            ));
+        }
+    }
 
     #[test]
     fn registry_requires_exact_schema_and_closed_canonical_arguments() {

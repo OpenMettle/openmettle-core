@@ -582,6 +582,13 @@ async fn execute<E: Executor>(
                 settings,
             )
             .await?;
+            match intent {
+                IntentResult::Invalidated(settled) => return Ok(WorkEnd::Invalidated(settled)),
+                IntentResult::ApprovalRequired => {
+                    return Ok(WorkEnd::Complete(Settle::Failed(FailReason::StepFailed)));
+                }
+                IntentResult::Applied(_) | IntentResult::Replayed(_) => {}
+            }
             let resumed = EffectDispatch {
                 pool,
                 artifacts: adapters.artifacts,

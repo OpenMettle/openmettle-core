@@ -1882,7 +1882,8 @@ async fn decision_commits_observed_revocation_and_quota_is_bound_to_the_effect()
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18.1"]
-async fn worker_sends_the_committed_approval_once_without_holding_a_connection() {
+async fn worker_sends_the_committed_approval_once_and_releases_invalidated_claims_without_an_adapter()
+ {
     use openmettle_core::worker::{
         self, ActiveRun, ApprovedAdapter, ApprovedEffects, Executor, OwnedObservation, StepResult,
     };
@@ -1985,17 +1986,17 @@ async fn worker_sends_the_committed_approval_once_without_holding_a_connection()
         .map(str::to_owned))
     })
     .unwrap();
-    let shutdown = async {
+    let wait_terminal = async |id: &str, expected: &str| {
         let mut c = api(&f.db).await;
         loop {
             let state: String =
                 sqlx::query_scalar("SELECT state FROM openmettle.runs WHERE id=$1::uuid")
-                    .bind(&r.run_id)
+                    .bind(id)
                     .fetch_one(&mut c)
                     .await
                     .unwrap();
             if queue::is_terminal(&state) {
-                assert_eq!(state, "succeeded");
+                assert_eq!(state, expected);
                 return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2009,7 +2010,55 @@ async fn worker_sends_the_committed_approval_once_without_holding_a_connection()
             settings,
             adapter.clone(),
             Some(effects),
-            shutdown,
+            wait_terminal(&r.run_id, "succeeded"),
+            Duration::from_secs(1),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(adapter.writes.load(Ordering::Relaxed), 1);
+
+    let r = f.claim("missing-adapter", "ordinary").await;
+    let parked = f.park(&r, "pending").await;
+    decide(
+        &mut api(&f.db).await,
+        &f.user,
+        &f.input(&r, &parked, HumanDecision::Approve, "yes"),
+        &Policy::default(),
+    )
+    .await
+    .unwrap();
+    // An older worker left a separate lookup on this run. Revoking the pending
+    // approval by removing the adapter must let the next holder reconcile it.
+    let mut w = worker(&f.db).await;
+    let mut tx = WriteTransaction::begin(&mut w).await.unwrap();
+    durable::record_intent(
+        &mut tx,
+        &Intent {
+            scope: &f.scope,
+            run: &r.run_id,
+            key: "earlier-lookup",
+            target: "fixture",
+            capability: "lookup",
+            request: Payload {
+                format: "fixture",
+                version: 1,
+                bytes: b"{}",
+            },
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    // The lease lasts 30 seconds. Waiting for expiry would exceed the test deadline.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        worker::run(
+            &pool,
+            None,
+            settings,
+            adapter.clone(),
+            wait_terminal(&r.run_id, "interrupted"),
             Duration::from_secs(1),
         ),
     )
