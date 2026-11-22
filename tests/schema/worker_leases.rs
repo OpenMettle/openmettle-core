@@ -987,9 +987,13 @@ mod live_turns {
     }
     impl Provider {
         async fn new() -> Self {
+            Self::with_bearer("synthetic-turn-credential".into()).await
+        }
+        async fn with_bearer(expected_bearer: String) -> Self {
             use http_body_util::{BodyExt, Full};
             use hyper::{Response, server::conn::http1, service::service_fn};
             use hyper_util::rt::TokioIo;
+            let expected_header = Arc::new(format!("Bearer {expected_bearer}"));
             let ca = Ca::new();
             let identity = ca.leaf("provider.example.test", false);
             let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -1010,16 +1014,18 @@ mod live_turns {
                 while let Ok((stream, _)) = listener.accept().await {
                     let acceptor = acceptor.clone();
                     let send = send.clone();
+                    let expected_header = expected_header.clone();
                     tokio::spawn(async move {
                         let tls = acceptor.accept(stream).await.unwrap();
                         let service =
                             service_fn(move |r: hyper::Request<hyper::body::Incoming>| {
                                 let send = send.clone();
+                                let expected_header = expected_header.clone();
                                 async move {
                                     let path = r.uri().path().to_owned();
-                                    assert!(
-                                        r.headers()["authorization"]
-                                            == "Bearer synthetic-turn-credential"
+                                    assert_eq!(
+                                        r.headers()["authorization"],
+                                        expected_header.as_str()
                                     );
                                     let bytes = r.into_body().collect().await.unwrap().to_bytes();
                                     let (reply, rx) = oneshot::channel();
@@ -1238,6 +1244,7 @@ mod live_turns {
                 capabilities: &capabilities,
                 requested_rounds: Some(rounds),
                 now_ms: NOW,
+                cost_qualified: None,
             };
             let limits = queue::AdmissionLimits {
                 live_per_actor: 4,
@@ -2127,5 +2134,369 @@ mod live_turns {
                 .expect("peer closed");
             assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn metered_turn_dispatches_cost_bound_settles_and_releases_unused_rounds() {
+        use crate::authz_http::{Api, As, browser, success};
+        use openmettle_core::{
+            authz::gateway::settlement,
+            provider_http::gateway::UsageReport,
+            provider_keys::gateway::{Bearer, Context, GatewayKeys, GatewaySealer},
+        };
+        use sqlx::postgres::PgPoolOptions;
+
+        const INSTALL: &str = "00000000-0000-4000-8000-000000000083";
+        const PRINCIPAL: &str = "00000000-0000-4000-8000-000000000084";
+        const BUDGET: &str = "00000000-0000-4000-8000-000000000085";
+        const KEY_BYTES: [u8; 32] = [77; 32];
+
+        let db = TestDb::migrated().await;
+        let mut owner = connect(&db.0, OWNER).await;
+        providers(&mut owner).await;
+        let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+        let scope = personal_of(&db, &alice).await;
+        let alice_cookie = browser(&db, &alice, 1).await;
+        let alice_b = As::Browser(&alice_cookie);
+
+        // Configure 1,000-micro static cost budget and ample token budget.
+        owner
+            .execute(
+                "UPDATE openmettle.quota_defaults
+                    SET cost_denomination = 'usd_micros'
+                  WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'",
+            )
+            .await
+            .unwrap();
+        owner
+            .execute(
+                "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+                 VALUES ('personal', 'usage_tokens', 100000),
+                        ('personal', 'usage_cost_micros', 1000)",
+            )
+            .await
+            .unwrap();
+
+        // Provision gateway binding, sealed bearer generation, and active policy for model `a`.
+        let g_pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy_with(db.1.options(pg::GATEWAY));
+        let binding: String = sqlx::query_scalar(
+            "INSERT INTO openmettle.gateway_bindings (installation, user_id, principal, budget)
+             VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid) RETURNING id::text",
+        )
+        .bind(INSTALL)
+        .bind(&alice.user)
+        .bind(PRINCIPAL)
+        .bind(BUDGET)
+        .fetch_one(&g_pool)
+        .await
+        .unwrap();
+        let report_source: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+        let keys = GatewayKeys::new(&[("metered-k1".into(), KEY_BYTES)]).unwrap();
+        let (finger, env) = GatewaySealer::new(keys, g_pool.clone())
+            .seal(
+                &Context {
+                    installation: INSTALL,
+                    user_id: &alice.user,
+                    binding_id: &binding,
+                    principal: PRINCIPAL,
+                    generation: 1,
+                },
+                &Bearer::new(b"metered-round-token").unwrap(),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_generations
+                 (binding_id, generation, remote_key, expires_at, key_id, key_fingerprint, nonce, ciphertext)
+             VALUES ($1::uuid, 1, gen_random_uuid(), clock_timestamp() + interval '1 hour', $2, $3, $4, $5)",
+        )
+        .bind(&binding)
+        .bind(&env.key_id)
+        .bind(finger.as_slice())
+        .bind(env.nonce.as_slice())
+        .bind(env.ciphertext)
+        .execute(&g_pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_policy
+                 (binding_id, revision, scope_id, approval_id, model, report_source,
+                  provider_generation, approval_generation, user_generation, capabilities)
+             VALUES ($1::uuid, 1, $2::uuid, $3::uuid, 'a', $4::uuid, 0, 0, 0, '{}'::jsonb)",
+        )
+        .bind(&binding)
+        .bind(&scope)
+        .bind(&alice.approval)
+        .bind(&report_source)
+        .execute(&g_pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.gateway_bindings
+                SET active_generation = 1, observed_revision = 1, state = 'ready'
+              WHERE id = $1::uuid",
+        )
+        .bind(&binding)
+        .execute(&g_pool)
+        .await
+        .unwrap();
+
+        // Mount real API binary with qualified `cost_bound` (1 micro/token) and `prompt_bound`.
+        let dir = Dir::new();
+        std::fs::create_dir(dir.path("artifacts")).unwrap();
+        let mut doc = auth_config_support::document_v2_native(&dir, &Ca::new().pem());
+        doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+        let mut catalog: Value =
+            serde_json::from_slice(include_bytes!("../fixtures/conversation-catalog-v1.json"))
+                .unwrap();
+        catalog["models"]["a"]["pin"]["provider"] = "synthetic-sglang".into();
+        catalog["models"]["a"]["prompt_bound"] = json!({
+            "fixed_tokens": 4,
+            "tokens_per_turn": 4,
+            "tokens_per_part": 2,
+            "tokens_per_byte": 1,
+            "tokens_per_attachment": 10
+        });
+        catalog["models"]["a"]["cost_bound"] = json!({
+            "fixed_micros": 0,
+            "micros_per_token": 1
+        });
+        doc["catalog_file"] =
+            json!(dir.write("catalog.json", &serde_json::to_vec(&catalog).unwrap()));
+        doc["admission_limits"] = json!({
+            "live_per_actor": 4,
+            "live_per_scope": 8,
+            "queued_in_instance": 32,
+            "queue_timeout_seconds": 300,
+            "round_cap": 10
+        });
+        let http_api = Api::configured(&db, dir, doc, 4);
+
+        // Admit a 2-round run with 450-micro per-round ceiling -> reserves 900 micros total.
+        let conv = success(
+            http_api.call(
+                alice_b,
+                "POST",
+                "/v1/conversations",
+                Some("m-conv"),
+                Some(&json!({})),
+            ),
+            201,
+        );
+        let conv_id = conv["conversation_id"].as_str().unwrap();
+        let branch_id = conv["branch_id"].as_str().unwrap();
+        let make_run = |msg_id: &str, rounds: i64| {
+            json!({
+                "conversation_id": conv_id,
+                "branch_id": branch_id,
+                "proposal": {
+                    "expected_head_message_id": null,
+                    "turn": {
+                        "mode": "append",
+                        "input_message_id": msg_id,
+                        "parts": [{"text": "hello metered world"}]
+                    },
+                    "selection": {
+                        "model": "a",
+                        "layer": {"controls": {"context_window": "450", "output_reserve": "100"}}
+                    },
+                    "requested_rounds": rounds
+                }
+            })
+        };
+        let admitted = success(
+            http_api.call(
+                alice_b,
+                "POST",
+                "/v1/runs",
+                Some("metered-run-1"),
+                Some(&make_run("00000000-0000-4000-8000-00000000b001", 2)),
+            ),
+            201,
+        );
+        let run_id = admitted["run_id"].as_str().unwrap().to_owned();
+        let q_before = success(
+            http_api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+            200,
+        );
+        assert_eq!(q_before["usage"][1]["reserved_held"], "900");
+        assert_eq!(q_before["usage"][1]["remaining"], "100");
+
+        // Start real TurnExecutor worker with Route::metered against loopback TLS Provider.
+        let mut provider = Provider::with_bearer("metered-round-token".into()).await;
+        let mut child = Command::new(worker_binary())
+            .env("OPENMETTLE_TEST_TURN_WORKER", "1")
+            .args([
+                "--ignored",
+                "--exact",
+                "worker::turns::schema_fixture::worker_process",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.as_mut().unwrap();
+        serde_json::to_writer(
+            &mut *stdin,
+            &json!({
+                "database": db.url(WORKER),
+                "catalog": catalog,
+                "tools": false,
+                "scope": scope,
+                "actor": alice.user,
+                "ca": String::from_utf8(provider.ca.pem()).unwrap(),
+                "port": provider.port,
+                "artifacts": null,
+                "stop_during_observation": false,
+                "metered": {
+                    "installation": INSTALL,
+                    "key_id": "metered-k1",
+                    "key_bytes": KEY_BYTES,
+                }
+            }),
+        )
+        .unwrap();
+        writeln!(stdin).unwrap();
+        let _worker_proc = Process(child);
+
+        // Round 1 reaches TLS provider with decrypted gateway bearer; verify 450-micro child hold.
+        let req = provider.request().await;
+        let req_id: String = sqlx::query_scalar(
+            "SELECT id::text FROM openmettle.gateway_requests
+              WHERE run_id = $1::uuid AND round = 1 AND state = 'handed_off'",
+        )
+        .bind(&run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        let (child_cost, parent_rem): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT reserved_units FROM openmettle.quota_reservations
+                      WHERE gateway_request_id = $1::uuid AND resource_kind = 'usage_cost_micros'),
+                    (SELECT held_units FROM openmettle.quota_reservations
+                      WHERE run_id = $2::uuid AND gateway_request_id IS NULL
+                        AND resource_kind = 'usage_cost_micros')",
+        )
+        .bind(&req_id)
+        .bind(&run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!((child_cost, parent_rem), (450, 450));
+
+        // Settle Round 1 at 200 micros (150 tokens) through real gateway::settlement::ingest.
+        let report_id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+        let outcome = settlement::ingest(
+            &g_pool,
+            &UsageReport {
+                request: req_id.clone(),
+                installation: INSTALL.into(),
+                principal: PRINCIPAL.into(),
+                scope: scope.clone(),
+                source: report_source,
+                report_id,
+                revision: 0,
+                r#final: true,
+                prompt_tokens: Some(100),
+                completion_tokens: Some(50),
+                reasoning_tokens: None,
+                reasoning_included: None,
+                cost: Some("200".into()),
+                unit: Some("usd_micros".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, settlement::Outcome::Applied);
+
+        // Reply with final answer; worker publishes answer, settles Succeeded, and releases the
+        // unused 450-micro Round 2 parent hold immediately.
+        req.respond(completion(
+            json!("metered answer"),
+            None,
+            json!({"prompt_tokens": 100, "completion_tokens": 50}),
+        ));
+        let mut api_c = api(&db).await;
+        tokio::time::timeout(Duration::from_secs(25), async {
+            loop {
+                let stored: String =
+                    sqlx::query_scalar("SELECT state FROM openmettle.runs WHERE id = $1::uuid")
+                        .bind(&run_id)
+                        .fetch_one(&mut api_c)
+                        .await
+                        .unwrap();
+                if queue::is_terminal(&stored) {
+                    assert_eq!(stored, "succeeded");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("worker settled metered run");
+
+        // Zero accounting drift and unused Round 2 hold released -> 200 active, 0 held, 800 remaining.
+        let drift: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
+               FROM openmettle.quota_verify_accounting_drift()",
+        )
+        .fetch_one(&mut worker(&db).await)
+        .await
+        .unwrap();
+        assert_eq!(drift, (0, 0, 0, 0));
+        let q_after = success(
+            http_api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+            200,
+        );
+        assert_eq!(q_after["usage"][1]["active_used"], "200");
+        assert_eq!(q_after["usage"][1]["reserved_held"], "0");
+        assert_eq!(q_after["usage"][1]["remaining"], "800");
+
+        // Subsequent 450-micro POST /v1/runs succeeds with 201 Created (200 + 450 = 650 <= 1000).
+        let conv2 = success(
+            http_api.call(
+                alice_b,
+                "POST",
+                "/v1/conversations",
+                Some("m-conv-2"),
+                Some(&json!({})),
+            ),
+            201,
+        );
+        let next_run = success(
+            http_api.call(
+                alice_b,
+                "POST",
+                "/v1/runs",
+                Some("metered-run-2"),
+                Some(&json!({
+                    "conversation_id": conv2["conversation_id"],
+                    "branch_id": conv2["branch_id"],
+                    "proposal": {
+                        "expected_head_message_id": null,
+                        "turn": {
+                            "mode": "append",
+                            "input_message_id": "00000000-0000-4000-8000-00000000b002",
+                            "parts": [{"text": "second metered run"}]
+                        },
+                        "selection": {
+                            "model": "a",
+                            "layer": {"controls": {"context_window": "450", "output_reserve": "100"}}
+                        },
+                        "requested_rounds": 1
+                    }
+                })),
+            ),
+            201,
+        );
+        assert!(next_run["run_id"].is_string());
     }
 }

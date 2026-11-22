@@ -40,7 +40,7 @@ fn audience() -> Vec<u8> {
     )
 }
 
-async fn browser(db: &TestDb, account: &Account, n: u8) -> String {
+pub(super) async fn browser(db: &TestDb, account: &Account, n: u8) -> String {
     seeded_session(db, account, n, None).await
 }
 
@@ -50,14 +50,14 @@ async fn native(db: &TestDb, account: &Account, n: u8) -> String {
 
 /// A session credential on its channel.
 #[derive(Clone, Copy)]
-enum As<'a> {
+pub(super) enum As<'a> {
     Browser(&'a str),
     Native(&'a str),
 }
 
 /// The API binary with `AUTH_CONFIG` and `ARTIFACTS_DIR`, connected as `openmettle_api` and,
 /// for session issuance, as `openmettle_issuance` (ADR 0030). Killed on drop.
-struct Api {
+pub(super) struct Api {
     process: Process,
     dir: auth_config_support::Dir,
     bind: String,
@@ -77,7 +77,7 @@ impl Api {
         Self::configured(db, dir, document, 4)
     }
 
-    fn configured(
+    pub(super) fn configured(
         db: &TestDb,
         dir: auth_config_support::Dir,
         document: Value,
@@ -181,7 +181,7 @@ impl Api {
 
     /// One `/v1` request: the status and the JSON body (`null` when empty). Every problem
     /// decodes with the contract consumer.
-    fn call(
+    pub(super) fn call(
         &self,
         who: As<'_>,
         method: &str,
@@ -277,7 +277,7 @@ async fn mounted() -> (TestDb, Api) {
 }
 
 #[track_caller]
-fn success(response: (u16, Value), status: u16) -> Value {
+pub(super) fn success(response: (u16, Value), status: u16) -> Value {
     assert_eq!(response.0, status, "{}", response.1);
     response.1
 }
@@ -2701,6 +2701,36 @@ async fn create_run_distinguishes_rate_limited_quota_and_provisioning_refusals_o
         unbound_cost["quota"],
         json!({"resource_kind": "usage_cost_micros", "scope_kind": "instance"})
     );
+    // Even when personal usage_cost_micros hard_limit = 0, missing profile cost_bound must still
+    // fail closed with 503 provisioning (NOT 429 quota) because qualification precedes capacity.
+    success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/usage_cost_micros"),
+            Some("cost-zero-qual"),
+            Some(&json!({"hard_limit": "0", "reason": "zero cost ceiling"})),
+        ),
+        200,
+    );
+    let (status, unbound_zero) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("cost-unbound-b-zero"),
+        Some(&cost_body(
+            &conv5_id,
+            &branch5_id,
+            "00000000-0000-4000-8000-00000000a023",
+            json!({"model": "b", "layer": {"controls": {"output_reserve": "256"}}}),
+        )),
+    );
+    assert_eq!(status, 503, "{unbound_zero}");
+    assert_eq!(unbound_zero["code"], "provisioning");
+    assert_eq!(
+        unbound_zero["quota"],
+        json!({"resource_kind": "usage_cost_micros", "scope_kind": "instance"})
+    );
     for (idx, run) in [cost_run_1, cost_run_2].into_iter().enumerate() {
         success(
             api.call(
@@ -2714,8 +2744,8 @@ async fn create_run_distinguishes_rate_limited_quota_and_provisioning_refusals_o
         );
     }
 
-    // 4b. Device-slot profiles enforce device_reservations (unconfigured -> 503 provisioning,
-    //     0 -> 429 quota, 1 -> admits first, refuses second, cancel frees the slot immediately).
+    // 4a. Exact HTTP Idempotency-Key replay of a pre-PR3 queued run (missing gateway_reservations
+    //     and quota_reservations) backfills both rows cleanly and keeps subsequent replays read-only.
     success(
         api.call(
             admin_n,
@@ -2726,6 +2756,167 @@ async fn create_run_distinguishes_rate_limited_quota_and_provisioning_refusals_o
         ),
         200,
     );
+    {
+        let (legacy_conv, legacy_branch) = conv("conv-legacy-replay");
+        let legacy_msg = "00000000-0000-4000-8000-00000000a024";
+        let legacy_body = run_body(&legacy_conv, &legacy_branch, legacy_msg, 1);
+        let seed_run = success(
+            api.call(
+                alice_b,
+                "POST",
+                "/v1/runs",
+                Some("legacy-seed-src"),
+                Some(&legacy_body),
+            ),
+            201,
+        );
+        let seed_id = seed_run["run_id"].as_str().unwrap();
+        success(
+            api.call(
+                alice_b,
+                "POST",
+                &format!("/v1/runs/{seed_id}/cancel"),
+                Some("legacy-seed-cancel"),
+                None,
+            ),
+            200,
+        );
+        let (input_snap, config_snap): (Vec<u8>, Vec<u8>) = sqlx::query_as(
+            "SELECT input_snapshot, config_snapshot FROM openmettle.runs WHERE id = $1::uuid",
+        )
+        .bind(seed_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        let replay_client_key = "legacy-http-replay-1";
+        let hashed_key: String = framed_digest(
+            b"openmettle/v1-idempotency/1\0",
+            &[
+                b"createRun",
+                legacy_conv.as_bytes(),
+                replay_client_key.as_bytes(),
+            ],
+        )
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+        let mut api_c = connect(&db.0, API).await;
+        let mut tx = WriteTransaction::begin(&mut api_c).await.unwrap();
+        let openmettle_core::authz::runs::Admission::Admitted {
+            run_id: legacy_run_id,
+            ..
+        } = openmettle_core::authz::runs::admit_run(
+            &mut tx,
+            &openmettle_core::authz::runs::RunAdmission {
+                input: openmettle_core::runs::RunInput {
+                    scope: &alice_scope,
+                    actor: &alice.user,
+                    conversation: &legacy_conv,
+                    branch: &legacy_branch,
+                    message: legacy_msg,
+                    key: &hashed_key,
+                    format: openmettle_core::model_config::SNAPSHOT_FORMAT,
+                    version: openmettle_core::model_config::SNAPSHOT_VERSION,
+                    input: &input_snap,
+                    config: &config_snap,
+                },
+                actor_approval_id: &alice.approval,
+                capabilities: &[],
+                requested_rounds: Some(1),
+                now_ms: authz_store::NOW,
+                cost_qualified: None,
+            },
+            &openmettle_core::authz::runs::AdmissionLimits {
+                live_per_actor: 4,
+                live_per_scope: 8,
+                queued_in_instance: 32,
+                queue_timeout: Duration::from_secs(300),
+                round_cap: 10,
+            },
+        )
+        .await
+        .unwrap()
+        else {
+            panic!("expected legacy queued admission");
+        };
+        tx.commit().await.unwrap();
+        // Verify pre-replay state has no gateway_reservations or quota_reservations for this run.
+        let (pre_gw, pre_qr): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM openmettle.gateway_reservations WHERE run_id = $1::uuid),
+                    (SELECT count(*) FROM openmettle.quota_reservations WHERE run_id = $1::uuid)",
+        )
+        .bind(&legacy_run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!((pre_gw, pre_qr), (0, 0));
+        // Exact replay backfills both gateway_reservations and quota_reservations and returns 200 OK.
+        let replayed_legacy = success(
+            api.call(
+                alice_b,
+                "POST",
+                "/v1/runs",
+                Some(replay_client_key),
+                Some(&legacy_body),
+            ),
+            200,
+        );
+        assert_eq!(replayed_legacy["run_id"], legacy_run_id);
+        let (post_gw, post_qr): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM openmettle.gateway_reservations WHERE run_id = $1::uuid),
+                    (SELECT count(*) FROM openmettle.quota_reservations WHERE run_id = $1::uuid AND state = 'held')",
+        )
+        .bind(&legacy_run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!((post_gw, post_qr), (1, 1));
+        // Second exact replay stays read-only even if personal usage_tokens is lowered to 0.
+        success(
+            api.call(
+                admin_n,
+                "PUT",
+                &format!("/v1/admin/scopes/{alice_scope}/quotas/usage_tokens"),
+                Some("tok-zero-after-backfill"),
+                Some(&json!({"hard_limit": "0", "reason": "test read-only replay"})),
+            ),
+            200,
+        );
+        let replayed_again = success(
+            api.call(
+                alice_b,
+                "POST",
+                "/v1/runs",
+                Some(replay_client_key),
+                Some(&legacy_body),
+            ),
+            200,
+        );
+        assert_eq!(replayed_again["run_id"], legacy_run_id);
+        success(
+            api.call(
+                alice_b,
+                "POST",
+                &format!("/v1/runs/{legacy_run_id}/cancel"),
+                Some("cancel-legacy-replayed"),
+                None,
+            ),
+            200,
+        );
+        success(
+            api.call(
+                admin_n,
+                "PUT",
+                &format!("/v1/admin/scopes/{alice_scope}/quotas/usage_tokens"),
+                Some("tok-1m-restore"),
+                Some(&json!({"hard_limit": "1000000", "reason": "restore tokens"})),
+            ),
+            200,
+        );
+    }
+
+    // 4b. Device-slot profiles enforce device_reservations (unconfigured -> 503 provisioning,
+    //     0 -> 429 quota, 1 -> admits first, refuses second, cancel frees the slot immediately).
     let gpu_sel = json!({"model": "gpu", "layer": {"controls": {"output_reserve": "256"}}});
     let (status, dev_unconf) = api.call(
         alice_b,

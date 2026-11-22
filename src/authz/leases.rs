@@ -618,6 +618,9 @@ async fn finish_resolution(
         .execute(&mut *c)
         .await?;
     resolution.event(c, lease.scope_id, lease.run_id).await?;
+    if !matches!(resolution, Resolution::Reconciling(_)) {
+        super::runs::release_terminal_runs(c, &[lease.run_id.to_owned()]).await?;
+    }
     Ok(match resolution {
         Resolution::Reconciling(unresolved) => Settled::Reconciling { unresolved },
         _ => Settled::Terminal {
@@ -750,6 +753,7 @@ pub async fn settle_expired(c: &mut PgConnection, limit: u32) -> Result<Vec<Stri
                 .event(c, row.try_get("scope_id")?, row.try_get("id")?)
                 .await?;
         }
+        super::runs::release_terminal_runs(c, &ids).await?;
         Ok(ids)
     })
     .await

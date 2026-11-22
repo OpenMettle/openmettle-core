@@ -988,6 +988,7 @@ pub async fn expire_waits(c: &mut PgConnection, limit: u32) -> Result<Vec<String
             fail(c, &scope, &id, if bound { EXPIRED } else { INVALID_WAIT }).await?;
             ids.push(id);
         }
+        runs::release_terminal_runs(c, &ids).await?;
         Ok(ids)
     })
     .await

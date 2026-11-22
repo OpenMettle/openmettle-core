@@ -32,7 +32,7 @@ impl std::error::Error for Error {}
 impl From<sqlx::Error> for Error {
     fn from(error: sqlx::Error) -> Self {
         match error.as_database_error().and_then(|e| e.code()).as_deref() {
-            Some("OMQ01" | "OMQ02") => Self::Refused,
+            Some("OMQ01" | "OMQ02" | "OMQ05") => Self::Refused,
             _ => Self::Database,
         }
     }
@@ -77,7 +77,7 @@ pub async fn hold_with_cost(
         .execute(tx.connection()?)
         .await?;
     if let Some(run) = run {
-        let cost = crate::quotas::cost_ceiling(tx, r, cost_ceiling).await?;
+        let cost = crate::quotas::cost_ceiling(tx, r, None, cost_ceiling).await?;
         for (resource, amount) in [("usage_cost_micros", cost), ("usage_tokens", Some(units))] {
             if let Some(amount) = amount {
                 sqlx::query("SELECT openmettle.quota_reserve($1::uuid,$2::uuid,$3,$4,$5,$6::uuid,NULL,NULL,
@@ -138,6 +138,143 @@ pub async fn reserve_with_cost<'a>(
     tx.commit().await?;
     Ok(pending)
 }
+/// Inputs for reserving one leased worker turn round with qualified cost and device bounds.
+pub struct TurnRound<'a> {
+    pub scope_id: &'a str,
+    pub actor: &'a str,
+    pub approval: &'a str,
+    pub run_id: &'a str,
+    pub round: i32,
+    pub claim_token: &'a str,
+    pub installation: &'a str,
+    pub model: &'a str,
+    pub round_tokens: i64,
+    pub round_cost: Option<i64>,
+    pub requires_device_slot: bool,
+}
+
+/// Owned unsent turn-round reservation handle. Never cloned or serialized.
+pub struct TurnPending {
+    pub id: String,
+    secret: [u8; 32],
+    reservation_id: String,
+    scope_id: String,
+    actor: String,
+    approval: String,
+    run_id: String,
+    round: i32,
+    claim_token: String,
+    installation: String,
+    model: String,
+    units: i64,
+}
+
+impl TurnPending {
+    fn as_pending(&self) -> Pending<'_> {
+        Pending {
+            id: self.id.clone(),
+            secret: self.secret,
+            call: Call {
+                reservation: Reservation {
+                    id: &self.reservation_id,
+                    scope_id: &self.scope_id,
+                    actor: &self.actor,
+                    approval: &self.approval,
+                },
+                installation: &self.installation,
+                model: &self.model,
+                units: self.units,
+                authority: Authority::Lease {
+                    run: &self.run_id,
+                    round: self.round,
+                    token: &self.claim_token,
+                },
+            },
+        }
+    }
+
+    pub async fn release(&self, pool: &PgPool) -> Result<bool, Error> {
+        self.as_pending().release(pool).await
+    }
+
+    pub async fn handoff(&self, pool: &PgPool, keys: &GatewayKeys) -> Result<Dispatch, Error> {
+        self.as_pending().handoff(pool, keys).await
+    }
+}
+
+/// Reserve one leased worker turn round in a single write transaction: unwind any superseded
+/// round hold, recover missing legacy/pre-PR3 gateway or quota parent holds (enforcing profile
+/// `cost_bound` and `requires_device_slot`), insert the round `gateway_requests` row, and bind
+/// its metered quota slice.
+pub async fn reserve_turn_round(pool: &PgPool, round: TurnRound<'_>) -> Result<TurnPending, Error> {
+    let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
+    sqlx::query(
+        "SELECT openmettle.quota_unwind_superseded_round($1::uuid, $2::uuid, $3::uuid, $4)",
+    )
+    .bind(round.scope_id)
+    .bind(round.run_id)
+    .bind(round.claim_token)
+    .bind(round.round)
+    .execute(tx.connection()?)
+    .await?;
+    let reservation_id: String = sqlx::query_scalar(
+        "SELECT openmettle.quota_ensure_legacy_run_holds(
+             $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7
+         )::text",
+    )
+    .bind(round.scope_id)
+    .bind(round.run_id)
+    .bind(round.claim_token)
+    .bind(round.round_tokens)
+    .bind(round.round_cost)
+    .bind(round.round_cost.is_none())
+    .bind(round.requires_device_slot)
+    .fetch_one(tx.connection()?)
+    .await?;
+    let call = Call {
+        reservation: Reservation {
+            id: &reservation_id,
+            scope_id: round.scope_id,
+            actor: round.actor,
+            approval: round.approval,
+        },
+        installation: round.installation,
+        model: round.model,
+        units: round.round_tokens,
+        authority: Authority::Lease {
+            run: round.run_id,
+            round: round.round,
+            token: round.claim_token,
+        },
+    };
+    let pending = reserve_in(&mut tx, call).await?;
+    crate::quotas::bind_request(
+        &mut tx,
+        &pending.call,
+        &pending.id,
+        &pending.secret,
+        round.round_cost,
+    )
+    .await?;
+    let id = pending.id;
+    let secret = pending.secret;
+    tx.commit().await?;
+    Ok(TurnPending {
+        id,
+        secret,
+        reservation_id,
+        scope_id: round.scope_id.to_owned(),
+        actor: round.actor.to_owned(),
+        approval: round.approval.to_owned(),
+        run_id: round.run_id.to_owned(),
+        round: round.round,
+        claim_token: round.claim_token.to_owned(),
+        installation: round.installation.to_owned(),
+        model: round.model.to_owned(),
+        units: round.round_tokens,
+    })
+}
+
 async fn reserve_in<'a>(
     tx: &mut WriteTransaction<'_>,
     call: Call<'a>,
@@ -188,6 +325,17 @@ pub struct Dispatch {
     pub(crate) model: String,
     pub(crate) server: bool,
     pub(crate) authorization: hyper::header::HeaderValue,
+}
+impl Dispatch {
+    /// Returns the sensitive `Authorization` header only when this handoff matches `server` and
+    /// `model`, preserving binding between reservation handoff and inference dispatch.
+    pub fn authorization_for(
+        &self,
+        server: bool,
+        model: &str,
+    ) -> Option<hyper::header::HeaderValue> {
+        (self.server == server && self.model == model).then(|| self.authorization.clone())
+    }
 }
 impl Pending<'_> {
     pub async fn release(&self, pool: &PgPool) -> Result<bool, Error> {
@@ -406,3 +554,28 @@ pub use crate::provider_http::gateway::problem;
 pub mod family;
 pub mod reconcile;
 pub mod settlement;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyper::header::HeaderValue;
+
+    #[test]
+    fn dispatch_authorization_checks_server_and_model() {
+        let mut auth = HeaderValue::from_static("Bearer handed-off");
+        auth.set_sensitive(true);
+        let dispatch = Dispatch {
+            id: "00000000-0000-4000-8000-000000000001".into(),
+            installation: "00000000-0000-4000-8000-000000000002".into(),
+            model: "a".into(),
+            server: true,
+            authorization: auth,
+        };
+        assert_eq!(
+            dispatch.authorization_for(true, "a").as_ref(),
+            Some(&HeaderValue::from_static("Bearer handed-off"))
+        );
+        assert!(dispatch.authorization_for(false, "a").is_none());
+        assert!(dispatch.authorization_for(true, "b").is_none());
+    }
+}

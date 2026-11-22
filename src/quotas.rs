@@ -41,6 +41,7 @@ pub(crate) async fn prepare_round(
 pub(crate) async fn cost_ceiling(
     tx: &mut WriteTransaction<'_>,
     owner: &Reservation<'_>,
+    run: Option<&str>,
     supplied: Option<i64>,
 ) -> Result<Option<i64>, Error> {
     let configured: Option<i64> =
@@ -52,7 +53,39 @@ pub(crate) async fn cost_ceiling(
     match (configured, supplied) {
         (None, None) => Ok(None),
         (Some(limit), Some(n)) if n > 0 && n <= limit => Ok(Some(n)),
-        (Some(n), None) if n > 0 => Ok(Some(n)),
+        (Some(limit), None) if limit > 0 => {
+            if let Some(run_id) = run
+                && let Some((reserved_units, held_units, round_limit)) =
+                    sqlx::query_as::<_, (i64, i64, Option<i32>)>(
+                        "SELECT h.reserved_units, h.held_units, r.round_limit
+                           FROM openmettle.quota_reservations h
+                           JOIN openmettle.runs r
+                             ON r.id = h.run_id AND r.scope_id = h.scope_id
+                          WHERE h.scope_id = $1::uuid
+                            AND h.run_id = $2::uuid
+                            AND h.gateway_request_id IS NULL
+                            AND h.resource_kind = 'usage_cost_micros'
+                            AND h.state = 'held'",
+                    )
+                    .bind(owner.scope_id)
+                    .bind(run_id)
+                    .fetch_optional(tx.connection()?)
+                    .await?
+            {
+                if held_units <= 0 {
+                    return Err(Error::Refused);
+                }
+                let rounds = i128::from(round_limit.unwrap_or(1).max(1));
+                let per_round = ((i128::from(reserved_units) + rounds - 1) / rounds) as i64;
+                let slice = per_round.min(held_units).min(limit);
+                return if slice > 0 {
+                    Ok(Some(slice))
+                } else {
+                    Err(Error::Refused)
+                };
+            }
+            Ok(Some(limit))
+        }
         _ => Err(Error::Refused),
     }
 }
@@ -64,7 +97,18 @@ pub(crate) async fn bind_request(
     secret: &[u8],
     supplied: Option<i64>,
 ) -> Result<(), Error> {
-    let cost = cost_ceiling(tx, &call.reservation, supplied).await?;
+    let enforced: bool =
+        sqlx::query_scalar("SELECT metering_enforced FROM openmettle.quota_enforcement WHERE id")
+            .fetch_one(tx.connection()?)
+            .await?;
+    if !enforced {
+        return Ok(());
+    }
+    let run = match call.authority {
+        Authority::Lease { run, .. } => Some(run),
+        Authority::Session { .. } => None,
+    };
+    let cost = cost_ceiling(tx, &call.reservation, run, supplied).await?;
     for (resource, amount) in [
         ("usage_cost_micros", cost),
         ("usage_tokens", Some(call.units)),
@@ -1349,6 +1393,90 @@ pub async fn reserve_admitted_run_budget(
     result
 }
 
+/// Backfill missing `gateway_reservations` and/or metered `quota_reservations` parent holds
+/// for an already-`queued` run on exact HTTP `Idempotency-Key` replay (e.g. a queued run
+/// admitted by an `N-1` server or before migration 0024).
+///
+/// Returns `Ok((true, None))` when at least one missing row was backfilled and the caller must
+/// commit `tx`; `Ok((false, None))` when the run already has its budget rows (normal replay,
+/// stay read-only); or `Ok((false, Some(limit)))` when backfill is refused by quota/provisioning.
+pub async fn backfill_replayed_run_budget(
+    tx: &mut WriteTransaction<'_>,
+    input: &RunBudgetReservation<'_>,
+) -> Result<(bool, Option<RunLimit>), StoreError> {
+    let mut outer = tx.take_active()?;
+    let result = backfill_replayed_run_budget_inner(&mut outer, input).await;
+    tx.restore(outer);
+    result
+}
+
+async fn backfill_replayed_run_budget_inner(
+    outer: &mut Transaction<'_, Postgres>,
+    input: &RunBudgetReservation<'_>,
+) -> Result<(bool, Option<RunLimit>), StoreError> {
+    let has_gateway_reservations: bool =
+        sqlx::query_scalar("SELECT to_regclass('openmettle.gateway_reservations') IS NOT NULL")
+            .fetch_one(&mut **outer)
+            .await?;
+    if !has_gateway_reservations {
+        return Ok((false, None));
+    }
+    let has_quota_schema: bool =
+        sqlx::query_scalar("SELECT to_regclass('openmettle.quota_enforcement') IS NOT NULL")
+            .fetch_one(&mut **outer)
+            .await?;
+    let enforced = if has_quota_schema {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT metering_enforced FROM openmettle.quota_enforcement WHERE id",
+        )
+        .fetch_one(&mut **outer)
+        .await?
+    } else {
+        false
+    };
+    if enforced {
+        let has_token_hold: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM openmettle.quota_reservations
+                  WHERE scope_id = $1::uuid
+                    AND run_id = $2::uuid
+                    AND gateway_request_id IS NULL
+                    AND resource_kind = 'usage_tokens'
+             )",
+        )
+        .bind(input.scope_id)
+        .bind(input.run_id)
+        .fetch_one(&mut **outer)
+        .await?;
+        if has_token_hold {
+            return Ok((false, None));
+        }
+    }
+    // `gateway_run_hold()` trigger makes this INSERT a no-op (`rows_affected == 0`) when the
+    // identical row already exists, and inserts (`rows_affected == 1`) when missing.
+    let gw_inserted = sqlx::query(
+        "INSERT INTO openmettle.gateway_reservations
+             (id, scope_id, actor_user_id, approval_id, run_id, units)
+         VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $1::uuid, $5)",
+    )
+    .bind(input.run_id)
+    .bind(input.scope_id)
+    .bind(input.actor_user_id)
+    .bind(input.actor_approval_id)
+    .bind(input.token_units)
+    .execute(&mut **outer)
+    .await?
+    .rows_affected()
+        > 0;
+    if !enforced {
+        return Ok((gw_inserted, None));
+    }
+    if let Some(refusal) = reserve_metered_holds_inner(outer, input).await? {
+        return Ok((false, Some(refusal)));
+    }
+    Ok((true, None))
+}
+
 async fn reserve_admitted_run_budget_inner(
     outer: &mut Transaction<'_, Postgres>,
     input: &RunBudgetReservation<'_>,
@@ -1391,6 +1519,13 @@ async fn reserve_admitted_run_budget_inner(
         return Ok(None);
     }
 
+    reserve_metered_holds_inner(outer, input).await
+}
+
+async fn reserve_metered_holds_inner(
+    outer: &mut Transaction<'_, Postgres>,
+    input: &RunBudgetReservation<'_>,
+) -> Result<Option<RunLimit>, StoreError> {
     // Canonical alphabetical resource_kind order (ADR 0040):
     // 1. device_reservations (when required by profile)
     // 2. usage_cost_micros (when any applicable cost limit is configured)

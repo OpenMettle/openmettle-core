@@ -201,6 +201,7 @@ async fn published_paths_replay_revisions_and_budget_survive_forks() {
         capabilities: &[],
         requested_rounds: None,
         now_ms: NOW,
+        cost_qualified: None,
     };
     let limits = AdmissionLimits {
         live_per_actor: 10,

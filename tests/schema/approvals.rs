@@ -166,6 +166,7 @@ impl Fixture {
             capabilities: &[],
             requested_rounds: None,
             now_ms: session.context().observed_ms(),
+            cost_qualified: None,
         };
         let result = queue::admit_run_with_mode(&mut tx, &request, limits, session).await;
         if result.is_ok() {

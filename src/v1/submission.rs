@@ -420,12 +420,12 @@ pub(super) async fn submit(
     .await?;
     let mut tx = WriteTransaction::begin_bounded(c, false).await?;
     let result = admission(&mut tx, &visible.scope_id, call, r, limits, catalog).await;
-    if matches!(result, Ok(Admission::Admitted { .. })) {
+    if matches!(result, Ok((_, true))) {
         tx.commit().await?
     } else {
         tx.rollback().await?
     }
-    match result? {
+    match result?.0 {
         Admission::Admitted { run_id, .. } => Ok((StatusCode::CREATED, run_id)),
         Admission::Replayed { run_id, .. } => Ok((StatusCode::OK, run_id)),
         Admission::Refused(RunLimit::ActorLimit | RunLimit::ScopeLimit) => Err(problem(
@@ -468,7 +468,7 @@ async fn admission(
     r: &Request,
     limits: &AdmissionLimits,
     catalog: Option<&Catalog>,
-) -> Result<Admission, Problem> {
+) -> Result<(Admission, bool), Problem> {
     let c = tx.connection()?;
     let ctx = call.context;
     queue::lock_scope_actor(c, scope, ctx.user_id()).await?;
@@ -519,6 +519,16 @@ async fn admission(
         if mode.execution_mode != r.execution_mode || !previous.matches(&intent) {
             return Err(KEY_CONFLICT);
         }
+        let (round_cost, device_slot) = match catalog {
+            Some(cat) => match cat.target(&config.effective) {
+                Ok(profile) => (
+                    cat.round_cost_ceiling(&config.effective)?,
+                    profile.requires_device_slot,
+                ),
+                Err(_) => (None, false),
+            },
+            None => (None, false),
+        };
         (
             found.branch_id,
             found.input_message_id,
@@ -530,8 +540,8 @@ async fn admission(
             },
             config.required_capabilities,
             config.effective.ceiling.value,
-            None,
-            false,
+            round_cost,
+            device_slot,
         )
     } else {
         let audit = AuditContext {
@@ -608,16 +618,13 @@ async fn admission(
             capabilities: &caps,
             requested_rounds: intent.requested_rounds,
             now_ms: ctx.observed_ms(),
+            cost_qualified: Some(per_round_cost_micros.is_some()),
         },
         limits,
         ctx,
     )
     .await?;
-    if let Admission::Admitted {
-        ref run_id,
-        round_limit,
-    } = admitted
-    {
+    let build_budget = |round_limit: i32| -> Result<(i64, Option<i64>), Problem> {
         let per_round = per_round_ceiling.ok_or(PROVISIONING)?;
         let token_units = per_round
             .checked_mul(u64::from(u32::try_from(round_limit).map_err(|_| INTERNAL)?))
@@ -632,25 +639,60 @@ async fn admission(
                     .ok_or(INVALID)
             })
             .transpose()?;
-        if let Some(limit) = crate::quotas::reserve_admitted_run_budget(
-            tx,
-            &crate::quotas::RunBudgetReservation {
-                scope_id: scope,
-                scope_kind,
-                actor_user_id: ctx.user_id(),
-                actor_approval_id: ctx.approval_id(),
-                run_id,
-                token_units,
-                cost_units,
-                requires_device_slot,
-            },
-        )
-        .await?
-        {
-            return Ok(Admission::Refused(limit));
+        Ok((token_units, cost_units))
+    };
+    match &admitted {
+        Admission::Admitted {
+            run_id,
+            round_limit,
+        } => {
+            let (token_units, cost_units) = build_budget(*round_limit)?;
+            if let Some(limit) = crate::quotas::reserve_admitted_run_budget(
+                tx,
+                &crate::quotas::RunBudgetReservation {
+                    scope_id: scope,
+                    scope_kind,
+                    actor_user_id: ctx.user_id(),
+                    actor_approval_id: ctx.approval_id(),
+                    run_id,
+                    token_units,
+                    cost_units,
+                    requires_device_slot,
+                },
+            )
+            .await?
+            {
+                return Ok((Admission::Refused(limit), false));
+            }
+            Ok((admitted, true))
         }
+        Admission::Replayed {
+            run_id,
+            state,
+            round_limit,
+        } if state == "queued" => {
+            let (token_units, cost_units) = build_budget(round_limit.unwrap_or(limits.round_cap))?;
+            let (committed, refusal) = crate::quotas::backfill_replayed_run_budget(
+                tx,
+                &crate::quotas::RunBudgetReservation {
+                    scope_id: scope,
+                    scope_kind,
+                    actor_user_id: ctx.user_id(),
+                    actor_approval_id: ctx.approval_id(),
+                    run_id,
+                    token_units,
+                    cost_units,
+                    requires_device_slot,
+                },
+            )
+            .await?;
+            if let Some(limit) = refusal {
+                return Ok((Admission::Refused(limit), false));
+            }
+            Ok((admitted, committed))
+        }
+        _ => Ok((admitted, false)),
     }
-    Ok(admitted)
 }
 pub(super) async fn cancel(
     c: &mut PgConnection,

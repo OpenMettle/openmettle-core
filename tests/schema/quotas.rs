@@ -948,6 +948,7 @@ async fn schema_23_run_budget_survives_upgrade_to_26_and_legacy_worker_dispatch(
             capabilities: &[],
             requested_rounds: Some(2),
             now_ms: authz_store::NOW,
+            cost_qualified: None,
         },
         &limits,
     )
@@ -1074,6 +1075,21 @@ async fn schema_23_run_budget_survives_upgrade_to_26_and_legacy_worker_dispatch(
             .contains("openmettle.quota_revoke_scope_override(uuid,uuid,text,text,text,jsonb)")),
         "{grants:?}"
     );
+    assert!(
+        grants.iter().any(|g| {
+            g == "openmettle_worker has EXECUTE on function openmettle.quota_ensure_legacy_run_holds(uuid,uuid,uuid,bigint,bigint,boolean,boolean)"
+        }),
+        "{grants:?}"
+    );
+    for role in ["openmettle_api", "openmettle_worker"] {
+        let expected = format!(
+            "{role} has EXECUTE on function openmettle.quota_release_terminal_runs(uuid[])"
+        );
+        assert!(
+            grants.iter().any(|g| g == &expected),
+            "{expected} not in {grants:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1141,6 +1157,7 @@ async fn cancel_and_expire_immediately_release_holds_unless_operation_is_in_flig
                 capabilities: &[],
                 requested_rounds: Some(1),
                 now_ms: authz_store::NOW,
+                cost_qualified: None,
             },
             limits,
         )
@@ -1256,4 +1273,700 @@ async fn cancel_and_expire_immediately_release_holds_unless_operation_is_in_flig
     .await
     .unwrap();
     assert_eq!(still_held, 2);
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn schema_23_cost_device_upgrade_pre_pr3_worker_recovery_and_gateway_reserve_slice() {
+    use openmettle_core::{
+        authz::{
+            gateway::{self, Authority, Call, Reservation, TurnRound},
+            leases::LeaseSettings,
+            runs::{self as authz_queue, Admission, AdmissionLimits, ClaimLimits, RunAdmission},
+        },
+        quotas::{self, RunBudgetReservation},
+        runs::{RunInput, WriteTransaction},
+    };
+    use sqlx::postgres::PgPoolOptions;
+
+    const INSTALL: &str = "00000000-0000-4000-8000-000000000073";
+
+    let db = TestDb::new().await;
+    let settings = db.settings(Duration::from_secs(10));
+    migrate::apply(&settings, &MIGRATIONS[..23]).await.unwrap();
+
+    let mut owner = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut owner).await;
+    let alice =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let scope = authz_runs::personal_of(&db, &alice).await;
+    let chat = authz_runs::chat(&db, &scope, "personal", &alice).await;
+    let mut api = connect(&db.0, API).await;
+    let (branch, message) = branch_and_message(&mut api, &scope, &chat).await;
+    let limits = AdmissionLimits {
+        live_per_actor: 8,
+        live_per_scope: 8,
+        queued_in_instance: 32,
+        queue_timeout: Duration::from_secs(300),
+        round_cap: 10,
+    };
+
+    // 1. Admit a 1-round run on schema 23 (records gateway_reservations = 450, no quota_reservations).
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    let Admission::Admitted {
+        run_id: run_s23, ..
+    } = authz_queue::admit_run(
+        &mut tx,
+        &RunAdmission {
+            input: RunInput {
+                scope: &scope,
+                actor: &alice.user,
+                conversation: &chat,
+                branch: &branch,
+                message: &message,
+                key: "s23-cost-dev",
+                format: "openmettle.conversation",
+                version: 1,
+                input: b"{}",
+                config: br#"{"effective":{"ceiling":{"value":450}}}"#,
+            },
+            actor_approval_id: &alice.approval,
+            capabilities: &[],
+            requested_rounds: Some(1),
+            now_ms: authz_store::NOW,
+            cost_qualified: None,
+        },
+        &limits,
+    )
+    .await
+    .unwrap()
+    else {
+        panic!("expected schema-23 admission");
+    };
+    assert!(
+        quotas::reserve_admitted_run_budget(
+            &mut tx,
+            &RunBudgetReservation {
+                scope_id: &scope,
+                scope_kind: "personal",
+                actor_user_id: &alice.user,
+                actor_approval_id: &alice.approval,
+                run_id: &run_s23,
+                token_units: 450,
+                cost_units: None,
+                requires_device_slot: false,
+            },
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    tx.commit().await.unwrap();
+
+    // Upgrade 23 -> 26, activate metering, configure static 1000-micro cost limit + 1 device slot,
+    // and pre-charge 200 micros active_used (leaving 800 remaining: enough for 450, NOT 1000!).
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+    owner
+        .execute(
+            "UPDATE openmettle.quota_defaults
+                SET cost_denomination = 'usd_micros'
+              WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'",
+        )
+        .await
+        .unwrap();
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 100000),
+                    ('personal', 'usage_cost_micros', 1000),
+                    ('personal', 'device_reservations', 1)",
+        )
+        .await
+        .unwrap();
+    owner
+        .execute(
+            "UPDATE openmettle.quota_enforcement
+                SET metering_enforced = true, metering_enforced_at = clock_timestamp()
+              WHERE id",
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.quota_budgets
+             (target_kind, scope_id, resource_kind, window_kind, window_start, active_used, reserved_held)
+         VALUES ('scope', $1::uuid, 'usage_cost_micros', 'static', 'epoch'::timestamptz, 200, 0)",
+    )
+    .bind(&scope)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    let worker_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(db.1.options(WORKER));
+    let mut worker = connect(&db.0, WORKER).await;
+    let lease_cfg = LeaseSettings {
+        lease: Duration::from_secs(60),
+        execution_timeout: Duration::from_secs(600),
+    };
+    let claim_cfg = ClaimLimits {
+        executing_per_actor: 4,
+        executing_per_scope: 8,
+    };
+    let claimed_s23 = authz_queue::claim_next(&mut worker, &claim_cfg, &lease_cfg)
+        .await
+        .unwrap()
+        .expect("claimed schema-23 run");
+    assert_eq!(claimed_s23.run_id, run_s23);
+
+    // reserve_turn_round recovers BOTH device_reservations (1) and 450-micro cost hold (NOT 1000!),
+    // succeeding with 200 active + 450 reserved = 650 <= 1000.
+    let pending_s23 = gateway::reserve_turn_round(
+        &worker_pool,
+        TurnRound {
+            scope_id: &scope,
+            actor: &alice.user,
+            approval: &alice.approval,
+            run_id: &run_s23,
+            round: 1,
+            claim_token: &claimed_s23.claim_token,
+            installation: INSTALL,
+            model: "a",
+            round_tokens: 450,
+            round_cost: Some(450),
+            requires_device_slot: true,
+        },
+    )
+    .await
+    .unwrap();
+    let parent_holds: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT resource_kind, reserved_units, held_units
+           FROM openmettle.quota_reservations
+          WHERE run_id = $1::uuid AND gateway_request_id IS NULL
+          ORDER BY resource_kind",
+    )
+    .bind(&run_s23)
+    .fetch_all(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        parent_holds,
+        vec![
+            ("device_reservations".into(), 1, 1),
+            ("usage_cost_micros".into(), 450, 0),
+            ("usage_tokens".into(), 450, 0),
+        ]
+    );
+    // Release Round 1 unsent (returns 450 micros to parent hold), then verify gateway::reserve with
+    // cost_ceiling = None derives the 450-micro per-round slice from the parent hold (NOT 1000!).
+    assert!(pending_s23.release(&worker_pool).await.unwrap());
+    let pending_auto = gateway::reserve(
+        &worker_pool,
+        Call {
+            reservation: Reservation {
+                id: &run_s23,
+                scope_id: &scope,
+                actor: &alice.user,
+                approval: &alice.approval,
+            },
+            installation: INSTALL,
+            model: "a",
+            units: 450,
+            authority: Authority::Lease {
+                run: &run_s23,
+                round: 1,
+                token: &claimed_s23.claim_token,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let child_cost: i64 = sqlx::query_scalar(
+        "SELECT reserved_units FROM openmettle.quota_reservations
+          WHERE gateway_request_id = $1::uuid AND resource_kind = 'usage_cost_micros'",
+    )
+    .bind(&pending_auto.id)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(child_cost, 450);
+    assert!(pending_auto.release(&worker_pool).await.unwrap());
+    openmettle_core::authz::leases::settle(
+        &mut worker,
+        &claimed_s23.lease(),
+        &lease_cfg,
+        openmettle_core::authz::leases::Settle::Succeeded,
+    )
+    .await
+    .unwrap();
+
+    // 2. Pre-PR3 live queued run inserted WITHOUT a gateway_reservations row recovers cleanly on
+    //    direct worker dispatch (`reserve_turn_round`), creating gateway_reservations + quota holds.
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    let Admission::Admitted {
+        run_id: run_legacy, ..
+    } = authz_queue::admit_run(
+        &mut tx,
+        &RunAdmission {
+            input: RunInput {
+                scope: &scope,
+                actor: &alice.user,
+                conversation: &chat,
+                branch: &branch,
+                message: &message,
+                key: "pre-pr3-no-gw-res",
+                format: "openmettle.conversation",
+                version: 1,
+                input: b"{}",
+                config: br#"{"effective":{"ceiling":{"value":300}}}"#,
+            },
+            actor_approval_id: &alice.approval,
+            capabilities: &[],
+            requested_rounds: Some(2),
+            now_ms: authz_store::NOW,
+            cost_qualified: None,
+        },
+        &limits,
+    )
+    .await
+    .unwrap()
+    else {
+        panic!("expected pre-PR3 admission");
+    };
+    tx.commit().await.unwrap();
+    let pre_gw: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM openmettle.gateway_reservations WHERE run_id = $1::uuid",
+    )
+    .bind(&run_legacy)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(pre_gw, 0);
+
+    let claimed_legacy = authz_queue::claim_next(&mut worker, &claim_cfg, &lease_cfg)
+        .await
+        .unwrap()
+        .expect("claimed pre-PR3 run");
+    assert_eq!(claimed_legacy.run_id, run_legacy);
+    let pending_legacy = gateway::reserve_turn_round(
+        &worker_pool,
+        TurnRound {
+            scope_id: &scope,
+            actor: &alice.user,
+            approval: &alice.approval,
+            run_id: &run_legacy,
+            round: 1,
+            claim_token: &claimed_legacy.claim_token,
+            installation: INSTALL,
+            model: "a",
+            round_tokens: 300,
+            round_cost: Some(300),
+            requires_device_slot: true,
+        },
+    )
+    .await
+    .unwrap();
+    let gw_recovered: (i64, i64) = sqlx::query_as(
+        "SELECT units, allocated FROM openmettle.gateway_reservations WHERE run_id = $1::uuid",
+    )
+    .bind(&run_legacy)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(gw_recovered, (600, 300));
+    assert!(pending_legacy.release(&worker_pool).await.unwrap());
+    openmettle_core::authz::leases::settle(
+        &mut worker,
+        &claimed_legacy.lease(),
+        &lease_cfg,
+        openmettle_core::authz::leases::Settle::Succeeded,
+    )
+    .await
+    .unwrap();
+    let remaining_held: i64 = sqlx::query_scalar(
+        "SELECT coalesce(sum(reserved_held), 0)::bigint FROM openmettle.quota_budgets",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(remaining_held, 0);
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn schema_25_expiry_gating_and_batch_terminal_hold_release() {
+    use openmettle_core::{
+        authz::{
+            approvals,
+            leases::{self, LeaseSettings, Settle},
+            projects::{self, ProjectSettingsInput},
+            runs::{self as authz_queue, Admission, AdmissionLimits, ClaimLimits, RunAdmission},
+        },
+        quotas::{self, RunBudgetReservation},
+        runs::{RunInput, WriteTransaction},
+    };
+    use serde_json::json;
+
+    // Part A (Finding #5): on schema 25 (before 0026 exists), expire_queued as openmettle_worker
+    // on a run with an origin_role = 'api' parent hold must commit cleanly without 42501.
+    let db25 = TestDb::new().await;
+    let settings25 = db25.settings(Duration::from_secs(10));
+    migrate::apply(&settings25, &MIGRATIONS[..25])
+        .await
+        .unwrap();
+    let mut owner25 = connect(&db25.0, OWNER).await;
+    authz_store::providers(&mut owner25).await;
+    let alice25 = authz_store::account(
+        &mut owner25,
+        authz_store::PROVIDER,
+        true,
+        authz_store::FUTURE,
+    )
+    .await;
+    let scope25 = authz_runs::personal_of(&db25, &alice25).await;
+    owner25
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 100000)",
+        )
+        .await
+        .unwrap();
+    owner25
+        .execute(
+            "UPDATE openmettle.quota_enforcement
+                SET metering_enforced = true, metering_enforced_at = clock_timestamp()
+              WHERE id AND NOT metering_enforced",
+        )
+        .await
+        .unwrap();
+    let chat25 = authz_runs::chat(&db25, &scope25, "personal", &alice25).await;
+    let mut api25 = connect(&db25.0, API).await;
+    let (branch25, msg25) = branch_and_message(&mut api25, &scope25, &chat25).await;
+    let limits = AdmissionLimits {
+        live_per_actor: 8,
+        live_per_scope: 8,
+        queued_in_instance: 32,
+        queue_timeout: Duration::from_secs(300),
+        round_cap: 10,
+    };
+    let mut tx = WriteTransaction::begin(&mut api25).await.unwrap();
+    let Admission::Admitted { run_id: r25, .. } = authz_queue::admit_run(
+        &mut tx,
+        &RunAdmission {
+            input: RunInput {
+                scope: &scope25,
+                actor: &alice25.user,
+                conversation: &chat25,
+                branch: &branch25,
+                message: &msg25,
+                key: "s25-expire",
+                format: "openmettle.conversation",
+                version: 1,
+                input: b"{}",
+                config: b"{}",
+            },
+            actor_approval_id: &alice25.approval,
+            capabilities: &[],
+            requested_rounds: Some(1),
+            now_ms: authz_store::NOW,
+            cost_qualified: None,
+        },
+        &limits,
+    )
+    .await
+    .unwrap() else {
+        panic!("expected schema-25 admission");
+    };
+    assert!(
+        quotas::reserve_admitted_run_budget(
+            &mut tx,
+            &RunBudgetReservation {
+                scope_id: &scope25,
+                scope_kind: "personal",
+                actor_user_id: &alice25.user,
+                actor_approval_id: &alice25.approval,
+                run_id: &r25,
+                token_units: 5000,
+                cost_units: None,
+                requires_device_slot: false,
+            },
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    tx.commit().await.unwrap();
+    sqlx::query(
+        "UPDATE openmettle.runs
+            SET created_at = clock_timestamp() - interval '2 seconds',
+                queue_expires_at = clock_timestamp() - interval '1 second'
+          WHERE id = $1::uuid",
+    )
+    .bind(&r25)
+    .execute(&mut owner25)
+    .await
+    .unwrap();
+    let mut worker25 = connect(&db25.0, WORKER).await;
+    assert_eq!(
+        authz_queue::expire_queued(&mut worker25, 10).await.unwrap(),
+        vec![r25]
+    );
+
+    // Part B (Findings #2 & #6): on schema 26, batch expire_queued across personal & project scopes,
+    // approvals::expire_waits, leases::settle, and leases::settle_expired all release holds cleanly.
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut owner).await;
+    let alice =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let personal_scope = authz_runs::personal_of(&db, &alice).await;
+    let mut api = connect(&db.0, API).await;
+    let defaults = json!({});
+    let proj_id = authz_store::applied(
+        projects::create_project(
+            &mut api,
+            &authz_store::ctx(&alice, "batch-proj"),
+            &ProjectSettingsInput {
+                name: "Batch Quota Project",
+                instructions: "",
+                defaults: &defaults,
+            },
+        )
+        .await,
+    );
+    let proj_scope: String =
+        sqlx::query_scalar("SELECT scope_id::text FROM openmettle.projects WHERE id = $1::uuid")
+            .bind(&proj_id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    owner
+        .execute(
+            "UPDATE openmettle.quota_defaults
+                SET cost_denomination = 'usd_micros', hard_limit = 100000
+              WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'",
+        )
+        .await
+        .unwrap();
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 100000),
+                    ('project', 'usage_tokens', 100000),
+                    ('instance', 'usage_tokens', 500000),
+                    ('personal', 'usage_cost_micros', 50000),
+                    ('project', 'usage_cost_micros', 50000),
+                    ('personal', 'device_reservations', 4),
+                    ('project', 'device_reservations', 4),
+                    ('instance', 'device_reservations', 8)",
+        )
+        .await
+        .unwrap();
+    let p_chat = authz_runs::chat(&db, &personal_scope, "personal", &alice).await;
+    let (p_branch, p_msg) = branch_and_message(&mut api, &personal_scope, &p_chat).await;
+    let pr_chat = authz_runs::chat(&db, &proj_scope, "project", &alice).await;
+    let (pr_branch, pr_msg) = branch_and_message(&mut api, &proj_scope, &pr_chat).await;
+
+    let mut admit_all = async |scope_id: &str,
+                               scope_kind: &'static str,
+                               chat_id: &str,
+                               branch_id: &str,
+                               msg_id: &str,
+                               key: &str| {
+        let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+        let Admission::Admitted { run_id, .. } = authz_queue::admit_run(
+            &mut tx,
+            &RunAdmission {
+                input: RunInput {
+                    scope: scope_id,
+                    actor: &alice.user,
+                    conversation: chat_id,
+                    branch: branch_id,
+                    message: msg_id,
+                    key,
+                    format: "openmettle.conversation",
+                    version: 1,
+                    input: b"{}",
+                    config: b"{}",
+                },
+                actor_approval_id: &alice.approval,
+                capabilities: &[],
+                requested_rounds: Some(1),
+                now_ms: authz_store::NOW,
+                cost_qualified: Some(true),
+            },
+            &limits,
+        )
+        .await
+        .unwrap() else {
+            panic!("expected admission");
+        };
+        assert!(
+            quotas::reserve_admitted_run_budget(
+                &mut tx,
+                &RunBudgetReservation {
+                    scope_id,
+                    scope_kind,
+                    actor_user_id: &alice.user,
+                    actor_approval_id: &alice.approval,
+                    run_id: &run_id,
+                    token_units: 1000,
+                    cost_units: Some(500),
+                    requires_device_slot: true,
+                },
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        tx.commit().await.unwrap();
+        run_id
+    };
+
+    // 1. Cross-scope batch expire_queued releases device + cost + token holds across both scopes.
+    let r_pers = admit_all(
+        &personal_scope,
+        "personal",
+        &p_chat,
+        &p_branch,
+        &p_msg,
+        "b-exp-1",
+    )
+    .await;
+    let r_proj = admit_all(
+        &proj_scope,
+        "project",
+        &pr_chat,
+        &pr_branch,
+        &pr_msg,
+        "b-exp-2",
+    )
+    .await;
+    sqlx::query(
+        "UPDATE openmettle.runs
+            SET created_at = clock_timestamp() - interval '2 seconds',
+                queue_expires_at = clock_timestamp() - interval '1 second'
+          WHERE id = ANY($1::text[]::uuid[])",
+    )
+    .bind(&[r_pers.clone(), r_proj.clone()])
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    let mut worker = connect(&db.0, WORKER).await;
+    let expired = authz_queue::expire_queued(&mut worker, 10).await.unwrap();
+    assert_eq!(expired.len(), 2);
+    let total_held: i64 = sqlx::query_scalar(
+        "SELECT coalesce(sum(reserved_held), 0)::bigint FROM openmettle.quota_budgets",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(total_held, 0);
+
+    // 2. approvals::expire_waits releases holds for an expired waiting run.
+    let r_wait = admit_all(
+        &personal_scope,
+        "personal",
+        &p_chat,
+        &p_branch,
+        &p_msg,
+        "b-wait",
+    )
+    .await;
+    sqlx::query(
+        "UPDATE openmettle.runs SET state = 'waiting', wait_reason = NULL WHERE id = $1::uuid",
+    )
+    .bind(&r_wait)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        approvals::expire_waits(&mut worker, 10).await.unwrap(),
+        vec![r_wait]
+    );
+    let total_held: i64 = sqlx::query_scalar(
+        "SELECT coalesce(sum(reserved_held), 0)::bigint FROM openmettle.quota_budgets",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(total_held, 0);
+
+    // 3. leases::settle (Succeeded) and leases::settle_expired release parent holds immediately.
+    let r_ok = admit_all(
+        &personal_scope,
+        "personal",
+        &p_chat,
+        &p_branch,
+        &p_msg,
+        "b-ok",
+    )
+    .await;
+    let r_dead = admit_all(
+        &proj_scope,
+        "project",
+        &pr_chat,
+        &pr_branch,
+        &pr_msg,
+        "b-dead",
+    )
+    .await;
+    let lease_cfg = LeaseSettings {
+        lease: Duration::from_secs(60),
+        execution_timeout: Duration::from_secs(600),
+    };
+    let claim_cfg = ClaimLimits {
+        executing_per_actor: 4,
+        executing_per_scope: 8,
+    };
+    let c1 = authz_queue::claim_next(&mut worker, &claim_cfg, &lease_cfg)
+        .await
+        .unwrap()
+        .unwrap();
+    let c2 = authz_queue::claim_next(&mut worker, &claim_cfg, &lease_cfg)
+        .await
+        .unwrap()
+        .unwrap();
+    let (ok_claim, dead_claim) = if c1.run_id == r_ok {
+        (c1, c2)
+    } else {
+        (c2, c1)
+    };
+    leases::settle(
+        &mut worker,
+        &ok_claim.lease(),
+        &lease_cfg,
+        Settle::Succeeded,
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE openmettle.runs
+            SET lease_expires_at = clock_timestamp() - interval '2 seconds',
+                execution_expires_at = clock_timestamp() - interval '1 second'
+          WHERE id = $1::uuid",
+    )
+    .bind(&dead_claim.run_id)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        leases::settle_expired(&mut worker, 10).await.unwrap(),
+        vec![r_dead]
+    );
+    let total_held: i64 = sqlx::query_scalar(
+        "SELECT coalesce(sum(reserved_held), 0)::bigint FROM openmettle.quota_budgets",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(total_held, 0);
+    let drift: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
+           FROM openmettle.quota_verify_accounting_drift()",
+    )
+    .fetch_one(&mut worker)
+    .await
+    .unwrap();
+    assert_eq!(drift, (0, 0, 0, 0));
 }

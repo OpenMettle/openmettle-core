@@ -156,6 +156,7 @@ async fn admit_on(
         capabilities: &[],
         requested_rounds: rounds,
         now_ms: NOW,
+        cost_qualified: None,
     };
     let outcome = queue::admit_run(&mut tx, &request, limits).await;
     if matches!(outcome, Ok(Admission::Admitted { .. })) {
@@ -725,6 +726,7 @@ async fn admission_racing_archive_delete_or_disable_never_leaves_a_live_run() {
             capabilities: &[],
             requested_rounds: None,
             now_ms: NOW,
+            cost_qualified: None,
         };
         let Admission::Admitted { run_id, .. } = queue::admit_run(&mut tx, &admission, &LIMITS)
             .await
@@ -1475,6 +1477,7 @@ async fn quota_overrides_and_metered_budgets_enforce_admission_and_claim_limits_
             capabilities: &[],
             requested_rounds: None,
             now_ms: NOW,
+            cost_qualified: None,
         },
         &LIMITS,
     )
@@ -1522,6 +1525,7 @@ async fn quota_overrides_and_metered_budgets_enforce_admission_and_claim_limits_
             capabilities: &[],
             requested_rounds: Some(25),
             now_ms: NOW,
+            cost_qualified: None,
         },
         &LIMITS,
     )
@@ -1559,6 +1563,7 @@ async fn quota_overrides_and_metered_budgets_enforce_admission_and_claim_limits_
             capabilities: &[],
             requested_rounds: Some(25),
             now_ms: NOW,
+            cost_qualified: None,
         },
         &LIMITS,
     )
@@ -1577,6 +1582,7 @@ async fn quota_overrides_and_metered_budgets_enforce_admission_and_claim_limits_
             capabilities: &[],
             requested_rounds: None,
             now_ms: NOW,
+            cost_qualified: None,
         },
         &LIMITS,
     )
@@ -1614,6 +1620,7 @@ async fn quota_overrides_and_metered_budgets_enforce_admission_and_claim_limits_
             capabilities: &[],
             requested_rounds: None,
             now_ms: NOW,
+            cost_qualified: None,
         },
         &LIMITS,
     )
@@ -1654,6 +1661,7 @@ async fn quota_overrides_and_metered_budgets_enforce_admission_and_claim_limits_
             capabilities: &[],
             requested_rounds: None,
             now_ms: NOW,
+            cost_qualified: None,
         },
         &LIMITS,
     )
@@ -1688,6 +1696,7 @@ async fn quota_overrides_and_metered_budgets_enforce_admission_and_claim_limits_
             capabilities: &[],
             requested_rounds: None,
             now_ms: NOW,
+            cost_qualified: None,
         },
         &LIMITS,
     )

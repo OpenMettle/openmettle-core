@@ -457,29 +457,29 @@ pub(super) async fn cancel_user_runs(
     cancel_revoked(c, CANCEL_USER, user_id).await
 }
 
-async fn release_terminal_run_holds(
+/// Release held run-level parent quota reservations for a batch of terminal runs in one
+/// deadlock-free `SECURITY DEFINER` call (canonical `runs -> quota_reservations -> quota_budgets`
+/// lock order across the entire batch). Gated on schema >= 26 so rolling upgrades on schemas
+/// 24 and 25 never hit `42501` when expiring or settling cross-role holds.
+pub(super) async fn release_terminal_runs(
     c: &mut PgConnection,
-    scope_id: &str,
-    run_id: &str,
+    run_ids: &[String],
 ) -> Result<(), StoreError> {
-    if !has_quota_schema(c).await? {
+    if run_ids.is_empty() {
         return Ok(());
     }
-    sqlx::query(
-        "SELECT openmettle.quota_release_unsent(id, NULL, false)
-           FROM (
-               SELECT id FROM openmettle.quota_reservations
-                WHERE scope_id = $1::uuid
-                  AND run_id = $2::uuid
-                  AND gateway_request_id IS NULL
-                  AND state = 'held'
-                ORDER BY resource_kind, id
-           ) AS due",
+    let has_release_fn: bool = sqlx::query_scalar(
+        "SELECT to_regprocedure('openmettle.quota_release_terminal_runs(uuid[])') IS NOT NULL",
     )
-    .bind(scope_id)
-    .bind(run_id)
-    .execute(&mut *c)
+    .fetch_one(&mut *c)
     .await?;
+    if !has_release_fn {
+        return Ok(());
+    }
+    sqlx::query("SELECT openmettle.quota_release_terminal_runs($1::text[]::uuid[])")
+        .bind(run_ids)
+        .execute(&mut *c)
+        .await?;
     Ok(())
 }
 
@@ -491,12 +491,14 @@ async fn cancel_revoked(
     let mut rows: Vec<(String, String, String)> =
         sqlx::query_as(sql).bind(id).fetch_all(&mut *c).await?;
     rows.sort_by(|a, b| a.1.cmp(&b.1));
+    let mut cancelled = Vec::new();
     for (scope, id, state) in &rows {
         cancel_event(c, scope, id, state, CancelReason::Revoked).await?;
         if state == "cancelled" {
-            release_terminal_run_holds(c, scope, id).await?;
+            cancelled.push(id.clone());
         }
     }
+    release_terminal_runs(c, &cancelled).await?;
     Ok(rows.len() as u64)
 }
 
@@ -515,7 +517,7 @@ pub(super) async fn cancel_one(
     if let Some(state) = &state {
         cancel_event(c, scope, id, state, reason).await?;
         if state == "cancelled" {
-            release_terminal_run_holds(c, scope, id).await?;
+            release_terminal_runs(c, &[id.to_owned()]).await?;
         }
     }
     Ok(state)
@@ -627,6 +629,9 @@ pub struct RunAdmission<'a> {
     /// The round count the caller validated from its request, if any.
     pub requested_rounds: Option<i64>,
     pub now_ms: i64,
+    /// Whether the selected catalog profile carries a qualified `cost_bound` (`Some(true)` /
+    /// `Some(false)` from catalog-aware callers; `None` for low-level non-catalog callers).
+    pub cost_qualified: Option<bool>,
 }
 
 impl RunAdmission<'_> {
@@ -1006,8 +1011,14 @@ async fn admit(
         }
     }
     if quota_schema
-        && let Some(refusal) =
-            check_metered_admission(c, r.scope, scope_kind, &actor_scope_id).await?
+        && let Some(refusal) = check_metered_admission(
+            c,
+            r.scope,
+            scope_kind,
+            &actor_scope_id,
+            request.cost_qualified,
+        )
+        .await?
     {
         return Ok(Admission::Refused(refusal));
     }
@@ -1077,6 +1088,7 @@ async fn check_metered_admission(
     scope_id: &str,
     scope_kind: &'static str,
     actor_scope_id: &str,
+    cost_qualified: Option<bool>,
 ) -> Result<Option<RunLimit>, StoreError> {
     let enforced: bool =
         sqlx::query_scalar("SELECT metering_enforced FROM openmettle.quota_enforcement WHERE id")
@@ -1147,7 +1159,7 @@ async fn check_metered_admission(
             if !rows.iter().any(|r| r.1.is_some()) {
                 continue;
             }
-            if cost_denomination.is_none() {
+            if cost_denomination.is_none() || cost_qualified == Some(false) {
                 return Ok(Some(RunLimit::QuotaUnconfigured {
                     resource_kind: resource,
                     scope_kind: "instance",
@@ -1258,9 +1270,7 @@ pub async fn expire_queued(c: &mut PgConnection, limit: u32) -> Result<Vec<Strin
             .await?;
         expired.sort_by(|a, b| a.1.cmp(&b.1));
         let ids: Vec<String> = expired.iter().map(|(_, run)| run.clone()).collect();
-        for (scope_id, run_id) in &expired {
-            release_terminal_run_holds(c, scope_id, run_id).await?;
-        }
+        release_terminal_runs(c, &ids).await?;
         terminal_events(c, expired, EXPIRED).await?;
         Ok(ids)
     })
@@ -2044,6 +2054,7 @@ mod tests {
             capabilities,
             requested_rounds: None,
             now_ms: 1,
+            cost_qualified: None,
         }
     }
 

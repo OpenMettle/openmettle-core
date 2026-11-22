@@ -908,6 +908,7 @@ async fn shared_reader_replays_only_public_approval_transitions_and_terminal_rea
             capabilities: &[],
             requested_rounds: None,
             now_ms: session.observed_ms(),
+            cost_qualified: None,
         },
         &crate::approvals::LIMITS,
         &session,

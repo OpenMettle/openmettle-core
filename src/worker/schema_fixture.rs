@@ -10,6 +10,13 @@ use serde::Deserialize;
 use std::{collections::BTreeMap, io::BufRead};
 
 #[derive(Deserialize)]
+struct MeteredSetup {
+    installation: String,
+    key_id: String,
+    key_bytes: [u8; 32],
+}
+
+#[derive(Deserialize)]
 struct Setup {
     database: String,
     catalog: Value,
@@ -20,12 +27,15 @@ struct Setup {
     tools: bool,
     artifacts: Option<std::path::PathBuf>,
     stop_during_observation: bool,
+    #[serde(default)]
+    metered: Option<MeteredSetup>,
 }
 
 struct Routes {
     gateways: BTreeMap<String, Arc<Gateway>>,
     scope: String,
     actor: String,
+    metered: Option<(String, Arc<crate::provider_keys::gateway::GatewayKeys>)>,
 }
 impl TurnRoutes for Routes {
     async fn route(
@@ -37,15 +47,25 @@ impl TurnRoutes for Routes {
         if claim.scope_id != self.scope || actor != self.actor {
             return Err(inference::Error::Credential);
         }
-        Ok(Route {
-            gateway: self
-                .gateways
-                .get(&model.model)
-                .ok_or(inference::Error::Provisioning)?
-                .clone(),
-            bearer: "synthetic-turn-credential".into(),
-            stream: false,
-        })
+        let gateway = self
+            .gateways
+            .get(&model.model)
+            .ok_or(inference::Error::Provisioning)?
+            .clone();
+        if let Some((installation, keys)) = &self.metered {
+            Ok(Route::metered(
+                gateway,
+                installation.clone(),
+                keys.clone(),
+                false,
+            ))
+        } else {
+            Ok(Route::bearer(
+                gateway,
+                "synthetic-turn-credential".into(),
+                false,
+            ))
+        }
     }
     fn tools(&self, _: &ClaimedRun) -> Vec<Tool> {
         vec![Tool {
@@ -206,10 +226,20 @@ async fn worker_process() {
         })
     })
     .unwrap();
+    let metered = setup.metered.map(|m| {
+        (
+            m.installation,
+            Arc::new(
+                crate::provider_keys::gateway::GatewayKeys::new(&[(m.key_id, m.key_bytes)])
+                    .unwrap(),
+            ),
+        )
+    });
     let routes = Routes {
         gateways,
         actor: setup.actor,
         scope: setup.scope,
+        metered,
     };
     let mut executor = TurnExecutor::new(
         pool.clone(),

@@ -12,11 +12,43 @@ use crate::{
 };
 use serde_json::{Map, Value};
 
+/// Metered gateway dispatch settings for a leased worker turn route.
+pub struct MeteredRoute {
+    pub installation: String,
+    pub keys: Arc<crate::provider_keys::gateway::GatewayKeys>,
+}
+
 /// The credential owner resolves this route at dispatch for the admitted actor and scope.
 pub struct Route {
     pub gateway: Arc<Gateway>,
     pub bearer: String,
     pub stream: bool,
+    pub metered: Option<MeteredRoute>,
+}
+
+impl Route {
+    pub fn bearer(gateway: Arc<Gateway>, bearer: String, stream: bool) -> Self {
+        Self {
+            gateway,
+            bearer,
+            stream,
+            metered: None,
+        }
+    }
+
+    pub fn metered(
+        gateway: Arc<Gateway>,
+        installation: String,
+        keys: Arc<crate::provider_keys::gateway::GatewayKeys>,
+        stream: bool,
+    ) -> Self {
+        Self {
+            gateway,
+            bearer: String::new(),
+            stream,
+            metered: Some(MeteredRoute { installation, keys }),
+        }
+    }
 }
 
 pub trait TurnRoutes: Send + Sync + 'static {
@@ -271,7 +303,7 @@ impl<R: TurnRoutes> TurnExecutor<R> {
         config: &ConfigSnapshot,
         continuation: &[History],
         tools: Option<Vec<Tool>>,
-    ) -> Result<(Route, Request, i64), StepResult> {
+    ) -> Result<(Route, Request, i64, String), StepResult> {
         self.authority(claim, config).await?;
         let prompt = {
             let mut c = self.pool.acquire().await.map_err(|_| FAILED)?;
@@ -316,7 +348,7 @@ impl<R: TurnRoutes> TurnExecutor<R> {
         }
         let round = self.next_round(claim, continuation.is_empty()).await?;
         self.authority(claim, config).await?;
-        Ok((route, request, round))
+        Ok((route, request, round, actor))
     }
 
     async fn execute_turn(
@@ -339,7 +371,7 @@ impl<R: TurnRoutes> TurnExecutor<R> {
             .map(|_| self.routes.tools(&run.claim))
             .filter(|t| !t.is_empty());
         loop {
-            let (route, request, round) = tokio::select! {
+            let (route, request, round, actor) = tokio::select! {
                 biased;
                 _ = stop.wait_for(Option::is_some) => return Err(StepResult::Stopped),
                 ready = self.prepare_round(&run.claim, &config, &continuation, tools) => ready?,
@@ -370,13 +402,66 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                     _ => return Err(FAILED),
                 }
             }
+            let dispatch = if let Some(metered) = &route.metered {
+                let round_tokens = config
+                    .effective
+                    .ceiling
+                    .value
+                    .and_then(|n| i64::try_from(n).ok())
+                    .filter(|&n| n > 0)
+                    .ok_or(FAILED)?;
+                let round_cost = self
+                    .catalog
+                    .round_cost_ceiling(&config.effective)
+                    .map_err(|_| FAILED)?;
+                let requires_device_slot = self
+                    .catalog
+                    .target(&config.effective)
+                    .map_err(|_| FAILED)?
+                    .requires_device_slot;
+                let round_i32 = i32::try_from(round).map_err(|_| FAILED)?;
+                let pending = crate::authz::gateway::reserve_turn_round(
+                    &self.pool,
+                    crate::authz::gateway::TurnRound {
+                        scope_id: &run.claim.scope_id,
+                        actor: &actor,
+                        approval: &run.claim.actor_approval_id,
+                        run_id: &run.claim.run_id,
+                        round: round_i32,
+                        claim_token: &run.claim.claim_token,
+                        installation: &metered.installation,
+                        model: &config.effective.model,
+                        round_tokens,
+                        round_cost,
+                        requires_device_slot,
+                    },
+                )
+                .await
+                .map_err(|_| FAILED)?;
+                if cx.stop.borrow().is_some() {
+                    let _ = pending.release(&self.pool).await;
+                    return Err(StepResult::Stopped);
+                }
+                Some(
+                    pending
+                        .handoff(&self.pool, &metered.keys)
+                        .await
+                        .map_err(|_| FAILED)?,
+                )
+            } else {
+                None
+            };
+            let credential = match &dispatch {
+                Some(d) => Credential::Dispatch(d),
+                None => Credential::Bearer(&route.bearer),
+            };
             let turn = route
                 .gateway
                 .server(
                     &self.catalog,
                     &config.effective,
                     &request,
-                    Credential::Bearer(&route.bearer),
+                    credential,
                     RunStop::from_worker(run, cx.stop.clone()),
                     |_| async {},
                 )
