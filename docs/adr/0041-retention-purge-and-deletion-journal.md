@@ -141,10 +141,10 @@ ADR 0040's volume-pinned 3-stage physical purge on the durable worker path.
   - Preserve original `purge_after` deadlines from the restored database and journal; never
     restart the 30-day grace window on restore.
   - **Fail closed on any journal fault.** If the external journal is absent, unreadable,
-    truncated, fails hash-chain/checksum verification, reports a `max_journal_seq` older than the
-    restored snapshot, or conflicts with the restored volume/ledger, replay aborts and keeps
-    `restore_reconciliation_gate.open = false`. Recovery cannot reopen until an operator resolves
-    or explicitly breaks glass with a recorded audit trail.
+    truncated, fails hash-chain/checksum verification, lags the restored snapshot, or leaves an
+    unresolved deletion/revocation gap or volume/ledger conflict, replay aborts with a hard
+    restore-validation failure. Audited operator break-glass permits offline repair/reconciliation
+    tooling only; live API/worker access and `restore_reconciliation_gate` stay locked until replay succeeds.
 
 ### API, authorization and telemetry invariants
 
