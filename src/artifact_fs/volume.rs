@@ -19,6 +19,10 @@ fn dirs() -> OFlags {
 fn invalid() -> io::Error {
     io::Error::other("artifact volume identity mismatch")
 }
+#[allow(clippy::unnecessary_cast)]
+fn stat_dev(stat: &at::Stat) -> u64 {
+    stat.st_dev as u64
+}
 
 #[derive(Debug)]
 pub(super) struct Volume {
@@ -85,7 +89,7 @@ impl Volume {
         match at::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(s)
                 if FileType::from_raw_mode(s.st_mode) == FileType::RegularFile
-                    && u128::try_from(s.st_dev).ok() == Some(u128::from(self.dev)) =>
+                    && stat_dev(&s) == self.dev =>
             {
                 Ok(Some(s.st_ino))
             }
