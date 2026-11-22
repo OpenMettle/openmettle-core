@@ -110,6 +110,7 @@ impl fmt::Display for Error {
 pub struct Store {
     volume: Arc<Volume>,
     pool: Arc<OnceLock<PgPool>>,
+    purge_pass: Arc<tokio::sync::Mutex<reclaim::AnchorPass>>,
     expiry_pass: Arc<[tokio::sync::Mutex<reclaim::AnchorPass>; 4]>,
     staging_pass: Arc<tokio::sync::Mutex<staging::StagingSweepState>>,
     anchor_pass: Arc<[tokio::sync::Mutex<reclaim::AnchorPass>; 2]>,
@@ -127,6 +128,7 @@ impl Store {
             volume: Arc::new(Volume::open(root, create).map_err(|_| InvalidDirectory)?),
             pool: Default::default(),
             staging_pass: Default::default(),
+            purge_pass: Default::default(),
             expiry_pass: Default::default(),
             anchor_pass: Default::default(),
         })

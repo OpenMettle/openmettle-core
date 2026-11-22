@@ -71,6 +71,9 @@ fn check(v: &Volume, row: &sqlx::postgres::PgRow) -> Result<bool, Error> {
     match state {
         "released" if r.is_none() && s.is_none() => Ok(false),
         "reserved" => {
+            if bound.is_none() && r.is_some() {
+                return Err(Error::Io);
+            }
             if bound.is_some()
                 && (s.into_iter().chain(r).any(|ino| Some(ino) != bound)
                     || (s.is_none() && r.is_none() && reclaim_anchor.is_none()))
@@ -160,6 +163,10 @@ pub async fn verify_accounting_drift(pool: &PgPool, store: Option<&Store>) -> Re
                     .bind(&cursor)
                     .fetch_one(pool)
                     .await?;
+                if updated.get::<bool, _>("adoption_unverified") {
+                    report.quarantined += 1;
+                    continue;
+                }
                 result = check(v, &updated);
             }
             match result {
@@ -190,7 +197,7 @@ pub async fn verify_accounting_drift(pool: &PgPool, store: Option<&Store>) -> Re
                 .bind(id)
                 .fetch_optional(pool)
                 .await?;
-            if row.is_none() && v.inode(dir, name)?.is_some() {
+            if row.is_none() && !matches!(v.inode(dir, name), Ok(None)) {
                 report.files += 1;
             }
         }

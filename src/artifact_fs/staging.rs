@@ -81,6 +81,7 @@ pub(super) async fn sweep(pool: &PgPool, store: &Store, limit: usize) -> Result<
             StagingSweepState::Open(dir, page)
         };
     }
+    let mut first_error = None;
     if let StagingSweepState::Open(dir, page) | StagingSweepState::DrainingEof(dir, page) =
         &mut *state
     {
@@ -90,13 +91,15 @@ pub(super) async fn sweep(pool: &PgPool, store: &Store, limit: usize) -> Result<
             let Some(name) = page.front() else { break };
             let result = detach_alias(pool, store, &pin, name).await;
             page.pop_front();
-            result?;
+            if let Err(e) = result {
+                first_error.get_or_insert(e);
+            }
         }
     }
     if matches!(&*state,StagingSweepState::DrainingEof(_,q) if q.is_empty()) {
         *state = StagingSweepState::Idle;
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 async fn detach_alias(pool: &PgPool, store: &Store, pin: &str, name: &OsStr) -> Result<(), Error> {
@@ -123,10 +126,24 @@ async fn detach_alias(pool: &PgPool, store: &Store, pin: &str, name: &OsStr) -> 
     let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
     let canonical = runs::is_canonical_uuid(id);
     let row=sqlx::query("SELECT state,reclaim_state,payload_ino::text,adoption_unverified FROM openmettle.storage_reservations
-        WHERE id=$1::uuid FOR UPDATE").bind(canonical.then_some(id)).fetch_optional(tx.connection()?).await?;
+        WHERE id=$1::uuid FOR UPDATE SKIP LOCKED").bind(canonical.then_some(id)).fetch_optional(tx.connection()?).await?;
     let mut clear = false;
     let serialize_orphan = match row {
-        None if aged => true,
+        None if aged => {
+            // SKIP LOCKED also returns no row for an active writer. An unlocked snapshot
+            // distinguishes it from an orphan before taking the instance lock.
+            if canonical
+                && sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT FROM openmettle.storage_reservations WHERE id=$1::uuid)",
+                )
+                .bind(id)
+                .fetch_one(tx.connection()?)
+                .await?
+            {
+                return Ok(());
+            }
+            true
+        }
         None => return Ok(()),
         Some(row) => {
             if row.get::<bool, _>("adoption_unverified") {
@@ -150,7 +167,7 @@ async fn detach_alias(pool: &PgPool, store: &Store, pin: &str, name: &OsStr) -> 
                 ("settled", _, false) if bound == Some(ino) => {
                     let live = sqlx::query(
                         "SELECT FROM openmettle.artifact_revisions WHERE reservation_id=$1::uuid
-                        AND state IN ('active','retained') FOR UPDATE",
+                        AND state IN ('active','retained') FOR UPDATE SKIP LOCKED",
                     )
                     .bind(id)
                     .fetch_optional(tx.connection()?)
@@ -180,15 +197,18 @@ async fn detach_alias(pool: &PgPool, store: &Store, pin: &str, name: &OsStr) -> 
     v.matches(&file, &v.staging, name, ino)?;
     v.unlink(&v.staging, name, ino)?;
     drop(file);
-    at::fsync(&v.staging)?;
     if clear {
+        at::fsync(&v.staging)?;
         sqlx::query(
             "UPDATE openmettle.storage_reservations SET reclaim_state='none' WHERE id=$1::uuid",
         )
         .bind(id)
         .execute(tx.connection()?)
         .await?;
+        tx.commit().await?;
+    } else {
+        tx.commit().await?;
+        at::fsync(&v.staging)?;
     }
-    tx.commit().await?;
     Ok(())
 }

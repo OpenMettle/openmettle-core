@@ -42,13 +42,86 @@ impl From<rustix::io::Errno> for Failure {
 type Uuid = [u8; 16];
 
 const INVENTORY: &str =
-    "SELECT s.id::text,pg_catalog.uuid_send(s.id) AS reservation_uuid,s.scope_id::text,s.state,s.reclaim_state,s.payload_ino::text,s.max_bytes,
+    "SELECT s.id::text,pg_catalog.uuid_send(s.id) AS reservation_uuid,s.scope_id::text,s.state,s.reclaim_state,s.payload_ino::text,s.adoption_unverified,s.max_bytes,
     r.id::text AS revision,r.state AS revision_state,r.purge_stage,r.size_bytes,r.content_digest
     FROM openmettle.storage_reservations s LEFT JOIN openmettle.artifact_revisions r
     ON r.scope_id=s.scope_id AND r.reservation_id=s.id ORDER BY s.id";
 
+// A same-length rewrite can preserve the inode. Include both change timestamps when
+// deciding whether the unlocked digest is still evidence for the locked inventory.
+#[derive(PartialEq, Eq)]
+struct FileStamp {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+impl From<&std::fs::Metadata> for FileStamp {
+    fn from(m: &std::fs::Metadata) -> Self {
+        Self {
+            device: m.dev(),
+            inode: m.ino(),
+            length: m.len(),
+            modified: (m.mtime(), m.mtime_nsec()),
+            changed: (m.ctime(), m.ctime_nsec()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct RevisionDigests {
+    results: HashMap<String, (FileStamp, bool)>,
+    recheck: bool,
+}
+const RESCAN: &str = "revision changed during inspection";
+const READ_FAILED: &str = "cannot read revision digest";
+
+impl RevisionDigests {
+    fn verify(
+        &mut self,
+        id: &str,
+        file: &mut File,
+        size: u64,
+        expected: &[u8],
+    ) -> Result<(), Failure> {
+        let stamp = FileStamp::from(&file.metadata()?);
+        let matches = if self.recheck {
+            let Some((prior, matched)) = self.results.get(id) else {
+                return Err(Failure(RESCAN));
+            };
+            if *prior != stamp {
+                return Err(Failure(RESCAN));
+            }
+            *matched
+        } else {
+            let mut hash = Sha256::new();
+            let mut buf = [0; 65536];
+            loop {
+                let n = file.read(&mut buf).map_err(|_| Failure(READ_FAILED))?;
+                if n == 0 {
+                    break;
+                }
+                hash.update(&buf[..n]);
+            }
+            if FileStamp::from(&file.metadata()?) != stamp {
+                return Err(Failure(RESCAN));
+            }
+            let matched = stamp.length == size && hash.finalize().as_slice() == expected;
+            self.results.insert(id.into(), (stamp, matched));
+            matched
+        };
+        if matches {
+            Ok(())
+        } else {
+            Err(Failure("size_or_digest_mismatch"))
+        }
+    }
+}
+
 #[derive(Default)]
 struct Evidence {
+    revision_digests: RevisionDigests,
     owners: HashMap<(u64, u64), String>,
     files: Vec<File>,
     verified: HashMap<String, u64>,
@@ -79,7 +152,7 @@ impl Evidence {
     ) -> Result<(), Failure> {
         for row in rows {
             if let Err(error) = self.inspect(v, row, locks) {
-                if error.0 == "reservation in use" {
+                if matches!(error.0, "reservation in use" | RESCAN | READ_FAILED) {
                     return Err(error);
                 }
                 if row.try_get::<&str, _>("state")? == "reserved" {
@@ -198,7 +271,9 @@ impl Evidence {
                 }
             };
             let held = locks.get(&(v.dev, ino));
-            if held.is_some_and(|owner| *owner != uuid) {
+            // In the locked inspection the current row/entry inventory determines
+            // ownership. The first scan's descriptor still pins and locks the inode.
+            if !self.revision_digests.recheck && held.is_some_and(|owner| *owner != uuid) {
                 alias = true;
                 continue;
             }
@@ -262,20 +337,12 @@ impl Evidence {
                 let mut f = v.regular(&v.revisions, id, false)?;
                 let m = f.metadata()?;
                 if rev != Some("purging") || m.len() != 0 || bound.is_none() {
-                    let mut h = Sha256::new();
-                    let mut buf = [0; 65536];
-                    loop {
-                        let n = f.read(&mut buf)?;
-                        if n == 0 {
-                            break;
-                        }
-                        h.update(&buf[..n]);
-                    }
-                    if m.len() != size as u64
-                        || h.finalize().as_slice() != row.try_get::<&[u8], _>("content_digest")?
-                    {
-                        return Err(Failure("size_or_digest_mismatch"));
-                    }
+                    self.revision_digests.verify(
+                        id,
+                        &mut f,
+                        size as u64,
+                        row.try_get("content_digest")?,
+                    )?;
                     self.digests += 1;
                 }
                 v.matches(&f, &v.revisions, id, ino)?;
@@ -403,13 +470,22 @@ async fn verify_and_pin(
                 row.get::<Option<String>, _>("revision"),
                 row.get::<String, _>("state"),
                 row.get::<Option<String>, _>("revision_state"),
+                row.get::<String, _>("reclaim_state"),
+                row.get::<Option<String>, _>("purge_stage"),
+                row.get::<Option<String>, _>("payload_ino"),
+                row.get::<bool, _>("adoption_unverified"),
+                row.get::<Option<i64>, _>("size_bytes"),
+                row.get::<Option<Vec<u8>>, _>("content_digest"),
             )
         };
         let scanned: HashSet<_> = rows.iter().map(identity).collect();
         // The potentially long pre-scan has no SQL lock. Revalidate the locked snapshot below.
         let mut pre = Evidence::default();
         let mut held_candidate_locks: HashMap<(u64, u64), Uuid> = HashMap::new();
-        pre.inspect_all(v, &rows, &mut held_candidate_locks)?;
+        match pre.inspect_all(v, &rows, &mut held_candidate_locks) {
+            Err(Failure(RESCAN)) => continue,
+            result => result?,
+        }
         let mut tx = c.begin().await?;
         sqlx::query("SELECT id FROM openmettle.storage_reservations ORDER BY id FOR UPDATE")
             .execute(&mut *tx)
@@ -435,22 +511,26 @@ async fn verify_and_pin(
             v.verify(pin)?;
         }
         let rows = sqlx::query(INVENTORY).fetch_all(&mut *tx).await?;
-        if rows.iter().any(|r| !scanned.contains(&identity(r))) {
+        if rows.len() != scanned.len() || rows.iter().any(|r| !scanned.contains(&identity(r))) {
             tx.rollback().await?;
             continue;
         }
         // Retain the pre-scan file descriptions and LOCK_EX through the Phase 3C commit.
         let mut evidence = Evidence {
             files: pre.files,
-            mismatch: pre.mismatch,
-            quarantine: if pre.mismatch.is_some() {
-                pre.quarantine
-            } else {
-                HashSet::new()
+            revision_digests: RevisionDigests {
+                results: pre.revision_digests.results,
+                recheck: true,
             },
             ..Evidence::default()
         };
-        evidence.inspect_all(v, &rows, &mut held_candidate_locks)?;
+        match evidence.inspect_all(v, &rows, &mut held_candidate_locks) {
+            Err(Failure(RESCAN)) => {
+                tx.rollback().await?;
+                continue;
+            }
+            result => result?,
+        }
         if !rows.is_empty()
             && evidence.digests == 0
             && (!independent_identity(v, opts) || (evidence.survivors == 0 && !opts.confirm_absent))
@@ -510,5 +590,32 @@ async fn verify_and_pin(
         .bind(run).execute(&mut *tx).await?;
         tx.commit().await?;
         return evidence.mismatch.map_or(Ok(()), |e| Err(Failure(e)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth_config::tests::support::Dir;
+
+    #[test]
+    fn locked_inventory_reuses_the_digest_and_restarts_on_a_changed_file() {
+        let dir = Dir::new();
+        let path = dir.path("revision");
+        std::fs::write(&path, b"payload").unwrap();
+        let hash = Sha256::digest(b"payload");
+        let mut cache = RevisionDigests::default();
+        cache
+            .verify("rev", &mut File::open(&path).unwrap(), 7, &hash)
+            .unwrap();
+        cache.recheck = true;
+        // A write-only descriptor permits fstat but would fail any attempt to read the payload.
+        let mut file = File::options().write(true).open(&path).unwrap();
+        cache.verify("rev", &mut file, 7, &hash).unwrap();
+        file.set_len(2).unwrap();
+        assert_eq!(
+            cache.verify("rev", &mut file, 7, &hash).unwrap_err().0,
+            RESCAN
+        );
     }
 }

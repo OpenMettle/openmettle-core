@@ -89,6 +89,8 @@ ALTER TABLE openmettle.artifact_revisions
             purge_stage IN ('none', 'anchor_pending_unlink')
             AND (purge_stage = 'none' OR state = 'purged')
         );
+CREATE INDEX artifact_revisions_due_key_idx ON openmettle.artifact_revisions
+    ((coalesce(purge_after,'-infinity'::timestamptz)),id) WHERE state IN ('purging','retained');
 CREATE INDEX artifact_revisions_purge_anchor_idx
     ON openmettle.artifact_revisions (purged_at, id)
     WHERE state = 'purged' AND purge_stage = 'anchor_pending_unlink';
@@ -1048,16 +1050,16 @@ BEGIN
     SELECT * INTO STRICT r FROM openmettle.runs WHERE scope_id=p_scope AND id=p_run AND state='running'
         AND cancel_reason IS NULL AND claim_token=p_claim AND lease_expires_at>clock_timestamp() FOR NO KEY UPDATE;
     SELECT * INTO STRICT g FROM openmettle.gateway_reservations WHERE run_id=p_run FOR NO KEY UPDATE;
-    IF g.units>g.allocated AND NOT EXISTS (SELECT FROM openmettle.quota_reservations WHERE scope_id=p_scope
-        AND run_id=p_run AND gateway_request_id IS NULL AND resource_kind='usage_tokens') THEN
-        PERFORM openmettle.quota_reserve(p_scope,r.actor_user_id,'usage_tokens',g.units-g.allocated,
-            'run:'||p_run,p_run,NULL,NULL,r.lease_expires_at);
-    END IF;
     cost_max:=openmettle.quota_cost_ceiling(p_scope,r.actor_user_id);
     IF g.units>g.allocated AND cost_max IS NOT NULL AND NOT EXISTS (SELECT FROM openmettle.quota_reservations
         WHERE scope_id=p_scope AND run_id=p_run AND gateway_request_id IS NULL AND resource_kind='usage_cost_micros') THEN
         IF cost_max=0 THEN RAISE EXCEPTION 'cost limit exceeded' USING ERRCODE='OMQ01'; END IF;
         PERFORM openmettle.quota_reserve(p_scope,r.actor_user_id,'usage_cost_micros',cost_max,
+            'run:'||p_run,p_run,NULL,NULL,r.lease_expires_at);
+    END IF;
+    IF g.units>g.allocated AND NOT EXISTS (SELECT FROM openmettle.quota_reservations WHERE scope_id=p_scope
+        AND run_id=p_run AND gateway_request_id IS NULL AND resource_kind='usage_tokens') THEN
+        PERFORM openmettle.quota_reserve(p_scope,r.actor_user_id,'usage_tokens',g.units-g.allocated,
             'run:'||p_run,p_run,NULL,NULL,r.lease_expires_at);
     END IF;
 END
@@ -1210,8 +1212,10 @@ BEGIN
           AND g.source=p_report_source AND g.report_id=p_report_id) THEN
         RAISE EXCEPTION 'unknown accepted report' USING ERRCODE='23514';
     END IF;
+    PERFORM FROM openmettle.quota_reservations WHERE gateway_request_id=p_request
+        AND state IN ('handoff_committed','settled') ORDER BY resource_kind,id FOR NO KEY UPDATE;
     FOR h IN SELECT * FROM openmettle.quota_reservations WHERE gateway_request_id=p_request
-        AND state IN ('handoff_committed','settled') ORDER BY resource_kind FOR UPDATE
+        AND state IN ('handoff_committed','settled') ORDER BY resource_kind,id
     LOOP
         FOR step IN SELECT * FROM openmettle.quota_gateway_fold(p_request,h.resource_kind,h.reserved_units,p_source_revision)
             WHERE rev>coalesce(h.accepted_source_revision,-1) ORDER BY rev
@@ -1274,7 +1278,12 @@ BEGIN
         UPDATE openmettle.gateway_requests SET state='released' WHERE id=q.id;
         UPDATE openmettle.gateway_reservations SET allocated=allocated-q.units WHERE id=q.reservation_id;
     END IF;
-    FOR h IN SELECT * FROM openmettle.quota_reservations WHERE gateway_request_id=q.id ORDER BY resource_kind LOOP
+    -- Lock every slice and parent before the first budget credit.
+    PERFORM FROM openmettle.quota_reservations h1
+        WHERE h1.gateway_request_id=q.id OR h1.id IN
+            (SELECT parent_reservation_id FROM openmettle.quota_reservations WHERE gateway_request_id=q.id)
+        ORDER BY h1.resource_kind,h1.id FOR NO KEY UPDATE;
+    FOR h IN SELECT * FROM openmettle.quota_reservations WHERE gateway_request_id=q.id ORDER BY resource_kind,id LOOP
         IF (h.scope_id,h.actor_user_id,h.run_id) IS DISTINCT FROM (q.scope_id,q.actor_user_id,q.run_id) THEN
             RAISE EXCEPTION 'gateway quota ownership mismatch' USING ERRCODE='23514';
         END IF;
@@ -1412,7 +1421,8 @@ BEGIN
            AND lease_expires_at IS DISTINCT FROM deadline;
         UPDATE openmettle.storage_reservations SET lease_expires_at=deadline
          WHERE run_id=NEW.id AND scope_id=NEW.scope_id AND state='reserved'
-           AND NOT adoption_unverified AND reclaim_state='none' AND lease_expires_at IS DISTINCT FROM deadline;
+           AND NOT adoption_unverified AND reclaim_state='none' AND deadline>created_at
+           AND (lease_expires_at IS NULL OR lease_expires_at<deadline);
     END IF;
     RETURN NEW;
 END
@@ -1421,36 +1431,55 @@ REVOKE ALL ON FUNCTION openmettle.quota_follow_run_deadline() FROM PUBLIC;
 CREATE TRIGGER quota_run_deadline_guard AFTER UPDATE OF state,lease_expires_at,approval_wait_id ON openmettle.runs
     FOR EACH ROW WHEN (NEW.state IN ('running','waiting')) EXECUTE FUNCTION openmettle.quota_follow_run_deadline();
 
-CREATE FUNCTION openmettle.quota_release_unsent(p_id uuid,p_dispatch bytea DEFAULT NULL)
+CREATE FUNCTION openmettle.quota_release_unsent(p_id uuid,p_dispatch bytea DEFAULT NULL,p_sweep boolean DEFAULT false)
 RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
 DECLARE h openmettle.quota_reservations%ROWTYPE; q openmettle.gateway_requests%ROWTYPE;
-    sweep boolean:=p_dispatch IS NULL AND pg_has_role(session_user,'openmettle_worker','USAGE');
 BEGIN
+    IF p_sweep IS NULL OR (p_sweep AND NOT pg_has_role(session_user,'openmettle_worker','USAGE')) THEN
+        RAISE EXCEPTION 'invalid sweep authority' USING ERRCODE='42501';
+    END IF;
     SELECT * INTO h FROM openmettle.quota_reservations WHERE id=p_id AND state='held';
     IF NOT FOUND THEN RETURN false; END IF;
-    IF NOT sweep AND NOT pg_has_role(session_user,'openmettle_'||h.origin_role,'USAGE') THEN
+    IF NOT p_sweep AND NOT pg_has_role(session_user,'openmettle_'||h.origin_role,'USAGE') THEN
         RAISE EXCEPTION 'invalid release authority' USING ERRCODE='42501'; END IF;
     IF h.run_id IS NOT NULL THEN
-        PERFORM FROM openmettle.runs r WHERE id=h.run_id AND (NOT sweep OR (r.state IN ('succeeded','failed','cancelled','interrupted')
-            AND NOT EXISTS (SELECT FROM openmettle.operations WHERE run_id=r.id AND outcome IN ('intent','outcome_unknown'))))
-            FOR NO KEY UPDATE SKIP LOCKED;
+        IF p_sweep THEN
+            PERFORM FROM openmettle.runs r WHERE id=h.run_id AND r.state IN ('succeeded','failed','cancelled','interrupted')
+                AND NOT EXISTS (SELECT FROM openmettle.operations WHERE run_id=r.id AND outcome IN ('intent','outcome_unknown'))
+                FOR NO KEY UPDATE SKIP LOCKED;
+        ELSE
+            PERFORM FROM openmettle.runs WHERE id=h.run_id FOR NO KEY UPDATE;
+        END IF;
         IF NOT FOUND THEN RETURN false; END IF;
     END IF;
     IF h.gateway_request_id IS NOT NULL THEN
         SELECT * INTO STRICT q FROM openmettle.gateway_requests WHERE id=h.gateway_request_id;
-        IF NOT sweep AND (p_dispatch IS NULL OR octet_length(p_dispatch)<>32 OR q.dispatch_hash<>sha256(p_dispatch)) THEN
+        IF NOT p_sweep AND (p_dispatch IS NULL OR octet_length(p_dispatch)<>32 OR q.dispatch_hash<>sha256(p_dispatch)) THEN
             RAISE EXCEPTION 'invalid release authority' USING ERRCODE='42501'; END IF;
-        PERFORM FROM openmettle.gateway_reservations WHERE id=q.reservation_id FOR NO KEY UPDATE SKIP LOCKED;
-        IF NOT FOUND THEN RETURN false; END IF;
-        SELECT * INTO q FROM openmettle.gateway_requests WHERE id=h.gateway_request_id FOR NO KEY UPDATE SKIP LOCKED;
-        IF NOT FOUND OR q.state='handed_off' OR (NOT sweep AND q.state<>'released') THEN RETURN false; END IF;
+        IF p_sweep THEN
+            PERFORM FROM openmettle.gateway_reservations WHERE id=q.reservation_id FOR NO KEY UPDATE SKIP LOCKED;
+            IF NOT FOUND THEN RETURN false; END IF;
+            SELECT * INTO q FROM openmettle.gateway_requests WHERE id=h.gateway_request_id FOR NO KEY UPDATE SKIP LOCKED;
+        ELSE
+            PERFORM FROM openmettle.gateway_reservations WHERE id=q.reservation_id FOR NO KEY UPDATE;
+            SELECT * INTO q FROM openmettle.gateway_requests WHERE id=h.gateway_request_id FOR NO KEY UPDATE;
+        END IF;
+        IF NOT FOUND OR q.state='handed_off' OR (NOT p_sweep AND q.state<>'released') THEN RETURN false; END IF;
     END IF;
     IF h.parent_reservation_id IS NOT NULL THEN
-        PERFORM FROM openmettle.quota_reservations WHERE id=h.parent_reservation_id FOR NO KEY UPDATE SKIP LOCKED;
+        IF p_sweep THEN
+            PERFORM FROM openmettle.quota_reservations WHERE id=h.parent_reservation_id FOR NO KEY UPDATE SKIP LOCKED;
+        ELSE
+            PERFORM FROM openmettle.quota_reservations WHERE id=h.parent_reservation_id FOR NO KEY UPDATE;
+        END IF;
         IF NOT FOUND THEN RETURN false; END IF;
     END IF;
-    SELECT * INTO h FROM openmettle.quota_reservations WHERE id=p_id AND state='held'
-        AND (NOT sweep OR lease_expires_at<=clock_timestamp()) FOR NO KEY UPDATE SKIP LOCKED;
+    IF p_sweep THEN
+        SELECT * INTO h FROM openmettle.quota_reservations WHERE id=p_id AND state='held'
+            AND lease_expires_at<=clock_timestamp() FOR NO KEY UPDATE SKIP LOCKED;
+    ELSE
+        SELECT * INTO h FROM openmettle.quota_reservations WHERE id=p_id AND state='held' FOR NO KEY UPDATE;
+    END IF;
     IF NOT FOUND THEN RETURN false; END IF;
     IF h.gateway_request_id IS NOT NULL THEN
         IF (h.scope_id,h.actor_user_id,h.run_id) IS DISTINCT FROM (q.scope_id,q.actor_user_id,q.run_id) THEN
@@ -1461,12 +1490,12 @@ BEGIN
             UPDATE openmettle.gateway_reservations SET allocated=allocated-q.units WHERE id=q.reservation_id;
         END IF;
     END IF;
-    PERFORM openmettle.quota_unwind_hold(h.id,CASE WHEN sweep THEN 'stale_sweep' ELSE 'release' END);
+    PERFORM openmettle.quota_unwind_hold(h.id,CASE WHEN p_sweep THEN 'stale_sweep' ELSE 'release' END);
     RETURN true;
 END
 $$;
-REVOKE ALL ON FUNCTION openmettle.quota_release_unsent(uuid,bytea) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION openmettle.quota_release_unsent(uuid,bytea) TO openmettle_api,openmettle_worker;
+REVOKE ALL ON FUNCTION openmettle.quota_release_unsent(uuid,bytea,boolean) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION openmettle.quota_release_unsent(uuid,bytea,boolean) TO openmettle_api,openmettle_worker;
 
 CREATE FUNCTION openmettle.quota_commit_device_handoff(p_hold uuid,p_scope uuid,p_run uuid,p_claim uuid,p_grant uuid)
 RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
@@ -1594,6 +1623,10 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog AS $$
         UNION ALL SELECT FROM openmettle.storage_instance i WHERE
             (i.active_bytes,i.retained_bytes,i.reserved_bytes)<>(SELECT coalesce(sum(active),0),coalesce(sum(retained),0),
                 coalesce(sum(reserved),0) FROM storage)
+        UNION ALL SELECT FROM openmettle.artifact_revisions r JOIN openmettle.storage_reservations sr
+            ON sr.scope_id=r.scope_id AND sr.id=r.reservation_id
+            WHERE r.state IN ('active','retained','purging') AND sr.payload_ino IS NULL
+            AND EXISTS (SELECT FROM openmettle.storage_volume_control WHERE id AND volume_id IS NOT NULL)
     ), applied AS (
         SELECT h.* FROM openmettle.quota_reservations h WHERE gateway_request_id IS NOT NULL
             AND state IN ('handoff_committed','settled')

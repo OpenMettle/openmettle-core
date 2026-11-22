@@ -135,7 +135,19 @@ pub(super) async fn release(
         renew(pool, &pin, id, &token, ino, false, truncated).await?;
         if !truncated {
             v.verify(&pin)?;
-            v.matches(&file, dir, src, ino)?;
+            // Publication may have linked another name between our first probe and LOCK_EX.
+            let (r, s) = match (v.inode(&v.revisions, id), v.inode(&v.staging, id)) {
+                (Ok(r), Ok(s))
+                    if r.into_iter().chain(s).all(|other| other == ino)
+                        && v.matches(&file, dir, src, ino).is_ok() =>
+                {
+                    (r, s)
+                }
+                _ => {
+                    quarantine_claim(pool, store, &pin, id, &token).await?;
+                    return Err(Error::Io);
+                }
+            };
             file.set_len(0)?;
             file.sync_all()?;
             anchor(v, dir, src, &v.staging, &name, ino)?;
@@ -331,6 +343,9 @@ async fn purge_one(
     let name = format!(".purge.{reservation}");
     let a = v.inode(&v.revisions, &name)?;
     let r = v.inode(&v.revisions, reservation)?;
+    if r.is_some_and(|other| other != ino) {
+        return Err(Error::Io);
+    }
     let src = if a == Some(ino) {
         name.as_str()
     } else if a.is_none() && r == Some(ino) {
@@ -351,6 +366,10 @@ async fn purge_one(
     tx.commit().await?;
     v.verify(pin)?;
     v.matches(&f, &v.revisions, src, ino)?;
+    let r = v.inode(&v.revisions, reservation)?;
+    if r.is_some_and(|other| other != ino) {
+        return Err(Error::Io);
+    }
     f.set_len(0)?;
     f.sync_all()?;
     anchor(v, &v.revisions, src, &v.revisions, &name, ino)?;
@@ -533,12 +552,32 @@ pub async fn purge_due(pool: &PgPool, store: &Store, limit: i64) -> Result<usize
         return Ok(0);
     };
     let anchors = sweep_anchors(pool, store, &pin, limit, true).await;
-    let page=sqlx::query_as::<_,(String,String,String,String)>("SELECT r.scope_id::text,r.id::text,r.reservation_id::text,sr.payload_ino::text
-        FROM openmettle.artifact_revisions r JOIN openmettle.storage_reservations sr ON sr.scope_id=r.scope_id AND sr.id=r.reservation_id
-        WHERE NOT sr.adoption_unverified AND sr.payload_ino IS NOT NULL AND ((r.state='retained' AND r.purge_after<=now()) OR r.state='purging')
-        ORDER BY r.purge_after,r.id LIMIT $1").bind(limit).fetch_all(pool).await?;
+    let mut pass = store.purge_pass.lock().await;
+    const DUE: &str = "FROM openmettle.artifact_revisions r JOIN openmettle.storage_reservations sr
+        ON sr.scope_id=r.scope_id AND sr.id=r.reservation_id
+        WHERE NOT sr.adoption_unverified AND sr.payload_ino IS NOT NULL
+        AND (r.state='purging' OR (r.state='retained' AND r.purge_after<=statement_timestamp()))";
+    const KEY: &str = "coalesce(r.purge_after,'-infinity'::timestamptz)";
+    if pass.upper.is_none() {
+        pass.upper = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {KEY}::text,r.id::text {DUE} ORDER BY {KEY} DESC,r.id DESC LIMIT 1"
+        )))
+        .fetch_optional(pool)
+        .await?;
+    }
+    let Some(upper) = &pass.upper else {
+        return anchors.map(|()| 0);
+    };
+    let page = sqlx::query_as::<_, (String,String,String,String,String)>(sqlx::AssertSqlSafe(format!(
+        "SELECT {KEY}::text,r.id::text,r.scope_id::text,r.reservation_id::text,sr.payload_ino::text {DUE}
+         AND ($1::text::timestamptz IS NULL OR ({KEY},r.id)>($1::text::timestamptz,$2::uuid))
+         AND ({KEY},r.id)<=($3::text::timestamptz,$4::uuid) ORDER BY {KEY},r.id LIMIT $5"
+    ))).bind(pass.after.as_ref().map(|k| &k.0)).bind(pass.after.as_ref().map(|k| &k.1))
+       .bind(&upper.0).bind(&upper.1).bind(limit).fetch_all(pool).await?;
+    let last = page.last().map(|(t, id, ..)| (t.clone(), id.clone()));
+    let finished = page.len() < limit as usize || last == pass.upper;
     let pin = pin.as_str();
-    let count = sweep_items(page, |(scope, id, res, ino)| async move {
+    let count = sweep_items(page, |(_, id, scope, res, ino)| async move {
         purge_one(
             pool,
             store,
@@ -550,7 +589,12 @@ pub async fn purge_due(pool: &PgPool, store: &Store, limit: i64) -> Result<usize
         )
         .await
     })
-    .await?;
+    .await;
+    if finished {
+        *pass = AnchorPass::default();
+    } else {
+        pass.after = last;
+    }
     anchors?;
-    Ok(count)
+    count
 }

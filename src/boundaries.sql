@@ -113,7 +113,7 @@ quota_functions(signature,definer,roles) AS (
         ('openmettle.quota_release_orphan_gateway_requests(interval,timestamptz,uuid,timestamptz,uuid,integer)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.quota_renew_lease(uuid,uuid,uuid,timestamptz)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.quota_follow_run_deadline()',true,ARRAY[]::text[]),
-        ('openmettle.quota_release_unsent(uuid,bytea)',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
+        ('openmettle.quota_release_unsent(uuid,bytea,boolean)',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
         ('openmettle.quota_commit_device_handoff(uuid,uuid,uuid,uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.quota_lock_override(uuid,uuid,text)',false,ARRAY[]::text[]),
         ('openmettle.quota_upsert_scope_override(uuid,uuid,text,bigint,timestamptz,text)',true,ARRAY['openmettle_api']::text[]),

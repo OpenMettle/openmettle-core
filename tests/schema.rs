@@ -242,6 +242,29 @@ impl TestDb {
     }
 }
 
+/// Wait for the operation under test to reach a lock held by the fixture.
+async fn wait_for_blocked_peer(db: &TestDb, holder: i32) {
+    let mut observer = db.admin().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT FROM pg_stat_activity WHERE datname=current_database()
+                    AND $1=ANY(pg_blocking_pids(pid)))",
+            )
+            .bind(holder)
+            .fetch_one(&mut observer)
+            .await
+            .unwrap();
+            if waiting {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("expected a peer to wait on the fixture lock");
+}
+
 fn sqlstate<T: std::fmt::Debug>(result: Result<T, sqlx::Error>) -> String {
     match result {
         Err(sqlx::Error::Database(e)) => e.code().unwrap_or_default().into_owned(),
@@ -988,7 +1011,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "47ee7ed667d0f65034e4b9ea8315f66807ae8ed5a4428f3afc1763d205c8bc00",
         "e9221570f5187a4fc2d666d3724d8646d6d4236d3cb7997538e80ec10355be57",
         "275b395fab0a1e90fc6f9a3039d008adc138294af0cb0da9cb944df87b26ec1c",
-        "700a54eaba068e65b559df8621e41e75e55d1aa0ea475006538bf15c3b728877",
+        "a6ea85d09af2c2aa7d267499623a46a3922e695b79bdf585cd8e2164d68e5d9a",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));

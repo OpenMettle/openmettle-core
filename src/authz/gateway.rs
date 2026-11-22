@@ -78,7 +78,7 @@ pub async fn hold_with_cost(
         .await?;
     if let Some(run) = run {
         let cost = crate::quotas::cost_ceiling(tx, r, cost_ceiling).await?;
-        for (resource, amount) in [("usage_tokens", Some(units)), ("usage_cost_micros", cost)] {
+        for (resource, amount) in [("usage_cost_micros", cost), ("usage_tokens", Some(units))] {
             if let Some(amount) = amount {
                 sqlx::query("SELECT openmettle.quota_reserve($1::uuid,$2::uuid,$3,$4,$5,$6::uuid,NULL,NULL,
                     (SELECT coalesce(queue_expires_at,clock_timestamp())+interval '60 seconds' FROM openmettle.runs WHERE id=$6::uuid))")

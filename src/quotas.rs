@@ -56,8 +56,8 @@ pub(crate) async fn bind_request(
 ) -> Result<(), Error> {
     let cost = cost_ceiling(tx, &call.reservation, supplied).await?;
     for (resource, amount) in [
-        ("usage_tokens", Some(call.units)),
         ("usage_cost_micros", cost),
+        ("usage_tokens", Some(call.units)),
     ] {
         let Some(amount) = amount else { continue };
         match call.authority {
@@ -140,7 +140,7 @@ pub(crate) async fn reconcile_stale_quotas(
         pass.after = Some((at, id.clone()));
         if eligible {
             let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
-            sqlx::query("SELECT openmettle.quota_release_unsent($1::uuid)")
+            sqlx::query("SELECT openmettle.quota_release_unsent($1::uuid,NULL,true)")
                 .bind(&id)
                 .execute(tx.connection()?)
                 .await?;

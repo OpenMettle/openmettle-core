@@ -801,15 +801,49 @@ async fn handoff_rechecks_authority_and_only_a_released_run_round_can_retry() {
             SET revision=excluded.revision,measured=excluded.measured,final=true")
             .bind(request).bind(rev as i64).bind(tokens.map(|n|n*2));
         prelocked_settlement(&g, request, update).await.unwrap();
-        sqlx::query(
+        let settle = sqlx::query(
             "SELECT openmettle.quota_settle_gateway_usage(request_id,source,report_id,revision)
             FROM openmettle.gateway_usage_reports WHERE request_id=$1::uuid AND revision=$2",
         )
         .bind(request)
-        .bind(rev as i64)
-        .execute(&g)
-        .await
-        .unwrap();
+        .bind(rev as i64);
+        if rev == 1 {
+            // This revision settles cost. Both requests charge the same cost and token budgets.
+            let other_id = uuid(&mut c).await;
+            let unsent = gateway::reserve_with_cost(
+                &api,
+                caller(&actor, &credential, &scope, &other_id),
+                Some(10),
+            )
+            .await
+            .unwrap();
+            let order: Vec<String> = sqlx::query_scalar(
+                "SELECT resource_kind FROM openmettle.quota_reservations
+                WHERE gateway_request_id=$1::uuid ORDER BY created_at",
+            )
+            .bind(&unsent.id)
+            .fetch_all(&g)
+            .await
+            .unwrap();
+            assert_eq!(order, ["usage_cost_micros", "usage_tokens"]);
+            let mut blocker = c.begin().await.unwrap();
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid() FROM openmettle.quota_reservations
+                WHERE gateway_request_id=$1::uuid AND resource_kind='usage_tokens' FOR NO KEY UPDATE")
+                .bind(&unsent.id).fetch_one(&mut *blocker).await.unwrap();
+            let release = unsent.release(&api);
+            let settle_while_unwind_waits = async {
+                wait_for_blocked_peer(&db, pid).await;
+                tokio::time::timeout(Duration::from_secs(5), settle.execute(&g))
+                    .await
+                    .expect("waiting unwind must leave the shared budgets available")
+                    .unwrap();
+                blocker.commit().await.unwrap();
+            };
+            let (released, ()) = tokio::join!(release, settle_while_unwind_waits);
+            assert!(released.unwrap());
+        } else {
+            settle.execute(&g).await.unwrap();
+        }
         let values: Vec<String> = sqlx::query_scalar(
             "SELECT settled_units::text FROM openmettle.quota_reservations
             WHERE gateway_request_id=$1::uuid ORDER BY resource_kind",

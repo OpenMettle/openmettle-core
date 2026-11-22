@@ -122,7 +122,7 @@ async fn reserve_inner(
         // On a pinned deployment serialize acquisition with adoption before locking counters.
         // Existing unpinned HTTP uploads can proceed while the fleet is being replaced.
         sqlx::query("SELECT openmettle.storage_lock_pinned_volume() FROM openmettle.storage_volume_control
-            WHERE id AND volume_id IS NOT NULL").execute(&mut *sp).await?;
+            WHERE id AND (volume_id IS NOT NULL OR adoption_run_id IS NOT NULL)").execute(&mut *sp).await?;
         sqlx::query("INSERT INTO openmettle.storage_accounts(scope_id) VALUES ($1::uuid) ON CONFLICT DO NOTHING")
             .bind(r.scope).execute(&mut *sp).await?;
         let account = sqlx::query("SELECT active_bytes,retained_bytes,reserved_bytes FROM openmettle.storage_accounts
@@ -300,7 +300,7 @@ async fn adjust(
 ) -> Result<(), Error> {
     sqlx::query(
         "SELECT openmettle.storage_lock_pinned_volume() FROM openmettle.storage_volume_control
-        WHERE id AND volume_id IS NOT NULL",
+        WHERE id AND (volume_id IS NOT NULL OR adoption_run_id IS NOT NULL)",
     )
     .execute(&mut **tx)
     .await?;
