@@ -414,28 +414,6 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                     _ => return Err(FAILED),
                 }
             }
-            let metering_enforced = {
-                let mut c = self.pool.acquire().await.map_err(|_| FAILED)?;
-                let has_table: bool = sqlx::query_scalar(
-                    "SELECT to_regclass('openmettle.quota_enforcement') IS NOT NULL",
-                )
-                .fetch_one(&mut *c)
-                .await
-                .map_err(|_| FAILED)?;
-                if has_table {
-                    sqlx::query_scalar::<_, bool>(
-                        "SELECT metering_enforced FROM openmettle.quota_enforcement WHERE id",
-                    )
-                    .fetch_one(&mut *c)
-                    .await
-                    .map_err(|_| FAILED)?
-                } else {
-                    false
-                }
-            };
-            if metering_enforced && route.metered.is_none() {
-                return Err(FAILED);
-            }
             let turn = if let Some(metered) = &route.metered {
                 let round_tokens = config
                     .effective
@@ -472,47 +450,25 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 )
                 .await
                 .map_err(|_| FAILED)?;
-                if requires_device_slot && metering_enforced {
-                    let Some(grant_id) = metered.device_grant_id.as_deref() else {
-                        let _ = pending.release(&self.pool).await;
-                        return Err(FAILED);
-                    };
-                    if crate::authz::gateway::verify_turn_device_hold(
-                        &self.pool,
-                        &run.claim.scope_id,
-                        &run.claim.run_id,
-                        grant_id,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        let _ = pending.release(&self.pool).await;
-                        return Err(FAILED);
-                    }
-                }
                 if cx.stop.borrow().is_some() {
                     let _ = pending.release(&self.pool).await;
                     return Err(StepResult::Stopped);
                 }
-                let dispatch = match pending.handoff(&self.pool, &metered.keys).await {
+                let dispatch = match pending
+                    .handoff(
+                        &self.pool,
+                        &metered.keys,
+                        requires_device_slot,
+                        metered.device_grant_id.as_deref(),
+                    )
+                    .await
+                {
                     Ok(dispatch) => dispatch,
                     Err(_) => {
                         let _ = pending.release(&self.pool).await;
                         return Err(FAILED);
                     }
                 };
-                if requires_device_slot && metering_enforced {
-                    let grant_id = metered.device_grant_id.as_deref().ok_or(FAILED)?;
-                    crate::authz::gateway::commit_turn_device_handoff(
-                        &self.pool,
-                        &run.claim.scope_id,
-                        &run.claim.run_id,
-                        &run.claim.claim_token,
-                        grant_id,
-                    )
-                    .await
-                    .map_err(|_| FAILED)?;
-                }
                 crate::provider_http::BillableInferenceRef {
                     installation: &metered.installation,
                     route: &route.gateway,
@@ -528,6 +484,57 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 .await
                 .map_err(inference::Error::step_result)?
             } else {
+                if cx.stop.borrow().is_some() {
+                    return Err(StepResult::Stopped);
+                }
+                {
+                    let mut c = self.pool.acquire().await.map_err(|_| FAILED)?;
+                    let has_quota_schema: bool = sqlx::query_scalar(
+                        "SELECT to_regclass('openmettle.quota_enforcement') IS NOT NULL",
+                    )
+                    .fetch_one(&mut *c)
+                    .await
+                    .map_err(|_| FAILED)?;
+                    if has_quota_schema {
+                        let has_guard: bool = sqlx::query_scalar(
+                            "SELECT to_regprocedure(
+                                 'openmettle.quota_authorize_unmetered_turn_round(uuid,uuid,uuid)'
+                             ) IS NOT NULL",
+                        )
+                        .fetch_one(&mut *c)
+                        .await
+                        .map_err(|_| FAILED)?;
+                        if has_guard {
+                            sqlx::query(
+                                "SELECT openmettle.quota_authorize_unmetered_turn_round(
+                                     $1::uuid, $2::uuid, $3::uuid
+                                 )",
+                            )
+                            .bind(&run.claim.scope_id)
+                            .bind(&run.claim.run_id)
+                            .bind(&run.claim.claim_token)
+                            .execute(&mut *c)
+                            .await
+                            .map_err(|_| FAILED)?;
+                        } else {
+                            let blocked: bool = sqlx::query_scalar(
+                                "SELECT (SELECT metering_enforced FROM openmettle.quota_enforcement WHERE id)
+                                     OR EXISTS (
+                                         SELECT 1 FROM openmettle.quota_reservations
+                                          WHERE scope_id = $1::uuid AND run_id = $2::uuid
+                                     )",
+                            )
+                            .bind(&run.claim.scope_id)
+                            .bind(&run.claim.run_id)
+                            .fetch_one(&mut *c)
+                            .await
+                            .map_err(|_| FAILED)?;
+                            if blocked {
+                                return Err(FAILED);
+                            }
+                        }
+                    }
+                }
                 route
                     .gateway
                     .server(

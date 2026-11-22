@@ -63,40 +63,67 @@ pub(crate) async fn prepare_round(
     Ok(())
 }
 
+struct CostLimitState {
+    denomination: Option<String>,
+    any_limit: bool,
+    personal_limit: bool,
+    tightest_scope_kind: Option<String>,
+}
+
 async fn cost_limit_state(
     c: &mut PgConnection,
     scope_id: &str,
     actor_user_id: &str,
-) -> Result<(Option<String>, bool), sqlx::Error> {
-    sqlx::query_as(
+) -> Result<CostLimitState, sqlx::Error> {
+    let (denomination, any_limit, personal_limit, tightest_scope_kind): (
+        Option<String>,
+        bool,
+        bool,
+        Option<String>,
+    ) = sqlx::query_as(
         "WITH stamp AS (SELECT clock_timestamp() AS now),
          tiers AS (
-             SELECT id AS scope_id, kind AS scope_kind
+             SELECT id AS scope_id, kind AS scope_kind, (personal_user_id = $2::uuid) AS is_personal
                FROM openmettle.scopes
               WHERE id = $1::uuid OR personal_user_id = $2::uuid
              UNION ALL
-             SELECT NULL::uuid, 'instance'::text
+             SELECT NULL::uuid, 'instance'::text, false
+         ),
+         resolved AS (
+             SELECT t.scope_kind,
+                    t.is_personal,
+                    coalesce(
+                        CASE WHEN o.revoked_at IS NULL
+                              AND (o.expires_at IS NULL OR o.expires_at > (SELECT now FROM stamp))
+                             THEN o.hard_limit END,
+                        d.hard_limit
+                    ) AS hard_limit
+               FROM tiers t
+               LEFT JOIN openmettle.quota_defaults d
+                 ON d.scope_kind = t.scope_kind AND d.resource_kind = 'usage_cost_micros'
+               LEFT JOIN openmettle.quota_overrides o
+                 ON o.scope_id = t.scope_id AND o.resource_kind = 'usage_cost_micros'
          )
          SELECT (SELECT cost_denomination FROM openmettle.quota_defaults
                   WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'),
-                EXISTS (
-                    SELECT 1 FROM tiers t
-                    LEFT JOIN openmettle.quota_defaults d
-                      ON d.scope_kind = t.scope_kind AND d.resource_kind = 'usage_cost_micros'
-                    LEFT JOIN openmettle.quota_overrides o
-                      ON o.scope_id = t.scope_id AND o.resource_kind = 'usage_cost_micros'
-                   WHERE coalesce(
-                             CASE WHEN o.revoked_at IS NULL
-                                   AND (o.expires_at IS NULL OR o.expires_at > (SELECT now FROM stamp))
-                                  THEN o.hard_limit END,
-                             d.hard_limit
-                         ) IS NOT NULL
-                )",
+                EXISTS (SELECT 1 FROM resolved WHERE hard_limit IS NOT NULL),
+                EXISTS (SELECT 1 FROM resolved WHERE is_personal AND hard_limit IS NOT NULL),
+                (SELECT scope_kind FROM resolved
+                  WHERE hard_limit IS NOT NULL
+                  ORDER BY hard_limit ASC,
+                           CASE scope_kind WHEN 'personal' THEN 0 WHEN 'project' THEN 1 ELSE 2 END
+                  LIMIT 1)",
     )
     .bind(scope_id)
     .bind(actor_user_id)
     .fetch_one(c)
-    .await
+    .await?;
+    Ok(CostLimitState {
+        denomination,
+        any_limit,
+        personal_limit,
+        tightest_scope_kind,
+    })
 }
 
 pub(crate) async fn cost_ceiling(
@@ -106,13 +133,15 @@ pub(crate) async fn cost_ceiling(
     current_request_id: Option<&str>,
     supplied: Option<i64>,
 ) -> Result<Option<i64>, Error> {
-    let (_, any_cost_limit) =
-        cost_limit_state(tx.connection()?, owner.scope_id, owner.actor).await?;
-    if !any_cost_limit {
+    let state = cost_limit_state(tx.connection()?, owner.scope_id, owner.actor).await?;
+    if !state.any_limit {
         return match supplied {
             Some(n) if n <= 0 => Err(Error::Refused),
             _ => Ok(None),
         };
+    }
+    if state.denomination.is_none() || !state.personal_limit {
+        return Err(Error::Refused);
     }
     let configured: Option<i64> =
         sqlx::query_scalar("SELECT openmettle.quota_cost_ceiling($1::uuid,$2::uuid)")
@@ -1436,9 +1465,12 @@ pub struct RunBudgetReservation<'a> {
     pub actor_approval_id: &'a str,
     pub run_id: &'a str,
     pub token_units: i64,
-    /// Qualified total run cost ceiling (`per_round_cost_micros * round_limit`) when the profile
-    /// carries a `cost_bound`, or `None` when the profile is unqualified for cost metering.
-    pub cost_units: Option<i64>,
+    /// Qualified per-round cost ceiling when the profile carries a `cost_bound`, or `None` when
+    /// the profile is unqualified for cost metering. Multiplied by `round_limit` only when a
+    /// `usage_cost_micros` limit is actually active.
+    pub per_round_cost_micros: Option<i64>,
+    /// Effective run round limit (`>= 1`).
+    pub round_limit: i32,
     /// True when executing this profile requires one concurrent `device_reservations` slot.
     pub requires_device_slot: bool,
 }
@@ -1486,28 +1518,68 @@ async fn backfill_replayed_run_budget_inner(
     if !has_gateway_reservations {
         return Ok((false, None));
     }
-    // Follow canonical lock order (`runs -> gateway_reservations -> quota_budgets`), verify the
-    // run is still `queued`, and reuse the locked run's original `actor_approval_id` so replays
-    // from another linked identity never fail `gateway_run_hold()` with 23503.
-    let run_row: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT state, actor_approval_id::text
-           FROM openmettle.runs
-          WHERE scope_id = $1::uuid
-            AND id = $2::uuid
-            AND actor_user_id = $3::uuid
-            FOR NO KEY UPDATE",
+    let has_helper: bool = sqlx::query_scalar(
+        "SELECT to_regprocedure(
+             'openmettle.quota_ensure_replayed_run_gateway_reservation(uuid,uuid,uuid,bigint)'
+         ) IS NOT NULL",
     )
-    .bind(input.scope_id)
-    .bind(input.run_id)
-    .bind(input.actor_user_id)
-    .fetch_optional(&mut **outer)
+    .fetch_one(&mut **outer)
     .await?;
-    let Some((state, Some(run_approval_id))) = run_row else {
-        return Ok((false, None));
+    let (gw_inserted, effective_token_units) = if has_helper {
+        let row: Option<(String, i64, bool)> = sqlx::query_as(
+            "SELECT reservation_id::text, units, inserted
+               FROM openmettle.quota_ensure_replayed_run_gateway_reservation(
+                    $1::uuid, $2::uuid, $3::uuid, $4
+               )",
+        )
+        .bind(input.scope_id)
+        .bind(input.run_id)
+        .bind(input.actor_user_id)
+        .bind(input.token_units)
+        .fetch_optional(&mut **outer)
+        .await?;
+        let Some((_, units, inserted)) = row else {
+            return Ok((false, None));
+        };
+        (inserted, units)
+    } else {
+        // Pre-0026 fallback: lock the run row in canonical order and reuse its actor_approval_id.
+        let run_row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT state, actor_approval_id::text
+               FROM openmettle.runs
+              WHERE scope_id = $1::uuid
+                AND id = $2::uuid
+                AND actor_user_id = $3::uuid
+                FOR NO KEY UPDATE",
+        )
+        .bind(input.scope_id)
+        .bind(input.run_id)
+        .bind(input.actor_user_id)
+        .fetch_optional(&mut **outer)
+        .await?;
+        let Some((state, Some(run_approval_id))) = run_row else {
+            return Ok((false, None));
+        };
+        if state != "queued" {
+            return Ok((false, None));
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO openmettle.gateway_reservations
+                 (id, scope_id, actor_user_id, approval_id, run_id, units)
+             VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $1::uuid, $5)",
+        )
+        .bind(input.run_id)
+        .bind(input.scope_id)
+        .bind(input.actor_user_id)
+        .bind(&run_approval_id)
+        .bind(input.token_units)
+        .execute(&mut **outer)
+        .await?
+        .rows_affected()
+            > 0;
+        (inserted, input.token_units)
     };
-    if state != "queued" {
-        return Ok((false, None));
-    }
+
     let has_quota_schema: bool =
         sqlx::query_scalar("SELECT to_regclass('openmettle.quota_enforcement') IS NOT NULL")
             .fetch_one(&mut **outer)
@@ -1521,44 +1593,30 @@ async fn backfill_replayed_run_budget_inner(
     } else {
         false
     };
-    if enforced {
-        let has_token_hold: bool = sqlx::query_scalar(
-            "SELECT EXISTS (
-                 SELECT 1 FROM openmettle.quota_reservations
-                  WHERE scope_id = $1::uuid
-                    AND run_id = $2::uuid
-                    AND gateway_request_id IS NULL
-                    AND resource_kind = 'usage_tokens'
-             )",
-        )
-        .bind(input.scope_id)
-        .bind(input.run_id)
-        .fetch_one(&mut **outer)
-        .await?;
-        if has_token_hold {
-            return Ok((false, None));
-        }
-    }
-    // `gateway_run_hold()` trigger makes this INSERT a no-op (`rows_affected == 0`) when the
-    // identical row already exists, and inserts (`rows_affected == 1`) when missing.
-    let gw_inserted = sqlx::query(
-        "INSERT INTO openmettle.gateway_reservations
-             (id, scope_id, actor_user_id, approval_id, run_id, units)
-         VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $1::uuid, $5)",
-    )
-    .bind(input.run_id)
-    .bind(input.scope_id)
-    .bind(input.actor_user_id)
-    .bind(&run_approval_id)
-    .bind(input.token_units)
-    .execute(&mut **outer)
-    .await?
-    .rows_affected()
-        > 0;
     if !enforced {
         return Ok((gw_inserted, None));
     }
-    if let Some(refusal) = reserve_metered_holds_inner(outer, input).await? {
+    let has_token_hold: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM openmettle.quota_reservations
+              WHERE scope_id = $1::uuid
+                AND run_id = $2::uuid
+                AND gateway_request_id IS NULL
+                AND resource_kind = 'usage_tokens'
+         )",
+    )
+    .bind(input.scope_id)
+    .bind(input.run_id)
+    .fetch_one(&mut **outer)
+    .await?;
+    if has_token_hold {
+        return Ok((gw_inserted, None));
+    }
+    let effective = RunBudgetReservation {
+        token_units: effective_token_units,
+        ..*input
+    };
+    if let Some(refusal) = reserve_metered_holds_inner(outer, &effective).await? {
         return Ok((false, Some(refusal)));
     }
     Ok((true, None))
@@ -1632,14 +1690,37 @@ async fn reserve_metered_holds_inner(
         return Ok(Some(refusal));
     }
 
-    let (cost_denomination, any_cost_limit) =
-        cost_limit_state(outer, input.scope_id, input.actor_user_id).await?;
+    let cost_state = cost_limit_state(outer, input.scope_id, input.actor_user_id).await?;
 
-    if any_cost_limit {
-        let Some(cost_units) = input.cost_units.filter(|_| cost_denomination.is_some()) else {
+    if cost_state.any_limit {
+        let Some(per_round_cost) = input
+            .per_round_cost_micros
+            .filter(|_| cost_state.denomination.is_some())
+        else {
             return Ok(Some(RunLimit::QuotaUnconfigured {
                 resource_kind: "usage_cost_micros",
                 scope_kind: "instance",
+            }));
+        };
+        if !cost_state.personal_limit {
+            return Ok(Some(RunLimit::QuotaUnconfigured {
+                resource_kind: "usage_cost_micros",
+                scope_kind: "personal",
+            }));
+        }
+        let per_round_u64 = u64::try_from(per_round_cost)
+            .ok()
+            .filter(|&n| n > 0)
+            .ok_or(StoreError::InvalidInput("cost_units"))?;
+        let rounds_u32 = u32::try_from(input.round_limit)
+            .ok()
+            .filter(|&n| n > 0)
+            .ok_or(StoreError::InvalidInput("round_limit"))?;
+        let total_u128 = u128::from(per_round_u64) * u128::from(rounds_u32);
+        let Ok(cost_units) = i64::try_from(total_u128) else {
+            return Ok(Some(RunLimit::Quota {
+                resource_kind: "usage_cost_micros",
+                scope_kind: db_tier(cost_state.tightest_scope_kind.as_deref(), input.scope_kind),
             }));
         };
         if let Some(refusal) = try_quota_reserve(

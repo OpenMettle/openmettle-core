@@ -2678,7 +2678,8 @@ mod live_turns {
                     actor_approval_id: &chat.f.actor.approval,
                     run_id: &id,
                     token_units: 16384,
-                    cost_units: None,
+                    per_round_cost_micros: None,
+                    round_limit: 2,
                     requires_device_slot: false,
                 },
             )
@@ -3015,7 +3016,8 @@ mod live_turns {
                         actor_approval_id: &chat.f.actor.approval,
                         run_id: &r1,
                         token_units: 16384,
-                        cost_units: None,
+                        per_round_cost_micros: None,
+                        round_limit: 2,
                         requires_device_slot: true,
                     },
                 )
@@ -3053,7 +3055,8 @@ mod live_turns {
                         actor_approval_id: &chat.f.actor.approval,
                         run_id: &r2,
                         token_units: 16384,
-                        cost_units: None,
+                        per_round_cost_micros: None,
+                        round_limit: 2,
                         requires_device_slot: true,
                     },
                 )
@@ -3148,7 +3151,8 @@ mod live_turns {
                         actor_approval_id: &chat.f.actor.approval,
                         run_id: &id,
                         token_units: 16384,
-                        cost_units: None,
+                        per_round_cost_micros: None,
+                        round_limit: 2,
                         requires_device_slot: false,
                     },
                 )

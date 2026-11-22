@@ -197,8 +197,56 @@ impl TurnPending {
         self.as_pending().release(pool).await
     }
 
-    pub async fn handoff(&self, pool: &PgPool, keys: &GatewayKeys) -> Result<Dispatch, Error> {
-        self.as_pending().handoff(pool, keys).await
+    /// Atomically commit gateway handoff, optional device-slot handoff (when `requires_device_slot`
+    /// is true and metering or a device hold applies), and round usage child holds in a single
+    /// write transaction. Any pre-commit failure rolls back `gateway_requests` to `'reserved'` so
+    /// `release()` can immediately unwind the unsent round.
+    pub async fn handoff(
+        &self,
+        pool: &PgPool,
+        keys: &GatewayKeys,
+        requires_device_slot: bool,
+        device_grant_id: Option<&str>,
+    ) -> Result<Dispatch, Error> {
+        if requires_device_slot
+            && device_grant_id.is_some_and(|g| !crate::runs::is_canonical_uuid(g))
+        {
+            return Err(Error::Refused);
+        }
+        let pending = self.as_pending();
+        let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
+        let dispatch = pending.handoff_in(&mut tx, keys).await?;
+        if requires_device_slot {
+            let res = sqlx::query(
+                "SELECT openmettle.quota_commit_turn_device_handoff(
+                     $1::uuid, $2::uuid, $3::uuid, $4::uuid
+                 )",
+            )
+            .bind(&self.scope_id)
+            .bind(&self.run_id)
+            .bind(&self.claim_token)
+            .bind(device_grant_id)
+            .execute(tx.connection()?)
+            .await;
+            if let Err(err) = res {
+                return match err.as_database_error().and_then(|e| e.code()).as_deref() {
+                    Some("42501" | "23505" | "OMQ04") => Err(Error::Refused),
+                    _ => Err(Error::from(err)),
+                };
+            }
+        }
+        sqlx::query("SELECT openmettle.quota_commit_handoff($1::uuid,$2::bytea)")
+            .bind(&pending.id)
+            .bind(pending.secret.as_slice())
+            .execute(tx.connection()?)
+            .await?;
+        if tx.commit().await.is_err() {
+            let mut recovery = WriteTransaction::begin_bounded_pool(pool, false).await?;
+            pending.recover_in(&mut recovery).await?;
+            recovery.commit().await?;
+            return Err(Error::Database);
+        }
+        Ok(dispatch)
     }
 }
 
@@ -273,107 +321,6 @@ pub async fn reserve_turn_round(pool: &PgPool, round: TurnRound<'_>) -> Result<T
         model: round.model.to_owned(),
         units: round.round_tokens,
     })
-}
-
-/// Pre-check that a device-required run holds an active `device_reservations` parent hold
-/// compatible with `device_grant_id` before committing gateway handoff.
-pub async fn verify_turn_device_hold(
-    pool: &PgPool,
-    scope_id: &str,
-    run_id: &str,
-    device_grant_id: &str,
-) -> Result<(), Error> {
-    if !crate::runs::is_canonical_uuid(device_grant_id) {
-        return Err(Error::Refused);
-    }
-    let row: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT state, device_grant_id::text
-           FROM openmettle.quota_reservations
-          WHERE scope_id = $1::uuid
-            AND run_id = $2::uuid
-            AND gateway_request_id IS NULL
-            AND resource_kind = 'device_reservations'",
-    )
-    .bind(scope_id)
-    .bind(run_id)
-    .fetch_optional(pool)
-    .await?;
-    match row {
-        Some((state, _)) if state == "held" => Ok(()),
-        Some((state, existing))
-            if state == "handoff_committed" && existing.as_deref() == Some(device_grant_id) =>
-        {
-            Ok(())
-        }
-        _ => Err(Error::Refused),
-    }
-}
-
-/// Transition the run's `device_reservations` hold from `'held'` to `'handoff_committed'` via
-/// `openmettle.quota_commit_device_handoff` on Round 1, or verify it is already
-/// `'handoff_committed'` with the matching `device_grant_id` on subsequent rounds.
-pub async fn commit_turn_device_handoff(
-    pool: &PgPool,
-    scope_id: &str,
-    run_id: &str,
-    claim_token: &str,
-    device_grant_id: &str,
-) -> Result<(), Error> {
-    if !crate::runs::is_canonical_uuid(device_grant_id) {
-        return Err(Error::Refused);
-    }
-    let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
-    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT id::text, state, device_grant_id::text
-           FROM openmettle.quota_reservations
-          WHERE scope_id = $1::uuid
-            AND run_id = $2::uuid
-            AND gateway_request_id IS NULL
-            AND resource_kind = 'device_reservations'",
-    )
-    .bind(scope_id)
-    .bind(run_id)
-    .fetch_optional(tx.connection()?)
-    .await?;
-    match row {
-        Some((hold_id, state, _)) if state == "held" => {
-            let committed: bool = sqlx::query_scalar(
-                "SELECT openmettle.quota_commit_device_handoff(
-                     $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid
-                 )",
-            )
-            .bind(&hold_id)
-            .bind(scope_id)
-            .bind(run_id)
-            .bind(claim_token)
-            .bind(device_grant_id)
-            .fetch_one(tx.connection()?)
-            .await?;
-            if !committed {
-                // Re-read in case a concurrent recovery already committed the same grant.
-                let after: Option<(String, Option<String>)> = sqlx::query_as(
-                    "SELECT state, device_grant_id::text
-                       FROM openmettle.quota_reservations
-                      WHERE id = $1::uuid",
-                )
-                .bind(&hold_id)
-                .fetch_optional(tx.connection()?)
-                .await?;
-                if !matches!(
-                    after,
-                    Some((ref s, ref g))
-                        if s == "handoff_committed" && g.as_deref() == Some(device_grant_id)
-                ) {
-                    return Err(Error::Refused);
-                }
-            }
-        }
-        Some((_, state, existing))
-            if state == "handoff_committed" && existing.as_deref() == Some(device_grant_id) => {}
-        _ => return Err(Error::Refused),
-    }
-    tx.commit().await?;
-    Ok(())
 }
 
 async fn reserve_in<'a>(

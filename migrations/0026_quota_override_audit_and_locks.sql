@@ -759,7 +759,9 @@ BEGIN
         coalesce(r.round_limit, 1) - coalesce(
             (SELECT count(*)::integer
                FROM openmettle.gateway_requests
-              WHERE reservation_id = g.id AND state <> 'released'),
+              WHERE reservation_id = g.id
+                AND run_id IS NOT NULL
+                AND state <> 'released'),
             0
         )
     );
@@ -817,6 +819,10 @@ BEGIN
             IF p_per_round_cost_micros <= 0 THEN
                 RAISE EXCEPTION 'invalid cost bound' USING ERRCODE = '23514';
             END IF;
+            IF p_per_round_cost_micros::numeric * v_rem_rounds > 9223372036854775807 THEN
+                RAISE EXCEPTION 'cost limit exceeded'
+                    USING ERRCODE = 'OMQ01', DETAIL = 'personal';
+            END IF;
             v_cost_units := p_per_round_cost_micros * v_rem_rounds;
         ELSE
             v_cost_units := openmettle.quota_cost_ceiling(p_scope, r.actor_user_id);
@@ -855,9 +861,45 @@ $$;
 REVOKE ALL ON FUNCTION openmettle.quota_ensure_legacy_run_holds(uuid, uuid, uuid, bigint, bigint, boolean, boolean) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION openmettle.quota_ensure_legacy_run_holds(uuid, uuid, uuid, bigint, bigint, boolean, boolean) TO openmettle_worker;
 
+-- Require BOTH instance cost_denomination AND an active personal usage_cost_micros limit
+-- whenever any cost tier applies; expiring a personal override must fail closed even if a
+-- project or instance cost limit remains configured.
+CREATE OR REPLACE FUNCTION openmettle.quota_cost_ceiling(p_scope uuid, p_actor uuid)
+RETURNS bigint
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+    WITH tiers AS (
+        SELECT id, kind, (personal_user_id = p_actor) AS is_personal
+          FROM openmettle.scopes
+         WHERE id = p_scope OR personal_user_id = p_actor
+        UNION ALL
+        SELECT NULL::uuid, 'instance'::text, false
+    ),
+    resolved AS (
+        SELECT t.is_personal, cfg.hard_limit
+          FROM tiers t
+          CROSS JOIN LATERAL openmettle.quota_limit(t.id, t.kind, 'usage_cost_micros') cfg
+    )
+    SELECT CASE
+               WHEN EXISTS (
+                   SELECT 1 FROM openmettle.quota_defaults
+                    WHERE scope_kind = 'instance'
+                      AND resource_kind = 'usage_cost_micros'
+                      AND cost_denomination IS NOT NULL
+               )
+                AND EXISTS (
+                   SELECT 1 FROM resolved WHERE is_personal AND hard_limit IS NOT NULL
+               )
+               THEN (SELECT min(hard_limit) FROM resolved)
+           END
+$$;
+
 -- Compute a run's per-round cost slice by dividing its remaining parent usage_cost_micros hold
--- across remaining unallocated rounds (including p_current_request if already inserted), so
--- mid-run recovered cost parents preserve the exact per-round ceiling.
+-- across remaining unallocated rounds (including p_current_request if already inserted), using
+-- gateway_requests_run_round_active_idx via gateway_reservations.id.
 CREATE FUNCTION openmettle.quota_run_round_cost_slice(
     p_scope uuid,
     p_run uuid,
@@ -872,6 +914,7 @@ AS $$
 DECLARE
     v_held bigint;
     v_round_limit integer;
+    v_reservation_id uuid;
     v_prior_rounds integer;
     v_rem_rounds integer;
 BEGIN
@@ -890,15 +933,191 @@ BEGIN
     IF v_held <= 0 THEN
         RETURN 0;
     END IF;
-    SELECT count(*)::integer
-      INTO v_prior_rounds
-      FROM openmettle.gateway_requests q
-     WHERE q.run_id = p_run
-       AND q.state <> 'released'
-       AND (p_current_request IS NULL OR q.id <> p_current_request);
+    SELECT g.id
+      INTO v_reservation_id
+      FROM openmettle.gateway_reservations g
+     WHERE g.run_id = p_run;
+    IF v_reservation_id IS NOT NULL THEN
+        SELECT count(*)::integer
+          INTO v_prior_rounds
+          FROM openmettle.gateway_requests q
+         WHERE q.reservation_id = v_reservation_id
+           AND q.run_id IS NOT NULL
+           AND q.state <> 'released'
+           AND (p_current_request IS NULL OR q.id <> p_current_request);
+    ELSE
+        v_prior_rounds := 0;
+    END IF;
     v_rem_rounds := greatest(1, v_round_limit - coalesce(v_prior_rounds, 0));
     RETURN ((v_held - 1) / v_rem_rounds) + 1;
 END;
 $$;
 REVOKE ALL ON FUNCTION openmettle.quota_run_round_cost_slice(uuid, uuid, uuid) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION openmettle.quota_run_round_cost_slice(uuid, uuid, uuid) TO openmettle_worker;
+
+-- Serialize unmetered worker turn dispatch against metering_enforced activation and refuse
+-- whenever metering is enforced or the run already holds quota reservations.
+CREATE FUNCTION openmettle.quota_authorize_unmetered_turn_round(
+    p_scope uuid,
+    p_run uuid,
+    p_claim uuid
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+    v_enforced boolean;
+BEGIN
+    PERFORM FROM openmettle.runs
+     WHERE scope_id = p_scope
+       AND id = p_run
+       AND state = 'running'
+       AND cancel_reason IS NULL
+       AND claim_token = p_claim
+       AND lease_expires_at > clock_timestamp()
+       FOR NO KEY UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'invalid unmetered turn round' USING ERRCODE = '42501';
+    END IF;
+    SELECT metering_enforced INTO STRICT v_enforced
+      FROM openmettle.quota_enforcement
+     WHERE id
+       FOR SHARE;
+    IF v_enforced OR EXISTS (
+        SELECT 1 FROM openmettle.quota_reservations
+         WHERE scope_id = p_scope
+           AND run_id = p_run
+    ) THEN
+        RAISE EXCEPTION 'metered dispatch required' USING ERRCODE = 'OMQ04';
+    END IF;
+END;
+$$;
+REVOKE ALL ON FUNCTION openmettle.quota_authorize_unmetered_turn_round(uuid, uuid, uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION openmettle.quota_authorize_unmetered_turn_round(uuid, uuid, uuid) TO openmettle_worker;
+
+-- Atomically verify/commit a device-slot run's device_reservations hold inside the same
+-- transaction as gateway_handoff and quota_commit_handoff, serialized with quota_enforcement.
+CREATE FUNCTION openmettle.quota_commit_turn_device_handoff(
+    p_scope uuid,
+    p_run uuid,
+    p_claim uuid,
+    p_grant uuid
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+    v_enforced boolean;
+    v_hold openmettle.quota_reservations%ROWTYPE;
+BEGIN
+    PERFORM FROM openmettle.runs
+     WHERE scope_id = p_scope
+       AND id = p_run
+       AND state = 'running'
+       AND cancel_reason IS NULL
+       AND claim_token = p_claim
+       AND lease_expires_at > clock_timestamp()
+       FOR NO KEY UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'invalid device handoff' USING ERRCODE = '42501';
+    END IF;
+
+    SELECT * INTO v_hold
+      FROM openmettle.quota_reservations
+     WHERE scope_id = p_scope
+       AND run_id = p_run
+       AND gateway_request_id IS NULL
+       AND resource_kind = 'device_reservations'
+       FOR NO KEY UPDATE;
+
+    SELECT metering_enforced INTO STRICT v_enforced
+      FROM openmettle.quota_enforcement
+     WHERE id
+       FOR SHARE;
+
+    IF NOT v_enforced AND v_hold.id IS NULL THEN
+        RETURN;
+    END IF;
+
+    IF p_grant IS NULL OR v_hold.id IS NULL THEN
+        RAISE EXCEPTION 'invalid device handoff' USING ERRCODE = '42501';
+    END IF;
+
+    IF v_hold.state = 'held' THEN
+        UPDATE openmettle.quota_reservations
+           SET state = 'handoff_committed',
+               device_grant_id = p_grant,
+               revision = revision + 1
+         WHERE id = v_hold.id
+           AND state = 'held';
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'invalid device handoff' USING ERRCODE = '42501';
+        END IF;
+    ELSIF v_hold.state = 'handoff_committed' AND v_hold.device_grant_id = p_grant THEN
+        RETURN;
+    ELSE
+        RAISE EXCEPTION 'invalid device handoff' USING ERRCODE = '42501';
+    END IF;
+END;
+$$;
+REVOKE ALL ON FUNCTION openmettle.quota_commit_turn_device_handoff(uuid, uuid, uuid, uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION openmettle.quota_commit_turn_device_handoff(uuid, uuid, uuid, uuid) TO openmettle_worker;
+
+-- Lock a replayed queued run in canonical order (runs -> gateway_reservations), reuse any
+-- pre-existing gateway_reservations row (even with id <> run_id), or insert one using the
+-- locked run's original actor_approval_id.
+CREATE FUNCTION openmettle.quota_ensure_replayed_run_gateway_reservation(
+    p_scope uuid,
+    p_run uuid,
+    p_actor uuid,
+    p_units bigint
+)
+RETURNS TABLE (
+    reservation_id uuid,
+    units bigint,
+    inserted boolean
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+    r openmettle.runs%ROWTYPE;
+    g openmettle.gateway_reservations%ROWTYPE;
+BEGIN
+    SELECT * INTO r
+      FROM openmettle.runs
+     WHERE scope_id = p_scope
+       AND id = p_run
+       AND actor_user_id = p_actor
+       FOR NO KEY UPDATE;
+    IF NOT FOUND OR r.state <> 'queued' OR r.actor_approval_id IS NULL THEN
+        RETURN;
+    END IF;
+    SELECT * INTO g
+      FROM openmettle.gateway_reservations
+     WHERE run_id = p_run
+       FOR NO KEY UPDATE;
+    IF FOUND THEN
+        reservation_id := g.id;
+        units := g.units;
+        inserted := false;
+        RETURN NEXT;
+        RETURN;
+    END IF;
+    INSERT INTO openmettle.gateway_reservations
+        (id, scope_id, actor_user_id, approval_id, run_id, units)
+    VALUES (r.id, r.scope_id, r.actor_user_id, r.actor_approval_id, r.id, p_units)
+    RETURNING * INTO STRICT g;
+    reservation_id := g.id;
+    units := g.units;
+    inserted := true;
+    RETURN NEXT;
+END;
+$$;
+REVOKE ALL ON FUNCTION openmettle.quota_ensure_replayed_run_gateway_reservation(uuid, uuid, uuid, bigint) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION openmettle.quota_ensure_replayed_run_gateway_reservation(uuid, uuid, uuid, bigint) TO openmettle_api;

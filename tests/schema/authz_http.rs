@@ -2961,6 +2961,10 @@ async fn create_run_distinguishes_rate_limited_quota_and_provisioning_refusals_o
     assert_eq!(status, 429, "{dev_zero}");
     assert_eq!(dev_zero["code"], "quota");
     assert_eq!(
+        dev_zero["detail"],
+        "The device reservation quota does not allow this request."
+    );
+    assert_eq!(
         dev_zero["quota"],
         json!({"resource_kind": "device_reservations", "scope_kind": "personal"})
     );
@@ -3012,6 +3016,10 @@ async fn create_run_distinguishes_rate_limited_quota_and_provisioning_refusals_o
     );
     assert_eq!(status, 429, "{dev_full}");
     assert_eq!(dev_full["code"], "quota");
+    assert_eq!(
+        dev_full["detail"],
+        "The device reservation quota does not allow this request."
+    );
     assert_eq!(
         dev_full["quota"],
         json!({"resource_kind": "device_reservations", "scope_kind": "personal"})
@@ -3394,6 +3402,151 @@ async fn manage_quotas_overrides_enforce_admin_upgrade_gate_idempotency_and_vali
         200,
     );
     assert_eq!(utf8_ok["revision"], "4");
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn extreme_per_round_cost_bound_admits_on_token_only_and_returns_429_when_cost_limited() {
+    use crate::{auth_config_support::Dir, ca::Ca};
+
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut owner).await;
+    let alice = authz_store::account(&mut owner, PROVIDER, true, FUTURE).await;
+    let alice_cookie = browser(&db, &alice, 1).await;
+    let alice_b = As::Browser(&alice_cookie);
+
+    // Token-only deployment: cost_denomination stays NULL and all usage_cost_micros limits are NULL.
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 100000)",
+        )
+        .await
+        .unwrap();
+
+    let dir = Dir::new();
+    std::fs::create_dir(dir.path("artifacts")).unwrap();
+    let mut doc = auth_config_support::document_v2_native(&dir, &Ca::new().pem());
+    doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+    let mut catalog: Value =
+        serde_json::from_slice(include_bytes!("../fixtures/conversation-catalog-v1.json")).unwrap();
+    catalog["models"]["a"]["prompt_bound"] = json!({
+        "fixed_tokens": 4,
+        "tokens_per_turn": 4,
+        "tokens_per_part": 2,
+        "tokens_per_byte": 1,
+        "tokens_per_attachment": 10
+    });
+    catalog["models"]["a"]["cost_bound"] = json!({
+        "fixed_micros": i64::MAX,
+        "micros_per_token": 0
+    });
+    doc["catalog_file"] = json!(dir.write("catalog.json", &serde_json::to_vec(&catalog).unwrap()));
+    doc["admission_limits"] = json!({
+        "live_per_actor": 4,
+        "live_per_scope": 8,
+        "queued_in_instance": 32,
+        "queue_timeout_seconds": 300,
+        "round_cap": 10
+    });
+    let api = Api::configured(&db, dir, doc, 4);
+
+    let conv = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/conversations",
+            Some("extreme-conv-1"),
+            Some(&json!({})),
+        ),
+        201,
+    );
+    let make_run = |conv_id: &str, branch_id: &str, msg_id: &str| {
+        json!({
+            "conversation_id": conv_id,
+            "branch_id": branch_id,
+            "proposal": {
+                "expected_head_message_id": null,
+                "turn": {
+                    "mode": "append",
+                    "input_message_id": msg_id,
+                    "parts": [{"text": "extreme per-round cost bound"}]
+                },
+                "selection": {
+                    "model": "a",
+                    "layer": {"controls": {"context_window": "450", "output_reserve": "100"}}
+                },
+                "requested_rounds": 2
+            }
+        })
+    };
+
+    // 1. Token-only deployment must admit a 2-round fixed_micros=i64::MAX run with 201 Created.
+    let admitted = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some("extreme-run-token-only"),
+            Some(&make_run(
+                conv["conversation_id"].as_str().unwrap(),
+                conv["branch_id"].as_str().unwrap(),
+                "00000000-0000-4000-8000-00000000e001",
+            )),
+        ),
+        201,
+    );
+    assert!(admitted["run_id"].is_string());
+
+    // 2. Once cost limits are configured, 2 * i64::MAX overflows i64 and must fail with 429 quota
+    //    (not 400 validation).
+    owner
+        .execute(
+            "UPDATE openmettle.quota_defaults
+                SET cost_denomination = 'usd_micros'
+              WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'",
+        )
+        .await
+        .unwrap();
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_cost_micros', 1000000)",
+        )
+        .await
+        .unwrap();
+    let conv2 = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/conversations",
+            Some("extreme-conv-2"),
+            Some(&json!({})),
+        ),
+        201,
+    );
+    let (status, body) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("extreme-run-cost-limited"),
+        Some(&make_run(
+            conv2["conversation_id"].as_str().unwrap(),
+            conv2["branch_id"].as_str().unwrap(),
+            "00000000-0000-4000-8000-00000000e002",
+        )),
+    );
+    assert_eq!(status, 429, "{body}");
+    assert_eq!(body["code"], "quota");
+    assert_eq!(
+        body["detail"],
+        "The usage budget does not allow this request."
+    );
+    assert_eq!(
+        body["quota"],
+        json!({"resource_kind": "usage_cost_micros", "scope_kind": "personal"})
+    );
 }
 
 #[path = "run_events_http.rs"]

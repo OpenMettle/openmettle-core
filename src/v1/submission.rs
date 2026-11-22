@@ -440,7 +440,11 @@ pub(super) async fn submit(
         }) => Err(quota_problem(
             StatusCode::TOO_MANY_REQUESTS,
             "quota",
-            "The usage budget does not allow this request.",
+            if resource_kind == "device_reservations" {
+                "The device reservation quota does not allow this request."
+            } else {
+                "The usage budget does not allow this request."
+            },
             resource_kind,
             scope_kind,
         )),
@@ -624,29 +628,20 @@ async fn admission(
         ctx,
     )
     .await?;
-    let build_budget = |round_limit: i32| -> Result<(i64, Option<i64>), Problem> {
+    let build_token_units = |round_limit: i32| -> Result<i64, Problem> {
         let per_round = per_round_ceiling.ok_or(PROVISIONING)?;
-        let token_units = per_round
+        per_round
             .checked_mul(u64::from(u32::try_from(round_limit).map_err(|_| INTERNAL)?))
             .and_then(|n| i64::try_from(n).ok())
             .filter(|&n| n > 0)
-            .ok_or(INVALID)?;
-        let cost_units = per_round_cost_micros
-            .map(|per_round_cost| {
-                per_round_cost
-                    .checked_mul(i64::from(round_limit))
-                    .filter(|&n| n > 0)
-                    .ok_or(INVALID)
-            })
-            .transpose()?;
-        Ok((token_units, cost_units))
+            .ok_or(INVALID)
     };
     match &admitted {
         Admission::Admitted {
             run_id,
             round_limit,
         } => {
-            let (token_units, cost_units) = build_budget(*round_limit)?;
+            let token_units = build_token_units(*round_limit)?;
             if let Some(limit) = crate::quotas::reserve_admitted_run_budget(
                 tx,
                 &crate::quotas::RunBudgetReservation {
@@ -656,7 +651,8 @@ async fn admission(
                     actor_approval_id: ctx.approval_id(),
                     run_id,
                     token_units,
-                    cost_units,
+                    per_round_cost_micros,
+                    round_limit: *round_limit,
                     requires_device_slot,
                 },
             )
@@ -671,7 +667,8 @@ async fn admission(
             state,
             round_limit,
         } if state == "queued" => {
-            let (token_units, cost_units) = build_budget(round_limit.unwrap_or(limits.round_cap))?;
+            let effective_rounds = round_limit.unwrap_or(limits.round_cap);
+            let token_units = build_token_units(effective_rounds)?;
             let (committed, refusal) = crate::quotas::backfill_replayed_run_budget(
                 tx,
                 &crate::quotas::RunBudgetReservation {
@@ -681,7 +678,8 @@ async fn admission(
                     actor_approval_id: ctx.approval_id(),
                     run_id,
                     token_units,
-                    cost_units,
+                    per_round_cost_micros,
+                    round_limit: effective_rounds,
                     requires_device_slot,
                 },
             )

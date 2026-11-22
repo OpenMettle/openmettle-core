@@ -136,6 +136,9 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.storage_lock_not_adopting()',true,ARRAY['openmettle_api']::text[]),
         ('openmettle.quota_ensure_legacy_run_holds(uuid,uuid,uuid,bigint,bigint,boolean,boolean)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.quota_run_round_cost_slice(uuid,uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.quota_authorize_unmetered_turn_round(uuid,uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.quota_commit_turn_device_handoff(uuid,uuid,uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.quota_ensure_replayed_run_gateway_reservation(uuid,uuid,uuid,bigint)',true,ARRAY['openmettle_api']::text[]),
         ('openmettle.quota_release_terminal_runs(uuid[])',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
         ('openmettle.quota_upsert_scope_override(uuid,uuid,text,bigint,timestamptz,text,text,jsonb)',true,ARRAY['openmettle_api']::text[]),
         ('openmettle.quota_revoke_scope_override(uuid,uuid,text,text,text,jsonb)',true,ARRAY['openmettle_api']::text[])) AS f WHERE $1 >= 26
