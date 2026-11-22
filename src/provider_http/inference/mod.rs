@@ -167,7 +167,6 @@ impl From<super::Error> for Error {
 /// Obtained from the gateway credential owner at dispatch. Only that owner can establish missing entitlement.
 pub enum Credential<'a> {
     Bearer(&'a str),
-    Dispatch(&'a crate::authz::gateway::Dispatch),
     MissingEntitlement,
     Broken,
 }
@@ -285,7 +284,7 @@ impl Gateway {
         let server = run.is_some();
         let dispatch = async {
             // Provisioning or a broken credential takes precedence over model selection.
-            let headers = headers(credential, request.stream, server, &effective.model)?;
+            let headers = headers(credential, request.stream)?;
             // The catalog checks both snapshot revision and profile pin, even for a caller
             // with unknown capacity. Admission owns the populated path and prompt estimate.
             catalog
@@ -386,12 +385,7 @@ fn within_overall(
     result.map_err(|_| Error::Timeout)?
 }
 
-fn headers(
-    credential: Credential<'_>,
-    stream: bool,
-    server: bool,
-    model: &str,
-) -> Result<HeaderMap, Error> {
+fn headers(credential: Credential<'_>, stream: bool) -> Result<HeaderMap, Error> {
     let bearer = match credential {
         Credential::Bearer(token) => {
             if token.is_empty()
@@ -403,13 +397,6 @@ fn headers(
             }
             let mut bearer =
                 HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| Error::Credential)?;
-            bearer.set_sensitive(true);
-            bearer
-        }
-        Credential::Dispatch(dispatch) => {
-            let mut bearer = dispatch
-                .authorization_for(server, model)
-                .ok_or(Error::Credential)?;
             bearer.set_sensitive(true);
             bearer
         }
@@ -446,7 +433,7 @@ mod tests {
     use super::*;
     #[test]
     fn authorization_is_single_and_sensitive() {
-        let h = headers(Credential::Bearer("fixture-only"), true, false, "a").unwrap();
+        let h = headers(Credential::Bearer("fixture-only"), true).unwrap();
         assert_eq!(h.get_all(header::AUTHORIZATION).iter().count(), 1);
         assert!(h[header::AUTHORIZATION].is_sensitive());
     }

@@ -77,7 +77,7 @@ pub async fn hold_with_cost(
         .execute(tx.connection()?)
         .await?;
     if let Some(run) = run {
-        let cost = crate::quotas::cost_ceiling(tx, r, None, cost_ceiling).await?;
+        let cost = crate::quotas::cost_ceiling(tx, r, None, None, cost_ceiling).await?;
         for (resource, amount) in [("usage_cost_micros", cost), ("usage_tokens", Some(units))] {
             if let Some(amount) = amount {
                 sqlx::query("SELECT openmettle.quota_reserve($1::uuid,$2::uuid,$3,$4,$5,$6::uuid,NULL,NULL,
@@ -125,7 +125,7 @@ pub async fn reserve_with_cost<'a>(
     cost_ceiling: Option<i64>,
 ) -> Result<Pending<'a>, Error> {
     let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
-    crate::quotas::prepare_round(&mut tx, &call).await?;
+    crate::quotas::prepare_round(&mut tx, &call, cost_ceiling).await?;
     let pending = reserve_in(&mut tx, call).await?;
     crate::quotas::bind_request(
         &mut tx,
@@ -275,6 +275,107 @@ pub async fn reserve_turn_round(pool: &PgPool, round: TurnRound<'_>) -> Result<T
     })
 }
 
+/// Pre-check that a device-required run holds an active `device_reservations` parent hold
+/// compatible with `device_grant_id` before committing gateway handoff.
+pub async fn verify_turn_device_hold(
+    pool: &PgPool,
+    scope_id: &str,
+    run_id: &str,
+    device_grant_id: &str,
+) -> Result<(), Error> {
+    if !crate::runs::is_canonical_uuid(device_grant_id) {
+        return Err(Error::Refused);
+    }
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT state, device_grant_id::text
+           FROM openmettle.quota_reservations
+          WHERE scope_id = $1::uuid
+            AND run_id = $2::uuid
+            AND gateway_request_id IS NULL
+            AND resource_kind = 'device_reservations'",
+    )
+    .bind(scope_id)
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        Some((state, _)) if state == "held" => Ok(()),
+        Some((state, existing))
+            if state == "handoff_committed" && existing.as_deref() == Some(device_grant_id) =>
+        {
+            Ok(())
+        }
+        _ => Err(Error::Refused),
+    }
+}
+
+/// Transition the run's `device_reservations` hold from `'held'` to `'handoff_committed'` via
+/// `openmettle.quota_commit_device_handoff` on Round 1, or verify it is already
+/// `'handoff_committed'` with the matching `device_grant_id` on subsequent rounds.
+pub async fn commit_turn_device_handoff(
+    pool: &PgPool,
+    scope_id: &str,
+    run_id: &str,
+    claim_token: &str,
+    device_grant_id: &str,
+) -> Result<(), Error> {
+    if !crate::runs::is_canonical_uuid(device_grant_id) {
+        return Err(Error::Refused);
+    }
+    let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
+    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id::text, state, device_grant_id::text
+           FROM openmettle.quota_reservations
+          WHERE scope_id = $1::uuid
+            AND run_id = $2::uuid
+            AND gateway_request_id IS NULL
+            AND resource_kind = 'device_reservations'",
+    )
+    .bind(scope_id)
+    .bind(run_id)
+    .fetch_optional(tx.connection()?)
+    .await?;
+    match row {
+        Some((hold_id, state, _)) if state == "held" => {
+            let committed: bool = sqlx::query_scalar(
+                "SELECT openmettle.quota_commit_device_handoff(
+                     $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid
+                 )",
+            )
+            .bind(&hold_id)
+            .bind(scope_id)
+            .bind(run_id)
+            .bind(claim_token)
+            .bind(device_grant_id)
+            .fetch_one(tx.connection()?)
+            .await?;
+            if !committed {
+                // Re-read in case a concurrent recovery already committed the same grant.
+                let after: Option<(String, Option<String>)> = sqlx::query_as(
+                    "SELECT state, device_grant_id::text
+                       FROM openmettle.quota_reservations
+                      WHERE id = $1::uuid",
+                )
+                .bind(&hold_id)
+                .fetch_optional(tx.connection()?)
+                .await?;
+                if !matches!(
+                    after,
+                    Some((ref s, ref g))
+                        if s == "handoff_committed" && g.as_deref() == Some(device_grant_id)
+                ) {
+                    return Err(Error::Refused);
+                }
+            }
+        }
+        Some((_, state, existing))
+            if state == "handoff_committed" && existing.as_deref() == Some(device_grant_id) => {}
+        _ => return Err(Error::Refused),
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 async fn reserve_in<'a>(
     tx: &mut WriteTransaction<'_>,
     call: Call<'a>,
@@ -325,17 +426,6 @@ pub struct Dispatch {
     pub(crate) model: String,
     pub(crate) server: bool,
     pub(crate) authorization: hyper::header::HeaderValue,
-}
-impl Dispatch {
-    /// Returns the sensitive `Authorization` header only when this handoff matches `server` and
-    /// `model`, preserving binding between reservation handoff and inference dispatch.
-    pub fn authorization_for(
-        &self,
-        server: bool,
-        model: &str,
-    ) -> Option<hyper::header::HeaderValue> {
-        (self.server == server && self.model == model).then(|| self.authorization.clone())
-    }
 }
 impl Pending<'_> {
     pub async fn release(&self, pool: &PgPool) -> Result<bool, Error> {
@@ -554,28 +644,3 @@ pub use crate::provider_http::gateway::problem;
 pub mod family;
 pub mod reconcile;
 pub mod settlement;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use hyper::header::HeaderValue;
-
-    #[test]
-    fn dispatch_authorization_checks_server_and_model() {
-        let mut auth = HeaderValue::from_static("Bearer handed-off");
-        auth.set_sensitive(true);
-        let dispatch = Dispatch {
-            id: "00000000-0000-4000-8000-000000000001".into(),
-            installation: "00000000-0000-4000-8000-000000000002".into(),
-            model: "a".into(),
-            server: true,
-            authorization: auth,
-        };
-        assert_eq!(
-            dispatch.authorization_for(true, "a").as_ref(),
-            Some(&HeaderValue::from_static("Bearer handed-off"))
-        );
-        assert!(dispatch.authorization_for(false, "a").is_none());
-        assert!(dispatch.authorization_for(true, "b").is_none());
-    }
-}

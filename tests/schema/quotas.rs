@@ -1970,3 +1970,491 @@ async fn schema_25_expiry_gating_and_batch_terminal_hold_release() {
     .unwrap();
     assert_eq!(drift, (0, 0, 0, 0));
 }
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn mid_run_recovered_cost_hold_slice_replayed_backfill_and_single_run_expiry_release() {
+    use openmettle_core::{
+        authz::{
+            approvals::{
+                self, DecisionInput, EffectPolicy, EffectSession, HumanDecision, Proposal, Review,
+            },
+            gateway::{self, Authority, Call, Reservation},
+            leases::{self, LeaseSettings, Settle},
+            runs::{self as authz_queue, Admission, AdmissionLimits, ClaimLimits, RunAdmission},
+            store::StoreError,
+        },
+        quotas::{self, RunBudgetReservation},
+        runs::{RunInput, WriteTransaction},
+        sessions,
+    };
+    use sqlx::postgres::PgPoolOptions;
+
+    const INSTALL: &str = "00000000-0000-4000-8000-000000000097";
+
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut owner).await;
+    let alice =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let scope = authz_runs::personal_of(&db, &alice).await;
+    // Start token-only (no cost limits yet) so Rounds 1 & 2 run before cost metering is enabled.
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 100000)",
+        )
+        .await
+        .unwrap();
+
+    let mut api = connect(&db.0, API).await;
+    let mut worker = connect(&db.0, WORKER).await;
+    let worker_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(db.1.options(WORKER));
+    let chat = authz_runs::chat(&db, &scope, "personal", &alice).await;
+    let (branch, msg) = branch_and_message(&mut api, &scope, &chat).await;
+    let limits = AdmissionLimits {
+        live_per_actor: 8,
+        live_per_scope: 8,
+        queued_in_instance: 32,
+        queue_timeout: Duration::from_secs(300),
+        round_cap: 10,
+    };
+    let lease_cfg = LeaseSettings {
+        lease: Duration::from_secs(60),
+        execution_timeout: Duration::from_secs(600),
+    };
+    let claim_cfg = ClaimLimits {
+        executing_per_actor: 4,
+        executing_per_scope: 8,
+    };
+
+    // Part A (P2 #6 & #7): 4-round run completes Rounds 1 & 2 before cost limits are configured.
+    // Then cost limits are enabled with only 250 micros remaining (enough for 2 * 100 = 200, NOT 1000).
+    // Round 3 via reserve_with_cost(..., Some(100)) recovers 200 (not 1000!) and allocates 100.
+    // Round 4 via reserve(..., None) computes exact slice 100 via quota_run_round_cost_slice (not 200/4 = 50!).
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    let Admission::Admitted {
+        run_id: r_multi, ..
+    } = authz_queue::admit_run(
+        &mut tx,
+        &RunAdmission {
+            input: RunInput {
+                scope: &scope,
+                actor: &alice.user,
+                conversation: &chat,
+                branch: &branch,
+                message: &msg,
+                key: "multi-round-mid-cost",
+                format: "openmettle.conversation",
+                version: 1,
+                input: b"{}",
+                config: br#"{"effective":{"ceiling":{"value":100}}}"#,
+            },
+            actor_approval_id: &alice.approval,
+            capabilities: &[],
+            requested_rounds: Some(4),
+            now_ms: authz_store::NOW,
+            cost_qualified: None,
+        },
+        &limits,
+    )
+    .await
+    .unwrap()
+    else {
+        panic!("expected admission");
+    };
+    assert!(
+        quotas::reserve_admitted_run_budget(
+            &mut tx,
+            &RunBudgetReservation {
+                scope_id: &scope,
+                scope_kind: "personal",
+                actor_user_id: &alice.user,
+                actor_approval_id: &alice.approval,
+                run_id: &r_multi,
+                token_units: 400,
+                cost_units: None,
+                requires_device_slot: false,
+            },
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    tx.commit().await.unwrap();
+
+    let claimed = authz_queue::claim_next(&mut worker, &claim_cfg, &lease_cfg)
+        .await
+        .unwrap()
+        .expect("claimed 4-round run");
+    assert_eq!(claimed.run_id, r_multi);
+    let make_call = |round: i32| Call {
+        reservation: Reservation {
+            id: &r_multi,
+            scope_id: &scope,
+            actor: &alice.user,
+            approval: &alice.approval,
+        },
+        installation: INSTALL,
+        model: "a",
+        units: 100,
+        authority: Authority::Lease {
+            run: &r_multi,
+            round,
+            token: &claimed.claim_token,
+        },
+    };
+    let p1 = gateway::reserve(&worker_pool, make_call(1)).await.unwrap();
+    let p2 = gateway::reserve(&worker_pool, make_call(2)).await.unwrap();
+
+    // Enable 1,000-micro cost limit and reserve 750 micros via a separate real hold -> only 250
+    // micros remain available (enough for 2 remaining rounds * 100 = 200, NOT full 1,000 ceiling).
+    owner
+        .execute(
+            "UPDATE openmettle.quota_defaults
+                SET cost_denomination = 'usd_micros'
+              WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'",
+        )
+        .await
+        .unwrap();
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_cost_micros', 1000)",
+        )
+        .await
+        .unwrap();
+    let prior_cost_hold: String = sqlx::query_scalar(
+        "SELECT openmettle.quota_reserve(
+             $1::uuid, $2::uuid, 'usage_cost_micros', 750, 'prior-cost-hold',
+             NULL, NULL, NULL, clock_timestamp() + interval '15 minutes'
+         )::text",
+    )
+    .bind(&scope)
+    .bind(&alice.user)
+    .fetch_one(&mut api)
+    .await
+    .unwrap();
+
+    // Round 3 supplies Some(100) -> recovers 200-micro parent (2 remaining rounds) and takes 100.
+    let p3 = gateway::reserve_with_cost(&worker_pool, make_call(3), Some(100))
+        .await
+        .unwrap();
+    let (parent_res, parent_held): (i64, i64) = sqlx::query_as(
+        "SELECT reserved_units, held_units FROM openmettle.quota_reservations
+          WHERE run_id = $1::uuid AND gateway_request_id IS NULL
+            AND resource_kind = 'usage_cost_micros'",
+    )
+    .bind(&r_multi)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!((parent_res, parent_held), (200, 100));
+    let r3_cost: i64 = sqlx::query_scalar(
+        "SELECT reserved_units FROM openmettle.quota_reservations
+          WHERE gateway_request_id = $1::uuid AND resource_kind = 'usage_cost_micros'",
+    )
+    .bind(&p3.id)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(r3_cost, 100);
+
+    // Direct worker EXECUTE check on quota_run_round_cost_slice before Round 4: 100 held / 1 left = 100.
+    let slice: Option<i64> = sqlx::query_scalar(
+        "SELECT openmettle.quota_run_round_cost_slice($1::uuid, $2::uuid, NULL)",
+    )
+    .bind(&scope)
+    .bind(&r_multi)
+    .fetch_one(&mut worker)
+    .await
+    .unwrap();
+    assert_eq!(slice, Some(100));
+
+    // Round 4 supplies None -> must derive 100 micros (NOT 200 / 4 = 50!).
+    let p4 = gateway::reserve(&worker_pool, make_call(4)).await.unwrap();
+    let r4_cost: i64 = sqlx::query_scalar(
+        "SELECT reserved_units FROM openmettle.quota_reservations
+          WHERE gateway_request_id = $1::uuid AND resource_kind = 'usage_cost_micros'",
+    )
+    .bind(&p4.id)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(r4_cost, 100);
+    let parent_held_after_r4: i64 = sqlx::query_scalar(
+        "SELECT held_units FROM openmettle.quota_reservations
+          WHERE run_id = $1::uuid AND gateway_request_id IS NULL
+            AND resource_kind = 'usage_cost_micros'",
+    )
+    .bind(&r_multi)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(parent_held_after_r4, 0);
+
+    // Clean up Rounds 1..4, settle r_multi, and release the 750-micro helper hold so budgets return to 0.
+    for p in [p1, p2, p3, p4] {
+        assert!(p.release(&worker_pool).await.unwrap());
+    }
+    leases::settle(&mut worker, &claimed.lease(), &lease_cfg, Settle::Succeeded)
+        .await
+        .unwrap();
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT openmettle.quota_release_unsent($1::uuid)")
+            .bind(&prior_cost_hold)
+            .fetch_one(&mut api)
+            .await
+            .unwrap()
+    );
+
+    // Part B (P2 #8 & #9): backfill_replayed_run_budget skips terminal/non-queued runs and uses
+    // the locked run's original actor_approval_id when a user replays from a second linked approval.
+    let approval_2: String = sqlx::query_scalar(
+        "WITH i AS (INSERT INTO openmettle.user_identities (user_id, issuer, subject)
+                    VALUES ($1::uuid, 'https://authz-store.example.test', 'second-subject') RETURNING id)
+         INSERT INTO openmettle.local_identity_approvals
+             (provider_id, identity_id, active, expires_ms, changed_by, change_reason)
+         SELECT $2::uuid, i.id, true, $3, 'fixture-owner', 'second synthetic approval' FROM i
+         RETURNING id::text",
+    )
+    .bind(&alice.user)
+    .bind(authz_store::PROVIDER)
+    .bind(authz_store::FUTURE)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+
+    let admit_bare = async |c: &mut PgConnection, key: &str| {
+        let mut tx = WriteTransaction::begin(c).await.unwrap();
+        let Admission::Admitted { run_id, .. } = authz_queue::admit_run(
+            &mut tx,
+            &RunAdmission {
+                input: RunInput {
+                    scope: &scope,
+                    actor: &alice.user,
+                    conversation: &chat,
+                    branch: &branch,
+                    message: &msg,
+                    key,
+                    format: "openmettle.conversation",
+                    version: 1,
+                    input: b"{}",
+                    config: b"{}",
+                },
+                actor_approval_id: &alice.approval,
+                capabilities: &[],
+                requested_rounds: Some(1),
+                now_ms: authz_store::NOW,
+                cost_qualified: Some(true),
+            },
+            &limits,
+        )
+        .await
+        .unwrap() else {
+            panic!("expected bare admission");
+        };
+        tx.commit().await.unwrap();
+        run_id
+    };
+
+    // B1: Cancelled run -> backfill skips cleanly with zero gateway_reservations or quota holds.
+    let r_cancelled = admit_bare(&mut api, "replay-cancelled").await;
+    let actor = authz_store::principal(&db, &alice).await;
+    authz_queue::cancel_run(&mut api, &actor, &scope, &r_cancelled)
+        .await
+        .unwrap();
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    assert_eq!(
+        quotas::backfill_replayed_run_budget(
+            &mut tx,
+            &RunBudgetReservation {
+                scope_id: &scope,
+                scope_kind: "personal",
+                actor_user_id: &alice.user,
+                actor_approval_id: &approval_2,
+                run_id: &r_cancelled,
+                token_units: 200,
+                cost_units: Some(100),
+                requires_device_slot: false,
+            },
+        )
+        .await
+        .unwrap(),
+        (false, None)
+    );
+    tx.commit().await.unwrap();
+    let ghost_rows: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM openmettle.gateway_reservations WHERE run_id = $1::uuid),
+                (SELECT count(*) FROM openmettle.quota_reservations WHERE run_id = $1::uuid)",
+    )
+    .bind(&r_cancelled)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(ghost_rows, (0, 0));
+
+    // B2: Live queued run replayed under approval_2 -> succeeds using alice.approval (no 23503!).
+    let r_replayed = admit_bare(&mut api, "replay-second-approval").await;
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    assert_eq!(
+        quotas::backfill_replayed_run_budget(
+            &mut tx,
+            &RunBudgetReservation {
+                scope_id: &scope,
+                scope_kind: "personal",
+                actor_user_id: &alice.user,
+                actor_approval_id: &approval_2,
+                run_id: &r_replayed,
+                token_units: 200,
+                cost_units: Some(100),
+                requires_device_slot: false,
+            },
+        )
+        .await
+        .unwrap(),
+        (true, None)
+    );
+    tx.commit().await.unwrap();
+    let stored_gw_approval: String = sqlx::query_scalar(
+        "SELECT approval_id::text FROM openmettle.gateway_reservations WHERE run_id = $1::uuid",
+    )
+    .bind(&r_replayed)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(stored_gw_approval, alice.approval);
+    authz_queue::cancel_run(&mut api, &actor, &scope, &r_replayed)
+        .await
+        .unwrap();
+
+    // Part C (P2 #10): single-run approvals::decide failing an expired wait releases parent holds.
+    struct NoopPolicy;
+    impl EffectPolicy for NoopPolicy {
+        fn review(&self, _: &str, _: &str, _: &Proposal) -> Result<Option<Review>, StoreError> {
+            Ok(None)
+        }
+    }
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    let Admission::Admitted { run_id: r_wait, .. } = authz_queue::admit_run(
+        &mut tx,
+        &RunAdmission {
+            input: RunInput {
+                scope: &scope,
+                actor: &alice.user,
+                conversation: &chat,
+                branch: &branch,
+                message: &msg,
+                key: "single-run-expired-wait",
+                format: "openmettle.conversation",
+                version: 1,
+                input: b"{}",
+                config: b"{}",
+            },
+            actor_approval_id: &alice.approval,
+            capabilities: &[],
+            requested_rounds: Some(1),
+            now_ms: authz_store::NOW,
+            cost_qualified: Some(true),
+        },
+        &limits,
+    )
+    .await
+    .unwrap() else {
+        panic!("expected wait admission");
+    };
+    assert!(
+        quotas::reserve_admitted_run_budget(
+            &mut tx,
+            &RunBudgetReservation {
+                scope_id: &scope,
+                scope_kind: "personal",
+                actor_user_id: &alice.user,
+                actor_approval_id: &alice.approval,
+                run_id: &r_wait,
+                token_units: 300,
+                cost_units: Some(150),
+                requires_device_slot: false,
+            },
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    tx.commit().await.unwrap();
+
+    let wait_id: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.run_approvals
+             (scope_id, run_id, actor_user_id, logical_key, tool_id, tool_version,
+              canonical_arguments, destination, authority_evidence, binding_digest,
+              approval_expires_at, resume_execution_expires_at)
+         SELECT scope_id, id, actor_user_id, 'exp-wait', 'lookup', '1', '{}', 'fixture', 'fixture',
+                sha256('fixture'), clock_timestamp() - interval '1 second',
+                clock_timestamp() + interval '5 minutes'
+           FROM openmettle.runs WHERE id = $1::uuid
+         RETURNING id::text",
+    )
+    .bind(&r_wait)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE openmettle.runs
+            SET state = 'waiting', wait_reason = 'approval', approval_wait_id = $1::uuid
+          WHERE id = $2::uuid",
+    )
+    .bind(&wait_id)
+    .bind(&r_wait)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    let token = authz_runs::seeded_session(&db, &alice, 1, None).await;
+    let sess_policy =
+        sessions::Policy::new(Duration::from_secs(60), 10, Duration::from_secs(3)).unwrap();
+    let eff_sess = EffectSession::validate(&mut api, &token, &sess_policy, None)
+        .await
+        .unwrap();
+    let digest = "0".repeat(64);
+    let err = approvals::decide(
+        &mut api,
+        &eff_sess,
+        &DecisionInput {
+            scope: &scope,
+            run: &r_wait,
+            approval: &wait_id,
+            decision: HumanDecision::Approve,
+            binding_digest: &digest,
+            idempotency_key: "late-approve",
+        },
+        &NoopPolicy,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, StoreError::Conflict(_)));
+
+    let wait_state: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.runs WHERE id = $1::uuid")
+            .bind(&r_wait)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    assert_eq!(wait_state, "failed");
+    let total_held: i64 = sqlx::query_scalar(
+        "SELECT coalesce(sum(reserved_held), 0)::bigint FROM openmettle.quota_budgets",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(total_held, 0);
+    let drift: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
+           FROM openmettle.quota_verify_accounting_drift()",
+    )
+    .fetch_one(&mut worker)
+    .await
+    .unwrap();
+    assert_eq!(drift, (0, 0, 0, 0));
+}

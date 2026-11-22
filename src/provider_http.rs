@@ -357,13 +357,13 @@ mod tests;
 #[path = "../tests/provider_inference/redaction.rs"]
 mod inference_redaction;
 
-/// Couples the installation, authorized model and call identity to the existing
-/// inference codecs. The database connection is returned before this method runs.
-pub struct BillableInference {
-    pub installation: String,
-    pub route: inference::Gateway,
+/// Borrowed view over an installation and pinned inference route for single-use billable sends.
+pub struct BillableInferenceRef<'a> {
+    pub installation: &'a str,
+    pub route: &'a inference::Gateway,
 }
-impl BillableInference {
+
+impl BillableInferenceRef<'_> {
     pub async fn send<F: Future<Output = ()>>(
         &self,
         dispatch: Dispatch,
@@ -403,5 +403,30 @@ impl BillableInference {
                 }
             })
             .await
+    }
+}
+
+/// Couples the installation, authorized model and call identity to the existing
+/// inference codecs. The database connection is returned before this method runs.
+pub struct BillableInference {
+    pub installation: String,
+    pub route: inference::Gateway,
+}
+impl BillableInference {
+    pub async fn send<F: Future<Output = ()>>(
+        &self,
+        dispatch: Dispatch,
+        catalog: &Catalog,
+        effective: &Effective,
+        request: &inference::Request,
+        run: Option<inference::RunStop>,
+        visible: impl FnMut(inference::VisibleDelta) -> F,
+    ) -> Result<inference::Turn, inference::Error> {
+        BillableInferenceRef {
+            installation: &self.installation,
+            route: &self.route,
+        }
+        .send(dispatch, catalog, effective, request, run, visible)
+        .await
     }
 }

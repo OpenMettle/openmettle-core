@@ -951,7 +951,7 @@ pub async fn recover_park(
     .await
 }
 
-async fn fail(
+async fn fail_without_release(
     c: &mut PgConnection,
     scope: &str,
     run: &str,
@@ -960,6 +960,16 @@ async fn fail(
     sqlx::query("UPDATE openmettle.runs SET state='failed',wait_reason=NULL WHERE id=$1::uuid AND scope_id=$2::uuid")
         .bind(run).bind(scope).execute(&mut *c).await?;
     runs::append(c, scope, run, runs::TERMINAL_KEY, reason).await
+}
+
+async fn fail(
+    c: &mut PgConnection,
+    scope: &str,
+    run: &str,
+    reason: Payload<'_>,
+) -> Result<(), StoreError> {
+    fail_without_release(c, scope, run, reason).await?;
+    runs::release_terminal_runs(c, &[run.to_owned()]).await
 }
 
 // Probe each waiting row's single approval by primary key as the ordered sweep advances.
@@ -985,7 +995,8 @@ pub async fn expire_waits(c: &mut PgConnection, limit: u32) -> Result<Vec<String
             .await?;
         let mut ids = Vec::with_capacity(rows.len());
         for (scope, id, bound) in rows {
-            fail(c, &scope, &id, if bound { EXPIRED } else { INVALID_WAIT }).await?;
+            fail_without_release(c, &scope, &id, if bound { EXPIRED } else { INVALID_WAIT })
+                .await?;
             ids.push(id);
         }
         runs::release_terminal_runs(c, &ids).await?;

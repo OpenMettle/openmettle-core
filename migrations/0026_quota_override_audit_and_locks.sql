@@ -854,3 +854,51 @@ END;
 $$;
 REVOKE ALL ON FUNCTION openmettle.quota_ensure_legacy_run_holds(uuid, uuid, uuid, bigint, bigint, boolean, boolean) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION openmettle.quota_ensure_legacy_run_holds(uuid, uuid, uuid, bigint, bigint, boolean, boolean) TO openmettle_worker;
+
+-- Compute a run's per-round cost slice by dividing its remaining parent usage_cost_micros hold
+-- across remaining unallocated rounds (including p_current_request if already inserted), so
+-- mid-run recovered cost parents preserve the exact per-round ceiling.
+CREATE FUNCTION openmettle.quota_run_round_cost_slice(
+    p_scope uuid,
+    p_run uuid,
+    p_current_request uuid DEFAULT NULL
+)
+RETURNS bigint
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+    v_held bigint;
+    v_round_limit integer;
+    v_prior_rounds integer;
+    v_rem_rounds integer;
+BEGIN
+    SELECT h.held_units, coalesce(r.round_limit, 1)
+      INTO v_held, v_round_limit
+      FROM openmettle.quota_reservations h
+      JOIN openmettle.runs r ON r.id = h.run_id AND r.scope_id = h.scope_id
+     WHERE h.scope_id = p_scope
+       AND h.run_id = p_run
+       AND h.gateway_request_id IS NULL
+       AND h.resource_kind = 'usage_cost_micros'
+       AND h.state = 'held';
+    IF NOT FOUND THEN
+        RETURN NULL;
+    END IF;
+    IF v_held <= 0 THEN
+        RETURN 0;
+    END IF;
+    SELECT count(*)::integer
+      INTO v_prior_rounds
+      FROM openmettle.gateway_requests q
+     WHERE q.run_id = p_run
+       AND q.state <> 'released'
+       AND (p_current_request IS NULL OR q.id <> p_current_request);
+    v_rem_rounds := greatest(1, v_round_limit - coalesce(v_prior_rounds, 0));
+    RETURN ((v_held - 1) / v_rem_rounds) + 1;
+END;
+$$;
+REVOKE ALL ON FUNCTION openmettle.quota_run_round_cost_slice(uuid, uuid, uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION openmettle.quota_run_round_cost_slice(uuid, uuid, uuid) TO openmettle_worker;

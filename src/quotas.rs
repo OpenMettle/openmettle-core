@@ -17,6 +17,7 @@ use std::fmt;
 pub(crate) async fn prepare_round(
     tx: &mut WriteTransaction<'_>,
     call: &Call<'_>,
+    cost_ceiling: Option<i64>,
 ) -> Result<(), Error> {
     if let Authority::Lease { run, round, token } = call.authority {
         sqlx::query(
@@ -28,22 +29,91 @@ pub(crate) async fn prepare_round(
         .bind(round)
         .execute(tx.connection()?)
         .await?;
-        sqlx::query("SELECT openmettle.quota_ensure_legacy_run_holds($1::uuid,$2::uuid,$3::uuid)")
+        let has_v26_legacy: bool = sqlx::query_scalar(
+            "SELECT to_regprocedure(
+                 'openmettle.quota_ensure_legacy_run_holds(uuid,uuid,uuid,bigint,bigint,boolean,boolean)'
+             ) IS NOT NULL",
+        )
+        .fetch_one(tx.connection()?)
+        .await?;
+        if has_v26_legacy {
+            sqlx::query(
+                "SELECT openmettle.quota_ensure_legacy_run_holds(
+                     $1::uuid,$2::uuid,$3::uuid,$4,$5,false,false
+                 )",
+            )
+            .bind(call.reservation.scope_id)
+            .bind(run)
+            .bind(token)
+            .bind(call.units)
+            .bind(cost_ceiling)
+            .execute(tx.connection()?)
+            .await?;
+        } else {
+            sqlx::query(
+                "SELECT openmettle.quota_ensure_legacy_run_holds($1::uuid,$2::uuid,$3::uuid)",
+            )
             .bind(call.reservation.scope_id)
             .bind(run)
             .bind(token)
             .execute(tx.connection()?)
             .await?;
+        }
     }
     Ok(())
+}
+
+async fn cost_limit_state(
+    c: &mut PgConnection,
+    scope_id: &str,
+    actor_user_id: &str,
+) -> Result<(Option<String>, bool), sqlx::Error> {
+    sqlx::query_as(
+        "WITH stamp AS (SELECT clock_timestamp() AS now),
+         tiers AS (
+             SELECT id AS scope_id, kind AS scope_kind
+               FROM openmettle.scopes
+              WHERE id = $1::uuid OR personal_user_id = $2::uuid
+             UNION ALL
+             SELECT NULL::uuid, 'instance'::text
+         )
+         SELECT (SELECT cost_denomination FROM openmettle.quota_defaults
+                  WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'),
+                EXISTS (
+                    SELECT 1 FROM tiers t
+                    LEFT JOIN openmettle.quota_defaults d
+                      ON d.scope_kind = t.scope_kind AND d.resource_kind = 'usage_cost_micros'
+                    LEFT JOIN openmettle.quota_overrides o
+                      ON o.scope_id = t.scope_id AND o.resource_kind = 'usage_cost_micros'
+                   WHERE coalesce(
+                             CASE WHEN o.revoked_at IS NULL
+                                   AND (o.expires_at IS NULL OR o.expires_at > (SELECT now FROM stamp))
+                                  THEN o.hard_limit END,
+                             d.hard_limit
+                         ) IS NOT NULL
+                )",
+    )
+    .bind(scope_id)
+    .bind(actor_user_id)
+    .fetch_one(c)
+    .await
 }
 
 pub(crate) async fn cost_ceiling(
     tx: &mut WriteTransaction<'_>,
     owner: &Reservation<'_>,
     run: Option<&str>,
+    current_request_id: Option<&str>,
     supplied: Option<i64>,
 ) -> Result<Option<i64>, Error> {
+    let (_, any_cost_limit) =
+        cost_limit_state(tx.connection()?, owner.scope_id, owner.actor).await?;
+    if !any_cost_limit {
+        return match supplied {
+            Some(n) if n <= 0 => Err(Error::Refused),
+            _ => Ok(None),
+        };
+    }
     let configured: Option<i64> =
         sqlx::query_scalar("SELECT openmettle.quota_cost_ceiling($1::uuid,$2::uuid)")
             .bind(owner.scope_id)
@@ -51,38 +121,33 @@ pub(crate) async fn cost_ceiling(
             .fetch_one(tx.connection()?)
             .await?;
     match (configured, supplied) {
-        (None, None) => Ok(None),
         (Some(limit), Some(n)) if n > 0 && n <= limit => Ok(Some(n)),
         (Some(limit), None) if limit > 0 => {
-            if let Some(run_id) = run
-                && let Some((reserved_units, held_units, round_limit)) =
-                    sqlx::query_as::<_, (i64, i64, Option<i32>)>(
-                        "SELECT h.reserved_units, h.held_units, r.round_limit
-                           FROM openmettle.quota_reservations h
-                           JOIN openmettle.runs r
-                             ON r.id = h.run_id AND r.scope_id = h.scope_id
-                          WHERE h.scope_id = $1::uuid
-                            AND h.run_id = $2::uuid
-                            AND h.gateway_request_id IS NULL
-                            AND h.resource_kind = 'usage_cost_micros'
-                            AND h.state = 'held'",
+            if let Some(run_id) = run {
+                let has_slice_fn: bool = sqlx::query_scalar(
+                    "SELECT to_regprocedure(
+                         'openmettle.quota_run_round_cost_slice(uuid,uuid,uuid)'
+                     ) IS NOT NULL",
+                )
+                .fetch_one(tx.connection()?)
+                .await?;
+                if has_slice_fn
+                    && let Some(slice) = sqlx::query_scalar::<_, Option<i64>>(
+                        "SELECT openmettle.quota_run_round_cost_slice($1::uuid,$2::uuid,$3::uuid)",
                     )
                     .bind(owner.scope_id)
                     .bind(run_id)
-                    .fetch_optional(tx.connection()?)
+                    .bind(current_request_id)
+                    .fetch_one(tx.connection()?)
                     .await?
-            {
-                if held_units <= 0 {
-                    return Err(Error::Refused);
+                {
+                    let slice = slice.min(limit);
+                    return if slice > 0 {
+                        Ok(Some(slice))
+                    } else {
+                        Err(Error::Refused)
+                    };
                 }
-                let rounds = i128::from(round_limit.unwrap_or(1).max(1));
-                let per_round = ((i128::from(reserved_units) + rounds - 1) / rounds) as i64;
-                let slice = per_round.min(held_units).min(limit);
-                return if slice > 0 {
-                    Ok(Some(slice))
-                } else {
-                    Err(Error::Refused)
-                };
             }
             Ok(Some(limit))
         }
@@ -108,7 +173,7 @@ pub(crate) async fn bind_request(
         Authority::Lease { run, .. } => Some(run),
         Authority::Session { .. } => None,
     };
-    let cost = cost_ceiling(tx, &call.reservation, run, supplied).await?;
+    let cost = cost_ceiling(tx, &call.reservation, run, Some(id), supplied).await?;
     for (resource, amount) in [
         ("usage_cost_micros", cost),
         ("usage_tokens", Some(call.units)),
@@ -1421,6 +1486,28 @@ async fn backfill_replayed_run_budget_inner(
     if !has_gateway_reservations {
         return Ok((false, None));
     }
+    // Follow canonical lock order (`runs -> gateway_reservations -> quota_budgets`), verify the
+    // run is still `queued`, and reuse the locked run's original `actor_approval_id` so replays
+    // from another linked identity never fail `gateway_run_hold()` with 23503.
+    let run_row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT state, actor_approval_id::text
+           FROM openmettle.runs
+          WHERE scope_id = $1::uuid
+            AND id = $2::uuid
+            AND actor_user_id = $3::uuid
+            FOR NO KEY UPDATE",
+    )
+    .bind(input.scope_id)
+    .bind(input.run_id)
+    .bind(input.actor_user_id)
+    .fetch_optional(&mut **outer)
+    .await?;
+    let Some((state, Some(run_approval_id))) = run_row else {
+        return Ok((false, None));
+    };
+    if state != "queued" {
+        return Ok((false, None));
+    }
     let has_quota_schema: bool =
         sqlx::query_scalar("SELECT to_regclass('openmettle.quota_enforcement') IS NOT NULL")
             .fetch_one(&mut **outer)
@@ -1462,7 +1549,7 @@ async fn backfill_replayed_run_budget_inner(
     .bind(input.run_id)
     .bind(input.scope_id)
     .bind(input.actor_user_id)
-    .bind(input.actor_approval_id)
+    .bind(&run_approval_id)
     .bind(input.token_units)
     .execute(&mut **outer)
     .await?
@@ -1545,38 +1632,8 @@ async fn reserve_metered_holds_inner(
         return Ok(Some(refusal));
     }
 
-    let (cost_denomination, any_cost_limit): (Option<String>, bool) = sqlx::query_as(
-        "WITH stamp AS (SELECT clock_timestamp() AS now),
-         actor AS (SELECT id FROM openmettle.scopes WHERE personal_user_id = $3::uuid),
-         tiers(ord, scope_id, scope_kind) AS (
-             SELECT 1, $1::uuid, $2::text
-             UNION ALL
-             SELECT 2, (SELECT id FROM actor), 'personal'::text
-              WHERE $1::uuid <> (SELECT id FROM actor)
-             UNION ALL
-             SELECT 3, NULL::uuid, 'instance'::text
-         )
-         SELECT (SELECT cost_denomination FROM openmettle.quota_defaults
-                  WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'),
-                EXISTS (
-                    SELECT 1 FROM tiers t
-                    LEFT JOIN openmettle.quota_defaults d
-                      ON d.scope_kind = t.scope_kind AND d.resource_kind = 'usage_cost_micros'
-                    LEFT JOIN openmettle.quota_overrides o
-                      ON o.scope_id = t.scope_id AND o.resource_kind = 'usage_cost_micros'
-                   WHERE coalesce(
-                             CASE WHEN o.revoked_at IS NULL
-                                   AND (o.expires_at IS NULL OR o.expires_at > (SELECT now FROM stamp))
-                                  THEN o.hard_limit END,
-                             d.hard_limit
-                         ) IS NOT NULL
-                )",
-    )
-    .bind(input.scope_id)
-    .bind(input.scope_kind)
-    .bind(input.actor_user_id)
-    .fetch_one(&mut **outer)
-    .await?;
+    let (cost_denomination, any_cost_limit) =
+        cost_limit_state(outer, input.scope_id, input.actor_user_id).await?;
 
     if any_cost_limit {
         let Some(cost_units) = input.cost_units.filter(|_| cost_denomination.is_some()) else {

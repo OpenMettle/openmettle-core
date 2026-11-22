@@ -16,6 +16,7 @@ use serde_json::{Map, Value};
 pub struct MeteredRoute {
     pub installation: String,
     pub keys: Arc<crate::provider_keys::gateway::GatewayKeys>,
+    pub device_grant_id: Option<String>,
 }
 
 /// The credential owner resolves this route at dispatch for the admitted actor and scope.
@@ -46,8 +47,19 @@ impl Route {
             gateway,
             bearer: String::new(),
             stream,
-            metered: Some(MeteredRoute { installation, keys }),
+            metered: Some(MeteredRoute {
+                installation,
+                keys,
+                device_grant_id: None,
+            }),
         }
+    }
+
+    pub fn with_device_grant(mut self, device_grant_id: String) -> Self {
+        if let Some(metered) = &mut self.metered {
+            metered.device_grant_id = Some(device_grant_id);
+        }
+        self
     }
 }
 
@@ -402,7 +414,29 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                     _ => return Err(FAILED),
                 }
             }
-            let dispatch = if let Some(metered) = &route.metered {
+            let metering_enforced = {
+                let mut c = self.pool.acquire().await.map_err(|_| FAILED)?;
+                let has_table: bool = sqlx::query_scalar(
+                    "SELECT to_regclass('openmettle.quota_enforcement') IS NOT NULL",
+                )
+                .fetch_one(&mut *c)
+                .await
+                .map_err(|_| FAILED)?;
+                if has_table {
+                    sqlx::query_scalar::<_, bool>(
+                        "SELECT metering_enforced FROM openmettle.quota_enforcement WHERE id",
+                    )
+                    .fetch_one(&mut *c)
+                    .await
+                    .map_err(|_| FAILED)?
+                } else {
+                    false
+                }
+            };
+            if metering_enforced && route.metered.is_none() {
+                return Err(FAILED);
+            }
+            let turn = if let Some(metered) = &route.metered {
                 let round_tokens = config
                     .effective
                     .ceiling
@@ -438,35 +472,75 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 )
                 .await
                 .map_err(|_| FAILED)?;
+                if requires_device_slot && metering_enforced {
+                    let Some(grant_id) = metered.device_grant_id.as_deref() else {
+                        let _ = pending.release(&self.pool).await;
+                        return Err(FAILED);
+                    };
+                    if crate::authz::gateway::verify_turn_device_hold(
+                        &self.pool,
+                        &run.claim.scope_id,
+                        &run.claim.run_id,
+                        grant_id,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        let _ = pending.release(&self.pool).await;
+                        return Err(FAILED);
+                    }
+                }
                 if cx.stop.borrow().is_some() {
                     let _ = pending.release(&self.pool).await;
                     return Err(StepResult::Stopped);
                 }
-                Some(
-                    pending
-                        .handoff(&self.pool, &metered.keys)
-                        .await
-                        .map_err(|_| FAILED)?,
-                )
-            } else {
-                None
-            };
-            let credential = match &dispatch {
-                Some(d) => Credential::Dispatch(d),
-                None => Credential::Bearer(&route.bearer),
-            };
-            let turn = route
-                .gateway
-                .server(
+                let dispatch = match pending.handoff(&self.pool, &metered.keys).await {
+                    Ok(dispatch) => dispatch,
+                    Err(_) => {
+                        let _ = pending.release(&self.pool).await;
+                        return Err(FAILED);
+                    }
+                };
+                if requires_device_slot && metering_enforced {
+                    let grant_id = metered.device_grant_id.as_deref().ok_or(FAILED)?;
+                    crate::authz::gateway::commit_turn_device_handoff(
+                        &self.pool,
+                        &run.claim.scope_id,
+                        &run.claim.run_id,
+                        &run.claim.claim_token,
+                        grant_id,
+                    )
+                    .await
+                    .map_err(|_| FAILED)?;
+                }
+                crate::provider_http::BillableInferenceRef {
+                    installation: &metered.installation,
+                    route: &route.gateway,
+                }
+                .send(
+                    dispatch,
                     &self.catalog,
                     &config.effective,
                     &request,
-                    credential,
-                    RunStop::from_worker(run, cx.stop.clone()),
+                    Some(RunStop::from_worker(run, cx.stop.clone())),
                     |_| async {},
                 )
                 .await
-                .map_err(inference::Error::step_result)?;
+                .map_err(inference::Error::step_result)?
+            } else {
+                route
+                    .gateway
+                    .server(
+                        &self.catalog,
+                        &config.effective,
+                        &request,
+                        Credential::Bearer(&route.bearer),
+                        RunStop::from_worker(run, cx.stop.clone()),
+                        |_| async {},
+                    )
+                    .await
+                    .map_err(inference::Error::step_result)?
+            };
             tools = request.tools;
             let [answer]: [_; 1] = turn.answers.try_into().map_err(|_| FAILED)?;
             match answer.calls {
