@@ -6,6 +6,7 @@ Read the README and relevant documentation before changing code. This repository
 - Follow KISS, DRY and YAGNI: prefer the simplest direct design, consolidate genuine duplication instead of copy-pasting lists or helpers, and do not add speculative abstractions, flags or dead scaffolding for unrequested future cases.
 - Keep site-specific values, credentials and private data outside tracked files.
 - Preserve upstream licenses, copyright notices and provenance.
+- For external web research or upstream documentation, use the available Exa MCP tools first (e.g. `web_search_exa`, `web_search_advanced_exa`, `get_code_context_exa`, `crawling_exa` or `web_fetch_exa`). Use built-in web search or fetch only when Exa MCP is unavailable in the current runtime. Explicitly report blocked access or rate limits and identify any facts you could not verify.
 - Clearly distinguish implemented behavior from plans and unverified assumptions.
 - Prefer validation and dry-run behavior for infrastructure changes. Do not apply to a live cluster, erase storage or publish a release without task authorization.
 - Run `python3 scripts/check_repository.py` and the component-specific checks relevant to the change. Report checks not run and why.
