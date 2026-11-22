@@ -373,7 +373,9 @@ async fn human_park_decision_resume_and_committed_intent_recovery() {
         tasks: StepTasks::default().handle(),
     };
     let mut sends = 0;
-    let (bytes, _) = committed.start(&step).unwrap();
+    let StartPermit::Ready { request: bytes, .. } = committed.start(&step) else {
+        panic!("expected ready")
+    };
     sends += 1;
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["authorization"]["basis"], "human");
@@ -637,7 +639,10 @@ async fn expired_endpoint_key_and_mismatched_ledger_evidence_cannot_start_a_writ
         tasks: StepTasks::default().handle(),
     };
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    assert!(intent.start(&step).is_none());
+    assert!(matches!(
+        intent.start(&step),
+        StartPermit::AuthorityExpired { .. }
+    ));
     assert!(
         matches!(record_fenced_intent(&mut w, &r.lease(), &p, None, &policy, &LEASES)
         .await.unwrap(), IntentResult::Replayed(id) if id == op)
@@ -825,7 +830,10 @@ async fn human_endpoint_expiry_guards_decision_intent_and_send() {
                 deadline: tokio::time::Instant::now() + Duration::from_secs(30),
                 tasks: StepTasks::default().handle(),
             };
-            assert!(committed.start(&step).is_none());
+            assert!(matches!(
+                committed.start(&step),
+                StartPermit::AuthorityExpired { .. }
+            ));
         }
     }
 }
@@ -2110,3 +2118,6 @@ async fn restore_preserves_receipts_and_unknown_intents_without_authorizing_a_se
         events(&f.db, &automatic.run_id).await
     );
 }
+
+#[path = "mcp.rs"]
+mod mcp_core;

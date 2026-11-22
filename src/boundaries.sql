@@ -41,6 +41,9 @@ effect_columns (relation, attribute, role, privilege) AS (
             'issued_client','issued_epoch','provider_generation','approval_generation','user_generation',
             'created_ms','expires_ms','revoked'])
     ) AS t(relation,role,privilege,columns), unnest(columns) attribute WHERE $1 >= 22
+    UNION ALL SELECT 'operations',attribute,'openmettle_worker',privilege FROM (VALUES
+        ('dispatched_attempts','INSERT'),('dispatched_attempts','UPDATE'),('effective_expires_us','INSERT')
+    ) t(attribute,privilege) WHERE $1 >= 25
 ),
 quota_columns (relation,attribute,role,privilege) AS (
     SELECT 'storage_reservations', attribute, role, privilege FROM (VALUES
@@ -80,7 +83,7 @@ gateway_columns (relation,attribute,role,privilege) AS (
         ('gateway_requests','openmettle_worker','INSERT',ARRAY['id','reservation_id','scope_id','actor_user_id','approval_id','installation','model','units','dispatch_hash','run_id','round'])
     ) AS t(relation,role,privilege,columns), unnest(columns) attribute WHERE $1 >= 23
 ),
-quota_functions(signature,definer,roles) AS (
+runtime_functions(signature,definer,roles) AS (
     SELECT * FROM (VALUES
         ('openmettle.record_accepted_gateway_settlement()',true,ARRAY[]::text[]),
         ('openmettle.quota_take_warnings(integer)',true,ARRAY['openmettle_worker']::text[]),
@@ -123,6 +126,11 @@ quota_functions(signature,definer,roles) AS (
         ('openmettle.quota_release_device_slot(uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.quota_commit_handoff(uuid,uuid)',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
         ('openmettle.quota_bump_config_revision()',false,ARRAY[]::text[])) AS f WHERE $1 >= 24
+    UNION ALL SELECT signature,definer,ARRAY[]::text[] FROM (VALUES
+        ('openmettle.guard_operation_dispatch()',false),
+        ('openmettle.fail_abandoned_reads(uuid,uuid)',false),
+        ('openmettle.resolve_abandoned_repeatable_reads()',true)
+    ) t(signature,definer) WHERE $1 >= 25
 ),
 gateway_functions (signature,definer,inference) AS (
     SELECT * FROM (VALUES ('openmettle.gateway_allocate()',true,false), ('openmettle.gateway_run_hold()',true,false),
@@ -675,7 +683,7 @@ violations (violation) AS (
       AND NOT (g.kind='function' AND g.privilege='EXECUTE'
                AND pg_get_userbyid(g.grantee) IN ('openmettle_api','openmettle_worker')
                AND EXISTS (SELECT FROM gateway_functions f WHERE f.inference AND g.target='function ' || f.signature))
-      AND NOT (g.kind='function' AND g.privilege='EXECUTE' AND EXISTS (SELECT FROM quota_functions f
+      AND NOT (g.kind='function' AND g.privilege='EXECUTE' AND EXISTS (SELECT FROM runtime_functions f
                WHERE g.target='function ' || to_regprocedure(f.signature)::text AND pg_get_userbyid(g.grantee)=ANY(f.roles)))
       AND NOT (g.kind = 'column' AND g.schema_name = 'openmettle'
                AND (g.object_name::text, g.column_name::text,
@@ -704,7 +712,7 @@ violations (violation) AS (
             AND NOT has_function_privilege(r.oid,p.oid,'EXECUTE')))
     UNION ALL
     SELECT format('unsafe or missing quota function %s',f.signature)
-    FROM quota_functions f LEFT JOIN pg_proc p ON p.oid=to_regprocedure(f.signature)
+    FROM runtime_functions f LEFT JOIN pg_proc p ON p.oid=to_regprocedure(f.signature)
     WHERE p.oid IS NULL OR p.prosecdef<>f.definer OR pg_get_userbyid(p.proowner)<>'openmettle_owner'
        OR p.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog']
        OR EXISTS (SELECT FROM aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a

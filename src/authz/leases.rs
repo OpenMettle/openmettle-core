@@ -300,6 +300,7 @@ pub enum Settle {
 pub enum FailReason {
     StepFailed,
     RoundLimit,
+    ApprovalExpired,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -437,6 +438,10 @@ impl Resolution {
             Self::Failed(FailReason::StepFailed) => {
                 ("openmettle.run-failed", br#"{"reason":"step_failed"}"#)
             }
+            Self::Failed(FailReason::ApprovalExpired) => (
+                "openmettle.run-approval-expired",
+                br#"{"reason":"approval_expired"}"#,
+            ),
             Self::Failed(FailReason::RoundLimit) => {
                 ("openmettle.run-failed", br#"{"reason":"round_limit"}"#)
             }
@@ -517,18 +522,8 @@ pub(crate) async fn handoff(
         if held.state == ExecState::Reconciling {
             return release_locked(c, lease).await;
         }
-        let pending = held.cancel.is_some()
-            || sqlx::query_scalar::<_, bool>(concat!(
-                "SELECT EXISTS (SELECT FROM openmettle.operations
-               WHERE scope_id = $1::uuid AND run_id = $2::uuid AND ",
-                unresolved!(),
-                ")"
-            ))
-            .bind(lease.scope_id)
-            .bind(lease.run_id)
-            .fetch_one(&mut *c)
-            .await?;
-        if pending {
+        let (pending, time_to_reclaim) = settlement_inputs(c, lease, settings).await?;
+        if held.cancel.is_some() || pending > 0 || !time_to_reclaim {
             let settled =
                 settle_locked(c, lease, held.state, held.cancel, settings, Settle::Stopped).await?;
             if matches!(settled, Settled::Terminal { .. }) {

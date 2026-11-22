@@ -657,6 +657,18 @@ const ADDITIVE_COLUMNS: &[AdditiveColumn] = &[
         column: "purge_stage",
         default: ColumnDefault::Str("none"),
     },
+    AdditiveColumn {
+        since: 25,
+        table: "operations",
+        column: "dispatched_attempts",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 25,
+        table: "operations",
+        column: "effective_expires_us",
+        default: ColumnDefault::Null,
+    },
 ];
 
 /// Single declarative registry of every table added after migration 14, ordered by `since`
@@ -1012,6 +1024,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "e9221570f5187a4fc2d666d3724d8646d6d4236d3cb7997538e80ec10355be57",
         "275b395fab0a1e90fc6f9a3039d008adc138294af0cb0da9cb944df87b26ec1c",
         "a6ea85d09af2c2aa7d267499623a46a3922e695b79bdf585cd8e2164d68e5d9a",
+        "814d7832603fdb9752e55259c1c44b6815228ae5fb128b54ed5becf9fed508d7",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));

@@ -146,6 +146,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "transactional quotas and volume pinning",
         sql: include_str!("../migrations/0024_transactional_quotas_and_volume_pinning.sql"),
     },
+    Source {
+        version: 25,
+        description: "mcp tool operations",
+        sql: include_str!("../migrations/0025_mcp_tool_operations.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.
