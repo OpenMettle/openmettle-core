@@ -617,7 +617,15 @@ fn cost_bound_and_device_slot_catalog_rules() {
     assert_eq!(p.round_cost_ceiling(600), Ok(Some(1250)));
     assert_eq!(
         p.round_cost_ceiling(u64::MAX),
-        Err(Error::Invalid("cost budget"))
+        Ok(Some(u128::from(u64::MAX) * 2 + 50))
+    );
+    let huge = catalog(|d| {
+        d["models"]["a"]["cost_bound"] = json!({"fixed_micros": i64::MAX, "micros_per_token": 1});
+    })
+    .unwrap();
+    assert_eq!(
+        huge.model("a").unwrap().round_cost_ceiling(600),
+        Ok(Some(u128::from(i64::MAX as u64) + 600))
     );
 
     let e = c

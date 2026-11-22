@@ -103,6 +103,7 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.quota_warn(text,uuid,text,timestamptz,numeric,numeric,bigint,smallint,smallint,bigint,bigint)',false,ARRAY[]::text[]),
         ('openmettle.quota_reserve(uuid,uuid,text,bigint,text,uuid,uuid,bytea,timestamptz)',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
         ('openmettle.quota_cost_ceiling(uuid,uuid)',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
+        ('openmettle.quota_ensure_legacy_run_holds(uuid,uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.quota_allocate_round(uuid,bytea,uuid,text,bigint)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.quota_commit_handoff(uuid,bytea)',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
         ('openmettle.quota_gateway_fold(uuid,text,bigint,bigint)',false,ARRAY[]::text[]),
@@ -124,7 +125,6 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.quota_commit_handoff(uuid,uuid)',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
         ('openmettle.quota_bump_config_revision()',false,ARRAY[]::text[])) AS f WHERE $1 >= 24
     UNION ALL SELECT * FROM (VALUES
-        ('openmettle.quota_ensure_legacy_run_holds(uuid,uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.quota_upsert_scope_override(uuid,uuid,text,bigint,timestamptz,text)',true,ARRAY['openmettle_api']::text[]),
         ('openmettle.quota_revoke_scope_override(uuid,uuid,text,text)',true,ARRAY['openmettle_api']::text[])) AS f WHERE $1 BETWEEN 24 AND 25
     UNION ALL SELECT signature,definer,ARRAY[]::text[] FROM (VALUES
@@ -134,10 +134,10 @@ runtime_functions(signature,definer,roles) AS (
     ) t(signature,definer) WHERE $1 >= 25
     UNION ALL SELECT * FROM (VALUES
         ('openmettle.storage_lock_not_adopting()',true,ARRAY['openmettle_api']::text[]),
-        ('openmettle.quota_ensure_legacy_run_holds(uuid,uuid,uuid,bigint,bigint,boolean,boolean)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.quota_prepare_turn_round(uuid,uuid,uuid,bigint,bigint,boolean,boolean,boolean,boolean)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.quota_run_round_cost_slice(uuid,uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.quota_authorize_unmetered_turn_round(uuid,uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
-        ('openmettle.quota_commit_turn_device_handoff(uuid,uuid,uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.quota_commit_turn_handoff(uuid,bytea,uuid,uuid,uuid,boolean,uuid)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.quota_ensure_replayed_run_gateway_reservation(uuid,uuid,uuid,bigint)',true,ARRAY['openmettle_api']::text[]),
         ('openmettle.quota_release_terminal_runs(uuid[])',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
         ('openmettle.quota_upsert_scope_override(uuid,uuid,text,bigint,timestamptz,text,text,jsonb)',true,ARRAY['openmettle_api']::text[]),

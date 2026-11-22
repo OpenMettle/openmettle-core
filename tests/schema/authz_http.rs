@@ -3440,7 +3440,7 @@ async fn extreme_per_round_cost_bound_admits_on_token_only_and_returns_429_when_
     });
     catalog["models"]["a"]["cost_bound"] = json!({
         "fixed_micros": i64::MAX,
-        "micros_per_token": 0
+        "micros_per_token": 1
     });
     doc["catalog_file"] = json!(dir.write("catalog.json", &serde_json::to_vec(&catalog).unwrap()));
     doc["admission_limits"] = json!({

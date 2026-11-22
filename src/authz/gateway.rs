@@ -77,7 +77,8 @@ pub async fn hold_with_cost(
         .execute(tx.connection()?)
         .await?;
     if let Some(run) = run {
-        let cost = crate::quotas::cost_ceiling(tx, r, None, None, cost_ceiling).await?;
+        let cost_u128 = cost_ceiling.map(|c| u128::try_from(c).unwrap_or(0));
+        let cost = crate::quotas::cost_ceiling(tx, r, None, None, cost_u128).await?;
         for (resource, amount) in [("usage_cost_micros", cost), ("usage_tokens", Some(units))] {
             if let Some(amount) = amount {
                 sqlx::query("SELECT openmettle.quota_reserve($1::uuid,$2::uuid,$3,$4,$5,$6::uuid,NULL,NULL,
@@ -127,12 +128,13 @@ pub async fn reserve_with_cost<'a>(
     let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
     crate::quotas::prepare_round(&mut tx, &call, cost_ceiling).await?;
     let pending = reserve_in(&mut tx, call).await?;
+    let cost_u128 = cost_ceiling.map(|c| u128::try_from(c).unwrap_or(0));
     crate::quotas::bind_request(
         &mut tx,
         &pending.call,
         &pending.id,
         &pending.secret,
-        cost_ceiling,
+        cost_u128,
     )
     .await?;
     tx.commit().await?;
@@ -149,7 +151,7 @@ pub struct TurnRound<'a> {
     pub installation: &'a str,
     pub model: &'a str,
     pub round_tokens: i64,
-    pub round_cost: Option<i64>,
+    pub round_cost: Option<u128>,
     pub requires_device_slot: bool,
 }
 
@@ -197,10 +199,11 @@ impl TurnPending {
         self.as_pending().release(pool).await
     }
 
-    /// Atomically commit gateway handoff, optional device-slot handoff (when `requires_device_slot`
-    /// is true and metering or a device hold applies), and round usage child holds in a single
-    /// write transaction. Any pre-commit failure rolls back `gateway_requests` to `'reserved'` so
-    /// `release()` can immediately unwind the unsent round.
+    /// Atomically commit gateway handoff, optional device-slot handoff, and round usage child
+    /// holds in a single write transaction following strict ADR 0040 lock order:
+    /// `runs -> gateway_requests -> quota_reservations (resource_kind, id) -> quota_enforcement`.
+    /// Any pre-commit failure rolls back `gateway_requests` to `'reserved'` so `release()` can
+    /// immediately unwind the unsent round.
     pub async fn handoff(
         &self,
         pool: &PgPool,
@@ -215,31 +218,46 @@ impl TurnPending {
         }
         let pending = self.as_pending();
         let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
-        let dispatch = pending.handoff_in(&mut tx, keys).await?;
-        if requires_device_slot {
-            let res = sqlx::query(
-                "SELECT openmettle.quota_commit_turn_device_handoff(
-                     $1::uuid, $2::uuid, $3::uuid, $4::uuid
-                 )",
-            )
-            .bind(&self.scope_id)
-            .bind(&self.run_id)
-            .bind(&self.claim_token)
-            .bind(device_grant_id)
-            .execute(tx.connection()?)
-            .await;
-            if let Err(err) = res {
-                return match err.as_database_error().and_then(|e| e.code()).as_deref() {
-                    Some("42501" | "23505" | "OMQ04") => Err(Error::Refused),
-                    _ => Err(Error::from(err)),
-                };
-            }
+        let live: Option<bool> = sqlx::query_scalar(
+            "SELECT true
+               FROM openmettle.runs
+              WHERE scope_id = $1::uuid
+                AND id = $2::uuid
+                AND state = 'running'
+                AND cancel_reason IS NULL
+                AND claim_token = $3::uuid
+                AND lease_expires_at > clock_timestamp()
+                FOR NO KEY UPDATE",
+        )
+        .bind(&self.scope_id)
+        .bind(&self.run_id)
+        .bind(&self.claim_token)
+        .fetch_optional(tx.connection()?)
+        .await?;
+        if live.is_none() {
+            return Err(Error::Refused);
         }
-        sqlx::query("SELECT openmettle.quota_commit_handoff($1::uuid,$2::bytea)")
-            .bind(&pending.id)
-            .bind(pending.secret.as_slice())
-            .execute(tx.connection()?)
-            .await?;
+        let dispatch = pending.handoff_in(&mut tx, keys).await?;
+        let res = sqlx::query(
+            "SELECT openmettle.quota_commit_turn_handoff(
+                 $1::uuid, $2::bytea, $3::uuid, $4::uuid, $5::uuid, $6, $7::uuid
+             )",
+        )
+        .bind(&pending.id)
+        .bind(pending.secret.as_slice())
+        .bind(&self.scope_id)
+        .bind(&self.run_id)
+        .bind(&self.claim_token)
+        .bind(requires_device_slot)
+        .bind(device_grant_id)
+        .execute(tx.connection()?)
+        .await;
+        if let Err(err) = res {
+            return match err.as_database_error().and_then(|e| e.code()).as_deref() {
+                Some("42501" | "23505" | "OMQ04") => Err(Error::Refused),
+                _ => Err(Error::from(err)),
+            };
+        }
         if tx.commit().await.is_err() {
             let mut recovery = WriteTransaction::begin_bounded_pool(pool, false).await?;
             pending.recover_in(&mut recovery).await?;
@@ -265,17 +283,20 @@ pub async fn reserve_turn_round(pool: &PgPool, round: TurnRound<'_>) -> Result<T
     .bind(round.round)
     .execute(tx.connection()?)
     .await?;
+    let round_cost_i64 = round.round_cost.and_then(|c| i64::try_from(c).ok());
+    let round_cost_overflow = round.round_cost.is_some_and(|c| i64::try_from(c).is_err());
     let reservation_id: String = sqlx::query_scalar(
-        "SELECT openmettle.quota_ensure_legacy_run_holds(
-             $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7
+        "SELECT openmettle.quota_prepare_turn_round(
+             $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, false
          )::text",
     )
     .bind(round.scope_id)
     .bind(round.run_id)
     .bind(round.claim_token)
     .bind(round.round_tokens)
-    .bind(round.round_cost)
+    .bind(round_cost_i64)
     .bind(round.round_cost.is_none())
+    .bind(round_cost_overflow)
     .bind(round.requires_device_slot)
     .fetch_one(tx.connection()?)
     .await?;

@@ -29,17 +29,17 @@ pub(crate) async fn prepare_round(
         .bind(round)
         .execute(tx.connection()?)
         .await?;
-        let has_v26_legacy: bool = sqlx::query_scalar(
+        let has_v26_prepare: bool = sqlx::query_scalar(
             "SELECT to_regprocedure(
-                 'openmettle.quota_ensure_legacy_run_holds(uuid,uuid,uuid,bigint,bigint,boolean,boolean)'
+                 'openmettle.quota_prepare_turn_round(uuid,uuid,uuid,bigint,bigint,boolean,boolean,boolean,boolean)'
              ) IS NOT NULL",
         )
         .fetch_one(tx.connection()?)
         .await?;
-        if has_v26_legacy {
+        if has_v26_prepare {
             sqlx::query(
-                "SELECT openmettle.quota_ensure_legacy_run_holds(
-                     $1::uuid,$2::uuid,$3::uuid,$4,$5,false,false
+                "SELECT openmettle.quota_prepare_turn_round(
+                     $1::uuid,$2::uuid,$3::uuid,$4,$5,false,false,false,true
                  )",
             )
             .bind(call.reservation.scope_id)
@@ -126,17 +126,41 @@ async fn cost_limit_state(
     })
 }
 
+async fn round_cost_slice(
+    c: &mut PgConnection,
+    scope_id: &str,
+    run_id: &str,
+    current_request_id: Option<&str>,
+) -> Result<Option<i64>, sqlx::Error> {
+    let has_slice_fn: bool = sqlx::query_scalar(
+        "SELECT to_regprocedure(
+             'openmettle.quota_run_round_cost_slice(uuid,uuid,uuid)'
+         ) IS NOT NULL",
+    )
+    .fetch_one(&mut *c)
+    .await?;
+    if !has_slice_fn {
+        return Ok(None);
+    }
+    sqlx::query_scalar("SELECT openmettle.quota_run_round_cost_slice($1::uuid,$2::uuid,$3::uuid)")
+        .bind(scope_id)
+        .bind(run_id)
+        .bind(current_request_id)
+        .fetch_one(&mut *c)
+        .await
+}
+
 pub(crate) async fn cost_ceiling(
     tx: &mut WriteTransaction<'_>,
     owner: &Reservation<'_>,
     run: Option<&str>,
     current_request_id: Option<&str>,
-    supplied: Option<i64>,
+    supplied: Option<u128>,
 ) -> Result<Option<i64>, Error> {
     let state = cost_limit_state(tx.connection()?, owner.scope_id, owner.actor).await?;
     if !state.any_limit {
         return match supplied {
-            Some(n) if n <= 0 => Err(Error::Refused),
+            Some(0) => Err(Error::Refused),
             _ => Ok(None),
         };
     }
@@ -150,33 +174,28 @@ pub(crate) async fn cost_ceiling(
             .fetch_one(tx.connection()?)
             .await?;
     match (configured, supplied) {
-        (Some(limit), Some(n)) if n > 0 && n <= limit => Ok(Some(n)),
+        (Some(limit), Some(n)) => {
+            let Ok(n) = i64::try_from(n) else {
+                return Err(Error::Refused);
+            };
+            if n > 0 && n <= limit {
+                Ok(Some(n))
+            } else {
+                Err(Error::Refused)
+            }
+        }
         (Some(limit), None) if limit > 0 => {
-            if let Some(run_id) = run {
-                let has_slice_fn: bool = sqlx::query_scalar(
-                    "SELECT to_regprocedure(
-                         'openmettle.quota_run_round_cost_slice(uuid,uuid,uuid)'
-                     ) IS NOT NULL",
-                )
-                .fetch_one(tx.connection()?)
-                .await?;
-                if has_slice_fn
-                    && let Some(slice) = sqlx::query_scalar::<_, Option<i64>>(
-                        "SELECT openmettle.quota_run_round_cost_slice($1::uuid,$2::uuid,$3::uuid)",
-                    )
-                    .bind(owner.scope_id)
-                    .bind(run_id)
-                    .bind(current_request_id)
-                    .fetch_one(tx.connection()?)
-                    .await?
-                {
-                    let slice = slice.min(limit);
-                    return if slice > 0 {
-                        Ok(Some(slice))
-                    } else {
-                        Err(Error::Refused)
-                    };
-                }
+            if let Some(run_id) = run
+                && let Some(slice) =
+                    round_cost_slice(tx.connection()?, owner.scope_id, run_id, current_request_id)
+                        .await?
+            {
+                let slice = slice.min(limit);
+                return if slice > 0 {
+                    Ok(Some(slice))
+                } else {
+                    Err(Error::Refused)
+                };
             }
             Ok(Some(limit))
         }
@@ -189,27 +208,20 @@ pub(crate) async fn bind_request(
     call: &Call<'_>,
     id: &str,
     secret: &[u8],
-    supplied: Option<i64>,
+    supplied: Option<u128>,
 ) -> Result<(), Error> {
     let enforced: bool =
         sqlx::query_scalar("SELECT metering_enforced FROM openmettle.quota_enforcement WHERE id")
             .fetch_one(tx.connection()?)
             .await?;
-    if !enforced {
-        return Ok(());
-    }
-    let run = match call.authority {
-        Authority::Lease { run, .. } => Some(run),
-        Authority::Session { .. } => None,
-    };
-    let cost = cost_ceiling(tx, &call.reservation, run, Some(id), supplied).await?;
-    for (resource, amount) in [
-        ("usage_cost_micros", cost),
-        ("usage_tokens", Some(call.units)),
-    ] {
-        let Some(amount) = amount else { continue };
-        match call.authority {
-            Authority::Session { .. } => {
+    match call.authority {
+        Authority::Session { .. } => {
+            let cost = cost_ceiling(tx, &call.reservation, None, Some(id), supplied).await?;
+            for (resource, amount) in [
+                ("usage_cost_micros", cost),
+                ("usage_tokens", Some(call.units)),
+            ] {
+                let Some(amount) = amount else { continue };
                 sqlx::query(
                     "SELECT openmettle.quota_reserve($1::uuid,$2::uuid,$3,$4,$5,NULL,$6::uuid,$7,
                     clock_timestamp()+interval '15 minutes')",
@@ -224,8 +236,19 @@ pub(crate) async fn bind_request(
                 .execute(tx.connection()?)
                 .await?;
             }
-            Authority::Lease { token, .. } => {
-                sqlx::query("SELECT openmettle.quota_allocate_round($1::uuid,$2,$3::uuid,$4,$5)")
+        }
+        Authority::Lease { run, token, .. } => {
+            if enforced {
+                let cost =
+                    cost_ceiling(tx, &call.reservation, Some(run), Some(id), supplied).await?;
+                for (resource, amount) in [
+                    ("usage_cost_micros", cost),
+                    ("usage_tokens", Some(call.units)),
+                ] {
+                    let Some(amount) = amount else { continue };
+                    sqlx::query(
+                        "SELECT openmettle.quota_allocate_round($1::uuid,$2,$3::uuid,$4,$5)",
+                    )
                     .bind(id)
                     .bind(secret)
                     .bind(token)
@@ -233,6 +256,83 @@ pub(crate) async fn bind_request(
                     .bind(amount)
                     .execute(tx.connection()?)
                     .await?;
+                }
+            } else {
+                // Pre-activation (`!enforced`): allocate child holds from any already-charged
+                // parent `quota_reservations` on this run so gateway settlement charges provider
+                // usage instead of releasing the whole parent balance on terminal settlement.
+                let parents: Vec<(String, i64)> = sqlx::query_as(
+                    "SELECT resource_kind, held_units
+                       FROM openmettle.quota_reservations
+                      WHERE scope_id = $1::uuid
+                        AND run_id = $2::uuid
+                        AND gateway_request_id IS NULL
+                        AND state = 'held'
+                        AND resource_kind IN ('usage_cost_micros', 'usage_tokens')
+                      ORDER BY resource_kind ASC",
+                )
+                .bind(call.reservation.scope_id)
+                .bind(run)
+                .fetch_all(tx.connection()?)
+                .await?;
+                let mut parent_cost_held = None;
+                let mut has_token_parent = false;
+                for (kind, held) in parents {
+                    match kind.as_str() {
+                        "usage_cost_micros" => parent_cost_held = Some(held),
+                        "usage_tokens" => has_token_parent = true,
+                        _ => {}
+                    }
+                }
+                let cost = if let Some(held) = parent_cost_held {
+                    let state = cost_limit_state(
+                        tx.connection()?,
+                        call.reservation.scope_id,
+                        call.reservation.actor,
+                    )
+                    .await?;
+                    if state.any_limit {
+                        cost_ceiling(tx, &call.reservation, Some(run), Some(id), supplied).await?
+                    } else if let Some(s) = supplied {
+                        let s = i64::try_from(s).map_err(|_| Error::Refused)?;
+                        if s <= 0 || s > held {
+                            return Err(Error::Refused);
+                        }
+                        Some(s)
+                    } else {
+                        let slice = round_cost_slice(
+                            tx.connection()?,
+                            call.reservation.scope_id,
+                            run,
+                            Some(id),
+                        )
+                        .await?
+                        .unwrap_or(held)
+                        .min(held);
+                        if slice <= 0 {
+                            return Err(Error::Refused);
+                        }
+                        Some(slice)
+                    }
+                } else {
+                    None
+                };
+                for (resource, amount) in [
+                    ("usage_cost_micros", cost),
+                    ("usage_tokens", has_token_parent.then_some(call.units)),
+                ] {
+                    let Some(amount) = amount else { continue };
+                    sqlx::query(
+                        "SELECT openmettle.quota_allocate_round($1::uuid,$2,$3::uuid,$4,$5)",
+                    )
+                    .bind(id)
+                    .bind(secret)
+                    .bind(token)
+                    .bind(resource)
+                    .bind(amount)
+                    .execute(tx.connection()?)
+                    .await?;
+                }
             }
         }
     }
@@ -1468,7 +1568,7 @@ pub struct RunBudgetReservation<'a> {
     /// Qualified per-round cost ceiling when the profile carries a `cost_bound`, or `None` when
     /// the profile is unqualified for cost metering. Multiplied by `round_limit` only when a
     /// `usage_cost_micros` limit is actually active.
-    pub per_round_cost_micros: Option<i64>,
+    pub per_round_cost_micros: Option<u128>,
     /// Effective run round limit (`>= 1`).
     pub round_limit: i32,
     /// True when executing this profile requires one concurrent `device_reservations` slot.
@@ -1563,7 +1663,8 @@ async fn backfill_replayed_run_budget_inner(
         if state != "queued" {
             return Ok((false, None));
         }
-        let inserted = sqlx::query(
+        let mut sp = outer.begin().await?;
+        let inserted = match sqlx::query(
             "INSERT INTO openmettle.gateway_reservations
                  (id, scope_id, actor_user_id, approval_id, run_id, units)
              VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $1::uuid, $5)",
@@ -1573,10 +1674,24 @@ async fn backfill_replayed_run_budget_inner(
         .bind(input.actor_user_id)
         .bind(&run_approval_id)
         .bind(input.token_units)
-        .execute(&mut **outer)
-        .await?
-        .rows_affected()
-            > 0;
+        .execute(&mut *sp)
+        .await
+        {
+            Ok(done) => {
+                sp.commit().await?;
+                done.rows_affected() > 0
+            }
+            Err(err)
+                if err.as_database_error().and_then(|e| e.code()).as_deref() == Some("23505") =>
+            {
+                sp.rollback().await?;
+                false
+            }
+            Err(err) => {
+                sp.rollback().await?;
+                return Err(StoreError::Database(err));
+            }
+        };
         (inserted, input.token_units)
     };
 
@@ -1708,16 +1823,17 @@ async fn reserve_metered_holds_inner(
                 scope_kind: "personal",
             }));
         }
-        let per_round_u64 = u64::try_from(per_round_cost)
-            .ok()
-            .filter(|&n| n > 0)
-            .ok_or(StoreError::InvalidInput("cost_units"))?;
+        if per_round_cost == 0 {
+            return Err(StoreError::InvalidInput("cost_units"));
+        }
         let rounds_u32 = u32::try_from(input.round_limit)
             .ok()
             .filter(|&n| n > 0)
             .ok_or(StoreError::InvalidInput("round_limit"))?;
-        let total_u128 = u128::from(per_round_u64) * u128::from(rounds_u32);
-        let Ok(cost_units) = i64::try_from(total_u128) else {
+        let Some(cost_units) = per_round_cost
+            .checked_mul(u128::from(rounds_u32))
+            .and_then(|total| i64::try_from(total).ok())
+        else {
             return Ok(Some(RunLimit::Quota {
                 resource_kind: "usage_cost_micros",
                 scope_kind: db_tier(cost_state.tightest_scope_kind.as_deref(), input.scope_kind),

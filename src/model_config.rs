@@ -666,15 +666,16 @@ impl Profile {
     }
 
     /// Qualified upper-bound cost in micro-units for one round of up to `round_tokens` tokens,
-    /// or `Ok(None)` when this profile carries no qualified `cost_bound`.
-    pub fn round_cost_ceiling(&self, round_tokens: u64) -> Result<Option<i64>, Error> {
+    /// or `Ok(None)` when this profile carries no qualified `cost_bound`. Computed in `u128` so
+    /// token-only installations without cost limits never reject valid large `cost_bound` profiles;
+    /// callers enforce `i64::MAX` bounds only when a cost tier applies.
+    pub fn round_cost_ceiling(&self, round_tokens: u64) -> Result<Option<u128>, Error> {
         let Some(cb) = self.cost_bound else {
             return Ok(None);
         };
-        let total = round_tokens
-            .checked_mul(cb.micros_per_token)
-            .and_then(|v| v.checked_add(cb.fixed_micros))
-            .and_then(|n| i64::try_from(n).ok())
+        let total = u128::from(round_tokens)
+            .checked_mul(u128::from(cb.micros_per_token))
+            .and_then(|v| v.checked_add(u128::from(cb.fixed_micros)))
             .filter(|&n| n > 0)
             .ok_or(Error::Invalid("cost budget"))?;
         Ok(Some(total))
@@ -748,8 +749,8 @@ impl Catalog {
     }
 
     /// Qualified per-round cost ceiling in micro-units for the resolved effective configuration,
-    /// shared by `/v1/runs` admission and worker round dispatch (`gateway::reserve_with_cost`).
-    pub fn round_cost_ceiling(&self, e: &Effective) -> Result<Option<i64>, Error> {
+    /// shared by `/v1/runs` admission and worker round dispatch (`gateway::reserve_turn_round`).
+    pub fn round_cost_ceiling(&self, e: &Effective) -> Result<Option<u128>, Error> {
         let target = self.target(e)?;
         let round_tokens = e.ceiling.value.ok_or(Error::Provisioning)?;
         target.round_cost_ceiling(round_tokens)

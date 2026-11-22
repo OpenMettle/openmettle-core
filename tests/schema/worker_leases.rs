@@ -2699,6 +2699,39 @@ mod live_turns {
         .await
         .unwrap();
         assert_eq!(held, 0);
+
+        // Also fail closed on schema 25 (quota_enforcement exists, metering_enforced = false,
+        // without schema-26's FOR SHARE guard helper) so MVCC cannot race activation.
+        let db25 = TestDb::new().await;
+        let settings25 = db25.settings(Duration::from_secs(10));
+        migrate::apply(&settings25, &MIGRATIONS[..23])
+            .await
+            .unwrap();
+        let mut owner25 = connect(&db25.0, OWNER).await;
+        providers(&mut owner25).await;
+        let actor25 = account(&mut owner25, PROVIDER, true, FUTURE).await;
+        let scope25 = personal_of(&db25, &actor25).await;
+        migrate::apply(&settings25, &MIGRATIONS[..25])
+            .await
+            .unwrap();
+        let enforced25: bool = sqlx::query_scalar(
+            "SELECT metering_enforced FROM openmettle.quota_enforcement WHERE id",
+        )
+        .fetch_one(&mut owner25)
+        .await
+        .unwrap();
+        assert!(!enforced25);
+        let mut chat25 = Chat::on(Fixture {
+            db: db25,
+            actor: actor25,
+            scope: scope25,
+        })
+        .await;
+        chat25.unmetered = true;
+        let (id25, _) = chat25.submit("unmetered-schema25", "a", 1).await;
+        let _worker25 = chat25.start(&server).await;
+        chat25.done(&id25, "failed", Some("step_failed")).await;
+        assert!(server.requests.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -2818,7 +2851,7 @@ mod live_turns {
             "tokens_per_attachment": 10
         });
         catalog["models"]["a"]["cost_bound"] = json!({
-            "fixed_micros": 0,
+            "fixed_micros": i64::MAX,
             "micros_per_token": 1
         });
         doc["catalog_file"] =

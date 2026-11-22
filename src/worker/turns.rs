@@ -504,35 +504,20 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                         .fetch_one(&mut *c)
                         .await
                         .map_err(|_| FAILED)?;
-                        if has_guard {
-                            sqlx::query(
-                                "SELECT openmettle.quota_authorize_unmetered_turn_round(
-                                     $1::uuid, $2::uuid, $3::uuid
-                                 )",
-                            )
-                            .bind(&run.claim.scope_id)
-                            .bind(&run.claim.run_id)
-                            .bind(&run.claim.claim_token)
-                            .execute(&mut *c)
-                            .await
-                            .map_err(|_| FAILED)?;
-                        } else {
-                            let blocked: bool = sqlx::query_scalar(
-                                "SELECT (SELECT metering_enforced FROM openmettle.quota_enforcement WHERE id)
-                                     OR EXISTS (
-                                         SELECT 1 FROM openmettle.quota_reservations
-                                          WHERE scope_id = $1::uuid AND run_id = $2::uuid
-                                     )",
-                            )
-                            .bind(&run.claim.scope_id)
-                            .bind(&run.claim.run_id)
-                            .fetch_one(&mut *c)
-                            .await
-                            .map_err(|_| FAILED)?;
-                            if blocked {
-                                return Err(FAILED);
-                            }
+                        if !has_guard {
+                            return Err(FAILED);
                         }
+                        sqlx::query(
+                            "SELECT openmettle.quota_authorize_unmetered_turn_round(
+                                 $1::uuid, $2::uuid, $3::uuid
+                             )",
+                        )
+                        .bind(&run.claim.scope_id)
+                        .bind(&run.claim.run_id)
+                        .bind(&run.claim.claim_token)
+                        .execute(&mut *c)
+                        .await
+                        .map_err(|_| FAILED)?;
                     }
                 }
                 route
