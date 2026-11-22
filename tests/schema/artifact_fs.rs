@@ -1007,12 +1007,24 @@ async fn worker_binary_sweeps_with_and_without_payloads_and_recovers_after_signa
         ids = expired_runs(&f, &mut lock, sig).await;
         tokio::time::timeout(Duration::from_secs(8), async {
             loop {
-                let waiting: bool = sqlx::query_scalar("SELECT EXISTS (SELECT FROM pg_stat_activity WHERE datname = current_database() AND usename = 'openmettle_worker' AND wait_event_type = 'Lock' AND query LIKE '%WITH due AS MATERIALIZED%')")
-                    .fetch_one(&mut f.db.admin().await).await.unwrap();
-                if waiting { break }
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                        SELECT FROM pg_stat_activity p JOIN pg_locks l ON l.pid = p.pid
+                        WHERE p.datname = current_database() AND p.usename = 'openmettle_worker'
+                          AND p.wait_event_type = 'Lock' AND NOT l.granted
+                          AND l.relation = 'openmettle.runs'::regclass)",
+                )
+                .fetch_one(&mut f.db.admin().await)
+                .await
+                .unwrap();
+                if waiting {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         signal(&process.0, sig);
         lock.commit().await.unwrap();
         let status = process.0.wait().unwrap();

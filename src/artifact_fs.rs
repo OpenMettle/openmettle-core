@@ -4,6 +4,9 @@ pub mod adoption;
 mod drift;
 pub use drift::{Drift, verify_accounting_drift};
 mod reclaim;
+mod spill;
+pub(crate) use spill::configure_slots;
+pub use spill::{SpillContext, publish_bytes};
 mod staging;
 mod volume;
 use crate::{
@@ -111,7 +114,7 @@ pub struct Store {
     volume: Arc<Volume>,
     pool: Arc<OnceLock<PgPool>>,
     purge_pass: Arc<tokio::sync::Mutex<reclaim::AnchorPass>>,
-    expiry_pass: Arc<[tokio::sync::Mutex<reclaim::AnchorPass>; 4]>,
+    expiry_pass: Arc<[tokio::sync::Mutex<reclaim::AnchorPass>; 5]>,
     staging_pass: Arc<tokio::sync::Mutex<staging::StagingSweepState>>,
     anchor_pass: Arc<[tokio::sync::Mutex<reclaim::AnchorPass>; 2]>,
 }
@@ -173,6 +176,10 @@ impl Store {
         Ok(None)
     }
     async fn stage(&self, reservation: &str) -> Result<Staged, Error> {
+        self.create_stage(reservation, false)
+    }
+
+    fn create_stage(&self, reservation: &str, exclusive: bool) -> Result<Staged, Error> {
         runs::uuid(reservation)?;
         self.volume.recheck()?;
         let f = at::openat(
@@ -189,7 +196,12 @@ impl Store {
             }
         })?;
         let f = fs::File::from(f);
-        f.try_lock_shared().map_err(|_| Error::InProgress)?;
+        if exclusive {
+            f.try_lock()
+        } else {
+            f.try_lock_shared()
+        }
+        .map_err(|_| Error::InProgress)?;
         let ino = f.metadata()?.ino();
         self.volume
             .matches(&f, &self.volume.staging, reservation, ino)?;
@@ -673,7 +685,7 @@ async fn lock_writer(
     Ok(())
 }
 async fn abort(pool: &PgPool, store: &Store, scope: &str, id: &str, error: Error) -> Error {
-    let _ = reclaim::release(pool, store, scope, id, None).await;
+    let _ = reclaim::release(pool, store, scope, id, None, false).await;
     error
 }
 fn batch(limit: i64) -> Result<(), Error> {
@@ -702,6 +714,6 @@ async fn sweep_items<T, F: Future<Output = Result<bool, Error>>>(
     first_error.map_or(Ok(count), Err)
 }
 
-pub use reclaim::{purge_due, reconcile_expired};
+pub use reclaim::{purge_due, reconcile_expired, reconcile_run_spills};
 #[cfg(test)]
 mod tests;

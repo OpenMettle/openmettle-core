@@ -12,6 +12,7 @@ pub mod capabilities;
 pub mod grants;
 pub mod invitation;
 pub mod login;
+pub mod mcp;
 pub mod membership;
 pub mod migrate;
 pub mod model_config;
@@ -495,6 +496,10 @@ pub async fn run(role: Role) -> u8 {
     // or the listener opens, with the offline check's fixed category line (ADRs 0015, 0025).
     let pool = pool(&config);
     if let Some(store) = &artifacts {
+        if matches!(role, Role::Worker) && store.probe_writable().is_err() {
+            eprintln!("configuration error: invalid ARTIFACTS_DIR");
+            return 78;
+        }
         store.attach(&pool);
         // Liveness is available during DB outages. Each operation rechecks the pin before use.
         if let Ok(Err(artifact_fs::Error::Io | artifact_fs::Error::Missing)) = tokio::time::timeout(

@@ -185,7 +185,7 @@ pub enum EffectClass {
     Read,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "support")]
 pub enum EndpointKey {
     Supported {
@@ -201,7 +201,7 @@ pub enum EndpointKey {
 
 /// Supplied by trusted server code for the exact tool, schema, destination and resource.
 /// Unavailable policy, an unpinned destination, or an unsupported quota returns no review.
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
 pub struct Review {
     pub class: EffectClass,
     pub capability: String,
@@ -217,7 +217,7 @@ pub struct Review {
     pub reservation: Option<StorageReservation>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageReservation {
     pub id: String,
     pub required_bytes: i64,
@@ -550,7 +550,7 @@ const RUN: &str = "SELECT actor_user_id::text, actor_approval_id::text, conversa
 
 const REQUEST: &str = "SELECT a.id::text, a.logical_key,a.tool_id,a.tool_version,a.canonical_arguments,
     a.destination,a.authority_evidence,a.binding_digest,(extract(epoch FROM a.approval_expires_at)*1000000)::bigint AS expires,
-    d.decision,d.deciding_session_id, EXISTS(SELECT FROM openmettle.operations o
+    d.decision,d.binding_digest AS decision_digest,d.deciding_session_id, EXISTS(SELECT FROM openmettle.operations o
          WHERE o.run_id=a.run_id AND o.logical_key=a.logical_key) AS consumed
     FROM openmettle.run_approvals a LEFT JOIN openmettle.run_approval_decisions d ON d.approval_id=a.id
     WHERE a.run_id=$1::uuid AND a.id=$2::uuid";
@@ -627,7 +627,10 @@ async fn authorized(
             name: &review.capability,
             gate: review.gate,
         }],
-        extra_target: p.artifact.map(|id| (ResourceKind::Artifact, id)),
+        extra_target: p
+            .artifact
+            .filter(|_| review.class != EffectClass::Read)
+            .map(|id| (ResourceKind::Artifact, id)),
         now_ms: snap.now / 1000,
     };
     if let RunContinuation::Invalidate(reason) =
@@ -635,7 +638,33 @@ async fn authorized(
     {
         return Err(StoreError::Denied(reason));
     }
+    if let Some(id) = p.artifact.filter(|_| review.class == EffectClass::Read) {
+        readable_artifact(c, s, id, snap.now / 1000).await?;
+    }
     Ok(snap)
+}
+
+async fn readable_artifact(
+    c: &mut PgConnection,
+    s: &Subject<'_>,
+    id: &str,
+    ms: i64,
+) -> Result<(), StoreError> {
+    let actor = store::hydrate_worker_principal(c, s.actor, s.approval, ms)
+        .await?
+        .ok_or(DENIED)?;
+    let scope = runs::run_scope(c, s.scope, ms).await?.ok_or(HIDDEN)?;
+    let artifact = projects::hydrate_resource(c, ResourceKind::Artifact, id, ms)
+        .await?
+        .ok_or(HIDDEN)?;
+    if !super::same_scope(&artifact.scope, &scope) {
+        return Err(HIDDEN);
+    }
+    store::check(super::authorize_resource(
+        &actor,
+        &artifact,
+        super::Action::Read,
+    ))
 }
 
 fn automatic(row: &PgRow, snap: &Snapshot) -> Result<bool, StoreError> {
@@ -1315,12 +1344,64 @@ pub enum IntentResult {
 pub struct CommittedIntent {
     pub operation_id: String,
     request: Vec<u8>,
-    deadline: Instant,
+    effect_deadline: Instant,
+    lease_margin_deadline: Instant,
 }
+
+pub enum StartPermit {
+    Stopped(crate::worker::Stop),
+    AuthorityExpired {
+        operation_id: String,
+        request: Vec<u8>,
+    },
+    LeaseMarginExhausted,
+    Ready {
+        request: Vec<u8>,
+        deadline: Instant,
+    },
+}
+
 impl CommittedIntent {
-    pub fn start(self, step: &StepContext) -> Option<(Vec<u8>, Instant)> {
-        let until = self.deadline.min(step.deadline);
-        (step.stop.borrow().is_none() && Instant::now() < until).then_some((self.request, until))
+    fn new(
+        id: String,
+        request: Vec<u8>,
+        sent: Instant,
+        remaining_us: i64,
+        held: &leases::Held,
+        settings: &LeaseSettings,
+    ) -> Self {
+        Self {
+            operation_id: id,
+            request,
+            effect_deadline: sent + Duration::from_micros(remaining_us.max(0) as u64),
+            lease_margin_deadline: sent
+                + held
+                    .lease_remaining
+                    .min(held.execution_remaining)
+                    .saturating_sub(settings.lease / 3),
+        }
+    }
+
+    pub fn start(self, step: &StepContext) -> StartPermit {
+        let now = Instant::now();
+        if let Some(stop) = *step.stop.borrow() {
+            StartPermit::Stopped(stop)
+        } else if now >= self.effect_deadline {
+            StartPermit::AuthorityExpired {
+                operation_id: self.operation_id,
+                request: self.request,
+            }
+        } else if now >= self.lease_margin_deadline.min(step.deadline) {
+            StartPermit::LeaseMarginExhausted
+        } else {
+            StartPermit::Ready {
+                request: self.request,
+                deadline: self
+                    .effect_deadline
+                    .min(self.lease_margin_deadline)
+                    .min(step.deadline),
+            }
+        }
     }
 }
 
@@ -1380,11 +1461,57 @@ pub(crate) async fn pending_effect(
         .transpose()
 }
 const INSERT_INTENT: &str = "INSERT INTO openmettle.operations
-                (scope_id,run_id,logical_key,target,capability,format,format_version,request,request_identity,request_digest,approval_id)
-                SELECT $5::uuid,$11::uuid,$12,$13,$14,'openmettle.effect',1,$15,$16,$17,$18::uuid FROM snap,t,openmettle.runs r
+                (scope_id,run_id,logical_key,target,capability,format,format_version,request,request_identity,request_digest,approval_id,dispatched_attempts,effective_expires_us)
+                SELECT $5::uuid,$11::uuid,$12,$13,$14,'openmettle.effect',1,$15,$16,$17,$18::uuid,CASE WHEN $14='repeatable_read' THEN 0 END,$20 FROM snap,t,openmettle.runs r
                 WHERE r.id=$11::uuid AND r.state='running' AND r.cancel_reason IS NULL AND r.claim_token=$19::uuid
                 AND r.lease_expires_at>t.at AND r.execution_expires_at>t.at AND now_us<$20 AND base=$21 AND tool=$22
                 AND (NOT $23 OR (eligible AND yolo=$24)) RETURNING id::text";
+
+async fn committed_binding(
+    c: &mut PgConnection,
+    s: &Subject<'_>,
+    p: &Proposal,
+    approval: Option<&str>,
+    old: &PgRow,
+) -> Result<(String, Binding, Review), StoreError> {
+    let bytes: &[u8] = old.try_get("request")?;
+    let envelope: Value = unique(bytes).map_err(|_| CONFLICT)?;
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let basis = &envelope["authorization"];
+    let evidence = STANDARD
+        .decode(basis["authority"].as_str().ok_or(CONFLICT)?)
+        .map_err(|_| CONFLICT)?;
+    let expires = basis["expires_us"].as_i64().ok_or(CONFLICT)?;
+    let binding = Binding {
+        hash: p.binding(s, expires, &evidence),
+        expires,
+        evidence,
+    };
+    let review: Review =
+        serde_json::from_value(envelope["endpoint"].clone()).map_err(|_| CONFLICT)?;
+    let capability: &str = old.try_get("capability")?;
+    if review.capability_class() != capability {
+        return Err(CONFLICT);
+    }
+    let rebuilt = binding.envelope(p, s, &review, approval)?;
+    let intent = Intent {
+        scope: s.scope,
+        run: s.run.ok_or(INVALID)?,
+        key: &p.logical_key,
+        target: &p.destination,
+        capability,
+        request: Payload {
+            format: "openmettle.effect",
+            version: 1,
+            bytes: &rebuilt,
+        },
+    };
+    let id = durable::intent_identity(&intent)?;
+    let op = durable::existing_intent(c, &intent, approval, &id)
+        .await?
+        .ok_or(CONFLICT)?;
+    Ok((op, binding, review))
+}
 
 /// Record or inspect one exact logical effect. A missing commit reply grants no send permit.
 pub async fn record_fenced_intent(
@@ -1418,42 +1545,7 @@ pub async fn record_fenced_intent(
         .fetch_optional(&mut *c)
         .await?
         {
-            let bytes: &[u8] = old.try_get("request")?;
-            let envelope: Value = unique(bytes).map_err(|_| CONFLICT)?;
-            use base64::{Engine, engine::general_purpose::STANDARD};
-            let basis = &envelope["authorization"];
-            let evidence = STANDARD
-                .decode(basis["authority"].as_str().ok_or(CONFLICT)?)
-                .map_err(|_| CONFLICT)?;
-            let expires = basis["expires_us"].as_i64().ok_or(CONFLICT)?;
-            let binding = Binding {
-                hash: p.binding(&s, expires, &evidence),
-                expires,
-                evidence,
-            };
-            let review: Review = serde_json::from_value(envelope["endpoint"].clone())
-                .map_err(|_| CONFLICT)?;
-            let capability: &str = old.try_get("capability")?;
-            if review.capability_class() != capability {
-                return Err(CONFLICT);
-            }
-            let rebuilt = binding.envelope(p, &s, &review, approval)?;
-            let intent = Intent {
-                scope: s.scope,
-                run: lease.run_id,
-                key: &p.logical_key,
-                target: &p.destination,
-                capability,
-                request: Payload {
-                    format: "openmettle.effect",
-                    version: 1,
-                    bytes: &rebuilt,
-                },
-            };
-            let id = durable::intent_identity(&intent)?;
-            let op = durable::existing_intent(c, &intent, approval, &id)
-                .await?
-                .ok_or(CONFLICT)?;
+            let (op, _, _) = committed_binding(c, &s, p, approval, &old).await?;
             return Ok(IntentResult::Replayed(op));
         }
         let pointer: Option<&str> = r.try_get("approval_wait_id")?;
@@ -1549,18 +1641,7 @@ pub async fn record_fenced_intent(
                 .ok_or(DENIED)?;
             let op: String = row.try_get("id")?;
             durable::intent_event(c, &intent, &op, &id).await?;
-            let margin = settings.lease / 3;
-            let remaining =
-                Duration::from_micros((effective_until - snap.now).max(0) as u64).min(
-                    held.lease_remaining
-                        .min(held.execution_remaining)
-                        .saturating_sub(margin),
-                );
-            Ok(IntentResult::Applied(CommittedIntent {
-                operation_id: op,
-                request: bytes,
-                deadline: sent + remaining,
-            }))
+            Ok(IntentResult::Applied(CommittedIntent::new(op, bytes, sent, effective_until - snap.now, held, settings)))
         }
         .await;
         match (attempt, expiry) {
@@ -1571,6 +1652,441 @@ pub async fn record_fenced_intent(
         }
     })
     .await
+}
+
+/// Only a separately committed read attempt can grant a replay dispatch permit.
+pub enum ReplayEffect {
+    Pending,
+    Handoff,
+    Ready(CommittedIntent),
+    Observed {
+        succeeded: bool,
+        output: Option<String>,
+    },
+    Invalidated(Settled),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum ReplayAction {
+    Inspect,
+    PrepareSpill,
+    StartRead,
+    RefreshUnstarted,
+}
+
+pub async fn recheck_replay_effect_authority(
+    c: &mut PgConnection,
+    lease: &Lease<'_>,
+    operation: &str,
+    proposal: &Proposal,
+    settings: &LeaseSettings,
+    policy: &impl EffectPolicy,
+) -> Result<ReplayEffect, LeaseError> {
+    check_operation(
+        c,
+        lease,
+        operation,
+        proposal,
+        settings,
+        policy,
+        ReplayAction::Inspect,
+    )
+    .await
+}
+
+pub async fn start_replayed_read(
+    c: &mut PgConnection,
+    lease: &Lease<'_>,
+    operation: &str,
+    proposal: &Proposal,
+    settings: &LeaseSettings,
+    policy: &impl EffectPolicy,
+) -> Result<ReplayEffect, LeaseError> {
+    check_operation(
+        c,
+        lease,
+        operation,
+        proposal,
+        settings,
+        policy,
+        ReplayAction::StartRead,
+    )
+    .await
+}
+
+pub(crate) async fn expire_unstarted_intent(
+    c: &mut PgConnection,
+    lease: &Lease<'_>,
+    operation: &str,
+    proposal: &Proposal,
+    settings: &LeaseSettings,
+    policy: &impl EffectPolicy,
+) -> Result<ReplayEffect, LeaseError> {
+    check_operation(
+        c,
+        lease,
+        operation,
+        proposal,
+        settings,
+        policy,
+        ReplayAction::RefreshUnstarted,
+    )
+    .await
+}
+
+async fn active_revision(
+    c: &mut PgConnection,
+    s: &Subject<'_>,
+    artifact: &str,
+    revision: &str,
+) -> Result<(), StoreError> {
+    if !crate::storage::read_revision(c, artifact, revision)
+        .await?
+        .is_some_and(|r| r.scope_id == s.scope && r.state == "active")
+    {
+        return Err(HIDDEN);
+    }
+    Ok(())
+}
+
+async fn invalidate_post_intent(
+    tx: &mut durable::WriteTransaction<'_>,
+    lease: &Lease<'_>,
+    settings: &LeaseSettings,
+    op: &PgRow,
+    expires: i64,
+) -> Result<ReplayEffect, StoreError> {
+    let capability: &str = op.try_get("capability")?;
+    let outcome: &str = op.try_get("outcome")?;
+    let attempts: Option<i32> = op.try_get("dispatched_attempts")?;
+    let ambiguous = capability != "repeatable_read"
+        && (outcome == "outcome_unknown" || (outcome == "intent" && attempts != Some(0)));
+    let id: &str = op.try_get("id")?;
+    if outcome == "intent" && (!ambiguous || capability == "non_repeatable") {
+        durable::record_observation(
+            tx,
+            &durable::Observation {
+                scope: lease.scope_id,
+                run: lease.run_id,
+                operation: id,
+                key: &format!("invalidated:{id}"),
+                expected_revision: 0,
+                outcome: if ambiguous {
+                    "outcome_unknown"
+                } else {
+                    "failed"
+                },
+                handle: None,
+                evidence: event(
+                    "openmettle.effect-invalidated",
+                    br#"{"reason":"authority_invalid"}"#,
+                ),
+            },
+        )
+        .await?;
+    }
+    let c = tx.connection()?;
+    let now = sqlx::query_scalar::<_,i64>("SELECT (extract(epoch FROM clock_timestamp())*1000000)::bigint
+        FROM openmettle.runs WHERE id=$1::uuid AND scope_id=$2::uuid AND state='running'
+        AND claim_token=$3::uuid AND cancel_reason IS NULL AND least(lease_expires_at,execution_expires_at)>clock_timestamp()")
+        .bind(lease.run_id).bind(lease.scope_id).bind(lease.claim_token).fetch_optional(&mut *c).await?
+        .ok_or(StoreError::Conflict("expired effect claim"))?;
+    let expired = now >= expires;
+    let (cancel, input) = if expired && !ambiguous {
+        (
+            None,
+            leases::Settle::Failed(leases::FailReason::ApprovalExpired),
+        )
+    } else {
+        if !expired {
+            sqlx::query("UPDATE openmettle.runs SET cancel_reason='revoked' WHERE id=$1::uuid")
+                .bind(lease.run_id)
+                .execute(&mut *c)
+                .await?;
+        }
+        (
+            (!expired).then_some(CancelReason::Revoked),
+            leases::Settle::Stopped,
+        )
+    };
+    Ok(ReplayEffect::Invalidated(
+        leases::settle_locked(
+            c,
+            lease,
+            leases::ExecState::Running,
+            cancel,
+            settings,
+            input,
+        )
+        .await?,
+    ))
+}
+
+/// The base and tool components of ADR 0035 evidence contain the exact mapped
+/// observations used at admission. Look up only these cycles when classifying expiry.
+fn bound_observations(binding: &Binding) -> Result<Vec<String>, StoreError> {
+    let mut bytes = binding
+        .evidence
+        .strip_prefix(b"openmettle/effect-authority/1\0")
+        .ok_or(CONFLICT)?;
+    let mut cycles = Vec::new();
+    for _ in 0..2 {
+        let (len, rest) = bytes.split_at_checked(8).ok_or(CONFLICT)?;
+        let len = usize::try_from(u64::from_be_bytes(len.try_into().map_err(|_| CONFLICT)?))
+            .map_err(|_| CONFLICT)?;
+        let (field, rest) = rest.split_at_checked(len).ok_or(CONFLICT)?;
+        bytes = rest;
+        let field: Value = serde_json::from_slice(field).map_err(|_| CONFLICT)?;
+        for observation in field[3].as_array().ok_or(CONFLICT)? {
+            cycles.push(
+                observation["change_id"]
+                    .as_str()
+                    .ok_or(CONFLICT)?
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(cycles)
+}
+
+async fn observed_output(
+    c: &mut PgConnection,
+    s: &Subject<'_>,
+    op: &PgRow,
+    ms: i64,
+) -> Result<Option<String>, StoreError> {
+    if op.try_get::<Option<&str>, _>("observation_format")? != Some(crate::mcp::RESULT_FORMAT) {
+        return Ok(None);
+    }
+    let bytes: &[u8] = op.try_get("evidence")?;
+    if bytes.len() > crate::mcp::INLINE_BYTES || op.try_get::<i32, _>("observation_version")? != 1 {
+        return Err(CONFLICT);
+    }
+    let outcome: &str = op.try_get("outcome")?;
+    let result = unique(bytes).map_err(|_| CONFLICT)?;
+    if (outcome == "failed" && result["status"] != "tool_error")
+        || (outcome == "succeeded" && result["status"] != "ok")
+    {
+        return Err(CONFLICT);
+    }
+    if result["storage"] == "spilled" {
+        let provenance = &result["provenance"];
+        let artifact = provenance["artifact_id"].as_str().ok_or(CONFLICT)?;
+        let revision = provenance["revision_id"].as_str().ok_or(CONFLICT)?;
+        let operation: &str = op.try_get("id")?;
+        if provenance["operation_id"] != operation {
+            return Err(CONFLICT);
+        }
+        readable_artifact(c, s, artifact, ms).await?;
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT FROM openmettle.artifact_revisions r
+            JOIN openmettle.storage_reservations sr ON sr.id=r.reservation_id AND sr.scope_id=r.scope_id
+            WHERE r.scope_id=$1::uuid AND r.artifact_id=$2::uuid AND r.id=$3::uuid AND r.state='active'
+            AND sr.run_id=$4::uuid AND sr.operation_id=$5::uuid AND sr.state='settled'
+            AND sr.idempotency_key LIKE 'tool-spill:%')").bind(s.scope).bind(artifact).bind(revision)
+            .bind(s.run).bind(operation).fetch_one(c).await?;
+        if !exists {
+            return Err(HIDDEN);
+        }
+    }
+    Ok(Some(
+        std::str::from_utf8(bytes).map_err(|_| CONFLICT)?.to_owned(),
+    ))
+}
+
+pub(crate) async fn check_operation(
+    c: &mut PgConnection,
+    lease: &Lease<'_>,
+    operation: &str,
+    p: &Proposal,
+    settings: &LeaseSettings,
+    policy: &impl EffectPolicy,
+    action: ReplayAction,
+) -> Result<ReplayEffect, LeaseError> {
+    settings.validate()?;
+    let sent = Instant::now();
+    leases::fenced(c, lease, Fence::Step, async |tx, held| {
+        let c = tx.connection()?;
+        let r = sqlx::query(RUN)
+            .bind(lease.run_id)
+            .bind(lease.scope_id)
+            .fetch_one(&mut *c)
+            .await?;
+        let s = subject(&r, lease.scope_id, lease.run_id)?;
+        let op = sqlx::query("SELECT id::text, request,capability,approval_id::text,dispatched_attempts,
+                effective_expires_us,outcome,observation_format,observation_version,evidence
+                FROM openmettle.operations WHERE scope_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid FOR UPDATE")
+                .bind(s.scope).bind(lease.run_id).bind(operation).fetch_optional(&mut *c).await?.ok_or(CONFLICT)?;
+        let approval: Option<&str> = op.try_get("approval_id")?;
+        let (id, committed, endpoint) = committed_binding(c, &s, p, approval, &op).await?;
+        if id != operation {
+            return Err(CONFLICT);
+        }
+        let decision = sqlx::query(REQUEST)
+            .bind(lease.run_id)
+            .bind(approval)
+            .fetch_optional(&mut *c)
+            .await?;
+        let decider = decision
+            .as_ref()
+            .and_then(|d| d.get::<Option<&str>, _>("deciding_session_id"));
+        // Keep naturally expired sessions visible even when the live AUTH snapshot disappears.
+        let mut bound: i64 = sqlx::query_scalar("SELECT least($1::bigint,$2::bigint,
+                (SELECT min(least(ls.expires_ms,a.expires_ms))*1000 FROM openmettle.local_sessions ls
+                 JOIN openmettle.local_identity_approvals a ON a.id=ls.approval_id
+                 WHERE ls.id IN ($3,$4) AND NOT ls.revoked AND a.active),
+                (SELECT min(least(m.expires_ms,m.issued_ms+1000::bigint*m.max_age_seconds))*1000
+                 FROM openmettle.membership_observations m WHERE m.enabled AND (m.observation).state='present'
+                 AND (m.observation).change_id::text=ANY($5::text[])))")
+                .bind(committed.expires).bind(op.try_get::<Option<i64>,_>("effective_expires_us")?)
+                .bind(s.session).bind(decider).bind(bound_observations(&committed)?).fetch_one(&mut *c).await?;
+        let authority = async {
+                let review = reviewed(policy, &s, p).map_err(|error| match error {
+                    StoreError::Database(_) => error,
+                    _ => DENIED,
+                })?;
+                if let EndpointKey::Supported { expires_us, .. } = review.endpoint_key {
+                    bound = bound.min(expires_us);
+                }
+                if review != endpoint || review.reservation.is_some() {
+                    return Err(DENIED);
+                }
+                if approval.is_some() {
+                    let receipt = decision.as_ref().ok_or(DENIED)?;
+                    if receipt.try_get::<Option<&str>, _>("decision")? != Some("approve")
+                        || decider.is_none()
+                        || !committed.matches(p, receipt)?
+                        || receipt.try_get::<Option<&[u8]>, _>("decision_digest")? != Some(&committed.hash)
+                    {
+                        return Err(DENIED);
+                    }
+                }
+                let proof = proof(&s, &review, decider);
+                let snap = authorized(c, &proof, &review).await?;
+                bound = bound.min(validity(&snap, &review));
+                let auto = approval.is_none() && review.class != EffectClass::Read;
+                if auto {
+                    let actor = store::hydrate_worker_principal(c, s.actor, s.approval, snap.now / 1000)
+                        .await?
+                        .ok_or(DENIED)?;
+                    if review.class != EffectClass::EligibleWrite
+                        || !automatic(&r, &snap)?
+                        || !authorize_capability(
+                            &actor,
+                            &store::load_platform_capabilities(c).await?,
+                            YOLO,
+                            CapabilityGate::OptIn,
+                        )
+                        .is_allowed()
+                    {
+                        return Err(DENIED);
+                    }
+                }
+                let live = Binding::new(p, &s, &snap, &review, committed.expires, auto)?;
+                if snap.now >= bound || live.hash != committed.hash || live.evidence != committed.evidence {
+                    return Err(DENIED);
+                }
+                let outcome: &str = op.try_get("outcome")?;
+                if outcome == "succeeded" && p.tool == crate::mcp::READ_RANGE {
+                    active_revision(
+                        c,
+                        &s,
+                        review.artifact.as_deref().ok_or(DENIED)?,
+                        p.arguments["revision_id"].as_str().ok_or(DENIED)?,
+                    )
+                    .await?;
+                }
+                let observed = matches!(outcome, "succeeded" | "failed");
+                let output = if observed {
+                    observed_output(c, &s, &op, snap.now / 1000).await?
+                } else {
+                    None
+                };
+                let attempts: Option<i32> = op.try_get("dispatched_attempts")?;
+                let start = action == ReplayAction::StartRead && !observed;
+                if start && (review.class != EffectClass::Read || outcome != "intent") {
+                    return Err(CONFLICT);
+                }
+                let increment = start && attempts.is_some_and(|n| n < 3);
+                if increment
+                    && sent
+                        + held
+                            .lease_remaining
+                            .min(held.execution_remaining)
+                            .saturating_sub(settings.lease / 3)
+                        <= Instant::now()
+                {
+                    return Ok(Some(ReplayEffect::Handoff));
+                }
+                let guard = "FROM snap,t,openmettle.runs r WHERE r.id=$11::uuid AND r.state='running'
+                            AND r.cancel_reason IS NULL AND r.claim_token=$12::uuid AND least(r.lease_expires_at,r.execution_expires_at)>t.at
+                            AND snap.now_us<$13 AND snap.base=$14 AND snap.tool=$15 AND (NOT $16 OR (snap.eligible AND snap.yolo=$17))";
+                let sql = if increment {
+                    format!("{AUTH} UPDATE openmettle.operations o SET dispatched_attempts=o.dispatched_attempts+1 {guard}
+                                AND o.id=$18::uuid AND o.run_id=r.id AND o.outcome='intent' AND o.capability='repeatable_read' AND o.dispatched_attempts<3 RETURNING snap.now_us")
+                } else {
+                    format!("{AUTH} SELECT snap.now_us {guard}")
+                };
+                let mut q = proof
+                    .query(&sql)
+                    .bind(lease.claim_token)
+                    .bind(bound)
+                    .bind(&snap.base)
+                    .bind(&snap.tool)
+                    .bind(auto)
+                    .bind(&snap.yolo);
+                if increment {
+                    q = q.bind(operation);
+                }
+                let now: i64 = q
+                    .fetch_optional(&mut *c)
+                    .await?
+                    .ok_or(DENIED)?
+                    .try_get("now_us")?;
+                if observed {
+                    return Ok(Some(ReplayEffect::Observed {
+                        succeeded: outcome == "succeeded",
+                        output,
+                    }));
+                }
+                if start && !increment {
+                    return Ok(None);
+                }
+                if !increment && action != ReplayAction::RefreshUnstarted {
+                    return Ok(Some(ReplayEffect::Pending));
+                }
+                Ok(Some(ReplayEffect::Ready(CommittedIntent::new(
+                    id,
+                    op.try_get("request")?,
+                    sent,
+                    bound - now,
+                    held,
+                    settings,
+                ))))
+            }.await;
+        match authority {
+            Ok(Some(result)) => Ok(result),
+            Ok(None) => {
+                let output = crate::mcp::ToolFault::Transient.envelope();
+                crate::mcp::observe(tx, lease, operation, false, &output).await?;
+                Ok(ReplayEffect::Observed {
+                    succeeded: false,
+                    output: Some(output),
+                })
+            }
+            Err(StoreError::Denied(_) | StoreError::NotFound) => {
+                // Publication has a known response in hand. Record that write before
+                // settling the run, so revocation cannot turn success into uncertainty.
+                if action == ReplayAction::PrepareSpill
+                    && op.try_get::<&str, _>("outcome")? == "intent"
+                    && op.try_get::<&str, _>("capability")? != "repeatable_read"
+                {
+                    return Err(DENIED);
+                }
+                invalidate_post_intent(tx, lease, settings, &op, bound).await
+            }
+            Err(error) => Err(error),
+        }
+    }).await
 }
 
 #[cfg(test)]

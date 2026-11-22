@@ -47,6 +47,7 @@ pub(super) async fn release(
     scope: &str,
     id: &str,
     age: Option<i64>,
+    spill: bool,
 ) -> Result<bool, Error> {
     runs::uuid(id)?;
     let Some(pin) = store.prepare(pool, false).await? else {
@@ -62,21 +63,26 @@ pub(super) async fn release(
     .fetch_one(claim.connection()?)
     .await?;
     if let Some(run) = &run {
-        let ok=sqlx::query("SELECT FROM openmettle.runs WHERE id=$1::uuid AND state IN ('succeeded','failed','interrupted','cancelled')
-            AND NOT EXISTS (SELECT FROM openmettle.operations WHERE run_id=$1::uuid AND outcome IN ('intent','outcome_unknown'))
-            FOR NO KEY UPDATE SKIP LOCKED").bind(run).fetch_optional(claim.connection()?).await?;
+        let ok=sqlx::query("SELECT FROM openmettle.runs r WHERE id=$1::uuid AND (
+            ($2 AND EXISTS (SELECT FROM openmettle.storage_reservations sr JOIN openmettle.operations o
+                ON o.id=sr.operation_id AND o.run_id=r.id AND o.scope_id=r.scope_id
+                WHERE sr.id=$3::uuid AND o.outcome IN ('succeeded','failed'))
+                AND NOT EXISTS (SELECT FROM openmettle.artifact_revisions WHERE reservation_id=$3::uuid))
+            OR (NOT $2 AND state IN ('succeeded','failed','interrupted','cancelled')
+                AND NOT EXISTS (SELECT FROM openmettle.operations WHERE run_id=r.id AND outcome IN ('intent','outcome_unknown'))))
+            FOR NO KEY UPDATE SKIP LOCKED").bind(run).bind(spill).bind(id).fetch_optional(claim.connection()?).await?;
         if ok.is_none() {
             return Ok(false);
         }
     }
     let row=sqlx::query("SELECT reclaim_state,payload_ino::text,gen_random_uuid()::text AS token
         FROM openmettle.storage_reservations WHERE scope_id=$1::uuid AND id=$2::uuid AND state='reserved'
-        AND NOT adoption_unverified AND (operation_id IS NULL OR idempotency_key NOT LIKE 'tool-spill:%')
+        AND NOT adoption_unverified AND (operation_id IS NOT NULL AND idempotency_key LIKE 'tool-spill:%')=$4
         AND (reclaim_state='none' OR reclaim_lease_until<=clock_timestamp())
-        AND ($3::bigint IS NULL OR coalesce(lease_expires_at, greatest(created_at,
+        AND (CASE WHEN $4 THEN created_at + $3::bigint * interval '1 millisecond' <= clock_timestamp() ELSE ($3::bigint IS NULL OR coalesce(lease_expires_at, greatest(created_at,
             (SELECT coalesce(r.execution_expires_at,r.queue_expires_at,r.created_at) FROM openmettle.runs r WHERE r.id=run_id))
-            + $3 * interval '1 millisecond')<=clock_timestamp())
-        FOR UPDATE SKIP LOCKED").bind(scope).bind(id).bind(age).fetch_optional(claim.connection()?).await?;
+            + $3 * interval '1 millisecond')<=clock_timestamp()) END)
+        FOR UPDATE SKIP LOCKED").bind(scope).bind(id).bind(age).bind(spill).fetch_optional(claim.connection()?).await?;
     let Some(row) = row else { return Ok(false) };
     let truncated = row.get::<String, _>("reclaim_state") == "truncated";
     let token: String = row.get("token");
@@ -489,7 +495,28 @@ pub async fn reconcile_expired(
     Ok(count)
 }
 
-// Keep four separate cursors because the partial indexes have different keys and predicates.
+/// Reclaim only old, operation-bound tool spills after their outcome is known.
+pub async fn reconcile_run_spills(
+    pool: &PgPool,
+    store: &Store,
+    older_than: Duration,
+    limit: i64,
+) -> Result<usize, Error> {
+    batch(limit)?;
+    if store.prepare(pool, false).await?.is_none() {
+        return Ok(0);
+    }
+    expiry_page(
+        pool,
+        store,
+        4,
+        i64::try_from(older_than.as_millis()).map_err(|_| Error::Io)?,
+        limit,
+    )
+    .await
+}
+
+// Each expiry partition has its own keyset cursor and fixed pass watermark.
 async fn expiry_page(
     pool: &PgPool,
     store: &Store,
@@ -497,13 +524,21 @@ async fn expiry_page(
     age: i64,
     limit: i64,
 ) -> Result<usize, Error> {
+    let spill = partition == 4;
     let legacy = partition % 2 == 1;
-    let (column, expiry) = if legacy {
+    let (column, expiry) = if spill {
+        (
+            "created_at",
+            "operation_id IS NOT NULL AND idempotency_key LIKE 'tool-spill:%'",
+        )
+    } else if legacy {
         ("created_at", "lease_expires_at IS NULL")
     } else {
         ("lease_expires_at", "lease_expires_at IS NOT NULL")
     };
-    let run = if partition < 2 {
+    let run = if spill {
+        "run_id IS NOT NULL"
+    } else if partition < 2 {
         "run_id IS NULL"
     } else {
         "run_id IS NOT NULL AND (operation_id IS NULL OR idempotency_key NOT LIKE 'tool-spill:%')"
@@ -513,7 +548,7 @@ async fn expiry_page(
         let cutoff: String = sqlx::query_scalar(
             "SELECT (clock_timestamp()-$1::bigint*interval '1 millisecond')::text",
         )
-        .bind(if legacy { age } else { 0 })
+        .bind(if legacy || spill { age } else { 0 })
         .fetch_one(pool)
         .await?;
         pass.upper = Some((cutoff, "ffffffff-ffff-ffff-ffff-ffffffffffff".into()));
@@ -533,7 +568,7 @@ async fn expiry_page(
     let mut error = None;
     for (at, id, scope) in page {
         pass.after = Some((at, id.clone()));
-        match release(pool, store, &scope, &id, Some(age)).await {
+        match release(pool, store, &scope, &id, Some(age), spill).await {
             Ok(released) => count += usize::from(released),
             Err(e) => {
                 error.get_or_insert(e);

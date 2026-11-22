@@ -117,10 +117,14 @@ impl TaskHandle {
 pub enum StepResult {
     /// A model answer awaiting publication under the run fence.
     Answer(turns::FinalAnswer),
+    /// A known scoped tool outcome awaiting bounded observation and optional publication.
+    ToolResponse(Result<String, crate::mcp::ToolFault>),
     /// Model-visible output of an observed, reviewed tool operation.
     ToolOutput(String),
     /// A fenced authority check already invalidated the run.
-    Invalidated,
+    Invalidated(Settled),
+    Handoff,
+    LeaseLost,
     Continue,
     Finished,
     Failed(FailReason),
@@ -186,6 +190,7 @@ impl EffectPolicy for Option<&ApprovedEffects> {
 }
 
 struct Adapters<'a, E> {
+    artifacts: Option<&'a artifact_fs::Store>,
     executor: &'a E,
     approved: Option<&'a ApprovedEffects>,
 }
@@ -243,7 +248,16 @@ pub(crate) async fn maintenance(
         }
         if let Some(store) = store {
             let age = artifact_fs::UPLOAD_TIMEOUT + Duration::from_secs(300);
-            if !sweep(artifact_fs::reconcile_expired(pool, store, age, 100)).await {
+            // Maximum reviewed call (300 s), maximum lease drain (100 s), and 900 s grace.
+            let spills = sweep(artifact_fs::reconcile_run_spills(
+                pool,
+                store,
+                Duration::from_secs(1300),
+                100,
+            ))
+            .await;
+            let uploads = sweep(artifact_fs::reconcile_expired(pool, store, age, 100)).await;
+            if !spills || !uploads {
                 sweep_failed(Sweep::Uploads);
             }
             if !sweep(artifact_fs::purge_due(pool, store, 100)).await {
@@ -312,6 +326,7 @@ pub async fn run_with_approvals<E: Executor>(
             let _ = stopping.changed().await;
             return;
         };
+        artifact_fs::configure_slots(policy.slots);
         let mut poll_at = Instant::now();
         while stopping.borrow().is_none() {
             while runs.try_join_next().is_some() {
@@ -324,10 +339,12 @@ pub async fn run_with_approvals<E: Executor>(
                     let (pool, executor, shutdown) =
                         (pool.clone(), executor.clone(), stopping.clone());
                     let approved = approved.clone();
+                    let artifacts = store.cloned();
                     runs.spawn(async move {
                         run_one(
                             &pool,
                             Adapters {
+                                artifacts: artifacts.as_ref(),
                                 executor: executor.as_ref(),
                                 approved: approved.as_deref(),
                             },
@@ -510,7 +527,8 @@ async fn reconcile<E: Executor>(
 enum WorkEnd {
     Answer(turns::FinalAnswer),
     Complete(Settle),
-    Invalidated,
+    Invalidated(Settled),
+    Handoff,
     Stop(Stop),
     Incomplete,
 }
@@ -538,11 +556,10 @@ async fn execute<E: Executor>(
         if let Some(why) = context.stopped() {
             return Ok(WorkEnd::Stop(why));
         }
-        if queue::recheck_claim(&mut *connection(pool).await?, &run.claim, settings)
-            .await?
-            .is_some()
+        if let Some(settled) =
+            queue::recheck_claim(&mut *connection(pool).await?, &run.claim, settings).await?
         {
-            return Ok(WorkEnd::Invalidated);
+            return Ok(WorkEnd::Invalidated(settled));
         }
         if let Some(why) = context.stopped() {
             return Ok(WorkEnd::Stop(why));
@@ -566,30 +583,35 @@ async fn execute<E: Executor>(
             )
             .await?;
             match intent {
-                IntentResult::Applied(intent) => {
-                    let mut step = context.step();
-                    let operation = intent.operation_id.clone();
-                    let Some((request, deadline)) = intent.start(&step) else {
-                        return Ok(WorkEnd::Complete(Settle::Stopped));
-                    };
-                    step.deadline = deadline;
-                    adapters
-                        .approved
-                        .ok_or(StoreError::Conflict("approval adapter"))?
-                        .adapter
-                        .send(run, operation, request, step)
-                        .await
+                IntentResult::Invalidated(settled) => return Ok(WorkEnd::Invalidated(settled)),
+                IntentResult::ApprovalRequired => {
+                    return Ok(WorkEnd::Complete(Settle::Failed(FailReason::StepFailed)));
                 }
-                IntentResult::Invalidated(_) => return Ok(WorkEnd::Invalidated),
-                _ => return Ok(WorkEnd::Complete(Settle::Stopped)),
+                IntentResult::Applied(_) | IntentResult::Replayed(_) => {}
+            }
+            let resumed = EffectDispatch {
+                pool,
+                artifacts: adapters.artifacts,
+                effects: adapters
+                    .approved
+                    .ok_or(StoreError::Conflict("approval adapter"))?,
+                settings,
+            }
+            .send(run, &proposal, intent, context.step())
+            .await;
+            match resumed {
+                StepResult::ToolOutput(_) => StepResult::Continue,
+                other => other,
             }
         } else {
             adapters.executor.step(run, context.step()).await
         };
         match result {
-            StepResult::Invalidated => return Ok(WorkEnd::Invalidated),
+            StepResult::Invalidated(settled) => return Ok(WorkEnd::Invalidated(settled)),
+            StepResult::Handoff => return Ok(WorkEnd::Handoff),
+            StepResult::LeaseLost => return Ok(WorkEnd::Stop(Stop::LeaseLost)),
             StepResult::Answer(answer) => return Ok(WorkEnd::Answer(answer)),
-            StepResult::ToolOutput(_) => {
+            StepResult::ToolOutput(_) | StepResult::ToolResponse(_) => {
                 return Ok(WorkEnd::Complete(Settle::Failed(FailReason::StepFailed)));
             }
             StepResult::Continue => continue,
@@ -638,7 +660,7 @@ async fn run_one<E: Executor>(
         end = &mut work => {
             let why = match end {
                 WorkEnd::Stop(why) => Some(why),
-                WorkEnd::Invalidated => Some(Stop::Cancel),
+                WorkEnd::Invalidated(_) => Some(Stop::Cancel),
                 _ => context.stopped(),
             };
             (why, Some(end))
@@ -707,8 +729,14 @@ async fn run_one<E: Executor>(
                 _ => return,
             }
         }
-        WorkEnd::Invalidated => {
-            let _ = leases::release_lease(&mut c, &lease).await;
+        WorkEnd::Invalidated(settled) => {
+            if matches!(settled, Settled::Reconciling { .. }) {
+                let _ = leases::release_lease(&mut c, &lease).await;
+            }
+            return;
+        }
+        WorkEnd::Handoff => {
+            let _ = leases::handoff(&mut c, &lease, &settings).await;
             return;
         }
         WorkEnd::Complete(input @ (Settle::Succeeded | Settle::Failed(_))) => input,
@@ -729,6 +757,211 @@ async fn run_one<E: Executor>(
     }
     if matches!(settled, Ok(Settled::Reconciling { .. })) {
         let _ = leases::release_lease(&mut c, &lease).await;
+    }
+}
+
+/// Shared by live turns and resumed approvals. An existing write never gains a send
+/// permit. A read, including its first attempt, passes through a second transaction.
+pub(crate) struct EffectDispatch<'a> {
+    pub pool: &'a PgPool,
+    pub artifacts: Option<&'a artifact_fs::Store>,
+    pub effects: &'a ApprovedEffects,
+    pub settings: &'a LeaseSettings,
+}
+
+impl EffectDispatch<'_> {
+    pub async fn send(
+        &self,
+        run: &ActiveRun,
+        proposal: &Proposal,
+        intent: IntentResult,
+        mut step: StepContext,
+    ) -> StepResult {
+        let Self {
+            pool,
+            artifacts,
+            effects,
+            settings,
+        } = *self;
+        use approvals::ReplayEffect;
+        let fail = StepResult::Failed(FailReason::StepFailed);
+        let (op, fresh) = match intent {
+            IntentResult::Applied(i) => (i.operation_id.clone(), Some(i)),
+            IntentResult::Replayed(id) => (id, None),
+            IntentResult::Invalidated(s) => return StepResult::Invalidated(s),
+            IntentResult::ApprovalRequired => return fail,
+        };
+        let policy = Some(effects);
+        let lease = run.claim.lease();
+        let Ok(mut c) = pool.acquire().await else {
+            return StepResult::LeaseLost;
+        };
+        let class:Result<String,_>=sqlx::query_scalar("SELECT capability FROM openmettle.operations WHERE scope_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid")
+        .bind(lease.scope_id).bind(lease.run_id).bind(&op).fetch_one(&mut *c).await;
+        let permit = match class.as_deref() {
+            Err(_) => return StepResult::LeaseLost,
+            Ok("repeatable_read") => {
+                if let Some(why) = *step.stop.borrow() {
+                    return stopped_step(why);
+                }
+                if Instant::now() >= step.deadline {
+                    return StepResult::Handoff;
+                }
+                approvals::start_replayed_read(&mut c, &lease, &op, proposal, settings, &policy)
+                    .await
+            }
+            Ok(_) => match fresh {
+                Some(i) => Ok(ReplayEffect::Ready(i)),
+                None => {
+                    approvals::recheck_replay_effect_authority(
+                        &mut c, &lease, &op, proposal, settings, &policy,
+                    )
+                    .await
+                }
+            },
+        };
+        let bytes = match start_permit(
+            &mut c,
+            &lease,
+            (&op, proposal),
+            settings,
+            &policy,
+            &mut step,
+            permit,
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(step) => return step,
+        };
+        drop(c);
+        let result = match timeout_at(
+            step.deadline,
+            effects.adapter.send(run, op.clone(), bytes, step.clone()),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => return StepResult::Handoff,
+        };
+        let output = match result {
+            StepResult::ToolResponse(Ok(text)) if proposal.tool != crate::mcp::READ_RANGE => {
+                let cx = artifact_fs::SpillContext {
+                    pool,
+                    lease,
+                    proposal,
+                    operation: &op,
+                    step: &step,
+                };
+                return artifact_fs::publish_bytes(&cx, artifacts, &text, settings, &policy).await;
+            }
+            StepResult::ToolResponse(known) => {
+                // Range pages have already been sized after JSON escaping. Known faults
+                // always use a fixed inline envelope and cannot enter spill publication.
+                let success = known.is_ok();
+                let output = known.unwrap_or_else(crate::mcp::ToolFault::envelope);
+                if *step.stop.borrow() == Some(Stop::LeaseLost) {
+                    return StepResult::LeaseLost;
+                }
+                let Ok(mut c) = pool.acquire().await else {
+                    return StepResult::LeaseLost;
+                };
+                if let Err(e) =
+                    crate::mcp::observe_known(&mut c, &lease, &step, &op, success, &output).await
+                {
+                    return turns::lease_step(e);
+                }
+                output
+            }
+            StepResult::ToolOutput(output) => output,
+            other => return other,
+        };
+        if let Some(why) = *step.stop.borrow() {
+            return stopped_step(why);
+        }
+        if Instant::now() >= step.deadline {
+            return StepResult::Handoff;
+        }
+        let Ok(mut c) = pool.acquire().await else {
+            return StepResult::LeaseLost;
+        };
+        match approvals::recheck_replay_effect_authority(
+            &mut c, &lease, &op, proposal, settings, &policy,
+        )
+        .await
+        {
+            Ok(ReplayEffect::Observed {
+                output: Some(stored),
+                ..
+            }) => StepResult::ToolOutput(stored),
+            // Preserve the output of legacy adapters with their own observation format.
+            Ok(ReplayEffect::Observed {
+                succeeded: true, ..
+            }) if output.len() <= 65536 => StepResult::ToolOutput(output),
+            Ok(ReplayEffect::Invalidated(s)) => StepResult::Invalidated(s),
+            Err(e) => turns::lease_step(e),
+            _ => fail,
+        }
+    }
+}
+
+/// If the conservative local authority clock fires, consult the primary before
+/// invalidating. A second short local window hands off without starting work.
+pub(crate) async fn start_permit(
+    c: &mut sqlx::PgConnection,
+    lease: &leases::Lease<'_>,
+    effect: (&str, &Proposal),
+    settings: &LeaseSettings,
+    policy: &impl EffectPolicy,
+    step: &mut StepContext,
+    mut permit: Result<approvals::ReplayEffect, LeaseError>,
+) -> Result<Vec<u8>, StepResult> {
+    use approvals::{ReplayEffect, StartPermit};
+    let (operation, proposal) = effect;
+    let mut refreshed = false;
+    loop {
+        match permit {
+            Ok(ReplayEffect::Ready(intent)) => match intent.start(step) {
+                StartPermit::Stopped(stop) => return Err(stopped_step(stop)),
+                StartPermit::LeaseMarginExhausted => return Err(StepResult::Handoff),
+                StartPermit::AuthorityExpired { .. } if !refreshed => {
+                    refreshed = true;
+                    permit = approvals::expire_unstarted_intent(
+                        c, lease, operation, proposal, settings, policy,
+                    )
+                    .await;
+                }
+                StartPermit::AuthorityExpired { .. } => return Err(StepResult::Handoff),
+                StartPermit::Ready { request, deadline } => {
+                    step.deadline = deadline;
+                    return Ok(request);
+                }
+            },
+            Ok(ReplayEffect::Observed {
+                output: Some(output),
+                ..
+            }) => {
+                return Err(if let Some(why) = *step.stop.borrow() {
+                    stopped_step(why)
+                } else if Instant::now() >= step.deadline {
+                    StepResult::Handoff
+                } else {
+                    StepResult::ToolOutput(output)
+                });
+            }
+            Ok(ReplayEffect::Invalidated(s)) => return Err(StepResult::Invalidated(s)),
+            Ok(ReplayEffect::Handoff) => return Err(StepResult::Handoff),
+            Ok(_) => return Err(StepResult::Failed(FailReason::StepFailed)),
+            Err(e) => return Err(turns::lease_step(e)),
+        }
+    }
+}
+
+pub(crate) fn stopped_step(why: Stop) -> StepResult {
+    match why {
+        Stop::LeaseLost => StepResult::LeaseLost,
+        Stop::Shutdown => StepResult::Handoff,
+        Stop::Deadline | Stop::Cancel => StepResult::Stopped,
     }
 }
 

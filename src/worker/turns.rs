@@ -84,11 +84,12 @@ pub(super) async fn publish(
 }
 
 const FAILED: StepResult = StepResult::Failed(FailReason::StepFailed);
-fn lease_step(error: LeaseError) -> StepResult {
+pub(crate) fn lease_step(error: LeaseError) -> StepResult {
     match error {
         LeaseError::Stopping(_) => StepResult::Stopped,
+        LeaseError::Store(StoreError::Conflict("expired effect claim")) => StepResult::LeaseLost,
         LeaseError::StaleClaim | LeaseError::Expired | LeaseError::Terminal { .. } => {
-            StepResult::Invalidated
+            StepResult::LeaseLost
         }
         LeaseError::Store(_) => FAILED,
     }
@@ -141,7 +142,9 @@ impl<R: TurnRoutes> TurnExecutor<R> {
         };
         match queue::recheck_leased(&mut c, &claim.lease(), &check, &self.leases).await {
             Ok(RunRecheckOutcome::Continue) => Ok(()),
-            Ok(_) => Err(StepResult::Invalidated),
+            // recheck_leased has already settled. Handoff releases a reconciling
+            // holder, and the Hold fence refuses an already terminal run.
+            Ok(_) => Err(StepResult::Handoff),
             Err(error) => Err(lease_step(error)),
         }
     }
@@ -178,19 +181,41 @@ impl<R: TurnRoutes> TurnExecutor<R> {
         cx: &StepContext,
         config: &ConfigSnapshot,
         call: &Call,
+        prior_effects: &mut Vec<(String, Proposal)>,
     ) -> Result<String, StepResult> {
         let effects = self.effects.as_deref().ok_or(FAILED)?;
-        let proposal = self.routes.proposal(&run.claim, call).ok_or(FAILED)?;
-        if proposal.tool != call.name || proposal.arguments() != &call.arguments {
-            return Err(FAILED);
-        }
         self.authority(&run.claim, config).await?;
+        let refused = || crate::mcp::ToolFault::TerminalRefusal.envelope();
+        let Some(proposal) = self.routes.proposal(&run.claim, call) else {
+            return Ok(refused());
+        };
+        if proposal.tool != call.name {
+            return Ok(refused());
+        }
+        if proposal.tool == crate::mcp::READ_RANGE {
+            let Ok(expected) = crate::mcp::Registry.proposal(
+                &run.claim.scope_id,
+                &proposal.logical_key,
+                &call.name,
+                &proposal.version,
+                call.arguments.to_string().as_bytes(),
+            ) else {
+                return Ok(refused());
+            };
+            if expected.arguments() != proposal.arguments()
+                || expected.destination() != proposal.destination()
+            {
+                return Ok(refused());
+            }
+        } else if proposal.arguments() != &call.arguments {
+            return Ok(refused());
+        }
         let intent = {
             let mut c = self.pool.acquire().await.map_err(|_| FAILED)?;
             if cx.stop.borrow().is_some() {
                 return Err(StepResult::Stopped);
             }
-            approvals::record_fenced_intent(
+            match approvals::record_fenced_intent(
                 &mut c,
                 &run.claim.lease(),
                 &proposal,
@@ -199,54 +224,45 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 &self.leases,
             )
             .await
-            .map_err(lease_step)?
+            {
+                Ok(intent) => intent,
+                Err(LeaseError::Store(StoreError::Denied(_) | StoreError::InvalidInput(_))) => {
+                    return Ok(refused());
+                }
+                Err(e) => return Err(lease_step(e)),
+            }
         };
-        let intent = match intent {
-            IntentResult::Applied(intent) => intent,
-            IntentResult::Invalidated(_) => return Err(StepResult::Invalidated),
-            IntentResult::ApprovalRequired | IntentResult::Replayed(_) => return Err(FAILED),
-        };
-        let op = intent.operation_id.clone();
-        // This new intent carries a fresh, lease-bounded send deadline. A previous
-        // model round may have outlived the initial step snapshot through renewal.
-        let mut step = StepContext {
+        let step = StepContext {
             deadline: run.execution_deadline,
             ..cx.clone()
         };
-        let Some((bytes, deadline)) = intent.start(&step) else {
-            return Err(if step.stop.borrow().is_some() {
-                StepResult::Stopped
-            } else {
-                FAILED
-            });
+        let id = match &intent {
+            IntentResult::Applied(i) => Some(i.operation_id.clone()),
+            IntentResult::Replayed(id) => Some(id.clone()),
+            _ => None,
         };
-        step.deadline = deadline;
-        let result = timeout_at(deadline, effects.adapter.send(run, op.clone(), bytes, step))
-            .await
-            .map_err(|_| FAILED)?;
-        let output = match result {
-            StepResult::ToolOutput(output) => output,
-            StepResult::Stopped | StepResult::Invalidated | StepResult::Failed(_) => {
-                return Err(result);
-            }
-            StepResult::Answer(_) | StepResult::Continue | StepResult::Finished => {
-                return Err(FAILED);
-            }
-        };
-        if output.len() > 65536 {
-            return Err(FAILED);
-        }
-        let observed: bool = sqlx::query_scalar(
-            "SELECT outcome='succeeded' FROM openmettle.operations
-           WHERE scope_id=$1::uuid AND run_id=$2::uuid AND id=$3::uuid",
-        )
-        .bind(&run.claim.scope_id)
-        .bind(&run.claim.run_id)
-        .bind(op)
-        .fetch_one(&self.pool)
+        match (EffectDispatch {
+            pool: &self.pool,
+            artifacts: self.artifacts.as_ref(),
+            effects,
+            settings: &self.leases,
+        })
+        .send(run, &proposal, intent, step)
         .await
-        .map_err(|_| FAILED)?;
-        if observed { Ok(output) } else { Err(FAILED) }
+        {
+            StepResult::ToolOutput(output) => {
+                if let Some(id) = id {
+                    prior_effects.push((id, proposal));
+                }
+                Ok(output)
+            }
+            stopped @ (StepResult::Stopped
+            | StepResult::Handoff
+            | StepResult::LeaseLost
+            | StepResult::Invalidated(_)
+            | StepResult::Failed(_)) => Err(stopped),
+            _ => Err(FAILED),
+        }
     }
 
     async fn prepare_round(
@@ -316,6 +332,7 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 .map_err(|_| FAILED)?
         };
         let mut continuation = Vec::new();
+        let mut prior_effects: Vec<(String, Proposal)> = Vec::new();
         let mut tools = self
             .effects
             .as_ref()
@@ -327,6 +344,32 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 _ = stop.wait_for(Option::is_some) => return Err(StepResult::Stopped),
                 ready = self.prepare_round(&run.claim, &config, &continuation, tools) => ready?,
             };
+            // These cached tool messages will be sent to the model again on every
+            // continuation. Recheck each operation immediately before exposing history.
+            for (op, proposal) in &prior_effects {
+                let mut c = self
+                    .pool
+                    .acquire()
+                    .await
+                    .map_err(|_| StepResult::LeaseLost)?;
+                match approvals::recheck_replay_effect_authority(
+                    &mut c,
+                    &run.claim.lease(),
+                    op,
+                    proposal,
+                    &self.leases,
+                    &self.effects.as_deref(),
+                )
+                .await
+                .map_err(lease_step)?
+                {
+                    approvals::ReplayEffect::Observed { .. } => {}
+                    approvals::ReplayEffect::Invalidated(s) => {
+                        return Err(StepResult::Invalidated(s));
+                    }
+                    _ => return Err(FAILED),
+                }
+            }
             let turn = route
                 .gateway
                 .server(
@@ -375,7 +418,9 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                     let [call] = calls.as_slice() else {
                         return Err(FAILED);
                     };
-                    let output = self.tool(run, &cx, &config, call).await?;
+                    let output = self
+                        .tool(run, &cx, &config, call, &mut prior_effects)
+                        .await?;
                     let id = call.id.clone();
                     continuation.push(History::Assistant {
                         parts: answer.parts,
