@@ -125,6 +125,12 @@ fn shipped_sql(name: &str) -> String {
             .unwrap();
         return literal(body).0;
     }
+    if name == "HAS_EXECUTING_QUOTA_RULES" {
+        let (_, body) = SOURCE
+            .split_once("const HAS_EXECUTING_QUOTA_RULES: &str = ")
+            .unwrap();
+        return literal(body).0;
+    }
     let macro_at = SOURCE.find("macro_rules! non_terminal").unwrap();
     let (non_terminal, _) = literal(&SOURCE[macro_at..]);
     const LEASE_SOURCE: &str = include_str!("../../src/authz/leases.rs");
@@ -376,6 +382,7 @@ struct Waits {
 /// Drive the profile against a migrated disposable database and return the JSON report.
 async fn measure_queue_contention_and_plans(db: &TestDb, profile: &Profile) -> Value {
     let started = Instant::now();
+    seed_token_budget(db).await;
     let mut owner = connect(&db.0, OWNER).await;
     providers(&mut owner).await;
     let server: String = sqlx::query_scalar("SHOW server_version")
@@ -821,6 +828,11 @@ fn shipped_statements_are_rebuilt_from_the_store_source() {
     assert!(claim.starts_with("WITH executing AS ("));
     assert!(claim.contains("FOR NO KEY UPDATE OF r SKIP LOCKED"));
     assert!(claim.trim_end().ends_with("::bigint AS execution_ms"));
+    let probe = shipped_sql("HAS_EXECUTING_QUOTA_RULES");
+    assert!(probe.contains("quota_overrides") && probe.contains("executing_runs_per_actor"));
+    let claim_quotas = shipped_sql("CLAIM_WITH_QUOTAS");
+    assert_eq!(claim_quotas.matches(LIVE).count(), 2);
+    assert!(claim_quotas.contains("FOR NO KEY UPDATE OF r SKIP LOCKED"));
 }
 
 #[test]
@@ -877,6 +889,140 @@ async fn wait_sweep_uses_the_partial_index_over_populated_history() {
             .unwrap()
             .contains(&json!("runs_wait_sweep_idx")),
         "{sweep}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn claim_quota_probe_and_claim_with_quotas_use_partial_indexes_over_unrelated_overrides() {
+    let db = TestDb::migrated().await;
+    seed_token_budget(&db).await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &admin).await;
+    let actor = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let scope = personal_of(&db, &actor).await;
+    let template = request(&db, &scope, "personal", &actor, "quota-plan").await;
+    seed_history(&mut owner, &template, 1024).await;
+    for i in 0..4 {
+        admitted(&db, &template.keyed(&format!("queued-{i}"))).await;
+    }
+    // Populate 300 unrelated storage_bytes overrides so quota_overrides spans multiple heap pages.
+    owner
+        .execute(
+            "WITH synthetic_users AS (
+                 INSERT INTO openmettle.users (id)
+                 SELECT gen_random_uuid() FROM generate_series(1, 300)
+                 RETURNING id
+             ),
+             synthetic_scopes AS (
+                 INSERT INTO openmettle.scopes (kind, personal_user_id)
+                 SELECT 'personal', id FROM synthetic_users
+                 RETURNING id
+             )
+             INSERT INTO openmettle.quota_overrides
+                 (scope_id, scope_kind, resource_kind, hard_limit, reason, updated_by_user_id)
+             SELECT s.id, 'personal', 'storage_bytes', 1048576, repeat('x', 200),
+                    (SELECT id FROM openmettle.users ORDER BY created_at LIMIT 1)
+               FROM synthetic_scopes s",
+        )
+        .await
+        .unwrap();
+    owner.execute("ANALYZE openmettle.runs").await.unwrap();
+    owner
+        .execute("ANALYZE openmettle.quota_overrides")
+        .await
+        .unwrap();
+    owner
+        .execute("ANALYZE openmettle.quota_defaults")
+        .await
+        .unwrap();
+    let partial: bool = sqlx::query_scalar(
+        "SELECT indpred IS NOT NULL FROM pg_index
+          WHERE indexrelid = 'openmettle.quota_overrides_executing_active_idx'::regclass",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert!(partial);
+
+    // 1. With only unrelated storage_bytes overrides, the hot probe uses the partial index
+    //    and never seq-scans openmettle.quota_overrides.
+    let probe = explain(
+        &mut worker(&db).await,
+        &shipped_sql("HAS_EXECUTING_QUOTA_RULES"),
+        vec![],
+    )
+    .await;
+    let probe_seq: Vec<&str> = probe["seq_scans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        !probe_seq.contains(&"quota_overrides"),
+        "probe seq-scanned quota_overrides: {probe}"
+    );
+    assert!(
+        probe["index_names"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("quota_overrides_executing_active_idx")),
+        "probe did not use quota_overrides_executing_active_idx: {probe}"
+    );
+
+    // 2. With an active executing_runs_per_actor override, CLAIM_WITH_QUOTAS uses runs_dispatch_idx
+    //    and never seq-scans openmettle.runs or openmettle.quota_overrides.
+    sqlx::query(
+        "INSERT INTO openmettle.quota_overrides
+             (scope_id, scope_kind, resource_kind, hard_limit, reason, updated_by_user_id)
+         VALUES ($1::uuid, 'personal', 'executing_runs_per_actor', 4, 'plan test', $2::uuid)",
+    )
+    .bind(&scope)
+    .bind(&admin.user)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    owner
+        .execute("ANALYZE openmettle.quota_overrides")
+        .await
+        .unwrap();
+    let mut w = worker(&db).await;
+    let mut tx = w.begin().await.unwrap();
+    sqlx::query("SELECT FROM openmettle.run_dispatch_lock FOR NO KEY UPDATE")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let claim_q = explain(
+        &mut tx,
+        &shipped_sql("CLAIM_WITH_QUOTAS"),
+        vec![
+            Bind::Int(OPEN.executing_per_actor.into()),
+            Bind::Int(OPEN.executing_per_scope.into()),
+            Bind::Int(LEASES.lease.as_millis() as i64),
+            Bind::Int(LEASES.execution_timeout.as_millis() as i64),
+        ],
+    )
+    .await;
+    tx.rollback().await.unwrap();
+    let claim_seq: Vec<&str> = claim_q["seq_scans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        !claim_seq.contains(&"runs") && !claim_seq.contains(&"quota_overrides"),
+        "CLAIM_WITH_QUOTAS seq-scanned runs or quota_overrides: {claim_q}"
+    );
+    assert!(
+        claim_q["index_names"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("runs_dispatch_idx")),
+        "CLAIM_WITH_QUOTAS did not use runs_dispatch_idx: {claim_q}"
     );
 }
 

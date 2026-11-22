@@ -109,6 +109,37 @@ fn path_resource(parts: &Parts) -> Result<QuotaResourceKind, Problem> {
         .ok_or(INVALID)
 }
 
+use sqlx::{Connection, PgConnection};
+
+async fn read_only_snapshot<T>(
+    c: &mut PgConnection,
+    work: impl AsyncFnOnce(&mut PgConnection) -> Result<T, Problem>,
+) -> Result<T, Problem> {
+    let mut tx = c.begin().await.map_err(|_| UNAVAILABLE)?;
+    if sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .is_err()
+        || sqlx::query("SELECT set_config('statement_timeout', '3s', true)")
+            .execute(&mut *tx)
+            .await
+            .is_err()
+    {
+        let _ = tx.rollback().await;
+        return Err(UNAVAILABLE);
+    }
+    match work(&mut tx).await {
+        Ok(value) => {
+            tx.commit().await.map_err(|_| UNAVAILABLE)?;
+            Ok(value)
+        }
+        Err(error) => {
+            tx.rollback().await.map_err(|_| UNAVAILABLE)?;
+            Err(error)
+        }
+    }
+}
+
 impl Api {
     pub(super) async fn quota_operation(
         &self,
@@ -126,15 +157,29 @@ impl Api {
             .extensions
             .get::<authz::runs::AdmissionLimits>()
             .copied();
+        let claim = parts
+            .extensions
+            .get::<authz::runs::ClaimLimits>()
+            .copied()
+            .or_else(|| self.browser.claim_limits());
         match op {
             Op::GetPersonalQuotas => {
                 let context = self.authenticate(&session).await?;
                 let summary = self
                     .with_connection(async |c| {
-                        let p = principal(c, &context).await?;
-                        quotas::read_summary(c, &p.personal_scope_id, Some(&p.user_id), limits)
+                        read_only_snapshot(c, async |tx| {
+                            let p = principal(tx, &context).await?;
+                            quotas::read_summary_in_tx(
+                                tx,
+                                &p.personal_scope_id,
+                                Some(&p.user_id),
+                                limits,
+                                claim,
+                            )
                             .await
                             .map_err(quota_error)
+                        })
+                        .await
                     })
                     .await?;
                 let value = serde_json::to_value(summary).map_err(|_| INTERNAL)?;
@@ -144,12 +189,22 @@ impl Api {
                 let context = self.authenticate(&session).await?;
                 let summary = self
                     .with_connection(async |c| {
-                        let p = principal(c, &context).await?;
-                        let view =
-                            projects::read_project(c, &p, target, context.observed_ms()).await?;
-                        quotas::read_summary(c, &view.settings.scope_id, None, limits)
+                        read_only_snapshot(c, async |tx| {
+                            let p = principal(tx, &context).await?;
+                            let view =
+                                projects::read_project(tx, &p, target, context.observed_ms())
+                                    .await?;
+                            quotas::read_summary_in_tx(
+                                tx,
+                                &view.settings.scope_id,
+                                None,
+                                limits,
+                                claim,
+                            )
                             .await
                             .map_err(quota_error)
+                        })
+                        .await
                     })
                     .await?;
                 let value = serde_json::to_value(summary).map_err(|_| INTERNAL)?;

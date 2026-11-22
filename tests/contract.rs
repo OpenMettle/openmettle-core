@@ -1719,6 +1719,35 @@ fn consumer_decodes_wide_quota_counters_overrides_and_closed_problem_quota() {
     assert_eq!(project.storage.status, QuotaStatus::Unconfigured);
     assert!(project.warnings.is_empty());
 
+    for invalid_summary in [
+        "QuotaSummaryPersonal--missing-live-per-actor",
+        "QuotaSummaryPersonal--missing-executing-per-actor",
+        "QuotaSummaryProject--with-live-per-actor",
+        "QuotaSummaryProject--with-executing-per-actor",
+    ] {
+        assert!(
+            consumer::decode_quota_summary(&fixture(invalid_summary)).is_err(),
+            "{invalid_summary}"
+        );
+    }
+
+    let max_utf8_reason = "é".repeat(128);
+    let over_utf8_reason = "é".repeat(129);
+    assert_eq!(max_utf8_reason.len(), 256);
+    assert_eq!(over_utf8_reason.len(), 258);
+    assert!(consumer::encode_quota_override_set_request(100, None, &max_utf8_reason).is_ok());
+    assert!(consumer::encode_quota_override_revoke_request(&max_utf8_reason).is_ok());
+    for bad in ["", over_utf8_reason.as_str(), "nul\0byte"] {
+        assert!(
+            consumer::encode_quota_override_set_request(100, None, bad).is_err(),
+            "{bad:?}"
+        );
+        assert!(
+            consumer::encode_quota_override_revoke_request(bad).is_err(),
+            "{bad:?}"
+        );
+    }
+
     let compat =
         consumer::decode_quota_summary(&fixture("QuotaSummaryPersonal--unrecognized-status"))
             .unwrap();

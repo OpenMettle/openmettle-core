@@ -1725,7 +1725,41 @@ async fn quota_summary_wide_counters_privacy_warnings_and_hard_limit_reads_work_
         "not_found",
     );
 
-    // 3. Cross-tenant privacy: remaining_bytes never leaks instance headroom consumed by bob.
+    // 3. Unconfigured instance storage budget on a configured project reports scope_kind = "instance".
+    let proj_scope = proj["scope_id"].as_str().unwrap();
+    owner
+        .execute(
+            "UPDATE openmettle.storage_instance
+                SET instance_budget_bytes = NULL, personal_limit_bytes = 10000, project_limit_bytes = 10000",
+        )
+        .await
+        .unwrap();
+    let probe_up = form(
+        "instunconf",
+        &[
+            file_part(Some("p.txt"), "text/plain", "hello"),
+            metadata_part("{}"),
+        ],
+        true,
+    );
+    let (status, inst_unconf) = api.upload(
+        alice_b,
+        &format!("/v1/artifacts?scope_id={proj_scope}&max_bytes=5"),
+        "proj-inst-unconf",
+        &probe_up,
+    );
+    assert_eq!(status, 503, "{inst_unconf}");
+    assert_eq!(inst_unconf["code"], "provisioning");
+    assert_eq!(
+        inst_unconf["quota"],
+        json!({"resource_kind": "storage_bytes", "scope_kind": "instance"})
+    );
+    assert!(validate_openapi_schema(
+        "#/components/schemas/Problem",
+        &inst_unconf
+    ));
+
+    // Cross-tenant privacy: remaining_bytes never leaks instance headroom consumed by bob.
     owner
         .execute(
             "UPDATE openmettle.storage_instance
@@ -1892,7 +1926,8 @@ async fn quota_summary_wide_counters_privacy_warnings_and_hard_limit_reads_work_
     );
     assert_eq!(storage_warns(&s3), vec![80]);
 
-    // Revoke override -> bumps limit_revision -> clears warning again.
+    // Revoke override -> reverts active limit_revision to 0 (default 2000 bytes); because Alice is
+    // still at 1900/2000 (95% >= 80%), the default-level 80% warning stays active.
     success(
         api.call(
             admin_n,
@@ -1907,7 +1942,8 @@ async fn quota_summary_wide_counters_privacy_warnings_and_hard_limit_reads_work_
         api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
         200,
     );
-    assert!(storage_warns(&s4).is_empty());
+    assert_eq!(s4["storage"]["status"], "warning");
+    assert_eq!(storage_warns(&s4), vec![80]);
 
     // Config edit (storage_instance.config_revision bump) re-arms warnings for the new threshold.
     limits(&db, Some(2_500), Some(100_000)).await;
@@ -1958,6 +1994,54 @@ async fn quota_summary_wide_counters_privacy_warnings_and_hard_limit_reads_work_
         200,
     );
     assert!(storage_warns(&s_cfg2).is_empty());
+
+    // Expiring a temporary low storage override clears its warning once the higher default resumes.
+    limits(&db, Some(20_000), Some(100_000)).await;
+    success(
+        api.call(
+            admin_b,
+            "PUT",
+            &ov_path,
+            Some("ov-temp-exp"),
+            Some(&json!({
+                "hard_limit": "2500",
+                "expires_at": "2028-01-01T00:00:00.000000Z",
+                "reason": "temporary cap"
+            })),
+        ),
+        200,
+    );
+    success(
+        api.upload(
+            alice_b,
+            "/v1/artifacts?max_bytes=200",
+            "alice-warn-temp-exp",
+            &warn_up2,
+        ),
+        201,
+    );
+    let s_temp_warn = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(s_temp_warn["storage"]["status"], "warning");
+    assert_eq!(storage_warns(&s_temp_warn), vec![90]);
+    sqlx::query(
+        "UPDATE openmettle.quota_overrides
+            SET expires_at = clock_timestamp() - interval '1 second'
+          WHERE scope_id = $1::uuid AND resource_kind = 'storage_bytes'",
+    )
+    .bind(&alice_scope)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    let s_after_exp = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(s_after_exp["storage"]["limit_source"], "default");
+    assert_eq!(s_after_exp["storage"]["status"], "ok");
+    assert!(storage_warns(&s_after_exp).is_empty());
 
     // 5. Hard limit = 0: new upload fails 429 quota, while reads, downloads, retention & quota reads succeed!
     success(
@@ -2070,11 +2154,60 @@ async fn quota_summary_wide_counters_privacy_warnings_and_hard_limit_reads_work_
     .await
     .unwrap();
     tx.commit().await.unwrap();
-    // Restart API with cursor_keys so cancelRun can return its Run snapshot.
+    // Restart API with cursor_keys and claim_limits so cancelRun works and QuotaSummary exposes claim defaults.
     let dir = auth_config_support::Dir::new();
     let mut doc = auth_config_support::document_v2_native(&dir, &ca::Ca::new().pem());
     doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+    doc["claim_limits"] = json!({
+        "executing_per_actor": 3,
+        "executing_per_scope": 7
+    });
     let api_with_keys = Api::configured(&db, dir, doc, 4);
+    let personal_claim = success(
+        api_with_keys.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert!(validate_openapi_schema(
+        "#/components/schemas/QuotaSummary",
+        &personal_claim
+    ));
+    assert_eq!(
+        personal_claim["execution"]["executing_runs_per_actor"]["limit"],
+        "3"
+    );
+    assert_eq!(
+        personal_claim["execution"]["executing_runs_per_actor"]["limit_source"],
+        "default"
+    );
+    assert_eq!(
+        personal_claim["execution"]["executing_runs_per_scope"]["limit"],
+        "7"
+    );
+    assert_eq!(
+        personal_claim["execution"]["executing_runs_per_scope"]["limit_source"],
+        "default"
+    );
+    let proj_claim = success(
+        api_with_keys.call(alice_n, "GET", &proj_path, None, None),
+        200,
+    );
+    assert!(validate_openapi_schema(
+        "#/components/schemas/QuotaSummary",
+        &proj_claim
+    ));
+    assert_eq!(
+        proj_claim["execution"]["executing_runs_per_scope"]["limit"],
+        "7"
+    );
+    assert_eq!(
+        proj_claim["execution"]["executing_runs_per_scope"]["limit_source"],
+        "default"
+    );
+    assert!(
+        proj_claim["execution"]
+            .get("executing_runs_per_actor")
+            .is_none()
+    );
     let cancelled = success(
         api_with_keys.call(
             alice_b,
@@ -2123,22 +2256,27 @@ async fn create_run_distinguishes_rate_limited_quota_and_provisioning_refusals_o
     });
     let api = Api::configured(&db, dir, doc, 4);
 
-    let root = success(
-        api.call(
-            alice_b,
-            "POST",
-            "/v1/conversations",
-            Some("conv-q"),
-            Some(&json!({})),
-        ),
-        201,
-    );
-    let conv_id = root["conversation_id"].as_str().unwrap();
-    let branch_id = root["branch_id"].as_str().unwrap();
-    let run_body = |msg_id: &str| {
+    let conv = |key: &str| {
+        let root = success(
+            api.call(
+                alice_b,
+                "POST",
+                "/v1/conversations",
+                Some(key),
+                Some(&json!({})),
+            ),
+            201,
+        );
+        (
+            root["conversation_id"].as_str().unwrap().to_owned(),
+            root["branch_id"].as_str().unwrap().to_owned(),
+        )
+    };
+    let (conv_id, branch_id) = conv("conv-q");
+    let run_body = |c_id: &str, b_id: &str, msg_id: &str, rounds: i64| {
         json!({
-            "conversation_id": conv_id,
-            "branch_id": branch_id,
+            "conversation_id": c_id,
+            "branch_id": b_id,
             "proposal": {
                 "expected_head_message_id": null,
                 "turn": {
@@ -2146,10 +2284,35 @@ async fn create_run_distinguishes_rate_limited_quota_and_provisioning_refusals_o
                     "input_message_id": msg_id,
                     "parts": [{"text": "hello"}]
                 },
-                "selection": {"preset": "study"}
+                "selection": {"preset": "study"},
+                "requested_rounds": rounds
             }
         })
     };
+
+    // 0. Fresh DB (metering_enforced = true, zero usage_tokens rows) fails closed with 503 provisioning.
+    let (status, fresh_prov) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("run-fresh-unconf"),
+        Some(&run_body(
+            &conv_id,
+            &branch_id,
+            "00000000-0000-4000-8000-00000000a000",
+            2,
+        )),
+    );
+    assert_eq!(status, 503, "{fresh_prov}");
+    assert_eq!(fresh_prov["code"], "provisioning");
+    assert_eq!(
+        fresh_prov["quota"],
+        json!({"resource_kind": "usage_tokens", "scope_kind": "personal"})
+    );
+    assert!(validate_openapi_schema(
+        "#/components/schemas/Problem",
+        &fresh_prov
+    ));
 
     // 1. Overridden live_runs_per_actor = 0 -> 429 rate_limited (distinct from quota).
     success(
@@ -2167,7 +2330,12 @@ async fn create_run_distinguishes_rate_limited_quota_and_provisioning_refusals_o
         "POST",
         "/v1/runs",
         Some("run-rl"),
-        Some(&run_body("00000000-0000-4000-8000-00000000a001")),
+        Some(&run_body(
+            &conv_id,
+            &branch_id,
+            "00000000-0000-4000-8000-00000000a001",
+            2,
+        )),
     );
     assert_eq!(status, 429, "{rl}");
     assert_eq!(rl["code"], "rate_limited");
@@ -2199,7 +2367,12 @@ async fn create_run_distinguishes_rate_limited_quota_and_provisioning_refusals_o
         "POST",
         "/v1/runs",
         Some("run-q"),
-        Some(&run_body("00000000-0000-4000-8000-00000000a002")),
+        Some(&run_body(
+            &conv_id,
+            &branch_id,
+            "00000000-0000-4000-8000-00000000a002",
+            2,
+        )),
     );
     assert_eq!(status, 429, "{q}");
     assert_eq!(q["code"], "quota");
@@ -2210,7 +2383,208 @@ async fn create_run_distinguishes_rate_limited_quota_and_provisioning_refusals_o
     assert!(!q.to_string().contains("CANARY-secret-reason"));
     assert!(validate_openapi_schema("#/components/schemas/Problem", &q));
 
-    // Revoke personal override while keeping instance usage_tokens default -> 503 provisioning.
+    // 2. Positive headroom smaller than the run's token envelope (8192 * 2 = 16384 > 10000)
+    //    must refuse with 429 quota and roll back the run, branch message, and gateway/quota holds.
+    success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/usage_tokens"),
+            Some("tok-10k"),
+            Some(&json!({"hard_limit": "10000", "reason": "smaller than envelope"})),
+        ),
+        200,
+    );
+    let (status, env_ref) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("run-too-big-envelope"),
+        Some(&run_body(
+            &conv_id,
+            &branch_id,
+            "00000000-0000-4000-8000-00000000a003",
+            2,
+        )),
+    );
+    assert_eq!(status, 429, "{env_ref}");
+    assert_eq!(env_ref["code"], "quota");
+    assert_eq!(
+        env_ref["quota"],
+        json!({"resource_kind": "usage_tokens", "scope_kind": "personal"})
+    );
+    let (runs_n, msgs_n, gw_n, qr_n): (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM openmettle.runs),
+                (SELECT count(*) FROM openmettle.messages),
+                (SELECT count(*) FROM openmettle.gateway_reservations),
+                (SELECT count(*) FROM openmettle.quota_reservations)",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!((runs_n, msgs_n, gw_n, qr_n), (0, 0, 0, 0));
+
+    // 3. Unconfigured (hard_limit = NULL) usage_cost_micros default must NOT block runs;
+    //    two concurrent POST /v1/runs competing for headroom sufficient for 1 (20000 vs 16384 each)
+    //    admit at most 1, refuse the other with 429 quota, and exact replay never double-charges.
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_cost_micros', NULL)",
+        )
+        .await
+        .unwrap();
+    success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/usage_tokens"),
+            Some("tok-20k"),
+            Some(&json!({"hard_limit": "20000", "reason": "headroom for one run"})),
+        ),
+        200,
+    );
+    let (conv2_id, branch2_id) = conv("conv-q-2");
+    let body_a = run_body(
+        &conv_id,
+        &branch_id,
+        "00000000-0000-4000-8000-00000000a004",
+        2,
+    );
+    let body_b = run_body(
+        &conv2_id,
+        &branch2_id,
+        "00000000-0000-4000-8000-00000000a005",
+        2,
+    );
+    let barrier = std::sync::Barrier::new(2);
+    let (res_a, res_b) = std::thread::scope(|s| {
+        let b_ref = &barrier;
+        let api_ref = &api;
+        let ba = &body_a;
+        let bb = &body_b;
+        let t = s.spawn(move || {
+            b_ref.wait();
+            api_ref.call(alice_b, "POST", "/v1/runs", Some("race-a"), Some(ba))
+        });
+        barrier.wait();
+        let rb = api.call(alice_b, "POST", "/v1/runs", Some("race-b"), Some(bb));
+        (t.join().unwrap(), rb)
+    });
+    let mut statuses = [res_a.0, res_b.0];
+    statuses.sort();
+    assert_eq!(statuses, [201, 429], "a={res_a:?} b={res_b:?}");
+    let (winner_key, winner_body, winner_val, loser_val) = if res_a.0 == 201 {
+        ("race-a", &body_a, &res_a.1, &res_b.1)
+    } else {
+        ("race-b", &body_b, &res_b.1, &res_a.1)
+    };
+    assert_eq!(loser_val["code"], "quota");
+    assert_eq!(
+        loser_val["quota"],
+        json!({"resource_kind": "usage_tokens", "scope_kind": "personal"})
+    );
+    let summary_held = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(summary_held["usage"][0]["reserved_held"], "16384");
+    assert_eq!(summary_held["usage"][0]["remaining"], "3616");
+
+    // Exact replay returns 200 OK with the same run_id and does not double-charge reserved_held.
+    let replayed = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some(winner_key),
+            Some(winner_body),
+        ),
+        200,
+    );
+    assert_eq!(replayed["run_id"], winner_val["run_id"]);
+    let summary_after_replay = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(summary_after_replay["usage"][0]["reserved_held"], "16384");
+
+    // 4. Configured usage_cost_micros reserves cost before tokens (canonical order) and blocks second run.
+    owner
+        .execute(
+            "UPDATE openmettle.quota_defaults
+                SET cost_denomination = 'usd_micros'
+              WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'",
+        )
+        .await
+        .unwrap();
+    success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/usage_tokens"),
+            Some("tok-1m"),
+            Some(&json!({"hard_limit": "1000000", "reason": "ample tokens"})),
+        ),
+        200,
+    );
+    success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/usage_cost_micros"),
+            Some("cost-1000"),
+            Some(&json!({"hard_limit": "1000", "reason": "cost ceiling"})),
+        ),
+        200,
+    );
+    let (conv3_id, branch3_id) = conv("conv-q-3");
+    let (conv4_id, branch4_id) = conv("conv-q-4");
+    success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some("cost-run-1"),
+            Some(&run_body(
+                &conv3_id,
+                &branch3_id,
+                "00000000-0000-4000-8000-00000000a006",
+                1,
+            )),
+        ),
+        201,
+    );
+    let (status, cost_ref) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("cost-run-2"),
+        Some(&run_body(
+            &conv4_id,
+            &branch4_id,
+            "00000000-0000-4000-8000-00000000a007",
+            1,
+        )),
+    );
+    assert_eq!(status, 429, "{cost_ref}");
+    assert_eq!(cost_ref["code"], "quota");
+    assert_eq!(
+        cost_ref["quota"],
+        json!({"resource_kind": "usage_cost_micros", "scope_kind": "personal"})
+    );
+
+    // 5. Revoke personal usage_tokens override while keeping instance default -> 503 provisioning.
+    success(
+        api.call(
+            admin_n,
+            "POST",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/usage_cost_micros/revoke"),
+            Some("cost-rev"),
+            Some(&json!({"reason": "remove cost override"})),
+        ),
+        200,
+    );
     success(
         api.call(
             admin_n,
@@ -2233,7 +2607,12 @@ async fn create_run_distinguishes_rate_limited_quota_and_provisioning_refusals_o
         "POST",
         "/v1/runs",
         Some("run-prov"),
-        Some(&run_body("00000000-0000-4000-8000-00000000a003")),
+        Some(&run_body(
+            &conv4_id,
+            &branch4_id,
+            "00000000-0000-4000-8000-00000000a008",
+            1,
+        )),
     );
     assert_eq!(status, 503, "{prov}");
     assert_eq!(prov["code"], "provisioning");
@@ -2482,6 +2861,14 @@ async fn manage_quotas_overrides_enforce_admin_upgrade_gate_idempotency_and_vali
         404,
         "not_found",
     );
+    // Replaying set-k1 AFTER later set AND revoke still returns original recorded revision 1.
+    assert_eq!(
+        success(
+            api.call(admin_b, "PUT", &tok_path, Some("set-k1"), Some(&body1)),
+            200,
+        ),
+        r1
+    );
     let audit_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM openmettle.authorization_audit
           WHERE actor_user_id = $1::uuid
@@ -2491,7 +2878,45 @@ async fn manage_quotas_overrides_enforce_admin_upgrade_gate_idempotency_and_vali
     .fetch_one(&mut owner)
     .await
     .unwrap();
-    assert!(audit_count >= 3);
+    assert_eq!(audit_count, 3);
+
+    // Multibyte UTF-8 reason boundary: 256 UTF-8 bytes accepted, 258 UTF-8 bytes rejected with 400 validation.
+    let ok_utf8 = "é".repeat(128);
+    let over_utf8 = "é".repeat(129);
+    assert_eq!((ok_utf8.len(), over_utf8.len()), (256, 258));
+    refused(
+        api.call(
+            admin_b,
+            "PUT",
+            &tok_path,
+            Some("utf8-over-set"),
+            Some(&json!({"hard_limit": "12345", "reason": over_utf8})),
+        ),
+        400,
+        "validation",
+    );
+    refused(
+        api.call(
+            admin_b,
+            "POST",
+            &format!("{tok_path}/revoke"),
+            Some("utf8-over-rev"),
+            Some(&json!({"reason": over_utf8})),
+        ),
+        400,
+        "validation",
+    );
+    let utf8_ok = success(
+        api.call(
+            admin_b,
+            "PUT",
+            &tok_path,
+            Some("utf8-exact-set"),
+            Some(&json!({"hard_limit": "12345", "reason": ok_utf8})),
+        ),
+        200,
+    );
+    assert_eq!(utf8_ok["revision"], "4");
 }
 
 #[path = "run_events_http.rs"]

@@ -292,6 +292,7 @@ struct Users {
 }
 impl Users {
     async fn new(db: &TestDb) -> Self {
+        super::run_admission::seed_token_budget(db).await;
         let mut owner = connect(&db.0, OWNER).await;
         authz_store::providers(&mut owner).await;
         let actor = authz_store::account(&mut owner, PROVIDER, true, FUTURE).await;

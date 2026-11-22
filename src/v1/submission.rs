@@ -497,7 +497,12 @@ async fn admission(
         selection: &r.proposal.selection,
         requested_rounds: r.proposal.requested_rounds,
     };
-    let (branch, message, format, version, snapshots, gates) =
+    let scope_kind = if view.project_id.is_some() {
+        "project"
+    } else {
+        "personal"
+    };
+    let (branch, message, format, version, snapshots, gates, per_round_ceiling) =
         if let Some(found) = queue::find_run(c, scope, ctx.user_id(), &key).await? {
             let (previous, config) = Snapshots::decode(&found).map_err(|_| KEY_CONFLICT)?;
             let mode: StoredMode =
@@ -515,6 +520,7 @@ async fn admission(
                     config: found.config_snapshot,
                 },
                 config.required_capabilities,
+                config.effective.ceiling.value,
             )
         } else {
             let audit = AuditContext {
@@ -560,13 +566,14 @@ async fn admission(
                 SNAPSHOT_VERSION,
                 snapshots,
                 config.required_capabilities,
+                config.effective.ceiling.value,
             )
         };
     let caps = gates
         .iter()
         .map(|(name, gate)| queue::CapabilityUse { name, gate: *gate })
         .collect::<Vec<_>>();
-    Ok(queue::admit_run_with_mode(
+    let admitted = queue::admit_run_with_mode(
         tx,
         &queue::RunAdmission {
             input: RunInput {
@@ -589,7 +596,33 @@ async fn admission(
         limits,
         ctx,
     )
-    .await?)
+    .await?;
+    if let Admission::Admitted {
+        ref run_id,
+        round_limit,
+    } = admitted
+    {
+        let per_round = per_round_ceiling.ok_or(PROVISIONING)?;
+        let token_units = per_round
+            .checked_mul(u64::from(u32::try_from(round_limit).map_err(|_| INTERNAL)?))
+            .and_then(|n| i64::try_from(n).ok())
+            .filter(|&n| n > 0)
+            .ok_or(INVALID)?;
+        if let Some(limit) = crate::quotas::reserve_admitted_run_budget(
+            tx,
+            scope,
+            scope_kind,
+            ctx.user_id(),
+            ctx.approval_id(),
+            run_id,
+            token_units,
+        )
+        .await?
+        {
+            return Ok(Admission::Refused(limit));
+        }
+    }
+    Ok(admitted)
 }
 pub(super) async fn cancel(
     c: &mut PgConnection,

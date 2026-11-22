@@ -4,14 +4,14 @@ use crate::{
     authz::gateway::{Authority, Call, Error, Reservation},
     authz::{
         self, Action, AdminChange, DenialReason, PolicyReason,
-        runs::AdmissionLimits,
+        runs::{AdmissionLimits, ClaimLimits, RunLimit},
         store::{self, AuditContext, StoreError},
     },
     runs::WriteTransaction,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::{Connection, PgConnection, PgPool, Row};
+use sqlx::{Acquire, PgConnection, PgPool, Postgres, Row, Transaction};
 use std::fmt;
 
 pub(crate) async fn prepare_round(
@@ -505,6 +505,7 @@ pub async fn read_summary(
     scope_id: &str,
     actor_user_id: Option<&str>,
     admission: Option<AdmissionLimits>,
+    claim: Option<ClaimLimits>,
 ) -> Result<QuotaSummary, QuotaError> {
     store::uuid(scope_id, "scope_id")?;
     if let Some(actor) = actor_user_id {
@@ -517,6 +518,32 @@ pub async fn read_summary(
     sqlx::query("SELECT set_config('statement_timeout', '3s', true)")
         .execute(&mut *tx)
         .await?;
+    let result = read_summary_in_tx(&mut tx, scope_id, actor_user_id, admission, claim).await;
+    match result {
+        Ok(summary) => {
+            tx.commit().await?;
+            Ok(summary)
+        }
+        Err(error) => {
+            let _ = tx.rollback().await;
+            Err(error)
+        }
+    }
+}
+
+/// Read one quota summary inside an already-open `REPEATABLE READ, READ ONLY` transaction so
+/// authorization checks and quota reads share a single consistent database snapshot.
+pub(crate) async fn read_summary_in_tx(
+    tx: &mut PgConnection,
+    scope_id: &str,
+    actor_user_id: Option<&str>,
+    admission: Option<AdmissionLimits>,
+    claim: Option<ClaimLimits>,
+) -> Result<QuotaSummary, QuotaError> {
+    store::uuid(scope_id, "scope_id")?;
+    if let Some(actor) = actor_user_id {
+        store::uuid(actor, "actor_user_id")?;
+    }
 
     let scope_row: Option<(String, i64, String)> = sqlx::query_as(
         "SELECT s.kind,
@@ -552,7 +579,11 @@ pub async fn read_summary(
                      THEN o.hard_limit END AS override_limit,
                 CASE WHEN o.revoked_at IS NULL AND (o.expires_at IS NULL OR o.expires_at > $3::text::timestamptz)
                      THEN (extract(epoch FROM o.expires_at) * 1000000)::bigint END AS override_expires_us,
-                coalesce(o.revision, 0) AS limit_revision
+                coalesce(
+                    CASE WHEN o.revoked_at IS NULL AND (o.expires_at IS NULL OR o.expires_at > $3::text::timestamptz)
+                         THEN o.revision END,
+                    0
+                ) AS limit_revision
            FROM (VALUES (1)) AS seed(id)
            LEFT JOIN openmettle.storage_accounts a ON a.scope_id = $1::uuid
            LEFT JOIN openmettle.storage_instance i ON i.id
@@ -598,6 +629,8 @@ pub async fn read_summary(
         s_row.try_get("limit_revision")?,
         s_row.try_get("config_revision")?,
     )];
+    let mut warn_state = std::collections::BTreeMap::new();
+    warn_state.insert("storage_bytes".to_owned(), (storage_limit, charged_u128));
 
     // 2. Metered usage budgets (usage_tokens, usage_cost_micros)
     let usage_rows = sqlx::query(
@@ -622,7 +655,11 @@ pub async fn read_summary(
                          THEN o.hard_limit END AS override_limit,
                     CASE WHEN o.revoked_at IS NULL AND (o.expires_at IS NULL OR o.expires_at > $3::text::timestamptz)
                          THEN (extract(epoch FROM o.expires_at) * 1000000)::bigint END AS override_expires_us,
-                    coalesce(o.revision, 0) AS limit_revision,
+                    coalesce(
+                        CASE WHEN o.revoked_at IS NULL AND (o.expires_at IS NULL OR o.expires_at > $3::text::timestamptz)
+                             THEN o.revision END,
+                        0
+                    ) AS limit_revision,
                     CASE WHEN d.window_seconds IS NULL THEN 'static' ELSE 'windowed' END AS window_kind,
                     CASE WHEN d.window_seconds IS NULL THEN 'epoch'::timestamptz
                          ELSE date_bin(make_interval(secs => d.window_seconds), $3::text::timestamptz, 'epoch')
@@ -705,6 +742,7 @@ pub async fn read_summary(
             row.try_get("limit_revision")?,
             row.try_get("config_revision")?,
         ));
+        warn_state.insert(resource_kind.clone(), (eff_limit, charged));
         usage.push(QuotaUsageItem {
             resource_kind,
             unit,
@@ -734,7 +772,11 @@ pub async fn read_summary(
                      THEN (extract(epoch FROM o.expires_at) * 1000000)::bigint END AS override_expires_us,
                 coalesce(d.warn_pct_1, 80)::smallint AS warn_pct_1,
                 coalesce(d.warn_pct_2, 90)::smallint AS warn_pct_2,
-                coalesce(o.revision, 0) AS limit_revision,
+                coalesce(
+                    CASE WHEN o.revoked_at IS NULL AND (o.expires_at IS NULL OR o.expires_at > $3::text::timestamptz)
+                         THEN o.revision END,
+                    0
+                ) AS limit_revision,
                 coalesce(d.config_revision, 1) AS config_revision
            FROM (VALUES (1)) AS seed(id)
            LEFT JOIN openmettle.quota_defaults d
@@ -769,6 +811,7 @@ pub async fn read_summary(
         dev_row.try_get("limit_revision")?,
         dev_row.try_get("config_revision")?,
     ));
+    warn_state.insert("device_reservations".to_owned(), (dev_limit, dev_held));
     let device_capacity = QuotaDeviceCapacitySummary {
         active_reservations: QuotaDeviceReservationsSummary {
             reserved_held: dev_held_str,
@@ -851,7 +894,10 @@ pub async fn read_summary(
         limit_source: src,
         override_expires_at: exp,
     };
-    let (lim, src, exp) = resolve_exec("executing_runs_per_scope", None)?;
+    let (lim, src, exp) = resolve_exec(
+        "executing_runs_per_scope",
+        claim.map(|l| i64::from(l.executing_per_scope)),
+    )?;
     let executing_runs_per_scope = QuotaExecutionCounter {
         current: scope_exec.to_string(),
         limit: lim,
@@ -891,7 +937,10 @@ pub async fn read_summary(
             limit_source: src,
             override_expires_at: exp,
         };
-        let (lim, src, exp) = resolve_exec("executing_runs_per_actor", None)?;
+        let (lim, src, exp) = resolve_exec(
+            "executing_runs_per_actor",
+            claim.map(|l| i64::from(l.executing_per_actor)),
+        )?;
         let exec = QuotaExecutionCounter {
             current: actor_exec.to_string(),
             limit: lim,
@@ -903,7 +952,8 @@ pub async fn read_summary(
         (None, None)
     };
 
-    // 5. Active deduplicated warnings for this scope only (re-armed on revision/config/bucket change)
+    // 5. Active deduplicated warnings for this scope only (re-armed on revision/config/bucket
+    // change and validated against the current effective limit and charged usage).
     let res_kinds: Vec<&str> = active_warn_keys.iter().map(|k| k.0.as_str()).collect();
     let buckets: Vec<&str> = active_warn_keys.iter().map(|k| k.1.as_str()).collect();
     let lim_revs: Vec<i64> = active_warn_keys.iter().map(|k| k.2).collect();
@@ -935,15 +985,27 @@ pub async fn read_summary(
 
     let mut warnings = Vec::with_capacity(warn_rows.len());
     for row in warn_rows {
+        let resource_kind: String = row.try_get("resource_kind")?;
+        let threshold_pct: i16 = row.try_get("threshold_pct")?;
+        let still_crossed = warn_state
+            .get(&resource_kind)
+            .and_then(|(lim, charged)| lim.map(|l| (l, *charged)))
+            .is_some_and(|(lim, charged)| {
+                lim > 0
+                    && charged.saturating_mul(100)
+                        >= (lim as u128).saturating_mul(u128::from(threshold_pct.max(1) as u16))
+            });
+        if !still_crossed {
+            continue;
+        }
         warnings.push(QuotaWarning {
-            resource_kind: row.try_get("resource_kind")?,
-            threshold_pct: row.try_get("threshold_pct")?,
+            resource_kind,
+            threshold_pct,
             dedupe_bucket: format_timestamp_us(row.try_get("dedupe_bucket_us")?)?,
             triggered_at: format_timestamp_us(row.try_get("triggered_at_us")?)?,
         });
     }
 
-    tx.commit().await?;
     Ok(QuotaSummary {
         scope_id: scope_id.to_owned(),
         scope_kind,
@@ -969,10 +1031,14 @@ async fn read_override_row(
 ) -> Result<QuotaOverride, QuotaError> {
     let row = sqlx::query(
         "SELECT scope_id::text, scope_kind, resource_kind, hard_limit,
-                (extract(epoch FROM expires_at) * 1000000)::bigint AS expires_us,
-                (extract(epoch FROM revoked_at) * 1000000)::bigint AS revoked_us,
+                CASE WHEN expires_at IS NOT NULL
+                     THEN to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+                END AS expires_at,
+                CASE WHEN revoked_at IS NOT NULL
+                     THEN to_char(revoked_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+                END AS revoked_at,
                 revision,
-                (extract(epoch FROM updated_at) * 1000000)::bigint AS updated_us
+                to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at
            FROM openmettle.quota_overrides
           WHERE scope_id = $1::uuid AND resource_kind = $2",
     )
@@ -985,10 +1051,10 @@ async fn read_override_row(
         scope_kind: row.try_get("scope_kind")?,
         resource_kind: row.try_get("resource_kind")?,
         hard_limit: row.try_get::<i64, _>("hard_limit")?.to_string(),
-        expires_at: opt_timestamp_us(row.try_get("expires_us")?)?,
-        revoked_at: opt_timestamp_us(row.try_get("revoked_us")?)?,
+        expires_at: row.try_get("expires_at")?,
+        revoked_at: row.try_get("revoked_at")?,
         revision: row.try_get::<i64, _>("revision")?.to_string(),
-        updated_at: format_timestamp_us(row.try_get("updated_us")?)?,
+        updated_at: row.try_get("updated_at")?,
     })
 }
 
@@ -996,6 +1062,7 @@ fn map_override_sql_error(error: sqlx::Error) -> QuotaError {
     if let sqlx::Error::Database(ref db) = error {
         match db.code().as_deref() {
             Some("OMQ02") => return QuotaError::CostDenominationUnconfigured,
+            Some("OMQ03") => return QuotaError::AdoptionInProgress,
             Some("P0002") => return QuotaError::Store(StoreError::NotFound),
             Some("42501") => {
                 return QuotaError::Store(StoreError::Denied(DenialReason::Policy(
@@ -1025,20 +1092,19 @@ async fn authorize_manage_quotas_and_check_upgrade(
             enabled_account_admins: 0,
         },
     ))?;
-    let (metering_enforced, adoption_idle): (bool, bool) = sqlx::query_as(
-        "SELECT e.metering_enforced, v.adoption_run_id IS NULL
-           FROM openmettle.quota_enforcement e
-           CROSS JOIN openmettle.storage_volume_control v
-          WHERE e.id AND v.id",
-    )
-    .fetch_one(&mut *c)
-    .await?;
+    let metering_enforced: bool =
+        sqlx::query_scalar("SELECT metering_enforced FROM openmettle.quota_enforcement WHERE id")
+            .fetch_one(&mut *c)
+            .await?;
     if !metering_enforced {
         return Err(QuotaError::UpgradeNotEnforced);
     }
-    if !adoption_idle {
-        return Err(QuotaError::AdoptionInProgress);
-    }
+    // Acquire FOR SHARE on storage_volume_control so override writes serialize against adoption
+    // and never overlap an active adoption run (OMQ03 -> 503 unavailable).
+    sqlx::query("SELECT openmettle.storage_lock_not_adopting()")
+        .execute(&mut *c)
+        .await
+        .map_err(map_override_sql_error)?;
     Ok(())
 }
 
@@ -1084,35 +1150,6 @@ async fn check_override_idempotency(
     Ok(Some(response))
 }
 
-async fn record_override_idempotency(
-    c: &mut PgConnection,
-    ctx: &AuditContext<'_>,
-    action: &'static str,
-    scope_id: &str,
-    request: &Value,
-    response: &QuotaOverride,
-) -> Result<(), QuotaError> {
-    let details = json!({
-        "request": request,
-        "response": response,
-    })
-    .to_string();
-    sqlx::query(
-        "INSERT INTO openmettle.authorization_audit
-             (actor_user_id, action, target_kind, target_id, request_key, reason, details)
-         VALUES ($1::uuid, $2, 'quota_scope', $3, $4, $5, $6::jsonb)",
-    )
-    .bind(ctx.actor_user_id)
-    .bind(action)
-    .bind(scope_id)
-    .bind(ctx.request_key)
-    .bind(ctx.reason)
-    .bind(&details)
-    .execute(c)
-    .await?;
-    Ok(())
-}
-
 async fn validate_scope_for_resource(
     c: &mut PgConnection,
     scope_id: &str,
@@ -1135,7 +1172,8 @@ async fn validate_scope_for_resource(
 }
 
 /// Create or update one scope quota override as `openmettle_api` (`Action::ManageQuotas`),
-/// serialized under `account_admin_lock` with exact idempotent replay and conflict detection.
+/// serialized under `account_admin_lock` and `storage_volume_control FOR SHARE` with one
+/// authoritative `authorization_audit` row per write, exact idempotent replay, and conflict check.
 pub async fn set_scope_override(
     c: &mut PgConnection,
     ctx: &AuditContext<'_>,
@@ -1172,9 +1210,10 @@ pub async fn set_scope_override(
             return Ok(replayed);
         }
         validate_scope_for_resource(c, scope_id, resource).await?;
+        let req_text = req.to_string();
         sqlx::query_scalar::<_, i64>(
             "SELECT openmettle.quota_upsert_scope_override(
-                 $1::uuid, $2::uuid, $3, $4, $5::text::timestamptz, $6
+                 $1::uuid, $2::uuid, $3, $4, $5::text::timestamptz, $6, $7, $8::jsonb
              )",
         )
         .bind(scope_id)
@@ -1183,12 +1222,12 @@ pub async fn set_scope_override(
         .bind(hard_limit)
         .bind(expires_at)
         .bind(ctx.reason)
+        .bind(ctx.request_key)
+        .bind(&req_text)
         .fetch_one(&mut *c)
         .await
         .map_err(map_override_sql_error)?;
-        let record = read_override_row(c, scope_id, resource).await?;
-        record_override_idempotency(c, ctx, "quota.override.set", scope_id, &req, &record).await?;
-        Ok(record)
+        read_override_row(c, scope_id, resource).await
     }
     .await;
     match outcome {
@@ -1204,7 +1243,8 @@ pub async fn set_scope_override(
 }
 
 /// Revoke an active scope quota override as `openmettle_api` (`Action::ManageQuotas`),
-/// serialized under `account_admin_lock` with exact idempotent replay and conflict detection.
+/// serialized under `account_admin_lock` and `storage_volume_control FOR SHARE` with one
+/// authoritative `authorization_audit` row per write, exact idempotent replay, and conflict check.
 pub async fn revoke_scope_override(
     c: &mut PgConnection,
     ctx: &AuditContext<'_>,
@@ -1232,13 +1272,18 @@ pub async fn revoke_scope_override(
             return Ok(replayed);
         }
         validate_scope_for_resource(c, scope_id, resource).await?;
+        let req_text = req.to_string();
         let revoked: Option<i64> = sqlx::query_scalar(
-            "SELECT openmettle.quota_revoke_scope_override($1::uuid, $2::uuid, $3, $4)",
+            "SELECT openmettle.quota_revoke_scope_override(
+                 $1::uuid, $2::uuid, $3, $4, $5, $6::jsonb
+             )",
         )
         .bind(scope_id)
         .bind(ctx.actor_user_id)
         .bind(resource.as_str())
         .bind(ctx.reason)
+        .bind(ctx.request_key)
+        .bind(&req_text)
         .fetch_one(&mut *c)
         .await
         .map_err(map_override_sql_error)?;
@@ -1259,10 +1304,7 @@ pub async fn revoke_scope_override(
                 QuotaError::Store(StoreError::NotFound)
             });
         }
-        let record = read_override_row(c, scope_id, resource).await?;
-        record_override_idempotency(c, ctx, "quota.override.revoke", scope_id, &req, &record)
-            .await?;
-        Ok(record)
+        read_override_row(c, scope_id, resource).await
     }
     .await;
     match outcome {
@@ -1275,4 +1317,319 @@ pub async fn revoke_scope_override(
             Err(error)
         }
     }
+}
+
+/// Reserve the run-level gateway and metered quota holds inside the `/v1/runs` admission
+/// transaction (`runs -> gateway_reservations -> quota_budgets` lock order, ADR 0040).
+///
+/// Returns `Ok(Some(limit))` when a metered budget refuses the reservation so the caller rolls
+/// back the entire submission transaction cleanly (no committed run, branch turn, or hold).
+pub(crate) async fn reserve_admitted_run_budget(
+    tx: &mut WriteTransaction<'_>,
+    scope_id: &str,
+    scope_kind: &'static str,
+    actor_user_id: &str,
+    actor_approval_id: &str,
+    run_id: &str,
+    token_units: i64,
+) -> Result<Option<RunLimit>, StoreError> {
+    let mut outer = tx.take_active()?;
+    let result = reserve_admitted_run_budget_inner(
+        &mut outer,
+        scope_id,
+        scope_kind,
+        actor_user_id,
+        actor_approval_id,
+        run_id,
+        token_units,
+    )
+    .await;
+    tx.restore(outer);
+    result
+}
+
+async fn reserve_admitted_run_budget_inner(
+    outer: &mut Transaction<'_, Postgres>,
+    scope_id: &str,
+    scope_kind: &'static str,
+    actor_user_id: &str,
+    actor_approval_id: &str,
+    run_id: &str,
+    token_units: i64,
+) -> Result<Option<RunLimit>, StoreError> {
+    let has_quota_schema: bool =
+        sqlx::query_scalar("SELECT to_regclass('openmettle.quota_enforcement') IS NOT NULL")
+            .fetch_one(&mut **outer)
+            .await?;
+    if !has_quota_schema {
+        return Ok(None);
+    }
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_reservations
+             (id, scope_id, actor_user_id, approval_id, run_id, units)
+         VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $1::uuid, $5)",
+    )
+    .bind(run_id)
+    .bind(scope_id)
+    .bind(actor_user_id)
+    .bind(actor_approval_id)
+    .bind(token_units)
+    .execute(&mut **outer)
+    .await?;
+
+    let enforced: bool =
+        sqlx::query_scalar("SELECT metering_enforced FROM openmettle.quota_enforcement WHERE id")
+            .fetch_one(&mut **outer)
+            .await?;
+    if !enforced {
+        return Ok(None);
+    }
+
+    // Canonical order: reserve usage_cost_micros when configured, then usage_tokens unconditionally.
+    let (cost_denomination, any_cost_limit): (Option<String>, bool) = sqlx::query_as(
+        "WITH stamp AS (SELECT clock_timestamp() AS now),
+         actor AS (SELECT id FROM openmettle.scopes WHERE personal_user_id = $3::uuid),
+         tiers(ord, scope_id, scope_kind) AS (
+             SELECT 1, $1::uuid, $2::text
+             UNION ALL
+             SELECT 2, (SELECT id FROM actor), 'personal'::text
+              WHERE $1::uuid <> (SELECT id FROM actor)
+             UNION ALL
+             SELECT 3, NULL::uuid, 'instance'::text
+         )
+         SELECT (SELECT cost_denomination FROM openmettle.quota_defaults
+                  WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'),
+                EXISTS (
+                    SELECT 1 FROM tiers t
+                    LEFT JOIN openmettle.quota_defaults d
+                      ON d.scope_kind = t.scope_kind AND d.resource_kind = 'usage_cost_micros'
+                    LEFT JOIN openmettle.quota_overrides o
+                      ON o.scope_id = t.scope_id AND o.resource_kind = 'usage_cost_micros'
+                   WHERE coalesce(
+                             CASE WHEN o.revoked_at IS NULL
+                                   AND (o.expires_at IS NULL OR o.expires_at > (SELECT now FROM stamp))
+                                  THEN o.hard_limit END,
+                             d.hard_limit
+                         ) IS NOT NULL
+                )",
+    )
+    .bind(scope_id)
+    .bind(scope_kind)
+    .bind(actor_user_id)
+    .fetch_one(&mut **outer)
+    .await?;
+
+    if any_cost_limit {
+        if cost_denomination.is_none() {
+            return Ok(Some(RunLimit::QuotaUnconfigured {
+                resource_kind: "usage_cost_micros",
+                scope_kind: "instance",
+            }));
+        }
+        let cost_ceiling: Option<i64> =
+            sqlx::query_scalar("SELECT openmettle.quota_cost_ceiling($1::uuid, $2::uuid)")
+                .bind(scope_id)
+                .bind(actor_user_id)
+                .fetch_one(&mut **outer)
+                .await?;
+        match cost_ceiling {
+            Some(0) => {
+                let tier = find_failing_tier(
+                    &mut *outer,
+                    scope_id,
+                    scope_kind,
+                    actor_user_id,
+                    "usage_cost_micros",
+                    1,
+                )
+                .await?;
+                return Ok(Some(RunLimit::Quota {
+                    resource_kind: "usage_cost_micros",
+                    scope_kind: tier,
+                }));
+            }
+            Some(cost_units) => {
+                if let Some(refusal) = try_quota_reserve(
+                    outer,
+                    scope_id,
+                    scope_kind,
+                    actor_user_id,
+                    run_id,
+                    "usage_cost_micros",
+                    cost_units,
+                )
+                .await?
+                {
+                    return Ok(Some(refusal));
+                }
+            }
+            None => {}
+        }
+    }
+
+    try_quota_reserve(
+        outer,
+        scope_id,
+        scope_kind,
+        actor_user_id,
+        run_id,
+        "usage_tokens",
+        token_units,
+    )
+    .await
+}
+
+async fn try_quota_reserve(
+    outer: &mut Transaction<'_, Postgres>,
+    scope_id: &str,
+    scope_kind: &'static str,
+    actor_user_id: &str,
+    run_id: &str,
+    resource: &'static str,
+    units: i64,
+) -> Result<Option<RunLimit>, StoreError> {
+    let mut sp = outer.begin().await?;
+    let res = sqlx::query_scalar::<_, String>(
+        "SELECT openmettle.quota_reserve(
+             $1::uuid,
+             $2::uuid,
+             $3,
+             $4,
+             'run:' || $5,
+             $5::uuid,
+             NULL,
+             NULL,
+             (SELECT greatest(clock_timestamp() + interval '1 second',
+                              coalesce(queue_expires_at, clock_timestamp()) + interval '60 seconds')
+                FROM openmettle.runs
+               WHERE id = $5::uuid)
+         )::text",
+    )
+    .bind(scope_id)
+    .bind(actor_user_id)
+    .bind(resource)
+    .bind(units)
+    .bind(run_id)
+    .fetch_one(&mut *sp)
+    .await;
+    match res {
+        Ok(_) => {
+            sp.commit().await?;
+            Ok(None)
+        }
+        Err(err) => {
+            sp.rollback().await?;
+            if let sqlx::Error::Database(ref db) = err {
+                match db.code().as_deref() {
+                    Some("OMQ01") => {
+                        let tier = find_failing_tier(
+                            &mut *outer,
+                            scope_id,
+                            scope_kind,
+                            actor_user_id,
+                            resource,
+                            units,
+                        )
+                        .await?;
+                        return Ok(Some(RunLimit::Quota {
+                            resource_kind: resource,
+                            scope_kind: tier,
+                        }));
+                    }
+                    Some("OMQ02") => {
+                        return Ok(Some(RunLimit::QuotaUnconfigured {
+                            resource_kind: resource,
+                            scope_kind: "instance",
+                        }));
+                    }
+                    Some("OMQ05") => {
+                        return Ok(Some(RunLimit::QuotaUnconfigured {
+                            resource_kind: resource,
+                            scope_kind: "personal",
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+            Err(StoreError::Database(err))
+        }
+    }
+}
+
+async fn find_failing_tier(
+    c: &mut PgConnection,
+    scope_id: &str,
+    scope_kind: &'static str,
+    actor_user_id: &str,
+    resource: &'static str,
+    requested_units: i64,
+) -> Result<&'static str, StoreError> {
+    let rows: Vec<(String, Option<i64>, String, String)> = sqlx::query_as(
+        "WITH stamp AS (SELECT clock_timestamp() AS now),
+         actor AS (SELECT id FROM openmettle.scopes WHERE personal_user_id = $3::uuid),
+         tiers(ord, scope_id, scope_kind) AS (
+             SELECT 1, $1::uuid, $2::text
+             UNION ALL
+             SELECT 2, (SELECT id FROM actor), 'personal'::text
+              WHERE $1::uuid <> (SELECT id FROM actor)
+             UNION ALL
+             SELECT 3, NULL::uuid, 'instance'::text
+         ),
+         cfg AS (
+             SELECT t.ord,
+                    t.scope_id,
+                    t.scope_kind,
+                    coalesce(
+                        CASE WHEN o.revoked_at IS NULL
+                              AND (o.expires_at IS NULL OR o.expires_at > (SELECT now FROM stamp))
+                             THEN o.hard_limit END,
+                        d.hard_limit
+                    ) AS hard_limit,
+                    CASE WHEN d.window_seconds IS NULL THEN 'static' ELSE 'windowed' END AS window_kind,
+                    CASE WHEN d.window_seconds IS NULL THEN 'epoch'::timestamptz
+                         ELSE date_bin(make_interval(secs => d.window_seconds), (SELECT now FROM stamp), 'epoch')
+                    END AS window_start
+               FROM tiers t
+               LEFT JOIN openmettle.quota_defaults d
+                 ON d.scope_kind = t.scope_kind AND d.resource_kind = $4
+               LEFT JOIN openmettle.quota_overrides o
+                 ON o.scope_id = t.scope_id AND o.resource_kind = $4
+         )
+         SELECT cfg.scope_kind,
+                cfg.hard_limit,
+                coalesce(b.active_used, 0)::text,
+                coalesce(b.reserved_held, 0)::text
+           FROM cfg
+           LEFT JOIN openmettle.quota_budgets b
+             ON b.target_kind = CASE WHEN cfg.scope_id IS NULL THEN 'instance' ELSE 'scope' END
+            AND b.scope_id IS NOT DISTINCT FROM cfg.scope_id
+            AND b.resource_kind = $4
+            AND b.window_kind = cfg.window_kind
+            AND b.window_start = cfg.window_start
+          ORDER BY cfg.ord",
+    )
+    .bind(scope_id)
+    .bind(scope_kind)
+    .bind(actor_user_id)
+    .bind(resource)
+    .fetch_all(&mut *c)
+    .await?;
+    let req = u128::try_from(requested_units.max(0)).unwrap_or(0);
+    for (tier_kind, limit, used_text, held_text) in rows {
+        let Some(limit) = limit else { continue };
+        let used: u128 = used_text.parse().map_err(|_| {
+            StoreError::Database(sqlx::Error::Protocol("invalid quota counter".into()))
+        })?;
+        let held: u128 = held_text.parse().map_err(|_| {
+            StoreError::Database(sqlx::Error::Protocol("invalid quota counter".into()))
+        })?;
+        if limit <= 0 || used.saturating_add(held).saturating_add(req) > limit as u128 {
+            return Ok(match tier_kind.as_str() {
+                "personal" => "personal",
+                "project" => "project",
+                _ => "instance",
+            });
+        }
+    }
+    Ok(scope_kind)
 }

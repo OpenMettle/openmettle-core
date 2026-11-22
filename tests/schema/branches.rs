@@ -117,6 +117,7 @@ async fn revision(c: &mut PgConnection, f: &Fixture) -> String {
 #[ignore = "isolated PostgreSQL 18"]
 async fn published_paths_replay_revisions_and_budget_survive_forks() {
     let db = TestDb::migrated().await;
+    super::run_admission::seed_token_budget(&db).await;
     let f = Fixture::new(&db).await;
     let chat = f.chat();
     let root = &f.root.branch_id;

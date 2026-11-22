@@ -162,6 +162,9 @@ impl BrowserAuth {
             issuance,
         }
     }
+    pub(crate) fn claim_limits(&self) -> Option<crate::authz::runs::ClaimLimits> {
+        self.config.claim_limits
+    }
     fn provider(&self, id: &str) -> Result<&ManagedProvider, login::Error> {
         configured(self.config.providers(), id).ok_or(login::Error::Rejected)
     }

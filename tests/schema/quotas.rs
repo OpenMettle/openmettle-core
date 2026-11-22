@@ -274,6 +274,7 @@ async fn run_renewal_preserves_storage_settlement_margin_for_late_reservations()
         storage::{ReservationInput, reserve},
     };
     let db = TestDb::migrated().await;
+    run_admission::seed_token_budget(&db).await;
     let mut owner = connect(&db.0, OWNER).await;
     authz_store::providers(&mut owner).await;
     let actor =
@@ -490,10 +491,13 @@ async fn quota_store_enforces_upgrade_gate_denomination_idempotency_and_wide_sum
         quotas::{self, QuotaError, QuotaResourceKind as K},
     };
 
-    // 1. Upgraded DB (`applied = 23` -> `24`) gates override writes until metering_enforced = true.
+    // 1. Upgraded DB (`applied = 23` -> `24` -> `25` -> `26`) verifies historical boundaries
+    //    at each version and gates override writes until metering_enforced = true.
     let upgraded = TestDb::new().await;
     let settings = upgraded.settings(Duration::from_secs(10));
     migrate::apply(&settings, &MIGRATIONS[..23]).await.unwrap();
+    migrate::apply(&settings, &MIGRATIONS[..24]).await.unwrap();
+    migrate::apply(&settings, &MIGRATIONS[..25]).await.unwrap();
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
     let mut u_owner = connect(&upgraded.0, OWNER).await;
     authz_store::providers(&mut u_owner).await;
@@ -655,14 +659,38 @@ async fn quota_store_enforces_upgrade_gate_denomination_idempotency_and_wide_sum
     let session_tok = authz_runs::seeded_session(&db, &alice, 7, None).await;
     settle_oversized_three_column_tokens(&db, &alice, &alice_scope, &session_tok).await;
 
-    let summary = quotas::read_summary(&mut api, &alice_scope, Some(&alice.user), None)
-        .await
-        .unwrap();
+    let summary = quotas::read_summary(
+        &mut api,
+        &alice_scope,
+        Some(&alice.user),
+        None,
+        Some(openmettle_core::authz::runs::ClaimLimits {
+            executing_per_actor: 3,
+            executing_per_scope: 7,
+        }),
+    )
+    .await
+    .unwrap();
     assert_eq!(summary.usage[0].resource_kind, "usage_tokens");
     assert_eq!(summary.usage[0].active_used, "27670116110564327421");
     assert_eq!(summary.usage[0].remaining.as_deref(), Some("0"));
     assert_eq!(summary.usage[0].status, "hard_limit");
     assert!(summary.usage[0].last_reconciled_at.is_some());
+    assert_eq!(
+        summary.execution.executing_runs_per_scope.limit.as_deref(),
+        Some("7")
+    );
+    assert_eq!(
+        summary.execution.executing_runs_per_scope.limit_source,
+        "default"
+    );
+    let actor_exec = summary
+        .execution
+        .executing_runs_per_actor
+        .as_ref()
+        .expect("personal summary includes executing_runs_per_actor");
+    assert_eq!(actor_exec.limit.as_deref(), Some("3"));
+    assert_eq!(actor_exec.limit_source, "default");
 
     let drift: (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
@@ -672,4 +700,185 @@ async fn quota_store_enforces_upgrade_gate_denomination_idempotency_and_wide_sum
     .await
     .unwrap();
     assert_eq!(drift, (0, 0, 0, 0));
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn quota_override_locks_single_audit_and_expired_override_warnings() {
+    use openmettle_core::{
+        authz::store::AuditContext,
+        quotas::{self, QuotaError, QuotaResourceKind as K},
+        runs::WriteTransaction,
+        storage::{self, ReservationInput},
+    };
+
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut owner).await;
+    let admin =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    authz_store::make_admin(&mut owner, &admin).await;
+    let alice =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let scope = authz_runs::personal_of(&db, &alice).await;
+
+    // 1. Unpinned volume (volume_id IS NULL, adoption_run_id IS NULL) permits overrides, AND
+    //    holding storage_volume_control FOR UPDATE serializes concurrent override writes.
+    let (vol, adopt): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT volume_id::text, adoption_run_id::text FROM openmettle.storage_volume_control WHERE id",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!((vol, adopt), (None, None));
+
+    let mut adoption_tx = owner.begin().await.unwrap();
+    sqlx::query("SELECT id FROM openmettle.storage_volume_control WHERE id FOR UPDATE")
+        .execute(&mut *adoption_tx)
+        .await
+        .unwrap();
+    let db_name = db.0.clone();
+    let admin_id = admin.user.clone();
+    let admin_app = admin.approval.clone();
+    let scope_clone = scope.clone();
+    let writer = tokio::spawn(async move {
+        let mut c = connect(&db_name, API).await;
+        let ctx = AuditContext {
+            actor_user_id: &admin_id,
+            actor_approval_id: &admin_app,
+            now_ms: authz_store::NOW,
+            request_key: "adopt-race-key",
+            reason: "racing adoption",
+        };
+        quotas::set_scope_override(&mut c, &ctx, &scope_clone, K::StorageBytes, 4096, None).await
+    });
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(
+        !writer.is_finished(),
+        "override write must wait on storage_volume_control FOR SHARE while adoption holds FOR UPDATE"
+    );
+    sqlx::query(
+        "UPDATE openmettle.storage_volume_control SET adoption_run_id = gen_random_uuid() WHERE id",
+    )
+    .execute(&mut *adoption_tx)
+    .await
+    .unwrap();
+    adoption_tx.commit().await.unwrap();
+    assert!(matches!(
+        writer.await.unwrap(),
+        Err(QuotaError::AdoptionInProgress)
+    ));
+    owner
+        .execute("UPDATE openmettle.storage_volume_control SET adoption_run_id = NULL WHERE id")
+        .await
+        .unwrap();
+
+    // 2. Exactly one authorization_audit row per mutation, and replay of k1 after k2 + revoke keeps rev 1.
+    let mut api = connect(&db.0, API).await;
+    let mk_ctx = |key| AuditContext {
+        actor_user_id: &admin.user,
+        actor_approval_id: &admin.approval,
+        now_ms: authz_store::NOW,
+        request_key: key,
+        reason: "single audit check",
+    };
+    let s1 = quotas::set_scope_override(&mut api, &mk_ctx("k1"), &scope, K::UsageTokens, 500, None)
+        .await
+        .unwrap();
+    assert_eq!(s1.revision, "1");
+    let s2 = quotas::set_scope_override(&mut api, &mk_ctx("k2"), &scope, K::UsageTokens, 900, None)
+        .await
+        .unwrap();
+    assert_eq!(s2.revision, "2");
+    let r3 = quotas::revoke_scope_override(&mut api, &mk_ctx("k3"), &scope, K::UsageTokens)
+        .await
+        .unwrap();
+    assert_eq!(r3.revision, "3");
+    // Replaying k1 after k2 and revoke returns the original recorded revision 1.
+    let s1_replay =
+        quotas::set_scope_override(&mut api, &mk_ctx("k1"), &scope, K::UsageTokens, 500, None)
+            .await
+            .unwrap();
+    assert_eq!(s1_replay, s1);
+    let audit_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM openmettle.authorization_audit
+          WHERE actor_user_id = $1::uuid
+            AND action IN ('quota.override.set', 'quota.override.revoke')",
+    )
+    .bind(&admin.user)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(audit_rows, 3);
+
+    // 3. Expired temporary low storage override reverts limit_revision to 0 and clears obsolete warnings.
+    owner
+        .execute(
+            "UPDATE openmettle.storage_instance
+                SET instance_budget_bytes = 100000, personal_limit_bytes = 10000, project_limit_bytes = 10000",
+        )
+        .await
+        .unwrap();
+    quotas::set_scope_override(
+        &mut api,
+        &mk_ctx("temp-low-storage"),
+        &scope,
+        K::StorageBytes,
+        1000,
+        Some("2028-01-01T00:00:00.000000Z"),
+    )
+    .await
+    .unwrap();
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    storage::reserve(
+        &mut tx,
+        &ReservationInput {
+            scope: &scope,
+            actor: &alice.user,
+            key: "warn-exp-1",
+            artifact: "00000000-0000-4000-8000-000000000099",
+            max_bytes: 850,
+            run: None,
+            operation: None,
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let before_exp = quotas::read_summary(&mut api, &scope, Some(&alice.user), None, None)
+        .await
+        .unwrap();
+    assert_eq!(before_exp.storage.status, "warning");
+    assert_eq!(before_exp.warnings.len(), 1);
+    assert_eq!(before_exp.warnings[0].threshold_pct, 80);
+
+    // Expire the temporary override; default limit (10000) applies -> 850/10000 = 8.5% -> ok, 0 warnings.
+    sqlx::query(
+        "UPDATE openmettle.quota_overrides
+            SET expires_at = clock_timestamp() - interval '1 second'
+          WHERE scope_id = $1::uuid AND resource_kind = 'storage_bytes'",
+    )
+    .bind(&scope)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    let after_exp = quotas::read_summary(&mut api, &scope, Some(&alice.user), None, None)
+        .await
+        .unwrap();
+    assert_eq!(after_exp.storage.limit_bytes.as_deref(), Some("10000"));
+    assert_eq!(after_exp.storage.limit_source, "default");
+    assert_eq!(after_exp.storage.status, "ok");
+    assert!(
+        after_exp.warnings.is_empty(),
+        "obsolete override warning remained after expiry: {:?}",
+        after_exp.warnings
+    );
+    let active_limit_rev: i64 = sqlx::query_scalar(
+        "SELECT limit_revision FROM openmettle.quota_limit($1::uuid, 'personal', 'storage_bytes')",
+    )
+    .bind(&scope)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(active_limit_rev, 0);
 }

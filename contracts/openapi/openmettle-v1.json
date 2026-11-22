@@ -6451,7 +6451,7 @@
         ]
       },
       "QuotaOverrideReason": {
-        "description": "Required reason recorded on the quota override and append-only authorization audit.",
+        "description": "Required reason recorded on the quota override and append-only authorization audit. Must be 1 to 256 UTF-8 bytes without NUL bytes; JSON Schema maxLength bounds Unicode code points while the server and consumer enforce the 256 UTF-8 byte ceiling.",
         "type": "string",
         "minLength": 1,
         "maxLength": 256
@@ -6948,7 +6948,63 @@
               "$ref": "#/components/schemas/QuotaWarning"
             }
           }
-        }
+        },
+        "allOf": [
+          {
+            "if": {
+              "required": [
+                "scope_kind"
+              ],
+              "properties": {
+                "scope_kind": {
+                  "const": "personal"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "execution": {
+                  "required": [
+                    "live_runs_per_actor",
+                    "executing_runs_per_actor"
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "required": [
+                "scope_kind"
+              ],
+              "properties": {
+                "scope_kind": {
+                  "const": "project"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "execution": {
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "live_runs_per_actor"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "executing_runs_per_actor"
+                        ]
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        ]
       },
       "QuotaOverrideSetRequest": {
         "description": "Closed request body to create or update a scope quota override (ADR 0040).",
@@ -9801,6 +9857,26 @@
                 "instancePath": "/usage/0/active_used",
                 "keyword": "maxLength"
               }
+            },
+            {
+              "name": "missing-live-per-actor",
+              "class": "invalid",
+              "op": "remove",
+              "path": "/execution/live_runs_per_actor",
+              "expect": {
+                "instancePath": "/execution",
+                "keyword": "required"
+              }
+            },
+            {
+              "name": "missing-executing-per-actor",
+              "class": "invalid",
+              "op": "remove",
+              "path": "/execution/executing_runs_per_actor",
+              "expect": {
+                "instancePath": "/execution",
+                "keyword": "required"
+              }
             }
           ]
         }
@@ -9905,7 +9981,40 @@
         "x-openmettle-fixture": {
           "schema": "#/components/schemas/QuotaSummary",
           "direction": "response",
-          "mutations": []
+          "mutations": [
+            {
+              "name": "with-live-per-actor",
+              "class": "invalid",
+              "op": "set",
+              "path": "/execution/live_runs_per_actor",
+              "value": {
+                "current": "0",
+                "limit": "4",
+                "limit_source": "default",
+                "override_expires_at": null
+              },
+              "expect": {
+                "instancePath": "/execution",
+                "keyword": "not"
+              }
+            },
+            {
+              "name": "with-executing-per-actor",
+              "class": "invalid",
+              "op": "set",
+              "path": "/execution/executing_runs_per_actor",
+              "value": {
+                "current": "0",
+                "limit": "2",
+                "limit_source": "default",
+                "override_expires_at": null
+              },
+              "expect": {
+                "instancePath": "/execution",
+                "keyword": "not"
+              }
+            }
+          ]
         }
       },
       "QuotaOverrideSetRequestTypical": {

@@ -112,6 +112,7 @@ impl Fixture {
         Self::on(TestDb::migrated().await).await
     }
     async fn on(db: TestDb) -> Self {
+        super::run_admission::seed_token_budget(&db).await;
         let mut owner = connect(&db.0, OWNER).await;
         providers(&mut owner).await;
         let actor = account(&mut owner, PROVIDER, true, FUTURE).await;

@@ -90,6 +90,27 @@ pub(super) async fn worker(db: &TestDb) -> PgConnection {
     connect(&db.0, WORKER).await
 }
 
+/// Seed a generous personal `usage_tokens` default for non-quota admission tests once migration
+/// 0024 exists (safe no-op on pre-0024 populated-upgrade fixtures and preserves existing rows).
+pub(super) async fn seed_token_budget(db: &TestDb) {
+    let mut owner = connect(&db.0, OWNER).await;
+    let has_table: bool =
+        sqlx::query_scalar("SELECT to_regclass('openmettle.quota_defaults') IS NOT NULL")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    if has_table {
+        owner
+            .execute(
+                "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+                 VALUES ('personal', 'usage_tokens', 1000000000)
+                 ON CONFLICT (scope_kind, resource_kind) DO NOTHING",
+            )
+            .await
+            .unwrap();
+    }
+}
+
 /// A request on a new conversation, branch and input message of `actor` in `scope`.
 pub(super) async fn request(
     db: &TestDb,
@@ -354,6 +375,7 @@ async fn recheck(db: &TestDb, claim: &ClaimedRun) -> Result<RunRecheckOutcome, l
 #[ignore = "isolated CI PostgreSQL 18 required"]
 async fn identical_admissions_admit_once_and_replays_keep_the_original_admission() {
     let db = TestDb::migrated().await;
+    seed_token_budget(&db).await;
     let mut owner = connect(&db.0, OWNER).await;
     providers(&mut owner).await;
     let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
@@ -502,6 +524,7 @@ async fn identical_admissions_admit_once_and_replays_keep_the_original_admission
 #[ignore = "isolated CI PostgreSQL 18 required"]
 async fn concurrent_admissions_admit_exactly_the_actor_scope_and_queue_limits() {
     let db = TestDb::migrated().await;
+    seed_token_budget(&db).await;
     let mut owner = connect(&db.0, OWNER).await;
     providers(&mut owner).await;
     let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
@@ -637,6 +660,7 @@ async fn concurrent_admissions_admit_exactly_the_actor_scope_and_queue_limits() 
 #[ignore = "isolated CI PostgreSQL 18 required"]
 async fn admission_racing_archive_delete_or_disable_never_leaves_a_live_run() {
     let db = TestDb::migrated().await;
+    seed_token_budget(&db).await;
     let mut owner = connect(&db.0, OWNER).await;
     providers(&mut owner).await;
     let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
@@ -767,6 +791,7 @@ async fn admission_racing_archive_delete_or_disable_never_leaves_a_live_run() {
 #[ignore = "isolated CI PostgreSQL 18 required"]
 async fn callers_cancel_only_their_own_runs_exactly_once() {
     let db = TestDb::migrated().await;
+    seed_token_budget(&db).await;
     let mut owner = connect(&db.0, OWNER).await;
     providers(&mut owner).await;
     let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
@@ -861,6 +886,7 @@ async fn callers_cancel_only_their_own_runs_exactly_once() {
 #[ignore = "isolated CI PostgreSQL 18 required"]
 async fn expired_and_unadmitted_runs_are_never_claimed_and_fail_exactly_once() {
     let db = TestDb::migrated().await;
+    seed_token_budget(&db).await;
     let mut owner = connect(&db.0, OWNER).await;
     providers(&mut owner).await;
     let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
@@ -953,6 +979,7 @@ async fn expired_and_unadmitted_runs_are_never_claimed_and_fail_exactly_once() {
 #[ignore = "isolated CI PostgreSQL 18 required"]
 async fn concurrent_claimers_never_share_a_run_or_exceed_the_executing_limits() {
     let db = TestDb::migrated().await;
+    seed_token_budget(&db).await;
     let mut owner = connect(&db.0, OWNER).await;
     providers(&mut owner).await;
     let a = account(&mut owner, PROVIDER, true, FUTURE).await;
@@ -1052,6 +1079,7 @@ async fn concurrent_claimers_never_share_a_run_or_exceed_the_executing_limits() 
 #[ignore = "isolated CI PostgreSQL 18 required"]
 async fn claims_serve_idle_actors_first_in_fifo_order_and_skip_locked_rows() {
     let db = TestDb::migrated().await;
+    seed_token_budget(&db).await;
     let mut owner = connect(&db.0, OWNER).await;
     providers(&mut owner).await;
     let mut accounts = Vec::new();
@@ -1108,6 +1136,7 @@ async fn claims_serve_idle_actors_first_in_fifo_order_and_skip_locked_rows() {
 #[ignore = "isolated CI PostgreSQL 18 required"]
 async fn the_recheck_after_a_claim_cancels_revoked_runs_with_one_terminal_event() {
     let db = TestDb::migrated().await;
+    seed_token_budget(&db).await;
     let mut owner = connect(&db.0, OWNER).await;
     providers(&mut owner).await;
     let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
@@ -1176,6 +1205,7 @@ async fn queue_privileges_and_constraints_are_minimal_at_version_19() {
     let db = TestDb::new().await;
     let settings = db.settings(Duration::from_secs(5));
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
+    seed_token_budget(&db).await;
     let mut admin = db.admin().await;
     // (insert admission, update admission, update claim, insert claim, select dispatch lock,
     //  update lock_guard, update id, other dispatch privileges, delete or truncate runs)
@@ -1433,6 +1463,43 @@ async fn quota_overrides_and_metered_budgets_enforce_admission_and_claim_limits_
         reason: "run admission quota test",
     };
 
+    // 0. Fresh DB with metering_enforced = true and zero usage_tokens rows MUST fail closed (503 provisioning).
+    let r_unconf = request(&db, &scope, "personal", &alice, "fresh-unconf").await;
+    let mut c = api(&db).await;
+    let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+    let fresh_unconf = queue::admit_run(
+        &mut tx,
+        &RunAdmission {
+            input: r_unconf.input(),
+            actor_approval_id: &alice.approval,
+            capabilities: &[],
+            requested_rounds: None,
+            now_ms: NOW,
+        },
+        &LIMITS,
+    )
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        fresh_unconf,
+        Admission::Refused(RunLimit::QuotaUnconfigured {
+            resource_kind: "usage_tokens",
+            scope_kind: "personal",
+        })
+    );
+
+    // Seed personal usage_tokens and an unconfigured (hard_limit = NULL) usage_cost_micros row;
+    // the NULL cost default must NOT block run admission.
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 100000),
+                    ('personal', 'usage_cost_micros', NULL)",
+        )
+        .await
+        .unwrap();
+
     // 1. Override round_cap to 7 and verify both default and capped requested_rounds.
     let mut c_admin = api(&db).await;
     quotas::set_scope_override(
@@ -1446,7 +1513,6 @@ async fn quota_overrides_and_metered_budgets_enforce_admission_and_claim_limits_
     .await
     .unwrap();
     let r1 = request(&db, &scope, "personal", &alice, "rc-default").await;
-    let mut c = api(&db).await;
     let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
     let res = queue::admit_run(
         &mut tx,
@@ -1565,6 +1631,12 @@ async fn quota_overrides_and_metered_budgets_enforce_admission_and_claim_limits_
     .unwrap();
 
     // 3. Metered usage_tokens admission enforcement (QuotaUnconfigured vs Quota).
+    owner
+        .execute(
+            "DELETE FROM openmettle.quota_defaults WHERE scope_kind = 'personal' AND resource_kind = 'usage_tokens'",
+        )
+        .await
+        .unwrap();
     owner
         .execute(
             "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)

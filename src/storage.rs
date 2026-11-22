@@ -200,6 +200,41 @@ async fn reserve_inner(
     result
 }
 
+/// Determine which storage tier (`"personal"`, `"project"`, or `"instance"`) lacks a configured
+/// limit after [`reserve`] returns [`Error::LimitUnconfigured`]. Checks the scope's effective
+/// limit (`quota_overrides` then `storage_instance` default) first; if the scope limit is
+/// configured or `storage_instance` is absent, the unconfigured tier is `"instance"`.
+pub async fn unconfigured_tier(
+    c: &mut PgConnection,
+    scope: &str,
+    scope_kind: &'static str,
+) -> Result<&'static str, Error> {
+    uuid(scope)?;
+    let row: Option<(Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT coalesce(
+                    (SELECT o.hard_limit FROM openmettle.quota_overrides o
+                      WHERE o.scope_id = $1::uuid
+                        AND o.resource_kind = 'storage_bytes'
+                        AND o.revoked_at IS NULL
+                        AND (o.expires_at IS NULL OR o.expires_at > clock_timestamp())),
+                    CASE WHEN $2 = 'personal' THEN i.personal_limit_bytes
+                         ELSE i.project_limit_bytes END
+                ),
+                i.instance_budget_bytes
+           FROM openmettle.storage_instance i
+          WHERE i.id",
+    )
+    .bind(scope)
+    .bind(scope_kind)
+    .fetch_optional(c)
+    .await?;
+    Ok(match row {
+        None => "instance",
+        Some((Some(_), None)) => "instance",
+        Some((None, _)) | Some((Some(_), Some(_))) => scope_kind,
+    })
+}
+
 /// The artifact an upload under `(scope, actor, key)` names: the one an earlier reservation
 /// with that key chose, so an exact retry reserves the same identity again, or else a new random
 /// UUID. Two first attempts racing on one key may choose different artifacts; `reserve` then

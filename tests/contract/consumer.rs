@@ -1249,6 +1249,24 @@ pub fn decode_quota_summary(value: &Value) -> Result<QuotaSummary, String> {
         parse_decimal(&c.current, true)?;
         opt_decimal(c.limit.as_deref())?;
     }
+    match wire.scope_kind.as_str() {
+        "personal"
+            if wire.execution.live_runs_per_actor.is_none()
+                || wire.execution.executing_runs_per_actor.is_none() =>
+        {
+            return Err(
+                "personal quota summary requires live_runs_per_actor and executing_runs_per_actor"
+                    .into(),
+            );
+        }
+        "project"
+            if wire.execution.live_runs_per_actor.is_some()
+                || wire.execution.executing_runs_per_actor.is_some() =>
+        {
+            return Err("project quota summary must omit per-actor execution counters".into());
+        }
+        _ => {}
+    }
     let round_cap_limit = opt_decimal(wire.execution.round_cap.limit.as_deref())?;
     let dev = wire.device_capacity.active_reservations;
     if dev.warn_thresholds.len() != 2 {
@@ -1280,6 +1298,38 @@ pub fn decode_quota_summary(value: &Value) -> Result<QuotaSummary, String> {
         device_reservations,
         warnings,
     })
+}
+
+/// Validates `QuotaOverrideReason` against the server's 1..=256 UTF-8 byte bound (no NUL).
+pub fn validate_quota_override_reason(reason: &str) -> Result<(), String> {
+    if reason.is_empty() || reason.len() > 256 || reason.contains('\0') {
+        return Err("override reason must be 1 to 256 UTF-8 bytes without NUL".into());
+    }
+    Ok(())
+}
+
+/// Builds a validated `QuotaOverrideSetRequest` JSON payload matching server byte bounds.
+pub fn encode_quota_override_set_request(
+    hard_limit: u64,
+    expires_at: Option<&str>,
+    reason: &str,
+) -> Result<Value, String> {
+    validate_quota_override_reason(reason)?;
+    let mut map = Map::new();
+    map.insert("hard_limit".into(), Value::String(hard_limit.to_string()));
+    if let Some(ts) = expires_at {
+        map.insert("expires_at".into(), Value::String(ts.to_owned()));
+    }
+    map.insert("reason".into(), Value::String(reason.to_owned()));
+    Ok(Value::Object(map))
+}
+
+/// Builds a validated `QuotaOverrideRevokeRequest` JSON payload matching server byte bounds.
+pub fn encode_quota_override_revoke_request(reason: &str) -> Result<Value, String> {
+    validate_quota_override_reason(reason)?;
+    let mut map = Map::new();
+    map.insert("reason".into(), Value::String(reason.to_owned()));
+    Ok(Value::Object(map))
 }
 
 #[derive(Deserialize)]
