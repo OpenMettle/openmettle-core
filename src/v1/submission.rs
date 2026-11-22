@@ -502,73 +502,89 @@ async fn admission(
     } else {
         "personal"
     };
-    let (branch, message, format, version, snapshots, gates, per_round_ceiling) =
-        if let Some(found) = queue::find_run(c, scope, ctx.user_id(), &key).await? {
-            let (previous, config) = Snapshots::decode(&found).map_err(|_| KEY_CONFLICT)?;
-            let mode: StoredMode =
-                serde_json::from_slice(&found.config_snapshot).map_err(|_| KEY_CONFLICT)?;
-            if mode.execution_mode != r.execution_mode || !previous.matches(&intent) {
-                return Err(KEY_CONFLICT);
-            }
-            (
-                found.branch_id,
-                found.input_message_id,
-                found.snapshot_format,
-                found.snapshot_version,
-                Snapshots {
-                    input: found.input_snapshot,
-                    config: found.config_snapshot,
-                },
-                config.required_capabilities,
-                config.effective.ceiling.value,
-            )
-        } else {
-            let audit = AuditContext {
-                request_key: &key,
-                ..call.audit()
-            };
-            let target = branches::prepare_turn(
-                tx,
-                &audit,
-                chat,
-                &r.branch_id,
-                intent.expected_head_message_id,
-                intent.operation,
-            )
-            .await?;
-            let c = tx.connection()?;
-            let catalog = catalog.ok_or(PROVISIONING)?;
-            let mut config = resolve(c, &actor, &view, catalog, intent.selection).await?;
-            if r.execution_mode == ExecutionMode::Yolo {
-                config
-                    .required_capabilities
-                    .insert("runs.use_yolo".into(), authz::CapabilityGate::OptIn);
-            }
-            let history = branches::history(c, &actor, chat, &target.branch_id, ctx.observed_ms())
-                .await?
-                .ok_or(NOT_FOUND)?;
-            let path = history
-                .turns
-                .iter()
-                .map(|t| t.metadata.clone())
-                .collect::<Vec<_>>();
-            budget(catalog, &config.effective, &path, &history, None)?.admit()?;
-            let mut snapshots = Snapshots::encode(&intent, &history, catalog, &config)?;
-            snapshots.config = serde_json::to_vec(&AdmissionConfig {
-                config: &config,
-                execution_mode: r.execution_mode,
-            })
-            .map_err(|_| INTERNAL)?;
-            (
-                target.branch_id,
-                target.input_message_id,
-                SNAPSHOT_FORMAT.to_owned(),
-                SNAPSHOT_VERSION,
-                snapshots,
-                config.required_capabilities,
-                config.effective.ceiling.value,
-            )
+    let (
+        branch,
+        message,
+        format,
+        version,
+        snapshots,
+        gates,
+        per_round_ceiling,
+        per_round_cost_micros,
+        requires_device_slot,
+    ) = if let Some(found) = queue::find_run(c, scope, ctx.user_id(), &key).await? {
+        let (previous, config) = Snapshots::decode(&found).map_err(|_| KEY_CONFLICT)?;
+        let mode: StoredMode =
+            serde_json::from_slice(&found.config_snapshot).map_err(|_| KEY_CONFLICT)?;
+        if mode.execution_mode != r.execution_mode || !previous.matches(&intent) {
+            return Err(KEY_CONFLICT);
+        }
+        (
+            found.branch_id,
+            found.input_message_id,
+            found.snapshot_format,
+            found.snapshot_version,
+            Snapshots {
+                input: found.input_snapshot,
+                config: found.config_snapshot,
+            },
+            config.required_capabilities,
+            config.effective.ceiling.value,
+            None,
+            false,
+        )
+    } else {
+        let audit = AuditContext {
+            request_key: &key,
+            ..call.audit()
         };
+        let target = branches::prepare_turn(
+            tx,
+            &audit,
+            chat,
+            &r.branch_id,
+            intent.expected_head_message_id,
+            intent.operation,
+        )
+        .await?;
+        let c = tx.connection()?;
+        let catalog = catalog.ok_or(PROVISIONING)?;
+        let mut config = resolve(c, &actor, &view, catalog, intent.selection).await?;
+        if r.execution_mode == ExecutionMode::Yolo {
+            config
+                .required_capabilities
+                .insert("runs.use_yolo".into(), authz::CapabilityGate::OptIn);
+        }
+        let history = branches::history(c, &actor, chat, &target.branch_id, ctx.observed_ms())
+            .await?
+            .ok_or(NOT_FOUND)?;
+        let path = history
+            .turns
+            .iter()
+            .map(|t| t.metadata.clone())
+            .collect::<Vec<_>>();
+        budget(catalog, &config.effective, &path, &history, None)?.admit()?;
+        let profile = catalog.target(&config.effective)?;
+        let round_cost = catalog.round_cost_ceiling(&config.effective)?;
+        let device_slot = profile.requires_device_slot;
+        let mut snapshots = Snapshots::encode(&intent, &history, catalog, &config)?;
+        snapshots.config = serde_json::to_vec(&AdmissionConfig {
+            config: &config,
+            execution_mode: r.execution_mode,
+        })
+        .map_err(|_| INTERNAL)?;
+        (
+            target.branch_id,
+            target.input_message_id,
+            SNAPSHOT_FORMAT.to_owned(),
+            SNAPSHOT_VERSION,
+            snapshots,
+            config.required_capabilities,
+            config.effective.ceiling.value,
+            round_cost,
+            device_slot,
+        )
+    };
     let caps = gates
         .iter()
         .map(|(name, gate)| queue::CapabilityUse { name, gate: *gate })
@@ -608,14 +624,26 @@ async fn admission(
             .and_then(|n| i64::try_from(n).ok())
             .filter(|&n| n > 0)
             .ok_or(INVALID)?;
+        let cost_units = per_round_cost_micros
+            .map(|per_round_cost| {
+                per_round_cost
+                    .checked_mul(i64::from(round_limit))
+                    .filter(|&n| n > 0)
+                    .ok_or(INVALID)
+            })
+            .transpose()?;
         if let Some(limit) = crate::quotas::reserve_admitted_run_budget(
             tx,
-            scope,
-            scope_kind,
-            ctx.user_id(),
-            ctx.approval_id(),
-            run_id,
-            token_units,
+            &crate::quotas::RunBudgetReservation {
+                scope_id: scope,
+                scope_kind,
+                actor_user_id: ctx.user_id(),
+                actor_approval_id: ctx.approval_id(),
+                run_id,
+                token_units,
+                cost_units,
+                requires_device_slot,
+            },
         )
         .await?
         {

@@ -12,8 +12,10 @@ pub enum Error {
     StaleRevision,
     TransactionUnavailable,
     Database(sqlx::Error),
-    /// Storage limits are not configured; new reservations are refused.
+    /// Owner scope storage limit is not configured; new reservations are refused.
     LimitUnconfigured,
+    /// Instance storage budget is not configured; new reservations are refused.
+    InstanceLimitUnconfigured,
     /// The owner scope's byte limit would be exceeded.
     OwnerLimit,
     /// The instance's logical storage budget would be exceeded.
@@ -41,6 +43,7 @@ impl std::fmt::Display for Error {
             }
             Self::Database(_) => "persistence database error",
             Self::LimitUnconfigured => "storage limits are not configured",
+            Self::InstanceLimitUnconfigured => "instance storage budget is not configured",
             Self::OwnerLimit => "owner storage limit exceeded",
             Self::InstanceLimit => "instance storage budget exceeded",
             Self::Unresolved => "linked operation outcome unresolved",

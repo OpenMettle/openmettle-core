@@ -249,6 +249,13 @@ fn upload_problem(error: artifact_fs::Error, scope_kind: &'static str) -> Proble
             "storage_bytes",
             scope_kind,
         ),
+        artifact_fs::Error::Storage(runs::Error::InstanceLimitUnconfigured) => quota_problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provisioning",
+            "Quota limits are not configured for this resource.",
+            "storage_bytes",
+            "instance",
+        ),
         other => ingest_problem(other),
     }
 }
@@ -257,12 +264,12 @@ fn upload_problem(error: artifact_fs::Error, scope_kind: &'static str) -> Proble
 /// (or a spent key) under the same `Idempotency-Key`.
 fn storage_problem(error: runs::Error) -> Problem {
     use runs::Error::{
-        Conflict, Database, InstanceLimit, Invalid, LimitUnconfigured, NotEligible, NotFound,
-        OwnerLimit, StaleRevision, TransactionUnavailable, Unresolved,
+        Conflict, Database, InstanceLimit, InstanceLimitUnconfigured, Invalid, LimitUnconfigured,
+        NotEligible, NotFound, OwnerLimit, StaleRevision, TransactionUnavailable, Unresolved,
     };
     match error {
         OwnerLimit | InstanceLimit => QUOTA,
-        LimitUnconfigured => PROVISIONING,
+        LimitUnconfigured | InstanceLimitUnconfigured => PROVISIONING,
         Conflict => KEY_CONFLICT,
         NotFound => NOT_FOUND,
         Invalid => INVALID,
@@ -350,25 +357,10 @@ impl Api {
         let ingest = artifact_fs::ingest(&self.pool, store, &upload, body, |form| {
             metadata(&form.metadata)
         });
-        let stored = match tokio::time::timeout(UPLOAD_TIMEOUT, ingest)
+        let stored = tokio::time::timeout(UPLOAD_TIMEOUT, ingest)
             .await
             .map_err(|_| TIMEOUT)?
-        {
-            Ok(stored) => stored,
-            Err(artifact_fs::Error::Storage(runs::Error::LimitUnconfigured)) => {
-                let tier = self
-                    .database(
-                        async |c| Ok(storage::unconfigured_tier(c, &scope, scope_kind).await?),
-                    )
-                    .await
-                    .unwrap_or(scope_kind);
-                return Err(upload_problem(
-                    artifact_fs::Error::Storage(runs::Error::LimitUnconfigured),
-                    tier,
-                ));
-            }
-            Err(error) => return Err(upload_problem(error, scope_kind)),
-        };
+            .map_err(|error| upload_problem(error, scope_kind))?;
         let revision = self
             .database(async |c| read_revision(c, &artifact, &stored.revision).await)
             .await?;

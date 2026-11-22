@@ -1724,6 +1724,8 @@ fn consumer_decodes_wide_quota_counters_overrides_and_closed_problem_quota() {
         "QuotaSummaryPersonal--missing-executing-per-actor",
         "QuotaSummaryProject--with-live-per-actor",
         "QuotaSummaryProject--with-executing-per-actor",
+        "QuotaSummaryProject--with-null-live-per-actor",
+        "QuotaSummaryProject--with-null-executing-per-actor",
     ] {
         assert!(
             consumer::decode_quota_summary(&fixture(invalid_summary)).is_err(),

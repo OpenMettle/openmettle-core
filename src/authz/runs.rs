@@ -457,6 +457,32 @@ pub(super) async fn cancel_user_runs(
     cancel_revoked(c, CANCEL_USER, user_id).await
 }
 
+async fn release_terminal_run_holds(
+    c: &mut PgConnection,
+    scope_id: &str,
+    run_id: &str,
+) -> Result<(), StoreError> {
+    if !has_quota_schema(c).await? {
+        return Ok(());
+    }
+    sqlx::query(
+        "SELECT openmettle.quota_release_unsent(id, NULL, false)
+           FROM (
+               SELECT id FROM openmettle.quota_reservations
+                WHERE scope_id = $1::uuid
+                  AND run_id = $2::uuid
+                  AND gateway_request_id IS NULL
+                  AND state = 'held'
+                ORDER BY resource_kind, id
+           ) AS due",
+    )
+    .bind(scope_id)
+    .bind(run_id)
+    .execute(&mut *c)
+    .await?;
+    Ok(())
+}
+
 async fn cancel_revoked(
     c: &mut PgConnection,
     sql: &'static str,
@@ -467,6 +493,9 @@ async fn cancel_revoked(
     rows.sort_by(|a, b| a.1.cmp(&b.1));
     for (scope, id, state) in &rows {
         cancel_event(c, scope, id, state, CancelReason::Revoked).await?;
+        if state == "cancelled" {
+            release_terminal_run_holds(c, scope, id).await?;
+        }
     }
     Ok(rows.len() as u64)
 }
@@ -485,6 +514,9 @@ pub(super) async fn cancel_one(
         .await?;
     if let Some(state) = &state {
         cancel_event(c, scope, id, state, reason).await?;
+        if state == "cancelled" {
+            release_terminal_run_holds(c, scope, id).await?;
+        }
     }
     Ok(state)
 }
@@ -1220,13 +1252,16 @@ pub async fn expire_queued(c: &mut PgConnection, limit: u32) -> Result<Vec<Strin
         return Err(StoreError::InvalidInput("limit"));
     }
     transaction(c, async |c| {
-        let expired: Vec<(String, String)> = sqlx::query_as(EXPIRE)
+        let mut expired: Vec<(String, String)> = sqlx::query_as(EXPIRE)
             .bind(i64::from(limit))
             .fetch_all(&mut *c)
             .await?;
-        let mut ids: Vec<String> = expired.iter().map(|(_, run)| run.clone()).collect();
+        expired.sort_by(|a, b| a.1.cmp(&b.1));
+        let ids: Vec<String> = expired.iter().map(|(_, run)| run.clone()).collect();
+        for (scope_id, run_id) in &expired {
+            release_terminal_run_holds(c, scope_id, run_id).await?;
+        }
         terminal_events(c, expired, EXPIRED).await?;
-        ids.sort();
         Ok(ids)
     })
     .await

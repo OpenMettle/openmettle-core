@@ -1200,6 +1200,12 @@ fn opt_decimal(v: Option<&str>) -> Result<Option<i64>, String> {
 }
 
 pub fn decode_quota_summary(value: &Value) -> Result<QuotaSummary, String> {
+    let exec_obj = value
+        .get("execution")
+        .and_then(Value::as_object)
+        .ok_or("missing execution object")?;
+    let has_live_actor_key = exec_obj.contains_key("live_runs_per_actor");
+    let has_exec_actor_key = exec_obj.contains_key("executing_runs_per_actor");
     let wire: WireQuotaSummary =
         serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
     if wire.storage.warn_thresholds.len() != 2 {
@@ -1260,7 +1266,9 @@ pub fn decode_quota_summary(value: &Value) -> Result<QuotaSummary, String> {
             );
         }
         "project"
-            if wire.execution.live_runs_per_actor.is_some()
+            if has_live_actor_key
+                || has_exec_actor_key
+                || wire.execution.live_runs_per_actor.is_some()
                 || wire.execution.executing_runs_per_actor.is_some() =>
         {
             return Err("project quota summary must omit per-actor execution counters".into());

@@ -10013,6 +10013,28 @@
                 "instancePath": "/execution",
                 "keyword": "not"
               }
+            },
+            {
+              "name": "with-null-live-per-actor",
+              "class": "invalid",
+              "op": "set",
+              "path": "/execution/live_runs_per_actor",
+              "value": null,
+              "expect": {
+                "instancePath": "/execution",
+                "keyword": "not"
+              }
+            },
+            {
+              "name": "with-null-executing-per-actor",
+              "class": "invalid",
+              "op": "set",
+              "path": "/execution/executing_runs_per_actor",
+              "value": null,
+              "expect": {
+                "instancePath": "/execution",
+                "keyword": "not"
+              }
             }
           ]
         }

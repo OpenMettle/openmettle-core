@@ -16,9 +16,12 @@ use sqlx::{Acquire, PgConnection, Postgres, Row, Transaction};
 fn record<T>(operation: StorageOperation, result: Result<T, Error>) -> Result<T, Error> {
     let outcome = match &result {
         Ok(_) => StorageOutcome::Ok,
-        Err(Error::OwnerLimit | Error::InstanceLimit | Error::LimitUnconfigured) => {
-            StorageOutcome::QuotaRefused
-        }
+        Err(
+            Error::OwnerLimit
+            | Error::InstanceLimit
+            | Error::LimitUnconfigured
+            | Error::InstanceLimitUnconfigured,
+        ) => StorageOutcome::QuotaRefused,
         Err(Error::Conflict | Error::StaleRevision | Error::NotEligible | Error::Unresolved) => {
             StorageOutcome::Conflict
         }
@@ -155,7 +158,7 @@ async fn reserve_inner(
         }
         let instance = sqlx::query("SELECT instance_budget_bytes,personal_limit_bytes,project_limit_bytes,
              active_bytes,retained_bytes,reserved_bytes FROM openmettle.storage_instance FOR UPDATE")
-            .fetch_optional(&mut *sp).await?.ok_or(Error::LimitUnconfigured)?;
+            .fetch_optional(&mut *sp).await?.ok_or(Error::InstanceLimitUnconfigured)?;
         let override_limit:Option<i64>=sqlx::query_scalar("SELECT hard_limit FROM openmettle.quota_overrides WHERE
             scope_id=$1::uuid AND resource_kind='storage_bytes' AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>clock_timestamp())")
             .bind(r.scope).fetch_optional(&mut *sp).await?;
@@ -164,9 +167,11 @@ async fn reserve_inner(
         } else {
             "project_limit_bytes"
         }));
-        let budget: Option<i64> = instance.get("instance_budget_bytes");
-        let (Some(owner_limit), Some(budget)) = (owner_limit, budget) else {
+        let Some(owner_limit) = owner_limit else {
             return Err(Error::LimitUnconfigured);
+        };
+        let Some(budget): Option<i64> = instance.get("instance_budget_bytes") else {
+            return Err(Error::InstanceLimitUnconfigured);
         };
         let charged = |row: &sqlx::postgres::PgRow| {
             ["active_bytes", "retained_bytes", "reserved_bytes"]
@@ -198,41 +203,6 @@ async fn reserve_inner(
     let result = finish(sp, result).await?;
     tx.restore(outer);
     result
-}
-
-/// Determine which storage tier (`"personal"`, `"project"`, or `"instance"`) lacks a configured
-/// limit after [`reserve`] returns [`Error::LimitUnconfigured`]. Checks the scope's effective
-/// limit (`quota_overrides` then `storage_instance` default) first; if the scope limit is
-/// configured or `storage_instance` is absent, the unconfigured tier is `"instance"`.
-pub async fn unconfigured_tier(
-    c: &mut PgConnection,
-    scope: &str,
-    scope_kind: &'static str,
-) -> Result<&'static str, Error> {
-    uuid(scope)?;
-    let row: Option<(Option<i64>, Option<i64>)> = sqlx::query_as(
-        "SELECT coalesce(
-                    (SELECT o.hard_limit FROM openmettle.quota_overrides o
-                      WHERE o.scope_id = $1::uuid
-                        AND o.resource_kind = 'storage_bytes'
-                        AND o.revoked_at IS NULL
-                        AND (o.expires_at IS NULL OR o.expires_at > clock_timestamp())),
-                    CASE WHEN $2 = 'personal' THEN i.personal_limit_bytes
-                         ELSE i.project_limit_bytes END
-                ),
-                i.instance_budget_bytes
-           FROM openmettle.storage_instance i
-          WHERE i.id",
-    )
-    .bind(scope)
-    .bind(scope_kind)
-    .fetch_optional(c)
-    .await?;
-    Ok(match row {
-        None => "instance",
-        Some((Some(_), None)) => "instance",
-        Some((None, _)) | Some((Some(_), Some(_))) => scope_kind,
-    })
 }
 
 /// The artifact an upload under `(scope, actor, key)` names: the one an earlier reservation

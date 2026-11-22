@@ -2239,13 +2239,24 @@ async fn create_run_distinguishes_rate_limited_quota_and_provisioning_refusals_o
     doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
     let mut catalog: Value =
         serde_json::from_slice(include_bytes!("../fixtures/conversation-catalog-v1.json")).unwrap();
-    catalog["models"]["a"]["prompt_bound"] = json!({
+    let prompt_bound = json!({
         "fixed_tokens": 4,
         "tokens_per_turn": 4,
         "tokens_per_part": 2,
         "tokens_per_byte": 1,
         "tokens_per_attachment": 10
     });
+    catalog["models"]["a"]["prompt_bound"] = prompt_bound.clone();
+    catalog["models"]["a"]["cost_bound"] = json!({
+        "fixed_micros": 0,
+        "micros_per_token": 1
+    });
+    // Model `b` has a qualified prompt bound but intentionally omits `cost_bound`.
+    catalog["models"]["b"]["prompt_bound"] = prompt_bound;
+    let mut gpu = catalog["models"]["a"].clone();
+    gpu["pin"]["revision"] = json!("profile-gpu/1");
+    gpu["requires_device_slot"] = json!(true);
+    catalog["models"]["gpu"] = gpu;
     doc["catalog_file"] = json!(dir.write("catalog.json", &serde_json::to_vec(&catalog).unwrap()));
     doc["admission_limits"] = json!({
         "live_per_actor": 4,
@@ -2509,7 +2520,57 @@ async fn create_run_distinguishes_rate_limited_quota_and_provisioning_refusals_o
     );
     assert_eq!(summary_after_replay["usage"][0]["reserved_held"], "16384");
 
-    // 4. Configured usage_cost_micros reserves cost before tokens (canonical order) and blocks second run.
+    // 3b. Cancelling the queued winning run immediately releases its token hold without a worker
+    //     sweep so a fresh 2-round run succeeds immediately.
+    let winner_run_id = winner_val["run_id"].as_str().unwrap();
+    let cancelled = success(
+        api.call(
+            alice_b,
+            "POST",
+            &format!("/v1/runs/{winner_run_id}/cancel"),
+            Some("cancel-winner"),
+            None,
+        ),
+        200,
+    );
+    assert_eq!(cancelled["state"], "cancelled");
+    let summary_after_cancel = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(summary_after_cancel["usage"][0]["reserved_held"], "0");
+    assert_eq!(summary_after_cancel["usage"][0]["remaining"], "20000");
+    let (conv_retry_id, branch_retry_id) = conv("conv-q-retry");
+    let retried = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some("run-after-cancel"),
+            Some(&run_body(
+                &conv_retry_id,
+                &branch_retry_id,
+                "00000000-0000-4000-8000-00000000a015",
+                2,
+            )),
+        ),
+        201,
+    );
+    success(
+        api.call(
+            alice_b,
+            "POST",
+            &format!("/v1/runs/{}/cancel", retried["run_id"].as_str().unwrap()),
+            Some("cancel-retried"),
+            None,
+        ),
+        200,
+    );
+
+    // 4. Configured usage_cost_micros reserves the profile's qualified cost_bound (450 micros per
+    //    450-token round, NOT hard_limit=1000), allowing two concurrent 450-micro runs (900 <= 1000)
+    //    and refusing a third (900 + 450 > 1000) with 429 quota, while a profile without cost_bound
+    //    fails closed with 503 provisioning.
     owner
         .execute(
             "UPDATE openmettle.quota_defaults
@@ -2538,33 +2599,81 @@ async fn create_run_distinguishes_rate_limited_quota_and_provisioning_refusals_o
         ),
         200,
     );
+    let cost_body = |c_id: &str, b_id: &str, msg_id: &str, selection: Value| {
+        json!({
+            "conversation_id": c_id,
+            "branch_id": b_id,
+            "proposal": {
+                "expected_head_message_id": null,
+                "turn": {
+                    "mode": "append",
+                    "input_message_id": msg_id,
+                    "parts": [{"text": "hello"}]
+                },
+                "selection": selection,
+                "requested_rounds": 1
+            }
+        })
+    };
+    let small_a = json!({
+        "model": "a",
+        "layer": {"controls": {"context_window": "450", "output_reserve": "100"}}
+    });
     let (conv3_id, branch3_id) = conv("conv-q-3");
     let (conv4_id, branch4_id) = conv("conv-q-4");
-    success(
+    let (conv5_id, branch5_id) = conv("conv-q-5");
+    let cost_run_1 = success(
         api.call(
             alice_b,
             "POST",
             "/v1/runs",
             Some("cost-run-1"),
-            Some(&run_body(
+            Some(&cost_body(
                 &conv3_id,
                 &branch3_id,
                 "00000000-0000-4000-8000-00000000a006",
-                1,
+                small_a.clone(),
             )),
         ),
         201,
     );
+    let summary_cost_1 = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(summary_cost_1["usage"][1]["reserved_held"], "450");
+    assert_eq!(summary_cost_1["usage"][1]["remaining"], "550");
+    let cost_run_2 = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some("cost-run-2"),
+            Some(&cost_body(
+                &conv4_id,
+                &branch4_id,
+                "00000000-0000-4000-8000-00000000a007",
+                small_a.clone(),
+            )),
+        ),
+        201,
+    );
+    let summary_cost_2 = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(summary_cost_2["usage"][1]["reserved_held"], "900");
+    assert_eq!(summary_cost_2["usage"][1]["remaining"], "100");
     let (status, cost_ref) = api.call(
         alice_b,
         "POST",
         "/v1/runs",
-        Some("cost-run-2"),
-        Some(&run_body(
-            &conv4_id,
-            &branch4_id,
-            "00000000-0000-4000-8000-00000000a007",
-            1,
+        Some("cost-run-3"),
+        Some(&cost_body(
+            &conv5_id,
+            &branch5_id,
+            "00000000-0000-4000-8000-00000000a016",
+            small_a,
         )),
     );
     assert_eq!(status, 429, "{cost_ref}");
@@ -2573,8 +2682,40 @@ async fn create_run_distinguishes_rate_limited_quota_and_provisioning_refusals_o
         cost_ref["quota"],
         json!({"resource_kind": "usage_cost_micros", "scope_kind": "personal"})
     );
+    // Profile `b` lacks `cost_bound` while usage_cost_micros is configured -> 503 provisioning.
+    let (status, unbound_cost) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("cost-unbound-b"),
+        Some(&cost_body(
+            &conv5_id,
+            &branch5_id,
+            "00000000-0000-4000-8000-00000000a017",
+            json!({"model": "b", "layer": {"controls": {"output_reserve": "256"}}}),
+        )),
+    );
+    assert_eq!(status, 503, "{unbound_cost}");
+    assert_eq!(unbound_cost["code"], "provisioning");
+    assert_eq!(
+        unbound_cost["quota"],
+        json!({"resource_kind": "usage_cost_micros", "scope_kind": "instance"})
+    );
+    for (idx, run) in [cost_run_1, cost_run_2].into_iter().enumerate() {
+        success(
+            api.call(
+                alice_b,
+                "POST",
+                &format!("/v1/runs/{}/cancel", run["run_id"].as_str().unwrap()),
+                Some(&format!("cancel-cost-{idx}")),
+                None,
+            ),
+            200,
+        );
+    }
 
-    // 5. Revoke personal usage_tokens override while keeping instance default -> 503 provisioning.
+    // 4b. Device-slot profiles enforce device_reservations (unconfigured -> 503 provisioning,
+    //     0 -> 429 quota, 1 -> admits first, refuses second, cancel frees the slot immediately).
     success(
         api.call(
             admin_n,
@@ -2585,6 +2726,150 @@ async fn create_run_distinguishes_rate_limited_quota_and_provisioning_refusals_o
         ),
         200,
     );
+    let gpu_sel = json!({"model": "gpu", "layer": {"controls": {"output_reserve": "256"}}});
+    let (status, dev_unconf) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("gpu-unconf"),
+        Some(&cost_body(
+            &conv5_id,
+            &branch5_id,
+            "00000000-0000-4000-8000-00000000a018",
+            gpu_sel.clone(),
+        )),
+    );
+    assert_eq!(status, 503, "{dev_unconf}");
+    assert_eq!(dev_unconf["code"], "provisioning");
+    assert_eq!(
+        dev_unconf["quota"],
+        json!({"resource_kind": "device_reservations", "scope_kind": "personal"})
+    );
+    success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/device_reservations"),
+            Some("dev-0"),
+            Some(&json!({"hard_limit": "0", "reason": "no gpu slots"})),
+        ),
+        200,
+    );
+    let (status, dev_zero) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("gpu-zero"),
+        Some(&cost_body(
+            &conv5_id,
+            &branch5_id,
+            "00000000-0000-4000-8000-00000000a019",
+            gpu_sel.clone(),
+        )),
+    );
+    assert_eq!(status, 429, "{dev_zero}");
+    assert_eq!(dev_zero["code"], "quota");
+    assert_eq!(
+        dev_zero["quota"],
+        json!({"resource_kind": "device_reservations", "scope_kind": "personal"})
+    );
+    success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/device_reservations"),
+            Some("dev-1"),
+            Some(&json!({"hard_limit": "1", "reason": "one gpu slot"})),
+        ),
+        200,
+    );
+    let gpu_run_1 = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some("gpu-run-1"),
+            Some(&cost_body(
+                &conv5_id,
+                &branch5_id,
+                "00000000-0000-4000-8000-00000000a020",
+                gpu_sel.clone(),
+            )),
+        ),
+        201,
+    );
+    let dev_summary = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(
+        dev_summary["device_capacity"]["active_reservations"]["reserved_held"],
+        "1"
+    );
+    let (conv6_id, branch6_id) = conv("conv-q-6");
+    let (status, dev_full) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("gpu-run-2-full"),
+        Some(&cost_body(
+            &conv6_id,
+            &branch6_id,
+            "00000000-0000-4000-8000-00000000a021",
+            gpu_sel.clone(),
+        )),
+    );
+    assert_eq!(status, 429, "{dev_full}");
+    assert_eq!(dev_full["code"], "quota");
+    assert_eq!(
+        dev_full["quota"],
+        json!({"resource_kind": "device_reservations", "scope_kind": "personal"})
+    );
+    success(
+        api.call(
+            alice_b,
+            "POST",
+            &format!("/v1/runs/{}/cancel", gpu_run_1["run_id"].as_str().unwrap()),
+            Some("cancel-gpu-1"),
+            None,
+        ),
+        200,
+    );
+    let dev_after_cancel = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(
+        dev_after_cancel["device_capacity"]["active_reservations"]["reserved_held"],
+        "0"
+    );
+    let gpu_run_2 = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some("gpu-run-2-ok"),
+            Some(&cost_body(
+                &conv6_id,
+                &branch6_id,
+                "00000000-0000-4000-8000-00000000a022",
+                gpu_sel,
+            )),
+        ),
+        201,
+    );
+    success(
+        api.call(
+            alice_b,
+            "POST",
+            &format!("/v1/runs/{}/cancel", gpu_run_2["run_id"].as_str().unwrap()),
+            Some("cancel-gpu-2"),
+            None,
+        ),
+        200,
+    );
+
+    // 5. Revoke personal usage_tokens override while keeping instance default -> 503 provisioning.
     success(
         api.call(
             admin_n,
@@ -2602,14 +2887,15 @@ async fn create_run_distinguishes_rate_limited_quota_and_provisioning_refusals_o
         )
         .await
         .unwrap();
+    let (conv7_id, branch7_id) = conv("conv-q-7");
     let (status, prov) = api.call(
         alice_b,
         "POST",
         "/v1/runs",
         Some("run-prov"),
         Some(&run_body(
-            &conv4_id,
-            &branch4_id,
+            &conv7_id,
+            &branch7_id,
             "00000000-0000-4000-8000-00000000a008",
             1,
         )),

@@ -882,3 +882,378 @@ async fn quota_override_locks_single_audit_and_expired_override_warnings() {
     .unwrap();
     assert_eq!(active_limit_rev, 0);
 }
+
+async fn branch_and_message(api: &mut PgConnection, scope: &str, chat: &str) -> (String, String) {
+    let msg = message(api, scope, chat, None).await.unwrap();
+    let branch: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.conversation_branches (scope_id, conversation_id)
+         VALUES ($1::uuid, $2::uuid) RETURNING id::text",
+    )
+    .bind(scope)
+    .bind(chat)
+    .fetch_one(&mut *api)
+    .await
+    .unwrap();
+    (branch, msg)
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn schema_23_run_budget_survives_upgrade_to_26_and_legacy_worker_dispatch() {
+    use openmettle_core::{
+        authz::{
+            leases::LeaseSettings,
+            runs::{self as authz_queue, Admission, AdmissionLimits, ClaimLimits, RunAdmission},
+        },
+        quotas::{self, RunBudgetReservation},
+        runs::{RunInput, WriteTransaction},
+    };
+
+    let db = TestDb::new().await;
+    let settings = db.settings(Duration::from_secs(10));
+    migrate::apply(&settings, &MIGRATIONS[..23]).await.unwrap();
+
+    let mut owner = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut owner).await;
+    let alice =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let scope = authz_runs::personal_of(&db, &alice).await;
+    let chat = authz_runs::chat(&db, &scope, "personal", &alice).await;
+    let mut api = connect(&db.0, API).await;
+    let (branch, message) = branch_and_message(&mut api, &scope, &chat).await;
+    let limits = AdmissionLimits {
+        live_per_actor: 4,
+        live_per_scope: 8,
+        queued_in_instance: 32,
+        queue_timeout: Duration::from_secs(300),
+        round_cap: 10,
+    };
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    let admitted = authz_queue::admit_run(
+        &mut tx,
+        &RunAdmission {
+            input: RunInput {
+                scope: &scope,
+                actor: &alice.user,
+                conversation: &chat,
+                branch: &branch,
+                message: &message,
+                key: "schema-23-run",
+                format: "openmettle.conversation",
+                version: 1,
+                input: b"{}",
+                config: b"{}",
+            },
+            actor_approval_id: &alice.approval,
+            capabilities: &[],
+            requested_rounds: Some(2),
+            now_ms: authz_store::NOW,
+        },
+        &limits,
+    )
+    .await
+    .unwrap();
+    let run_id = match admitted {
+        Admission::Admitted { run_id, .. } => run_id,
+        other => panic!("expected admitted run, got {other:?}"),
+    };
+    let refusal = quotas::reserve_admitted_run_budget(
+        &mut tx,
+        &RunBudgetReservation {
+            scope_id: &scope,
+            scope_kind: "personal",
+            actor_user_id: &alice.user,
+            actor_approval_id: &alice.approval,
+            run_id: &run_id,
+            token_units: 8192,
+            cost_units: None,
+            requires_device_slot: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(refusal.is_none());
+    tx.commit().await.unwrap();
+
+    // Schema 23 must already record the gateway_reservations row before 0024 exists.
+    let gw_units: i64 = sqlx::query_scalar(
+        "SELECT units FROM openmettle.gateway_reservations WHERE run_id = $1::uuid",
+    )
+    .bind(&run_id)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(gw_units, 8192);
+
+    // Upgrade 23 -> 26, enable metering, configure usage_tokens, and dispatch via worker claim.
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 100000)",
+        )
+        .await
+        .unwrap();
+    owner
+        .execute(
+            "UPDATE openmettle.quota_enforcement
+                SET metering_enforced = true, metering_enforced_at = clock_timestamp()
+              WHERE id",
+        )
+        .await
+        .unwrap();
+
+    let mut worker = connect(&db.0, WORKER).await;
+    let claimed = authz_queue::claim_next(
+        &mut worker,
+        &ClaimLimits {
+            executing_per_actor: 4,
+            executing_per_scope: 8,
+        },
+        &LeaseSettings {
+            lease: Duration::from_secs(60),
+            execution_timeout: Duration::from_secs(600),
+        },
+    )
+    .await
+    .unwrap()
+    .expect("claimed schema-23 run after upgrade");
+    assert_eq!(claimed.run_id, run_id);
+
+    sqlx::query("SELECT openmettle.quota_ensure_legacy_run_holds($1::uuid, $2::uuid, $3::uuid)")
+        .bind(&claimed.scope_id)
+        .bind(&claimed.run_id)
+        .bind(&claimed.claim_token)
+        .execute(&mut worker)
+        .await
+        .unwrap();
+
+    let held: (String, i64, String) = sqlx::query_as(
+        "SELECT resource_kind, held_units, state
+           FROM openmettle.quota_reservations
+          WHERE run_id = $1::uuid AND gateway_request_id IS NULL",
+    )
+    .bind(&run_id)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(held, ("usage_tokens".into(), 8192, "held".into()));
+
+    // Verify the prior-binary grants allowlist SQL across MIGRATIONS[23..] decodes cleanly
+    // with zero NULLs after 0026 drops the superseded 6-arg/4-arg override signatures.
+    let quota_sql: String = MIGRATIONS[23..]
+        .iter()
+        .map(|m| m.sql)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let grants: Vec<String> = sqlx::query_scalar(
+        r"SELECT DISTINCT trim(role) || ' has EXECUTE on function ' || proc::text
+            FROM regexp_matches($1, 'GRANT\s+EXECUTE\s+ON\s+FUNCTION\s+(openmettle\.\w+\([^)]*\))\s+TO\s+([^;]+);','gi') parts,
+                 unnest(string_to_array(parts[2],',')) role,
+                 LATERAL (SELECT to_regprocedure(parts[1]) AS proc) p
+           WHERE p.proc IS NOT NULL",
+    )
+    .bind(&quota_sql)
+    .fetch_all(&mut owner)
+    .await
+    .unwrap();
+    assert!(
+        grants.iter().any(|g| {
+            g == "openmettle_api has EXECUTE on function openmettle.storage_lock_not_adopting()"
+        }),
+        "{grants:?}"
+    );
+    assert!(
+        grants.iter().any(|g| g.contains(
+            "openmettle.quota_upsert_scope_override(uuid,uuid,text,bigint,timestamp with time zone,text,text,jsonb)"
+        )),
+        "{grants:?}"
+    );
+    assert!(
+        grants.iter().any(|g| g
+            .contains("openmettle.quota_revoke_scope_override(uuid,uuid,text,text,text,jsonb)")),
+        "{grants:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn cancel_and_expire_immediately_release_holds_unless_operation_is_in_flight() {
+    use openmettle_core::{
+        authz::runs::{
+            self as authz_queue, Admission, AdmissionLimits, CancelOutcome, RunAdmission,
+        },
+        quotas::{self, RunBudgetReservation},
+        runs::{RunInput, WriteTransaction},
+    };
+
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut owner).await;
+    let alice =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let scope = authz_runs::personal_of(&db, &alice).await;
+    let chat = authz_runs::chat(&db, &scope, "personal", &alice).await;
+    let mut api = connect(&db.0, API).await;
+    let (branch, message) = branch_and_message(&mut api, &scope, &chat).await;
+
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 20000),
+                    ('personal', 'device_reservations', 1)",
+        )
+        .await
+        .unwrap();
+
+    let limits = AdmissionLimits {
+        live_per_actor: 4,
+        live_per_scope: 8,
+        queued_in_instance: 32,
+        queue_timeout: Duration::from_secs(300),
+        round_cap: 10,
+    };
+    async fn admit_with_holds(
+        api: &mut PgConnection,
+        alice: &authz_store::Account,
+        target: (&str, &str, &str, &str),
+        limits: &AdmissionLimits,
+        key: &str,
+    ) -> String {
+        let (scope, chat, branch, message) = target;
+        let mut tx = WriteTransaction::begin(api).await.unwrap();
+        let Admission::Admitted { run_id, .. } = authz_queue::admit_run(
+            &mut tx,
+            &RunAdmission {
+                input: RunInput {
+                    scope,
+                    actor: &alice.user,
+                    conversation: chat,
+                    branch,
+                    message,
+                    key,
+                    format: "openmettle.conversation",
+                    version: 1,
+                    input: b"{}",
+                    config: b"{}",
+                },
+                actor_approval_id: &alice.approval,
+                capabilities: &[],
+                requested_rounds: Some(1),
+                now_ms: authz_store::NOW,
+            },
+            limits,
+        )
+        .await
+        .unwrap() else {
+            panic!("expected admitted run");
+        };
+        assert!(
+            quotas::reserve_admitted_run_budget(
+                &mut tx,
+                &RunBudgetReservation {
+                    scope_id: scope,
+                    scope_kind: "personal",
+                    actor_user_id: &alice.user,
+                    actor_approval_id: &alice.approval,
+                    run_id: &run_id,
+                    token_units: 12000,
+                    cost_units: None,
+                    requires_device_slot: true,
+                },
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        tx.commit().await.unwrap();
+        run_id
+    }
+
+    // 1. Expiring a queued run immediately releases both token and device parent holds.
+    let run_exp = admit_with_holds(
+        &mut api,
+        &alice,
+        (&scope, &chat, &branch, &message),
+        &limits,
+        "exp-1",
+    )
+    .await;
+    sqlx::query(
+        "UPDATE openmettle.runs
+            SET created_at = clock_timestamp() - interval '2 seconds',
+                queue_expires_at = clock_timestamp() - interval '1 second'
+          WHERE id = $1::uuid",
+    )
+    .bind(&run_exp)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    let mut worker = connect(&db.0, WORKER).await;
+    assert_eq!(
+        authz_queue::expire_queued(&mut worker, 10).await.unwrap(),
+        vec![run_exp.clone()]
+    );
+    let held_after_expire: i64 = sqlx::query_scalar(
+        "SELECT coalesce(sum(reserved_held), 0)::bigint FROM openmettle.quota_budgets",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(held_after_expire, 0);
+
+    // 2. Cancelling a waiting run with an outcome_unknown operation succeeds without releasing holds early.
+    let run_wait = admit_with_holds(
+        &mut api,
+        &alice,
+        (&scope, &chat, &branch, &message),
+        &limits,
+        "wait-op-1",
+    )
+    .await;
+    sqlx::query(
+        "UPDATE openmettle.runs SET state = 'waiting', wait_reason = NULL WHERE id = $1::uuid",
+    )
+    .bind(&run_wait)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.operations
+             (scope_id, run_id, logical_key, target, capability, format, format_version,
+              request, request_identity, request_digest, outcome, revision,
+              observation_format, observation_version, evidence)
+         VALUES ($1::uuid, $2::uuid, 'op-unknown', 'synthetic-target', 'non_repeatable',
+                 'openmettle.op', 1, '\\x01'::bytea, '\\x01'::bytea, sha256('\\x01'::bytea),
+                 'outcome_unknown', 1, 'openmettle.obs', 1, '\\x01'::bytea)",
+    )
+    .bind(&scope)
+    .bind(&run_wait)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    let principal = openmettle_core::authz::store::hydrate_api_principal(
+        &mut api,
+        &alice.user,
+        &alice.approval,
+        authz_store::NOW,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        authz_queue::cancel_run(&mut api, &principal, &scope, &run_wait)
+            .await
+            .unwrap(),
+        CancelOutcome::Cancelled
+    );
+    let still_held: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM openmettle.quota_reservations
+          WHERE run_id = $1::uuid AND state = 'held'",
+    )
+    .bind(&run_wait)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(still_held, 2);
+}

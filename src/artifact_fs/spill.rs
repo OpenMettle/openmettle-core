@@ -176,7 +176,10 @@ async fn publish(
         {
             Ok(r) => r.id,
             Err(
-                runs::Error::InstanceLimit | runs::Error::OwnerLimit | runs::Error::LimitUnconfigured,
+                runs::Error::InstanceLimit
+                | runs::Error::OwnerLimit
+                | runs::Error::LimitUnconfigured
+                | runs::Error::InstanceLimitUnconfigured,
             ) => return Ok(None),
             Err(e) => return Err(e),
         };

@@ -1319,49 +1319,48 @@ pub async fn revoke_scope_override(
     }
 }
 
+/// Inputs for reserving run-level gateway and metered quota holds inside `/v1/runs` admission.
+pub struct RunBudgetReservation<'a> {
+    pub scope_id: &'a str,
+    pub scope_kind: &'static str,
+    pub actor_user_id: &'a str,
+    pub actor_approval_id: &'a str,
+    pub run_id: &'a str,
+    pub token_units: i64,
+    /// Qualified total run cost ceiling (`per_round_cost_micros * round_limit`) when the profile
+    /// carries a `cost_bound`, or `None` when the profile is unqualified for cost metering.
+    pub cost_units: Option<i64>,
+    /// True when executing this profile requires one concurrent `device_reservations` slot.
+    pub requires_device_slot: bool,
+}
+
 /// Reserve the run-level gateway and metered quota holds inside the `/v1/runs` admission
 /// transaction (`runs -> gateway_reservations -> quota_budgets` lock order, ADR 0040).
 ///
 /// Returns `Ok(Some(limit))` when a metered budget refuses the reservation so the caller rolls
 /// back the entire submission transaction cleanly (no committed run, branch turn, or hold).
-pub(crate) async fn reserve_admitted_run_budget(
+pub async fn reserve_admitted_run_budget(
     tx: &mut WriteTransaction<'_>,
-    scope_id: &str,
-    scope_kind: &'static str,
-    actor_user_id: &str,
-    actor_approval_id: &str,
-    run_id: &str,
-    token_units: i64,
+    input: &RunBudgetReservation<'_>,
 ) -> Result<Option<RunLimit>, StoreError> {
     let mut outer = tx.take_active()?;
-    let result = reserve_admitted_run_budget_inner(
-        &mut outer,
-        scope_id,
-        scope_kind,
-        actor_user_id,
-        actor_approval_id,
-        run_id,
-        token_units,
-    )
-    .await;
+    let result = reserve_admitted_run_budget_inner(&mut outer, input).await;
     tx.restore(outer);
     result
 }
 
 async fn reserve_admitted_run_budget_inner(
     outer: &mut Transaction<'_, Postgres>,
-    scope_id: &str,
-    scope_kind: &'static str,
-    actor_user_id: &str,
-    actor_approval_id: &str,
-    run_id: &str,
-    token_units: i64,
+    input: &RunBudgetReservation<'_>,
 ) -> Result<Option<RunLimit>, StoreError> {
-    let has_quota_schema: bool =
-        sqlx::query_scalar("SELECT to_regclass('openmettle.quota_enforcement') IS NOT NULL")
+    // Schema 23 adds `gateway_reservations`; schema 24 adds `quota_enforcement` / `quota_reserve`.
+    // Keep the two checks separate so runs admitted on schema 23 still record `gateway_reservations`
+    // and survive upgrading 23 -> 24+ cleanly.
+    let has_gateway_reservations: bool =
+        sqlx::query_scalar("SELECT to_regclass('openmettle.gateway_reservations') IS NOT NULL")
             .fetch_one(&mut **outer)
             .await?;
-    if !has_quota_schema {
+    if !has_gateway_reservations {
         return Ok(None);
     }
     sqlx::query(
@@ -1369,14 +1368,21 @@ async fn reserve_admitted_run_budget_inner(
              (id, scope_id, actor_user_id, approval_id, run_id, units)
          VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $1::uuid, $5)",
     )
-    .bind(run_id)
-    .bind(scope_id)
-    .bind(actor_user_id)
-    .bind(actor_approval_id)
-    .bind(token_units)
+    .bind(input.run_id)
+    .bind(input.scope_id)
+    .bind(input.actor_user_id)
+    .bind(input.actor_approval_id)
+    .bind(input.token_units)
     .execute(&mut **outer)
     .await?;
 
+    let has_quota_schema: bool =
+        sqlx::query_scalar("SELECT to_regclass('openmettle.quota_enforcement') IS NOT NULL")
+            .fetch_one(&mut **outer)
+            .await?;
+    if !has_quota_schema {
+        return Ok(None);
+    }
     let enforced: bool =
         sqlx::query_scalar("SELECT metering_enforced FROM openmettle.quota_enforcement WHERE id")
             .fetch_one(&mut **outer)
@@ -1385,7 +1391,25 @@ async fn reserve_admitted_run_budget_inner(
         return Ok(None);
     }
 
-    // Canonical order: reserve usage_cost_micros when configured, then usage_tokens unconditionally.
+    // Canonical alphabetical resource_kind order (ADR 0040):
+    // 1. device_reservations (when required by profile)
+    // 2. usage_cost_micros (when any applicable cost limit is configured)
+    // 3. usage_tokens (always)
+    if input.requires_device_slot
+        && let Some(refusal) = try_quota_reserve(
+            outer,
+            input.scope_id,
+            input.scope_kind,
+            input.actor_user_id,
+            input.run_id,
+            "device_reservations",
+            1,
+        )
+        .await?
+    {
+        return Ok(Some(refusal));
+    }
+
     let (cost_denomination, any_cost_limit): (Option<String>, bool) = sqlx::query_as(
         "WITH stamp AS (SELECT clock_timestamp() AS now),
          actor AS (SELECT id FROM openmettle.scopes WHERE personal_user_id = $3::uuid),
@@ -1413,70 +1437,53 @@ async fn reserve_admitted_run_budget_inner(
                          ) IS NOT NULL
                 )",
     )
-    .bind(scope_id)
-    .bind(scope_kind)
-    .bind(actor_user_id)
+    .bind(input.scope_id)
+    .bind(input.scope_kind)
+    .bind(input.actor_user_id)
     .fetch_one(&mut **outer)
     .await?;
 
     if any_cost_limit {
-        if cost_denomination.is_none() {
+        let Some(cost_units) = input.cost_units.filter(|_| cost_denomination.is_some()) else {
             return Ok(Some(RunLimit::QuotaUnconfigured {
                 resource_kind: "usage_cost_micros",
                 scope_kind: "instance",
             }));
-        }
-        let cost_ceiling: Option<i64> =
-            sqlx::query_scalar("SELECT openmettle.quota_cost_ceiling($1::uuid, $2::uuid)")
-                .bind(scope_id)
-                .bind(actor_user_id)
-                .fetch_one(&mut **outer)
-                .await?;
-        match cost_ceiling {
-            Some(0) => {
-                let tier = find_failing_tier(
-                    &mut *outer,
-                    scope_id,
-                    scope_kind,
-                    actor_user_id,
-                    "usage_cost_micros",
-                    1,
-                )
-                .await?;
-                return Ok(Some(RunLimit::Quota {
-                    resource_kind: "usage_cost_micros",
-                    scope_kind: tier,
-                }));
-            }
-            Some(cost_units) => {
-                if let Some(refusal) = try_quota_reserve(
-                    outer,
-                    scope_id,
-                    scope_kind,
-                    actor_user_id,
-                    run_id,
-                    "usage_cost_micros",
-                    cost_units,
-                )
-                .await?
-                {
-                    return Ok(Some(refusal));
-                }
-            }
-            None => {}
+        };
+        if let Some(refusal) = try_quota_reserve(
+            outer,
+            input.scope_id,
+            input.scope_kind,
+            input.actor_user_id,
+            input.run_id,
+            "usage_cost_micros",
+            cost_units,
+        )
+        .await?
+        {
+            return Ok(Some(refusal));
         }
     }
 
     try_quota_reserve(
         outer,
-        scope_id,
-        scope_kind,
-        actor_user_id,
-        run_id,
+        input.scope_id,
+        input.scope_kind,
+        input.actor_user_id,
+        input.run_id,
         "usage_tokens",
-        token_units,
+        input.token_units,
     )
     .await
+}
+
+fn db_tier(detail: Option<&str>, fallback: &'static str) -> &'static str {
+    match detail {
+        Some("personal") => "personal",
+        Some("project") => "project",
+        Some("instance") => "instance",
+        _ => fallback,
+    }
 }
 
 async fn try_quota_reserve(
@@ -1520,20 +1527,14 @@ async fn try_quota_reserve(
         Err(err) => {
             sp.rollback().await?;
             if let sqlx::Error::Database(ref db) = err {
+                let detail = db
+                    .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
+                    .and_then(|pg| pg.detail());
                 match db.code().as_deref() {
                     Some("OMQ01") => {
-                        let tier = find_failing_tier(
-                            &mut *outer,
-                            scope_id,
-                            scope_kind,
-                            actor_user_id,
-                            resource,
-                            units,
-                        )
-                        .await?;
                         return Ok(Some(RunLimit::Quota {
                             resource_kind: resource,
-                            scope_kind: tier,
+                            scope_kind: db_tier(detail, scope_kind),
                         }));
                     }
                     Some("OMQ02") => {
@@ -1545,7 +1546,7 @@ async fn try_quota_reserve(
                     Some("OMQ05") => {
                         return Ok(Some(RunLimit::QuotaUnconfigured {
                             resource_kind: resource,
-                            scope_kind: "personal",
+                            scope_kind: db_tier(detail, "personal"),
                         }));
                     }
                     _ => {}
@@ -1554,82 +1555,4 @@ async fn try_quota_reserve(
             Err(StoreError::Database(err))
         }
     }
-}
-
-async fn find_failing_tier(
-    c: &mut PgConnection,
-    scope_id: &str,
-    scope_kind: &'static str,
-    actor_user_id: &str,
-    resource: &'static str,
-    requested_units: i64,
-) -> Result<&'static str, StoreError> {
-    let rows: Vec<(String, Option<i64>, String, String)> = sqlx::query_as(
-        "WITH stamp AS (SELECT clock_timestamp() AS now),
-         actor AS (SELECT id FROM openmettle.scopes WHERE personal_user_id = $3::uuid),
-         tiers(ord, scope_id, scope_kind) AS (
-             SELECT 1, $1::uuid, $2::text
-             UNION ALL
-             SELECT 2, (SELECT id FROM actor), 'personal'::text
-              WHERE $1::uuid <> (SELECT id FROM actor)
-             UNION ALL
-             SELECT 3, NULL::uuid, 'instance'::text
-         ),
-         cfg AS (
-             SELECT t.ord,
-                    t.scope_id,
-                    t.scope_kind,
-                    coalesce(
-                        CASE WHEN o.revoked_at IS NULL
-                              AND (o.expires_at IS NULL OR o.expires_at > (SELECT now FROM stamp))
-                             THEN o.hard_limit END,
-                        d.hard_limit
-                    ) AS hard_limit,
-                    CASE WHEN d.window_seconds IS NULL THEN 'static' ELSE 'windowed' END AS window_kind,
-                    CASE WHEN d.window_seconds IS NULL THEN 'epoch'::timestamptz
-                         ELSE date_bin(make_interval(secs => d.window_seconds), (SELECT now FROM stamp), 'epoch')
-                    END AS window_start
-               FROM tiers t
-               LEFT JOIN openmettle.quota_defaults d
-                 ON d.scope_kind = t.scope_kind AND d.resource_kind = $4
-               LEFT JOIN openmettle.quota_overrides o
-                 ON o.scope_id = t.scope_id AND o.resource_kind = $4
-         )
-         SELECT cfg.scope_kind,
-                cfg.hard_limit,
-                coalesce(b.active_used, 0)::text,
-                coalesce(b.reserved_held, 0)::text
-           FROM cfg
-           LEFT JOIN openmettle.quota_budgets b
-             ON b.target_kind = CASE WHEN cfg.scope_id IS NULL THEN 'instance' ELSE 'scope' END
-            AND b.scope_id IS NOT DISTINCT FROM cfg.scope_id
-            AND b.resource_kind = $4
-            AND b.window_kind = cfg.window_kind
-            AND b.window_start = cfg.window_start
-          ORDER BY cfg.ord",
-    )
-    .bind(scope_id)
-    .bind(scope_kind)
-    .bind(actor_user_id)
-    .bind(resource)
-    .fetch_all(&mut *c)
-    .await?;
-    let req = u128::try_from(requested_units.max(0)).unwrap_or(0);
-    for (tier_kind, limit, used_text, held_text) in rows {
-        let Some(limit) = limit else { continue };
-        let used: u128 = used_text.parse().map_err(|_| {
-            StoreError::Database(sqlx::Error::Protocol("invalid quota counter".into()))
-        })?;
-        let held: u128 = held_text.parse().map_err(|_| {
-            StoreError::Database(sqlx::Error::Protocol("invalid quota counter".into()))
-        })?;
-        if limit <= 0 || used.saturating_add(held).saturating_add(req) > limit as u128 {
-            return Ok(match tier_kind.as_str() {
-                "personal" => "personal",
-                "project" => "project",
-                _ => "instance",
-            });
-        }
-    }
-    Ok(scope_kind)
 }
