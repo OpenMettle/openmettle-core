@@ -1147,3 +1147,158 @@ async fn missing_overlapping_or_overprivileged_gateway_is_refused() {
     }
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn family_wall_clock_policy_covers_gap_fold_midnight_and_child_switch() {
+    use gateway::family::{FamilyPolicy, Hours};
+    let db = TestDb::migrated().await;
+    let mut c = connect(&db.0, pg::GATEWAY).await;
+    let mut f = FamilyPolicy {
+        revision: 1,
+        zone: "America/New_York".into(),
+        quiet: Some(Hours {
+            start_minute: 90,
+            end_minute: 180,
+        }),
+        study: Some(Hours {
+            start_minute: 23 * 60,
+            end_minute: 60,
+        }),
+        study_models: ["school".into()].into(),
+        disabled_models: ["disabled".into()].into(),
+    };
+    for (utc, model, allowed) in [
+        ("2026-03-08T06:29:59Z", "a", true),
+        ("2026-03-08T06:30:00Z", "a", false),
+        ("2026-03-08T06:59:59Z", "a", false),
+        ("2026-03-08T07:00:00Z", "a", true),
+        ("2026-11-01T05:29:59Z", "a", true),
+        ("2026-11-01T05:30:00Z", "a", false),
+        ("2026-11-01T06:29:59Z", "a", true),
+        ("2026-11-01T06:30:00Z", "a", false),
+        ("2026-11-01T07:59:59Z", "a", false),
+        ("2026-11-01T08:00:00Z", "a", true),
+        ("2026-11-01T03:10:00Z", "a", false),
+        ("2026-11-01T04:30:00Z", "school", true),
+        ("2026-11-01T08:00:00Z", "disabled", false),
+    ] {
+        let at = chrono::DateTime::parse_from_rfc3339(utc)
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            f.permits(&mut c, model, Some(at)).await.unwrap(),
+            allowed,
+            "{utc}"
+        );
+    }
+    f.zone = "Unknown/Zone".into();
+    assert_eq!(
+        f.permits(&mut c, "a", None).await,
+        Err(gateway::Error::Refused)
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn discovery_rehydrates_committed_group_observations_without_a_hint() {
+    use gateway::reconcile::{ModelRequest, Profile, Sweep};
+    use openmettle_core::{
+        authz::{Grantee, ProjectRole, projects},
+        model_config::Catalog,
+        provider_http::gateway::problem::{Access, Problem},
+    };
+    let db = TestDb::migrated().await;
+    let mut c = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut c).await;
+    let actor =
+        authz_store::account(&mut c, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let owner =
+        authz_store::account(&mut c, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let (project, scope) = run_admission::new_project(&db, &owner, "family-project").await;
+    authz_store::applied(
+        projects::set_project_member_role(
+            &mut run_admission::api(&db).await,
+            &authz_store::ctx(&owner, "family-grant"),
+            &project,
+            &Grantee::OidcGroup("synthetic-team".into()),
+            ProjectRole::Editor,
+        )
+        .await,
+    );
+    let now: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint")
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+    let mut owner = authz_store::present_membership_at(&db, &actor, now).await;
+    let catalog =
+        Catalog::load(include_bytes!("../fixtures/conversation-catalog-v1.json")).unwrap();
+    let profile = Profile {
+        installation: INSTALL,
+        report_source: PRINCIPAL,
+        revision: 1,
+        rotation_epoch: 0,
+        renew_before: Duration::from_secs(30),
+        catalog: &catalog,
+        families: &Default::default(),
+    };
+    let g = pool(&db, pg::GATEWAY);
+    let mut s = Sweep::default();
+    let revision = || {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT desired_revision FROM openmettle.gateway_bindings WHERE user_id=$1::uuid",
+        )
+        .bind(&actor.user)
+        .fetch_one(&g)
+    };
+    let request = || ModelRequest {
+        access: Access::Entitled,
+        user: &actor.user,
+        scope: &scope,
+        approval: &actor.approval,
+        model: None,
+    };
+    s.discover(&g, &profile, 64).await.unwrap();
+    assert_eq!(revision().await.unwrap(), 1);
+    assert_eq!(
+        profile
+            .select_model(&g, request(), None, || panic!("binding precedes selection"))
+            .await,
+        Err(Problem::Provisioning)
+    );
+    owner
+        .execute("UPDATE openmettle.membership_observations SET observation.state='absent'")
+        .await
+        .unwrap();
+    assert_eq!(
+        profile.select_model(&g, request(), None, || panic!()).await,
+        Err(Problem::Policy)
+    );
+    s.discover(&g, &profile, 64).await.unwrap();
+    assert_eq!(revision().await.unwrap(), 2);
+    s.discover(&g, &profile, 64).await.unwrap();
+    assert_eq!(revision().await.unwrap(), 2);
+    owner
+        .execute("UPDATE openmettle.membership_observations SET observation.state='present'")
+        .await
+        .unwrap();
+    s.discover(&g, &profile, 64).await.unwrap();
+    assert_eq!(revision().await.unwrap(), 3);
+    sqlx::query("UPDATE openmettle.local_identity_approvals SET active=false WHERE id=$1::uuid")
+        .bind(&actor.approval)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    s.discover(&g, &profile, 64).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM openmettle.gateway_bindings WHERE user_id=$1::uuid"
+        )
+        .bind(&actor.user)
+        .fetch_one(&g)
+        .await
+        .unwrap(),
+        "suspended"
+    );
+}

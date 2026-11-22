@@ -213,6 +213,75 @@ impl ProviderOutcome {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayStep {
+    Readiness,
+    Principal,
+    Budget,
+    Policy,
+    Key,
+    Revoke,
+    Usage,
+}
+impl GatewayStep {
+    pub const ALL: [Self; 7] = [
+        Self::Readiness,
+        Self::Principal,
+        Self::Budget,
+        Self::Policy,
+        Self::Key,
+        Self::Revoke,
+        Self::Usage,
+    ];
+    pub const NAMES: [&str; 7] = [
+        "readiness",
+        "principal",
+        "budget",
+        "policy",
+        "key",
+        "revoke",
+        "usage",
+    ];
+    pub const fn as_str(self) -> &'static str {
+        Self::NAMES[self as usize]
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayCause {
+    Policy,
+    ServiceAuth,
+    Transport,
+    Timeout,
+    Protocol,
+    Protection,
+    Unknown,
+}
+impl GatewayCause {
+    pub const ALL: [Self; 7] = [
+        Self::Policy,
+        Self::ServiceAuth,
+        Self::Transport,
+        Self::Timeout,
+        Self::Protocol,
+        Self::Protection,
+        Self::Unknown,
+    ];
+    pub const NAMES: [&str; 7] = [
+        "policy",
+        "service_auth",
+        "transport",
+        "timeout",
+        "protocol",
+        "protection",
+        "unknown",
+    ];
+    pub const fn as_str(self) -> &'static str {
+        Self::NAMES[self as usize]
+    }
+}
+
+const LAG: [&str; 3] = ["under_minute", "under_hour", "hour_or_more"];
+
 /// Closed artifact storage accounting operation set (ADR 0005).
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -528,6 +597,36 @@ pub const DESCRIPTORS: &[MetricDescriptor] = &[
         labels: &[],
         buckets: None,
     },
+    MetricDescriptor {
+        name: "openmettle.gateway.failures",
+        prometheus_name: "openmettle_gateway_failures_total",
+        kind: InstrumentKind::Counter,
+        unit: "{failure}",
+        description: "Gateway failures by operation step and cause.",
+        labels: &[
+            LabelDescriptor {
+                name: "step",
+                values: &GatewayStep::NAMES,
+            },
+            LabelDescriptor {
+                name: "cause",
+                values: &GatewayCause::NAMES,
+            },
+        ],
+        buckets: None,
+    },
+    MetricDescriptor {
+        name: "openmettle.gateway.backfill.age",
+        prometheus_name: "openmettle_gateway_backfill_age_total",
+        kind: InstrumentKind::Counter,
+        unit: "{observation}",
+        description: "Age of unresolved handoffs observed during backfill.",
+        labels: &[LabelDescriptor {
+            name: "lag",
+            values: &LAG,
+        }],
+        buckets: None,
+    },
 ];
 
 /// Sum of `max_series()` (OTLP data-point streams) across all v1 metrics.
@@ -609,6 +708,8 @@ pub struct Metrics {
     provider_requests: [AtomicU64; PROVIDER_SLOTS],
     provider_duration: [HistogramSlot; PROVIDER_SLOTS],
     storage_operations: [AtomicU64; STORAGE_SLOTS],
+    gateway_failures: [[AtomicU64; 7]; 7],
+    gateway_lag: [AtomicU64; 3],
     overdue_handoffs: AtomicU64,
     cancellations: [AtomicU64; CancelReason::NAMES.len()],
     telemetry_dropped: [AtomicU64; DROPPED_SLOTS],
@@ -645,6 +746,8 @@ impl Metrics {
             provider_requests: std::array::from_fn(|_| AtomicU64::new(0)),
             provider_duration: std::array::from_fn(|_| HistogramSlot::new()),
             storage_operations: std::array::from_fn(|_| AtomicU64::new(0)),
+            gateway_failures: Default::default(),
+            gateway_lag: Default::default(),
             overdue_handoffs: AtomicU64::new(0),
             cancellations: std::array::from_fn(|_| AtomicU64::new(0)),
             telemetry_dropped: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -686,6 +789,18 @@ impl Metrics {
     pub fn record_storage(&self, operation: StorageOperation, outcome: StorageOutcome) {
         let idx = operation.index() * StorageOutcome::NAMES.len() + outcome.index();
         self.storage_operations[idx].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_gateway_failure(&self, step: GatewayStep, cause: GatewayCause) {
+        self.gateway_failures[step as usize][cause as usize].fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_gateway_lag(&self, age_seconds: i64) {
+        let bucket = match age_seconds {
+            ..60 => 0,
+            60..3600 => 1,
+            _ => 2,
+        };
+        self.gateway_lag[bucket].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_overdue_handoffs(&self, count: u64) {
@@ -878,6 +993,33 @@ impl Metrics {
                 vec![counter_point(start, now, overdue, &[])],
             );
         }
+
+        let mut failures = Vec::new();
+        for step in GatewayStep::ALL {
+            for cause in GatewayCause::ALL {
+                let n =
+                    self.gateway_failures[step as usize][cause as usize].load(Ordering::Relaxed);
+                if n > 0 {
+                    failures.push(counter_point(
+                        start,
+                        now,
+                        n,
+                        &[("step", step.as_str()), ("cause", cause.as_str())],
+                    ));
+                }
+            }
+        }
+        push_counter(&mut metrics, &DESCRIPTORS[10], failures);
+        let lag = self
+            .gateway_lag
+            .iter()
+            .zip(LAG)
+            .filter_map(|(count, lag)| {
+                let n = count.load(Ordering::Relaxed);
+                (n > 0).then(|| counter_point(start, now, n, &[("lag", lag)]))
+            })
+            .collect();
+        push_counter(&mut metrics, &DESCRIPTORS[11], lag);
 
         if metrics.is_empty() {
             return None;

@@ -32,7 +32,7 @@ impl std::error::Error for Error {}
 impl From<sqlx::Error> for Error {
     fn from(error: sqlx::Error) -> Self {
         match error.as_database_error().and_then(|e| e.code()).as_deref() {
-            Some("OMQ01") => Self::Refused,
+            Some("OMQ01" | "OMQ02") => Self::Refused,
             _ => Self::Database,
         }
     }
@@ -366,7 +366,7 @@ pub async fn publish_generation(
         .execute(tx.connection()?)
         .await?;
     let row = sqlx::query("SELECT generation,desired_revision FROM openmettle.gateway_intents WHERE binding_id=$1::uuid
-        AND operation_id=$2::uuid AND claim=$3::uuid AND due_at>clock_timestamp() AND NOT complete AND action IN ('issue','rotate') FOR UPDATE")
+        AND operation_id=$2::uuid AND claim=$3::uuid AND due_at>clock_timestamp() AND NOT complete AND action IN ('issue','rotate') AND NOT (parameters ? 'signature') FOR UPDATE")
         .bind(binding)
         .bind(operation)
         .bind(claim)
@@ -400,3 +400,9 @@ pub async fn publish_generation(
     tx.commit().await?;
     Ok(changed)
 }
+
+/// Fixed caller-facing classification shared by preflight and the pinned inference decoder.
+pub use crate::provider_http::gateway::problem;
+pub mod family;
+pub mod reconcile;
+pub mod settlement;
