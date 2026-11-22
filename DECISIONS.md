@@ -1,6 +1,6 @@
 # Decision records
 
-## Index (0001–0038)
+## Index (0001–0041)
 
 | ADR | Title | Date |
 | --- | --- | --- |
@@ -42,6 +42,9 @@
 | [0036](docs/adr/0036-conversation-branches-presets-and-effective-model-config.md) | Conversation branches, presets and effective model configuration | 21 November 2026 |
 | [0037](docs/adr/0037-gateway-provisioning-and-usage-reconciliation.md) | Application-owned gateway provisioning and usage reconciliation | 21 November 2026 |
 | [0038](docs/adr/0038-sglang-and-external-provider-conformance-adapter.md) | SGLang and external-provider conformance adapter | 21 November 2026 |
+| [0039](docs/adr/0039-scoped-mcp-adapter-and-bounded-tool-results.md) | Scoped MCP adapter, reviewed tool contracts and bounded spill artifacts | 21 November 2026 |
+| [0040](docs/adr/0040-transactional-quotas-and-reservation-reconciliation.md) | Transactional quotas and reservation reconciliation | 21 November 2026 |
+| [0041](docs/adr/0041-retention-purge-and-deletion-journal.md) | Retention, purge and deletion journal | 22 November 2026 |
 
 ## 0001 — Repository bootstrap (16 November 2026)
 
