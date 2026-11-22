@@ -1,15 +1,11 @@
-//! Filesystem artifact payloads (ADR 0031) over the ADR 0005 accounting helpers. Every path is
-//! `<root>/staging/<reservation>` or `<root>/revisions/<reservation>`, where the reservation is
-//! the server-generated UUID that `storage::reserve` returned. No client file name, database
-//! path column or other request value ever names a file.
-//!
-//! Publication order: write the staging file (created exclusively, mode 0600) and `fsync` it;
-//! then, holding the reservation's row lock, rename it into `revisions/`, `fsync` that
-//! directory and `storage::settle` in the same transaction. A failure before the rename unlinks
-//! the staging file and releases the reservation. A revision file whose
-//! reservation is still `reserved` (a crash or lost response between rename and settle) is
-//! replaced by a retry with the same idempotency key, or removed by [`reconcile_expired`] before
-//! it releases the reservation, so no uncharged payload remains.
+//! Filesystem artifact payloads. PostgreSQL owns reservation state and the volume pin.
+//! An open regular file and a durable hard link preserve payload identity across commits.
+pub mod adoption;
+mod drift;
+pub use drift::{Drift, verify_accounting_drift};
+mod reclaim;
+mod staging;
+mod volume;
 use crate::{
     multipart::{self, Form, Parser},
     runs::{self, WriteTransaction},
@@ -18,19 +14,25 @@ use crate::{
 use axum::body::{Bytes, HttpBody};
 use http_body_util::BodyExt;
 use hyper::body::{Frame, SizeHint};
+use rustix::fs::{self as at, AtFlags, Mode, OFlags};
 use sha2::{Digest as _, Sha256};
 use sqlx::PgPool;
+use sqlx::Row;
 use std::{
     fmt, fs,
     future::Future,
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
-    path::{Path, PathBuf},
+    path::Path,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
 };
+use std::{
+    os::unix::fs::MetadataExt,
+    sync::{Arc, OnceLock},
+};
 use tokio::task::JoinHandle;
+use volume::Volume;
 
 const STAGING: &str = "staging";
 const REVISIONS: &str = "revisions";
@@ -71,6 +73,16 @@ impl From<runs::Error> for Error {
     }
 }
 
+impl From<std::io::Error> for Error {
+    fn from(_: std::io::Error) -> Self {
+        Self::Io
+    }
+}
+impl From<rustix::io::Errno> for Error {
+    fn from(_: rustix::io::Errno) -> Self {
+        Self::Io
+    }
+}
 impl From<sqlx::Error> for Error {
     fn from(error: sqlx::Error) -> Self {
         Self::Storage(runs::Error::Database(error))
@@ -96,75 +108,97 @@ impl fmt::Display for Error {
 /// A validated artifacts directory with its `staging` and `revisions` subdirectories.
 #[derive(Clone, Debug)]
 pub struct Store {
-    staging: PathBuf,
-    revisions: PathBuf,
+    volume: Arc<Volume>,
+    pool: Arc<OnceLock<PgPool>>,
+    expiry_pass: Arc<[tokio::sync::Mutex<reclaim::AnchorPass>; 4]>,
+    staging_pass: Arc<tokio::sync::Mutex<staging::StagingSweepState>>,
+    anchor_pass: Arc<[tokio::sync::Mutex<reclaim::AnchorPass>; 2]>,
 }
-
 impl Store {
-    /// Validates `root` at startup: an absolute path to an existing directory that is not
-    /// itself a symbolic link. Creates `staging` and `revisions` (mode 0700) if absent; each
-    /// must then be a real, readable directory. Symbolic links above the leaf are allowed.
     pub fn open(root: &Path) -> Result<Self, InvalidDirectory> {
-        let directory = |path: &Path| {
-            fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_dir())
-                && fs::read_dir(path).is_ok()
-        };
-        if !root.is_absolute() || !directory(root) {
-            return Err(InvalidDirectory);
-        }
-        let store = Self {
-            staging: root.join(STAGING),
-            revisions: root.join(REVISIONS),
-        };
-        for dir in [&store.staging, &store.revisions] {
-            match fs::DirBuilder::new().mode(0o700).create(dir) {
-                Ok(()) => {}
-                Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
-                Err(_) => return Err(InvalidDirectory),
-            }
-            if !directory(dir) {
-                return Err(InvalidDirectory);
-            }
-        }
-        sync_dir(root).map_err(|_| InvalidDirectory)?;
-        Ok(store)
+        Self::open_volume(root, true)
     }
-
-    fn paths(&self, reservation: &str) -> Result<(PathBuf, PathBuf), Error> {
-        // Only the canonical lower-case UUID text names a file: no separator, dot or NUL.
-        runs::uuid(reservation)?;
-        Ok((
-            self.staging.join(reservation),
-            self.revisions.join(reservation),
-        ))
+    /// Open an existing volume for read-only inspection without creating directories.
+    pub fn open_existing(root: &Path) -> Result<Self, InvalidDirectory> {
+        Self::open_volume(root, false)
     }
-
-    /// Creates the staging file exclusively; an existing one means another request (or a crash
-    /// awaiting reconciliation) holds the reservation.
+    fn open_volume(root: &Path, create: bool) -> Result<Self, InvalidDirectory> {
+        Ok(Self {
+            volume: Arc::new(Volume::open(root, create).map_err(|_| InvalidDirectory)?),
+            pool: Default::default(),
+            staging_pass: Default::default(),
+            expiry_pass: Default::default(),
+            anchor_pass: Default::default(),
+        })
+    }
+    /// Initializes a fresh installation from the API role and verifies an existing pin.
+    pub async fn initialize_api(&self, pool: &PgPool) -> Result<(), Error> {
+        self.prepare(pool, true).await.map(|_| ())
+    }
+    pub(crate) async fn verify_startup(&self, pool: &PgPool, api: bool) -> Result<(), Error> {
+        self.prepare(pool, api).await.map(|_| ())
+    }
+    pub(crate) fn attach(&self, pool: &PgPool) {
+        self.pool.get_or_init(|| pool.clone());
+    }
+    // Re-read the database marker for each operation. On a pre-adoption upgrade only HTTP
+    // acquisition and publication may proceed without sentinels.
+    async fn prepare(&self, pool: &PgPool, bootstrap: bool) -> Result<Option<String>, Error> {
+        self.attach(pool);
+        self.volume.recheck()?;
+        let (pin,auto,adopting,empty):(Option<String>,bool,bool,bool)=sqlx::query_as(
+            "SELECT volume_id::text,bootstrap_auto_pin_allowed,adoption_run_id IS NOT NULL,
+             NOT EXISTS (SELECT FROM openmettle.storage_reservations) AND NOT EXISTS (SELECT FROM openmettle.artifact_revisions)
+             FROM openmettle.storage_volume_control WHERE id").fetch_one(pool).await?;
+        if adopting {
+            return Err(Error::Io);
+        }
+        if let Some(id) = pin {
+            self.volume.verify(&id)?;
+            return Ok(Some(id));
+        }
+        if auto && bootstrap && empty {
+            let id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+                .fetch_one(pool)
+                .await?;
+            let id = self.volume.publish_identity(&id)?;
+            sqlx::query("SELECT openmettle.storage_pin_volume_id($1::uuid)")
+                .bind(&id)
+                .execute(pool)
+                .await?;
+            return Ok(Some(id));
+        }
+        Ok(None)
+    }
     async fn stage(&self, reservation: &str) -> Result<Staged, Error> {
-        let (path, revision) = self.paths(reservation)?;
-        let open = path.clone();
-        let file = blocking(move || {
-            fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(open)
-        })
-        .await
-        .map_err(|e| match e.kind() {
-            ErrorKind::AlreadyExists => Error::InProgress,
-            _ => Error::Io,
+        runs::uuid(reservation)?;
+        self.volume.recheck()?;
+        let f = at::openat(
+            &self.volume.staging,
+            reservation,
+            OFlags::CREATE | OFlags::EXCL | OFlags::RDWR | OFlags::NOFOLLOW,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|e| {
+            if e == rustix::io::Errno::EXIST {
+                Error::InProgress
+            } else {
+                Error::Io
+            }
         })?;
+        let f = fs::File::from(f);
+        f.try_lock_shared().map_err(|_| Error::InProgress)?;
+        let ino = f.metadata()?.ino();
+        self.volume
+            .matches(&f, &self.volume.staging, reservation, ino)?;
+        at::fsync(&self.volume.staging)?;
         Ok(Staged {
-            path,
-            revision,
-            revisions: self.revisions.clone(),
-            file: Some(file),
-            publishing: false,
+            volume: self.volume.clone(),
+            id: reservation.to_string(),
+            ino,
+            file: Some(f),
         })
     }
-
     /// Opens the published payload of a settled revision and positions it at `start`; the body
     /// streams the next `len` bytes. The file must be a regular file (not a symbolic link) of
     /// exactly `size` bytes, else [`Error::Missing`]. `start + len` must not exceed `size`.
@@ -175,40 +209,43 @@ impl Store {
         start: u64,
         len: u64,
     ) -> Result<Content, Error> {
-        let (_, path) = self.paths(reservation)?;
+        runs::uuid(reservation)?;
         let size = u64::try_from(size).map_err(|_| Error::Missing)?;
         if start.checked_add(len).is_none_or(|end| end > size) {
             return Err(Error::Missing);
         }
-        let file = blocking(move || {
-            let regular = |m: &fs::Metadata| m.file_type().is_file() && m.len() == size;
-            if !fs::symlink_metadata(&path).is_ok_and(|m| regular(&m)) {
-                return Err(ErrorKind::NotFound.into());
-            }
-            let mut file = fs::File::open(&path)?;
-            if !regular(&file.metadata()?) {
-                return Err(ErrorKind::NotFound.into());
-            }
-            file.seek(SeekFrom::Start(start))?;
-            Ok(file)
-        })
-        .await
-        .map_err(|e| match e.kind() {
-            ErrorKind::NotFound => Error::Missing,
-            _ => Error::Io,
-        })?;
+        let pool = self.pool.get().ok_or(Error::Io)?;
+        let pin = self.prepare(pool, false).await?;
+        let (ino, bad): (Option<String>, bool) = sqlx::query_as(
+            "SELECT payload_ino::text,adoption_unverified
+            FROM openmettle.storage_reservations WHERE id=$1::uuid AND state='settled'",
+        )
+        .bind(reservation)
+        .fetch_one(pool)
+        .await?;
+        if bad || (pin.is_some() && ino.is_none()) {
+            return Err(Error::Io);
+        }
+        let mut file = self
+            .volume
+            .regular(&self.volume.revisions, reservation, false)
+            .map_err(|_| Error::Missing)?;
+        file.try_lock_shared().map_err(|_| Error::Missing)?;
+        let m = file.metadata()?;
+        if m.len() != size {
+            return Err(Error::Missing);
+        }
+        if ino.is_some_and(|v| v != m.ino().to_string()) {
+            return Err(Error::Io);
+        }
+        self.volume
+            .matches(&file, &self.volume.revisions, reservation, m.ino())?;
+        file.seek(SeekFrom::Start(start))?;
         Ok(Content {
             file: Some(file),
             remaining: len,
             pending: None,
         })
-    }
-
-    /// Unlinks both payload paths of `reservation` (absent is fine) and syncs the directories.
-    fn remove(&self, reservation: &str) -> Result<(), Error> {
-        let (staging, revision) = self.paths(reservation)?;
-        remove(&staging, &self.staging).map_err(|_| Error::Io)?;
-        remove(&revision, &self.revisions).map_err(|_| Error::Io)
     }
 }
 
@@ -220,30 +257,12 @@ async fn blocking<T: Send + 'static>(
         .unwrap_or_else(|_| Err(ErrorKind::Other.into()))
 }
 
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
-    fs::File::open(dir)?.sync_all()
-}
-
-fn remove(path: &Path, dir: &Path) -> std::io::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => sync_dir(dir),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
-}
-
-/// An exclusively created staging file. Dropping it before publication unlinks it, including
-/// when the request future is cancelled mid-stream.
 struct Staged {
-    path: PathBuf,
-    revision: PathBuf,
-    revisions: PathBuf,
-    /// `None` after a failed or cancelled write; the upload must then be abandoned.
+    id: String,
+    volume: Arc<Volume>,
+    ino: u64,
     file: Option<fs::File>,
-    /// Set once the rename task owns the file; it cleans up after itself on failure.
-    publishing: bool,
 }
-
 impl Staged {
     async fn write(&mut self, bytes: Vec<u8>) -> Result<(), Error> {
         let mut file = self.file.take().ok_or(Error::Io)?;
@@ -267,34 +286,22 @@ impl Staged {
         Ok(())
     }
 
-    /// Rename into `revisions/` and `fsync` that directory. On failure both paths are unlinked,
-    /// so the caller may release the reservation.
-    async fn publish(mut self) -> Result<(), Error> {
-        drop(self.file.take().ok_or(Error::Io)?);
-        self.publishing = true;
-        let (staging, revision, revisions) = (
-            self.path.clone(),
-            self.revision.clone(),
-            self.revisions.clone(),
-        );
-        blocking(move || {
-            let result = fs::rename(&staging, &revision).and_then(|()| sync_dir(&revisions));
-            if result.is_err() {
-                let _ = fs::remove_file(&staging);
-                let _ = fs::remove_file(&revision);
-            }
-            result
-        })
-        .await
-        .map_err(|_| Error::Io)
-    }
-}
-
-impl Drop for Staged {
-    fn drop(&mut self) {
-        if !self.publishing {
-            let _ = fs::remove_file(&self.path);
-        }
+    fn publish(&self) -> Result<(), Error> {
+        let f = self.file.as_ref().ok_or(Error::Io)?;
+        self.volume.recheck()?;
+        self.volume
+            .matches(f, &self.volume.staging, &self.id, self.ino)?;
+        at::linkat(
+            &self.volume.staging,
+            self.id.as_str(),
+            &self.volume.revisions,
+            self.id.as_str(),
+            AtFlags::empty(),
+        )?;
+        at::fsync(&self.volume.revisions)?;
+        self.volume
+            .matches(f, &self.volume.revisions, &self.id, self.ino)?;
+        Ok(())
     }
 }
 
@@ -436,10 +443,8 @@ async fn committed<T, E: From<runs::Error>>(
 }
 
 /// Reserve, stream the multipart `body` into staging, check the completed form with `accept`,
-/// publish and settle. Every refusal before publication unlinks the staging file and then
-/// releases the reservation, except [`Error::InProgress`], which leaves the other request's
-/// file and reservation alone. A cancelled future unlinks its staging file; its reservation
-/// stays `reserved` for a retry or [`reconcile_expired`].
+/// publish and settle. The writer commits its claim before creating staging. Cancellation leaves
+/// any file and charge for fenced recovery. Failed validation releases through the same cleaner.
 ///
 /// An exact retry of a settled upload re-reads the body without writing, settles it as an
 /// exact replay and returns the same revision with no second charge; a changed body, media type
@@ -465,17 +470,33 @@ where
         run: None,
         operation: None,
     };
+    let pin = store.prepare(pool, true).await?;
     let reservation =
         committed::<_, Error>(pool, async |tx| Ok(storage::reserve(tx, &input).await?)).await?;
     let id = reservation.id;
     let staged = match reservation.state {
         ReservationState::Released => return Err(runs::Error::Conflict.into()),
         ReservationState::Settled => None,
-        ReservationState::Reserved => match store.stage(&id).await {
-            Ok(staged) => Some(staged),
-            Err(Error::InProgress) => return Err(Error::InProgress),
-            Err(error) => return Err(abort(pool, upload.scope, &id, error).await),
-        },
+        ReservationState::Reserved => {
+            committed(pool, async |tx| {
+                lock_writer(tx, &id, pin.as_deref(), false, None, false).await?;
+                sqlx::query("UPDATE openmettle.storage_reservations SET stage_claimed=true WHERE id=$1::uuid")
+                    .bind(&id).execute(tx.connection()?).await?;
+                Ok::<_, Error>(())
+            }).await?;
+            if let Some(pin) = pin.as_deref() {
+                store.volume.verify(pin)?;
+            }
+            let staged = store.stage(&id).await?;
+            committed(pool, async |tx| {
+                lock_writer(tx, &id, pin.as_deref(), true, None, false).await?;
+                store.volume.matches(staged.file.as_ref().ok_or(Error::Io)?, &store.volume.staging, &id, staged.ino)?;
+                sqlx::query("UPDATE openmettle.storage_reservations SET payload_ino=$2::text::numeric WHERE id=$1::uuid")
+                    .bind(&id).bind(staged.ino.to_string()).execute(tx.connection()?).await?;
+                Ok::<_, Error>(())
+            }).await?;
+            Some(staged)
+        }
     };
     let fresh = staged.is_some();
     let mut sink = Sink {
@@ -505,8 +526,8 @@ where
     let form = match received {
         Ok(form) => form,
         Err(error) if fresh => {
-            drop(sink); // unlink staging before the release
-            return Err(abort(pool, upload.scope, &id, error).await);
+            drop(sink); // release the shared file lock before reclamation
+            return Err(abort(pool, store, upload.scope, &id, error).await);
         }
         Err(error) => return Err(error),
     };
@@ -517,7 +538,7 @@ where
         && let Err(error) = file.sync().await
     {
         drop(staged);
-        return Err(abort(pool, upload.scope, &id, error).await);
+        return Err(abort(pool, store, upload.scope, &id, error).await);
     }
     let settlement = Settlement {
         scope: upload.scope,
@@ -527,50 +548,69 @@ where
         media_type: &form.media_type,
         display_name: form.display_name.as_deref(),
     };
-    // The rename happens under the reservation's row lock, in the settling transaction, so it
-    // never replaces the payload of a revision another request settled, or races
-    // `reconcile_expired`. A reservation no longer `reserved` keeps no staging file; `settle`
-    // then replays or conflicts.
-    let settled = committed::<_, Error>(pool, async |tx| {
-        let mut published = false;
-        if let Some(staged) = staged {
-            let state: String = sqlx::query_scalar(
-                "SELECT state FROM openmettle.storage_reservations
-                  WHERE scope_id = $1::uuid AND id = $2::uuid FOR UPDATE",
+    if let Some(file) = staged.as_ref() {
+        committed(pool, async |tx| {
+            lock_writer(tx, &id, pin.as_deref(), true, Some(file.ino), false).await?;
+            store.volume.matches(
+                file.file.as_ref().ok_or(Error::Io)?,
+                &store.volume.staging,
+                &id,
+                file.ino,
+            )?;
+            sqlx::query(
+                "UPDATE openmettle.storage_reservations SET publish_pending=true WHERE id=$1::uuid",
             )
-            .bind(upload.scope)
             .bind(&id)
-            .fetch_one(tx.connection()?)
+            .execute(tx.connection()?)
             .await?;
-            if state == "reserved" {
-                staged.publish().await?;
-                published = true;
+            Ok::<_, Error>(())
+        })
+        .await?;
+        if let Some(pin) = &pin {
+            store.volume.verify(pin)?;
+        }
+        if file.publish().is_err() {
+            quarantine_writer(pool, &id, file.ino).await?;
+            return Err(Error::Io);
+        }
+    }
+    let revision = committed(pool, async |tx| {
+        if let Some(file) = staged.as_ref() {
+            lock_writer(tx, &id, pin.as_deref(), true, Some(file.ino), true).await?;
+        }
+        let revision = storage::settle(tx, &settlement).await?;
+        if let Some(file) = staged.as_ref() {
+            if let Some(pin) = &pin {
+                store.volume.verify(pin)?;
+            } else {
+                store.volume.recheck()?;
+            }
+            let fd = file.file.as_ref().ok_or(Error::Io)?;
+            store
+                .volume
+                .matches(fd, &store.volume.staging, &id, file.ino)?;
+            store
+                .volume
+                .matches(fd, &store.volume.revisions, &id, file.ino)?;
+            if fd.metadata()?.len() != size_bytes as u64 {
+                return Err(Error::Io);
             }
         }
-        Ok((storage::settle(tx, &settlement).await?, published))
+        Ok::<_, Error>(revision)
     })
     .await;
-    let (revision, published) = match settled {
-        Ok(settled) => settled,
-        // Only publication fails with `Io`: both paths are gone, so the release is safe.
-        Err(Error::Io) => return Err(abort(pool, upload.scope, &id, Error::Io).await),
-        Err(error) => return Err(error),
-    };
-    // A replay, or a request whose reservation another request settled, must find that
-    // revision's payload: a regular file (not a symlink) of exactly the settled size.
-    if !published {
-        let (_, path) = store.paths(&id)?;
-        let size = sink.size;
-        let present =
-            blocking(move || {
-                Ok(fs::symlink_metadata(path)
-                    .is_ok_and(|m| m.file_type().is_file() && m.len() == size))
-            })
-            .await
-            .unwrap_or(false);
-        if !present {
-            return Err(Error::Missing);
-        }
+    if matches!(revision, Err(Error::Io))
+        && let Some(file) = staged.as_ref()
+    {
+        quarantine_writer(pool, &id, file.ino).await?;
+    }
+    let revision = revision?;
+    if let Some(file) = staged {
+        let ino = file.ino;
+        let _ = store.volume.detach_staged(&id, ino);
+        drop(file);
+    } else {
+        store.read(&id, size_bytes, 0, 0).await?;
     }
     Ok(Stored {
         revision,
@@ -581,16 +621,59 @@ where
     })
 }
 
-/// Releases an unpublished reservation after its staging file is gone and returns `error`. A
-/// failed release leaves the reservation for [`reconcile_expired`].
-async fn abort(pool: &PgPool, scope: &str, reservation: &str, error: Error) -> Error {
-    let _ = committed(pool, async |tx| {
-        storage::release(tx, scope, reservation).await
-    })
-    .await;
-    error
+async fn quarantine_writer(pool: &PgPool, id: &str, ino: u64) -> Result<(), Error> {
+    sqlx::query(
+        "UPDATE openmettle.storage_reservations SET adoption_unverified=true,publish_pending=false
+        WHERE id=$1::uuid AND payload_ino=$2::text::numeric AND publish_pending
+        AND state='reserved' AND reclaim_state='none'",
+    )
+    .bind(id)
+    .bind(ino.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
+async fn lock_writer(
+    tx: &mut WriteTransaction<'_>,
+    id: &str,
+    pin: Option<&str>,
+    claimed: bool,
+    ino: Option<u64>,
+    pending: bool,
+) -> Result<(), Error> {
+    let ok: Option<bool> = sqlx::query_scalar(
+        "SELECT stage_claimed=$2 AND publish_pending=$4 AND payload_ino IS NOT DISTINCT FROM $3::text::numeric
+        AND NOT adoption_unverified AND reclaim_state='none' FROM openmettle.storage_reservations
+        WHERE id=$1::uuid AND state='reserved' FOR UPDATE",
+    )
+    .bind(id)
+    .bind(claimed)
+    .bind(ino.map(|i| i.to_string()))
+    .bind(pending)
+    .fetch_optional(tx.connection()?)
+    .await?;
+    if ok != Some(true) {
+        return Err(Error::InProgress);
+    }
+    let (vol, adopting): (Option<String>, bool) = sqlx::query_as(
+        "SELECT volume_id::text,adoption_run_id IS NOT NULL
+        FROM openmettle.storage_volume_control WHERE id",
+    )
+    .fetch_one(tx.connection()?)
+    .await?;
+    if adopting || vol.as_deref() != pin {
+        return Err(Error::Io);
+    }
+    if let Some(expected) = pin {
+        reclaim::lock_pin(tx, expected).await?;
+    }
+    Ok(())
+}
+async fn abort(pool: &PgPool, store: &Store, scope: &str, id: &str, error: Error) -> Error {
+    let _ = reclaim::release(pool, store, scope, id, None).await;
+    error
+}
 fn batch(limit: i64) -> Result<(), Error> {
     if (1..=MAX_BATCH).contains(&limit) {
         Ok(())
@@ -617,98 +700,6 @@ async fn sweep_items<T, F: Future<Output = Result<bool, Error>>>(
     first_error.map_or(Ok(count), Err)
 }
 
-/// Releases up to `limit` upload reservations (no run link) still `reserved` more than
-/// `older_than` after creation, oldest first. Under the reservation's row lock it unlinks any
-/// `staging/` or `revisions/` file first, so no uncharged payload remains. `older_than` must
-/// exceed the longest upload plus settlement; an upload still running past it would lose its
-/// reservation. Returns the number released. Works as `openmettle_api` or
-/// `openmettle_worker`.
-pub async fn reconcile_expired(
-    pool: &PgPool,
-    store: &Store,
-    older_than: Duration,
-    limit: i64,
-) -> Result<usize, Error> {
-    batch(limit)?;
-    let age = i64::try_from(older_than.as_millis()).map_err(|_| runs::Error::Invalid)?;
-    let mut scan = WriteTransaction::begin_bounded_pool(pool, true).await?;
-    let candidates: Vec<(String, String)> = sqlx::query_as(
-        "SELECT scope_id::text, id::text FROM openmettle.storage_reservations
-          WHERE state = 'reserved' AND run_id IS NULL
-            AND created_at < now() - $1 * interval '1 millisecond'
-          ORDER BY created_at LIMIT $2",
-    )
-    .bind(age)
-    .bind(limit)
-    .fetch_all(scan.connection()?)
-    .await?;
-    scan.commit().await?;
-    sweep_items(candidates, |(scope, reservation)| async move {
-        let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
-        let locked = sqlx::query(
-            "SELECT FROM openmettle.storage_reservations
-              WHERE scope_id = $1::uuid AND id = $2::uuid AND state = 'reserved'
-              FOR UPDATE SKIP LOCKED",
-        )
-        .bind(&scope)
-        .bind(&reservation)
-        .fetch_optional(tx.connection()?)
-        .await?;
-        if locked.is_none() {
-            return Ok(false);
-        }
-        // Keep the row locked until both unlinks finish, even if the sweep times out.
-        let store = store.clone();
-        let (mut tx, reservation) = tokio::task::spawn_blocking(move || {
-            store.remove(&reservation)?;
-            Ok::<_, Error>((tx, reservation))
-        })
-        .await
-        .map_err(|_| Error::Io)??;
-        storage::release(&mut tx, &scope, &reservation).await?;
-        tx.commit().await?;
-        Ok(true)
-    })
-    .await
-}
-
-/// Purges up to `limit` revisions: expired `retained` ones are claimed with `begin_purge`, and
-/// claims left by an earlier crash are resumed. Each payload `revisions/<reservation>` is
-/// unlinked, then `confirm_purge` stops charging it. `openmettle_worker` only (ADR 0005 column
-/// grants). Returns the number confirmed.
-pub async fn purge_due(pool: &PgPool, store: &Store, limit: i64) -> Result<usize, Error> {
-    batch(limit)?;
-    let mut scan = WriteTransaction::begin_bounded_pool(pool, true).await?;
-    let due: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT scope_id::text, id::text, reservation_id::text FROM openmettle.artifact_revisions
-          WHERE (state = 'retained' AND purge_after <= now()) OR state = 'purging'
-          ORDER BY purge_after LIMIT $1",
-    )
-    .bind(limit)
-    .fetch_all(scan.connection()?)
-    .await?;
-    scan.commit().await?;
-    sweep_items(due, |(scope, revision, reservation)| async move {
-        // A claim must be committed before its confirmation (ADR 0005). A revision restored
-        // since the scan is no longer eligible and is skipped.
-        let mut claim = WriteTransaction::begin_bounded_pool(pool, false).await?;
-        match storage::begin_purge(&mut claim, &scope, &revision).await {
-            Ok(()) => claim.commit().await?,
-            Err(runs::Error::NotEligible) => return Ok(false),
-            Err(error) => return Err(error.into()),
-        }
-        let (_, path) = store.paths(&reservation)?;
-        let dir = store.revisions.clone();
-        blocking(move || remove(&path, &dir))
-            .await
-            .map_err(|_| Error::Io)?;
-        let mut confirm = WriteTransaction::begin_bounded_pool(pool, false).await?;
-        storage::confirm_purge(&mut confirm, &scope, &revision).await?;
-        confirm.commit().await?;
-        Ok(true)
-    })
-    .await
-}
-
+pub use reclaim::{purge_due, reconcile_expired};
 #[cfg(test)]
 mod tests;

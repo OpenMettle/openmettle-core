@@ -1028,7 +1028,6 @@ async fn login_snapshot(db: &TestDb, base_version: i64) -> Vec<String> {
     .await
 }
 async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool) {
-    use openmettle_core::storage::{self as accounting, ReservationInput, Settlement};
     let base_version = *versions.last().unwrap();
     let db = TestDb::new().await;
     let old = std::path::PathBuf::from(
@@ -1088,39 +1087,66 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
             .fetch_one(&mut api)
             .await
             .unwrap();
-        let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
-        let reserved = accounting::reserve(
-            &mut tx,
-            &ReservationInput {
-                scope,
-                actor: &c.actor,
-                key,
-                artifact: &artifact,
-                max_bytes: 100,
-                run: None,
-                operation: None,
-            },
+        // Seed the actual schema of the historical writer, including its storage counters.
+        let mut tx = api.begin().await.unwrap();
+        sqlx::query("INSERT INTO openmettle.storage_accounts(scope_id) VALUES($1::uuid) ON CONFLICT DO NOTHING")
+            .bind(scope).execute(&mut *tx).await.unwrap();
+        let id: String = sqlx::query_scalar("INSERT INTO openmettle.storage_reservations
+            (scope_id,actor_user_id,idempotency_key,artifact_id,max_bytes,request_identity,request_digest)
+            VALUES($1::uuid,$2::uuid,$3,$4::uuid,100,convert_to($3,'UTF8'),sha256(convert_to($3,'UTF8')))
+            RETURNING id::text")
+            .bind(scope).bind(&c.actor).bind(key).bind(&artifact).fetch_one(&mut *tx).await.unwrap();
+        let (active, retained, reserved) = if retain {
+            (0i64, 10i64, 0i64)
+        } else if settle {
+            (10, 0, 0)
+        } else {
+            (0, 0, 100)
+        };
+        sqlx::query("UPDATE openmettle.storage_accounts SET active_bytes=active_bytes+$2,
+            retained_bytes=retained_bytes+$3,reserved_bytes=reserved_bytes+$4 WHERE scope_id=$1::uuid")
+            .bind(scope).bind(active).bind(retained).bind(reserved).execute(&mut *tx).await.unwrap();
+        sqlx::query(
+            "UPDATE openmettle.storage_instance SET active_bytes=active_bytes+$1,
+            retained_bytes=retained_bytes+$2,reserved_bytes=reserved_bytes+$3",
         )
+        .bind(active)
+        .bind(retained)
+        .bind(reserved)
+        .execute(&mut *tx)
         .await
         .unwrap();
         if settle {
-            let revision = accounting::settle(
-                &mut tx,
-                &Settlement {
-                    scope,
-                    reservation: &reserved.id,
-                    size_bytes: 10,
-                    content_digest: &[0; 32],
-                    media_type: "text/plain",
-                    display_name: None,
-                },
+            sqlx::query(
+                "INSERT INTO openmettle.artifacts(id,scope_id,scope_kind,owner_user_id)
+                SELECT $1::uuid,id,kind,$3::uuid FROM openmettle.scopes WHERE id=$2::uuid",
             )
+            .bind(&artifact)
+            .bind(scope)
+            .bind(&c.actor)
+            .execute(&mut *tx)
             .await
             .unwrap();
+            sqlx::query("UPDATE openmettle.artifacts SET last_revision=1 WHERE id=$1::uuid")
+                .bind(&artifact)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO openmettle.artifact_revisions(scope_id,artifact_id,revision,reservation_id,
+                size_bytes,content_digest,media_type,created_by_user_id)
+                VALUES($1::uuid,$2::uuid,1,$3::uuid,10,$4,'text/plain',$5::uuid)")
+                .bind(scope).bind(&artifact).bind(&id).bind(&[0u8;32][..]).bind(&c.actor).execute(&mut *tx).await.unwrap();
+            sqlx::query("UPDATE openmettle.storage_reservations SET state='settled',settled_bytes=10,closed_at=now()
+                WHERE id=$1::uuid").bind(&id).execute(&mut *tx).await.unwrap();
             if retain {
-                accounting::retain_revision(&mut tx, scope, &revision, 3600)
-                    .await
-                    .unwrap();
+                sqlx::query(
+                    "UPDATE openmettle.artifact_revisions SET state='retained',retained_at=now(),
+                    purge_after=now()+interval '1 hour' WHERE reservation_id=$1::uuid",
+                )
+                .bind(&id)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
             }
         }
         tx.commit().await.unwrap();
@@ -1536,6 +1562,13 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
             "openmettle_worker has SELECT on openmettle.login_provider_revisions",
             "openmettle_worker has SELECT on openmettle.user_identities",
         ];
+        // Old binaries print PostgreSQL's canonical regprocedure spelling. Resolve the exact
+        // role/signature pairs granted by the new migration against that same catalog.
+        let quota_grants: Vec<String> = sqlx::query_scalar(r"SELECT trim(role) ||
+            ' has EXECUTE on function ' || to_regprocedure(parts[1])::text
+            FROM regexp_matches($1, 'GRANT\s+EXECUTE\s+ON\s+FUNCTION\s+(openmettle\.\w+\([^)]*\))\s+TO\s+([^;]+);','gi') parts,
+            unnest(string_to_array(parts[2],',')) role")
+            .bind(MIGRATIONS[23].sql).fetch_all(&mut owner).await.unwrap();
         for violation in &reported {
             let later = violation.contains("openmettle.native_handoffs")
                 || violation.ends_with(" on function openmettle.redeem_home_invitation(uuid,text,text,text,bigint,bytea)")
@@ -1543,6 +1576,7 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
                     ["gateway_handoff(uuid,bytea,bytea,bytea,uuid)", "gateway_release(uuid,bytea)"]
                         .iter().any(|signature| **violation == format!("{role} has EXECUTE on function openmettle.{signature}"))
                 })
+                || quota_grants.iter().any(|grant| grant==violation)
                 || worker_reads.contains(violation)
                 || later_objects.iter().any(|object| {
                     violation.ends_with(&format!(" on {object}"))

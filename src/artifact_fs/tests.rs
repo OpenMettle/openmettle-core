@@ -25,11 +25,17 @@ fn open_creates_private_subdirectories_and_is_repeatable() {
         assert!(fs::symlink_metadata(&path).unwrap().is_dir());
         assert_eq!(mode(&path), 0o700);
     }
-    assert_eq!(store.staging, Path::new(&dir.path("root")).join(STAGING));
+    store.volume.recheck().unwrap();
     // Existing subdirectories are reused, not replaced.
-    fs::write(store.revisions.join("kept"), b"x").unwrap();
+    fs::write(Path::new(&dir.path("root/revisions")).join("kept"), b"x").unwrap();
     let again = Store::open(Path::new(&dir.path("root"))).unwrap();
-    assert!(again.revisions.join("kept").exists());
+    assert!(
+        again
+            .volume
+            .inode(&again.volume.revisions, "kept")
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]
@@ -81,13 +87,11 @@ fn open_refuses_unusable_directories() {
     }
 }
 
-#[test]
-fn paths_come_only_from_a_canonical_reservation_uuid() {
+#[tokio::test]
+async fn paths_come_only_from_a_canonical_reservation_uuid() {
     let dir = Dir::new();
     let store = store(&dir);
-    let (staging, revision) = store.paths(RESERVATION).unwrap();
-    assert_eq!(staging, store.staging.join(RESERVATION));
-    assert_eq!(revision, store.revisions.join(RESERVATION));
+    assert!(store.stage(RESERVATION).await.is_ok());
     for refused in [
         "../0b0a5d9e-1c1e-4c6a-9a49-3f1d2b7c8e1",
         "0B0A5D9E-1C1E-4C6A-9A49-3F1D2B7C8E10",
@@ -95,16 +99,16 @@ fn paths_come_only_from_a_canonical_reservation_uuid() {
         "report.pdf",
         "",
     ] {
-        assert!(store.paths(refused).is_err(), "{refused:?}");
+        assert!(store.stage(refused).await.is_err(), "{refused:?}");
     }
 }
 
 #[tokio::test]
-async fn staging_is_exclusive_private_and_unlinked_when_abandoned() {
+async fn staging_is_exclusive_private_and_keeps_abandoned_inode_for_reclamation() {
     let dir = Dir::new();
     let store = store(&dir);
     let mut staged = store.stage(RESERVATION).await.unwrap();
-    let path = store.staging.join(RESERVATION);
+    let path = Path::new(&dir.path("root/staging")).join(RESERVATION);
     assert_eq!(mode(&path), 0o600);
     // A second request under the same reservation never touches the first one's file.
     assert!(matches!(
@@ -113,18 +117,21 @@ async fn staging_is_exclusive_private_and_unlinked_when_abandoned() {
     ));
     staged.write(b"partial".to_vec()).await.unwrap();
     assert_eq!(fs::read(&path).unwrap(), b"partial");
-    drop(staged);
-    assert!(!path.exists());
-    // A cancelled write leaves nothing behind either.
-    let mut staged = store.stage(RESERVATION).await.unwrap();
+    // An interrupted write leaves the same inode for the fenced reconciler.
+    let before = staged.ino;
     {
         let write = staged.write(vec![1; 1 << 20]);
         tokio::pin!(write);
         let _ = futures_poll_once(write.as_mut()).await;
     }
     drop(staged);
-    assert!(!path.exists());
-    assert!(fs::read_dir(&store.revisions).unwrap().next().is_none());
+    assert_eq!(fs::metadata(path).unwrap().ino(), before);
+    assert!(
+        fs::read_dir(dir.path("root/revisions"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
 }
 
 /// Polls `future` once, as a request future that is dropped mid-write would be.
@@ -141,25 +148,39 @@ async fn futures_poll_once<F: std::future::Future + Unpin>(future: F) -> Option<
 }
 
 #[tokio::test]
-async fn publish_syncs_and_renames_into_revisions() {
+async fn publish_never_replaces_a_collision_and_preserves_both_links_until_detach() {
     let dir = Dir::new();
     let store = store(&dir);
-    // A stale revision file of the same reservation (crash before settle) is replaced.
-    fs::write(store.revisions.join(RESERVATION), b"stale").unwrap();
+    // A foreign revision file must survive a publication attempt.
+    fs::write(
+        Path::new(&dir.path("root/revisions")).join(RESERVATION),
+        b"stale",
+    )
+    .unwrap();
     let mut staged = store.stage(RESERVATION).await.unwrap();
     for chunk in [b"hello ".to_vec(), b"world".to_vec()] {
         staged.write(chunk).await.unwrap();
     }
     staged.sync().await.unwrap();
-    staged.publish().await.unwrap();
-    assert!(!store.staging.join(RESERVATION).exists());
-    let published = store.revisions.join(RESERVATION);
-    assert_eq!(fs::read(&published).unwrap(), b"hello world");
+    assert!(staged.publish().is_err());
+    let published = Path::new(&dir.path("root/revisions")).join(RESERVATION);
+    assert_eq!(fs::read(&published).unwrap(), b"stale");
+    fs::remove_file(&published).unwrap();
+    staged.publish().unwrap();
+    let ino = staged.ino;
+    assert_eq!(fs::metadata(&published).unwrap().ino(), ino);
     assert_eq!(mode(&published), 0o600);
-    store.remove(RESERVATION).unwrap();
-    assert!(!published.exists());
-    // Removing absent files is not an error.
-    store.remove(RESERVATION).unwrap();
+    let cleaner = store
+        .volume
+        .regular(&store.volume.staging, RESERVATION, true)
+        .unwrap();
+    assert!(matches!(
+        cleaner.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    drop(staged);
+    store.volume.detach_staged(RESERVATION, ino).unwrap();
+    assert_eq!(fs::read(&published).unwrap(), b"hello world");
 }
 
 #[tokio::test]
@@ -178,7 +199,7 @@ async fn sink_enforces_the_ceiling_without_a_declared_length() {
     assert!(matches!(sink.write(vec![b'a']).await, Err(Error::TooLarge)));
     assert_eq!(sink.size, 10);
     assert_eq!(
-        fs::read(store.staging.join(RESERVATION)).unwrap(),
+        fs::read(Path::new(&dir.path("root/staging")).join(RESERVATION)).unwrap(),
         [b'a'; 10]
     );
     assert_eq!(
@@ -186,7 +207,11 @@ async fn sink_enforces_the_ceiling_without_a_declared_length() {
         <[u8; 32]>::from(Sha256::digest([b'a'; 10]))
     );
     drop(sink);
-    assert!(!store.staging.join(RESERVATION).exists());
+    assert!(
+        Path::new(&dir.path("root/staging"))
+            .join(RESERVATION)
+            .exists()
+    );
 }
 
 #[test]

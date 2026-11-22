@@ -42,6 +42,20 @@ effect_columns (relation, attribute, role, privilege) AS (
             'created_ms','expires_ms','revoked'])
     ) AS t(relation,role,privilege,columns), unnest(columns) attribute WHERE $1 >= 22
 ),
+quota_columns (relation,attribute,role,privilege) AS (
+    SELECT 'storage_reservations', attribute, role, privilege FROM (VALUES
+        ('INSERT',ARRAY['lease_expires_at','stage_claimed']),
+        ('UPDATE',ARRAY['lease_expires_at','adoption_unverified','stage_claimed','payload_ino',
+            'publish_pending','reclaim_state','reclaim_claim_token','reclaim_lease_until'])) t(privilege,columns),
+        unnest(columns) attribute, unnest(ARRAY['openmettle_api','openmettle_worker']) role WHERE $1 >= 24
+    UNION ALL SELECT 'artifact_revisions','purge_stage','openmettle_worker','UPDATE' WHERE $1 >= 24
+),
+quota_tables (relation,role,privilege) AS (
+    SELECT relation,role,'SELECT' FROM unnest(ARRAY['quota_defaults','quota_enforcement','quota_overrides',
+        'quota_reservations','quota_budgets','quota_reservation_charges','quota_reconciliations','quota_warning_events',
+        'storage_volume_control']) relation, unnest(ARRAY['openmettle_api','openmettle_worker','openmettle_gateway']) role
+    WHERE $1 >= 24 AND (relation<>'storage_volume_control' OR role<>'openmettle_gateway')
+),
 gateway_columns (relation,attribute,role,privilege) AS (
     SELECT relation, attribute, role, privilege FROM (VALUES
         ('account_admin_lock','openmettle_gateway','UPDATE',ARRAY['lock_guard']),
@@ -65,6 +79,50 @@ gateway_columns (relation,attribute,role,privilege) AS (
         ('gateway_requests','openmettle_api','INSERT',ARRAY['id','reservation_id','scope_id','actor_user_id','approval_id','installation','model','units','dispatch_hash','session_id']),
         ('gateway_requests','openmettle_worker','INSERT',ARRAY['id','reservation_id','scope_id','actor_user_id','approval_id','installation','model','units','dispatch_hash','run_id','round'])
     ) AS t(relation,role,privilege,columns), unnest(columns) attribute WHERE $1 >= 23
+),
+quota_functions(signature,definer,roles) AS (
+    SELECT * FROM (VALUES
+        ('openmettle.record_accepted_gateway_settlement()',true,ARRAY[]::text[]),
+        ('openmettle.quota_take_warnings(integer)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.enforce_quota_reservation_gateway_binding()',true,ARRAY[]::text[]),
+        ('openmettle.enforce_cost_denomination_immutability()',false,ARRAY[]::text[]),
+        ('openmettle.enforce_gateway_report_cost_unit()',true,ARRAY[]::text[]),
+        ('openmettle.enforce_quota_enforcement_write_once()',false,ARRAY[]::text[]),
+        ('openmettle.enforce_gateway_handoff_holds()',true,ARRAY[]::text[]),
+        ('openmettle.quota_lock_gateway_request_for_settlement(uuid)',true,ARRAY['openmettle_gateway']::text[]),
+        ('openmettle.enforce_tool_spill_reservation_binding()',false,ARRAY[]::text[]),
+        ('openmettle.storage_lock_pinned_volume()',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
+        ('openmettle.storage_pin_volume_id(uuid)',true,ARRAY['openmettle_api']::text[]),
+        ('openmettle.enforce_runtime_storage_volume_pinned()',false,ARRAY[]::text[]),
+        ('openmettle.enforce_storage_reservation_monotonic_guards()',false,ARRAY[]::text[]),
+        ('openmettle.enforce_storage_override()',false,ARRAY[]::text[]),
+        ('openmettle.quota_limit(uuid,text,text)',false,ARRAY[]::text[]),
+        ('openmettle.quota_warn(text,uuid,text,timestamptz,numeric,numeric,bigint,smallint,smallint,bigint,bigint)',false,ARRAY[]::text[]),
+        ('openmettle.quota_reserve(uuid,uuid,text,bigint,text,uuid,uuid,bytea,timestamptz)',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
+        ('openmettle.quota_cost_ceiling(uuid,uuid)',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
+        ('openmettle.quota_ensure_legacy_run_holds(uuid,uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.quota_allocate_round(uuid,bytea,uuid,text,bigint)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.quota_commit_handoff(uuid,bytea)',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
+        ('openmettle.quota_gateway_fold(uuid,text,bigint,bigint)',false,ARRAY[]::text[]),
+        ('openmettle.quota_adjust(uuid,numeric,numeric)',false,ARRAY[]::text[]),
+        ('openmettle.quota_settle_gateway_usage(uuid,uuid,uuid,bigint)',true,ARRAY['openmettle_gateway']::text[]),
+        ('openmettle.quota_unwind_hold(uuid,text)',false,ARRAY[]::text[]),
+        ('openmettle.quota_unwind_request(uuid,text)',false,ARRAY[]::text[]),
+        ('openmettle.quota_recover_lost_handoff(uuid,bytea,uuid,uuid,uuid)',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
+        ('openmettle.quota_unwind_superseded_round(uuid,uuid,uuid,integer)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.quota_release_orphan_gateway_requests(interval,timestamptz,uuid,timestamptz,uuid,integer)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.quota_renew_lease(uuid,uuid,uuid,timestamptz)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.quota_follow_run_deadline()',true,ARRAY[]::text[]),
+        ('openmettle.quota_release_unsent(uuid,bytea)',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
+        ('openmettle.quota_commit_device_handoff(uuid,uuid,uuid,uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.quota_lock_override(uuid,uuid,text)',false,ARRAY[]::text[]),
+        ('openmettle.quota_upsert_scope_override(uuid,uuid,text,bigint,timestamptz,text)',true,ARRAY['openmettle_api']::text[]),
+        ('openmettle.quota_revoke_scope_override(uuid,uuid,text,text)',true,ARRAY['openmettle_api']::text[]),
+        ('openmettle.quota_record_storage_warning(uuid,bigint)',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
+        ('openmettle.quota_verify_accounting_drift()',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.quota_release_device_slot(uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.quota_commit_handoff(uuid,uuid)',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
+        ('openmettle.quota_bump_config_revision()',false,ARRAY[]::text[])) AS f WHERE $1 >= 24
 ),
 gateway_functions (signature,definer,inference) AS (
     SELECT * FROM (VALUES ('openmettle.gateway_allocate()',true,false), ('openmettle.gateway_run_hold()',true,false),
@@ -180,6 +238,7 @@ contract (relation, role, privilege) AS (
         'login_provider_revisions','grant_assignments','grant_changes','local_groups',
         'local_group_memberships','membership_observations','grant_mapping_rules','grant_mapping_revisions',
         'project_settings','platform_capability_denies','user_capability_denies','user_capability_grants']), 'openmettle_gateway', 'SELECT' WHERE $1 >= 23
+    UNION ALL SELECT * FROM quota_tables
 ),
 column_contract (relation, attribute, role, privilege) AS (
     VALUES ('users', 'disabled_at', 'openmettle_api', 'UPDATE')
@@ -240,6 +299,8 @@ column_contract (relation, attribute, role, privilege) AS (
         ('openmettle_worker', 'INSERT', ARRAY['scope_id','conversation_id','message_id','run_id',
             'reasoning_blocks','reasoning_bytes','input_count','output_count'])
     ) AS t(role,privilege,columns), unnest(columns) attribute WHERE $1 >= 21
+    UNION ALL
+    SELECT * FROM quota_columns
     UNION ALL
     SELECT * FROM gateway_columns
     UNION ALL
@@ -586,7 +647,9 @@ violations (violation) AS (
     FROM grants AS g
     WHERE (g.grantee IN (SELECT oid FROM principals)
            OR ($1 >= 23 AND g.schema_name='openmettle' AND g.kind IN ('relation','column')
-               AND g.object_name LIKE 'gateway\_%' AND g.grantee NOT IN (SELECT oid FROM owner_role)))
+               AND (g.object_name LIKE 'gateway\_%' OR ($1>=24 AND
+                    (g.object_name LIKE 'quota\_%' OR g.object_name='storage_volume_control')))
+               AND g.grantee NOT IN (SELECT oid FROM owner_role)))
       AND NOT (g.kind = 'database' AND g.grantee <> 0 AND g.privilege = 'CONNECT')
       AND NOT (g.kind = 'database' AND g.grantee = 0 AND $1 < 1
                AND g.privilege IN ('CONNECT', 'TEMPORARY'))
@@ -612,19 +675,21 @@ violations (violation) AS (
       AND NOT (g.kind='function' AND g.privilege='EXECUTE'
                AND pg_get_userbyid(g.grantee) IN ('openmettle_api','openmettle_worker')
                AND EXISTS (SELECT FROM gateway_functions f WHERE f.inference AND g.target='function ' || f.signature))
+      AND NOT (g.kind='function' AND g.privilege='EXECUTE' AND EXISTS (SELECT FROM quota_functions f
+               WHERE g.target='function ' || to_regprocedure(f.signature)::text AND pg_get_userbyid(g.grantee)=ANY(f.roles)))
       AND NOT (g.kind = 'column' AND g.schema_name = 'openmettle'
                AND (g.object_name::text, g.column_name::text,
                     pg_get_userbyid(g.grantee)::text, g.privilege)
                    IN (SELECT relation, attribute, role, privilege FROM column_contract))
     UNION ALL
     SELECT format('%s lacks %s on openmettle.%s.%s', c.role, c.privilege, c.relation, c.attribute)
-    FROM (SELECT * FROM effect_columns UNION ALL SELECT * FROM gateway_columns) c WHERE NOT EXISTS (
+    FROM (SELECT * FROM effect_columns UNION ALL SELECT * FROM gateway_columns UNION ALL SELECT * FROM quota_columns) c WHERE NOT EXISTS (
         SELECT FROM grants g WHERE g.kind='column' AND g.schema_name='openmettle'
           AND g.object_name=c.relation AND g.column_name=c.attribute
           AND pg_get_userbyid(g.grantee)=c.role AND g.privilege=c.privilege)
     UNION ALL
     SELECT format('%s lacks SELECT on openmettle.%s', c.role, c.relation) FROM contract c
-    WHERE (c.role='openmettle_gateway' OR c.relation IN ('run_approvals','run_approval_decisions')) AND NOT EXISTS (
+    WHERE (c.relation IN (SELECT relation FROM quota_tables) OR c.role='openmettle_gateway' OR c.relation IN ('run_approvals','run_approval_decisions')) AND NOT EXISTS (
         SELECT FROM grants g WHERE g.kind='relation' AND g.schema_name='openmettle'
           AND g.object_name=c.relation AND pg_get_userbyid(g.grantee)=c.role AND g.privilege=c.privilege)
     UNION ALL
@@ -637,6 +702,14 @@ violations (violation) AS (
                     a.grantee NOT IN (SELECT oid FROM pg_roles WHERE rolname IN ('openmettle_api','openmettle_worker'))))
        OR (f.inference AND EXISTS (SELECT FROM pg_roles r WHERE r.rolname IN ('openmettle_api','openmettle_worker')
             AND NOT has_function_privilege(r.oid,p.oid,'EXECUTE')))
+    UNION ALL
+    SELECT format('unsafe or missing quota function %s',f.signature)
+    FROM quota_functions f LEFT JOIN pg_proc p ON p.oid=to_regprocedure(f.signature)
+    WHERE p.oid IS NULL OR p.prosecdef<>f.definer OR pg_get_userbyid(p.proowner)<>'openmettle_owner'
+       OR p.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog']
+       OR EXISTS (SELECT FROM aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a
+             WHERE a.grantee<>p.proowner AND (a.is_grantable OR NOT(pg_get_userbyid(a.grantee)=ANY(f.roles))))
+       OR EXISTS (SELECT FROM unnest(f.roles) role WHERE NOT has_function_privilege(role,p.oid,'EXECUTE'))
     UNION ALL
     SELECT 'openmettle_gateway lacks CONNECT or schema USAGE'
     FROM pg_roles r WHERE $1>=23 AND r.rolname='openmettle_gateway'

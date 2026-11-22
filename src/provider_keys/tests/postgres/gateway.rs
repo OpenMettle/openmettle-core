@@ -40,6 +40,13 @@ async fn id(pool: &PgPool) -> String {
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn recovered_user_key_dispatches_only_after_acknowledged_commits_on_each_login() {
     let mut f = Flow::new().await;
+    sqlx::query(
+        "INSERT INTO openmettle.quota_defaults(scope_kind,resource_kind,hard_limit)
+        VALUES('personal','usage_tokens',1000000),('project','usage_tokens',1000000)",
+    )
+    .execute(&mut f.owner)
+    .await
+    .unwrap();
     let actor = sessions::seed(&mut f, true, true).await;
     let credential = sessions::issue(&mut f).await;
     let (scope,approval):(String,String)=sqlx::query_as("SELECT sc.id::text,s.approval_id::text

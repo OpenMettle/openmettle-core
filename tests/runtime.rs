@@ -2494,6 +2494,7 @@ fn failed_sweeps_report_fixed_categories_and_retry_next_tick() {
         for expected in [
             "expire_queued",
             "settle_expired",
+            "reconcile_stale_quotas",
             "reconcile_expired",
             "purge_due",
         ] {

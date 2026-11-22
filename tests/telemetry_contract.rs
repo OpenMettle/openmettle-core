@@ -250,6 +250,10 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
         other => panic!("expected Sum for openmettle.telemetry.dropped, got {other:?}"),
     }
 
+    // An overdue handoff can be observed again on a later sweep.
+    store.record_overdue_handoffs(3);
+    store.record_overdue_handoffs(2);
+
     // Exhaust every single enum combination across all metrics.
     for &m in telemetry::Method::ALL {
         for &r in RouteClass::ALL {
@@ -315,6 +319,12 @@ fn exhaustive_metric_recording_never_exceeds_contract_cardinality() {
         let point_count = match (descriptor.kind, proto_metric.data.as_ref().unwrap()) {
             (InstrumentKind::Counter, metric::Data::Sum(sum)) => {
                 assert!(sum.is_monotonic);
+                if descriptor.name == "openmettle.quota.overdue.handoffs" {
+                    assert!(sum.data_points[0].attributes.is_empty());
+                    assert!(matches!(sum.data_points[0].value, Some(
+                        opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(5)
+                    )));
+                }
                 sum.data_points.len()
             }
             (InstrumentKind::Histogram, metric::Data::Histogram(hist)) => {

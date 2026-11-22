@@ -1224,7 +1224,20 @@ async fn populated_v14_upgrade_keeps_rows_and_adds_empty_authorization_state() {
     for entry in expected_added_tables_since(14) {
         let actual: BTreeSet<String> = after[entry.table]
             .iter()
-            .map(|row| canonical_json(row))
+            .map(|row| {
+                let mut value: serde_json::Value = serde_json::from_str(row).unwrap();
+                if entry.table == "quota_defaults" {
+                    assert!(
+                        value
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("updated_at")
+                            .unwrap()
+                            .is_string()
+                    );
+                }
+                value.to_string()
+            })
             .collect();
         let expected: BTreeSet<String> = entry.seed_row.into_iter().map(canonical_json).collect();
         assert_eq!(actual, expected, "{}", entry.table);

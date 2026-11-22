@@ -16,8 +16,8 @@
       "logs_days": 7,
       "metrics_days": 14
     },
-    "max_data_point_streams": 359,
-    "max_prometheus_series_per_process": 1022,
+    "max_data_point_streams": 360,
+    "max_prometheus_series_per_process": 1023,
     "disallowed_metric_label_substrings": [
       "user_id",
       "scope_id",
@@ -69,9 +69,19 @@
       "schema_version",
       "dropped_lines",
       "dropped_spans",
-      "dropped_metric_exports"
+      "dropped_metric_exports",
+      "target_kind",
+      "scope_kind",
+      "resource_kind",
+      "threshold_pct",
+      "dedupe_bucket"
     ],
     "events": [
+      {
+        "name": "quota.warning",
+        "levels": ["warn"],
+        "fields": ["event", "target_kind", "scope_kind", "resource_kind", "threshold_pct", "dedupe_bucket"]
+      },
       {
         "name": "worker.sweep.failed",
         "levels": ["warn"],
@@ -255,6 +265,15 @@
       "labels": {
         "reason": ["requested", "revoked"]
       }
+    },
+    {
+      "name": "openmettle.quota.overdue.handoffs",
+      "prometheus_name": "openmettle_quota_overdue_handoffs_total",
+      "kind": "counter",
+      "unit": "{observation}",
+      "semantics": "overdue_committed_handoffs_observed_per_bounded_sweep",
+      "max_series": 1,
+      "labels": {}
     }
   ],
   "reserved_signals": [

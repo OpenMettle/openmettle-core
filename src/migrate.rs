@@ -141,6 +141,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "gateway provisioning and reservations",
         sql: include_str!("../migrations/0023_gateway_provisioning_and_reservations.sql"),
     },
+    Source {
+        version: 24,
+        description: "transactional quotas and volume pinning",
+        sql: include_str!("../migrations/0024_transactional_quotas_and_volume_pinning.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.
@@ -476,7 +481,7 @@ pub async fn apply(settings: &Settings, sources: &[Source]) -> Result<(), Failur
 }
 
 /// Returns boundary violations; empty when provisioning matches the contract.
-async fn boundary_violations(connection: &mut PgConnection) -> Result<Vec<String>, sqlx::Error> {
+async fn applied_version(connection: &mut PgConnection) -> Result<i64, sqlx::Error> {
     let history: bool =
         sqlx::query_scalar("SELECT to_regclass('openmettle._sqlx_migrations') IS NOT NULL")
             .fetch_one(&mut *connection)
@@ -491,6 +496,13 @@ async fn boundary_violations(connection: &mut PgConnection) -> Result<Vec<String
     } else {
         0
     };
+    Ok(applied)
+}
+
+async fn boundary_violations(
+    connection: &mut PgConnection,
+    applied: i64,
+) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar(BOUNDARIES)
         .bind(applied)
         .fetch_all(connection)
@@ -506,7 +518,8 @@ async fn migrate_within_boundaries(
     // connection releases this outer acquisition on success, error or cancellation.
     connection.lock().await.map_err(Failure::Migrate)?;
     // Refuse before SQLx creates the schema or history table, on every run.
-    let violations = boundary_violations(connection)
+    let applied = applied_version(connection).await.map_err(Failure::Check)?;
+    let violations = boundary_violations(connection, applied)
         .await
         .map_err(Failure::Check)?;
     if !violations.is_empty() {
@@ -520,6 +533,11 @@ async fn migrate_within_boundaries(
             .execute("RESET ALL")
             .await
             .map_err(Failure::Check)?;
+        sqlx::query("SELECT pg_catalog.set_config('openmettle.bootstrap_from_zero', $1, false)")
+            .bind(if applied == 0 { "true" } else { "false" })
+            .execute(&mut *connection)
+            .await
+            .map_err(Failure::Check)?;
         migrator
             .run_to(version, &mut *connection)
             .await
@@ -529,7 +547,8 @@ async fn migrate_within_boundaries(
         .execute("RESET ALL")
         .await
         .map_err(Failure::Check)?;
-    let violations = boundary_violations(connection)
+    let applied = applied_version(connection).await.map_err(Failure::Check)?;
+    let violations = boundary_violations(connection, applied)
         .await
         .map_err(Failure::Check)?;
     if violations.is_empty() {

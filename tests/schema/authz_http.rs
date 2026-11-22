@@ -85,14 +85,17 @@ impl Api {
     ) -> Self {
         let auth = dir.write("auth.json", document.to_string().as_bytes());
         let bind = address();
-        let child = binary("api")
+        let mut cmd = binary("api");
+        if Path::new(&dir.path("artifacts")).is_dir() {
+            cmd.env("OPENMETTLE_API_ARTIFACTS_DIR", dir.path("artifacts"));
+        }
+        let child = cmd
             .env("OPENMETTLE_API_BIND", &bind)
             .env("OPENMETTLE_API_DATABASE_URL", db.url(API))
             .env("OPENMETTLE_API_DB_MAX_CONNECTIONS", connections.to_string())
             .env("OPENMETTLE_API_DB_TIMEOUT_MS", "2000")
             .env("OPENMETTLE_API_AUTH_CONFIG", &auth)
             .env("OPENMETTLE_API_ISSUANCE_DATABASE_URL", db.url(ISSUANCE))
-            .env("OPENMETTLE_API_ARTIFACTS_DIR", dir.path("artifacts"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -113,6 +116,7 @@ impl Api {
         let mut names: Vec<String> = fs::read_dir(Path::new(&self.dir.path("artifacts")).join(sub))
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name != ".openmettle-volume-id")
             .collect();
         names.sort();
         names
@@ -1544,7 +1548,13 @@ async fn interrupted_uploads_leave_nothing_after_reconciliation() {
     let dir = api.kill();
     drop(slow);
     let staging = Path::new(&dir.path("artifacts")).join("staging");
-    assert_eq!(fs::read_dir(&staging).unwrap().count(), 1);
+    assert_eq!(
+        fs::read_dir(&staging)
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name() != ".openmettle-volume-id")
+            .count(),
+        1
+    );
     assert!(reservations(&db, "reserved").await >= 1);
     let pool = PgPoolOptions::new()
         .max_connections(1)
@@ -1552,11 +1562,25 @@ async fn interrupted_uploads_leave_nothing_after_reconciliation() {
         .await
         .unwrap();
     let store = Store::open(Path::new(&dir.path("artifacts"))).unwrap();
+    db.admin()
+        .await
+        .execute(
+            "UPDATE openmettle.storage_reservations SET created_at=now()-interval '901 seconds',
+        lease_expires_at=now()-interval '1 second' WHERE state='reserved'",
+        )
+        .await
+        .unwrap();
     let released = artifact_fs::reconcile_expired(&pool, &store, Duration::ZERO, 10)
         .await
         .unwrap();
     assert!(released >= 1);
-    assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
+    assert_eq!(
+        fs::read_dir(&staging)
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name() != ".openmettle-volume-id")
+            .count(),
+        0
+    );
     assert_eq!(reservations(&db, "reserved").await, 0);
     assert_eq!(charged(&db, &personal).await, (0, 0, 0));
 
