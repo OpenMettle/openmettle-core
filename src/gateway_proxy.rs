@@ -7,8 +7,10 @@
 //!   report's routing fields come from that stored row, never from the caller. An unusable or
 //!   unknown ID is refused before anything is sent upstream.
 //! - **Forwarding.** The request body goes upstream byte for byte, with only `Content-Type`,
-//!   `Accept` and the request ID; `Authorization` and cookies are not forwarded. The upstream
-//!   status, `Content-Type` and body are relayed chunk by chunk as they arrive.
+//!   `Accept`, `Accept-Encoding: identity` and the request ID; `Authorization`, cookies and
+//!   fields the caller names in `Connection` are not forwarded. The upstream status,
+//!   `Content-Type` and body are relayed chunk by chunk as they arrive. Only identity bodies
+//!   pass in either direction.
 //! - **Usage.** One relay task per request copies each upstream chunk to the caller and to the
 //!   usage reader and then writes at most one final report itself, so the write does not depend
 //!   on the caller staying connected. A response that is not a completed 200 with a usage object
@@ -30,7 +32,7 @@ use axum::{
     Router,
     body::{Body, Bytes},
     extract::{Request, State},
-    http::{HeaderMap, StatusCode, Uri, header, uri::Authority},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header, uri::Authority},
     response::Response,
     routing::post,
 };
@@ -43,6 +45,7 @@ use hyper_util::rt::TokioIo;
 use sqlx::PgPool;
 use std::{
     future::Future,
+    net::Ipv6Addr,
     pin::Pin,
     sync::{
         Arc,
@@ -54,7 +57,7 @@ use std::{
 use tokio::{
     net::TcpStream,
     sync::{mpsc, watch},
-    time::timeout,
+    time::{Instant, sleep_until, timeout},
 };
 use usage::{Extract, Usage};
 
@@ -68,6 +71,9 @@ const REQUEST_READ: Duration = Duration::from_secs(10);
 const RELAY_BUFFER: usize = 8;
 /// Pauses before the second and third attempt to store a report after a transient failure.
 const WRITE_RETRIES: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(500)];
+/// Each attempt to store a report gets this many `DB_TIMEOUT_MS` before it is abandoned and
+/// retried, also when its database connection has stopped answering.
+const WRITE_ATTEMPT_TIMEOUTS: u32 = 5;
 /// SGLang counts reasoning tokens inside `completion_tokens` (recorded 23 Nov 2026), so
 /// settlement must not add them again.
 const REASONING_INCLUDED: bool = true;
@@ -87,6 +93,11 @@ const BODY: Problem = problem(
     "validation",
     "The request body exceeds 2 MiB or did not arrive in time.",
 );
+const ENCODED_REQUEST: Problem = problem(
+    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+    "unsupported_media_type",
+    "Only an identity-encoded request body is accepted.",
+);
 const UNAVAILABLE: Problem = problem(
     StatusCode::SERVICE_UNAVAILABLE,
     "unavailable",
@@ -96,6 +107,11 @@ const UPSTREAM: Problem = problem(
     StatusCode::BAD_GATEWAY,
     "provider_failure",
     "The model server could not be reached.",
+);
+const ENCODED_RESPONSE: Problem = problem(
+    StatusCode::BAD_GATEWAY,
+    "provider_failure",
+    "The model server answered with an unsupported content encoding.",
 );
 const UPSTREAM_TIMEOUT: Problem = problem(
     StatusCode::GATEWAY_TIMEOUT,
@@ -146,7 +162,8 @@ impl Settings {
 }
 
 /// An `http://host[:port]` origin with at most a `/` path. TLS is not supported in this
-/// increment; user information, another path, a query and a fragment are refused.
+/// increment; user information, another path, a query and a fragment are refused. A bracketed
+/// host must be an IPv6 address, followed by nothing or by a port.
 fn origin(url: &str) -> Result<Authority, &'static str> {
     const INVALID: &str = "invalid UPSTREAM_URL";
     let uri: Uri = url.parse().map_err(|_| INVALID)?;
@@ -155,19 +172,59 @@ fn origin(url: &str) -> Result<Authority, &'static str> {
         Some(_) => return Err("UPSTREAM_URL must use http://"),
         None => return Err(INVALID),
     }
-    match (uri.authority(), uri.path_and_query().map(|p| p.as_str())) {
-        (Some(authority), None | Some("/"))
-            if !authority.host().is_empty()
-                && !authority.as_str().contains('@')
-                && !url.contains('#')
-                // `port()` is `None` for an unparsable port, so look for an explicit one.
-                && (authority.as_str().len() == authority.host().len()
-                    || authority.port_u16().is_some_and(|p| p > 0)) =>
-        {
-            Ok(authority.clone())
-        }
-        _ => Err(INVALID),
+    let authority = uri.authority().ok_or(INVALID)?;
+    let host = authority.host();
+    let host_valid = match host.strip_prefix('[') {
+        Some(literal) => literal
+            .strip_suffix(']')
+            .is_some_and(|address| address.parse::<Ipv6Addr>().is_ok()),
+        None => !host.is_empty() && !host.contains(['[', ']']),
+    };
+    let port_valid = match authority.as_str().strip_prefix(host) {
+        Some("") => true,
+        Some(port) => port.strip_prefix(':').is_some_and(|port| {
+            port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok_and(|p| p > 0)
+        }),
+        None => false,
+    };
+    if host_valid
+        && port_valid
+        && !authority.as_str().contains('@')
+        && !url.contains('#')
+        && matches!(uri.path_and_query().map(|p| p.as_str()), None | Some("/"))
+    {
+        Ok(authority.clone())
+    } else {
+        Err(INVALID)
     }
+}
+
+/// The values of `name`, unless the message's `Connection` field names it as hop-by-hop.
+fn end_to_end<'h>(
+    headers: &'h HeaderMap,
+    name: &HeaderName,
+) -> impl Iterator<Item = &'h HeaderValue> {
+    let hop_by_hop = headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case(name.as_str()));
+    headers.get_all(name).iter().filter(move |_| !hop_by_hop)
+}
+
+/// No content coding other than `identity`.
+fn identity(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .all(|value| {
+            value.to_str().is_ok_and(|codings| {
+                codings
+                    .split(',')
+                    .all(|coding| coding.trim().eq_ignore_ascii_case("identity"))
+            })
+        })
 }
 
 /// Relay tasks still running. Shutdown waits for them after the listener has drained, so a
@@ -257,7 +314,16 @@ impl Proxy {
     async fn forward(&self, request: Request) -> Result<Response, Problem> {
         let (parts, body) = request.into_parts();
         let id = correlation(&parts.headers)?;
+        if !identity(&parts.headers) {
+            return Err(ENCODED_REQUEST);
+        }
         let routing = self.routing(&id).await?;
+        // From here on, every early end, including the server dropping this handler because the
+        // caller left, logs why nothing was recorded.
+        let mut unrecorded = Unrecorded {
+            id: &id,
+            gap: Some(UsageGap::RequestBody),
+        };
         let body = match timeout(REQUEST_READ, axum::body::to_bytes(body, MAX_REQUEST_BYTES)).await
         {
             Ok(Ok(body)) => body,
@@ -266,24 +332,20 @@ impl Proxy {
         let mut outbound = hyper::Request::post(ROUTE)
             .header(header::HOST, self.settings.upstream.as_str())
             .header(header::CONNECTION, "close")
+            .header(header::ACCEPT_ENCODING, "identity")
             .header("x-request-id", &id)
             .body(Full::new(body))
             .map_err(|_| CORRELATION)?;
         for name in [header::CONTENT_TYPE, header::ACCEPT] {
-            for value in parts.headers.get_all(&name) {
+            for value in end_to_end(&parts.headers, &name) {
                 outbound.headers_mut().append(name.clone(), value.clone());
             }
         }
-        let exchanged = {
-            let mut waiting = Waiting(Some(&id));
-            let exchanged = self.exchange(outbound).await;
-            waiting.0 = None;
-            exchanged
-        };
-        let (upstream, response) = match exchanged {
+        unrecorded.gap = Some(UsageGap::CallerDisconnected);
+        let (upstream, response) = match self.exchange(outbound).await {
             Ok(exchanged) => exchanged,
             Err(gap) => {
-                telemetry::gateway_usage_unrecorded(&id, gap);
+                unrecorded.gap = Some(gap);
                 return Err(match gap {
                     UsageGap::UpstreamTimeout => UPSTREAM_TIMEOUT,
                     _ => UPSTREAM,
@@ -291,17 +353,23 @@ impl Proxy {
             }
         };
         let (head, body) = response.into_parts();
+        // Neither relayed unlabelled nor read for usage; the upstream connection closes here.
+        if !identity(&head.headers) {
+            unrecorded.gap = Some(UsageGap::UpstreamEncoding);
+            return Err(ENCODED_RESPONSE);
+        }
+        unrecorded.gap = None;
+        drop(unrecorded);
         let (frames, receiver) = mpsc::channel(RELAY_BUFFER);
         let complete = Arc::new(AtomicBool::new(false));
         let mut relayed = Response::new(Body::new(Relayed {
             frames: receiver,
             complete: complete.clone(),
             hint: body.size_hint(),
-            flushing: false,
             ended: false,
         }));
         *relayed.status_mut() = head.status;
-        for value in head.headers.get_all(header::CONTENT_TYPE) {
+        for value in end_to_end(&head.headers, &header::CONTENT_TYPE) {
             relayed
                 .headers_mut()
                 .append(header::CONTENT_TYPE, value.clone());
@@ -315,8 +383,11 @@ impl Proxy {
             body,
             frames,
             complete,
+            delivering: true,
+            drain_by: None,
             idle: self.settings.idle_timeout,
             pool: self.pool.clone(),
+            write_limit: self.database_timeout * WRITE_ATTEMPT_TIMEOUTS,
             _running: self.relays.start(),
         };
         tokio::spawn(relay.run());
@@ -368,14 +439,18 @@ impl Proxy {
     }
 }
 
-/// Logs a caller that leaves while the proxy waits for the response head: the server then
-/// drops the handler, and the upstream connection with it.
-struct Waiting<'a>(Option<&'a str>);
+/// Logs `gap` for a handled request that ends before its relay starts: a refusal after the
+/// lookup, or the server dropping the handler because the caller left, which also closes the
+/// upstream connection.
+struct Unrecorded<'a> {
+    id: &'a str,
+    gap: Option<UsageGap>,
+}
 
-impl Drop for Waiting<'_> {
+impl Drop for Unrecorded<'_> {
     fn drop(&mut self) {
-        if let Some(id) = self.0 {
-            telemetry::gateway_usage_unrecorded(id, UsageGap::CallerDisconnected);
+        if let Some(gap) = self.gap {
+            telemetry::gateway_usage_unrecorded(self.id, gap);
         }
     }
 }
@@ -401,14 +476,13 @@ impl Upstream {
 }
 
 /// What the caller reads: the upstream's chunks as they arrive. It ends cleanly only after the
-/// upstream body did. Any other end is an error, so the caller's response is cut as well instead
-/// of looking complete.
+/// upstream body did and the caller received every chunk. Any other end is an error, so the
+/// caller gets a prefix of the upstream bytes and an unclean end, never a response that looks
+/// complete; how much of the prefix still reaches it is not promised.
 struct Relayed {
     frames: mpsc::Receiver<Bytes>,
     complete: Arc<AtomicBool>,
     hint: SizeHint,
-    /// A cut was seen and the connection was given one turn to flush.
-    flushing: bool,
     ended: bool,
 }
 
@@ -423,23 +497,13 @@ impl hyper::body::Body for Relayed {
         if self.ended {
             return Poll::Ready(None);
         }
-        if let Some(data) = ready!(self.frames.poll_recv(cx)) {
-            return Poll::Ready(Some(Ok(Frame::data(data))));
-        }
-        if self.complete.load(Ordering::Acquire) {
-            self.ended = true;
-            return Poll::Ready(None);
-        }
-        // hyper closes the connection on a body error without writing out the chunks it still
-        // buffers. Waiting one turn lets it flush them first; a caller whose socket is full may
-        // still miss the tail of a response that is cut anyway.
-        if !self.flushing {
-            self.flushing = true;
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
-        }
-        self.ended = true;
-        Poll::Ready(Some(Err(Cut)))
+        Poll::Ready(match ready!(self.frames.poll_recv(cx)) {
+            Some(data) => Some(Ok(Frame::data(data))),
+            None => {
+                self.ended = true;
+                (!self.complete.load(Ordering::Acquire)).then_some(Err(Cut))
+            }
+        })
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -469,15 +533,21 @@ struct Relay {
     complete: Arc<AtomicBool>,
     /// `None` unless the upstream answered 200.
     extract: Option<Extract>,
+    /// Whether the caller still gets every chunk.
+    delivering: bool,
+    /// Set once the caller has gone: the rest of the body must arrive by then.
+    drain_by: Option<Instant>,
     idle: Duration,
     pool: PgPool,
+    /// Bound on each attempt to store the report.
+    write_limit: Duration,
     _running: Running,
 }
 
 impl Relay {
     async fn run(mut self) {
         let copied = self.copy().await;
-        if copied.is_ok() {
+        if copied.is_ok() && self.delivering {
             self.complete.store(true, Ordering::Release);
         }
         let Self {
@@ -488,6 +558,7 @@ impl Relay {
             frames,
             extract,
             pool,
+            write_limit,
             _running,
             ..
         } = self;
@@ -499,24 +570,25 @@ impl Relay {
             (Some(extract), Ok(())) => extract.finish(),
         };
         match usage {
-            Ok(usage) => record(&pool, &report(id, routing, usage)).await,
+            Ok(usage) => record(&pool, &report(id, routing, usage), write_limit).await,
             Err(gap) => telemetry::gateway_usage_unrecorded(&id, gap),
         }
     }
 
-    /// Reads the upstream body to its end. The caller gets every chunk until it leaves; after
-    /// that the rest is read only if the usage may already be in hand, and the upstream
-    /// connection is dropped otherwise.
+    /// Reads the upstream body to its end. The caller gets every chunk until it leaves or stops
+    /// reading; after that the rest is read only while the usage may still be in hand, checked
+    /// after every read, and within one idle timeout in total. Otherwise the upstream
+    /// connection is dropped.
     async fn copy(&mut self) -> Result<(), UsageGap> {
-        let mut caller = true;
         loop {
+            let drain_by = self.drain_by;
             let frame = tokio::select! {
-                () = self.frames.closed(), if caller => {
-                    caller = false;
-                    if !self.draining() {
-                        return Err(UsageGap::CallerDisconnected);
-                    }
+                () = self.frames.closed(), if self.delivering => {
+                    self.detach()?;
                     continue;
+                }
+                () = sleep_until(drain_by.unwrap_or_else(Instant::now)), if drain_by.is_some() => {
+                    return Err(UsageGap::UpstreamTimeout);
                 }
                 frame = self.upstream.drive(timeout(self.idle, self.body.frame())) => frame,
             };
@@ -533,13 +605,26 @@ impl Relay {
             if let Some(extract) = &mut self.extract {
                 extract.feed(&data);
             }
-            if caller && !matches!(timeout(self.idle, self.frames.send(data)).await, Ok(Ok(()))) {
-                caller = false;
-                if !self.draining() {
-                    return Err(UsageGap::CallerDisconnected);
+            if self.delivering {
+                // A caller that takes no chunk for an idle timeout is treated as gone.
+                if !matches!(timeout(self.idle, self.frames.send(data)).await, Ok(Ok(()))) {
+                    self.detach()?;
                 }
+            } else if !self.draining() {
+                return Err(UsageGap::CallerDisconnected);
             }
         }
+    }
+
+    /// The caller has gone or stopped reading, so it will not get the rest. Reading on is worth
+    /// it only while the usage may already be in hand.
+    fn detach(&mut self) -> Result<(), UsageGap> {
+        self.delivering = false;
+        if !self.draining() {
+            return Err(UsageGap::CallerDisconnected);
+        }
+        self.drain_by = Some(Instant::now() + self.idle);
+        Ok(())
     }
 
     fn draining(&self) -> bool {
@@ -570,12 +655,17 @@ fn report(id: String, routing: Routing, usage: Usage) -> UsageReport {
     }
 }
 
-/// Stores `report`, retrying a transient database failure twice. An identical report is
-/// accepted again as a duplicate, so a retry after an ambiguous commit is safe. No local spool.
-async fn record(pool: &PgPool, report: &UsageReport) {
+/// Stores `report`, retrying a transient database failure twice. Each attempt is bounded by
+/// `limit`: an abandoned attempt rolls back when its connection is next used, and sqlx tests a
+/// connection before it rejoins the pool. An identical report is accepted again as a duplicate,
+/// so a retry after an ambiguous commit is safe. No local spool.
+async fn record(pool: &PgPool, report: &UsageReport, limit: Duration) {
     let mut attempt = 0;
     loop {
-        match settlement::ingest(pool, report).await {
+        let outcome = timeout(limit, settlement::ingest(pool, report))
+            .await
+            .unwrap_or(Err(StoreError::Database));
+        match outcome {
             Ok(_) => return,
             Err(StoreError::Database | StoreError::Retryable) if attempt < WRITE_RETRIES.len() => {
                 tokio::time::sleep(WRITE_RETRIES[attempt]).await;
@@ -606,6 +696,7 @@ mod tests {
             ("http://127.0.0.1:30000/", "127.0.0.1:30000"),
             ("http://sglang.models.svc:30000", "sglang.models.svc:30000"),
             ("http://[::1]:30000", "[::1]:30000"),
+            ("http://[::1]", "[::1]"),
             ("http://localhost", "localhost"),
         ] {
             let settings = parse(&[("UPSTREAM_URL", url)]).unwrap();
@@ -627,6 +718,11 @@ mod tests {
             ("http://127.0.0.1:0", "invalid UPSTREAM_URL"),
             ("http://127.0.0.1:", "invalid UPSTREAM_URL"),
             ("http://exa mple", "invalid UPSTREAM_URL"),
+            ("http://[::1]typo:8080", "invalid UPSTREAM_URL"),
+            ("http://[]:8080", "invalid UPSTREAM_URL"),
+            ("http://[127.0.0.1]:8080", "invalid UPSTREAM_URL"),
+            ("http://[::1]:+80", "invalid UPSTREAM_URL"),
+            ("http://a]b:8080", "invalid UPSTREAM_URL"),
         ] {
             assert_eq!(
                 parse(&[("UPSTREAM_URL", url)]).err(),

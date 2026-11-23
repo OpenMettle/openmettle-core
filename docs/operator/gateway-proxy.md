@@ -21,16 +21,31 @@ usage report for the request's gateway hold, through the same settlement path as
   handed off with `404 not_found`, before anything is sent upstream. Refusals use the
   application API's problem document (`application/problem+json`).
 - **Forwarding.** The request body (at most 2 MiB, read within 10 s) is sent upstream byte
-  for byte on a new connection, with only `Content-Type`, `Accept` and the request ID.
-  `Authorization`, cookies and other caller headers are not forwarded.
-- **Relay.** The upstream status, `Content-Type` and body are relayed chunk by chunk as they
-  arrive. A server-sent event reaches the caller before the upstream has finished. If the
-  upstream body breaks off, the caller's response is cut as well rather than ending cleanly.
+  for byte on a new connection, with only `Content-Type`, `Accept`, `Accept-Encoding:
+  identity` and the request ID. `Authorization`, cookies, other caller headers and any field
+  the caller names in `Connection` are not forwarded.
+- **Identity bodies only.** A request with a `Content-Encoding` other than `identity` is
+  refused with `415 unsupported_media_type` before anything is sent upstream. An upstream
+  answer with one is not relayed: the caller gets `502 provider_failure` and the upstream
+  connection is closed.
+- **Relay.** The upstream status, `Content-Type` (unless the upstream names it in
+  `Connection`) and body are relayed chunk by chunk as they arrive. A server-sent event
+  reaches the caller before the upstream has finished. The caller's response ends cleanly only
+  if the upstream body completed and the caller received every chunk. Otherwise the caller
+  receives a prefix of the upstream bytes and an unclean end of the HTTP body (no terminal
+  chunk, or fewer bytes than `Content-Length`); how much of that prefix arrives is not
+  promised.
 - **Usage.** A copy of each chunk is read for the usage object. When the upstream answered
   200, the body completed (a JSON document, or a stream ending with `data: [DONE]`) and a
-  usage object arrived, one final report is written. This holds whatever the
-  `finish_reason`, including `length`: the proxy records what the upstream reports it
-  consumed.
+  valid usage object arrived, one final report is written. In a stream, only a usage object
+  in the last data event before `[DONE]` counts; an earlier one may be interim. This holds
+  whatever the `finish_reason`, including `length`: the proxy records what the upstream
+  reports it consumed.
+- **Caller leaving.** A caller that disconnects, or takes no relayed chunk for an idle
+  timeout, gets nothing more. If the usage is not in hand yet, the upstream connection is
+  closed so the server stops generating. If it may be (a stream whose last event carried
+  usage, or a JSON body within its parse bound), the relay reads on to finish the accounting,
+  rechecking after every read and for at most one idle timeout in total.
 
 ## What it records
 
@@ -39,14 +54,19 @@ usage report for the request's gateway hold, through the same settlement path as
 | `request`, `installation`, `principal`, `scope`, `source` | The stored handed-off request and its binding |
 | `report_id`, `revision`, `final` | The request ID, `0` and `true` |
 | `prompt_tokens`, `completion_tokens` | The upstream's counts; both are required |
-| `reasoning_tokens` | Top-level `reasoning_tokens` or `completion_tokens_details.reasoning_tokens`, which must agree when both are present |
+| `reasoning_tokens` | Top-level `reasoning_tokens` or `completion_tokens_details.reasoning_tokens`, which must agree when both are present and cannot exceed `completion_tokens` |
 | `reasoning_included` | `true` whenever reasoning tokens are recorded, because SGLang counts them inside `completion_tokens` (recorded 23 Nov 2026). Settlement then measures `prompt + max(completion, reasoning)` |
 | `cost`, `unit` | Not recorded |
 
+A valid usage object is a JSON object inside a JSON object, with non-negative integer counts
+that fit a `bigint`, no duplicate keys, and a `completion_tokens_details` that is `null` or an
+object.
+
 The report is written by the task that relays the response, so the write does not depend on
-the caller staying connected. A transient database failure is retried twice (after 100 ms and
-500 ms). There is no local spool: if the write still fails, the proxy logs
-`gateway.usage.failed` and the hold stays for reconciliation.
+the caller staying connected. Each attempt is bounded by five `DB_TIMEOUT_MS` (10 s by
+default), also when its database connection stops answering, and a transient failure or an
+expired attempt is retried twice (after 100 ms and 500 ms). There is no local spool: if the
+write still fails, the proxy logs `gateway.usage.failed` and the hold stays for reconciliation.
 
 The report identity is derived from the request, so a retry writes the same report. A second
 dispatch of the same request is still forwarded in this increment; if the upstream reports the
@@ -61,13 +81,15 @@ names the gateway request and the reason (`error.type`):
 
 | Reason | Cause |
 | --- | --- |
+| `request_body` | The request body exceeded 2 MiB, did not arrive within 10 s, or the caller left while sending it (`400 validation`); nothing was forwarded |
 | `upstream_status` | The upstream answered with a status other than 200; its response is still relayed |
 | `upstream_transport` | The upstream could not be reached or failed before a response head (caller gets `502 provider_failure`) |
-| `upstream_timeout` | Connect, response-head or idle-read timeout (`504 timeout` if no head arrived) |
+| `upstream_encoding` | The upstream answered with a content coding other than `identity` (caller gets `502 provider_failure`) |
+| `upstream_timeout` | Connect, response-head or idle-read timeout (`504 timeout` if no head arrived), or the upstream did not finish within one idle timeout after the caller left |
 | `incomplete` | The body broke off, or a stream ended without `[DONE]` |
-| `caller_disconnected` | The caller left before the usage arrived; the upstream connection is closed |
-| `no_usage` | The response completed without a usage object, for example a stream requested without `stream_options.include_usage` |
-| `unparsable` | A parse bound was exceeded, or the usage could not be read |
+| `caller_disconnected` | The caller left or stopped reading before the usage was in hand, or the usage went out of reach while the relay read on; the upstream connection is closed |
+| `no_usage` | The response completed without a usage object, for example a stream requested without `stream_options.include_usage`, or a stream whose last data event before `[DONE]` carried none |
+| `unparsable` | A parse bound was exceeded, or the usage was not a valid usage object |
 
 Increment 3 replaces these gaps with explicit incomplete reports.
 
@@ -88,9 +110,10 @@ The gateway reads the same process settings as the API and the worker under the
 | `UPSTREAM_IDLE_TIMEOUT_MS` | 1–3,600,000 ms | 120,000 |
 
 `UPSTREAM_URL` names one origin. User information, another path, a query and a fragment are
-refused. The idle timeout bounds the wait for the response head (SGLang sends a non-streamed
-head only after generating the whole answer), for each later body read, and for a caller that
-does not accept a relayed chunk; a caller that slow is treated as gone.
+refused, and a bracketed host must be an IPv6 address followed by nothing or a port. The idle
+timeout bounds the wait for the response head (SGLang sends a non-streamed head only after
+generating the whole answer), each later body read, a caller that does not accept a relayed
+chunk (it is then treated as gone), and the whole rest of the body once the caller has gone.
 
 A refusal exits 78 with one fixed line, for example `configuration error: UPSTREAM_URL is
 required`, `configuration error: UPSTREAM_URL must use http://` or `configuration error:
@@ -109,7 +132,9 @@ invalid UPSTREAM_URL`. The line never contains the value.
 `SIGTERM` or `SIGINT` stops accepting connections. Responses in flight keep streaming, and
 reports whose usage was read are written before the database pool closes, all within
 `SHUTDOWN_TIMEOUT_MS`. A response still streaming at the deadline is cut and records nothing,
-and the process exits 1.
+and the process exits 1. So does a database connection that stopped answering: sqlx tests an
+abandoned connection before returning it to the pool, without a time limit, and the pool
+waits for it when closing.
 
 ## Known gaps in this increment
 
@@ -124,6 +149,7 @@ and the process exits 1.
 - **Chat completions only.** The Responses API is not routed.
 - **A second dispatch of one request is forwarded.** Settlement does not double-charge it.
 - **No concurrency limit** on relayed requests.
+- **Identity bodies only.** Compressed requests and answers are refused rather than relayed.
 
 ## Testing
 

@@ -13,7 +13,10 @@ use openmettle_core::{
 };
 use serde_json::Value;
 use sqlx::{PgPool, postgres::PgPoolOptions};
-use std::sync::{Mutex, atomic::AtomicUsize};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, AtomicUsize},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::Notify,
@@ -249,19 +252,156 @@ struct Received {
     body: Vec<u8>,
 }
 
-/// Holds a stream after its first event until the caller has read that event through the
-/// proxy. A proxy that buffered the response would never deliver it, and the stand-in would
-/// give up waiting and count a timeout. A proxy that closes the upstream connection meanwhile
-/// is counted too.
+/// Coordinates the stand-in with the caller. A held answer pauses after its first body write
+/// until the caller has read that write through the proxy and releases it. A proxy that
+/// buffered the response would never deliver it, and the stand-in would give up waiting and
+/// count a timeout.
 #[derive(Default)]
 struct Gate {
-    first_event_relayed: Notify,
+    released: Notify,
     timeouts: AtomicUsize,
+    /// Answers the proxy cut off by closing the upstream connection.
     closed_by_proxy: AtomicUsize,
+    /// Answers written to their end.
+    finished: AtomicUsize,
 }
 
-/// Replays the recorded response whose recorded request body equals the forwarded body, in
-/// several TCP writes: a JSON body in two halves, a stream one HTTP chunk per SSE event.
+/// One stand-in answer: the response head, then the body writes in order.
+struct Script {
+    writes: Box<dyn Iterator<Item = Vec<u8>> + Send>,
+    held: bool,
+    /// Pause before each body write after the first.
+    pause: Duration,
+}
+
+fn chunk(data: &[u8]) -> Vec<u8> {
+    let mut chunk = format!("{:x}\r\n", data.len()).into_bytes();
+    chunk.extend_from_slice(data);
+    chunk.extend_from_slice(b"\r\n");
+    chunk
+}
+
+const SSE_HEAD: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\n\
+    transfer-encoding: chunked\r\n\r\n";
+
+/// One SSE event carrying `content` and, like SGLang's `continuous_usage_stats`, the usage so
+/// far.
+fn continuous_event(content: &str, completion: usize) -> Vec<u8> {
+    format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{content}\"}}}}],\
+         \"usage\":{{\"prompt_tokens\":5,\"completion_tokens\":{completion}}}}}\n\n"
+    )
+    .into_bytes()
+}
+
+/// Events in the synthetic continuous-usage stream, each with 64 KiB of content: 16 MiB, more
+/// than every buffer between the stand-in and a caller that does not read.
+const CONTINUOUS_EVENTS: usize = 256;
+
+fn continuous_body() -> Vec<u8> {
+    let content = "x".repeat(64 * 1024);
+    let mut body: Vec<u8> = (1..=CONTINUOUS_EVENTS)
+        .flat_map(|n| continuous_event(&content, n))
+        .collect();
+    body.extend_from_slice(b"data: [DONE]\n\n");
+    body
+}
+
+/// A recorded answer for its recorded request, a synthetic one for `{"synthetic":"…"}`, and
+/// otherwise none.
+fn script(body: &[u8]) -> Option<Script> {
+    let recorded_case = SETTLED
+        .iter()
+        .map(|(case, ..)| *case)
+        .chain([ABORTED, UPSTREAM_500])
+        .find(|case| recorded::file(case, "request.json") == body);
+    if let Some(case) = recorded_case {
+        let response = recorded::body(case);
+        let mut writes = vec![recorded::head(case).into_bytes()];
+        let held = recorded::chunked(case);
+        if held {
+            writes.extend(recorded::events(&response).into_iter().map(chunk));
+            // The aborted recording closes without the terminal chunk.
+            if case != ABORTED {
+                writes.push(b"0\r\n\r\n".to_vec());
+            }
+        } else {
+            let (first, rest) = response.split_at(response.len() / 2);
+            writes.extend([first.to_vec(), rest.to_vec()]);
+        }
+        return Some(Script {
+            writes: Box::new(writes.into_iter()),
+            held,
+            pause: Duration::ZERO,
+        });
+    }
+    let name = serde_json::from_slice::<Value>(body).ok()?["synthetic"].take();
+    let (writes, held, pause): (Box<dyn Iterator<Item = Vec<u8>> + Send>, _, _) =
+        match name.as_str()? {
+            // Usage in every event, in 64 KiB-content events.
+            "continuous" => {
+                let body = continuous_body();
+                let mut writes = vec![SSE_HEAD.as_bytes().to_vec()];
+                writes.extend(recorded::events(&body).into_iter().map(chunk));
+                writes.push(b"0\r\n\r\n".to_vec());
+                (Box::new(writes.into_iter()), false, Duration::ZERO)
+            }
+            // A 16 MiB JSON answer: eight times the usage parse bound.
+            "large-json" => {
+                let length = 16 * 1024 * 1024;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {length}\r\n\r\n"
+                );
+                let prefix = br#"{"usage":{"prompt_tokens":1,"completion_tokens":1},"pad":""#;
+                let mut first = prefix.to_vec();
+                first.resize(64 * 1024, b'x');
+                let rest = (length - first.len()) / (256 * 1024);
+                let mut writes = vec![head.into_bytes(), first];
+                writes.extend((0..rest).map(|_| vec![b'x'; 256 * 1024]));
+                let last = length - 64 * 1024 - rest * 256 * 1024 - 2;
+                let mut tail = vec![b'x'; last];
+                tail.extend_from_slice(b"\"}");
+                writes.push(tail);
+                (Box::new(writes.into_iter()), true, Duration::ZERO)
+            }
+            // An endless stream with usage in every event, one every 200 ms.
+            "trickle" => {
+                let head = std::iter::once(SSE_HEAD.as_bytes().to_vec());
+                let events = (1..).map(|n| chunk(&continuous_event("x", n)));
+                (
+                    Box::new(head.chain(events)),
+                    true,
+                    Duration::from_millis(200),
+                )
+            }
+            "gzip" => {
+                let response = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                    content-encoding: gzip\r\ncontent-length: 4\r\n\r\n";
+                let writes = vec![response.as_bytes().to_vec(), b"\x1f\x8b\x08\x00".to_vec()];
+                (Box::new(writes.into_iter()), false, Duration::ZERO)
+            }
+            // The recorded plain answer, with its `Content-Type` named hop-by-hop.
+            "hop" => {
+                let response = recorded::body("02-chat-plain");
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nconnection: content-type\r\n\
+                     content-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                    response.len()
+                );
+                let writes = vec![head.into_bytes(), response];
+                (Box::new(writes.into_iter()), false, Duration::ZERO)
+            }
+            _ => return None,
+        };
+    Some(Script {
+        writes,
+        held,
+        pause,
+    })
+}
+
+/// Answers each request with its script, in separate TCP writes.
 struct StandIn {
     address: String,
     received: Arc<Mutex<Vec<Received>>>,
@@ -290,6 +430,11 @@ impl StandIn {
     fn count(&self) -> usize {
         self.received.lock().unwrap().len()
     }
+
+    /// The lowercased head of the `n`th request received.
+    fn head(&self, n: usize) -> String {
+        self.received.lock().unwrap()[n].head.clone()
+    }
 }
 
 async fn replay(
@@ -300,44 +445,26 @@ async fn replay(
     let Some((head, body)) = read_request(&mut socket).await else {
         return;
     };
-    let case = SETTLED
-        .iter()
-        .map(|(case, ..)| *case)
-        .chain([ABORTED, UPSTREAM_500])
-        .find(|case| recorded::file(case, "request.json") == body);
+    let script = script(&body);
     received.lock().unwrap().push(Received { head, body });
-    let Some(case) = case else {
+    let mut probe = [0; 1];
+    let Some(script) = script else {
         // Any other request stalls before the head until the proxy closes the connection.
-        let mut probe = [0; 1];
         let _ = socket.read(&mut probe).await;
         gate.closed_by_proxy.fetch_add(1, Ordering::SeqCst);
         return;
     };
-    let response = recorded::body(case);
-    let mut writes = vec![recorded::head(case).into_bytes()];
-    if recorded::chunked(case) {
-        for event in recorded::events(&response) {
-            let mut chunk = format!("{:x}\r\n", event.len()).into_bytes();
-            chunk.extend_from_slice(event);
-            chunk.extend_from_slice(b"\r\n");
-            writes.push(chunk);
+    for (n, write) in script.writes.enumerate() {
+        if n > 1 {
+            tokio::time::sleep(script.pause).await;
         }
-        // The aborted recording closes without the terminal chunk.
-        if case != ABORTED {
-            writes.push(b"0\r\n\r\n".to_vec());
-        }
-    } else {
-        let (first, rest) = response.split_at(response.len() / 2);
-        writes.extend([first.to_vec(), rest.to_vec()]);
-    }
-    for (n, write) in writes.iter().enumerate() {
-        if socket.write_all(write).await.is_err() || socket.flush().await.is_err() {
+        if socket.write_all(&write).await.is_err() || socket.flush().await.is_err() {
+            gate.closed_by_proxy.fetch_add(1, Ordering::SeqCst);
             return;
         }
-        if n == 1 && recorded::chunked(case) {
-            let mut probe = [0; 1];
+        if n == 1 && script.held {
             tokio::select! {
-                () = gate.first_event_relayed.notified() => {}
+                () = gate.released.notified() => {}
                 // The proxy sends nothing more on this connection; a read ends only if it closes.
                 _ = socket.read(&mut probe) => {
                     gate.closed_by_proxy.fetch_add(1, Ordering::SeqCst);
@@ -349,6 +476,7 @@ async fn replay(
             }
         }
     }
+    gate.finished.fetch_add(1, Ordering::SeqCst);
 }
 
 /// One request head and its `Content-Length` body.
@@ -381,6 +509,93 @@ fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
         .map(str::trim)
 }
 
+// --- silent database connection ---------------------------------------------------------------
+
+/// Text of the first statement settlement sends inside its transaction.
+const SETTLEMENT_LOCK: &[u8] = b"quota_lock_gateway_request_for_settlement";
+
+/// Forwards connections to the test PostgreSQL service, except that the first connection to
+/// send [`SETTLEMENT_LOCK`] goes silent from then on: nothing more is forwarded either way and
+/// its sockets stay open until [`Self::release`].
+struct Silencer {
+    address: String,
+    /// Settlement attempts seen; only the first was silenced.
+    attempts: Arc<AtomicUsize>,
+    release: Arc<Notify>,
+}
+
+impl Silencer {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let admin = pg::admin_options();
+        let server = format!("{}:{}", admin.get_host(), admin.get_port());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let (used, freed) = (attempts.clone(), release.clone());
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let server = tokio::net::TcpStream::connect(&server).await.unwrap();
+                tokio::spawn(forward(client, server, used.clone(), freed.clone()));
+            }
+        });
+        Self {
+            address,
+            attempts,
+            release,
+        }
+    }
+
+    fn release(&self) {
+        self.release.notify_waiters();
+    }
+}
+
+async fn forward(
+    client: tokio::net::TcpStream,
+    server: tokio::net::TcpStream,
+    attempts: Arc<AtomicUsize>,
+    release: Arc<Notify>,
+) {
+    let (mut client_read, mut client_write) = client.into_split();
+    let (mut server_read, mut server_write) = server.into_split();
+    let silent = Arc::new(AtomicBool::new(false));
+    let quiet = silent.clone();
+    // Each direction ends when its source does; a silent connection's replies are discarded.
+    let replies = async move {
+        let mut buffer = [0; 8192];
+        while let Ok(n @ 1..) = server_read.read(&mut buffer).await {
+            if !quiet.load(Ordering::SeqCst) && client_write.write_all(&buffer[..n]).await.is_err()
+            {
+                break;
+            }
+        }
+    };
+    let requests = async move {
+        let mut buffer = [0; 8192];
+        let mut seen = Vec::new();
+        while let Ok(n @ 1..) = client_read.read(&mut buffer).await {
+            seen.extend_from_slice(&buffer[..n]);
+            if seen
+                .windows(SETTLEMENT_LOCK.len())
+                .any(|w| w == SETTLEMENT_LOCK)
+                && attempts.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                // Hold both sockets open, unanswered, until the test lets them go; returning
+                // then closes the connection both ways.
+                silent.store(true, Ordering::SeqCst);
+                release.notified().await;
+                return;
+            }
+            seen.drain(..seen.len().saturating_sub(SETTLEMENT_LOCK.len()));
+            if server_write.write_all(&buffer[..n]).await.is_err() {
+                return;
+            }
+        }
+    };
+    tokio::join!(replies, requests);
+}
+
 // --- caller -----------------------------------------------------------------------------------
 
 /// The caller's view of one response, read to the end of the connection.
@@ -389,7 +604,8 @@ struct Reply {
     /// Lowercased status line and headers.
     head: String,
     body: Vec<u8>,
-    /// Whether the framing completed: the terminal chunk or the full `Content-Length`.
+    /// Whether the framing completed: the terminal chunk and the end of its (empty) trailer
+    /// section, or the full `Content-Length`.
     complete: bool,
 }
 
@@ -422,7 +638,8 @@ fn parse(raw: &[u8]) -> Reply {
     }
 }
 
-/// The payload of a chunked body so far, and whether its terminal chunk arrived.
+/// The payload of a chunked body so far, and whether it ended: the zero-size chunk followed by
+/// the blank line that closes its trailer section.
 fn dechunk(mut raw: &[u8]) -> (Vec<u8>, bool) {
     let mut body = Vec::new();
     loop {
@@ -433,7 +650,8 @@ fn dechunk(mut raw: &[u8]) -> (Vec<u8>, bool) {
         let size = usize::from_str_radix(size.split(';').next().unwrap().trim(), 16).unwrap();
         raw = &raw[line + 2..];
         if size == 0 {
-            return (body, true);
+            let ended = raw.starts_with(b"\r\n") || raw.windows(4).any(|w| w == b"\r\n\r\n");
+            return (body, ended);
         }
         body.extend_from_slice(&raw[..size.min(raw.len())]);
         if raw.len() < size + 2 {
@@ -441,6 +659,22 @@ fn dechunk(mut raw: &[u8]) -> (Vec<u8>, bool) {
         }
         raw = &raw[size + 2..];
     }
+}
+
+/// What the caller does once the given first bytes of the body have arrived.
+#[derive(Clone, Copy)]
+enum Then<'a> {
+    /// Reads to the end; nothing is held.
+    Read,
+    /// Releases the held stand-in and reads to the end.
+    Release(&'a [u8]),
+    /// Closes the connection and leaves the stand-in held.
+    Leave(&'a [u8]),
+    /// Closes the connection, then releases the stand-in.
+    LeaveAndRelease(&'a [u8]),
+    /// Releases a held stand-in, if any, and reads nothing more until the stand-in has written
+    /// its whole answer: meanwhile the proxy meets a caller that has stopped reading.
+    Stall(Option<&'a [u8]>),
 }
 
 /// The gateway binary serving the fixture's database through the stand-in.
@@ -454,26 +688,29 @@ struct Harness {
 
 impl Harness {
     async fn start() -> Self {
-        let upstream = StandIn::start().await;
-        let url = format!("http://{}", upstream.address);
-        Self::start_with(upstream, &url).await
+        Self::launch(Fixture::new().await, StandIn::start().await, &[]).await
     }
 
-    /// Serves through `url`, which is the stand-in unless a live check names another upstream.
-    async fn start_with(upstream: StandIn, url: &str) -> Self {
-        let fixture = Fixture::new().await;
+    /// Serves the fixture through the stand-in, with extra `OPENMETTLE_GATEWAY_` settings
+    /// applied last.
+    async fn launch(fixture: Fixture, upstream: StandIn, settings: &[(&str, String)]) -> Self {
         let bind = address();
-        let mut child = binary("gateway")
+        let mut command = binary("gateway");
+        command
             .env("OPENMETTLE_GATEWAY_BIND", &bind)
             .env(
                 "OPENMETTLE_GATEWAY_DATABASE_URL",
                 fixture.db.url(pg::GATEWAY),
             )
-            .env("OPENMETTLE_GATEWAY_UPSTREAM_URL", url)
-            .env("OPENMETTLE_GATEWAY_SHUTDOWN_TIMEOUT_MS", "10000")
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
+            .env(
+                "OPENMETTLE_GATEWAY_UPSTREAM_URL",
+                format!("http://{}", upstream.address),
+            )
+            .env("OPENMETTLE_GATEWAY_SHUTDOWN_TIMEOUT_MS", "10000");
+        for (key, value) in settings {
+            command.env(format!("OPENMETTLE_GATEWAY_{key}"), value);
+        }
+        let mut child = command.stdout(Stdio::null()).spawn().unwrap();
         let mut pipe = child.stderr.take().unwrap();
         let stderr = thread::spawn(move || {
             let mut text = String::new();
@@ -491,38 +728,47 @@ impl Harness {
         }
     }
 
-    /// Sends `body` with the synthetic credentials and reads the response to the end. With
-    /// `first_event`, releases the stand-in once that event has arrived, or instead closes the
-    /// connection then if `leave`.
-    async fn send(
-        &self,
-        id: Option<&str>,
-        body: &[u8],
-        first_event: Option<&[u8]>,
-        leave: bool,
-    ) -> Reply {
+    /// Sends `body` with the synthetic credentials and any `extra` header lines, then follows
+    /// `then`. Without a `Connection` line in `extra`, the request asks to close.
+    async fn send(&self, id: Option<&str>, body: &[u8], extra: &str, then: Then<'_>) -> Reply {
+        let finished = self.upstream.gate.finished.load(Ordering::SeqCst);
         let mut socket = tokio::net::TcpStream::connect(&self.bind).await.unwrap();
-        let accept = match first_event {
-            Some(_) => "text/event-stream",
-            None => "application/json",
-        };
         let mut request = format!(
             "POST /v1/chat/completions HTTP/1.1\r\nHost: gateway.test\r\n\
-             Content-Type: application/json\r\nAccept: {accept}\r\n\
+             Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\n\
              Authorization: Bearer {CREDENTIAL}\r\nCookie: session={COOKIE}\r\n\
-             Content-Length: {}\r\nConnection: close\r\n",
+             Content-Length: {}\r\n{extra}",
             body.len()
         );
+        if !extra.to_ascii_lowercase().contains("connection:") {
+            request.push_str("Connection: close\r\n");
+        }
         if let Some(id) = id {
             request.push_str(&format!("X-Request-Id: {id}\r\n"));
         }
         request.push_str("\r\n");
         socket.write_all(request.as_bytes()).await.unwrap();
         socket.write_all(body).await.unwrap();
+        let gate = &self.upstream.gate;
         let mut raw = Vec::new();
-        let mut waiting = first_event;
-        let mut read = [0; 8192];
+        let mut read = [0; 65536];
+        let mut waiting = match then {
+            Then::Read | Then::Stall(None) => None,
+            Then::Release(first)
+            | Then::Leave(first)
+            | Then::LeaveAndRelease(first)
+            | Then::Stall(Some(first)) => Some(first),
+        };
+        let mut stall = matches!(then, Then::Stall(None));
         loop {
+            if stall {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while gate.finished.load(Ordering::SeqCst) == finished {
+                    assert!(Instant::now() < deadline, "the stand-in never finished");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                stall = false;
+            }
             let n = tokio::time::timeout(Duration::from_secs(20), socket.read(&mut read))
                 .await
                 .expect("the proxy response stalled")
@@ -532,33 +778,49 @@ impl Harness {
             }
             raw.extend_from_slice(&read[..n]);
             let so_far = parse(&raw);
-            if let Some(event) = waiting
-                && so_far.body.starts_with(event)
+            if let Some(first) = waiting
+                && so_far.body.starts_with(first)
             {
-                if leave {
-                    return so_far;
+                waiting = None;
+                match then {
+                    Then::Leave(_) => return so_far,
+                    Then::LeaveAndRelease(_) => {
+                        drop(socket);
+                        gate.released.notify_one();
+                        return so_far;
+                    }
+                    Then::Stall(_) => stall = true,
+                    _ => {}
                 }
                 // A response that is already complete was not held: releasing now would leave a
                 // stale permit for the next stream.
                 if !so_far.complete {
-                    self.upstream.gate.first_event_relayed.notify_one();
+                    gate.released.notify_one();
                 }
-                waiting = None;
             }
         }
     }
 
-    /// Sends the recorded request of `case`, holding a stream until its first event arrives.
+    /// Sends the recorded request of `case`. A stream is released once its first event arrives
+    /// unless `then` says otherwise.
     async fn send_case(&self, case: &str, id: &str) -> Reply {
-        self.send_recorded(case, id, false).await
-    }
-
-    async fn send_recorded(&self, case: &str, id: &str, leave: bool) -> Reply {
         let response = recorded::body(case);
         let events = recorded::events(&response);
-        let first_event = recorded::chunked(case).then(|| events[0]);
+        let then = match recorded::chunked(case) {
+            true => Then::Release(events[0]),
+            false => Then::Read,
+        };
+        self.send_recorded(case, id, then).await
+    }
+
+    async fn send_recorded(&self, case: &str, id: &str, then: Then<'_>) -> Reply {
         let request = recorded::file(case, "request.json");
-        self.send(Some(id), &request, first_event, leave).await
+        self.send(Some(id), &request, "", then).await
+    }
+
+    async fn send_synthetic(&self, name: &str, id: &str, then: Then<'_>) -> Reply {
+        let request = format!(r#"{{"synthetic":"{name}"}}"#);
+        self.send(Some(id), request.as_bytes(), "", then).await
     }
 
     /// Stops the binary with SIGTERM, which drains running relays and their reports, and
@@ -601,6 +863,23 @@ fn content_type(head: &str) -> Option<String> {
     header(head, "content-type").map(str::to_owned)
 }
 
+fn unrecorded(id: &str, reason: &str) -> (String, String, String) {
+    (
+        "gateway.usage.unrecorded".to_owned(),
+        id.to_owned(),
+        reason.to_owned(),
+    )
+}
+
+/// Waits up to `limit` for `done`.
+async fn eventually(limit: Duration, what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + limit;
+    while !done() {
+        assert!(Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn relays_recorded_answers_unchanged_and_settles_their_usage_as_the_gateway() {
@@ -628,11 +907,14 @@ async fn relays_recorded_answers_unchanged_and_settles_their_usage_as_the_gatewa
                 received.body == recorded::file(case, "request.json"),
                 "{case}: the upstream receives the caller's bytes"
             );
-            assert_eq!(header(&received.head, "x-request-id"), Some(id.as_str()));
-            assert_eq!(
-                header(&received.head, "content-type"),
-                Some("application/json")
-            );
+            for (name, value) in [
+                ("x-request-id", id.as_str()),
+                ("content-type", "application/json"),
+                ("accept", "application/json, text/event-stream"),
+                ("accept-encoding", "identity"),
+            ] {
+                assert_eq!(header(&received.head, name), Some(value), "{case}: {name}");
+            }
             for withheld in ["authorization", "cookie", CREDENTIAL, COOKIE] {
                 assert!(!received.head.contains(withheld), "{case}: {withheld}");
             }
@@ -676,6 +958,9 @@ async fn relays_recorded_answers_unchanged_and_settles_their_usage_as_the_gatewa
     assert_eq!(events, []);
 }
 
+/// A cut upstream stream reaches the caller as a prefix of its bytes with an unclean end, never
+/// as a complete response. The caller reads nothing more after the first event until the
+/// stand-in has written everything and closed, so the cut meets data still in flight.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn relays_but_leaves_the_hold_when_no_usage_was_observed() {
@@ -686,9 +971,16 @@ async fn relays_but_leaves_the_hold_when_no_usage_was_observed() {
     assert_eq!(h.fixture.hold(&aborted).await, held);
     assert_eq!(h.fixture.hold(&failed).await, held);
 
-    let reply = h.send_case(ABORTED, &aborted).await;
+    let recorded_body = recorded::body(ABORTED);
+    let first = recorded::events(&recorded_body)[0];
+    let reply = h
+        .send_recorded(ABORTED, &aborted, Then::Stall(Some(first)))
+        .await;
     assert_eq!(reply.status, 200);
-    assert!(reply.body == recorded::body(ABORTED));
+    assert!(
+        reply.body.len() >= first.len() && recorded_body.starts_with(&reply.body),
+        "the caller receives a prefix of the upstream bytes"
+    );
     assert!(
         !reply.complete,
         "the caller's response is cut like the upstream's"
@@ -707,13 +999,6 @@ async fn relays_but_leaves_the_hold_when_no_usage_was_observed() {
         assert_eq!(fixture.settlement(id).await, None);
         assert_eq!(fixture.hold(id).await, held);
     }
-    let unrecorded = |id: &str, reason: &str| {
-        (
-            "gateway.usage.unrecorded".to_owned(),
-            id.to_owned(),
-            reason.to_owned(),
-        )
-    };
     let mut expected = vec![
         unrecorded(&aborted, "incomplete"),
         unrecorded(&failed, "upstream_status"),
@@ -727,20 +1012,29 @@ async fn relays_but_leaves_the_hold_when_no_usage_was_observed() {
 async fn refuses_unusable_or_unready_request_ids_before_forwarding() {
     let h = Harness::start().await;
     let reserved = h.fixture.request(true).await;
+    let handed_off = h.fixture.request(false).await;
     let unknown: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
         .fetch_one(&h.fixture.owner)
         .await
         .unwrap();
     let body = recorded::file("02-chat-plain", "request.json");
-    for (id, status, code) in [
-        (None, 400, "validation"),
-        (Some("not-a-request-id".to_owned()), 400, "validation"),
-        (Some(reserved.to_ascii_uppercase()), 400, "validation"),
-        (Some(unknown), 404, "not_found"),
+    let uppercase = "0F8FAD5B-D9CB-469F-A165-70867728950E".to_owned();
+    for (id, extra, status, code) in [
+        (None, "", 400, "validation"),
+        (Some("not-a-request-id".to_owned()), "", 400, "validation"),
+        (Some(uppercase), "", 400, "validation"),
+        (Some(unknown), "", 404, "not_found"),
         // Reserved but not yet handed off.
-        (Some(reserved.clone()), 404, "not_found"),
+        (Some(reserved.clone()), "", 404, "not_found"),
+        // Only identity bodies are forwarded in this increment.
+        (
+            Some(handed_off.clone()),
+            "Content-Encoding: gzip\r\n",
+            415,
+            "unsupported_media_type",
+        ),
     ] {
-        let reply = h.send(id.as_deref(), &body, None, false).await;
+        let reply = h.send(id.as_deref(), &body, extra, Then::Read).await;
         assert_eq!(reply.status, status, "{id:?}");
         assert_eq!(
             content_type(&reply.head).as_deref(),
@@ -755,6 +1049,7 @@ async fn refuses_unusable_or_unready_request_ids_before_forwarding() {
     assert_eq!(h.upstream.count(), 0, "nothing was forwarded");
     let (fixture, _, events) = h.stop().await;
     assert_eq!(fixture.reports(&reserved).await, []);
+    assert_eq!(fixture.reports(&handed_off).await, []);
     assert_eq!(events, []);
 }
 
@@ -786,9 +1081,23 @@ async fn a_repeated_dispatch_of_one_request_is_settled_once() {
     assert_eq!(events, []);
 }
 
+/// The transaction start of each settlement attempt by `openmettle_gateway` that is waiting for
+/// a lock in the fixture's database. Read as the superuser: other roles' wait states are hidden.
+async fn blocked_attempts(fixture: &Fixture) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT xact_start::text FROM pg_stat_activity
+          WHERE datname=$1 AND usename='openmettle_gateway' AND wait_event_type='Lock'",
+    )
+    .bind(&fixture.db.0)
+    .fetch_all(&mut fixture.db.admin().await)
+    .await
+    .unwrap()
+}
+
 /// A report write still retrying at SIGTERM finishes before the pool closes. The test holds the
-/// request's settlement lock past settlement's 2 s lock timeout, so the first write fails
-/// transiently and the relay retries while the process drains.
+/// request's settlement lock, sees the first attempt wait for it, signals, and releases the
+/// lock only once a second, distinct attempt is waiting: the first has hit settlement's lock
+/// timeout and the relay is retrying while the process drains.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn shutdown_waits_for_a_report_write_that_is_retrying() {
@@ -802,8 +1111,26 @@ async fn shutdown_waits_for_a_report_write_that_is_retrying() {
         .unwrap();
     let reply = h.send_case("02-chat-plain", &id).await;
     assert_eq!(reply.status, 200);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let first = loop {
+        if let [attempt] = &blocked_attempts(&h.fixture).await[..] {
+            break attempt.clone();
+        }
+        assert!(Instant::now() < deadline, "no write attempt waited");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     signal(&h.gateway.0, "-TERM");
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    loop {
+        if blocked_attempts(&h.fixture)
+            .await
+            .iter()
+            .any(|attempt| *attempt != first)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the write was not retried");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     lock.commit().await.unwrap();
     // Draining ignores the second SIGTERM that `stop` sends.
     let (fixture, _, events) = h.stop().await;
@@ -823,28 +1150,24 @@ async fn a_caller_leaving_mid_stream_drops_the_upstream_and_records_nothing() {
     let h = Harness::start().await;
     let id = h.fixture.request(false).await;
     let held = h.fixture.hold(&id).await;
-    let reply = h.send_recorded("04-chat-stream-reasoning", &id, true).await;
+    let case = "04-chat-stream-reasoning";
+    let response = recorded::body(case);
+    let reply = h
+        .send_recorded(case, &id, Then::Leave(recorded::events(&response)[0]))
+        .await;
     assert!(reply.status == 200 && !reply.complete);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while h.upstream.gate.closed_by_proxy.load(Ordering::SeqCst) == 0 {
-        assert!(
-            Instant::now() < deadline,
-            "the upstream connection stayed open"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(h.upstream.gate.timeouts.load(Ordering::SeqCst), 0);
+    let gate = &h.upstream.gate;
+    eventually(
+        Duration::from_secs(5),
+        "the upstream connection stayed open",
+        || gate.closed_by_proxy.load(Ordering::SeqCst) > 0,
+    )
+    .await;
+    assert_eq!(gate.timeouts.load(Ordering::SeqCst), 0);
     let (fixture, _, events) = h.stop().await;
     assert_eq!(fixture.reports(&id).await, []);
     assert_eq!(fixture.hold(&id).await, held);
-    assert_eq!(
-        events,
-        [(
-            "gateway.usage.unrecorded".to_owned(),
-            id,
-            "caller_disconnected".to_owned()
-        )]
-    );
+    assert_eq!(events, [unrecorded(&id, "caller_disconnected")]);
 }
 
 /// The usage object in a relayed body: the JSON document's, or a stream's last one.
@@ -880,18 +1203,12 @@ async fn live_upstream_usage_matches_what_the_caller_received() {
         eprintln!("skipped: TEST_GATEWAY_UPSTREAM_URL is unset");
         return;
     };
-    let h = Harness::start_with(StandIn::start().await, &url).await;
+    let settings = [("UPSTREAM_URL", url)];
+    let h = Harness::launch(Fixture::new().await, StandIn::start().await, &settings).await;
     let mut sent = Vec::new();
     for (case, ..) in SETTLED {
         let id = h.fixture.request(false).await;
-        let reply = h
-            .send(
-                Some(&id),
-                &recorded::file(case, "request.json"),
-                None,
-                false,
-            )
-            .await;
+        let reply = h.send_recorded(case, &id, Then::Read).await;
         assert!(
             reply.status == 200 && reply.complete,
             "{case}: {}",
@@ -944,28 +1261,230 @@ async fn a_caller_leaving_before_the_response_head_drops_the_upstream() {
     );
     socket.write_all(request.as_bytes()).await.unwrap();
     socket.write_all(body).await.unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while h.upstream.count() == 0 {
-        assert!(Instant::now() < deadline, "the request was not forwarded");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    eventually(
+        Duration::from_secs(5),
+        "the request was not forwarded",
+        || h.upstream.count() > 0,
+    )
+    .await;
     drop(socket);
-    while h.upstream.gate.closed_by_proxy.load(Ordering::SeqCst) == 0 {
-        assert!(
-            Instant::now() < deadline,
-            "the upstream connection stayed open"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    eventually(
+        Duration::from_secs(5),
+        "the upstream connection stayed open",
+        || h.upstream.gate.closed_by_proxy.load(Ordering::SeqCst) > 0,
+    )
+    .await;
     let (fixture, _, events) = h.stop().await;
     assert_eq!(fixture.reports(&id).await, []);
     assert_eq!(fixture.hold(&id).await, held);
+    assert_eq!(events, [unrecorded(&id, "caller_disconnected")]);
+}
+
+/// A caller that stops reading is cut off after one idle timeout. Its response then ends
+/// uncleanly, never as a complete response missing data, while the relay still reads the rest
+/// and records the final usage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_caller_that_stops_reading_gets_an_unclean_end_and_usage_is_still_recorded() {
+    let settings = [("UPSTREAM_IDLE_TIMEOUT_MS", "1000".to_owned())];
+    let h = Harness::launch(Fixture::new().await, StandIn::start().await, &settings).await;
+    let id = h.fixture.request(false).await;
+    let reply = h.send_synthetic("continuous", &id, Then::Stall(None)).await;
+    assert_eq!(reply.status, 200);
+    let full = continuous_body();
+    assert!(
+        reply.body.len() < full.len() && full.starts_with(&reply.body),
+        "the caller receives a prefix of the stream"
+    );
+    assert!(!reply.complete, "a truncated response must not end cleanly");
+    let (fixture, _, events) = h.stop().await;
+    let completion = CONTINUOUS_EVENTS as i64;
     assert_eq!(
-        events,
+        fixture.reports(&id).await,
         [(
-            "gateway.usage.unrecorded".to_owned(),
-            id,
-            "caller_disconnected".to_owned()
+            id.clone(),
+            SOURCE.to_owned(),
+            0,
+            true,
+            Some(5),
+            Some(completion),
+            None,
+            None
         )]
     );
+    assert_eq!(events, []);
+}
+
+/// Only identity bodies are relayed in this increment: the upstream is asked for one, and a
+/// compressed answer is refused with 502 and recorded as nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_compressed_answer_is_refused_and_records_nothing() {
+    let h = Harness::start().await;
+    let id = h.fixture.request(false).await;
+    let held = h.fixture.hold(&id).await;
+    let reply = h.send_synthetic("gzip", &id, Then::Read).await;
+    assert_eq!(reply.status, 502);
+    assert!(!reply.head.contains("content-encoding"));
+    let problem: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(problem["code"], "provider_failure");
+    assert_eq!(
+        header(&h.upstream.head(0), "accept-encoding"),
+        Some("identity")
+    );
+    let (fixture, _, events) = h.stop().await;
+    assert_eq!(fixture.reports(&id).await, []);
+    assert_eq!(fixture.hold(&id).await, held);
+    assert_eq!(events, [unrecorded(&id, "upstream_encoding")]);
+}
+
+/// After the caller has left, the relay reads on only while the usage stays within reach: a
+/// JSON answer that grows past the usage parse bound ends the read and the upstream connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_detached_relay_stops_when_the_usage_goes_out_of_reach() {
+    let h = Harness::start().await;
+    let id = h.fixture.request(false).await;
+    let reply = h
+        .send_synthetic("large-json", &id, Then::LeaveAndRelease(b"{\"usage\""))
+        .await;
+    assert_eq!(reply.status, 200);
+    let gate = &h.upstream.gate;
+    eventually(
+        Duration::from_secs(10),
+        "the upstream connection stayed open",
+        || gate.closed_by_proxy.load(Ordering::SeqCst) > 0,
+    )
+    .await;
+    assert_eq!(gate.finished.load(Ordering::SeqCst), 0);
+    let (fixture, _, events) = h.stop().await;
+    assert_eq!(fixture.reports(&id).await, []);
+    assert_eq!(events, [unrecorded(&id, "caller_disconnected")]);
+}
+
+/// After the caller has left, the upstream gets one idle timeout in total to finish, even if it
+/// keeps sending within each idle interval.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_detached_relay_gives_the_upstream_one_idle_timeout_to_finish() {
+    let settings = [("UPSTREAM_IDLE_TIMEOUT_MS", "1000".to_owned())];
+    let h = Harness::launch(Fixture::new().await, StandIn::start().await, &settings).await;
+    let id = h.fixture.request(false).await;
+    let first = continuous_event("x", 1);
+    let reply = h
+        .send_synthetic("trickle", &id, Then::LeaveAndRelease(&first))
+        .await;
+    assert_eq!(reply.status, 200);
+    eventually(
+        Duration::from_secs(6),
+        "the upstream connection stayed open",
+        || h.upstream.gate.closed_by_proxy.load(Ordering::SeqCst) > 0,
+    )
+    .await;
+    let (fixture, _, events) = h.stop().await;
+    assert_eq!(fixture.reports(&id).await, []);
+    assert_eq!(events, [unrecorded(&id, "upstream_timeout")]);
+}
+
+/// A settlement attempt whose database connection goes silent is abandoned after its
+/// client-side deadline (five `DB_TIMEOUT_MS`) and retried on another connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_report_write_on_a_silent_database_connection_is_retried() {
+    let fixture = Fixture::new().await;
+    let silencer = Silencer::start().await;
+    let url = format!(
+        "postgres://{}:{PASSWORD}@{}/{}?sslmode=disable",
+        pg::GATEWAY,
+        silencer.address,
+        fixture.db.0
+    );
+    let settings = [("DATABASE_URL", url), ("DB_TIMEOUT_MS", "400".to_owned())];
+    let h = Harness::launch(fixture, StandIn::start().await, &settings).await;
+    let id = h.fixture.request(false).await;
+    let reply = h.send_case("02-chat-plain", &id).await;
+    assert_eq!(reply.status, 200);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while h.fixture.reports(&id).await.is_empty() {
+        assert!(Instant::now() < deadline, "the report was never written");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The first attempt went silent and was abandoned; the second stored the report.
+    assert_eq!(silencer.attempts.load(Ordering::SeqCst), 2);
+    // Let the silent connection go, so the pool can close at shutdown.
+    silencer.release();
+    let (fixture, _, events) = h.stop().await;
+    assert_eq!(
+        fixture.settlement(&id).await,
+        Some((0, true, Some("19".to_owned()), 0))
+    );
+    assert_eq!(events, []);
+}
+
+/// Fields the caller or the upstream names in `Connection` are hop-by-hop: they are not
+/// forwarded even when they are otherwise allowed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn connection_nominated_fields_are_not_forwarded() {
+    let h = Harness::start().await;
+    let id = h.fixture.request(false).await;
+    let body = recorded::file("02-chat-plain", "request.json");
+    let reply = h
+        .send(
+            Some(&id),
+            &body,
+            "Connection: close, Accept\r\n",
+            Then::Read,
+        )
+        .await;
+    assert_eq!(reply.status, 200);
+    let head = h.upstream.head(0);
+    assert_eq!(header(&head, "accept"), None, "{head}");
+    assert_eq!(header(&head, "content-type"), Some("application/json"));
+    let hop = h.fixture.request(false).await;
+    let reply = h.send_synthetic("hop", &hop, Then::Read).await;
+    assert_eq!(reply.status, 200);
+    assert_eq!(content_type(&reply.head), None, "{}", reply.head);
+    assert!(reply.body == recorded::body("02-chat-plain"));
+    let (fixture, _, events) = h.stop().await;
+    for id in [&id, &hop] {
+        assert_eq!(fixture.reports(id).await.len(), 1);
+    }
+    assert_eq!(events, []);
+}
+
+/// A handed-off request whose body never arrives in full is refused and logged as unrecorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn an_unread_request_body_is_logged_as_unrecorded() {
+    let h = Harness::start().await;
+    let id = h.fixture.request(false).await;
+    let mut socket = tokio::net::TcpStream::connect(&h.bind).await.unwrap();
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: gateway.test\r\n\
+         Content-Type: application/json\r\nX-Request-Id: {id}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        2 * 1024 * 1024 + 1
+    );
+    socket.write_all(request.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(20), socket.read_to_end(&mut raw)).await;
+    let reply = parse(&raw);
+    assert_eq!(reply.status, 400);
+    assert_eq!(h.upstream.count(), 0);
+    let (_, _, events) = h.stop().await;
+    assert_eq!(events, [unrecorded(&id, "request_body")]);
+}
+
+/// The test's own chunked-body reader: a body ends only with the blank line after the
+/// zero-size chunk, so a cut right after `0\r\n` is not mistaken for a complete response.
+#[test]
+fn dechunking_needs_the_end_of_the_trailer_section() {
+    assert_eq!(dechunk(b"3\r\nabc\r\n0\r\n"), (b"abc".to_vec(), false));
+    assert_eq!(dechunk(b"3\r\nabc\r\n0\r\n\r\n"), (b"abc".to_vec(), true));
+    assert_eq!(
+        dechunk(b"3\r\nabc\r\n0\r\nx: y\r\n\r\n"),
+        (b"abc".to_vec(), true)
+    );
+    assert_eq!(dechunk(b"3\r\nab"), (b"ab".to_vec(), false));
 }

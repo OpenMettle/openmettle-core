@@ -753,27 +753,34 @@ pub(crate) mod tests;
 /// was; explicit incomplete reports are a later increment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UsageGap {
+    /// The caller's request body was too large, too slow, or cut off by the caller leaving.
+    RequestBody,
     /// The upstream answered with a status other than 200.
     UpstreamStatus,
     /// The upstream could not be reached, or the exchange failed before a response head.
     UpstreamTransport,
-    /// Connecting, or waiting for the head or the next body bytes, took too long.
+    /// The upstream answered with a content coding other than `identity`.
+    UpstreamEncoding,
+    /// Connecting, waiting for the head or the next body bytes, or finishing the body after the
+    /// caller left, took too long.
     UpstreamTimeout,
     /// The body ended early or without the stream's `[DONE]` event.
     Incomplete,
-    /// The caller left before the upstream's usage was read.
+    /// The caller left or stopped reading before the upstream's usage was in hand.
     CallerDisconnected,
     /// The response completed without a usage object.
     NoUsage,
-    /// The response exceeded a parse bound or its usage could not be read.
+    /// The response exceeded a parse bound, or its usage was not a valid usage object.
     Unparsable,
 }
 
 impl UsageGap {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::RequestBody => "request_body",
             Self::UpstreamStatus => "upstream_status",
             Self::UpstreamTransport => "upstream_transport",
+            Self::UpstreamEncoding => "upstream_encoding",
             Self::UpstreamTimeout => "upstream_timeout",
             Self::Incomplete => "incomplete",
             Self::CallerDisconnected => "caller_disconnected",
