@@ -1,6 +1,8 @@
 //! ADR 0031: migration 17 and the filesystem artifact engine over isolated PostgreSQL 18 and a
 //! per-test temporary directory. Every value is synthetic.
-use super::storage::{account, assert_totals, configure_limits as configure, new_uuid};
+use super::storage::{
+    account, assert_totals, configure_limits as configure, new_uuid, retention_grace,
+};
 use super::*;
 use crate::auth_config_support::Dir;
 use axum::body::{Bytes, HttpBody};
@@ -112,6 +114,8 @@ impl Fixture {
     async fn new() -> Self {
         let db = TestDb::migrated().await;
         configure(&db, Some(10_000), Some(10_000), Some(10_000)).await;
+        // Removed revisions become due after one second.
+        retention_grace(&db, 1).await;
         let c = Context::new(&db).await;
         let api = pool(&db, API).await;
         let dir = Dir::new();
@@ -794,7 +798,7 @@ async fn purge_unlinks_the_payload_before_confirming() {
     );
     let mut cn = connect(&f.db.0, API).await;
     let mut tx = WriteTransaction::begin(&mut cn).await.unwrap();
-    storage::retain_revision(&mut tx, &f.c.scope, &stored.revision, 1)
+    storage::retain_revision(&mut tx, &f.c.scope, &stored.revision)
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -825,6 +829,100 @@ async fn purge_unlinks_the_payload_before_confirming() {
             .await
             .unwrap();
     assert_eq!(state, "purged");
+    assert_eq!(journaled(&f.db).await, [stored.revision]);
+    assert_totals(&f.db).await;
+}
+
+/// Revisions in the deletion journal, in journal order.
+async fn journaled(db: &TestDb) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT entity_id::text FROM openmettle.deletion_journal ORDER BY journal_seq",
+    )
+    .fetch_all(&mut db.admin().await)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn purge_resumes_after_worker_death_at_each_stage_without_double_release() {
+    let f = Fixture::new().await;
+    retention_grace(&f.db, 0).await;
+    let body = form("x", &[METADATA, file(None, b"payload")], true);
+    let revisions = f.root.join("revisions");
+    let mut api = connect(&f.db.0, API).await;
+    let mut cn = connect(&f.db.0, WORKER).await;
+    let mut stored = Vec::new();
+    // Each worker died after a different stage: after its claim committed, after Stage A
+    // anchored, truncated and unlinked the payload, and after confirmation but before Stage C.
+    for (stage, key) in ["claimed", "unlinked", "confirmed"].into_iter().enumerate() {
+        let doc = new_uuid(&f.db).await;
+        let s = f
+            .upload(key, &doc, 100, "x", chunked(&body, 16), true)
+            .await
+            .unwrap();
+        let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+        storage::retain_revision(&mut tx, &f.c.scope, &s.revision)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = WriteTransaction::begin(&mut cn).await.unwrap();
+        storage::begin_purge(&mut tx, &f.c.scope, &s.revision)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        if stage > 0 {
+            let payload = revisions.join(&s.reservation);
+            let anchor = revisions.join(format!(".purge.{}", s.reservation));
+            fs::hard_link(&payload, &anchor).unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&anchor)
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+            fs::remove_file(&payload).unwrap();
+        }
+        if stage > 1 {
+            let mut tx = WriteTransaction::begin(&mut cn).await.unwrap();
+            storage::confirm_purge(&mut tx, &f.c.scope, &s.revision)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+        stored.push(s);
+    }
+    assert_eq!(account(&f.db, &f.c.scope).await, (0, 14, 0));
+    assert_eq!(journaled(&f.db).await, [stored[2].revision.clone()]);
+    assert_totals(&f.db).await;
+
+    let worker = pool(&f.db, WORKER).await;
+    assert_eq!(
+        artifact_fs::purge_due(&worker, &f.store, 10).await.unwrap(),
+        2
+    );
+    assert!(
+        f.files("revisions").is_empty(),
+        "{:?}",
+        f.files("revisions")
+    );
+    assert_eq!(account(&f.db, &f.c.scope).await, (0, 0, 0));
+    assert_eq!(
+        artifact_fs::purge_due(&worker, &f.store, 10).await.unwrap(),
+        0
+    );
+    let mut recorded = journaled(&f.db).await;
+    recorded.sort();
+    let mut expected: Vec<String> = stored.iter().map(|s| s.revision.clone()).collect();
+    expected.sort();
+    assert_eq!(recorded, expected);
+    let left: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM openmettle.artifact_revisions WHERE state <> 'purged' OR purge_stage <> 'none'",
+    )
+    .fetch_one(&mut f.db.admin().await)
+    .await
+    .unwrap();
+    assert_eq!(left, 0);
     assert_totals(&f.db).await;
 }
 
@@ -890,7 +988,7 @@ async fn worker_purges_unlocked_revisions_and_sweeps_runs_while_a_revision_stays
             .await
             .unwrap();
         let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
-        storage::retain_revision(&mut tx, &f.c.scope, &stored.revision, 1)
+        storage::retain_revision(&mut tx, &f.c.scope, &stored.revision)
             .await
             .unwrap();
         tx.commit().await.unwrap();
@@ -973,7 +1071,7 @@ async fn worker_binary_sweeps_with_and_without_payloads_and_recovers_after_signa
     let payload = f.root.join("revisions").join(&stored.reservation);
     let mut c = connect(&f.db.0, API).await;
     let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
-    storage::retain_revision(&mut tx, &f.c.scope, &stored.revision, 1)
+    storage::retain_revision(&mut tx, &f.c.scope, &stored.revision)
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -1218,7 +1316,7 @@ async fn adoption_clears_detached_pending_anchors_even_after_inode_reuse() {
     storage::release(&mut tx, &f.c.scope, &released)
         .await
         .unwrap();
-    storage::retain_revision(&mut tx, &f.c.scope, &old.revision, 1)
+    storage::retain_revision(&mut tx, &f.c.scope, &old.revision)
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -1461,7 +1559,7 @@ async fn purge_advances_past_a_busy_payload_and_refuses_a_foreign_revision_alias
             .await
             .unwrap();
         let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
-        storage::retain_revision(&mut tx, &f.c.scope, &stored.revision, 1)
+        storage::retain_revision(&mut tx, &f.c.scope, &stored.revision)
             .await
             .unwrap();
         tx.commit().await.unwrap();
@@ -1498,6 +1596,8 @@ async fn purge_advances_past_a_busy_payload_and_refuses_a_foreign_revision_alias
     assert_eq!(fs::read(&paths[0]).unwrap(), b"foreign");
     assert_eq!(fs::read(anchor).unwrap(), b"payload");
     assert_eq!(account(&f.db, &f.c.scope).await, (0, 7, 0));
+    // Only the purged revision is journaled; the refused one keeps its charge and no record.
+    assert_eq!(journaled(&f.db).await.len(), 1);
 }
 
 #[tokio::test]

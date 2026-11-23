@@ -48,8 +48,10 @@ ADR 0040's volume-pinned 3-stage physical purge on the durable worker path.
   `[min_grace_seconds, max_grace_seconds]` (permitting `0` for immediate purge eligibility only
   when deployment policy sets `min_grace_seconds = 0`). Only `account_admin` (or
   `openmettle_owner` bootstrap/break-glass) may mutate the policy, and every change increments a
-  monotonic `policy_revision` and writes an `authorization_audit` record with actor, old/new
-  values, reason and request key.
+  monotonic `policy_revision` (a trigger enforces this for every writer). An `account_admin`
+  change, through `openmettle.retention_set_grace`, also writes an `authorization_audit` record
+  with actor, old/new values, reason and request key; `openmettle_owner` sets the deployment
+  bounds as configuration, outside the application audit trail.
 - **Forward-only policy edits.** Changing `retention_grace_seconds` governs subsequent
   disassociations. Adjusting existing `purge_after` deadlines is a separate explicit, previewable
   and audited `account_admin` action. Quota reductions, expired overrides or hard-limit pressure
@@ -119,8 +121,9 @@ ADR 0040's volume-pinned 3-stage physical purge on the durable worker path.
   `original_purge_after`, `purged_at`, `content_digest` (SHA-256 bytes for purged revisions only),
   `policy_revision` and `request_key`, plus a running hash-chain digest linking `journal_seq` to
   `journal_seq - 1`. It never stores `display_name`, filenames, prompts, message text, secrets,
-  credentials, emails or payload bytes. Application roles receive `SELECT` and `INSERT` only
-  (zero `UPDATE`, `DELETE` or `TRUNCATE`).
+  credentials, emails or payload bytes. Application roles never receive `UPDATE`, `DELETE` or
+  `TRUNCATE`. Purge records are appended by a `SECURITY DEFINER` trigger on the confirmation, so
+  application roles need no journal privilege for them.
 - **Backup-survivable watermark contract (coordinated with V1-30 `#27`).** Because restoring an
   older PostgreSQL dump rolls back in-database rows, V1-30's backup/export pipeline continuously
   or per-capture exports append-only, integrity-checked journal segments and a signed/checksummed
@@ -202,3 +205,13 @@ ADR 0040's volume-pinned 3-stage physical purge on the durable worker path.
 | **PR1 (this record)** | Concise ADR 0041 and [`DECISIONS.md`](../../DECISIONS.md) index update (`0039`–`0041`). No schema, code or fixture changes; `#16` remains open. |
 | **PR2 (Schema, store, journal and restore barrier)** | Additive migration (policy table/revision, `purge_after >= retained_at`, hold/reference indexes, append-only `deletion_journal`, `restore_reconciliation_gate`, role grants and `src/boundaries.sql`), `storage::begin_purge` reference/hold recheck, atomic `confirm_purge` journal append, scheduled worker `purge_due` integration and `openmettle-admin` journal export/replay gate. Isolated PostgreSQL 18 suite covering expiry boundaries (`grace = 0`, `now() == purge_after`), live-reference and concurrent-reattachment races, duplicate purge/retries, worker death across all stages without double release, storage/`OMQ03` failures and fail-closed journal lag/tamper replay gates. |
 | **PR3 (`/v1` API, admin routes and OpenAPI fixtures)** | Authenticated `/v1` artifact/revision disassociation and pre-expiry restore routes, audited `account_admin` retention-policy and deadline-preview/apply routes, restore-gate health/status surfacing, OpenAPI contract updates plus regenerated `contracts/fixtures/`, telemetry contract/alert updates if metrics are added, and authorization/concealment/redaction canary tests. |
+
+PR2 is delivered in two increments (23 November 2026). **PR2a** (migration 28) adds the
+retention policy and `retention_set_grace`, `purge_after >= retained_at`, operator-only holds,
+the reference predicate (`artifact_revision_pinned`) used by `begin_purge` and by a claim guard
+for every writer, the attach/hold row lock, and the hash-chained `deletion_journal` holding purge
+records only (journal fields for revocations and tombstones arrive with those events). Every
+attachment counts as live because no conversation or project tombstone exists yet; no knowledge
+links exist yet. Its suite covers expiry boundaries, races, retries, duplicates, interrupted
+stages and `OMQ03`. **PR2b** adds `restore_reconciliation_gate`, the `openmettle-admin` journal
+export/replay gate with lag and tamper checks, and worker `purge_due` scheduling.

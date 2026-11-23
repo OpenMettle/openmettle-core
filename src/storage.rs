@@ -3,8 +3,9 @@
 //! inside a savepoint and never commit. They keep counters consistent only for writers that
 //! use them; direct SQL by an application role can bypass that protocol.
 //!
-//! Lock order across helpers: run, reservation, artifact, revision, owner account, instance.
-//! Each helper follows it. Callers composing several helpers or owners in one transaction can
+//! Lock order across helpers: run, reservation, artifact, revision, volume control, owner
+//! account, instance, and at commit the deletion journal head (ADR 0040, ADR 0041). Each helper
+//! follows it. Callers composing several helpers or owners in one transaction can
 //! still deadlock (SQLSTATE 40P01): abandon the whole transaction and retry it with the same
 //! idempotency keys. Never infer success from a failed or interrupted commit.
 use crate::{
@@ -612,32 +613,33 @@ async fn lifecycle<T>(
 }
 
 /// Move an active revision to retained with `purge_after = now() + grace`, keeping its bytes
-/// charged. `grace_seconds` is the deployment's configured grace (30 days by default) and must
-/// be positive. A retry, or a call in any later state, returns the stored deadline unchanged.
+/// charged. The grace and the policy revision stamped with it come from the installation's
+/// `retention_policy` (30 days by default; 0, immediate purge eligibility, only when the
+/// operator's bounds allow it), read when this call runs: a concurrent policy change applies
+/// either wholly or not at all. A retry, or a call in any later state, returns the stored
+/// deadline unchanged.
 pub async fn retain_revision(
     tx: &mut WriteTransaction<'_>,
     scope: &str,
     revision: &str,
-    grace_seconds: u32,
 ) -> Result<String, Error> {
-    if grace_seconds == 0 {
-        return record(StorageOperation::Retain, Err(Error::Invalid));
-    }
     lifecycle(StorageOperation::Retain, tx, scope, revision, async |sp| {
         let (state, size, deadline, ..) = lock_revision(sp, scope, revision).await?;
         if state != "active" {
             return deadline.ok_or(Error::Invalid);
         }
+        // No row when the policy singleton is missing: refuse rather than guess a grace.
         let deadline: String = sqlx::query_scalar(
-            "UPDATE openmettle.artifact_revisions SET state='retained',
-             retained_at=now(),purge_after=now()+$3*interval '1 second'
-             WHERE scope_id=$1::uuid AND id=$2::uuid RETURNING purge_after::text",
+            "UPDATE openmettle.artifact_revisions r SET state='retained',retained_at=now(),
+             purge_after=now()+p.grace_seconds*interval '1 second',retention_policy_revision=p.revision
+             FROM openmettle.retention_policy p
+             WHERE p.id AND r.scope_id=$1::uuid AND r.id=$2::uuid RETURNING r.purge_after::text",
         )
         .bind(scope)
         .bind(revision)
-        .bind(i64::from(grace_seconds))
-        .fetch_one(&mut **sp)
-        .await?;
+        .fetch_optional(&mut **sp)
+        .await?
+        .ok_or(Error::NotFound)?;
         adjust(sp, scope, -size, size, 0).await?;
         Ok(deadline)
     })
@@ -658,8 +660,8 @@ pub async fn restore_revision(
             "retained" if before => {}
             _ => return Err(Error::NotEligible),
         }
-        sqlx::query("UPDATE openmettle.artifact_revisions SET state='active',retained_at=NULL,purge_after=NULL
-             WHERE scope_id=$1::uuid AND id=$2::uuid")
+        sqlx::query("UPDATE openmettle.artifact_revisions SET state='active',retained_at=NULL,purge_after=NULL,
+             retention_policy_revision=NULL WHERE scope_id=$1::uuid AND id=$2::uuid")
             .bind(scope).bind(revision).execute(&mut **sp).await?;
         adjust(sp, scope, size, -size, 0).await
     })
@@ -667,7 +669,19 @@ pub async fn restore_revision(
 }
 
 /// Claim an expired retained revision for purge. Bytes stay charged. Repeating the claim, or
-/// claiming a purged revision, is a no-op; before the deadline it is not eligible.
+/// claiming a purged revision, is a no-op. It is not eligible before the deadline, while its
+/// payload binding is unverified, or while `openmettle.artifact_revision_pinned` finds a
+/// reference: a message attachment, an operator hold, or its writing run still unfinished.
+///
+/// Requires `READ COMMITTED`; migration 28's claim guard fails the claim with SQLSTATE 25000
+/// under any other level, because the recheck must see references that other sessions commit
+/// while this one waits for the revision lock. Lock order: the revision row `FOR UPDATE`, then
+/// `storage_volume_control` `FOR SHARE` through migration 24's pin guard on the claim (OMQ03
+/// while unpinned or adopting). Every new attachment or hold first locks the revision row
+/// `FOR SHARE`, so it either commits before this lock is granted and the recheck (a later
+/// statement, with a newer snapshot) sees it, or it waits and then fails on `purging` (OMR01).
+/// Runs only move towards an outcome. The guarantee holds while this transaction keeps the row
+/// lock; once `purging` commits, no new reference or restore can succeed.
 pub async fn begin_purge(
     tx: &mut WriteTransaction<'_>,
     scope: &str,
@@ -679,15 +693,23 @@ pub async fn begin_purge(
         scope,
         revision,
         async |sp| {
-            let verified: bool = sqlx::query_scalar("SELECT NOT s.adoption_unverified AND s.payload_ino IS NOT NULL
-                FROM openmettle.storage_reservations s JOIN openmettle.artifact_revisions r
-                ON r.scope_id=s.scope_id AND s.id=r.reservation_id WHERE r.scope_id=$1::uuid AND r.id=$2::uuid")
-                .bind(scope).bind(revision).fetch_optional(&mut **sp).await?.ok_or(Error::NotFound)?;
-            if !verified { return Err(Error::NotEligible); }
             let (state, _, _, _, due, _) = lock_revision(sp, scope, revision).await?;
+            let recheck = state == "retained" && due;
+            let eligible: bool = sqlx::query_scalar(
+                "SELECT NOT s.adoption_unverified AND s.payload_ino IS NOT NULL
+                    AND NOT ($3 AND openmettle.artifact_revision_pinned(r.scope_id, r.id))
+                 FROM openmettle.artifact_revisions r JOIN openmettle.storage_reservations s
+                 ON s.scope_id=r.scope_id AND s.id=r.reservation_id WHERE r.scope_id=$1::uuid AND r.id=$2::uuid",
+            )
+            .bind(scope)
+            .bind(revision)
+            .bind(recheck)
+            .fetch_one(&mut **sp)
+            .await?;
             match state.as_str() {
+                _ if !eligible => return Err(Error::NotEligible),
                 "purging" | "purged" => return Ok(()),
-                "retained" if due => {}
+                _ if recheck => {}
                 _ => return Err(Error::NotEligible),
             }
             sqlx::query(
@@ -706,7 +728,9 @@ pub async fn begin_purge(
 
 /// Record that payload deletion succeeded and stop charging the bytes. Requires a purge claim
 /// committed by an earlier transaction. Repeated confirmation is a no-op and never decrements
-/// twice.
+/// twice. Migration 28's deferred trigger appends the revision's `deletion_journal` record when
+/// the caller commits, taking the journal head lock after every storage lock; a confirmation
+/// that rolls back (or whose commit fails) leaves neither the purge nor a record.
 pub async fn confirm_purge(
     tx: &mut WriteTransaction<'_>,
     scope: &str,
