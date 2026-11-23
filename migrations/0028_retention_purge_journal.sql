@@ -79,8 +79,11 @@ BEGIN
         RAISE EXCEPTION 'retention policy changes require READ COMMITTED' USING ERRCODE = '25000';
     END IF;
     PERFORM FROM openmettle.account_admin_lock WHERE id FOR NO KEY UPDATE;
-    IF NOT EXISTS (SELECT FROM openmettle.account_admins a JOIN openmettle.users u ON u.id = a.user_id
-                    WHERE a.user_id = p_actor AND a.active AND u.disabled_at IS NULL) THEN
+    -- sessions::disable_user locks only the user row: hold it FOR SHARE so a disable in flight
+    -- is waited for and rechecked, and a later one waits for this change to commit.
+    PERFORM FROM openmettle.account_admins a JOIN openmettle.users u ON u.id = a.user_id
+     WHERE a.user_id = p_actor AND a.active AND u.disabled_at IS NULL FOR SHARE OF u;
+    IF NOT FOUND THEN
         RAISE EXCEPTION 'administrator required' USING ERRCODE = '42501';
     END IF;
     SELECT * INTO STRICT prior FROM openmettle.retention_policy WHERE id FOR UPDATE;

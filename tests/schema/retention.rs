@@ -881,21 +881,31 @@ async fn schema_27_removals_and_claims_complete_after_the_upgrade_with_one_journ
     .await
     .unwrap();
     assert_eq!(recorded, [(free.clone(), None), (claimed.clone(), None)]);
-    // The operator query in docs/operator: purges of a referenced revision claimed before the
-    // upgrade.
-    let legacy: Vec<String> = sqlx::query_scalar(
+    // An operator-forced (break-glass) purge of the other attached revision after the upgrade.
+    sqlx::query(
+        "UPDATE openmettle.artifact_revisions SET state = 'purging', purging_at = now() WHERE id = $1::uuid",
+    )
+    .bind(attached)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    step(&db.0, &c.scope, attached, Step::Confirm)
+        .await
+        .unwrap();
+    // The operator query in docs/operator lists every journaled purge of a revision that is
+    // still attached: claims made before the upgrade completed, and operator-forced purges.
+    let attached_purges: Vec<String> = sqlx::query_scalar(
         "SELECT j.entity_id::text FROM openmettle.deletion_journal j
-           JOIN openmettle.artifact_revisions r ON r.id = j.entity_id
-          WHERE r.purging_at < (SELECT installed_on FROM openmettle._sqlx_migrations WHERE version = 28)
-            AND EXISTS (SELECT FROM openmettle.message_parts p
-                         WHERE p.scope_id = j.scope_id AND p.artifact_revision_id = j.entity_id)",
+          WHERE EXISTS (SELECT FROM openmettle.message_parts p
+                         WHERE p.scope_id = j.scope_id AND p.artifact_revision_id = j.entity_id)
+          ORDER BY j.journal_seq",
     )
     .fetch_all(&mut owner)
     .await
     .unwrap();
-    assert_eq!(legacy, std::slice::from_ref(claimed));
+    assert_eq!(attached_purges, [claimed.clone(), attached.clone()]);
     assert_chain(&db).await;
-    assert_eq!(account(&db, &c.scope).await, (0, 10, 0));
+    assert_eq!(account(&db, &c.scope).await, (0, 0, 0));
     assert_totals(&db).await;
 }
 
@@ -1081,6 +1091,37 @@ async fn a_demoted_administrator_cannot_change_the_policy() {
         assert_eq!(revision(&mut owner).await, before);
         demote(&mut owner, true).await;
     }
+    // sessions::disable_user locks only the user row, not account_admin_lock: the setter waits
+    // for a disable in flight and is refused once it commits.
+    let mut disabler = connect(&db.0, API).await;
+    let holder = pid(&mut disabler).await;
+    let mut tx = WriteTransaction::begin(&mut disabler).await.unwrap();
+    for sql in [
+        "SELECT session_generation FROM openmettle.users WHERE id = $1::uuid FOR UPDATE",
+        "UPDATE openmettle.users SET disabled_at = GREATEST(created_at, clock_timestamp()),
+             session_generation = session_generation + 1 WHERE id = $1::uuid",
+    ] {
+        sqlx::query(sql)
+            .bind(&admin)
+            .execute(tx.connection().unwrap())
+            .await
+            .unwrap();
+    }
+    let setter = tokio::spawn({
+        let (db, admin) = (db.0.clone(), admin.clone());
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT openmettle.retention_set_grace($1::uuid, 60, 'synthetic', 'disabled')",
+            )
+            .bind(&admin)
+            .fetch_one(&mut connect(&db, API).await)
+            .await
+        }
+    });
+    wait_for_blocked_peer(&db, holder).await;
+    tx.commit().await.unwrap();
+    assert_eq!(sqlstate(setter.await.unwrap()), "42501");
+    assert_eq!(revision(&mut owner).await, before);
 }
 
 #[tokio::test]

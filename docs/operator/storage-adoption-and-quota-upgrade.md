@@ -98,14 +98,12 @@ SELECT r.id FROM openmettle.artifact_revisions r
                 WHERE p.scope_id = r.scope_id AND p.artifact_revision_id = r.id);
 ```
 
-After they complete, their journal records identify them:
+At any time afterwards, this lists every journaled purge whose revision is still attached. Each one is either a claim made before the upgrade completed or an operator-forced (break-glass) purge. Schema `0028` never claims an attached revision otherwise.
 
 ```sql
 SELECT j.journal_seq, j.entity_id
   FROM openmettle.deletion_journal j
-  JOIN openmettle.artifact_revisions r ON r.id = j.entity_id
- WHERE r.purging_at < (SELECT installed_on FROM openmettle._sqlx_migrations WHERE version = 28)
-   AND EXISTS (SELECT FROM openmettle.message_parts p
+ WHERE EXISTS (SELECT FROM openmettle.message_parts p
                 WHERE p.scope_id = j.scope_id AND p.artifact_revision_id = j.entity_id);
 ```
 
