@@ -93,10 +93,17 @@ jobs:
             # Invitation codes (schema 13): the block B merge, the last release before native sign-in.
             13 615dcffc93af18ab0db40a7a2fafc3c0752d4c77
           RELEASES
+      # ADR 0043: the packaged worker's transport refuses loopback, so its schema tests reach the
+      # synthetic TLS gateway on a private address held by the loopback interface, named here.
+      - name: Name a private address for the packaged worker's gateway fixture
+        run: |
+          sudo ip address add 10.213.0.1/32 dev lo
+          printf '10.213.0.1 gateway.worker.test\n' | sudo tee -a /etc/hosts >/dev/null
       # POSTGRES_CONTAINER runs the exact ADR 0014 operator scripts with the pinned service psql.
       - name: PostgreSQL schema, migration and role integration
         run: cargo test --locked --offline --test schema -- --ignored
         env:
+          TEST_GATEWAY_HOST: gateway.worker.test
           POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
           V13_BINARY_DIR: ${{ runner.temp }}/openmettle-v13/target/debug
           V12_BINARY_DIR: ${{ runner.temp }}/openmettle-v12/target/debug

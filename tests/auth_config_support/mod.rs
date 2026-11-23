@@ -134,3 +134,43 @@ pub fn cursor_keys(dir: &Dir) -> Value {
     json!({"active":{"id":"cursor-b","path":dir.write("cursor-b", &[2;32])},
         "verify_only":[{"id":"cursor-a","path":dir.write("cursor-a", &[1;32])}]})
 }
+
+/// A valid worker inference document (ADR 0043) for every model of `catalog`: the catalog
+/// file, one synthetic gateway key and `bundle` written to `dir`, and one non-streamed Chat
+/// Completions route per model at `https://{authority}/v1/chat/completions`. Tests set the
+/// installation, key ring and private ranges through JSON pointers.
+#[allow(dead_code)] // The contract tests start no worker.
+pub fn inference_document(dir: &Dir, catalog: &Value, bundle: &[u8], authority: &str) -> Value {
+    let bundle = dir.write("gateway-ca.pem", bundle);
+    let routes: serde_json::Map<String, Value> = catalog["models"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(model, profile)| {
+            let route = json!({
+                "endpoint": format!("https://{authority}/v1/chat/completions"),
+                "trust": {"roots": "bundle", "bundle_path": bundle},
+                "private_cidrs": [],
+                "pin": profile["pin"],
+                "protocol": "chat_completions",
+                "stream": false,
+                "images": false,
+                "usage": true,
+                "setup_timeout_milliseconds": 5000,
+                "idle_timeout_milliseconds": 45000,
+                "overall_timeout_milliseconds": 50000
+            });
+            (model.clone(), route)
+        })
+        .collect();
+    json!({
+        "version": 1,
+        "catalog_file": dir.write("catalog.json", catalog.to_string().as_bytes()),
+        "installation": "00000000-0000-4000-8000-0000000000c1",
+        "gateway_keys": {
+            "active": {"id": "gateway-b", "path": dir.write("gateway-key-b", &[0xc2; 32])},
+            "decrypt_only": [{"id": "gateway-a", "path": dir.write("gateway-key-a", &[0xc1; 32])}]
+        },
+        "routes": routes
+    })
+}

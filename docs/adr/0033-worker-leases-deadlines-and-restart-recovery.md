@@ -553,7 +553,9 @@ is one renewal per `L/3`. The number of slots a pool sustains is not measured he
 
 Policy values have no default, as in ADR 0032. The binary has no executor until V1-07 provides
 the model and tool loop, so PR3 refuses `RUN_SLOTS` until then (exit 78) and the maintenance
-sweeps are the worker's only work.
+sweeps are the worker's only work. *(Amended by
+[ADR 0043](0043-packaged-worker-inference-configuration.md): the binary accepts `RUN_SLOTS`
+together with `OPENMETTLE_WORKER_INFERENCE_CONFIG` and runs the turn executor.)*
 
 ### Lock order
 

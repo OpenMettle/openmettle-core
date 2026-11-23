@@ -3,6 +3,9 @@
 //! browser sign-in, optional native sign-in, and the authenticated `/v1` routes.
 //! Artifact payloads require `OPENMETTLE_API_ARTIFACTS_DIR` (ADR 0031). Run snapshots
 //! and replayable event streams require cursor keys in the auth document (ADR 0034).
+//! The worker runs maintenance sweeps; with `OPENMETTLE_WORKER_RUN_SLOTS` and an
+//! `OPENMETTLE_WORKER_INFERENCE_CONFIG` document it also executes metered turn rounds
+//! (ADRs 0033 and 0043).
 pub mod artifact_fs;
 pub mod auth;
 pub mod auth_config;
@@ -36,7 +39,7 @@ use sqlx::{
     ConnectOptions, PgPool,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{future::Future, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use telemetry::{Process, ProcessFailure, Signal};
 
 #[derive(Clone, Copy)]
@@ -45,7 +48,8 @@ pub enum Role {
     Worker,
 }
 
-/// Validated ADR 0033 settings. The library runner can accept a run policy with an executor.
+/// Validated ADR 0033 settings. A run policy needs an executor: the binary builds the packaged
+/// turn executor from `INFERENCE_CONFIG` (ADR 0043).
 #[derive(Clone, Copy, Debug)]
 pub struct WorkerSettings {
     sweep: Duration,
@@ -60,7 +64,8 @@ struct RunPolicy {
     limits: authz::runs::ClaimLimits,
 }
 
-const WORKER_KEYS: [&str; 7] = [
+/// Worker run settings. The API refuses each under either prefix.
+const WORKER_KEYS: [&str; 8] = [
     "SWEEP_MS",
     "POLL_MS",
     "RUN_SLOTS",
@@ -68,6 +73,7 @@ const WORKER_KEYS: [&str; 7] = [
     "EXECUTION_TIMEOUT_MS",
     "EXECUTING_PER_ACTOR",
     "EXECUTING_PER_SCOPE",
+    "INFERENCE_CONFIG",
 ];
 
 impl WorkerSettings {
@@ -86,7 +92,7 @@ impl WorkerSettings {
                 })
                 .transpose()
         };
-        let [sweep, poll, slots, lease, execution, actor, scope] = WORKER_KEYS;
+        let [sweep, poll, slots, lease, execution, actor, scope, _] = WORKER_KEYS;
         let millis = |n: u32| Duration::from_millis(n.into());
         let sweep = millis(number(sweep, 1000, 3_600_000)?.unwrap_or(60_000));
         let poll = millis(number(poll, 100, 60_000)?.unwrap_or(1000));
@@ -150,6 +156,9 @@ struct Config {
     /// [`artifact_fs::Store::open`] before telemetry starts. `None` leaves artifact file I/O
     /// disabled.
     artifacts_dir: Option<PathBuf>,
+    /// `OPENMETTLE_WORKER_INFERENCE_CONFIG` (ADR 0043): the worker's inference document, set
+    /// exactly when `RUN_SLOTS` is. Always `None` for the API.
+    inference_config: Option<PathBuf>,
 }
 
 /// ADR 0030: the API's issuance credential, mounted into the API container only.
@@ -231,9 +240,18 @@ impl Config {
             Role::Worker => {
                 let settings =
                     WorkerSettings::parse(config.database_timeout, |key| env_var(prefix, key))?;
-                if settings.policy.is_some() {
-                    return Err("RUN_SLOTS requires a worker executor");
+                // Slots need the executor's document and the document needs slots: neither
+                // falls back to maintenance alone or is silently ignored.
+                let path = env_var(prefix, "INFERENCE_CONFIG")?.map(PathBuf::from);
+                match (&settings.policy, &path) {
+                    (Some(_), None) => return Err("RUN_SLOTS requires INFERENCE_CONFIG"),
+                    (None, Some(_)) => return Err("INFERENCE_CONFIG requires RUN_SLOTS"),
+                    (_, Some(path)) if !path.is_absolute() => {
+                        return Err("invalid INFERENCE_CONFIG");
+                    }
+                    _ => {}
                 }
+                config.inference_config = path;
                 config.worker = Some(settings);
             }
         }
@@ -322,6 +340,7 @@ impl Config {
             auth_config,
             issuance,
             artifacts_dir,
+            inference_config: None,
         })
     }
 }
@@ -479,6 +498,16 @@ pub async fn run(role: Role) -> u8 {
             return 78;
         }
     };
+    // The worker's inference document and the files it names are read here as well: local files
+    // only, with one fixed category line (ADR 0043).
+    let inference = match config.inference_config.as_deref().map(worker::config::load) {
+        None => None,
+        Some(Ok(loaded)) => Some(loaded),
+        Some(Err(error)) => {
+            eprintln!("inference configuration error: {error}");
+            return 78;
+        }
+    };
     // The artifacts directory must exist as a real directory with usable subdirectories. It
     // is opened once; the API's `/v1` routes use this store.
     let artifacts = match config
@@ -527,18 +556,26 @@ pub async fn run(role: Role) -> u8 {
             return 1;
         }
     };
+    // `Config::load` pairs a run policy with the inference document, so slots always get
+    // the executor and maintenance alone runs only without slots.
+    let worker = config.worker.map(|settings| WorkerRuntime {
+        settings,
+        executor: settings.policy.zip(inference).map(|(policy, inference)| {
+            let executor = worker::turns::TurnExecutor::new(
+                pool.clone(),
+                inference.catalog,
+                policy.leases,
+                inference.routes,
+            );
+            Arc::new(match &artifacts {
+                Some(store) => executor.with_artifacts(store.clone()),
+                None => executor,
+            })
+        }),
+        store: artifacts,
+    });
     let (drain, flush) = shutdown_budget(config.shutdown_timeout);
-    let code = match serve(
-        config.bind,
-        app,
-        pool,
-        issuance,
-        process,
-        drain,
-        config.worker.map(|settings| (settings, artifacts)),
-    )
-    .await
-    {
+    let code = match serve(config.bind, app, pool, issuance, process, drain, worker).await {
         Ok(()) => {
             telemetry::process_stopped(process);
             0
@@ -577,6 +614,31 @@ fn lazy_pool(options: &PgConnectOptions, connections: u32, timeout: Duration) ->
         .connect_lazy_with(options.clone())
 }
 
+/// The worker's work beside its probes: maintenance sweeps, and with run slots the ADR 0033
+/// run loop over the packaged turn executor (ADR 0043).
+struct WorkerRuntime {
+    settings: WorkerSettings,
+    store: Option<artifact_fs::Store>,
+    executor: Option<Arc<worker::turns::TurnExecutor<worker::config::GatewayRoutes>>>,
+}
+
+impl WorkerRuntime {
+    /// Works until `shutdown`, then drains claimed runs for at most `run_budget`.
+    async fn run(self, pool: &PgPool, shutdown: impl Future<Output = ()>, run_budget: Duration) {
+        let store = self.store.as_ref();
+        match self.executor {
+            Some(executor) => {
+                worker::run(pool, store, self.settings, executor, shutdown, run_budget).await;
+            }
+            // Dropping maintenance at shutdown stops polling and rolls back its transaction.
+            None => tokio::select! {
+                () = shutdown => {}
+                () = worker::maintenance(pool, store, self.settings.sweep) => {}
+            },
+        }
+    }
+}
+
 async fn serve(
     bind: SocketAddr,
     app: Router,
@@ -584,7 +646,7 @@ async fn serve(
     issuance: Option<PgPool>,
     process: Process,
     drain: Duration,
-    worker: Option<(WorkerSettings, Option<artifact_fs::Store>)>,
+    worker: Option<WorkerRuntime>,
 ) -> Result<(), ProcessFailure> {
     // Install signal handlers before opening the listener.
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -604,24 +666,34 @@ async fn serve(
     let server = std::future::IntoFuture::into_future(server);
     tokio::pin!(server);
     telemetry::process_started(process);
-    // Dropping maintenance at the signal stops polling and rolls back in-flight transactions.
+    // ADR 0033: claimed runs drain within half the drain budget while the probes keep serving;
+    // HTTP shutdown and the pool close get the rest. The API has no background work.
     let http_budget = if worker.is_some() {
         drain - drain / 2
     } else {
         drain
     };
+    let (stop_worker, worker_stopping) = tokio::sync::oneshot::channel::<()>();
+    let background = async {
+        let stopping = async {
+            let _ = worker_stopping.await;
+        };
+        match worker {
+            Some(worker) => worker.run(&pool, stopping, drain / 2).await,
+            None => stopping.await,
+        }
+    };
+    tokio::pin!(background);
     let signal = tokio::select! {
-        _ = async {
-            if let Some((settings, store)) = worker {
-                worker::maintenance(&pool, store.as_ref(), settings.sweep).await;
-            }
-            std::future::pending::<()>().await
-        } => unreachable!(),
+        // Every branch above waits for `stop_worker`, which is held until the signal.
+        () = &mut background => unreachable!(),
         result = &mut server => return result.map_err(|_| ProcessFailure::Server),
         _ = terminate.recv() => Signal::Terminate,
         _ = interrupt.recv() => Signal::Interrupt,
     };
     telemetry::process_stopping(process, signal);
+    let _ = stop_worker.send(());
+    background.await;
     stream_stop.send_replace(true);
     let _ = stop_tx.send(());
     tokio::time::timeout(http_budget, async {
