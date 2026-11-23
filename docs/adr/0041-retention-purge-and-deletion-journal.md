@@ -219,3 +219,24 @@ referenced (it was valid then, and its payload may be partly gone). Because deci
 wall clock after their locks, the suite covers grace 0 and a just-reached deadline rather than
 the equal instant, plus races, retries, duplicates, interrupted stages and `OMQ03`. **PR2b** adds `restore_reconciliation_gate`, the `openmettle-admin` journal
 export/replay gate with lag and tamper checks, and worker `purge_due` scheduling.
+
+PR2b (migration 29, 23 November 2026) settles what the barrier above leaves open:
+
+- **Closing.** A database cannot detect that it was restored, and a backup holds the gate open,
+  so the restore procedure closes it (`openmettle-admin restore lock --required-seq N`) before
+  any process starts; V1-30 must make that step part of every restore. `required_journal_seq` is
+  the larger of the restored head and the newest watermark known independently of the export.
+- **While closed.** A trigger refuses every application role's move into `purging` or `purged`
+  (`OMR02`), so no writer, including a previous release, can fork the restored journal. The
+  worker binary claims no run and skips `purge_due`, which ADR 0033 already schedules; PR2b
+  only gates it. The API's `503` is PR3, so until then the API stays stopped.
+- **Replay.** Records are stored verbatim after matching or extending the restored chain. A
+  journaled revision still unpurged moves to `purging` under the journal's original deadline,
+  and the volume-pinned purge removes its payload and releases its bytes once. The gate opens
+  only if the restored journal ends at the export's watermark and reaches the requirement, no
+  journaled revision is unpurged and the accounting verification is healthy. No reference is
+  stripped: without tombstones a restored attachment or hold on a purged revision is the state
+  an owner break-glass purge leaves live, and its content is gone either way.
+- **Limits.** The export is checksummed, not signed (signing belongs to V1-30). Only confirmed
+  purges are journaled; PR3's removal route must also journal deadline commitments, because a
+  removal after the backup is otherwise undone by a restore. No released binary performs one.

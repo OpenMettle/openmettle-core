@@ -107,6 +107,51 @@ SELECT j.journal_seq, j.entity_id
                 WHERE p.scope_id = j.scope_id AND p.artifact_revision_id = j.entity_id);
 ```
 
+## Upgrade from 0028 to 0029 (restore gate)
+
+Migration `0029` adds `openmettle.restore_reconciliation_gate` and needs no activation step. Apply it with `openmettle-migrate` and roll the API and worker deployments. The gate starts open, because a live database is not a restore, and the deletion journal is unchanged: purges after the upgrade continue the same hash chain.
+
+- Previous-release workers purge as before while the gate is open. Once an operator closes it (only during a restore), their purge claims and confirmations fail with SQLSTATE `OMR02`, logged as `worker.sweep.failed` for `purge_due`, but they still claim runs. Never start a `0028` worker against a restored database.
+- No previous-release API or admin binary reads or changes the gate.
+
+## Restore the deletion journal after a database restore
+
+A database cannot tell that it was restored, and a backup carries the gate as it was when the backup was taken, normally open. The restore procedure therefore closes it before any API or worker starts. While it is closed, no application role can move a revision into `purging` or `purged` (`OMR02`), so nothing appends to the restored journal, and `openmettle-worker` claims no run and runs no purge sweep. The API does not read the gate in this release (V1-16 PR3 adds `503 unavailable`), so keep it stopped until the gate opens.
+
+**Export.** Run the export with every backup, as the owner, and keep the file outside the primary storage failure domain for the full backup retention. The command refuses to overwrite an existing file and prints the export's watermark, `watermark <journal_seq> <chain_digest> <exported_at Unix microseconds>`. Record that line separately from the export file, for example with the recovery set. The export carries a SHA-256 checksum that detects damage, not forgery: it is not signed.
+
+```sh
+openmettle-admin journal export "$EXPORT_FILE"
+```
+
+**Restore.** With the API and worker stopped and PostgreSQL and the artifact volume restored to the same recovery point:
+
+1. Restore database-level privileges if the restore method does not: migration 1 revokes `PUBLIC` access to the database and grants `CONNECT` to the application roles, and the migrator refuses a database where `PUBLIC` keeps it. Run `openmettle-migrate` if the backup predates the release. A backup from before `0029` gets an open gate from the migration, like any other.
+2. Close the gate, naming the newest watermark sequence recorded independently of the export you will replay. The gate records the restored journal head as its snapshot and requires the larger of the two. Closing a closed gate keeps its snapshot and only raises the requirement.
+
+   ```sh
+   openmettle-admin restore lock --required-seq "$WATERMARK_SEQ"
+   ```
+
+3. Replay the newest export. Pass the artifact root; it may be omitted only when no volume is pinned.
+
+   ```sh
+   openmettle-admin restore replay "$EXPORT_FILE" "$ARTIFACT_ROOT"
+   ```
+
+Replay first applies every record in one transaction, or none. A record already in the restored journal must match it exactly; each later record must extend its hash chain and is stored verbatim. A revision the restored database still holds unpurged moves to `purging` under the journal's original deadline, never a new grace window. Restored revisions that the journal does not name keep their stored deadlines. Replay then deletes the resurrected payloads through the volume-pinned purge, releasing each revision's bytes once, runs the accounting verification, and opens the gate only if the restored journal ends at the export's watermark, reaches the required sequence and names no unpurged revision. Any failure leaves the gate closed. Rerunning after a fix resumes where the previous attempt stopped.
+
+| Failure | Meaning |
+| --- | --- |
+| `invalid export: …` | The file is damaged or truncated, or its records are out of order or have a gap. Use an intact copy. |
+| `OMR02` | The gate is not closed. |
+| `OMR03` | A record differs from the restored journal, does not extend its chain, or names a revision with other content: a wrong, altered or forged export, or a backup from another deployment. |
+| `OMR04` | The export ends before the restored journal (it is older than the backup) or before the required sequence. Find a newer export; records never exported cannot be reconstructed. |
+| `OMR05` | A replayed revision is still unpurged, for example because its payload binding is unverified or quarantined. Repair it and rerun. |
+| `accounting drift detected` | Run `openmettle-admin quota verify "$ARTIFACT_ROOT"` and repair before rerunning. |
+
+Then continue with the README's database restore checklist and start the worker. This release journals confirmed purges only. A removal made after the backup but not yet purged is not journaled, so its revision is active again after the restore; no route performs removals until V1-16 PR3, which must journal them. Revocations and tombstones are not journaled yet either.
+
 ## Monitor overdue handoffs
 
 The worker records up to 100 overdue committed handoffs per maintenance sweep in `openmettle_quota_overdue_handoffs_total`. The counter measures observations across sweeps. An outstanding handoff can contribute more than once. Use the database ledger to identify the holds. The observation leaves quota charges intact.
