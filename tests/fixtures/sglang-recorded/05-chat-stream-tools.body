@@ -1,0 +1,27 @@
+data: {"id":"d436edac5e71449a977e6d7015ae5694","object":"chat.completion.chunk","created":1795450127,"model":"recorded-sglang-model","choices":[{"index":0,"delta":{"reasoning_content":null,"role":"assistant","content":""},"logprobs":null,"finish_reason":null,"matched_stop":null}]}
+
+data: {"id":"d436edac5e71449a977e6d7015ae5694","object":"chat.completion.chunk","created":1795450127,"model":"recorded-sglang-model","choices":[{"index":0,"delta":{"role":null,"content":null,"reasoning_content":null,"tool_calls":[{"id":"call_34ecef725cee46718265ef1a","index":0,"type":"function","function":{"name":"get_weather","arguments":""}}]},"logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"d436edac5e71449a977e6d7015ae5694","object":"chat.completion.chunk","created":1795450127,"model":"recorded-sglang-model","choices":[{"index":0,"delta":{"role":null,"content":null,"reasoning_content":null,"tool_calls":[{"id":null,"index":0,"type":"function","function":{"name":null,"arguments":"{"}}]},"logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"d436edac5e71449a977e6d7015ae5694","object":"chat.completion.chunk","created":1795450127,"model":"recorded-sglang-model","choices":[{"index":0,"delta":{"role":null,"content":null,"reasoning_content":null,"tool_calls":[{"id":null,"index":0,"type":"function","function":{"name":null,"arguments":"\"city\": \"Paris\""}}]},"logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"d436edac5e71449a977e6d7015ae5694","object":"chat.completion.chunk","created":1795450127,"model":"recorded-sglang-model","choices":[{"index":0,"delta":{"role":null,"content":"\n","reasoning_content":null},"logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"d436edac5e71449a977e6d7015ae5694","object":"chat.completion.chunk","created":1795450127,"model":"recorded-sglang-model","choices":[{"index":0,"delta":{"role":null,"content":null,"reasoning_content":null,"tool_calls":[{"id":null,"index":0,"type":"function","function":{"name":null,"arguments":"}"}}]},"logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"d436edac5e71449a977e6d7015ae5694","object":"chat.completion.chunk","created":1795450127,"model":"recorded-sglang-model","choices":[{"index":0,"delta":{"role":null,"content":null,"reasoning_content":null,"tool_calls":[{"id":"call_db80d6f4519142a3a89c2452","index":1,"type":"function","function":{"name":"get_time","arguments":""}}]},"logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"d436edac5e71449a977e6d7015ae5694","object":"chat.completion.chunk","created":1795450127,"model":"recorded-sglang-model","choices":[{"index":0,"delta":{"role":null,"content":null,"reasoning_content":null,"tool_calls":[{"id":null,"index":1,"type":"function","function":{"name":null,"arguments":"{"}}]},"logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"d436edac5e71449a977e6d7015ae5694","object":"chat.completion.chunk","created":1795450127,"model":"recorded-sglang-model","choices":[{"index":0,"delta":{"role":null,"content":null,"reasoning_content":null,"tool_calls":[{"id":null,"index":1,"type":"function","function":{"name":null,"arguments":"\"city\": \"Paris\""}}]},"logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"d436edac5e71449a977e6d7015ae5694","object":"chat.completion.chunk","created":1795450127,"model":"recorded-sglang-model","choices":[{"index":0,"delta":{"role":null,"content":null,"reasoning_content":null,"tool_calls":[{"id":null,"index":1,"type":"function","function":{"name":null,"arguments":"}"}}]},"logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}
+
+data: {"id":"d436edac5e71449a977e6d7015ae5694","object":"chat.completion.chunk","created":1795450127,"model":"recorded-sglang-model","choices":[{"index":0,"delta":{"reasoning_content":null},"logprobs":null,"finish_reason":"tool_calls","matched_stop":248046}]}
+
+data: {"id":"d436edac5e71449a977e6d7015ae5694","object":"chat.completion.chunk","created":1795450127,"model":"recorded-sglang-model","choices":[],"usage":{"prompt_tokens":354,"total_tokens":406,"completion_tokens":52,"prompt_tokens_details":{"cached_tokens":0},"reasoning_tokens":0,"completion_tokens_details":null}}
+
+data: [DONE]
+
+
