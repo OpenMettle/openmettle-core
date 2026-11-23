@@ -3,9 +3,10 @@
 Accepted with its implementation, 23 November 2026 (V1-07 worker activation). Refs #8 and #11.
 Builds on [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md) (leases and the run
 loop), [ADR 0036](0036-conversation-branches-presets-and-effective-model-config.md) (catalog and
-turn executor), [ADR 0037](0037-gateway-provisioning-and-usage-reconciliation.md) (per-user
-gateway keys and reservations) and [ADR 0038](0038-sglang-and-external-provider-conformance-adapter.md)
-(route qualification).
+turn executor), [ADR 0037](0037-gateway-provisioning-and-usage-reconciliation.md) (reservations,
+handoff and settlement) and [ADR 0038](0038-sglang-and-external-provider-conformance-adapter.md)
+(route qualification). The dispatch credential source in this record is provisional; see
+[Dispatch credential](#dispatch-credential-provisional).
 
 ## Problem
 
@@ -42,8 +43,8 @@ worker run settings.
 | --- | --- |
 | `version` | `1` |
 | `catalog_file` | The catalog file the API mounts. Admission pins its revision and profiles. |
-| `installation` | Canonical lowercase UUID of the gateway installation whose bindings the worker dispatches under. |
-| `gateway_keys` | `active` and `decrypt_only` key files. They use the format and limits of the API document's member: 32 raw bytes each, one active key and up to three previous keys, distinct IDs and material. |
+| `installation` | Canonical lowercase UUID of the gateway installation the worker dispatches under. Provisional. |
+| `gateway_keys` | The API document's `gateway_keys` member, reused unchanged: `active` and `decrypt_only` key files of 32 raw bytes, at most four keys, distinct IDs and material. Provisional. |
 | `routes` | One member per catalog model ID, and no others. |
 
 Each route has these members:
@@ -79,9 +80,8 @@ line never contains a value, path, URL, identifier or key byte.
 ### Execution
 
 The binary builds `TurnExecutor` with `worker::config::GatewayRoutes`. Every round uses
-`Route::metered`: the reservation, the fenced handoff that unseals the admitted actor's own key,
-the `x-request-id` correlation and settlement inputs are the library's, unchanged. The packaged
-binary has no static or shared bearer route. `Route::bearer` remains a library path.
+`Route::metered`: the reservation, the fenced handoff, the `x-request-id` correlation committed
+before the send and the settlement inputs are the library's, unchanged.
 
 The worker offers no tools. Function, parallel-call and separator qualifications stay off until
 V1-14 wires reviewed tool rounds, and a model tool call fails the turn. With
@@ -92,16 +92,27 @@ keep serving. HTTP shutdown and the pool close use the rest. A round in flight a
 stops, and the lease is handed back for immediate re-claim. A round already handed to the
 gateway counts against the run's budget, and its request keeps its hold for usage settlement.
 
-### Key material
+### Dispatch credential (provisional)
 
-The wrapping keys are shared. The worker must unseal the envelopes that the reconciliation
-process seals, so its ring holds the same key bytes. The mounts are separate. The worker's
-document names only the catalog, the gateway ring and route trust bundles. The worker never
-reads the API's document, login keys, cursor keys, issuance credential or provider settings.
-Project only the gateway ring into the worker's volume. The ADR 0037 cross-ring separation
-check stays in the API's offline check, which compares the gateway ring with the login and
-cursor rings when the API document names it. The worker sees no other ring, so it cannot repeat
-that check.
+On 23 November 2026 the owner decided that the inference gateway becomes a forwarding and
+metering proxy, authorized per request by an OpenMettle-owned endpoint against OpenMettle's
+database. The gateway will no longer hold per-user virtual keys. A later gateway-authorization
+increment amends ADR 0037 and defines what the worker presents at dispatch. This record does not
+amend ADR 0037.
+
+Until then, the worker uses the library's current credential path unchanged: the fenced handoff
+opens the admitted user's sealed gateway key with the configured ring and sends it as the
+bearer. This increment does only what that path requires. It reuses the API document's
+`gateway_keys` format, reads the ring in one statement of the loader and supplies it in one
+place, `GatewayRoutes::route`. It defines no distribution, rotation or operator procedure for
+the ring. The replacement changes `installation`, `gateway_keys` and that method, and nothing
+else in the worker.
+
+The worker's document is separate from the API's. The worker never reads the API's document,
+login keys, cursor keys, issuance credential or provider settings. Today the worker's ring holds
+the same key bytes as the sealing ring, because it opens the same envelopes. The ADR 0037
+cross-ring separation check runs only in the API's offline check, when the API document names
+the ring.
 
 ## Process contract
 
@@ -110,15 +121,16 @@ that check.
 exercises (as in ADRs 0025 and 0031). To enable turns, deploy must:
 
 - set `RUN_SLOTS`, the ADR 0033 lease and claim settings and `INFERENCE_CONFIG`;
-- mount the document, the API's catalog file, the gateway ring and any trust bundles read-only;
+- mount the document, the API's catalog file, any trust bundles and, provisionally, the gateway
+  ring read-only;
 - allow egress from the worker to the gateway endpoints only;
 - size `SHUTDOWN_TIMEOUT_MS` and the pod's termination grace period for the drain.
 
 ## Alternatives
 
 - **Load the API's document.** Rejected: its loader reads login keys and provider settings.
-- **Environment variables for routes.** Rejected: ADR 0037 forbids key material in variables,
-  and per-model qualification does not fit flat keys.
+- **Environment variables for routes.** Rejected: per-model qualification does not fit flat
+  keys, and file references keep any credential material out of the environment.
 - **Take the pin from the catalog.** Rejected: a catalog edit would re-qualify a route silently.
   ADR 0038 qualifies only the tested profile and route.
 - **Allow models without a route.** Rejected: runs would fail at dispatch instead of startup.
@@ -128,7 +140,9 @@ exercises (as in ADRs 0025 and 0031). To enable turns, deploy must:
 ## Consequences
 
 - The packaged worker executes metered turn rounds. Live gateway and model qualification
-  (ADR 0038 PR3) and gateway reconciliation (ADR 0037 PR3) remain separate.
+  (ADR 0038 PR3) remain separate.
+- The dispatch credential source is provisional and will be replaced by the
+  gateway-authorization increment.
 - A catalog change needs the same file on the API and worker and matching route pins, then a
   restart of both.
 - Profiles that require a device slot cannot be served by the packaged worker yet.

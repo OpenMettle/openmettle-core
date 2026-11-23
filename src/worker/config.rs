@@ -3,10 +3,11 @@
 //! `OPENMETTLE_WORKER_INFERENCE_CONFIG` names one strict JSON document. The document and the
 //! files it names are read once at startup, before telemetry, the listener or any database, DNS
 //! or network work. It carries only what turn execution needs: the model catalog the API admits
-//! against (ADR 0036), the gateway installation and its unseal-only key ring (ADR 0037), and one
-//! qualified HTTPS route per catalog model (ADR 0038). Login, cursor and session material stays
-//! in the API's document. Refusals are fixed categories that never carry a path, URL, identifier
-//! or key byte.
+//! against (ADR 0036), one qualified HTTPS route per catalog model (ADR 0038) and, provisionally,
+//! the dispatch credential source of the library's metered path: the gateway installation and the
+//! API document's `gateway_keys` ring format (ADR 0037). A later gateway-authorization increment
+//! replaces that source. Login, cursor and session material stays in the API's document.
+//! Refusals are fixed categories that never carry a path, URL, identifier or key byte.
 use super::turns::{Route, TurnRoutes};
 use crate::{
     auth_config::{self, CursorFiles, Error as Shape, Object},
@@ -63,10 +64,12 @@ pub struct InferenceConfig {
     pub routes: GatewayRoutes,
 }
 
-/// Metered routes for one gateway installation. Each dispatch unseals the admitted actor's own
-/// key inside the fenced handoff (ADR 0037); there is no static or shared bearer.
+/// Metered routes for one gateway installation.
 pub struct GatewayRoutes {
     installation: String,
+    /// Provisional dispatch credential source (ADR 0043): the library's metered handoff unseals
+    /// the admitted actor's gateway key with this ring. [`TurnRoutes::route`] below is the only
+    /// place the worker supplies it; the gateway-authorization increment replaces both.
     keys: Arc<GatewayKeys>,
     models: BTreeMap<String, (Arc<Gateway>, bool)>,
 }
@@ -229,6 +232,7 @@ pub fn load(path: &Path) -> Result<InferenceConfig, Error> {
         .map_err(|_| Error::Route)?;
         models.insert(model, (Arc::new(gateway), route.stream));
     }
+    // Provisional (ADR 0043): the API document's ring format, read last and only here.
     let keys = Arc::new(auth_config::gateway_keys(&keys.gateway_material()?)?);
     Ok(InferenceConfig {
         catalog: Arc::new(catalog),

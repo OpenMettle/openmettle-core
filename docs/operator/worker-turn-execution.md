@@ -10,9 +10,9 @@ or deployment-private values; never commit site details or key files.
 
 - The schema is migrated, and the API serves run admission with `catalog_file`,
   `admission_limits` and `cursor_keys`.
-- The gateway installation exists. Users who will run turns have `ready` gateway bindings with
-  a sealed key generation and a policy for each model they use. The reconciliation process
-  provisions these (ADR 0037). The worker only reads them.
+- Provisional, until the gateway-authorization increment: users who will run turns have
+  `ready` gateway bindings for the configured installation, with a sealed key generation and a
+  policy for each model they use (ADR 0037). The worker only reads them.
 - Every model in the catalog has a route that was qualified for its exact `pin`. A profile with
   `requires_device_slot` stops the worker at startup.
 
@@ -24,7 +24,7 @@ Mount each file read-only into the worker pod only:
 | --- | --- | --- |
 | Inference document | Deployment configuration | No, but it names the secret files |
 | Catalog | The same file as the API's `catalog_file` | No |
-| Gateway ring (`gateway_keys`) | The unseal keys of the reconciliation process's ring | Yes |
+| Gateway ring (`gateway_keys`, provisional) | The ring the current credential path opens | Yes |
 | Trust bundles | The gateway's issuing CA, when `trust.roots` is `bundle` | No |
 
 Do not mount the API's `auth.json`, login keys, cursor keys or issuance credential into the
@@ -64,9 +64,8 @@ and cloud metadata addresses are always refused.
 
 - **Catalog.** Update the catalog file and the route pins together, then restart the API and the
   worker. A run admitted under another catalog revision fails before its round is reserved.
-- **Gateway ring.** Add a new key to the worker's `decrypt_only` list, and to every other
-  unsealing process, before the reconciliation process seals with it. Remove an old key only
-  after every envelope that uses it has been rewrapped (ADR 0037).
+- **Dispatch credential.** `installation` and `gateway_keys` are provisional (ADR 0043). The
+  gateway-authorization increment replaces them and will document their successor.
 - **Routes.** Re-qualify a route before changing its endpoint, protocol, stream mode or pin.
 
 ## Stopping
