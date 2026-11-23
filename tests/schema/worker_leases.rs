@@ -2457,16 +2457,17 @@ mod live_turns {
             .await
             .expect("stopped worker closed its gateway request");
         // A server left unpolled during the drain would answer only after it, past the
-        // handoff's lock wait.
+        // handoff's lock wait. Time the exchange alone, from connect to the last response
+        // byte, so the test's own scheduling is not charged to the worker. The row stays
+        // locked until the response has arrived.
         let bind = first.bind.clone();
-        let started = Instant::now();
-        let probe = tokio::task::spawn_blocking(move || http_status(&bind, "/healthz"));
-        assert_eq!(probe.await.unwrap().as_deref(), Some("HTTP/1.1 200 OK"));
-        let waited = started.elapsed();
-        assert!(
-            waited < Duration::from_millis(500),
-            "probe waited {waited:?}"
-        );
+        let probe = tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
+            (http_status(&bind, "/healthz"), started.elapsed())
+        });
+        let (status, waited) = probe.await.unwrap();
+        assert_eq!(status.as_deref(), Some("HTTP/1.1 200 OK"));
+        assert!(waited < Duration::from_secs(1), "probe waited {waited:?}");
         hold.rollback().await.unwrap();
         let (status, stderr) = exited(first.process).await;
         assert!(status.success(), "{stderr}");
@@ -2527,9 +2528,9 @@ mod live_turns {
     }
 
     /// ADR 0033 crash recovery through the packaged binary: after SIGKILL during a sent round
-    /// the dead holder's lease still excludes a replacement. Once the lease is due, the
-    /// replacement reclaims the run and fails it at its exhausted round budget instead of
-    /// replaying the round.
+    /// the dead holder's lease still excludes a replacement, which meanwhile claims and
+    /// finishes another run. Once the lease is due, the replacement reclaims the run and
+    /// fails it at its exhausted round budget instead of replaying the round.
     #[tokio::test]
     #[ignore = "isolated PostgreSQL 18, synthetic TLS gateway and TEST_GATEWAY_HOST"]
     async fn packaged_worker_crash_waits_for_the_lease_and_never_replays_a_sent_round() {
@@ -2554,11 +2555,40 @@ mod live_turns {
         tokio::time::timeout(Duration::from_secs(5), sent.reply.closed())
             .await
             .expect("killed worker disconnected");
-        let _replacement = chat.start_packaged(&provider, &dir, &[]).await;
-        // The replacement polls every 100 ms; the dead holder's lease still stands. With one
-        // round a stolen claim would send nothing, so check the claim itself as well.
-        let early = tokio::time::timeout(Duration::from_secs(2), provider.requests.recv()).await;
-        assert!(early.is_err(), "replacement dispatched under a live lease");
+        // An eligible run the replacement can claim beside the live lease. Its synthetic
+        // snapshot fails the step before any gateway call, so the claim cycle ends at once.
+        let other = chat.f.admit("claim cycle under a live lease").await;
+        let limits = [("EXECUTING_PER_ACTOR", "2"), ("EXECUTING_PER_SCOPE", "2")];
+        let _replacement = chat.start_packaged(&provider, &dir, &limits).await;
+        // Each claim cycle tries `reclaim_next` before `claim_next`, so a finished second run
+        // shows the replacement checked the live lease at least once.
+        let mut c = worker(&chat.f.db).await;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let state: String =
+                    sqlx::query_scalar("SELECT state FROM openmettle.runs WHERE id=$1::uuid")
+                        .bind(&other)
+                        .fetch_one(&mut c)
+                        .await
+                        .unwrap();
+                if queue::is_terminal(&state) {
+                    break assert_eq!(state, "failed");
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("replacement finished a claim cycle");
+        let claimed_other = events(&chat.f.db, &other)
+            .await
+            .iter()
+            .any(|e| e.2 == "openmettle.run-claimed");
+        assert!(claimed_other);
+        // With one round a stolen claim would send nothing, so check the claim itself.
+        assert!(
+            provider.requests.try_recv().is_err(),
+            "dispatch under a live lease"
+        );
         assert_eq!(holder().await, claimed, "replacement took a live lease");
         let reclaimed = events(&chat.f.db, &id)
             .await
@@ -2577,7 +2607,8 @@ mod live_turns {
     }
 
     /// Prompt assembly reads an image attachment on the connection it already holds, so the
-    /// smallest pool the worker accepts serves an image turn while the sweeps run beside it.
+    /// smallest pool the worker accepts serves an image turn, and a sweep settles other work
+    /// on that same connection while the image round is open at the gateway.
     #[tokio::test]
     #[ignore = "isolated PostgreSQL 18, synthetic TLS gateway and TEST_GATEWAY_HOST"]
     async fn packaged_worker_reads_an_image_turn_on_a_single_connection_pool() {
@@ -2588,19 +2619,56 @@ mod live_turns {
         let (id, _) = chat.submit_parts("single connection", "a", 1, &parts).await;
         let worker_dir = Dir::new();
         let settings = [("DB_MAX_CONNECTIONS", "1"), ("SWEEP_MS", "1000")];
-        let worker = chat.start_packaged(&provider, &worker_dir, &settings).await;
-        let request = provider.request().await;
+        let packaged = chat.start_packaged(&provider, &worker_dir, &settings).await;
+        let sent = provider.request().await;
         assert_eq!(
-            request.body["messages"].as_array().unwrap().last().unwrap()["content"],
+            sent.body["messages"].as_array().unwrap().last().unwrap()["content"],
             json!([
                 {"type":"text","text":"describe"}, {"type":"image_url","image_url":{"url":"data:image/png;base64,cGl4ZWxz"}}
             ])
         );
-        request.respond(completion(json!("image received"), None, Value::Null));
+        // The one slot is busy, so only the queue sweep can settle this overdue run.
+        let overdue = request(
+            &chat.f.db,
+            &chat.f.scope,
+            "project",
+            &chat.f.actor,
+            "overdue",
+        )
+        .await;
+        let overdue = admitted(&chat.f.db, &overdue).await;
+        owner_exec(
+            &chat.f.db,
+            "UPDATE openmettle.runs SET queue_expires_at=clock_timestamp() WHERE id=$1::uuid",
+            &overdue,
+        )
+        .await;
+        let mut c = worker(&chat.f.db).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let state: String =
+                    sqlx::query_scalar("SELECT state FROM openmettle.runs WHERE id=$1::uuid")
+                        .bind(&overdue)
+                        .fetch_one(&mut c)
+                        .await
+                        .unwrap();
+                if state != "queued" {
+                    break assert_eq!(state, "failed");
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("a sweep settled the overdue run on the single connection");
+        let expired = events(&chat.f.db, &overdue)
+            .await
+            .iter()
+            .any(|e| e.2 == "openmettle.run-expired");
+        assert!(expired);
+        assert!(!sent.reply.is_closed(), "the image round was still open");
+        sent.respond(completion(json!("image received"), None, Value::Null));
         chat.done(&id, "succeeded", None).await;
-        // Two sweep ticks share the single connection with the idle run loop.
-        tokio::time::sleep(Duration::from_millis(2500)).await;
-        let (status, stderr) = terminate(worker.process).await;
+        let (status, stderr) = terminate(packaged.process).await;
         assert!(status.success(), "{stderr}");
         assert!(!stderr.contains("worker.sweep.failed"), "{stderr}");
     }

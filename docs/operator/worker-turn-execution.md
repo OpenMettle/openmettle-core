@@ -44,9 +44,12 @@ Set these with the `OPENMETTLE_WORKER_` prefix:
 `DB_MAX_CONNECTIONS` has no minimum beyond the usual one. No task on the turn path waits for
 a second pooled connection while it holds one; prompt assembly reads attachments on the
 connection it already holds. Each claimed run uses at most two connections at a time, one for
-its step and one for its lease renewal, and the sweeps use one more. With at least
-`2 × RUN_SLOTS + 1` connections nothing waits for the pool. A smaller pool makes tasks queue
-for up to `DB_TIMEOUT_MS`. How much throughput a given size sustains has not been measured.
+its step and one for its lease renewal, and the sweeps use one more, so run and maintenance
+work needs at most `2 × RUN_SLOTS + 1`. Each `/readyz` probe in flight takes one more from the
+same pool. With one probe at a time, `2 × RUN_SLOTS + 2` connections let nothing wait. With a
+smaller pool, tasks queue for up to `DB_TIMEOUT_MS`. A `/readyz` that cannot get a connection
+in that time answers 503 `not ready`: work continues, but repeated failures mark the pod not
+ready. How much throughput a given size sustains has not been measured.
 
 ## Network
 

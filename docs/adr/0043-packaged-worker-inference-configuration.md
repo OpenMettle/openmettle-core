@@ -91,9 +91,11 @@ the connection prompt assembly already holds.
 
 No turn-path task waits for a second pooled connection while holding one, so every accepted
 `DB_MAX_CONNECTIONS` works, including 1, and no minimum is enforced. A claimed run uses at most
-two connections at a time (its step and its renewal), and the sweeps use one. At
-`2 × RUN_SLOTS + 1` connections nothing waits; below that, tasks queue for up to
-`DB_TIMEOUT_MS`, which `LEASE_MS` already covers six times.
+two connections at a time (its step and its renewal), and the sweeps use one, so run and
+maintenance work needs at most `2 × RUN_SLOTS + 1`. Each `/readyz` probe in flight takes one
+more from the same pool, so with one probe at a time nothing waits at `2 × RUN_SLOTS + 2`.
+Below that, tasks queue for up to `DB_TIMEOUT_MS`, which `LEASE_MS` already covers six times,
+and a `/readyz` that cannot get a connection in that time answers 503 while work continues.
 
 Shutdown follows ADR 0033. The run loop drains within half the drain budget while the HTTP
 server keeps answering probes. HTTP shutdown and the pool close use the rest. A round in
