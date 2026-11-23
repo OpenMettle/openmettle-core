@@ -6215,3 +6215,260 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
         assert_eq!(drift, (0, 0, 0, 0));
     }
 }
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn override_expiring_during_budget_lock_wait_is_refused_by_post_lock_clock_timestamp() {
+    use sqlx::postgres::PgPoolOptions;
+
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    let mut owner_lock = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut owner).await;
+    let alice =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let scope = authz_runs::personal_of(&db, &alice).await;
+
+    // 1. quota_reserve + quota_limit: default personal usage_tokens = 500; seed quota_budgets row
+    //    via a tiny reserve + release, then add a short-lived 2000-token override (+180ms).
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 500)",
+        )
+        .await
+        .unwrap();
+    let api_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(db.1.options(API));
+    let seed_hold: String = sqlx::query_scalar(
+        "SELECT openmettle.quota_reserve(
+             $1::uuid, $2::uuid, 'usage_tokens', 1, 'seed-lock-wait',
+             NULL, NULL, NULL, clock_timestamp() + interval '5 minutes'
+         )::text",
+    )
+    .bind(&scope)
+    .bind(&alice.user)
+    .fetch_one(&api_pool)
+    .await
+    .unwrap();
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT openmettle.quota_release_unsent($1::uuid)")
+            .bind(&seed_hold)
+            .fetch_one(&api_pool)
+            .await
+            .unwrap()
+    );
+
+    sqlx::query(
+        "INSERT INTO openmettle.quota_overrides
+             (scope_id, scope_kind, resource_kind, hard_limit, expires_at, reason, updated_by_user_id)
+         VALUES ($1::uuid, 'personal', 'usage_tokens', 2000,
+                 clock_timestamp() + interval '250 milliseconds', 'lock-wait-override', $2::uuid)",
+    )
+    .bind(&scope)
+    .bind(&alice.user)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    // Connection 1 locks the personal quota_budgets row while the 2000-token override is STILL active.
+    let lock_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut owner_lock)
+        .await
+        .unwrap();
+    let mut lock_tx = owner_lock.begin().await.unwrap();
+    sqlx::query(
+        "SELECT id FROM openmettle.quota_budgets
+          WHERE target_kind = 'scope' AND scope_id = $1::uuid
+            AND resource_kind = 'usage_tokens'
+            FOR UPDATE",
+    )
+    .bind(&scope)
+    .fetch_one(&mut *lock_tx)
+    .await
+    .unwrap();
+
+    // Connection 2 enters quota_reserve BEFORE expiry (statement_timestamp() sees override active)
+    // and blocks on the quota_budgets row lock held by Connection 1.
+    let api_pool_c = api_pool.clone();
+    let scope_c = scope.clone();
+    let user_c = alice.user.clone();
+    let reserve_task = tokio::spawn(async move {
+        sqlx::query_scalar::<_, String>(
+            "SELECT openmettle.quota_reserve(
+                 $1::uuid, $2::uuid, 'usage_tokens', 1000, 'lock-wait-expiry-check',
+                 NULL, NULL, NULL, clock_timestamp() + interval '5 minutes'
+             )::text",
+        )
+        .bind(&scope_c)
+        .bind(&user_c)
+        .fetch_one(&api_pool_c)
+        .await
+    });
+
+    // Wait until Connection 2 is blocked on Connection 1's transaction lock inside quota_reserve.
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1
+                   FROM pg_locks waiter
+                   JOIN pg_locks holder
+                     ON holder.locktype = waiter.locktype
+                    AND holder.transactionid = waiter.transactionid
+                    AND holder.granted
+                    AND holder.pid = $1
+                  WHERE waiter.locktype = 'transactionid'
+                    AND NOT waiter.granted
+             )",
+        )
+        .bind(lock_pid)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        if blocked {
+            break;
+        }
+        assert!(
+            Instant::now() < wait_deadline,
+            "quota_reserve did not block on quota_budgets lock"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Hold the lock until clock_timestamp() strictly passes the override's expires_at.
+    let exp_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let expired: bool = sqlx::query_scalar(
+            "SELECT clock_timestamp() > expires_at
+               FROM openmettle.quota_overrides
+              WHERE scope_id = $1::uuid AND resource_kind = 'usage_tokens'",
+        )
+        .bind(&scope)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        if expired {
+            break;
+        }
+        assert!(Instant::now() < exp_deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Release the lock: Connection 2 re-evaluates quota_limit() at post-lock clock_timestamp(),
+    // sees the expired override, and MUST fail closed with OMQ01 against default 500!
+    lock_tx.rollback().await.unwrap();
+    let reserve_res = reserve_task.await.unwrap();
+    assert_eq!(
+        sqlstate(reserve_res),
+        "OMQ01",
+        "override expired during budget lock wait must fail closed against restored default"
+    );
+
+    // 2. quota_record_storage_warning: hold storage_accounts FOR UPDATE across storage override
+    //    expiry so post-lock clock_timestamp() sees default 1000 bytes (850/1000 = 85% >= 80%) and
+    //    emits the warning at limit_revision = 0 instead of using pre-wait statement_timestamp().
+    owner
+        .execute(
+            "UPDATE openmettle.storage_instance
+                SET instance_budget_bytes = 100000, personal_limit_bytes = 1000, project_limit_bytes = 1000",
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.storage_accounts (scope_id, active_bytes, retained_bytes, reserved_bytes)
+         VALUES ($1::uuid, 850, 0, 0)
+         ON CONFLICT (scope_id) DO UPDATE SET active_bytes = 850, retained_bytes = 0, reserved_bytes = 0",
+    )
+    .bind(&scope)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.quota_overrides
+             (scope_id, scope_kind, resource_kind, hard_limit, expires_at, reason, updated_by_user_id)
+         VALUES ($1::uuid, 'personal', 'storage_bytes', 10000,
+                 clock_timestamp() + interval '250 milliseconds', 'storage-lock-wait-override', $2::uuid)",
+    )
+    .bind(&scope)
+    .bind(&alice.user)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    let mut s_lock_tx = owner_lock.begin().await.unwrap();
+    sqlx::query(
+        "SELECT scope_id FROM openmettle.storage_accounts WHERE scope_id = $1::uuid FOR UPDATE",
+    )
+    .bind(&scope)
+    .fetch_one(&mut *s_lock_tx)
+    .await
+    .unwrap();
+
+    let scope_s = scope.clone();
+    let warn_task = tokio::spawn(async move {
+        sqlx::query("SELECT openmettle.quota_record_storage_warning($1::uuid, 850)")
+            .bind(&scope_s)
+            .execute(&api_pool)
+            .await
+    });
+
+    let sw_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1
+                   FROM pg_locks waiter
+                   JOIN pg_locks holder
+                     ON holder.locktype = waiter.locktype
+                    AND holder.transactionid = waiter.transactionid
+                    AND holder.granted
+                    AND holder.pid = $1
+                  WHERE waiter.locktype = 'transactionid'
+                    AND NOT waiter.granted
+             )",
+        )
+        .bind(lock_pid)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        if blocked {
+            break;
+        }
+        assert!(Instant::now() < sw_deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let sexp_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let expired: bool = sqlx::query_scalar(
+            "SELECT clock_timestamp() > expires_at
+               FROM openmettle.quota_overrides
+              WHERE scope_id = $1::uuid AND resource_kind = 'storage_bytes'",
+        )
+        .bind(&scope)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        if expired {
+            break;
+        }
+        assert!(Instant::now() < sexp_deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    s_lock_tx.rollback().await.unwrap();
+    warn_task.await.unwrap().unwrap();
+
+    let warn_revs: Vec<i64> = sqlx::query_scalar(
+        "SELECT limit_revision FROM openmettle.quota_warning_events
+          WHERE scope_id = $1::uuid AND resource_kind = 'storage_bytes' AND threshold_pct = 80",
+    )
+    .bind(&scope)
+    .fetch_all(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        warn_revs,
+        vec![0],
+        "post-lock clock_timestamp() must see expired storage override and emit default 80% warning at limit_revision = 0"
+    );
+}

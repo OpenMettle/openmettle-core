@@ -222,6 +222,8 @@ GRANT EXECUTE ON FUNCTION openmettle.quota_revoke_scope_override(uuid, uuid, tex
 
 -- Retain o.revision on explicitly revoked overrides so default-level threshold warnings re-arm
 -- in the same bucket (ADR 0040), while naturally expired unrevoked overrides revert to 0.
+-- Evaluate expiry against one fresh clock_timestamp() so post-lock checks see overrides that
+-- expired while waiting on contended quota_budgets / storage locks.
 CREATE OR REPLACE FUNCTION openmettle.quota_limit(p_scope uuid, p_kind text, p_resource text)
 RETURNS TABLE (
     hard_limit bigint,
@@ -232,11 +234,14 @@ RETURNS TABLE (
     limit_revision bigint
 )
 LANGUAGE sql
-STABLE
+VOLATILE
 SET search_path = pg_catalog
 AS $$
+    WITH stamp AS MATERIALIZED (
+        SELECT clock_timestamp() AS ts
+    )
     SELECT coalesce(
-               CASE WHEN o.revoked_at IS NULL AND (o.expires_at IS NULL OR o.expires_at > statement_timestamp())
+               CASE WHEN o.revoked_at IS NULL AND (o.expires_at IS NULL OR o.expires_at > stamp.ts)
                     THEN o.hard_limit END,
                d.hard_limit
            ),
@@ -246,10 +251,10 @@ AS $$
            coalesce(d.config_revision, 1),
            CASE
                WHEN o.revoked_at IS NOT NULL THEN o.revision
-               WHEN o.expires_at IS NULL OR o.expires_at > statement_timestamp() THEN coalesce(o.revision, 0)
+               WHEN o.expires_at IS NULL OR o.expires_at > stamp.ts THEN coalesce(o.revision, 0)
                ELSE 0
            END
-      FROM (VALUES (1)) AS seed(id)
+      FROM stamp
       LEFT JOIN openmettle.quota_defaults d
         ON d.scope_kind = p_kind AND d.resource_kind = p_resource
       LEFT JOIN openmettle.quota_overrides o
@@ -268,18 +273,21 @@ DECLARE
     charged numeric;
     lim bigint;
     rev bigint;
-    bucket timestamptz := date_trunc('day', clock_timestamp(), 'UTC');
+    now_ts timestamptz;
+    bucket timestamptz;
 BEGIN
     SELECT * INTO STRICT a FROM openmettle.storage_accounts WHERE scope_id = p_scope FOR UPDATE;
     SELECT * INTO STRICT i FROM openmettle.storage_instance WHERE id FOR NO KEY UPDATE;
+    now_ts := clock_timestamp();
+    bucket := date_trunc('day', now_ts, 'UTC');
     SELECT coalesce(
-               CASE WHEN o.revoked_at IS NULL AND (o.expires_at IS NULL OR o.expires_at > statement_timestamp())
+               CASE WHEN o.revoked_at IS NULL AND (o.expires_at IS NULL OR o.expires_at > now_ts)
                     THEN o.hard_limit END,
                CASE WHEN s.kind = 'personal' THEN i.personal_limit_bytes ELSE i.project_limit_bytes END
            ),
            CASE
                WHEN o.revoked_at IS NOT NULL THEN o.revision
-               WHEN o.expires_at IS NULL OR o.expires_at > statement_timestamp() THEN coalesce(o.revision, 0)
+               WHEN o.expires_at IS NULL OR o.expires_at > now_ts THEN coalesce(o.revision, 0)
                ELSE 0
            END
       INTO STRICT lim, rev
@@ -877,7 +885,7 @@ GRANT EXECUTE ON FUNCTION openmettle.quota_prepare_turn_round(uuid, uuid, uuid, 
 CREATE OR REPLACE FUNCTION openmettle.quota_cost_ceiling(p_scope uuid, p_actor uuid)
 RETURNS bigint
 LANGUAGE sql
-STABLE
+VOLATILE
 SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
@@ -1118,18 +1126,54 @@ SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
 DECLARE
+    v_unwound boolean := false;
     v_reservation uuid;
+    v_payload bytea;
+    v_metered_event boolean := false;
 BEGIN
     IF p_round IS NULL OR p_round <= 0 THEN
         RETURN false;
     END IF;
 
-    PERFORM openmettle.quota_unwind_superseded_round(p_scope, p_run, p_claim, p_round);
+    v_unwound := openmettle.quota_unwind_superseded_round(p_scope, p_run, p_claim, p_round);
 
     SELECT id INTO v_reservation
       FROM openmettle.gateway_reservations
      WHERE run_id = p_run;
-    IF NOT FOUND THEN
+
+    IF NOT v_unwound THEN
+        IF v_reservation IS NOT NULL AND EXISTS (
+            SELECT 1
+              FROM openmettle.gateway_requests
+             WHERE reservation_id = v_reservation
+               AND round = p_round
+               AND state = 'released'
+        ) THEN
+            v_metered_event := true;
+        ELSE
+            SELECT payload INTO v_payload
+              FROM openmettle.run_events
+             WHERE scope_id = p_scope
+               AND run_id = p_run
+               AND append_key = 'model-round:' || p_round
+               AND format = 'openmettle.model-round';
+            IF FOUND THEN
+                BEGIN
+                    v_metered_event := coalesce(
+                        (convert_from(v_payload, 'UTF8')::jsonb ->> 'metered') = 'true',
+                        false
+                    );
+                EXCEPTION WHEN others THEN
+                    v_metered_event := false;
+                END;
+            END IF;
+        END IF;
+        IF v_metered_event IS NOT TRUE THEN
+            RETURN false;
+        END IF;
+    END IF;
+
+    IF v_reservation IS NULL THEN
         RETURN true;
     END IF;
 

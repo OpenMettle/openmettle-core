@@ -2656,6 +2656,374 @@ mod live_turns {
 
     #[tokio::test]
     #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn bearer_crash_replaced_by_metered_worker_preserves_round_budget() {
+        use crate::authz_http::{Api, As, browser, success};
+        use openmettle_core::{
+            migrate,
+            provider_keys::gateway::{Bearer, Context, GatewayKeys, GatewaySealer},
+        };
+        use sqlx::postgres::PgPoolOptions;
+
+        const INSTALL: &str = "00000000-0000-4000-8000-0000000000e1";
+        const PRINCIPAL: &str = "00000000-0000-4000-8000-0000000000e2";
+        const BUDGET: &str = "00000000-0000-4000-8000-0000000000e3";
+        const KEY_BYTES: [u8; 32] = [83; 32];
+
+        for rounds in [1i64, 2i64] {
+            // Upgrade from schema 23 -> latest so metering_enforced starts false and a pre-activation
+            // Route::bearer worker can legitimately dispatch Round 1 without gateway_requests rows.
+            let db = TestDb::new().await;
+            let settings = db.settings(Duration::from_secs(10));
+            migrate::apply(&settings, &migrate::MIGRATIONS[..23])
+                .await
+                .unwrap();
+            let mut owner = connect(&db.0, OWNER).await;
+            providers(&mut owner).await;
+            let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+            let scope = personal_of(&db, &alice).await;
+            migrate::apply(&settings, migrate::MIGRATIONS)
+                .await
+                .unwrap();
+            let alice_cookie = browser(&db, &alice, 1).await;
+            let alice_b = As::Browser(&alice_cookie);
+
+            owner
+                .execute(
+                    "UPDATE openmettle.quota_defaults
+                        SET cost_denomination = 'usd_micros'
+                      WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'",
+                )
+                .await
+                .unwrap();
+            owner
+                .execute(
+                    "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+                     VALUES ('personal', 'usage_tokens', 100000),
+                            ('personal', 'usage_cost_micros', 1000)",
+                )
+                .await
+                .unwrap();
+
+            // Provision gateway binding with sealed `synthetic-bearer` so both bearer Worker 1 and
+            // metered Worker 2 target the same loopback TLS Provider.
+            let g_pool = PgPoolOptions::new()
+                .max_connections(2)
+                .connect_lazy_with(db.1.options(pg::GATEWAY));
+            let binding: String = sqlx::query_scalar(
+                "INSERT INTO openmettle.gateway_bindings (installation, user_id, principal, budget)
+                 VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid) RETURNING id::text",
+            )
+            .bind(INSTALL)
+            .bind(&alice.user)
+            .bind(PRINCIPAL)
+            .bind(BUDGET)
+            .fetch_one(&g_pool)
+            .await
+            .unwrap();
+            let report_source: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+                .fetch_one(&mut owner)
+                .await
+                .unwrap();
+            let keys = GatewayKeys::new(&[("b2m-k1".into(), KEY_BYTES)]).unwrap();
+            let (finger, env) = GatewaySealer::new(keys, g_pool.clone())
+                .seal(
+                    &Context {
+                        installation: INSTALL,
+                        user_id: &alice.user,
+                        binding_id: &binding,
+                        principal: PRINCIPAL,
+                        generation: 1,
+                    },
+                    &Bearer::new(b"synthetic-turn-credential").unwrap(),
+                )
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO openmettle.gateway_generations
+                     (binding_id, generation, remote_key, expires_at, key_id, key_fingerprint, nonce, ciphertext)
+                 VALUES ($1::uuid, 1, gen_random_uuid(), clock_timestamp() + interval '1 hour', $2, $3, $4, $5)",
+            )
+            .bind(&binding)
+            .bind(&env.key_id)
+            .bind(finger.as_slice())
+            .bind(env.nonce.as_slice())
+            .bind(env.ciphertext)
+            .execute(&g_pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO openmettle.gateway_policy
+                     (binding_id, revision, scope_id, approval_id, model, report_source,
+                      provider_generation, approval_generation, user_generation, capabilities)
+                 VALUES ($1::uuid, 1, $2::uuid, $3::uuid, 'a', $4::uuid, 0, 0, 0, '{}'::jsonb)",
+            )
+            .bind(&binding)
+            .bind(&scope)
+            .bind(&alice.approval)
+            .bind(&report_source)
+            .execute(&g_pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "UPDATE openmettle.gateway_bindings
+                    SET active_generation = 1, observed_revision = 1, state = 'ready'
+                  WHERE id = $1::uuid",
+            )
+            .bind(&binding)
+            .execute(&g_pool)
+            .await
+            .unwrap();
+
+            let dir = Dir::new();
+            std::fs::create_dir(dir.path("artifacts")).unwrap();
+            let mut doc = auth_config_support::document_v2_native(&dir, &Ca::new().pem());
+            doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+            let mut catalog: Value =
+                serde_json::from_slice(include_bytes!("../fixtures/conversation-catalog-v1.json"))
+                    .unwrap();
+            catalog["models"]["a"]["pin"]["provider"] = "synthetic-sglang".into();
+            catalog["models"]["a"]["prompt_bound"] = json!({
+                "fixed_tokens": 4,
+                "tokens_per_turn": 4,
+                "tokens_per_part": 2,
+                "tokens_per_byte": 1,
+                "tokens_per_attachment": 10
+            });
+            catalog["models"]["a"]["cost_bound"] = json!({
+                "fixed_micros": 0,
+                "micros_per_token": 1
+            });
+            doc["catalog_file"] =
+                json!(dir.write("catalog.json", &serde_json::to_vec(&catalog).unwrap()));
+            doc["admission_limits"] = json!({
+                "live_per_actor": 4,
+                "live_per_scope": 8,
+                "queued_in_instance": 32,
+                "queue_timeout_seconds": 300,
+                "round_cap": 10
+            });
+            let http_api = Api::configured(&db, dir, doc, 4);
+
+            let conv = success(
+                http_api.call(
+                    alice_b,
+                    "POST",
+                    "/v1/conversations",
+                    Some(&format!("b2m-conv-{rounds}")),
+                    Some(&json!({})),
+                ),
+                201,
+            );
+            let conv_id = conv["conversation_id"].as_str().unwrap();
+            let branch_id = conv["branch_id"].as_str().unwrap();
+            let admitted = success(
+                http_api.call(
+                    alice_b,
+                    "POST",
+                    "/v1/runs",
+                    Some(&format!("b2m-run-{rounds}")),
+                    Some(&json!({
+                        "conversation_id": conv_id,
+                        "branch_id": branch_id,
+                        "proposal": {
+                            "expected_head_message_id": null,
+                            "turn": {
+                                "mode": "append",
+                                "input_message_id": format!("00000000-0000-4000-8000-00000000e00{rounds}"),
+                                "parts": [{"text": "bearer crash then metered replacement"}]
+                            },
+                            "selection": {
+                                "model": "a",
+                                "layer": {"controls": {"context_window": "450", "output_reserve": "100"}}
+                            },
+                            "requested_rounds": rounds
+                        }
+                    })),
+                ),
+                201,
+            );
+            let run_id = admitted["run_id"].as_str().unwrap().to_owned();
+
+            // 1. Start Worker 1 with Route::bearer ("metered": null), let it send Round 1 over TLS,
+            //    and kill it mid-inference before answer publication.
+            let mut provider = Provider::new().await;
+            let mut w1_child = Command::new(worker_binary())
+                .env("OPENMETTLE_TEST_TURN_WORKER", "1")
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "worker::turns::schema_fixture::worker_process",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap();
+            let w1_stdin = w1_child.stdin.as_mut().unwrap();
+            serde_json::to_writer(
+                &mut *w1_stdin,
+                &json!({
+                    "database": db.url(WORKER),
+                    "catalog": catalog,
+                    "tools": false,
+                    "scope": scope,
+                    "actor": alice.user,
+                    "ca": String::from_utf8(provider.ca.pem()).unwrap(),
+                    "port": provider.port,
+                    "artifacts": null,
+                    "stop_during_observation": false,
+                    "metered": null,
+                }),
+            )
+            .unwrap();
+            writeln!(w1_stdin).unwrap();
+            let w1_proc = Process(w1_child);
+
+            let mut req1 = provider.request().await;
+            assert!(
+                req1.request_id.is_none(),
+                "predecessor Route::bearer worker must not attach gateway x-request-id"
+            );
+            drop(w1_proc);
+            tokio::time::timeout(Duration::from_secs(5), req1.reply.closed())
+                .await
+                .expect("crashed bearer worker disconnected");
+            owner_exec(
+                &db,
+                "UPDATE openmettle.runs SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1::uuid",
+                &run_id,
+            )
+            .await;
+
+            // 2. Start Replacement Worker 2 with Route::metered. Because Worker 1's model-round:1
+            //    has no durable metered evidence, Worker 2 MUST NOT reuse Round 1.
+            let mut w2_child = Command::new(worker_binary())
+                .env("OPENMETTLE_TEST_TURN_WORKER", "1")
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "worker::turns::schema_fixture::worker_process",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap();
+            let w2_stdin = w2_child.stdin.as_mut().unwrap();
+            serde_json::to_writer(
+                &mut *w2_stdin,
+                &json!({
+                    "database": db.url(WORKER),
+                    "catalog": catalog,
+                    "tools": false,
+                    "scope": scope,
+                    "actor": alice.user,
+                    "ca": String::from_utf8(provider.ca.pem()).unwrap(),
+                    "port": provider.port,
+                    "artifacts": null,
+                    "stop_during_observation": false,
+                    "metered": {
+                        "installation": INSTALL,
+                        "key_id": "b2m-k1",
+                        "key_bytes": KEY_BYTES,
+                    }
+                }),
+            )
+            .unwrap();
+            writeln!(w2_stdin).unwrap();
+            let _w2_proc = Process(w2_child);
+
+            let mut api_c = api(&db).await;
+            if rounds == 1 {
+                tokio::time::timeout(Duration::from_secs(25), async {
+                    loop {
+                        let state: String = sqlx::query_scalar(
+                            "SELECT state FROM openmettle.runs WHERE id = $1::uuid",
+                        )
+                        .bind(&run_id)
+                        .fetch_one(&mut api_c)
+                        .await
+                        .unwrap();
+                        if queue::is_terminal(&state) {
+                            assert_eq!(state, "failed");
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("round_limit=1 run failed without reusing bearer round");
+                terminal(
+                    &db,
+                    &run_id,
+                    "openmettle.run-failed",
+                    json!({"reason": "round_limit"}).to_string().as_bytes(),
+                )
+                .await;
+                assert!(
+                    provider.requests.try_recv().is_err(),
+                    "metered replacement must never send a second provider request when round_limit=1"
+                );
+            } else {
+                let req2 = provider.request().await;
+                assert!(
+                    req2.request_id.is_some(),
+                    "metered replacement must dispatch Round 2 through gateway"
+                );
+                req2.respond(completion(
+                    json!("metered round 2 answer"),
+                    None,
+                    json!({"prompt_tokens": 50, "completion_tokens": 20}),
+                ));
+                tokio::time::timeout(Duration::from_secs(25), async {
+                    loop {
+                        let state: String = sqlx::query_scalar(
+                            "SELECT state FROM openmettle.runs WHERE id = $1::uuid",
+                        )
+                        .bind(&run_id)
+                        .fetch_one(&mut api_c)
+                        .await
+                        .unwrap();
+                        if queue::is_terminal(&state) {
+                            assert_eq!(state, "succeeded");
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("round_limit=2 run advanced to Round 2 and succeeded");
+                let events: Vec<(String, String)> = sqlx::query_as(
+                    "SELECT append_key, convert_from(payload, 'UTF8')
+                       FROM openmettle.run_events
+                      WHERE scope_id = $1::uuid AND run_id = $2::uuid
+                        AND format = 'openmettle.model-round'
+                      ORDER BY sequence ASC",
+                )
+                .bind(&scope)
+                .bind(&run_id)
+                .fetch_all(&mut owner)
+                .await
+                .unwrap();
+                assert_eq!(
+                    events,
+                    vec![
+                        ("model-round:1".into(), "{}".into()),
+                        ("model-round:2".into(), r#"{"metered":true}"#.into()),
+                    ]
+                );
+            }
+            let drift: (i64, i64, i64, i64) = sqlx::query_as(
+                "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
+                   FROM openmettle.quota_verify_accounting_drift()",
+            )
+            .fetch_one(&mut worker(&db).await)
+            .await
+            .unwrap();
+            assert_eq!(drift, (0, 0, 0, 0));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
     async fn deadline_and_mid_stream_cancel_close_inference_without_answers() {
         for cancel in [true, false] {
             let chat = Chat::new().await;

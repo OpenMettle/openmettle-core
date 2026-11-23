@@ -243,8 +243,23 @@ impl<R: TurnRoutes> TurnExecutor<R> {
             }
             let round = used + 1;
             if round <= i64::from(claim.round_limit) {
-                crate::runs::append_event(tx, &claim.scope_id, &claim.run_id, &format!("model-round:{round}"),
-                    Payload { format: "openmettle.model-round", version: 1, bytes: b"{}" }).await?;
+                let bytes: &[u8] = if metered {
+                    br#"{"metered":true}"#
+                } else {
+                    b"{}"
+                };
+                crate::runs::append_event(
+                    tx,
+                    &claim.scope_id,
+                    &claim.run_id,
+                    &format!("model-round:{round}"),
+                    Payload {
+                        format: "openmettle.model-round",
+                        version: 1,
+                        bytes,
+                    },
+                )
+                .await?;
             }
             Ok(round)
         }).await.map_err(lease_step)?;

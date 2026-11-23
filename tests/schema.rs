@@ -1025,7 +1025,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "275b395fab0a1e90fc6f9a3039d008adc138294af0cb0da9cb944df87b26ec1c",
         "a6ea85d09af2c2aa7d267499623a46a3922e695b79bdf585cd8e2164d68e5d9a",
         "814d7832603fdb9752e55259c1c44b6815228ae5fb128b54ed5becf9fed508d7",
-        "b30b4d76b7f3ed2ccaf5312316aa91fa6aaab6711d792ca19ef38be66ea51d20",
+        "48c080f2d05dd3824548411ab0624a9359f475fcfc3f1410446071fa380edeeb",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
