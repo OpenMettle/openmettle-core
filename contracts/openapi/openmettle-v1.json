@@ -2618,6 +2618,296 @@
           }
         }
       }
+    },
+    "/v1/quotas/personal": {
+      "get": {
+        "operationId": "getPersonalQuotas",
+        "summary": "Read the caller's personal scope quota summary",
+        "description": "Reads storage, metered usage, execution limits, device reservation capacity and active scope warnings for the authenticated caller's personal scope from the primary database. Remaining capacity never leaks instance headroom.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The caller's personal quota summary.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QuotaSummary"
+                },
+                "examples": {
+                  "personal": {
+                    "$ref": "#/components/examples/QuotaSummaryPersonal"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/projects/{project_id}/quotas": {
+      "get": {
+        "operationId": "getProjectQuotas",
+        "summary": "Read a project scope's quota summary",
+        "description": "Requires current project Read membership on the primary database. A non-member, deleted project or non-member account administrator receives not_found. Returns only the project's own quotas, never another member's personal usage or instance headroom.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ProjectId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The project scope quota summary.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QuotaSummary"
+                },
+                "examples": {
+                  "project": {
+                    "$ref": "#/components/examples/QuotaSummaryProject"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/admin/scopes/{scope_id}/quotas/{resource_kind}": {
+      "put": {
+        "operationId": "setQuotaOverride",
+        "summary": "Create or update a scope-level quota override",
+        "description": "Account administrator only (ManageQuotas). Requires Idempotency-Key and completed rolling-upgrade activation. round_cap must be 1..=1000; per-actor resources apply only to personal scopes. usage_cost_micros requires a configured deployment cost_denomination.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ScopePathId"
+          },
+          {
+            "$ref": "#/components/parameters/QuotaResourceKind"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QuotaOverrideSetRequest"
+              },
+              "examples": {
+                "typical": {
+                  "$ref": "#/components/examples/QuotaOverrideSetRequestTypical"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The active scope quota override.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QuotaOverride"
+                },
+                "examples": {
+                  "active": {
+                    "$ref": "#/components/examples/QuotaOverrideActive"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
+    },
+    "/v1/admin/scopes/{scope_id}/quotas/{resource_kind}/revoke": {
+      "post": {
+        "operationId": "revokeQuotaOverride",
+        "summary": "Revoke an active scope-level quota override",
+        "description": "Account administrator only (ManageQuotas). Requires Idempotency-Key and completed rolling-upgrade activation. Revokes the active override and returns the updated revoked record.",
+        "x-openmettle-implementation": "implemented",
+        "security": [
+          {
+            "browserSession": []
+          },
+          {
+            "nativeSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ScopePathId"
+          },
+          {
+            "$ref": "#/components/parameters/QuotaResourceKind"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QuotaOverrideRevokeRequest"
+              },
+              "examples": {
+                "typical": {
+                  "$ref": "#/components/examples/QuotaOverrideRevokeRequestTypical"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The revoked scope quota override.",
+            "headers": {
+              "OpenMettle-API-Version": {
+                "$ref": "#/components/headers/ApiVersion"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QuotaOverride"
+                },
+                "examples": {
+                  "revoked": {
+                    "$ref": "#/components/examples/QuotaOverrideRevoked"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/Timeout"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -2843,6 +3133,24 @@
         "description": "Canonical approval UUID within this run.",
         "schema": {
           "$ref": "#/components/schemas/Uuid"
+        }
+      },
+      "ScopePathId": {
+        "name": "scope_id",
+        "in": "path",
+        "required": true,
+        "description": "The target personal or project scope identifier. A malformed identifier fails with validation; a missing scope fails with not_found.",
+        "schema": {
+          "$ref": "#/components/schemas/Uuid"
+        }
+      },
+      "QuotaResourceKind": {
+        "name": "resource_kind",
+        "in": "path",
+        "required": true,
+        "description": "Quota resource kind to override or revoke. Per-actor resources are valid only on personal scopes.",
+        "schema": {
+          "$ref": "#/components/schemas/QuotaResourceKind"
         }
       }
     },
@@ -3235,6 +3543,10 @@
             "items": {
               "$ref": "#/components/schemas/ProblemField"
             }
+          },
+          "quota": {
+            "description": "Optional closed low-cardinality quota refusal metadata (ADR 0040).",
+            "$ref": "#/components/schemas/ProblemQuota"
           }
         },
         "allOf": [
@@ -6085,6 +6397,725 @@
           "binding_digest",
           "decided_at"
         ]
+      },
+      "WideNonNegativeDecimal": {
+        "description": "Canonical base-10 integer from 0 to 10^38 - 1 (38 decimal digits, matching PostgreSQL numeric(38, 0)) encoded as a string, without sign, leading zeros, exponent or fraction. Used for wide metered usage and reservation counters that can exceed signed 64-bit maximum.",
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 38,
+        "pattern": "^(?:0|[1-9][0-9]{0,37})$"
+      },
+      "ProblemQuota": {
+        "description": "Closed low-cardinality quota refusal metadata (ADR 0040). Never carries byte counts, token counts, limits, override reasons or identifiers.",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "resource_kind",
+          "scope_kind"
+        ],
+        "properties": {
+          "resource_kind": {
+            "description": "Quota resource kind that caused the refusal. Open vocabulary.",
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "storage_bytes",
+              "usage_tokens",
+              "usage_cost_micros",
+              "device_reservations"
+            ]
+          },
+          "scope_kind": {
+            "description": "Scope tier that caused the refusal: personal, project or instance.",
+            "type": "string",
+            "enum": [
+              "personal",
+              "project",
+              "instance"
+            ]
+          }
+        }
+      },
+      "QuotaResourceKind": {
+        "description": "Quota resource kind managed by transactional quotas and scope overrides.",
+        "type": "string",
+        "enum": [
+          "storage_bytes",
+          "usage_tokens",
+          "usage_cost_micros",
+          "device_reservations",
+          "live_runs_per_actor",
+          "live_runs_per_scope",
+          "executing_runs_per_actor",
+          "executing_runs_per_scope",
+          "round_cap"
+        ]
+      },
+      "QuotaOverrideReason": {
+        "description": "Required reason recorded on the quota override and append-only authorization audit. Must be 1 to 256 UTF-8 bytes without NUL bytes; JSON Schema maxLength bounds Unicode code points while the server and consumer enforce the 256 UTF-8 byte ceiling.",
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256
+      },
+      "QuotaWarnThresholds": {
+        "description": "Ordered percentage warning thresholds [warn_pct_1, warn_pct_2].",
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 2,
+        "items": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 99
+        }
+      },
+      "QuotaStorageSummary": {
+        "description": "Storage quota state for the requested scope. remaining_bytes is computed strictly from max(0, limit_bytes - charged_bytes) and never leaks instance headroom.",
+        "type": "object",
+        "required": [
+          "limit_bytes",
+          "limit_source",
+          "override_expires_at",
+          "active_bytes",
+          "retained_bytes",
+          "reserved_bytes",
+          "charged_bytes",
+          "remaining_bytes",
+          "warn_thresholds",
+          "status"
+        ],
+        "properties": {
+          "limit_bytes": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NonNegativeDecimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "limit_source": {
+            "description": "Origin of limit_bytes: default, override or unconfigured. Open vocabulary.",
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "default",
+              "override",
+              "unconfigured"
+            ]
+          },
+          "override_expires_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "active_bytes": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "retained_bytes": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "reserved_bytes": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "charged_bytes": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "remaining_bytes": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NonNegativeDecimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "warn_thresholds": {
+            "$ref": "#/components/schemas/QuotaWarnThresholds"
+          },
+          "status": {
+            "description": "Threshold state: ok, warning, hard_limit or unconfigured. Open vocabulary.",
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "ok",
+              "warning",
+              "hard_limit",
+              "unconfigured"
+            ]
+          }
+        }
+      },
+      "QuotaUsageItem": {
+        "description": "One metered usage budget item for the requested scope. Wide accumulators use WideNonNegativeDecimal.",
+        "type": "object",
+        "required": [
+          "resource_kind",
+          "unit",
+          "window_kind",
+          "window_start",
+          "window_end",
+          "limit",
+          "limit_source",
+          "override_expires_at",
+          "active_used",
+          "reserved_held",
+          "remaining",
+          "warn_thresholds",
+          "status",
+          "authoritative_source",
+          "last_reconciled_at"
+        ],
+        "properties": {
+          "resource_kind": {
+            "description": "Metered usage resource kind. Open vocabulary.",
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "usage_tokens",
+              "usage_cost_micros"
+            ]
+          },
+          "unit": {
+            "description": "Unit label, including the deployment cost_denomination for usage_cost_micros, or null when unconfigured.",
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "window_kind": {
+            "description": "Budget window mode: windowed or static. Open vocabulary.",
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "windowed",
+              "static"
+            ]
+          },
+          "window_start": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "window_end": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NonNegativeDecimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "limit_source": {
+            "description": "Origin of limit: default, override or unconfigured. Open vocabulary.",
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "default",
+              "override",
+              "unconfigured"
+            ]
+          },
+          "override_expires_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "active_used": {
+            "$ref": "#/components/schemas/WideNonNegativeDecimal"
+          },
+          "reserved_held": {
+            "$ref": "#/components/schemas/WideNonNegativeDecimal"
+          },
+          "remaining": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NonNegativeDecimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "warn_thresholds": {
+            "$ref": "#/components/schemas/QuotaWarnThresholds"
+          },
+          "status": {
+            "description": "Threshold state: ok, warning, hard_limit or unconfigured. Open vocabulary.",
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "ok",
+              "warning",
+              "hard_limit",
+              "unconfigured"
+            ]
+          },
+          "authoritative_source": {
+            "description": "Authoritative settlement source for this metered budget. Open vocabulary.",
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "gateway"
+            ]
+          },
+          "last_reconciled_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "QuotaExecutionCounter": {
+        "description": "Live or executing run concurrency counter and effective limit.",
+        "type": "object",
+        "required": [
+          "current",
+          "limit",
+          "limit_source",
+          "override_expires_at"
+        ],
+        "properties": {
+          "current": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NonNegativeDecimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "limit_source": {
+            "$ref": "#/components/schemas/Code",
+            "description": "Origin of limit: default, override, worker (governed by worker-local claim settings when no database default or override is configured) or unconfigured. Open vocabulary.",
+            "examples": [
+              "default",
+              "override",
+              "worker",
+              "unconfigured"
+            ]
+          },
+          "override_expires_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "QuotaLimitProjection": {
+        "description": "Effective non-counter execution limit such as round_cap.",
+        "type": "object",
+        "required": [
+          "limit",
+          "limit_source",
+          "override_expires_at"
+        ],
+        "properties": {
+          "limit": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NonNegativeDecimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "limit_source": {
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "default",
+              "override",
+              "unconfigured"
+            ]
+          },
+          "override_expires_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "QuotaExecutionSummary": {
+        "description": "Execution concurrency and round-cap state. Per-actor fields appear only on personal summaries.",
+        "type": "object",
+        "required": [
+          "live_runs_per_scope",
+          "executing_runs_per_scope",
+          "round_cap"
+        ],
+        "properties": {
+          "live_runs_per_scope": {
+            "$ref": "#/components/schemas/QuotaExecutionCounter"
+          },
+          "executing_runs_per_scope": {
+            "$ref": "#/components/schemas/QuotaExecutionCounter"
+          },
+          "round_cap": {
+            "$ref": "#/components/schemas/QuotaLimitProjection"
+          },
+          "live_runs_per_actor": {
+            "$ref": "#/components/schemas/QuotaExecutionCounter"
+          },
+          "executing_runs_per_actor": {
+            "$ref": "#/components/schemas/QuotaExecutionCounter"
+          }
+        }
+      },
+      "QuotaDeviceReservationsSummary": {
+        "description": "Concurrent device reservation slot budget for the requested scope, distinct from physical VRAM telemetry.",
+        "type": "object",
+        "required": [
+          "reserved_held",
+          "limit",
+          "limit_source",
+          "override_expires_at",
+          "warn_thresholds",
+          "status"
+        ],
+        "properties": {
+          "reserved_held": {
+            "$ref": "#/components/schemas/WideNonNegativeDecimal"
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NonNegativeDecimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "limit_source": {
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "default",
+              "override",
+              "unconfigured"
+            ]
+          },
+          "override_expires_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "warn_thresholds": {
+            "$ref": "#/components/schemas/QuotaWarnThresholds"
+          },
+          "status": {
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "ok",
+              "warning",
+              "hard_limit",
+              "unconfigured"
+            ]
+          }
+        }
+      },
+      "QuotaDeviceCapacitySummary": {
+        "description": "Device capacity quota projection for the requested scope.",
+        "type": "object",
+        "required": [
+          "active_reservations"
+        ],
+        "properties": {
+          "active_reservations": {
+            "$ref": "#/components/schemas/QuotaDeviceReservationsSummary"
+          }
+        }
+      },
+      "QuotaWarning": {
+        "description": "One active deduplicated quota threshold warning for the requested scope.",
+        "type": "object",
+        "required": [
+          "resource_kind",
+          "threshold_pct",
+          "dedupe_bucket",
+          "triggered_at"
+        ],
+        "properties": {
+          "resource_kind": {
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "storage_bytes",
+              "usage_tokens",
+              "usage_cost_micros",
+              "device_reservations"
+            ]
+          },
+          "threshold_pct": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "dedupe_bucket": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "triggered_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        }
+      },
+      "QuotaSummary": {
+        "description": "Consistent primary-database quota summary for one personal or project scope (ADR 0040).",
+        "type": "object",
+        "required": [
+          "scope_id",
+          "scope_kind",
+          "observed_at",
+          "storage",
+          "usage",
+          "execution",
+          "device_capacity",
+          "warnings"
+        ],
+        "properties": {
+          "scope_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "scope_kind": {
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "personal",
+              "project"
+            ]
+          },
+          "observed_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "storage": {
+            "$ref": "#/components/schemas/QuotaStorageSummary"
+          },
+          "usage": {
+            "type": "array",
+            "maxItems": 16,
+            "items": {
+              "$ref": "#/components/schemas/QuotaUsageItem"
+            }
+          },
+          "execution": {
+            "$ref": "#/components/schemas/QuotaExecutionSummary"
+          },
+          "device_capacity": {
+            "$ref": "#/components/schemas/QuotaDeviceCapacitySummary"
+          },
+          "warnings": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "$ref": "#/components/schemas/QuotaWarning"
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "required": [
+                "scope_kind"
+              ],
+              "properties": {
+                "scope_kind": {
+                  "const": "personal"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "execution": {
+                  "required": [
+                    "live_runs_per_actor",
+                    "executing_runs_per_actor"
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "required": [
+                "scope_kind"
+              ],
+              "properties": {
+                "scope_kind": {
+                  "const": "project"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "execution": {
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "live_runs_per_actor"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "executing_runs_per_actor"
+                        ]
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "QuotaOverrideSetRequest": {
+        "description": "Closed request body to create or update a scope quota override (ADR 0040).",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "hard_limit",
+          "reason"
+        ],
+        "properties": {
+          "hard_limit": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reason": {
+            "$ref": "#/components/schemas/QuotaOverrideReason"
+          }
+        }
+      },
+      "QuotaOverrideRevokeRequest": {
+        "description": "Closed request body to revoke an active scope quota override (ADR 0040).",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "$ref": "#/components/schemas/QuotaOverrideReason"
+          }
+        }
+      },
+      "QuotaOverride": {
+        "description": "Scope-level numeric quota override record returned after set or revoke.",
+        "type": "object",
+        "required": [
+          "scope_id",
+          "scope_kind",
+          "resource_kind",
+          "hard_limit",
+          "expires_at",
+          "revoked_at",
+          "revision",
+          "updated_at"
+        ],
+        "properties": {
+          "scope_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "scope_kind": {
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "personal",
+              "project"
+            ]
+          },
+          "resource_kind": {
+            "$ref": "#/components/schemas/Code",
+            "examples": [
+              "storage_bytes",
+              "usage_tokens",
+              "usage_cost_micros",
+              "device_reservations",
+              "live_runs_per_actor",
+              "live_runs_per_scope",
+              "executing_runs_per_actor",
+              "executing_runs_per_scope",
+              "round_cap"
+            ]
+          },
+          "hard_limit": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "revoked_at": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "revision": {
+            "$ref": "#/components/schemas/NonNegativeDecimal"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        }
       }
     },
     "examples": {
@@ -6548,7 +7579,70 @@
         "x-openmettle-fixture": {
           "schema": "#/components/schemas/Problem",
           "direction": "response",
-          "mutations": []
+          "mutations": [
+            {
+              "name": "with-quota-extension",
+              "class": "valid",
+              "op": "set",
+              "path": "/quota",
+              "value": {
+                "resource_kind": "usage_tokens",
+                "scope_kind": "personal"
+              }
+            },
+            {
+              "name": "with-instance-quota-extension",
+              "class": "valid",
+              "op": "set",
+              "path": "/quota",
+              "value": {
+                "resource_kind": "storage_bytes",
+                "scope_kind": "instance"
+              }
+            },
+            {
+              "name": "quota-unknown-field",
+              "class": "invalid",
+              "op": "set",
+              "path": "/quota",
+              "value": {
+                "resource_kind": "storage_bytes",
+                "scope_kind": "personal",
+                "remaining_bytes": "0"
+              },
+              "expect": {
+                "instancePath": "/quota",
+                "keyword": "additionalProperties"
+              }
+            },
+            {
+              "name": "quota-bad-scope-kind",
+              "class": "invalid",
+              "op": "set",
+              "path": "/quota",
+              "value": {
+                "resource_kind": "storage_bytes",
+                "scope_kind": "global"
+              },
+              "expect": {
+                "instancePath": "/quota/scope_kind",
+                "keyword": "enum"
+              }
+            },
+            {
+              "name": "quota-missing-resource-kind",
+              "class": "invalid",
+              "op": "set",
+              "path": "/quota",
+              "value": {
+                "scope_kind": "personal"
+              },
+              "expect": {
+                "instancePath": "/quota",
+                "keyword": "required"
+              }
+            }
+          ]
         }
       },
       "ProblemRateLimited": {
@@ -8558,6 +9652,501 @@
               }
             }
           ]
+        }
+      },
+      "WideCounterZero": {
+        "summary": "Smallest wide counter (numeric(38, 0))",
+        "dataValue": "0",
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/WideNonNegativeDecimal",
+          "direction": "value",
+          "mutations": [
+            {
+              "name": "three-column-token-sum-above-signed-64",
+              "class": "valid",
+              "op": "set",
+              "path": "",
+              "value": "27670116110564327421"
+            },
+            {
+              "name": "numeric-38-maximum",
+              "class": "valid",
+              "op": "set",
+              "path": "",
+              "value": "99999999999999999999999999999999999999"
+            },
+            {
+              "name": "thirty-nine-digits",
+              "class": "invalid",
+              "op": "set",
+              "path": "",
+              "value": "100000000000000000000000000000000000000",
+              "expect": {
+                "instancePath": "",
+                "keyword": "maxLength"
+              }
+            },
+            {
+              "name": "leading-zero",
+              "class": "invalid",
+              "op": "set",
+              "path": "",
+              "value": "01",
+              "expect": {
+                "instancePath": "",
+                "keyword": "pattern"
+              }
+            },
+            {
+              "name": "negative",
+              "class": "invalid",
+              "op": "set",
+              "path": "",
+              "value": "-1",
+              "expect": {
+                "instancePath": "",
+                "keyword": "pattern"
+              }
+            },
+            {
+              "name": "json-number",
+              "class": "invalid",
+              "op": "set",
+              "path": "",
+              "value": 42,
+              "expect": {
+                "instancePath": "",
+                "keyword": "type"
+              }
+            }
+          ]
+        }
+      },
+      "QuotaSummaryPersonal": {
+        "summary": "Personal scope quota summary including wide counter",
+        "dataValue": {
+          "scope_id": "10111213-1415-4617-8819-1a1b1c1d1e1f",
+          "scope_kind": "personal",
+          "observed_at": "2026-11-20T12:00:00.000000Z",
+          "storage": {
+            "limit_bytes": "1073741824",
+            "limit_source": "default",
+            "override_expires_at": null,
+            "active_bytes": "4096",
+            "retained_bytes": "1024",
+            "reserved_bytes": "0",
+            "charged_bytes": "5120",
+            "remaining_bytes": "1073736704",
+            "warn_thresholds": [
+              80,
+              90
+            ],
+            "status": "ok"
+          },
+          "usage": [
+            {
+              "resource_kind": "usage_tokens",
+              "unit": "tokens",
+              "window_kind": "windowed",
+              "window_start": "2026-11-20T00:00:00.000000Z",
+              "window_end": "2026-11-21T00:00:00.000000Z",
+              "limit": "1000000",
+              "limit_source": "override",
+              "override_expires_at": "2026-12-01T00:00:00.000000Z",
+              "active_used": "27670116110564327421",
+              "reserved_held": "0",
+              "remaining": "0",
+              "warn_thresholds": [
+                80,
+                90
+              ],
+              "status": "hard_limit",
+              "authoritative_source": "gateway",
+              "last_reconciled_at": "2026-11-20T11:59:00.000000Z"
+            },
+            {
+              "resource_kind": "usage_cost_micros",
+              "unit": "usd_micros",
+              "window_kind": "static",
+              "window_start": "1970-01-01T00:00:00.000000Z",
+              "window_end": null,
+              "limit": "5000000",
+              "limit_source": "default",
+              "override_expires_at": null,
+              "active_used": "4250000",
+              "reserved_held": "0",
+              "remaining": "750000",
+              "warn_thresholds": [
+                80,
+                90
+              ],
+              "status": "warning",
+              "authoritative_source": "gateway",
+              "last_reconciled_at": "2026-11-20T11:59:00.000000Z"
+            }
+          ],
+          "execution": {
+            "live_runs_per_scope": {
+              "current": "1",
+              "limit": "8",
+              "limit_source": "default",
+              "override_expires_at": null
+            },
+            "executing_runs_per_scope": {
+              "current": "1",
+              "limit": "2",
+              "limit_source": "override",
+              "override_expires_at": null
+            },
+            "round_cap": {
+              "limit": "25",
+              "limit_source": "default",
+              "override_expires_at": null
+            },
+            "live_runs_per_actor": {
+              "current": "1",
+              "limit": "4",
+              "limit_source": "default",
+              "override_expires_at": null
+            },
+            "executing_runs_per_actor": {
+              "current": "1",
+              "limit": "2",
+              "limit_source": "default",
+              "override_expires_at": null
+            }
+          },
+          "device_capacity": {
+            "active_reservations": {
+              "reserved_held": "1",
+              "limit": "2",
+              "limit_source": "default",
+              "override_expires_at": null,
+              "warn_thresholds": [
+                80,
+                90
+              ],
+              "status": "ok"
+            }
+          },
+          "warnings": [
+            {
+              "resource_kind": "usage_cost_micros",
+              "threshold_pct": 80,
+              "dedupe_bucket": "2026-11-20T00:00:00.000000Z",
+              "triggered_at": "2026-11-20T11:59:00.000000Z"
+            }
+          ]
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/QuotaSummary",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "unrecognized-status",
+              "class": "compat",
+              "op": "set",
+              "path": "/storage/status",
+              "value": "soft_grace"
+            },
+            {
+              "name": "wide-counter-invalid-39-digits",
+              "class": "invalid",
+              "op": "set",
+              "path": "/usage/0/active_used",
+              "value": "100000000000000000000000000000000000000",
+              "expect": {
+                "instancePath": "/usage/0/active_used",
+                "keyword": "maxLength"
+              }
+            },
+            {
+              "name": "missing-live-per-actor",
+              "class": "invalid",
+              "op": "remove",
+              "path": "/execution/live_runs_per_actor",
+              "expect": {
+                "instancePath": "/execution",
+                "keyword": "required"
+              }
+            },
+            {
+              "name": "missing-executing-per-actor",
+              "class": "invalid",
+              "op": "remove",
+              "path": "/execution/executing_runs_per_actor",
+              "expect": {
+                "instancePath": "/execution",
+                "keyword": "required"
+              }
+            }
+          ]
+        }
+      },
+      "QuotaSummaryProject": {
+        "summary": "Project scope quota summary without per-actor fields",
+        "dataValue": {
+          "scope_id": "20212223-2425-4627-8829-2a2b2c2d2e2f",
+          "scope_kind": "project",
+          "observed_at": "2026-11-20T12:00:00.000000Z",
+          "storage": {
+            "limit_bytes": null,
+            "limit_source": "unconfigured",
+            "override_expires_at": null,
+            "active_bytes": "0",
+            "retained_bytes": "0",
+            "reserved_bytes": "0",
+            "charged_bytes": "0",
+            "remaining_bytes": null,
+            "warn_thresholds": [
+              80,
+              90
+            ],
+            "status": "unconfigured"
+          },
+          "usage": [
+            {
+              "resource_kind": "usage_tokens",
+              "unit": "tokens",
+              "window_kind": "static",
+              "window_start": "1970-01-01T00:00:00.000000Z",
+              "window_end": null,
+              "limit": null,
+              "limit_source": "unconfigured",
+              "override_expires_at": null,
+              "active_used": "0",
+              "reserved_held": "0",
+              "remaining": null,
+              "warn_thresholds": [
+                80,
+                90
+              ],
+              "status": "unconfigured",
+              "authoritative_source": "gateway",
+              "last_reconciled_at": null
+            },
+            {
+              "resource_kind": "usage_cost_micros",
+              "unit": null,
+              "window_kind": "static",
+              "window_start": "1970-01-01T00:00:00.000000Z",
+              "window_end": null,
+              "limit": null,
+              "limit_source": "unconfigured",
+              "override_expires_at": null,
+              "active_used": "0",
+              "reserved_held": "0",
+              "remaining": null,
+              "warn_thresholds": [
+                80,
+                90
+              ],
+              "status": "unconfigured",
+              "authoritative_source": "gateway",
+              "last_reconciled_at": null
+            }
+          ],
+          "execution": {
+            "live_runs_per_scope": {
+              "current": "0",
+              "limit": null,
+              "limit_source": "unconfigured",
+              "override_expires_at": null
+            },
+            "executing_runs_per_scope": {
+              "current": "0",
+              "limit": null,
+              "limit_source": "worker",
+              "override_expires_at": null
+            },
+            "round_cap": {
+              "limit": null,
+              "limit_source": "unconfigured",
+              "override_expires_at": null
+            }
+          },
+          "device_capacity": {
+            "active_reservations": {
+              "reserved_held": "0",
+              "limit": null,
+              "limit_source": "unconfigured",
+              "override_expires_at": null,
+              "warn_thresholds": [
+                80,
+                90
+              ],
+              "status": "unconfigured"
+            }
+          },
+          "warnings": []
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/QuotaSummary",
+          "direction": "response",
+          "mutations": [
+            {
+              "name": "with-live-per-actor",
+              "class": "invalid",
+              "op": "set",
+              "path": "/execution/live_runs_per_actor",
+              "value": {
+                "current": "0",
+                "limit": "4",
+                "limit_source": "default",
+                "override_expires_at": null
+              },
+              "expect": {
+                "instancePath": "/execution",
+                "keyword": "not"
+              }
+            },
+            {
+              "name": "with-executing-per-actor",
+              "class": "invalid",
+              "op": "set",
+              "path": "/execution/executing_runs_per_actor",
+              "value": {
+                "current": "0",
+                "limit": "2",
+                "limit_source": "default",
+                "override_expires_at": null
+              },
+              "expect": {
+                "instancePath": "/execution",
+                "keyword": "not"
+              }
+            },
+            {
+              "name": "with-null-live-per-actor",
+              "class": "invalid",
+              "op": "set",
+              "path": "/execution/live_runs_per_actor",
+              "value": null,
+              "expect": {
+                "instancePath": "/execution",
+                "keyword": "not"
+              }
+            },
+            {
+              "name": "with-null-executing-per-actor",
+              "class": "invalid",
+              "op": "set",
+              "path": "/execution/executing_runs_per_actor",
+              "value": null,
+              "expect": {
+                "instancePath": "/execution",
+                "keyword": "not"
+              }
+            }
+          ]
+        }
+      },
+      "QuotaOverrideSetRequestTypical": {
+        "summary": "Set a scope quota override",
+        "dataValue": {
+          "hard_limit": "500000",
+          "expires_at": "2026-12-31T23:59:59.000000Z",
+          "reason": "Increase budget for evaluation cohort"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/QuotaOverrideSetRequest",
+          "direction": "request",
+          "mutations": [
+            {
+              "name": "without-expiry",
+              "class": "valid",
+              "op": "remove",
+              "path": "/expires_at"
+            },
+            {
+              "name": "zero-hard-limit",
+              "class": "valid",
+              "op": "set",
+              "path": "/hard_limit",
+              "value": "0"
+            },
+            {
+              "name": "empty-reason",
+              "class": "invalid",
+              "op": "set",
+              "path": "/reason",
+              "value": "",
+              "expect": {
+                "instancePath": "/reason",
+                "keyword": "minLength"
+              }
+            },
+            {
+              "name": "hard-limit-above-signed-64",
+              "class": "invalid",
+              "op": "set",
+              "path": "/hard_limit",
+              "value": "9223372036854775808",
+              "expect": {
+                "instancePath": "/hard_limit",
+                "keyword": "pattern"
+              }
+            }
+          ]
+        }
+      },
+      "QuotaOverrideRevokeRequestTypical": {
+        "summary": "Revoke an active scope quota override",
+        "dataValue": {
+          "reason": "Return scope to deployment defaults"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/QuotaOverrideRevokeRequest",
+          "direction": "request",
+          "mutations": [
+            {
+              "name": "empty-reason",
+              "class": "invalid",
+              "op": "set",
+              "path": "/reason",
+              "value": "",
+              "expect": {
+                "instancePath": "/reason",
+                "keyword": "minLength"
+              }
+            }
+          ]
+        }
+      },
+      "QuotaOverrideActive": {
+        "summary": "Active scope quota override",
+        "dataValue": {
+          "scope_id": "10111213-1415-4617-8819-1a1b1c1d1e1f",
+          "scope_kind": "personal",
+          "resource_kind": "usage_tokens",
+          "hard_limit": "500000",
+          "expires_at": "2026-12-31T23:59:59.000000Z",
+          "revoked_at": null,
+          "revision": "1",
+          "updated_at": "2026-11-20T12:00:00.000000Z"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/QuotaOverride",
+          "direction": "response",
+          "mutations": []
+        }
+      },
+      "QuotaOverrideRevoked": {
+        "summary": "Revoked scope quota override",
+        "dataValue": {
+          "scope_id": "10111213-1415-4617-8819-1a1b1c1d1e1f",
+          "scope_kind": "personal",
+          "resource_kind": "usage_tokens",
+          "hard_limit": "500000",
+          "expires_at": "2026-12-31T23:59:59.000000Z",
+          "revoked_at": "2026-11-20T12:05:00.000000Z",
+          "revision": "2",
+          "updated_at": "2026-11-20T12:05:00.000000Z"
+        },
+        "x-openmettle-fixture": {
+          "schema": "#/components/schemas/QuotaOverride",
+          "direction": "response",
+          "mutations": []
         }
       }
     }

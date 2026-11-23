@@ -592,3 +592,134 @@ async fn omitted_reasoning_preserves_tool_and_result_pair_rejects_missing_or_dup
         assert!(!req.contains(THINK) && req.contains("done") && req.contains(ARG));
     }
 }
+
+#[tokio::test]
+async fn prepared_request_decodes_tool_calls_against_bound_request_tools() {
+    for (p, stream) in MODES {
+        let bytes = canary_turn(p, stream);
+        let mock = Mock::new(p, move |_| Reply::Bytes(bytes.clone())).await;
+        let c = catalog(p, false);
+        let e = effective(&c, false);
+        let g = mock.gateway(&e, NORMAL);
+        let r = request(stream);
+
+        // caller_prepared decodes the tool call strictly against the prepared request's bound tools.
+        let prepared_caller = g.prepare(&c, &e, &r, false).unwrap();
+        assert!(std::ptr::eq(prepared_caller.gateway(), &g));
+        assert_eq!(prepared_caller.model_name(), e.model);
+        assert!(!prepared_caller.is_server());
+        assert_eq!(
+            prepared_caller.round_tokens(),
+            e.ceiling.value.map(|v| v as i64)
+        );
+        assert_eq!(
+            prepared_caller.output_reserve(),
+            e.output_reserve.value.map(|v| v as i64)
+        );
+        assert_eq!(prepared_caller.round_cost(), None);
+        assert!(!prepared_caller.requires_device_slot());
+        g.validate_outbound_headers(Credential::Bearer(TOKEN), &prepared_caller)
+            .unwrap();
+        let oversized_bearer = "b".repeat(940);
+        assert_eq!(
+            g.validate_outbound_headers(Credential::Bearer(&oversized_bearer), &prepared_caller),
+            Err(Error::Credential)
+        );
+        let caller_turn = g
+            .caller_prepared(prepared_caller, Credential::Bearer(TOKEN), |_| async {})
+            .await
+            .unwrap();
+        let CallGroup::Valid(caller_calls) = &caller_turn.answers[0].calls else {
+            panic!("expected valid caller_prepared tool calls");
+        };
+        assert_eq!(caller_calls.len(), 1);
+        assert_eq!(caller_calls[0].id, "c");
+
+        // server_prepared decodes the tool call strictly against the prepared request's bound tools.
+        let prepared_server = g.prepare(&c, &e, &r, true).unwrap();
+        let (_tx, stop) = super::timing::run_stop(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        );
+        let server_turn = g
+            .server_prepared(
+                prepared_server,
+                Credential::Bearer(TOKEN),
+                stop,
+                |_| async {},
+            )
+            .await
+            .unwrap();
+        let CallGroup::Valid(server_calls) = &server_turn.answers[0].calls else {
+            panic!("expected valid server_prepared tool calls");
+        };
+        assert_eq!(server_calls.len(), 1);
+        assert_eq!(server_calls[0].id, "c");
+
+        // Mismatched server flag between prepare() and *_prepared() is refused before HTTP.
+        let wrong_for_caller = g.prepare(&c, &e, &r, true).unwrap();
+        assert_eq!(
+            g.caller_prepared(wrong_for_caller, Credential::Bearer(TOKEN), |_| async {})
+                .await
+                .err(),
+            Some(Error::Validation)
+        );
+        let wrong_for_server = g.prepare(&c, &e, &r, false).unwrap();
+        let (_tx2, stop2) = super::timing::run_stop(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        );
+        assert_eq!(
+            g.server_prepared(
+                wrong_for_server,
+                Credential::Bearer(TOKEN),
+                stop2,
+                |_| async {}
+            )
+            .await
+            .err(),
+            Some(Error::Validation)
+        );
+        mock.assert_inference_only(2);
+    }
+}
+
+#[tokio::test]
+async fn prepared_request_rejects_cross_gateway_same_pin_dispatch() {
+    let chat_mock = Mock::new(Protocol::Chat, |_| Reply::Bytes(Vec::new())).await;
+    let resp_mock = Mock::new(Protocol::Responses, |_| Reply::Bytes(Vec::new())).await;
+    let c = catalog(Protocol::Chat, false);
+    let e = effective(&c, false);
+    let chat_gw = chat_mock.gateway(&e, NORMAL);
+    let resp_gw = resp_mock.gateway(&e, NORMAL);
+    let r = request(false);
+
+    let chat_caller = chat_gw.prepare(&c, &e, &r, false).unwrap();
+    assert_eq!(
+        resp_gw.validate_outbound_headers(Credential::Bearer(TOKEN), &chat_caller),
+        Err(Error::Validation)
+    );
+    assert_eq!(
+        resp_gw
+            .caller_prepared(chat_caller, Credential::Bearer(TOKEN), |_| async {})
+            .await
+            .err(),
+        Some(Error::Validation)
+    );
+
+    let chat_server = chat_gw.prepare(&c, &e, &r, true).unwrap();
+    assert_eq!(
+        resp_gw.validate_outbound_headers(Credential::Bearer(TOKEN), &chat_server),
+        Err(Error::Validation)
+    );
+    let (_tx, stop) =
+        super::timing::run_stop(tokio::time::Instant::now() + std::time::Duration::from_secs(5));
+    assert_eq!(
+        resp_gw
+            .server_prepared(chat_server, Credential::Bearer(TOKEN), stop, |_| async {})
+            .await
+            .err(),
+        Some(Error::Validation)
+    );
+
+    chat_mock.assert_inference_only(0);
+    resp_mock.assert_inference_only(0);
+}

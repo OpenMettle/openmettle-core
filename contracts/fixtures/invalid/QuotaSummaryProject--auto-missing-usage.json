@@ -1,0 +1,71 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "QuotaSummaryProject--auto-missing-usage",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "device_capacity": {
+      "active_reservations": {
+        "limit": null,
+        "limit_source": "unconfigured",
+        "override_expires_at": null,
+        "reserved_held": "0",
+        "status": "unconfigured",
+        "warn_thresholds": [
+          80,
+          90
+        ]
+      }
+    },
+    "execution": {
+      "executing_runs_per_scope": {
+        "current": "0",
+        "limit": null,
+        "limit_source": "worker",
+        "override_expires_at": null
+      },
+      "live_runs_per_scope": {
+        "current": "0",
+        "limit": null,
+        "limit_source": "unconfigured",
+        "override_expires_at": null
+      },
+      "round_cap": {
+        "limit": null,
+        "limit_source": "unconfigured",
+        "override_expires_at": null
+      }
+    },
+    "observed_at": "2026-11-20T12:00:00.000000Z",
+    "scope_id": "20212223-2425-4627-8829-2a2b2c2d2e2f",
+    "scope_kind": "project",
+    "storage": {
+      "active_bytes": "0",
+      "charged_bytes": "0",
+      "limit_bytes": null,
+      "limit_source": "unconfigured",
+      "override_expires_at": null,
+      "remaining_bytes": null,
+      "reserved_bytes": "0",
+      "retained_bytes": "0",
+      "status": "unconfigured",
+      "warn_thresholds": [
+        80,
+        90
+      ]
+    },
+    "warnings": []
+  },
+  "mutation": {
+    "name": "auto-missing-usage",
+    "op": "remove",
+    "path": "/usage"
+  },
+  "schema": "#/components/schemas/QuotaSummary",
+  "source": "#/components/examples/QuotaSummaryProject"
+}

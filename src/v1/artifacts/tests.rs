@@ -212,6 +212,10 @@ fn upload_failures_map_to_adr_0007_categories() {
         (E::Storage(runs::Error::OwnerLimit), QUOTA),
         (E::Storage(runs::Error::InstanceLimit), QUOTA),
         (E::Storage(runs::Error::LimitUnconfigured), PROVISIONING),
+        (
+            E::Storage(runs::Error::InstanceLimitUnconfigured),
+            PROVISIONING,
+        ),
         (E::Storage(runs::Error::Conflict), KEY_CONFLICT),
         (E::Storage(runs::Error::NotFound), NOT_FOUND),
         (E::Storage(runs::Error::Invalid), INVALID),

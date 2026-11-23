@@ -669,6 +669,18 @@ const ADDITIVE_COLUMNS: &[AdditiveColumn] = &[
         column: "effective_expires_us",
         default: ColumnDefault::Null,
     },
+    AdditiveColumn {
+        since: 26,
+        table: "quota_enforcement",
+        column: "overrides_enforced",
+        default: ColumnDefault::Bool(false),
+    },
+    AdditiveColumn {
+        since: 26,
+        table: "quota_enforcement",
+        column: "overrides_enforced_at",
+        default: ColumnDefault::Null,
+    },
 ];
 
 /// Single declarative registry of every table added after migration 14, ordered by `since`
@@ -826,7 +838,9 @@ const ADDITIVE_TABLES: &[AdditiveTable] = &[
     AdditiveTable {
         since: 24,
         table: "quota_enforcement",
-        seed_row: Some(r#"{"id":true,"metering_enforced":false,"metering_enforced_at":null}"#),
+        seed_row: Some(
+            r#"{"id":true,"metering_enforced":false,"metering_enforced_at":null,"overrides_enforced":false,"overrides_enforced_at":null}"#,
+        ),
     },
     AdditiveTable {
         since: 24,
@@ -1025,6 +1039,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "275b395fab0a1e90fc6f9a3039d008adc138294af0cb0da9cb944df87b26ec1c",
         "a6ea85d09af2c2aa7d267499623a46a3922e695b79bdf585cd8e2164d68e5d9a",
         "814d7832603fdb9752e55259c1c44b6815228ae5fb128b54ed5becf9fed508d7",
+        "dad89ccf522802b8c572ec8947fdfede32e569a5e26004ecb593edf50c96711f",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
@@ -1191,7 +1206,9 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
             ("quota_cost_unit_lock", Some(r#"{"id":true}"#)),
             (
                 "quota_enforcement",
-                Some(r#"{"id":true,"metering_enforced":false,"metering_enforced_at":null}"#)
+                Some(
+                    r#"{"id":true,"metering_enforced":false,"metering_enforced_at":null,"overrides_enforced":false,"overrides_enforced_at":null}"#
+                )
             ),
             ("quota_gateway_handoffs", None),
             ("quota_overrides", None),

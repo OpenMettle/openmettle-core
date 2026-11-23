@@ -1,0 +1,24 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "additionalProperties",
+    "valid": false
+  },
+  "fixture": "QuotaOverrideRevokeRequestTypical--auto-unknown-root-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "reason": "Return scope to deployment defaults",
+    "x_contract_future_field": {
+      "added_in": "1.999"
+    }
+  },
+  "mutation": {
+    "name": "auto-unknown-root-field",
+    "op": "set",
+    "path": "/x_contract_future_field"
+  },
+  "schema": "#/components/schemas/QuotaOverrideRevokeRequest",
+  "source": "#/components/examples/QuotaOverrideRevokeRequestTypical"
+}

@@ -1,0 +1,18 @@
+{
+  "class": "valid",
+  "direction": "value",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "WideCounterZero--numeric-38-maximum",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": "99999999999999999999999999999999999999",
+  "mutation": {
+    "name": "numeric-38-maximum",
+    "op": "set",
+    "path": "",
+    "value": "99999999999999999999999999999999999999"
+  },
+  "schema": "#/components/schemas/WideNonNegativeDecimal",
+  "source": "#/components/examples/WideCounterZero"
+}

@@ -420,12 +420,12 @@ pub(super) async fn submit(
     .await?;
     let mut tx = WriteTransaction::begin_bounded(c, false).await?;
     let result = admission(&mut tx, &visible.scope_id, call, r, limits, catalog).await;
-    if matches!(result, Ok(Admission::Admitted { .. })) {
+    if matches!(result, Ok((_, true))) {
         tx.commit().await?
     } else {
         tx.rollback().await?
     }
-    match result? {
+    match result?.0 {
         Admission::Admitted { run_id, .. } => Ok((StatusCode::CREATED, run_id)),
         Admission::Replayed { run_id, .. } => Ok((StatusCode::OK, run_id)),
         Admission::Refused(RunLimit::ActorLimit | RunLimit::ScopeLimit) => Err(problem(
@@ -434,6 +434,30 @@ pub(super) async fn submit(
             "A live run limit has been reached.",
         )),
         Admission::Refused(RunLimit::QueueFull) => Err(QUEUE_FULL),
+        Admission::Refused(RunLimit::Quota {
+            resource_kind,
+            scope_kind,
+        }) => Err(quota_problem(
+            StatusCode::TOO_MANY_REQUESTS,
+            "quota",
+            if resource_kind == "device_reservations" {
+                "The device reservation quota does not allow this request."
+            } else {
+                "The usage budget does not allow this request."
+            },
+            resource_kind,
+            scope_kind,
+        )),
+        Admission::Refused(RunLimit::QuotaUnconfigured {
+            resource_kind,
+            scope_kind,
+        }) => Err(quota_problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provisioning",
+            "Quota limits are not configured for this resource.",
+            resource_kind,
+            scope_kind,
+        )),
     }
 }
 pub(super) const QUEUE_FULL: Problem = problem(
@@ -448,7 +472,7 @@ async fn admission(
     r: &Request,
     limits: &AdmissionLimits,
     catalog: Option<&Catalog>,
-) -> Result<Admission, Problem> {
+) -> Result<(Admission, bool), Problem> {
     let c = tx.connection()?;
     let ctx = call.context;
     queue::lock_scope_actor(c, scope, ctx.user_id()).await?;
@@ -477,76 +501,109 @@ async fn admission(
         selection: &r.proposal.selection,
         requested_rounds: r.proposal.requested_rounds,
     };
-    let (branch, message, format, version, snapshots, gates) =
-        if let Some(found) = queue::find_run(c, scope, ctx.user_id(), &key).await? {
-            let (previous, config) = Snapshots::decode(&found).map_err(|_| KEY_CONFLICT)?;
-            let mode: StoredMode =
-                serde_json::from_slice(&found.config_snapshot).map_err(|_| KEY_CONFLICT)?;
-            if mode.execution_mode != r.execution_mode || !previous.matches(&intent) {
-                return Err(KEY_CONFLICT);
-            }
-            (
-                found.branch_id,
-                found.input_message_id,
-                found.snapshot_format,
-                found.snapshot_version,
-                Snapshots {
-                    input: found.input_snapshot,
-                    config: found.config_snapshot,
-                },
-                config.required_capabilities,
-            )
-        } else {
-            let audit = AuditContext {
-                request_key: &key,
-                ..call.audit()
-            };
-            let target = branches::prepare_turn(
-                tx,
-                &audit,
-                chat,
-                &r.branch_id,
-                intent.expected_head_message_id,
-                intent.operation,
-            )
-            .await?;
-            let c = tx.connection()?;
-            let catalog = catalog.ok_or(PROVISIONING)?;
-            let mut config = resolve(c, &actor, &view, catalog, intent.selection).await?;
-            if r.execution_mode == ExecutionMode::Yolo {
-                config
-                    .required_capabilities
-                    .insert("runs.use_yolo".into(), authz::CapabilityGate::OptIn);
-            }
-            let history = branches::history(c, &actor, chat, &target.branch_id, ctx.observed_ms())
-                .await?
-                .ok_or(NOT_FOUND)?;
-            let path = history
-                .turns
-                .iter()
-                .map(|t| t.metadata.clone())
-                .collect::<Vec<_>>();
-            budget(catalog, &config.effective, &path, &history, None)?.admit()?;
-            let mut snapshots = Snapshots::encode(&intent, &history, catalog, &config)?;
-            snapshots.config = serde_json::to_vec(&AdmissionConfig {
-                config: &config,
-                execution_mode: r.execution_mode,
-            })
-            .map_err(|_| INTERNAL)?;
-            (
-                target.branch_id,
-                target.input_message_id,
-                SNAPSHOT_FORMAT.to_owned(),
-                SNAPSHOT_VERSION,
-                snapshots,
-                config.required_capabilities,
-            )
+    let scope_kind = if view.project_id.is_some() {
+        "project"
+    } else {
+        "personal"
+    };
+    let (
+        branch,
+        message,
+        format,
+        version,
+        snapshots,
+        gates,
+        per_round_ceiling,
+        per_round_cost_micros,
+        requires_device_slot,
+    ) = if let Some(found) = queue::find_run(c, scope, ctx.user_id(), &key).await? {
+        let (previous, config) = Snapshots::decode(&found).map_err(|_| KEY_CONFLICT)?;
+        let mode: StoredMode =
+            serde_json::from_slice(&found.config_snapshot).map_err(|_| KEY_CONFLICT)?;
+        if mode.execution_mode != r.execution_mode || !previous.matches(&intent) {
+            return Err(KEY_CONFLICT);
+        }
+        let (round_cost, device_slot) = match catalog {
+            Some(cat) => match cat.target(&config.effective) {
+                Ok(profile) => (
+                    cat.round_cost_ceiling(&config.effective).ok().flatten(),
+                    profile.requires_device_slot,
+                ),
+                Err(_) => (None, false),
+            },
+            None => (None, false),
         };
+        (
+            found.branch_id,
+            found.input_message_id,
+            found.snapshot_format,
+            found.snapshot_version,
+            Snapshots {
+                input: found.input_snapshot,
+                config: found.config_snapshot,
+            },
+            config.required_capabilities,
+            config.effective.ceiling.value,
+            round_cost,
+            device_slot,
+        )
+    } else {
+        let audit = AuditContext {
+            request_key: &key,
+            ..call.audit()
+        };
+        let target = branches::prepare_turn(
+            tx,
+            &audit,
+            chat,
+            &r.branch_id,
+            intent.expected_head_message_id,
+            intent.operation,
+        )
+        .await?;
+        let c = tx.connection()?;
+        let catalog = catalog.ok_or(PROVISIONING)?;
+        let mut config = resolve(c, &actor, &view, catalog, intent.selection).await?;
+        if r.execution_mode == ExecutionMode::Yolo {
+            config
+                .required_capabilities
+                .insert("runs.use_yolo".into(), authz::CapabilityGate::OptIn);
+        }
+        let history = branches::history(c, &actor, chat, &target.branch_id, ctx.observed_ms())
+            .await?
+            .ok_or(NOT_FOUND)?;
+        let path = history
+            .turns
+            .iter()
+            .map(|t| t.metadata.clone())
+            .collect::<Vec<_>>();
+        budget(catalog, &config.effective, &path, &history, None)?.admit()?;
+        let profile = catalog.target(&config.effective)?;
+        let round_cost = catalog.round_cost_ceiling(&config.effective)?;
+        let device_slot = profile.requires_device_slot;
+        let mut snapshots = Snapshots::encode(&intent, &history, catalog, &config)?;
+        snapshots.config = serde_json::to_vec(&AdmissionConfig {
+            config: &config,
+            execution_mode: r.execution_mode,
+        })
+        .map_err(|_| INTERNAL)?;
+        (
+            target.branch_id,
+            target.input_message_id,
+            SNAPSHOT_FORMAT.to_owned(),
+            SNAPSHOT_VERSION,
+            snapshots,
+            config.required_capabilities,
+            config.effective.ceiling.value,
+            round_cost,
+            device_slot,
+        )
+    };
     let caps = gates
         .iter()
         .map(|(name, gate)| queue::CapabilityUse { name, gate: *gate })
         .collect::<Vec<_>>();
-    Ok(queue::admit_run_with_mode(
+    let admitted = queue::admit_run_with_mode(
         tx,
         &queue::RunAdmission {
             input: RunInput {
@@ -565,11 +622,77 @@ async fn admission(
             capabilities: &caps,
             requested_rounds: intent.requested_rounds,
             now_ms: ctx.observed_ms(),
+            cost_qualified: Some(per_round_cost_micros.is_some()),
         },
         limits,
         ctx,
     )
-    .await?)
+    .await?;
+    let build_token_units = |round_limit: i32| -> Result<i64, Problem> {
+        let per_round = per_round_ceiling.ok_or(PROVISIONING)?;
+        per_round
+            .checked_mul(u64::from(u32::try_from(round_limit).map_err(|_| INTERNAL)?))
+            .and_then(|n| i64::try_from(n).ok())
+            .filter(|&n| n > 0)
+            .ok_or(INVALID)
+    };
+    match &admitted {
+        Admission::Admitted {
+            run_id,
+            round_limit,
+        } => {
+            let token_units = build_token_units(*round_limit)?;
+            if let Some(limit) = crate::quotas::reserve_admitted_run_budget(
+                tx,
+                &crate::quotas::RunBudgetReservation {
+                    scope_id: scope,
+                    scope_kind,
+                    actor_user_id: ctx.user_id(),
+                    actor_approval_id: ctx.approval_id(),
+                    run_id,
+                    token_units,
+                    per_round_cost_micros,
+                    round_limit: *round_limit,
+                    requires_device_slot,
+                },
+            )
+            .await?
+            {
+                return Ok((Admission::Refused(limit), false));
+            }
+            Ok((admitted, true))
+        }
+        Admission::Replayed {
+            run_id,
+            state,
+            round_limit,
+        } if state == "queued" => {
+            let effective_rounds = round_limit.unwrap_or(limits.round_cap);
+            let Ok(token_units) = build_token_units(effective_rounds) else {
+                return Ok((admitted, false));
+            };
+            let (committed, refusal) = crate::quotas::backfill_replayed_run_budget(
+                tx,
+                &crate::quotas::RunBudgetReservation {
+                    scope_id: scope,
+                    scope_kind,
+                    actor_user_id: ctx.user_id(),
+                    actor_approval_id: ctx.approval_id(),
+                    run_id,
+                    token_units,
+                    per_round_cost_micros,
+                    round_limit: effective_rounds,
+                    requires_device_slot,
+                },
+            )
+            .await?;
+            if refusal.is_some() {
+                return Ok((admitted, false));
+            }
+            Ok((admitted, committed))
+        }
+        _ => Ok((admitted, false)),
+    }
 }
 pub(super) async fn cancel(
     c: &mut PgConnection,

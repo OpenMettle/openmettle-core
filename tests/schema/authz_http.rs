@@ -40,7 +40,7 @@ fn audience() -> Vec<u8> {
     )
 }
 
-async fn browser(db: &TestDb, account: &Account, n: u8) -> String {
+pub(super) async fn browser(db: &TestDb, account: &Account, n: u8) -> String {
     seeded_session(db, account, n, None).await
 }
 
@@ -50,14 +50,14 @@ async fn native(db: &TestDb, account: &Account, n: u8) -> String {
 
 /// A session credential on its channel.
 #[derive(Clone, Copy)]
-enum As<'a> {
+pub(super) enum As<'a> {
     Browser(&'a str),
     Native(&'a str),
 }
 
 /// The API binary with `AUTH_CONFIG` and `ARTIFACTS_DIR`, connected as `openmettle_api` and,
 /// for session issuance, as `openmettle_issuance` (ADR 0030). Killed on drop.
-struct Api {
+pub(super) struct Api {
     process: Process,
     dir: auth_config_support::Dir,
     bind: String,
@@ -77,7 +77,7 @@ impl Api {
         Self::configured(db, dir, document, 4)
     }
 
-    fn configured(
+    pub(super) fn configured(
         db: &TestDb,
         dir: auth_config_support::Dir,
         document: Value,
@@ -181,7 +181,7 @@ impl Api {
 
     /// One `/v1` request: the status and the JSON body (`null` when empty). Every problem
     /// decodes with the contract consumer.
-    fn call(
+    pub(super) fn call(
         &self,
         who: As<'_>,
         method: &str,
@@ -277,7 +277,7 @@ async fn mounted() -> (TestDb, Api) {
 }
 
 #[track_caller]
-fn success(response: (u16, Value), status: u16) -> Value {
+pub(super) fn success(response: (u16, Value), status: u16) -> Value {
     assert_eq!(response.0, status, "{}", response.1);
     response.1
 }
@@ -1594,6 +1594,2964 @@ async fn interrupted_uploads_leave_nothing_after_reconciliation() {
     let stored = success(api.upload(alice_n, "/v1/artifacts", "fresh", &body), 201);
     assert_eq!(stored["size_bytes"], "4096");
     assert_eq!(charged(&db, &personal).await, (4096, 0, 0));
+}
+
+fn validate_openapi_schema(pointer: &str, instance: &Value) -> bool {
+    let mut doc: Value =
+        serde_json::from_str(include_str!("../../contracts/openapi/openmettle-v1.json")).unwrap();
+    doc["$ref"] = json!(pointer);
+    let validator = jsonschema::draft202012::options()
+        .should_validate_formats(true)
+        .build(&doc)
+        .unwrap();
+    validator.is_valid(instance)
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn quota_summary_wide_counters_privacy_warnings_and_hard_limit_reads_work_on_both_channels() {
+    let (db, api) = mounted().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let bob = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &admin).await;
+
+    let (a_b, a_n) = (browser(&db, &alice, 1).await, native(&db, &alice, 2).await);
+    let (b_b, b_n) = (browser(&db, &bob, 3).await, native(&db, &bob, 4).await);
+    let (adm_b, adm_n) = (browser(&db, &admin, 5).await, native(&db, &admin, 6).await);
+    let (alice_b, alice_n) = (As::Browser(&a_b), As::Native(&a_n));
+    let (bob_b, bob_n) = (As::Browser(&b_b), As::Native(&b_n));
+    let (admin_b, admin_n) = (As::Browser(&adm_b), As::Native(&adm_n));
+
+    let alice_scope = personal_of(&db, &alice).await;
+    let proj = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/projects",
+            Some("quota-proj"),
+            Some(&json!({"name": "Alpha Quotas"})),
+        ),
+        201,
+    );
+    let proj_id = proj["project_id"].as_str().unwrap();
+    let proj_path = format!("/v1/projects/{proj_id}/quotas");
+
+    // 1. Project quota concealment: non-member and non-member account_admin receive 404 not_found.
+    for who in [bob_b, bob_n, admin_b, admin_n] {
+        refused(
+            api.call(who, "GET", &proj_path, None, None),
+            404,
+            "not_found",
+        );
+    }
+
+    // 2. Oversized > i64::MAX 3-column token settlement read via GET /v1/quotas/personal.
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 1000), ('instance', 'usage_tokens', 10000000000)",
+        )
+        .await
+        .unwrap();
+    super::quotas::settle_oversized_three_column_tokens(&db, &alice, &alice_scope, &a_b).await;
+
+    for who in [alice_b, alice_n] {
+        let summary = success(api.call(who, "GET", "/v1/quotas/personal", None, None), 200);
+        assert!(
+            validate_openapi_schema("#/components/schemas/QuotaSummary", &summary),
+            "QuotaSummary schema rejected wide counter response: {summary}"
+        );
+        let wide_val = &summary["usage"][0]["active_used"];
+        assert_eq!(wide_val, "27670116110564327421");
+        assert!(validate_openapi_schema(
+            "#/components/schemas/WideNonNegativeDecimal",
+            wide_val
+        ));
+        assert!(!validate_openapi_schema(
+            "#/components/schemas/NonNegativeDecimal",
+            wide_val
+        ));
+        let decoded = consumer::decode_quota_summary(&summary).unwrap();
+        assert_eq!(decoded.usage[0].active_used, 27_670_116_110_564_327_421u128);
+        assert_eq!(decoded.usage[0].remaining, Some(0));
+        assert_eq!(decoded.usage[0].status, consumer::QuotaStatus::HardLimit);
+        assert!(decoded.has_actor_execution);
+    }
+
+    // Project summary never leaks member's personal usage or per-actor execution fields.
+    let proj_summary = success(api.call(alice_n, "GET", &proj_path, None, None), 200);
+    assert!(validate_openapi_schema(
+        "#/components/schemas/QuotaSummary",
+        &proj_summary
+    ));
+    let decoded_proj = consumer::decode_quota_summary(&proj_summary).unwrap();
+    assert_eq!(decoded_proj.scope_kind, "project");
+    assert!(!decoded_proj.has_actor_execution);
+    assert_eq!(decoded_proj.usage[0].active_used, 0);
+
+    // Deleted project becomes 404 even for its owner.
+    let del_proj = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/projects",
+            Some("quota-del-proj"),
+            Some(&json!({"name": "Soon Deleted"})),
+        ),
+        201,
+    );
+    let del_id = del_proj["project_id"].as_str().unwrap();
+    success(
+        api.call(
+            alice_b,
+            "DELETE",
+            &format!("/v1/projects/{del_id}"),
+            Some("del-now"),
+            None,
+        ),
+        204,
+    );
+    refused(
+        api.call(
+            alice_n,
+            "GET",
+            &format!("/v1/projects/{del_id}/quotas"),
+            None,
+            None,
+        ),
+        404,
+        "not_found",
+    );
+
+    // 3. Unconfigured instance storage budget on a configured project reports scope_kind = "instance".
+    let proj_scope = proj["scope_id"].as_str().unwrap();
+    owner
+        .execute(
+            "UPDATE openmettle.storage_instance
+                SET instance_budget_bytes = NULL, personal_limit_bytes = 10000, project_limit_bytes = 10000",
+        )
+        .await
+        .unwrap();
+    let probe_up = form(
+        "instunconf",
+        &[
+            file_part(Some("p.txt"), "text/plain", "hello"),
+            metadata_part("{}"),
+        ],
+        true,
+    );
+    let (status, inst_unconf) = api.upload(
+        alice_b,
+        &format!("/v1/artifacts?scope_id={proj_scope}&max_bytes=5"),
+        "proj-inst-unconf",
+        &probe_up,
+    );
+    assert_eq!(status, 503, "{inst_unconf}");
+    assert_eq!(inst_unconf["code"], "provisioning");
+    assert_eq!(
+        inst_unconf["quota"],
+        json!({"resource_kind": "storage_bytes", "scope_kind": "instance"})
+    );
+    assert!(validate_openapi_schema(
+        "#/components/schemas/Problem",
+        &inst_unconf
+    ));
+
+    // Cross-tenant privacy: remaining_bytes never leaks instance headroom consumed by bob.
+    owner
+        .execute(
+            "UPDATE openmettle.storage_instance
+                SET instance_budget_bytes = 12000, personal_limit_bytes = 10000, project_limit_bytes = 10000",
+        )
+        .await
+        .unwrap();
+    let payload_9k = "b".repeat(9_000);
+    let bob_up = form(
+        "bob9k",
+        &[
+            file_part(Some("bob.bin"), "application/octet-stream", &payload_9k),
+            metadata_part("{}"),
+        ],
+        true,
+    );
+    success(
+        api.upload(bob_n, "/v1/artifacts?max_bytes=9000", "bob-9k", &bob_up),
+        201,
+    );
+    let payload_1k = "a".repeat(1_000);
+    let alice_up = form(
+        "alice1k",
+        &[
+            file_part(Some("alice.txt"), "text/plain", &payload_1k),
+            metadata_part("{}"),
+        ],
+        true,
+    );
+    let alice_rev = success(
+        api.upload(
+            alice_b,
+            "/v1/artifacts?max_bytes=1000",
+            "alice-1k",
+            &alice_up,
+        ),
+        201,
+    );
+    let alice_summary = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    // Instance only has 2000 bytes left, yet alice sees 9000 = max(0, 10000 - 1000).
+    assert_eq!(alice_summary["storage"]["charged_bytes"], "1000");
+    assert_eq!(alice_summary["storage"]["remaining_bytes"], "9000");
+
+    // Exceeding instance headroom yields 429 quota with closed quota:{storage_bytes,instance} and no counts.
+    let payload_4k = "x".repeat(4_000);
+    let too_much = form(
+        "alice4k",
+        &[
+            file_part(Some("big.txt"), "text/plain", &payload_4k),
+            metadata_part("{}"),
+        ],
+        true,
+    );
+    let (status, prob) = api.upload(
+        alice_n,
+        "/v1/artifacts?max_bytes=4000",
+        "alice-4k",
+        &too_much,
+    );
+    assert_eq!(status, 429, "{prob}");
+    assert_eq!(prob["code"], "quota");
+    assert_eq!(
+        prob["quota"],
+        json!({"resource_kind": "storage_bytes", "scope_kind": "instance"})
+    );
+    let prob_text = prob.to_string();
+    assert!(
+        !prob_text.contains("9000")
+            && !prob_text.contains("12000")
+            && !prob_text.contains(&bob.user)
+    );
+
+    // 4. Warning deduplication & re-arming across override edit/revoke and config edit.
+    limits(&db, Some(2_000), Some(100_000)).await;
+    // Alice already has 1000 bytes; upload 700 -> 1700/2000 = 85% -> crosses 80% once.
+    let payload_700 = "w".repeat(700);
+    let warn_up = form(
+        "warn700",
+        &[
+            file_part(Some("w.txt"), "text/plain", &payload_700),
+            metadata_part("{}"),
+        ],
+        true,
+    );
+    success(
+        api.upload(
+            alice_b,
+            "/v1/artifacts?max_bytes=700",
+            "alice-warn-1",
+            &warn_up,
+        ),
+        201,
+    );
+    let s1 = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    let storage_warns = |s: &Value| -> Vec<i64> {
+        s["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|w| w["resource_kind"] == "storage_bytes")
+            .map(|w| w["threshold_pct"].as_i64().unwrap())
+            .collect()
+    };
+    assert_eq!(storage_warns(&s1), vec![80]);
+    // Bob's summary must not show Alice's warnings or instance warnings.
+    let bob_s = success(
+        api.call(bob_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert!(
+        bob_s["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|w| w["resource_kind"] != "usage_tokens")
+    );
+    // Edit Alice's storage_bytes override -> bumps limit_revision -> clears old 80% warning & re-arms.
+    let ov_path = format!("/v1/admin/scopes/{alice_scope}/quotas/storage_bytes");
+    success(
+        api.call(
+            admin_b,
+            "PUT",
+            &ov_path,
+            Some("ov-rearm-1"),
+            Some(&json!({"hard_limit": "2200", "reason": "CANARY-override-reason"})),
+        ),
+        200,
+    );
+    let s2 = success(
+        api.call(alice_n, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert!(storage_warns(&s2).is_empty());
+    assert!(!s2.to_string().contains("CANARY-override-reason"));
+
+    // Cross 80% under the new override revision (1700 + 200 = 1900 / 2200 = 86%).
+    let payload_200 = "z".repeat(200);
+    let warn_up2 = form(
+        "warn200",
+        &[
+            file_part(Some("z.txt"), "text/plain", &payload_200),
+            metadata_part("{}"),
+        ],
+        true,
+    );
+    success(
+        api.upload(
+            alice_b,
+            "/v1/artifacts?max_bytes=200",
+            "alice-warn-2",
+            &warn_up2,
+        ),
+        201,
+    );
+    let s3 = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(storage_warns(&s3), vec![80]);
+
+    // Revoke override -> retains o.revision (2) as limit_revision while restoring the default
+    // 2000-byte limit, re-arming default-level threshold warnings in the same bucket (ADR 0040).
+    // Alice is still at 1900/2000 (95% >= 80%), so status remains "warning" with no warning
+    // emitted yet at the new limit_revision.
+    success(
+        api.call(
+            admin_n,
+            "POST",
+            &format!("{ov_path}/revoke"),
+            Some("ov-rearm-rev"),
+            Some(&json!({"reason": "re-arm check"})),
+        ),
+        200,
+    );
+    let s4 = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(s4["storage"]["status"], "warning");
+    assert!(storage_warns(&s4).is_empty());
+
+    // Config edit (storage_instance.config_revision bump) re-arms warnings for the new threshold.
+    limits(&db, Some(2_500), Some(100_000)).await;
+    // Alice currently has 1900 bytes; upload 200 -> 2100/2500 = 84% -> triggers 80% under current config_revision.
+    success(
+        api.upload(
+            alice_b,
+            "/v1/artifacts?max_bytes=200",
+            "alice-warn-cfg-1",
+            &warn_up2,
+        ),
+        201,
+    );
+    let s_cfg1 = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(storage_warns(&s_cfg1), vec![80]);
+    // Flapping another small upload within the same UTC day deduplicates the 80% warning (no duplicate entry).
+    let tiny = form(
+        "tiny10",
+        &[
+            file_part(Some("t.txt"), "text/plain", "1234567890"),
+            metadata_part("{}"),
+        ],
+        true,
+    );
+    success(
+        api.upload(
+            alice_b,
+            "/v1/artifacts?max_bytes=10",
+            "alice-warn-flap",
+            &tiny,
+        ),
+        201,
+    );
+    let s_flap = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(storage_warns(&s_flap), vec![80]);
+    owner
+        .execute("UPDATE openmettle.storage_instance SET warn_pct_1 = 75 WHERE id")
+        .await
+        .unwrap();
+    let s_cfg2 = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert!(storage_warns(&s_cfg2).is_empty());
+
+    // Expiring a temporary low storage override clears its warning once the higher default resumes.
+    limits(&db, Some(20_000), Some(100_000)).await;
+    success(
+        api.call(
+            admin_b,
+            "PUT",
+            &ov_path,
+            Some("ov-temp-exp"),
+            Some(&json!({
+                "hard_limit": "2500",
+                "expires_at": "2028-01-01T00:00:00.000000Z",
+                "reason": "temporary cap"
+            })),
+        ),
+        200,
+    );
+    success(
+        api.upload(
+            alice_b,
+            "/v1/artifacts?max_bytes=200",
+            "alice-warn-temp-exp",
+            &warn_up2,
+        ),
+        201,
+    );
+    let s_temp_warn = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(s_temp_warn["storage"]["status"], "warning");
+    assert_eq!(storage_warns(&s_temp_warn), vec![90]);
+    sqlx::query(
+        "UPDATE openmettle.quota_overrides
+            SET expires_at = clock_timestamp() - interval '1 second'
+          WHERE scope_id = $1::uuid AND resource_kind = 'storage_bytes'",
+    )
+    .bind(&alice_scope)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    let s_after_exp = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(s_after_exp["storage"]["limit_source"], "default");
+    assert_eq!(s_after_exp["storage"]["status"], "ok");
+    assert!(storage_warns(&s_after_exp).is_empty());
+
+    // 5. Hard limit = 0: new upload fails 429 quota, while reads, downloads, retention & quota reads succeed!
+    success(
+        api.call(
+            admin_b,
+            "PUT",
+            &ov_path,
+            Some("ov-zero"),
+            Some(&json!({"hard_limit": "0", "reason": "freeze"})),
+        ),
+        200,
+    );
+    let (status, prob) = api.upload(
+        alice_b,
+        "/v1/artifacts?max_bytes=10",
+        "blocked-zero",
+        &warn_up2,
+    );
+    assert_eq!(status, 429, "{prob}");
+    assert_eq!(
+        prob["quota"],
+        json!({"resource_kind": "storage_bytes", "scope_kind": "personal"})
+    );
+
+    // Quota summary read, artifact read, revision metadata, and content download all stay allowed.
+    let s_zero = success(
+        api.call(alice_n, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(s_zero["storage"]["status"], "hard_limit");
+    assert_eq!(s_zero["storage"]["remaining_bytes"], "0");
+
+    let art_id = alice_rev["artifact_id"].as_str().unwrap();
+    let rev_id = alice_rev["revision_id"].as_str().unwrap();
+    success(
+        api.call(
+            alice_b,
+            "GET",
+            &format!("/v1/artifacts/{art_id}"),
+            None,
+            None,
+        ),
+        200,
+    );
+    success(
+        api.call(
+            alice_n,
+            "GET",
+            &format!("/v1/artifacts/{art_id}/revisions/{rev_id}"),
+            None,
+            None,
+        ),
+        200,
+    );
+    let (dl_status, _, dl_bytes) = api.download(
+        alice_b,
+        "GET",
+        &format!("/v1/artifacts/{art_id}/revisions/{rev_id}/content"),
+        None,
+    );
+    assert_eq!((dl_status, dl_bytes.len()), (200, 1000));
+
+    // Retention remains permitted at hard_limit = 0.
+    let mut c = connect(&db.0, API).await;
+    let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+    storage::retain_revision(&mut tx, &alice_scope, rev_id, 3600)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // Run cancellation remains permitted even when usage_tokens is over limit and live_runs_per_actor = 0.
+    let live_ov = format!("/v1/admin/scopes/{alice_scope}/quotas/live_runs_per_actor");
+    success(
+        api.call(
+            admin_b,
+            "PUT",
+            &live_ov,
+            Some("live-zero"),
+            Some(&json!({"hard_limit": "0", "reason": "freeze runs"})),
+        ),
+        200,
+    );
+    let conv_id = chat(&db, &alice_scope, "personal", &alice).await;
+    let msg_id = message(&mut c, &alice_scope, &conv_id, None).await.unwrap();
+    let branch_id: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.conversation_branches (scope_id, conversation_id)
+         VALUES ($1::uuid, $2::uuid) RETURNING id::text",
+    )
+    .bind(&alice_scope)
+    .bind(&conv_id)
+    .fetch_one(&mut c)
+    .await
+    .unwrap();
+    let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+    let run_id = openmettle_core::runs::create_run(
+        &mut tx,
+        &openmettle_core::runs::RunInput {
+            scope: &alice_scope,
+            actor: &alice.user,
+            conversation: &conv_id,
+            branch: &branch_id,
+            message: &msg_id,
+            key: "cancel-at-hard-limit",
+            format: "openmettle.synthetic-run",
+            version: 1,
+            input: b"{}",
+            config: b"{}",
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    // Restart API with cursor_keys so cancelRun works and verify executing_runs_* reports
+    // worker-local fallback ("worker") when unconfigured in DB, then exact DB defaults once set.
+    let dir = auth_config_support::Dir::new();
+    let mut doc = auth_config_support::document_v2_native(&dir, &ca::Ca::new().pem());
+    doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+    let api_with_keys = Api::configured(&db, dir, doc, 4);
+    let personal_worker = success(
+        api_with_keys.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert!(validate_openapi_schema(
+        "#/components/schemas/QuotaSummary",
+        &personal_worker
+    ));
+    assert_eq!(
+        personal_worker["execution"]["executing_runs_per_actor"]["limit"],
+        Value::Null
+    );
+    assert_eq!(
+        personal_worker["execution"]["executing_runs_per_actor"]["limit_source"],
+        "worker"
+    );
+    assert_eq!(
+        personal_worker["execution"]["executing_runs_per_scope"]["limit"],
+        Value::Null
+    );
+    assert_eq!(
+        personal_worker["execution"]["executing_runs_per_scope"]["limit_source"],
+        "worker"
+    );
+    let proj_worker = success(
+        api_with_keys.call(alice_n, "GET", &proj_path, None, None),
+        200,
+    );
+    assert!(validate_openapi_schema(
+        "#/components/schemas/QuotaSummary",
+        &proj_worker
+    ));
+    assert_eq!(
+        proj_worker["execution"]["executing_runs_per_scope"]["limit"],
+        Value::Null
+    );
+    assert_eq!(
+        proj_worker["execution"]["executing_runs_per_scope"]["limit_source"],
+        "worker"
+    );
+    assert!(
+        proj_worker["execution"]
+            .get("executing_runs_per_actor")
+            .is_none()
+    );
+
+    // Configure authoritative DB defaults enforced by CLAIM_WITH_QUOTAS and verify summaries reflect them.
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'executing_runs_per_actor', 3),
+                    ('personal', 'executing_runs_per_scope', 7),
+                    ('project', 'executing_runs_per_scope', 7)",
+        )
+        .await
+        .unwrap();
+    let personal_claim = success(
+        api_with_keys.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert!(validate_openapi_schema(
+        "#/components/schemas/QuotaSummary",
+        &personal_claim
+    ));
+    assert_eq!(
+        personal_claim["execution"]["executing_runs_per_actor"]["limit"],
+        "3"
+    );
+    assert_eq!(
+        personal_claim["execution"]["executing_runs_per_actor"]["limit_source"],
+        "default"
+    );
+    assert_eq!(
+        personal_claim["execution"]["executing_runs_per_scope"]["limit"],
+        "7"
+    );
+    assert_eq!(
+        personal_claim["execution"]["executing_runs_per_scope"]["limit_source"],
+        "default"
+    );
+    let proj_claim = success(
+        api_with_keys.call(alice_n, "GET", &proj_path, None, None),
+        200,
+    );
+    assert!(validate_openapi_schema(
+        "#/components/schemas/QuotaSummary",
+        &proj_claim
+    ));
+    assert_eq!(
+        proj_claim["execution"]["executing_runs_per_scope"]["limit"],
+        "7"
+    );
+    assert_eq!(
+        proj_claim["execution"]["executing_runs_per_scope"]["limit_source"],
+        "default"
+    );
+    assert!(
+        proj_claim["execution"]
+            .get("executing_runs_per_actor")
+            .is_none()
+    );
+    let cancelled = success(
+        api_with_keys.call(
+            alice_b,
+            "POST",
+            &format!("/v1/runs/{run_id}/cancel"),
+            Some("cancel-ok"),
+            None,
+        ),
+        200,
+    );
+    assert_eq!(cancelled["state"], "cancelled");
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn create_run_distinguishes_rate_limited_quota_and_provisioning_refusals_over_http() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &admin).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let (a_b, adm_n) = (browser(&db, &alice, 1).await, native(&db, &admin, 2).await);
+    let (alice_b, admin_n) = (As::Browser(&a_b), As::Native(&adm_n));
+    let alice_scope = personal_of(&db, &alice).await;
+
+    let dir = auth_config_support::Dir::new();
+    let mut doc = auth_config_support::document_v2_native(&dir, &ca::Ca::new().pem());
+    doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+    let mut catalog: Value =
+        serde_json::from_slice(include_bytes!("../fixtures/conversation-catalog-v1.json")).unwrap();
+    let prompt_bound = json!({
+        "fixed_tokens": 4,
+        "tokens_per_turn": 4,
+        "tokens_per_part": 2,
+        "tokens_per_byte": 1,
+        "tokens_per_attachment": 10
+    });
+    catalog["models"]["a"]["prompt_bound"] = prompt_bound.clone();
+    catalog["models"]["a"]["cost_bound"] = json!({
+        "fixed_micros": 0,
+        "micros_per_token": 1
+    });
+    // Model `b` has a qualified prompt bound but intentionally omits `cost_bound`.
+    catalog["models"]["b"]["prompt_bound"] = prompt_bound;
+    let mut gpu = catalog["models"]["a"].clone();
+    gpu["pin"]["revision"] = json!("profile-gpu/1");
+    gpu["requires_device_slot"] = json!(true);
+    catalog["models"]["gpu"] = gpu;
+    doc["catalog_file"] = json!(dir.write("catalog.json", &serde_json::to_vec(&catalog).unwrap()));
+    doc["admission_limits"] = json!({
+        "live_per_actor": 4,
+        "live_per_scope": 8,
+        "queued_in_instance": 32,
+        "queue_timeout_seconds": 300,
+        "round_cap": 10
+    });
+    let api = Api::configured(&db, dir, doc, 4);
+
+    let conv = |key: &str| {
+        let root = success(
+            api.call(
+                alice_b,
+                "POST",
+                "/v1/conversations",
+                Some(key),
+                Some(&json!({})),
+            ),
+            201,
+        );
+        (
+            root["conversation_id"].as_str().unwrap().to_owned(),
+            root["branch_id"].as_str().unwrap().to_owned(),
+        )
+    };
+    let (conv_id, branch_id) = conv("conv-q");
+    let run_body = |c_id: &str, b_id: &str, msg_id: &str, rounds: i64| {
+        json!({
+            "conversation_id": c_id,
+            "branch_id": b_id,
+            "proposal": {
+                "expected_head_message_id": null,
+                "turn": {
+                    "mode": "append",
+                    "input_message_id": msg_id,
+                    "parts": [{"text": "hello"}]
+                },
+                "selection": {"preset": "study"},
+                "requested_rounds": rounds
+            }
+        })
+    };
+
+    // 0. Fresh DB (metering_enforced = true, zero usage_tokens rows) fails closed with 503 provisioning.
+    let (status, fresh_prov) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("run-fresh-unconf"),
+        Some(&run_body(
+            &conv_id,
+            &branch_id,
+            "00000000-0000-4000-8000-00000000a000",
+            2,
+        )),
+    );
+    assert_eq!(status, 503, "{fresh_prov}");
+    assert_eq!(fresh_prov["code"], "provisioning");
+    assert_eq!(
+        fresh_prov["quota"],
+        json!({"resource_kind": "usage_tokens", "scope_kind": "personal"})
+    );
+    assert!(validate_openapi_schema(
+        "#/components/schemas/Problem",
+        &fresh_prov
+    ));
+
+    // 1. Overridden live_runs_per_actor = 0 -> 429 rate_limited (distinct from quota).
+    success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/live_runs_per_actor"),
+            Some("rl-zero"),
+            Some(&json!({"hard_limit": "0", "reason": "test rate limit"})),
+        ),
+        200,
+    );
+    let (status, rl) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("run-rl"),
+        Some(&run_body(
+            &conv_id,
+            &branch_id,
+            "00000000-0000-4000-8000-00000000a001",
+            2,
+        )),
+    );
+    assert_eq!(status, 429, "{rl}");
+    assert_eq!(rl["code"], "rate_limited");
+    assert!(rl.get("quota").is_none());
+
+    // Revoke live_runs_per_actor override, set usage_tokens override to 0 -> 429 quota with closed metadata.
+    success(
+        api.call(
+            admin_n,
+            "POST",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/live_runs_per_actor/revoke"),
+            Some("rl-rev"),
+            Some(&json!({"reason": "restore"})),
+        ),
+        200,
+    );
+    success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/usage_tokens"),
+            Some("tok-zero"),
+            Some(&json!({"hard_limit": "0", "reason": "CANARY-secret-reason"})),
+        ),
+        200,
+    );
+    let (status, q) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("run-q"),
+        Some(&run_body(
+            &conv_id,
+            &branch_id,
+            "00000000-0000-4000-8000-00000000a002",
+            2,
+        )),
+    );
+    assert_eq!(status, 429, "{q}");
+    assert_eq!(q["code"], "quota");
+    assert_eq!(
+        q["quota"],
+        json!({"resource_kind": "usage_tokens", "scope_kind": "personal"})
+    );
+    assert!(!q.to_string().contains("CANARY-secret-reason"));
+    assert!(validate_openapi_schema("#/components/schemas/Problem", &q));
+
+    // 2. Positive headroom smaller than the run's token envelope (8192 * 2 = 16384 > 10000)
+    //    must refuse with 429 quota and roll back the run, branch message, and gateway/quota holds.
+    success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/usage_tokens"),
+            Some("tok-10k"),
+            Some(&json!({"hard_limit": "10000", "reason": "smaller than envelope"})),
+        ),
+        200,
+    );
+    let (status, env_ref) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("run-too-big-envelope"),
+        Some(&run_body(
+            &conv_id,
+            &branch_id,
+            "00000000-0000-4000-8000-00000000a003",
+            2,
+        )),
+    );
+    assert_eq!(status, 429, "{env_ref}");
+    assert_eq!(env_ref["code"], "quota");
+    assert_eq!(
+        env_ref["quota"],
+        json!({"resource_kind": "usage_tokens", "scope_kind": "personal"})
+    );
+    let (runs_n, msgs_n, gw_n, qr_n): (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM openmettle.runs),
+                (SELECT count(*) FROM openmettle.messages),
+                (SELECT count(*) FROM openmettle.gateway_reservations),
+                (SELECT count(*) FROM openmettle.quota_reservations)",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!((runs_n, msgs_n, gw_n, qr_n), (0, 0, 0, 0));
+
+    // 3. Unconfigured (hard_limit = NULL) usage_cost_micros default must NOT block runs;
+    //    two concurrent POST /v1/runs competing for headroom sufficient for 1 (20000 vs 16384 each)
+    //    admit at most 1, refuse the other with 429 quota, and exact replay never double-charges.
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_cost_micros', NULL)",
+        )
+        .await
+        .unwrap();
+    success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/usage_tokens"),
+            Some("tok-20k"),
+            Some(&json!({"hard_limit": "20000", "reason": "headroom for one run"})),
+        ),
+        200,
+    );
+    let (conv2_id, branch2_id) = conv("conv-q-2");
+    let body_a = run_body(
+        &conv_id,
+        &branch_id,
+        "00000000-0000-4000-8000-00000000a004",
+        2,
+    );
+    let body_b = run_body(
+        &conv2_id,
+        &branch2_id,
+        "00000000-0000-4000-8000-00000000a005",
+        2,
+    );
+    let barrier = std::sync::Barrier::new(2);
+    let (res_a, res_b) = std::thread::scope(|s| {
+        let b_ref = &barrier;
+        let api_ref = &api;
+        let ba = &body_a;
+        let bb = &body_b;
+        let t = s.spawn(move || {
+            b_ref.wait();
+            api_ref.call(alice_b, "POST", "/v1/runs", Some("race-a"), Some(ba))
+        });
+        barrier.wait();
+        let rb = api.call(alice_b, "POST", "/v1/runs", Some("race-b"), Some(bb));
+        (t.join().unwrap(), rb)
+    });
+    let mut statuses = [res_a.0, res_b.0];
+    statuses.sort();
+    assert_eq!(statuses, [201, 429], "a={res_a:?} b={res_b:?}");
+    let (winner_key, winner_body, winner_val, loser_val) = if res_a.0 == 201 {
+        ("race-a", &body_a, &res_a.1, &res_b.1)
+    } else {
+        ("race-b", &body_b, &res_b.1, &res_a.1)
+    };
+    assert_eq!(loser_val["code"], "quota");
+    assert_eq!(
+        loser_val["quota"],
+        json!({"resource_kind": "usage_tokens", "scope_kind": "personal"})
+    );
+    let summary_held = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(summary_held["usage"][0]["reserved_held"], "16384");
+    assert_eq!(summary_held["usage"][0]["remaining"], "3616");
+
+    // Exact replay returns 200 OK with the same run_id and does not double-charge reserved_held.
+    let replayed = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some(winner_key),
+            Some(winner_body),
+        ),
+        200,
+    );
+    assert_eq!(replayed["run_id"], winner_val["run_id"]);
+    let summary_after_replay = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(summary_after_replay["usage"][0]["reserved_held"], "16384");
+
+    // 3b. Cancelling the queued winning run immediately releases its token hold without a worker
+    //     sweep so a fresh 2-round run succeeds immediately.
+    let winner_run_id = winner_val["run_id"].as_str().unwrap();
+    let cancelled = success(
+        api.call(
+            alice_b,
+            "POST",
+            &format!("/v1/runs/{winner_run_id}/cancel"),
+            Some("cancel-winner"),
+            None,
+        ),
+        200,
+    );
+    assert_eq!(cancelled["state"], "cancelled");
+    let summary_after_cancel = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(summary_after_cancel["usage"][0]["reserved_held"], "0");
+    assert_eq!(summary_after_cancel["usage"][0]["remaining"], "20000");
+    let (conv_retry_id, branch_retry_id) = conv("conv-q-retry");
+    let retried = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some("run-after-cancel"),
+            Some(&run_body(
+                &conv_retry_id,
+                &branch_retry_id,
+                "00000000-0000-4000-8000-00000000a015",
+                2,
+            )),
+        ),
+        201,
+    );
+    success(
+        api.call(
+            alice_b,
+            "POST",
+            &format!("/v1/runs/{}/cancel", retried["run_id"].as_str().unwrap()),
+            Some("cancel-retried"),
+            None,
+        ),
+        200,
+    );
+
+    // 4. Configured usage_cost_micros reserves the profile's qualified cost_bound (450 micros per
+    //    450-token round, NOT hard_limit=1000), allowing two concurrent 450-micro runs (900 <= 1000)
+    //    and refusing a third (900 + 450 > 1000) with 429 quota, while a profile without cost_bound
+    //    fails closed with 503 provisioning.
+    owner
+        .execute(
+            "UPDATE openmettle.quota_defaults
+                SET cost_denomination = 'usd_micros'
+              WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'",
+        )
+        .await
+        .unwrap();
+    success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/usage_tokens"),
+            Some("tok-1m"),
+            Some(&json!({"hard_limit": "1000000", "reason": "ample tokens"})),
+        ),
+        200,
+    );
+    success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/usage_cost_micros"),
+            Some("cost-1000"),
+            Some(&json!({"hard_limit": "1000", "reason": "cost ceiling"})),
+        ),
+        200,
+    );
+    let cost_body = |c_id: &str, b_id: &str, msg_id: &str, selection: Value| {
+        json!({
+            "conversation_id": c_id,
+            "branch_id": b_id,
+            "proposal": {
+                "expected_head_message_id": null,
+                "turn": {
+                    "mode": "append",
+                    "input_message_id": msg_id,
+                    "parts": [{"text": "hello"}]
+                },
+                "selection": selection,
+                "requested_rounds": 1
+            }
+        })
+    };
+    let small_a = json!({
+        "model": "a",
+        "layer": {"controls": {"context_window": "450", "output_reserve": "100"}}
+    });
+    let (conv3_id, branch3_id) = conv("conv-q-3");
+    let (conv4_id, branch4_id) = conv("conv-q-4");
+    let (conv5_id, branch5_id) = conv("conv-q-5");
+    let cost_run_1 = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some("cost-run-1"),
+            Some(&cost_body(
+                &conv3_id,
+                &branch3_id,
+                "00000000-0000-4000-8000-00000000a006",
+                small_a.clone(),
+            )),
+        ),
+        201,
+    );
+    let summary_cost_1 = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(summary_cost_1["usage"][1]["reserved_held"], "450");
+    assert_eq!(summary_cost_1["usage"][1]["remaining"], "550");
+    let cost_run_2 = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some("cost-run-2"),
+            Some(&cost_body(
+                &conv4_id,
+                &branch4_id,
+                "00000000-0000-4000-8000-00000000a007",
+                small_a.clone(),
+            )),
+        ),
+        201,
+    );
+    let summary_cost_2 = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(summary_cost_2["usage"][1]["reserved_held"], "900");
+    assert_eq!(summary_cost_2["usage"][1]["remaining"], "100");
+    let (status, cost_ref) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("cost-run-3"),
+        Some(&cost_body(
+            &conv5_id,
+            &branch5_id,
+            "00000000-0000-4000-8000-00000000a016",
+            small_a,
+        )),
+    );
+    assert_eq!(status, 429, "{cost_ref}");
+    assert_eq!(cost_ref["code"], "quota");
+    assert_eq!(
+        cost_ref["quota"],
+        json!({"resource_kind": "usage_cost_micros", "scope_kind": "personal"})
+    );
+    // Profile `b` lacks `cost_bound` while usage_cost_micros is configured -> 503 provisioning.
+    let (status, unbound_cost) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("cost-unbound-b"),
+        Some(&cost_body(
+            &conv5_id,
+            &branch5_id,
+            "00000000-0000-4000-8000-00000000a017",
+            json!({"model": "b", "layer": {"controls": {"output_reserve": "256"}}}),
+        )),
+    );
+    assert_eq!(status, 503, "{unbound_cost}");
+    assert_eq!(unbound_cost["code"], "provisioning");
+    assert_eq!(
+        unbound_cost["quota"],
+        json!({"resource_kind": "usage_cost_micros", "scope_kind": "instance"})
+    );
+    // Even when personal usage_cost_micros hard_limit = 0, missing profile cost_bound must still
+    // fail closed with 503 provisioning (NOT 429 quota) because qualification precedes capacity.
+    success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/usage_cost_micros"),
+            Some("cost-zero-qual"),
+            Some(&json!({"hard_limit": "0", "reason": "zero cost ceiling"})),
+        ),
+        200,
+    );
+    let (status, unbound_zero) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("cost-unbound-b-zero"),
+        Some(&cost_body(
+            &conv5_id,
+            &branch5_id,
+            "00000000-0000-4000-8000-00000000a023",
+            json!({"model": "b", "layer": {"controls": {"output_reserve": "256"}}}),
+        )),
+    );
+    assert_eq!(status, 503, "{unbound_zero}");
+    assert_eq!(unbound_zero["code"], "provisioning");
+    assert_eq!(
+        unbound_zero["quota"],
+        json!({"resource_kind": "usage_cost_micros", "scope_kind": "instance"})
+    );
+    for (idx, run) in [cost_run_1, cost_run_2].into_iter().enumerate() {
+        success(
+            api.call(
+                alice_b,
+                "POST",
+                &format!("/v1/runs/{}/cancel", run["run_id"].as_str().unwrap()),
+                Some(&format!("cancel-cost-{idx}")),
+                None,
+            ),
+            200,
+        );
+    }
+
+    // 4a. Exact HTTP Idempotency-Key replay of a pre-PR3 queued run (missing gateway_reservations
+    //     and quota_reservations) backfills both rows cleanly and keeps subsequent replays read-only.
+    success(
+        api.call(
+            admin_n,
+            "POST",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/usage_cost_micros/revoke"),
+            Some("cost-rev"),
+            Some(&json!({"reason": "remove cost override"})),
+        ),
+        200,
+    );
+    {
+        let (legacy_conv, legacy_branch) = conv("conv-legacy-replay");
+        let legacy_msg = "00000000-0000-4000-8000-00000000a024";
+        let legacy_body = run_body(&legacy_conv, &legacy_branch, legacy_msg, 1);
+        let seed_run = success(
+            api.call(
+                alice_b,
+                "POST",
+                "/v1/runs",
+                Some("legacy-seed-src"),
+                Some(&legacy_body),
+            ),
+            201,
+        );
+        let seed_id = seed_run["run_id"].as_str().unwrap();
+        success(
+            api.call(
+                alice_b,
+                "POST",
+                &format!("/v1/runs/{seed_id}/cancel"),
+                Some("legacy-seed-cancel"),
+                None,
+            ),
+            200,
+        );
+        let (input_snap, config_snap): (Vec<u8>, Vec<u8>) = sqlx::query_as(
+            "SELECT input_snapshot, config_snapshot FROM openmettle.runs WHERE id = $1::uuid",
+        )
+        .bind(seed_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        let replay_client_key = "legacy-http-replay-1";
+        let hashed_key: String = framed_digest(
+            b"openmettle/v1-idempotency/1\0",
+            &[
+                b"createRun",
+                legacy_conv.as_bytes(),
+                replay_client_key.as_bytes(),
+            ],
+        )
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+        let mut api_c = connect(&db.0, API).await;
+        let mut tx = WriteTransaction::begin(&mut api_c).await.unwrap();
+        let openmettle_core::authz::runs::Admission::Admitted {
+            run_id: legacy_run_id,
+            ..
+        } = openmettle_core::authz::runs::admit_run(
+            &mut tx,
+            &openmettle_core::authz::runs::RunAdmission {
+                input: openmettle_core::runs::RunInput {
+                    scope: &alice_scope,
+                    actor: &alice.user,
+                    conversation: &legacy_conv,
+                    branch: &legacy_branch,
+                    message: legacy_msg,
+                    key: &hashed_key,
+                    format: openmettle_core::model_config::SNAPSHOT_FORMAT,
+                    version: openmettle_core::model_config::SNAPSHOT_VERSION,
+                    input: &input_snap,
+                    config: &config_snap,
+                },
+                actor_approval_id: &alice.approval,
+                capabilities: &[],
+                requested_rounds: Some(1),
+                now_ms: authz_store::NOW,
+                cost_qualified: None,
+            },
+            &openmettle_core::authz::runs::AdmissionLimits {
+                live_per_actor: 4,
+                live_per_scope: 8,
+                queued_in_instance: 32,
+                queue_timeout: Duration::from_secs(300),
+                round_cap: 10,
+            },
+        )
+        .await
+        .unwrap()
+        else {
+            panic!("expected legacy queued admission");
+        };
+        tx.commit().await.unwrap();
+        // Verify pre-replay state has no gateway_reservations or quota_reservations for this run.
+        let (pre_gw, pre_qr): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM openmettle.gateway_reservations WHERE run_id = $1::uuid),
+                    (SELECT count(*) FROM openmettle.quota_reservations WHERE run_id = $1::uuid)",
+        )
+        .bind(&legacy_run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!((pre_gw, pre_qr), (0, 0));
+        // Exact replay backfills both gateway_reservations and quota_reservations and returns 200 OK.
+        let replayed_legacy = success(
+            api.call(
+                alice_b,
+                "POST",
+                "/v1/runs",
+                Some(replay_client_key),
+                Some(&legacy_body),
+            ),
+            200,
+        );
+        assert_eq!(replayed_legacy["run_id"], legacy_run_id);
+        let (post_gw, post_qr): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM openmettle.gateway_reservations WHERE run_id = $1::uuid),
+                    (SELECT count(*) FROM openmettle.quota_reservations WHERE run_id = $1::uuid AND state = 'held')",
+        )
+        .bind(&legacy_run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!((post_gw, post_qr), (1, 1));
+        // Second exact replay stays read-only even if personal usage_tokens is lowered to 0.
+        success(
+            api.call(
+                admin_n,
+                "PUT",
+                &format!("/v1/admin/scopes/{alice_scope}/quotas/usage_tokens"),
+                Some("tok-zero-after-backfill"),
+                Some(&json!({"hard_limit": "0", "reason": "test read-only replay"})),
+            ),
+            200,
+        );
+        let replayed_again = success(
+            api.call(
+                alice_b,
+                "POST",
+                "/v1/runs",
+                Some(replay_client_key),
+                Some(&legacy_body),
+            ),
+            200,
+        );
+        assert_eq!(replayed_again["run_id"], legacy_run_id);
+        success(
+            api.call(
+                alice_b,
+                "POST",
+                &format!("/v1/runs/{legacy_run_id}/cancel"),
+                Some("cancel-legacy-replayed"),
+                None,
+            ),
+            200,
+        );
+        success(
+            api.call(
+                admin_n,
+                "PUT",
+                &format!("/v1/admin/scopes/{alice_scope}/quotas/usage_tokens"),
+                Some("tok-1m-restore"),
+                Some(&json!({"hard_limit": "1000000", "reason": "restore tokens"})),
+            ),
+            200,
+        );
+    }
+
+    // 4b. Device-slot profiles enforce device_reservations (unconfigured -> 503 provisioning,
+    //     0 -> 429 quota, 1 -> admits first, refuses second, cancel frees the slot immediately).
+    let gpu_sel = json!({"model": "gpu", "layer": {"controls": {"output_reserve": "256"}}});
+    let (status, dev_unconf) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("gpu-unconf"),
+        Some(&cost_body(
+            &conv5_id,
+            &branch5_id,
+            "00000000-0000-4000-8000-00000000a018",
+            gpu_sel.clone(),
+        )),
+    );
+    assert_eq!(status, 503, "{dev_unconf}");
+    assert_eq!(dev_unconf["code"], "provisioning");
+    assert_eq!(
+        dev_unconf["quota"],
+        json!({"resource_kind": "device_reservations", "scope_kind": "personal"})
+    );
+    success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/device_reservations"),
+            Some("dev-0"),
+            Some(&json!({"hard_limit": "0", "reason": "no gpu slots"})),
+        ),
+        200,
+    );
+    let (status, dev_zero) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("gpu-zero"),
+        Some(&cost_body(
+            &conv5_id,
+            &branch5_id,
+            "00000000-0000-4000-8000-00000000a019",
+            gpu_sel.clone(),
+        )),
+    );
+    assert_eq!(status, 429, "{dev_zero}");
+    assert_eq!(dev_zero["code"], "quota");
+    assert_eq!(
+        dev_zero["detail"],
+        "The device reservation quota does not allow this request."
+    );
+    assert_eq!(
+        dev_zero["quota"],
+        json!({"resource_kind": "device_reservations", "scope_kind": "personal"})
+    );
+    success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/device_reservations"),
+            Some("dev-1"),
+            Some(&json!({"hard_limit": "1", "reason": "one gpu slot"})),
+        ),
+        200,
+    );
+    let gpu_run_1 = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some("gpu-run-1"),
+            Some(&cost_body(
+                &conv5_id,
+                &branch5_id,
+                "00000000-0000-4000-8000-00000000a020",
+                gpu_sel.clone(),
+            )),
+        ),
+        201,
+    );
+    let dev_summary = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(
+        dev_summary["device_capacity"]["active_reservations"]["reserved_held"],
+        "1"
+    );
+    let (conv6_id, branch6_id) = conv("conv-q-6");
+    let (status, dev_full) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("gpu-run-2-full"),
+        Some(&cost_body(
+            &conv6_id,
+            &branch6_id,
+            "00000000-0000-4000-8000-00000000a021",
+            gpu_sel.clone(),
+        )),
+    );
+    assert_eq!(status, 429, "{dev_full}");
+    assert_eq!(dev_full["code"], "quota");
+    assert_eq!(
+        dev_full["detail"],
+        "The device reservation quota does not allow this request."
+    );
+    assert_eq!(
+        dev_full["quota"],
+        json!({"resource_kind": "device_reservations", "scope_kind": "personal"})
+    );
+    success(
+        api.call(
+            alice_b,
+            "POST",
+            &format!("/v1/runs/{}/cancel", gpu_run_1["run_id"].as_str().unwrap()),
+            Some("cancel-gpu-1"),
+            None,
+        ),
+        200,
+    );
+    let dev_after_cancel = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(
+        dev_after_cancel["device_capacity"]["active_reservations"]["reserved_held"],
+        "0"
+    );
+    let gpu_run_2 = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some("gpu-run-2-ok"),
+            Some(&cost_body(
+                &conv6_id,
+                &branch6_id,
+                "00000000-0000-4000-8000-00000000a022",
+                gpu_sel,
+            )),
+        ),
+        201,
+    );
+    success(
+        api.call(
+            alice_b,
+            "POST",
+            &format!("/v1/runs/{}/cancel", gpu_run_2["run_id"].as_str().unwrap()),
+            Some("cancel-gpu-2"),
+            None,
+        ),
+        200,
+    );
+
+    // 5. Revoke personal usage_tokens override while keeping instance default -> 503 provisioning.
+    success(
+        api.call(
+            admin_n,
+            "POST",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/usage_tokens/revoke"),
+            Some("tok-rev"),
+            Some(&json!({"reason": "remove override"})),
+        ),
+        200,
+    );
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('instance', 'usage_tokens', 100000)",
+        )
+        .await
+        .unwrap();
+    let (conv7_id, branch7_id) = conv("conv-q-7");
+    let (status, prov) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("run-prov"),
+        Some(&run_body(
+            &conv7_id,
+            &branch7_id,
+            "00000000-0000-4000-8000-00000000a008",
+            1,
+        )),
+    );
+    assert_eq!(status, 503, "{prov}");
+    assert_eq!(prov["code"], "provisioning");
+    assert_eq!(
+        prov["quota"],
+        json!({"resource_kind": "usage_tokens", "scope_kind": "personal"})
+    );
+    assert!(validate_openapi_schema(
+        "#/components/schemas/Problem",
+        &prov
+    ));
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn manage_quotas_overrides_enforce_admin_upgrade_gate_idempotency_and_validation() {
+    let (db, api) = mounted().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    let admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &admin).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let (adm_b, adm_n) = (browser(&db, &admin, 1).await, native(&db, &admin, 2).await);
+    let (a_b, a_n) = (browser(&db, &alice, 3).await, native(&db, &alice, 4).await);
+    let (admin_b, admin_n) = (As::Browser(&adm_b), As::Native(&adm_n));
+    let (alice_b, alice_n) = (As::Browser(&a_b), As::Native(&a_n));
+    let alice_scope = personal_of(&db, &alice).await;
+    let proj = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/projects",
+            Some("proj-for-admin"),
+            Some(&json!({"name": "Admin Quota Target"})),
+        ),
+        201,
+    );
+    let proj_scope = proj["scope_id"].as_str().unwrap();
+
+    let tok_path = format!("/v1/admin/scopes/{alice_scope}/quotas/usage_tokens");
+    let cost_path = format!("/v1/admin/scopes/{alice_scope}/quotas/usage_cost_micros");
+    let missing_path = "/v1/admin/scopes/00000000-0000-4000-8000-000000009999/quotas/usage_tokens";
+
+    // Non-admin refused with 403 policy on both channels.
+    for who in [alice_b, alice_n] {
+        refused(
+            api.call(
+                who,
+                "PUT",
+                &tok_path,
+                Some("non-admin-set"),
+                Some(&json!({"hard_limit": "100", "reason": "nope"})),
+            ),
+            403,
+            "policy",
+        );
+        refused(
+            api.call(
+                who,
+                "POST",
+                &format!("{tok_path}/revoke"),
+                Some("non-admin-rev"),
+                Some(&json!({"reason": "nope"})),
+            ),
+            403,
+            "policy",
+        );
+    }
+
+    // Missing scope -> 404; per-actor on project scope -> 400; OMQ02 -> 503 provisioning.
+    refused(
+        api.call(
+            admin_b,
+            "PUT",
+            missing_path,
+            Some("missing-1"),
+            Some(&json!({"hard_limit": "100", "reason": "missing"})),
+        ),
+        404,
+        "not_found",
+    );
+    refused(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{proj_scope}/quotas/live_runs_per_actor"),
+            Some("bad-per-actor"),
+            Some(&json!({"hard_limit": "2", "reason": "invalid target"})),
+        ),
+        400,
+        "validation",
+    );
+    let (status, omq02) = api.call(
+        admin_b,
+        "PUT",
+        &cost_path,
+        Some("omq02-1"),
+        Some(&json!({"hard_limit": "1000", "reason": "no denom"})),
+    );
+    assert_eq!(status, 503, "{omq02}");
+    assert_eq!(omq02["code"], "provisioning");
+    assert_eq!(
+        omq02["quota"],
+        json!({"resource_kind": "usage_cost_micros", "scope_kind": "instance"})
+    );
+
+    // Adoption in progress gates override writes with 503 unavailable.
+    owner
+        .execute("UPDATE openmettle.storage_volume_control SET adoption_run_id = gen_random_uuid() WHERE id")
+        .await
+        .unwrap();
+    refused(
+        api.call(
+            admin_b,
+            "PUT",
+            &tok_path,
+            Some("during-adoption"),
+            Some(&json!({"hard_limit": "50000", "reason": "blocked"})),
+        ),
+        503,
+        "unavailable",
+    );
+    owner
+        .execute("UPDATE openmettle.storage_volume_control SET adoption_run_id = NULL WHERE id")
+        .await
+        .unwrap();
+
+    // Audited set, exact replay preserving recorded revision even after a later update, and 409 conflict.
+    let body1 = json!({
+        "hard_limit": "50000",
+        "expires_at": "2028-01-01T00:00:00.000000Z",
+        "reason": "CANARY-secret-admin-note"
+    });
+    let r1 = success(
+        api.call(admin_b, "PUT", &tok_path, Some("set-k1"), Some(&body1)),
+        200,
+    );
+    assert!(validate_openapi_schema(
+        "#/components/schemas/QuotaOverride",
+        &r1
+    ));
+    let dec1 = consumer::decode_quota_override(&r1).unwrap();
+    assert_eq!((dec1.hard_limit, dec1.revision), (50_000, 1));
+    assert!(dec1.revoked_at.is_none());
+    assert!(!r1.to_string().contains("CANARY-secret-admin-note"));
+
+    // Exact replay returns identical revision 1 without bumping revision.
+    let r1_replay = success(
+        api.call(admin_n, "PUT", &tok_path, Some("set-k1"), Some(&body1)),
+        200,
+    );
+    assert_eq!(r1_replay, r1);
+
+    // Second write advances revision to 2; replaying set-k1 still returns original revision 1.
+    let body2 = json!({"hard_limit": "75000", "reason": "second bump"});
+    let r2 = success(
+        api.call(admin_n, "PUT", &tok_path, Some("set-k2"), Some(&body2)),
+        200,
+    );
+    assert_eq!(r2["revision"], "2");
+    assert_eq!(
+        success(
+            api.call(admin_b, "PUT", &tok_path, Some("set-k1"), Some(&body1)),
+            200,
+        ),
+        r1
+    );
+
+    // Mismatched payload on set-k1 -> 409 idempotency_conflict.
+    refused(
+        api.call(
+            admin_b,
+            "PUT",
+            &tok_path,
+            Some("set-k1"),
+            Some(&json!({"hard_limit": "99999", "reason": "CANARY-secret-admin-note"})),
+        ),
+        409,
+        "idempotency_conflict",
+    );
+
+    // Reusing set-k1 on revoke is a distinct operation (ADR 0007 key scoping).
+    let rev_body = json!({"reason": "return to defaults"});
+    let rev = success(
+        api.call(
+            admin_b,
+            "POST",
+            &format!("{tok_path}/revoke"),
+            Some("set-k1"),
+            Some(&rev_body),
+        ),
+        200,
+    );
+    assert!(validate_openapi_schema(
+        "#/components/schemas/QuotaOverride",
+        &rev
+    ));
+    let dec_rev = consumer::decode_quota_override(&rev).unwrap();
+    assert_eq!(dec_rev.revision, 3);
+    assert!(dec_rev.revoked_at.is_some());
+
+    // Exact replay of revoke returns identical revision 3; changed reason conflicts; new key returns 409 conflict.
+    assert_eq!(
+        success(
+            api.call(
+                admin_n,
+                "POST",
+                &format!("{tok_path}/revoke"),
+                Some("set-k1"),
+                Some(&rev_body),
+            ),
+            200,
+        ),
+        rev
+    );
+    refused(
+        api.call(
+            admin_n,
+            "POST",
+            &format!("{tok_path}/revoke"),
+            Some("set-k1"),
+            Some(&json!({"reason": "different"})),
+        ),
+        409,
+        "idempotency_conflict",
+    );
+    refused(
+        api.call(
+            admin_n,
+            "POST",
+            &format!("{tok_path}/revoke"),
+            Some("rev-again"),
+            Some(&rev_body),
+        ),
+        409,
+        "conflict",
+    );
+    // Revoking a resource with no override row returns 404 not_found.
+    refused(
+        api.call(
+            admin_n,
+            "POST",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/device_reservations/revoke"),
+            Some("rev-none"),
+            Some(&rev_body),
+        ),
+        404,
+        "not_found",
+    );
+    // Replaying set-k1 AFTER later set AND revoke still returns original recorded revision 1.
+    assert_eq!(
+        success(
+            api.call(admin_b, "PUT", &tok_path, Some("set-k1"), Some(&body1)),
+            200,
+        ),
+        r1
+    );
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM openmettle.authorization_audit
+          WHERE actor_user_id = $1::uuid
+            AND action IN ('quota.override.set', 'quota.override.revoke')",
+    )
+    .bind(&admin.user)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(audit_count, 3);
+
+    // Multibyte UTF-8 reason boundary: 256 UTF-8 bytes accepted, 258 UTF-8 bytes rejected with 400 validation.
+    let ok_utf8 = "é".repeat(128);
+    let over_utf8 = "é".repeat(129);
+    assert_eq!((ok_utf8.len(), over_utf8.len()), (256, 258));
+    refused(
+        api.call(
+            admin_b,
+            "PUT",
+            &tok_path,
+            Some("utf8-over-set"),
+            Some(&json!({"hard_limit": "12345", "reason": over_utf8})),
+        ),
+        400,
+        "validation",
+    );
+    refused(
+        api.call(
+            admin_b,
+            "POST",
+            &format!("{tok_path}/revoke"),
+            Some("utf8-over-rev"),
+            Some(&json!({"reason": over_utf8})),
+        ),
+        400,
+        "validation",
+    );
+    let utf8_ok = success(
+        api.call(
+            admin_b,
+            "PUT",
+            &tok_path,
+            Some("utf8-exact-set"),
+            Some(&json!({"hard_limit": "12345", "reason": ok_utf8})),
+        ),
+        200,
+    );
+    assert_eq!(utf8_ok["revision"], "4");
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn extreme_per_round_cost_bound_admits_on_token_only_and_returns_429_when_cost_limited() {
+    use crate::{auth_config_support::Dir, ca::Ca};
+
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut owner).await;
+    let alice = authz_store::account(&mut owner, PROVIDER, true, FUTURE).await;
+    let alice_cookie = browser(&db, &alice, 1).await;
+    let alice_b = As::Browser(&alice_cookie);
+
+    // Token-only deployment: cost_denomination stays NULL and all usage_cost_micros limits are NULL.
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 100000)",
+        )
+        .await
+        .unwrap();
+
+    let dir = Dir::new();
+    std::fs::create_dir(dir.path("artifacts")).unwrap();
+    let mut doc = auth_config_support::document_v2_native(&dir, &Ca::new().pem());
+    doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+    let mut catalog: Value =
+        serde_json::from_slice(include_bytes!("../fixtures/conversation-catalog-v1.json")).unwrap();
+    catalog["models"]["a"]["prompt_bound"] = json!({
+        "fixed_tokens": 4,
+        "tokens_per_turn": 4,
+        "tokens_per_part": 2,
+        "tokens_per_byte": 1,
+        "tokens_per_attachment": 10
+    });
+    catalog["models"]["a"]["cost_bound"] = json!({
+        "fixed_micros": i64::MAX,
+        "micros_per_token": 1
+    });
+    doc["catalog_file"] = json!(dir.write("catalog.json", &serde_json::to_vec(&catalog).unwrap()));
+    doc["admission_limits"] = json!({
+        "live_per_actor": 4,
+        "live_per_scope": 8,
+        "queued_in_instance": 32,
+        "queue_timeout_seconds": 300,
+        "round_cap": 10
+    });
+    let api = Api::configured(&db, dir, doc, 4);
+
+    let conv = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/conversations",
+            Some("extreme-conv-1"),
+            Some(&json!({})),
+        ),
+        201,
+    );
+    let make_run = |conv_id: &str, branch_id: &str, msg_id: &str| {
+        json!({
+            "conversation_id": conv_id,
+            "branch_id": branch_id,
+            "proposal": {
+                "expected_head_message_id": null,
+                "turn": {
+                    "mode": "append",
+                    "input_message_id": msg_id,
+                    "parts": [{"text": "extreme per-round cost bound"}]
+                },
+                "selection": {
+                    "model": "a",
+                    "layer": {"controls": {"context_window": "450", "output_reserve": "100"}}
+                },
+                "requested_rounds": 2
+            }
+        })
+    };
+
+    // 1. Token-only deployment must admit a 2-round fixed_micros=i64::MAX run with 201 Created.
+    let admitted = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some("extreme-run-token-only"),
+            Some(&make_run(
+                conv["conversation_id"].as_str().unwrap(),
+                conv["branch_id"].as_str().unwrap(),
+                "00000000-0000-4000-8000-00000000e001",
+            )),
+        ),
+        201,
+    );
+    assert!(admitted["run_id"].is_string());
+
+    // 2. Once cost limits are configured, 2 * i64::MAX overflows i64 and must fail with 429 quota
+    //    (not 400 validation).
+    owner
+        .execute(
+            "UPDATE openmettle.quota_defaults
+                SET cost_denomination = 'usd_micros'
+              WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'",
+        )
+        .await
+        .unwrap();
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_cost_micros', 1000000)",
+        )
+        .await
+        .unwrap();
+    let conv2 = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/conversations",
+            Some("extreme-conv-2"),
+            Some(&json!({})),
+        ),
+        201,
+    );
+    let (status, body) = api.call(
+        alice_b,
+        "POST",
+        "/v1/runs",
+        Some("extreme-run-cost-limited"),
+        Some(&make_run(
+            conv2["conversation_id"].as_str().unwrap(),
+            conv2["branch_id"].as_str().unwrap(),
+            "00000000-0000-4000-8000-00000000e002",
+        )),
+    );
+    assert_eq!(status, 429, "{body}");
+    assert_eq!(body["code"], "quota");
+    assert_eq!(
+        body["detail"],
+        "The usage budget does not allow this request."
+    );
+    assert_eq!(
+        body["quota"],
+        json!({"resource_kind": "usage_cost_micros", "scope_kind": "personal"})
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn revoked_override_rearms_default_threshold_warnings_over_http() {
+    use openmettle_core::{
+        runs::WriteTransaction,
+        storage::{self, ReservationInput},
+    };
+
+    let (db, api) = mounted().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    let mut api_conn = connect(&db.0, API).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &admin).await;
+
+    let a_b = browser(&db, &alice, 1).await;
+    let adm_b = browser(&db, &admin, 2).await;
+    let (alice_b, admin_b) = (As::Browser(&a_b), As::Browser(&adm_b));
+    let scope = personal_of(&db, &alice).await;
+
+    // Seed personal defaults: storage_bytes = 1000, usage_tokens = 1000, device_reservations = 10.
+    limits(&db, Some(1_000), Some(100_000)).await;
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 1000),
+                    ('personal', 'device_reservations', 10)",
+        )
+        .await
+        .unwrap();
+
+    let warnings_for = |summary: &Value, resource: &str| -> Vec<i64> {
+        summary["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|w| w["resource_kind"] == resource)
+            .map(|w| w["threshold_pct"].as_i64().unwrap())
+            .collect()
+    };
+
+    // 1. Cross default 80% threshold for all three resources -> warnings emitted at limit_revision = 0.
+    let mut tx = WriteTransaction::begin(&mut api_conn).await.unwrap();
+    let s_res1 = storage::reserve(
+        &mut tx,
+        &ReservationInput {
+            scope: &scope,
+            actor: &alice.user,
+            key: "rearm-s-1",
+            artifact: "00000000-0000-4000-8000-00000000a101",
+            max_bytes: 850,
+            run: None,
+            operation: None,
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let tok_res1: String = sqlx::query_scalar(
+        "SELECT openmettle.quota_reserve(
+             $1::uuid, $2::uuid, 'usage_tokens', 850, 'rearm-tok-1',
+             NULL, NULL, NULL, clock_timestamp() + interval '10 minutes'
+         )::text",
+    )
+    .bind(&scope)
+    .bind(&alice.user)
+    .fetch_one(&mut api_conn)
+    .await
+    .unwrap();
+    let dev_res1: String = sqlx::query_scalar(
+        "SELECT openmettle.quota_reserve(
+             $1::uuid, $2::uuid, 'device_reservations', 8, 'rearm-dev-1',
+             NULL, NULL, NULL, clock_timestamp() + interval '10 minutes'
+         )::text",
+    )
+    .bind(&scope)
+    .bind(&alice.user)
+    .fetch_one(&mut api_conn)
+    .await
+    .unwrap();
+
+    let summary1 = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    for resource in ["storage_bytes", "usage_tokens", "device_reservations"] {
+        assert_eq!(warnings_for(&summary1, resource), vec![80], "{resource}");
+        let revs: Vec<i64> = sqlx::query_scalar(
+            "SELECT limit_revision
+               FROM openmettle.quota_warning_events
+              WHERE scope_id = $1::uuid AND resource_kind = $2 AND threshold_pct = 80
+              ORDER BY limit_revision ASC",
+        )
+        .bind(&scope)
+        .bind(resource)
+        .fetch_all(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(revs, vec![0], "{resource}");
+    }
+
+    // 2. Release holds below 80%, apply higher overrides (revision = 1), then revoke (revision = 2).
+    let mut tx_rel = WriteTransaction::begin(&mut api_conn).await.unwrap();
+    storage::release(&mut tx_rel, &scope, &s_res1.id)
+        .await
+        .unwrap();
+    tx_rel.commit().await.unwrap();
+    for hold_id in [&tok_res1, &dev_res1] {
+        let released: bool = sqlx::query_scalar("SELECT openmettle.quota_release_unsent($1::uuid)")
+            .bind(hold_id)
+            .fetch_one(&mut api_conn)
+            .await
+            .unwrap();
+        assert!(released);
+    }
+
+    for (resource, high_limit) in [
+        ("storage_bytes", "2000"),
+        ("usage_tokens", "2000"),
+        ("device_reservations", "20"),
+    ] {
+        let ov_path = format!("/v1/admin/scopes/{scope}/quotas/{resource}");
+        success(
+            api.call(
+                admin_b,
+                "PUT",
+                &ov_path,
+                Some(&format!("rearm-put-{resource}")),
+                Some(&json!({"hard_limit": high_limit, "reason": "temporary bump"})),
+            ),
+            200,
+        );
+        success(
+            api.call(
+                admin_b,
+                "POST",
+                &format!("{ov_path}/revoke"),
+                Some(&format!("rearm-rev-{resource}")),
+                Some(&json!({"reason": "restore default"})),
+            ),
+            200,
+        );
+        let active_rev: i64 = sqlx::query_scalar(
+            "SELECT limit_revision FROM openmettle.quota_limit($1::uuid, 'personal', $2)",
+        )
+        .bind(&scope)
+        .bind(resource)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(
+            active_rev, 2,
+            "{resource} revoked override must retain o.revision = 2"
+        );
+    }
+
+    let summary_between = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(summary_between["storage"]["limit_source"], "default");
+    assert_eq!(summary_between["storage"]["limit_bytes"], "1000");
+    assert!(summary_between["warnings"].as_array().unwrap().is_empty());
+
+    // 3. Cross default 80% threshold again in the SAME bucket -> new quota_warning_events row at
+    // limit_revision = 2 for every resource, surfaced by GET /v1/quotas/personal.
+    let mut tx2 = WriteTransaction::begin(&mut api_conn).await.unwrap();
+    let _s_res2 = storage::reserve(
+        &mut tx2,
+        &ReservationInput {
+            scope: &scope,
+            actor: &alice.user,
+            key: "rearm-s-2",
+            artifact: "00000000-0000-4000-8000-00000000a102",
+            max_bytes: 850,
+            run: None,
+            operation: None,
+        },
+    )
+    .await
+    .unwrap();
+    tx2.commit().await.unwrap();
+    let _: String = sqlx::query_scalar(
+        "SELECT openmettle.quota_reserve(
+             $1::uuid, $2::uuid, 'usage_tokens', 850, 'rearm-tok-2',
+             NULL, NULL, NULL, clock_timestamp() + interval '10 minutes'
+         )::text",
+    )
+    .bind(&scope)
+    .bind(&alice.user)
+    .fetch_one(&mut api_conn)
+    .await
+    .unwrap();
+    let _: String = sqlx::query_scalar(
+        "SELECT openmettle.quota_reserve(
+             $1::uuid, $2::uuid, 'device_reservations', 8, 'rearm-dev-2',
+             NULL, NULL, NULL, clock_timestamp() + interval '10 minutes'
+         )::text",
+    )
+    .bind(&scope)
+    .bind(&alice.user)
+    .fetch_one(&mut api_conn)
+    .await
+    .unwrap();
+
+    let summary2 = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert!(validate_openapi_schema(
+        "#/components/schemas/QuotaSummary",
+        &summary2
+    ));
+    for resource in ["storage_bytes", "usage_tokens", "device_reservations"] {
+        assert_eq!(
+            warnings_for(&summary2, resource),
+            vec![80],
+            "revoked override must re-arm default 80% warning for {resource}: {summary2}"
+        );
+        let revs: Vec<i64> = sqlx::query_scalar(
+            "SELECT limit_revision
+               FROM openmettle.quota_warning_events
+              WHERE scope_id = $1::uuid AND resource_kind = $2 AND threshold_pct = 80
+              ORDER BY limit_revision ASC",
+        )
+        .bind(&scope)
+        .bind(resource)
+        .fetch_all(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(
+            revs,
+            vec![0, 2],
+            "{resource} must emit a fresh warning row at limit_revision = 2 in the same bucket"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn post_runs_maps_lock_wait_personal_override_expiry_to_503_provisioning() {
+    use crate::{auth_config_support::Dir, ca::Ca};
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    let mut owner_lock = connect(&db.0, OWNER).await;
+    let lock_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut owner_lock)
+        .await
+        .unwrap();
+    authz_store::providers(&mut owner).await;
+    let alice = authz_store::account(&mut owner, PROVIDER, true, FUTURE).await;
+    let scope = personal_of(&db, &alice).await;
+    let alice_cookie = browser(&db, &alice, 1).await;
+    let alice_b = As::Browser(&alice_cookie);
+
+    // Instance default is configured; personal usage_tokens has NO default — only a temporary override.
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('instance', 'usage_tokens', 100000)",
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.quota_overrides
+             (scope_id, scope_kind, resource_kind, hard_limit, expires_at, reason, updated_by_user_id)
+         VALUES ($1::uuid, 'personal', 'usage_tokens', 100000,
+                 clock_timestamp() + interval '1 hour', 'seed-only-personal', $2::uuid)",
+    )
+    .bind(&scope)
+    .bind(&alice.user)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    let mut api_conn = connect(&db.0, API).await;
+    let seed: String = sqlx::query_scalar(
+        "SELECT openmettle.quota_reserve(
+             $1::uuid, $2::uuid, 'usage_tokens', 1, 'rr13-http-seed',
+             NULL, NULL, NULL, clock_timestamp() + interval '5 minutes'
+         )::text",
+    )
+    .bind(&scope)
+    .bind(&alice.user)
+    .fetch_one(&mut api_conn)
+    .await
+    .unwrap();
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT openmettle.quota_release_unsent($1::uuid)")
+            .bind(&seed)
+            .fetch_one(&mut api_conn)
+            .await
+            .unwrap()
+    );
+
+    let dir = Dir::new();
+    std::fs::create_dir(dir.path("artifacts")).unwrap();
+    let mut doc = auth_config_support::document_v2_native(&dir, &Ca::new().pem());
+    doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+    let mut catalog: Value =
+        serde_json::from_slice(include_bytes!("../fixtures/conversation-catalog-v1.json")).unwrap();
+    catalog["models"]["a"]["prompt_bound"] = json!({
+        "fixed_tokens": 4,
+        "tokens_per_turn": 4,
+        "tokens_per_part": 2,
+        "tokens_per_byte": 1,
+        "tokens_per_attachment": 10
+    });
+    doc["catalog_file"] = json!(dir.write("catalog.json", &serde_json::to_vec(&catalog).unwrap()));
+    doc["admission_limits"] = json!({
+        "live_per_actor": 4,
+        "live_per_scope": 8,
+        "queued_in_instance": 32,
+        "queue_timeout_seconds": 300,
+        "round_cap": 10
+    });
+    let api = Api::configured(&db, dir, doc, 4);
+    let conv = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/conversations",
+            Some("rr13-http-conv"),
+            Some(&json!({})),
+        ),
+        201,
+    );
+    let run_body = json!({
+        "conversation_id": conv["conversation_id"],
+        "branch_id": conv["branch_id"],
+        "proposal": {
+            "expected_head_message_id": null,
+            "turn": {
+                "mode": "append",
+                "input_message_id": "00000000-0000-4000-8000-00000000f013",
+                "parts": [{"text": "expiring sole personal override during instance lock wait"}]
+            },
+            "selection": {
+                "model": "a",
+                "layer": {"controls": {"context_window": "450", "output_reserve": "100"}}
+            },
+            "requested_rounds": 1
+        }
+    });
+
+    // Keep the sole personal override active (+1 hour) while locking the instance budget row so
+    // Pass 1 deterministically sees the override active and blocks on the instance lock.
+    let mut inst_tx = owner_lock.begin().await.unwrap();
+    sqlx::query(
+        "SELECT id FROM openmettle.quota_budgets
+          WHERE target_kind = 'instance' AND scope_id IS NULL
+            AND resource_kind = 'usage_tokens'
+            FOR NO KEY UPDATE",
+    )
+    .fetch_one(&mut *inst_tx)
+    .await
+    .unwrap();
+
+    // Send POST /v1/runs on a blocking thread so it enters quota_reserve while override is active
+    // and blocks on the instance budget lock.
+    let api = std::sync::Arc::new(api);
+    let api_c = std::sync::Arc::clone(&api);
+    let cookie_c = alice_cookie.clone();
+    let http_task = tokio::task::spawn_blocking(move || {
+        api_c.call(
+            As::Browser(&cookie_c),
+            "POST",
+            "/v1/runs",
+            Some("rr13-http-omq05"),
+            Some(&run_body),
+        )
+    });
+
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1
+                   FROM pg_locks waiter
+                   JOIN pg_locks holder
+                     ON holder.locktype = waiter.locktype
+                    AND holder.transactionid = waiter.transactionid
+                    AND holder.granted
+                    AND holder.pid = $1
+                  WHERE waiter.locktype = 'transactionid'
+                    AND NOT waiter.granted
+             )",
+        )
+        .bind(lock_pid)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        if blocked {
+            break;
+        }
+        assert!(Instant::now() < wait_deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Deterministically expire the sole personal override while POST /v1/runs is blocked on instance.
+    sqlx::query(
+        "UPDATE openmettle.quota_overrides
+            SET expires_at = clock_timestamp() - interval '1 second'
+          WHERE scope_id = $1::uuid AND resource_kind = 'usage_tokens'",
+    )
+    .bind(&scope)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    inst_tx.rollback().await.unwrap();
+
+    let (status, body) = http_task.await.unwrap();
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["code"], "provisioning");
+    assert_eq!(
+        body["quota"],
+        json!({"resource_kind": "usage_tokens", "scope_kind": "personal"})
+    );
+    assert!(validate_openapi_schema(
+        "#/components/schemas/Problem",
+        &body
+    ));
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn post_runs_exact_replay_returns_200_when_backfill_refused_and_worker_enforces_quota() {
+    use crate::{auth_config_support::Dir, ca::Ca};
+    use openmettle_core::{
+        authz::{
+            gateway::{self, TurnRound},
+            leases::{self, FailReason, LeaseSettings, Settle},
+            runs::{self as authz_queue, ClaimLimits, RunLimit},
+        },
+        migrate,
+        quotas::{self, RunBudgetReservation},
+        runs::WriteTransaction,
+    };
+    use sqlx::postgres::PgPoolOptions;
+
+    const INSTALL: &str = "00000000-0000-4000-8000-0000000000fa";
+
+    // Upgrade from schema 23 -> latest so metering_enforced starts false and POST /v1/runs admits
+    // a queued run without quota_reservations parent holds.
+    let db = TestDb::new().await;
+    let settings = db.settings(Duration::from_secs(10));
+    migrate::apply(&settings, &migrate::MIGRATIONS[..23])
+        .await
+        .unwrap();
+    let mut owner = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut owner).await;
+    let admin =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    authz_store::make_admin(&mut owner, &admin).await;
+    let alice =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let scope = authz_runs::personal_of(&db, &alice).await;
+    migrate::apply(&settings, migrate::MIGRATIONS)
+        .await
+        .unwrap();
+
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 100000),
+                    ('personal', 'device_reservations', 1)",
+        )
+        .await
+        .unwrap();
+
+    let dir = Dir::new();
+    std::fs::create_dir(dir.path("artifacts")).unwrap();
+    let mut doc = auth_config_support::document_v2_native(&dir, &Ca::new().pem());
+    doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+    let mut catalog: Value =
+        serde_json::from_slice(include_bytes!("../fixtures/conversation-catalog-v1.json")).unwrap();
+    catalog["models"]["a"]["pin"]["provider"] = "synthetic-sglang".into();
+    catalog["models"]["a"]["prompt_bound"] = json!({
+        "fixed_tokens": 4,
+        "tokens_per_turn": 4,
+        "tokens_per_part": 2,
+        "tokens_per_byte": 1,
+        "tokens_per_attachment": 10
+    });
+    doc["catalog_file"] = json!(dir.write("catalog.json", &serde_json::to_vec(&catalog).unwrap()));
+    doc["admission_limits"] = json!({
+        "live_per_actor": 4,
+        "live_per_scope": 8,
+        "queued_in_instance": 32,
+        "queue_timeout_seconds": 300,
+        "round_cap": 10
+    });
+    let api = Api::configured(&db, dir, doc, 4);
+    let admin_tok = native(&db, &admin, 1).await;
+    let admin_n = As::Native(&admin_tok);
+    let alice_cookie = browser(&db, &alice, 2).await;
+    let alice_b = As::Browser(&alice_cookie);
+
+    let conv = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/conversations",
+            Some("rr16-replay-conv"),
+            Some(&json!({})),
+        ),
+        201,
+    );
+    let conv_id = conv["conversation_id"].as_str().unwrap();
+    let branch_id = conv["branch_id"].as_str().unwrap();
+    let run_body = json!({
+        "conversation_id": conv_id,
+        "branch_id": branch_id,
+        "proposal": {
+            "expected_head_message_id": null,
+            "turn": {
+                "mode": "append",
+                "input_message_id": "00000000-0000-4000-8000-00000000fa01",
+                "parts": [{"text": "pre-activation queued run"}]
+            },
+            "selection": {
+                "model": "a",
+                "layer": {"controls": {"context_window": "450", "output_reserve": "100"}}
+            },
+            "requested_rounds": 1
+        }
+    });
+    let admitted = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some("rr16-replay-key"),
+            Some(&run_body),
+        ),
+        201,
+    );
+    let run_id = admitted["run_id"].as_str().unwrap().to_owned();
+    let (pre_gw, pre_qr): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM openmettle.gateway_reservations WHERE run_id = $1::uuid),
+                (SELECT count(*) FROM openmettle.quota_reservations WHERE run_id = $1::uuid)",
+    )
+    .bind(&run_id)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!((pre_gw, pre_qr), (1, 0));
+
+    // Also admit a second pre-activation queued run missing BOTH gateway_reservations and
+    // quota_reservations so we can verify direct backfill_replayed_run_budget savepoint rollback.
+    let mut api_c = connect(&db.0, API).await;
+    let conv2 = authz_runs::chat(&db, &scope, "personal", &alice).await;
+    let msg2 = message(&mut api_c, &scope, &conv2, None).await.unwrap();
+    let branch2: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.conversation_branches (scope_id, conversation_id)
+         VALUES ($1::uuid, $2::uuid) RETURNING id::text",
+    )
+    .bind(&scope)
+    .bind(&conv2)
+    .fetch_one(&mut api_c)
+    .await
+    .unwrap();
+    let mut tx = WriteTransaction::begin(&mut api_c).await.unwrap();
+    let authz_queue::Admission::Admitted { run_id: run2, .. } = authz_queue::admit_run(
+        &mut tx,
+        &authz_queue::RunAdmission {
+            input: openmettle_core::runs::RunInput {
+                scope: &scope,
+                actor: &alice.user,
+                conversation: &conv2,
+                branch: &branch2,
+                message: &msg2,
+                key: "rr16-savepoint-run2",
+                format: openmettle_core::model_config::SNAPSHOT_FORMAT,
+                version: openmettle_core::model_config::SNAPSHOT_VERSION,
+                input: b"{}",
+                config: br#"{"effective":{"ceiling":{"value":450}}}"#,
+            },
+            actor_approval_id: &alice.approval,
+            capabilities: &[],
+            requested_rounds: Some(1),
+            now_ms: authz_store::NOW,
+            cost_qualified: None,
+        },
+        &authz_queue::AdmissionLimits {
+            live_per_actor: 4,
+            live_per_scope: 8,
+            queued_in_instance: 32,
+            queue_timeout: Duration::from_secs(300),
+            round_cap: 10,
+        },
+    )
+    .await
+    .unwrap() else {
+        panic!("expected admission");
+    };
+    tx.commit().await.unwrap();
+
+    // Activate metering + overrides and lower personal usage_tokens override to 0.
+    owner
+        .execute(
+            "UPDATE openmettle.quota_enforcement
+                SET metering_enforced = true,
+                    metering_enforced_at = clock_timestamp(),
+                    overrides_enforced = true,
+                    overrides_enforced_at = clock_timestamp()
+              WHERE id",
+        )
+        .await
+        .unwrap();
+    success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{scope}/quotas/usage_tokens"),
+            Some("rr16-zero-tokens"),
+            Some(&json!({"hard_limit": "0", "reason": "zero tokens before replay"})),
+        ),
+        200,
+    );
+
+    // Exact replay MUST return 200 OK with the original run_id even though backfill is refused.
+    let replayed = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some("rr16-replay-key"),
+            Some(&run_body),
+        ),
+        200,
+    );
+    assert_eq!(replayed["run_id"], run_id);
+
+    let (post_state, post_gw, post_qr): (String, i64, i64) = sqlx::query_as(
+        "SELECT state,
+                (SELECT count(*) FROM openmettle.gateway_reservations WHERE run_id = $1::uuid),
+                (SELECT count(*) FROM openmettle.quota_reservations WHERE run_id = $1::uuid)
+           FROM openmettle.runs
+          WHERE id = $1::uuid",
+    )
+    .bind(&run_id)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!((post_state.as_str(), post_gw, post_qr), ("queued", 1, 0));
+
+    // Verify direct backfill_replayed_run_budget rolls back partial gateway_reservations +
+    // device_reservations writes atomically via savepoint when usage_tokens refuses, even if the
+    // caller commits the outer transaction.
+    {
+        let mut btx = WriteTransaction::begin(&mut api_c).await.unwrap();
+        let (committed, refusal) = quotas::backfill_replayed_run_budget(
+            &mut btx,
+            &RunBudgetReservation {
+                scope_id: &scope,
+                scope_kind: "personal",
+                actor_user_id: &alice.user,
+                actor_approval_id: &alice.approval,
+                run_id: &run2,
+                token_units: 450,
+                per_round_cost_micros: None,
+                round_limit: 1,
+                requires_device_slot: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!committed);
+        assert_eq!(
+            refusal,
+            Some(RunLimit::Quota {
+                resource_kind: "usage_tokens",
+                scope_kind: "personal",
+            })
+        );
+        // Commit the outer tx to prove the internal savepoint already rolled back both
+        // gateway_reservations and device_reservations holds.
+        btx.commit().await.unwrap();
+    }
+    let (r2_gw, r2_qr): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM openmettle.gateway_reservations WHERE run_id = $1::uuid),
+                (SELECT count(*) FROM openmettle.quota_reservations WHERE run_id = $1::uuid)",
+    )
+    .bind(&run2)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!((r2_gw, r2_qr), (0, 0));
+
+    let actor_principal = authz_store::principal(&db, &alice).await;
+    authz_queue::cancel_run(&mut api_c, &actor_principal, &scope, &run2)
+        .await
+        .unwrap();
+
+    // Worker claims the replayed queued run and enforces the 0 usage_tokens quota at dispatch time
+    // without stranding holds or gateway_requests.
+    let mut worker = connect(&db.0, WORKER).await;
+    let worker_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(db.1.options(WORKER));
+    let lease_cfg = LeaseSettings {
+        lease: Duration::from_secs(60),
+        execution_timeout: Duration::from_secs(600),
+    };
+    let claim = authz_queue::claim_next(
+        &mut worker,
+        &ClaimLimits {
+            executing_per_actor: 4,
+            executing_per_scope: 8,
+        },
+        &lease_cfg,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(claim.run_id, run_id);
+    assert!(matches!(
+        gateway::reserve_turn_round(
+            &worker_pool,
+            TurnRound {
+                scope_id: &scope,
+                actor: &alice.user,
+                approval: &alice.approval,
+                run_id: &run_id,
+                round: 1,
+                claim_token: &claim.claim_token,
+                installation: INSTALL,
+                model: "a",
+                round_tokens: 450,
+                round_cost: None,
+                requires_device_slot: false,
+            },
+        )
+        .await,
+        Err(gateway::Error::Refused)
+    ));
+    leases::settle(
+        &mut worker,
+        &claim.lease(),
+        &lease_cfg,
+        Settle::Failed(FailReason::StepFailed),
+    )
+    .await
+    .unwrap();
+
+    let (req_count, hold_count, total_held): (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM openmettle.gateway_requests WHERE run_id = $1::uuid),
+                (SELECT count(*) FROM openmettle.quota_reservations WHERE run_id = $1::uuid),
+                (SELECT coalesce(sum(reserved_held), 0)::bigint FROM openmettle.quota_budgets)",
+    )
+    .bind(&run_id)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!((req_count, hold_count, total_held), (0, 0, 0));
+
+    let drift: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
+           FROM openmettle.quota_verify_accounting_drift()",
+    )
+    .fetch_one(&mut worker)
+    .await
+    .unwrap();
+    assert_eq!(drift, (0, 0, 0, 0));
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn schema_25_to_26_upgrade_gates_manage_quotas_until_overrides_enforced() {
+    use crate::{auth_config_support::Dir, ca::Ca};
+    use openmettle_core::{
+        authz::store::AuditContext,
+        migrate,
+        quotas::{self, QuotaError, QuotaResourceKind},
+    };
+
+    // Start on schema 25 and activate metering_enforced = true BEFORE migration 0026 applies.
+    let db = TestDb::new().await;
+    let settings = db.settings(Duration::from_secs(10));
+    migrate::apply(&settings, &migrate::MIGRATIONS[..25])
+        .await
+        .unwrap();
+    let mut owner = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut owner).await;
+    let admin =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    authz_store::make_admin(&mut owner, &admin).await;
+    let alice =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let alice_scope = authz_runs::personal_of(&db, &alice).await;
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 100000)",
+        )
+        .await
+        .unwrap();
+    // Fresh 0 -> 25 already starts with metering_enforced = true; capture its original timestamp.
+    let (metering_before, original_metering_at): (bool, String) = sqlx::query_as(
+        "SELECT metering_enforced, metering_enforced_at::text
+           FROM openmettle.quota_enforcement
+          WHERE id",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert!(metering_before);
+
+    // Apply migration 0026: overrides_enforced MUST start false even though metering_enforced
+    // was already true on schema 25.
+    migrate::apply(&settings, migrate::MIGRATIONS)
+        .await
+        .unwrap();
+    let pre_flags: (bool, bool, Option<String>) = sqlx::query_as(
+        "SELECT metering_enforced, overrides_enforced, overrides_enforced_at::text
+           FROM openmettle.quota_enforcement
+          WHERE id",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(pre_flags, (true, false, None));
+
+    let dir = Dir::new();
+    std::fs::create_dir(dir.path("artifacts")).unwrap();
+    let mut doc = auth_config_support::document_v2_native(&dir, &Ca::new().pem());
+    doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+    let mut catalog: Value =
+        serde_json::from_slice(include_bytes!("../fixtures/conversation-catalog-v1.json")).unwrap();
+    catalog["models"]["a"]["pin"]["provider"] = "synthetic-sglang".into();
+    doc["catalog_file"] = json!(dir.write("catalog.json", &serde_json::to_vec(&catalog).unwrap()));
+    doc["admission_limits"] = json!({
+        "live_per_actor": 4,
+        "live_per_scope": 8,
+        "queued_in_instance": 32,
+        "queue_timeout_seconds": 300,
+        "round_cap": 10
+    });
+    let api = Api::configured(&db, dir, doc, 4);
+    let admin_tok = native(&db, &admin, 1).await;
+    let admin_n = As::Native(&admin_tok);
+
+    // 1. HTTP PUT /v1/admin/scopes/{scope}/quotas/live_runs_per_actor MUST fail with 503 provisioning.
+    let (status, gated_body) = api.call(
+        admin_n,
+        "PUT",
+        &format!("/v1/admin/scopes/{alice_scope}/quotas/live_runs_per_actor"),
+        Some("rr17-gated-http"),
+        Some(&json!({"hard_limit": "0", "reason": "must refuse before 26 rollout activation"})),
+    );
+    assert_eq!(status, 503, "{gated_body}");
+    assert_eq!(gated_body["code"], "provisioning");
+    assert!(validate_openapi_schema(
+        "#/components/schemas/Problem",
+        &gated_body
+    ));
+
+    // 2. Direct Rust store call MUST fail with UpgradeNotEnforced.
+    let mut api_c = connect(&db.0, API).await;
+    let ctx = AuditContext {
+        actor_user_id: &admin.user,
+        actor_approval_id: &admin.approval,
+        now_ms: authz_store::NOW,
+        request_key: "rr17-gated-store",
+        reason: "must refuse before 26 rollout activation",
+    };
+    assert!(matches!(
+        quotas::set_scope_override(
+            &mut api_c,
+            &ctx,
+            &alice_scope,
+            QuotaResourceKind::LiveRunsPerActor,
+            0,
+            None,
+        )
+        .await,
+        Err(QuotaError::UpgradeNotEnforced)
+    ));
+
+    // 3. Defense-in-depth SQL helpers MUST raise OMQ06 directly as openmettle_api.
+    let sql_upsert = sqlx::query(
+        "SELECT openmettle.quota_upsert_scope_override(
+             $1::uuid, $2::uuid, 'live_runs_per_actor', 0, NULL, 'direct-sql-check', NULL, NULL
+         )",
+    )
+    .bind(&alice_scope)
+    .bind(&admin.user)
+    .execute(&mut api_c)
+    .await;
+    assert_eq!(sqlstate(sql_upsert), "OMQ06");
+    let sql_revoke = sqlx::query(
+        "SELECT openmettle.quota_revoke_scope_override(
+             $1::uuid, $2::uuid, 'live_runs_per_actor', 'direct-sql-revoke', NULL, NULL
+         )",
+    )
+    .bind(&alice_scope)
+    .bind(&admin.user)
+    .execute(&mut api_c)
+    .await;
+    assert_eq!(sqlstate(sql_revoke), "OMQ06");
+
+    // 4. Run the real `openmettle-admin quota activate` binary: preserves original metering_enforced_at,
+    //    flips overrides_enforced = true, stays idempotent on rerun, and remains write-once (OMQ04).
+    for _ in 0..2 {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_openmettle-admin"));
+        scrub_env(&mut cmd);
+        let out = cmd
+            .env("OPENMETTLE_ADMIN_DATABASE_URL", db.url(OWNER))
+            .args(["quota", "activate"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+    let (post_metering, post_metering_at, post_overrides, post_overrides_at): (
+        bool,
+        String,
+        bool,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT metering_enforced, metering_enforced_at::text, overrides_enforced, overrides_enforced_at::text
+           FROM openmettle.quota_enforcement
+          WHERE id",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert!(post_metering);
+    assert_eq!(post_metering_at, original_metering_at);
+    assert!(post_overrides);
+    assert!(post_overrides_at.is_some());
+
+    let revert = owner
+        .execute("UPDATE openmettle.quota_enforcement SET overrides_enforced = false WHERE id")
+        .await;
+    assert_eq!(sqlstate(revert), "OMQ04");
+
+    // 5. After activation, HTTP ManageQuotas write succeeds cleanly with 200 OK.
+    let updated = success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/live_runs_per_actor"),
+            Some("rr17-gated-http"),
+            Some(&json!({"hard_limit": "0", "reason": "allowed after 26 rollout activation"})),
+        ),
+        200,
+    );
+    assert_eq!(updated["hard_limit"], "0");
+    assert_eq!(updated["revision"], "1");
 }
 
 #[path = "run_events_http.rs"]

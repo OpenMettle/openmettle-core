@@ -151,6 +151,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "mcp tool operations",
         sql: include_str!("../migrations/0025_mcp_tool_operations.sql"),
     },
+    Source {
+        version: 26,
+        description: "quota override audit and locks",
+        sql: include_str!("../migrations/0026_quota_override_audit_and_locks.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

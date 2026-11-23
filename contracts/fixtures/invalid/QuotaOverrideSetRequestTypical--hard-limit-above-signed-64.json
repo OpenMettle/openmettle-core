@@ -1,0 +1,24 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "/hard_limit",
+    "keyword": "pattern",
+    "valid": false
+  },
+  "fixture": "QuotaOverrideSetRequestTypical--hard-limit-above-signed-64",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "expires_at": "2026-12-31T23:59:59.000000Z",
+    "hard_limit": "9223372036854775808",
+    "reason": "Increase budget for evaluation cohort"
+  },
+  "mutation": {
+    "name": "hard-limit-above-signed-64",
+    "op": "set",
+    "path": "/hard_limit",
+    "value": "9223372036854775808"
+  },
+  "schema": "#/components/schemas/QuotaOverrideSetRequest",
+  "source": "#/components/examples/QuotaOverrideSetRequestTypical"
+}

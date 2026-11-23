@@ -12,11 +12,55 @@ use crate::{
 };
 use serde_json::{Map, Value};
 
+/// Metered gateway dispatch settings for a leased worker turn route.
+pub struct MeteredRoute {
+    pub installation: String,
+    pub keys: Arc<crate::provider_keys::gateway::GatewayKeys>,
+    pub device_grant_id: Option<String>,
+}
+
 /// The credential owner resolves this route at dispatch for the admitted actor and scope.
 pub struct Route {
     pub gateway: Arc<Gateway>,
     pub bearer: String,
     pub stream: bool,
+    pub metered: Option<MeteredRoute>,
+}
+
+impl Route {
+    pub fn bearer(gateway: Arc<Gateway>, bearer: String, stream: bool) -> Self {
+        Self {
+            gateway,
+            bearer,
+            stream,
+            metered: None,
+        }
+    }
+
+    pub fn metered(
+        gateway: Arc<Gateway>,
+        installation: String,
+        keys: Arc<crate::provider_keys::gateway::GatewayKeys>,
+        stream: bool,
+    ) -> Self {
+        Self {
+            gateway,
+            bearer: String::new(),
+            stream,
+            metered: Some(MeteredRoute {
+                installation,
+                keys,
+                device_grant_id: None,
+            }),
+        }
+    }
+
+    pub fn with_device_grant(mut self, device_grant_id: String) -> Self {
+        if let Some(metered) = &mut self.metered {
+            metered.device_grant_id = Some(device_grant_id);
+        }
+        self
+    }
 }
 
 pub trait TurnRoutes: Send + Sync + 'static {
@@ -149,8 +193,14 @@ impl<R: TurnRoutes> TurnExecutor<R> {
         }
     }
 
-    /// Reserve the model round before HTTP. A replacement holder cannot reset the round budget.
-    async fn next_round(&self, claim: &ClaimedRun, restarting: bool) -> Result<i64, StepResult> {
+    /// Reserve the model round before HTTP. A replacement holder cannot reset the round budget,
+    /// except when a metered predecessor never reached gateway handoff for its reserved round.
+    async fn next_round(
+        &self,
+        claim: &ClaimedRun,
+        restarting: bool,
+        metered: bool,
+    ) -> Result<i64, StepResult> {
         let mut c = self.pool.acquire().await.map_err(|_| FAILED)?;
         let number = leases::with_lease(&mut c, &claim.lease(), Fence::Step, async |tx, _| {
             let (used, has_effect): (i64,bool) = sqlx::query_as("SELECT
@@ -161,10 +211,55 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 // The in-memory tool transcript did not survive. Never redispatch a past effect.
                 return Err(crate::runs::Error::Conflict);
             }
+            if restarting
+                && metered
+                && used > 0
+                && used <= i64::from(claim.round_limit)
+                && let Ok(prior_round) = i32::try_from(used)
+            {
+                let has_recover: bool = sqlx::query_scalar(
+                    "SELECT to_regprocedure(
+                         'openmettle.quota_recover_unsent_turn_round(uuid,uuid,uuid,integer)'
+                     ) IS NOT NULL",
+                )
+                .fetch_one(tx.connection()?)
+                .await?;
+                if has_recover {
+                    let reusable: bool = sqlx::query_scalar(
+                        "SELECT openmettle.quota_recover_unsent_turn_round(
+                             $1::uuid, $2::uuid, $3::uuid, $4
+                         )",
+                    )
+                    .bind(&claim.scope_id)
+                    .bind(&claim.run_id)
+                    .bind(&claim.claim_token)
+                    .bind(prior_round)
+                    .fetch_one(tx.connection()?)
+                    .await?;
+                    if reusable {
+                        return Ok(used);
+                    }
+                }
+            }
             let round = used + 1;
             if round <= i64::from(claim.round_limit) {
-                crate::runs::append_event(tx, &claim.scope_id, &claim.run_id, &format!("model-round:{round}"),
-                    Payload { format: "openmettle.model-round", version: 1, bytes: b"{}" }).await?;
+                let bytes: &[u8] = if metered {
+                    br#"{"metered":true}"#
+                } else {
+                    b"{}"
+                };
+                crate::runs::append_event(
+                    tx,
+                    &claim.scope_id,
+                    &claim.run_id,
+                    &format!("model-round:{round}"),
+                    Payload {
+                        format: "openmettle.model-round",
+                        version: 1,
+                        bytes,
+                    },
+                )
+                .await?;
             }
             Ok(round)
         }).await.map_err(lease_step)?;
@@ -271,7 +366,7 @@ impl<R: TurnRoutes> TurnExecutor<R> {
         config: &ConfigSnapshot,
         continuation: &[History],
         tools: Option<Vec<Tool>>,
-    ) -> Result<(Route, Request, i64), StepResult> {
+    ) -> Result<(Route, Request, i64, String), StepResult> {
         self.authority(claim, config).await?;
         let prompt = {
             let mut c = self.pool.acquire().await.map_err(|_| FAILED)?;
@@ -314,9 +409,11 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 return Err(FAILED);
             }
         }
-        let round = self.next_round(claim, continuation.is_empty()).await?;
+        let round = self
+            .next_round(claim, continuation.is_empty(), route.metered.is_some())
+            .await?;
         self.authority(claim, config).await?;
-        Ok((route, request, round))
+        Ok((route, request, round, actor))
     }
 
     async fn execute_turn(
@@ -339,7 +436,7 @@ impl<R: TurnRoutes> TurnExecutor<R> {
             .map(|_| self.routes.tools(&run.claim))
             .filter(|t| !t.is_empty());
         loop {
-            let (route, request, round) = tokio::select! {
+            let (route, request, round, actor) = tokio::select! {
                 biased;
                 _ = stop.wait_for(Option::is_some) => return Err(StepResult::Stopped),
                 ready = self.prepare_round(&run.claim, &config, &continuation, tools) => ready?,
@@ -370,18 +467,147 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                     _ => return Err(FAILED),
                 }
             }
-            let turn = route
-                .gateway
-                .server(
-                    &self.catalog,
-                    &config.effective,
-                    &request,
-                    Credential::Bearer(&route.bearer),
-                    RunStop::from_worker(run, cx.stop.clone()),
-                    |_| async {},
-                )
-                .await
-                .map_err(inference::Error::step_result)?;
+            let turn = if let Some(metered) = &route.metered {
+                let billable = crate::provider_http::BillableInferenceRef {
+                    installation: &metered.installation,
+                    route: &route.gateway,
+                };
+                // Validate and wire-encode the outbound payload BEFORE reserving or committing a
+                // gateway handoff so oversized/invalid payloads never strand handoff_committed holds.
+                let mut prepared = billable
+                    .prepare(&self.catalog, &config.effective, &request, true)
+                    .map_err(inference::Error::step_result)?;
+                let round_tokens = prepared.round_tokens().ok_or(FAILED)?;
+                let round_cost = prepared.round_cost();
+                let requires_device_slot = prepared.requires_device_slot();
+                const MAX_RETRYABLE_RESERVE_ATTEMPTS: u8 = 4;
+                const MAX_MISSING_HOLD_HANDOFF_RETRIES: u8 = 2;
+                let round_i32 = i32::try_from(round).map_err(|_| FAILED)?;
+                let turn_dispatch = {
+                    let mut missing_hold_retries: u8 = 0;
+                    let mut retryable_attempts: u8 = 0;
+                    loop {
+                        let pending = match crate::authz::gateway::reserve_turn_round(
+                            &self.pool,
+                            crate::authz::gateway::TurnRound {
+                                scope_id: &run.claim.scope_id,
+                                actor: &actor,
+                                approval: &run.claim.actor_approval_id,
+                                run_id: &run.claim.run_id,
+                                round: round_i32,
+                                claim_token: &run.claim.claim_token,
+                                installation: &metered.installation,
+                                model: &config.effective.model,
+                                round_tokens,
+                                round_cost,
+                                requires_device_slot,
+                            },
+                        )
+                        .await
+                        {
+                            Ok(pending) => pending,
+                            Err(crate::authz::gateway::Error::Retryable)
+                                if retryable_attempts < MAX_RETRYABLE_RESERVE_ATTEMPTS =>
+                            {
+                                if cx.stop.borrow().is_some() {
+                                    return Err(StepResult::Stopped);
+                                }
+                                retryable_attempts += 1;
+                                continue;
+                            }
+                            Err(_) => return Err(FAILED),
+                        };
+                        if cx.stop.borrow().is_some() {
+                            let _ = pending.release(&self.pool).await;
+                            return Err(StepResult::Stopped);
+                        }
+                        match pending
+                            .handoff_turn(
+                                &self.pool,
+                                &metered.keys,
+                                metered.device_grant_id.as_deref(),
+                                &billable,
+                                prepared,
+                            )
+                            .await
+                        {
+                            Ok(turn_dispatch) => break turn_dispatch,
+                            Err(err)
+                                if matches!(
+                                    err.0,
+                                    crate::authz::gateway::TurnHandoffError::MissingHold
+                                ) && missing_hold_retries < MAX_MISSING_HOLD_HANDOFF_RETRIES =>
+                            {
+                                prepared = err.1;
+                                if !matches!(pending.release(&self.pool).await, Ok(true)) {
+                                    return Err(FAILED);
+                                }
+                                if cx.stop.borrow().is_some() {
+                                    return Err(StepResult::Stopped);
+                                }
+                                missing_hold_retries += 1;
+                            }
+                            Err(_) => {
+                                let _ = pending.release(&self.pool).await;
+                                return Err(FAILED);
+                            }
+                        }
+                    }
+                };
+                turn_dispatch
+                    .send(RunStop::from_worker(run, cx.stop.clone()), |_| async {})
+                    .await
+                    .map_err(inference::Error::step_result)?
+            } else {
+                if cx.stop.borrow().is_some() {
+                    return Err(StepResult::Stopped);
+                }
+                {
+                    let mut c = self.pool.acquire().await.map_err(|_| FAILED)?;
+                    let has_quota_schema: bool = sqlx::query_scalar(
+                        "SELECT to_regclass('openmettle.quota_enforcement') IS NOT NULL",
+                    )
+                    .fetch_one(&mut *c)
+                    .await
+                    .map_err(|_| FAILED)?;
+                    if has_quota_schema {
+                        let has_guard: bool = sqlx::query_scalar(
+                            "SELECT to_regprocedure(
+                                 'openmettle.quota_authorize_unmetered_turn_round(uuid,uuid,uuid)'
+                             ) IS NOT NULL",
+                        )
+                        .fetch_one(&mut *c)
+                        .await
+                        .map_err(|_| FAILED)?;
+                        if !has_guard {
+                            return Err(FAILED);
+                        }
+                        sqlx::query(
+                            "SELECT openmettle.quota_authorize_unmetered_turn_round(
+                                 $1::uuid, $2::uuid, $3::uuid
+                             )",
+                        )
+                        .bind(&run.claim.scope_id)
+                        .bind(&run.claim.run_id)
+                        .bind(&run.claim.claim_token)
+                        .execute(&mut *c)
+                        .await
+                        .map_err(|_| FAILED)?;
+                    }
+                }
+                route
+                    .gateway
+                    .server(
+                        &self.catalog,
+                        &config.effective,
+                        &request,
+                        Credential::Bearer(&route.bearer),
+                        RunStop::from_worker(run, cx.stop.clone()),
+                        |_| async {},
+                    )
+                    .await
+                    .map_err(inference::Error::step_result)?
+            };
             tools = request.tools;
             let [answer]: [_; 1] = turn.answers.try_into().map_err(|_| FAILED)?;
             match answer.calls {

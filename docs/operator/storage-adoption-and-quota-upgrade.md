@@ -1,6 +1,6 @@
 # Upgrade storage and activate metering
 
-Use this procedure when an existing database moves from migration 0023 or earlier to 0024. It applies even if the deployment has never accepted an upload or gateway request. Schedule a maintenance window and retain a matched database backup and artifact volume snapshot. Record the filesystem UUID and the device and inode of the original revisions directory independently of the tree you intend to adopt.
+Sections 1 through 4 cover upgrading an existing database from migration 0023 or earlier to the current quota schema (0026). Deployments already on migration 0024 or 0025 should follow [Upgrade from 0024 or 0025 to 0026](#upgrade-from-0024-or-0025-to-0026) instead. This procedure applies even if the deployment has never accepted an upload or gateway request. Schedule a maintenance window and retain a matched database backup and artifact volume snapshot. Record the filesystem UUID and the device and inode of the original revisions directory independently of the tree you intend to adopt.
 
 ## 1. Stop all legacy artifact cleaners
 
@@ -11,11 +11,13 @@ Before running the migration, scale the old worker deployment to zero, or restar
 Run the new `openmettle-migrate` job with its existing owner connection. In the migrated database, inspect the singleton markers.
 
 ```sql
-SELECT volume_id, adoption_run_id, bootstrap_auto_pin_allowed, metering_enforced
+SELECT volume_id, adoption_run_id, bootstrap_auto_pin_allowed,
+       metering_enforced, metering_enforced_at,
+       overrides_enforced, overrides_enforced_at
 FROM openmettle.storage_volume_control CROSS JOIN openmettle.quota_enforcement;
 ```
 
-Both IDs must be null and both flags false on an upgrade. A new installation starts with metering enabled and permits the API to pin an empty store. Configure operator-approved limits before serving metered requests. The actor's personal token ceiling applies to project requests too. Set the deployment cost denomination by updating the existing instance cost default. The denomination becomes permanent.
+Both IDs and both enforcement timestamps must be null and all three flags false on an upgrade from 0023 or earlier. A new installation starts with metering and overrides enabled and permits the API to pin an empty store. Configure operator-approved limits before serving metered requests. The actor's personal token ceiling applies to project requests too. Set the deployment cost denomination by updating the existing instance cost default. The denomination becomes permanent. Before setting any non-null `usage_cost_micros` default (`quota_defaults`) or scope override (`quota_overrides`), configure and deployment-qualify `cost_bound` (`fixed_micros` and `micros_per_token`, expressed in the permanent `cost_denomination` micro-units) on every catalog model profile that will serve cost-metered runs and roll API and worker processes onto that catalog revision; profiles without `cost_bound` fail closed with `503 provisioning` (`quota.resource_kind = "usage_cost_micros"`) once cost limits are active.
 
 ## 3. Replace every API and worker
 
@@ -54,7 +56,32 @@ openmettle-admin quota drain-orphans
 openmettle-admin quota activate
 ```
 
-Verify `metering_enforced` is true and `metering_enforced_at` is set. Activation is irreversible. A committed gateway handoff retains its hold until accepted gateway usage settles it. A committed device slot stays charged until V1-18 provides durable evidence of release or non-allocation.
+Verify `metering_enforced` and `overrides_enforced` are both true and both `metering_enforced_at` and `overrides_enforced_at` are set. Activation is irreversible. A committed gateway handoff retains its hold until accepted gateway usage settles it. A committed device slot stays charged until V1-18 provides durable evidence of release or non-allocation.
+
+## Upgrade from 0024 or 0025 to 0026
+
+Existing `0024` or `0025` deployments, including installations that already have `metering_enforced = true`, enter schema `0026` with `overrides_enforced = false` and `overrides_enforced_at = NULL`. Until activation completes, `ManageQuotas` scope override writes fail closed with `503 provisioning` while older replicas drain.
+
+1. Apply migration `0026` with `openmettle-migrate` using its existing owner connection.
+2. Roll all API and worker deployments to the `0026` binaries and confirm that every `0024`/`0025` API and worker replica and job has exited.
+3. Inspect the current adoption and enforcement markers:
+
+```sql
+SELECT volume_id, adoption_run_id,
+       metering_enforced, metering_enforced_at,
+       overrides_enforced, overrides_enforced_at
+FROM openmettle.storage_volume_control CROSS JOIN openmettle.quota_enforcement;
+```
+
+4. Activate according to the observed `metering_enforced` state:
+   - **If `metering_enforced = true`:** if any `usage_cost_micros` default or override is active (or before adding one), confirm that every catalog model profile serving cost-metered runs carries a deployment-qualified `cost_bound` (`fixed_micros` and `micros_per_token` in the permanent `cost_denomination` micro-units) and that all API and worker processes are rolled onto that catalog revision; profiles without `cost_bound` fail closed with `503 provisioning` (`quota.resource_kind = "usage_cost_micros"`). Then rerun `openmettle-admin quota activate`. The command is idempotent, preserves the original `metering_enforced_at` timestamp, and sets `overrides_enforced = true` and `overrides_enforced_at`.
+   - **If `metering_enforced = false`:** do **not** run `openmettle-admin quota activate` yet. First configure operator-approved quota limits and the permanent instance `cost_denomination` (Section 2), configure and deployment-qualify `cost_bound` (`fixed_micros` and `micros_per_token`) on every catalog model profile serving cost-metered runs and roll API and worker processes onto that catalog revision before setting any non-null `usage_cost_micros` default or override (profiles without `cost_bound` fail closed with `503 provisioning` and `quota.resource_kind = "usage_cost_micros"`), complete volume adoption (if storage is enabled or nonempty) and `openmettle-admin quota drain-orphans` (Section 4), and finally run `openmettle-admin quota activate` to enable both `metering_enforced` and `overrides_enforced`.
+5. Verify in SQL that all four enforcement columns are active and non-null:
+
+```sql
+SELECT metering_enforced, metering_enforced_at, overrides_enforced, overrides_enforced_at
+FROM openmettle.quota_enforcement;
+```
 
 ## Monitor overdue handoffs
 

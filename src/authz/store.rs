@@ -53,11 +53,11 @@ impl From<crate::runs::Error> for StoreError {
     }
 }
 
-pub(super) fn uuid(value: &str, what: &'static str) -> Result<(), StoreError> {
+pub(crate) fn uuid(value: &str, what: &'static str) -> Result<(), StoreError> {
     crate::runs::uuid(value).map_err(|_| StoreError::InvalidInput(what))
 }
 
-pub(super) fn check(decision: Decision) -> Result<(), StoreError> {
+pub(crate) fn check(decision: Decision) -> Result<(), StoreError> {
     match decision {
         Decision::Allow => Ok(()),
         Decision::Deny(reason) => Err(StoreError::Denied(reason)),
@@ -196,7 +196,7 @@ pub struct AuditContext<'a> {
 }
 
 impl AuditContext<'_> {
-    pub(super) fn validate(&self) -> Result<(), StoreError> {
+    pub(crate) fn validate(&self) -> Result<(), StoreError> {
         uuid(self.actor_user_id, "actor_user_id")?;
         uuid(self.actor_approval_id, "actor_approval_id")?;
         // PostgreSQL text cannot hold NUL, so it is refused here rather than by the database.
@@ -284,13 +284,13 @@ pub(super) fn unique(error: sqlx::Error, constraint: &str, conflict: &'static st
 }
 
 /// One bounded READ COMMITTED transaction, shared by the writers and the run recheck.
-pub(super) async fn begin(c: &mut PgConnection) -> Result<WriteTransaction<'_>, StoreError> {
+pub(crate) async fn begin(c: &mut PgConnection) -> Result<WriteTransaction<'_>, StoreError> {
     Ok(WriteTransaction::begin_bounded(c, false).await?)
 }
 
 /// Run `body` in one READ COMMITTED write transaction: commit on success, roll back otherwise.
 /// The audit context is validated before the transaction starts.
-pub(super) async fn transact<T>(
+pub(crate) async fn transact<T>(
     c: &mut PgConnection,
     ctx: &AuditContext<'_>,
     body: impl AsyncFnOnce(&mut WriteTransaction<'_>) -> Result<T, StoreError>,
@@ -310,7 +310,7 @@ pub(super) async fn transact<T>(
 }
 
 /// The actor re-hydrated from the primary inside the write transaction; it must be active.
-pub(super) async fn acting(
+pub(crate) async fn acting(
     c: &mut PgConnection,
     ctx: &AuditContext<'_>,
 ) -> Result<Principal, StoreError> {

@@ -1563,12 +1563,20 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
             "openmettle_worker has SELECT on openmettle.user_identities",
         ];
         // Old binaries print PostgreSQL's canonical regprocedure spelling. Resolve the exact
-        // role/signature pairs granted by the new migration against that same catalog.
-        let quota_grants: Vec<String> = sqlx::query_scalar(r"SELECT trim(role) ||
-            ' has EXECUTE on function ' || to_regprocedure(parts[1])::text
+        // role/signature pairs granted by migrations 0024+ that still exist in the final catalog
+        // (skipping signatures superseded and dropped by later migrations such as 0026).
+        let quota_sql: String = MIGRATIONS[23..]
+            .iter()
+            .map(|m| m.sql)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let quota_grants: Vec<String> = sqlx::query_scalar(r"SELECT DISTINCT trim(role) ||
+            ' has EXECUTE on function ' || proc::text
             FROM regexp_matches($1, 'GRANT\s+EXECUTE\s+ON\s+FUNCTION\s+(openmettle\.\w+\([^)]*\))\s+TO\s+([^;]+);','gi') parts,
-            unnest(string_to_array(parts[2],',')) role")
-            .bind(MIGRATIONS[23].sql).fetch_all(&mut owner).await.unwrap();
+            unnest(string_to_array(parts[2],',')) role,
+            LATERAL (SELECT to_regprocedure(parts[1]) AS proc) p
+            WHERE p.proc IS NOT NULL")
+            .bind(&quota_sql).fetch_all(&mut owner).await.unwrap();
         for violation in &reported {
             let later = violation.contains("openmettle.native_handoffs")
                 || violation.ends_with(" on function openmettle.redeem_home_invitation(uuid,text,text,text,bigint,bytea)")

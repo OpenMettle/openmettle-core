@@ -292,6 +292,7 @@ struct Users {
 }
 impl Users {
     async fn new(db: &TestDb) -> Self {
+        super::run_admission::seed_token_budget(db).await;
         let mut owner = connect(&db.0, OWNER).await;
         authz_store::providers(&mut owner).await;
         let actor = authz_store::account(&mut owner, PROVIDER, true, FUTURE).await;
@@ -1629,6 +1630,7 @@ async fn replay_of_pre_binding_admission_preserves_snapshot_bytes_and_null_evide
         capabilities: &[],
         requested_rounds: None,
         now_ms: NOW,
+        cost_qualified: None,
     };
     let Admission::Admitted { run_id, .. } =
         queue::admit_run(&mut tx, &admission, &crate::approvals::LIMITS)

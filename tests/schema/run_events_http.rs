@@ -887,6 +887,7 @@ async fn shared_reader_replays_only_public_approval_transitions_and_terminal_rea
     .fetch_one(&mut api)
     .await
     .unwrap();
+    super::run_admission::seed_token_budget(&f.db).await;
     let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
     let admission = queue::admit_run_with_mode(
         &mut tx,
@@ -907,6 +908,7 @@ async fn shared_reader_replays_only_public_approval_transitions_and_terminal_rea
             capabilities: &[],
             requested_rounds: None,
             now_ms: session.observed_ms(),
+            cost_qualified: None,
         },
         &crate::approvals::LIMITS,
         &session,

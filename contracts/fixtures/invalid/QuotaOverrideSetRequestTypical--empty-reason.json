@@ -1,0 +1,24 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "/reason",
+    "keyword": "minLength",
+    "valid": false
+  },
+  "fixture": "QuotaOverrideSetRequestTypical--empty-reason",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "expires_at": "2026-12-31T23:59:59.000000Z",
+    "hard_limit": "500000",
+    "reason": ""
+  },
+  "mutation": {
+    "name": "empty-reason",
+    "op": "set",
+    "path": "/reason",
+    "value": ""
+  },
+  "schema": "#/components/schemas/QuotaOverrideSetRequest",
+  "source": "#/components/examples/QuotaOverrideSetRequestTypical"
+}

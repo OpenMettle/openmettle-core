@@ -883,3 +883,288 @@ async fn document_get_capabilities_keep_destination_method_and_stream_bounds() {
     let documents = ProviderDocuments::configured(&token, &url, &url).unwrap();
     assert_eq!(documents.fetch_jwks().await.unwrap_err(), Error::TooLarge);
 }
+
+#[tokio::test]
+async fn turn_dispatch_sends_to_originating_gateway_with_bound_request_id() {
+    use crate::model_config::{Catalog, Selection};
+    use crate::provider_http::inference::{
+        Gateway, History, Protocol, Qualification, Request, RunStop, Timeouts,
+    };
+    use crate::worker::ActiveRun;
+    use tokio::sync::watch;
+
+    let ca = fixture::Ca::new();
+    let expected_id = "00000000-0000-4000-8000-000000001919";
+    let expected_bearer = "turn-dispatch-wire-bearer";
+    let server = fixture::Server::start(ca.leaf(fixture::HOST, false), move |received| {
+        assert!(
+            received
+                .head
+                .starts_with("POST /v1/chat/completions HTTP/1.1\r\n")
+        );
+        let header_val = |name: &str| {
+            received
+                .head
+                .lines()
+                .filter_map(|l| l.split_once(':'))
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.trim().to_owned())
+        };
+        assert_eq!(
+            header_val("authorization").as_deref(),
+            Some(format!("Bearer {expected_bearer}").as_str())
+        );
+        assert_eq!(header_val("x-request-id").as_deref(), Some(expected_id));
+        let body = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "bound ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2}
+        });
+        fixture::Reply::Bytes(fixture::response(
+            200,
+            &[("content-type", "application/json")],
+            body.to_string().as_bytes(),
+        ))
+    })
+    .await;
+
+    let catalog =
+        Catalog::load(include_bytes!("../fixtures/conversation-catalog-v1.json")).unwrap();
+    let effective = catalog
+        .resolve(
+            &Selection::default(),
+            &serde_json::from_value(serde_json::json!({"preset": "study"})).unwrap(),
+            None,
+            |_, _| true,
+        )
+        .unwrap();
+    let mut gateway = Gateway::new(
+        &format!(
+            "https://{}:{}/v1/chat/completions",
+            fixture::HOST,
+            server.port
+        ),
+        Trust::Bundle(&ca.pem()),
+        &[],
+        Qualification {
+            model: effective.model.clone(),
+            pin: effective.profile.clone(),
+            protocol: Protocol::Chat,
+            json: true,
+            sse: false,
+            functions: None,
+            images: false,
+            parallel: false,
+            usage: true,
+            tool_separator_whitespace: false,
+        },
+        Timeouts {
+            setup: Duration::from_secs(5),
+            idle: Duration::from_secs(5),
+            overall: Duration::from_secs(10),
+        },
+    )
+    .unwrap();
+    let port = server.port;
+    gateway.fixture_lookup(Arc::new(move |_, _| {
+        Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))])
+    }));
+
+    let req = Request {
+        history: vec![History::User("hello turn dispatch".into())],
+        tools: None,
+        parallel: None,
+        stream: false,
+    };
+    let prepared = gateway.prepare(&catalog, &effective, &req, true).unwrap();
+    let dispatch = Dispatch {
+        id: expected_id.to_owned(),
+        installation: "00000000-0000-4000-8000-000000001918".to_owned(),
+        model: effective.model.clone(),
+        server: true,
+        authorization: HeaderValue::from_str(&format!("Bearer {expected_bearer}")).unwrap(),
+    };
+    let turn_dispatch = TurnDispatch::new(dispatch, prepared);
+    let (_tx, stop_rx) = watch::channel(None);
+    let run = ActiveRun {
+        claim: crate::authz::runs::ClaimedRun {
+            scope_id: "s".into(),
+            run_id: "r".into(),
+            claim_token: "t".into(),
+            actor_approval_id: "a".into(),
+            round_limit: 1,
+            lease_remaining: Duration::from_secs(10),
+            execution_remaining: Duration::from_secs(10),
+        },
+        state: crate::authz::leases::ExecState::Running,
+        execution_deadline: tokio::time::Instant::now() + Duration::from_secs(10),
+    };
+    let turn = turn_dispatch
+        .send(RunStop::from_worker(&run, stop_rx), |_| async {})
+        .await
+        .unwrap();
+    assert_eq!(turn.answers[0].parts, ["bound ok"]);
+    assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn billable_dispatch_follows_mode_and_requires_output_cap() {
+    use crate::{
+        model_config::{Catalog, Selection},
+        provider_http::{
+            BillableDispatch, BillableInferenceRef,
+            inference::{Gateway, History, Protocol, Qualification, Request, RunStop, Timeouts},
+        },
+        worker::ActiveRun,
+    };
+    use std::sync::atomic::Ordering;
+    use tokio::sync::watch;
+
+    let ca = fixture::Ca::new();
+    let expected_id = "00000000-0000-4000-8000-000000002101";
+    let expected_bearer = "synthetic-billable-dispatch-token";
+    let server = fixture::Server::start(ca.leaf(fixture::HOST, false), move |req| {
+        assert!(
+            req.head
+                .contains(&format!("x-request-id: {expected_id}\r\n")),
+            "missing x-request-id: {}",
+            req.head
+        );
+        assert!(
+            req.head
+                .contains(&format!("authorization: Bearer {expected_bearer}\r\n")),
+            "missing bearer header: {}",
+            req.head
+        );
+        fixture::Reply::Bytes(fixture::json(
+            br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"billable ok"},"finish_reason":"stop"}]}"#,
+        ))
+    })
+    .await;
+
+    let catalog =
+        Catalog::load(include_bytes!("../fixtures/conversation-catalog-v1.json")).unwrap();
+    let missing_cap = catalog
+        .resolve(
+            &Selection::default(),
+            &serde_json::from_value(serde_json::json!({
+                "model": "a",
+                "layer": {"controls": {"context_window": 100}}
+            }))
+            .unwrap(),
+            None,
+            |_, _| true,
+        )
+        .unwrap();
+    let valid_eff = catalog
+        .resolve(
+            &Selection::default(),
+            &serde_json::from_value(serde_json::json!({
+                "model": "a",
+                "layer": {"controls": {"context_window": 100, "output_reserve": 40}}
+            }))
+            .unwrap(),
+            None,
+            |_, _| true,
+        )
+        .unwrap();
+    let mut gateway = Gateway::new(
+        &format!(
+            "https://{}:{}/v1/chat/completions",
+            fixture::HOST,
+            server.port
+        ),
+        Trust::Bundle(&ca.pem()),
+        &[],
+        Qualification {
+            model: valid_eff.model.clone(),
+            pin: valid_eff.profile.clone(),
+            protocol: Protocol::Chat,
+            json: true,
+            sse: false,
+            functions: None,
+            images: false,
+            parallel: false,
+            usage: true,
+            tool_separator_whitespace: false,
+        },
+        Timeouts {
+            setup: Duration::from_secs(5),
+            idle: Duration::from_secs(5),
+            overall: Duration::from_secs(10),
+        },
+    )
+    .unwrap();
+    let port = server.port;
+    gateway.fixture_lookup(Arc::new(move |_, _| {
+        Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))])
+    }));
+    let billable = BillableInferenceRef {
+        installation: "00000000-0000-4000-8000-000000002102",
+        route: &gateway,
+    };
+    let req = Request {
+        history: vec![History::User("hello billable dispatch".into())],
+        tools: None,
+        parallel: None,
+        stream: false,
+    };
+
+    // Missing output_reserve fails BillableInferenceRef::prepare for BOTH caller and server modes.
+    assert_eq!(
+        billable.prepare(&catalog, &missing_cap, &req, false).err(),
+        Some(crate::provider_http::inference::Error::Validation)
+    );
+    assert_eq!(
+        billable.prepare(&catalog, &missing_cap, &req, true).err(),
+        Some(crate::provider_http::inference::Error::Validation)
+    );
+
+    let mk_dispatch = |server_flag: bool| Dispatch {
+        id: expected_id.to_owned(),
+        installation: "00000000-0000-4000-8000-000000002102".to_owned(),
+        model: valid_eff.model.clone(),
+        server: server_flag,
+        authorization: HeaderValue::from_str(&format!("Bearer {expected_bearer}")).unwrap(),
+    };
+    let (_tx, stop_rx) = watch::channel(None);
+    let run = ActiveRun {
+        claim: crate::authz::runs::ClaimedRun {
+            scope_id: "s".into(),
+            run_id: "r".into(),
+            claim_token: "t".into(),
+            actor_approval_id: "a".into(),
+            round_limit: 1,
+            lease_remaining: Duration::from_secs(10),
+            execution_remaining: Duration::from_secs(10),
+        },
+        state: crate::authz::leases::ExecState::Running,
+        execution_deadline: tokio::time::Instant::now() + Duration::from_secs(10),
+    };
+
+    // The validated request mode selects the variant, so each committed dispatch exposes only
+    // its matching send and each transmits once with x-request-id.
+    let BillableDispatch::Caller(caller) = BillableDispatch::new(
+        mk_dispatch(false),
+        billable.prepare(&catalog, &valid_eff, &req, false).unwrap(),
+    ) else {
+        panic!("a caller-mode request must yield BillableDispatch::Caller");
+    };
+    let caller_turn = caller.send(|_| async {}).await.unwrap();
+    assert_eq!(caller_turn.answers[0].parts, ["billable ok"]);
+    let BillableDispatch::Server(leased) = BillableDispatch::new(
+        mk_dispatch(true),
+        billable.prepare(&catalog, &valid_eff, &req, true).unwrap(),
+    ) else {
+        panic!("a server-mode request must yield BillableDispatch::Server");
+    };
+    let server_turn = leased
+        .send(RunStop::from_worker(&run, stop_rx), |_| async {})
+        .await
+        .unwrap();
+    assert_eq!(server_turn.answers[0].parts, ["billable ok"]);
+    assert_eq!(server.requests.load(Ordering::SeqCst), 2);
+}

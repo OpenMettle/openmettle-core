@@ -172,7 +172,11 @@ async fn recovered_user_key_dispatches_only_after_acknowledged_commits_on_each_l
     let effective = catalog
         .resolve(
             &Selection::default(),
-            &serde_json::from_value(json!({"model":"a"})).unwrap(),
+            &serde_json::from_value(json!({
+                "model": "a",
+                "layer": {"controls": {"context_window": 10, "output_reserve": 4}}
+            }))
+            .unwrap(),
             None,
             |_, _| true,
         )
@@ -240,6 +244,124 @@ async fn recovered_user_key_dispatches_only_after_acknowledged_commits_on_each_l
                 .execute(&mut f.owner)
                 .await
                 .unwrap();
+
+            // Regression: missing or oversized wire output_reserve MUST fail both
+            // BillableInference::prepare (server and caller) and direct Pending::handoff
+            // BEFORE committing gateway_requests or sending any TLS request.
+            let ring = keys();
+            let bad_pending = gateway::reserve(
+                &worker,
+                Call {
+                    reservation: Reservation {
+                        id: &run_hold,
+                        scope_id: &scope,
+                        actor: &actor,
+                        approval: &approval,
+                    },
+                    installation: INSTALL,
+                    model: "a",
+                    units: 10,
+                    authority: Authority::Lease {
+                        run: &run,
+                        round: 1,
+                        token: &lease,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+            let missing_cap_effective = catalog
+                .resolve(
+                    &Selection::default(),
+                    &serde_json::from_value(json!({
+                        "model": "a",
+                        "layer": {"controls": {"context_window": 10}}
+                    }))
+                    .unwrap(),
+                    None,
+                    |_, _| true,
+                )
+                .unwrap();
+            assert_eq!(
+                client
+                    .prepare(&catalog, &missing_cap_effective, &req, true)
+                    .err(),
+                Some(crate::provider_http::inference::Error::Validation)
+            );
+            assert_eq!(
+                client
+                    .prepare(&catalog, &missing_cap_effective, &req, false)
+                    .err(),
+                Some(crate::provider_http::inference::Error::Validation)
+            );
+            let bad_missing = client
+                .route
+                .prepare(&catalog, &missing_cap_effective, &req, true)
+                .unwrap();
+            assert!(matches!(
+                bad_pending
+                    .handoff(&worker, &ring, &client.as_ref(), bad_missing)
+                    .await,
+                Err(gateway::Error::Refused)
+            ));
+            let overcap_effective = catalog
+                .resolve(
+                    &Selection::default(),
+                    &serde_json::from_value(json!({
+                        "model": "a",
+                        "layer": {"controls": {"context_window": 20, "output_reserve": 12}}
+                    }))
+                    .unwrap(),
+                    None,
+                    |_, _| true,
+                )
+                .unwrap();
+            let bad_overcap = client
+                .route
+                .prepare(&catalog, &overcap_effective, &req, true)
+                .unwrap();
+            assert!(matches!(
+                bad_pending
+                    .handoff(&worker, &ring, &client.as_ref(), bad_overcap)
+                    .await,
+                Err(gateway::Error::Refused)
+            ));
+            let mut overcap_same_ceil = overcap_effective;
+            overcap_same_ceil.ceiling.value = Some(10);
+            assert_eq!(
+                client
+                    .prepare(&catalog, &overcap_same_ceil, &req, true)
+                    .err(),
+                Some(crate::provider_http::inference::Error::Validation)
+            );
+            let bad_overcap_same_ceil = client
+                .route
+                .prepare(&catalog, &overcap_same_ceil, &req, true)
+                .unwrap();
+            assert!(matches!(
+                bad_pending
+                    .handoff(&worker, &ring, &client.as_ref(), bad_overcap_same_ceil)
+                    .await,
+                Err(gateway::Error::Refused)
+            ));
+            let bad_state: String = sqlx::query_scalar(
+                "SELECT state FROM openmettle.gateway_requests WHERE id=$1::uuid",
+            )
+            .bind(&bad_pending.id)
+            .fetch_one(&gateway_pool)
+            .await
+            .unwrap();
+            assert_eq!(bad_state, "reserved");
+            assert_eq!(peer.requests.load(Ordering::SeqCst), idx);
+            assert!(bad_pending.release(&worker).await.unwrap());
+            let released_state: String = sqlx::query_scalar(
+                "SELECT state FROM openmettle.gateway_requests WHERE id=$1::uuid",
+            )
+            .bind(&bad_pending.id)
+            .fetch_one(&gateway_pool)
+            .await
+            .unwrap();
+            assert_eq!(released_state, "released");
         }
         for n in 1..=3 {
             let server = role == WORKER;
@@ -279,19 +401,22 @@ async fn recovered_user_key_dispatches_only_after_acknowledged_commits_on_each_l
                         .ssl_mode(sqlx::postgres::PgSslMode::Disable),
                 );
                 cancel_at_response(&mut barrier, async {
+                    let prepared = client.prepare(&catalog, &effective, &req, server).unwrap();
                     let pending = gateway::reserve(&proxy, call).await.unwrap();
-                    let ticket = pending.handoff(&proxy, &ring).await.unwrap();
-                    client
-                        .send(
-                            ticket,
-                            &catalog,
-                            &effective,
-                            &req,
-                            server.then(|| RunStop::from_worker(&active, rx.clone())),
-                            |_| async {},
-                        )
+                    let ticket = pending
+                        .handoff(&proxy, &ring, &client.as_ref(), prepared)
                         .await
                         .unwrap();
+                    match ticket {
+                        gateway::BillableDispatch::Server(d) if server => d
+                            .send(RunStop::from_worker(&active, rx.clone()), |_| async {})
+                            .await
+                            .unwrap(),
+                        gateway::BillableDispatch::Caller(d) if !server => {
+                            d.send(|_| async {}).await.unwrap()
+                        }
+                        _ => panic!("handoff mode must follow the authority"),
+                    };
                 })
                 .await;
                 proxy.close().await;
@@ -299,8 +424,16 @@ async fn recovered_user_key_dispatches_only_after_acknowledged_commits_on_each_l
                 assert_eq!(peer.requests.load(Ordering::SeqCst), idx);
                 continue;
             }
-            let pending = gateway::reserve(pool, call).await.unwrap();
-            let ticket = pending.handoff(pool, &ring).await.unwrap();
+            let prepared = client.prepare(&catalog, &effective, &req, server).unwrap();
+            let mut pending = gateway::reserve(pool, call).await.unwrap();
+            // An equivalent noncanonical spelling of the public id still dispatches the
+            // database-canonical `x-request-id`.
+            let spelled = format!("{{{}}}", pending.id.to_uppercase());
+            let canonical = std::mem::replace(&mut pending.id, spelled);
+            let ticket = pending
+                .handoff(pool, &ring, &client.as_ref(), prepared)
+                .await
+                .unwrap();
             // Independent primary connection sees the committed hold and handoff
             // while the TLS peer has observed no request for this identity.
             let state: String = sqlx::query_scalar(
@@ -312,20 +445,19 @@ async fn recovered_user_key_dispatches_only_after_acknowledged_commits_on_each_l
             .unwrap();
             assert_eq!(state, "handed_off");
             assert_eq!(peer.requests.load(Ordering::SeqCst), idx);
-            client
-                .send(
-                    ticket,
-                    &catalog,
-                    &effective,
-                    &req,
-                    server.then(|| RunStop::from_worker(&active, rx.clone())),
-                    |_| async {},
-                )
-                .await
-                .unwrap();
+            match ticket {
+                gateway::BillableDispatch::Server(d) if server => d
+                    .send(RunStop::from_worker(&active, rx.clone()), |_| async {})
+                    .await
+                    .unwrap(),
+                gateway::BillableDispatch::Caller(d) if !server => {
+                    d.send(|_| async {}).await.unwrap()
+                }
+                _ => panic!("handoff mode must follow the authority"),
+            };
+            assert_eq!(peer.requests.load(Ordering::SeqCst), idx + 1);
             assert!(
-                peer.heads.lock().unwrap()[idx]
-                    .contains(&format!("x-request-id: {}\r\n", pending.id))
+                peer.heads.lock().unwrap()[idx].contains(&format!("x-request-id: {canonical}\r\n"))
             );
             assert!(!pending.release(pool).await.unwrap());
         }
@@ -504,10 +636,74 @@ async fn reconciliation_discovers_redemption_and_fences_inflight_renewal_on_gran
             native_audience: None,
         },
     };
+    let make_handoff_fx = |units: i64, cost_micros: u64| {
+        let mut doc: Value = serde_json::from_slice(include_bytes!(
+            "../../../../tests/fixtures/conversation-catalog-v1.json"
+        ))
+        .unwrap();
+        let entry = &mut doc["models"]["a"];
+        entry["context_window"] = json!(units);
+        entry["output_limit"] = json!(units);
+        entry["cost_bound"] = json!({"fixed_micros": cost_micros, "micros_per_token": 0});
+        doc["presets"]["study"]["defaults"]["controls"]["output_reserve"] =
+            json!((units / 2).max(1));
+        let cat = Catalog::load(&serde_json::to_vec(&doc).unwrap()).unwrap();
+        let eff = cat
+            .resolve(
+                &Selection::default(),
+                &serde_json::from_value(json!({
+                    "model": "a",
+                    "layer": {"controls": {"context_window": units, "output_reserve": (units / 2).max(1)}}
+                }))
+                .unwrap(),
+                None,
+                |_, _| true,
+            )
+            .unwrap();
+        let route = Gateway::new(
+            &format!("https://{}:{}/v1/chat/completions", tls::HOST, peer.port),
+            Trust::Bundle(&ca.pem()),
+            &[],
+            Qualification {
+                model: "a".into(),
+                pin: eff.profile.clone(),
+                protocol: Protocol::Chat,
+                json: true,
+                sse: false,
+                functions: None,
+                images: false,
+                parallel: false,
+                usage: false,
+                tool_separator_whitespace: false,
+            },
+            Timeouts {
+                setup: Duration::from_secs(2),
+                idle: Duration::from_secs(2),
+                overall: Duration::from_secs(4),
+            },
+        )
+        .unwrap();
+        let billable = BillableInference {
+            installation: INSTALL.into(),
+            route,
+        };
+        let req = Request {
+            history: vec![History::User("synthetic".into())],
+            tools: None,
+            parallel: None,
+            stream: false,
+        };
+        (cat, eff, req, billable)
+    };
     let pending = gateway::reserve_with_cost(&api, call, Some(40))
         .await
         .unwrap();
-    pending.handoff(&api, &keys()).await.unwrap();
+    let (h_cat, h_eff, h_req, h_client) = make_handoff_fx(100, 40);
+    let h_prepared = h_client.prepare(&h_cat, &h_eff, &h_req, false).unwrap();
+    pending
+        .handoff(&api, &keys(), &h_client.as_ref(), h_prepared)
+        .await
+        .unwrap();
 
     let child = |user: &str, revision: i64, zone: &str, disabled: &[&str]| {
         json!({"user":user,
@@ -572,7 +768,12 @@ async fn reconciliation_discovers_redemption_and_fences_inflight_renewal_on_gran
     )
     .await
     .unwrap();
-    fallback.handoff(&api, &keys()).await.unwrap();
+    let (f_cat, f_eff, f_req, f_client) = make_handoff_fx(10, 1);
+    let f_prepared = f_client.prepare(&f_cat, &f_eff, &f_req, false).unwrap();
+    fallback
+        .handoff(&api, &keys(), &f_client.as_ref(), f_prepared)
+        .await
+        .unwrap();
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT generation FROM openmettle.gateway_requests WHERE id=$1::uuid"
@@ -625,8 +826,12 @@ async fn reconciliation_discovers_redemption_and_fences_inflight_renewal_on_gran
             .execute(&mut f.owner)
             .await
             .unwrap();
+        let (n_cat, n_eff, n_req, n_client) = make_handoff_fx(100, 10);
+        let n_prepared = n_client.prepare(&n_cat, &n_eff, &n_req, false).unwrap();
         assert!(matches!(
-            no_send.handoff(&api, &keys()).await,
+            no_send
+                .handoff(&api, &keys(), &n_client.as_ref(), n_prepared)
+                .await,
             Err(gateway::Error::Refused)
         ));
         allow_reply.notify_one();

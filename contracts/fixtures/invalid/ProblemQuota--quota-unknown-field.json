@@ -1,0 +1,36 @@
+{
+  "class": "invalid",
+  "direction": "response",
+  "expect": {
+    "instancePath": "/quota",
+    "keyword": "additionalProperties",
+    "valid": false
+  },
+  "fixture": "ProblemQuota--quota-unknown-field",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "code": "quota",
+    "detail": "A usage quota for this account has been reached.",
+    "quota": {
+      "remaining_bytes": "0",
+      "resource_kind": "storage_bytes",
+      "scope_kind": "personal"
+    },
+    "request_id": "3e4f5a6b-7c8d-4e9f-8a1b-2c3d4e5f6a7b",
+    "status": 429,
+    "title": "Too Many Requests",
+    "type": "about:blank"
+  },
+  "mutation": {
+    "name": "quota-unknown-field",
+    "op": "set",
+    "path": "/quota",
+    "value": {
+      "remaining_bytes": "0",
+      "resource_kind": "storage_bytes",
+      "scope_kind": "personal"
+    }
+  },
+  "schema": "#/components/schemas/Problem",
+  "source": "#/components/examples/ProblemQuota"
+}

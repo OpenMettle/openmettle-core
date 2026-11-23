@@ -1,0 +1,19 @@
+{
+  "class": "invalid",
+  "direction": "request",
+  "expect": {
+    "instancePath": "",
+    "keyword": "required",
+    "valid": false
+  },
+  "fixture": "QuotaOverrideRevokeRequestTypical--auto-missing-reason",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {},
+  "mutation": {
+    "name": "auto-missing-reason",
+    "op": "remove",
+    "path": "/reason"
+  },
+  "schema": "#/components/schemas/QuotaOverrideRevokeRequest",
+  "source": "#/components/examples/QuotaOverrideRevokeRequestTypical"
+}

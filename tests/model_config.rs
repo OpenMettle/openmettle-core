@@ -585,3 +585,60 @@ fn measured_path_profile_switch_and_replay_gate() {
     assert_eq!(budget.admit(), Err(Error::Provisioning));
     assert!(c.budget(&e, &path[..1], None).unwrap().measured.is_none());
 }
+
+#[test]
+fn cost_bound_and_device_slot_catalog_rules() {
+    let base = Catalog::load(FIXTURE).unwrap();
+    let a = base.model("a").unwrap();
+    assert!(a.cost_bound.is_none());
+    assert!(!a.requires_device_slot);
+    assert_eq!(a.round_cost_ceiling(8192), Ok(None));
+
+    // Invalid cost_bound configurations are rejected at catalog load time.
+    for invalid in [
+        json!({"fixed_micros": 0, "micros_per_token": 0}),
+        json!({"fixed_micros": (i64::MAX as u64) + 1, "micros_per_token": 1}),
+        json!({"fixed_micros": 0, "micros_per_token": (i64::MAX as u64) + 1}),
+        json!({"fixed_micros": 1, "micros_per_token": 1, "extra": true}),
+    ] {
+        assert!(
+            catalog(|d| d["models"]["a"]["cost_bound"] = invalid.clone()).is_err(),
+            "{invalid}"
+        );
+    }
+
+    let c = catalog(|d| {
+        d["models"]["a"]["cost_bound"] = json!({"fixed_micros": 50, "micros_per_token": 2});
+        d["models"]["a"]["requires_device_slot"] = json!(true);
+    })
+    .unwrap();
+    let p = c.model("a").unwrap();
+    assert!(p.requires_device_slot);
+    assert_eq!(p.round_cost_ceiling(600), Ok(Some(1250)));
+    assert_eq!(
+        p.round_cost_ceiling(u64::MAX),
+        Ok(Some(u128::from(u64::MAX) * 2 + 50))
+    );
+    let huge = catalog(|d| {
+        d["models"]["a"]["cost_bound"] = json!({"fixed_micros": i64::MAX, "micros_per_token": 1});
+    })
+    .unwrap();
+    assert_eq!(
+        huge.model("a").unwrap().round_cost_ceiling(600),
+        Ok(Some(u128::from(i64::MAX as u64) + 600))
+    );
+
+    let e = c
+        .resolve(
+            &Selection::default(),
+            &selection(json!({"model": "a", "layer": {"controls": {"context_window": 600, "output_reserve": 100}}})),
+            None,
+            permit,
+        )
+        .unwrap();
+    assert_eq!(c.round_cost_ceiling(&e), Ok(Some(1250)));
+    // Roundtrip serialization preserves cost_bound and requires_device_slot.
+    let reloaded = Catalog::load(&c.bytes()).unwrap();
+    assert_eq!(reloaded.model("a").unwrap().cost_bound, p.cost_bound);
+    assert!(reloaded.model("a").unwrap().requires_device_slot);
+}

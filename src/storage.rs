@@ -16,9 +16,12 @@ use sqlx::{Acquire, PgConnection, Postgres, Row, Transaction};
 fn record<T>(operation: StorageOperation, result: Result<T, Error>) -> Result<T, Error> {
     let outcome = match &result {
         Ok(_) => StorageOutcome::Ok,
-        Err(Error::OwnerLimit | Error::InstanceLimit | Error::LimitUnconfigured) => {
-            StorageOutcome::QuotaRefused
-        }
+        Err(
+            Error::OwnerLimit
+            | Error::InstanceLimit
+            | Error::LimitUnconfigured
+            | Error::InstanceLimitUnconfigured,
+        ) => StorageOutcome::QuotaRefused,
         Err(Error::Conflict | Error::StaleRevision | Error::NotEligible | Error::Unresolved) => {
             StorageOutcome::Conflict
         }
@@ -155,7 +158,7 @@ async fn reserve_inner(
         }
         let instance = sqlx::query("SELECT instance_budget_bytes,personal_limit_bytes,project_limit_bytes,
              active_bytes,retained_bytes,reserved_bytes FROM openmettle.storage_instance FOR UPDATE")
-            .fetch_optional(&mut *sp).await?.ok_or(Error::LimitUnconfigured)?;
+            .fetch_optional(&mut *sp).await?.ok_or(Error::InstanceLimitUnconfigured)?;
         let override_limit:Option<i64>=sqlx::query_scalar("SELECT hard_limit FROM openmettle.quota_overrides WHERE
             scope_id=$1::uuid AND resource_kind='storage_bytes' AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>clock_timestamp())")
             .bind(r.scope).fetch_optional(&mut *sp).await?;
@@ -164,9 +167,11 @@ async fn reserve_inner(
         } else {
             "project_limit_bytes"
         }));
-        let budget: Option<i64> = instance.get("instance_budget_bytes");
-        let (Some(owner_limit), Some(budget)) = (owner_limit, budget) else {
+        let Some(owner_limit) = owner_limit else {
             return Err(Error::LimitUnconfigured);
+        };
+        let Some(budget): Option<i64> = instance.get("instance_budget_bytes") else {
+            return Err(Error::InstanceLimitUnconfigured);
         };
         let charged = |row: &sqlx::postgres::PgRow| {
             ["active_bytes", "retained_bytes", "reserved_bytes"]

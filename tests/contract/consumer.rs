@@ -30,6 +30,19 @@ pub fn parse_decimal(text: &str, allow_zero: bool) -> Result<i64, String> {
     Ok(value)
 }
 
+/// Canonical base-10 integer string for `WideNonNegativeDecimal` (`numeric(38, 0)`), up to 38
+/// digits (`0..=10^38 - 1`). Every valid value fits losslessly in `u128`.
+pub fn parse_wide_decimal(text: &str) -> Result<u128, String> {
+    if text.is_empty() || text.len() > 38 || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("not a canonical wide decimal: {text:?}"));
+    }
+    if text.len() > 1 && text.starts_with('0') {
+        return Err(format!("leading zero: {text:?}"));
+    }
+    text.parse::<u128>()
+        .map_err(|_| format!("outside 38-digit range: {text:?}"))
+}
+
 #[derive(Debug, PartialEq)]
 pub enum VersionError {
     UnsupportedMajor(String),
@@ -217,11 +230,25 @@ pub enum Category {
     OtherServer(String),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct ProblemQuota {
+    pub resource_kind: String,
+    pub scope_kind: String,
+}
+
 #[derive(Debug)]
 pub struct Problem {
     pub status: u16,
     pub category: Category,
     pub detail: Option<String>,
+    pub quota: Option<ProblemQuota>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireProblemQuota {
+    resource_kind: String,
+    scope_kind: String,
 }
 
 #[derive(Deserialize)]
@@ -236,10 +263,26 @@ struct WireProblem {
     detail: Option<String>,
     #[allow(dead_code)]
     request_id: String,
+    quota: Option<WireProblemQuota>,
 }
 
 pub fn decode_problem(value: &Value) -> Result<Problem, String> {
     let wire: WireProblem = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    let quota = match wire.quota {
+        Some(q) => {
+            if !matches!(q.scope_kind.as_str(), "personal" | "project" | "instance") {
+                return Err(format!("invalid quota scope_kind {}", q.scope_kind));
+            }
+            if q.resource_kind.is_empty() {
+                return Err("empty quota resource_kind".into());
+            }
+            Some(ProblemQuota {
+                resource_kind: q.resource_kind,
+                scope_kind: q.scope_kind,
+            })
+        }
+        None => None,
+    };
     let known = match wire.code.as_str() {
         "validation" => Some((Category::Validation, 400)),
         "invalid_cursor" => Some((Category::InvalidCursor, 400)),
@@ -276,6 +319,7 @@ pub fn decode_problem(value: &Value) -> Result<Problem, String> {
         status: wire.status,
         category,
         detail: wire.detail,
+        quota,
     })
 }
 
@@ -942,4 +986,385 @@ pub fn decode_conversation_operation(op: &str, v: &Value) -> Result<(), String> 
             Ok(())
         }
     }
+}
+
+// --- quotas (ADR 0040 PR3) --------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum QuotaStatus {
+    Ok,
+    Warning,
+    HardLimit,
+    Unconfigured,
+    Unrecognized(String),
+}
+
+impl QuotaStatus {
+    fn from_wire(s: String) -> Self {
+        match s.as_str() {
+            "ok" => Self::Ok,
+            "warning" => Self::Warning,
+            "hard_limit" => Self::HardLimit,
+            "unconfigured" => Self::Unconfigured,
+            _ => Self::Unrecognized(s),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct QuotaStorage {
+    pub limit_bytes: Option<i64>,
+    pub limit_source: String,
+    pub active_bytes: i64,
+    pub retained_bytes: i64,
+    pub reserved_bytes: i64,
+    pub charged_bytes: i64,
+    pub remaining_bytes: Option<i64>,
+    pub status: QuotaStatus,
+}
+
+#[derive(Debug)]
+pub struct QuotaUsage {
+    pub resource_kind: String,
+    pub unit: Option<String>,
+    pub window_kind: String,
+    pub limit: Option<i64>,
+    pub limit_source: String,
+    pub active_used: u128,
+    pub reserved_held: u128,
+    pub remaining: Option<i64>,
+    pub status: QuotaStatus,
+}
+
+#[derive(Debug)]
+pub struct QuotaDeviceReservations {
+    pub reserved_held: u128,
+    pub limit: Option<i64>,
+    pub status: QuotaStatus,
+}
+
+#[derive(Debug)]
+pub struct QuotaWarning {
+    pub resource_kind: String,
+    pub threshold_pct: u16,
+    pub dedupe_bucket: String,
+    pub triggered_at: String,
+}
+
+#[derive(Debug)]
+pub struct QuotaSummary {
+    pub scope_id: String,
+    pub scope_kind: String,
+    pub storage: QuotaStorage,
+    pub usage: Vec<QuotaUsage>,
+    pub has_actor_execution: bool,
+    pub round_cap_limit: Option<i64>,
+    pub device_reservations: QuotaDeviceReservations,
+    pub warnings: Vec<QuotaWarning>,
+}
+
+#[derive(Debug)]
+pub struct QuotaOverride {
+    pub scope_id: String,
+    pub scope_kind: String,
+    pub resource_kind: String,
+    pub hard_limit: i64,
+    pub expires_at: Option<String>,
+    pub revoked_at: Option<String>,
+    pub revision: i64,
+    pub updated_at: String,
+}
+
+#[derive(Deserialize)]
+struct WireQuotaStorage {
+    #[serde(deserialize_with = "required_nullable")]
+    limit_bytes: Option<String>,
+    limit_source: String,
+    #[allow(dead_code)]
+    #[serde(deserialize_with = "required_nullable")]
+    override_expires_at: Option<String>,
+    active_bytes: String,
+    retained_bytes: String,
+    reserved_bytes: String,
+    charged_bytes: String,
+    #[serde(deserialize_with = "required_nullable")]
+    remaining_bytes: Option<String>,
+    warn_thresholds: Vec<u16>,
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct WireQuotaUsage {
+    resource_kind: String,
+    #[serde(deserialize_with = "required_nullable")]
+    unit: Option<String>,
+    window_kind: String,
+    #[allow(dead_code)]
+    window_start: String,
+    #[allow(dead_code)]
+    #[serde(deserialize_with = "required_nullable")]
+    window_end: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    limit: Option<String>,
+    limit_source: String,
+    #[allow(dead_code)]
+    #[serde(deserialize_with = "required_nullable")]
+    override_expires_at: Option<String>,
+    active_used: String,
+    reserved_held: String,
+    #[serde(deserialize_with = "required_nullable")]
+    remaining: Option<String>,
+    warn_thresholds: Vec<u16>,
+    status: String,
+    #[allow(dead_code)]
+    authoritative_source: String,
+    #[allow(dead_code)]
+    #[serde(deserialize_with = "required_nullable")]
+    last_reconciled_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WireQuotaExecCounter {
+    current: String,
+    #[serde(deserialize_with = "required_nullable")]
+    limit: Option<String>,
+    #[allow(dead_code)]
+    limit_source: String,
+    #[allow(dead_code)]
+    #[serde(deserialize_with = "required_nullable")]
+    override_expires_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WireQuotaLimitProj {
+    #[serde(deserialize_with = "required_nullable")]
+    limit: Option<String>,
+    #[allow(dead_code)]
+    limit_source: String,
+    #[allow(dead_code)]
+    #[serde(deserialize_with = "required_nullable")]
+    override_expires_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WireQuotaExecution {
+    live_runs_per_scope: WireQuotaExecCounter,
+    executing_runs_per_scope: WireQuotaExecCounter,
+    round_cap: WireQuotaLimitProj,
+    live_runs_per_actor: Option<WireQuotaExecCounter>,
+    executing_runs_per_actor: Option<WireQuotaExecCounter>,
+}
+
+#[derive(Deserialize)]
+struct WireQuotaDeviceRes {
+    reserved_held: String,
+    #[serde(deserialize_with = "required_nullable")]
+    limit: Option<String>,
+    #[allow(dead_code)]
+    limit_source: String,
+    #[allow(dead_code)]
+    #[serde(deserialize_with = "required_nullable")]
+    override_expires_at: Option<String>,
+    warn_thresholds: Vec<u16>,
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct WireQuotaDeviceCap {
+    active_reservations: WireQuotaDeviceRes,
+}
+
+#[derive(Deserialize)]
+struct WireQuotaWarning {
+    resource_kind: String,
+    threshold_pct: u16,
+    dedupe_bucket: String,
+    triggered_at: String,
+}
+
+#[derive(Deserialize)]
+struct WireQuotaSummary {
+    scope_id: String,
+    scope_kind: String,
+    #[allow(dead_code)]
+    observed_at: String,
+    storage: WireQuotaStorage,
+    usage: Vec<WireQuotaUsage>,
+    execution: WireQuotaExecution,
+    device_capacity: WireQuotaDeviceCap,
+    warnings: Vec<WireQuotaWarning>,
+}
+
+fn opt_decimal(v: Option<&str>) -> Result<Option<i64>, String> {
+    v.map(|s| parse_decimal(s, true)).transpose()
+}
+
+pub fn decode_quota_summary(value: &Value) -> Result<QuotaSummary, String> {
+    let exec_obj = value
+        .get("execution")
+        .and_then(Value::as_object)
+        .ok_or("missing execution object")?;
+    let has_live_actor_key = exec_obj.contains_key("live_runs_per_actor");
+    let has_exec_actor_key = exec_obj.contains_key("executing_runs_per_actor");
+    let wire: WireQuotaSummary =
+        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    if wire.storage.warn_thresholds.len() != 2 {
+        return Err("storage warn_thresholds must have two items".into());
+    }
+    let storage = QuotaStorage {
+        limit_bytes: opt_decimal(wire.storage.limit_bytes.as_deref())?,
+        limit_source: wire.storage.limit_source,
+        active_bytes: parse_decimal(&wire.storage.active_bytes, true)?,
+        retained_bytes: parse_decimal(&wire.storage.retained_bytes, true)?,
+        reserved_bytes: parse_decimal(&wire.storage.reserved_bytes, true)?,
+        charged_bytes: parse_decimal(&wire.storage.charged_bytes, true)?,
+        remaining_bytes: opt_decimal(wire.storage.remaining_bytes.as_deref())?,
+        status: QuotaStatus::from_wire(wire.storage.status),
+    };
+    let mut usage = Vec::with_capacity(wire.usage.len());
+    for item in wire.usage {
+        if item.warn_thresholds.len() != 2 {
+            return Err("usage warn_thresholds must have two items".into());
+        }
+        usage.push(QuotaUsage {
+            resource_kind: item.resource_kind,
+            unit: item.unit,
+            window_kind: item.window_kind,
+            limit: opt_decimal(item.limit.as_deref())?,
+            limit_source: item.limit_source,
+            active_used: parse_wide_decimal(&item.active_used)?,
+            reserved_held: parse_wide_decimal(&item.reserved_held)?,
+            remaining: opt_decimal(item.remaining.as_deref())?,
+            status: QuotaStatus::from_wire(item.status),
+        });
+    }
+    for c in [
+        &wire.execution.live_runs_per_scope,
+        &wire.execution.executing_runs_per_scope,
+    ] {
+        parse_decimal(&c.current, true)?;
+        opt_decimal(c.limit.as_deref())?;
+    }
+    for c in [
+        &wire.execution.live_runs_per_actor,
+        &wire.execution.executing_runs_per_actor,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        parse_decimal(&c.current, true)?;
+        opt_decimal(c.limit.as_deref())?;
+    }
+    match wire.scope_kind.as_str() {
+        "personal"
+            if wire.execution.live_runs_per_actor.is_none()
+                || wire.execution.executing_runs_per_actor.is_none() =>
+        {
+            return Err(
+                "personal quota summary requires live_runs_per_actor and executing_runs_per_actor"
+                    .into(),
+            );
+        }
+        "project"
+            if has_live_actor_key
+                || has_exec_actor_key
+                || wire.execution.live_runs_per_actor.is_some()
+                || wire.execution.executing_runs_per_actor.is_some() =>
+        {
+            return Err("project quota summary must omit per-actor execution counters".into());
+        }
+        _ => {}
+    }
+    let round_cap_limit = opt_decimal(wire.execution.round_cap.limit.as_deref())?;
+    let dev = wire.device_capacity.active_reservations;
+    if dev.warn_thresholds.len() != 2 {
+        return Err("device warn_thresholds must have two items".into());
+    }
+    let device_reservations = QuotaDeviceReservations {
+        reserved_held: parse_wide_decimal(&dev.reserved_held)?,
+        limit: opt_decimal(dev.limit.as_deref())?,
+        status: QuotaStatus::from_wire(dev.status),
+    };
+    let warnings = wire
+        .warnings
+        .into_iter()
+        .map(|w| QuotaWarning {
+            resource_kind: w.resource_kind,
+            threshold_pct: w.threshold_pct,
+            dedupe_bucket: w.dedupe_bucket,
+            triggered_at: w.triggered_at,
+        })
+        .collect();
+    Ok(QuotaSummary {
+        scope_id: wire.scope_id,
+        scope_kind: wire.scope_kind,
+        storage,
+        usage,
+        has_actor_execution: wire.execution.live_runs_per_actor.is_some()
+            && wire.execution.executing_runs_per_actor.is_some(),
+        round_cap_limit,
+        device_reservations,
+        warnings,
+    })
+}
+
+/// Validates `QuotaOverrideReason` against the server's 1..=256 UTF-8 byte bound (no NUL).
+pub fn validate_quota_override_reason(reason: &str) -> Result<(), String> {
+    if reason.is_empty() || reason.len() > 256 || reason.contains('\0') {
+        return Err("override reason must be 1 to 256 UTF-8 bytes without NUL".into());
+    }
+    Ok(())
+}
+
+/// Builds a validated `QuotaOverrideSetRequest` JSON payload matching server byte bounds.
+pub fn encode_quota_override_set_request(
+    hard_limit: u64,
+    expires_at: Option<&str>,
+    reason: &str,
+) -> Result<Value, String> {
+    validate_quota_override_reason(reason)?;
+    let mut map = Map::new();
+    map.insert("hard_limit".into(), Value::String(hard_limit.to_string()));
+    if let Some(ts) = expires_at {
+        map.insert("expires_at".into(), Value::String(ts.to_owned()));
+    }
+    map.insert("reason".into(), Value::String(reason.to_owned()));
+    Ok(Value::Object(map))
+}
+
+/// Builds a validated `QuotaOverrideRevokeRequest` JSON payload matching server byte bounds.
+pub fn encode_quota_override_revoke_request(reason: &str) -> Result<Value, String> {
+    validate_quota_override_reason(reason)?;
+    let mut map = Map::new();
+    map.insert("reason".into(), Value::String(reason.to_owned()));
+    Ok(Value::Object(map))
+}
+
+#[derive(Deserialize)]
+struct WireQuotaOverride {
+    scope_id: String,
+    scope_kind: String,
+    resource_kind: String,
+    hard_limit: String,
+    #[serde(deserialize_with = "required_nullable")]
+    expires_at: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    revoked_at: Option<String>,
+    revision: String,
+    updated_at: String,
+}
+
+pub fn decode_quota_override(value: &Value) -> Result<QuotaOverride, String> {
+    let wire: WireQuotaOverride =
+        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    Ok(QuotaOverride {
+        scope_id: wire.scope_id,
+        scope_kind: wire.scope_kind,
+        resource_kind: wire.resource_kind,
+        hard_limit: parse_decimal(&wire.hard_limit, true)?,
+        expires_at: wire.expires_at,
+        revoked_at: wire.revoked_at,
+        revision: parse_decimal(&wire.revision, false)?,
+        updated_at: wire.updated_at,
+    })
 }

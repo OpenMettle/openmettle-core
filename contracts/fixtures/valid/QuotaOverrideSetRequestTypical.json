@@ -1,0 +1,17 @@
+{
+  "class": "valid",
+  "direction": "request",
+  "expect": {
+    "valid": true
+  },
+  "fixture": "QuotaOverrideSetRequestTypical",
+  "generated_by": "scripts/contract_fixtures.py",
+  "instance": {
+    "expires_at": "2026-12-31T23:59:59.000000Z",
+    "hard_limit": "500000",
+    "reason": "Increase budget for evaluation cohort"
+  },
+  "mutation": null,
+  "schema": "#/components/schemas/QuotaOverrideSetRequest",
+  "source": "#/components/examples/QuotaOverrideSetRequestTypical"
+}

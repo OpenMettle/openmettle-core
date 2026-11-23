@@ -73,12 +73,27 @@ pub struct PromptBound {
     pub tokens_per_attachment: Option<u32>,
 }
 
+/// Qualified per-round upper-bound pricing in configured cost-denomination micro-units (ADR 0040).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CostBound {
+    #[serde(default)]
+    pub fixed_micros: u64,
+    pub micros_per_token: u64,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     /// Deployment-qualified upper bounds for this exact profile and estimator revision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_bound: Option<PromptBound>,
+    /// Deployment-qualified per-round cost bound when `usage_cost_micros` metering is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_bound: Option<CostBound>,
+    /// True when executing this profile requires reserving a concurrent `device_reservations` slot.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub requires_device_slot: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub required_capabilities: BTreeMap<String, crate::authz::CapabilityGate>,
     pub pin: ProfilePin,
@@ -176,6 +191,11 @@ impl Catalog {
                 || p.prompt_bound
                     .as_ref()
                     .is_some_and(|b| b.tokens_per_byte == 0 || p.estimator_revision.is_none())
+                || p.cost_bound.is_some_and(|c| {
+                    c.fixed_micros > i64::MAX as u64
+                        || c.micros_per_token > i64::MAX as u64
+                        || (c.fixed_micros == 0 && c.micros_per_token == 0)
+                })
                 || [p.context_window, p.output_limit, p.conservative_ceiling]
                     .into_iter()
                     .flatten()
@@ -644,6 +664,22 @@ impl Profile {
             .iter()
             .find(|rule| &rule.source.profile == profile && rule.source.format == format)
     }
+
+    /// Qualified upper-bound cost in micro-units for one round of up to `round_tokens` tokens,
+    /// or `Ok(None)` when this profile carries no qualified `cost_bound`. Computed in `u128` so
+    /// token-only installations without cost limits never reject valid large `cost_bound` profiles;
+    /// callers enforce `i64::MAX` bounds only when a cost tier applies.
+    pub fn round_cost_ceiling(&self, round_tokens: u64) -> Result<Option<u128>, Error> {
+        let Some(cb) = self.cost_bound else {
+            return Ok(None);
+        };
+        let total = u128::from(round_tokens)
+            .checked_mul(u128::from(cb.micros_per_token))
+            .and_then(|v| v.checked_add(u128::from(cb.fixed_micros)))
+            .filter(|&n| n > 0)
+            .ok_or(Error::Invalid("cost budget"))?;
+        Ok(Some(total))
+    }
 }
 
 pub const SNAPSHOT_FORMAT: &str = "openmettle.conversation";
@@ -710,6 +746,14 @@ impl Catalog {
         self.model(&e.model)
             .filter(|p| p.pin == e.profile && self.0.revision == e.catalog_revision)
             .ok_or(Error::Provisioning)
+    }
+
+    /// Qualified per-round cost ceiling in micro-units for the resolved effective configuration,
+    /// shared by `/v1/runs` admission and worker round dispatch (`gateway::reserve_turn_round`).
+    pub fn round_cost_ceiling(&self, e: &Effective) -> Result<Option<u128>, Error> {
+        let target = self.target(e)?;
+        let round_tokens = e.ceiling.value.ok_or(Error::Provisioning)?;
+        target.round_cost_ceiling(round_tokens)
     }
 
     /// The path is ordered head first and contains no siblings. Only a qualified estimator for
