@@ -8,9 +8,16 @@
 //! cut the answer short. Reasoning arrives as a top-level `reasoning_tokens` and as
 //! `completion_tokens_details.reasoning_tokens` (or `null`), and is already counted in
 //! `completion_tokens`.
-use crate::{provider_http::inference::stream::Sse, telemetry::UsageGap};
+//!
+//! Only a usage object in the stream's last data event before `[DONE]` counts: an earlier one
+//! may be interim. Documents are read with the worker decoder's parser, which refuses duplicate
+//! keys, and the envelope, `usage` and any `completion_tokens_details` must be JSON objects.
+use crate::{
+    provider_http::inference::{json, stream::Sse},
+    telemetry::UsageGap,
+};
 use axum::http::HeaderValue;
-use serde::Deserialize;
+use serde_json::{Map, Value};
 
 /// Largest non-streamed body read for usage: the worker decoder's response bound. A larger body
 /// is still relayed in full. Streamed events are bounded by the shared SSE framer (128 KiB per
@@ -26,54 +33,48 @@ pub(crate) struct Usage {
     pub reasoning: Option<i64>,
 }
 
-#[derive(Deserialize)]
-struct Envelope {
-    usage: Option<Raw>,
-}
-
-#[derive(Deserialize)]
-struct Raw {
-    prompt_tokens: Option<u64>,
-    completion_tokens: Option<u64>,
-    reasoning_tokens: Option<u64>,
-    completion_tokens_details: Option<Details>,
-}
-
-#[derive(Deserialize)]
-struct Details {
-    reasoning_tokens: Option<u64>,
-}
-
-impl Raw {
-    /// Both counts are required, each must fit a database `bigint`, and the two reasoning
-    /// fields must agree when both are present.
-    fn usage(self) -> Option<Usage> {
-        let count = |n: u64| i64::try_from(n).ok();
-        let detail = self
-            .completion_tokens_details
-            .and_then(|d| d.reasoning_tokens);
-        let reasoning = match (self.reasoning_tokens, detail) {
-            (Some(top), Some(detail)) if top != detail => return None,
-            (top, detail) => match top.or(detail) {
-                Some(n) => Some(count(n)?),
-                None => None,
-            },
-        };
-        Some(Usage {
-            prompt: count(self.prompt_tokens?)?,
-            completion: count(self.completion_tokens?)?,
-            reasoning,
-        })
+/// A count that is absent or `null` (`Some(None)`), or a non-negative integer that fits a
+/// database `bigint`; `None` refuses anything else.
+fn count(object: &Map<String, Value>, key: &str) -> Option<Option<i64>> {
+    match object.get(key) {
+        None | Some(Value::Null) => Some(None),
+        Some(n) => n.as_u64().and_then(|n| i64::try_from(n).ok()).map(Some),
     }
+}
+
+/// Both counts are required. The two reasoning fields must agree when both are present, and
+/// reasoning cannot exceed the completion count that includes it.
+fn usage(object: &Map<String, Value>) -> Option<Usage> {
+    let detail = match object.get("completion_tokens_details") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(details)) => count(details, "reasoning_tokens")?,
+        Some(_) => return None,
+    };
+    let reasoning = match (count(object, "reasoning_tokens")?, detail) {
+        (Some(top), Some(detail)) if top != detail => return None,
+        (top, detail) => top.or(detail),
+    };
+    let completion = count(object, "completion_tokens")??;
+    if reasoning.is_some_and(|reasoning| reasoning > completion) {
+        return None;
+    }
+    Some(Usage {
+        prompt: count(object, "prompt_tokens")??,
+        completion,
+        reasoning,
+    })
 }
 
 /// `usage` of one JSON document: `Ok(None)` when absent or `null`.
 fn parse(bytes: &[u8]) -> Result<Option<Usage>, UsageGap> {
-    let envelope: Envelope = serde_json::from_slice(bytes).map_err(|_| UsageGap::Unparsable)?;
-    envelope
-        .usage
-        .map(|raw| raw.usage().ok_or(UsageGap::Unparsable))
-        .transpose()
+    let Ok(Value::Object(envelope)) = json::parse(bytes) else {
+        return Err(UsageGap::Unparsable);
+    };
+    match envelope.get("usage") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(object)) => usage(object).map(Some).ok_or(UsageGap::Unparsable),
+        Some(_) => Err(UsageGap::Unparsable),
+    }
 }
 
 /// The reader for one 200 response, chosen by its media type.
@@ -139,10 +140,9 @@ impl Extract {
                             // Nothing may follow the terminator.
                             (true, _) => *failed = true,
                             (false, b"[DONE]") => *done = true,
-                            // The last usage object wins; SGLang sends one.
+                            // Only the last data event's usage counts.
                             (false, data) => match parse(data) {
-                                Ok(Some(found)) => *usage = Some(found),
-                                Ok(None) => {}
+                                Ok(found) => *usage = found,
                                 Err(_) => *failed = true,
                             },
                         },
@@ -154,8 +154,8 @@ impl Extract {
     }
 
     /// Whether the usage may already be in hand, so the rest of the upstream body is worth
-    /// reading after the caller has left: a stream after its usage chunk, or a JSON body within
-    /// its bound (SGLang sends a JSON head only after generating the whole answer).
+    /// reading after the caller has left: a stream whose last event carried usage, or a JSON
+    /// body within its bound (SGLang sends a JSON head only after generating the whole answer).
     pub fn worth_draining(&self) -> bool {
         match self {
             Self::Json { over, .. } => !over,
@@ -280,6 +280,54 @@ mod tests {
                 &[b"data: {oops}\n\n", usage_event, b"data: [DONE]\n\n"]
             ),
             Err(UsageGap::Unparsable)
+        );
+    }
+
+    #[test]
+    fn a_stream_counts_only_the_usage_of_its_last_event() {
+        let interim =
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1}}\n\n";
+        let null_usage =
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}],\"usage\":null}\n\n";
+        let no_usage = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}]}\n\n";
+        let last =
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":9}}\n\n";
+        let done = b"data: [DONE]\n\n";
+        for later in [&null_usage[..], &no_usage[..]] {
+            assert_eq!(
+                read(STREAM, &[interim, later, done]),
+                Err(UsageGap::NoUsage)
+            );
+            assert_eq!(
+                read(STREAM, &[interim, later, last, done]),
+                Ok(usage(2, 9, None))
+            );
+        }
+    }
+
+    #[test]
+    fn usage_must_be_objects_with_reasoning_inside_completion() {
+        for body in [
+            r#"[{"usage":{"prompt_tokens":3,"completion_tokens":5}}]"#,
+            r#"{"usage":[3,5,null,null]}"#,
+            r#"{"usage":{"prompt_tokens":3,"completion_tokens":5,"completion_tokens_details":[4]}}"#,
+            r#"{"usage":{"prompt_tokens":3,"completion_tokens":5,"completion_tokens_details":7}}"#,
+            r#"{"usage":{"prompt_tokens":3,"completion_tokens":5,"reasoning_tokens":7}}"#,
+            r#"{"usage":{"prompt_tokens":3,"completion_tokens":5,"completion_tokens_details":{"reasoning_tokens":6}}}"#,
+            r#"{"usage":{"prompt_tokens":3.0,"completion_tokens":5}}"#,
+            r#"{"usage":{"prompt_tokens":3,"prompt_tokens":4,"completion_tokens":5}}"#,
+            r#"{"usage":{"prompt_tokens":3,"completion_tokens":5},"usage":null}"#,
+        ] {
+            assert_eq!(
+                read("application/json", &[body.as_bytes()]),
+                Err(UsageGap::Unparsable),
+                "{body}"
+            );
+        }
+        let edge = r#"{"usage":{"prompt_tokens":3,"completion_tokens":5,"reasoning_tokens":5,"completion_tokens_details":{"reasoning_tokens":null}}}"#;
+        assert_eq!(
+            read("application/json", &[edge.as_bytes()]),
+            Ok(usage(3, 5, Some(5)))
         );
     }
 
