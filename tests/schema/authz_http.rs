@@ -3895,16 +3895,8 @@ async fn post_runs_maps_lock_wait_personal_override_expiry_to_503_provisioning()
         }
     });
 
-    // Shorten the sole personal override to expire in 250ms, then lock the instance budget row.
-    sqlx::query(
-        "UPDATE openmettle.quota_overrides
-            SET expires_at = clock_timestamp() + interval '250 milliseconds'
-          WHERE scope_id = $1::uuid AND resource_kind = 'usage_tokens'",
-    )
-    .bind(&scope)
-    .execute(&mut owner)
-    .await
-    .unwrap();
+    // Keep the sole personal override active (+1 hour) while locking the instance budget row so
+    // Pass 1 deterministically sees the override active and blocks on the instance lock.
     let mut inst_tx = owner_lock.begin().await.unwrap();
     sqlx::query(
         "SELECT id FROM openmettle.quota_budgets
@@ -3956,23 +3948,16 @@ async fn post_runs_maps_lock_wait_personal_override_expiry_to_503_provisioning()
         assert!(Instant::now() < wait_deadline);
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    let exp_deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let expired: bool = sqlx::query_scalar(
-            "SELECT clock_timestamp() > expires_at
-               FROM openmettle.quota_overrides
-              WHERE scope_id = $1::uuid AND resource_kind = 'usage_tokens'",
-        )
-        .bind(&scope)
-        .fetch_one(&mut owner)
-        .await
-        .unwrap();
-        if expired {
-            break;
-        }
-        assert!(Instant::now() < exp_deadline);
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // Deterministically expire the sole personal override while POST /v1/runs is blocked on instance.
+    sqlx::query(
+        "UPDATE openmettle.quota_overrides
+            SET expires_at = clock_timestamp() - interval '1 second'
+          WHERE scope_id = $1::uuid AND resource_kind = 'usage_tokens'",
+    )
+    .bind(&scope)
+    .execute(&mut owner)
+    .await
+    .unwrap();
     inst_tx.rollback().await.unwrap();
 
     let (status, body) = http_task.await.unwrap();

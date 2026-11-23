@@ -3024,6 +3024,202 @@ mod live_turns {
 
     #[tokio::test]
     #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn turn_executor_retries_retryable_40001_reservation_and_succeeds() {
+        use openmettle_core::{authz::gateway::settlement, provider_http::gateway::UsageReport};
+        use sqlx::postgres::PgPoolOptions;
+
+        let chat = Chat::new().await;
+        let db = &chat.f.db;
+        let mut owner = connect(&db.0, OWNER).await;
+        let mut owner_lock = connect(&db.0, OWNER).await;
+        let lock_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut owner_lock)
+            .await
+            .unwrap();
+
+        // Add static instance usage_tokens default + pre-created budget row to hold during Pass 1.
+        owner
+            .execute(
+                "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+                 VALUES ('instance', 'usage_tokens', 1000000000)
+                 ON CONFLICT (scope_kind, resource_kind) DO NOTHING",
+            )
+            .await
+            .unwrap();
+        owner
+            .execute(
+                "INSERT INTO openmettle.quota_budgets
+                     (target_kind, scope_id, resource_kind, window_kind, window_start)
+                 VALUES ('instance', NULL, 'usage_tokens', 'static', 'epoch'::timestamptz)
+                 ON CONFLICT DO NOTHING",
+            )
+            .await
+            .unwrap();
+
+        let (installation, _, _) = chat.ensure_metered_gateway().await;
+        let g_pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy_with(db.1.options(pg::GATEWAY));
+        let (principal, report_source): (String, String) = sqlx::query_as(
+            "SELECT b.principal::text, p.report_source::text
+               FROM openmettle.gateway_bindings b
+               JOIN openmettle.gateway_policy p ON p.binding_id = b.id
+              WHERE b.installation = $1::uuid AND b.user_id = $2::uuid AND p.model = 'a'
+              LIMIT 1",
+        )
+        .bind(&installation)
+        .bind(&chat.f.actor.user)
+        .fetch_one(&g_pool)
+        .await
+        .unwrap();
+
+        // Admit a pre-activation/legacy run WITHOUT parent quota holds so TurnExecutor triggers
+        // quota_prepare_turn_round -> quota_reserve on Round 1.
+        let (run_id, _) = chat.submit("rr14-turn-retry-40001", "a", 1).await;
+
+        // Hold the instance budget lock before starting TurnExecutor so its first reserve_turn_round
+        // blocks inside quota_reserve Pass 1.
+        let mut inst_tx = owner_lock.begin().await.unwrap();
+        sqlx::query(
+            "SELECT id FROM openmettle.quota_budgets
+              WHERE target_kind = 'instance' AND scope_id IS NULL
+                AND resource_kind = 'usage_tokens'
+                FOR NO KEY UPDATE",
+        )
+        .fetch_one(&mut *inst_tx)
+        .await
+        .unwrap();
+
+        let mut provider = Provider::new().await;
+        let _worker_proc = chat.start(&provider).await;
+
+        // Wait until the TurnExecutor worker is blocked on lock_pid inside quota_reserve.
+        let wait_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let blocked: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1
+                       FROM pg_locks waiter
+                       JOIN pg_locks holder
+                         ON holder.locktype = waiter.locktype
+                        AND holder.transactionid = waiter.transactionid
+                        AND holder.granted
+                        AND holder.pid = $1
+                      WHERE waiter.locktype = 'transactionid'
+                        AND NOT waiter.granted
+                 )",
+            )
+            .bind(lock_pid)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+            if blocked {
+                break;
+            }
+            assert!(
+                Instant::now() < wait_deadline,
+                "TurnExecutor did not block on instance budget lock"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Flip personal usage_tokens from static -> windowed (3600s) while TurnExecutor is blocked
+        // on instance -> Pass 2 raises 40001 -> gateway::Error::Retryable -> TurnExecutor retries
+        // automatically within the live lease and dispatches once!
+        owner
+            .execute(
+                "UPDATE openmettle.quota_defaults
+                    SET window_seconds = 3600
+                  WHERE scope_kind = 'personal' AND resource_kind = 'usage_tokens'",
+            )
+            .await
+            .unwrap();
+        inst_tx.rollback().await.unwrap();
+
+        let req = provider.request().await;
+        let req_id = req
+            .request_id
+            .clone()
+            .expect("retried metered dispatch must attach x-request-id");
+        let report_id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+        assert_eq!(
+            settlement::ingest(
+                &g_pool,
+                &UsageReport {
+                    request: req_id,
+                    installation,
+                    principal,
+                    scope: chat.f.scope.clone(),
+                    source: report_source,
+                    report_id,
+                    revision: 0,
+                    r#final: true,
+                    prompt_tokens: Some(40),
+                    completion_tokens: Some(15),
+                    reasoning_tokens: None,
+                    reasoning_included: None,
+                    cost: None,
+                    unit: None,
+                },
+            )
+            .await
+            .unwrap(),
+            settlement::Outcome::Applied
+        );
+        req.respond(completion(
+            json!("retried cleanly after 40001"),
+            None,
+            json!({"prompt_tokens": 40, "completion_tokens": 15}),
+        ));
+
+        chat.done(&run_id, "succeeded", None).await;
+
+        assert!(
+            provider.requests.try_recv().is_err(),
+            "retried reservation must dispatch to the provider exactly once"
+        );
+        let round_events: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM openmettle.run_events
+              WHERE scope_id = $1::uuid AND run_id = $2::uuid
+                AND format = 'openmettle.model-round'",
+        )
+        .bind(&chat.f.scope)
+        .bind(&run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(round_events, 1);
+
+        // Confirm the retried reservation charged the newly windowed personal budget.
+        let win_kind: String = sqlx::query_scalar(
+            "SELECT b.window_kind
+               FROM openmettle.quota_reservation_charges c
+               JOIN openmettle.quota_reservations r ON r.id = c.reservation_id
+               JOIN openmettle.quota_budgets b ON b.id = c.budget_id
+              WHERE r.run_id = $1::uuid AND r.gateway_request_id IS NULL
+                AND r.resource_kind = 'usage_tokens' AND c.charge_role = 'primary_scope'",
+        )
+        .bind(&run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(win_kind, "windowed");
+
+        let drift: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
+               FROM openmettle.quota_verify_accounting_drift()",
+        )
+        .fetch_one(&mut worker(db).await)
+        .await
+        .unwrap();
+        assert_eq!(drift, (0, 0, 0, 0));
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
     async fn deadline_and_mid_stream_cancel_close_inference_without_answers() {
         for cancel in [true, false] {
             let chat = Chat::new().await;

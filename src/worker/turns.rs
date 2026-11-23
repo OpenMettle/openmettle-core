@@ -484,11 +484,13 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                     .target(&config.effective)
                     .map_err(|_| FAILED)?
                     .requires_device_slot;
+                const MAX_RETRYABLE_RESERVE_ATTEMPTS: u8 = 4;
                 let round_i32 = i32::try_from(round).map_err(|_| FAILED)?;
                 let dispatch = {
-                    let mut retried = false;
+                    let mut retried_activation = false;
+                    let mut retryable_attempts: u8 = 0;
                     loop {
-                        let pending = crate::authz::gateway::reserve_turn_round(
+                        let pending = match crate::authz::gateway::reserve_turn_round(
                             &self.pool,
                             crate::authz::gateway::TurnRound {
                                 scope_id: &run.claim.scope_id,
@@ -505,7 +507,19 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                             },
                         )
                         .await
-                        .map_err(|_| FAILED)?;
+                        {
+                            Ok(pending) => pending,
+                            Err(crate::authz::gateway::Error::Retryable)
+                                if retryable_attempts < MAX_RETRYABLE_RESERVE_ATTEMPTS =>
+                            {
+                                if cx.stop.borrow().is_some() {
+                                    return Err(StepResult::Stopped);
+                                }
+                                retryable_attempts += 1;
+                                continue;
+                            }
+                            Err(_) => return Err(FAILED),
+                        };
                         if cx.stop.borrow().is_some() {
                             let _ = pending.release(&self.pool).await;
                             return Err(StepResult::Stopped);
@@ -520,13 +534,13 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                         {
                             Ok(dispatch) => break dispatch,
                             Err(crate::authz::gateway::Error::Refused)
-                                if !retried && !pending.enforced_at_bind =>
+                                if !retried_activation && !pending.enforced_at_bind =>
                             {
                                 let _ = pending.release(&self.pool).await;
                                 if cx.stop.borrow().is_some() {
                                     return Err(StepResult::Stopped);
                                 }
-                                retried = true;
+                                retried_activation = true;
                             }
                             Err(_) => {
                                 let _ = pending.release(&self.pool).await;

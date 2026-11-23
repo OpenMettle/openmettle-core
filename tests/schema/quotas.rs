@@ -6508,25 +6508,17 @@ async fn two_pass_quota_reserve_post_lock_expiry_for_instance_wait_omq05_and_opt
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     };
-    let wait_expired = async |owner: &mut PgConnection, scope: &str, resource: &str| {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let expired: bool = sqlx::query_scalar(
-                "SELECT clock_timestamp() > expires_at
-                   FROM openmettle.quota_overrides
-                  WHERE scope_id = $1::uuid AND resource_kind = $2",
-            )
-            .bind(scope)
-            .bind(resource)
-            .fetch_one(&mut *owner)
-            .await
-            .unwrap();
-            if expired {
-                return;
-            }
-            assert!(Instant::now() < deadline);
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    let expire_override = async |owner: &mut PgConnection, scope: &str, resource: &str| {
+        sqlx::query(
+            "UPDATE openmettle.quota_overrides
+                SET expires_at = clock_timestamp() - interval '1 second'
+              WHERE scope_id = $1::uuid AND resource_kind = $2",
+        )
+        .bind(scope)
+        .bind(resource)
+        .execute(&mut *owner)
+        .await
+        .unwrap();
     };
     let err_code_detail = |res: Result<String, sqlx::Error>| -> (String, Option<String>) {
         let err = res.expect_err("expected database error");
@@ -6587,7 +6579,7 @@ async fn two_pass_quota_reserve_post_lock_expiry_for_instance_wait_omq05_and_opt
         "INSERT INTO openmettle.quota_overrides
              (scope_id, scope_kind, resource_kind, hard_limit, expires_at, reason, updated_by_user_id)
          VALUES ($1::uuid, 'personal', 'usage_tokens', 2000,
-                 clock_timestamp() + interval '250 milliseconds', 'rr13-inst-wait', $2::uuid)",
+                 clock_timestamp() + interval '1 hour', 'rr13-inst-wait', $2::uuid)",
     )
     .bind(&personal_scope)
     .bind(&alice.user)
@@ -6623,7 +6615,7 @@ async fn two_pass_quota_reserve_post_lock_expiry_for_instance_wait_omq05_and_opt
         .await
     });
     wait_blocked_on(&mut owner, lock_pid).await;
-    wait_expired(&mut owner, &personal_scope, "usage_tokens").await;
+    expire_override(&mut owner, &personal_scope, "usage_tokens").await;
     inst_tx.rollback().await.unwrap();
     assert_eq!(
         err_code_detail(t1.await.unwrap()),
@@ -6643,7 +6635,7 @@ async fn two_pass_quota_reserve_post_lock_expiry_for_instance_wait_omq05_and_opt
     sqlx::query(
         "UPDATE openmettle.quota_overrides
             SET hard_limit = 2000,
-                expires_at = clock_timestamp() + interval '250 milliseconds'
+                expires_at = clock_timestamp() + interval '1 hour'
           WHERE scope_id = $1::uuid AND resource_kind = 'usage_tokens'",
     )
     .bind(&personal_scope)
@@ -6678,7 +6670,7 @@ async fn two_pass_quota_reserve_post_lock_expiry_for_instance_wait_omq05_and_opt
         .await
     });
     wait_blocked_on(&mut owner, lock_pid).await;
-    wait_expired(&mut owner, &personal_scope, "usage_tokens").await;
+    expire_override(&mut owner, &personal_scope, "usage_tokens").await;
     inst_tx2.rollback().await.unwrap();
     assert_eq!(
         err_code_detail(t2.await.unwrap()),
@@ -6687,7 +6679,8 @@ async fn two_pass_quota_reserve_post_lock_expiry_for_instance_wait_omq05_and_opt
     );
 
     // 3. Optional project override (with project default NULL) expires while waiting on instance
-    //    lock -> MUST skip charging project and succeed charging personal + instance cleanly!
+    //    lock -> Pass 1 locks the project budget row, then Pass 2 skips charging project and
+    //    succeeds charging personal + instance cleanly!
     sqlx::query(
         "DELETE FROM openmettle.quota_overrides
           WHERE scope_id = $1::uuid AND resource_kind = 'usage_tokens'",
@@ -6703,13 +6696,24 @@ async fn two_pass_quota_reserve_post_lock_expiry_for_instance_wait_omq05_and_opt
         )
         .await
         .unwrap();
-    // Temporary project override is lower (500) than requested 1000; once it expires during the
-    // instance lock wait, project reverts to NULL (unconfigured/optional) and is skipped cleanly.
+    // Pre-create the project budget row (revision = 1, active = 0, held = 0) so a separate
+    // connection can observe Pass 1's FOR NO KEY UPDATE lock via NOWAIT (55P03) while blocked.
+    sqlx::query(
+        "INSERT INTO openmettle.quota_budgets
+             (target_kind, scope_id, resource_kind, window_kind, window_start)
+         VALUES ('scope', $1::uuid, 'usage_tokens', 'static', 'epoch'::timestamptz)",
+    )
+    .bind(&project_scope)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    // Active project override (500 < requested 1000) forces Pass 1 to lock the project budget row;
+    // expiring it while blocked on instance causes Pass 2 to skip the optional project tier.
     sqlx::query(
         "INSERT INTO openmettle.quota_overrides
              (scope_id, scope_kind, resource_kind, hard_limit, expires_at, reason, updated_by_user_id)
          VALUES ($1::uuid, 'project', 'usage_tokens', 500,
-                 clock_timestamp() + interval '250 milliseconds', 'rr13-opt-project-exp', $2::uuid)",
+                 clock_timestamp() + interval '1 hour', 'rr13-opt-project-exp', $2::uuid)",
     )
     .bind(&project_scope)
     .bind(&alice.user)
@@ -6744,11 +6748,53 @@ async fn two_pass_quota_reserve_post_lock_expiry_for_instance_wait_omq05_and_opt
         .await
     });
     wait_blocked_on(&mut owner, lock_pid).await;
-    wait_expired(&mut owner, &project_scope, "usage_tokens").await;
+
+    // While blocked on instance and BEFORE expiring the override, verify Pass 1 holds FOR NO KEY
+    // UPDATE on the project budget row (55P03 on NOWAIT) with zero charges yet.
+    let proj_counters: (i64, i64, i64) = sqlx::query_as(
+        "SELECT active_used::bigint, reserved_held::bigint, revision
+           FROM openmettle.quota_budgets
+          WHERE scope_id = $1::uuid AND resource_kind = 'usage_tokens'",
+    )
+    .bind(&project_scope)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(proj_counters, (0, 0, 1));
+    assert_eq!(
+        sqlstate(
+            sqlx::query(
+                "SELECT id FROM openmettle.quota_budgets
+                  WHERE scope_id = $1::uuid AND resource_kind = 'usage_tokens'
+                    FOR NO KEY UPDATE NOWAIT",
+            )
+            .bind(&project_scope)
+            .fetch_one(&mut owner)
+            .await
+        ),
+        "55P03",
+        "Pass 1 must hold FOR NO KEY UPDATE on the project budget row before blocking on instance"
+    );
+
+    expire_override(&mut owner, &project_scope, "usage_tokens").await;
     inst_tx3.rollback().await.unwrap();
     let hold_id = t3.await.unwrap().expect(
         "expiring optional project override during lock wait must skip project and succeed",
     );
+
+    // After commit, project budget lock is released (NOWAIT succeeds) and its counters & revision
+    // are completely untouched (0, 0, 1).
+    let proj_after: (i64, i64, i64) = sqlx::query_as(
+        "SELECT active_used::bigint, reserved_held::bigint, revision
+           FROM openmettle.quota_budgets
+          WHERE scope_id = $1::uuid AND resource_kind = 'usage_tokens'
+            FOR NO KEY UPDATE NOWAIT",
+    )
+    .bind(&project_scope)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(proj_after, (0, 0, 1));
 
     let charge_roles: Vec<String> = sqlx::query_scalar(
         "SELECT charge_role FROM openmettle.quota_reservation_charges
@@ -6776,6 +6822,371 @@ async fn two_pass_quota_reserve_post_lock_expiry_for_instance_wait_omq05_and_opt
            FROM openmettle.quota_verify_accounting_drift()",
     )
     .fetch_one(&mut connect(&db.0, WORKER).await)
+    .await
+    .unwrap();
+    assert_eq!(drift, (0, 0, 0, 0));
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn reserve_turn_round_returns_retryable_on_40001_and_succeeds_on_retry() {
+    use openmettle_core::{
+        authz::{
+            gateway::{self, TurnRound, settlement},
+            leases::{self, LeaseSettings, Settle},
+            runs::{self as authz_queue, Admission, AdmissionLimits, ClaimLimits, RunAdmission},
+        },
+        provider_http::gateway::UsageReport,
+        provider_keys::gateway::{Bearer, Context, GatewayKeys, GatewaySealer},
+        runs::{RunInput, WriteTransaction},
+    };
+    use sqlx::postgres::PgPoolOptions;
+
+    const INSTALL: &str = "00000000-0000-4000-8000-0000000000f1";
+    const PRINCIPAL: &str = "00000000-0000-4000-8000-0000000000f2";
+    const BUDGET: &str = "00000000-0000-4000-8000-0000000000f3";
+    const KEY_BYTES: [u8; 32] = [141u8; 32];
+
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    let mut owner_lock = connect(&db.0, OWNER).await;
+    let lock_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut owner_lock)
+        .await
+        .unwrap();
+    authz_store::providers(&mut owner).await;
+    let alice =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let (_, project_scope) = run_admission::new_project(&db, &alice, "rr14-retry-project").await;
+    let grant_cycle: String = sqlx::query_scalar(
+        "SELECT h.cycle_id::text
+           FROM openmettle.grant_assignments g
+           JOIN openmettle.grant_changes h
+             ON h.assignment_id = g.id AND h.revision = g.last_revision
+          WHERE g.scope_id = $1::uuid
+            AND g.grantee_user_id = $2::uuid
+            AND g.target_kind = 'project'
+            AND g.assignment_format = 'openmettle.project-role'
+            AND g.assignment_key IN ('editor', 'owner')
+            AND h.decision = 'grant'
+          LIMIT 1",
+    )
+    .bind(&project_scope)
+    .bind(&alice.user)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 100000),
+                    ('instance', 'usage_tokens', 100000)",
+        )
+        .await
+        .unwrap();
+    // Seed the instance budget row so Connection 1 can lock it before reserve_turn_round runs.
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_budgets
+                 (target_kind, scope_id, resource_kind, window_kind, window_start)
+             VALUES ('instance', NULL, 'usage_tokens', 'static', 'epoch'::timestamptz)",
+        )
+        .await
+        .unwrap();
+
+    let g_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(db.1.options(pg::GATEWAY));
+    let binding: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.gateway_bindings (installation, user_id, principal, budget)
+         VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid) RETURNING id::text",
+    )
+    .bind(INSTALL)
+    .bind(&alice.user)
+    .bind(PRINCIPAL)
+    .bind(BUDGET)
+    .fetch_one(&g_pool)
+    .await
+    .unwrap();
+    let report_source: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+    let keys = GatewayKeys::new(&[("rr14-k1".into(), KEY_BYTES)]).unwrap();
+    let (finger, env) = GatewaySealer::new(
+        GatewayKeys::new(&[("rr14-k1".into(), KEY_BYTES)]).unwrap(),
+        g_pool.clone(),
+    )
+    .seal(
+        &Context {
+            installation: INSTALL,
+            user_id: &alice.user,
+            binding_id: &binding,
+            principal: PRINCIPAL,
+            generation: 1,
+        },
+        &Bearer::new(b"rr14-bearer").unwrap(),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_generations
+             (binding_id, generation, remote_key, expires_at, key_id, key_fingerprint, nonce, ciphertext)
+         VALUES ($1::uuid, 1, gen_random_uuid(), clock_timestamp() + interval '1 hour', $2, $3, $4, $5)",
+    )
+    .bind(&binding)
+    .bind(&env.key_id)
+    .bind(finger.as_slice())
+    .bind(env.nonce.as_slice())
+    .bind(env.ciphertext)
+    .execute(&g_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_policy
+             (binding_id, revision, scope_id, approval_id, model, report_source,
+              provider_generation, approval_generation, user_generation, capabilities, grant_cycle)
+         VALUES ($1::uuid, 1, $2::uuid, $3::uuid, 'a', $4::uuid, 0, 0, 0, '{}'::jsonb, $5::uuid)",
+    )
+    .bind(&binding)
+    .bind(&project_scope)
+    .bind(&alice.approval)
+    .bind(&report_source)
+    .bind(&grant_cycle)
+    .execute(&g_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE openmettle.gateway_bindings
+            SET active_generation = 1, observed_revision = 1, state = 'ready'
+          WHERE id = $1::uuid",
+    )
+    .bind(&binding)
+    .execute(&g_pool)
+    .await
+    .unwrap();
+
+    // Admit a legacy/pre-activation run in project_scope WITHOUT parent quota holds so
+    // reserve_turn_round materializes parent holds through quota_prepare_turn_round -> quota_reserve.
+    let mut api = connect(&db.0, API).await;
+    let mut worker = connect(&db.0, WORKER).await;
+    let worker_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(db.1.options(WORKER));
+    let chat = authz_runs::chat(&db, &project_scope, "project", &alice).await;
+    let (branch, msg) = branch_and_message(&mut api, &project_scope, &chat).await;
+    let limits = AdmissionLimits {
+        live_per_actor: 8,
+        live_per_scope: 8,
+        queued_in_instance: 32,
+        queue_timeout: Duration::from_secs(300),
+        round_cap: 4,
+    };
+    let lease_cfg = LeaseSettings {
+        lease: Duration::from_secs(60),
+        execution_timeout: Duration::from_secs(600),
+    };
+    let claim_cfg = ClaimLimits {
+        executing_per_actor: 4,
+        executing_per_scope: 8,
+    };
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    let Admission::Admitted { run_id: r1, .. } = authz_queue::admit_run(
+        &mut tx,
+        &RunAdmission {
+            input: RunInput {
+                scope: &project_scope,
+                actor: &alice.user,
+                conversation: &chat,
+                branch: &branch,
+                message: &msg,
+                key: "rr14-retryable-40001",
+                format: "openmettle.conversation",
+                version: 1,
+                input: b"{}",
+                config: br#"{"effective":{"ceiling":{"value":200}}}"#,
+            },
+            actor_approval_id: &alice.approval,
+            capabilities: &[],
+            requested_rounds: Some(1),
+            now_ms: authz_store::NOW,
+            cost_qualified: None,
+        },
+        &limits,
+    )
+    .await
+    .unwrap() else {
+        panic!("expected admission");
+    };
+    tx.commit().await.unwrap();
+    let claim1 = authz_queue::claim_next(&mut worker, &claim_cfg, &lease_cfg)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim1.run_id, r1);
+
+    // Hold the instance budget lock while project usage_tokens is unconfigured (NULL in Pass 1).
+    let mut inst_tx = owner_lock.begin().await.unwrap();
+    sqlx::query(
+        "SELECT id FROM openmettle.quota_budgets
+          WHERE target_kind = 'instance' AND scope_id IS NULL
+            AND resource_kind = 'usage_tokens'
+            FOR NO KEY UPDATE",
+    )
+    .fetch_one(&mut *inst_tx)
+    .await
+    .unwrap();
+
+    let wp_c = worker_pool.clone();
+    let proj_c = project_scope.clone();
+    let actor_c = alice.user.clone();
+    let approval_c = alice.approval.clone();
+    let run_c = r1.clone();
+    let tok_c = claim1.claim_token.clone();
+    let first_task = tokio::spawn(async move {
+        gateway::reserve_turn_round(
+            &wp_c,
+            TurnRound {
+                scope_id: &proj_c,
+                actor: &actor_c,
+                approval: &approval_c,
+                run_id: &run_c,
+                round: 1,
+                claim_token: &tok_c,
+                installation: INSTALL,
+                model: "a",
+                round_tokens: 200,
+                round_cost: None,
+                requires_device_slot: false,
+            },
+        )
+        .await
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1
+                   FROM pg_locks waiter
+                   JOIN pg_locks holder
+                     ON holder.locktype = waiter.locktype
+                    AND holder.transactionid = waiter.transactionid
+                    AND holder.granted
+                    AND holder.pid = $1
+                  WHERE waiter.locktype = 'transactionid'
+                    AND NOT waiter.granted
+             )",
+        )
+        .bind(lock_pid)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        if blocked {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Activate an optional project usage_tokens override while reserve_turn_round is blocked on
+    // instance -> Pass 2 sees project flip NULL -> NOT NULL without a Pass 1 lock -> 40001 ->
+    // gateway::Error::Retryable (NOT Error::Database).
+    sqlx::query(
+        "INSERT INTO openmettle.quota_overrides
+             (scope_id, scope_kind, resource_kind, hard_limit, expires_at, reason, updated_by_user_id)
+         VALUES ($1::uuid, 'project', 'usage_tokens', 50000, NULL, 'rr14-mid-wait-project-tier', $2::uuid)",
+    )
+    .bind(&project_scope)
+    .bind(&alice.user)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    inst_tx.rollback().await.unwrap();
+
+    assert!(
+        matches!(first_task.await.unwrap(), Err(gateway::Error::Retryable)),
+        "40001 from quota_reserve during lock wait must map to gateway::Error::Retryable"
+    );
+
+    // Immediate retry on the rolled-back reservation succeeds, charging all 3 tiers cleanly.
+    let pending = gateway::reserve_turn_round(
+        &worker_pool,
+        TurnRound {
+            scope_id: &project_scope,
+            actor: &alice.user,
+            approval: &alice.approval,
+            run_id: &r1,
+            round: 1,
+            claim_token: &claim1.claim_token,
+            installation: INSTALL,
+            model: "a",
+            round_tokens: 200,
+            round_cost: None,
+            requires_device_slot: false,
+        },
+    )
+    .await
+    .expect("immediate retry after Error::Retryable must succeed");
+    let _disp = pending.handoff(&worker_pool, &keys, None).await.unwrap();
+    let charge_roles: Vec<String> = sqlx::query_scalar(
+        "SELECT c.charge_role
+           FROM openmettle.quota_reservation_charges c
+           JOIN openmettle.quota_reservations r ON r.id = c.reservation_id
+          WHERE r.run_id = $1::uuid AND r.gateway_request_id IS NULL
+            AND r.resource_kind = 'usage_tokens'
+          ORDER BY c.charge_role ASC",
+    )
+    .bind(&r1)
+    .fetch_all(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        charge_roles,
+        vec![
+            "actor_scope".to_owned(),
+            "instance".to_owned(),
+            "primary_scope".to_owned(),
+        ]
+    );
+
+    let report_id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+    assert_eq!(
+        settlement::ingest(
+            &g_pool,
+            &UsageReport {
+                request: pending.id.clone(),
+                installation: INSTALL.into(),
+                principal: PRINCIPAL.into(),
+                scope: project_scope.clone(),
+                source: report_source,
+                report_id,
+                revision: 0,
+                r#final: true,
+                prompt_tokens: Some(80),
+                completion_tokens: Some(40),
+                reasoning_tokens: None,
+                reasoning_included: None,
+                cost: None,
+                unit: None,
+            },
+        )
+        .await
+        .unwrap(),
+        settlement::Outcome::Applied
+    );
+    leases::settle(&mut worker, &claim1.lease(), &lease_cfg, Settle::Succeeded)
+        .await
+        .unwrap();
+    let drift: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
+           FROM openmettle.quota_verify_accounting_drift()",
+    )
+    .fetch_one(&mut worker)
     .await
     .unwrap();
     assert_eq!(drift, (0, 0, 0, 0));

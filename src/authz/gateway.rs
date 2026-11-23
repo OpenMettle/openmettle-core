@@ -15,6 +15,7 @@ use std::fmt;
 pub enum Error {
     Database,
     Refused,
+    Retryable,
     Protection,
     Conflict,
 }
@@ -23,6 +24,7 @@ impl fmt::Display for Error {
         f.write_str(match self {
             Self::Database => "gateway store unavailable",
             Self::Refused => "gateway request refused",
+            Self::Retryable => "gateway reservation retryable",
             Self::Protection => "gateway credential unavailable",
             Self::Conflict => "gateway intent conflict",
         })
@@ -33,6 +35,7 @@ impl From<sqlx::Error> for Error {
     fn from(error: sqlx::Error) -> Self {
         match error.as_database_error().and_then(|e| e.code()).as_deref() {
             Some("OMQ01" | "OMQ02" | "OMQ05") => Self::Refused,
+            Some("40001") => Self::Retryable,
             _ => Self::Database,
         }
     }
@@ -46,8 +49,11 @@ pub(crate) fn map_stale_lease(err: sqlx::Error) -> Error {
     }
 }
 impl From<crate::runs::Error> for Error {
-    fn from(_: crate::runs::Error) -> Self {
-        Self::Database
+    fn from(error: crate::runs::Error) -> Self {
+        match error {
+            crate::runs::Error::Database(db) => Self::from(db),
+            _ => Self::Database,
+        }
     }
 }
 
@@ -137,29 +143,40 @@ pub async fn reserve_with_cost<'a>(
     cost_ceiling: Option<i64>,
 ) -> Result<Pending<'a>, Error> {
     let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
-    crate::quotas::prepare_round(&mut tx, &call, cost_ceiling).await?;
-    let pending = reserve_in(&mut tx, call).await?;
-    let spec = match cost_ceiling {
-        Some(c) => crate::quotas::CostBoundSpec::Profile(Some(u128::try_from(c).unwrap_or(0))),
-        None => crate::quotas::CostBoundSpec::Legacy,
-    };
-    if matches!(
-        crate::quotas::bind_request(
-            &mut tx,
-            &pending.call,
-            &pending.id,
-            &pending.secret,
-            spec,
-            false,
-        )
-        .await?,
-        crate::quotas::BindOutcome::NeedsParentHolds
-    ) {
-        tx.rollback().await?;
-        return Err(Error::Refused);
+    let res = async {
+        crate::quotas::prepare_round(&mut tx, &call, cost_ceiling).await?;
+        let pending = reserve_in(&mut tx, call).await?;
+        let spec = match cost_ceiling {
+            Some(c) => crate::quotas::CostBoundSpec::Profile(Some(u128::try_from(c).unwrap_or(0))),
+            None => crate::quotas::CostBoundSpec::Legacy,
+        };
+        if matches!(
+            crate::quotas::bind_request(
+                &mut tx,
+                &pending.call,
+                &pending.id,
+                &pending.secret,
+                spec,
+                false,
+            )
+            .await?,
+            crate::quotas::BindOutcome::NeedsParentHolds
+        ) {
+            return Err(Error::Refused);
+        }
+        Ok(pending)
     }
-    tx.commit().await?;
-    Ok(pending)
+    .await;
+    match res {
+        Ok(pending) => {
+            tx.commit().await?;
+            Ok(pending)
+        }
+        Err(err) => {
+            let _ = tx.rollback().await;
+            Err(err)
+        }
+    }
 }
 /// Inputs for reserving one leased worker turn round with qualified cost and device bounds.
 pub struct TurnRound<'a> {
@@ -305,79 +322,70 @@ pub async fn reserve_turn_round(pool: &PgPool, round: TurnRound<'_>) -> Result<T
     let round_cost_overflow = round.round_cost.is_some_and(|c| i64::try_from(c).is_err());
     for force_holds in [false, true] {
         let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
-        sqlx::query("SELECT openmettle.quota_lock_run_actor_prefix($1::uuid, $2::uuid)")
+        let attempt: Result<Option<TurnPending>, Error> = async {
+            sqlx::query("SELECT openmettle.quota_lock_run_actor_prefix($1::uuid, $2::uuid)")
+                .bind(round.scope_id)
+                .bind(round.run_id)
+                .execute(tx.connection()?)
+                .await?;
+            sqlx::query(
+                "SELECT openmettle.quota_unwind_superseded_round($1::uuid, $2::uuid, $3::uuid, $4)",
+            )
             .bind(round.scope_id)
             .bind(round.run_id)
+            .bind(round.claim_token)
+            .bind(round.round)
             .execute(tx.connection()?)
-            .await?;
-        sqlx::query(
-            "SELECT openmettle.quota_unwind_superseded_round($1::uuid, $2::uuid, $3::uuid, $4)",
-        )
-        .bind(round.scope_id)
-        .bind(round.run_id)
-        .bind(round.claim_token)
-        .bind(round.round)
-        .execute(tx.connection()?)
-        .await
-        .map_err(map_stale_lease)?;
-        let reservation_id: String = sqlx::query_scalar(
-            "SELECT openmettle.quota_prepare_turn_round(
-                 $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9
-             )::text",
-        )
-        .bind(round.scope_id)
-        .bind(round.run_id)
-        .bind(round.claim_token)
-        .bind(round.round_tokens)
-        .bind(round_cost_i64)
-        .bind(round.round_cost.is_none())
-        .bind(round_cost_overflow)
-        .bind(round.requires_device_slot)
-        .bind(force_holds)
-        .fetch_one(tx.connection()?)
-        .await
-        .map_err(map_stale_lease)?;
-        let call = Call {
-            reservation: Reservation {
-                id: &reservation_id,
-                scope_id: round.scope_id,
-                actor: round.actor,
-                approval: round.approval,
-            },
-            installation: round.installation,
-            model: round.model,
-            units: round.round_tokens,
-            authority: Authority::Lease {
-                run: round.run_id,
-                round: round.round,
-                token: round.claim_token,
-            },
-        };
-        let pending = reserve_in(&mut tx, call).await?;
-        match crate::quotas::bind_request(
-            &mut tx,
-            &pending.call,
-            &pending.id,
-            &pending.secret,
-            crate::quotas::CostBoundSpec::Profile(round.round_cost),
-            round.requires_device_slot,
-        )
-        .await?
-        {
-            crate::quotas::BindOutcome::NeedsParentHolds => {
-                tx.rollback().await?;
-                if force_holds {
-                    return Err(Error::Refused);
-                }
-                continue;
-            }
-            crate::quotas::BindOutcome::Bound { enforced_at_bind } => {
-                let id = pending.id;
-                let secret = pending.secret;
-                tx.commit().await?;
-                return Ok(TurnPending {
-                    id,
-                    secret,
+            .await
+            .map_err(map_stale_lease)?;
+            let reservation_id: String = sqlx::query_scalar(
+                "SELECT openmettle.quota_prepare_turn_round(
+                     $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9
+                 )::text",
+            )
+            .bind(round.scope_id)
+            .bind(round.run_id)
+            .bind(round.claim_token)
+            .bind(round.round_tokens)
+            .bind(round_cost_i64)
+            .bind(round.round_cost.is_none())
+            .bind(round_cost_overflow)
+            .bind(round.requires_device_slot)
+            .bind(force_holds)
+            .fetch_one(tx.connection()?)
+            .await
+            .map_err(map_stale_lease)?;
+            let call = Call {
+                reservation: Reservation {
+                    id: &reservation_id,
+                    scope_id: round.scope_id,
+                    actor: round.actor,
+                    approval: round.approval,
+                },
+                installation: round.installation,
+                model: round.model,
+                units: round.round_tokens,
+                authority: Authority::Lease {
+                    run: round.run_id,
+                    round: round.round,
+                    token: round.claim_token,
+                },
+            };
+            let pending = reserve_in(&mut tx, call).await?;
+            match crate::quotas::bind_request(
+                &mut tx,
+                &pending.call,
+                &pending.id,
+                &pending.secret,
+                crate::quotas::CostBoundSpec::Profile(round.round_cost),
+                round.requires_device_slot,
+            )
+            .await?
+            {
+                crate::quotas::BindOutcome::NeedsParentHolds => Ok(None),
+                crate::quotas::BindOutcome::Bound { enforced_at_bind } => Ok(Some(TurnPending {
+                    id: pending.id,
+                    secret: pending.secret,
                     reservation_id,
                     scope_id: round.scope_id.to_owned(),
                     actor: round.actor.to_owned(),
@@ -391,7 +399,24 @@ pub async fn reserve_turn_round(pool: &PgPool, round: TurnRound<'_>) -> Result<T
                     cost_bound_missing: round.round_cost.is_none(),
                     requires_device_slot: round.requires_device_slot,
                     enforced_at_bind,
-                });
+                })),
+            }
+        }
+        .await;
+        match attempt {
+            Ok(None) => {
+                tx.rollback().await?;
+                if force_holds {
+                    return Err(Error::Refused);
+                }
+            }
+            Ok(Some(pending)) => {
+                tx.commit().await?;
+                return Ok(pending);
+            }
+            Err(err) => {
+                let _ = tx.rollback().await;
+                return Err(err);
             }
         }
     }
