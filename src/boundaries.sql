@@ -155,8 +155,7 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.quota_upsert_scope_override(uuid,uuid,text,bigint,timestamptz,text,text,jsonb)',true,ARRAY['openmettle_api']::text[]),
         ('openmettle.quota_revoke_scope_override(uuid,uuid,text,text,text,jsonb)',true,ARRAY['openmettle_api']::text[])) AS f WHERE $1 >= 26
     UNION ALL SELECT * FROM (VALUES
-        ('openmettle.capacity_refuse_device_move()',false,ARRAY[]::text[]),
-        ('openmettle.capacity_lock_groups_for_configuration()',false,ARRAY[]::text[]),
+        ('openmettle.capacity_lock_device_group()',false,ARRAY[]::text[]),
         ('openmettle.capacity_lock_group(uuid)',false,ARRAY[]::text[]),
         ('openmettle.capacity_fence(uuid,bytea,bigint)',false,ARRAY[]::text[]),
         ('openmettle.capacity_lock_run(uuid,uuid,uuid)',false,ARRAY[]::text[]),

@@ -1093,7 +1093,7 @@ async fn every_time_bound_is_rechecked_after_the_slot_handoff_waits() {
     let decision = f
         .grant_behind_lock(&controller, 1, hold_lock, "60 s", Some(1))
         .await;
-    assert_eq!(decision, Ok(Decision::Unavailable));
+    assert_eq!(decision, Err(Error::Expired));
     // The controller's lease lapses during the wait.
     f.ttl("60000").await;
     assert!(
@@ -1585,6 +1585,272 @@ async fn readiness_is_evaluated_on_the_callers_snapshot() {
     assert_eq!(closed.unwrap(), GrantState::UnknownAllocation);
     assert!(read.unwrap());
     assert!(!admits(&mut c).await);
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn an_expiry_after_the_last_wait_aborts_the_callers_transaction() {
+    let mut f = Fixture::new(&[GPU0], 2).await;
+    let mut c = f.worker().await;
+    let controller = open_group(&mut c, 1, &[GPU0]).await;
+    f.ttl("1000").await;
+    assert!(
+        publish(&mut c, &controller, 2, 0, &[sample(GPU0, 0, SPARE)])
+            .await
+            .unwrap()
+    );
+    // Hold run 1's slot so its decision waits past the sample's freshness.
+    let mut blocker = connect(&f.db.0, OWNER).await;
+    let mut held = blocker.begin().await.unwrap();
+    sqlx::query("SELECT FROM openmettle.quota_reservations WHERE id = $1::uuid FOR NO KEY UPDATE")
+        .bind(f.runs[1].hold.as_deref().unwrap())
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let mut w = f.worker().await;
+    let mut tx = WriteTransaction::begin(&mut w).await.unwrap();
+    // An earlier write in the caller's transaction: run 0's grant.
+    granted(
+        capacity::grant(
+            tx.connection().unwrap(),
+            &controller,
+            &f.request(0, "earlier", &[bytes(GPU0, GIB)]),
+        )
+        .await
+        .unwrap(),
+    );
+    let need = [bytes(GPU0, GIB)];
+    let request = f.request(1, "expires", &need);
+    let db = &f.db;
+    let conn = tx.connection().unwrap();
+    let (decision, ()) = tokio::join!(capacity::grant(conn, &controller, &request), async move {
+        authz_store::wait_for_lock_waiters(db, 1).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        held.commit().await.unwrap();
+    });
+    assert_eq!(decision, Err(Error::Expired));
+    // The transaction is aborted: its next statement fails, and the earlier grant is gone.
+    assert_eq!(
+        sqlstate(
+            sqlx::query("SELECT 1")
+                .execute(tx.connection().unwrap())
+                .await
+        ),
+        "25P02"
+    );
+    tx.rollback().await.unwrap();
+    assert_eq!(f.grants().await, 0);
+    assert_eq!(f.slot(0).await, ("held".into(), None, 2));
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn release_rolls_back_when_the_controller_lease_lapses_during_settlement() {
+    let mut f = Fixture::new(&[GPU0], 1).await;
+    let mut c = f.worker().await;
+    let controller = open_group(&mut c, 1, &[GPU0]).await;
+    let grant = granted(
+        capacity::grant(
+            &mut c,
+            &controller,
+            &f.request(0, "settle", &[bytes(GPU0, GIB)]),
+        )
+        .await
+        .unwrap(),
+    );
+    capacity::reconcile(&mut c, &controller, &grant, Evidence::Releasing)
+        .await
+        .unwrap();
+    // Hold the run's slot row so settlement waits past the controller's lease.
+    let mut blocker = connect(&f.db.0, OWNER).await;
+    let mut held = blocker.begin().await.unwrap();
+    sqlx::query("SELECT FROM openmettle.quota_reservations WHERE id = $1::uuid FOR NO KEY UPDATE")
+        .bind(f.runs[0].hold.as_deref().unwrap())
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    controller
+        .renew(&mut c, Duration::from_millis(1000))
+        .await
+        .unwrap();
+    let devices = [GPU0.to_string()];
+    let mut w = f.worker().await;
+    let db = &f.db;
+    let (outcome, ()) = tokio::join!(
+        capacity::reconcile(&mut w, &controller, &grant, Evidence::Released(&devices)),
+        async move {
+            authz_store::wait_for_lock_waiters(db, 1).await;
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            held.commit().await.unwrap();
+        }
+    );
+    assert_eq!(outcome, Err(Error::Fenced));
+    // The release rolled back: both ledgers keep their charges.
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.capacity_grants WHERE id = $1::uuid")
+            .bind(&grant)
+            .fetch_one(&mut f.owner)
+            .await
+            .unwrap();
+    assert_eq!(state, "releasing");
+    assert_eq!(
+        f.slot(0).await,
+        ("handoff_committed".into(), Some(grant), 1)
+    );
+    assert_eq!(f.drift().await, (0, 0, 0, 0));
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn publication_rolls_back_when_the_controller_lease_lapses_during_its_wait() {
+    let f = Fixture::new(&[GPU0], 0).await;
+    let mut c = f.worker().await;
+    // An operator holds the device row, so the device's first sample waits in its foreign-key
+    // check past the controller's lease.
+    let mut operator = connect(&f.db.0, OWNER).await;
+    let mut held = operator.begin().await.unwrap();
+    sqlx::query("SELECT FROM openmettle.capacity_devices WHERE id = $1::uuid FOR UPDATE")
+        .bind(GPU0)
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let controller = Controller::acquire(&mut c, GROUP, Duration::from_millis(1000))
+        .await
+        .unwrap();
+    let observed_at_us = db_now_us(&mut c).await;
+    let devices = [sample(GPU0, 0, SPARE)];
+    let observation = Observation {
+        revision: 1,
+        observed_at_us,
+        commit_watermark: 0,
+        devices: &devices,
+    };
+    let db = &f.db;
+    let (published, ()) = tokio::join!(
+        capacity::publish(&mut c, &controller, &observation),
+        async move {
+            authz_store::wait_for_lock_waiters(db, 1).await;
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            held.commit().await.unwrap();
+        }
+    );
+    assert_eq!(published, Err(Error::Fenced));
+    let snapshot = capacity::snapshot(&mut c, GROUP).await.unwrap().unwrap();
+    assert_eq!(
+        (snapshot.observation_revision, snapshot.devices.len()),
+        (0, 0)
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_device_with_grant_history_cannot_be_replaced_into_another_group() {
+    let mut f = Fixture::new(&[GPU0], 1).await;
+    let mut c = f.worker().await;
+    let controller = open_group(&mut c, 1, &[GPU0]).await;
+    let grant = granted(
+        capacity::grant(
+            &mut c,
+            &controller,
+            &f.request(0, "history", &[bytes(GPU0, GIB)]),
+        )
+        .await
+        .unwrap(),
+    );
+    // Drop the sample so only the grant history references the device.
+    f.owner_exec(
+        "DELETE FROM openmettle.capacity_observations WHERE group_id = $1::uuid",
+        &[GROUP],
+    )
+    .await;
+    let mut operator = connect(&f.db.0, OWNER).await;
+    let replace = || {
+        sqlx::query(
+            "WITH gone AS (
+                 DELETE FROM openmettle.capacity_devices WHERE id = $1::uuid
+                 RETURNING id, chat_floor_bytes)
+             INSERT INTO openmettle.capacity_devices (id, group_id, chat_floor_bytes)
+             SELECT id, $2::uuid, chat_floor_bytes FROM gone",
+        )
+        .bind(GPU0)
+        .bind(GROUP_B)
+    };
+    // Refused with an outstanding grant, and again with only released history.
+    assert_eq!(sqlstate(replace().execute(&mut operator).await), "23503");
+    capacity::reconcile(
+        &mut c,
+        &controller,
+        &grant,
+        Evidence::Released(&[GPU0.into()]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sqlstate(replace().execute(&mut operator).await), "23503");
+    let group: String = sqlx::query_scalar(
+        "SELECT group_id::text FROM openmettle.capacity_devices WHERE id = $1::uuid",
+    )
+    .bind(GPU0)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(group, GROUP);
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn device_configuration_locks_only_its_own_visible_group() {
+    const GPU2: &str = "00000000-0000-4000-8000-00000000c0d2";
+    const GPU3: &str = "00000000-0000-4000-8000-00000000c0d3";
+    const GROUP_C: &str = "00000000-0000-4000-8000-00000000c003";
+    let f = Fixture::new(&[GPU0], 0).await;
+    let add = |device, group| {
+        sqlx::query(
+            "INSERT INTO openmettle.capacity_devices (id, group_id, chat_floor_bytes)
+             VALUES ($1::uuid, $2::uuid, 0)",
+        )
+        .bind(device)
+        .bind(group)
+    };
+    let lock_group = |group| {
+        sqlx::query("SELECT FROM openmettle.capacity_groups WHERE id = $1::uuid FOR NO KEY UPDATE")
+            .bind(group)
+    };
+    let within = Duration::from_secs(2);
+    // While a decision holds one group, a device write into another group proceeds and a write
+    // into the held group waits for it.
+    let mut decider = connect(&f.db.0, OWNER).await;
+    let mut held = decider.begin().await.unwrap();
+    lock_group(GROUP).execute(&mut *held).await.unwrap();
+    let mut other = connect(&f.db.0, OWNER).await;
+    tokio::time::timeout(within, add(GPU1, GROUP_B).execute(&mut other))
+        .await
+        .expect("a write into another group does not wait")
+        .unwrap();
+    let mut same = connect(&f.db.0, OWNER).await;
+    let db = &f.db;
+    let (done, ()) = tokio::join!(add(GPU2, GROUP).execute(&mut same), async move {
+        authz_store::wait_for_lock_waiters(db, 1).await;
+        held.commit().await.unwrap();
+    });
+    done.unwrap();
+    // A device for a group whose creating transaction is still open is refused, even while that
+    // transaction holds another group, rather than added without its group's lock.
+    let mut creator = connect(&f.db.0, OWNER).await;
+    let mut creating = creator.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.capacity_groups (id, observation_ttl_ms) VALUES ($1::uuid, 60000)",
+    )
+    .bind(GROUP_C)
+    .execute(&mut *creating)
+    .await
+    .unwrap();
+    lock_group(GROUP).execute(&mut *creating).await.unwrap();
+    let refused = tokio::time::timeout(within, add(GPU3, GROUP_C).execute(&mut other))
+        .await
+        .expect("a write into an invisible group does not wait");
+    assert_eq!(sqlstate(refused), "23503");
+    creating.commit().await.unwrap();
+    add(GPU3, GROUP_C).execute(&mut other).await.unwrap();
 }
 
 #[tokio::test]

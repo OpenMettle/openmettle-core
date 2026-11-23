@@ -5,11 +5,13 @@
 -- openmettle_owner configures managed groups and their devices. Every runtime write goes
 -- through the SECURITY DEFINER functions below, granted to openmettle_worker only, and every
 -- controller write proves the secret returned once by capacity_acquire_controller. Lock order
--- extends ADR 0040: runs -> capacity_groups -> capacity_devices -> capacity_grants
--- -> quota_reservations -> quota_budgets -> quota_enforcement. No capacity path locks runs after
--- a capacity row, and device configuration writes lock every group first. Decisions require
+-- extends ADR 0040: runs -> capacity_groups -> capacity_grants -> quota_reservations
+-- -> quota_budgets -> quota_enforcement; controller writes take no device row lock beyond
+-- foreign-key checks. No capacity path locks runs after a capacity row. Decisions require
 -- READ COMMITTED, so every statement after the group lock sees each transition committed
--- before it.
+-- before it. A device configuration write locks its own group, so it serializes with that
+-- group's decisions. Two operator transactions that each change devices in several groups can
+-- still deadlock with each other; PostgreSQL then aborts one with 40P01, and it can be retried.
 
 CREATE TABLE openmettle.capacity_groups (
     id uuid PRIMARY KEY,
@@ -106,59 +108,55 @@ CREATE INDEX capacity_grants_charged_idx
 CREATE UNIQUE INDEX capacity_grants_live_run_uidx
     ON openmettle.capacity_grants (run_id) WHERE state <> 'released';
 
--- Footprint rows reference the device alone, so a later drain-and-move need not rewrite history.
+-- Footprint rows reference the device within its group, so a device with grant history, even
+-- only released history, cannot be deleted or replaced into another group.
 CREATE TABLE openmettle.capacity_grant_devices (
     grant_id uuid NOT NULL,
     group_id uuid NOT NULL,
-    device_id uuid NOT NULL REFERENCES openmettle.capacity_devices (id),
+    device_id uuid NOT NULL,
     bytes bigint NOT NULL CHECK (bytes > 0),
     release_evidence text CHECK (release_evidence IN ('released', 'not_allocated')),
     released_epoch bigint,
     released_at timestamptz,
     PRIMARY KEY (grant_id, device_id),
     FOREIGN KEY (group_id, grant_id) REFERENCES openmettle.capacity_grants (group_id, id),
+    FOREIGN KEY (group_id, device_id) REFERENCES openmettle.capacity_devices (group_id, id),
     CHECK ((release_evidence IS NULL) = (released_at IS NULL)),
     CHECK ((released_at IS NULL) = (released_epoch IS NULL))
 );
 CREATE INDEX capacity_grant_devices_device_idx
-    ON openmettle.capacity_grant_devices (device_id, grant_id);
+    ON openmettle.capacity_grant_devices (group_id, device_id);
 
 GRANT SELECT ON openmettle.capacity_groups, openmettle.capacity_devices,
     openmettle.capacity_observations, openmettle.capacity_grants,
     openmettle.capacity_grant_devices TO openmettle_worker;
 
--- Device membership is immutable, in every isolation level and whatever the grant history.
-CREATE FUNCTION openmettle.capacity_refuse_device_move()
+-- A device configuration write locks the device's own group, so it serializes with that group's
+-- decisions. A group that is not visible yet (for example, created by a transaction still open)
+-- refuses the write, as the device's foreign key would. Membership is immutable.
+CREATE FUNCTION openmettle.capacity_lock_device_group()
 RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog
 AS $$
 BEGIN
-    RAISE EXCEPTION 'capacity device membership is immutable' USING ERRCODE = '23514';
+    IF TG_OP = 'UPDATE' AND NEW.group_id IS DISTINCT FROM OLD.group_id THEN
+        RAISE EXCEPTION 'capacity device membership is immutable' USING ERRCODE = '23514';
+    END IF;
+    PERFORM
+       FROM openmettle.capacity_groups
+      WHERE id = CASE TG_OP WHEN 'DELETE' THEN OLD.group_id ELSE NEW.group_id END
+        FOR NO KEY UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'unknown capacity group' USING ERRCODE = '23503';
+    END IF;
+    RETURN CASE TG_OP WHEN 'DELETE' THEN OLD ELSE NEW END;
 END;
 $$;
-REVOKE ALL ON FUNCTION openmettle.capacity_refuse_device_move() FROM PUBLIC;
-CREATE TRIGGER capacity_devices_membership_immutable
-    BEFORE UPDATE OF group_id ON openmettle.capacity_devices
-    FOR EACH ROW WHEN (OLD.group_id IS DISTINCT FROM NEW.group_id)
-    EXECUTE FUNCTION openmettle.capacity_refuse_device_move();
-
--- Device configuration writes take every group lock, in id order, before any device row lock,
--- so they and grant decisions always lock a group before its devices.
-CREATE FUNCTION openmettle.capacity_lock_groups_for_configuration()
-RETURNS trigger
-LANGUAGE plpgsql
-SET search_path = pg_catalog
-AS $$
-BEGIN
-    PERFORM FROM openmettle.capacity_groups ORDER BY id FOR NO KEY UPDATE;
-    RETURN NULL;
-END;
-$$;
-REVOKE ALL ON FUNCTION openmettle.capacity_lock_groups_for_configuration() FROM PUBLIC;
-CREATE TRIGGER capacity_devices_configuration_lock
+REVOKE ALL ON FUNCTION openmettle.capacity_lock_device_group() FROM PUBLIC;
+CREATE TRIGGER capacity_devices_lock_group
     BEFORE INSERT OR UPDATE OR DELETE ON openmettle.capacity_devices
-    FOR EACH STATEMENT EXECUTE FUNCTION openmettle.capacity_lock_groups_for_configuration();
+    FOR EACH ROW EXECUTE FUNCTION openmettle.capacity_lock_device_group();
 
 -- Internal: lock the group under READ COMMITTED. A REPEATABLE READ snapshot taken before the
 -- lock could miss a committed transition that closes the group.
@@ -183,6 +181,11 @@ $$;
 REVOKE ALL ON FUNCTION openmettle.capacity_lock_group(uuid) FROM PUBLIC;
 
 -- Internal: lock the group and verify the controller's secret, epoch and lease on database time.
+-- Rule for every controller write: call this first, and call it again (with the run-lease and
+-- readiness checks the write depends on) after the write's last statement that can wait for a
+-- lock. With the group lock held, nothing after that recheck waits, so every write is rolled back
+-- unless its time bounds held after its last wait. A COMMIT the caller delays after the function
+-- returns is outside this guarantee. Writes whose only wait is this call need no second call.
 CREATE FUNCTION openmettle.capacity_fence(p_group uuid, p_secret bytea, p_epoch bigint)
 RETURNS openmettle.capacity_groups
 LANGUAGE plpgsql
@@ -405,6 +408,8 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'inconsistent capacity observation' USING ERRCODE = '22023';
     END IF;
+    -- The upsert's foreign-key checks can wait on a device row: recheck (see capacity_fence).
+    PERFORM openmettle.capacity_fence(p_group, p_secret, p_epoch);
     UPDATE openmettle.capacity_groups
        SET observation_revision = p_revision,
            observation_epoch = p_epoch,
@@ -443,8 +448,8 @@ GRANT EXECUTE ON FUNCTION openmettle.capacity_resume(uuid, bytea, bigint) TO ope
 -- the snapshot. A new grant commits the run's held device_reservations slot in the same
 -- transaction; once quota metering is enforced, a run without a held slot (none admitted, or
 -- one already used by an earlier grant) is refused. After the last statement that can block,
--- the run lease, controller lease and sample freshness are rechecked on database time, and the
--- decision rolls back on expiry (OMC02 when the group no longer admits it).
+-- the run lease, controller lease and sample freshness are rechecked on database time; expiry
+-- raises (42501, OMC01, or OMC02 when the group no longer admits it), aborting the transaction.
 CREATE FUNCTION openmettle.capacity_grant(
     p_group uuid,
     p_secret bytea,
@@ -569,7 +574,7 @@ BEGIN
         END IF;
     END IF;
 
-    -- Nothing below can block: recheck every time-bounded condition on database time.
+    -- After the last wait: recheck every time bound this decision depends on (see capacity_fence).
     PERFORM openmettle.capacity_lock_run(p_scope, p_run, p_claim);
     PERFORM openmettle.capacity_fence(p_group, p_secret, p_epoch);
     IF NOT openmettle.capacity_admits(p_group, false) THEN
@@ -663,6 +668,8 @@ BEGIN
      WHERE id = p_grant;
     IF v.quota_hold_id IS NOT NULL THEN
         PERFORM openmettle.quota_release_device_slot(v.quota_hold_id, v.id);
+        -- Settling the slot can wait on its reservation and budget rows (see capacity_fence).
+        PERFORM openmettle.capacity_fence(p_group, p_secret, p_epoch);
     END IF;
     RETURN 'released';
 END;

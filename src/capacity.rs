@@ -8,12 +8,21 @@
 //! and only confirmed release or non-allocation on every device returns its bytes and settles
 //! that slot.
 //!
-//! Every call must run under `READ COMMITTED`; any other level fails with [`Error::Invalid`]
-//! (SQLSTATE `25000`). `WriteTransaction::begin_bounded` and `begin_bounded_pool` in
-//! [`crate::runs`] select it explicitly. An autocommit statement on a pooled connection,
-//! [`crate::runs::WriteTransaction::begin`] and a plain `sqlx` transaction inherit the role's or
-//! server's `default_transaction_isolation`, so use them only where that setting is
-//! `read committed` (the PostgreSQL default).
+//! The fenced writes ([`Controller::acquire`], [`Controller::renew`], [`publish`], [`resume`],
+//! [`grant`] and [`reconcile`]) must run under `READ COMMITTED`; any other level fails with
+//! [`Error::Invalid`] (SQLSTATE `25000`). `WriteTransaction::begin_bounded` and
+//! `begin_bounded_pool` in [`crate::runs`] select it explicitly. An autocommit statement on a
+//! pooled connection, [`crate::runs::WriteTransaction::begin`] and a plain `sqlx` transaction
+//! inherit the role's or server's `default_transaction_isolation`, so use them only where that
+//! setting is `read committed` (the PostgreSQL default). [`snapshot`] is a read and works at any
+//! level: inside `REPEATABLE READ` it returns the transaction's snapshot, possibly older than
+//! committed state, with `admits_bursts` evaluated on that snapshot at the current time.
+//!
+//! Every `Err` from a write means PostgreSQL raised an error, which aborts the caller's
+//! transaction: its earlier writes are lost and its next statement fails until it rolls back.
+//! That includes expiries detected after a write's last lock wait (`LeaseLost`, `Fenced`,
+//! `Expired`). An `Ok` outcome, including `Decision::Insufficient` and `Decision::Unavailable`,
+//! leaves the transaction intact.
 use crate::runs::is_canonical_uuid;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::Serialize;
@@ -36,6 +45,9 @@ pub enum Error {
     /// The request identity names another request, the run already holds a live grant, or its
     /// device slot is bound elsewhere.
     Conflict,
+    /// The group stopped admitting bursts (its sample went stale) while the grant waited for its
+    /// last lock. The decision and the caller's transaction are aborted.
+    Expired,
     Database,
 }
 impl fmt::Display for Error {
@@ -46,6 +58,7 @@ impl fmt::Display for Error {
             Self::LeaseLost => "run lease not active",
             Self::SlotRequired => "run device slot required",
             Self::Conflict => "capacity request conflict",
+            Self::Expired => "capacity decision expired",
             Self::Database => "capacity store unavailable",
         })
     }
@@ -58,6 +71,7 @@ impl From<sqlx::Error> for Error {
             Some("42501") => Self::LeaseLost,
             Some("OMQ04") => Self::SlotRequired,
             Some("23505") => Self::Conflict,
+            Some("OMC02") => Self::Expired,
             Some("22003" | "22023" | "22P02" | "23502" | "23503" | "23514" | "25000") => {
                 Self::Invalid
             }
@@ -262,7 +276,10 @@ pub enum Decision {
 }
 
 /// Decide a grant under the group fence and the run's active lease. A new grant charges its full
-/// footprint and binds the run's `device_reservations` slot before the caller dispatches.
+/// footprint and binds the run's `device_reservations` slot before the caller dispatches. If
+/// the run lease, controller lease or sample expires while the decision waits for its last lock,
+/// it returns `LeaseLost`, `Fenced` or `Expired`; like every `Err`, that aborts the caller's
+/// transaction, including writes it made earlier.
 pub async fn grant(
     c: &mut PgConnection,
     controller: &Controller,
@@ -291,15 +308,7 @@ pub async fn grant(
     .bind(request.profile)
     .bind(footprint)
     .fetch_one(c)
-    .await;
-    // OMC02: the group stopped admitting bursts while the decision waited for its last lock,
-    // and the decision rolled back.
-    let row = match row {
-        Err(e) if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("OMC02") => {
-            return Ok(Decision::Unavailable);
-        }
-        row => row?,
-    };
+    .await?;
     let outcome: String = row.try_get("outcome")?;
     Ok(
         match (
@@ -335,7 +344,9 @@ pub enum Evidence<'a> {
 }
 
 /// Record fenced evidence for a grant. The grant reaches `released`, and its device slot is
-/// settled in the same transaction, only when every device of its footprint has confirmed.
+/// settled in the same transaction, only when every device of its footprint has confirmed. If
+/// the controller lease expires while settlement waits for the slot's rows, it returns `Fenced`
+/// and the caller's transaction is aborted.
 pub async fn reconcile(
     c: &mut PgConnection,
     controller: &Controller,
@@ -413,7 +424,9 @@ impl Snapshot {
     }
 }
 
-/// Read the group's latest snapshot. Returns `None` for an unknown group.
+/// Read the group's latest snapshot. Returns `None` for an unknown group. A read at any
+/// isolation level: rows and `admits_bursts` come from the statement's (or, under
+/// `REPEATABLE READ`, the transaction's) snapshot.
 pub async fn snapshot(c: &mut PgConnection, group_id: &str) -> Result<Option<Snapshot>, Error> {
     ids(&[group_id])?;
     let rows = sqlx::query(
