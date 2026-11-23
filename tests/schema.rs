@@ -406,6 +406,8 @@ struct AdditiveTable {
 }
 
 const SINGLETON_LOCK_SEED: &str = r#"{"id": true, "lock_guard": false}"#;
+const RETENTION_POLICY_SEED: &str = r#"{"id":true,"revision":1,"grace_seconds":2592000,"min_grace_seconds":2592000,"max_grace_seconds":2592000}"#;
+const DELETION_JOURNAL_HEAD_SEED: &str = r#"{"id":true,"journal_seq":0,"chain_digest":"\\x0000000000000000000000000000000000000000000000000000000000000000"}"#;
 
 /// Single declarative registry of every column added to an existing table by migrations after
 /// the early schema baselines, ordered by `since` migration version. Adding entries here
@@ -681,6 +683,12 @@ const ADDITIVE_COLUMNS: &[AdditiveColumn] = &[
         column: "overrides_enforced_at",
         default: ColumnDefault::Null,
     },
+    AdditiveColumn {
+        since: 28,
+        table: "artifact_revisions",
+        column: "retention_policy_revision",
+        default: ColumnDefault::Null,
+    },
 ];
 
 /// Single declarative registry of every table added after migration 14, ordered by `since`
@@ -902,6 +910,26 @@ const ADDITIVE_TABLES: &[AdditiveTable] = &[
         table: "capacity_grant_devices",
         seed_row: None,
     },
+    AdditiveTable {
+        since: 28,
+        table: "retention_policy",
+        seed_row: Some(RETENTION_POLICY_SEED),
+    },
+    AdditiveTable {
+        since: 28,
+        table: "artifact_retention_holds",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 28,
+        table: "deletion_journal",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 28,
+        table: "deletion_journal_head",
+        seed_row: Some(DELETION_JOURNAL_HEAD_SEED),
+    },
 ];
 
 fn additive_columns_since(base_version: i64) -> impl Iterator<Item = &'static AdditiveColumn> {
@@ -1066,6 +1094,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "814d7832603fdb9752e55259c1c44b6815228ae5fb128b54ed5becf9fed508d7",
         "dad89ccf522802b8c572ec8947fdfede32e569a5e26004ecb593edf50c96711f",
         "f420dac4231768d9eab1c1e1d21f156864c98af88335380ee1de392f7ba7e6d0",
+        "feda63e3c2ed89d787e6e5a978a15208068598085fe8de52a8620b583c5789a6",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
@@ -1191,7 +1220,7 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
     let after_14: Vec<(&str, Option<&str>)> = expected_added_tables_since(14)
         .map(|e| (e.table, e.seed_row))
         .collect();
-    assert_eq!(after_14.len(), 42);
+    assert_eq!(after_14.len(), 46);
     assert!(after_14.contains(&("account_admin_lock", Some(SINGLETON_LOCK_SEED))));
     assert!(after_14.contains(&("run_dispatch_lock", Some(SINGLETON_LOCK_SEED))));
     let after_18: Vec<(&str, Option<&str>)> = expected_added_tables_since(18)
@@ -1248,6 +1277,10 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
             ("capacity_observations", None),
             ("capacity_grants", None),
             ("capacity_grant_devices", None),
+            ("retention_policy", Some(RETENTION_POLICY_SEED)),
+            ("artifact_retention_holds", None),
+            ("deletion_journal", None),
+            ("deletion_journal_head", Some(DELETION_JOURNAL_HEAD_SEED)),
         ]
     );
 

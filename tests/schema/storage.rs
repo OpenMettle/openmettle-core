@@ -8,7 +8,7 @@ fn sha(bytes: &[u8]) -> Vec<u8> {
     Sha256::digest(bytes).to_vec()
 }
 
-fn code(error: &Error) -> String {
+pub(super) fn code(error: &Error) -> String {
     match error {
         Error::Database(sqlx::Error::Database(e)) => e.code().unwrap_or_default().into_owned(),
         other => panic!("expected a database error, got {other}"),
@@ -16,7 +16,12 @@ fn code(error: &Error) -> String {
 }
 
 /// Owner-only configuration, as an operator would apply it.
-async fn configure(db: &TestDb, budget: Option<i64>, personal: Option<i64>, project: Option<i64>) {
+pub(super) async fn configure(
+    db: &TestDb,
+    budget: Option<i64>,
+    personal: Option<i64>,
+    project: Option<i64>,
+) {
     configure_limits(db, budget, personal, project).await;
     // Ledger-only tests use a synthetic owner-adopted volume. File tests initialize real sentinels.
     if db.exists("openmettle.storage_volume_control").await {
@@ -39,6 +44,17 @@ pub(super) async fn configure_limits(
     let mut owner = connect(&db.0, OWNER).await;
     sqlx::query("UPDATE openmettle.storage_instance SET instance_budget_bytes=$1,personal_limit_bytes=$2,project_limit_bytes=$3")
         .bind(budget).bind(personal).bind(project).execute(&mut owner).await.unwrap();
+}
+
+/// Owner-only retention bounds `[0, 30 days]` and the given grace, as an operator would set them.
+pub(super) async fn retention_grace(db: &TestDb, seconds: i32) {
+    sqlx::query(
+        "UPDATE openmettle.retention_policy SET min_grace_seconds=0, grace_seconds=$1 WHERE id",
+    )
+    .bind(seconds)
+    .execute(&mut connect(&db.0, OWNER).await)
+    .await
+    .unwrap();
 }
 
 /// Counters must equal the totals recomputed from reservation and revision rows.
@@ -84,7 +100,7 @@ pub(super) async fn new_uuid(db: &TestDb) -> String {
         .unwrap()
 }
 
-fn input<'a>(
+pub(super) fn input<'a>(
     scope: &'a str,
     actor: &'a str,
     key: &'a str,
@@ -102,7 +118,7 @@ fn input<'a>(
     }
 }
 
-async fn reserve(
+pub(super) async fn reserve(
     db: &TestDb,
     role: &str,
     r: &ReservationInput<'_>,
@@ -114,7 +130,7 @@ async fn reserve(
     result
 }
 
-async fn settle(
+pub(super) async fn settle(
     db: &TestDb,
     scope: &str,
     reservation: &str,
@@ -652,11 +668,11 @@ async fn retention_keeps_bytes_charged_until_confirmed_purge() {
     let rev = settle(&db, &c.scope, &r.id, 40, b"retained", "text/plain")
         .await
         .unwrap();
-    let step = async |role: &str, which: u8, grace: u32| -> Result<Option<String>, Error> {
+    let step = async |role: &str, which: u8| -> Result<Option<String>, Error> {
         let mut cn = connect(&db.0, role).await;
         let mut tx = WriteTransaction::begin(&mut cn).await.unwrap();
         let result = match which {
-            0 => storage::retain_revision(&mut tx, &c.scope, &rev, grace)
+            0 => storage::retain_revision(&mut tx, &c.scope, &rev)
                 .await
                 .map(Some),
             1 => storage::restore_revision(&mut tx, &c.scope, &rev)
@@ -672,23 +688,24 @@ async fn retention_keeps_bytes_charged_until_confirmed_purge() {
         tx.commit().await.unwrap();
         result
     };
-    assert!(matches!(step(API, 0, 0).await, Err(Error::Invalid)));
     // Role split: the worker cannot retain or restore; the API cannot claim or confirm purge.
-    assert_eq!(code(&step(WORKER, 0, 3600).await.unwrap_err()), "42501");
-    let first = step(API, 0, 3600).await.unwrap().unwrap();
+    assert_eq!(code(&step(WORKER, 0).await.unwrap_err()), "42501");
+    // The default policy: 30 days.
+    let first = step(API, 0).await.unwrap().unwrap();
     assert_eq!(account(&db, &c.scope).await, (0, 40, 0));
-    // Retries cannot move the stored deadline.
-    assert_eq!(step(API, 0, 1).await.unwrap().unwrap(), first);
-    assert!(matches!(step(WORKER, 2, 0).await, Err(Error::NotEligible)));
-    assert!(matches!(step(WORKER, 3, 0).await, Err(Error::NotEligible)));
-    assert_eq!(code(&step(WORKER, 1, 0).await.unwrap_err()), "42501");
-    step(API, 1, 0).await.unwrap();
+    // Retries cannot move the stored deadline, even after the policy changes.
+    retention_grace(&db, 1).await;
+    assert_eq!(step(API, 0).await.unwrap().unwrap(), first);
+    assert!(matches!(step(WORKER, 2).await, Err(Error::NotEligible)));
+    assert!(matches!(step(WORKER, 3).await, Err(Error::NotEligible)));
+    assert_eq!(code(&step(WORKER, 1).await.unwrap_err()), "42501");
+    step(API, 1).await.unwrap();
     assert_eq!(account(&db, &c.scope).await, (40, 0, 0));
-    // A new removal starts a new grace period.
-    step(API, 0, 1).await.unwrap();
+    // A new removal starts a new grace period under the current policy.
+    step(API, 0).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1200)).await;
-    assert!(matches!(step(API, 1, 0).await, Err(Error::NotEligible)));
-    assert_eq!(code(&step(API, 2, 0).await.unwrap_err()), "42501");
+    assert!(matches!(step(API, 1).await, Err(Error::NotEligible)));
+    assert_eq!(code(&step(API, 2).await.unwrap_err()), "42501");
     // Claim and confirmation in one transaction is refused: deletion happens between them.
     let mut cn = connect(&db.0, WORKER).await;
     let mut tx = WriteTransaction::begin(&mut cn).await.unwrap();
@@ -698,11 +715,11 @@ async fn retention_keeps_bytes_charged_until_confirmed_purge() {
         Err(Error::NotEligible)
     ));
     tx.commit().await.unwrap();
-    step(WORKER, 2, 0).await.unwrap();
+    step(WORKER, 2).await.unwrap();
     assert_eq!(account(&db, &c.scope).await, (0, 40, 0));
-    assert!(matches!(step(API, 1, 0).await, Err(Error::NotEligible)));
-    step(WORKER, 3, 0).await.unwrap();
-    step(WORKER, 3, 0).await.unwrap();
+    assert!(matches!(step(API, 1).await, Err(Error::NotEligible)));
+    step(WORKER, 3).await.unwrap();
+    step(WORKER, 3).await.unwrap();
     assert_eq!(account(&db, &c.scope).await, (0, 0, 0));
     assert_totals(&db).await;
 }
@@ -801,7 +818,7 @@ async fn storage_roles_and_scoped_references_are_bounded() {
     let mut cn = connect(&db.0, WORKER).await;
     let mut tx = WriteTransaction::begin(&mut cn).await.unwrap();
     assert!(matches!(
-        storage::retain_revision(&mut tx, &other.scope, &rev, 60).await,
+        storage::retain_revision(&mut tx, &other.scope, &rev).await,
         Err(Error::NotFound)
     ));
     tx.rollback().await.unwrap();
@@ -1235,7 +1252,7 @@ async fn lifecycle_constraints_reject_missing_values() {
         .unwrap();
     let mut cn = connect(&db.0, API).await;
     let mut tx = WriteTransaction::begin(&mut cn).await.unwrap();
-    storage::retain_revision(&mut tx, &c.scope, &rev, 60)
+    storage::retain_revision(&mut tx, &c.scope, &rev)
         .await
         .unwrap();
     tx.commit().await.unwrap();

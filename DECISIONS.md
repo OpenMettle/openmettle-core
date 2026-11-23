@@ -44,7 +44,7 @@
 | [0038](docs/adr/0038-sglang-and-external-provider-conformance-adapter.md) | SGLang and external-provider conformance adapter | 21 November 2026 |
 | [0039](docs/adr/0039-scoped-mcp-adapter-and-bounded-tool-results.md) | Scoped MCP adapter, reviewed tool contracts and bounded spill artifacts | 21 November 2026 |
 | [0040](docs/adr/0040-transactional-quotas-and-reservation-reconciliation.md) | Transactional quotas and reservation reconciliation | 21 November 2026 |
-| [0041](docs/adr/0041-retention-purge-and-deletion-journal.md) | Retention, purge and deletion journal | 22 November 2026 |
+| [0041](docs/adr/0041-retention-purge-and-deletion-journal.md) | Retention, purge and deletion journal | 22 November 2026; PR2a split and audit/journal privilege amendments 23 November 2026 |
 | [0042](docs/adr/0042-shared-capacity-api-and-resource-grants.md) | Shared capacity API and serialized resource grants | 22 November 2026 |
 
 ## 0001 — Repository bootstrap (16 November 2026)

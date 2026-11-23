@@ -1470,7 +1470,7 @@ async fn artifact_downloads_check_current_grants_and_serve_byte_ranges() {
     let personal = personal_of(&db, &alice).await;
     let mut c = connect(&db.0, API).await;
     let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
-    storage::retain_revision(&mut tx, &personal, &revision, 3600)
+    storage::retain_revision(&mut tx, &personal, &revision)
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -2109,7 +2109,7 @@ async fn quota_summary_wide_counters_privacy_warnings_and_hard_limit_reads_work_
     // Retention remains permitted at hard_limit = 0.
     let mut c = connect(&db.0, API).await;
     let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
-    storage::retain_revision(&mut tx, &alice_scope, rev_id, 3600)
+    storage::retain_revision(&mut tx, &alice_scope, rev_id)
         .await
         .unwrap();
     tx.commit().await.unwrap();

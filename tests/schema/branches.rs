@@ -477,7 +477,7 @@ async fn published_paths_replay_revisions_and_budget_survive_forks() {
     .unwrap();
     assert_eq!(totals, (7, 0, 0, 1));
     let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
-    storage::retain_revision(&mut tx, &f.scope, &revision, 60)
+    storage::retain_revision(&mut tx, &f.scope, &revision)
         .await
         .unwrap();
     tx.commit().await.unwrap();

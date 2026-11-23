@@ -83,6 +83,30 @@ SELECT metering_enforced, metering_enforced_at, overrides_enforced, overrides_en
 FROM openmettle.quota_enforcement;
 ```
 
+## Upgrade from 0027 to 0028 (retention)
+
+Migration `0028` ([ADR 0041](../adr/0041-retention-purge-and-deletion-journal.md)) needs no activation step. Apply it with `openmettle-migrate` and roll the API and worker deployments. Purges are deferred while a revision is still referenced (an attachment, an operator hold, or a run that wrote it and has not finished). Each confirmed purge is recorded in `openmettle.deletion_journal`.
+
+- The database sets every removal's deadline from `openmettle.retention_policy`. That includes removals by a `0027` API during the rollout, whose own grace is ignored.
+- A `0027` worker's purge claim on a referenced revision fails with SQLSTATE `OMR01`. Expect `worker.sweep.failed` for `purge_due` until the old workers exit.
+- A claim the old worker already committed (the revision is `purging`) is completed even if the revision is attached. Schema `0027` checked no references, the claim was valid when it was made, and its payload may already be truncated, so returning it to `retained` would offer damaged bytes for restore. Schema `0028` lets no `purging` revision gain an attachment or hold, so only these older claims (and owner break-glass claims) complete while referenced. Before upgrading, list the affected claims with:
+
+```sql
+SELECT r.id FROM openmettle.artifact_revisions r
+ WHERE r.state = 'purging'
+   AND EXISTS (SELECT FROM openmettle.message_parts p
+                WHERE p.scope_id = r.scope_id AND p.artifact_revision_id = r.id);
+```
+
+At any time afterwards, this lists every journaled purge whose revision is still attached. Each one is either a claim made before the upgrade completed or an operator-forced (break-glass) purge. Schema `0028` never claims an attached revision otherwise.
+
+```sql
+SELECT j.journal_seq, j.entity_id
+  FROM openmettle.deletion_journal j
+ WHERE EXISTS (SELECT FROM openmettle.message_parts p
+                WHERE p.scope_id = j.scope_id AND p.artifact_revision_id = j.entity_id);
+```
+
 ## Monitor overdue handoffs
 
 The worker records up to 100 overdue committed handoffs per maintenance sweep in `openmettle_quota_overdue_handoffs_total`. The counter measures observations across sweeps. An outstanding handoff can contribute more than once. Use the database ledger to identify the holds. The observation leaves quota charges intact.

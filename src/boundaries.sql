@@ -4,6 +4,8 @@
 -- revokes the PUBLIC database/public-schema defaults, which are tolerated only before that.
 -- Version 23 adds gateway reconciliation, request holds and one-call inference grants.
 -- Version 27 adds the worker-only fenced capacity store (ADR 0042).
+-- Version 28 adds the retention policy, operator holds and the deletion journal (ADR 0041); no
+-- role other than the owner may hold any privilege on the holds or journal tables.
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -64,6 +66,13 @@ quota_tables (relation,role,privilege) AS (
 capacity_tables (relation,role,privilege) AS (
     SELECT relation,'openmettle_worker','SELECT' FROM unnest(ARRAY['capacity_groups','capacity_devices',
         'capacity_observations','capacity_grants','capacity_grant_devices']) relation WHERE $1 >= 27
+),
+-- Version 28 (ADR 0041): the API reads the grace it applies and stamps its revision.
+retention_tables (relation,role,privilege) AS (
+    SELECT 'retention_policy','openmettle_api','SELECT' WHERE $1 >= 28
+),
+retention_columns (relation,attribute,role,privilege) AS (
+    SELECT 'artifact_revisions','retention_policy_revision','openmettle_api','UPDATE' WHERE $1 >= 28
 ),
 gateway_columns (relation,attribute,role,privilege) AS (
     SELECT relation, attribute, role, privilege FROM (VALUES
@@ -166,6 +175,14 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.capacity_resume(uuid,bytea,bigint)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.capacity_grant(uuid,bytea,bigint,uuid,uuid,uuid,text,text,jsonb)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.capacity_reconcile(uuid,bytea,bigint,uuid,text,uuid[])',true,ARRAY['openmettle_worker']::text[])) AS f WHERE $1 >= 27
+    UNION ALL SELECT * FROM (VALUES
+        ('openmettle.retention_policy_bump_revision()',false,ARRAY[]::text[]),
+        ('openmettle.retention_set_grace(uuid,integer,text,text)',true,ARRAY['openmettle_api']::text[]),
+        ('openmettle.retention_stamp_deadline()',true,ARRAY[]::text[]),
+        ('openmettle.retention_lock_referenced_revision()',false,ARRAY[]::text[]),
+        ('openmettle.artifact_revision_pinned(uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.retention_guard_purge_claim()',true,ARRAY[]::text[]),
+        ('openmettle.deletion_journal_append_purge()',true,ARRAY[]::text[])) AS f WHERE $1 >= 28
 ),
 gateway_functions (signature,definer,inference) AS (
     SELECT * FROM (VALUES ('openmettle.gateway_allocate()',true,false), ('openmettle.gateway_run_hold()',true,false),
@@ -283,6 +300,7 @@ contract (relation, role, privilege) AS (
         'project_settings','platform_capability_denies','user_capability_denies','user_capability_grants']), 'openmettle_gateway', 'SELECT' WHERE $1 >= 23
     UNION ALL SELECT * FROM quota_tables
     UNION ALL SELECT * FROM capacity_tables
+    UNION ALL SELECT * FROM retention_tables
 ),
 column_contract (relation, attribute, role, privilege) AS (
     VALUES ('users', 'disabled_at', 'openmettle_api', 'UPDATE')
@@ -345,6 +363,8 @@ column_contract (relation, attribute, role, privilege) AS (
     ) AS t(role,privilege,columns), unnest(columns) attribute WHERE $1 >= 21
     UNION ALL
     SELECT * FROM quota_columns
+    UNION ALL
+    SELECT * FROM retention_columns
     UNION ALL
     SELECT * FROM gateway_columns
     UNION ALL
@@ -693,7 +713,9 @@ violations (violation) AS (
            OR ($1 >= 23 AND g.schema_name='openmettle' AND g.kind IN ('relation','column')
                AND (g.object_name LIKE 'gateway\_%' OR ($1>=24 AND
                     (g.object_name LIKE 'quota\_%' OR g.object_name='storage_volume_control'))
-                    OR ($1>=27 AND g.object_name LIKE 'capacity\_%'))
+                    OR ($1>=27 AND g.object_name LIKE 'capacity\_%')
+                    OR ($1>=28 AND (g.object_name LIKE 'deletion\_journal%' OR g.object_name LIKE 'retention\_%'
+                                    OR g.object_name='artifact_retention_holds')))
                AND g.grantee NOT IN (SELECT oid FROM owner_role)))
       AND NOT (g.kind = 'database' AND g.grantee <> 0 AND g.privilege = 'CONNECT')
       AND NOT (g.kind = 'database' AND g.grantee = 0 AND $1 < 1
@@ -728,13 +750,15 @@ violations (violation) AS (
                    IN (SELECT relation, attribute, role, privilege FROM column_contract))
     UNION ALL
     SELECT format('%s lacks %s on openmettle.%s.%s', c.role, c.privilege, c.relation, c.attribute)
-    FROM (SELECT * FROM effect_columns UNION ALL SELECT * FROM gateway_columns UNION ALL SELECT * FROM quota_columns) c WHERE NOT EXISTS (
+    FROM (SELECT * FROM effect_columns UNION ALL SELECT * FROM gateway_columns UNION ALL SELECT * FROM quota_columns
+          UNION ALL SELECT * FROM retention_columns) c WHERE NOT EXISTS (
         SELECT FROM grants g WHERE g.kind='column' AND g.schema_name='openmettle'
           AND g.object_name=c.relation AND g.column_name=c.attribute
           AND pg_get_userbyid(g.grantee)=c.role AND g.privilege=c.privilege)
     UNION ALL
     SELECT format('%s lacks SELECT on openmettle.%s', c.role, c.relation) FROM contract c
-    WHERE (c.relation IN (SELECT relation FROM quota_tables UNION ALL SELECT relation FROM capacity_tables)
+    WHERE (c.relation IN (SELECT relation FROM quota_tables UNION ALL SELECT relation FROM capacity_tables
+                          UNION ALL SELECT relation FROM retention_tables)
            OR c.role='openmettle_gateway' OR c.relation IN ('run_approvals','run_approval_decisions')) AND NOT EXISTS (
         SELECT FROM grants g WHERE g.kind='relation' AND g.schema_name='openmettle'
           AND g.object_name=c.relation AND pg_get_userbyid(g.grantee)=c.role AND g.privilege=c.privilege)

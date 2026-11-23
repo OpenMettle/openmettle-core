@@ -161,6 +161,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "fenced capacity grants",
         sql: include_str!("../migrations/0027_fenced_capacity_grants.sql"),
     },
+    Source {
+        version: 28,
+        description: "retention purge journal",
+        sql: include_str!("../migrations/0028_retention_purge_journal.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

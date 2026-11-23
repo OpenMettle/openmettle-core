@@ -867,7 +867,7 @@ async fn shares_catalog_preview_history_and_cancellation() {
     assert_ne!(edited["branch_id"], retried["branch_id"]);
     assert_eq!(edited["input_message_id"], EDIT);
     let mut tx = WriteTransaction::begin(&mut con).await.unwrap();
-    storage::retain_revision(&mut tx, &fixture.scope, &attachment, 60)
+    storage::retain_revision(&mut tx, &fixture.scope, &attachment)
         .await
         .unwrap();
     tx.commit().await.unwrap();

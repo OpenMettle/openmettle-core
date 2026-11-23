@@ -48,16 +48,20 @@ ADR 0040's volume-pinned 3-stage physical purge on the durable worker path.
   `[min_grace_seconds, max_grace_seconds]` (permitting `0` for immediate purge eligibility only
   when deployment policy sets `min_grace_seconds = 0`). Only `account_admin` (or
   `openmettle_owner` bootstrap/break-glass) may mutate the policy, and every change increments a
-  monotonic `policy_revision` and writes an `authorization_audit` record with actor, old/new
-  values, reason and request key.
+  monotonic `policy_revision` (a trigger enforces this for every writer). An `account_admin`
+  change, through `openmettle.retention_set_grace`, also writes an `authorization_audit` record
+  with actor, old/new values, reason and request key; `openmettle_owner` sets the deployment
+  bounds as configuration, outside the application audit trail.
 - **Forward-only policy edits.** Changing `retention_grace_seconds` governs subsequent
   disassociations. Adjusting existing `purge_after` deadlines is a separate explicit, previewable
   and audited `account_admin` action. Quota reductions, expired overrides or hard-limit pressure
   never shorten grace periods or trigger early purge (ADR 0005, ADR 0040).
 - **Disassociation (`active -> retained`).** An authorized `Delete` on an artifact, revision,
-  conversation or project transitions affected `active` revisions to `retained`, stamping
-  `retained_at = now()`, `purge_after = now() + grace` and the applied `policy_revision` once on
-  the database clock. Supporting `grace = 0` requires PR2's additive migration to relax Migration
+  conversation or project transitions affected `active` revisions to `retained`. The database,
+  not the caller, stamps `retained_at`, `purge_after = retained_at + grace` and the applied
+  `policy_revision` once, from the current policy row and the database wall clock
+  (`clock_timestamp()`) read after the transition's locks. Every deadline comparison (restore,
+  claim) likewise uses the wall clock after its locks, never the transaction start time. Supporting `grace = 0` requires PR2's additive migration to relax Migration
   0004's `artifact_revisions_lifecycle_check` from `purge_after > retained_at` to
   `purge_after >= retained_at` and update `storage::retain_revision` to accept `0` only when the
   configured policy permits it. Bytes shift from `active_bytes` to `retained_bytes`, leaving total
@@ -84,14 +88,14 @@ ADR 0040's volume-pinned 3-stage physical purge on the durable worker path.
 
 | Phase | Owner | Required transactional and filesystem invariants |
 | --- | --- | --- |
-| Claim (`retained -> purging`) | `openmettle_worker` (`storage::begin_purge`) | Lock in canonical order; verify `openmettle.storage_lock_pinned_volume()` (`OMQ03`), `NOT adoption_unverified`, non-null `payload_ino`, `state = 'retained'` and `purge_after <= now()`. Recheck zero live references (`message_parts` in non-deleted conversations, non-terminal runs or unresolved operations/tool spills per [ADR 0004](0004-run-persistence.md), [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md) and [ADR 0039](0039-scoped-mcp-adapter-and-bounded-tool-results.md), active knowledge/derived-source links, and active retention holds). Commit `'purging'` before any disk mutation. |
+| Claim (`retained -> purging`) | `openmettle_worker` (`storage::begin_purge`) | Lock in canonical order; verify `openmettle.storage_lock_pinned_volume()` (`OMQ03`), `NOT adoption_unverified`, non-null `payload_ino`, `state = 'retained'` and `purge_after <= clock_timestamp()`. Recheck zero live references (`message_parts` in non-deleted conversations, non-terminal runs or unresolved operations/tool spills per [ADR 0004](0004-run-persistence.md), [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md) and [ADR 0039](0039-scoped-mcp-adapter-and-bounded-tool-results.md), active knowledge/derived-source links, and active retention holds). Commit `'purging'` before any disk mutation. |
 | Physical delete & anchor | `openmettle_worker` (`artifact_fs::purge_due`) | Delegate verbatim to [ADR 0040](0040-transactional-quotas-and-reservation-reconciliation.md)'s 3-stage protocol: Stage A creates/validates `revisions/.purge.<reservation_id>` under non-blocking `LOCK_EX` (deferring cleanly on `WouldBlock` while `Store::read` holds `LOCK_SH`), truncates and unlinks `revisions/<id>` and matching `staging/<id>` while `.purge.<id>` keeps `payload_ino` pinned; Stage B commits `storage::confirm_purge` (`purging -> purged`, `purge_stage = 'anchor_pending_unlink'`) and releases `retained_bytes` exactly once; Stage C detaches `.purge.<id>` via bounded cursor sweep. |
 | Derived & provenance cleanup | Durable worker sweeps | Removal immediately excludes source-dependent indexes, previews and memory facts from recall. Terminal purge enqueues idempotent cleanup of derived copies using recorded source provenance; independently supported shared facts require provenance-aware checks, and deletion cannot retract data already sent to an external model or provider. |
 
 - **Concurrent reattachment and race safety.** Any operation that attaches a revision to a
   message, run, knowledge collection or hold, or invokes `restore_revision`, locks the
   `artifact_revisions` row in canonical order and requires `state = 'active'` (or `state =
-  'retained' AND now() < purge_after` for restore). Because `begin_purge` locks the same row
+  'retained'` and the wall clock before `purge_after` for restore). Because `begin_purge` locks the same row
   before rechecking references and setting `state = 'purging'`, either the reattachment commits
   first (causing `begin_purge` to defer without purging) or `begin_purge` commits `'purging'`
   first (causing the concurrent attach/restore to fail with `NotEligible` / `409 conflict`).
@@ -119,8 +123,9 @@ ADR 0040's volume-pinned 3-stage physical purge on the durable worker path.
   `original_purge_after`, `purged_at`, `content_digest` (SHA-256 bytes for purged revisions only),
   `policy_revision` and `request_key`, plus a running hash-chain digest linking `journal_seq` to
   `journal_seq - 1`. It never stores `display_name`, filenames, prompts, message text, secrets,
-  credentials, emails or payload bytes. Application roles receive `SELECT` and `INSERT` only
-  (zero `UPDATE`, `DELETE` or `TRUNCATE`).
+  credentials, emails or payload bytes. Application roles never receive `UPDATE`, `DELETE` or
+  `TRUNCATE`. Purge records are appended by a `SECURITY DEFINER` trigger on the confirmation, so
+  application roles need no journal privilege for them.
 - **Backup-survivable watermark contract (coordinated with V1-30 `#27`).** Because restoring an
   older PostgreSQL dump rolls back in-database rows, V1-30's backup/export pipeline continuously
   or per-capture exports append-only, integrity-checked journal segments and a signed/checksummed
@@ -202,3 +207,15 @@ ADR 0040's volume-pinned 3-stage physical purge on the durable worker path.
 | **PR1 (this record)** | Concise ADR 0041 and [`DECISIONS.md`](../../DECISIONS.md) index update (`0039`–`0041`). No schema, code or fixture changes; `#16` remains open. |
 | **PR2 (Schema, store, journal and restore barrier)** | Additive migration (policy table/revision, `purge_after >= retained_at`, hold/reference indexes, append-only `deletion_journal`, `restore_reconciliation_gate`, role grants and `src/boundaries.sql`), `storage::begin_purge` reference/hold recheck, atomic `confirm_purge` journal append, scheduled worker `purge_due` integration and `openmettle-admin` journal export/replay gate. Isolated PostgreSQL 18 suite covering expiry boundaries (`grace = 0`, `now() == purge_after`), live-reference and concurrent-reattachment races, duplicate purge/retries, worker death across all stages without double release, storage/`OMQ03` failures and fail-closed journal lag/tamper replay gates. |
 | **PR3 (`/v1` API, admin routes and OpenAPI fixtures)** | Authenticated `/v1` artifact/revision disassociation and pre-expiry restore routes, audited `account_admin` retention-policy and deadline-preview/apply routes, restore-gate health/status surfacing, OpenAPI contract updates plus regenerated `contracts/fixtures/`, telemetry contract/alert updates if metrics are added, and authorization/concealment/redaction canary tests. |
+
+PR2 is delivered in two increments (23 November 2026). **PR2a** (migration 28) adds the
+retention policy and `retention_set_grace`, `purge_after >= retained_at`, operator-only holds,
+the reference predicate (`artifact_revision_pinned`) used by `begin_purge` and by a claim guard
+for every application role (`openmettle_owner` stays the break-glass path), the attach/hold row lock, and the hash-chained `deletion_journal` holding purge
+records only (journal fields for revocations and tombstones arrive with those events). Every
+attachment counts as live because no conversation or project tombstone exists yet; no knowledge
+links exist yet. A claim committed before the upgrade completes even if the revision is
+referenced (it was valid then, and its payload may be partly gone). Because decisions use the
+wall clock after their locks, the suite covers grace 0 and a just-reached deadline rather than
+the equal instant, plus races, retries, duplicates, interrupted stages and `OMQ03`. **PR2b** adds `restore_reconciliation_gate`, the `openmettle-admin` journal
+export/replay gate with lag and tamper checks, and worker `purge_due` scheduling.
