@@ -41,15 +41,19 @@ Set these with the `OPENMETTLE_WORKER_` prefix:
 - `SHUTDOWN_TIMEOUT_MS`: half of it drains in-flight runs. Keep the pod's termination grace
   period above it.
 
-Each claimed run borrows short-lived pool connections for lease renewal and its steps, and
-maintenance takes one more. The number of slots a `DB_MAX_CONNECTIONS` value sustains has not
-been measured.
+`DB_MAX_CONNECTIONS` has no minimum beyond the usual one. No task on the turn path waits for
+a second pooled connection while it holds one; prompt assembly reads attachments on the
+connection it already holds. Each claimed run uses at most two connections at a time, one for
+its step and one for its lease renewal, and the sweeps use one more. With at least
+`2 × RUN_SLOTS + 1` connections nothing waits for the pool. A smaller pool makes tasks queue
+for up to `DB_TIMEOUT_MS`. How much throughput a given size sustains has not been measured.
 
 ## Network
 
-Allow egress from the worker to the gateway endpoints only. For an in-cluster gateway Service,
-use its cluster DNS name in `endpoint` and add its Service range to `private_cidrs`. Loopback
-and cloud metadata addresses are always refused.
+Limit the worker's inference egress to the gateway endpoints. Keep the rules it already needs
+for PostgreSQL and cluster DNS. For an in-cluster gateway Service, use its cluster DNS name in
+`endpoint` and add its Service range to `private_cidrs`. Loopback and cloud metadata addresses
+are always refused.
 
 ## Verify
 
@@ -70,7 +74,14 @@ and cloud metadata addresses are always refused.
 
 ## Stopping
 
-`SIGTERM` stops claiming, stops in-flight rounds and hands their leases back so another
-replica can claim them at once. A round already handed to the gateway still counts against its
-run's round budget, and its gateway request keeps its hold until usage settles. After `SIGKILL`
-or a lost node, runs wait up to `LEASE_MS` before another worker claims them.
+`SIGTERM` stops claiming and stops in-flight rounds. The worker keeps answering probes while,
+within half the drain budget, each run waits at most `LEASE_MS / 6` for its step to stop and
+then hands its lease back, so another replica can claim it at once. A run whose handoff does not
+finish in that time is dropped, and its lease lapses: another worker claims it after up to
+`LEASE_MS`, as after a crash (ADR 0033). The default 5 s `SHUTDOWN_TIMEOUT_MS` leaves a short
+handoff window. Raise it, and the pod's termination grace period, when immediate re-claim
+matters.
+
+A round already handed to the gateway still counts against its run's round budget, and its
+gateway request keeps its hold until usage settles. After `SIGKILL` or a lost node, runs wait
+up to `LEASE_MS` before another worker claims them.

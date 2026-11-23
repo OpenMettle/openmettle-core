@@ -919,7 +919,7 @@ async fn worker_image(
     )
     .bind(scope)
     .bind(id)
-    .fetch_optional(c)
+    .fetch_optional(&mut *c)
     .await?
     .ok_or(HIDDEN)?;
     let media = match media.as_str() {
@@ -932,8 +932,9 @@ async fn worker_image(
         return Err(StoreError::InvalidInput("attachment size"));
     }
     *remaining -= size;
+    // The caller's connection, never a second one from the same pool (ADR 0043).
     let body = store
-        .read(&reservation, size, 0, size as u64)
+        .read_on(c, &reservation, size, 0, size as u64)
         .await
         .map_err(|_| HIDDEN)?;
     Ok((

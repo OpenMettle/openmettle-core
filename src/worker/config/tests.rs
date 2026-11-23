@@ -222,6 +222,29 @@ fn installation_coverage_and_profiles_are_checked_against_the_catalog() {
     );
 }
 
+/// Repeated members cannot pick one of two catalog profiles or routes (ADR 0043).
+#[test]
+fn repeated_models_and_routes_are_refused() {
+    let mut fixture = Fixture::new();
+    let catalog: Value = serde_json::from_slice(CATALOG).unwrap();
+    let mut other = catalog["models"]["a"].clone();
+    other["pin"]["revision"] = json!("profile-a/2");
+    let repeated = support::repeated(&catalog.to_string(), "models", "a", &other.to_string());
+    fixture.document["catalog_file"] = json!(
+        fixture
+            .dir
+            .write("repeated-catalog.json", repeated.as_bytes())
+    );
+    assert_eq!(refusal(fixture.load()), shape(Shape::Catalog));
+    let fixture = Fixture::new();
+    let route = fixture.document["routes"]["a"].to_string();
+    let text = support::repeated(&fixture.document.to_string(), "routes", "a", &route);
+    assert_eq!(
+        refusal(fixture.load_bytes(text.as_bytes())),
+        shape(Shape::DuplicateField)
+    );
+}
+
 #[test]
 fn routes_keep_the_transport_rules_and_bounded_timeouts() {
     let fixture = Fixture::new();

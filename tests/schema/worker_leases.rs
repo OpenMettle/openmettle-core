@@ -1140,9 +1140,16 @@ mod live_turns {
         })
     }
 
+    /// A packaged worker process and its probe address.
+    struct Packaged {
+        process: Process,
+        bind: String,
+    }
+
     /// The packaged `openmettle-worker` binary with one run slot and a version-1 inference
     /// document (ADR 0043) routing every catalog model to `provider` under the given gateway
-    /// installation and unseal key. Only the gateway's own address is opted in.
+    /// installation and unseal key, plus `settings` under its prefix. Only the gateway's own
+    /// address is opted in, and its routes accept the fixture's inline images.
     fn packaged_worker(
         db: &TestDb,
         dir: &Dir,
@@ -1150,7 +1157,8 @@ mod live_turns {
         provider: &Provider,
         installation: &str,
         (key_id, key_bytes): (&str, [u8; 32]),
-    ) -> Process {
+        settings: &[(&str, &str)],
+    ) -> Packaged {
         let mut document = crate::auth_config_support::inference_document(
             dir,
             catalog,
@@ -1164,11 +1172,13 @@ mod live_turns {
         });
         for route in document["routes"].as_object_mut().unwrap().values_mut() {
             route["private_cidrs"] = json!([provider.private_range()]);
+            route["images"] = json!(true);
         }
+        let bind = address();
         let mut command = binary("worker");
         command
             .env("OPENMETTLE_WORKER_DATABASE_URL", db.url(WORKER))
-            .env("OPENMETTLE_WORKER_BIND", address())
+            .env("OPENMETTLE_WORKER_BIND", &bind)
             .env(
                 "OPENMETTLE_WORKER_INFERENCE_CONFIG",
                 dir.write("inference.json", document.to_string().as_bytes()),
@@ -1180,38 +1190,52 @@ mod live_turns {
             ("EXECUTING_PER_ACTOR", "1"),
             ("EXECUTING_PER_SCOPE", "1"),
             ("POLL_MS", "100"),
-        ] {
+        ]
+        .into_iter()
+        .chain(settings.iter().copied())
+        {
             command.env(format!("OPENMETTLE_WORKER_{key}"), value);
         }
-        Process(command.spawn().unwrap())
+        Packaged {
+            process: Process(command.spawn().unwrap()),
+            bind,
+        }
     }
 
-    /// SIGTERM, then the exit status and complete stderr. The default 5-second shutdown budget
-    /// bounds the exit; the margin absorbs a loaded runner.
-    async fn terminate(mut process: Process) -> (std::process::ExitStatus, String) {
+    fn sigterm(process: &Process) {
         let pid = process.0.id().to_string();
-        assert!(
-            Command::new("kill")
-                .args(["-TERM", &pid])
-                .status()
-                .unwrap()
-                .success()
-        );
-        let exited = tokio::task::spawn_blocking(move || {
-            let mut stderr = String::new();
-            process
-                .0
-                .stderr
-                .take()
-                .unwrap()
-                .read_to_string(&mut stderr)
-                .unwrap();
-            (process.0.wait().unwrap(), stderr)
+        let sent = Command::new("kill").args(["-TERM", &pid]).status();
+        assert!(sent.unwrap().success());
+    }
+
+    /// The exit status and complete stderr. This function owns the child throughout: past the
+    /// deadline the panic drops the guard, which kills and reaps it, so a stuck worker fails
+    /// the test instead of hanging it. The default 5-second shutdown budget bounds a healthy
+    /// exit; the margin absorbs a loaded runner.
+    async fn exited(mut process: Process) -> (std::process::ExitStatus, String) {
+        let mut pipe = process.0.stderr.take().unwrap();
+        let stderr = tokio::task::spawn_blocking(move || {
+            let mut text = String::new();
+            let _ = pipe.read_to_string(&mut text);
+            text
         });
-        tokio::time::timeout(Duration::from_secs(10), exited)
-            .await
-            .expect("worker stopped within its shutdown budget")
-            .unwrap()
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = process.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker outlived its shutdown budget"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        (status, stderr.await.unwrap())
+    }
+
+    async fn terminate(process: Process) -> (std::process::ExitStatus, String) {
+        sigterm(&process);
+        exited(process).await
     }
 
     struct Chat {
@@ -1557,8 +1581,19 @@ mod live_turns {
             Process(child)
         }
 
-        async fn start_packaged(&self, provider: &Provider, dir: &Dir) -> Process {
+        async fn start_packaged(
+            &self,
+            provider: &Provider,
+            dir: &Dir,
+            settings: &[(&str, &str)],
+        ) -> Packaged {
             let (installation, key_id, key_bytes) = self.ensure_metered_gateway().await;
+            let root = self
+                .artifacts
+                .as_ref()
+                .map(|p| p.to_str().unwrap().to_owned());
+            let mut settings = settings.to_vec();
+            settings.extend(root.as_deref().map(|root| ("ARTIFACTS_DIR", root)));
             packaged_worker(
                 &self.f.db,
                 dir,
@@ -1566,6 +1601,7 @@ mod live_turns {
                 provider,
                 &installation,
                 (&key_id, key_bytes),
+                &settings,
             )
         }
 
@@ -2393,9 +2429,9 @@ mod live_turns {
     }
 
     /// ADR 0033 shutdown through the packaged binary (ADR 0043): SIGTERM during a sent metered
-    /// round closes the gateway request, hands the lease back at once and exits 0. A
-    /// replacement reclaims without waiting for expiry and sends the next round under a new
-    /// request ID; the handed-off round is never replayed.
+    /// round closes the gateway request, keeps answering probes while the run drains, hands the
+    /// lease back and exits 0. A replacement reclaims without waiting for expiry and sends the
+    /// next round under a new request ID; the handed-off round is never replayed.
     #[tokio::test]
     #[ignore = "isolated PostgreSQL 18, synthetic TLS gateway and TEST_GATEWAY_HOST"]
     async fn packaged_worker_hands_off_on_sigterm_and_a_replacement_completes() {
@@ -2403,16 +2439,38 @@ mod live_turns {
         let mut provider = Provider::packaged("synthetic-turn-credential").await;
         let (id, input) = chat.submit("packaged handoff", "a", 2).await;
         let dir = Dir::new();
-        let first = chat.start_packaged(&provider, &dir).await;
+        let first = chat.start_packaged(&provider, &dir, &[]).await;
         let mut sent = provider.request().await;
         assert_eq!(sent.path, "/v1/chat/completions");
         let sent_id = sent.request_id.take().expect("metered round x-request-id");
-        let (status, stderr) = terminate(first).await;
-        assert!(status.success(), "{stderr}");
-        assert!(!stderr.contains("synthetic-turn-credential"), "{stderr}");
+        // Hold the run row briefly (under the 2-second lock timeout) so the handoff waits
+        // inside the drain while the probe runs.
+        let mut holder = connect(&chat.f.db.0, OWNER).await;
+        let mut hold = holder.begin().await.unwrap();
+        sqlx::query("SELECT FROM openmettle.runs WHERE id = $1::uuid FOR NO KEY UPDATE")
+            .bind(&id)
+            .execute(&mut *hold)
+            .await
+            .unwrap();
+        sigterm(&first.process);
         tokio::time::timeout(Duration::from_secs(5), sent.reply.closed())
             .await
             .expect("stopped worker closed its gateway request");
+        // A server left unpolled during the drain would answer only after it, past the
+        // handoff's lock wait.
+        let bind = first.bind.clone();
+        let started = Instant::now();
+        let probe = tokio::task::spawn_blocking(move || http_status(&bind, "/healthz"));
+        assert_eq!(probe.await.unwrap().as_deref(), Some("HTTP/1.1 200 OK"));
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_millis(500),
+            "probe waited {waited:?}"
+        );
+        hold.rollback().await.unwrap();
+        let (status, stderr) = exited(first.process).await;
+        assert!(status.success(), "{stderr}");
+        assert!(!stderr.contains("synthetic-turn-credential"), "{stderr}");
         let (state, due): (String, bool) = sqlx::query_as(
             "SELECT state, lease_expires_at <= clock_timestamp() FROM openmettle.runs
               WHERE id = $1::uuid",
@@ -2423,7 +2481,7 @@ mod live_turns {
         .unwrap();
         assert_eq!((state.as_str(), due), ("running", true));
         assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
-        let _replacement = chat.start_packaged(&provider, &dir).await;
+        let _replacement = chat.start_packaged(&provider, &dir, &[]).await;
         let mut next = provider.request().await;
         let next_id = next.request_id.take().expect("metered round x-request-id");
         next.respond(completion(
@@ -2479,16 +2537,34 @@ mod live_turns {
         let mut provider = Provider::packaged("synthetic-turn-credential").await;
         let (id, input) = chat.submit("packaged crash", "a", 1).await;
         let dir = Dir::new();
-        let crashed = chat.start_packaged(&provider, &dir).await;
+        let crashed = chat.start_packaged(&provider, &dir, &[]).await;
         let mut sent = provider.request().await;
+        let holder = || async {
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT state, claim_token::text FROM openmettle.runs WHERE id = $1::uuid",
+            )
+            .bind(&id)
+            .fetch_one(&mut worker(&chat.f.db).await)
+            .await
+            .unwrap()
+        };
+        let claimed = holder().await;
+        assert_eq!(claimed.0, "running");
         drop(crashed); // SIGKILL and wait: no drain, handoff or settlement.
         tokio::time::timeout(Duration::from_secs(5), sent.reply.closed())
             .await
             .expect("killed worker disconnected");
-        let _replacement = chat.start_packaged(&provider, &dir).await;
-        // The replacement polls every 100 ms; the lapsed holder's lease still stands.
+        let _replacement = chat.start_packaged(&provider, &dir, &[]).await;
+        // The replacement polls every 100 ms; the dead holder's lease still stands. With one
+        // round a stolen claim would send nothing, so check the claim itself as well.
         let early = tokio::time::timeout(Duration::from_secs(2), provider.requests.recv()).await;
         assert!(early.is_err(), "replacement dispatched under a live lease");
+        assert_eq!(holder().await, claimed, "replacement took a live lease");
+        let reclaimed = events(&chat.f.db, &id)
+            .await
+            .iter()
+            .any(|e| e.2 == "openmettle.run-reclaimed");
+        assert!(!reclaimed, "replacement reclaimed a live lease");
         owner_exec(
             &chat.f.db,
             "UPDATE openmettle.runs SET lease_expires_at=clock_timestamp() WHERE id=$1::uuid",
@@ -2498,6 +2574,35 @@ mod live_turns {
         chat.done(&id, "failed", Some("round_limit")).await;
         assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
         assert!(provider.requests.try_recv().is_err());
+    }
+
+    /// Prompt assembly reads an image attachment on the connection it already holds, so the
+    /// smallest pool the worker accepts serves an image turn while the sweeps run beside it.
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18, synthetic TLS gateway and TEST_GATEWAY_HOST"]
+    async fn packaged_worker_reads_an_image_turn_on_a_single_connection_pool() {
+        let dir = Dir::new();
+        let (chat, _, _, revision) = shared_image_chat(&dir).await;
+        let mut provider = Provider::packaged("synthetic-turn-credential").await;
+        let parts = [Part::Text("describe".into()), Part::Attachment(revision)];
+        let (id, _) = chat.submit_parts("single connection", "a", 1, &parts).await;
+        let worker_dir = Dir::new();
+        let settings = [("DB_MAX_CONNECTIONS", "1"), ("SWEEP_MS", "1000")];
+        let worker = chat.start_packaged(&provider, &worker_dir, &settings).await;
+        let request = provider.request().await;
+        assert_eq!(
+            request.body["messages"].as_array().unwrap().last().unwrap()["content"],
+            json!([
+                {"type":"text","text":"describe"}, {"type":"image_url","image_url":{"url":"data:image/png;base64,cGl4ZWxz"}}
+            ])
+        );
+        request.respond(completion(json!("image received"), None, Value::Null));
+        chat.done(&id, "succeeded", None).await;
+        // Two sweep ticks share the single connection with the idle run loop.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let (status, stderr) = terminate(worker.process).await;
+        assert!(status.success(), "{stderr}");
+        assert!(!stderr.contains("worker.sweep.failed"), "{stderr}");
     }
 
     #[tokio::test]
@@ -4642,8 +4747,8 @@ mod live_turns {
         let (mut provider, worker_proc) = if packaged {
             let provider = Provider::packaged("metered-round-token").await;
             let key = ("metered-k1", KEY_BYTES);
-            let process = packaged_worker(&db, &worker_dir, &catalog, &provider, INSTALL, key);
-            (provider, process)
+            let worker = packaged_worker(&db, &worker_dir, &catalog, &provider, INSTALL, key, &[]);
+            (provider, worker.process)
         } else {
             let provider = Provider::with_bearer("metered-round-token".into()).await;
             let mut child = Command::new(worker_binary())

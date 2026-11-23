@@ -51,6 +51,31 @@ fn catalog_roundtrip_and_validation() {
     assert!(Catalog::load(br#"{"version":1,"revision":"empty","models":{},"presets":{}}"#).is_ok());
 }
 
+/// A JSON object keeps its last repeated member, so every catalog map refuses repeats instead
+/// of silently selecting one profile, preset or capability gate.
+#[test]
+fn repeated_map_members_are_refused() {
+    let mut doc: Value = serde_json::from_slice(FIXTURE).unwrap();
+    doc["models"]["a"]["required_capabilities"] = json!({"model.a": "on_by_default"});
+    let text = doc.to_string();
+    assert!(Catalog::load(text.as_bytes()).is_ok());
+    let mut other = doc["models"]["a"].clone();
+    other["pin"]["revision"] = json!("profile-a/2");
+    for (object, member, value) in [
+        ("models", "a", other.to_string()),
+        ("presets", "study", doc["presets"]["study"].to_string()),
+        ("required_capabilities", "model.a", "\"opt_in\"".to_owned()),
+    ] {
+        let opening = format!("\"{object}\":{{");
+        let repeated = text.replacen(&opening, &format!("{opening}\"{member}\":{value},"), 1);
+        assert_ne!(repeated, text, "{object}");
+        assert!(
+            matches!(Catalog::load(repeated.as_bytes()), Err(Error::Invalid(_))),
+            "{object}"
+        );
+    }
+}
+
 #[test]
 fn sources_instructions_selection_and_typed_project_settings() {
     let c = Catalog::load(FIXTURE).unwrap();

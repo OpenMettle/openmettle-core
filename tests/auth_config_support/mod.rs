@@ -174,3 +174,12 @@ pub fn inference_document(dir: &Dir, catalog: &Value, bundle: &[u8], authority: 
         "routes": routes
     })
 }
+
+/// `text` with `member: value` repeated at the start of the first `"object":{` map, so a loader
+/// that keeps the last of two equal keys can be told apart from one that refuses them.
+#[allow(dead_code)] // Only the catalog loader tests use it.
+pub fn repeated(text: &str, object: &str, member: &str, value: &str) -> String {
+    let opening = format!("\"{object}\":{{");
+    assert!(text.contains(&opening), "{object}");
+    text.replacen(&opening, &format!("{opening}\"{member}\":{value},"), 1)
+}

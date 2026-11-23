@@ -693,11 +693,22 @@ async fn serve(
     };
     telemetry::process_stopping(process, signal);
     let _ = stop_worker.send(());
-    background.await;
+    // The server keeps accepting probes while claimed runs drain. If it ends meanwhile, the
+    // drain still finishes and the server's result is reported afterwards.
+    let ended = tokio::select! {
+        () = &mut background => None,
+        result = &mut server => {
+            background.await;
+            Some(result)
+        }
+    };
     stream_stop.send_replace(true);
     let _ = stop_tx.send(());
     tokio::time::timeout(http_budget, async {
-        server.await.map_err(|_| ProcessFailure::Shutdown)?;
+        match ended {
+            Some(result) => result.map_err(|_| ProcessFailure::Server)?,
+            None => server.await.map_err(|_| ProcessFailure::Shutdown)?,
+        }
         // Both pools close within the deadline, so idle connections end cleanly before the
         // runtime is shut down.
         if let Some(issuance) = &issuance {

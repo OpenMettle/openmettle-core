@@ -65,7 +65,8 @@ Each route has these members:
 The document and every file it names are read once at startup, before telemetry, the listener
 or any database, DNS or network work. The loader reuses the ADR 0015 rules: absolute paths,
 regular files within bounds, symbolic links followed for projected volumes, duplicate JSON keys
-refused and strict members. Policy checks follow:
+refused and strict members. The catalog loader shared with the API also refuses a repeated
+member in any of its maps. Policy checks follow:
 
 - The routes name exactly the catalog's models.
 - Each route's `pin` equals its profile's `pin`.
@@ -85,12 +86,21 @@ before the send and the settlement inputs are the library's, unchanged.
 
 The worker offers no tools. Function, parallel-call and separator qualifications stay off until
 V1-14 wires reviewed tool rounds, and a model tool call fails the turn. With
-`OPENMETTLE_WORKER_ARTIFACTS_DIR`, the executor reads attachment revisions from that store.
+`OPENMETTLE_WORKER_ARTIFACTS_DIR`, the executor reads attachment revisions from that store, on
+the connection prompt assembly already holds.
 
-Shutdown follows ADR 0033. The run loop drains within half the drain budget while the probes
-keep serving. HTTP shutdown and the pool close use the rest. A round in flight at `SIGTERM`
-stops, and the lease is handed back for immediate re-claim. A round already handed to the
-gateway counts against the run's budget, and its request keeps its hold for usage settlement.
+No turn-path task waits for a second pooled connection while holding one, so every accepted
+`DB_MAX_CONNECTIONS` works, including 1, and no minimum is enforced. A claimed run uses at most
+two connections at a time (its step and its renewal), and the sweeps use one. At
+`2 × RUN_SLOTS + 1` connections nothing waits; below that, tasks queue for up to
+`DB_TIMEOUT_MS`, which `LEASE_MS` already covers six times.
+
+Shutdown follows ADR 0033. The run loop drains within half the drain budget while the HTTP
+server keeps answering probes. HTTP shutdown and the pool close use the rest. A round in
+flight at `SIGTERM` stops, and the lease is handed back for immediate re-claim. A run whose
+handoff outlasts its drain window is dropped, and its lease lapses, so another worker claims it
+after up to `LEASE_MS`. A round already handed to the gateway counts against the run's budget,
+and its request keeps its hold for usage settlement.
 
 ### Dispatch credential (provisional)
 
@@ -123,7 +133,8 @@ exercises (as in ADRs 0025 and 0031). To enable turns, deploy must:
 - set `RUN_SLOTS`, the ADR 0033 lease and claim settings and `INFERENCE_CONFIG`;
 - mount the document, the API's catalog file, any trust bundles and, provisionally, the gateway
   ring read-only;
-- allow egress from the worker to the gateway endpoints only;
+- limit the worker's inference egress to the gateway endpoints, keeping its PostgreSQL and
+  cluster DNS rules;
 - size `SHUTDOWN_TIMEOUT_MS` and the pod's termination grace period for the drain.
 
 ## Alternatives
@@ -150,10 +161,12 @@ exercises (as in ADRs 0025 and 0031). To enable turns, deploy must:
 
 ## Evidence
 
-- `src/worker/config/tests.rs`: strict shape, coverage, pins, device slots, transport rules,
-  timeout bounds, ring limits and value-free refusals.
+- `src/worker/config/tests.rs`: strict shape, repeated models and routes, coverage, pins,
+  device slots, transport rules, timeout bounds, ring limits and value-free refusals.
+- `tests/model_config.rs` and `src/auth_config/tests.rs`: repeated catalog members refused.
 - `tests/runtime.rs`: setting pairing and API refusal, refusals through the binary before any
   database contact, and a valid document that starts and stops cleanly.
 - `tests/schema/worker_leases.rs`, with PostgreSQL 18 and a synthetic TLS gateway on a private
   address: the API-admitted metered turn with quota holds, wire correlation, settlement ingest
-  and zero drift; `SIGTERM` handoff and re-claim; and `SIGKILL` lease exclusion without replay.
+  and zero drift; `SIGTERM` handoff and re-claim with a probe answered during the drain;
+  `SIGKILL` lease exclusion without replay; and an image turn on a one-connection pool.
