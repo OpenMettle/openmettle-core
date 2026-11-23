@@ -75,13 +75,24 @@
       "resource_kind",
       "threshold_pct",
       "dedupe_bucket",
-      "gateway.step"
+      "gateway.step",
+      "gateway.request_id"
     ],
     "events": [
       {
         "name": "gateway.failed",
         "levels": ["warn"],
         "fields": ["event", "gateway.step", "error.type"]
+      },
+      {
+        "name": "gateway.usage.unrecorded",
+        "levels": ["warn"],
+        "fields": ["event", "gateway.request_id", "error.type"]
+      },
+      {
+        "name": "gateway.usage.failed",
+        "levels": ["error"],
+        "fields": ["event", "gateway.request_id", "error.type"]
       },
       {
         "name": "quota.warning",

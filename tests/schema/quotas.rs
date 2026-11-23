@@ -1,6 +1,6 @@
 use super::*;
 
-struct TurnHandoffFixture {
+pub(super) struct TurnHandoffFixture {
     installation: String,
     catalog: openmettle_core::model_config::Catalog,
     effective: openmettle_core::model_config::Effective,
@@ -94,7 +94,7 @@ impl TurnHandoffFixture {
         }
     }
 
-    fn chat(
+    pub(super) fn chat(
         installation: &str,
         model: &str,
         round_tokens: i64,
@@ -111,7 +111,7 @@ impl TurnHandoffFixture {
         )
     }
 
-    fn billable(&self) -> openmettle_core::provider_http::BillableInferenceRef<'_> {
+    pub(super) fn billable(&self) -> openmettle_core::provider_http::BillableInferenceRef<'_> {
         openmettle_core::provider_http::BillableInferenceRef {
             installation: &self.installation,
             route: &self.route,
@@ -122,7 +122,7 @@ impl TurnHandoffFixture {
         self.prepare_mode(true)
     }
 
-    fn prepare_mode(
+    pub(super) fn prepare_mode(
         &self,
         server: bool,
     ) -> openmettle_core::provider_http::inference::PreparedRequest<'_> {

@@ -6,7 +6,7 @@ mod json;
 mod request;
 mod responses;
 mod schema;
-mod stream;
+pub(crate) mod stream;
 mod turn;
 
 pub use request::{History, ImageType, Request, Tool};

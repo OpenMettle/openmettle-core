@@ -82,14 +82,18 @@ struct QuotaDetail {
 
 /// One ADR 0007 problem category: a status, a stable code and a fixed, safe detail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Problem {
+pub(crate) struct Problem {
     status: StatusCode,
     code: &'static str,
     detail: &'static str,
     quota: Option<QuotaDetail>,
 }
 
-const fn problem(status: StatusCode, code: &'static str, detail: &'static str) -> Problem {
+pub(crate) const fn problem(
+    status: StatusCode,
+    code: &'static str,
+    detail: &'static str,
+) -> Problem {
     Problem {
         status,
         code,
@@ -188,7 +192,7 @@ const PROVISIONING: Problem = problem(
 );
 
 impl Problem {
-    fn response(self, id: Option<RequestId>) -> Response {
+    pub(crate) fn response(self, id: Option<RequestId>) -> Response {
         let mut body = json!({
             "type": "about:blank",
             "title": self.status.canonical_reason().unwrap_or("Error"),

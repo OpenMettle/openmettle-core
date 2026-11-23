@@ -67,6 +67,7 @@ pub const FIELDS: &[&str] = &[
     "threshold_pct",
     "dedupe_bucket",
     "gateway.step",
+    "gateway.request_id",
 ];
 
 /// The only field names [`SpanGuard`] admits: the request span's. `otel.kind` is consumed by
@@ -366,6 +367,7 @@ pub enum Process {
     Api,
     Worker,
     Migrate,
+    Gateway,
 }
 
 impl Process {
@@ -374,6 +376,7 @@ impl Process {
             Self::Api => "api",
             Self::Worker => "worker",
             Self::Migrate => "migrate",
+            Self::Gateway => "gateway",
         }
     }
 }
@@ -745,6 +748,65 @@ pub fn migration_interrupted(signal: Signal) {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// Why the gateway proxy wrote no usage report for a request it relayed. The hold stays as it
+/// was; explicit incomplete reports are a later increment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsageGap {
+    /// The upstream answered with a status other than 200.
+    UpstreamStatus,
+    /// The upstream could not be reached, or the exchange failed before a response head.
+    UpstreamTransport,
+    /// Connecting, or waiting for the head or the next body bytes, took too long.
+    UpstreamTimeout,
+    /// The body ended early or without the stream's `[DONE]` event.
+    Incomplete,
+    /// The caller left before the upstream's usage was read.
+    CallerDisconnected,
+    /// The response completed without a usage object.
+    NoUsage,
+    /// The response exceeded a parse bound or its usage could not be read.
+    Unparsable,
+}
+
+impl UsageGap {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UpstreamStatus => "upstream_status",
+            Self::UpstreamTransport => "upstream_transport",
+            Self::UpstreamTimeout => "upstream_timeout",
+            Self::Incomplete => "incomplete",
+            Self::CallerDisconnected => "caller_disconnected",
+            Self::NoUsage => "no_usage",
+            Self::Unparsable => "unparsable",
+        }
+    }
+}
+
+/// A gateway request identifier, recorded only in canonical lowercase UUID form. The proxy
+/// accepts one only after finding it as a handed-off request in the database.
+fn gateway_request(id: &str) -> Option<&str> {
+    crate::runs::is_canonical_uuid(id).then_some(id)
+}
+
+/// The gateway proxy relayed `request` but observed no usage to report.
+pub(crate) fn gateway_usage_unrecorded(request: &str, gap: UsageGap) {
+    tracing::warn!(target: TARGET, event = "gateway.usage.unrecorded",
+        "gateway.request_id" = gateway_request(request), "error.type" = gap.as_str());
+}
+
+/// The gateway proxy observed usage for `request` but could not store it, after bounded
+/// retries of a transient failure. `error`, so every configured level shows it.
+pub(crate) fn gateway_usage_failed(request: &str, error: &crate::authz::gateway::Error) {
+    use crate::authz::gateway::Error;
+    let cause = match error {
+        Error::Database | Error::Retryable => "database",
+        Error::Refused | Error::Protection => "refused",
+        Error::Conflict => "conflict",
+    };
+    tracing::error!(target: TARGET, event = "gateway.usage.failed",
+        "gateway.request_id" = gateway_request(request), "error.type" = cause);
+}
 
 pub fn gateway_failure(step: metrics::GatewayStep, cause: metrics::GatewayCause) {
     metrics::global().record_gateway_failure(step, cause);

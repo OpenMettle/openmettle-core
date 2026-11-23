@@ -5,7 +5,8 @@
 //! and replayable event streams require cursor keys in the auth document (ADR 0034).
 //! The worker runs maintenance sweeps; with `OPENMETTLE_WORKER_RUN_SLOTS` and an
 //! `OPENMETTLE_WORKER_INFERENCE_CONFIG` document it also executes metered turn rounds
-//! (ADRs 0033 and 0043).
+//! (ADRs 0033 and 0043). The gateway forwards chat completions to one upstream and records
+//! their usage ([`gateway_proxy`]); it is not yet deployable.
 pub mod artifact_fs;
 pub mod auth;
 pub mod auth_config;
@@ -13,6 +14,7 @@ pub mod authz;
 pub mod browser_auth;
 pub mod capabilities;
 pub mod capacity;
+pub mod gateway_proxy;
 pub mod grants;
 pub mod invitation;
 pub mod login;
@@ -46,6 +48,8 @@ use telemetry::{Process, ProcessFailure, Signal};
 pub enum Role {
     Api,
     Worker,
+    /// `openmettle-gateway` ([`gateway_proxy`]).
+    Gateway,
 }
 
 /// Validated ADR 0033 settings. A run policy needs an executor: the binary builds the packaged
@@ -159,6 +163,8 @@ struct Config {
     /// `OPENMETTLE_WORKER_INFERENCE_CONFIG` (ADR 0043): the worker's inference document, set
     /// exactly when `RUN_SLOTS` is. Always `None` for the API.
     inference_config: Option<PathBuf>,
+    /// The gateway's upstream settings; `Some` exactly for the gateway.
+    gateway: Option<gateway_proxy::Settings>,
 }
 
 /// ADR 0030: the API's issuance credential, mounted into the API container only.
@@ -225,6 +231,10 @@ impl Config {
                 refuse_issuance_url()?;
                 "OPENMETTLE_WORKER"
             }
+            Role::Gateway => {
+                refuse_issuance_url()?;
+                "OPENMETTLE_GATEWAY"
+            }
         };
         let mut config = Self::parse(role, |key| env_var(prefix, key))?;
         match role {
@@ -254,6 +264,9 @@ impl Config {
                 config.inference_config = path;
                 config.worker = Some(settings);
             }
+            Role::Gateway => {
+                config.gateway = Some(gateway_proxy::Settings::parse(|key| env_var(prefix, key))?);
+            }
         }
         Ok(config)
     }
@@ -265,6 +278,7 @@ impl Config {
         let port = match role {
             Role::Api => 8080,
             Role::Worker => 8081,
+            Role::Gateway => 8082,
         };
         let bind = get("BIND")?
             .unwrap_or_else(|| format!("127.0.0.1:{port}"))
@@ -279,8 +293,11 @@ impl Config {
             Duration::from_millis(number("SHUTDOWN_TIMEOUT_MS", 5000, 60000)?.into());
         let telemetry = telemetry::Settings::parse(&get)?;
         let otlp = telemetry::otlp::Settings::parse(&get)?;
-        // Both processes; a set value is never treated as unset.
-        let artifacts_dir = get("ARTIFACTS_DIR")?.map(PathBuf::from);
+        // The API and the worker; a set value is never treated as unset.
+        let artifacts_dir = match role {
+            Role::Api | Role::Worker => get("ARTIFACTS_DIR")?.map(PathBuf::from),
+            Role::Gateway => None,
+        };
         if artifacts_dir
             .as_deref()
             .is_some_and(|path| !path.is_absolute())
@@ -291,7 +308,7 @@ impl Config {
         // value is never treated as unset: empty or relative is refused, as the loader would.
         let auth_config = match role {
             Role::Api => get("AUTH_CONFIG")?.map(PathBuf::from),
-            Role::Worker => None,
+            Role::Worker | Role::Gateway => None,
         };
         if auth_config
             .as_deref()
@@ -303,7 +320,7 @@ impl Config {
         // different resolved user than the primary pool, including users filled from `PG*`
         // defaults. Read after `AUTH_CONFIG`, and by the API alone.
         let issuance = match role {
-            Role::Worker => None,
+            Role::Worker | Role::Gateway => None,
             Role::Api => match (get("ISSUANCE_DATABASE_URL")?, &auth_config) {
                 (Some(_), None) => return Err("ISSUANCE_DATABASE_URL requires AUTH_CONFIG"),
                 (None, Some(_)) => {
@@ -341,6 +358,7 @@ impl Config {
             issuance,
             artifacts_dir,
             inference_config: None,
+            gateway: None,
         })
     }
 }
@@ -479,6 +497,7 @@ pub async fn run(role: Role) -> u8 {
     let process = match role {
         Role::Api => Process::Api,
         Role::Worker => Process::Worker,
+        Role::Gateway => Process::Gateway,
     };
     // Configuration errors precede telemetry, whose own settings may be the invalid ones:
     // they stay one fixed stderr line that names a key or category, never a value.
@@ -549,6 +568,14 @@ pub async fn run(role: Role) -> u8 {
             return 78;
         }
     };
+    let (app, relays) = match config.gateway.clone() {
+        Some(settings) => {
+            let (proxy, relays) =
+                gateway_proxy::router(settings, pool.clone(), config.database_timeout);
+            (app.merge(proxy), Some(relays))
+        }
+        None => (app, None),
+    };
     let telemetry = match telemetry::install(config.telemetry, process, export) {
         Ok(telemetry) => telemetry,
         Err(unavailable) => {
@@ -575,7 +602,18 @@ pub async fn run(role: Role) -> u8 {
         store: artifacts,
     });
     let (drain, flush) = shutdown_budget(config.shutdown_timeout);
-    let code = match serve(config.bind, app, pool, issuance, process, drain, worker).await {
+    let code = match serve(
+        config.bind,
+        app,
+        pool,
+        issuance,
+        process,
+        drain,
+        worker,
+        relays,
+    )
+    .await
+    {
         Ok(()) => {
             telemetry::process_stopped(process);
             0
@@ -639,6 +677,9 @@ impl WorkerRuntime {
     }
 }
 
+/// `relays` are the gateway's running relay tasks: after the listener has drained, shutdown
+/// waits for them to write their reports before the pools close.
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     bind: SocketAddr,
     app: Router,
@@ -647,6 +688,7 @@ async fn serve(
     process: Process,
     drain: Duration,
     worker: Option<WorkerRuntime>,
+    relays: Option<gateway_proxy::Relays>,
 ) -> Result<(), ProcessFailure> {
     // Install signal handlers before opening the listener.
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -708,6 +750,9 @@ async fn serve(
         match ended {
             Some(result) => result.map_err(|_| ProcessFailure::Server)?,
             None => server.await.map_err(|_| ProcessFailure::Shutdown)?,
+        }
+        if let Some(relays) = &relays {
+            relays.idle().await;
         }
         // Both pools close within the deadline, so idle connections end cleanly before the
         // runtime is shut down.

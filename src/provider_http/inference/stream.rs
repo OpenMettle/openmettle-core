@@ -1,14 +1,15 @@
-//! Lines and events are bounded before growth. UTF-8 is validated after a complete line.
+//! Lines and events are bounded before growth. UTF-8 is validated after a complete line. The
+//! worker decoder and the gateway proxy's usage reader share this framing.
 use super::Error;
 
 const LINE: usize = 128 * 1024;
 const EVENT: usize = 256 * 1024;
-pub(super) struct Event {
+pub(crate) struct Event {
     pub name: Option<String>,
     pub data: Vec<u8>,
 }
 #[derive(Default)]
-pub(super) struct Sse {
+pub(crate) struct Sse {
     line: Vec<u8>,
     data: Vec<u8>,
     name: Option<String>,

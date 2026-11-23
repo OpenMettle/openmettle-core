@@ -26,6 +26,11 @@ path = "src/bin/migrate.rs"
 name = "openmettle-admin"
 path = "src/bin/admin.rs"
 
+# Increment 1 of OpenMettle's own inference proxy; not yet deployable (docs/operator/gateway-proxy.md).
+[[bin]]
+name = "openmettle-gateway"
+path = "src/bin/gateway.rs"
+
 [lints.rust]
 unsafe_code = "forbid"
 
