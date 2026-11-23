@@ -372,17 +372,15 @@ fn dispatch_credential(
 }
 
 /// Transmit a committed dispatch through `prepared`'s originating [`inference::Gateway`] with the
-/// single-use `Authorization` credential and `x-request-id` correlation header. A leased server
-/// send requires `run`; a caller-session send must not supply one.
+/// single-use `Authorization` credential and `x-request-id` correlation header. Callers construct
+/// the dispatch only after `validate_dispatch` matched its mode to `prepared`, and the gateway
+/// rejects a `prepared` mode that differs from `run`.
 async fn transmit<F: Future<Output = ()>>(
     dispatch: Dispatch,
     prepared: inference::PreparedRequest<'_>,
     run: Option<inference::RunStop>,
     visible: impl FnMut(inference::VisibleDelta) -> F,
 ) -> Result<inference::Turn, inference::Error> {
-    if dispatch.server != run.is_some() || prepared.is_server() != run.is_some() {
-        return Err(inference::Error::Credential);
-    }
     let gateway = prepared.gateway();
     let (id, cred) = dispatch_credential(&dispatch)?;
     transport::BILLABLE_REQUEST
@@ -395,9 +393,9 @@ async fn transmit<F: Future<Output = ()>>(
         .await
 }
 
-/// Single-use committed turn handoff bound to its originating inference route and prepared
-/// wire payload. Consumed by [`Self::send`] so the dispatched credential and `x-request-id`
-/// cannot be redirected to a different gateway endpoint.
+/// Single-use committed leased server-run handoff bound to its originating inference route and
+/// prepared wire payload. Consumed by [`Self::send`] so the dispatched credential and
+/// `x-request-id` cannot be redirected to a different gateway endpoint.
 pub struct TurnDispatch<'a> {
     dispatch: Dispatch,
     prepared: inference::PreparedRequest<'a>,
@@ -419,35 +417,41 @@ impl<'a> TurnDispatch<'a> {
     }
 }
 
-/// Single-use committed billable handoff returned by [`crate::authz::gateway::Pending::handoff`],
-/// bound to its originating inference route and the prepared wire payload whose token, output and
-/// cost bounds were checked against the funded reservation. Consumed by [`Self::send_caller`] or
-/// [`Self::send_server`] so the dispatched credential and `x-request-id` cannot be redirected.
-pub struct BillableDispatch<'a> {
+/// Single-use committed caller-session handoff bound to its originating inference route and
+/// prepared wire payload. Consumed by [`Self::send`].
+pub struct CallerDispatch<'a> {
     dispatch: Dispatch,
     prepared: inference::PreparedRequest<'a>,
 }
 
-impl<'a> BillableDispatch<'a> {
-    pub(crate) fn new(dispatch: Dispatch, prepared: inference::PreparedRequest<'a>) -> Self {
-        Self { dispatch, prepared }
-    }
-
-    /// Transmit a committed caller-session request; a leased handoff returns `Credential`.
-    pub async fn send_caller<F: Future<Output = ()>>(
+impl CallerDispatch<'_> {
+    /// Transmit the committed caller-session request through its originating
+    /// [`inference::Gateway`] with the single-use credential and `x-request-id` header.
+    pub async fn send<F: Future<Output = ()>>(
         self,
         visible: impl FnMut(inference::VisibleDelta) -> F,
     ) -> Result<inference::Turn, inference::Error> {
         transmit(self.dispatch, self.prepared, None, visible).await
     }
+}
 
-    /// Transmit a committed leased server-run request; a caller handoff returns `Credential`.
-    pub async fn send_server<F: Future<Output = ()>>(
-        self,
-        run: inference::RunStop,
-        visible: impl FnMut(inference::VisibleDelta) -> F,
-    ) -> Result<inference::Turn, inference::Error> {
-        transmit(self.dispatch, self.prepared, Some(run), visible).await
+/// Single-use committed billable handoff returned by [`crate::authz::gateway::Pending::handoff`],
+/// bound to its originating inference route and the prepared wire payload whose token, output and
+/// cost bounds were checked against the funded reservation. The variant follows the validated
+/// request mode, so a committed handoff exposes only the matching send operation.
+pub enum BillableDispatch<'a> {
+    Caller(CallerDispatch<'a>),
+    Server(TurnDispatch<'a>),
+}
+
+impl<'a> BillableDispatch<'a> {
+    /// Wrap a dispatch whose mode `validate_dispatch` already matched to `prepared`.
+    pub(crate) fn new(dispatch: Dispatch, prepared: inference::PreparedRequest<'a>) -> Self {
+        if prepared.is_server() {
+            Self::Server(TurnDispatch::new(dispatch, prepared))
+        } else {
+            Self::Caller(CallerDispatch { dispatch, prepared })
+        }
     }
 }
 

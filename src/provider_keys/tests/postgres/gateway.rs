@@ -407,14 +407,16 @@ async fn recovered_user_key_dispatches_only_after_acknowledged_commits_on_each_l
                         .handoff(&proxy, &ring, &client.as_ref(), prepared)
                         .await
                         .unwrap();
-                    if server {
-                        ticket
-                            .send_server(RunStop::from_worker(&active, rx.clone()), |_| async {})
+                    match ticket {
+                        gateway::BillableDispatch::Server(d) if server => d
+                            .send(RunStop::from_worker(&active, rx.clone()), |_| async {})
                             .await
-                            .unwrap();
-                    } else {
-                        ticket.send_caller(|_| async {}).await.unwrap();
-                    }
+                            .unwrap(),
+                        gateway::BillableDispatch::Caller(d) if !server => {
+                            d.send(|_| async {}).await.unwrap()
+                        }
+                        _ => panic!("handoff mode must follow the authority"),
+                    };
                 })
                 .await;
                 proxy.close().await;
@@ -439,14 +441,16 @@ async fn recovered_user_key_dispatches_only_after_acknowledged_commits_on_each_l
             .unwrap();
             assert_eq!(state, "handed_off");
             assert_eq!(peer.requests.load(Ordering::SeqCst), idx);
-            if server {
-                ticket
-                    .send_server(RunStop::from_worker(&active, rx.clone()), |_| async {})
+            match ticket {
+                gateway::BillableDispatch::Server(d) if server => d
+                    .send(RunStop::from_worker(&active, rx.clone()), |_| async {})
                     .await
-                    .unwrap();
-            } else {
-                ticket.send_caller(|_| async {}).await.unwrap();
-            }
+                    .unwrap(),
+                gateway::BillableDispatch::Caller(d) if !server => {
+                    d.send(|_| async {}).await.unwrap()
+                }
+                _ => panic!("handoff mode must follow the authority"),
+            };
             assert_eq!(peer.requests.load(Ordering::SeqCst), idx + 1);
             assert!(
                 peer.heads.lock().unwrap()[idx]

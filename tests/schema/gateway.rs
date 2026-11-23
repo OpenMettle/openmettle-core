@@ -821,7 +821,7 @@ async fn handoff_rechecks_authority_and_only_a_released_run_round_can_retry() {
         .unwrap()
     );
     assert!(gateway::reserve(&worker, round(1, LEASE)).await.is_err());
-    let p = gateway::reserve(&worker, round(1, &claim.claim_token))
+    let mut p = gateway::reserve(&worker, round(1, &claim.claim_token))
         .await
         .unwrap();
     assert_ne!(p.id, first);
@@ -852,9 +852,30 @@ async fn handoff_rechecks_authority_and_only_a_released_run_round_can_retry() {
             .await,
         Err(gateway::Error::Refused)
     ));
-    p.handoff(&worker, &ring, &fx.billable(), fx.prepare(true))
+    // The marker carries the database-canonical id, so an equivalent noncanonical spelling of
+    // `Pending::id` (braced, uppercase) still resolves to this request and is still refused.
+    let spelled = format!("{{{}}}", p.id.to_uppercase());
+    let canonical = std::mem::replace(&mut p.id, spelled);
+    assert!(matches!(
+        p.handoff(&worker, &ring, &dev_fx.billable(), dev_fx.prepare(true))
+            .await,
+        Err(gateway::Error::Refused)
+    ));
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.gateway_requests WHERE id=$1::uuid")
+            .bind(&canonical)
+            .fetch_one(&g)
+            .await
+            .unwrap();
+    assert_eq!(state, "reserved");
+    p.id = canonical;
+    let gateway::BillableDispatch::Server(_) = p
+        .handoff(&worker, &ring, &fx.billable(), fx.prepare(true))
         .await
-        .unwrap();
+        .unwrap()
+    else {
+        panic!("a leased handoff must yield BillableDispatch::Server");
+    };
     assert!(!p.release(&worker).await.unwrap());
     assert_eq!(
         sqlstate(insert_round(&scope).execute(&worker).await),

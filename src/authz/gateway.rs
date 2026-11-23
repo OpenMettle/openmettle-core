@@ -201,7 +201,7 @@ pub struct TurnRound<'a> {
     pub requires_device_slot: bool,
 }
 
-pub use crate::provider_http::{BillableDispatch, TurnDispatch};
+pub use crate::provider_http::{BillableDispatch, CallerDispatch, TurnDispatch};
 
 /// Owned unsent turn-round reservation handle. Never cloned or serialized.
 pub struct TurnPending {
@@ -649,7 +649,9 @@ impl Pending<'_> {
     /// and device-slot requests are marked so the deferred `enforce_gateway_handoff_holds` trigger
     /// raises `OMQ04` when a cost limit or required device hold is missing at commit. Every refusal
     /// rolls back and leaves the request `reserved` for [`Self::release`]. Returns a single-use
-    /// [`BillableDispatch`] bound to `prepared`'s originating gateway.
+    /// [`BillableDispatch`] bound to `prepared`'s originating gateway: `Server` for a lease,
+    /// `Caller` for a session. Markers carry the database-canonical request id so a rewritten
+    /// spelling of [`Self::id`] cannot evade the trigger.
     pub async fn handoff<'p>(
         &self,
         pool: &PgPool,
@@ -686,7 +688,7 @@ impl Pending<'_> {
             ] {
                 if mark {
                     sqlx::query(
-                        "SELECT set_config($1, coalesce(current_setting($1, true), '') || ',' || $2 || ',', true)",
+                        "SELECT set_config($1, coalesce(current_setting($1, true), '') || ',' || $2::uuid::text || ',', true)",
                     )
                     .bind(setting)
                     .bind(&self.id)

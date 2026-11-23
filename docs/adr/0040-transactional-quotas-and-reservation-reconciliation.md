@@ -4093,7 +4093,11 @@ against the V1-17 PR2 schema are protected across four fail-closed database and 
    (rolling back both `gateway_requests` to `'reserved'` and the `quota_gateway_handoffs` insert)
    or marks the uncommitted receipt `metering_enforced = true` (zero additional table/FK locks) so
    post-activation `quota_recover_lost_handoff` still recognizes pre-activation unmetered handoffs
-   and bound holds already transitioned to `'settled'` cleanly.
+   and bound holds already transitioned to `'settled'` cleanly. Run `device_reservations` holds
+   are V1-17 metered quota holds under the same contract: admission, `quota_prepare_turn_round`
+   and request binding create or require them only after activation, so the trigger refuses a
+   device-slot request without a granted, `'handoff_committed'` run device hold only when
+   `v_enforced = true`, while an existing run device hold must carry its grant in both states.
 2. **Unconditional `quota_lock_gateway_request_for_settlement` rollout guarantee across all
    `gateway_settlements` writers.** Every `openmettle_gateway` write transaction that inserts or
    updates `openmettle.gateway_settlements` — **both** settlement-only transactions **and**

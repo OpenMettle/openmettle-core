@@ -3819,6 +3819,157 @@ async fn pre_activation_charged_parents_pre26_replay_savepoint_and_n1_legacy_hol
     .unwrap();
     assert_eq!(drift, (0, 0, 0, 0));
 
+    // A4: Device-slot quota holds activate with metering (ADR 0040). Before activation a leased,
+    // token-funded legacy Pending::handoff for a device-slot profile commits without a run
+    // device_reservations hold; once metering_enforced flips, the same shape is refused with
+    // the request left reserved and releasable.
+    let dev_fx = TurnHandoffFixture::chat(INSTALL, "a", 100, Some(50), true);
+    let mut dev_runs = Vec::new();
+    for key in ["preact-device-before", "preact-device-after"] {
+        let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+        let Admission::Admitted { run_id, .. } = authz_queue::admit_run(
+            &mut tx,
+            &RunAdmission {
+                input: RunInput {
+                    scope: &scope,
+                    actor: &alice.user,
+                    conversation: &chat,
+                    branch: &branch,
+                    message: &msg,
+                    key,
+                    format: "openmettle.conversation",
+                    version: 1,
+                    input: b"{}",
+                    config: br#"{"effective":{"ceiling":{"value":100}}}"#,
+                },
+                actor_approval_id: &alice.approval,
+                capabilities: &[],
+                requested_rounds: Some(1),
+                now_ms: authz_store::NOW,
+                cost_qualified: Some(true),
+            },
+            &limits,
+        )
+        .await
+        .unwrap() else {
+            panic!("expected device admission");
+        };
+        tx.commit().await.unwrap();
+        let claim = authz_queue::claim_next(&mut worker, &claim_cfg, &lease_cfg)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.run_id, run_id);
+        dev_runs.push(claim);
+    }
+    fn device_call<'a>(
+        claim: &'a authz_queue::ClaimedRun,
+        scope: &'a str,
+        actor: &'a str,
+        approval: &'a str,
+    ) -> Call<'a> {
+        Call {
+            reservation: Reservation {
+                id: &claim.run_id,
+                scope_id: scope,
+                actor,
+                approval,
+            },
+            installation: INSTALL,
+            model: "a",
+            units: 100,
+            authority: Authority::Lease {
+                run: &claim.run_id,
+                round: 1,
+                token: &claim.claim_token,
+            },
+        }
+    }
+    /// (request state, usage_tokens child holds, run device_reservations holds)
+    async fn device_state(
+        owner: &mut sqlx::PgConnection,
+        request: &str,
+        run: &str,
+    ) -> (String, i64, i64) {
+        sqlx::query_as(
+            "SELECT (SELECT state FROM openmettle.gateway_requests WHERE id = $1::uuid),
+                    (SELECT count(*) FROM openmettle.quota_reservations
+                      WHERE gateway_request_id = $1::uuid AND resource_kind = 'usage_tokens'),
+                    (SELECT count(*) FROM openmettle.quota_reservations
+                      WHERE run_id = $2::uuid AND resource_kind = 'device_reservations')",
+        )
+        .bind(request)
+        .bind(run)
+        .fetch_one(owner)
+        .await
+        .unwrap()
+    }
+    let p_before = gateway::reserve_with_cost(
+        &worker_pool,
+        device_call(&dev_runs[0], &scope, &alice.user, &alice.approval),
+        Some(50),
+    )
+    .await
+    .unwrap();
+    let gateway::BillableDispatch::Server(_) = p_before
+        .handoff(&worker_pool, &keys, &dev_fx.billable(), dev_fx.prepare())
+        .await
+        .unwrap()
+    else {
+        panic!("a leased handoff must yield BillableDispatch::Server");
+    };
+    assert_eq!(
+        device_state(&mut owner, &p_before.id, &dev_runs[0].run_id).await,
+        ("handed_off".into(), 1, 0)
+    );
+    owner
+        .execute(
+            "UPDATE openmettle.quota_enforcement
+                SET metering_enforced = true, metering_enforced_at = clock_timestamp()
+              WHERE id AND NOT metering_enforced",
+        )
+        .await
+        .unwrap();
+    let p_after = gateway::reserve_with_cost(
+        &worker_pool,
+        device_call(&dev_runs[1], &scope, &alice.user, &alice.approval),
+        Some(50),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        p_after
+            .handoff(&worker_pool, &keys, &dev_fx.billable(), dev_fx.prepare())
+            .await,
+        Err(gateway::Error::Refused)
+    ));
+    assert_eq!(
+        device_state(&mut owner, &p_after.id, &dev_runs[1].run_id).await,
+        ("reserved".into(), 1, 0)
+    );
+    assert!(p_after.release(&worker_pool).await.unwrap());
+    // The refusal is the device-slot check: the released round retries with a non-device profile.
+    let plain_fx = TurnHandoffFixture::chat(INSTALL, "a", 100, Some(50), false);
+    let p_retry = gateway::reserve_with_cost(
+        &worker_pool,
+        device_call(&dev_runs[1], &scope, &alice.user, &alice.approval),
+        Some(50),
+    )
+    .await
+    .unwrap();
+    let gateway::BillableDispatch::Server(_) = p_retry
+        .handoff(
+            &worker_pool,
+            &keys,
+            &plain_fx.billable(),
+            plain_fx.prepare(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("a leased handoff must yield BillableDispatch::Server");
+    };
+
     // Part B (P2 #4 / #5): On schema 25 (pre-0026 fallback without helper), exact replay backfill
     // on a queued run with an existing gateway_reservations row (id <> run_id, units = 300) under a
     // 400-token limit when replay passes recomputed token_units = 500 rolls back the savepoint on

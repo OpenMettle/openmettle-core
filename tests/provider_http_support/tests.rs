@@ -1011,7 +1011,7 @@ async fn turn_dispatch_sends_to_originating_gateway_with_bound_request_id() {
 }
 
 #[tokio::test]
-async fn billable_dispatch_enforces_mode_and_output_cap() {
+async fn billable_dispatch_follows_mode_and_requires_output_cap() {
     use crate::{
         model_config::{Catalog, Selection},
         provider_http::{
@@ -1145,41 +1145,24 @@ async fn billable_dispatch_enforces_mode_and_output_cap() {
         execution_deadline: tokio::time::Instant::now() + Duration::from_secs(10),
     };
 
-    // Mode mismatch rejects before any network I/O.
-    let bad_caller = BillableDispatch::new(
-        mk_dispatch(true),
-        billable.prepare(&catalog, &valid_eff, &req, true).unwrap(),
-    );
-    assert_eq!(
-        bad_caller.send_caller(|_| async {}).await.err(),
-        Some(crate::provider_http::inference::Error::Credential)
-    );
-    let bad_server = BillableDispatch::new(
+    // The validated request mode selects the variant, so each committed dispatch exposes only
+    // its matching send and each transmits once with x-request-id.
+    let BillableDispatch::Caller(caller) = BillableDispatch::new(
         mk_dispatch(false),
         billable.prepare(&catalog, &valid_eff, &req, false).unwrap(),
-    );
-    assert_eq!(
-        bad_server
-            .send_server(RunStop::from_worker(&run, stop_rx.clone()), |_| async {})
-            .await
-            .err(),
-        Some(crate::provider_http::inference::Error::Credential)
-    );
-    assert_eq!(server.requests.load(Ordering::SeqCst), 0);
-
-    // Matching caller and server dispatches transmit once each with x-request-id.
-    let ok_caller = BillableDispatch::new(
-        mk_dispatch(false),
-        billable.prepare(&catalog, &valid_eff, &req, false).unwrap(),
-    );
-    let caller_turn = ok_caller.send_caller(|_| async {}).await.unwrap();
+    ) else {
+        panic!("a caller-mode request must yield BillableDispatch::Caller");
+    };
+    let caller_turn = caller.send(|_| async {}).await.unwrap();
     assert_eq!(caller_turn.answers[0].parts, ["billable ok"]);
-    let ok_server = BillableDispatch::new(
+    let BillableDispatch::Server(leased) = BillableDispatch::new(
         mk_dispatch(true),
         billable.prepare(&catalog, &valid_eff, &req, true).unwrap(),
-    );
-    let server_turn = ok_server
-        .send_server(RunStop::from_worker(&run, stop_rx), |_| async {})
+    ) else {
+        panic!("a server-mode request must yield BillableDispatch::Server");
+    };
+    let server_turn = leased
+        .send(RunStop::from_worker(&run, stop_rx), |_| async {})
         .await
         .unwrap();
     assert_eq!(server_turn.answers[0].parts, ["billable ok"]);
