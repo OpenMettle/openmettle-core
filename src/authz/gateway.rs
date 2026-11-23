@@ -210,6 +210,15 @@ pub struct TurnPending {
     cost_bound_missing: bool,
     requires_device_slot: bool,
     pub(crate) enforced_at_bind: bool,
+    pub(crate) cost_bound_at_bind: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TurnHandoffError {
+    /// Deferred `OMQ04` rolled back `handoff` pre-dispatch because enforcement or the first
+    /// applicable cost limit activated after `reserve_turn_round` bound without the required hold.
+    MissingHold,
+    Other(Error),
 }
 
 impl TurnPending {
@@ -251,13 +260,29 @@ impl TurnPending {
         keys: &GatewayKeys,
         device_grant_id: Option<&str>,
     ) -> Result<Dispatch, Error> {
+        self.handoff_turn(pool, keys, device_grant_id)
+            .await
+            .map_err(|err| match err {
+                TurnHandoffError::MissingHold => Error::Refused,
+                TurnHandoffError::Other(err) => err,
+            })
+    }
+
+    pub(crate) async fn handoff_turn(
+        &self,
+        pool: &PgPool,
+        keys: &GatewayKeys,
+        device_grant_id: Option<&str>,
+    ) -> Result<Dispatch, TurnHandoffError> {
         if self.requires_device_slot
             && device_grant_id.is_some_and(|g| !crate::runs::is_canonical_uuid(g))
         {
-            return Err(Error::Refused);
+            return Err(TurnHandoffError::Other(Error::Refused));
         }
         let pending = self.as_pending();
-        let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
+        let mut tx = WriteTransaction::begin_bounded_pool(pool, false)
+            .await
+            .map_err(|err| TurnHandoffError::Other(Error::from(err)))?;
         let prefix = sqlx::query(
             "SELECT openmettle.quota_lock_turn_handoff_prefix(
                  $1::uuid, $2::bytea, $3::uuid, $4::uuid, $5::uuid
@@ -268,15 +293,27 @@ impl TurnPending {
         .bind(&self.scope_id)
         .bind(&self.run_id)
         .bind(&self.claim_token)
-        .execute(tx.connection()?)
+        .execute(
+            tx.connection()
+                .map_err(|err| TurnHandoffError::Other(Error::from(err)))?,
+        )
         .await;
         if let Err(err) = prefix {
-            return match err.as_database_error().and_then(|e| e.code()).as_deref() {
-                Some("42501") => Err(Error::Refused),
-                _ => Err(Error::from(err)),
-            };
+            let _ = tx.rollback().await;
+            return Err(TurnHandoffError::Other(
+                match err.as_database_error().and_then(|e| e.code()).as_deref() {
+                    Some("42501") => Error::Refused,
+                    _ => Error::from(err),
+                },
+            ));
         }
-        let dispatch = pending.handoff_in(&mut tx, keys).await?;
+        let dispatch = match pending.handoff_in(&mut tx, keys).await {
+            Ok(dispatch) => dispatch,
+            Err(err) => {
+                let _ = tx.rollback().await;
+                return Err(TurnHandoffError::Other(err));
+            }
+        };
         let res = sqlx::query(
             "SELECT openmettle.quota_commit_turn_handoff(
                  $1::uuid, $2::bytea, $3::uuid, $4::uuid, $5::uuid, $6, $7::uuid, $8
@@ -290,24 +327,45 @@ impl TurnPending {
         .bind(self.requires_device_slot)
         .bind(device_grant_id)
         .bind(self.cost_bound_missing)
-        .execute(tx.connection()?)
+        .execute(
+            tx.connection()
+                .map_err(|err| TurnHandoffError::Other(Error::from(err)))?,
+        )
         .await;
         if let Err(err) = res {
-            return match err.as_database_error().and_then(|e| e.code()).as_deref() {
-                Some("42501" | "23505" | "OMQ04") => Err(Error::Refused),
-                _ => Err(Error::from(err)),
-            };
+            let _ = tx.rollback().await;
+            return Err(TurnHandoffError::Other(
+                match err.as_database_error().and_then(|e| e.code()).as_deref() {
+                    Some("42501" | "23505" | "OMQ04") => Error::Refused,
+                    _ => Error::from(err),
+                },
+            ));
         }
         if let Err(err) = tx.commit().await {
             if let crate::runs::Error::Database(ref db) = err
                 && db.as_database_error().and_then(|e| e.code()).as_deref() == Some("OMQ04")
             {
-                return Err(Error::Refused);
+                let retryable_missing_hold = (!self.enforced_at_bind
+                    || (!self.cost_bound_at_bind && !self.cost_bound_missing))
+                    && (!self.requires_device_slot || device_grant_id.is_some());
+                return Err(if retryable_missing_hold {
+                    TurnHandoffError::MissingHold
+                } else {
+                    TurnHandoffError::Other(Error::Refused)
+                });
             }
-            let mut recovery = WriteTransaction::begin_bounded_pool(pool, false).await?;
-            pending.recover_in(&mut recovery).await?;
-            recovery.commit().await?;
-            return Err(Error::Database);
+            let mut recovery = WriteTransaction::begin_bounded_pool(pool, false)
+                .await
+                .map_err(|err| TurnHandoffError::Other(Error::from(err)))?;
+            pending
+                .recover_in(&mut recovery)
+                .await
+                .map_err(TurnHandoffError::Other)?;
+            recovery
+                .commit()
+                .await
+                .map_err(|err| TurnHandoffError::Other(Error::from(err)))?;
+            return Err(TurnHandoffError::Other(Error::Database));
         }
         Ok(dispatch)
     }
@@ -383,7 +441,10 @@ pub async fn reserve_turn_round(pool: &PgPool, round: TurnRound<'_>) -> Result<T
             .await?
             {
                 crate::quotas::BindOutcome::NeedsParentHolds => Ok(None),
-                crate::quotas::BindOutcome::Bound { enforced_at_bind } => Ok(Some(TurnPending {
+                crate::quotas::BindOutcome::Bound {
+                    enforced_at_bind,
+                    cost_bound_at_bind,
+                } => Ok(Some(TurnPending {
                     id: pending.id,
                     secret: pending.secret,
                     reservation_id,
@@ -399,6 +460,7 @@ pub async fn reserve_turn_round(pool: &PgPool, round: TurnRound<'_>) -> Result<T
                     cost_bound_missing: round.round_cost.is_none(),
                     requires_device_slot: round.requires_device_slot,
                     enforced_at_bind,
+                    cost_bound_at_bind,
                 })),
             }
         }

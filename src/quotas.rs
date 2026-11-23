@@ -298,8 +298,12 @@ pub(crate) async fn cost_ceiling(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BindOutcome {
     /// Request holds were bound (`enforced_at_bind` is true when `metering_enforced` was already
-    /// active during binding so all required run-level and request-level holds are materialized).
-    Bound { enforced_at_bind: bool },
+    /// active during binding; `cost_bound_at_bind` is true when a `usage_cost_micros` hold was
+    /// bound for the request).
+    Bound {
+        enforced_at_bind: bool,
+        cost_bound_at_bind: bool,
+    },
     /// `metering_enforced` flipped `false -> true` after `quota_prepare_turn_round` skipped
     /// creating run-level parent holds; caller must roll back and retry preparation with
     /// `p_require_holds = true`.
@@ -342,6 +346,7 @@ pub(crate) async fn bind_request(
             }
             Ok(BindOutcome::Bound {
                 enforced_at_bind: true,
+                cost_bound_at_bind: cost.is_some(),
             })
         }
         Authority::Lease { run, token, .. } => {
@@ -415,6 +420,7 @@ pub(crate) async fn bind_request(
             }
             Ok(BindOutcome::Bound {
                 enforced_at_bind: enforced,
+                cost_bound_at_bind: cost.is_some(),
             })
         }
     }

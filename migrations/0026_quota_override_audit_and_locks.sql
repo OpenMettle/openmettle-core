@@ -772,10 +772,204 @@ $$;
 REVOKE ALL ON FUNCTION openmettle.quota_release_terminal_runs(uuid[]) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION openmettle.quota_release_terminal_runs(uuid[]) TO openmettle_api, openmettle_worker;
 
+-- Internal owner-only helper: report whether a durable openmettle.model-round event payload
+-- carries durable metered dispatch evidence (`{"metered":true}`), returning false on NULL,
+-- empty `{}`, non-JSON, or non-object payloads.
+CREATE FUNCTION openmettle.quota_is_metered_round_event(p_payload bytea)
+RETURNS boolean
+LANGUAGE plpgsql
+STABLE
+SET search_path = pg_catalog
+AS $$
+BEGIN
+    IF p_payload IS NULL THEN
+        RETURN false;
+    END IF;
+    RETURN coalesce(
+        (convert_from(p_payload, 'UTF8')::jsonb ->> 'metered') = 'true',
+        false
+    );
+EXCEPTION WHEN others THEN
+    RETURN false;
+END;
+$$;
+REVOKE ALL ON FUNCTION openmettle.quota_is_metered_round_event(bytea) FROM PUBLIC;
+
+-- Internal owner-only helper: count prior consumed rounds for a run across both active
+-- gateway_requests rows and durable openmettle.model-round run_events (including prior bearer
+-- rounds that never allocated from gateway_reservations), plus how many of those prior rounds
+-- did not deduct from gateway_reservations.allocated.
+CREATE FUNCTION openmettle.quota_prior_consumed_rounds(
+    p_scope uuid,
+    p_run uuid,
+    p_reservation uuid,
+    p_exclude_request uuid DEFAULT NULL
+)
+RETURNS TABLE (
+    prior_rounds integer,
+    unallocated_prior_rounds integer
+)
+LANGUAGE sql
+STABLE
+SET search_path = pg_catalog
+AS $$
+    WITH gateway_rounds AS (
+        SELECT DISTINCT q.round AS round_no
+          FROM openmettle.gateway_requests q
+         WHERE p_reservation IS NOT NULL
+           AND q.reservation_id = p_reservation
+           AND q.run_id IS NOT NULL
+           AND q.state <> 'released'
+           AND (p_exclude_request IS NULL OR q.id <> p_exclude_request)
+    ),
+    event_rounds AS (
+        SELECT substring(e.append_key FROM '^model-round:([0-9]{1,9})$')::integer AS round_no,
+               openmettle.quota_is_metered_round_event(e.payload) AS is_metered
+          FROM openmettle.run_events e
+         WHERE e.scope_id = p_scope
+           AND e.run_id = p_run
+           AND e.format = 'openmettle.model-round'
+           AND e.append_key ~ '^model-round:[0-9]{1,9}$'
+    ),
+    ceiling AS (
+        SELECT coalesce(
+            CASE WHEN p_exclude_request IS NOT NULL THEN (
+                SELECT q.round
+                  FROM openmettle.gateway_requests q
+                 WHERE q.id = p_exclude_request
+            ) END,
+            (SELECT max(er.round_no) FROM event_rounds er)
+        ) AS round_no
+    ),
+    consumed_event_rounds AS (
+        SELECT DISTINCT er.round_no
+          FROM event_rounds er
+          CROSS JOIN ceiling c
+         WHERE NOT er.is_metered
+            OR er.round_no < c.round_no
+    )
+    SELECT (
+               SELECT count(*)::integer
+                 FROM (
+                     SELECT round_no FROM gateway_rounds
+                     UNION
+                     SELECT round_no FROM consumed_event_rounds
+                 ) all_prior
+           ) AS prior_rounds,
+           (
+               SELECT count(*)::integer
+                 FROM (
+                     SELECT round_no FROM consumed_event_rounds
+                     EXCEPT
+                     SELECT round_no FROM gateway_rounds
+                 ) unalloc_prior
+           ) AS unallocated_prior_rounds
+$$;
+REVOKE ALL ON FUNCTION openmettle.quota_prior_consumed_rounds(uuid, uuid, uuid, uuid) FROM PUBLIC;
+
 -- Keep 3-arg openmettle.quota_ensure_legacy_run_holds(uuid, uuid, uuid) intact for draining N-1
--- workers, and add openmettle.quota_prepare_turn_round for schema-26 workers and reserve_with_cost
+-- workers, updating its body to size replacement token holds from remaining rounds after any
+-- prior unallocated bearer rounds.
+CREATE OR REPLACE FUNCTION openmettle.quota_ensure_legacy_run_holds(
+    p_scope uuid,
+    p_run uuid,
+    p_claim uuid
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+    r openmettle.runs%ROWTYPE;
+    g openmettle.gateway_reservations%ROWTYPE;
+    cost_max bigint;
+    v_cfg jsonb;
+    v_round_tokens bigint;
+    v_prior_rounds integer;
+    v_unalloc_rounds integer;
+    v_rem_rounds integer;
+    v_token_units bigint;
+BEGIN
+    SELECT * INTO STRICT r
+      FROM openmettle.runs
+     WHERE scope_id = p_scope
+       AND id = p_run
+       AND state = 'running'
+       AND cancel_reason IS NULL
+       AND claim_token = p_claim
+       AND lease_expires_at > clock_timestamp()
+       FOR NO KEY UPDATE;
+    SELECT * INTO STRICT g
+      FROM openmettle.gateway_reservations
+     WHERE run_id = p_run
+       FOR NO KEY UPDATE;
+    cost_max := openmettle.quota_cost_ceiling(p_scope, r.actor_user_id);
+    IF g.units > g.allocated AND cost_max IS NOT NULL AND NOT EXISTS (
+        SELECT FROM openmettle.quota_reservations
+         WHERE scope_id = p_scope
+           AND run_id = p_run
+           AND gateway_request_id IS NULL
+           AND resource_kind = 'usage_cost_micros'
+    ) THEN
+        IF cost_max = 0 THEN
+            RAISE EXCEPTION 'cost limit exceeded' USING ERRCODE = 'OMQ01';
+        END IF;
+        PERFORM openmettle.quota_reserve(
+            p_scope, r.actor_user_id, 'usage_cost_micros', cost_max,
+            'run:' || p_run, p_run, NULL, NULL, r.lease_expires_at
+        );
+    END IF;
+    IF g.units > g.allocated AND NOT EXISTS (
+        SELECT FROM openmettle.quota_reservations
+         WHERE scope_id = p_scope
+           AND run_id = p_run
+           AND gateway_request_id IS NULL
+           AND resource_kind = 'usage_tokens'
+    ) THEN
+        SELECT prior_rounds, unallocated_prior_rounds
+          INTO STRICT v_prior_rounds, v_unalloc_rounds
+          FROM openmettle.quota_prior_consumed_rounds(p_scope, p_run, g.id, NULL);
+        IF v_unalloc_rounds > 0 THEN
+            BEGIN
+                v_cfg := convert_from(r.config_snapshot, 'UTF8')::jsonb;
+            EXCEPTION WHEN others THEN
+                v_cfg := NULL;
+            END;
+            BEGIN
+                v_round_tokens := coalesce(
+                    (v_cfg #>> '{effective,ceiling,value}')::bigint,
+                    (v_cfg #>> '{config,effective,ceiling,value}')::bigint
+                );
+            EXCEPTION WHEN others THEN
+                v_round_tokens := NULL;
+            END;
+            IF v_round_tokens IS NOT NULL AND v_round_tokens <= 0 THEN
+                v_round_tokens := NULL;
+            END IF;
+            v_rem_rounds := greatest(1, coalesce(r.round_limit, 1) - v_prior_rounds);
+            v_token_units := least(
+                (g.units - g.allocated)::numeric,
+                coalesce(
+                    v_round_tokens::numeric,
+                    (((g.units - 1) / greatest(1, coalesce(r.round_limit, 1))) + 1)::numeric
+                ) * v_rem_rounds
+            )::bigint;
+        ELSE
+            v_token_units := g.units - g.allocated;
+        END IF;
+        PERFORM openmettle.quota_reserve(
+            p_scope, r.actor_user_id, 'usage_tokens', v_token_units,
+            'run:' || p_run, p_run, NULL, NULL, r.lease_expires_at
+        );
+    END IF;
+END;
+$$;
+
+-- Add openmettle.quota_prepare_turn_round for schema-26 workers and reserve_with_cost
 -- callers to recover missing gateway_reservations, device_reservations, and qualified per-round
--- cost_bound holds (returning gateway_reservations.id).
+-- cost_bound holds (returning gateway_reservations.id), sizing remaining holds accurately even
+-- after prior unallocated bearer rounds.
 CREATE FUNCTION openmettle.quota_prepare_turn_round(
     p_scope uuid,
     p_run uuid,
@@ -800,7 +994,10 @@ DECLARE
     v_rounds integer;
     v_total_tokens bigint;
     v_enforced boolean;
+    v_prior_rounds integer;
+    v_unalloc_rounds integer;
     v_rem_rounds integer;
+    v_token_units bigint;
     v_scope_kind text;
     v_actor_scope uuid;
     v_cost_denom text;
@@ -818,25 +1015,39 @@ BEGIN
        AND lease_expires_at > clock_timestamp()
        FOR NO KEY UPDATE;
 
-    SELECT * INTO g
-      FROM openmettle.gateway_reservations
-     WHERE run_id = p_run
-       FOR NO KEY UPDATE;
-    IF NOT FOUND THEN
-        BEGIN
-            v_cfg := convert_from(r.config_snapshot, 'UTF8')::jsonb;
-        EXCEPTION WHEN others THEN
-            v_cfg := NULL;
-        END;
+    BEGIN
+        v_cfg := convert_from(r.config_snapshot, 'UTF8')::jsonb;
+    EXCEPTION WHEN others THEN
+        v_cfg := NULL;
+    END;
+    BEGIN
         v_round_tokens := coalesce(
             (v_cfg #>> '{effective,ceiling,value}')::bigint,
             (v_cfg #>> '{config,effective,ceiling,value}')::bigint,
             p_fallback_round_tokens
         );
-        IF v_round_tokens IS NULL OR v_round_tokens <= 0 THEN
+    EXCEPTION WHEN others THEN
+        v_round_tokens := p_fallback_round_tokens;
+    END;
+    IF v_round_tokens IS NOT NULL AND v_round_tokens <= 0 THEN
+        v_round_tokens := NULL;
+    END IF;
+
+    SELECT * INTO g
+      FROM openmettle.gateway_reservations
+     WHERE run_id = p_run
+       FOR NO KEY UPDATE;
+    IF NOT FOUND THEN
+        IF v_round_tokens IS NULL THEN
             RAISE EXCEPTION 'missing token ceiling for legacy run' USING ERRCODE = '23514';
         END IF;
-        v_rounds := greatest(1, coalesce(r.round_limit, 1));
+        SELECT prior_rounds
+          INTO STRICT v_prior_rounds
+          FROM openmettle.quota_prior_consumed_rounds(p_scope, p_run, NULL, NULL);
+        v_rounds := greatest(1, coalesce(r.round_limit, 1) - v_prior_rounds);
+        IF v_round_tokens::numeric * v_rounds > 9223372036854775807 THEN
+            RAISE EXCEPTION 'token ceiling overflow for legacy run' USING ERRCODE = '23514';
+        END IF;
         v_total_tokens := v_round_tokens * v_rounds;
         INSERT INTO openmettle.gateway_reservations
             (id, scope_id, actor_user_id, approval_id, run_id, units)
@@ -851,17 +1062,10 @@ BEGIN
         RETURN g.id;
     END IF;
 
-    v_rem_rounds := greatest(
-        1,
-        coalesce(r.round_limit, 1) - coalesce(
-            (SELECT count(*)::integer
-               FROM openmettle.gateway_requests
-              WHERE reservation_id = g.id
-                AND run_id IS NOT NULL
-                AND state <> 'released'),
-            0
-        )
-    );
+    SELECT prior_rounds, unallocated_prior_rounds
+      INTO STRICT v_prior_rounds, v_unalloc_rounds
+      FROM openmettle.quota_prior_consumed_rounds(p_scope, p_run, g.id, NULL);
+    v_rem_rounds := greatest(1, coalesce(r.round_limit, 1) - v_prior_rounds);
 
     -- 1. device_reservations (canonical alphabetical order)
     IF p_requires_device_slot AND NOT EXISTS (
@@ -953,8 +1157,19 @@ BEGIN
            AND gateway_request_id IS NULL
            AND resource_kind = 'usage_tokens'
     ) THEN
+        IF v_unalloc_rounds > 0 THEN
+            v_token_units := least(
+                (g.units - g.allocated)::numeric,
+                coalesce(
+                    v_round_tokens::numeric,
+                    (((g.units - 1) / greatest(1, coalesce(r.round_limit, 1))) + 1)::numeric
+                ) * v_rem_rounds
+            )::bigint;
+        ELSE
+            v_token_units := g.units - g.allocated;
+        END IF;
         PERFORM openmettle.quota_reserve(
-            p_scope, r.actor_user_id, 'usage_tokens', g.units - g.allocated,
+            p_scope, r.actor_user_id, 'usage_tokens', v_token_units,
             'run:' || p_run, p_run, NULL, NULL, r.lease_expires_at
         );
     END IF;
@@ -1041,17 +1256,9 @@ BEGIN
       INTO v_reservation_id
       FROM openmettle.gateway_reservations g
      WHERE g.run_id = p_run;
-    IF v_reservation_id IS NOT NULL THEN
-        SELECT count(*)::integer
-          INTO v_prior_rounds
-          FROM openmettle.gateway_requests q
-         WHERE q.reservation_id = v_reservation_id
-           AND q.run_id IS NOT NULL
-           AND q.state <> 'released'
-           AND (p_current_request IS NULL OR q.id <> p_current_request);
-    ELSE
-        v_prior_rounds := 0;
-    END IF;
+    SELECT prior_rounds
+      INTO STRICT v_prior_rounds
+      FROM openmettle.quota_prior_consumed_rounds(p_scope, p_run, v_reservation_id, p_current_request);
     v_rem_rounds := greatest(1, v_round_limit - coalesce(v_prior_rounds, 0));
     RETURN ((v_held - 1) / v_rem_rounds) + 1;
 END;
@@ -1244,14 +1451,7 @@ BEGIN
                AND append_key = 'model-round:' || p_round
                AND format = 'openmettle.model-round';
             IF FOUND THEN
-                BEGIN
-                    v_metered_event := coalesce(
-                        (convert_from(v_payload, 'UTF8')::jsonb ->> 'metered') = 'true',
-                        false
-                    );
-                EXCEPTION WHEN others THEN
-                    v_metered_event := false;
-                END;
+                v_metered_event := openmettle.quota_is_metered_round_event(v_payload);
             END IF;
         END IF;
         IF v_metered_event IS NOT TRUE THEN
