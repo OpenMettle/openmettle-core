@@ -2,11 +2,11 @@
 //! Only visible text is streamed. Calls become available after the entire response validates.
 mod chat;
 mod decode;
-mod json;
+pub(crate) mod json;
 mod request;
 mod responses;
 mod schema;
-mod stream;
+pub(crate) mod stream;
 mod turn;
 
 pub use request::{History, ImageType, Request, Tool};

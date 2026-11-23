@@ -37,6 +37,7 @@ fn binary(name: &str) -> Command {
     let mut command = Command::new(match name {
         "migrate" => env!("CARGO_BIN_EXE_openmettle-migrate"),
         "api" => env!("CARGO_BIN_EXE_openmettle-api"),
+        "gateway" => env!("CARGO_BIN_EXE_openmettle-gateway"),
         _ => env!("CARGO_BIN_EXE_openmettle-worker"),
     });
     scrub_env(&mut command);
@@ -2813,6 +2814,12 @@ mod approvals;
 
 #[path = "schema/gateway.rs"]
 mod gateway;
+
+#[path = "schema/gateway_proxy.rs"]
+mod gateway_proxy;
+
+#[path = "support/sglang_recorded.rs"]
+mod sglang_recorded;
 
 #[path = "schema/quotas.rs"]
 mod quotas;

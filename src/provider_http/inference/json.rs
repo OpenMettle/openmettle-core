@@ -1,4 +1,5 @@
-//! Preserve duplicate-key evidence until every nested object has been visited.
+//! Preserve duplicate-key evidence until every nested object has been visited. The worker
+//! decoder and the gateway proxy's usage reader share this parser.
 use super::Error;
 use serde::{
     Deserialize, Deserializer,
@@ -60,7 +61,7 @@ impl<'de> Visitor<'de> for Json {
         Ok(Value::Object(obj))
     }
 }
-pub(super) fn parse(bytes: &[u8]) -> Result<Value, Error> {
+pub(crate) fn parse(bytes: &[u8]) -> Result<Value, Error> {
     serde_json::from_slice::<Unique>(bytes)
         .map(|u| u.0)
         .map_err(|_| Error::Malformed)

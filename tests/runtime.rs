@@ -2117,6 +2117,154 @@ fn unavailable_database_keeps_liveness_and_bounded_readiness() {
     }
 }
 
+fn gateway() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_openmettle-gateway"));
+    scrub_env(&mut command);
+    command
+}
+
+/// `openmettle-gateway` refuses missing or unsupported settings with one fixed line that names
+/// the key, never the value, and exits 78 before any listener opens.
+#[test]
+fn gateway_refuses_incomplete_or_unsupported_settings_with_a_fixed_line() {
+    // Serving would exit 1 on this occupied address instead.
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let database = ("DATABASE_URL", "postgres://localhost/test");
+    let upstream = ("UPSTREAM_URL", "http://127.0.0.1:30000");
+    let cases: &[(&[(&str, &str)], &str)] = &[
+        (&[upstream], "DATABASE_URL is required"),
+        (&[database], "UPSTREAM_URL is required"),
+        (
+            &[
+                database,
+                ("UPSTREAM_URL", "https://synthetic-secret.example.test"),
+            ],
+            "UPSTREAM_URL must use http://",
+        ),
+        (
+            &[database, ("UPSTREAM_URL", "synthetic-secret")],
+            "invalid UPSTREAM_URL",
+        ),
+        (
+            &[
+                database,
+                (
+                    "UPSTREAM_URL",
+                    "http://synthetic-secret:8000/v1/chat/completions",
+                ),
+            ],
+            "invalid UPSTREAM_URL",
+        ),
+        (
+            &[database, upstream, ("UPSTREAM_IDLE_TIMEOUT_MS", "0")],
+            "configuration outside allowed range",
+        ),
+    ];
+    for (settings, line) in cases {
+        let mut command = gateway();
+        command.env(
+            "OPENMETTLE_GATEWAY_BIND",
+            occupied.local_addr().unwrap().to_string(),
+        );
+        for (key, value) in *settings {
+            command.env(format!("OPENMETTLE_GATEWAY_{key}"), value);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(78), "{line}");
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            format!("configuration error: {line}\n")
+        );
+    }
+    // The API's issuance credential is refused here as in the worker.
+    let output = gateway()
+        .env("OPENMETTLE_GATEWAY_DATABASE_URL", database.1)
+        .env("OPENMETTLE_GATEWAY_UPSTREAM_URL", upstream.1)
+        .env(
+            "OPENMETTLE_API_ISSUANCE_DATABASE_URL",
+            "postgres://CANARY@localhost/test",
+        )
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(78));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "configuration error: OPENMETTLE_API_ISSUANCE_DATABASE_URL is refused outside the API\n"
+    );
+}
+
+/// The gateway serves the operational probes and the one proxy route, records its role in
+/// lifecycle events and drains on SIGTERM, with PostgreSQL and the upstream unavailable.
+#[test]
+fn gateway_serves_probes_and_its_route_and_stops_on_a_signal() {
+    let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
+    let bind = address();
+    let mut process = Process(
+        gateway()
+            .env("OPENMETTLE_GATEWAY_BIND", &bind)
+            .env(
+                "OPENMETTLE_GATEWAY_DATABASE_URL",
+                format!(
+                    "postgres://fixture@{}/fixture?sslmode=disable",
+                    unavailable.local_addr().unwrap()
+                ),
+            )
+            .env("OPENMETTLE_GATEWAY_DB_TIMEOUT_MS", "150")
+            .env("OPENMETTLE_GATEWAY_SHUTDOWN_TIMEOUT_MS", "1000")
+            .env("OPENMETTLE_GATEWAY_UPSTREAM_URL", "http://127.0.0.1:9")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    wait_status(&mut process, &bind, "/healthz", 200);
+    assert!(
+        response(&bind, "/readyz")
+            .unwrap()
+            .starts_with("HTTP/1.1 503")
+    );
+    for (request, status) in [
+        ("GET /v1/chat/completions", 405),
+        ("POST /v1/responses", 404),
+        ("POST /v1/completions", 404),
+    ] {
+        let reply = send(
+            &bind,
+            &format!("{request} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+        )
+        .unwrap();
+        assert!(
+            reply.starts_with(&format!("HTTP/1.1 {status}")),
+            "{request}"
+        );
+    }
+    // An unusable request ID is refused before the database or the upstream is consulted.
+    let reply = send(
+        &bind,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+    )
+    .unwrap();
+    assert!(reply.starts_with("HTTP/1.1 400"));
+    assert!(reply.contains("\"code\":\"validation\""));
+    stop(&mut process, "-TERM");
+    let (stdout, stderr) = drain(&mut process);
+    assert!(stdout.is_empty());
+    let events: Vec<serde_json::Value> = stderr
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let lifecycle: Vec<_> = events
+        .iter()
+        .filter(|e| e["role"] == "gateway")
+        .map(|e| e["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        lifecycle,
+        ["process.started", "process.stopping", "process.stopped"]
+    );
+}
+
 #[test]
 fn occupied_listener_exits_with_runtime_error() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
