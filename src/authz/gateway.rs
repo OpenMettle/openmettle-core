@@ -252,15 +252,19 @@ impl TurnPending {
     /// Atomically commit gateway handoff, optional device-slot handoff, and round usage child
     /// holds in a single write transaction following strict ADR 0040 lock order:
     /// `account_admin_lock..users..runs -> gateway_requests -> quota_reservations (resource_kind, id)
-    /// -> quota_gateway_handoffs -> quota_enforcement`. Any pre-commit or deferred OMQ04 failure
-    /// rolls back `gateway_requests` to `'reserved'` so `release()` can immediately unwind the round.
+    /// -> quota_gateway_handoffs -> quota_enforcement`. Validates route binding and complete
+    /// outbound headers against `billable` and `prepared` before committing. Any pre-commit or
+    /// deferred OMQ04 failure rolls back `gateway_requests` to `'reserved'` so `release()` can
+    /// immediately unwind the round.
     pub async fn handoff(
         &self,
         pool: &PgPool,
         keys: &GatewayKeys,
         device_grant_id: Option<&str>,
+        billable: &crate::provider_http::BillableInferenceRef<'_>,
+        prepared: &crate::provider_http::inference::PreparedRequest<'_>,
     ) -> Result<Dispatch, Error> {
-        self.handoff_turn(pool, keys, device_grant_id, |_| Ok(()))
+        self.handoff_turn(pool, keys, device_grant_id, billable, prepared)
             .await
             .map_err(|err| match err {
                 TurnHandoffError::MissingHold => Error::Refused,
@@ -273,7 +277,8 @@ impl TurnPending {
         pool: &PgPool,
         keys: &GatewayKeys,
         device_grant_id: Option<&str>,
-        validate: impl FnOnce(&Dispatch) -> Result<(), Error>,
+        billable: &crate::provider_http::BillableInferenceRef<'_>,
+        prepared: &crate::provider_http::inference::PreparedRequest<'_>,
     ) -> Result<Dispatch, TurnHandoffError> {
         if self.requires_device_slot
             && device_grant_id.is_some_and(|g| !crate::runs::is_canonical_uuid(g))
@@ -315,9 +320,12 @@ impl TurnPending {
                 return Err(TurnHandoffError::Other(err));
             }
         };
-        if let Err(err) = validate(&dispatch) {
+        if let Err(err) = billable.validate_dispatch(&dispatch, prepared) {
             let _ = tx.rollback().await;
-            return Err(TurnHandoffError::Other(err));
+            return Err(TurnHandoffError::Other(match err {
+                crate::provider_http::inference::Error::Validation => Error::Refused,
+                _ => Error::Protection,
+            }));
         }
         let res = sqlx::query(
             "SELECT openmettle.quota_commit_turn_handoff(

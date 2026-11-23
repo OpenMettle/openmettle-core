@@ -191,9 +191,11 @@ impl RunStop {
     }
 }
 
-/// Validated and wire-encoded inference request borrowing its authoritative model profile and
-/// source [`Request`] so neither can be mutated between [`Gateway::prepare`] and dispatch.
+/// Validated and wire-encoded inference request borrowing its originating [`Gateway`],
+/// authoritative model profile, and source [`Request`] so none can be substituted or mutated
+/// between [`Gateway::prepare`] and dispatch.
 pub struct PreparedRequest<'a> {
+    gateway: &'a Gateway,
     model: String,
     profile: &'a crate::model_config::Profile,
     request: &'a Request,
@@ -299,15 +301,20 @@ impl Gateway {
         Ok(outbound)
     }
 
-    /// Validate that the complete outbound HTTP headers (including `Host`, `Connection`,
-    /// `Authorization`, `Accept`, `Content-Type`, `Content-Length`, and any scoped `x-request-id`)
-    /// fit within [`super::MAX_REQUEST_HEADER_BYTES`] before committing a billable gateway handoff.
+    /// Validate that `prepared` originated from this exact [`Gateway`] instance and that the
+    /// complete outbound HTTP headers (including `Host`, `Connection`, `Authorization`, `Accept`,
+    /// `Content-Type`, `Content-Length`, and any scoped `x-request-id`) fit within
+    /// [`super::MAX_REQUEST_HEADER_BYTES`] before committing a billable gateway handoff.
     pub(crate) fn validate_outbound_headers(
         &self,
         credential: Credential<'_>,
         prepared: &PreparedRequest<'_>,
     ) -> Result<(), Error> {
-        let headers = headers(credential, prepared.request.stream)?;
+        if !std::ptr::eq(self, prepared.gateway) {
+            return Err(Error::Validation.for_profile(self.family_policy_v1));
+        }
+        let headers = headers(credential, prepared.request.stream)
+            .map_err(|e| e.for_profile(self.family_policy_v1))?;
         self.build_outbound_with_headers(headers, Vec::new(), prepared.body.len())
             .map(|_| ())
             .map_err(|e| e.for_profile(self.family_policy_v1))
@@ -316,7 +323,7 @@ impl Gateway {
     /// Validate model/profile selection against this route and wire-encode the outbound JSON body
     /// before reserving or committing a billable gateway handoff.
     pub fn prepare<'a>(
-        &self,
+        &'a self,
         catalog: &'a Catalog,
         effective: &Effective,
         request: &'a Request,
@@ -327,7 +334,7 @@ impl Gateway {
     }
 
     fn prepare_inner<'a>(
-        &self,
+        &'a self,
         catalog: &'a Catalog,
         effective: &Effective,
         request: &'a Request,
@@ -348,6 +355,7 @@ impl Gateway {
             .ok_or(Error::Validation)?;
         let body = request.encode(&self.qualification, profile, effective, server)?;
         Ok(PreparedRequest {
+            gateway: self,
             model: effective.model.clone(),
             profile,
             request,
@@ -444,7 +452,8 @@ impl Gateway {
                     self.prepare_inner(catalog, effective, request, server)?
                 }
                 Outbound::Prepared(prepared) => {
-                    if prepared.server != server
+                    if !std::ptr::eq(self, prepared.gateway)
+                        || prepared.server != server
                         || self.qualification.model != prepared.model
                         || self.qualification.pin != prepared.profile.pin
                     {

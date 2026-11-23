@@ -11,11 +11,13 @@ Before running the migration, scale the old worker deployment to zero, or restar
 Run the new `openmettle-migrate` job with its existing owner connection. In the migrated database, inspect the singleton markers.
 
 ```sql
-SELECT volume_id, adoption_run_id, bootstrap_auto_pin_allowed, metering_enforced
+SELECT volume_id, adoption_run_id, bootstrap_auto_pin_allowed,
+       metering_enforced, metering_enforced_at,
+       overrides_enforced, overrides_enforced_at
 FROM openmettle.storage_volume_control CROSS JOIN openmettle.quota_enforcement;
 ```
 
-Both IDs must be null and both flags false on an upgrade. A new installation starts with metering enabled and permits the API to pin an empty store. Configure operator-approved limits before serving metered requests. The actor's personal token ceiling applies to project requests too. Set the deployment cost denomination by updating the existing instance cost default. The denomination becomes permanent.
+Both IDs and both enforcement timestamps must be null and all three flags false on an upgrade from 0023 or earlier. A new installation starts with metering and overrides enabled and permits the API to pin an empty store. Configure operator-approved limits before serving metered requests. The actor's personal token ceiling applies to project requests too. Set the deployment cost denomination by updating the existing instance cost default. The denomination becomes permanent.
 
 ## 3. Replace every API and worker
 
@@ -54,7 +56,21 @@ openmettle-admin quota drain-orphans
 openmettle-admin quota activate
 ```
 
-Verify `metering_enforced` is true and `metering_enforced_at` is set. Activation is irreversible. A committed gateway handoff retains its hold until accepted gateway usage settles it. A committed device slot stays charged until V1-18 provides durable evidence of release or non-allocation.
+Verify `metering_enforced` and `overrides_enforced` are both true and both `metering_enforced_at` and `overrides_enforced_at` are set. Activation is irreversible. A committed gateway handoff retains its hold until accepted gateway usage settles it. A committed device slot stays charged until V1-18 provides durable evidence of release or non-allocation.
+
+## Upgrade from 0024 or 0025 to 0026
+
+Existing `0024` or `0025` deployments, including installations that already have `metering_enforced = true`, enter schema `0026` with `overrides_enforced = false` and `overrides_enforced_at = NULL`. Until activation completes, `ManageQuotas` scope override writes fail closed with `503 provisioning` while older replicas drain.
+
+1. Apply migration `0026` with `openmettle-migrate` using its existing owner connection.
+2. Roll all API and worker deployments to the `0026` binaries and confirm that every `0024`/`0025` API and worker replica and job has exited.
+3. Rerun `openmettle-admin quota activate`. The command is idempotent, preserves the original `metering_enforced_at` timestamp, and sets `overrides_enforced = true` and `overrides_enforced_at`.
+4. Verify in SQL that all four columns are active and non-null:
+
+```sql
+SELECT metering_enforced, metering_enforced_at, overrides_enforced, overrides_enforced_at
+FROM openmettle.quota_enforcement;
+```
 
 ## Monitor overdue handoffs
 

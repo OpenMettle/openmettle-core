@@ -1,5 +1,99 @@
 use super::*;
 
+struct TurnHandoffFixture {
+    installation: String,
+    catalog: openmettle_core::model_config::Catalog,
+    effective: openmettle_core::model_config::Effective,
+    request: openmettle_core::provider_http::inference::Request,
+    route: openmettle_core::provider_http::inference::Gateway,
+}
+
+impl TurnHandoffFixture {
+    fn new(
+        installation: &str,
+        protocol: openmettle_core::provider_http::inference::Protocol,
+    ) -> Self {
+        use openmettle_core::{
+            model_config::{Catalog, Selection},
+            provider_http::{
+                Trust,
+                inference::{Gateway, History, Protocol, Qualification, Request, Timeouts},
+            },
+        };
+        let ca = crate::ca::Ca::new();
+        let catalog =
+            Catalog::load(include_bytes!("../fixtures/conversation-catalog-v1.json")).unwrap();
+        let effective = catalog
+            .resolve(
+                &Selection::default(),
+                &serde_json::from_value(serde_json::json!({"preset": "study"})).unwrap(),
+                None,
+                |_, _| true,
+            )
+            .unwrap();
+        let path = match protocol {
+            Protocol::Chat => "/v1/chat/completions",
+            Protocol::Responses => "/v1/responses",
+        };
+        let route = Gateway::new(
+            &format!("https://provider.example.test{path}"),
+            Trust::Bundle(&ca.pem()),
+            &[],
+            Qualification {
+                model: effective.model.clone(),
+                pin: effective.profile.clone(),
+                protocol,
+                json: true,
+                sse: false,
+                functions: None,
+                images: false,
+                parallel: false,
+                usage: true,
+                tool_separator_whitespace: false,
+            },
+            Timeouts {
+                setup: Duration::from_secs(5),
+                idle: Duration::from_secs(30),
+                overall: Duration::from_secs(45),
+            },
+        )
+        .unwrap();
+        let request = Request {
+            history: vec![History::User("quota handoff fixture".into())],
+            tools: None,
+            parallel: None,
+            stream: false,
+        };
+        Self {
+            installation: installation.to_owned(),
+            catalog,
+            effective,
+            request,
+            route,
+        }
+    }
+
+    fn chat(installation: &str) -> Self {
+        Self::new(
+            installation,
+            openmettle_core::provider_http::inference::Protocol::Chat,
+        )
+    }
+
+    fn billable(&self) -> openmettle_core::provider_http::BillableInferenceRef<'_> {
+        openmettle_core::provider_http::BillableInferenceRef {
+            installation: &self.installation,
+            route: &self.route,
+        }
+    }
+
+    fn prepare(&self) -> openmettle_core::provider_http::inference::PreparedRequest<'_> {
+        self.billable()
+            .prepare(&self.catalog, &self.effective, &self.request, true)
+            .unwrap()
+    }
+}
+
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn device_handoff_keeps_every_slot_charged_until_durable_release_evidence_exists() {
@@ -1995,7 +2089,6 @@ async fn schema_25_expiry_gating_and_batch_terminal_hold_release() {
     .unwrap();
     assert_eq!(drift, (0, 0, 0, 0));
 }
-
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn mid_run_recovered_cost_hold_slice_replayed_backfill_and_single_run_expiry_release() {
@@ -2487,7 +2580,6 @@ async fn mid_run_recovered_cost_hold_slice_replayed_backfill_and_single_run_expi
     .unwrap();
     assert_eq!(drift, (0, 0, 0, 0));
 }
-
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_legacy_gw_reuse() {
@@ -2714,8 +2806,15 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
     )
     .await
     .unwrap();
+    let fx = TurnHandoffFixture::chat(INSTALL);
     let _disp1 = p1
-        .handoff(&worker_pool, &keys, Some(GRANT_1))
+        .handoff(
+            &worker_pool,
+            &keys,
+            Some(GRANT_1),
+            &fx.billable(),
+            &fx.prepare(),
+        )
         .await
         .unwrap();
 
@@ -2754,7 +2853,14 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
     .await
     .unwrap();
     assert!(matches!(
-        p2.handoff(&worker_pool, &keys, Some(GRANT_1)).await,
+        p2.handoff(
+            &worker_pool,
+            &keys,
+            Some(GRANT_1),
+            &fx.billable(),
+            &fx.prepare(),
+        )
+        .await,
         Err(gateway::Error::Refused)
     ));
     let req2_state: String =
@@ -2815,7 +2921,15 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
         .await
         .unwrap();
     assert!(matches!(
-        p2_cancel.handoff(&worker_pool, &keys, Some(GRANT_2)).await,
+        p2_cancel
+            .handoff(
+                &worker_pool,
+                &keys,
+                Some(GRANT_2),
+                &fx.billable(),
+                &fx.prepare(),
+            )
+            .await,
         Err(gateway::Error::Refused)
     ));
     let req2c_state: String =
@@ -3501,8 +3615,9 @@ async fn pre_activation_charged_parents_pre26_replay_savepoint_and_n1_legacy_hol
     )
     .await
     .unwrap();
+    let fx = TurnHandoffFixture::chat(INSTALL);
     let _disp = pending_held
-        .handoff(&worker_pool, &keys, None)
+        .handoff(&worker_pool, &keys, None, &fx.billable(), &fx.prepare())
         .await
         .unwrap();
     let child_rows: Vec<(String, i64, String)> = sqlx::query_as(
@@ -3975,7 +4090,11 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
     )
     .await
     .unwrap();
-    let _disp1 = p1.handoff(&worker_pool, &keys, None).await.unwrap();
+    let fx = TurnHandoffFixture::chat(INSTALL);
+    let _disp1 = p1
+        .handoff(&worker_pool, &keys, None, &fx.billable(), &fx.prepare())
+        .await
+        .unwrap();
     let r1_child_cost: (i64, String) = sqlx::query_as(
         "SELECT reserved_units, state FROM openmettle.quota_reservations
           WHERE gateway_request_id = $1::uuid AND resource_kind = 'usage_cost_micros'",
@@ -4308,8 +4427,17 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
         )
         .await
         .unwrap();
+    let fx = TurnHandoffFixture::chat(INSTALL);
     assert!(matches!(
-        p_race.handoff(&wp_up, &keys_up, Some(GRANT_RACE)).await,
+        p_race
+            .handoff(
+                &wp_up,
+                &keys_up,
+                Some(GRANT_RACE),
+                &fx.billable(),
+                &fx.prepare(),
+            )
+            .await,
         Err(gateway::Error::Refused)
     ));
     let race_req_state: String =
@@ -4638,8 +4766,11 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
     .execute(&mut owner)
     .await
     .unwrap();
+    let fx = TurnHandoffFixture::chat(INSTALL);
     assert!(matches!(
-        p_unqual.handoff(&worker_pool, &keys, None).await,
+        p_unqual
+            .handoff(&worker_pool, &keys, None, &fx.billable(), &fx.prepare())
+            .await,
         Err(gateway::Error::Refused)
     ));
     let unqual_state: String =
@@ -4846,8 +4977,11 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
             )
             .await
             .unwrap();
+        let fx = TurnHandoffFixture::chat(INSTALL);
         assert!(matches!(
-            p_null_denom.handoff(&wp2, &keys2, None).await,
+            p_null_denom
+                .handoff(&wp2, &keys2, None, &fx.billable(), &fx.prepare())
+                .await,
             Err(gateway::Error::Refused)
         ));
         let null_denom_state: String =
@@ -5015,7 +5149,6 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
     .unwrap();
     assert_eq!(drift, (0, 0, 0, 0));
 }
-
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn stale_lease_on_reserve_turn_round_and_gateway_reserve_returns_refused() {
@@ -5268,8 +5401,11 @@ async fn stale_lease_on_reserve_turn_round_and_gateway_reserve_returns_refused()
     )
     .await
     .unwrap();
+    let fx = TurnHandoffFixture::chat(INSTALL);
     assert!(matches!(
-        p_dev.handoff(&worker_pool, &keys, None).await,
+        p_dev
+            .handoff(&worker_pool, &keys, None, &fx.billable(), &fx.prepare())
+            .await,
         Err(gateway::Error::Refused)
     ));
     let state: String =
@@ -5616,7 +5752,6 @@ async fn stale_lease_on_reserve_turn_round_and_gateway_reserve_returns_refused()
     .unwrap();
     assert_eq!(drift, (0, 0, 0, 0));
 }
-
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materializes_holds() {
@@ -5936,8 +6071,15 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
                 ("usage_tokens".into(), 100, "held".into()),
             ]
         );
+        let fx = TurnHandoffFixture::chat(INSTALL);
         let _disp = pending
-            .handoff(&worker_pool, &keys, Some(GRANT_1))
+            .handoff(
+                &worker_pool,
+                &keys,
+                Some(GRANT_1),
+                &fx.billable(),
+                &fx.prepare(),
+            )
             .await
             .unwrap();
         let report_id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
@@ -6155,8 +6297,17 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
             )
             .await
             .unwrap();
+        let fx = TurnHandoffFixture::chat(INSTALL);
         assert!(matches!(
-            p_pre.handoff(&worker_pool, &keys, Some(GRANT_2)).await,
+            p_pre
+                .handoff(
+                    &worker_pool,
+                    &keys,
+                    Some(GRANT_2),
+                    &fx.billable(),
+                    &fx.prepare(),
+                )
+                .await,
             Err(gateway::Error::Refused)
         ));
         assert!(p_pre.release(&worker_pool).await.unwrap());
@@ -6181,7 +6332,13 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
         .await
         .unwrap();
         let _disp = p_retry
-            .handoff(&worker_pool, &keys, Some(GRANT_2))
+            .handoff(
+                &worker_pool,
+                &keys,
+                Some(GRANT_2),
+                &fx.billable(),
+                &fx.prepare(),
+            )
             .await
             .unwrap();
         let report_id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
@@ -7139,7 +7296,11 @@ async fn reserve_turn_round_returns_retryable_on_40001_and_succeeds_on_retry() {
     )
     .await
     .expect("immediate retry after Error::Retryable must succeed");
-    let _disp = pending.handoff(&worker_pool, &keys, None).await.unwrap();
+    let fx = TurnHandoffFixture::chat(INSTALL);
+    let _disp = pending
+        .handoff(&worker_pool, &keys, None, &fx.billable(), &fx.prepare())
+        .await
+        .unwrap();
     let charge_roles: Vec<String> = sqlx::query_scalar(
         "SELECT c.charge_role
            FROM openmettle.quota_reservation_charges c
@@ -7201,7 +7362,6 @@ async fn reserve_turn_round_returns_retryable_on_40001_and_succeeds_on_retry() {
     .unwrap();
     assert_eq!(drift, (0, 0, 0, 0));
 }
-
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn replacement_holds_and_cost_slice_account_for_prior_bearer_rounds() {
@@ -7466,7 +7626,11 @@ async fn replacement_holds_and_cost_slice_account_for_prior_bearer_rounds() {
         ]
     );
 
-    let _disp_a = pending_a.handoff(&worker_pool, &keys, None).await.unwrap();
+    let fx = TurnHandoffFixture::chat(INSTALL);
+    let _disp_a = pending_a
+        .handoff(&worker_pool, &keys, None, &fx.billable(), &fx.prepare())
+        .await
+        .unwrap();
     let report_id_a: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
         .fetch_one(&mut owner)
         .await
@@ -7685,4 +7849,467 @@ async fn replacement_holds_and_cost_slice_account_for_prior_bearer_rounds() {
     .await
     .unwrap();
     assert_eq!(drift, (0, 0, 0, 0));
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn public_turn_handoff_rejects_oversized_bearer_and_cross_gateway_prepared_before_commit() {
+    use openmettle_core::{
+        authz::{
+            gateway::{self, TurnRound, settlement},
+            leases::{self, FailReason, LeaseSettings, Settle},
+            runs::{self as authz_queue, Admission, AdmissionLimits, ClaimLimits, RunAdmission},
+        },
+        provider_http::{gateway::UsageReport, inference::Protocol},
+        provider_keys::gateway::{Bearer, Context, GatewayKeys, GatewaySealer},
+        quotas::{self, RunBudgetReservation},
+        runs::{RunInput, WriteTransaction},
+    };
+    use sqlx::postgres::PgPoolOptions;
+
+    const INSTALL: &str = "00000000-0000-4000-8000-000000001818";
+    const PRINCIPAL: &str = "00000000-0000-4000-8000-000000001819";
+    const BUDGET: &str = "00000000-0000-4000-8000-00000000181a";
+    const KEY_BYTES: [u8; 32] = [0x61; 32];
+
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut owner).await;
+    let alice =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let alice_scope = authz_runs::personal_of(&db, &alice).await;
+
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 10000)",
+        )
+        .await
+        .unwrap();
+    owner
+        .execute(
+            "UPDATE openmettle.quota_defaults
+                SET cost_denomination = 'usd_micros'
+              WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'",
+        )
+        .await
+        .unwrap();
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_cost_micros', 10000)",
+        )
+        .await
+        .unwrap();
+
+    let g_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(db.1.options(pg::GATEWAY));
+    let binding: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.gateway_bindings (installation, user_id, principal, budget)
+         VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid)
+         RETURNING id::text",
+    )
+    .bind(INSTALL)
+    .bind(&alice.user)
+    .bind(PRINCIPAL)
+    .bind(BUDGET)
+    .fetch_one(&g_pool)
+    .await
+    .unwrap();
+    let report_source: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+    let keys = GatewayKeys::new(&[("rr18-k1".into(), KEY_BYTES)]).unwrap();
+
+    // Generation 1: valid 896-byte Bearer whose complete outbound HTTP headers exceed 1024 bytes.
+    let long_bearer = Bearer::new(&[b'b'; 896]).expect("896-byte bearer is valid");
+    let (finger1, env1) = GatewaySealer::new(
+        GatewayKeys::new(&[("rr18-k1".into(), KEY_BYTES)]).unwrap(),
+        g_pool.clone(),
+    )
+    .seal(
+        &Context {
+            installation: INSTALL,
+            user_id: &alice.user,
+            binding_id: &binding,
+            principal: PRINCIPAL,
+            generation: 1,
+        },
+        &long_bearer,
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_generations
+             (binding_id, generation, remote_key, expires_at, key_id, key_fingerprint, nonce, ciphertext)
+         VALUES ($1::uuid, 1, gen_random_uuid(), clock_timestamp() + interval '1 hour', $2, $3, $4, $5)",
+    )
+    .bind(&binding)
+    .bind(&env1.key_id)
+    .bind(finger1.as_slice())
+    .bind(env1.nonce.as_slice())
+    .bind(env1.ciphertext)
+    .execute(&g_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_policy
+             (binding_id, revision, scope_id, approval_id, model, report_source,
+              provider_generation, approval_generation, user_generation, capabilities)
+         VALUES ($1::uuid, 1, $2::uuid, $3::uuid, 'a', $4::uuid, 0, 0, 0, '{}'::jsonb)",
+    )
+    .bind(&binding)
+    .bind(&alice_scope)
+    .bind(&alice.approval)
+    .bind(&report_source)
+    .execute(&g_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE openmettle.gateway_bindings
+            SET active_generation = 1, observed_revision = 1, state = 'ready'
+          WHERE id = $1::uuid",
+    )
+    .bind(&binding)
+    .execute(&g_pool)
+    .await
+    .unwrap();
+
+    let mut api = connect(&db.0, API).await;
+    let mut worker = connect(&db.0, WORKER).await;
+    let worker_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(db.1.options(WORKER));
+    let limits = AdmissionLimits {
+        live_per_actor: 8,
+        live_per_scope: 8,
+        queued_in_instance: 32,
+        queue_timeout: Duration::from_secs(300),
+        round_cap: 4,
+    };
+    let lease_cfg = LeaseSettings {
+        lease: Duration::from_secs(60),
+        execution_timeout: Duration::from_secs(600),
+    };
+    let claim_cfg = ClaimLimits {
+        executing_per_actor: 4,
+        executing_per_scope: 8,
+    };
+
+    let chat_fx = TurnHandoffFixture::chat(INSTALL);
+    let resp_fx = TurnHandoffFixture::new(INSTALL, Protocol::Responses);
+    let chat_billable = chat_fx.billable();
+    let resp_billable = resp_fx.billable();
+    let chat_prepared = chat_fx.prepare();
+
+    // Part A (P2 #1): Public TurnPending::handoff rejects an oversized 896-byte Bearer BEFORE
+    // committing gateway_requests or quota_reservations handoff_committed holds.
+    let chat_a = authz_runs::chat(&db, &alice_scope, "personal", &alice).await;
+    let (branch_a, msg_a) = branch_and_message(&mut api, &alice_scope, &chat_a).await;
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    let Admission::Admitted { run_id: r_a, .. } = authz_queue::admit_run(
+        &mut tx,
+        &RunAdmission {
+            input: RunInput {
+                scope: &alice_scope,
+                actor: &alice.user,
+                conversation: &chat_a,
+                branch: &branch_a,
+                message: &msg_a,
+                key: "rr18-oversized-bearer",
+                format: "openmettle.conversation",
+                version: 1,
+                input: b"{}",
+                config: br#"{"effective":{"ceiling":{"value":450}}}"#,
+            },
+            actor_approval_id: &alice.approval,
+            capabilities: &[],
+            requested_rounds: Some(1),
+            now_ms: authz_store::NOW,
+            cost_qualified: None,
+        },
+        &limits,
+    )
+    .await
+    .unwrap() else {
+        panic!("expected admission");
+    };
+    assert!(
+        quotas::reserve_admitted_run_budget(
+            &mut tx,
+            &RunBudgetReservation {
+                scope_id: &alice_scope,
+                scope_kind: "personal",
+                actor_user_id: &alice.user,
+                actor_approval_id: &alice.approval,
+                run_id: &r_a,
+                token_units: 450,
+                per_round_cost_micros: Some(450),
+                round_limit: 1,
+                requires_device_slot: false,
+            },
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    tx.commit().await.unwrap();
+
+    let claim_a = authz_queue::claim_next(&mut worker, &claim_cfg, &lease_cfg)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim_a.run_id, r_a);
+
+    let pending_a = gateway::reserve_turn_round(
+        &worker_pool,
+        TurnRound {
+            scope_id: &alice_scope,
+            actor: &alice.user,
+            approval: &alice.approval,
+            run_id: &r_a,
+            round: 1,
+            claim_token: &claim_a.claim_token,
+            installation: INSTALL,
+            model: "a",
+            round_tokens: 450,
+            round_cost: Some(450),
+            requires_device_slot: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        pending_a
+            .handoff(&worker_pool, &keys, None, &chat_billable, &chat_prepared)
+            .await,
+        Err(gateway::Error::Protection)
+    ));
+    let req_a_state: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.gateway_requests WHERE id = $1::uuid")
+            .bind(&pending_a.id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    assert_eq!(req_a_state, "reserved");
+    let committed_a: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM openmettle.quota_reservations
+          WHERE run_id = $1::uuid AND state = 'handoff_committed'",
+    )
+    .bind(&r_a)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(committed_a, 0);
+    assert!(pending_a.release(&worker_pool).await.unwrap());
+    let req_a_after: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.gateway_requests WHERE id = $1::uuid")
+            .bind(&pending_a.id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    assert_eq!(req_a_after, "released");
+    leases::settle(
+        &mut worker,
+        &claim_a.lease(),
+        &lease_cfg,
+        Settle::Failed(FailReason::StepFailed),
+    )
+    .await
+    .unwrap();
+    let drift_a: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
+           FROM openmettle.quota_verify_accounting_drift()",
+    )
+    .fetch_one(&mut worker)
+    .await
+    .unwrap();
+    assert_eq!(drift_a, (0, 0, 0, 0));
+
+    // Part B (P2 #2): Rotate to a short valid Bearer and verify that passing a Chat-prepared
+    // PreparedRequest to a same-model, same-pin Responses BillableInferenceRef fails BEFORE
+    // handoff commit with Error::Refused, while the matching Chat route commits cleanly.
+    let (finger2, env2) = GatewaySealer::new(
+        GatewayKeys::new(&[("rr18-k1".into(), KEY_BYTES)]).unwrap(),
+        g_pool.clone(),
+    )
+    .seal(
+        &Context {
+            installation: INSTALL,
+            user_id: &alice.user,
+            binding_id: &binding,
+            principal: PRINCIPAL,
+            generation: 2,
+        },
+        &Bearer::new(b"rr18-short-bearer").unwrap(),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_generations
+             (binding_id, generation, remote_key, expires_at, key_id, key_fingerprint, nonce, ciphertext)
+         VALUES ($1::uuid, 2, gen_random_uuid(), clock_timestamp() + interval '1 hour', $2, $3, $4, $5)",
+    )
+    .bind(&binding)
+    .bind(&env2.key_id)
+    .bind(finger2.as_slice())
+    .bind(env2.nonce.as_slice())
+    .bind(env2.ciphertext)
+    .execute(&g_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE openmettle.gateway_bindings
+            SET active_generation = 2
+          WHERE id = $1::uuid",
+    )
+    .bind(&binding)
+    .execute(&g_pool)
+    .await
+    .unwrap();
+
+    let chat_b = authz_runs::chat(&db, &alice_scope, "personal", &alice).await;
+    let (branch_b, msg_b) = branch_and_message(&mut api, &alice_scope, &chat_b).await;
+    let mut tx_b = WriteTransaction::begin(&mut api).await.unwrap();
+    let Admission::Admitted { run_id: r_b, .. } = authz_queue::admit_run(
+        &mut tx_b,
+        &RunAdmission {
+            input: RunInput {
+                scope: &alice_scope,
+                actor: &alice.user,
+                conversation: &chat_b,
+                branch: &branch_b,
+                message: &msg_b,
+                key: "rr18-cross-gateway",
+                format: "openmettle.conversation",
+                version: 1,
+                input: b"{}",
+                config: br#"{"effective":{"ceiling":{"value":450}}}"#,
+            },
+            actor_approval_id: &alice.approval,
+            capabilities: &[],
+            requested_rounds: Some(1),
+            now_ms: authz_store::NOW,
+            cost_qualified: None,
+        },
+        &limits,
+    )
+    .await
+    .unwrap() else {
+        panic!("expected admission");
+    };
+    assert!(
+        quotas::reserve_admitted_run_budget(
+            &mut tx_b,
+            &RunBudgetReservation {
+                scope_id: &alice_scope,
+                scope_kind: "personal",
+                actor_user_id: &alice.user,
+                actor_approval_id: &alice.approval,
+                run_id: &r_b,
+                token_units: 450,
+                per_round_cost_micros: Some(450),
+                round_limit: 1,
+                requires_device_slot: false,
+            },
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    tx_b.commit().await.unwrap();
+
+    let claim_b = authz_queue::claim_next(&mut worker, &claim_cfg, &lease_cfg)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim_b.run_id, r_b);
+
+    let pending_b = gateway::reserve_turn_round(
+        &worker_pool,
+        TurnRound {
+            scope_id: &alice_scope,
+            actor: &alice.user,
+            approval: &alice.approval,
+            run_id: &r_b,
+            round: 1,
+            claim_token: &claim_b.claim_token,
+            installation: INSTALL,
+            model: "a",
+            round_tokens: 450,
+            round_cost: Some(450),
+            requires_device_slot: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        pending_b
+            .handoff(&worker_pool, &keys, None, &resp_billable, &chat_prepared)
+            .await,
+        Err(gateway::Error::Refused)
+    ));
+    let req_b_state: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.gateway_requests WHERE id = $1::uuid")
+            .bind(&pending_b.id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    assert_eq!(req_b_state, "reserved");
+    let committed_b: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM openmettle.quota_reservations
+          WHERE run_id = $1::uuid AND state = 'handoff_committed'",
+    )
+    .bind(&r_b)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(committed_b, 0);
+
+    // Matching originating Chat route hands off cleanly.
+    let _disp_b = pending_b
+        .handoff(&worker_pool, &keys, None, &chat_billable, &chat_prepared)
+        .await
+        .unwrap();
+    let report_id_b: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+    assert_eq!(
+        settlement::ingest(
+            &g_pool,
+            &UsageReport {
+                request: pending_b.id.clone(),
+                installation: INSTALL.into(),
+                principal: PRINCIPAL.into(),
+                scope: alice_scope.clone(),
+                source: report_source.clone(),
+                report_id: report_id_b,
+                revision: 0,
+                r#final: true,
+                prompt_tokens: Some(100),
+                completion_tokens: Some(50),
+                reasoning_tokens: None,
+                reasoning_included: None,
+                cost: Some("120".into()),
+                unit: Some("usd_micros".into()),
+            },
+        )
+        .await
+        .unwrap(),
+        settlement::Outcome::Applied
+    );
+    leases::settle(&mut worker, &claim_b.lease(), &lease_cfg, Settle::Succeeded)
+        .await
+        .unwrap();
+    let drift_b: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
+           FROM openmettle.quota_verify_accounting_drift()",
+    )
+    .fetch_one(&mut worker)
+    .await
+    .unwrap();
+    assert_eq!(drift_b, (0, 0, 0, 0));
 }

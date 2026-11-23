@@ -539,11 +539,8 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                                 &self.pool,
                                 &metered.keys,
                                 metered.device_grant_id.as_deref(),
-                                |dispatch| {
-                                    billable
-                                        .validate_dispatch(dispatch, &prepared)
-                                        .map_err(|_| crate::authz::gateway::Error::Protection)
-                                },
+                                &billable,
+                                &prepared,
                             )
                             .await
                         {

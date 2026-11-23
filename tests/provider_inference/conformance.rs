@@ -670,3 +670,45 @@ async fn prepared_request_decodes_tool_calls_against_bound_request_tools() {
         mock.assert_inference_only(2);
     }
 }
+
+#[tokio::test]
+async fn prepared_request_rejects_cross_gateway_same_pin_dispatch() {
+    let chat_mock = Mock::new(Protocol::Chat, |_| Reply::Bytes(Vec::new())).await;
+    let resp_mock = Mock::new(Protocol::Responses, |_| Reply::Bytes(Vec::new())).await;
+    let c = catalog(Protocol::Chat, false);
+    let e = effective(&c, false);
+    let chat_gw = chat_mock.gateway(&e, NORMAL);
+    let resp_gw = resp_mock.gateway(&e, NORMAL);
+    let r = request(false);
+
+    let chat_caller = chat_gw.prepare(&c, &e, &r, false).unwrap();
+    assert_eq!(
+        resp_gw.validate_outbound_headers(Credential::Bearer(TOKEN), &chat_caller),
+        Err(Error::Validation)
+    );
+    assert_eq!(
+        resp_gw
+            .caller_prepared(chat_caller, Credential::Bearer(TOKEN), |_| async {})
+            .await
+            .err(),
+        Some(Error::Validation)
+    );
+
+    let chat_server = chat_gw.prepare(&c, &e, &r, true).unwrap();
+    assert_eq!(
+        resp_gw.validate_outbound_headers(Credential::Bearer(TOKEN), &chat_server),
+        Err(Error::Validation)
+    );
+    let (_tx, stop) =
+        super::timing::run_stop(tokio::time::Instant::now() + std::time::Duration::from_secs(5));
+    assert_eq!(
+        resp_gw
+            .server_prepared(chat_server, Credential::Bearer(TOKEN), stop, |_| async {})
+            .await
+            .err(),
+        Some(Error::Validation)
+    );
+
+    chat_mock.assert_inference_only(0);
+    resp_mock.assert_inference_only(0);
+}

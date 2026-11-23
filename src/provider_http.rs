@@ -363,14 +363,17 @@ pub struct BillableInferenceRef<'a> {
     pub route: &'a inference::Gateway,
 }
 
-impl BillableInferenceRef<'_> {
+impl<'r> BillableInferenceRef<'r> {
     pub fn prepare<'a>(
         &self,
         catalog: &'a Catalog,
         effective: &Effective,
         request: &'a inference::Request,
         server: bool,
-    ) -> Result<inference::PreparedRequest<'a>, inference::Error> {
+    ) -> Result<inference::PreparedRequest<'a>, inference::Error>
+    where
+        'r: 'a,
+    {
         self.route.prepare(catalog, effective, request, server)
     }
 
@@ -461,7 +464,7 @@ pub struct BillableInference {
 }
 impl BillableInference {
     pub fn prepare<'a>(
-        &self,
+        &'a self,
         catalog: &'a Catalog,
         effective: &Effective,
         request: &'a inference::Request,
