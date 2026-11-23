@@ -6,15 +6,12 @@
 use crate::authz::gateway::problem::{Cause, Problem};
 use crate::{
     provider_http::{fixture::Reply, inference::*},
+    sglang_recorded::*,
     support::*,
 };
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
-const DIR: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/sglang-recorded"
-);
 /// Synthetic substitute for the deployment's served model name.
 const MODEL: &str = "recorded-sglang-model";
 const CASES: [&str; 12] = [
@@ -31,29 +28,6 @@ const CASES: [&str; 12] = [
     "11-chat-bad-model",
     "14-responses-list",
 ];
-/// The capture client gave up mid-stream; the recording has neither `[DONE]` nor usage.
-const ABORTED: &str = "08-chat-stream-abort";
-
-fn file(case: &str, ext: &str) -> Vec<u8> {
-    std::fs::read(format!("{DIR}/{case}.{ext}")).unwrap()
-}
-/// Exact recorded body. Each body file carries one extra trailing LF for repository hygiene.
-fn body(case: &str) -> Vec<u8> {
-    let mut b = file(case, "body");
-    assert_eq!(b.pop(), Some(b'\n'), "{case}: missing hygiene LF");
-    b
-}
-/// Recorded status line and headers, stored with LF and sent with CRLF.
-fn head(case: &str) -> String {
-    String::from_utf8(file(case, "headers"))
-        .unwrap()
-        .replace('\n', "\r\n")
-}
-fn chunked(case: &str) -> bool {
-    head(case)
-        .to_ascii_lowercase()
-        .contains("transfer-encoding: chunked")
-}
 fn sent(case: &str) -> Value {
     serde_json::from_slice(&file(case, "request.json")).unwrap()
 }
@@ -106,7 +80,6 @@ fn chunkings(case: &str) -> &'static [Chunking] {
         &[Chunking::AsRecorded]
     }
 }
-/// The recording de-chunked the body, so original chunk boundaries are not preserved.
 fn response(case: &str, chunking: Chunking) -> Vec<u8> {
     let body = body(case);
     let mut out = head(case).into_bytes();
@@ -116,19 +89,7 @@ fn response(case: &str, chunking: Chunking) -> Vec<u8> {
             return out;
         }
         Chunking::PerByte => body.chunks(1).collect(),
-        Chunking::PerEvent => {
-            let (mut events, mut rest) = (Vec::new(), &body[..]);
-            while !rest.is_empty() {
-                let end = rest
-                    .windows(2)
-                    .position(|w| w == b"\n\n")
-                    .map_or(rest.len(), |i| i + 2);
-                let (event, tail) = rest.split_at(end);
-                events.push(event);
-                rest = tail;
-            }
-            events
-        }
+        Chunking::PerEvent => events(&body),
     };
     for piece in pieces {
         out.extend(chunk(piece));
