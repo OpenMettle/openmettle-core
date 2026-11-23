@@ -7,30 +7,30 @@ use openmettle_core::{
         runs::{self as authz_queue, Admission, AdmissionLimits, ClaimLimits, RunAdmission},
     },
     capacity::{
-        self, Decision, DeviceBytes, DeviceObservation, Error, Fence, GrantRequest, GrantState,
-        Observation, Release,
+        self, Controller, Decision, DeviceBytes, DeviceObservation, Error, Evidence, GrantRequest,
+        GrantState, Observation,
     },
     quotas::{self, RunBudgetReservation},
     runs::{RunInput, WriteTransaction},
 };
 
 const GROUP: &str = "00000000-0000-4000-8000-00000000c001";
+const GROUP_B: &str = "00000000-0000-4000-8000-00000000c002";
 const GPU0: &str = "00000000-0000-4000-8000-00000000c0d0";
 const GPU1: &str = "00000000-0000-4000-8000-00000000c0d1";
-const CTRL_A: &str = "00000000-0000-4000-8000-00000000c0a1";
-const CTRL_B: &str = "00000000-0000-4000-8000-00000000c0b2";
 const GIB: i64 = 1 << 30;
 /// 24 GiB device: chat uses its 16 GiB floor, 1 GiB headroom, so 7 GiB is grantable.
 const TOTAL: i64 = 24 * GIB;
 const FLOOR: i64 = 16 * GIB;
 const HEADROOM: i64 = GIB;
 const SPARE: i64 = TOTAL - FLOOR - HEADROOM;
+const LEASE: Duration = Duration::from_secs(60);
 
-/// One leased run with its run-level `device_reservations` hold.
+/// One leased run and its run-level `device_reservations` hold, when metering created one.
 struct Leased {
     run: String,
     claim: String,
-    hold: String,
+    hold: Option<String>,
 }
 
 struct Fixture {
@@ -41,9 +41,20 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// A group with `devices` configured and `runs` claimed runs that each hold one device slot.
+    /// A metered installation: every claimed run holds one device slot.
     async fn new(devices: &[&str], runs: usize) -> Self {
-        let db = TestDb::migrated().await;
+        Self::with(devices, runs, true).await
+    }
+
+    /// A group with `devices` configured and `runs` claimed runs. Without metering (an upgraded
+    /// installation before activation), admission creates no quota holds.
+    async fn with(devices: &[&str], runs: usize, metered: bool) -> Self {
+        let db = TestDb::new().await;
+        let settings = db.settings(Duration::from_secs(10));
+        if !metered {
+            migrate::apply(&settings, &MIGRATIONS[..23]).await.unwrap();
+        }
+        migrate::apply(&settings, MIGRATIONS).await.unwrap();
         let mut owner = connect(&db.0, OWNER).await;
         authz_store::providers(&mut owner).await;
         let alice =
@@ -58,13 +69,16 @@ impl Fixture {
             )
             .await
             .unwrap();
-        sqlx::query(
-            "INSERT INTO openmettle.capacity_groups (id, observation_ttl_ms) VALUES ($1::uuid, 60000)",
-        )
-        .bind(GROUP)
-        .execute(&mut owner)
-        .await
-        .unwrap();
+        for group in [GROUP, GROUP_B] {
+            sqlx::query(
+                "INSERT INTO openmettle.capacity_groups (id, observation_ttl_ms)
+                 VALUES ($1::uuid, 60000)",
+            )
+            .bind(group)
+            .execute(&mut owner)
+            .await
+            .unwrap();
+        }
         for device in devices {
             sqlx::query(
                 "INSERT INTO openmettle.capacity_devices (id, group_id, chat_floor_bytes)
@@ -155,15 +169,16 @@ impl Fixture {
             .await
             .unwrap()
             .unwrap();
-            let hold: String = sqlx::query_scalar(
+            let hold: Option<String> = sqlx::query_scalar(
                 "SELECT id::text FROM openmettle.quota_reservations
                   WHERE run_id = $1::uuid AND gateway_request_id IS NULL
                     AND resource_kind = 'device_reservations'",
             )
             .bind(&claim.run_id)
-            .fetch_one(&mut owner)
+            .fetch_optional(&mut owner)
             .await
             .unwrap();
+            assert_eq!(hold.is_some(), metered);
             leased.push(Leased {
                 run: claim.run_id,
                 claim: claim.claim_token,
@@ -207,33 +222,54 @@ impl Fixture {
                       WHERE scope_id = h.scope_id AND resource_kind = 'device_reservations')
                FROM openmettle.quota_reservations h WHERE h.id = $1::uuid",
         )
-        .bind(&self.runs[run].hold)
+        .bind(self.runs[run].hold.as_deref().unwrap())
         .fetch_one(&mut self.owner)
         .await
         .unwrap()
     }
 
+    async fn owner_exec(&mut self, sql: &str, binds: &[&str]) {
+        let mut query = sqlx::query(AssertSqlSafe(sql.to_owned()));
+        for bind in binds {
+            query = query.bind(*bind);
+        }
+        query.execute(&mut self.owner).await.unwrap();
+    }
+
     async fn expire_controller_lease(&mut self) {
-        sqlx::query(
+        self.owner_exec(
             "UPDATE openmettle.capacity_groups
                 SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1::uuid",
+            &[GROUP],
         )
-        .bind(GROUP)
-        .execute(&mut self.owner)
-        .await
-        .unwrap();
+        .await;
+    }
+
+    async fn expire_run_lease(&mut self, run: usize) {
+        let id = self.runs[run].run.clone();
+        self.owner_exec(
+            "UPDATE openmettle.runs SET lease_expires_at = clock_timestamp() - interval '1 second'
+              WHERE id = $1::uuid",
+            &[&id],
+        )
+        .await;
     }
 
     /// Change the group's configured freshness TTL, as an operator would.
-    async fn ttl(&mut self, ms: i32) {
-        sqlx::query(
-            "UPDATE openmettle.capacity_groups SET observation_ttl_ms = $2 WHERE id = $1::uuid",
+    async fn ttl(&mut self, ms: &str) {
+        self.owner_exec(
+            "UPDATE openmettle.capacity_groups SET observation_ttl_ms = $2::integer
+              WHERE id = $1::uuid",
+            &[GROUP, ms],
         )
-        .bind(GROUP)
-        .bind(ms)
-        .execute(&mut self.owner)
-        .await
-        .unwrap();
+        .await;
+    }
+
+    async fn grants(&mut self) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM openmettle.capacity_grants")
+            .fetch_one(&mut self.owner)
+            .await
+            .unwrap()
     }
 
     async fn drift(&mut self) -> (i64, i64, i64, i64) {
@@ -277,7 +313,7 @@ async fn db_now_us(c: &mut PgConnection) -> i64 {
 
 async fn publish(
     c: &mut PgConnection,
-    fence: &Fence<'_>,
+    controller: &Controller,
     revision: i64,
     watermark: i64,
     devices: &[DeviceObservation],
@@ -285,7 +321,7 @@ async fn publish(
     let observed_at_us = db_now_us(c).await;
     capacity::publish(
         c,
-        fence,
+        controller,
         &Observation {
             revision,
             observed_at_us,
@@ -306,25 +342,25 @@ fn granted(decision: Decision) -> String {
     }
 }
 
-/// Acquire, publish a full-spare snapshot at `revision` and resume: the group admits bursts.
-async fn open_group(
-    c: &mut PgConnection,
-    controller: &'static str,
-    revision: i64,
-    devices: &[&str],
-) -> i64 {
-    let epoch = capacity::acquire(c, GROUP, controller, Duration::from_secs(60))
+async fn admits(c: &mut PgConnection) -> bool {
+    capacity::snapshot(c, GROUP)
         .await
-        .unwrap();
-    let fence = Fence {
-        group_id: GROUP,
-        controller_id: controller,
-        epoch,
-    };
+        .unwrap()
+        .unwrap()
+        .admits_bursts
+}
+
+/// Acquire, publish a full-spare snapshot at `revision` and resume: the group admits bursts.
+async fn open_group(c: &mut PgConnection, revision: i64, devices: &[&str]) -> Controller {
+    let controller = Controller::acquire(c, GROUP, LEASE).await.unwrap();
     let samples: Vec<_> = devices.iter().map(|d| sample(d, 0, SPARE)).collect();
-    assert!(publish(c, &fence, revision, 0, &samples).await.unwrap());
-    assert!(capacity::resume(c, &fence).await.unwrap());
-    epoch
+    assert!(
+        publish(c, &controller, revision, 0, &samples)
+            .await
+            .unwrap()
+    );
+    assert!(capacity::resume(c, &controller).await.unwrap());
+    controller
 }
 
 #[tokio::test]
@@ -332,14 +368,9 @@ async fn open_group(
 async fn racing_callers_citing_one_revision_cannot_double_spend_the_last_bytes() {
     let mut f = Fixture::new(&[GPU0], 3).await;
     let mut ctl = f.worker().await;
-    let epoch = open_group(&mut ctl, CTRL_A, 1, &[GPU0]).await;
-    let fence = Fence {
-        group_id: GROUP,
-        controller_id: CTRL_A,
-        epoch,
-    };
+    let controller = open_group(&mut ctl, 1, &[GPU0]).await;
     let snapshot = capacity::snapshot(&mut ctl, GROUP).await.unwrap().unwrap();
-    assert!(snapshot.admits_bursts());
+    assert!(snapshot.admits_bursts);
     assert_eq!(snapshot.observation_revision, 1);
     assert_eq!(snapshot.totals().grantable_bytes, i128::from(SPARE));
 
@@ -357,8 +388,8 @@ async fn racing_callers_citing_one_revision_cannot_double_spend_the_last_bytes()
         .unwrap();
     let db = &f.db;
     let (a, b, ()) = tokio::join!(
-        capacity::grant(&mut w0, &fence, &r0),
-        capacity::grant(&mut w1, &fence, &r1),
+        capacity::grant(&mut w0, &controller, &r0),
+        capacity::grant(&mut w1, &controller, &r1),
         async move {
             authz_store::wait_for_lock_waiters(db, 2).await;
             held.commit().await.unwrap();
@@ -386,14 +417,14 @@ async fn racing_callers_citing_one_revision_cannot_double_spend_the_last_bytes()
     // The remaining 3 GiB fit; one byte more would spend the chat floor or headroom.
     let over = [bytes(GPU0, 3 * GIB + 1)];
     assert_eq!(
-        capacity::grant(&mut ctl, &fence, &f.request(2, "over", &over))
+        capacity::grant(&mut ctl, &controller, &f.request(2, "over", &over))
             .await
             .unwrap(),
         Decision::Insufficient
     );
     let rest = [bytes(GPU0, 3 * GIB)];
     granted(
-        capacity::grant(&mut ctl, &fence, &f.request(2, "rest", &rest))
+        capacity::grant(&mut ctl, &controller, &f.request(2, "rest", &rest))
             .await
             .unwrap(),
     );
@@ -413,12 +444,8 @@ async fn racing_callers_citing_one_revision_cannot_double_spend_the_last_bytes()
 async fn takeover_fences_delayed_old_epoch_writes_and_reopens_only_after_fresh_recovery() {
     let mut f = Fixture::new(&[GPU0], 2).await;
     let mut a = f.worker().await;
-    let old = Fence {
-        group_id: GROUP,
-        controller_id: CTRL_A,
-        epoch: open_group(&mut a, CTRL_A, 1, &[GPU0]).await,
-    };
-    assert_eq!(old.epoch, 1);
+    let old = open_group(&mut a, 1, &[GPU0]).await;
+    assert_eq!(old.epoch(), 1);
     let first = granted(
         capacity::grant(
             &mut a,
@@ -429,28 +456,64 @@ async fn takeover_fences_delayed_old_epoch_writes_and_reopens_only_after_fresh_r
         .unwrap(),
     );
     assert_eq!(
-        capacity::record_release(&mut a, &old, &first, Release::Releasing)
+        capacity::reconcile(&mut a, &old, &first, Evidence::Releasing)
             .await
             .unwrap(),
         GrantState::Releasing
     );
     let measured_before_takeover = db_now_us(&mut a).await;
 
-    // A live lease cannot be taken over; an expired one advances the epoch.
+    // Worker-readable rows never confer authority: neither the stored hash nor a guess passes.
+    let (hash, epoch): (Vec<u8>, i64) = sqlx::query_as(
+        "SELECT controller_token_hash, controller_epoch FROM openmettle.capacity_groups
+          WHERE id = $1::uuid",
+    )
+    .bind(GROUP)
+    .fetch_one(&mut a)
+    .await
+    .unwrap();
+    for secret in [hash, vec![0; 32]] {
+        assert_eq!(
+            sqlstate(
+                sqlx::query(
+                    "SELECT openmettle.capacity_reconcile($1::uuid, $2, $3, $4::uuid,
+                         'released', ARRAY[$5::uuid])",
+                )
+                .bind(GROUP)
+                .bind(&secret)
+                .bind(epoch)
+                .bind(&first)
+                .bind(GPU0)
+                .execute(&mut a)
+                .await
+            ),
+            "OMC01"
+        );
+        assert_eq!(
+            sqlstate(
+                sqlx::query("SELECT openmettle.capacity_renew_controller($1::uuid, $2, $3, 60000)")
+                    .bind(GROUP)
+                    .bind(&secret)
+                    .bind(epoch)
+                    .execute(&mut a)
+                    .await
+            ),
+            "OMC01"
+        );
+    }
+
+    // A live lease cannot be taken over; renewal extends it; an expired one advances the epoch.
     let mut b = f.worker().await;
     assert_eq!(
-        capacity::acquire(&mut b, GROUP, CTRL_B, Duration::from_secs(60)).await,
-        Err(Error::Fenced)
+        Controller::acquire(&mut b, GROUP, LEASE).await.unwrap_err(),
+        Error::Fenced
     );
+    old.renew(&mut a, LEASE).await.unwrap();
     f.expire_controller_lease().await;
-    let new = Fence {
-        group_id: GROUP,
-        controller_id: CTRL_B,
-        epoch: capacity::acquire(&mut b, GROUP, CTRL_B, Duration::from_secs(60))
-            .await
-            .unwrap(),
-    };
-    assert_eq!(new.epoch, 2);
+    assert!(!admits(&mut b).await);
+    assert_eq!(old.renew(&mut a, LEASE).await, Err(Error::Fenced));
+    let new = Controller::acquire(&mut b, GROUP, LEASE).await.unwrap();
+    assert_eq!(new.epoch(), 2);
 
     // Every delayed write from epoch 1 is refused and changes nothing.
     assert_eq!(
@@ -462,20 +525,16 @@ async fn takeover_fences_delayed_old_epoch_writes_and_reopens_only_after_fresh_r
         Err(Error::Fenced)
     );
     assert_eq!(
-        capacity::record_release(&mut a, &old, &first, Release::Released(&[GPU0.into()])).await,
+        capacity::reconcile(&mut a, &old, &first, Evidence::Released(&[GPU0.into()])).await,
         Err(Error::Fenced)
     );
     assert_eq!(capacity::resume(&mut a, &old).await, Err(Error::Fenced));
-    assert_eq!(
-        capacity::acquire(&mut a, GROUP, CTRL_A, Duration::from_secs(60)).await,
-        Err(Error::Fenced)
-    );
     let snapshot = capacity::snapshot(&mut b, GROUP).await.unwrap().unwrap();
     assert_eq!(
         (snapshot.controller_epoch, snapshot.observation_revision),
         (2, 1)
     );
-    assert!(!snapshot.admits_bursts());
+    assert!(!snapshot.admits_bursts);
     let state: String =
         sqlx::query_scalar("SELECT state FROM openmettle.capacity_grants WHERE id = $1::uuid")
             .bind(&first)
@@ -488,7 +547,8 @@ async fn takeover_fences_delayed_old_epoch_writes_and_reopens_only_after_fresh_r
         ("handoff_committed".into(), Some(first.clone()), 2)
     );
 
-    // The successor stays closed until it publishes a sample measured in its own epoch.
+    // The successor stays closed until it publishes a sample measured in its own epoch and
+    // attests the earlier grant against its fenced inventory.
     assert_eq!(
         capacity::grant(&mut b, &new, &f.request(1, "early", &[bytes(GPU0, GIB)]))
             .await
@@ -527,6 +587,13 @@ async fn takeover_fences_delayed_old_epoch_writes_and_reopens_only_after_fresh_r
         .await
         .unwrap()
     );
+    assert!(!capacity::resume(&mut b, &new).await.unwrap());
+    assert_eq!(
+        capacity::reconcile(&mut b, &new, &first, Evidence::Allocated)
+            .await
+            .unwrap(),
+        GrantState::Releasing
+    );
     assert!(capacity::resume(&mut b, &new).await.unwrap());
 
     // The releasing grant is still charged and the chat floor stays protected.
@@ -550,43 +617,35 @@ async fn takeover_fences_delayed_old_epoch_writes_and_reopens_only_after_fresh_r
         .unwrap(),
     );
     assert_eq!(
-        capacity::record_release(&mut b, &new, &first, Release::Released(&[GPU0.into()]))
+        capacity::reconcile(&mut b, &new, &first, Evidence::Released(&[GPU0.into()]))
             .await
             .unwrap(),
         GrantState::Released
     );
     assert_eq!(f.slot(0).await, ("released".into(), Some(first), 1));
 
-    // The same controller re-acquiring after its lease lapsed gets a new epoch, and the epoch
-    // alone fences its own delayed epoch-2 writes.
+    // The epoch alone fences a holder that re-acquires with the same secret after a lapse.
     f.expire_controller_lease().await;
-    let again = Fence {
-        epoch: capacity::acquire(&mut b, GROUP, CTRL_B, Duration::from_secs(60))
-            .await
-            .unwrap(),
-        ..new
+    let reused = [7u8; 32];
+    let acquire = |c: &'static str| {
+        sqlx::query_scalar::<_, i64>(c)
+            .bind(GROUP)
+            .bind(reused.as_slice())
     };
-    assert_eq!(again.epoch, 3);
+    let sql = "SELECT openmettle.capacity_acquire_controller($1::uuid, $2, 60000)";
+    let lapsed = acquire(sql).fetch_one(&mut b).await.unwrap();
+    f.expire_controller_lease().await;
+    assert_eq!(acquire(sql).fetch_one(&mut b).await.unwrap(), lapsed + 1);
     assert_eq!(
-        publish(
-            &mut b,
-            &new,
-            3,
-            2,
-            &[sample(GPU0, 3 * GIB, SPARE - 3 * GIB)]
-        )
-        .await,
-        Err(Error::Fenced)
-    );
-    assert_eq!(
-        capacity::record_release(&mut b, &new, &second, Release::Releasing).await,
-        Err(Error::Fenced)
-    );
-    assert_eq!(
-        capacity::grant(&mut b, &again, &f.request(0, "closed", &[bytes(GPU0, GIB)]))
-            .await
-            .unwrap(),
-        Decision::Unavailable
+        sqlstate(
+            sqlx::query("SELECT openmettle.capacity_resume($1::uuid, $2, $3)")
+                .bind(GROUP)
+                .bind(reused.as_slice())
+                .bind(lapsed)
+                .execute(&mut b)
+                .await
+        ),
+        "OMC01"
     );
     assert_eq!(
         f.slot(1).await,
@@ -600,11 +659,7 @@ async fn takeover_fences_delayed_old_epoch_writes_and_reopens_only_after_fresh_r
 async fn stale_or_inconsistent_observations_cannot_justify_a_grant() {
     let mut f = Fixture::new(&[GPU0, GPU1], 2).await;
     let mut c = f.worker().await;
-    let fence = Fence {
-        group_id: GROUP,
-        controller_id: CTRL_A,
-        epoch: open_group(&mut c, CTRL_A, 1, &[GPU0, GPU1]).await,
-    };
+    let controller = open_group(&mut c, 1, &[GPU0, GPU1]).await;
     let full = [sample(GPU0, 0, SPARE), sample(GPU1, 0, SPARE)];
 
     // Refused samples: a missing rank, a duplicate rank, an unconfigured device, a floor below
@@ -622,19 +677,19 @@ async fn stale_or_inconsistent_observations_cannot_justify_a_grant() {
         vec![sample(GPU0, 0, SPARE), sample(GPU1, 0, SPARE + 1)],
     ] {
         assert_eq!(
-            publish(&mut c, &fence, 2, 0, &devices).await,
+            publish(&mut c, &controller, 2, 0, &devices).await,
             Err(Error::Invalid)
         );
     }
     assert_eq!(
-        publish(&mut c, &fence, 2, 1, &full).await,
+        publish(&mut c, &controller, 2, 1, &full).await,
         Err(Error::Invalid)
     );
     let future = db_now_us(&mut c).await + 60_000_000;
     assert_eq!(
         capacity::publish(
             &mut c,
-            &fence,
+            &controller,
             &Observation {
                 revision: 2,
                 observed_at_us: future,
@@ -649,7 +704,7 @@ async fn stale_or_inconsistent_observations_cannot_justify_a_grant() {
     // A fresh sample admits a rank-constrained grant on both devices.
     let both = [bytes(GPU0, GIB), bytes(GPU1, GIB)];
     let first = granted(
-        capacity::grant(&mut c, &fence, &f.request(0, "fresh", &both))
+        capacity::grant(&mut c, &controller, &f.request(0, "fresh", &both))
             .await
             .unwrap(),
     );
@@ -658,7 +713,7 @@ async fn stale_or_inconsistent_observations_cannot_justify_a_grant() {
     assert_eq!(
         publish(
             &mut c,
-            &fence,
+            &controller,
             2,
             1,
             &[sample(GPU0, GIB, SPARE - GIB), sample(GPU1, 0, SPARE - GIB)]
@@ -671,79 +726,58 @@ async fn stale_or_inconsistent_observations_cannot_justify_a_grant() {
         sample(GPU0, GIB, SPARE - GIB),
         sample(GPU1, GIB, SPARE - GIB),
     ];
+    let at = |revision, observed_at_us| Observation {
+        revision,
+        observed_at_us,
+        commit_watermark: 1,
+        devices: &counted,
+    };
     assert!(
-        capacity::publish(
-            &mut c,
-            &fence,
-            &Observation {
-                revision: 2,
-                observed_at_us: sampled_at,
-                commit_watermark: 1,
-                devices: &counted,
-            },
-        )
-        .await
-        .unwrap()
+        capacity::publish(&mut c, &controller, &at(2, sampled_at))
+            .await
+            .unwrap()
     );
 
     // Past the TTL the group closes, and republishing the old sample never extends freshness.
-    f.ttl(1000).await;
+    f.ttl("1000").await;
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let late = [bytes(GPU0, GIB)];
     assert_eq!(
-        capacity::grant(&mut c, &fence, &f.request(1, "stale", &late))
+        capacity::grant(&mut c, &controller, &f.request(1, "stale", &late))
             .await
             .unwrap(),
         Decision::Unavailable
     );
     assert!(
-        capacity::publish(
-            &mut c,
-            &fence,
-            &Observation {
-                revision: 3,
-                observed_at_us: sampled_at,
-                commit_watermark: 1,
-                devices: &counted,
-            },
-        )
-        .await
-        .unwrap()
+        capacity::publish(&mut c, &controller, &at(3, sampled_at))
+            .await
+            .unwrap()
     );
     // A replayed revision is ignored even when it carries a newer measurement.
-    assert!(!publish(&mut c, &fence, 3, 1, &counted).await.unwrap());
+    assert!(!publish(&mut c, &controller, 3, 1, &counted).await.unwrap());
     let snapshot = capacity::snapshot(&mut c, GROUP).await.unwrap().unwrap();
     assert_eq!(snapshot.observation_revision, 3);
-    assert!(snapshot.ready && !snapshot.fresh && !snapshot.admits_bursts());
+    assert!(!snapshot.admits_bursts);
+    assert!(!capacity::resume(&mut c, &controller).await.unwrap());
     assert_eq!(snapshot.totals().committed_bytes, i128::from(2 * GIB));
     assert_eq!(
-        capacity::grant(&mut c, &fence, &f.request(1, "stale", &late))
+        capacity::grant(&mut c, &controller, &f.request(1, "stale", &late))
             .await
             .unwrap(),
         Decision::Unavailable
     );
     assert_eq!(
-        capacity::publish(
-            &mut c,
-            &fence,
-            &Observation {
-                revision: 4,
-                observed_at_us: sampled_at - 1,
-                commit_watermark: 1,
-                devices: &counted,
-            },
-        )
-        .await,
+        capacity::publish(&mut c, &controller, &at(4, sampled_at - 1)).await,
         Err(Error::Invalid)
     );
 
     // A fresh sample reopens the group; the earlier grant stays charged on both ranks.
-    f.ttl(60_000).await;
-    assert!(publish(&mut c, &fence, 4, 1, &counted).await.unwrap());
+    f.ttl("60000").await;
+    assert!(publish(&mut c, &controller, 4, 1, &counted).await.unwrap());
     assert_eq!(
         capacity::grant(
             &mut c,
-            &fence,
+            &controller,
             &f.request(1, "fit", &[bytes(GPU1, SPARE - GIB + 1)])
         )
         .await
@@ -753,7 +787,7 @@ async fn stale_or_inconsistent_observations_cannot_justify_a_grant() {
     granted(
         capacity::grant(
             &mut c,
-            &fence,
+            &controller,
             &f.request(1, "fit", &[bytes(GPU1, SPARE - GIB)]),
         )
         .await
@@ -764,24 +798,63 @@ async fn stale_or_inconsistent_observations_cannot_justify_a_grant() {
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
+async fn a_saturated_device_publishes_zero_spare_that_replaces_the_earlier_sample() {
+    let f = Fixture::new(&[GPU0], 1).await;
+    let mut c = f.worker().await;
+    let controller = open_group(&mut c, 1, &[GPU0]).await;
+    // Chat grows to fill the device: measured use exceeds what headroom allows.
+    let full = DeviceObservation {
+        actual_used_bytes: TOTAL,
+        reclaimable_bytes: GIB,
+        grantable_bytes: 0,
+        ..sample(GPU0, 0, 0)
+    };
+    assert!(
+        publish(&mut c, &controller, 2, 0, std::slice::from_ref(&full))
+            .await
+            .unwrap()
+    );
+    let snapshot = capacity::snapshot(&mut c, GROUP).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            snapshot.observation_revision,
+            snapshot.devices[0].grantable_bytes
+        ),
+        (2, 0)
+    );
+    assert_eq!(
+        capacity::grant(&mut c, &controller, &f.request(0, "one", &[bytes(GPU0, 1)]))
+            .await
+            .unwrap(),
+        Decision::Insufficient
+    );
+    // Spare capacity clamps at zero: no byte is grantable while the device is saturated.
+    let over = DeviceObservation {
+        grantable_bytes: 1,
+        ..full
+    };
+    assert_eq!(
+        publish(&mut c, &controller, 3, 0, &[over]).await,
+        Err(Error::Invalid)
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
 async fn replay_recovers_the_recorded_decision_and_conflicting_reuse_is_refused() {
     let mut f = Fixture::new(&[GPU0], 2).await;
     let mut c = f.worker().await;
-    let fence = Fence {
-        group_id: GROUP,
-        controller_id: CTRL_A,
-        epoch: open_group(&mut c, CTRL_A, 1, &[GPU0]).await,
-    };
+    let controller = open_group(&mut c, 1, &[GPU0]).await;
     let need = [bytes(GPU0, 2 * GIB)];
     let grant = granted(
-        capacity::grant(&mut c, &fence, &f.request(0, "replay", &need))
+        capacity::grant(&mut c, &controller, &f.request(0, "replay", &need))
             .await
             .unwrap(),
     );
     // A lost reply recovers the same grant without a second commitment.
     for _ in 0..2 {
         assert_eq!(
-            capacity::grant(&mut c, &fence, &f.request(0, "replay", &need))
+            capacity::grant(&mut c, &controller, &f.request(0, "replay", &need))
                 .await
                 .unwrap(),
             Decision::Grant {
@@ -797,13 +870,18 @@ async fn replay_recovers_the_recorded_decision_and_conflicting_reuse_is_refused(
             .await
             .unwrap();
     assert_eq!(seq, 1);
-    // The identity cannot change the footprint, and the run's slot cannot bind a second grant.
+    // The identity cannot change the footprint, and the run cannot hold a second live grant.
     assert_eq!(
-        capacity::grant(&mut c, &fence, &f.request(0, "replay", &[bytes(GPU0, GIB)])).await,
+        capacity::grant(
+            &mut c,
+            &controller,
+            &f.request(0, "replay", &[bytes(GPU0, GIB)])
+        )
+        .await,
         Err(Error::Conflict)
     );
     assert_eq!(
-        capacity::grant(&mut c, &fence, &f.request(0, "second", &need)).await,
+        capacity::grant(&mut c, &controller, &f.request(0, "second", &need)).await,
         Err(Error::Conflict)
     );
 
@@ -814,9 +892,14 @@ async fn replay_recovers_the_recorded_decision_and_conflicting_reuse_is_refused(
     );
     for _ in 0..2 {
         assert_eq!(
-            capacity::record_release(&mut c, &fence, &grant, Release::Released(&[GPU0.into()]))
-                .await
-                .unwrap(),
+            capacity::reconcile(
+                &mut c,
+                &controller,
+                &grant,
+                Evidence::Released(&[GPU0.into()])
+            )
+            .await
+            .unwrap(),
             GrantState::Released
         );
     }
@@ -825,7 +908,7 @@ async fn replay_recovers_the_recorded_decision_and_conflicting_reuse_is_refused(
         !sqlx::query_scalar::<_, bool>(
             "SELECT openmettle.quota_release_device_slot($1::uuid, $2::uuid)"
         )
-        .bind(&f.runs[0].hold)
+        .bind(f.runs[0].hold.as_deref().unwrap())
         .bind(&grant)
         .fetch_one(&mut c)
         .await
@@ -835,14 +918,14 @@ async fn replay_recovers_the_recorded_decision_and_conflicting_reuse_is_refused(
         "SELECT count(*) FROM openmettle.quota_reconciliations
           WHERE reservation_id = $1::uuid AND kind = 'release' AND delta_reserved = -1",
     )
-    .bind(&f.runs[0].hold)
+    .bind(f.runs[0].hold.as_deref().unwrap())
     .fetch_one(&mut f.owner)
     .await
     .unwrap();
     assert_eq!(releases, 1);
     // A replay after release reports the recorded outcome and never re-dispatches.
     assert_eq!(
-        capacity::grant(&mut c, &fence, &f.request(0, "replay", &need))
+        capacity::grant(&mut c, &controller, &f.request(0, "replay", &need))
             .await
             .unwrap(),
         Decision::Grant {
@@ -856,7 +939,7 @@ async fn replay_recovers_the_recorded_decision_and_conflicting_reuse_is_refused(
     let mut api = connect(&f.db.0, API).await;
     expect_state(
         &mut api,
-        "SELECT openmettle.capacity_acquire_controller(gen_random_uuid(), gen_random_uuid(), 1000)",
+        "SELECT openmettle.capacity_acquire_controller(gen_random_uuid(), '\\x00'::bytea, 1000)",
         "42501",
     )
     .await;
@@ -877,46 +960,221 @@ async fn replay_recovers_the_recorded_decision_and_conflicting_reuse_is_refused(
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
+async fn a_metered_grant_needs_the_runs_held_slot_and_a_run_holds_one_live_grant() {
+    let mut f = Fixture::with(&[GPU0], 2, false).await;
+    let mut c = f.worker().await;
+    let controller = open_group(&mut c, 1, &[GPU0]).await;
+    // Before metering, a run may still hold only one live grant, whatever its request keys.
+    granted(
+        capacity::grant(
+            &mut c,
+            &controller,
+            &f.request(0, "first", &[bytes(GPU0, GIB)]),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        capacity::grant(
+            &mut c,
+            &controller,
+            &f.request(0, "second", &[bytes(GPU0, GIB)])
+        )
+        .await,
+        Err(Error::Conflict)
+    );
+    // A run admitted before metering activation holds no device slot, so it cannot obtain
+    // physical capacity once metering is enforced.
+    f.owner_exec(
+        "UPDATE openmettle.quota_enforcement
+            SET metering_enforced = true, metering_enforced_at = clock_timestamp() WHERE id",
+        &[],
+    )
+    .await;
+    assert_eq!(
+        capacity::grant(
+            &mut c,
+            &controller,
+            &f.request(1, "metered", &[bytes(GPU0, GIB)])
+        )
+        .await,
+        Err(Error::SlotRequired)
+    );
+    assert_eq!(f.grants().await, 1);
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_claim_expiring_while_the_decision_waits_for_the_group_lock_is_refused() {
+    // Without metering there is no slot handoff to recheck the lease later.
+    let mut f = Fixture::with(&[GPU0], 1, false).await;
+    let mut c = f.worker().await;
+    let controller = open_group(&mut c, 1, &[GPU0]).await;
+    let run = f.runs[0].run.clone();
+    f.owner_exec(
+        "UPDATE openmettle.runs SET lease_expires_at = clock_timestamp() + interval '1500 ms'
+          WHERE id = $1::uuid",
+        &[&run],
+    )
+    .await;
+    let mut blocker = connect(&f.db.0, OWNER).await;
+    let mut held = blocker.begin().await.unwrap();
+    sqlx::query("SELECT FROM openmettle.capacity_groups WHERE id = $1::uuid FOR NO KEY UPDATE")
+        .bind(GROUP)
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let need = [bytes(GPU0, GIB)];
+    let request = f.request(0, "waits", &need);
+    let mut w = f.worker().await;
+    let db = &f.db;
+    let (decision, ()) = tokio::join!(capacity::grant(&mut w, &controller, &request), async move {
+        authz_store::wait_for_lock_waiters(db, 1).await;
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        held.commit().await.unwrap();
+    });
+    assert_eq!(decision, Err(Error::LeaseLost));
+    assert_eq!(f.grants().await, 0);
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn repeatable_read_cannot_decide_from_a_snapshot_before_a_closing_transition() {
+    let f = Fixture::new(&[GPU0], 2).await;
+    let mut c = f.worker().await;
+    let controller = open_group(&mut c, 1, &[GPU0]).await;
+    let first = granted(
+        capacity::grant(
+            &mut c,
+            &controller,
+            &f.request(0, "first", &[bytes(GPU0, GIB)]),
+        )
+        .await
+        .unwrap(),
+    );
+    let mut rr = f.worker().await;
+    let mut tx = rr.begin().await.unwrap();
+    tx.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .unwrap();
+    tx.execute("SELECT 1").await.unwrap();
+    // The allocation becomes unknown after the REPEATABLE READ snapshot was taken.
+    assert_eq!(
+        capacity::reconcile(&mut c, &controller, &first, Evidence::UnknownAllocation)
+            .await
+            .unwrap(),
+        GrantState::UnknownAllocation
+    );
+    let need = [bytes(GPU0, GIB)];
+    assert_eq!(
+        capacity::grant(&mut tx, &controller, &f.request(1, "stale-snapshot", &need)).await,
+        Err(Error::Invalid)
+    );
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        capacity::grant(&mut c, &controller, &f.request(1, "current", &need))
+            .await
+            .unwrap(),
+        Decision::Unavailable
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn raising_the_chat_floor_waits_for_decisions_and_closes_the_group_until_covered() {
+    let f = Fixture::new(&[GPU0], 1).await;
+    let mut c = f.worker().await;
+    let controller = open_group(&mut c, 1, &[GPU0]).await;
+    // The operator raises the floor in a transaction that is still open: the decision waits for
+    // it, then finds the published floor no longer covers the configuration.
+    let mut operator = connect(&f.db.0, OWNER).await;
+    let mut raise = operator.begin().await.unwrap();
+    sqlx::query("UPDATE openmettle.capacity_devices SET chat_floor_bytes = $2 WHERE id = $1::uuid")
+        .bind(GPU0)
+        .bind(FLOOR + GIB)
+        .execute(&mut *raise)
+        .await
+        .unwrap();
+    let need = [bytes(GPU0, GIB)];
+    let request = f.request(0, "floor", &need);
+    let db = &f.db;
+    let (decision, ()) = tokio::join!(capacity::grant(&mut c, &controller, &request), async move {
+        authz_store::wait_for_lock_waiters(db, 1).await;
+        raise.commit().await.unwrap();
+    });
+    assert_eq!(decision.unwrap(), Decision::Unavailable);
+    assert!(!admits(&mut c).await);
+    // A sample covering the raised floor reopens the group with one GiB less spare.
+    let raised = DeviceObservation {
+        actual_used_bytes: FLOOR + GIB,
+        active_chat_floor_bytes: FLOOR + GIB,
+        ..sample(GPU0, 0, SPARE - GIB)
+    };
+    assert!(publish(&mut c, &controller, 2, 0, &[raised]).await.unwrap());
+    assert_eq!(
+        capacity::grant(
+            &mut c,
+            &controller,
+            &f.request(0, "floor", &[bytes(GPU0, SPARE - GIB + 1)])
+        )
+        .await
+        .unwrap(),
+        Decision::Insufficient
+    );
+    granted(
+        capacity::grant(
+            &mut c,
+            &controller,
+            &f.request(0, "floor", &[bytes(GPU0, SPARE - GIB)]),
+        )
+        .await
+        .unwrap(),
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
 async fn partial_release_keeps_both_ledgers_charged_until_every_device_confirms() {
     let mut f = Fixture::new(&[GPU0, GPU1], 2).await;
     let mut c = f.worker().await;
-    let fence = Fence {
-        group_id: GROUP,
-        controller_id: CTRL_A,
-        epoch: open_group(&mut c, CTRL_A, 1, &[GPU0, GPU1]).await,
-    };
+    let controller = open_group(&mut c, 1, &[GPU0, GPU1]).await;
     let grant = granted(
         capacity::grant(
             &mut c,
-            &fence,
+            &controller,
             &f.request(0, "two-rank", &[bytes(GPU0, 2 * GIB), bytes(GPU1, 2 * GIB)]),
         )
         .await
         .unwrap(),
     );
     assert_eq!(
-        capacity::record_release(&mut c, &fence, &grant, Release::Releasing)
+        capacity::reconcile(&mut c, &controller, &grant, Evidence::Releasing)
             .await
             .unwrap(),
         GrantState::Releasing
     );
     // Evidence for a device outside the footprint is refused.
     assert_eq!(
-        capacity::record_release(
+        capacity::reconcile(
             &mut c,
-            &fence,
+            &controller,
             &grant,
-            Release::Released(&["00000000-0000-4000-8000-00000000c0ff".into()])
+            Evidence::Released(&["00000000-0000-4000-8000-00000000c0ff".into()])
         )
         .await,
         Err(Error::Invalid)
     );
     // One rank confirms: the allocation is unknown, both ledgers keep their charges and the
-    // group closes to bursts.
+    // group closes to bursts, which resume and snapshots report the same way.
     assert_eq!(
-        capacity::record_release(&mut c, &fence, &grant, Release::Released(&[GPU0.into()]))
-            .await
-            .unwrap(),
+        capacity::reconcile(
+            &mut c,
+            &controller,
+            &grant,
+            Evidence::Released(&[GPU0.into()])
+        )
+        .await
+        .unwrap(),
         GrantState::UnknownAllocation
     );
     assert_eq!(
@@ -926,7 +1184,7 @@ async fn partial_release_keeps_both_ledgers_charged_until_every_device_confirms(
     assert_eq!(
         sqlstate(
             sqlx::query("SELECT openmettle.quota_release_device_slot($1::uuid, $2::uuid)")
-                .bind(&f.runs[0].hold)
+                .bind(f.runs[0].hold.as_deref().unwrap())
                 .bind(&grant)
                 .execute(&mut c)
                 .await
@@ -936,21 +1194,20 @@ async fn partial_release_keeps_both_ledgers_charged_until_every_device_confirms(
     assert_eq!(
         capacity::grant(
             &mut c,
-            &fence,
+            &controller,
             &f.request(1, "blocked", &[bytes(GPU0, GIB)])
         )
         .await
         .unwrap(),
         Decision::Unavailable
     );
-    let snapshot = capacity::snapshot(&mut c, GROUP).await.unwrap().unwrap();
-    assert_eq!(snapshot.unknown_allocations, 1);
-    assert!(!snapshot.admits_bursts());
+    assert!(!admits(&mut c).await);
+    assert!(!capacity::resume(&mut c, &controller).await.unwrap());
     // The released rank's bytes are not returned by a sample that omits the whole grant.
     assert_eq!(
         publish(
             &mut c,
-            &fence,
+            &controller,
             2,
             1,
             &[
@@ -961,21 +1218,25 @@ async fn partial_release_keeps_both_ledgers_charged_until_every_device_confirms(
         .await,
         Err(Error::Invalid)
     );
-    // A later lost reply cannot downgrade the unknown allocation back to releasing.
+    // Neither a later release trigger nor an inventory attestation hides the unknown allocation.
     assert_eq!(
-        capacity::record_release(&mut c, &fence, &grant, Release::Releasing)
+        capacity::reconcile(&mut c, &controller, &grant, Evidence::Releasing)
             .await
             .unwrap(),
         GrantState::UnknownAllocation
     );
+    assert_eq!(
+        capacity::reconcile(&mut c, &controller, &grant, Evidence::Allocated).await,
+        Err(Error::Invalid)
+    );
 
     // The remaining rank confirms non-allocation: both ledgers settle exactly once.
     assert_eq!(
-        capacity::record_release(
+        capacity::reconcile(
             &mut c,
-            &fence,
+            &controller,
             &grant,
-            Release::NotAllocated(&[GPU0.into(), GPU1.into()])
+            Evidence::NotAllocated(&[GPU0.into(), GPU1.into()])
         )
         .await
         .unwrap(),
@@ -998,10 +1259,11 @@ async fn partial_release_keeps_both_ledgers_charged_until_every_device_confirms(
     );
     assert_eq!(f.slot(0).await, ("released".into(), Some(grant), 1));
     assert_eq!(f.drift().await, (0, 0, 0, 0));
+    assert!(capacity::resume(&mut c, &controller).await.unwrap());
     granted(
         capacity::grant(
             &mut c,
-            &fence,
+            &controller,
             &f.request(1, "reopened", &[bytes(GPU0, GIB)]),
         )
         .await
@@ -1012,14 +1274,10 @@ async fn partial_release_keeps_both_ledgers_charged_until_every_device_confirms(
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn crash_recovery_preserves_charges_until_a_current_controller_reconciles() {
-    let mut f = Fixture::new(&[GPU0], 2).await;
-    let mut c = f.worker().await;
-    let fence = Fence {
-        group_id: GROUP,
-        controller_id: CTRL_A,
-        epoch: open_group(&mut c, CTRL_A, 1, &[GPU0]).await,
-    };
-    let need = [bytes(GPU0, 4 * GIB)];
+    let mut f = Fixture::new(&[GPU0], 3).await;
+    let mut a = f.worker().await;
+    let first = open_group(&mut a, 1, &[GPU0]).await;
+    let need = [bytes(GPU0, 2 * GIB)];
 
     // A grant transaction that never commits leaves neither ledger changed.
     {
@@ -1028,7 +1286,7 @@ async fn crash_recovery_preserves_charges_until_a_current_controller_reconciles(
         granted(
             capacity::grant(
                 tx.connection().unwrap(),
-                &fence,
+                &first,
                 &f.request(0, "crash", &need),
             )
             .await
@@ -1036,93 +1294,94 @@ async fn crash_recovery_preserves_charges_until_a_current_controller_reconciles(
         );
         drop(tx);
     }
-    let grants: i64 = sqlx::query_scalar("SELECT count(*) FROM openmettle.capacity_grants")
-        .fetch_one(&mut f.owner)
-        .await
-        .unwrap();
-    assert_eq!(grants, 0);
-    assert_eq!(f.slot(0).await, ("held".into(), None, 2));
-    let grant = granted(
-        capacity::grant(&mut c, &fence, &f.request(0, "crash", &need))
+    assert_eq!(f.grants().await, 0);
+    assert_eq!(f.slot(0).await, ("held".into(), None, 3));
+    let dispatched = granted(
+        capacity::grant(&mut a, &first, &f.request(0, "crash", &need))
             .await
             .unwrap(),
     );
-
-    // The worker dies: its expired claim authorizes no new allocation.
-    sqlx::query(
-        "UPDATE openmettle.runs SET lease_expires_at = clock_timestamp() - interval '1 second'
-          WHERE id = $1::uuid",
-    )
-    .bind(&f.runs[0].run)
-    .execute(&mut f.owner)
-    .await
-    .unwrap();
-    assert_eq!(
-        capacity::grant(&mut c, &fence, &f.request(0, "after-crash", &need)).await,
-        Err(Error::LeaseLost)
+    let lost_reply = granted(
+        capacity::grant(&mut a, &first, &f.request(1, "lost-reply", &need))
+            .await
+            .unwrap(),
     );
+    // Run 1's reply is lost and recorded. Run 0's worker dies, and its expired claim authorizes
+    // no new allocation.
     assert_eq!(
-        f.slot(0).await,
-        ("handoff_committed".into(), Some(grant.clone()), 2)
-    );
-
-    // The controller dies with the dispatch outcome unknown. Its successor stays closed until it
-    // reconciles, and the chat floor plus the live grant stay charged throughout.
-    assert_eq!(
-        capacity::record_release(&mut c, &fence, &grant, Release::UnknownAllocation)
+        capacity::reconcile(&mut a, &first, &lost_reply, Evidence::UnknownAllocation)
             .await
             .unwrap(),
         GrantState::UnknownAllocation
     );
+    f.expire_run_lease(0).await;
+    assert_eq!(
+        capacity::grant(&mut a, &first, &f.request(0, "after-crash", &need)).await,
+        Err(Error::LeaseLost)
+    );
+
+    // The controller dies before recording anything about run 0's grant. Its successor stays
+    // closed until it attests that grant in its own epoch and release evidence resolves the
+    // unknown one; the charges and the chat floor survive throughout.
     f.expire_controller_lease().await;
     let mut b = f.worker().await;
-    let next = Fence {
-        group_id: GROUP,
-        controller_id: CTRL_B,
-        epoch: capacity::acquire(&mut b, GROUP, CTRL_B, Duration::from_secs(60))
-            .await
-            .unwrap(),
-    };
+    let next = Controller::acquire(&mut b, GROUP, LEASE).await.unwrap();
     let committed = [sample(GPU0, 4 * GIB, SPARE - 4 * GIB)];
-    assert!(publish(&mut b, &next, 2, 1, &committed).await.unwrap());
+    assert!(publish(&mut b, &next, 2, 2, &committed).await.unwrap());
     assert!(!capacity::resume(&mut b, &next).await.unwrap());
     assert_eq!(
         capacity::grant(
             &mut b,
             &next,
-            &f.request(1, "during-recovery", &[bytes(GPU0, GIB)])
+            &f.request(2, "during-recovery", &[bytes(GPU0, GIB)])
         )
         .await
         .unwrap(),
         Decision::Unavailable
     );
     assert_eq!(
-        f.slot(0).await,
-        ("handoff_committed".into(), Some(grant.clone()), 2)
+        capacity::reconcile(&mut b, &next, &lost_reply, Evidence::Allocated).await,
+        Err(Error::Invalid)
     );
-
-    // Behind its new fence the successor finds no allocation and settles the expired run's slot.
     assert_eq!(
-        capacity::record_release(&mut b, &next, &grant, Release::NotAllocated(&[GPU0.into()]))
-            .await
-            .unwrap(),
-        GrantState::Released
-    );
-    assert_eq!(f.slot(0).await, ("released".into(), Some(grant), 1));
-    assert!(capacity::resume(&mut b, &next).await.unwrap());
-    // The released bytes return only through a fresh sample; the floor stays out of reach.
-    assert_eq!(
-        capacity::grant(
+        capacity::reconcile(
             &mut b,
             &next,
-            &f.request(1, "resumed", &[bytes(GPU0, SPARE)])
+            &lost_reply,
+            Evidence::NotAllocated(&[GPU0.into()])
         )
         .await
         .unwrap(),
+        GrantState::Released
+    );
+    assert_eq!(f.slot(1).await, ("released".into(), Some(lost_reply), 2));
+    assert!(!capacity::resume(&mut b, &next).await.unwrap());
+    assert_eq!(
+        capacity::reconcile(&mut b, &next, &dispatched, Evidence::Allocated)
+            .await
+            .unwrap(),
+        GrantState::Granted
+    );
+    assert!(capacity::resume(&mut b, &next).await.unwrap());
+
+    // Behind its fence the successor then confirms the dead worker's allocation is gone and
+    // settles that run's slot without its lease.
+    for evidence in [Evidence::Releasing, Evidence::Released(&[GPU0.into()])] {
+        capacity::reconcile(&mut b, &next, &dispatched, evidence)
+            .await
+            .unwrap();
+    }
+    assert_eq!(f.slot(0).await, ("released".into(), Some(dispatched), 1));
+    // The released bytes return only through a fresh sample; the floor stays out of reach.
+    let rest = [bytes(GPU0, SPARE)];
+    assert_eq!(
+        capacity::grant(&mut b, &next, &f.request(2, "resumed", &rest))
+            .await
+            .unwrap(),
         Decision::Insufficient
     );
     assert!(
-        publish(&mut b, &next, 3, 1, &[sample(GPU0, 0, SPARE)])
+        publish(&mut b, &next, 3, 2, &[sample(GPU0, 0, SPARE)])
             .await
             .unwrap()
     );
@@ -1130,22 +1389,88 @@ async fn crash_recovery_preserves_charges_until_a_current_controller_reconciles(
         capacity::grant(
             &mut b,
             &next,
-            &f.request(1, "resumed", &[bytes(GPU0, SPARE + 1)])
+            &f.request(2, "resumed", &[bytes(GPU0, SPARE + 1)])
         )
         .await
         .unwrap(),
         Decision::Insufficient
     );
     granted(
+        capacity::grant(&mut b, &next, &f.request(2, "resumed", &rest))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(f.drift().await, (0, 0, 0, 0));
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_drained_device_moves_groups_and_keeps_its_release_history() {
+    let mut f = Fixture::new(&[GPU0, GPU1], 2).await;
+    let mut c = f.worker().await;
+    let controller = open_group(&mut c, 1, &[GPU0, GPU1]).await;
+    let grant = granted(
         capacity::grant(
-            &mut b,
-            &next,
-            &f.request(1, "resumed", &[bytes(GPU0, SPARE)]),
+            &mut c,
+            &controller,
+            &f.request(0, "gpu1", &[bytes(GPU1, GIB)]),
         )
         .await
         .unwrap(),
     );
-    assert_eq!(f.drift().await, (0, 0, 0, 0));
+    let mut operator = connect(&f.db.0, OWNER).await;
+    let move_gpu1 = || {
+        sqlx::query(
+            "UPDATE openmettle.capacity_devices SET group_id = $2::uuid WHERE id = $1::uuid",
+        )
+        .bind(GPU1)
+        .bind(GROUP_B)
+    };
+    // A device with a live commitment cannot leave its group.
+    assert_eq!(sqlstate(move_gpu1().execute(&mut operator).await), "23514");
+    capacity::reconcile(
+        &mut c,
+        &controller,
+        &grant,
+        Evidence::Released(&[GPU1.into()]),
+    )
+    .await
+    .unwrap();
+    move_gpu1().execute(&mut operator).await.unwrap();
+    // The release history stays, and the old group's sample of the device is discarded.
+    let history: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM openmettle.capacity_grant_devices
+                  WHERE grant_id = $1::uuid AND device_id = $2::uuid AND release_evidence IS NOT NULL),
+                (SELECT count(*) FROM openmettle.capacity_observations
+                  WHERE group_id = $3::uuid AND device_id = $2::uuid)",
+    )
+    .bind(&grant)
+    .bind(GPU1)
+    .bind(GROUP)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(history, (1, 0));
+    // The old group still admits on its remaining device and no longer accepts the moved one.
+    assert!(admits(&mut c).await);
+    assert_eq!(
+        capacity::grant(
+            &mut c,
+            &controller,
+            &f.request(1, "moved", &[bytes(GPU1, GIB)])
+        )
+        .await,
+        Err(Error::Invalid)
+    );
+    granted(
+        capacity::grant(
+            &mut c,
+            &controller,
+            &f.request(1, "kept", &[bytes(GPU0, GIB)]),
+        )
+        .await
+        .unwrap(),
+    );
 }
 
 #[tokio::test]

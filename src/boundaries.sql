@@ -155,12 +155,17 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.quota_upsert_scope_override(uuid,uuid,text,bigint,timestamptz,text,text,jsonb)',true,ARRAY['openmettle_api']::text[]),
         ('openmettle.quota_revoke_scope_override(uuid,uuid,text,text,text,jsonb)',true,ARRAY['openmettle_api']::text[])) AS f WHERE $1 >= 26
     UNION ALL SELECT * FROM (VALUES
-        ('openmettle.capacity_fence(uuid,uuid,bigint)',false,ARRAY[]::text[]),
-        ('openmettle.capacity_acquire_controller(uuid,uuid,integer)',true,ARRAY['openmettle_worker']::text[]),
-        ('openmettle.capacity_publish_observation(uuid,uuid,bigint,bigint,timestamptz,bigint,jsonb)',true,ARRAY['openmettle_worker']::text[]),
-        ('openmettle.capacity_resume(uuid,uuid,bigint)',true,ARRAY['openmettle_worker']::text[]),
-        ('openmettle.capacity_grant(uuid,uuid,bigint,uuid,uuid,uuid,text,text,jsonb)',true,ARRAY['openmettle_worker']::text[]),
-        ('openmettle.capacity_record_release(uuid,uuid,bigint,uuid,text,uuid[])',true,ARRAY['openmettle_worker']::text[])) AS f WHERE $1 >= 27
+        ('openmettle.capacity_guard_device_move()',false,ARRAY[]::text[]),
+        ('openmettle.capacity_lock_group(uuid)',false,ARRAY[]::text[]),
+        ('openmettle.capacity_fence(uuid,bytea,bigint)',false,ARRAY[]::text[]),
+        ('openmettle.capacity_lock_run(uuid,uuid,uuid)',false,ARRAY[]::text[]),
+        ('openmettle.capacity_admits(uuid,boolean)',false,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.capacity_acquire_controller(uuid,bytea,integer)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.capacity_renew_controller(uuid,bytea,bigint,integer)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.capacity_publish_observation(uuid,bytea,bigint,bigint,timestamptz,bigint,jsonb)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.capacity_resume(uuid,bytea,bigint)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.capacity_grant(uuid,bytea,bigint,uuid,uuid,uuid,text,text,jsonb)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.capacity_reconcile(uuid,bytea,bigint,uuid,text,uuid[])',true,ARRAY['openmettle_worker']::text[])) AS f WHERE $1 >= 27
 ),
 gateway_functions (signature,definer,inference) AS (
     SELECT * FROM (VALUES ('openmettle.gateway_allocate()',true,false), ('openmettle.gateway_run_hold()',true,false),

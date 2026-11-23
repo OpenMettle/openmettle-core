@@ -63,7 +63,9 @@ and safety headroom from total bytes, clamping spare capacity at zero.
 Deduplicate only overlap attributable to the same backing. Unattributed use
 remains charged. Virtual address reservations alone provide no physical backing.
 Group totals summarize the devices. A rank-constrained request must fit on each
-required device even when the group sum exceeds its requested bytes.
+required device even when the group sum exceeds its requested bytes. The store
+checks only necessary bounds on a published sample; the controller, which
+attributes measured use, is responsible for a conservative `grantable_bytes`.
 
 Reading a snapshot never reserves capacity. Within the group decision the
 controller includes commitments made since the measurement. Two callers citing

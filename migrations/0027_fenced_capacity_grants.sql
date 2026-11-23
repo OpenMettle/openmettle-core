@@ -3,14 +3,18 @@
 -- transaction with search_path pg_catalog,pg_temp; see docs/adr/0003-schema-migrations.md.
 --
 -- openmettle_owner configures managed groups and their devices. Every runtime write goes
--- through the SECURITY DEFINER functions below, granted to openmettle_worker only. Lock order
--- extends ADR 0040: runs -> capacity_groups -> capacity_grants -> quota_reservations
--- -> quota_budgets. No capacity path locks runs after a capacity row.
+-- through the SECURITY DEFINER functions below, granted to openmettle_worker only, and every
+-- controller write proves the secret returned once by capacity_acquire_controller. Lock order
+-- extends ADR 0040: runs -> capacity_groups -> capacity_devices -> capacity_grants
+-- -> quota_reservations -> quota_budgets -> quota_enforcement. No capacity path locks runs after
+-- a capacity row. Decisions require READ COMMITTED, so every statement after the group lock sees
+-- each transition committed before it.
 
 CREATE TABLE openmettle.capacity_groups (
     id uuid PRIMARY KEY,
     observation_ttl_ms integer NOT NULL CHECK (observation_ttl_ms BETWEEN 1000 AND 600000),
-    controller_id uuid,
+    -- sha256 of the current controller's 32-byte secret. The secret itself is never stored.
+    controller_token_hash bytea CHECK (octet_length(controller_token_hash) = 32),
     controller_epoch bigint NOT NULL DEFAULT 0 CHECK (controller_epoch >= 0),
     lease_expires_at timestamptz,
     epoch_started_at timestamptz,
@@ -22,9 +26,9 @@ CREATE TABLE openmettle.capacity_groups (
     -- The latest snapshot accounts for grants with commit_seq <= commit_watermark.
     commit_watermark bigint NOT NULL DEFAULT 0,
     commit_seq bigint NOT NULL DEFAULT 0 CHECK (commit_seq >= 0),
-    CHECK ((controller_epoch = 0) = (controller_id IS NULL)),
-    CHECK ((controller_id IS NULL) = (lease_expires_at IS NULL)),
-    CHECK ((controller_id IS NULL) = (epoch_started_at IS NULL)),
+    CHECK ((controller_epoch = 0) = (controller_token_hash IS NULL)),
+    CHECK ((controller_token_hash IS NULL) = (lease_expires_at IS NULL)),
+    CHECK ((controller_token_hash IS NULL) = (epoch_started_at IS NULL)),
     CHECK (ready_epoch IS NULL OR ready_epoch BETWEEN 1 AND controller_epoch),
     CHECK ((observation_revision = 0) = (observed_at IS NULL)),
     CHECK ((observed_at IS NULL) = (observation_epoch IS NULL)),
@@ -32,19 +36,18 @@ CREATE TABLE openmettle.capacity_groups (
     CHECK (commit_watermark BETWEEN 0 AND commit_seq)
 );
 
--- A device belongs to at most one group. chat_floor_bytes is the configured minimum that every
--- published active-chat floor must cover.
+-- A device belongs to one group at a time. chat_floor_bytes is the configured minimum that the
+-- current sample must cover before the group admits a grant.
 CREATE TABLE openmettle.capacity_devices (
     id uuid PRIMARY KEY,
     group_id uuid NOT NULL REFERENCES openmettle.capacity_groups (id),
-    chat_floor_bytes bigint NOT NULL CHECK (chat_floor_bytes >= 0),
-    UNIQUE (group_id, id)
+    chat_floor_bytes bigint NOT NULL CHECK (chat_floor_bytes >= 0)
 );
 
--- The latest published snapshot: one row per configured device at the group's revision.
+-- The latest published snapshot: one row per device at the group's revision.
 CREATE TABLE openmettle.capacity_observations (
-    group_id uuid NOT NULL,
-    device_id uuid NOT NULL,
+    group_id uuid NOT NULL REFERENCES openmettle.capacity_groups (id),
+    device_id uuid NOT NULL REFERENCES openmettle.capacity_devices (id),
     revision bigint NOT NULL CHECK (revision >= 1),
     total_bytes bigint NOT NULL CHECK (total_bytes > 0),
     committed_bytes bigint NOT NULL CHECK (committed_bytes >= 0),
@@ -54,16 +57,18 @@ CREATE TABLE openmettle.capacity_observations (
     active_chat_floor_bytes bigint NOT NULL CHECK (active_chat_floor_bytes >= 0),
     grantable_bytes bigint NOT NULL CHECK (grantable_bytes >= 0),
     PRIMARY KEY (group_id, device_id),
-    FOREIGN KEY (group_id, device_id) REFERENCES openmettle.capacity_devices (group_id, id),
     CHECK (reclaimable_bytes <= actual_used_bytes),
-    -- Necessary bound: grantable capacity never includes headroom, measured use, outstanding
-    -- commitments or the chat floor. The controller supplies the attributed fit itself.
-    CHECK (grantable_bytes::numeric + safety_headroom_bytes
-        + greatest(actual_used_bytes::numeric, committed_bytes::numeric + active_chat_floor_bytes)
-        <= total_bytes)
+    -- Necessary bound only: grantable capacity excludes headroom, measured use, outstanding
+    -- commitments and the chat floor, with spare capacity clamped at zero. The store cannot
+    -- attribute measured use to the floor or to a commitment, so the controller is responsible
+    -- for publishing a conservative grantable_bytes.
+    CHECK (grantable_bytes::numeric <= greatest(0::numeric, total_bytes::numeric
+        - safety_headroom_bytes
+        - greatest(actual_used_bytes::numeric, committed_bytes::numeric + active_chat_floor_bytes)))
 );
 
 -- A grant charges its full footprint from commit until every device confirms release.
+-- reconciled_epoch is the latest epoch that attested the grant against backend inventory.
 CREATE TABLE openmettle.capacity_grants (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     group_id uuid NOT NULL REFERENCES openmettle.capacity_groups (id),
@@ -77,6 +82,7 @@ CREATE TABLE openmettle.capacity_grants (
     state text NOT NULL DEFAULT 'granted'
         CHECK (state IN ('granted', 'releasing', 'unknown_allocation', 'released')),
     granted_epoch bigint NOT NULL CHECK (granted_epoch >= 1),
+    reconciled_epoch bigint NOT NULL,
     commit_seq bigint NOT NULL CHECK (commit_seq >= 1),
     released_epoch bigint,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -85,36 +91,67 @@ CREATE TABLE openmettle.capacity_grants (
     UNIQUE (group_id, commit_seq),
     UNIQUE (group_id, id),
     FOREIGN KEY (scope_id, run_id) REFERENCES openmettle.runs (scope_id, id),
+    CHECK (reconciled_epoch >= granted_epoch),
     CHECK ((state = 'released') = (released_at IS NOT NULL)),
     CHECK ((released_at IS NULL) = (released_epoch IS NULL)),
     CHECK (released_epoch IS NULL OR released_epoch >= granted_epoch)
 );
 CREATE INDEX capacity_grants_charged_idx
     ON openmettle.capacity_grants (group_id, commit_seq) WHERE state <> 'released';
+-- A run holds at most one live grant, whatever its request keys.
+CREATE UNIQUE INDEX capacity_grants_live_run_uidx
+    ON openmettle.capacity_grants (run_id) WHERE state <> 'released';
 
+-- Device rows reference the device alone, so release history never pins a drained device.
 CREATE TABLE openmettle.capacity_grant_devices (
     grant_id uuid NOT NULL,
     group_id uuid NOT NULL,
-    device_id uuid NOT NULL,
+    device_id uuid NOT NULL REFERENCES openmettle.capacity_devices (id),
     bytes bigint NOT NULL CHECK (bytes > 0),
     release_evidence text CHECK (release_evidence IN ('released', 'not_allocated')),
     released_epoch bigint,
     released_at timestamptz,
     PRIMARY KEY (grant_id, device_id),
     FOREIGN KEY (group_id, grant_id) REFERENCES openmettle.capacity_grants (group_id, id),
-    FOREIGN KEY (group_id, device_id) REFERENCES openmettle.capacity_devices (group_id, id),
     CHECK ((release_evidence IS NULL) = (released_at IS NULL)),
     CHECK ((released_at IS NULL) = (released_epoch IS NULL))
 );
 CREATE INDEX capacity_grant_devices_device_idx
-    ON openmettle.capacity_grant_devices (group_id, device_id);
+    ON openmettle.capacity_grant_devices (device_id, grant_id);
 
 GRANT SELECT ON openmettle.capacity_groups, openmettle.capacity_devices,
     openmettle.capacity_observations, openmettle.capacity_grants,
     openmettle.capacity_grant_devices TO openmettle_worker;
 
--- Internal: lock the group and verify the caller's lease and epoch against database time.
-CREATE FUNCTION openmettle.capacity_fence(p_group uuid, p_controller uuid, p_epoch bigint)
+-- A device moves groups only when drained; its sample in the old group is discarded.
+CREATE FUNCTION openmettle.capacity_guard_device_move()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+BEGIN
+    IF EXISTS (
+        SELECT
+          FROM openmettle.capacity_grant_devices gd
+          JOIN openmettle.capacity_grants c ON c.id = gd.grant_id
+         WHERE gd.device_id = OLD.id AND c.state <> 'released'
+    ) THEN
+        RAISE EXCEPTION 'device has outstanding capacity commitments' USING ERRCODE = '23514';
+    END IF;
+    DELETE FROM openmettle.capacity_observations
+     WHERE group_id = OLD.group_id AND device_id = OLD.id;
+    RETURN NEW;
+END;
+$$;
+REVOKE ALL ON FUNCTION openmettle.capacity_guard_device_move() FROM PUBLIC;
+CREATE TRIGGER capacity_devices_move_guard
+    BEFORE UPDATE OF group_id ON openmettle.capacity_devices
+    FOR EACH ROW WHEN (OLD.group_id IS DISTINCT FROM NEW.group_id)
+    EXECUTE FUNCTION openmettle.capacity_guard_device_move();
+
+-- Internal: lock the group under READ COMMITTED. A REPEATABLE READ snapshot taken before the
+-- lock could miss a committed transition that closes the group.
+CREATE FUNCTION openmettle.capacity_lock_group(p_group uuid)
 RETURNS openmettle.capacity_groups
 LANGUAGE plpgsql
 SET search_path = pg_catalog
@@ -122,9 +159,30 @@ AS $$
 DECLARE
     g openmettle.capacity_groups%ROWTYPE;
 BEGIN
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'capacity decisions require READ COMMITTED' USING ERRCODE = '25000';
+    END IF;
     SELECT * INTO g FROM openmettle.capacity_groups WHERE id = p_group FOR NO KEY UPDATE;
-    IF NOT FOUND
-       OR g.controller_id IS DISTINCT FROM p_controller
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'unknown capacity group' USING ERRCODE = '22023';
+    END IF;
+    RETURN g;
+END;
+$$;
+REVOKE ALL ON FUNCTION openmettle.capacity_lock_group(uuid) FROM PUBLIC;
+
+-- Internal: lock the group and verify the controller's secret, epoch and lease on database time.
+CREATE FUNCTION openmettle.capacity_fence(p_group uuid, p_secret bytea, p_epoch bigint)
+RETURNS openmettle.capacity_groups
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+DECLARE
+    g openmettle.capacity_groups%ROWTYPE;
+BEGIN
+    g := openmettle.capacity_lock_group(p_group);
+    IF octet_length(p_secret) IS DISTINCT FROM 32
+       OR g.controller_token_hash IS DISTINCT FROM sha256(p_secret)
        OR g.controller_epoch IS DISTINCT FROM p_epoch
        OR g.lease_expires_at <= clock_timestamp() THEN
         RAISE EXCEPTION 'capacity controller fenced' USING ERRCODE = 'OMC01';
@@ -132,11 +190,68 @@ BEGIN
     RETURN g;
 END;
 $$;
-REVOKE ALL ON FUNCTION openmettle.capacity_fence(uuid, uuid, bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION openmettle.capacity_fence(uuid, bytea, bigint) FROM PUBLIC;
 
--- Renew the caller's live lease, or take over an absent or expired one with a new epoch. A new
--- epoch closes the group to bursts until capacity_resume succeeds.
-CREATE FUNCTION openmettle.capacity_acquire_controller(p_group uuid, p_controller uuid, p_lease_ms integer)
+-- Internal: lock the run and require an active Step claim on database time.
+CREATE FUNCTION openmettle.capacity_lock_run(p_scope uuid, p_run uuid, p_claim uuid)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+BEGIN
+    PERFORM
+       FROM openmettle.runs r
+      WHERE r.scope_id = p_scope
+        AND r.id = p_run
+        AND r.state = 'running'
+        AND r.cancel_reason IS NULL
+        AND r.claim_token = p_claim
+        AND r.lease_expires_at > clock_timestamp()
+        FOR NO KEY UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'invalid device handoff' USING ERRCODE = '42501';
+    END IF;
+END;
+$$;
+REVOKE ALL ON FUNCTION openmettle.capacity_lock_run(uuid, uuid, uuid) FROM PUBLIC;
+
+-- The one readiness predicate shared by grant decisions, capacity_resume and snapshot reads:
+-- a live lease, a recovered epoch (unless resuming), a fresh sample from this epoch covering
+-- every device and its configured chat floor, no unknown allocation, and every live grant
+-- attested in this epoch.
+CREATE FUNCTION openmettle.capacity_admits(p_group uuid, p_resuming boolean)
+RETURNS boolean
+LANGUAGE sql
+SET search_path = pg_catalog
+AS $$
+    SELECT coalesce((
+        SELECT (p_resuming OR g.ready_epoch = g.controller_epoch)
+           AND g.lease_expires_at > clock_timestamp()
+           AND g.observation_epoch = g.controller_epoch
+           AND g.observed_at + g.observation_ttl_ms * interval '1 millisecond' > clock_timestamp()
+           AND NOT EXISTS (
+               SELECT
+                 FROM openmettle.capacity_grants c
+                WHERE c.group_id = g.id
+                  AND c.state <> 'released'
+                  AND (c.state = 'unknown_allocation' OR c.reconciled_epoch < g.controller_epoch))
+           AND NOT EXISTS (
+               SELECT
+                 FROM openmettle.capacity_devices d
+                 LEFT JOIN openmettle.capacity_observations o
+                   ON o.group_id = g.id AND o.device_id = d.id
+                  AND o.revision = g.observation_revision
+                WHERE d.group_id = g.id
+                  AND (o.device_id IS NULL OR o.active_chat_floor_bytes < d.chat_floor_bytes))
+          FROM openmettle.capacity_groups g
+         WHERE g.id = p_group), false)
+$$;
+REVOKE ALL ON FUNCTION openmettle.capacity_admits(uuid, boolean) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION openmettle.capacity_admits(uuid, boolean) TO openmettle_worker;
+
+-- Take over an absent or expired lease with a new epoch, binding sha256(p_secret). A new epoch
+-- closes the group to bursts until capacity_resume succeeds. A live lease is never taken over.
+CREATE FUNCTION openmettle.capacity_acquire_controller(p_group uuid, p_secret bytea, p_lease_ms integer)
 RETURNS bigint
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -144,44 +259,59 @@ SET search_path = pg_catalog
 AS $$
 DECLARE
     g openmettle.capacity_groups%ROWTYPE;
-    v_now timestamptz;
     v_epoch bigint;
 BEGIN
-    IF p_controller IS NULL OR p_lease_ms IS NULL OR p_lease_ms NOT BETWEEN 1000 AND 600000 THEN
+    IF octet_length(p_secret) IS DISTINCT FROM 32
+       OR p_lease_ms IS NULL OR p_lease_ms NOT BETWEEN 1000 AND 600000 THEN
         RAISE EXCEPTION 'invalid controller lease' USING ERRCODE = '22023';
     END IF;
-    SELECT * INTO g FROM openmettle.capacity_groups WHERE id = p_group FOR NO KEY UPDATE;
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'unknown capacity group' USING ERRCODE = '22023';
-    END IF;
-    v_now := clock_timestamp();
-    IF g.lease_expires_at > v_now THEN
-        IF g.controller_id <> p_controller THEN
-            RAISE EXCEPTION 'capacity controller fenced' USING ERRCODE = 'OMC01';
-        END IF;
-        UPDATE openmettle.capacity_groups
-           SET lease_expires_at = v_now + p_lease_ms * interval '1 millisecond'
-         WHERE id = p_group;
-        RETURN g.controller_epoch;
+    g := openmettle.capacity_lock_group(p_group);
+    IF g.lease_expires_at > clock_timestamp() THEN
+        RAISE EXCEPTION 'capacity controller fenced' USING ERRCODE = 'OMC01';
     END IF;
     UPDATE openmettle.capacity_groups
-       SET controller_id = p_controller,
+       SET controller_token_hash = sha256(p_secret),
            controller_epoch = controller_epoch + 1,
-           lease_expires_at = v_now + p_lease_ms * interval '1 millisecond',
-           epoch_started_at = v_now
+           lease_expires_at = clock_timestamp() + p_lease_ms * interval '1 millisecond',
+           epoch_started_at = clock_timestamp()
      WHERE id = p_group
     RETURNING controller_epoch INTO v_epoch;
     RETURN v_epoch;
 END;
 $$;
-REVOKE ALL ON FUNCTION openmettle.capacity_acquire_controller(uuid, uuid, integer) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION openmettle.capacity_acquire_controller(uuid, uuid, integer) TO openmettle_worker;
+REVOKE ALL ON FUNCTION openmettle.capacity_acquire_controller(uuid, bytea, integer) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION openmettle.capacity_acquire_controller(uuid, bytea, integer) TO openmettle_worker;
+
+-- Extend the caller's live lease within its epoch.
+CREATE FUNCTION openmettle.capacity_renew_controller(
+    p_group uuid,
+    p_secret bytea,
+    p_epoch bigint,
+    p_lease_ms integer
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+BEGIN
+    IF p_lease_ms IS NULL OR p_lease_ms NOT BETWEEN 1000 AND 600000 THEN
+        RAISE EXCEPTION 'invalid controller lease' USING ERRCODE = '22023';
+    END IF;
+    PERFORM openmettle.capacity_fence(p_group, p_secret, p_epoch);
+    UPDATE openmettle.capacity_groups
+       SET lease_expires_at = clock_timestamp() + p_lease_ms * interval '1 millisecond'
+     WHERE id = p_group;
+END;
+$$;
+REVOKE ALL ON FUNCTION openmettle.capacity_renew_controller(uuid, bytea, bigint, integer) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION openmettle.capacity_renew_controller(uuid, bytea, bigint, integer) TO openmettle_worker;
 
 -- Publish one complete snapshot. An equal or older revision is ignored and never extends
 -- freshness. The sample must be measured within the current epoch, after the previous sample.
 CREATE FUNCTION openmettle.capacity_publish_observation(
     p_group uuid,
-    p_controller uuid,
+    p_secret bytea,
     p_epoch bigint,
     p_revision bigint,
     p_observed_at timestamptz,
@@ -197,7 +327,7 @@ DECLARE
     g openmettle.capacity_groups%ROWTYPE;
     v_expected bigint;
 BEGIN
-    g := openmettle.capacity_fence(p_group, p_controller, p_epoch);
+    g := openmettle.capacity_fence(p_group, p_secret, p_epoch);
     IF p_revision IS NULL OR p_revision <= g.observation_revision THEN
         RETURN false;
     END IF;
@@ -268,44 +398,36 @@ BEGIN
     RETURN true;
 END;
 $$;
-REVOKE ALL ON FUNCTION openmettle.capacity_publish_observation(uuid, uuid, bigint, bigint, timestamptz, bigint, jsonb) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION openmettle.capacity_publish_observation(uuid, uuid, bigint, bigint, timestamptz, bigint, jsonb) TO openmettle_worker;
+REVOKE ALL ON FUNCTION openmettle.capacity_publish_observation(uuid, bytea, bigint, bigint, timestamptz, bigint, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION openmettle.capacity_publish_observation(uuid, bytea, bigint, bigint, timestamptz, bigint, jsonb) TO openmettle_worker;
 
--- Reopen bursts after takeover once the new epoch has a fresh sample and no unknown allocation.
-CREATE FUNCTION openmettle.capacity_resume(p_group uuid, p_controller uuid, p_epoch bigint)
+-- Reopen bursts in the current epoch once capacity_admits holds for a resuming group. Returns
+-- the predicate's current result, so a closed group never reports true.
+CREATE FUNCTION openmettle.capacity_resume(p_group uuid, p_secret bytea, p_epoch bigint)
 RETURNS boolean
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
-DECLARE
-    g openmettle.capacity_groups%ROWTYPE;
 BEGIN
-    g := openmettle.capacity_fence(p_group, p_controller, p_epoch);
-    IF g.ready_epoch = g.controller_epoch THEN
-        RETURN true;
-    END IF;
-    IF g.observation_epoch IS DISTINCT FROM g.controller_epoch
-       OR g.observed_at + g.observation_ttl_ms * interval '1 millisecond' <= clock_timestamp()
-       OR EXISTS (
-           SELECT FROM openmettle.capacity_grants
-            WHERE group_id = p_group AND state = 'unknown_allocation'
-       ) THEN
+    PERFORM openmettle.capacity_fence(p_group, p_secret, p_epoch);
+    IF NOT openmettle.capacity_admits(p_group, true) THEN
         RETURN false;
     END IF;
     UPDATE openmettle.capacity_groups SET ready_epoch = controller_epoch WHERE id = p_group;
     RETURN true;
 END;
 $$;
-REVOKE ALL ON FUNCTION openmettle.capacity_resume(uuid, uuid, bigint) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION openmettle.capacity_resume(uuid, uuid, bigint) TO openmettle_worker;
+REVOKE ALL ON FUNCTION openmettle.capacity_resume(uuid, bytea, bigint) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION openmettle.capacity_resume(uuid, bytea, bigint) TO openmettle_worker;
 
 -- Serialized grant decision for a leased run. A replay returns the recorded grant; otherwise the
--- footprint must fit every device after commitments made since the snapshot. A granted run-level
--- device_reservations hold is committed to the grant in the same transaction.
+-- footprint must fit every device after commitments made since the snapshot. The run's
+-- device_reservations hold is committed to a new grant in the same transaction, and is required
+-- once quota metering is enforced.
 CREATE FUNCTION openmettle.capacity_grant(
     p_group uuid,
-    p_controller uuid,
+    p_secret bytea,
     p_epoch bigint,
     p_scope uuid,
     p_run uuid,
@@ -324,6 +446,7 @@ DECLARE
     v_existing openmettle.capacity_grants%ROWTYPE;
     v_digest bytea;
     v_holds uuid[];
+    v_enforced boolean;
     v_seq bigint;
     v_id uuid;
 BEGIN
@@ -333,19 +456,11 @@ BEGIN
        OR jsonb_array_length(p_footprint) NOT BETWEEN 1 AND 64 THEN
         RAISE EXCEPTION 'invalid capacity request' USING ERRCODE = '22023';
     END IF;
-    PERFORM
-       FROM openmettle.runs r
-      WHERE r.scope_id = p_scope
-        AND r.id = p_run
-        AND r.state = 'running'
-        AND r.cancel_reason IS NULL
-        AND r.claim_token = p_claim
-        AND r.lease_expires_at > clock_timestamp()
-        FOR NO KEY UPDATE;
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'invalid device handoff' USING ERRCODE = '42501';
-    END IF;
-    g := openmettle.capacity_fence(p_group, p_controller, p_epoch);
+    PERFORM openmettle.capacity_lock_run(p_scope, p_run, p_claim);
+    g := openmettle.capacity_fence(p_group, p_secret, p_epoch);
+    -- Serialize with configuration: a chat floor change or device move waits for this decision,
+    -- and this decision waits for one in progress.
+    PERFORM FROM openmettle.capacity_devices WHERE group_id = p_group ORDER BY id FOR SHARE;
     IF EXISTS (
         SELECT
           FROM jsonb_to_recordset(p_footprint) AS f(device_id uuid, bytes bigint)
@@ -372,23 +487,7 @@ BEGIN
         RETURN;
     END IF;
 
-    -- Takeover, a stale or superseded sample, a missing rank or an unknown allocation keeps the
-    -- group closed. None of them can justify a positive grant.
-    IF g.ready_epoch IS DISTINCT FROM g.controller_epoch
-       OR g.observation_epoch IS DISTINCT FROM g.controller_epoch
-       OR g.observed_at + g.observation_ttl_ms * interval '1 millisecond' <= clock_timestamp()
-       OR EXISTS (
-           SELECT FROM openmettle.capacity_grants c
-            WHERE c.group_id = p_group AND c.state = 'unknown_allocation'
-       )
-       OR EXISTS (
-           SELECT
-             FROM jsonb_to_recordset(p_footprint) AS f(device_id uuid)
-             LEFT JOIN openmettle.capacity_observations o
-               ON o.group_id = p_group AND o.device_id = f.device_id
-              AND o.revision = g.observation_revision
-            WHERE o.device_id IS NULL
-       ) THEN
+    IF NOT openmettle.capacity_admits(p_group, false) THEN
         RETURN QUERY SELECT NULL::uuid, 'unavailable'::text;
         RETURN;
     END IF;
@@ -410,6 +509,8 @@ BEGIN
         RETURN;
     END IF;
 
+    -- The claim may have expired while this decision waited for the group lock.
+    PERFORM openmettle.capacity_lock_run(p_scope, p_run, p_claim);
     SELECT array_agg(h.id) INTO v_holds
       FROM openmettle.quota_reservations h
      WHERE h.scope_id = p_scope
@@ -424,10 +525,10 @@ BEGIN
     RETURNING commit_seq INTO v_seq;
     INSERT INTO openmettle.capacity_grants (
         group_id, scope_id, run_id, claim_token, quota_hold_id, request_key, request_digest,
-        profile, granted_epoch, commit_seq
+        profile, granted_epoch, reconciled_epoch, commit_seq
     ) VALUES (
         p_group, p_scope, p_run, p_claim, v_holds[1], p_request_key, v_digest,
-        p_profile, g.controller_epoch, v_seq
+        p_profile, g.controller_epoch, g.controller_epoch, v_seq
     )
     RETURNING id INTO v_id;
     INSERT INTO openmettle.capacity_grant_devices (grant_id, group_id, device_id, bytes)
@@ -437,22 +538,33 @@ BEGIN
        AND NOT openmettle.quota_commit_device_handoff(v_holds[1], p_scope, p_run, p_claim, v_id) THEN
         RAISE EXCEPTION 'run device slot is not available for this grant' USING ERRCODE = '23505';
     END IF;
+    -- quota_enforcement is the final lock (ADR 0040). Once metering is enforced, a run admitted
+    -- without a device slot cannot obtain physical capacity.
+    IF v_holds[1] IS NULL THEN
+        SELECT metering_enforced INTO v_enforced
+          FROM openmettle.quota_enforcement WHERE id FOR SHARE;
+        IF v_enforced THEN
+            RAISE EXCEPTION 'run device slot required' USING ERRCODE = 'OMQ04';
+        END IF;
+    END IF;
     RETURN QUERY SELECT v_id, 'granted'::text;
 END;
 $$;
-REVOKE ALL ON FUNCTION openmettle.capacity_grant(uuid, uuid, bigint, uuid, uuid, uuid, text, text, jsonb) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION openmettle.capacity_grant(uuid, uuid, bigint, uuid, uuid, uuid, text, text, jsonb) TO openmettle_worker;
+REVOKE ALL ON FUNCTION openmettle.capacity_grant(uuid, bytea, bigint, uuid, uuid, uuid, text, text, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION openmettle.capacity_grant(uuid, bytea, bigint, uuid, uuid, uuid, text, text, jsonb) TO openmettle_worker;
 
--- Fenced release transitions. Only confirmed release or non-allocation on every device of the
--- grant releases it, returns its bytes to fresh fit and settles its device slot. Partial or lost
--- evidence leaves unknown_allocation. The run's lease is not required: a current controller may
--- clean up after the worker's claim expired without authorizing new work on it.
-CREATE FUNCTION openmettle.capacity_record_release(
+-- Fenced reconciliation against backend inventory. 'allocated' attests a live grant in this
+-- epoch; 'releasing' records a release trigger; 'unknown_allocation' records a lost reply.
+-- Only confirmed release or non-allocation on every device releases a grant, returns its bytes
+-- to fresh fit and settles its device slot; partial evidence leaves unknown_allocation, which
+-- resolves only through release evidence. The run's lease is not required: a current controller
+-- may clean up after the worker's claim expired without authorizing new work on it.
+CREATE FUNCTION openmettle.capacity_reconcile(
     p_group uuid,
-    p_controller uuid,
+    p_secret bytea,
     p_epoch bigint,
     p_grant uuid,
-    p_outcome text,
+    p_evidence text,
     p_devices uuid[]
 )
 RETURNS text
@@ -464,26 +576,34 @@ DECLARE
     g openmettle.capacity_groups%ROWTYPE;
     v openmettle.capacity_grants%ROWTYPE;
 BEGIN
-    g := openmettle.capacity_fence(p_group, p_controller, p_epoch);
+    g := openmettle.capacity_fence(p_group, p_secret, p_epoch);
     SELECT * INTO v
       FROM openmettle.capacity_grants
      WHERE id = p_grant AND group_id = p_group
        FOR NO KEY UPDATE;
-    IF NOT FOUND OR p_outcome IS NULL
-       OR p_outcome NOT IN ('releasing', 'unknown_allocation', 'released', 'not_allocated') THEN
-        RAISE EXCEPTION 'invalid capacity release' USING ERRCODE = '22023';
+    IF NOT FOUND OR p_evidence IS NULL OR p_evidence NOT IN (
+           'allocated', 'releasing', 'unknown_allocation', 'released', 'not_allocated') THEN
+        RAISE EXCEPTION 'invalid capacity reconciliation' USING ERRCODE = '22023';
     END IF;
     IF v.state = 'released' THEN
         RETURN v.state;
     END IF;
-    IF p_outcome = 'releasing' THEN
+    IF p_evidence = 'allocated' THEN
+        IF v.state = 'unknown_allocation' THEN
+            RAISE EXCEPTION 'an unknown allocation resolves only through release evidence'
+                USING ERRCODE = '22023';
+        END IF;
+        UPDATE openmettle.capacity_grants SET reconciled_epoch = g.controller_epoch WHERE id = p_grant;
+        RETURN v.state;
+    END IF;
+    IF p_evidence = 'releasing' THEN
         IF v.state = 'granted' THEN
             UPDATE openmettle.capacity_grants SET state = 'releasing' WHERE id = p_grant;
             RETURN 'releasing';
         END IF;
         RETURN v.state;
     END IF;
-    IF p_outcome = 'unknown_allocation' THEN
+    IF p_evidence = 'unknown_allocation' THEN
         UPDATE openmettle.capacity_grants SET state = 'unknown_allocation' WHERE id = p_grant;
         RETURN 'unknown_allocation';
     END IF;
@@ -494,10 +614,10 @@ BEGIN
               WHERE gd.grant_id = p_grant AND gd.device_id = d.device_id
          )
     ) THEN
-        RAISE EXCEPTION 'invalid capacity release' USING ERRCODE = '22023';
+        RAISE EXCEPTION 'invalid capacity reconciliation' USING ERRCODE = '22023';
     END IF;
     UPDATE openmettle.capacity_grant_devices
-       SET release_evidence = p_outcome,
+       SET release_evidence = p_evidence,
            released_epoch = g.controller_epoch,
            released_at = clock_timestamp()
      WHERE grant_id = p_grant AND device_id = ANY (p_devices) AND released_at IS NULL;
@@ -519,8 +639,8 @@ BEGIN
     RETURN 'released';
 END;
 $$;
-REVOKE ALL ON FUNCTION openmettle.capacity_record_release(uuid, uuid, bigint, uuid, text, uuid[]) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION openmettle.capacity_record_release(uuid, uuid, bigint, uuid, text, uuid[]) TO openmettle_worker;
+REVOKE ALL ON FUNCTION openmettle.capacity_reconcile(uuid, bytea, bigint, uuid, text, uuid[]) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION openmettle.capacity_reconcile(uuid, bytea, bigint, uuid, text, uuid[]) TO openmettle_worker;
 
 -- Replace the migration 24 stub: a committed device slot is credited once, and only against a
 -- released capacity grant bound to it. Without that durable record the slot stays charged.
