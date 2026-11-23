@@ -759,7 +759,8 @@ pub enum UsageGap {
     UpstreamStatus,
     /// The upstream could not be reached, or the exchange failed before a response head.
     UpstreamTransport,
-    /// The upstream answered with a content coding other than `identity`.
+    /// The upstream answered with a content coding other than `identity` or a transfer coding
+    /// other than `chunked`.
     UpstreamEncoding,
     /// Connecting, waiting for the head or the next body bytes, or finishing the body after the
     /// caller left, took too long.

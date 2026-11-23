@@ -15,7 +15,8 @@ usage report for the request's gateway hold, through the same settlement path as
   Every other path answers 404, as do `/v1/responses` (the recorded server answers it with
   500) and `/v1/models`. `/healthz` and `/readyz` behave as in the API and the worker.
 - **Correlation.** The caller sends exactly one `x-request-id` holding the canonical lowercase
-  UUID of a gateway request in state `handed_off`. Its installation, scope, report source
+  UUID of a gateway request in state `handed_off`; an ID the caller names in `Connection`
+  counts as absent. Its installation, scope, report source
   and binding principal are read from the database; nothing else is taken from the caller. A
   missing or malformed ID is refused with `400 validation`, and an unknown request or one not
   handed off with `404 not_found`, before anything is sent upstream. Refusals use the
@@ -24,10 +25,13 @@ usage report for the request's gateway hold, through the same settlement path as
   for byte on a new connection, with only `Content-Type`, `Accept`, `Accept-Encoding:
   identity` and the request ID. `Authorization`, cookies, other caller headers and any field
   the caller names in `Connection` are not forwarded.
-- **Identity bodies only.** A request with a `Content-Encoding` other than `identity` is
-  refused with `415 unsupported_media_type` before anything is sent upstream. An upstream
-  answer with one is not relayed: the caller gets `502 provider_failure` and the upstream
-  connection is closed.
+- **HTTP/1.1 only.** Any other version is refused with `505 http_version_not_supported`
+  before anything else: an HTTP/1.0 caller could not tell a cut stream from a complete one.
+- **Identity bodies only.** A request with a `Content-Encoding` other than `identity`, or a
+  `Transfer-Encoding` other than one `chunked`, is refused with `415 unsupported_media_type`
+  before anything is sent upstream. An upstream answer with either is not relayed: the caller
+  gets `502 provider_failure` and the upstream connection is closed without reading the
+  body.
 - **Relay.** The upstream status, `Content-Type` (unless the upstream names it in
   `Connection`) and body are relayed chunk by chunk as they arrive. A server-sent event
   reaches the caller before the upstream has finished. The caller's response ends cleanly only
@@ -45,7 +49,8 @@ usage report for the request's gateway hold, through the same settlement path as
   timeout, gets nothing more. If the usage is not in hand yet, the upstream connection is
   closed so the server stops generating. If it may be (a stream whose last event carried
   usage, or a JSON body within its parse bound), the relay reads on to finish the accounting,
-  rechecking after every read and for at most one idle timeout in total.
+  rechecking after every read, and stops once one idle timeout has passed since the caller
+  left. A body that ends at that moment still counts.
 
 ## What it records
 
@@ -65,8 +70,12 @@ object.
 The report is written by the task that relays the response, so the write does not depend on
 the caller staying connected. Each attempt is bounded by five `DB_TIMEOUT_MS` (10 s by
 default), also when its database connection stops answering, and a transient failure or an
-expired attempt is retried twice (after 100 ms and 500 ms). There is no local spool: if the
-write still fails, the proxy logs `gateway.usage.failed` and the hold stays for reconciliation.
+expired attempt is retried twice (after 100 ms and 500 ms). An attempt is never cancelled in
+flight: one past its bound is left to finish or fail on its own while the retry runs, which is
+safe because settlement accepts the identical report once. There is no local spool. If no
+attempt confirms the write, the proxy logs `gateway.usage.failed`: the gateway could not confirm
+the write, and an earlier attempt may still have committed it. Check the request's usage report
+and hold before acting; if no report exists, the hold stays for reconciliation.
 
 The report identity is derived from the request, so a retry writes the same report. A second
 dispatch of the same request is still forwarded in this increment; if the upstream reports the
@@ -84,7 +93,7 @@ names the gateway request and the reason (`error.type`):
 | `request_body` | The request body exceeded 2 MiB, did not arrive within 10 s, or the caller left while sending it (`400 validation`); nothing was forwarded |
 | `upstream_status` | The upstream answered with a status other than 200; its response is still relayed |
 | `upstream_transport` | The upstream could not be reached or failed before a response head (caller gets `502 provider_failure`) |
-| `upstream_encoding` | The upstream answered with a content coding other than `identity` (caller gets `502 provider_failure`) |
+| `upstream_encoding` | The upstream answered with a content coding other than `identity` or a transfer coding other than `chunked` (caller gets `502 provider_failure`) |
 | `upstream_timeout` | Connect, response-head or idle-read timeout (`504 timeout` if no head arrived), or the upstream did not finish within one idle timeout after the caller left |
 | `incomplete` | The body broke off, or a stream ended without `[DONE]` |
 | `caller_disconnected` | The caller left or stopped reading before the usage was in hand, or the usage went out of reach while the relay read on; the upstream connection is closed |
@@ -113,7 +122,7 @@ The gateway reads the same process settings as the API and the worker under the
 refused, and a bracketed host must be an IPv6 address followed by nothing or a port. The idle
 timeout bounds the wait for the response head (SGLang sends a non-streamed head only after
 generating the whole answer), each later body read, a caller that does not accept a relayed
-chunk (it is then treated as gone), and the whole rest of the body once the caller has gone.
+chunk (it is then treated as gone), and how long the relay reads on once the caller has gone.
 
 A refusal exits 78 with one fixed line, for example `configuration error: UPSTREAM_URL is
 required`, `configuration error: UPSTREAM_URL must use http://` or `configuration error:
@@ -132,9 +141,8 @@ invalid UPSTREAM_URL`. The line never contains the value.
 `SIGTERM` or `SIGINT` stops accepting connections. Responses in flight keep streaming, and
 reports whose usage was read are written before the database pool closes, all within
 `SHUTDOWN_TIMEOUT_MS`. A response still streaming at the deadline is cut and records nothing,
-and the process exits 1. So does a database connection that stopped answering: sqlx tests an
-abandoned connection before returning it to the pool, without a time limit, and the pool
-waits for it when closing.
+and the process exits 1. So does a database exchange still running on a connection that
+stopped answering: the pool waits for every connection when closing.
 
 ## Known gaps in this increment
 

@@ -10,7 +10,7 @@
 //!   `Accept`, `Accept-Encoding: identity` and the request ID; `Authorization`, cookies and
 //!   fields the caller names in `Connection` are not forwarded. The upstream status,
 //!   `Content-Type` and body are relayed chunk by chunk as they arrive. Only identity bodies
-//!   pass in either direction.
+//!   pass in either direction, and only HTTP/1.1 callers are served.
 //! - **Usage.** One relay task per request copies each upstream chunk to the caller and to the
 //!   usage reader and then writes at most one final report itself, so the write does not depend
 //!   on the caller staying connected. A response that is not a completed 200 with a usage object
@@ -32,7 +32,7 @@ use axum::{
     Router,
     body::{Body, Bytes},
     extract::{Request, State},
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header, uri::Authority},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, Version, header, uri::Authority},
     response::Response,
     routing::post,
 };
@@ -92,6 +92,11 @@ const BODY: Problem = problem(
     StatusCode::BAD_REQUEST,
     "validation",
     "The request body exceeds 2 MiB or did not arrive in time.",
+);
+const VERSION: Problem = problem(
+    StatusCode::HTTP_VERSION_NOT_SUPPORTED,
+    "http_version_not_supported",
+    "This route needs HTTP/1.1.",
 );
 const ENCODED_REQUEST: Problem = problem(
     StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -213,18 +218,29 @@ fn end_to_end<'h>(
     headers.get_all(name).iter().filter(move |_| !hop_by_hop)
 }
 
-/// No content coding other than `identity`.
+/// No content coding other than `identity`, and no transfer coding other than one `chunked`:
+/// hyper removes only the chunk framing, so any other coding would pass through unlabelled.
 fn identity(headers: &HeaderMap) -> bool {
-    headers
-        .get_all(header::CONTENT_ENCODING)
-        .iter()
-        .all(|value| {
-            value.to_str().is_ok_and(|codings| {
-                codings
-                    .split(',')
-                    .all(|coding| coding.trim().eq_ignore_ascii_case("identity"))
+    let mut transfer = headers.get_all(header::TRANSFER_ENCODING).iter();
+    let framing = match (transfer.next(), transfer.next()) {
+        (None, _) => true,
+        (Some(coding), None) => coding
+            .as_bytes()
+            .trim_ascii()
+            .eq_ignore_ascii_case(b"chunked"),
+        _ => false,
+    };
+    framing
+        && headers
+            .get_all(header::CONTENT_ENCODING)
+            .iter()
+            .all(|value| {
+                value.to_str().is_ok_and(|codings| {
+                    codings
+                        .split(',')
+                        .all(|coding| coding.trim().eq_ignore_ascii_case("identity"))
+                })
             })
-        })
 }
 
 /// Relay tasks still running. Shutdown waits for them after the listener has drained, so a
@@ -296,9 +312,11 @@ struct Routing {
     source: String,
 }
 
-/// Exactly one `x-request-id` holding a canonical lowercase UUID.
+/// Exactly one `x-request-id` holding a canonical lowercase UUID. One named in `Connection` is
+/// hop-by-hop and counts as absent.
 fn correlation(headers: &HeaderMap) -> Result<String, Problem> {
-    let mut values = headers.get_all("x-request-id").iter();
+    let name = HeaderName::from_static("x-request-id");
+    let mut values = end_to_end(headers, &name);
     match (values.next(), values.next()) {
         (Some(value), None) => value
             .to_str()
@@ -313,6 +331,11 @@ fn correlation(headers: &HeaderMap) -> Result<String, Problem> {
 impl Proxy {
     async fn forward(&self, request: Request) -> Result<Response, Problem> {
         let (parts, body) = request.into_parts();
+        // HTTP/1.0 ends an unsized body by closing the connection, so a cut stream would look
+        // complete to the caller.
+        if parts.version != Version::HTTP_11 {
+            return Err(VERSION);
+        }
         let id = correlation(&parts.headers)?;
         if !identity(&parts.headers) {
             return Err(ENCODED_REQUEST);
@@ -394,25 +417,31 @@ impl Proxy {
         Ok(relayed)
     }
 
-    /// The stored routing fields of `id` while it is handed off.
+    /// The stored routing fields of `id` while it is handed off. Like every database exchange
+    /// here, the query runs in its own task: past the deadline the proxy stops waiting for it
+    /// but never cancels it in flight.
     async fn routing(&self, id: &str) -> Result<Routing, Problem> {
-        let row = sqlx::query_as::<_, (String, String, String, String)>(
-            "SELECT q.installation::text, b.principal::text, q.scope_id::text,
-                    q.report_source::text
-               FROM openmettle.gateway_requests q
-               JOIN openmettle.gateway_bindings b ON b.id = q.binding_id
-              WHERE q.id = $1::uuid AND q.state = 'handed_off'",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool);
+        let (pool, id) = (self.pool.clone(), id.to_owned());
+        let row = tokio::spawn(async move {
+            sqlx::query_as::<_, (String, String, String, String)>(
+                "SELECT q.installation::text, b.principal::text, q.scope_id::text,
+                        q.report_source::text
+                   FROM openmettle.gateway_requests q
+                   JOIN openmettle.gateway_bindings b ON b.id = q.binding_id
+                  WHERE q.id = $1::uuid AND q.state = 'handed_off'",
+            )
+            .bind(id)
+            .fetch_optional(&pool)
+            .await
+        });
         match timeout(self.database_timeout, row).await {
-            Ok(Ok(Some((installation, principal, scope, source)))) => Ok(Routing {
+            Ok(Ok(Ok(Some((installation, principal, scope, source))))) => Ok(Routing {
                 installation,
                 principal,
                 scope,
                 source,
             }),
-            Ok(Ok(None)) => Err(UNKNOWN),
+            Ok(Ok(Ok(None))) => Err(UNKNOWN),
             _ => Err(UNAVAILABLE),
         }
     }
@@ -535,7 +564,7 @@ struct Relay {
     extract: Option<Extract>,
     /// Whether the caller still gets every chunk.
     delivering: bool,
-    /// Set once the caller has gone: the rest of the body must arrive by then.
+    /// Set once the caller has gone: reading stops when it passes.
     drain_by: Option<Instant>,
     idle: Duration,
     pool: PgPool,
@@ -547,7 +576,7 @@ struct Relay {
 impl Relay {
     async fn run(mut self) {
         let copied = self.copy().await;
-        if copied.is_ok() && self.delivering {
+        if self.delivered(&copied) {
             self.complete.store(true, Ordering::Release);
         }
         let Self {
@@ -577,8 +606,9 @@ impl Relay {
 
     /// Reads the upstream body to its end. The caller gets every chunk until it leaves or stops
     /// reading; after that the rest is read only while the usage may still be in hand, checked
-    /// after every read, and within one idle timeout in total. Otherwise the upstream
-    /// connection is dropped.
+    /// after every read, and reading stops once one idle timeout has passed since then. A body
+    /// that ends as that deadline falls still counts. Otherwise the upstream connection is
+    /// dropped.
     async fn copy(&mut self) -> Result<(), UsageGap> {
         loop {
             let drain_by = self.drain_by;
@@ -627,6 +657,12 @@ impl Relay {
         Ok(())
     }
 
+    /// Whether the caller's response may end cleanly: the upstream body completed and the
+    /// caller received every chunk.
+    fn delivered(&self, copied: &Result<(), UsageGap>) -> bool {
+        copied.is_ok() && self.delivering
+    }
+
     fn draining(&self) -> bool {
         self.extract.as_ref().is_some_and(Extract::worth_draining)
     }
@@ -655,16 +691,24 @@ fn report(id: String, routing: Routing, usage: Usage) -> UsageReport {
     }
 }
 
-/// Stores `report`, retrying a transient database failure twice. Each attempt is bounded by
-/// `limit`: an abandoned attempt rolls back when its connection is next used, and sqlx tests a
-/// connection before it rejoins the pool. An identical report is accepted again as a duplicate,
-/// so a retry after an ambiguous commit is safe. No local spool.
+/// Stores `report`, retrying a transient database failure twice. No local spool.
+///
+/// Each attempt runs in its own task and is never cancelled in flight: sqlx counts a transaction
+/// only once the server acknowledges `BEGIN`, so a cancelled `BEGIN` could put its connection
+/// back in the pool inside a transaction. The proxy waits `limit` for an attempt; past that it
+/// retries while the abandoned attempt finishes or fails on its own, bounded by settlement's
+/// lock and statement timeouts unless its connection has gone silent. Overlap is safe:
+/// settlement locks the request and accepts the identical report once.
 async fn record(pool: &PgPool, report: &UsageReport, limit: Duration) {
     let mut attempt = 0;
     loop {
-        let outcome = timeout(limit, settlement::ingest(pool, report))
-            .await
-            .unwrap_or(Err(StoreError::Database));
+        let (pool, owned) = (pool.clone(), report.clone());
+        let task = tokio::spawn(async move { settlement::ingest(&pool, &owned).await });
+        let outcome = match timeout(limit, task).await {
+            Ok(Ok(outcome)) => outcome,
+            // Abandoned past `limit`, or the attempt panicked.
+            _ => Err(StoreError::Database),
+        };
         match outcome {
             Ok(_) => return,
             Err(StoreError::Database | StoreError::Retryable) if attempt < WRITE_RETRIES.len() => {
@@ -679,6 +723,12 @@ async fn record(pool: &PgPool, report: &UsageReport, limit: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::postgres::PgPoolOptions;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::oneshot,
+    };
 
     fn parse(pairs: &[(&str, &str)]) -> Result<Settings, &'static str> {
         Settings::parse(|key| {
@@ -774,15 +824,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_report_takes_its_identity_from_the_request() {
-        let routing = || Routing {
+    const ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+
+    fn routing() -> Routing {
+        Routing {
             installation: "00000000-0000-4000-8000-000000000001".into(),
             principal: "00000000-0000-4000-8000-000000000002".into(),
             scope: "00000000-0000-4000-8000-000000000003".into(),
             source: "00000000-0000-4000-8000-000000000004".into(),
-        };
-        let id = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        }
+    }
+
+    #[test]
+    fn a_report_takes_its_identity_from_the_request() {
+        let id = ID;
         let usage = Usage {
             prompt: 67,
             completion: 37,
@@ -814,5 +869,171 @@ mod tests {
             (plain.reasoning_tokens, plain.reasoning_included),
             (None, None)
         );
+    }
+
+    fn chunk(data: &[u8]) -> Vec<u8> {
+        let mut chunk = format!("{:x}\r\n", data.len()).into_bytes();
+        chunk.extend_from_slice(data);
+        chunk.extend_from_slice(b"\r\n");
+        chunk
+    }
+
+    /// One SSE chunk with content and the usage so far.
+    fn event(completion: usize) -> Vec<u8> {
+        chunk(
+            format!(
+                "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"x\"}}}}],\
+                 \"usage\":{{\"prompt_tokens\":5,\"completion_tokens\":{completion}}}}}\n\n"
+            )
+            .as_bytes(),
+        )
+    }
+
+    /// Answers one request with `head` and `before`, then, once `gate` opens, `after`. Yields
+    /// whether every write went out.
+    async fn upstream(
+        head: &str,
+        before: Vec<Vec<u8>>,
+        after: Vec<Vec<u8>>,
+        gate: oneshot::Receiver<()>,
+    ) -> (String, tokio::task::JoinHandle<bool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let head = head.as_bytes().to_vec();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                if socket.read(&mut byte).await.unwrap_or(0) == 0 {
+                    return false;
+                }
+                request.push(byte[0]);
+            }
+            for write in std::iter::once(head).chain(before) {
+                if socket.write_all(&write).await.is_err() {
+                    return false;
+                }
+            }
+            if gate.await.is_err() {
+                return false;
+            }
+            for write in after {
+                if socket.write_all(&write).await.is_err() {
+                    return false;
+                }
+            }
+            true
+        });
+        (address, task)
+    }
+
+    /// A relay of the answer from `address`, with the caller's end of its channel. Nothing here
+    /// reaches a database.
+    async fn relay(address: &str, idle: Duration) -> (Relay, mpsc::Receiver<Bytes>) {
+        let url = format!("http://{address}");
+        let idle_ms = idle.as_millis().to_string();
+        let settings = parse(&[
+            ("UPSTREAM_URL", &url),
+            ("UPSTREAM_IDLE_TIMEOUT_MS", &idle_ms),
+        ])
+        .unwrap();
+        let unused = "postgres://unused@127.0.0.1:1/unused".parse().unwrap();
+        let proxy = Proxy {
+            settings,
+            pool: PgPoolOptions::new().connect_lazy_with(unused),
+            database_timeout: Duration::from_secs(1),
+            relays: Relays::new(),
+        };
+        let outbound = hyper::Request::post(ROUTE)
+            .header(header::HOST, address)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let (upstream, response) = proxy.exchange(outbound).await.unwrap();
+        let (head, body) = response.into_parts();
+        let (frames, receiver) = mpsc::channel(RELAY_BUFFER);
+        let relay = Relay {
+            extract: Some(Extract::new(head.headers.get(header::CONTENT_TYPE))),
+            id: ID.into(),
+            routing: routing(),
+            upstream,
+            body,
+            frames,
+            complete: Arc::new(AtomicBool::new(false)),
+            delivering: true,
+            drain_by: None,
+            idle,
+            pool: proxy.pool.clone(),
+            write_limit: Duration::from_secs(1),
+            _running: proxy.relays.start(),
+        };
+        (relay, receiver)
+    }
+
+    const SSE: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+        transfer-encoding: chunked\r\n\r\n";
+
+    /// A caller that takes no chunk for an idle timeout is detached: it gets nothing more and no
+    /// clean end, while the relay reads on and still finds the final usage. The caller never
+    /// reads, so the relay channel fills; only then are the final usage and the end released,
+    /// and the relay can read them only after its next send has waited one idle timeout.
+    #[tokio::test]
+    async fn a_caller_that_stops_reading_is_detached_and_the_usage_still_counted() {
+        let (gate, open) = oneshot::channel();
+        let before = (1..=RELAY_BUFFER + 4).map(event).collect();
+        let after = vec![event(99), chunk(b"data: [DONE]\n\n"), b"0\r\n\r\n".to_vec()];
+        let (address, upstream) = upstream(SSE, before, after, open).await;
+        let (mut relay, receiver) = relay(&address, Duration::from_millis(500)).await;
+        let release = async {
+            while receiver.len() < RELAY_BUFFER {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            gate.send(()).unwrap();
+        };
+        let (copied, ()) = tokio::join!(relay.copy(), release);
+        assert_eq!(copied, Ok(()));
+        assert!(!relay.delivering);
+        assert!(
+            !relay.delivered(&copied),
+            "a caller that missed chunks must not see a clean end"
+        );
+        assert_eq!(receiver.len(), RELAY_BUFFER);
+        assert_eq!(
+            relay.extract.take().unwrap().finish(),
+            Ok(Usage {
+                prompt: 5,
+                completion: 99,
+                reasoning: None
+            })
+        );
+        assert!(upstream.await.unwrap());
+    }
+
+    /// After the caller has gone, the relay reads on only while the usage stays within reach.
+    /// The caller takes the first chunk and leaves; only then does the rest of a JSON answer,
+    /// four times the parse bound, arrive, so the relay detaches within the bound and must
+    /// stop on a later read.
+    #[tokio::test]
+    async fn a_detached_relay_stops_once_the_usage_is_out_of_reach() {
+        let piece = 64 * 1024;
+        let pieces = 4 * usage::MAX_JSON_BYTES / piece;
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\n\r\n",
+            pieces * piece
+        );
+        let mut first = br#"{"usage":{"prompt_tokens":1,"completion_tokens":1},"pad":""#.to_vec();
+        first.resize(piece, b'x');
+        let after = vec![vec![b'x'; piece]; pieces - 1];
+        let (gate, open) = oneshot::channel();
+        let (address, _upstream) = upstream(&head, vec![first], after, open).await;
+        let (mut relay, mut receiver) = relay(&address, Duration::from_secs(30)).await;
+        let leave = async move {
+            receiver.recv().await.unwrap();
+            drop(receiver);
+            gate.send(()).unwrap();
+        };
+        let (copied, ()) = tokio::join!(relay.copy(), leave);
+        assert_eq!(copied, Err(UsageGap::CallerDisconnected));
     }
 }
