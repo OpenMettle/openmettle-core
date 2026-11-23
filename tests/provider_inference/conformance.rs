@@ -612,6 +612,10 @@ async fn prepared_request_decodes_tool_calls_against_bound_request_tools() {
             prepared_caller.round_tokens(),
             e.ceiling.value.map(|v| v as i64)
         );
+        assert_eq!(
+            prepared_caller.output_reserve(),
+            e.output_reserve.value.map(|v| v as i64)
+        );
         assert_eq!(prepared_caller.round_cost(), None);
         assert!(!prepared_caller.requires_device_slot());
         g.validate_outbound_headers(Credential::Bearer(TOKEN), &prepared_caller)

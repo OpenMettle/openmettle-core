@@ -415,7 +415,16 @@ impl<'r> BillableInferenceRef<'r> {
     where
         'r: 'a,
     {
-        self.route.prepare(catalog, effective, request, server)
+        let prepared = self.route.prepare(catalog, effective, request, server)?;
+        if server
+            && !prepared
+                .round_tokens()
+                .zip(prepared.output_reserve())
+                .is_some_and(|(ceil, out)| out > 0 && out <= ceil)
+        {
+            return Err(inference::Error::Validation);
+        }
+        Ok(prepared)
     }
 
     pub fn validate_dispatch(

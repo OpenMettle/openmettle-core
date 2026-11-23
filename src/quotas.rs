@@ -4,7 +4,7 @@ use crate::{
     authz::gateway::{Authority, Call, Error, Reservation},
     authz::{
         self, Action, AdminChange, DenialReason, PolicyReason,
-        runs::{AdmissionLimits, ClaimLimits, RunLimit},
+        runs::{AdmissionLimits, RunLimit},
         store::{self, AuditContext, StoreError},
     },
     runs::WriteTransaction,
@@ -853,7 +853,6 @@ pub async fn read_summary(
     scope_id: &str,
     actor_user_id: Option<&str>,
     admission: Option<AdmissionLimits>,
-    claim: Option<ClaimLimits>,
 ) -> Result<QuotaSummary, QuotaError> {
     store::uuid(scope_id, "scope_id")?;
     if let Some(actor) = actor_user_id {
@@ -866,7 +865,7 @@ pub async fn read_summary(
     sqlx::query("SELECT set_config('statement_timeout', '3s', true)")
         .execute(&mut *tx)
         .await?;
-    let result = read_summary_in_tx(&mut tx, scope_id, actor_user_id, admission, claim).await;
+    let result = read_summary_in_tx(&mut tx, scope_id, actor_user_id, admission).await;
     match result {
         Ok(summary) => {
             tx.commit().await?;
@@ -886,7 +885,6 @@ pub(crate) async fn read_summary_in_tx(
     scope_id: &str,
     actor_user_id: Option<&str>,
     admission: Option<AdmissionLimits>,
-    claim: Option<ClaimLimits>,
 ) -> Result<QuotaSummary, QuotaError> {
     store::uuid(scope_id, "scope_id")?;
     if let Some(actor) = actor_user_id {
@@ -1231,6 +1229,13 @@ pub(crate) async fn read_summary_in_tx(
         let (lim, src, exp) = resolve_limit(ov, ov_exp, def.or(fallback))?;
         Ok((lim.map(|v| v.to_string()), src.to_owned(), exp))
     };
+    let resolve_worker_exec =
+        |kind: &str| -> Result<(Option<String>, String, Option<String>), QuotaError> {
+            let (ov, ov_exp, def) = exec_map.get(kind).copied().unwrap_or((None, None, None));
+            let (lim, src, exp) = resolve_limit(ov, ov_exp, def)?;
+            let src = if lim.is_none() { "worker" } else { src };
+            Ok((lim.map(|v| v.to_string()), src.to_owned(), exp))
+        };
 
     let (lim, src, exp) = resolve_exec(
         "live_runs_per_scope",
@@ -1242,10 +1247,7 @@ pub(crate) async fn read_summary_in_tx(
         limit_source: src,
         override_expires_at: exp,
     };
-    let (lim, src, exp) = resolve_exec(
-        "executing_runs_per_scope",
-        claim.map(|l| i64::from(l.executing_per_scope)),
-    )?;
+    let (lim, src, exp) = resolve_worker_exec("executing_runs_per_scope")?;
     let executing_runs_per_scope = QuotaExecutionCounter {
         current: scope_exec.to_string(),
         limit: lim,
@@ -1285,10 +1287,7 @@ pub(crate) async fn read_summary_in_tx(
             limit_source: src,
             override_expires_at: exp,
         };
-        let (lim, src, exp) = resolve_exec(
-            "executing_runs_per_actor",
-            claim.map(|l| i64::from(l.executing_per_actor)),
-        )?;
+        let (lim, src, exp) = resolve_worker_exec("executing_runs_per_actor")?;
         let exec = QuotaExecutionCounter {
             current: actor_exec.to_string(),
             limit: lim,

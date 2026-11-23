@@ -4413,7 +4413,10 @@ rule: `browserSession` (with configured `Origin` on writes) or `nativeSession`,
 - `execution`: `live_runs_per_scope` (`current`, `limit`, `limit_source`),
   `executing_runs_per_scope` (`current`, `limit`, `limit_source`), `round_cap` (`limit`,
   `limit_source`), plus `live_runs_per_actor` and `executing_runs_per_actor` on `personal`
-  summaries.
+  summaries. When neither `quota_overrides` nor `quota_defaults` is configured for
+  `executing_runs_per_scope` or `executing_runs_per_actor`, the API reports `limit: null` and
+  `limit_source: "worker"` to reflect that executing-run concurrency is governed by worker-local
+  claim settings.
 - `device_capacity`: `active_reservations` (`reserved_held` as `WideNonNegativeDecimal`, `limit`,
   `limit_source`, `warn_thresholds`, `status`), distinct from V1-18 physical VRAM telemetry.
 - `warnings`: array of active deduplicated warning projections (`resource_kind`, `threshold_pct`,

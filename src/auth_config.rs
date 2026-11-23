@@ -78,7 +78,6 @@ pub enum Error {
     GatewayKeyRing,
     Catalog,
     AdmissionLimits,
-    ClaimLimits,
     /// No provider, or more than the configured manager capacity.
     ProviderCount,
     ProviderIdentity,
@@ -124,7 +123,6 @@ impl fmt::Display for Error {
             Self::GatewayKeyRing => "gateway key files, identifiers or key separation are invalid",
             Self::Catalog => "model catalog is unreadable or invalid",
             Self::AdmissionLimits => "run admission limits are invalid",
-            Self::ClaimLimits => "run claim limits are invalid",
             Self::CursorKeyRing => "cursor key count, identifiers or key separation are invalid",
             Self::ProviderCount => "provider count is outside the configured capacity",
             Self::ProviderIdentity => "a provider identity is invalid",
@@ -519,7 +517,6 @@ struct Document {
     gateway_keys: Option<CursorFiles>,
     catalog_file: Option<String>,
     admission_limits: Option<crate::authz::runs::AdmissionLimits>,
-    claim_limits: Option<crate::authz::runs::ClaimLimits>,
     decrypt_only_keys: Vec<KeyFile>,
     max_issued_at_age_seconds: u64,
     future_skew_seconds: u64,
@@ -621,27 +618,6 @@ impl Document {
             } else {
                 None
             },
-            claim_limits: if version == VERSION_2 {
-                root.optional_object("claim_limits")?
-                    .map(|mut o| {
-                        let limits = crate::authz::runs::ClaimLimits {
-                            executing_per_actor: o
-                                .integer("executing_per_actor")?
-                                .try_into()
-                                .map_err(|_| Error::ClaimLimits)?,
-                            executing_per_scope: o
-                                .integer("executing_per_scope")?
-                                .try_into()
-                                .map_err(|_| Error::ClaimLimits)?,
-                        };
-                        o.end()?;
-                        limits.validate().map_err(|_| Error::ClaimLimits)?;
-                        Ok(limits)
-                    })
-                    .transpose()?
-            } else {
-                None
-            },
             cursor_keys: match version {
                 VERSION_2 => root
                     .optional_object("cursor_keys")?
@@ -731,7 +707,6 @@ fn key_material(
 pub struct AuthConfig {
     pub(crate) catalog: Option<crate::model_config::Catalog>,
     pub(crate) admission_limits: Option<crate::authz::runs::AdmissionLimits>,
-    pub(crate) claim_limits: Option<crate::authz::runs::ClaimLimits>,
     pub(crate) cursor_keys: Option<CursorKeys>,
     pub gateway_keys: Option<provider_keys::gateway::GatewayKeys>,
     keys: KeyRing,
@@ -797,7 +772,6 @@ impl AuthConfig {
             gateway_keys: None,
             catalog: None,
             admission_limits: None,
-            claim_limits: None,
             browser: None,
             native: None,
         }
@@ -951,7 +925,6 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
     Ok(AuthConfig {
         catalog,
         admission_limits: document.admission_limits,
-        claim_limits: document.claim_limits,
         cursor_keys,
         gateway_keys,
         keys,

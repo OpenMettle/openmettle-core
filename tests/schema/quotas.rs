@@ -794,38 +794,61 @@ async fn quota_store_enforces_upgrade_gate_denomination_idempotency_and_wide_sum
     let session_tok = authz_runs::seeded_session(&db, &alice, 7, None).await;
     settle_oversized_three_column_tokens(&db, &alice, &alice_scope, &session_tok).await;
 
-    let summary = quotas::read_summary(
-        &mut api,
-        &alice_scope,
-        Some(&alice.user),
-        None,
-        Some(openmettle_core::authz::runs::ClaimLimits {
-            executing_per_actor: 3,
-            executing_per_scope: 7,
-        }),
-    )
-    .await
-    .unwrap();
+    let summary = quotas::read_summary(&mut api, &alice_scope, Some(&alice.user), None)
+        .await
+        .unwrap();
     assert_eq!(summary.usage[0].resource_kind, "usage_tokens");
     assert_eq!(summary.usage[0].active_used, "27670116110564327421");
     assert_eq!(summary.usage[0].remaining.as_deref(), Some("0"));
     assert_eq!(summary.usage[0].status, "hard_limit");
     assert!(summary.usage[0].last_reconciled_at.is_some());
-    assert_eq!(
-        summary.execution.executing_runs_per_scope.limit.as_deref(),
-        Some("7")
-    );
+    assert_eq!(summary.execution.executing_runs_per_scope.limit, None);
     assert_eq!(
         summary.execution.executing_runs_per_scope.limit_source,
-        "default"
+        "worker"
     );
     let actor_exec = summary
         .execution
         .executing_runs_per_actor
         .as_ref()
         .expect("personal summary includes executing_runs_per_actor");
-    assert_eq!(actor_exec.limit.as_deref(), Some("3"));
-    assert_eq!(actor_exec.limit_source, "default");
+    assert_eq!(actor_exec.limit, None);
+    assert_eq!(actor_exec.limit_source, "worker");
+
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'executing_runs_per_actor', 3),
+                    ('personal', 'executing_runs_per_scope', 7)",
+        )
+        .await
+        .unwrap();
+    let summary_with_db_defaults =
+        quotas::read_summary(&mut api, &alice_scope, Some(&alice.user), None)
+            .await
+            .unwrap();
+    assert_eq!(
+        summary_with_db_defaults
+            .execution
+            .executing_runs_per_scope
+            .limit
+            .as_deref(),
+        Some("7")
+    );
+    assert_eq!(
+        summary_with_db_defaults
+            .execution
+            .executing_runs_per_scope
+            .limit_source,
+        "default"
+    );
+    let actor_exec_db = summary_with_db_defaults
+        .execution
+        .executing_runs_per_actor
+        .as_ref()
+        .expect("personal summary includes executing_runs_per_actor");
+    assert_eq!(actor_exec_db.limit.as_deref(), Some("3"));
+    assert_eq!(actor_exec_db.limit_source, "default");
 
     let drift: (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
@@ -980,7 +1003,7 @@ async fn quota_override_locks_single_audit_and_expired_override_warnings() {
     .await
     .unwrap();
     tx.commit().await.unwrap();
-    let before_exp = quotas::read_summary(&mut api, &scope, Some(&alice.user), None, None)
+    let before_exp = quotas::read_summary(&mut api, &scope, Some(&alice.user), None)
         .await
         .unwrap();
     assert_eq!(before_exp.storage.status, "warning");
@@ -997,7 +1020,7 @@ async fn quota_override_locks_single_audit_and_expired_override_warnings() {
     .execute(&mut owner)
     .await
     .unwrap();
-    let after_exp = quotas::read_summary(&mut api, &scope, Some(&alice.user), None, None)
+    let after_exp = quotas::read_summary(&mut api, &scope, Some(&alice.user), None)
         .await
         .unwrap();
     assert_eq!(after_exp.storage.limit_bytes.as_deref(), Some("10000"));
@@ -8295,6 +8318,82 @@ async fn public_turn_handoff_rejects_oversized_bearer_and_cross_gateway_prepared
             Err(gateway::Error::Refused)
         ));
     }
+
+    // Missing wire output cap (output_reserve = None) and oversized output cap
+    // (output_reserve = 600 > ceiling = 450) MUST both fail BillableInferenceRef::prepare(..., true)
+    // with Error::Validation AND fail TurnPending::handoff with Error::Refused even when prepared
+    // directly via Gateway::prepare(..., true).
+    let eff_no_output_cap = chat_fx
+        .catalog
+        .resolve(
+            &openmettle_core::model_config::Selection::default(),
+            &serde_json::from_value(serde_json::json!({"model": "a"})).unwrap(),
+            None,
+            |_, _| true,
+        )
+        .unwrap();
+    assert_eq!(eff_no_output_cap.ceiling.value, Some(450));
+    assert_eq!(eff_no_output_cap.output_reserve.value, None);
+    assert_eq!(
+        chat_billable
+            .prepare(&chat_fx.catalog, &eff_no_output_cap, &chat_fx.request, true)
+            .err(),
+        Some(openmettle_core::provider_http::inference::Error::Validation)
+    );
+    let direct_no_output_cap = chat_fx
+        .route
+        .prepare(&chat_fx.catalog, &eff_no_output_cap, &chat_fx.request, true)
+        .unwrap();
+    assert!(matches!(
+        pending_b
+            .handoff(
+                &worker_pool,
+                &keys,
+                None,
+                &chat_billable,
+                direct_no_output_cap,
+            )
+            .await,
+        Err(gateway::Error::Refused)
+    ));
+
+    let overcap_fx = TurnHandoffFixture::chat(INSTALL, "a", 1024, Some(450), false);
+    let mut eff_over_cap = overcap_fx.effective.clone();
+    eff_over_cap.ceiling.value = Some(450);
+    eff_over_cap.output_reserve.value = Some(600);
+    let overcap_billable = overcap_fx.billable();
+    assert_eq!(
+        overcap_billable
+            .prepare(
+                &overcap_fx.catalog,
+                &eff_over_cap,
+                &overcap_fx.request,
+                true,
+            )
+            .err(),
+        Some(openmettle_core::provider_http::inference::Error::Validation)
+    );
+    let direct_over_cap = overcap_fx
+        .route
+        .prepare(
+            &overcap_fx.catalog,
+            &eff_over_cap,
+            &overcap_fx.request,
+            true,
+        )
+        .unwrap();
+    assert!(matches!(
+        pending_b
+            .handoff(
+                &worker_pool,
+                &keys,
+                None,
+                &overcap_billable,
+                direct_over_cap,
+            )
+            .await,
+        Err(gateway::Error::Refused)
+    ));
     let req_b_state: String =
         sqlx::query_scalar("SELECT state FROM openmettle.gateway_requests WHERE id = $1::uuid")
             .bind(&pending_b.id)

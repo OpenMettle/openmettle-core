@@ -157,11 +157,6 @@ impl Api {
             .extensions
             .get::<authz::runs::AdmissionLimits>()
             .copied();
-        let claim = parts
-            .extensions
-            .get::<authz::runs::ClaimLimits>()
-            .copied()
-            .or_else(|| self.browser.claim_limits());
         match op {
             Op::GetPersonalQuotas => {
                 let context = self.authenticate(&session).await?;
@@ -174,7 +169,6 @@ impl Api {
                                 &p.personal_scope_id,
                                 Some(&p.user_id),
                                 limits,
-                                claim,
                             )
                             .await
                             .map_err(quota_error)
@@ -194,15 +188,9 @@ impl Api {
                             let view =
                                 projects::read_project(tx, &p, target, context.observed_ms())
                                     .await?;
-                            quotas::read_summary_in_tx(
-                                tx,
-                                &view.settings.scope_id,
-                                None,
-                                limits,
-                                claim,
-                            )
-                            .await
-                            .map_err(quota_error)
+                            quotas::read_summary_in_tx(tx, &view.settings.scope_id, None, limits)
+                                .await
+                                .map_err(quota_error)
                         })
                         .await
                     })

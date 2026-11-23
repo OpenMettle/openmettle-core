@@ -201,6 +201,7 @@ pub struct PreparedRequest<'a> {
     request: &'a Request,
     server: bool,
     round_tokens: Option<i64>,
+    output_reserve: Option<i64>,
     round_cost: Option<u128>,
     requires_device_slot: bool,
     body: Vec<u8>,
@@ -221,6 +222,10 @@ impl<'a> PreparedRequest<'a> {
 
     pub(crate) fn round_tokens(&self) -> Option<i64> {
         self.round_tokens
+    }
+
+    pub(crate) fn output_reserve(&self) -> Option<i64> {
+        self.output_reserve
     }
 
     pub(crate) fn round_cost(&self) -> Option<u128> {
@@ -377,6 +382,11 @@ impl Gateway {
             .value
             .and_then(|n| i64::try_from(n).ok())
             .filter(|&n| n > 0);
+        let output_reserve = effective
+            .output_reserve
+            .value
+            .and_then(|n| i64::try_from(n).ok())
+            .filter(|&n| n > 0);
         let round_cost = match effective.ceiling.value {
             Some(tokens) => profile
                 .round_cost_ceiling(tokens)
@@ -392,6 +402,7 @@ impl Gateway {
             request,
             server,
             round_tokens,
+            output_reserve,
             round_cost,
             requires_device_slot,
             body,

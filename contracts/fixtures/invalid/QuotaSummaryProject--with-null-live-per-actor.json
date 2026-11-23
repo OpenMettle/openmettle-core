@@ -26,7 +26,7 @@
       "executing_runs_per_scope": {
         "current": "0",
         "limit": null,
-        "limit_source": "unconfigured",
+        "limit_source": "worker",
         "override_expires_at": null
       },
       "live_runs_per_actor": null,

@@ -311,6 +311,9 @@ impl TurnPending {
             && device_grant_id.is_some_and(|g| !crate::runs::is_canonical_uuid(g)))
             || !prepared.is_server()
             || prepared.round_tokens() != Some(self.units)
+            || !prepared
+                .output_reserve()
+                .is_some_and(|out| out > 0 && out <= self.units)
             || prepared.round_cost() != self.round_cost
             || prepared.requires_device_slot() != self.requires_device_slot
         {

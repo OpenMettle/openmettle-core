@@ -2156,15 +2156,68 @@ async fn quota_summary_wide_counters_privacy_warnings_and_hard_limit_reads_work_
     .await
     .unwrap();
     tx.commit().await.unwrap();
-    // Restart API with cursor_keys and claim_limits so cancelRun works and QuotaSummary exposes claim defaults.
+    // Restart API with cursor_keys so cancelRun works and verify executing_runs_* reports
+    // worker-local fallback ("worker") when unconfigured in DB, then exact DB defaults once set.
     let dir = auth_config_support::Dir::new();
     let mut doc = auth_config_support::document_v2_native(&dir, &ca::Ca::new().pem());
     doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
-    doc["claim_limits"] = json!({
-        "executing_per_actor": 3,
-        "executing_per_scope": 7
-    });
     let api_with_keys = Api::configured(&db, dir, doc, 4);
+    let personal_worker = success(
+        api_with_keys.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert!(validate_openapi_schema(
+        "#/components/schemas/QuotaSummary",
+        &personal_worker
+    ));
+    assert_eq!(
+        personal_worker["execution"]["executing_runs_per_actor"]["limit"],
+        Value::Null
+    );
+    assert_eq!(
+        personal_worker["execution"]["executing_runs_per_actor"]["limit_source"],
+        "worker"
+    );
+    assert_eq!(
+        personal_worker["execution"]["executing_runs_per_scope"]["limit"],
+        Value::Null
+    );
+    assert_eq!(
+        personal_worker["execution"]["executing_runs_per_scope"]["limit_source"],
+        "worker"
+    );
+    let proj_worker = success(
+        api_with_keys.call(alice_n, "GET", &proj_path, None, None),
+        200,
+    );
+    assert!(validate_openapi_schema(
+        "#/components/schemas/QuotaSummary",
+        &proj_worker
+    ));
+    assert_eq!(
+        proj_worker["execution"]["executing_runs_per_scope"]["limit"],
+        Value::Null
+    );
+    assert_eq!(
+        proj_worker["execution"]["executing_runs_per_scope"]["limit_source"],
+        "worker"
+    );
+    assert!(
+        proj_worker["execution"]
+            .get("executing_runs_per_actor")
+            .is_none()
+    );
+
+    // Configure authoritative DB defaults enforced by CLAIM_WITH_QUOTAS and verify summaries reflect them.
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'executing_runs_per_actor', 3),
+                    ('personal', 'executing_runs_per_scope', 7),
+                    ('project', 'executing_runs_per_scope', 7)",
+        )
+        .await
+        .unwrap();
     let personal_claim = success(
         api_with_keys.call(alice_b, "GET", "/v1/quotas/personal", None, None),
         200,
