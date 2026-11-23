@@ -1082,7 +1082,8 @@ async fn schema_23_run_budget_survives_upgrade_to_26_and_legacy_worker_dispatch(
         "openmettle_worker has EXECUTE on function openmettle.quota_run_round_cost_slice(uuid,uuid,uuid)",
         "openmettle_worker has EXECUTE on function openmettle.quota_authorize_unmetered_turn_round(uuid,uuid,uuid)",
         "openmettle_worker has EXECUTE on function openmettle.quota_lock_turn_handoff_prefix(uuid,bytea,uuid,uuid,uuid)",
-        "openmettle_worker has EXECUTE on function openmettle.quota_commit_turn_handoff(uuid,bytea,uuid,uuid,uuid,boolean,uuid)",
+        "openmettle_worker has EXECUTE on function openmettle.quota_lock_run_actor_prefix(uuid,uuid)",
+        "openmettle_worker has EXECUTE on function openmettle.quota_commit_turn_handoff(uuid,bytea,uuid,uuid,uuid,boolean,uuid,boolean)",
         "openmettle_api has EXECUTE on function openmettle.quota_ensure_replayed_run_gateway_reservation(uuid,uuid,uuid,bigint)",
     ] {
         assert!(
@@ -4319,4 +4320,691 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
             .await
             .unwrap();
     assert_eq!(race_req_released, "released");
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disable_user_lock_order()
+{
+    use openmettle_core::{
+        authz::{
+            gateway::{self, TurnRound},
+            leases::{self, LeaseSettings, Settle},
+            runs::{self as authz_queue, Admission, AdmissionLimits, ClaimLimits, RunAdmission},
+            store::{self, WriteOutcome},
+        },
+        provider_keys::gateway::{Bearer, Context, GatewayKeys, GatewaySealer},
+        quotas::{self, RunBudgetReservation},
+        runs::{RunInput, WriteTransaction},
+    };
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    const INSTALL: &str = "00000000-0000-4000-8000-000000000081";
+    const PRINCIPAL: &str = "00000000-0000-4000-8000-000000000082";
+    const BUDGET: &str = "00000000-0000-4000-8000-000000000083";
+    const KEY_BYTES: [u8; 32] = [88u8; 32];
+
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut owner).await;
+    let admin =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    authz_store::make_admin(&mut owner, &admin).await;
+    let alice =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let scope = authz_runs::personal_of(&db, &alice).await;
+
+    owner
+        .execute(
+            "UPDATE openmettle.quota_defaults
+                SET cost_denomination = 'usd_micros'
+              WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'",
+        )
+        .await
+        .unwrap();
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 100000)",
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.quota_overrides
+             (scope_id, scope_kind, resource_kind, hard_limit, expires_at, reason, updated_by_user_id)
+         VALUES ($1::uuid, 'personal', 'usage_cost_micros', 5000,
+                 clock_timestamp() + interval '1 hour', 're-review-8 initial cost limit', $2::uuid)",
+    )
+    .bind(&scope)
+    .bind(&admin.user)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    // Provision gateway binding, generation, and policy for model `a`.
+    let g_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(db.1.options(pg::GATEWAY));
+    let binding: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.gateway_bindings (installation, user_id, principal, budget)
+         VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid) RETURNING id::text",
+    )
+    .bind(INSTALL)
+    .bind(&alice.user)
+    .bind(PRINCIPAL)
+    .bind(BUDGET)
+    .fetch_one(&g_pool)
+    .await
+    .unwrap();
+    let report_source: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+    let keys = GatewayKeys::new(&[("rr8-k1".into(), KEY_BYTES)]).unwrap();
+    let (finger, env) = GatewaySealer::new(
+        GatewayKeys::new(&[("rr8-k1".into(), KEY_BYTES)]).unwrap(),
+        g_pool.clone(),
+    )
+    .seal(
+        &Context {
+            installation: INSTALL,
+            user_id: &alice.user,
+            binding_id: &binding,
+            principal: PRINCIPAL,
+            generation: 1,
+        },
+        &Bearer::new(b"rr8-bearer").unwrap(),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_generations
+             (binding_id, generation, remote_key, expires_at, key_id, key_fingerprint, nonce, ciphertext)
+         VALUES ($1::uuid, 1, gen_random_uuid(), clock_timestamp() + interval '1 hour', $2, $3, $4, $5)",
+    )
+    .bind(&binding)
+    .bind(&env.key_id)
+    .bind(finger.as_slice())
+    .bind(env.nonce.as_slice())
+    .bind(env.ciphertext)
+    .execute(&g_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_policy
+             (binding_id, revision, scope_id, approval_id, model, report_source,
+              provider_generation, approval_generation, user_generation, capabilities)
+         VALUES ($1::uuid, 1, $2::uuid, $3::uuid, 'a', $4::uuid, 0, 0, 0, '{}'::jsonb)",
+    )
+    .bind(&binding)
+    .bind(&scope)
+    .bind(&alice.approval)
+    .bind(&report_source)
+    .execute(&g_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE openmettle.gateway_bindings
+            SET active_generation = 1, observed_revision = 1, state = 'ready'
+          WHERE id = $1::uuid",
+    )
+    .bind(&binding)
+    .execute(&g_pool)
+    .await
+    .unwrap();
+
+    let mut api = connect(&db.0, API).await;
+    let mut worker = connect(&db.0, WORKER).await;
+    let worker_pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect_lazy_with(db.1.options(WORKER));
+    let chat = authz_runs::chat(&db, &scope, "personal", &alice).await;
+    let (branch, msg) = branch_and_message(&mut api, &scope, &chat).await;
+    let limits = AdmissionLimits {
+        live_per_actor: 16,
+        live_per_scope: 16,
+        queued_in_instance: 32,
+        queue_timeout: Duration::from_secs(300),
+        round_cap: 10,
+    };
+    let lease_cfg = LeaseSettings {
+        lease: Duration::from_secs(60),
+        execution_timeout: Duration::from_secs(600),
+    };
+    let claim_cfg = ClaimLimits {
+        executing_per_actor: 8,
+        executing_per_scope: 16,
+    };
+
+    // Part A (P1 #1): Single-snapshot cost_limit_state across an override expiring right at the
+    // reservation boundary must NEVER skip allocating the usage_cost_micros child hold while a
+    // held usage_cost_micros parent exists.
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    let Admission::Admitted { run_id: r1, .. } = authz_queue::admit_run(
+        &mut tx,
+        &RunAdmission {
+            input: RunInput {
+                scope: &scope,
+                actor: &alice.user,
+                conversation: &chat,
+                branch: &branch,
+                message: &msg,
+                key: "rr8-boundary-expiry",
+                format: "openmettle.conversation",
+                version: 1,
+                input: b"{}",
+                config: br#"{"effective":{"ceiling":{"value":100}}}"#,
+            },
+            actor_approval_id: &alice.approval,
+            capabilities: &[],
+            requested_rounds: Some(2),
+            now_ms: authz_store::NOW,
+            cost_qualified: Some(true),
+        },
+        &limits,
+    )
+    .await
+    .unwrap() else {
+        panic!("expected admission");
+    };
+    assert!(
+        quotas::reserve_admitted_run_budget(
+            &mut tx,
+            &RunBudgetReservation {
+                scope_id: &scope,
+                scope_kind: "personal",
+                actor_user_id: &alice.user,
+                actor_approval_id: &alice.approval,
+                run_id: &r1,
+                token_units: 200,
+                per_round_cost_micros: Some(1000),
+                round_limit: 2,
+                requires_device_slot: false,
+            },
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    tx.commit().await.unwrap();
+
+    let claim1 = authz_queue::claim_next(&mut worker, &claim_cfg, &lease_cfg)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim1.run_id, r1);
+
+    // Arm override to expire 4ms from now and repeatedly reserve + release rounds right across the
+    // expiry instant; every single round MUST carry both usage_cost_micros and usage_tokens holds.
+    sqlx::query(
+        "UPDATE openmettle.quota_overrides
+            SET expires_at = clock_timestamp() + interval '4 milliseconds'
+          WHERE scope_id = $1::uuid AND resource_kind = 'usage_cost_micros'",
+    )
+    .bind(&scope)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    for round in 1..=6 {
+        let pending = gateway::reserve_turn_round(
+            &worker_pool,
+            TurnRound {
+                scope_id: &scope,
+                actor: &alice.user,
+                approval: &alice.approval,
+                run_id: &r1,
+                round,
+                claim_token: &claim1.claim_token,
+                installation: INSTALL,
+                model: "a",
+                round_tokens: 100,
+                round_cost: Some(750),
+                requires_device_slot: false,
+            },
+        )
+        .await
+        .unwrap();
+        let children: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT resource_kind, held_units
+               FROM openmettle.quota_reservations
+              WHERE gateway_request_id = $1::uuid
+                AND state = 'held'
+              ORDER BY resource_kind ASC",
+        )
+        .bind(&pending.id)
+        .fetch_all(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(
+            children,
+            vec![
+                ("usage_cost_micros".to_owned(), 750),
+                ("usage_tokens".to_owned(), 100),
+            ],
+            "round {round} must never drop usage_cost_micros child while cost parent is held"
+        );
+        assert!(pending.release(&worker_pool).await.unwrap());
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    // Part B1 (P2 #2): With all cost limits now expired/NULL, reserve_turn_round with an
+    // unqualified profile (round_cost = None) succeeds and slices the legacy cost parent. If an
+    // admin activates a cost override before TurnPending::handoff, deferred
+    // enforce_gateway_handoff_holds MUST reject the handoff with OMQ04 (Error::Refused), leaving
+    // gateway_requests in 'reserved' so pending.release() cleanly unwinds it.
+    sqlx::query(
+        "UPDATE openmettle.quota_overrides
+            SET expires_at = clock_timestamp() - interval '1 second'
+          WHERE scope_id = $1::uuid AND resource_kind = 'usage_cost_micros'",
+    )
+    .bind(&scope)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    let p_unqual = gateway::reserve_turn_round(
+        &worker_pool,
+        TurnRound {
+            scope_id: &scope,
+            actor: &alice.user,
+            approval: &alice.approval,
+            run_id: &r1,
+            round: 7,
+            claim_token: &claim1.claim_token,
+            installation: INSTALL,
+            model: "a",
+            round_tokens: 100,
+            round_cost: None,
+            requires_device_slot: false,
+        },
+    )
+    .await
+    .unwrap();
+    // Activate a cost override BEFORE TurnPending::handoff.
+    sqlx::query(
+        "UPDATE openmettle.quota_overrides
+            SET expires_at = NULL, hard_limit = 5000
+          WHERE scope_id = $1::uuid AND resource_kind = 'usage_cost_micros'",
+    )
+    .bind(&scope)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    assert!(matches!(
+        p_unqual.handoff(&worker_pool, &keys, false, None).await,
+        Err(gateway::Error::Refused)
+    ));
+    let unqual_state: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.gateway_requests WHERE id = $1::uuid")
+            .bind(&p_unqual.id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    assert_eq!(unqual_state, "reserved");
+    assert!(p_unqual.release(&worker_pool).await.unwrap());
+    let unqual_released: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.gateway_requests WHERE id = $1::uuid")
+            .bind(&p_unqual.id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    assert_eq!(unqual_released, "released");
+    leases::settle(
+        &mut worker,
+        &claim1.lease(),
+        &lease_cfg,
+        Settle::Failed(leases::FailReason::StepFailed),
+    )
+    .await
+    .unwrap();
+
+    // Part B2 (P2 #2): On a deployment where cost_denomination IS NULL and a round was reserved
+    // with a qualified cost bound while no cost limit existed (so no cost child was allocated),
+    // activating a cost limit with cost_denomination still NULL before handoff MUST fail closed
+    // with OMQ04 (Error::Refused) and roll back gateway_requests to 'reserved'.
+    {
+        let db2 = TestDb::migrated().await;
+        let mut owner2 = connect(&db2.0, OWNER).await;
+        authz_store::providers(&mut owner2).await;
+        let bob = authz_store::account(
+            &mut owner2,
+            authz_store::PROVIDER,
+            true,
+            authz_store::FUTURE,
+        )
+        .await;
+        let bob_scope = authz_runs::personal_of(&db2, &bob).await;
+        owner2
+            .execute(
+                "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+                 VALUES ('personal', 'usage_tokens', 100000)",
+            )
+            .await
+            .unwrap();
+        let g2 = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy_with(db2.1.options(pg::GATEWAY));
+        let b2: String = sqlx::query_scalar(
+            "INSERT INTO openmettle.gateway_bindings (installation, user_id, principal, budget)
+             VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid) RETURNING id::text",
+        )
+        .bind(INSTALL)
+        .bind(&bob.user)
+        .bind(PRINCIPAL)
+        .bind(BUDGET)
+        .fetch_one(&g2)
+        .await
+        .unwrap();
+        let rs2: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+            .fetch_one(&mut owner2)
+            .await
+            .unwrap();
+        let keys2 = GatewayKeys::new(&[("rr8-k2".into(), KEY_BYTES)]).unwrap();
+        let (f2, e2) = GatewaySealer::new(
+            GatewayKeys::new(&[("rr8-k2".into(), KEY_BYTES)]).unwrap(),
+            g2.clone(),
+        )
+        .seal(
+            &Context {
+                installation: INSTALL,
+                user_id: &bob.user,
+                binding_id: &b2,
+                principal: PRINCIPAL,
+                generation: 1,
+            },
+            &Bearer::new(b"rr8-bearer-2").unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_generations
+                 (binding_id, generation, remote_key, expires_at, key_id, key_fingerprint, nonce, ciphertext)
+             VALUES ($1::uuid, 1, gen_random_uuid(), clock_timestamp() + interval '1 hour', $2, $3, $4, $5)",
+        )
+        .bind(&b2)
+        .bind(&e2.key_id)
+        .bind(f2.as_slice())
+        .bind(e2.nonce.as_slice())
+        .bind(e2.ciphertext)
+        .execute(&g2)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_policy
+                 (binding_id, revision, scope_id, approval_id, model, report_source,
+                  provider_generation, approval_generation, user_generation, capabilities)
+             VALUES ($1::uuid, 1, $2::uuid, $3::uuid, 'a', $4::uuid, 0, 0, 0, '{}'::jsonb)",
+        )
+        .bind(&b2)
+        .bind(&bob_scope)
+        .bind(&bob.approval)
+        .bind(&rs2)
+        .execute(&g2)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.gateway_bindings
+                SET active_generation = 1, observed_revision = 1, state = 'ready'
+              WHERE id = $1::uuid",
+        )
+        .bind(&b2)
+        .execute(&g2)
+        .await
+        .unwrap();
+
+        let mut api2 = connect(&db2.0, API).await;
+        let mut worker2 = connect(&db2.0, WORKER).await;
+        let wp2 = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy_with(db2.1.options(WORKER));
+        let bob_chat = authz_runs::chat(&db2, &bob_scope, "personal", &bob).await;
+        let (bob_branch, bob_msg) = branch_and_message(&mut api2, &bob_scope, &bob_chat).await;
+        let mut tx2 = WriteTransaction::begin(&mut api2).await.unwrap();
+        let Admission::Admitted { run_id: r2, .. } = authz_queue::admit_run(
+            &mut tx2,
+            &RunAdmission {
+                input: RunInput {
+                    scope: &bob_scope,
+                    actor: &bob.user,
+                    conversation: &bob_chat,
+                    branch: &bob_branch,
+                    message: &bob_msg,
+                    key: "rr8-null-denom-race",
+                    format: "openmettle.conversation",
+                    version: 1,
+                    input: b"{}",
+                    config: br#"{"effective":{"ceiling":{"value":100}}}"#,
+                },
+                actor_approval_id: &bob.approval,
+                capabilities: &[],
+                requested_rounds: Some(1),
+                now_ms: authz_store::NOW,
+                cost_qualified: Some(true),
+            },
+            &limits,
+        )
+        .await
+        .unwrap() else {
+            panic!("expected admission");
+        };
+        assert!(
+            quotas::reserve_admitted_run_budget(
+                &mut tx2,
+                &RunBudgetReservation {
+                    scope_id: &bob_scope,
+                    scope_kind: "personal",
+                    actor_user_id: &bob.user,
+                    actor_approval_id: &bob.approval,
+                    run_id: &r2,
+                    token_units: 100,
+                    per_round_cost_micros: Some(500),
+                    round_limit: 1,
+                    requires_device_slot: false,
+                },
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        tx2.commit().await.unwrap();
+        let claim2 = authz_queue::claim_next(&mut worker2, &claim_cfg, &lease_cfg)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim2.run_id, r2);
+        let p_null_denom = gateway::reserve_turn_round(
+            &wp2,
+            TurnRound {
+                scope_id: &bob_scope,
+                actor: &bob.user,
+                approval: &bob.approval,
+                run_id: &r2,
+                round: 1,
+                claim_token: &claim2.claim_token,
+                installation: INSTALL,
+                model: "a",
+                round_tokens: 100,
+                round_cost: Some(500),
+                requires_device_slot: false,
+            },
+        )
+        .await
+        .unwrap();
+        // Insert a cost limit with cost_denomination STILL NULL before handoff.
+        owner2
+            .execute(
+                "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+                 VALUES ('personal', 'usage_cost_micros', 5000)",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            p_null_denom.handoff(&wp2, &keys2, false, None).await,
+            Err(gateway::Error::Refused)
+        ));
+        let null_denom_state: String =
+            sqlx::query_scalar("SELECT state FROM openmettle.gateway_requests WHERE id = $1::uuid")
+                .bind(&p_null_denom.id)
+                .fetch_one(&mut owner2)
+                .await
+                .unwrap();
+        assert_eq!(null_denom_state, "reserved");
+        assert!(p_null_denom.release(&wp2).await.unwrap());
+        leases::settle(
+            &mut worker2,
+            &claim2.lease(),
+            &lease_cfg,
+            Settle::Failed(leases::FailReason::StepFailed),
+        )
+        .await
+        .unwrap();
+        let drift2: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
+               FROM openmettle.quota_verify_accounting_drift()",
+        )
+        .fetch_one(&mut worker2)
+        .await
+        .unwrap();
+        assert_eq!(drift2, (0, 0, 0, 0));
+    }
+
+    // Clear alice's cost override before Part C so legacy runs without round_cost can reserve
+    // freely whenever reserve_turn_round wins the race against disable_user.
+    sqlx::query(
+        "DELETE FROM openmettle.quota_overrides
+          WHERE scope_id = $1::uuid AND resource_kind = 'usage_cost_micros'",
+    )
+    .bind(&scope)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    // Part C (P2 #3): Racing authz::store::disable_user against gateway::reserve_turn_round on
+    // legacy runs missing gateway_reservations MUST NEVER deadlock with PostgreSQL 40P01, because
+    // reserve_turn_round acquires openmettle.quota_lock_run_actor_prefix(...) before runs.
+    let api_pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect_lazy_with(db.1.options(API));
+    let mut reserved_wins = 0usize;
+    let mut disabled_wins = 0usize;
+    for iter in 0..8usize {
+        // Re-enable alice between race iterations without changing user_generation.
+        sqlx::query("UPDATE openmettle.users SET disabled_at = NULL WHERE id = $1::uuid")
+            .bind(&alice.user)
+            .execute(&mut owner)
+            .await
+            .unwrap();
+        // Admit a run WITHOUT inserting gateway_reservations so reserve_turn_round hits the
+        // legacy backfill INSERT INTO gateway_reservations (which FK-locks users + approvals).
+        let mut tx_r = WriteTransaction::begin(&mut api).await.unwrap();
+        let key = format!("rr8-lock-race-{iter}");
+        let Admission::Admitted { run_id: r_race, .. } = authz_queue::admit_run(
+            &mut tx_r,
+            &RunAdmission {
+                input: RunInput {
+                    scope: &scope,
+                    actor: &alice.user,
+                    conversation: &chat,
+                    branch: &branch,
+                    message: &msg,
+                    key: &key,
+                    format: "openmettle.conversation",
+                    version: 1,
+                    input: b"{}",
+                    config: br#"{"effective":{"ceiling":{"value":100}}}"#,
+                },
+                actor_approval_id: &alice.approval,
+                capabilities: &[],
+                requested_rounds: Some(1),
+                now_ms: authz_store::NOW,
+                cost_qualified: None,
+            },
+            &limits,
+        )
+        .await
+        .unwrap() else {
+            panic!("expected admission");
+        };
+        tx_r.commit().await.unwrap();
+        let claim_r = authz_queue::claim_next(&mut worker, &claim_cfg, &lease_cfg)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim_r.run_id, r_race);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = Arc::clone(&barrier);
+        let b2 = Arc::clone(&barrier);
+        let api_pool_c = api_pool.clone();
+        let wp_c = worker_pool.clone();
+        let admin_c = admin.clone();
+        let victim_user_d = alice.user.clone();
+        let victim_user_r = alice.user.clone();
+        let victim_approval = alice.approval.clone();
+        let scope_c = scope.clone();
+        let run_c = r_race.clone();
+        let claim_tok = claim_r.claim_token.clone();
+        let disable_key = format!("rr8-disable-{iter}");
+
+        let disable_fut = async move {
+            let mut conn = api_pool_c.acquire().await.unwrap();
+            let audit_ctx = authz_store::ctx(&admin_c, &disable_key);
+            b1.wait().await;
+            store::disable_user(&mut conn, &audit_ctx, &victim_user_d).await
+        };
+        let reserve_fut = async move {
+            b2.wait().await;
+            gateway::reserve_turn_round(
+                &wp_c,
+                TurnRound {
+                    scope_id: &scope_c,
+                    actor: &victim_user_r,
+                    approval: &victim_approval,
+                    run_id: &run_c,
+                    round: 1,
+                    claim_token: &claim_tok,
+                    installation: INSTALL,
+                    model: "a",
+                    round_tokens: 100,
+                    round_cost: None,
+                    requires_device_slot: false,
+                },
+            )
+            .await
+        };
+
+        let (disable_res, reserve_res) = tokio::join!(disable_fut, reserve_fut);
+        assert!(
+            matches!(disable_res, Ok(WriteOutcome::Applied { .. })),
+            "disable_user failed on iter {iter} (possible 40P01 deadlock): {disable_res:?}"
+        );
+        match reserve_res {
+            Ok(pending) => {
+                reserved_wins += 1;
+                // Clean up the unsent round so no open reservation lingers after the race.
+                let _ = pending.release(&worker_pool).await.unwrap();
+            }
+            Err(gateway::Error::Refused) => {
+                disabled_wins += 1;
+            }
+            Err(other) => {
+                panic!(
+                    "reserve_turn_round hit unexpected error on iter {iter} (possible 40P01 deadlock): {other:?}"
+                );
+            }
+        }
+        // disable_user marks a running run cancelling; settle it cleanly to terminal cancelled.
+        let _ = leases::settle(&mut worker, &claim_r.lease(), &lease_cfg, Settle::Stopped).await;
+    }
+    assert_eq!(reserved_wins + disabled_wins, 8);
+
+    let drift: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
+           FROM openmettle.quota_verify_accounting_drift()",
+    )
+    .fetch_one(&mut worker)
+    .await
+    .unwrap();
+    assert_eq!(drift, (0, 0, 0, 0));
 }

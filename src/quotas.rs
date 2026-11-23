@@ -20,6 +20,20 @@ pub(crate) async fn prepare_round(
     cost_ceiling: Option<i64>,
 ) -> Result<(), Error> {
     if let Authority::Lease { run, round, token } = call.authority {
+        let has_actor_prefix: bool = sqlx::query_scalar(
+            "SELECT to_regprocedure(
+                 'openmettle.quota_lock_run_actor_prefix(uuid,uuid)'
+             ) IS NOT NULL",
+        )
+        .fetch_one(tx.connection()?)
+        .await?;
+        if has_actor_prefix {
+            sqlx::query("SELECT openmettle.quota_lock_run_actor_prefix($1::uuid,$2::uuid)")
+                .bind(call.reservation.scope_id)
+                .bind(run)
+                .execute(tx.connection()?)
+                .await?;
+        }
         sqlx::query(
             "SELECT openmettle.quota_unwind_superseded_round($1::uuid,$2::uuid,$3::uuid,$4)",
         )
@@ -67,6 +81,7 @@ struct CostLimitState {
     denomination: Option<String>,
     any_limit: bool,
     personal_limit: bool,
+    min_limit: Option<i64>,
     tightest_scope_kind: Option<String>,
 }
 
@@ -75,10 +90,11 @@ async fn cost_limit_state(
     scope_id: &str,
     actor_user_id: &str,
 ) -> Result<CostLimitState, sqlx::Error> {
-    let (denomination, any_limit, personal_limit, tightest_scope_kind): (
+    let (denomination, any_limit, personal_limit, min_limit, tightest_scope_kind): (
         Option<String>,
         bool,
         bool,
+        Option<i64>,
         Option<String>,
     ) = sqlx::query_as(
         "WITH stamp AS (SELECT clock_timestamp() AS now),
@@ -108,6 +124,7 @@ async fn cost_limit_state(
                   WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'),
                 EXISTS (SELECT 1 FROM resolved WHERE hard_limit IS NOT NULL),
                 EXISTS (SELECT 1 FROM resolved WHERE is_personal AND hard_limit IS NOT NULL),
+                (SELECT min(hard_limit) FROM resolved),
                 (SELECT scope_kind FROM resolved
                   WHERE hard_limit IS NOT NULL
                   ORDER BY hard_limit ASC,
@@ -122,6 +139,7 @@ async fn cost_limit_state(
         denomination,
         any_limit,
         personal_limit,
+        min_limit,
         tightest_scope_kind,
     })
 }
@@ -162,6 +180,97 @@ pub(crate) enum CostBoundSpec {
     Profile(Option<u128>),
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn resolve_cost_from_state(
+    c: &mut PgConnection,
+    state: &CostLimitState,
+    owner: &Reservation<'_>,
+    run: Option<&str>,
+    current_request_id: Option<&str>,
+    parent_cost_held: Option<i64>,
+    enforced: bool,
+    spec: CostBoundSpec,
+) -> Result<Option<i64>, Error> {
+    if state.any_limit {
+        if !enforced && parent_cost_held.is_none() {
+            return if matches!(spec, CostBoundSpec::Profile(None)) {
+                Err(Error::Refused)
+            } else {
+                Ok(None)
+            };
+        }
+        if state.denomination.is_none() || !state.personal_limit {
+            return Err(Error::Refused);
+        }
+        let Some(limit) = state.min_limit.filter(|&l| l > 0) else {
+            return Err(Error::Refused);
+        };
+        let amount = match spec {
+            CostBoundSpec::Profile(Some(n)) => {
+                let Ok(n) = i64::try_from(n) else {
+                    return Err(Error::Refused);
+                };
+                if n <= 0 || n > limit {
+                    return Err(Error::Refused);
+                }
+                if let Some(held) = parent_cost_held
+                    && n > held
+                {
+                    return Err(Error::Refused);
+                }
+                n
+            }
+            CostBoundSpec::Profile(None) => return Err(Error::Refused),
+            CostBoundSpec::Legacy => {
+                let slice = if let Some(run_id) = run
+                    && let Some(s) =
+                        round_cost_slice(c, owner.scope_id, run_id, current_request_id).await?
+                {
+                    s.min(limit)
+                } else {
+                    limit
+                };
+                let slice = parent_cost_held.map_or(slice, |held| slice.min(held));
+                if slice <= 0 {
+                    return Err(Error::Refused);
+                }
+                slice
+            }
+        };
+        Ok(Some(amount))
+    } else if let Some(held) = parent_cost_held {
+        let amount = match spec {
+            CostBoundSpec::Profile(Some(s)) => {
+                let s = i64::try_from(s).map_err(|_| Error::Refused)?;
+                if s <= 0 || s > held {
+                    return Err(Error::Refused);
+                }
+                s
+            }
+            CostBoundSpec::Legacy | CostBoundSpec::Profile(None) => {
+                let slice = if let Some(run_id) = run {
+                    round_cost_slice(c, owner.scope_id, run_id, current_request_id)
+                        .await?
+                        .unwrap_or(held)
+                } else {
+                    held
+                }
+                .min(held);
+                if slice <= 0 {
+                    return Err(Error::Refused);
+                }
+                slice
+            }
+        };
+        Ok(Some(amount))
+    } else {
+        if matches!(spec, CostBoundSpec::Profile(Some(0))) {
+            return Err(Error::Refused);
+        }
+        Ok(None)
+    }
+}
+
 pub(crate) async fn cost_ceiling(
     tx: &mut WriteTransaction<'_>,
     owner: &Reservation<'_>,
@@ -170,50 +279,17 @@ pub(crate) async fn cost_ceiling(
     spec: CostBoundSpec,
 ) -> Result<Option<i64>, Error> {
     let state = cost_limit_state(tx.connection()?, owner.scope_id, owner.actor).await?;
-    if !state.any_limit {
-        return match spec {
-            CostBoundSpec::Profile(Some(0)) => Err(Error::Refused),
-            _ => Ok(None),
-        };
-    }
-    if state.denomination.is_none() || !state.personal_limit {
-        return Err(Error::Refused);
-    }
-    let configured: Option<i64> =
-        sqlx::query_scalar("SELECT openmettle.quota_cost_ceiling($1::uuid,$2::uuid)")
-            .bind(owner.scope_id)
-            .bind(owner.actor)
-            .fetch_one(tx.connection()?)
-            .await?;
-    match (configured, spec) {
-        (Some(limit), CostBoundSpec::Profile(Some(n))) => {
-            let Ok(n) = i64::try_from(n) else {
-                return Err(Error::Refused);
-            };
-            if n > 0 && n <= limit {
-                Ok(Some(n))
-            } else {
-                Err(Error::Refused)
-            }
-        }
-        (Some(_), CostBoundSpec::Profile(None)) => Err(Error::Refused),
-        (Some(limit), CostBoundSpec::Legacy) if limit > 0 => {
-            if let Some(run_id) = run
-                && let Some(slice) =
-                    round_cost_slice(tx.connection()?, owner.scope_id, run_id, current_request_id)
-                        .await?
-            {
-                let slice = slice.min(limit);
-                return if slice > 0 {
-                    Ok(Some(slice))
-                } else {
-                    Err(Error::Refused)
-                };
-            }
-            Ok(Some(limit))
-        }
-        _ => Err(Error::Refused),
-    }
+    resolve_cost_from_state(
+        tx.connection()?,
+        &state,
+        owner,
+        run,
+        current_request_id,
+        None,
+        true,
+        spec,
+    )
+    .await
 }
 
 pub(crate) async fn bind_request(
@@ -251,9 +327,9 @@ pub(crate) async fn bind_request(
             }
         }
         Authority::Lease { run, token, .. } => {
-            // Query already-charged parent holds on this run in BOTH activation states so an
-            // existing `usage_cost_micros` parent is still sliced and settled even if the last
-            // cost limit expired after admission (or while `metering_enforced` is still false).
+            // Query already-charged parent holds on this run in BOTH activation states and resolve
+            // cost-limit state in one atomic `clock_timestamp()` snapshot so an expiring cost limit
+            // can never drop a cost child when a held cost parent exists.
             let parents: Vec<(String, i64)> = sqlx::query_as(
                 "SELECT resource_kind, held_units
                    FROM openmettle.quota_reservations
@@ -283,45 +359,20 @@ pub(crate) async fn bind_request(
                 call.reservation.actor,
             )
             .await?;
-            let cost = if state.any_limit {
-                if enforced || parent_cost_held.is_some() {
-                    cost_ceiling(tx, &call.reservation, Some(run), Some(id), spec).await?
-                } else if matches!(spec, CostBoundSpec::Profile(None)) {
-                    return Err(Error::Refused);
-                } else {
-                    None
-                }
-            } else if let Some(held) = parent_cost_held {
-                match spec {
-                    CostBoundSpec::Profile(Some(s)) => {
-                        let s = i64::try_from(s).map_err(|_| Error::Refused)?;
-                        if s <= 0 || s > held {
-                            return Err(Error::Refused);
-                        }
-                        Some(s)
-                    }
-                    CostBoundSpec::Legacy | CostBoundSpec::Profile(None) => {
-                        let slice = round_cost_slice(
-                            tx.connection()?,
-                            call.reservation.scope_id,
-                            run,
-                            Some(id),
-                        )
-                        .await?
-                        .unwrap_or(held)
-                        .min(held);
-                        if slice <= 0 {
-                            return Err(Error::Refused);
-                        }
-                        Some(slice)
-                    }
-                }
-            } else {
-                if matches!(spec, CostBoundSpec::Profile(Some(0))) {
-                    return Err(Error::Refused);
-                }
-                None
-            };
+            let cost = resolve_cost_from_state(
+                tx.connection()?,
+                &state,
+                &call.reservation,
+                Some(run),
+                Some(id),
+                parent_cost_held,
+                enforced,
+                spec,
+            )
+            .await?;
+            if parent_cost_held.is_some() && cost.is_none() {
+                return Err(Error::Refused);
+            }
             let tokens = (enforced || has_token_parent).then_some(call.units);
             for (resource, amount) in [("usage_cost_micros", cost), ("usage_tokens", tokens)] {
                 let Some(amount) = amount else { continue };

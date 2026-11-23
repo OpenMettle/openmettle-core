@@ -1062,6 +1062,47 @@ $$;
 REVOKE ALL ON FUNCTION openmettle.quota_lock_turn_handoff_prefix(uuid, bytea, uuid, uuid, uuid) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION openmettle.quota_lock_turn_handoff_prefix(uuid, bytea, uuid, uuid, uuid) TO openmettle_worker;
 
+-- Acquire the canonical authorization prefix locks (`account_admin_lock -> projects ->
+-- login_providers/approvals -> users`) before a worker reservation transaction takes its first
+-- lock on `openmettle.runs` and inserts FK-bearing `gateway_reservations` / `quota_reservations`
+-- rows, preventing deadlocks with `disable_user` / `archive_project`.
+CREATE FUNCTION openmettle.quota_lock_run_actor_prefix(
+    p_scope uuid,
+    p_run uuid
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+    v_actor uuid;
+    v_approval uuid;
+BEGIN
+    SELECT r.actor_user_id, r.actor_approval_id
+      INTO v_actor, v_approval
+      FROM openmettle.runs r
+     WHERE r.scope_id = p_scope
+       AND r.id = p_run
+       AND pg_has_role(session_user, 'openmettle_worker', 'USAGE');
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+
+    PERFORM FROM openmettle.account_admin_lock FOR SHARE;
+    PERFORM FROM openmettle.projects p WHERE p.scope_id = p_scope FOR SHARE;
+    IF v_approval IS NOT NULL THEN
+        PERFORM FROM openmettle.login_providers p
+           JOIN openmettle.local_identity_approvals a ON a.provider_id = p.id
+          WHERE a.id = v_approval
+            FOR SHARE OF p, a;
+    END IF;
+    PERFORM FROM openmettle.users u WHERE u.id = v_actor FOR SHARE;
+END;
+$$;
+REVOKE ALL ON FUNCTION openmettle.quota_lock_run_actor_prefix(uuid, uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION openmettle.quota_lock_run_actor_prefix(uuid, uuid) TO openmettle_worker;
+
 -- Atomically commit a worker turn round's quota_reservations in strict canonical lock order
 -- (`account_admin_lock..users..runs` -> `gateway_requests` -> `quota_reservations (resource_kind, id)`).
 -- Leaves `quota_gateway_handoffs -> quota_enforcement FOR SHARE` strictly to the deferred
@@ -1073,7 +1114,8 @@ CREATE FUNCTION openmettle.quota_commit_turn_handoff(
     p_run uuid,
     p_claim uuid,
     p_requires_device_slot boolean,
-    p_device_grant uuid
+    p_device_grant uuid,
+    p_cost_bound_missing boolean DEFAULT false
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -1140,6 +1182,17 @@ BEGIN
        AND state = 'held'
        AND origin_role = 'worker';
 
+    IF p_cost_bound_missing THEN
+        PERFORM pg_catalog.set_config(
+            'openmettle.turn_cost_unqualified_requests',
+            coalesce(
+                pg_catalog.current_setting('openmettle.turn_cost_unqualified_requests', true),
+                ''
+            ) || ',' || req.id::text || ',',
+            true
+        );
+    END IF;
+
     IF p_requires_device_slot THEN
         PERFORM pg_catalog.set_config(
             'openmettle.turn_device_required_requests',
@@ -1172,12 +1225,12 @@ BEGIN
     END IF;
 END;
 $$;
-REVOKE ALL ON FUNCTION openmettle.quota_commit_turn_handoff(uuid, bytea, uuid, uuid, uuid, boolean, uuid) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION openmettle.quota_commit_turn_handoff(uuid, bytea, uuid, uuid, uuid, boolean, uuid) TO openmettle_worker;
+REVOKE ALL ON FUNCTION openmettle.quota_commit_turn_handoff(uuid, bytea, uuid, uuid, uuid, boolean, uuid, boolean) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION openmettle.quota_commit_turn_handoff(uuid, bytea, uuid, uuid, uuid, boolean, uuid, boolean) TO openmettle_worker;
 
--- Extend the deferred gateway handoff constraint trigger so device-slot turns verify
--- handoff_committed device_reservations strictly AFTER inserting quota_gateway_handoffs and
--- taking quota_enforcement FOR SHARE (preserving ADR 0040's exact lock order).
+-- Extend the deferred gateway handoff constraint trigger so device-slot and cost-unqualified
+-- turns are verified strictly AFTER inserting quota_gateway_handoffs and taking
+-- quota_enforcement FOR SHARE (preserving ADR 0040's exact lock order).
 CREATE OR REPLACE FUNCTION openmettle.enforce_gateway_handoff_holds()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -1189,6 +1242,7 @@ DECLARE
     v_scope_kind text;
     v_actor_scope_id uuid;
     v_cost_denom text;
+    v_any_cost_limit boolean := false;
     v_cost_required boolean := false;
 BEGIN
     IF EXISTS (
@@ -1201,38 +1255,10 @@ BEGIN
             USING ERRCODE = 'OMQ04';
     END IF;
 
-    SELECT cost_denomination INTO v_cost_denom
-      FROM openmettle.quota_defaults
-     WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros';
-
-    IF v_cost_denom IS NOT NULL THEN
-        SELECT kind INTO v_scope_kind
-          FROM openmettle.scopes
-         WHERE id = NEW.scope_id;
-        SELECT id INTO v_actor_scope_id
-          FROM openmettle.scopes
-         WHERE personal_user_id = NEW.actor_user_id;
-
-        v_cost_required := EXISTS (
-            SELECT 1
-              FROM openmettle.quota_defaults qd
-             WHERE qd.resource_kind = 'usage_cost_micros'
-               AND qd.hard_limit IS NOT NULL
-               AND qd.scope_kind IN ('instance', 'personal', v_scope_kind)
-        ) OR EXISTS (
-            SELECT 1
-              FROM openmettle.quota_overrides qo
-             WHERE qo.resource_kind = 'usage_cost_micros'
-               AND qo.scope_id IN (NEW.scope_id, v_actor_scope_id)
-               AND qo.revoked_at IS NULL
-               AND (qo.expires_at IS NULL OR qo.expires_at > clock_timestamp())
-        );
-    END IF;
-
     INSERT INTO openmettle.quota_gateway_handoffs (
         gateway_request_id, metering_enforced, cost_required
     ) VALUES (
-        NEW.id, false, v_cost_required
+        NEW.id, false, false
     );
 
     SELECT metering_enforced INTO STRICT v_enforced
@@ -1240,7 +1266,50 @@ BEGIN
      WHERE id
        FOR SHARE;
 
+    SELECT cost_denomination INTO v_cost_denom
+      FROM openmettle.quota_defaults
+     WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros';
+
+    SELECT kind INTO v_scope_kind
+      FROM openmettle.scopes
+     WHERE id = NEW.scope_id;
+    SELECT id INTO v_actor_scope_id
+      FROM openmettle.scopes
+     WHERE personal_user_id = NEW.actor_user_id;
+
+    v_any_cost_limit := EXISTS (
+        SELECT 1
+          FROM openmettle.quota_defaults qd
+         WHERE qd.resource_kind = 'usage_cost_micros'
+           AND qd.hard_limit IS NOT NULL
+           AND qd.scope_kind IN ('instance', 'personal', v_scope_kind)
+    ) OR EXISTS (
+        SELECT 1
+          FROM openmettle.quota_overrides qo
+         WHERE qo.resource_kind = 'usage_cost_micros'
+           AND qo.scope_id IN (NEW.scope_id, v_actor_scope_id)
+           AND qo.revoked_at IS NULL
+           AND (qo.expires_at IS NULL OR qo.expires_at > clock_timestamp())
+    );
+    v_cost_required := v_cost_denom IS NOT NULL AND v_any_cost_limit;
+
+    IF v_any_cost_limit
+       AND position(
+           ',' || NEW.id::text || ',' IN coalesce(
+               pg_catalog.current_setting('openmettle.turn_cost_unqualified_requests', true),
+               ''
+           )
+       ) > 0 THEN
+        RAISE EXCEPTION 'missing qualified cost_bound for cost-limited gateway handoff'
+            USING ERRCODE = 'OMQ04';
+    END IF;
+
     IF v_enforced THEN
+        IF v_any_cost_limit AND v_cost_denom IS NULL THEN
+            RAISE EXCEPTION 'cost denomination unconfigured for cost-limited gateway handoff'
+                USING ERRCODE = 'OMQ04';
+        END IF;
+
         IF NOT EXISTS (
             SELECT 1
               FROM openmettle.quota_reservations qr
@@ -1295,8 +1364,12 @@ BEGIN
                 USING ERRCODE = 'OMQ04';
         END IF;
 
+    END IF;
+
+    IF v_enforced OR v_cost_required THEN
         UPDATE openmettle.quota_gateway_handoffs
-           SET metering_enforced = true
+           SET metering_enforced = v_enforced,
+               cost_required = v_cost_required
          WHERE gateway_request_id = NEW.id;
     END IF;
 

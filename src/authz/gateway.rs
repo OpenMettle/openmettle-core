@@ -168,6 +168,7 @@ pub struct TurnPending {
     installation: String,
     model: String,
     units: i64,
+    cost_bound_missing: bool,
 }
 
 impl TurnPending {
@@ -238,7 +239,7 @@ impl TurnPending {
         let dispatch = pending.handoff_in(&mut tx, keys).await?;
         let res = sqlx::query(
             "SELECT openmettle.quota_commit_turn_handoff(
-                 $1::uuid, $2::bytea, $3::uuid, $4::uuid, $5::uuid, $6, $7::uuid
+                 $1::uuid, $2::bytea, $3::uuid, $4::uuid, $5::uuid, $6, $7::uuid, $8
              )",
         )
         .bind(&pending.id)
@@ -248,6 +249,7 @@ impl TurnPending {
         .bind(&self.claim_token)
         .bind(requires_device_slot)
         .bind(device_grant_id)
+        .bind(self.cost_bound_missing)
         .execute(tx.connection()?)
         .await;
         if let Err(err) = res {
@@ -277,6 +279,11 @@ impl TurnPending {
 /// its metered quota slice.
 pub async fn reserve_turn_round(pool: &PgPool, round: TurnRound<'_>) -> Result<TurnPending, Error> {
     let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
+    sqlx::query("SELECT openmettle.quota_lock_run_actor_prefix($1::uuid, $2::uuid)")
+        .bind(round.scope_id)
+        .bind(round.run_id)
+        .execute(tx.connection()?)
+        .await?;
     sqlx::query(
         "SELECT openmettle.quota_unwind_superseded_round($1::uuid, $2::uuid, $3::uuid, $4)",
     )
@@ -288,7 +295,7 @@ pub async fn reserve_turn_round(pool: &PgPool, round: TurnRound<'_>) -> Result<T
     .await?;
     let round_cost_i64 = round.round_cost.and_then(|c| i64::try_from(c).ok());
     let round_cost_overflow = round.round_cost.is_some_and(|c| i64::try_from(c).is_err());
-    let reservation_id: String = sqlx::query_scalar(
+    let reservation_id: String = match sqlx::query_scalar(
         "SELECT openmettle.quota_prepare_turn_round(
              $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, false
          )::text",
@@ -302,7 +309,16 @@ pub async fn reserve_turn_round(pool: &PgPool, round: TurnRound<'_>) -> Result<T
     .bind(round_cost_overflow)
     .bind(round.requires_device_slot)
     .fetch_one(tx.connection()?)
-    .await?;
+    .await
+    {
+        Ok(id) => id,
+        Err(err) => {
+            return match err.as_database_error().and_then(|e| e.code()).as_deref() {
+                Some("P0002" | "42501") => Err(Error::Refused),
+                _ => Err(Error::from(err)),
+            };
+        }
+    };
     let call = Call {
         reservation: Reservation {
             id: &reservation_id,
@@ -344,6 +360,7 @@ pub async fn reserve_turn_round(pool: &PgPool, round: TurnRound<'_>) -> Result<T
         installation: round.installation.to_owned(),
         model: round.model.to_owned(),
         units: round.round_tokens,
+        cost_bound_missing: round.round_cost.is_none(),
     })
 }
 
