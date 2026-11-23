@@ -1304,6 +1304,20 @@ BEGIN
             USING ERRCODE = 'OMQ04';
     END IF;
 
+    IF NEW.run_id IS NOT NULL
+       AND EXISTS (
+           SELECT 1
+             FROM openmettle.quota_reservations qr
+            WHERE qr.scope_id = NEW.scope_id
+              AND qr.run_id = NEW.run_id
+              AND qr.gateway_request_id IS NULL
+              AND qr.resource_kind = 'device_reservations'
+              AND (qr.state <> 'handoff_committed' OR qr.device_grant_id IS NULL)
+       ) THEN
+        RAISE EXCEPTION 'run device_reservations hold must be handoff_committed with a grant before gateway handoff'
+            USING ERRCODE = 'OMQ04';
+    END IF;
+
     IF v_enforced THEN
         IF v_any_cost_limit AND v_cost_denom IS NULL THEN
             RAISE EXCEPTION 'cost denomination unconfigured for cost-limited gateway handoff'

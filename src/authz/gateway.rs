@@ -449,7 +449,12 @@ impl Pending<'_> {
             .bind(self.secret.as_slice())
             .execute(tx.connection()?)
             .await?;
-        if tx.commit().await.is_err() {
+        if let Err(err) = tx.commit().await {
+            if let crate::runs::Error::Database(ref db) = err
+                && db.as_database_error().and_then(|e| e.code()).as_deref() == Some("OMQ04")
+            {
+                return Err(Error::Refused);
+            }
             let mut recovery = WriteTransaction::begin_bounded_pool(pool, false).await?;
             self.recover_in(&mut recovery).await?;
             recovery.commit().await?;

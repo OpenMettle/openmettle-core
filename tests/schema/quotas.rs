@@ -5010,10 +5010,11 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
 async fn stale_lease_on_reserve_turn_round_and_gateway_reserve_returns_refused() {
     use openmettle_core::{
         authz::{
-            gateway::{self, Authority, Call, Reservation, TurnRound},
+            gateway::{self, Authority, Call, Reservation, TurnRound, settlement},
             leases::{self, LeaseSettings, Settle},
             runs::{self as authz_queue, Admission, AdmissionLimits, ClaimLimits, RunAdmission},
         },
+        provider_http::gateway::UsageReport,
         provider_keys::gateway::{Bearer, Context, GatewayKeys, GatewaySealer},
         quotas::{self, RunBudgetReservation},
         runs::{RunInput, WriteTransaction},
@@ -5024,6 +5025,7 @@ async fn stale_lease_on_reserve_turn_round_and_gateway_reserve_returns_refused()
     const PRINCIPAL: &str = "00000000-0000-4000-8000-000000000092";
     const BUDGET: &str = "00000000-0000-4000-8000-000000000093";
     const STALE_CLAIM: &str = "00000000-0000-4000-8000-000000000099";
+    const GRANT_OK: &str = "00000000-0000-4000-8000-00000000d901";
     const KEY_BYTES: [u8; 32] = [91u8; 32];
 
     let db = TestDb::migrated().await;
@@ -5384,6 +5386,216 @@ async fn stale_lease_on_reserve_turn_round_and_gateway_reserve_returns_refused()
     leases::settle(&mut worker, &claim1.lease(), &lease_cfg, Settle::Stopped)
         .await
         .unwrap();
+
+    // 5. Public gateway::reserve + Pending::handoff on a leased run with a persisted 'held'
+    // device_reservations row MUST fail closed with Error::Refused (OMQ04), rolling back
+    // gateway_requests to 'reserved' so release() returns true. Once quota_commit_device_handoff
+    // commits a grant on that device hold, a subsequent gateway::reserve + Pending::handoff
+    // succeeds cleanly.
+    let mut tx2 = WriteTransaction::begin(&mut api).await.unwrap();
+    let Admission::Admitted { run_id: r2, .. } = authz_queue::admit_run(
+        &mut tx2,
+        &RunAdmission {
+            input: RunInput {
+                scope: &scope,
+                actor: &alice.user,
+                conversation: &chat,
+                branch: &branch,
+                message: &msg,
+                key: "rr10-pending-device-handoff",
+                format: "openmettle.conversation",
+                version: 1,
+                input: b"{}",
+                config: br#"{"effective":{"ceiling":{"value":100}}}"#,
+            },
+            actor_approval_id: &alice.approval,
+            capabilities: &[],
+            requested_rounds: Some(1),
+            now_ms: authz_store::NOW,
+            cost_qualified: None,
+        },
+        &limits,
+    )
+    .await
+    .unwrap() else {
+        panic!("expected admission");
+    };
+    assert!(
+        quotas::reserve_admitted_run_budget(
+            &mut tx2,
+            &RunBudgetReservation {
+                scope_id: &scope,
+                scope_kind: "personal",
+                actor_user_id: &alice.user,
+                actor_approval_id: &alice.approval,
+                run_id: &r2,
+                token_units: 100,
+                per_round_cost_micros: None,
+                round_limit: 1,
+                requires_device_slot: true,
+            },
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    tx2.commit().await.unwrap();
+    let claim2 = authz_queue::claim_next(&mut worker, &claim_cfg, &lease_cfg)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim2.run_id, r2);
+
+    let pending_blocked = gateway::reserve(
+        &worker_pool,
+        Call {
+            reservation: Reservation {
+                id: &r2,
+                scope_id: &scope,
+                actor: &alice.user,
+                approval: &alice.approval,
+            },
+            installation: INSTALL,
+            model: "a",
+            units: 100,
+            authority: Authority::Lease {
+                run: &r2,
+                round: 1,
+                token: &claim2.claim_token,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        pending_blocked.handoff(&worker_pool, &keys).await,
+        Err(gateway::Error::Refused)
+    ));
+    let blocked_state: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.gateway_requests WHERE id = $1::uuid")
+            .bind(&pending_blocked.id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    assert_eq!(blocked_state, "reserved");
+    assert!(pending_blocked.release(&worker_pool).await.unwrap());
+    let released_state: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.gateway_requests WHERE id = $1::uuid")
+            .bind(&pending_blocked.id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    assert_eq!(released_state, "released");
+
+    // Commit the run's device_reservations grant, then verify Pending::handoff succeeds.
+    let dev_hold_id: String = sqlx::query_scalar(
+        "SELECT id::text FROM openmettle.quota_reservations
+          WHERE scope_id = $1::uuid AND run_id = $2::uuid
+            AND gateway_request_id IS NULL AND resource_kind = 'device_reservations'",
+    )
+    .bind(&scope)
+    .bind(&r2)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    let committed: bool = sqlx::query_scalar(
+        "SELECT openmettle.quota_commit_device_handoff($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid)",
+    )
+    .bind(&dev_hold_id)
+    .bind(&scope)
+    .bind(&r2)
+    .bind(&claim2.claim_token)
+    .bind(GRANT_OK)
+    .fetch_one(&mut worker)
+    .await
+    .unwrap();
+    assert!(committed);
+
+    let pending_ok = gateway::reserve(
+        &worker_pool,
+        Call {
+            reservation: Reservation {
+                id: &r2,
+                scope_id: &scope,
+                actor: &alice.user,
+                approval: &alice.approval,
+            },
+            installation: INSTALL,
+            model: "a",
+            units: 100,
+            authority: Authority::Lease {
+                run: &r2,
+                round: 1,
+                token: &claim2.claim_token,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let _disp_ok = pending_ok.handoff(&worker_pool, &keys).await.unwrap();
+    let ok_state: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.gateway_requests WHERE id = $1::uuid")
+            .bind(&pending_ok.id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    assert_eq!(ok_state, "handed_off");
+
+    let report_id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+    assert_eq!(
+        settlement::ingest(
+            &g_pool,
+            &UsageReport {
+                request: pending_ok.id.clone(),
+                installation: INSTALL.into(),
+                principal: PRINCIPAL.into(),
+                scope: scope.clone(),
+                source: report_source.clone(),
+                report_id,
+                revision: 0,
+                r#final: true,
+                prompt_tokens: Some(40),
+                completion_tokens: Some(20),
+                reasoning_tokens: None,
+                reasoning_included: None,
+                cost: None,
+                unit: None,
+            },
+        )
+        .await
+        .unwrap(),
+        settlement::Outcome::Applied
+    );
+    leases::settle(&mut worker, &claim2.lease(), &lease_cfg, Settle::Succeeded)
+        .await
+        .unwrap();
+    // Committed device slot remains handoff_committed with its grant even after terminal settle
+    // until durable device-release evidence exists (OMQ06).
+    let dev_after: (String, Option<String>) = sqlx::query_as(
+        "SELECT state, device_grant_id::text FROM openmettle.quota_reservations WHERE id = $1::uuid",
+    )
+    .bind(&dev_hold_id)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        dev_after,
+        ("handoff_committed".into(), Some(GRANT_OK.into()))
+    );
+    assert_eq!(
+        sqlstate(
+            sqlx::query("SELECT openmettle.quota_release_device_slot($1::uuid, $2::uuid)")
+                .bind(&dev_hold_id)
+                .bind(GRANT_OK)
+                .execute(&mut worker)
+                .await
+        ),
+        "OMQ06"
+    );
+
     let drift: (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
            FROM openmettle.quota_verify_accounting_drift()",
