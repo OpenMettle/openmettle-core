@@ -182,7 +182,7 @@ impl Store {
     fn create_stage(&self, reservation: &str, exclusive: bool) -> Result<Staged, Error> {
         runs::uuid(reservation)?;
         self.volume.recheck()?;
-        let f = at::openat(
+        let f = volume::open_at(
             &self.volume.staging,
             reservation,
             OFlags::CREATE | OFlags::EXCL | OFlags::RDWR | OFlags::NOFOLLOW,
@@ -195,7 +195,6 @@ impl Store {
                 Error::Io
             }
         })?;
-        let f = fs::File::from(f);
         if exclusive {
             f.try_lock()
         } else {

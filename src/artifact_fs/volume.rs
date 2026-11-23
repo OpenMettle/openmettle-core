@@ -16,6 +16,16 @@ const SENTINEL: &str = ".openmettle-volume-id";
 fn dirs() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW
 }
+/// Every store descriptor is close-on-exec: a copy inherited by a child process would keep the
+/// open file description, and so its `flock`, alive after the store releases it.
+pub(super) fn open_at(
+    dir: impl std::os::fd::AsFd,
+    name: impl rustix::path::Arg,
+    flags: OFlags,
+    mode: Mode,
+) -> rustix::io::Result<File> {
+    at::openat(dir, name, flags | OFlags::CLOEXEC, mode).map(File::from)
+}
 fn invalid() -> io::Error {
     io::Error::other("artifact volume identity mismatch")
 }
@@ -38,7 +48,7 @@ impl Volume {
         if !path.is_absolute() {
             return Err(invalid());
         }
-        let root = File::from(at::open(path, dirs(), Mode::empty())?);
+        let root = open_at(at::CWD, path, dirs(), Mode::empty())?;
         let dev = root.metadata()?.dev();
         let directory = |name: &str| -> io::Result<File> {
             if create {
@@ -47,7 +57,7 @@ impl Volume {
                     Err(e) => return Err(e.into()),
                 }
             }
-            let file = File::from(at::openat(&root, name, dirs(), Mode::empty())?);
+            let file = open_at(&root, name, dirs(), Mode::empty())?;
             if file.metadata()?.dev() != dev {
                 return Err(invalid());
             }
@@ -123,12 +133,12 @@ impl Volume {
         } else {
             OFlags::RDONLY
         };
-        let f = File::from(at::openat(
+        let f = open_at(
             dir,
             name,
             flags | OFlags::NOFOLLOW | OFlags::NONBLOCK,
             Mode::empty(),
-        )?);
+        )?;
         self.matches(&f, dir, name, f.metadata()?.ino())?;
         Ok(f)
     }
@@ -179,12 +189,12 @@ impl Volume {
         for (dir, role) in self.entries() {
             let tmp = format!("{SENTINEL}.tmp.{}", proposed.replace('-', ""));
             // Fresh proposals are unique per invocation. Publish only fully durable files.
-            let mut f = File::from(at::openat(
+            let mut f = open_at(
                 dir,
                 tmp.as_str(),
                 OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW,
                 Mode::RUSR | Mode::WUSR,
-            )?);
+            )?;
             let result = (|| -> io::Result<()> {
                 writeln!(f, "{winner}:{role}")?;
                 f.sync_all()?;

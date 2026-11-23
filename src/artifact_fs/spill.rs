@@ -26,12 +26,12 @@ impl Store {
         v.recheck()?;
         let id = crate::telemetry::RequestId::generate().ok_or(Error::Io)?;
         let name = format!(".tool-probe.{id}");
-        let file = fs::File::from(at::openat(
+        let file = volume::open_at(
             &v.staging,
             &name,
             OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW,
             Mode::RUSR | Mode::WUSR,
-        )?);
+        )?;
         let ino = file.metadata()?.ino();
         let mut linked = false;
         let result = (|| {

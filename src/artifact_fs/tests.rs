@@ -229,3 +229,65 @@ fn errors_are_fixed_text() {
         assert!(!error.to_string().is_empty());
     }
 }
+
+/// Asserts that `fd` is not inherited by a child process.
+fn assert_cloexec(fd: impl std::os::fd::AsFd, what: &str) {
+    let flags = rustix::io::fcntl_getfd(fd).unwrap();
+    assert!(flags.contains(rustix::io::FdFlags::CLOEXEC), "{what}");
+}
+
+#[tokio::test]
+async fn store_descriptors_are_close_on_exec() {
+    let dir = Dir::new();
+    let store = store(&dir);
+    let v = &store.volume;
+    for (fd, what) in [
+        (&v.root, "root"),
+        (&v.staging, "staging"),
+        (&v.revisions, "revisions"),
+    ] {
+        assert_cloexec(fd, what);
+    }
+    let staged = store.stage(RESERVATION).await.unwrap();
+    assert_cloexec(staged.file.as_ref().unwrap(), "staged payload");
+    for writable in [false, true] {
+        assert_cloexec(
+            v.regular(&v.staging, RESERVATION, writable).unwrap(),
+            "regular",
+        );
+    }
+}
+
+/// Kills and reaps the child when the test ends, whatever the outcome.
+struct Child(std::process::Child);
+impl Drop for Child {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test]
+async fn a_child_process_does_not_keep_a_released_store_lock() {
+    let dir = Dir::new();
+    let store = store(&dir);
+    // `Staged` holds a shared `flock` on the payload until it is dropped.
+    let staged = store.stage(RESERVATION).await.unwrap();
+    let _child = Child(
+        std::process::Command::new("sleep")
+            .arg("60")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    drop(staged);
+    let v = &store.volume;
+    let cleaner = v.regular(&v.staging, RESERVATION, true).unwrap();
+    // An inherited descriptor keeps the lock for the child's lifetime. macOS may still hold
+    // close-on-exec descriptors for a few milliseconds while the child finishes `exec`.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while let Err(e) = cleaner.try_lock() {
+        assert!(std::time::Instant::now() < deadline, "{e:?}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
