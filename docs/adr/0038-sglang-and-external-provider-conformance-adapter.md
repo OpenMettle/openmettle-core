@@ -220,6 +220,15 @@ undeclared operation, assert the refusal and zero upstream requests.
 
 PR2's passing adapter suite unblocks V1-07 PR4's live turn executor in `src/worker.rs`.
 
+**Recorded fixtures.** `tests/fixtures/sglang-recorded/` holds responses recorded on
+23 Nov 2026 from one real SGLang deployment (patched fork, commit unverified).
+`tests/provider_inference/recorded_sglang.rs` replays them through `Gateway::caller`, with
+each stream re-chunked per event and per byte. They cover plain, streamed, reasoning and
+parallel tool-call Chat turns. `known_gap_*` tests pin the length cut-off, an aborted stream,
+unread reasoning tokens, the unchecked response model, Responses HTTP 500 and the tool-call
+separator. They are evidence from one deployment, not qualification. They contain no
+successful Responses output and do not replace PR3's live harness. See the fixture README.
+
 **PR3** delivers the owner-gated live harness. Run the applicable matrix against both
 the pinned SGLang profile and a documented compatible external endpoint through the
 selected gateway. For each, record the deployed revision tuple, fixture revision,

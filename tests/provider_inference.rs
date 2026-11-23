@@ -9,6 +9,8 @@ mod conformance;
 mod dns;
 #[path = "provider_inference/http.rs"]
 pub mod provider_http;
+#[path = "provider_inference/recorded_sglang.rs"]
+mod recorded_sglang;
 #[path = "provider_inference/support.rs"]
 mod support;
 #[path = "provider_inference/timing.rs"]

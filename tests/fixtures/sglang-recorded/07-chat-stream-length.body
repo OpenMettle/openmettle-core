@@ -1,0 +1,17 @@
+data: {"id":"7321d6a145854681807d225ebb443cf0","object":"chat.completion.chunk","created":1795450128,"model":"recorded-sglang-model","choices":[{"index":0,"delta":{"reasoning_content":null,"role":"assistant","content":""},"logprobs":null,"finish_reason":null,"matched_stop":null}]}
+
+data: {"id":"7321d6a145854681807d225ebb443cf0","object":"chat.completion.chunk","created":1795450128,"model":"recorded-sglang-model","choices":[{"index":0,"delta":{"reasoning_content":null,"content":"The"},"logprobs":null,"finish_reason":null,"matched_stop":null}]}
+
+data: {"id":"7321d6a145854681807d225ebb443cf0","object":"chat.completion.chunk","created":1795450128,"model":"recorded-sglang-model","choices":[{"index":0,"delta":{"reasoning_content":null,"content":" lighthouse did not merely stand"},"logprobs":null,"finish_reason":null,"matched_stop":null}]}
+
+data: {"id":"7321d6a145854681807d225ebb443cf0","object":"chat.completion.chunk","created":1795450128,"model":"recorded-sglang-model","choices":[{"index":0,"delta":{"reasoning_content":null,"content":" on the island"},"logprobs":null,"finish_reason":null,"matched_stop":null}]}
+
+data: {"id":"7321d6a145854681807d225ebb443cf0","object":"chat.completion.chunk","created":1795450128,"model":"recorded-sglang-model","choices":[{"index":0,"delta":{"reasoning_content":null,"content":" of Oak"},"logprobs":null,"finish_reason":null,"matched_stop":null}]}
+
+data: {"id":"7321d6a145854681807d225ebb443cf0","object":"chat.completion.chunk","created":1795450128,"model":"recorded-sglang-model","choices":[{"index":0,"delta":{"reasoning_content":null},"logprobs":null,"finish_reason":"length","matched_stop":null}]}
+
+data: {"id":"7321d6a145854681807d225ebb443cf0","object":"chat.completion.chunk","created":1795450128,"model":"recorded-sglang-model","choices":[],"usage":{"prompt_tokens":21,"total_tokens":33,"completion_tokens":12,"prompt_tokens_details":{"cached_tokens":0},"reasoning_tokens":0,"completion_tokens_details":null}}
+
+data: [DONE]
+
+

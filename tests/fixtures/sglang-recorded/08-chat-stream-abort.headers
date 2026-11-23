@@ -1,0 +1,7 @@
+HTTP/1.1 200 OK
+date: Mon, 23 Nov 2026 16:08:48 GMT
+server: uvicorn
+content-type: text/event-stream; charset=utf-8
+vary: Origin
+Transfer-Encoding: chunked
+
