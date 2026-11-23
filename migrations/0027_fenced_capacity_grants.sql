@@ -7,8 +7,9 @@
 -- controller write proves the secret returned once by capacity_acquire_controller. Lock order
 -- extends ADR 0040: runs -> capacity_groups -> capacity_devices -> capacity_grants
 -- -> quota_reservations -> quota_budgets -> quota_enforcement. No capacity path locks runs after
--- a capacity row. Decisions require READ COMMITTED, so every statement after the group lock sees
--- each transition committed before it.
+-- a capacity row, and device configuration writes lock every group first. Decisions require
+-- READ COMMITTED, so every statement after the group lock sees each transition committed
+-- before it.
 
 CREATE TABLE openmettle.capacity_groups (
     id uuid PRIMARY KEY,
@@ -36,18 +37,20 @@ CREATE TABLE openmettle.capacity_groups (
     CHECK (commit_watermark BETWEEN 0 AND commit_seq)
 );
 
--- A device belongs to one group at a time. chat_floor_bytes is the configured minimum that the
--- current sample must cover before the group admits a grant.
+-- A device belongs to one group, and that membership is immutable in this migration: a
+-- serialized drain-and-move is not delivered. chat_floor_bytes is the configured minimum that
+-- the current sample must cover before the group admits a grant.
 CREATE TABLE openmettle.capacity_devices (
     id uuid PRIMARY KEY,
     group_id uuid NOT NULL REFERENCES openmettle.capacity_groups (id),
-    chat_floor_bytes bigint NOT NULL CHECK (chat_floor_bytes >= 0)
+    chat_floor_bytes bigint NOT NULL CHECK (chat_floor_bytes >= 0),
+    UNIQUE (group_id, id)
 );
 
--- The latest published snapshot: one row per device at the group's revision.
+-- The latest published snapshot: one row per member device at the group's revision.
 CREATE TABLE openmettle.capacity_observations (
-    group_id uuid NOT NULL REFERENCES openmettle.capacity_groups (id),
-    device_id uuid NOT NULL REFERENCES openmettle.capacity_devices (id),
+    group_id uuid NOT NULL,
+    device_id uuid NOT NULL,
     revision bigint NOT NULL CHECK (revision >= 1),
     total_bytes bigint NOT NULL CHECK (total_bytes > 0),
     committed_bytes bigint NOT NULL CHECK (committed_bytes >= 0),
@@ -57,6 +60,7 @@ CREATE TABLE openmettle.capacity_observations (
     active_chat_floor_bytes bigint NOT NULL CHECK (active_chat_floor_bytes >= 0),
     grantable_bytes bigint NOT NULL CHECK (grantable_bytes >= 0),
     PRIMARY KEY (group_id, device_id),
+    FOREIGN KEY (group_id, device_id) REFERENCES openmettle.capacity_devices (group_id, id),
     CHECK (reclaimable_bytes <= actual_used_bytes),
     -- Necessary bound only: grantable capacity excludes headroom, measured use, outstanding
     -- commitments and the chat floor, with spare capacity clamped at zero. The store cannot
@@ -102,7 +106,7 @@ CREATE INDEX capacity_grants_charged_idx
 CREATE UNIQUE INDEX capacity_grants_live_run_uidx
     ON openmettle.capacity_grants (run_id) WHERE state <> 'released';
 
--- Device rows reference the device alone, so release history never pins a drained device.
+-- Footprint rows reference the device alone, so a later drain-and-move need not rewrite history.
 CREATE TABLE openmettle.capacity_grant_devices (
     grant_id uuid NOT NULL,
     group_id uuid NOT NULL,
@@ -123,31 +127,38 @@ GRANT SELECT ON openmettle.capacity_groups, openmettle.capacity_devices,
     openmettle.capacity_observations, openmettle.capacity_grants,
     openmettle.capacity_grant_devices TO openmettle_worker;
 
--- A device moves groups only when drained; its sample in the old group is discarded.
-CREATE FUNCTION openmettle.capacity_guard_device_move()
+-- Device membership is immutable, in every isolation level and whatever the grant history.
+CREATE FUNCTION openmettle.capacity_refuse_device_move()
 RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog
 AS $$
 BEGIN
-    IF EXISTS (
-        SELECT
-          FROM openmettle.capacity_grant_devices gd
-          JOIN openmettle.capacity_grants c ON c.id = gd.grant_id
-         WHERE gd.device_id = OLD.id AND c.state <> 'released'
-    ) THEN
-        RAISE EXCEPTION 'device has outstanding capacity commitments' USING ERRCODE = '23514';
-    END IF;
-    DELETE FROM openmettle.capacity_observations
-     WHERE group_id = OLD.group_id AND device_id = OLD.id;
-    RETURN NEW;
+    RAISE EXCEPTION 'capacity device membership is immutable' USING ERRCODE = '23514';
 END;
 $$;
-REVOKE ALL ON FUNCTION openmettle.capacity_guard_device_move() FROM PUBLIC;
-CREATE TRIGGER capacity_devices_move_guard
+REVOKE ALL ON FUNCTION openmettle.capacity_refuse_device_move() FROM PUBLIC;
+CREATE TRIGGER capacity_devices_membership_immutable
     BEFORE UPDATE OF group_id ON openmettle.capacity_devices
     FOR EACH ROW WHEN (OLD.group_id IS DISTINCT FROM NEW.group_id)
-    EXECUTE FUNCTION openmettle.capacity_guard_device_move();
+    EXECUTE FUNCTION openmettle.capacity_refuse_device_move();
+
+-- Device configuration writes take every group lock, in id order, before any device row lock,
+-- so they and grant decisions always lock a group before its devices.
+CREATE FUNCTION openmettle.capacity_lock_groups_for_configuration()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+BEGIN
+    PERFORM FROM openmettle.capacity_groups ORDER BY id FOR NO KEY UPDATE;
+    RETURN NULL;
+END;
+$$;
+REVOKE ALL ON FUNCTION openmettle.capacity_lock_groups_for_configuration() FROM PUBLIC;
+CREATE TRIGGER capacity_devices_configuration_lock
+    BEFORE INSERT OR UPDATE OR DELETE ON openmettle.capacity_devices
+    FOR EACH STATEMENT EXECUTE FUNCTION openmettle.capacity_lock_groups_for_configuration();
 
 -- Internal: lock the group under READ COMMITTED. A REPEATABLE READ snapshot taken before the
 -- lock could miss a committed transition that closes the group.
@@ -217,18 +228,22 @@ REVOKE ALL ON FUNCTION openmettle.capacity_lock_run(uuid, uuid, uuid) FROM PUBLI
 
 -- The one readiness predicate shared by grant decisions, capacity_resume and snapshot reads:
 -- a live lease, a recovered epoch (unless resuming), a fresh sample from this epoch covering
--- every device and its configured chat floor, no unknown allocation, and every live grant
--- attested in this epoch.
+-- at least one device, every device and its configured chat floor, no unknown allocation, and
+-- every live grant attested in this epoch. STABLE: it reads the caller's snapshot, at one
+-- evaluation time, so a snapshot read never pairs its rows with a later state.
 CREATE FUNCTION openmettle.capacity_admits(p_group uuid, p_resuming boolean)
 RETURNS boolean
 LANGUAGE sql
+STABLE
 SET search_path = pg_catalog
 AS $$
+    WITH t AS MATERIALIZED (SELECT clock_timestamp() AS now)
     SELECT coalesce((
         SELECT (p_resuming OR g.ready_epoch = g.controller_epoch)
-           AND g.lease_expires_at > clock_timestamp()
+           AND g.lease_expires_at > t.now
            AND g.observation_epoch = g.controller_epoch
-           AND g.observed_at + g.observation_ttl_ms * interval '1 millisecond' > clock_timestamp()
+           AND g.observed_at + g.observation_ttl_ms * interval '1 millisecond' > t.now
+           AND EXISTS (SELECT FROM openmettle.capacity_devices d WHERE d.group_id = g.id)
            AND NOT EXISTS (
                SELECT
                  FROM openmettle.capacity_grants c
@@ -245,6 +260,7 @@ AS $$
                   AND (o.device_id IS NULL OR o.active_chat_floor_bytes < d.chat_floor_bytes))
           FROM openmettle.capacity_groups g
          WHERE g.id = p_group), false)
+      FROM t
 $$;
 REVOKE ALL ON FUNCTION openmettle.capacity_admits(uuid, boolean) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION openmettle.capacity_admits(uuid, boolean) TO openmettle_worker;
@@ -421,10 +437,14 @@ $$;
 REVOKE ALL ON FUNCTION openmettle.capacity_resume(uuid, bytea, bigint) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION openmettle.capacity_resume(uuid, bytea, bigint) TO openmettle_worker;
 
--- Serialized grant decision for a leased run. A replay returns the recorded grant; otherwise the
--- footprint must fit every device after commitments made since the snapshot. The run's
--- device_reservations hold is committed to a new grant in the same transaction, and is required
--- once quota metering is enforced.
+-- Serialized grant decision for a leased run. A replay of an identical request returns the
+-- recorded grant before any current-state check. Otherwise the run's claim must be active, the
+-- group must admit bursts, and the footprint must fit every device after commitments made since
+-- the snapshot. A new grant commits the run's held device_reservations slot in the same
+-- transaction; once quota metering is enforced, a run without a held slot (none admitted, or
+-- one already used by an earlier grant) is refused. After the last statement that can block,
+-- the run lease, controller lease and sample freshness are rechecked on database time, and the
+-- decision rolls back on expiry (OMC02 when the group no longer admits it).
 CREATE FUNCTION openmettle.capacity_grant(
     p_group uuid,
     p_secret bytea,
@@ -456,25 +476,14 @@ BEGIN
        OR jsonb_array_length(p_footprint) NOT BETWEEN 1 AND 64 THEN
         RAISE EXCEPTION 'invalid capacity request' USING ERRCODE = '22023';
     END IF;
-    PERFORM openmettle.capacity_lock_run(p_scope, p_run, p_claim);
-    g := openmettle.capacity_fence(p_group, p_secret, p_epoch);
-    -- Serialize with configuration: a chat floor change or device move waits for this decision,
-    -- and this decision waits for one in progress.
-    PERFORM FROM openmettle.capacity_devices WHERE group_id = p_group ORDER BY id FOR SHARE;
-    IF EXISTS (
-        SELECT
-          FROM jsonb_to_recordset(p_footprint) AS f(device_id uuid, bytes bigint)
-          LEFT JOIN openmettle.capacity_devices d ON d.group_id = p_group AND d.id = f.device_id
-         WHERE d.id IS NULL OR f.bytes IS NULL OR f.bytes <= 0
-    ) OR (SELECT count(DISTINCT f.device_id) FROM jsonb_to_recordset(p_footprint) AS f(device_id uuid))
-         <> jsonb_array_length(p_footprint) THEN
-        RAISE EXCEPTION 'invalid capacity footprint' USING ERRCODE = '22023';
-    END IF;
     SELECT sha256(convert_to(jsonb_build_array(
                p_group, p_run, p_profile,
                jsonb_agg(jsonb_build_array(f.device_id, f.bytes) ORDER BY f.device_id))::text, 'UTF8'))
       INTO v_digest
       FROM jsonb_to_recordset(p_footprint) AS f(device_id uuid, bytes bigint);
+    -- Lock order: the run row before the group.
+    PERFORM FROM openmettle.runs WHERE scope_id = p_scope AND id = p_run FOR NO KEY UPDATE;
+    g := openmettle.capacity_fence(p_group, p_secret, p_epoch);
 
     SELECT * INTO v_existing
       FROM openmettle.capacity_grants c
@@ -487,16 +496,29 @@ BEGIN
         RETURN;
     END IF;
 
+    PERFORM openmettle.capacity_lock_run(p_scope, p_run, p_claim);
+    IF EXISTS (
+        SELECT
+          FROM jsonb_to_recordset(p_footprint) AS f(device_id uuid, bytes bigint)
+          LEFT JOIN openmettle.capacity_devices d ON d.group_id = p_group AND d.id = f.device_id
+         WHERE d.id IS NULL OR f.bytes IS NULL OR f.bytes <= 0
+    ) OR (SELECT count(DISTINCT f.device_id) FROM jsonb_to_recordset(p_footprint) AS f(device_id uuid))
+         <> jsonb_array_length(p_footprint) THEN
+        RAISE EXCEPTION 'invalid capacity footprint' USING ERRCODE = '22023';
+    END IF;
     IF NOT openmettle.capacity_admits(p_group, false) THEN
         RETURN QUERY SELECT NULL::uuid, 'unavailable'::text;
         RETURN;
     END IF;
+    -- Every requested device needs a current sample; a missing one never fits.
     IF EXISTS (
         SELECT
           FROM jsonb_to_recordset(p_footprint) AS f(device_id uuid, bytes bigint)
-          JOIN openmettle.capacity_observations o
+          LEFT JOIN openmettle.capacity_observations o
             ON o.group_id = p_group AND o.device_id = f.device_id
-         WHERE f.bytes > o.grantable_bytes - coalesce((
+           AND o.revision = g.observation_revision
+         WHERE o.device_id IS NULL
+            OR f.bytes > o.grantable_bytes - coalesce((
                    SELECT sum(gd.bytes)
                      FROM openmettle.capacity_grant_devices gd
                      JOIN openmettle.capacity_grants c ON c.id = gd.grant_id
@@ -509,14 +531,14 @@ BEGIN
         RETURN;
     END IF;
 
-    -- The claim may have expired while this decision waited for the group lock.
-    PERFORM openmettle.capacity_lock_run(p_scope, p_run, p_claim);
+    -- Only a held slot can back a new grant; a slot used by an earlier grant stays bound to it.
     SELECT array_agg(h.id) INTO v_holds
       FROM openmettle.quota_reservations h
      WHERE h.scope_id = p_scope
        AND h.run_id = p_run
        AND h.gateway_request_id IS NULL
-       AND h.resource_kind = 'device_reservations';
+       AND h.resource_kind = 'device_reservations'
+       AND h.state = 'held';
     IF cardinality(v_holds) > 1 THEN
         RAISE EXCEPTION 'ambiguous run device slot' USING ERRCODE = '23514';
     END IF;
@@ -534,18 +556,24 @@ BEGIN
     INSERT INTO openmettle.capacity_grant_devices (grant_id, group_id, device_id, bytes)
     SELECT v_id, p_group, f.device_id, f.bytes
       FROM jsonb_to_recordset(p_footprint) AS f(device_id uuid, bytes bigint);
-    IF v_holds[1] IS NOT NULL
-       AND NOT openmettle.quota_commit_device_handoff(v_holds[1], p_scope, p_run, p_claim, v_id) THEN
-        RAISE EXCEPTION 'run device slot is not available for this grant' USING ERRCODE = '23505';
-    END IF;
-    -- quota_enforcement is the final lock (ADR 0040). Once metering is enforced, a run admitted
-    -- without a device slot cannot obtain physical capacity.
-    IF v_holds[1] IS NULL THEN
+    IF v_holds[1] IS NOT NULL THEN
+        IF NOT openmettle.quota_commit_device_handoff(v_holds[1], p_scope, p_run, p_claim, v_id) THEN
+            RAISE EXCEPTION 'run device slot is not available for this grant' USING ERRCODE = '23505';
+        END IF;
+    ELSE
+        -- quota_enforcement is the final lock (ADR 0040).
         SELECT metering_enforced INTO v_enforced
           FROM openmettle.quota_enforcement WHERE id FOR SHARE;
         IF v_enforced THEN
             RAISE EXCEPTION 'run device slot required' USING ERRCODE = 'OMQ04';
         END IF;
+    END IF;
+
+    -- Nothing below can block: recheck every time-bounded condition on database time.
+    PERFORM openmettle.capacity_lock_run(p_scope, p_run, p_claim);
+    PERFORM openmettle.capacity_fence(p_group, p_secret, p_epoch);
+    IF NOT openmettle.capacity_admits(p_group, false) THEN
+        RAISE EXCEPTION 'capacity decision expired' USING ERRCODE = 'OMC02';
     END IF;
     RETURN QUERY SELECT v_id, 'granted'::text;
 END;

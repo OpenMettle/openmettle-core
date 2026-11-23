@@ -255,6 +255,44 @@ impl Fixture {
         .await;
     }
 
+    /// Give run `run` a claim lasting `lease`, then decide a 1 GiB grant for it while another
+    /// session holds `lock` (bound to run `hold`'s device slot, if given) for two seconds.
+    async fn grant_behind_lock(
+        &mut self,
+        controller: &Controller,
+        run: usize,
+        lock: &str,
+        lease: &str,
+        hold: Option<usize>,
+    ) -> Result<Decision, Error> {
+        let id = self.runs[run].run.clone();
+        self.owner_exec(
+            "UPDATE openmettle.runs SET lease_expires_at = clock_timestamp() + $2::interval
+              WHERE id = $1::uuid",
+            &[&id, lease],
+        )
+        .await;
+        let mut blocker = connect(&self.db.0, OWNER).await;
+        let mut held = blocker.begin().await.unwrap();
+        let mut query = sqlx::query(AssertSqlSafe(lock.to_owned()));
+        if let Some(hold) = hold {
+            query = query.bind(self.runs[hold].hold.clone().unwrap());
+        }
+        query.execute(&mut *held).await.unwrap();
+        let need = [bytes(GPU0, GIB)];
+        let key = format!("behind-lock-{run}");
+        let request = self.request(run, &key, &need);
+        let mut w = self.worker().await;
+        let db = &self.db;
+        let (decision, ()) =
+            tokio::join!(capacity::grant(&mut w, controller, &request), async move {
+                authz_store::wait_for_lock_waiters(db, 1).await;
+                tokio::time::sleep(Duration::from_millis(2000)).await;
+                held.commit().await.unwrap();
+            });
+        decision
+    }
+
     /// Change the group's configured freshness TTL, as an operator would.
     async fn ttl(&mut self, ms: &str) {
         self.owner_exec(
@@ -933,6 +971,11 @@ async fn replay_recovers_the_recorded_decision_and_conflicting_reuse_is_refused(
             state: GrantState::Released
         }
     );
+    // A metered run's slot backs one grant in PR2: once used, a new request is refused.
+    assert_eq!(
+        capacity::grant(&mut c, &controller, &f.request(0, "after-release", &need)).await,
+        Err(Error::SlotRequired)
+    );
     assert_eq!(f.drift().await, (0, 0, 0, 0));
 
     // Only the worker's fenced functions write the store.
@@ -1005,36 +1048,73 @@ async fn a_metered_grant_needs_the_runs_held_slot_and_a_run_holds_one_live_grant
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
-async fn a_claim_expiring_while_the_decision_waits_for_the_group_lock_is_refused() {
-    // Without metering there is no slot handoff to recheck the lease later.
-    let mut f = Fixture::with(&[GPU0], 1, false).await;
+async fn a_claim_expiring_while_an_unmetered_decision_waits_for_a_lock_is_refused() {
+    // Without metering there is no slot handoff; the group lock and the final enforcement-row
+    // lock are the waits.
+    let mut f = Fixture::with(&[GPU0], 2, false).await;
     let mut c = f.worker().await;
     let controller = open_group(&mut c, 1, &[GPU0]).await;
-    let run = f.runs[0].run.clone();
-    f.owner_exec(
-        "UPDATE openmettle.runs SET lease_expires_at = clock_timestamp() + interval '1500 ms'
-          WHERE id = $1::uuid",
-        &[&run],
-    )
-    .await;
-    let mut blocker = connect(&f.db.0, OWNER).await;
-    let mut held = blocker.begin().await.unwrap();
-    sqlx::query("SELECT FROM openmettle.capacity_groups WHERE id = $1::uuid FOR NO KEY UPDATE")
-        .bind(GROUP)
-        .execute(&mut *held)
+    for (run, lock) in [
+        (
+            0,
+            "SELECT FROM openmettle.capacity_groups FOR NO KEY UPDATE",
+        ),
+        (1, "SELECT FROM openmettle.quota_enforcement FOR UPDATE"),
+    ] {
+        let decision = f
+            .grant_behind_lock(&controller, run, lock, "1500 ms", None)
+            .await;
+        assert_eq!(decision, Err(Error::LeaseLost), "{lock}");
+    }
+    assert_eq!(f.grants().await, 0);
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn every_time_bound_is_rechecked_after_the_slot_handoff_waits() {
+    // The quota handoff's reservation update is the metered path's last blocking statement.
+    let mut f = Fixture::new(&[GPU0], 3).await;
+    let mut c = f.worker().await;
+    let controller = open_group(&mut c, 1, &[GPU0]).await;
+    let hold_lock = "SELECT FROM openmettle.quota_reservations WHERE id = $1::uuid
+                     FOR NO KEY UPDATE";
+    // The run's claim expires during the wait.
+    let decision = f
+        .grant_behind_lock(&controller, 0, hold_lock, "1500 ms", Some(0))
+        .await;
+    assert_eq!(decision, Err(Error::LeaseLost));
+    // The sample goes stale during the wait.
+    f.ttl("1000").await;
+    assert!(
+        publish(&mut c, &controller, 2, 0, &[sample(GPU0, 0, SPARE)])
+            .await
+            .unwrap()
+    );
+    let decision = f
+        .grant_behind_lock(&controller, 1, hold_lock, "60 s", Some(1))
+        .await;
+    assert_eq!(decision, Ok(Decision::Unavailable));
+    // The controller's lease lapses during the wait.
+    f.ttl("60000").await;
+    assert!(
+        publish(&mut c, &controller, 3, 0, &[sample(GPU0, 0, SPARE)])
+            .await
+            .unwrap()
+    );
+    controller
+        .renew(&mut c, Duration::from_millis(1000))
         .await
         .unwrap();
-    let need = [bytes(GPU0, GIB)];
-    let request = f.request(0, "waits", &need);
-    let mut w = f.worker().await;
-    let db = &f.db;
-    let (decision, ()) = tokio::join!(capacity::grant(&mut w, &controller, &request), async move {
-        authz_store::wait_for_lock_waiters(db, 1).await;
-        tokio::time::sleep(Duration::from_millis(2000)).await;
-        held.commit().await.unwrap();
-    });
-    assert_eq!(decision, Err(Error::LeaseLost));
+    let decision = f
+        .grant_behind_lock(&controller, 2, hold_lock, "60 s", Some(2))
+        .await;
+    assert_eq!(decision, Err(Error::Fenced));
+    // Every decision rolled back: no grant, and every slot is still held.
     assert_eq!(f.grants().await, 0);
+    for run in 0..3 {
+        assert_eq!(f.slot(run).await, ("held".into(), None, 3));
+    }
+    assert_eq!(f.drift().await, (0, 0, 0, 0));
 }
 
 #[tokio::test]
@@ -1081,36 +1161,44 @@ async fn repeatable_read_cannot_decide_from_a_snapshot_before_a_closing_transiti
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
-async fn raising_the_chat_floor_waits_for_decisions_and_closes_the_group_until_covered() {
-    let f = Fixture::new(&[GPU0], 1).await;
+async fn raising_chat_floors_waits_for_decisions_without_deadlock_and_closes_the_group() {
+    let f = Fixture::new(&[GPU0, GPU1], 1).await;
     let mut c = f.worker().await;
-    let controller = open_group(&mut c, 1, &[GPU0]).await;
-    // The operator raises the floor in a transaction that is still open: the decision waits for
-    // it, then finds the published floor no longer covers the configuration.
+    let controller = open_group(&mut c, 1, &[GPU0, GPU1]).await;
+    // The operator raises both floors in one open transaction, in the opposite device order to
+    // the decision's footprint. The decision waits on the group, never on a device row, then
+    // finds the published floors no longer cover the configuration.
     let mut operator = connect(&f.db.0, OWNER).await;
     let mut raise = operator.begin().await.unwrap();
-    sqlx::query("UPDATE openmettle.capacity_devices SET chat_floor_bytes = $2 WHERE id = $1::uuid")
-        .bind(GPU0)
+    let floor = |device| {
+        sqlx::query(
+            "UPDATE openmettle.capacity_devices SET chat_floor_bytes = $2 WHERE id = $1::uuid",
+        )
+        .bind(device)
         .bind(FLOOR + GIB)
-        .execute(&mut *raise)
-        .await
-        .unwrap();
-    let need = [bytes(GPU0, GIB)];
+    };
+    floor(GPU1).execute(&mut *raise).await.unwrap();
+    let need = [bytes(GPU0, GIB), bytes(GPU1, GIB)];
     let request = f.request(0, "floor", &need);
     let db = &f.db;
     let (decision, ()) = tokio::join!(capacity::grant(&mut c, &controller, &request), async move {
         authz_store::wait_for_lock_waiters(db, 1).await;
+        floor(GPU0).execute(&mut *raise).await.unwrap();
         raise.commit().await.unwrap();
     });
     assert_eq!(decision.unwrap(), Decision::Unavailable);
     assert!(!admits(&mut c).await);
-    // A sample covering the raised floor reopens the group with one GiB less spare.
-    let raised = DeviceObservation {
+    // A sample covering the raised floors reopens the group with one GiB less spare.
+    let raised = |device| DeviceObservation {
         actual_used_bytes: FLOOR + GIB,
         active_chat_floor_bytes: FLOOR + GIB,
-        ..sample(GPU0, 0, SPARE - GIB)
+        ..sample(device, 0, SPARE - GIB)
     };
-    assert!(publish(&mut c, &controller, 2, 0, &[raised]).await.unwrap());
+    assert!(
+        publish(&mut c, &controller, 2, 0, &[raised(GPU0), raised(GPU1)])
+            .await
+            .unwrap()
+    );
     assert_eq!(
         capacity::grant(
             &mut c,
@@ -1315,6 +1403,16 @@ async fn crash_recovery_preserves_charges_until_a_current_controller_reconciles(
         GrantState::UnknownAllocation
     );
     f.expire_run_lease(0).await;
+    // A replay of the identical request still recovers the recorded decision.
+    assert_eq!(
+        capacity::grant(&mut a, &first, &f.request(0, "crash", &need))
+            .await
+            .unwrap(),
+        Decision::Grant {
+            grant_id: dispatched.clone(),
+            state: GrantState::Granted
+        }
+    );
     assert_eq!(
         capacity::grant(&mut a, &first, &f.request(0, "after-crash", &need)).await,
         Err(Error::LeaseLost)
@@ -1405,72 +1503,88 @@ async fn crash_recovery_preserves_charges_until_a_current_controller_reconciles(
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
-async fn a_drained_device_moves_groups_and_keeps_its_release_history() {
-    let mut f = Fixture::new(&[GPU0, GPU1], 2).await;
+async fn device_membership_is_immutable_and_an_empty_group_never_admits() {
+    let mut f = Fixture::new(&[GPU0], 0).await;
     let mut c = f.worker().await;
-    let controller = open_group(&mut c, 1, &[GPU0, GPU1]).await;
+    let controller = open_group(&mut c, 1, &[GPU0]).await;
+    f.owner_exec(
+        "INSERT INTO openmettle.capacity_devices (id, group_id, chat_floor_bytes)
+         VALUES ($1::uuid, $2::uuid, 0)",
+        &[GPU1, GROUP_B],
+    )
+    .await;
+    // A sampled device and a never-sampled one both keep their group, at any isolation level.
+    let mut operator = connect(&f.db.0, OWNER).await;
+    let move_to = |device, group| {
+        sqlx::query(
+            "UPDATE openmettle.capacity_devices SET group_id = $2::uuid WHERE id = $1::uuid",
+        )
+        .bind(device)
+        .bind(group)
+    };
+    for (device, group) in [(GPU0, GROUP_B), (GPU1, GROUP)] {
+        assert_eq!(
+            sqlstate(move_to(device, group).execute(&mut operator).await),
+            "23514"
+        );
+        let mut tx = operator.begin().await.unwrap();
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlstate(move_to(device, group).execute(&mut *tx).await),
+            "23514"
+        );
+        tx.rollback().await.unwrap();
+    }
+    assert!(admits(&mut c).await);
+    // A recovered, freshly sampled group without any configured device admits nothing.
+    f.owner_exec(
+        "DELETE FROM openmettle.capacity_observations WHERE group_id = $1::uuid",
+        &[GROUP],
+    )
+    .await;
+    f.owner_exec(
+        "DELETE FROM openmettle.capacity_devices WHERE group_id = $1::uuid",
+        &[GROUP],
+    )
+    .await;
+    assert!(!admits(&mut c).await);
+    assert!(!capacity::resume(&mut c, &controller).await.unwrap());
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn readiness_is_evaluated_on_the_callers_snapshot() {
+    let f = Fixture::new(&[GPU0], 1).await;
+    let mut c = f.worker().await;
+    let controller = open_group(&mut c, 1, &[GPU0]).await;
     let grant = granted(
         capacity::grant(
             &mut c,
             &controller,
-            &f.request(0, "gpu1", &[bytes(GPU1, GIB)]),
+            &f.request(0, "first", &[bytes(GPU0, GIB)]),
         )
         .await
         .unwrap(),
     );
-    let mut operator = connect(&f.db.0, OWNER).await;
-    let move_gpu1 = || {
-        sqlx::query(
-            "UPDATE openmettle.capacity_devices SET group_id = $2::uuid WHERE id = $1::uuid",
-        )
-        .bind(GPU1)
-        .bind(GROUP_B)
-    };
-    // A device with a live commitment cannot leave its group.
-    assert_eq!(sqlstate(move_gpu1().execute(&mut operator).await), "23514");
-    capacity::reconcile(
-        &mut c,
-        &controller,
-        &grant,
-        Evidence::Released(&[GPU1.into()]),
+    // One statement takes its snapshot, pauses while the allocation becomes unknown, then
+    // evaluates readiness, as snapshot() does beside its rows: the answer belongs to the
+    // statement's snapshot, not to a later one.
+    let mut reader = f.worker().await;
+    let statement = sqlx::query_scalar::<_, bool>(
+        "SELECT openmettle.capacity_admits($1::uuid, false)
+           FROM (SELECT pg_sleep(1) OFFSET 0) AS pause",
     )
-    .await
-    .unwrap();
-    move_gpu1().execute(&mut operator).await.unwrap();
-    // The release history stays, and the old group's sample of the device is discarded.
-    let history: (i64, i64) = sqlx::query_as(
-        "SELECT (SELECT count(*) FROM openmettle.capacity_grant_devices
-                  WHERE grant_id = $1::uuid AND device_id = $2::uuid AND release_evidence IS NOT NULL),
-                (SELECT count(*) FROM openmettle.capacity_observations
-                  WHERE group_id = $3::uuid AND device_id = $2::uuid)",
-    )
-    .bind(&grant)
-    .bind(GPU1)
-    .bind(GROUP)
-    .fetch_one(&mut f.owner)
-    .await
-    .unwrap();
-    assert_eq!(history, (1, 0));
-    // The old group still admits on its remaining device and no longer accepts the moved one.
-    assert!(admits(&mut c).await);
-    assert_eq!(
-        capacity::grant(
-            &mut c,
-            &controller,
-            &f.request(1, "moved", &[bytes(GPU1, GIB)])
-        )
-        .await,
-        Err(Error::Invalid)
-    );
-    granted(
-        capacity::grant(
-            &mut c,
-            &controller,
-            &f.request(1, "kept", &[bytes(GPU0, GIB)]),
-        )
-        .await
-        .unwrap(),
-    );
+    .bind(GROUP);
+    let (read, closed) = tokio::join!(statement.fetch_one(&mut reader), async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        capacity::reconcile(&mut c, &controller, &grant, Evidence::UnknownAllocation).await
+    });
+    assert_eq!(closed.unwrap(), GrantState::UnknownAllocation);
+    assert!(read.unwrap());
+    assert!(!admits(&mut c).await);
 }
 
 #[tokio::test]

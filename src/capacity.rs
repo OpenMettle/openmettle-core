@@ -6,8 +6,14 @@
 //! row and subtracts commitments made since the cited measurement. A run-linked grant commits
 //! the run's `device_reservations` slot in the same transaction (`quota_commit_device_handoff`),
 //! and only confirmed release or non-allocation on every device returns its bytes and settles
-//! that slot. Every call must run under `READ COMMITTED`, as [`crate::runs::WriteTransaction`]
-//! does.
+//! that slot.
+//!
+//! Every call must run under `READ COMMITTED`; any other level fails with [`Error::Invalid`]
+//! (SQLSTATE `25000`). `WriteTransaction::begin_bounded` and `begin_bounded_pool` in
+//! [`crate::runs`] select it explicitly. An autocommit statement on a pooled connection,
+//! [`crate::runs::WriteTransaction::begin`] and a plain `sqlx` transaction inherit the role's or
+//! server's `default_transaction_isolation`, so use them only where that setting is
+//! `read committed` (the PostgreSQL default).
 use crate::runs::is_canonical_uuid;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::Serialize;
@@ -24,7 +30,8 @@ pub enum Error {
     Fenced,
     /// The run's claim is not an active `Step` lease.
     LeaseLost,
-    /// Quota metering is enforced and the run holds no `device_reservations` slot.
+    /// Quota metering is enforced and the run holds no unused `device_reservations` slot: none
+    /// was admitted, or an earlier grant already used it.
     SlotRequired,
     /// The request identity names another request, the run already holds a live grant, or its
     /// device slot is bound elsewhere.
@@ -284,7 +291,15 @@ pub async fn grant(
     .bind(request.profile)
     .bind(footprint)
     .fetch_one(c)
-    .await?;
+    .await;
+    // OMC02: the group stopped admitting bursts while the decision waited for its last lock,
+    // and the decision rolled back.
+    let row = match row {
+        Err(e) if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("OMC02") => {
+            return Ok(Decision::Unavailable);
+        }
+        row => row?,
+    };
     let outcome: String = row.try_get("outcome")?;
     Ok(
         match (
