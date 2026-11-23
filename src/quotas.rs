@@ -150,17 +150,29 @@ async fn round_cost_slice(
         .await
 }
 
+/// How a caller specifies the per-request cost bound for `cost_ceiling` / `bind_request`.
+#[derive(Clone, Copy)]
+pub(crate) enum CostBoundSpec {
+    /// Non-catalog `gateway::hold` / `gateway::reserve`: derive slice or ceiling from configured
+    /// limits when cost metering applies.
+    Legacy,
+    /// Catalog-driven turn round (`TurnRound`) or explicit caller bound: `Some(c)` supplies the
+    /// qualified ceiling; `None` means the profile has no qualified `cost_bound` and must fail
+    /// closed whenever any cost tier applies.
+    Profile(Option<u128>),
+}
+
 pub(crate) async fn cost_ceiling(
     tx: &mut WriteTransaction<'_>,
     owner: &Reservation<'_>,
     run: Option<&str>,
     current_request_id: Option<&str>,
-    supplied: Option<u128>,
+    spec: CostBoundSpec,
 ) -> Result<Option<i64>, Error> {
     let state = cost_limit_state(tx.connection()?, owner.scope_id, owner.actor).await?;
     if !state.any_limit {
-        return match supplied {
-            Some(0) => Err(Error::Refused),
+        return match spec {
+            CostBoundSpec::Profile(Some(0)) => Err(Error::Refused),
             _ => Ok(None),
         };
     }
@@ -173,8 +185,8 @@ pub(crate) async fn cost_ceiling(
             .bind(owner.actor)
             .fetch_one(tx.connection()?)
             .await?;
-    match (configured, supplied) {
-        (Some(limit), Some(n)) => {
+    match (configured, spec) {
+        (Some(limit), CostBoundSpec::Profile(Some(n))) => {
             let Ok(n) = i64::try_from(n) else {
                 return Err(Error::Refused);
             };
@@ -184,7 +196,8 @@ pub(crate) async fn cost_ceiling(
                 Err(Error::Refused)
             }
         }
-        (Some(limit), None) if limit > 0 => {
+        (Some(_), CostBoundSpec::Profile(None)) => Err(Error::Refused),
+        (Some(limit), CostBoundSpec::Legacy) if limit > 0 => {
             if let Some(run_id) = run
                 && let Some(slice) =
                     round_cost_slice(tx.connection()?, owner.scope_id, run_id, current_request_id)
@@ -208,7 +221,7 @@ pub(crate) async fn bind_request(
     call: &Call<'_>,
     id: &str,
     secret: &[u8],
-    supplied: Option<u128>,
+    spec: CostBoundSpec,
 ) -> Result<(), Error> {
     let enforced: bool =
         sqlx::query_scalar("SELECT metering_enforced FROM openmettle.quota_enforcement WHERE id")
@@ -216,7 +229,7 @@ pub(crate) async fn bind_request(
             .await?;
     match call.authority {
         Authority::Session { .. } => {
-            let cost = cost_ceiling(tx, &call.reservation, None, Some(id), supplied).await?;
+            let cost = cost_ceiling(tx, &call.reservation, None, Some(id), spec).await?;
             for (resource, amount) in [
                 ("usage_cost_micros", cost),
                 ("usage_tokens", Some(call.units)),
@@ -238,68 +251,56 @@ pub(crate) async fn bind_request(
             }
         }
         Authority::Lease { run, token, .. } => {
-            if enforced {
-                let cost =
-                    cost_ceiling(tx, &call.reservation, Some(run), Some(id), supplied).await?;
-                for (resource, amount) in [
-                    ("usage_cost_micros", cost),
-                    ("usage_tokens", Some(call.units)),
-                ] {
-                    let Some(amount) = amount else { continue };
-                    sqlx::query(
-                        "SELECT openmettle.quota_allocate_round($1::uuid,$2,$3::uuid,$4,$5)",
-                    )
-                    .bind(id)
-                    .bind(secret)
-                    .bind(token)
-                    .bind(resource)
-                    .bind(amount)
-                    .execute(tx.connection()?)
-                    .await?;
+            // Query already-charged parent holds on this run in BOTH activation states so an
+            // existing `usage_cost_micros` parent is still sliced and settled even if the last
+            // cost limit expired after admission (or while `metering_enforced` is still false).
+            let parents: Vec<(String, i64)> = sqlx::query_as(
+                "SELECT resource_kind, held_units
+                   FROM openmettle.quota_reservations
+                  WHERE scope_id = $1::uuid
+                    AND run_id = $2::uuid
+                    AND gateway_request_id IS NULL
+                    AND state = 'held'
+                    AND resource_kind IN ('usage_cost_micros', 'usage_tokens')
+                  ORDER BY resource_kind ASC",
+            )
+            .bind(call.reservation.scope_id)
+            .bind(run)
+            .fetch_all(tx.connection()?)
+            .await?;
+            let mut parent_cost_held = None;
+            let mut has_token_parent = false;
+            for (kind, held) in parents {
+                match kind.as_str() {
+                    "usage_cost_micros" => parent_cost_held = Some(held),
+                    "usage_tokens" => has_token_parent = true,
+                    _ => {}
                 }
-            } else {
-                // Pre-activation (`!enforced`): allocate child holds from any already-charged
-                // parent `quota_reservations` on this run so gateway settlement charges provider
-                // usage instead of releasing the whole parent balance on terminal settlement.
-                let parents: Vec<(String, i64)> = sqlx::query_as(
-                    "SELECT resource_kind, held_units
-                       FROM openmettle.quota_reservations
-                      WHERE scope_id = $1::uuid
-                        AND run_id = $2::uuid
-                        AND gateway_request_id IS NULL
-                        AND state = 'held'
-                        AND resource_kind IN ('usage_cost_micros', 'usage_tokens')
-                      ORDER BY resource_kind ASC",
-                )
-                .bind(call.reservation.scope_id)
-                .bind(run)
-                .fetch_all(tx.connection()?)
-                .await?;
-                let mut parent_cost_held = None;
-                let mut has_token_parent = false;
-                for (kind, held) in parents {
-                    match kind.as_str() {
-                        "usage_cost_micros" => parent_cost_held = Some(held),
-                        "usage_tokens" => has_token_parent = true,
-                        _ => {}
-                    }
+            }
+            let state = cost_limit_state(
+                tx.connection()?,
+                call.reservation.scope_id,
+                call.reservation.actor,
+            )
+            .await?;
+            let cost = if state.any_limit {
+                if enforced || parent_cost_held.is_some() {
+                    cost_ceiling(tx, &call.reservation, Some(run), Some(id), spec).await?
+                } else if matches!(spec, CostBoundSpec::Profile(None)) {
+                    return Err(Error::Refused);
+                } else {
+                    None
                 }
-                let cost = if let Some(held) = parent_cost_held {
-                    let state = cost_limit_state(
-                        tx.connection()?,
-                        call.reservation.scope_id,
-                        call.reservation.actor,
-                    )
-                    .await?;
-                    if state.any_limit {
-                        cost_ceiling(tx, &call.reservation, Some(run), Some(id), supplied).await?
-                    } else if let Some(s) = supplied {
+            } else if let Some(held) = parent_cost_held {
+                match spec {
+                    CostBoundSpec::Profile(Some(s)) => {
                         let s = i64::try_from(s).map_err(|_| Error::Refused)?;
                         if s <= 0 || s > held {
                             return Err(Error::Refused);
                         }
                         Some(s)
-                    } else {
+                    }
+                    CostBoundSpec::Legacy | CostBoundSpec::Profile(None) => {
                         let slice = round_cost_slice(
                             tx.connection()?,
                             call.reservation.scope_id,
@@ -314,17 +315,17 @@ pub(crate) async fn bind_request(
                         }
                         Some(slice)
                     }
-                } else {
-                    None
-                };
-                for (resource, amount) in [
-                    ("usage_cost_micros", cost),
-                    ("usage_tokens", has_token_parent.then_some(call.units)),
-                ] {
-                    let Some(amount) = amount else { continue };
-                    sqlx::query(
-                        "SELECT openmettle.quota_allocate_round($1::uuid,$2,$3::uuid,$4,$5)",
-                    )
+                }
+            } else {
+                if matches!(spec, CostBoundSpec::Profile(Some(0))) {
+                    return Err(Error::Refused);
+                }
+                None
+            };
+            let tokens = (enforced || has_token_parent).then_some(call.units);
+            for (resource, amount) in [("usage_cost_micros", cost), ("usage_tokens", tokens)] {
+                let Some(amount) = amount else { continue };
+                sqlx::query("SELECT openmettle.quota_allocate_round($1::uuid,$2,$3::uuid,$4,$5)")
                     .bind(id)
                     .bind(secret)
                     .bind(token)
@@ -332,7 +333,6 @@ pub(crate) async fn bind_request(
                     .bind(amount)
                     .execute(tx.connection()?)
                     .await?;
-                }
             }
         }
     }
@@ -1684,8 +1684,11 @@ async fn backfill_replayed_run_budget_inner(
             Err(err)
                 if err.as_database_error().and_then(|e| e.code()).as_deref() == Some("23505") =>
             {
+                // A legacy gateway_reservations row already exists (possibly with id <> run_id
+                // or smaller stored units); roll back the savepoint and defer parent hold
+                // materialization to the worker rather than charging recomputed input.token_units.
                 sp.rollback().await?;
-                false
+                return Ok((false, None));
             }
             Err(err) => {
                 sp.rollback().await?;

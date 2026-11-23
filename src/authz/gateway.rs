@@ -77,8 +77,11 @@ pub async fn hold_with_cost(
         .execute(tx.connection()?)
         .await?;
     if let Some(run) = run {
-        let cost_u128 = cost_ceiling.map(|c| u128::try_from(c).unwrap_or(0));
-        let cost = crate::quotas::cost_ceiling(tx, r, None, None, cost_u128).await?;
+        let spec = match cost_ceiling {
+            Some(c) => crate::quotas::CostBoundSpec::Profile(Some(u128::try_from(c).unwrap_or(0))),
+            None => crate::quotas::CostBoundSpec::Legacy,
+        };
+        let cost = crate::quotas::cost_ceiling(tx, r, None, None, spec).await?;
         for (resource, amount) in [("usage_cost_micros", cost), ("usage_tokens", Some(units))] {
             if let Some(amount) = amount {
                 sqlx::query("SELECT openmettle.quota_reserve($1::uuid,$2::uuid,$3,$4,$5,$6::uuid,NULL,NULL,
@@ -128,15 +131,11 @@ pub async fn reserve_with_cost<'a>(
     let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
     crate::quotas::prepare_round(&mut tx, &call, cost_ceiling).await?;
     let pending = reserve_in(&mut tx, call).await?;
-    let cost_u128 = cost_ceiling.map(|c| u128::try_from(c).unwrap_or(0));
-    crate::quotas::bind_request(
-        &mut tx,
-        &pending.call,
-        &pending.id,
-        &pending.secret,
-        cost_u128,
-    )
-    .await?;
+    let spec = match cost_ceiling {
+        Some(c) => crate::quotas::CostBoundSpec::Profile(Some(u128::try_from(c).unwrap_or(0))),
+        None => crate::quotas::CostBoundSpec::Legacy,
+    };
+    crate::quotas::bind_request(&mut tx, &pending.call, &pending.id, &pending.secret, spec).await?;
     tx.commit().await?;
     Ok(pending)
 }
@@ -201,9 +200,9 @@ impl TurnPending {
 
     /// Atomically commit gateway handoff, optional device-slot handoff, and round usage child
     /// holds in a single write transaction following strict ADR 0040 lock order:
-    /// `runs -> gateway_requests -> quota_reservations (resource_kind, id) -> quota_enforcement`.
-    /// Any pre-commit failure rolls back `gateway_requests` to `'reserved'` so `release()` can
-    /// immediately unwind the unsent round.
+    /// `account_admin_lock..users..runs -> gateway_requests -> quota_reservations (resource_kind, id)
+    /// -> quota_gateway_handoffs -> quota_enforcement`. Any pre-commit or deferred OMQ04 failure
+    /// rolls back `gateway_requests` to `'reserved'` so `release()` can immediately unwind the round.
     pub async fn handoff(
         &self,
         pool: &PgPool,
@@ -218,24 +217,23 @@ impl TurnPending {
         }
         let pending = self.as_pending();
         let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
-        let live: Option<bool> = sqlx::query_scalar(
-            "SELECT true
-               FROM openmettle.runs
-              WHERE scope_id = $1::uuid
-                AND id = $2::uuid
-                AND state = 'running'
-                AND cancel_reason IS NULL
-                AND claim_token = $3::uuid
-                AND lease_expires_at > clock_timestamp()
-                FOR NO KEY UPDATE",
+        let prefix = sqlx::query(
+            "SELECT openmettle.quota_lock_turn_handoff_prefix(
+                 $1::uuid, $2::bytea, $3::uuid, $4::uuid, $5::uuid
+             )",
         )
+        .bind(&pending.id)
+        .bind(pending.secret.as_slice())
         .bind(&self.scope_id)
         .bind(&self.run_id)
         .bind(&self.claim_token)
-        .fetch_optional(tx.connection()?)
-        .await?;
-        if live.is_none() {
-            return Err(Error::Refused);
+        .execute(tx.connection()?)
+        .await;
+        if let Err(err) = prefix {
+            return match err.as_database_error().and_then(|e| e.code()).as_deref() {
+                Some("42501") => Err(Error::Refused),
+                _ => Err(Error::from(err)),
+            };
         }
         let dispatch = pending.handoff_in(&mut tx, keys).await?;
         let res = sqlx::query(
@@ -258,7 +256,12 @@ impl TurnPending {
                 _ => Err(Error::from(err)),
             };
         }
-        if tx.commit().await.is_err() {
+        if let Err(err) = tx.commit().await {
+            if let crate::runs::Error::Database(ref db) = err
+                && db.as_database_error().and_then(|e| e.code()).as_deref() == Some("OMQ04")
+            {
+                return Err(Error::Refused);
+            }
             let mut recovery = WriteTransaction::begin_bounded_pool(pool, false).await?;
             pending.recover_in(&mut recovery).await?;
             recovery.commit().await?;
@@ -322,7 +325,7 @@ pub async fn reserve_turn_round(pool: &PgPool, round: TurnRound<'_>) -> Result<T
         &pending.call,
         &pending.id,
         &pending.secret,
-        round.round_cost,
+        crate::quotas::CostBoundSpec::Profile(round.round_cost),
     )
     .await?;
     let id = pending.id;
