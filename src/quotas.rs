@@ -1388,6 +1388,7 @@ fn map_override_sql_error(error: sqlx::Error) -> QuotaError {
         match db.code().as_deref() {
             Some("OMQ02") => return QuotaError::CostDenominationUnconfigured,
             Some("OMQ03") => return QuotaError::AdoptionInProgress,
+            Some("OMQ06") => return QuotaError::UpgradeNotEnforced,
             Some("P0002") => return QuotaError::Store(StoreError::NotFound),
             Some("42501") => {
                 return QuotaError::Store(StoreError::Denied(DenialReason::Policy(
@@ -1417,11 +1418,14 @@ async fn authorize_manage_quotas_and_check_upgrade(
             enabled_account_admins: 0,
         },
     ))?;
-    let metering_enforced: bool =
-        sqlx::query_scalar("SELECT metering_enforced FROM openmettle.quota_enforcement WHERE id")
-            .fetch_one(&mut *c)
-            .await?;
-    if !metering_enforced {
+    let (metering_enforced, overrides_enforced): (bool, bool) = sqlx::query_as(
+        "SELECT metering_enforced, overrides_enforced
+           FROM openmettle.quota_enforcement
+          WHERE id",
+    )
+    .fetch_one(&mut *c)
+    .await?;
+    if !metering_enforced || !overrides_enforced {
         return Err(QuotaError::UpgradeNotEnforced);
     }
     // Acquire FOR SHARE on storage_volume_control so override writes serialize against adoption

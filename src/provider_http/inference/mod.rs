@@ -191,14 +191,29 @@ impl RunStop {
     }
 }
 
-/// Validated and wire-encoded inference request ready to transmit without re-encoding once a
-/// dispatch credential is obtained.
-pub struct PreparedRequest {
+/// Validated and wire-encoded inference request borrowing its authoritative model profile and
+/// source [`Request`] so neither can be mutated between [`Gateway::prepare`] and dispatch.
+pub struct PreparedRequest<'a> {
     model: String,
-    profile: ProfilePin,
-    stream: bool,
+    profile: &'a crate::model_config::Profile,
+    request: &'a Request,
     server: bool,
     body: Vec<u8>,
+}
+
+impl PreparedRequest<'_> {
+    pub(crate) fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    pub(crate) fn is_server(&self) -> bool {
+        self.server
+    }
+}
+
+enum Outbound<'a> {
+    Raw(&'a Catalog, &'a Effective, &'a Request),
+    Prepared(PreparedRequest<'a>),
 }
 
 pub struct Gateway {
@@ -250,17 +265,64 @@ impl Gateway {
         self
     }
 
+    fn route(&self) -> transport::Route<'_> {
+        transport::Route {
+            endpoint: &self.endpoint,
+            allowed: &self.allowed,
+            tls: &self.tls,
+            lookup: &self.lookup,
+            slots: &DNS_SLOTS,
+            #[cfg(test)]
+            loopback: self.loopback,
+        }
+    }
+
+    fn build_outbound_with_headers(
+        &self,
+        headers: HeaderMap,
+        body: Vec<u8>,
+        body_len: usize,
+    ) -> Result<hyper::Request<http_body_util::Full<bytes::Bytes>>, Error> {
+        let content_length = body_len.to_string();
+        let outbound = self.route().request(hyper::Method::POST, &headers, body)?;
+        let header_bytes = outbound
+            .headers()
+            .iter()
+            .map(|(k, v)| k.as_str().len() + v.len() + 4)
+            .sum::<usize>()
+            + "content-length: ".len()
+            + content_length.len()
+            + 4;
+        if header_bytes > super::MAX_REQUEST_HEADER_BYTES {
+            return Err(Error::Credential);
+        }
+        Ok(outbound)
+    }
+
+    /// Validate that the complete outbound HTTP headers (including `Host`, `Connection`,
+    /// `Authorization`, `Accept`, `Content-Type`, `Content-Length`, and any scoped `x-request-id`)
+    /// fit within [`super::MAX_REQUEST_HEADER_BYTES`] before committing a billable gateway handoff.
+    pub(crate) fn validate_outbound_headers(
+        &self,
+        credential: Credential<'_>,
+        prepared: &PreparedRequest<'_>,
+    ) -> Result<(), Error> {
+        let headers = headers(credential, prepared.request.stream)?;
+        self.build_outbound_with_headers(headers, Vec::new(), prepared.body.len())
+            .map(|_| ())
+            .map_err(|e| e.for_profile(self.family_policy_v1))
+    }
+
     /// Validate model/profile selection against this route and wire-encode the outbound JSON body
     /// before reserving or committing a billable gateway handoff.
-    pub fn prepare(
+    pub fn prepare<'a>(
         &self,
-        catalog: &Catalog,
+        catalog: &'a Catalog,
         effective: &Effective,
-        request: &Request,
+        request: &'a Request,
         server: bool,
-    ) -> Result<PreparedRequest, Error> {
+    ) -> Result<PreparedRequest<'a>, Error> {
         self.prepare_inner(catalog, effective, request, server)
-            .map(|(_, prepared)| prepared)
             .map_err(|e| e.for_profile(self.family_policy_v1))
     }
 
@@ -268,9 +330,9 @@ impl Gateway {
         &self,
         catalog: &'a Catalog,
         effective: &Effective,
-        request: &Request,
+        request: &'a Request,
         server: bool,
-    ) -> Result<(&'a crate::model_config::Profile, PreparedRequest), Error> {
+    ) -> Result<PreparedRequest<'a>, Error> {
         // The catalog checks both snapshot revision and profile pin, even for a caller
         // with unknown capacity. Admission owns the populated path and prompt estimate.
         catalog
@@ -285,16 +347,13 @@ impl Gateway {
             })
             .ok_or(Error::Validation)?;
         let body = request.encode(&self.qualification, profile, effective, server)?;
-        Ok((
+        Ok(PreparedRequest {
+            model: effective.model.clone(),
             profile,
-            PreparedRequest {
-                model: effective.model.clone(),
-                profile: effective.profile.clone(),
-                stream: request.stream,
-                server,
-                body,
-            },
-        ))
+            request,
+            server,
+            body,
+        })
     }
 
     /// The facade captures its tool list at entry. It may forward visible deltas under
@@ -308,32 +367,26 @@ impl Gateway {
         credential: Credential<'_>,
         visible: impl FnMut(VisibleDelta) -> F,
     ) -> Result<Turn, Error> {
-        self.complete_prepared(catalog, effective, request, None, credential, None, visible)
-            .await
-            .map_err(|e| e.for_profile(self.family_policy_v1))
-    }
-
-    /// Transmit a pre-validated, pre-encoded caller request without repeating wire encoding.
-    pub async fn caller_prepared<F: Future<Output = ()>>(
-        &self,
-        catalog: &Catalog,
-        effective: &Effective,
-        request: &Request,
-        prepared: PreparedRequest,
-        credential: Credential<'_>,
-        visible: impl FnMut(VisibleDelta) -> F,
-    ) -> Result<Turn, Error> {
         self.complete_prepared(
-            catalog,
-            effective,
-            request,
-            Some(prepared),
+            Outbound::Raw(catalog, effective, request),
             credential,
             None,
             visible,
         )
         .await
         .map_err(|e| e.for_profile(self.family_policy_v1))
+    }
+
+    /// Transmit a pre-validated, pre-encoded caller request without repeating wire encoding.
+    pub async fn caller_prepared<F: Future<Output = ()>>(
+        &self,
+        prepared: PreparedRequest<'_>,
+        credential: Credential<'_>,
+        visible: impl FnMut(VisibleDelta) -> F,
+    ) -> Result<Turn, Error> {
+        self.complete_prepared(Outbound::Prepared(prepared), credential, None, visible)
+            .await
+            .map_err(|e| e.for_profile(self.family_policy_v1))
     }
 
     /// One model step after the executor's leased authority check. The executor owns
@@ -348,10 +401,7 @@ impl Gateway {
         visible: impl FnMut(VisibleDelta) -> F,
     ) -> Result<Turn, Error> {
         self.complete_prepared(
-            catalog,
-            effective,
-            request,
-            None,
+            Outbound::Raw(catalog, effective, request),
             credential,
             Some(run),
             visible,
@@ -361,37 +411,21 @@ impl Gateway {
     }
 
     /// Transmit a pre-validated, pre-encoded leased server request without repeating wire encoding.
-    #[allow(clippy::too_many_arguments)]
     pub async fn server_prepared<F: Future<Output = ()>>(
         &self,
-        catalog: &Catalog,
-        effective: &Effective,
-        request: &Request,
-        prepared: PreparedRequest,
+        prepared: PreparedRequest<'_>,
         credential: Credential<'_>,
         run: RunStop,
         visible: impl FnMut(VisibleDelta) -> F,
     ) -> Result<Turn, Error> {
-        self.complete_prepared(
-            catalog,
-            effective,
-            request,
-            Some(prepared),
-            credential,
-            Some(run),
-            visible,
-        )
-        .await
-        .map_err(|e| e.for_profile(self.family_policy_v1))
+        self.complete_prepared(Outbound::Prepared(prepared), credential, Some(run), visible)
+            .await
+            .map_err(|e| e.for_profile(self.family_policy_v1))
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn complete_prepared<F: Future<Output = ()>>(
         &self,
-        catalog: &Catalog,
-        effective: &Effective,
-        request: &Request,
-        prepared: Option<PreparedRequest>,
+        input: Outbound<'_>,
         credential: Credential<'_>,
         mut run: Option<RunStop>,
         visible: impl FnMut(VisibleDelta) -> F,
@@ -399,42 +433,35 @@ impl Gateway {
         let start = Instant::now();
         let server = run.is_some();
         let dispatch = async {
+            let stream = match &input {
+                Outbound::Raw(_, _, request) => request.stream,
+                Outbound::Prepared(prepared) => prepared.request.stream,
+            };
             // Provisioning or a broken credential takes precedence over model selection.
-            let headers = headers(credential, request.stream)?;
-            let (profile, body) = match prepared {
-                Some(prepared) => {
-                    if prepared.model != effective.model
-                        || prepared.profile != effective.profile
-                        || prepared.stream != request.stream
-                        || prepared.server != server
+            let headers = headers(credential, stream)?;
+            let prepared = match input {
+                Outbound::Raw(catalog, effective, request) => {
+                    self.prepare_inner(catalog, effective, request, server)?
+                }
+                Outbound::Prepared(prepared) => {
+                    if prepared.server != server
+                        || self.qualification.model != prepared.model
+                        || self.qualification.pin != prepared.profile.pin
                     {
                         return Err(Error::Validation);
                     }
-                    let profile = catalog
-                        .model(&effective.model)
-                        .filter(|p| {
-                            p.pin == effective.profile
-                                && p.pin == self.qualification.pin
-                                && self.qualification.model == effective.model
-                        })
-                        .ok_or(Error::Validation)?;
-                    (profile, prepared.body)
-                }
-                None => {
-                    let (profile, prepared) =
-                        self.prepare_inner(catalog, effective, request, server)?;
-                    (profile, prepared.body)
+                    prepared
                 }
             };
-            let route = transport::Route {
-                endpoint: &self.endpoint,
-                allowed: &self.allowed,
-                tls: &self.tls,
-                lookup: &self.lookup,
-                slots: &DNS_SLOTS,
-                #[cfg(test)]
-                loopback: self.loopback,
-            };
+            let PreparedRequest {
+                profile,
+                request,
+                body,
+                ..
+            } = prepared;
+            let body_len = body.len();
+            let outbound = self.build_outbound_with_headers(headers, body, body_len)?;
+            let route = self.route();
             let limits = transport::Limits {
                 request_body: BODY,
                 response_body: BODY,
@@ -443,19 +470,6 @@ impl Gateway {
                 setup: self.timeouts.setup,
                 total: self.timeouts.overall,
             };
-            let content_length = body.len().to_string();
-            let outbound = route.request(hyper::Method::POST, &headers, body)?;
-            let header_bytes = outbound
-                .headers()
-                .iter()
-                .map(|(k, v)| k.as_str().len() + v.len() + 4)
-                .sum::<usize>()
-                + "content-length: ".len()
-                + content_length.len()
-                + 4;
-            if header_bytes > super::MAX_REQUEST_HEADER_BYTES {
-                return Err(Error::Credential);
-            }
             let tls = route
                 .connect(start + self.timeouts.setup)
                 .await

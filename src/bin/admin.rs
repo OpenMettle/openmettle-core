@@ -63,8 +63,12 @@ async fn run() -> Result<(), &'static str> {
             }
             Some("activate") => {
                 sqlx::query(
-                    "UPDATE openmettle.quota_enforcement SET metering_enforced=true,
-                    metering_enforced_at=clock_timestamp() WHERE id AND NOT metering_enforced",
+                    "UPDATE openmettle.quota_enforcement
+                        SET metering_enforced = true,
+                            metering_enforced_at = coalesce(metering_enforced_at, clock_timestamp()),
+                            overrides_enforced = true,
+                            overrides_enforced_at = coalesce(overrides_enforced_at, clock_timestamp())
+                      WHERE id AND (NOT metering_enforced OR NOT overrides_enforced)",
                 )
                 .execute(&pool)
                 .await

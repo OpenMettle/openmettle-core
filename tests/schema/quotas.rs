@@ -526,6 +526,16 @@ async fn quota_store_enforces_upgrade_gate_denomination_idempotency_and_wide_sum
         .execute("UPDATE openmettle.quota_enforcement SET metering_enforced=true,metering_enforced_at=clock_timestamp() WHERE id")
         .await
         .unwrap();
+    // Flipping metering_enforced alone on an upgraded DB MUST still gate override writes until
+    // overrides_enforced is also activated (migration 26 rolling-upgrade completion gate).
+    assert!(matches!(
+        quotas::set_scope_override(&mut u_api, &u_ctx, &u_scope, K::StorageBytes, 1024, None).await,
+        Err(QuotaError::UpgradeNotEnforced)
+    ));
+    u_owner
+        .execute("UPDATE openmettle.quota_enforcement SET overrides_enforced=true,overrides_enforced_at=clock_timestamp() WHERE id")
+        .await
+        .unwrap();
     // Active adoption run also blocks override writes until cleared.
     u_owner
         .execute("UPDATE openmettle.storage_volume_control SET adoption_run_id=gen_random_uuid() WHERE id")

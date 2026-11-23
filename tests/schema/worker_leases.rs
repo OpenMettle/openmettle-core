@@ -4009,6 +4009,175 @@ mod live_turns {
 
     #[tokio::test]
     #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn oversized_bearer_header_rolls_back_handoff_before_commit() {
+        use openmettle_core::{
+            provider_keys::gateway::{Bearer, Context, GatewayKeys, GatewaySealer},
+            quotas::{self, RunBudgetReservation},
+        };
+        use sqlx::postgres::PgPoolOptions;
+
+        let mut chat = Chat::new().await;
+        chat.catalog["models"]["a"]["cost_bound"] = json!({
+            "fixed_micros": 0,
+            "micros_per_token": 1
+        });
+        let mut owner = connect(&chat.f.db.0, OWNER).await;
+        owner
+            .execute(
+                "UPDATE openmettle.quota_defaults
+                    SET cost_denomination = 'usd_micros'
+                  WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'",
+            )
+            .await
+            .unwrap();
+        owner
+            .execute(
+                "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+                 VALUES ('personal', 'usage_cost_micros', 1000000)",
+            )
+            .await
+            .unwrap();
+
+        let (installation, key_id, key_bytes) = chat.ensure_metered_gateway().await;
+        let g_pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy_with(chat.f.db.1.options(pg::GATEWAY));
+        let (binding_id, principal): (String, String) = sqlx::query_as(
+            "SELECT id::text, principal::text
+               FROM openmettle.gateway_bindings
+              WHERE installation = $1::uuid AND user_id = $2::uuid",
+        )
+        .bind(&installation)
+        .bind(&chat.f.actor.user)
+        .fetch_one(&g_pool)
+        .await
+        .unwrap();
+        // Seal an 896-byte valid Bearer (accepted by Bearer::new) whose complete outbound HTTP
+        // headers (Host + Connection + x-request-id + Authorization + Accept + Content-Type +
+        // Content-Length) exceed MAX_REQUEST_HEADER_BYTES (1024).
+        let keys = GatewayKeys::new(&[(key_id, key_bytes)]).unwrap();
+        let long_bearer = Bearer::new(&[b'b'; 896]).expect("896-byte bearer is valid");
+        let (finger, env) = GatewaySealer::new(keys, g_pool.clone())
+            .seal(
+                &Context {
+                    installation: &installation,
+                    user_id: &chat.f.actor.user,
+                    binding_id: &binding_id,
+                    principal: &principal,
+                    generation: 1,
+                },
+                &long_bearer,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.gateway_generations
+                SET key_id = $2, key_fingerprint = $3, nonce = $4, ciphertext = $5
+              WHERE binding_id = $1::uuid AND generation = 1",
+        )
+        .bind(&binding_id)
+        .bind(&env.key_id)
+        .bind(finger.as_slice())
+        .bind(env.nonce.as_slice())
+        .bind(env.ciphertext)
+        .execute(&g_pool)
+        .await
+        .unwrap();
+
+        let (run_id, _) = chat.submit("oversized-bearer-run", "a", 1).await;
+        {
+            let mut api_c = api(&chat.f.db).await;
+            let mut tx = WriteTransaction::begin(&mut api_c).await.unwrap();
+            assert!(
+                quotas::reserve_admitted_run_budget(
+                    &mut tx,
+                    &RunBudgetReservation {
+                        scope_id: &chat.f.scope,
+                        scope_kind: "personal",
+                        actor_user_id: &chat.f.actor.user,
+                        actor_approval_id: &chat.f.actor.approval,
+                        run_id: &run_id,
+                        token_units: 16384,
+                        per_round_cost_micros: Some(16384),
+                        round_limit: 1,
+                        requires_device_slot: false,
+                    },
+                )
+                .await
+                .unwrap()
+                .is_none()
+            );
+            tx.commit().await.unwrap();
+        }
+
+        let mut server = Provider::new().await;
+        let _worker = chat.start(&server).await;
+        chat.done(&run_id, "failed", Some("step_failed")).await;
+
+        assert!(
+            server.requests.try_recv().is_err(),
+            "oversized Authorization header must fail before opening provider TLS connection"
+        );
+        let req_states: Vec<String> = sqlx::query_scalar(
+            "SELECT state FROM openmettle.gateway_requests WHERE run_id = $1::uuid",
+        )
+        .bind(&run_id)
+        .fetch_all(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(req_states, vec!["released".to_owned()]);
+
+        let committed_holds: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM openmettle.quota_reservations
+              WHERE run_id = $1::uuid AND state = 'handoff_committed'",
+        )
+        .bind(&run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(committed_holds, 0);
+
+        let parent_holds: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT resource_kind, state, held_units
+               FROM openmettle.quota_reservations
+              WHERE run_id = $1::uuid AND gateway_request_id IS NULL
+              ORDER BY resource_kind ASC",
+        )
+        .bind(&run_id)
+        .fetch_all(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(
+            parent_holds,
+            vec![
+                ("usage_cost_micros".to_owned(), "released".to_owned(), 0),
+                ("usage_tokens".to_owned(), "released".to_owned(), 0),
+            ]
+        );
+
+        let usage_totals: (i64, i64) = sqlx::query_as(
+            "SELECT coalesce(sum(reserved_held), 0)::bigint,
+                    coalesce(sum(active_used), 0)::bigint
+               FROM openmettle.quota_budgets
+              WHERE resource_kind IN ('usage_tokens', 'usage_cost_micros')",
+        )
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(usage_totals, (0, 0));
+
+        let drift: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
+               FROM openmettle.quota_verify_accounting_drift()",
+        )
+        .fetch_one(&mut worker(&chat.f.db).await)
+        .await
+        .unwrap();
+        assert_eq!(drift, (0, 0, 0, 0));
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
     async fn deadline_and_mid_stream_cancel_close_inference_without_answers() {
         for cancel in [true, false] {
             let chat = Chat::new().await;

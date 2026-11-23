@@ -35,6 +35,40 @@ CREATE INDEX quota_overrides_executing_active_idx
     WHERE resource_kind IN ('executing_runs_per_actor', 'executing_runs_per_scope')
       AND revoked_at IS NULL;
 
+-- Gate ManageQuotas scope override writes across 25 -> 26 rolling upgrades even when
+-- metering_enforced was already activated on schema 24/25, until N-1 pods drain and
+-- `openmettle-admin quota activate` flips overrides_enforced = true.
+ALTER TABLE openmettle.quota_enforcement
+    ADD COLUMN overrides_enforced boolean NOT NULL DEFAULT false,
+    ADD COLUMN overrides_enforced_at timestamptz,
+    ADD CONSTRAINT quota_enforcement_overrides_check
+        CHECK (NOT overrides_enforced OR (metering_enforced AND overrides_enforced_at IS NOT NULL));
+
+UPDATE openmettle.quota_enforcement
+   SET overrides_enforced = true,
+       overrides_enforced_at = coalesce(metering_enforced_at, clock_timestamp())
+ WHERE id
+   AND metering_enforced
+   AND coalesce(pg_catalog.current_setting('openmettle.bootstrap_from_zero', true), 'false') = 'true';
+
+CREATE OR REPLACE FUNCTION openmettle.enforce_quota_enforcement_write_once()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+BEGIN
+    IF TG_OP IN ('INSERT', 'DELETE')
+       OR (OLD.metering_enforced AND (NOT NEW.metering_enforced
+           OR NEW.metering_enforced_at IS DISTINCT FROM OLD.metering_enforced_at))
+       OR (OLD.overrides_enforced AND (NOT NEW.overrides_enforced
+           OR NEW.overrides_enforced_at IS DISTINCT FROM OLD.overrides_enforced_at)) THEN
+        RAISE EXCEPTION 'quota_enforcement flags are write-once (false -> true)'
+            USING ERRCODE = 'OMQ04';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
 -- Consolidate override mutations to record exactly one authoritative authorization_audit row
 -- carrying both the SQL audit fields and the caller's idempotency request/response snapshot.
 DROP FUNCTION openmettle.quota_upsert_scope_override(uuid, uuid, text, bigint, timestamptz, text);
@@ -65,6 +99,15 @@ BEGIN
         RAISE EXCEPTION 'invalid request_key' USING ERRCODE = '23514';
     END IF;
     kind := openmettle.quota_lock_override(p_scope, p_actor, p_resource);
+    IF NOT EXISTS (
+        SELECT 1
+          FROM openmettle.quota_enforcement
+         WHERE id
+           AND metering_enforced
+           AND overrides_enforced
+    ) THEN
+        RAISE EXCEPTION 'quota overrides not yet enforced' USING ERRCODE = 'OMQ06';
+    END IF;
     IF p_resource = 'usage_cost_micros' AND NOT EXISTS (
         SELECT FROM openmettle.quota_defaults
          WHERE scope_kind = 'instance'
@@ -158,6 +201,15 @@ BEGIN
         RAISE EXCEPTION 'invalid request_key' USING ERRCODE = '23514';
     END IF;
     PERFORM openmettle.quota_lock_override(p_scope, p_actor, p_resource);
+    IF NOT EXISTS (
+        SELECT 1
+          FROM openmettle.quota_enforcement
+         WHERE id
+           AND metering_enforced
+           AND overrides_enforced
+    ) THEN
+        RAISE EXCEPTION 'quota overrides not yet enforced' USING ERRCODE = 'OMQ06';
+    END IF;
     SELECT hard_limit
       INTO prior
       FROM openmettle.quota_overrides

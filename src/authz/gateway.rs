@@ -260,7 +260,7 @@ impl TurnPending {
         keys: &GatewayKeys,
         device_grant_id: Option<&str>,
     ) -> Result<Dispatch, Error> {
-        self.handoff_turn(pool, keys, device_grant_id)
+        self.handoff_turn(pool, keys, device_grant_id, |_| Ok(()))
             .await
             .map_err(|err| match err {
                 TurnHandoffError::MissingHold => Error::Refused,
@@ -273,6 +273,7 @@ impl TurnPending {
         pool: &PgPool,
         keys: &GatewayKeys,
         device_grant_id: Option<&str>,
+        validate: impl FnOnce(&Dispatch) -> Result<(), Error>,
     ) -> Result<Dispatch, TurnHandoffError> {
         if self.requires_device_slot
             && device_grant_id.is_some_and(|g| !crate::runs::is_canonical_uuid(g))
@@ -314,6 +315,10 @@ impl TurnPending {
                 return Err(TurnHandoffError::Other(err));
             }
         };
+        if let Err(err) = validate(&dispatch) {
+            let _ = tx.rollback().await;
+            return Err(TurnHandoffError::Other(err));
+        }
         let res = sqlx::query(
             "SELECT openmettle.quota_commit_turn_handoff(
                  $1::uuid, $2::bytea, $3::uuid, $4::uuid, $5::uuid, $6, $7::uuid, $8

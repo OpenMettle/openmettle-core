@@ -4147,11 +4147,14 @@ async fn post_runs_exact_replay_returns_200_when_backfill_refused_and_worker_enf
     };
     tx.commit().await.unwrap();
 
-    // Activate metering and lower personal usage_tokens override to 0.
+    // Activate metering + overrides and lower personal usage_tokens override to 0.
     owner
         .execute(
             "UPDATE openmettle.quota_enforcement
-                SET metering_enforced = true, metering_enforced_at = clock_timestamp()
+                SET metering_enforced = true,
+                    metering_enforced_at = clock_timestamp(),
+                    overrides_enforced = true,
+                    overrides_enforced_at = clock_timestamp()
               WHERE id",
         )
         .await
@@ -4311,6 +4314,191 @@ async fn post_runs_exact_replay_returns_200_when_backfill_refused_and_worker_enf
     .await
     .unwrap();
     assert_eq!(drift, (0, 0, 0, 0));
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn schema_25_to_26_upgrade_gates_manage_quotas_until_overrides_enforced() {
+    use crate::{auth_config_support::Dir, ca::Ca};
+    use openmettle_core::{
+        authz::store::AuditContext,
+        migrate,
+        quotas::{self, QuotaError, QuotaResourceKind},
+    };
+
+    // Start on schema 25 and activate metering_enforced = true BEFORE migration 0026 applies.
+    let db = TestDb::new().await;
+    let settings = db.settings(Duration::from_secs(10));
+    migrate::apply(&settings, &migrate::MIGRATIONS[..25])
+        .await
+        .unwrap();
+    let mut owner = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut owner).await;
+    let admin =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    authz_store::make_admin(&mut owner, &admin).await;
+    let alice =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let alice_scope = authz_runs::personal_of(&db, &alice).await;
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 100000)",
+        )
+        .await
+        .unwrap();
+    // Fresh 0 -> 25 already starts with metering_enforced = true; capture its original timestamp.
+    let (metering_before, original_metering_at): (bool, String) = sqlx::query_as(
+        "SELECT metering_enforced, metering_enforced_at::text
+           FROM openmettle.quota_enforcement
+          WHERE id",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert!(metering_before);
+
+    // Apply migration 0026: overrides_enforced MUST start false even though metering_enforced
+    // was already true on schema 25.
+    migrate::apply(&settings, migrate::MIGRATIONS)
+        .await
+        .unwrap();
+    let pre_flags: (bool, bool, Option<String>) = sqlx::query_as(
+        "SELECT metering_enforced, overrides_enforced, overrides_enforced_at::text
+           FROM openmettle.quota_enforcement
+          WHERE id",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(pre_flags, (true, false, None));
+
+    let dir = Dir::new();
+    std::fs::create_dir(dir.path("artifacts")).unwrap();
+    let mut doc = auth_config_support::document_v2_native(&dir, &Ca::new().pem());
+    doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+    let mut catalog: Value =
+        serde_json::from_slice(include_bytes!("../fixtures/conversation-catalog-v1.json")).unwrap();
+    catalog["models"]["a"]["pin"]["provider"] = "synthetic-sglang".into();
+    doc["catalog_file"] = json!(dir.write("catalog.json", &serde_json::to_vec(&catalog).unwrap()));
+    doc["admission_limits"] = json!({
+        "live_per_actor": 4,
+        "live_per_scope": 8,
+        "queued_in_instance": 32,
+        "queue_timeout_seconds": 300,
+        "round_cap": 10
+    });
+    let api = Api::configured(&db, dir, doc, 4);
+    let admin_tok = native(&db, &admin, 1).await;
+    let admin_n = As::Native(&admin_tok);
+
+    // 1. HTTP PUT /v1/admin/scopes/{scope}/quotas/live_runs_per_actor MUST fail with 503 provisioning.
+    let (status, gated_body) = api.call(
+        admin_n,
+        "PUT",
+        &format!("/v1/admin/scopes/{alice_scope}/quotas/live_runs_per_actor"),
+        Some("rr17-gated-http"),
+        Some(&json!({"hard_limit": "0", "reason": "must refuse before 26 rollout activation"})),
+    );
+    assert_eq!(status, 503, "{gated_body}");
+    assert_eq!(gated_body["code"], "provisioning");
+    assert!(validate_openapi_schema(
+        "#/components/schemas/Problem",
+        &gated_body
+    ));
+
+    // 2. Direct Rust store call MUST fail with UpgradeNotEnforced.
+    let mut api_c = connect(&db.0, API).await;
+    let ctx = AuditContext {
+        actor_user_id: &admin.user,
+        actor_approval_id: &admin.approval,
+        now_ms: authz_store::NOW,
+        request_key: "rr17-gated-store",
+        reason: "must refuse before 26 rollout activation",
+    };
+    assert!(matches!(
+        quotas::set_scope_override(
+            &mut api_c,
+            &ctx,
+            &alice_scope,
+            QuotaResourceKind::LiveRunsPerActor,
+            0,
+            None,
+        )
+        .await,
+        Err(QuotaError::UpgradeNotEnforced)
+    ));
+
+    // 3. Defense-in-depth SQL helpers MUST raise OMQ06 directly as openmettle_api.
+    let sql_upsert = sqlx::query(
+        "SELECT openmettle.quota_upsert_scope_override(
+             $1::uuid, $2::uuid, 'live_runs_per_actor', 0, NULL, 'direct-sql-check', NULL, NULL
+         )",
+    )
+    .bind(&alice_scope)
+    .bind(&admin.user)
+    .execute(&mut api_c)
+    .await;
+    assert_eq!(sqlstate(sql_upsert), "OMQ06");
+    let sql_revoke = sqlx::query(
+        "SELECT openmettle.quota_revoke_scope_override(
+             $1::uuid, $2::uuid, 'live_runs_per_actor', 'direct-sql-revoke', NULL, NULL
+         )",
+    )
+    .bind(&alice_scope)
+    .bind(&admin.user)
+    .execute(&mut api_c)
+    .await;
+    assert_eq!(sqlstate(sql_revoke), "OMQ06");
+
+    // 4. Run the real `openmettle-admin quota activate` binary: preserves original metering_enforced_at,
+    //    flips overrides_enforced = true, stays idempotent on rerun, and remains write-once (OMQ04).
+    for _ in 0..2 {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_openmettle-admin"));
+        scrub_env(&mut cmd);
+        let out = cmd
+            .env("OPENMETTLE_ADMIN_DATABASE_URL", db.url(OWNER))
+            .args(["quota", "activate"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+    let (post_metering, post_metering_at, post_overrides, post_overrides_at): (
+        bool,
+        String,
+        bool,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT metering_enforced, metering_enforced_at::text, overrides_enforced, overrides_enforced_at::text
+           FROM openmettle.quota_enforcement
+          WHERE id",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert!(post_metering);
+    assert_eq!(post_metering_at, original_metering_at);
+    assert!(post_overrides);
+    assert!(post_overrides_at.is_some());
+
+    let revert = owner
+        .execute("UPDATE openmettle.quota_enforcement SET overrides_enforced = false WHERE id")
+        .await;
+    assert_eq!(sqlstate(revert), "OMQ04");
+
+    // 5. After activation, HTTP ManageQuotas write succeeds cleanly with 200 OK.
+    let updated = success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{alice_scope}/quotas/live_runs_per_actor"),
+            Some("rr17-gated-http"),
+            Some(&json!({"hard_limit": "0", "reason": "allowed after 26 rollout activation"})),
+        ),
+        200,
+    );
+    assert_eq!(updated["hard_limit"], "0");
+    assert_eq!(updated["revision"], "1");
 }
 
 #[path = "run_events_http.rs"]

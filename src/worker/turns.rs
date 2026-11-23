@@ -539,6 +539,11 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                                 &self.pool,
                                 &metered.keys,
                                 metered.device_grant_id.as_deref(),
+                                |dispatch| {
+                                    billable
+                                        .validate_dispatch(dispatch, &prepared)
+                                        .map_err(|_| crate::authz::gateway::Error::Protection)
+                                },
                             )
                             .await
                         {
@@ -564,9 +569,6 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 billable
                     .send_prepared(
                         dispatch,
-                        &self.catalog,
-                        &config.effective,
-                        &request,
                         prepared,
                         Some(RunStop::from_worker(run, cx.stop.clone())),
                         |_| async {},
