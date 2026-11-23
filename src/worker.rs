@@ -1,4 +1,5 @@
 //! Cooperative, fenced worker execution and scheduled maintenance (ADR 0033).
+pub mod config;
 pub mod turns;
 
 use crate::{

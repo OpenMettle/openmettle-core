@@ -965,6 +965,7 @@ mod live_turns {
     };
     use serde_json::{Value, json};
     use std::{
+        net::IpAddr,
         path::{Path, PathBuf},
         sync::OnceLock,
     };
@@ -982,6 +983,8 @@ mod live_turns {
         }
     }
     struct Provider {
+        host: String,
+        ip: IpAddr,
         port: u16,
         ca: Ca,
         requests: mpsc::Receiver<ModelRequest>,
@@ -991,12 +994,41 @@ mod live_turns {
             Self::with_bearer("synthetic-turn-credential".into()).await
         }
         async fn with_bearer(expected_bearer: String) -> Self {
+            let loopback = IpAddr::from([127, 0, 0, 1]);
+            Self::on("provider.example.test", loopback, expected_bearer).await
+        }
+        /// The packaged worker's transport refuses loopback (ADR 0010), so its gateway listens
+        /// on the one private address `TEST_GATEWAY_HOST` resolves to through the system
+        /// resolver. CI assigns that address to the loopback interface and names it in
+        /// `/etc/hosts`; the worker opts in to exactly that address.
+        async fn packaged(expected_bearer: &str) -> Self {
+            let host = std::env::var("TEST_GATEWAY_HOST")
+                .expect("TEST_GATEWAY_HOST must name a private address of this host");
+            let mut ips: Vec<IpAddr> = std::net::ToSocketAddrs::to_socket_addrs(&(&*host, 0))
+                .expect("TEST_GATEWAY_HOST resolves")
+                .map(|a| a.ip())
+                .collect();
+            ips.sort();
+            ips.dedup();
+            let [ip] = ips[..] else {
+                panic!("TEST_GATEWAY_HOST must resolve to exactly one address")
+            };
+            Self::on(&host, ip, expected_bearer.into()).await
+        }
+        fn authority(&self) -> String {
+            format!("{}:{}", self.host, self.port)
+        }
+        fn private_range(&self) -> String {
+            let prefix = if self.ip.is_ipv4() { 32 } else { 128 };
+            format!("{}/{prefix}", self.ip)
+        }
+        async fn on(host: &str, ip: IpAddr, expected_bearer: String) -> Self {
             use http_body_util::{BodyExt, Full};
             use hyper::{Response, server::conn::http1, service::service_fn};
             use hyper_util::rt::TokioIo;
             let expected_header = Arc::new(format!("Bearer {expected_bearer}"));
             let ca = Ca::new();
-            let identity = ca.leaf("provider.example.test", false);
+            let identity = ca.leaf(host, false);
             let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
                 rustls::crypto::ring::default_provider(),
             ))
@@ -1006,9 +1038,7 @@ mod live_turns {
             .with_single_cert(identity.chain, identity.key)
             .unwrap();
             let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
-            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-                .await
-                .unwrap();
+            let listener = tokio::net::TcpListener::bind((ip, 0)).await.unwrap();
             let port = listener.local_addr().unwrap().port();
             let (send, requests) = mpsc::channel(4);
             tokio::spawn(async move {
@@ -1059,7 +1089,13 @@ mod live_turns {
                     });
                 }
             });
-            Self { port, ca, requests }
+            Self {
+                host: host.into(),
+                ip,
+                port,
+                ca,
+                requests,
+            }
         }
         async fn request(&mut self) -> ModelRequest {
             tokio::time::timeout(Duration::from_secs(15), self.requests.recv())
@@ -1102,6 +1138,104 @@ mod live_turns {
                 .next()
                 .expect("library test executable")
         })
+    }
+
+    /// A packaged worker process and its probe address.
+    struct Packaged {
+        process: Process,
+        bind: String,
+    }
+
+    /// The packaged `openmettle-worker` binary with one run slot and a version-1 inference
+    /// document (ADR 0043) routing every catalog model to `provider` under the given gateway
+    /// installation and unseal key, plus `settings` under its prefix. Only the gateway's own
+    /// address is opted in, and its routes accept the fixture's inline images.
+    fn packaged_worker(
+        db: &TestDb,
+        dir: &Dir,
+        catalog: &Value,
+        provider: &Provider,
+        installation: &str,
+        (key_id, key_bytes): (&str, [u8; 32]),
+        settings: &[(&str, &str)],
+    ) -> Packaged {
+        let mut document = crate::auth_config_support::inference_document(
+            dir,
+            catalog,
+            &provider.ca.pem(),
+            &provider.authority(),
+        );
+        document["installation"] = json!(installation);
+        document["gateway_keys"] = json!({
+            "active": {"id": key_id, "path": dir.write("gateway-key", &key_bytes)},
+            "decrypt_only": []
+        });
+        for route in document["routes"].as_object_mut().unwrap().values_mut() {
+            route["private_cidrs"] = json!([provider.private_range()]);
+            route["images"] = json!(true);
+        }
+        let bind = address();
+        let mut command = binary("worker");
+        command
+            .env("OPENMETTLE_WORKER_DATABASE_URL", db.url(WORKER))
+            .env("OPENMETTLE_WORKER_BIND", &bind)
+            .env(
+                "OPENMETTLE_WORKER_INFERENCE_CONFIG",
+                dir.write("inference.json", document.to_string().as_bytes()),
+            );
+        for (key, value) in [
+            ("RUN_SLOTS", "1"),
+            ("LEASE_MS", "30000"),
+            ("EXECUTION_TIMEOUT_MS", "180000"),
+            ("EXECUTING_PER_ACTOR", "1"),
+            ("EXECUTING_PER_SCOPE", "1"),
+            ("POLL_MS", "100"),
+        ]
+        .into_iter()
+        .chain(settings.iter().copied())
+        {
+            command.env(format!("OPENMETTLE_WORKER_{key}"), value);
+        }
+        Packaged {
+            process: Process(command.spawn().unwrap()),
+            bind,
+        }
+    }
+
+    fn sigterm(process: &Process) {
+        let pid = process.0.id().to_string();
+        let sent = Command::new("kill").args(["-TERM", &pid]).status();
+        assert!(sent.unwrap().success());
+    }
+
+    /// The exit status and complete stderr. This function owns the child throughout: past the
+    /// deadline the panic drops the guard, which kills and reaps it, so a stuck worker fails
+    /// the test instead of hanging it. The default 5-second shutdown budget bounds a healthy
+    /// exit; the margin absorbs a loaded runner.
+    async fn exited(mut process: Process) -> (std::process::ExitStatus, String) {
+        let mut pipe = process.0.stderr.take().unwrap();
+        let stderr = tokio::task::spawn_blocking(move || {
+            let mut text = String::new();
+            let _ = pipe.read_to_string(&mut text);
+            text
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = process.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker outlived its shutdown budget"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        (status, stderr.await.unwrap())
+    }
+
+    async fn terminate(process: Process) -> (std::process::ExitStatus, String) {
+        sigterm(&process);
+        exited(process).await
     }
 
     struct Chat {
@@ -1445,6 +1579,30 @@ mod live_turns {
                 "artifacts":self.artifacts,"stop_during_observation":self.stop_during_observation,"metered":metered})).unwrap();
             writeln!(input).unwrap();
             Process(child)
+        }
+
+        async fn start_packaged(
+            &self,
+            provider: &Provider,
+            dir: &Dir,
+            settings: &[(&str, &str)],
+        ) -> Packaged {
+            let (installation, key_id, key_bytes) = self.ensure_metered_gateway().await;
+            let root = self
+                .artifacts
+                .as_ref()
+                .map(|p| p.to_str().unwrap().to_owned());
+            let mut settings = settings.to_vec();
+            settings.extend(root.as_deref().map(|root| ("ARTIFACTS_DIR", root)));
+            packaged_worker(
+                &self.f.db,
+                dir,
+                &self.catalog,
+                provider,
+                &installation,
+                (&key_id, key_bytes),
+                &settings,
+            )
         }
 
         async fn done(&self, run: &str, state: &str, reason: Option<&str>) {
@@ -2268,6 +2426,251 @@ mod live_turns {
                 assert_ne!(head, Some(input));
             }
         }
+    }
+
+    /// ADR 0033 shutdown through the packaged binary (ADR 0043): SIGTERM during a sent metered
+    /// round closes the gateway request, keeps answering probes while the run drains, hands the
+    /// lease back and exits 0. A replacement reclaims without waiting for expiry and sends the
+    /// next round under a new request ID; the handed-off round is never replayed.
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18, synthetic TLS gateway and TEST_GATEWAY_HOST"]
+    async fn packaged_worker_hands_off_on_sigterm_and_a_replacement_completes() {
+        let chat = Chat::new().await;
+        let mut provider = Provider::packaged("synthetic-turn-credential").await;
+        let (id, input) = chat.submit("packaged handoff", "a", 2).await;
+        let dir = Dir::new();
+        let first = chat.start_packaged(&provider, &dir, &[]).await;
+        let mut sent = provider.request().await;
+        assert_eq!(sent.path, "/v1/chat/completions");
+        let sent_id = sent.request_id.take().expect("metered round x-request-id");
+        // Hold the run row briefly (under the 2-second lock timeout) so the handoff waits
+        // inside the drain while the probe runs.
+        let mut holder = connect(&chat.f.db.0, OWNER).await;
+        let mut hold = holder.begin().await.unwrap();
+        sqlx::query("SELECT FROM openmettle.runs WHERE id = $1::uuid FOR NO KEY UPDATE")
+            .bind(&id)
+            .execute(&mut *hold)
+            .await
+            .unwrap();
+        sigterm(&first.process);
+        tokio::time::timeout(Duration::from_secs(5), sent.reply.closed())
+            .await
+            .expect("stopped worker closed its gateway request");
+        // A server left unpolled during the drain would answer only after it, past the
+        // handoff's lock wait. Time the exchange alone, from connect to the last response
+        // byte, so the test's own scheduling is not charged to the worker. The row stays
+        // locked until the response has arrived.
+        let bind = first.bind.clone();
+        let probe = tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
+            (http_status(&bind, "/healthz"), started.elapsed())
+        });
+        let (status, waited) = probe.await.unwrap();
+        assert_eq!(status.as_deref(), Some("HTTP/1.1 200 OK"));
+        assert!(waited < Duration::from_secs(1), "probe waited {waited:?}");
+        hold.rollback().await.unwrap();
+        let (status, stderr) = exited(first.process).await;
+        assert!(status.success(), "{stderr}");
+        assert!(!stderr.contains("synthetic-turn-credential"), "{stderr}");
+        let (state, due): (String, bool) = sqlx::query_as(
+            "SELECT state, lease_expires_at <= clock_timestamp() FROM openmettle.runs
+              WHERE id = $1::uuid",
+        )
+        .bind(&id)
+        .fetch_one(&mut worker(&chat.f.db).await)
+        .await
+        .unwrap();
+        assert_eq!((state.as_str(), due), ("running", true));
+        assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
+        let _replacement = chat.start_packaged(&provider, &dir, &[]).await;
+        let mut next = provider.request().await;
+        let next_id = next.request_id.take().expect("metered round x-request-id");
+        next.respond(completion(
+            json!("after handoff"),
+            None,
+            json!({"prompt_tokens": 9, "completion_tokens": 3}),
+        ));
+        chat.done(&id, "succeeded", None).await;
+        let (messages, turns, parts, head) = chat.graph().await;
+        assert_eq!((messages, turns, parts), (2, 2, 2));
+        let mut owner = connect(&chat.f.db.0, OWNER).await;
+        let counts: (Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT input_count, output_count FROM openmettle.message_turns
+              WHERE message_id = $1::uuid",
+        )
+        .bind(head)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(counts, (Some(9), Some(3)));
+        let rounds: Vec<(i32, String, String)> = sqlx::query_as(
+            "SELECT round, id::text, state FROM openmettle.gateway_requests
+              WHERE run_id = $1::uuid ORDER BY round",
+        )
+        .bind(&id)
+        .fetch_all(&mut owner)
+        .await
+        .unwrap();
+        let handed_off = String::from("handed_off");
+        assert_eq!(
+            rounds,
+            [(1, sent_id, handed_off.clone()), (2, next_id, handed_off)]
+        );
+        let formats: Vec<String> = events(&chat.f.db, &id)
+            .await
+            .into_iter()
+            .map(|e| e.2)
+            .collect();
+        assert!(
+            formats.iter().any(|f| f == "openmettle.run-reclaimed"),
+            "{formats:?}"
+        );
+    }
+
+    /// ADR 0033 crash recovery through the packaged binary: after SIGKILL during a sent round
+    /// the dead holder's lease still excludes a replacement, which meanwhile claims and
+    /// finishes another run. Once the lease is due, the replacement reclaims the run and
+    /// fails it at its exhausted round budget instead of replaying the round.
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18, synthetic TLS gateway and TEST_GATEWAY_HOST"]
+    async fn packaged_worker_crash_waits_for_the_lease_and_never_replays_a_sent_round() {
+        let chat = Chat::new().await;
+        let mut provider = Provider::packaged("synthetic-turn-credential").await;
+        let (id, input) = chat.submit("packaged crash", "a", 1).await;
+        let dir = Dir::new();
+        let crashed = chat.start_packaged(&provider, &dir, &[]).await;
+        let mut sent = provider.request().await;
+        let holder = || async {
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT state, claim_token::text FROM openmettle.runs WHERE id = $1::uuid",
+            )
+            .bind(&id)
+            .fetch_one(&mut worker(&chat.f.db).await)
+            .await
+            .unwrap()
+        };
+        let claimed = holder().await;
+        assert_eq!(claimed.0, "running");
+        drop(crashed); // SIGKILL and wait: no drain, handoff or settlement.
+        tokio::time::timeout(Duration::from_secs(5), sent.reply.closed())
+            .await
+            .expect("killed worker disconnected");
+        // An eligible run the replacement can claim beside the live lease. Its synthetic
+        // snapshot fails the step before any gateway call, so the claim cycle ends at once.
+        let other = chat.f.admit("claim cycle under a live lease").await;
+        let limits = [("EXECUTING_PER_ACTOR", "2"), ("EXECUTING_PER_SCOPE", "2")];
+        let _replacement = chat.start_packaged(&provider, &dir, &limits).await;
+        // Each claim cycle tries `reclaim_next` before `claim_next`, so a finished second run
+        // shows the replacement checked the live lease at least once.
+        let mut c = worker(&chat.f.db).await;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let state: String =
+                    sqlx::query_scalar("SELECT state FROM openmettle.runs WHERE id=$1::uuid")
+                        .bind(&other)
+                        .fetch_one(&mut c)
+                        .await
+                        .unwrap();
+                if queue::is_terminal(&state) {
+                    break assert_eq!(state, "failed");
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("replacement finished a claim cycle");
+        let claimed_other = events(&chat.f.db, &other)
+            .await
+            .iter()
+            .any(|e| e.2 == "openmettle.run-claimed");
+        assert!(claimed_other);
+        // With one round a stolen claim would send nothing, so check the claim itself.
+        assert!(
+            provider.requests.try_recv().is_err(),
+            "dispatch under a live lease"
+        );
+        assert_eq!(holder().await, claimed, "replacement took a live lease");
+        let reclaimed = events(&chat.f.db, &id)
+            .await
+            .iter()
+            .any(|e| e.2 == "openmettle.run-reclaimed");
+        assert!(!reclaimed, "replacement reclaimed a live lease");
+        owner_exec(
+            &chat.f.db,
+            "UPDATE openmettle.runs SET lease_expires_at=clock_timestamp() WHERE id=$1::uuid",
+            &id,
+        )
+        .await;
+        chat.done(&id, "failed", Some("round_limit")).await;
+        assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
+        assert!(provider.requests.try_recv().is_err());
+    }
+
+    /// Prompt assembly reads an image attachment on the connection it already holds, so the
+    /// smallest pool the worker accepts serves an image turn, and a sweep settles other work
+    /// on that same connection while the image round is open at the gateway.
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18, synthetic TLS gateway and TEST_GATEWAY_HOST"]
+    async fn packaged_worker_reads_an_image_turn_on_a_single_connection_pool() {
+        let dir = Dir::new();
+        let (chat, _, _, revision) = shared_image_chat(&dir).await;
+        let mut provider = Provider::packaged("synthetic-turn-credential").await;
+        let parts = [Part::Text("describe".into()), Part::Attachment(revision)];
+        let (id, _) = chat.submit_parts("single connection", "a", 1, &parts).await;
+        let worker_dir = Dir::new();
+        let settings = [("DB_MAX_CONNECTIONS", "1"), ("SWEEP_MS", "1000")];
+        let packaged = chat.start_packaged(&provider, &worker_dir, &settings).await;
+        let sent = provider.request().await;
+        assert_eq!(
+            sent.body["messages"].as_array().unwrap().last().unwrap()["content"],
+            json!([
+                {"type":"text","text":"describe"}, {"type":"image_url","image_url":{"url":"data:image/png;base64,cGl4ZWxz"}}
+            ])
+        );
+        // The one slot is busy, so only the queue sweep can settle this overdue run.
+        let overdue = request(
+            &chat.f.db,
+            &chat.f.scope,
+            "project",
+            &chat.f.actor,
+            "overdue",
+        )
+        .await;
+        let overdue = admitted(&chat.f.db, &overdue).await;
+        owner_exec(
+            &chat.f.db,
+            "UPDATE openmettle.runs SET queue_expires_at=clock_timestamp() WHERE id=$1::uuid",
+            &overdue,
+        )
+        .await;
+        let mut c = worker(&chat.f.db).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let state: String =
+                    sqlx::query_scalar("SELECT state FROM openmettle.runs WHERE id=$1::uuid")
+                        .bind(&overdue)
+                        .fetch_one(&mut c)
+                        .await
+                        .unwrap();
+                if state != "queued" {
+                    break assert_eq!(state, "failed");
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("a sweep settled the overdue run on the single connection");
+        let expired = events(&chat.f.db, &overdue)
+            .await
+            .iter()
+            .any(|e| e.2 == "openmettle.run-expired");
+        assert!(expired);
+        assert!(!sent.reply.is_closed(), "the image round was still open");
+        sent.respond(completion(json!("image received"), None, Value::Null));
+        chat.done(&id, "succeeded", None).await;
+        let (status, stderr) = terminate(packaged.process).await;
+        assert!(status.success(), "{stderr}");
+        assert!(!stderr.contains("worker.sweep.failed"), "{stderr}");
     }
 
     #[tokio::test]
@@ -4205,6 +4608,18 @@ mod live_turns {
     #[tokio::test]
     #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
     async fn metered_turn_dispatches_cost_bound_settles_and_releases_unused_rounds() {
+        metered_turn_scenario(false).await;
+    }
+
+    /// ADR 0043: the same admission, quota holds, wire correlation, usage settlement and drift
+    /// check with the packaged binary configured only through its environment and documents.
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18, synthetic TLS gateway and TEST_GATEWAY_HOST"]
+    async fn packaged_worker_dispatches_a_metered_turn_and_settles_its_usage() {
+        metered_turn_scenario(true).await;
+    }
+
+    async fn metered_turn_scenario(packaged: bool) {
         use crate::authz_http::{Api, As, browser, success};
         use openmettle_core::{
             authz::gateway::settlement,
@@ -4394,42 +4809,51 @@ mod live_turns {
         assert_eq!(q_before["usage"][1]["reserved_held"], "900");
         assert_eq!(q_before["usage"][1]["remaining"], "100");
 
-        // Start real TurnExecutor worker with Route::metered against loopback TLS Provider.
-        let mut provider = Provider::with_bearer("metered-round-token".into()).await;
-        let mut child = Command::new(worker_binary())
-            .env("OPENMETTLE_TEST_TURN_WORKER", "1")
-            .args([
-                "--ignored",
-                "--exact",
-                "worker::turns::schema_fixture::worker_process",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()
+        // Start a real TurnExecutor worker with Route::metered against the TLS gateway: the
+        // packaged binary, or the library test fixture with its loopback resolver.
+        let worker_dir = Dir::new();
+        let (mut provider, worker_proc) = if packaged {
+            let provider = Provider::packaged("metered-round-token").await;
+            let key = ("metered-k1", KEY_BYTES);
+            let worker = packaged_worker(&db, &worker_dir, &catalog, &provider, INSTALL, key, &[]);
+            (provider, worker.process)
+        } else {
+            let provider = Provider::with_bearer("metered-round-token".into()).await;
+            let mut child = Command::new(worker_binary())
+                .env("OPENMETTLE_TEST_TURN_WORKER", "1")
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "worker::turns::schema_fixture::worker_process",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap();
+            let stdin = child.stdin.as_mut().unwrap();
+            serde_json::to_writer(
+                &mut *stdin,
+                &json!({
+                    "database": db.url(WORKER),
+                    "catalog": catalog,
+                    "tools": false,
+                    "scope": scope,
+                    "actor": alice.user,
+                    "ca": String::from_utf8(provider.ca.pem()).unwrap(),
+                    "port": provider.port,
+                    "artifacts": null,
+                    "stop_during_observation": false,
+                    "metered": {
+                        "installation": INSTALL,
+                        "key_id": "metered-k1",
+                        "key_bytes": KEY_BYTES,
+                    }
+                }),
+            )
             .unwrap();
-        let stdin = child.stdin.as_mut().unwrap();
-        serde_json::to_writer(
-            &mut *stdin,
-            &json!({
-                "database": db.url(WORKER),
-                "catalog": catalog,
-                "tools": false,
-                "scope": scope,
-                "actor": alice.user,
-                "ca": String::from_utf8(provider.ca.pem()).unwrap(),
-                "port": provider.port,
-                "artifacts": null,
-                "stop_during_observation": false,
-                "metered": {
-                    "installation": INSTALL,
-                    "key_id": "metered-k1",
-                    "key_bytes": KEY_BYTES,
-                }
-            }),
-        )
-        .unwrap();
-        writeln!(stdin).unwrap();
-        let _worker_proc = Process(child);
+            writeln!(stdin).unwrap();
+            (provider, Process(child))
+        };
 
         // Round 1 reaches TLS provider with decrypted gateway bearer AND x-request-id header;
         // feed the peer-observed x-request-id directly into settlement::ingest (proving real wire correlation).
@@ -4561,6 +4985,13 @@ mod live_turns {
             201,
         );
         assert!(next_run["run_id"].is_string());
+        if packaged {
+            // The worker may hold the second run's round in flight; SIGTERM hands it back.
+            let (status, stderr) = terminate(worker_proc).await;
+            assert!(status.success(), "{stderr}");
+            assert!(!stderr.contains("metered-round-token"), "{stderr}");
+            assert!(!stderr.contains(&provider.host), "{stderr}");
+        }
     }
 
     #[tokio::test]

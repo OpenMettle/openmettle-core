@@ -3,7 +3,7 @@
 Rust API, worker and migration processes for OpenMettle. By default, `openmettle-api` and `openmettle-worker` serve CPU-only `/healthz` and PostgreSQL `/readyz` probes and answer `404` on sign-in and `/v1/*` paths.
 
 - **`openmettle-api`**: When `OPENMETTLE_API_AUTH_CONFIG` (a version-2 settings document) and `OPENMETTLE_API_ISSUANCE_DATABASE_URL` are set, mounts same-origin browser sign-in/session/logout routes ([ADR 0025](docs/adr/0025-browser-auth-runtime-mounting.md), [ADR 0030](docs/adr/0030-session-issuance-database-boundary.md)), optional native sign-in routes (`native` profile, [ADR 0029](docs/adr/0029-native-sign-in-mounting-and-session-context.md)), and the authenticated `/v1/*` routes marked `"x-openmettle-implementation": "implemented"` in [`contracts/openapi/openmettle-v1.json`](contracts/openapi/openmettle-v1.json) (enforcing per-request authorization under [ADR 0027](docs/adr/0027-authorization-and-private-projects.md); ordinary conversation creation/reads on `POST`/`GET /v1/conversations` and `GET /v1/conversations/{conversation_id}` and branch creation/reads on `POST`/`GET /v1/conversations/{conversation_id}/branches…` require neither `catalog_file` nor `admission_limits`). Optional version-2 settings supply the model/preset catalog and enable `effective-configuration` previews (`catalog_file` only, [ADR 0036](docs/adr/0036-conversation-branches-presets-and-effective-model-config.md)), enable fresh `POST /v1/runs` admission (`catalog_file`, `admission_limits`, and `cursor_keys`, [ADR 0032](docs/adr/0032-durable-run-admission-and-fair-work-queue.md)), and enable cursor signing for fresh/replayed `POST /v1/runs`, `POST /v1/runs/{run_id}/cancel`, run snapshots, and SSE event streams (`cursor_keys`, [ADR 0034](docs/adr/0034-ordered-events-and-replayable-sse.md)); `OPENMETTLE_API_ARTIFACTS_DIR` enables streaming artifact uploads and byte-range downloads ([ADR 0031](docs/adr/0031-filesystem-artifact-storage-and-streaming-multipart.md)).
-- **`openmettle-worker`**: Runs scheduled maintenance sweeps for expired queued runs, expired approval waits (`authz::approvals::expire_waits`, [ADR 0035](docs/adr/0035-approvals-permitted-yolo-and-effect-ledger.md)), and expired executing runs ([ADR 0033](docs/adr/0033-worker-leases-deadlines-and-restart-recovery.md)), plus abandoned-upload reconciliation and retained-revision purges when `OPENMETTLE_WORKER_ARTIFACTS_DIR` is set. Live model and tool turn execution belongs to V1-07 (`provider_http::inference` provides the bounded gateway conformance adapter under [ADR 0038](docs/adr/0038-sglang-and-external-provider-conformance-adapter.md)).
+- **`openmettle-worker`**: Runs scheduled maintenance sweeps for expired queued runs, expired approval waits (`authz::approvals::expire_waits`, [ADR 0035](docs/adr/0035-approvals-permitted-yolo-and-effect-ledger.md)), and expired executing runs ([ADR 0033](docs/adr/0033-worker-leases-deadlines-and-restart-recovery.md)), plus abandoned-upload reconciliation and retained-revision purges when `OPENMETTLE_WORKER_ARTIFACTS_DIR` is set. With `OPENMETTLE_WORKER_RUN_SLOTS` and an `OPENMETTLE_WORKER_INFERENCE_CONFIG` document, it also claims queued runs and executes metered model turn rounds through the configured gateway ([ADR 0043](docs/adr/0043-packaged-worker-inference-configuration.md), [worker turn execution](#worker-turn-execution-off-by-default)). Tool rounds (V1-14) and live gateway qualification (V1-08) remain separate.
 - **`openmettle-migrate`**: One-shot PostgreSQL 18 schema migrator owning identities, scopes, projects, conversations, managed branches, immutable message turns, runs/events/operations, scoped approvals and receipts (Migration 22, [ADR 0035](docs/adr/0035-approvals-permitted-yolo-and-effect-ledger.md)), artifact revisions and storage accounting, and typed grants ([ADR 0003](docs/adr/0003-schema-migrations.md)–[ADR 0006](docs/adr/0006-grant-persistence.md)).
 
 Runtime qualification and deployment acceptance remain separate gates.
@@ -76,8 +76,9 @@ The worker sweeps expired queued runs, expired approval waits (`authz::approvals
 | `LEASE_MS` | 30,000–600,000 ms and at least six times `DB_TIMEOUT_MS` | Required with slots |
 | `EXECUTION_TIMEOUT_MS` | 60,000–86,400,000 ms and at least twice `LEASE_MS` | Required with slots |
 | `EXECUTING_PER_ACTOR`, `EXECUTING_PER_SCOPE` | 1–1,024 each | Required with slots |
+| `INFERENCE_CONFIG` | Absolute path to the worker inference document | Required with slots and refused without them |
 
-Sweep and idle poll intervals add up to 20% jitter. The binary runs maintenance only and exits 78 if slots are configured. The library accepts slots with an executor. V1-07 supplies the production executor. The API refuses worker scheduling settings.
+Sweep and idle poll intervals add up to 20% jitter. Without slots the worker runs maintenance only. With slots it also runs the turn executor described under [Worker turn execution](#worker-turn-execution-off-by-default). The API refuses every worker setting in this table.
 
 The API, worker and migrator write structured events to stderr ([ADR 0024](docs/adr/0024-process-telemetry-and-redaction.md)). The API and worker write nothing to stdout. The `configuration error:` line, the `--check-auth-config` output and the migrator's result lines keep their existing plain form. Two settings use the process's own prefix (`OPENMETTLE_API_`, `OPENMETTLE_WORKER_` or `OPENMETTLE_MIGRATE_`):
 
@@ -128,6 +129,48 @@ Unset, the process opens no directory and starts exactly as before. Set, it crea
 - **Layout.** `staging/<reservation_id>` holds an upload in progress (mode 0600, created exclusively); `revisions/<reservation_id>` holds a published payload. The name is always the server-generated reservation UUID, never a client file name, which is kept only as the revision's display name.
 - **Durability.** A payload is `fsync`ed, renamed into `revisions/` and the directory `fsync`ed before the database records the revision. Refused, truncated or cancelled uploads leave no staging file, and their reservation is released, or released later by `artifact_fs::reconcile_expired`. A crashed process before the rename leaves its orphaned staging file and reservation until that reconciler runs, and a retry with the same key returns `409 conflict` while that staging file exists; a crash after the rename into `revisions/` but before database settlement can replace the unsettled file and settle on retry. `artifact_fs::purge_due` deletes expired retained payloads before confirming the purge. When `OPENMETTLE_WORKER_ARTIFACTS_DIR` is set, `openmettle-worker` schedules both helpers in batches of 100 with a 15-second budget: `artifact_fs::reconcile_expired` releases uploads older than 900 seconds (300 s beyond the 600 s upload limit), and `artifact_fs::purge_due` removes due retained revisions.
 - **Topology.** Every API and worker replica that writes or purges payloads must see the same directory. Use a `ReadWriteOnce` volume with all those pods on one node, or a `ReadWriteMany` storage class qualified for POSIX `rename`, exclusive creation and `fsync`. Back up PostgreSQL and the volume together.
+
+### Worker turn execution (off by default)
+
+[ADR 0043](docs/adr/0043-packaged-worker-inference-configuration.md) lets `openmettle-worker` claim queued runs and execute their model rounds. Set `OPENMETTLE_WORKER_RUN_SLOTS` with the ADR 0033 lease and claim settings above, and `OPENMETTLE_WORKER_INFERENCE_CONFIG` to the absolute path of this document:
+
+```json
+{
+  "version": 1,
+  "catalog_file": "/etc/openmettle/catalog/catalog.json",
+  "installation": "00000000-0000-4000-8000-000000000001",
+  "gateway_keys": {
+    "active": {"id": "gateway-2", "path": "/etc/openmettle/gateway-keys/gateway-2"},
+    "decrypt_only": [{"id": "gateway-1", "path": "/etc/openmettle/gateway-keys/gateway-1"}]
+  },
+  "routes": {
+    "example-model": {
+      "endpoint": "https://gateway.example.test/v1/chat/completions",
+      "trust": {"roots": "bundle", "bundle_path": "/etc/openmettle/gateway-ca/ca.pem"},
+      "private_cidrs": ["10.0.0.0/8"],
+      "pin": {"provider": "…", "revision": "…", "checkpoint": "…", "template": "…",
+              "parser": "…", "runtime": "…", "gateway": "…"},
+      "protocol": "chat_completions",
+      "stream": false,
+      "images": false,
+      "usage": true,
+      "setup_timeout_milliseconds": 5000,
+      "idle_timeout_milliseconds": 120000,
+      "overall_timeout_milliseconds": 600000
+    }
+  }
+}
+```
+
+- **Catalog.** Mount the same catalog file as the API's `catalog_file`. `routes` must name exactly its model IDs, and each route's `pin` must equal that model's catalog `pin`. A changed profile therefore needs a re-qualified route before the worker starts. The packaged worker cannot serve a profile with `requires_device_slot`.
+- **Dispatch credential (provisional).** Every round reserves its budget, commits its `x-request-id` and is handed off for usage settlement ([ADR 0037](docs/adr/0037-gateway-provisioning-and-usage-reconciliation.md)). For now `installation` and `gateway_keys` feed the library's current credential path, which opens the admitted user's sealed gateway key in the handoff. `gateway_keys` reuses the API document's member format. A later gateway-authorization increment replaces both members; do not build tooling around them. The worker never reads the API's document, login keys or cursor keys.
+- **Routes.** Each endpoint follows the provider transport rules: a canonical `https://` URL with a DNS name, no loopback or metadata address, and private addresses only inside `private_cidrs`. `trust` selects the native roots or exactly one PEM bundle. `stream` selects SSE or JSON, the only mode qualified for the route. Timeouts: setup 100–30,000 ms, idle 1,000–3,600,000 ms, overall 1,000–86,400,000 ms and at least the other two.
+- **Tools.** The worker offers no tools until V1-14. A model tool call fails the turn.
+- **Refusals.** The document and every file it names are read once before telemetry, the listener or any database or network work. A refusal exits 78 with `inference configuration error: ` and one fixed category, never a value or path.
+- **Shutdown.** `SIGTERM` stops claiming and stops in-flight rounds. Probes keep answering while, within half the drain budget, each run waits at most `LEASE_MS / 6` for its step to stop and hands its lease back for immediate re-claim. A run whose handoff does not finish in time is dropped, and another worker claims it after up to `LEASE_MS` ([ADR 0033](docs/adr/0033-worker-leases-deadlines-and-restart-recovery.md)). A round already handed to the gateway still counts against the run's round budget; a reserved round that was never sent is reused. Size `SHUTDOWN_TIMEOUT_MS` and the pod's termination grace period accordingly. After `SIGKILL`, runs wait up to `LEASE_MS` before another worker can claim them.
+- **Pool.** Any accepted `DB_MAX_CONNECTIONS` works: no task waits for a second connection while holding one. Each claimed run uses at most two connections and the sweeps one, so run and maintenance work needs at most `2 × RUN_SLOTS + 1`. Each `/readyz` probe in flight needs one more, so `2 × RUN_SLOTS + 2` avoids queueing with one probe at a time. On a full pool `/readyz` waits up to `DB_TIMEOUT_MS` and answers 503 while work continues.
+
+The process contract is unchanged; deploy must set these keys, mount the files read-only and allow the worker's inference egress to the gateway endpoints, beside its existing PostgreSQL and DNS access. [Enabling worker turn execution](docs/operator/worker-turn-execution.md) is the operator checklist.
 
 ### Browser sign-in routes (off by default)
 
@@ -866,9 +909,10 @@ primary database's millisecond clock at which it was checked
 (`sessions::Context::{approval_id, observed_ms}`, [ADR 0029](docs/adr/0029-native-sign-in-mounting-and-session-context.md)).
 When `OPENMETTLE_API_AUTH_CONFIG` is configured, every authenticated `/v1` route hydrates
 the caller's principal from the primary via `authz::store::hydrate_api_principal` and
-enforces these rules per request. The `openmettle-worker` binary currently runs periodic
-maintenance sweeps and refuses `OPENMETTLE_WORKER_RUN_SLOTS`; when library callers invoke
-`worker::run` or `worker::run_with_approvals` with an `Executor`, the runner claims a run
+enforces these rules per request. The `openmettle-worker` binary runs periodic
+maintenance sweeps and, with run slots and its inference document, the turn executor
+([ADR 0043](docs/adr/0043-packaged-worker-inference-configuration.md)). When
+`worker::run` or `worker::run_with_approvals` runs an `Executor`, the runner claims a run
 first (`claim_next` / `reclaim_next`) and then rechecks current execution authority on the
 primary (`recheck_claim`) before each step and before dispatching fenced effects
 ([ADR 0027](docs/adr/0027-authorization-and-private-projects.md),

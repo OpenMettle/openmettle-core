@@ -2433,7 +2433,20 @@ fn worker_scheduling_configuration_is_validated_before_serving() {
             invoke(true, &vars, key);
         }
     }
-    invoke(true, &policy, "RUN_SLOTS requires a worker executor");
+    // ADR 0043: slots and the inference document come together, and the API refuses both.
+    invoke(true, &policy, "RUN_SLOTS requires INFERENCE_CONFIG");
+    let document = ("INFERENCE_CONFIG", "/etc/openmettle/inference.json");
+    invoke(true, &[document], "INFERENCE_CONFIG requires RUN_SLOTS");
+    for path in ["inference.json", ""] {
+        let mut vars = policy.to_vec();
+        vars.push(("INFERENCE_CONFIG", path));
+        invoke(true, &vars, "invalid INFERENCE_CONFIG");
+    }
+    invoke(
+        false,
+        &[document],
+        "worker scheduling settings are refused on the API",
+    );
     invoke(
         true,
         &policy[..1],
@@ -2456,6 +2469,103 @@ fn worker_scheduling_configuration_is_validated_before_serving() {
         vars.push(change);
         invoke(true, &vars, message);
     }
+}
+
+/// ADR 0043 through the worker binary: an invalid inference document exits 78 with one fixed
+/// line before telemetry, the listener or the database, and a valid one starts the run loop
+/// without contacting its gateway, then stops cleanly.
+#[test]
+fn worker_validates_its_inference_document_before_serving() {
+    let catalog: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/conversation-catalog-v1.json")).unwrap();
+    let policy = [
+        ("RUN_SLOTS", "2"),
+        ("LEASE_MS", "30000"),
+        ("EXECUTION_TIMEOUT_MS", "60000"),
+        ("EXECUTING_PER_ACTOR", "1"),
+        ("EXECUTING_PER_SCOPE", "1"),
+    ];
+    let (database, url) = unavailable_database();
+    database.set_nonblocking(true).unwrap();
+    let dir = auth_config_support::Dir::new();
+    let valid = auth_config_support::inference_document(
+        &dir,
+        &catalog,
+        &ca::Ca::new().pem(),
+        "canary-gateway.example.test:8443",
+    );
+    let mut cases = vec![
+        (
+            json_with(&valid, "/installation", "CANARY-installation"),
+            "gateway installation is not a canonical UUID",
+        ),
+        (
+            json_with(
+                &valid,
+                "/routes/a/endpoint",
+                "http://canary-gateway.example.test/CANARY",
+            ),
+            "an inference route endpoint, trust, address policy or timeout is invalid",
+        ),
+        (
+            json_with(&valid, "/routes/b/pin/revision", "CANARY-revision"),
+            "an inference route does not match its catalog profile",
+        ),
+        (
+            json_with(&valid, "/gateway_keys/active/path", &dir.path("CANARY-key")),
+            "gateway key files, identifiers or key separation are invalid",
+        ),
+    ];
+    let mut uncovered = valid.clone();
+    uncovered["routes"].as_object_mut().unwrap().remove("b");
+    cases.push((
+        uncovered,
+        "inference routes do not name exactly the catalog's models",
+    ));
+    for (document, message) in cases {
+        let path = dir.write("inference.json", document.to_string().as_bytes());
+        let mut child = command(true);
+        child
+            .env("OPENMETTLE_WORKER_DATABASE_URL", &url)
+            .env("OPENMETTLE_WORKER_INFERENCE_CONFIG", &path);
+        for (key, value) in policy {
+            child.env(format!("OPENMETTLE_WORKER_{key}"), value);
+        }
+        let output = child.output().unwrap();
+        assert_eq!(output.status.code(), Some(78), "{message}");
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            format!("inference configuration error: {message}\n")
+        );
+    }
+    // No refused process dialled the database.
+    assert!(database.accept().is_err());
+    let path = dir.write("inference.json", valid.to_string().as_bytes());
+    let bind = address();
+    let mut settings: Vec<(&str, &str)> = policy.to_vec();
+    settings.push(("INFERENCE_CONFIG", &path));
+    let mut process = start_logging(true, &bind, &url, &settings);
+    wait_status(&mut process, &bind, "/healthz", 200);
+    stop(&mut process, "-TERM");
+    let (stdout, stderr) = drain(&mut process);
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        !stderr.contains("CANARY") && !stderr.contains("canary"),
+        "{stderr}"
+    );
+    let events: Vec<serde_json::Value> = stderr
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.first().unwrap()["event"], "process.started");
+    assert_eq!(events.last().unwrap()["event"], "process.stopped");
+}
+
+fn json_with(document: &serde_json::Value, pointer: &str, value: &str) -> serde_json::Value {
+    let mut document = document.clone();
+    *document.pointer_mut(pointer).unwrap() = value.into();
+    document
 }
 
 #[test]

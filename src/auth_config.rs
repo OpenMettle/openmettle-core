@@ -142,29 +142,32 @@ impl std::error::Error for Error {}
 /// One JSON object. Members are taken by name; whatever remains is an unknown field. Derived
 /// Serde structs are deliberately not used: they also accept positional arrays and `null`,
 /// which would give the document more than one accepted shape.
-struct Object(Map<String, Value>);
+pub(crate) struct Object(Map<String, Value>);
 impl Object {
-    fn new(value: Value) -> Result<Self, Error> {
+    pub(crate) fn new(value: Value) -> Result<Self, Error> {
         match value {
             Value::Object(members) => Ok(Self(members)),
             _ => Err(Error::Field),
         }
     }
-    fn take(&mut self, name: &str) -> Result<Value, Error> {
+    pub(crate) fn take(&mut self, name: &str) -> Result<Value, Error> {
         self.0.remove(name).ok_or(Error::MissingField)
     }
-    fn object(&mut self, name: &str) -> Result<Self, Error> {
+    pub(crate) fn object(&mut self, name: &str) -> Result<Self, Error> {
         Self::new(self.take(name)?)
     }
-    fn string(&mut self, name: &str) -> Result<String, Error> {
+    pub(crate) fn string(&mut self, name: &str) -> Result<String, Error> {
         match self.take(name)? {
             Value::String(value) => Ok(value),
             _ => Err(Error::Field),
         }
     }
     /// A non-negative JSON integer; fractions, exponents and strings are refused.
-    fn integer(&mut self, name: &str) -> Result<u64, Error> {
+    pub(crate) fn integer(&mut self, name: &str) -> Result<u64, Error> {
         self.take(name)?.as_u64().ok_or(Error::Field)
+    }
+    pub(crate) fn boolean(&mut self, name: &str) -> Result<bool, Error> {
+        self.take(name)?.as_bool().ok_or(Error::Field)
     }
     /// [`Self::integer`] for a member that may be absent. A present `null` is refused, so the
     /// member has exactly two accepted shapes: absent, or a plain integer.
@@ -190,7 +193,7 @@ impl Object {
             _ => Err(Error::Field),
         }
     }
-    fn end(self) -> Result<(), Error> {
+    pub(crate) fn end(self) -> Result<(), Error> {
         if self.0.is_empty() {
             Ok(())
         } else {
@@ -237,12 +240,13 @@ fn shared_key_material(left: &[(String, SharedSecret)], right: &[(String, Shared
     bool::from(shared)
 }
 
-struct CursorFiles {
+/// One active key file and its previous keys: cursor keys, or the gateway unseal ring.
+pub(crate) struct CursorFiles {
     active: KeyFile,
     verify_only: Vec<KeyFile>,
 }
 impl CursorFiles {
-    fn parse(mut keys: Object, previous: &str) -> Result<Self, Error> {
+    pub(crate) fn parse(mut keys: Object, previous: &str) -> Result<Self, Error> {
         let active = KeyFile::parse(keys.take("active")?)?;
         let verify_only = keys
             .array(previous)?
@@ -254,6 +258,11 @@ impl CursorFiles {
             active,
             verify_only,
         })
+    }
+
+    /// The raw gateway unseal ring (ADR 0037): the active key first, then previous keys.
+    pub(crate) fn gateway_material(&self) -> Result<Vec<(String, SharedSecret)>, Error> {
+        key_material(&self.active, &self.verify_only).map_err(|_| Error::GatewayKeyRing)
     }
 
     fn load(
@@ -307,21 +316,7 @@ struct Provider {
 impl Provider {
     fn parse(value: Value) -> Result<Self, Error> {
         let mut provider = Object::new(value)?;
-        let mut trust = provider.object("trust")?;
-        let bundle_path = match trust.string("roots")?.as_str() {
-            "native" => None,
-            "bundle" => Some(trust.string("bundle_path")?),
-            _ => return Err(Error::Field),
-        };
-        trust.end()?;
-        let private_cidrs = provider
-            .array("private_cidrs")?
-            .into_iter()
-            .map(|range| match range {
-                Value::String(range) => Ok(range),
-                _ => Err(Error::Field),
-            })
-            .collect::<Result<_, _>>()?;
+        let (bundle_path, private_cidrs) = destination(&mut provider)?;
         let parsed = Self {
             id: provider.string("id")?,
             issuer: provider.string("issuer")?,
@@ -339,6 +334,36 @@ impl Provider {
         provider.end()?;
         Ok(parsed)
     }
+}
+
+/// The `trust` object and `private_cidrs` array of one configured HTTPS destination: `None`
+/// selects the native roots, a path exactly one PEM bundle (ADR 0010).
+pub(crate) fn destination(object: &mut Object) -> Result<(Option<String>, Vec<String>), Error> {
+    let mut trust = object.object("trust")?;
+    let bundle_path = match trust.string("roots")?.as_str() {
+        "native" => None,
+        "bundle" => Some(trust.string("bundle_path")?),
+        _ => return Err(Error::Field),
+    };
+    trust.end()?;
+    let private_cidrs = object
+        .array("private_cidrs")?
+        .into_iter()
+        .map(|range| match range {
+            Value::String(range) => Ok(range),
+            _ => Err(Error::Field),
+        })
+        .collect::<Result<_, _>>()?;
+    Ok((bundle_path, private_cidrs))
+}
+
+/// Reads a configured PEM trust bundle within the transport's ceiling.
+pub(crate) fn trust_bundle(path: &str) -> Result<Vec<u8>, Error> {
+    read(
+        Path::new(path),
+        MAX_TRUST_BUNDLE_BYTES,
+        Error::TrustBundleFile,
+    )
 }
 
 /// The version-2 browser-routing profile (ADR 0020): one selected provider, the application
@@ -658,7 +683,7 @@ pub(crate) fn read_bounded(path: &Path, limit: usize) -> Option<Vec<u8>> {
 /// directory is never opened), checked again on the opened handle, and the read is capped.
 /// Ownership and mode are not inspected, and a writer racing in the same directory is not
 /// defended against: the directories must be deployment-owned.
-fn read(path: &Path, limit: usize, refusal: Error) -> Result<Vec<u8>, Error> {
+pub(crate) fn read(path: &Path, limit: usize, refusal: Error) -> Result<Vec<u8>, Error> {
     if !path.is_absolute() {
         return Err(Error::Path);
     }
@@ -700,6 +725,22 @@ fn key_material(
             Ok((key.id.clone(), bytes))
         })
         .collect()
+}
+
+/// The model catalog file shared by the API and the worker (ADR 0036).
+pub(crate) fn catalog(path: &str) -> Result<crate::model_config::Catalog, Error> {
+    crate::model_config::Catalog::load(&read(Path::new(path), MAX_CONFIG_BYTES, Error::Catalog)?)
+        .map_err(|_| Error::Catalog)
+}
+
+/// Unseal-only gateway keys from validated ring material (ADR 0037).
+pub(crate) fn gateway_keys(
+    material: &[(String, SharedSecret)],
+) -> Result<provider_keys::gateway::GatewayKeys, Error> {
+    provider_keys::gateway::GatewayKeys::from_bytes(
+        material.iter().map(|(id, key)| (id, key.secret_bytes())),
+    )
+    .map_err(|_| Error::GatewayKeyRing)
 }
 
 /// Everything the browser-auth runtime needs, constructed together or not at all. The manager
@@ -826,9 +867,7 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
     let gateway_material = document
         .gateway_keys
         .as_ref()
-        .map(|files| {
-            key_material(&files.active, &files.verify_only).map_err(|_| Error::GatewayKeyRing)
-        })
+        .map(CursorFiles::gateway_material)
         .transpose()?;
     let gateway_keys = gateway_material
         .as_deref()
@@ -836,10 +875,7 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
             if shared_key_material(gateway, &material) {
                 return Err(Error::GatewayKeyRing);
             }
-            provider_keys::gateway::GatewayKeys::from_bytes(
-                gateway.iter().map(|(id, key)| (id, key.secret_bytes())),
-            )
-            .map_err(|_| Error::GatewayKeyRing)
+            gateway_keys(gateway)
         })
         .transpose()?;
     let cursor_keys = document
@@ -873,13 +909,7 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
         let bundle = provider
             .bundle_path
             .as_deref()
-            .map(|path| {
-                read(
-                    Path::new(path),
-                    MAX_TRUST_BUNDLE_BYTES,
-                    Error::TrustBundleFile,
-                )
-            })
+            .map(trust_bundle)
             .transpose()?;
         let ranges: Vec<&str> = provider.private_cidrs.iter().map(String::as_str).collect();
         let config = ProviderConfig::new(
@@ -910,18 +940,7 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
         .native
         .map(|profile| profile.check(&providers, browser.as_ref()))
         .transpose()?;
-    let catalog = document
-        .catalog_file
-        .as_deref()
-        .map(|path| {
-            crate::model_config::Catalog::load(&read(
-                Path::new(path),
-                MAX_CONFIG_BYTES,
-                Error::Catalog,
-            )?)
-            .map_err(|_| Error::Catalog)
-        })
-        .transpose()?;
+    let catalog = document.catalog_file.as_deref().map(catalog).transpose()?;
     Ok(AuthConfig {
         catalog,
         admission_limits: document.admission_limits,

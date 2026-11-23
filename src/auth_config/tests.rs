@@ -1229,6 +1229,25 @@ async fn offline_outcomes_match_the_handoff_and_router_constructors() {
 
 /// Serving (ADR 0025) takes the same loader and additionally requires the profile. Version 1
 /// stays valid for the offline check, and every loader refusal passes through unchanged.
+/// The API and the worker load one catalog file; both refuse a repeated model (ADR 0043).
+#[test]
+fn catalog_file_refuses_a_repeated_model() {
+    let mut fixture = Fixture::v2();
+    let catalog: Value = serde_json::from_slice(include_bytes!(
+        "../../tests/fixtures/conversation-catalog-v1.json"
+    ))
+    .unwrap();
+    let text = catalog.to_string();
+    fixture.document["catalog_file"] = json!(fixture.dir.write("catalog.json", text.as_bytes()));
+    assert!(fixture.load().unwrap().catalog.is_some());
+    let mut other = catalog["models"]["a"].clone();
+    other["pin"]["revision"] = json!("profile-a/2");
+    let repeated = support::repeated(&text, "models", "a", &other.to_string());
+    fixture.document["catalog_file"] =
+        json!(fixture.dir.write("catalog.json", repeated.as_bytes()));
+    assert_eq!(refusal(fixture.load()), Error::Catalog);
+}
+
 #[test]
 fn serving_load_requires_the_version_2_profile() {
     let v2 = Fixture::v2();

@@ -19,8 +19,7 @@ use http_body_util::BodyExt;
 use hyper::body::{Frame, SizeHint};
 use rustix::fs::{self as at, AtFlags, Mode, OFlags};
 use sha2::{Digest as _, Sha256};
-use sqlx::PgPool;
-use sqlx::Row;
+use sqlx::{PgConnection, PgPool, Row};
 use std::{
     fmt, fs,
     future::Future,
@@ -150,11 +149,20 @@ impl Store {
     // acquisition and publication may proceed without sentinels.
     async fn prepare(&self, pool: &PgPool, bootstrap: bool) -> Result<Option<String>, Error> {
         self.attach(pool);
+        self.prepare_on(&mut *pool.acquire().await?, bootstrap)
+            .await
+    }
+    /// [`Self::prepare`] on a connection the caller holds.
+    async fn prepare_on(
+        &self,
+        c: &mut PgConnection,
+        bootstrap: bool,
+    ) -> Result<Option<String>, Error> {
         self.volume.recheck()?;
         let (pin,auto,adopting,empty):(Option<String>,bool,bool,bool)=sqlx::query_as(
             "SELECT volume_id::text,bootstrap_auto_pin_allowed,adoption_run_id IS NOT NULL,
              NOT EXISTS (SELECT FROM openmettle.storage_reservations) AND NOT EXISTS (SELECT FROM openmettle.artifact_revisions)
-             FROM openmettle.storage_volume_control WHERE id").fetch_one(pool).await?;
+             FROM openmettle.storage_volume_control WHERE id").fetch_one(&mut *c).await?;
         if adopting {
             return Err(Error::Io);
         }
@@ -164,12 +172,12 @@ impl Store {
         }
         if auto && bootstrap && empty {
             let id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
-                .fetch_one(pool)
+                .fetch_one(&mut *c)
                 .await?;
             let id = self.volume.publish_identity(&id)?;
             sqlx::query("SELECT openmettle.storage_pin_volume_id($1::uuid)")
                 .bind(&id)
-                .execute(pool)
+                .execute(&mut *c)
                 .await?;
             return Ok(Some(id));
         }
@@ -222,19 +230,32 @@ impl Store {
         start: u64,
         len: u64,
     ) -> Result<Content, Error> {
+        let pool = self.pool.get().ok_or(Error::Io)?;
+        self.read_on(&mut *pool.acquire().await?, reservation, size, start, len)
+            .await
+    }
+    /// [`Self::read`] on a connection the caller already holds, such as worker prompt
+    /// assembly, which must not wait for a second connection from its own pool.
+    pub(crate) async fn read_on(
+        &self,
+        c: &mut PgConnection,
+        reservation: &str,
+        size: i64,
+        start: u64,
+        len: u64,
+    ) -> Result<Content, Error> {
         runs::uuid(reservation)?;
         let size = u64::try_from(size).map_err(|_| Error::Missing)?;
         if start.checked_add(len).is_none_or(|end| end > size) {
             return Err(Error::Missing);
         }
-        let pool = self.pool.get().ok_or(Error::Io)?;
-        let pin = self.prepare(pool, false).await?;
+        let pin = self.prepare_on(c, false).await?;
         let (ino, bad): (Option<String>, bool) = sqlx::query_as(
             "SELECT payload_ino::text,adoption_unverified
             FROM openmettle.storage_reservations WHERE id=$1::uuid AND state='settled'",
         )
         .bind(reservation)
-        .fetch_one(pool)
+        .fetch_one(&mut *c)
         .await?;
         if bad || (pin.is_some() && ino.is_none()) {
             return Err(Error::Io);

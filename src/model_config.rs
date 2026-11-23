@@ -178,8 +178,10 @@ impl ProfilePin {
 
 impl Catalog {
     pub fn load(bytes: &[u8]) -> Result<Self, Error> {
-        let doc: CatalogDocument =
-            serde_json::from_slice(bytes).map_err(|_| Error::Invalid("catalog"))?;
+        // Maps keep the last of two equal keys, so refuse repeats before typed decoding.
+        let doc: CatalogDocument = crate::provider_keys::documents::unique(bytes)
+            .and_then(serde_json::from_value)
+            .map_err(|_| Error::Invalid("catalog"))?;
         if doc.version != 1 || !name(&doc.revision) {
             return Err(Error::Invalid("catalog revision"));
         }
