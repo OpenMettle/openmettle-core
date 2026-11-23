@@ -3,6 +3,7 @@
 -- $1: the highest successfully applied migration version (0 before migration 1). Migration 1
 -- revokes the PUBLIC database/public-schema defaults, which are tolerated only before that.
 -- Version 23 adds gateway reconciliation, request holds and one-call inference grants.
+-- Version 27 adds the worker-only fenced capacity store (ADR 0042).
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -58,6 +59,11 @@ quota_tables (relation,role,privilege) AS (
         'quota_reservations','quota_budgets','quota_reservation_charges','quota_reconciliations','quota_warning_events',
         'storage_volume_control']) relation, unnest(ARRAY['openmettle_api','openmettle_worker','openmettle_gateway']) role
     WHERE $1 >= 24 AND (relation<>'storage_volume_control' OR role<>'openmettle_gateway')
+),
+-- Version 27 (ADR 0042): the worker reads the capacity store; every write is a function call.
+capacity_tables (relation,role,privilege) AS (
+    SELECT relation,'openmettle_worker','SELECT' FROM unnest(ARRAY['capacity_groups','capacity_devices',
+        'capacity_observations','capacity_grants','capacity_grant_devices']) relation WHERE $1 >= 27
 ),
 gateway_columns (relation,attribute,role,privilege) AS (
     SELECT relation, attribute, role, privilege FROM (VALUES
@@ -148,6 +154,18 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.quota_release_terminal_runs(uuid[])',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
         ('openmettle.quota_upsert_scope_override(uuid,uuid,text,bigint,timestamptz,text,text,jsonb)',true,ARRAY['openmettle_api']::text[]),
         ('openmettle.quota_revoke_scope_override(uuid,uuid,text,text,text,jsonb)',true,ARRAY['openmettle_api']::text[])) AS f WHERE $1 >= 26
+    UNION ALL SELECT * FROM (VALUES
+        ('openmettle.capacity_lock_device_group()',false,ARRAY[]::text[]),
+        ('openmettle.capacity_lock_group(uuid)',false,ARRAY[]::text[]),
+        ('openmettle.capacity_fence(uuid,bytea,bigint)',false,ARRAY[]::text[]),
+        ('openmettle.capacity_lock_run(uuid,uuid,uuid)',false,ARRAY[]::text[]),
+        ('openmettle.capacity_admits(uuid,boolean)',false,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.capacity_acquire_controller(uuid,bytea,integer)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.capacity_renew_controller(uuid,bytea,bigint,integer)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.capacity_publish_observation(uuid,bytea,bigint,bigint,timestamptz,bigint,jsonb)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.capacity_resume(uuid,bytea,bigint)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.capacity_grant(uuid,bytea,bigint,uuid,uuid,uuid,text,text,jsonb)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.capacity_reconcile(uuid,bytea,bigint,uuid,text,uuid[])',true,ARRAY['openmettle_worker']::text[])) AS f WHERE $1 >= 27
 ),
 gateway_functions (signature,definer,inference) AS (
     SELECT * FROM (VALUES ('openmettle.gateway_allocate()',true,false), ('openmettle.gateway_run_hold()',true,false),
@@ -264,6 +282,7 @@ contract (relation, role, privilege) AS (
         'local_group_memberships','membership_observations','grant_mapping_rules','grant_mapping_revisions',
         'project_settings','platform_capability_denies','user_capability_denies','user_capability_grants']), 'openmettle_gateway', 'SELECT' WHERE $1 >= 23
     UNION ALL SELECT * FROM quota_tables
+    UNION ALL SELECT * FROM capacity_tables
 ),
 column_contract (relation, attribute, role, privilege) AS (
     VALUES ('users', 'disabled_at', 'openmettle_api', 'UPDATE')
@@ -673,7 +692,8 @@ violations (violation) AS (
     WHERE (g.grantee IN (SELECT oid FROM principals)
            OR ($1 >= 23 AND g.schema_name='openmettle' AND g.kind IN ('relation','column')
                AND (g.object_name LIKE 'gateway\_%' OR ($1>=24 AND
-                    (g.object_name LIKE 'quota\_%' OR g.object_name='storage_volume_control')))
+                    (g.object_name LIKE 'quota\_%' OR g.object_name='storage_volume_control'))
+                    OR ($1>=27 AND g.object_name LIKE 'capacity\_%'))
                AND g.grantee NOT IN (SELECT oid FROM owner_role)))
       AND NOT (g.kind = 'database' AND g.grantee <> 0 AND g.privilege = 'CONNECT')
       AND NOT (g.kind = 'database' AND g.grantee = 0 AND $1 < 1
@@ -714,7 +734,8 @@ violations (violation) AS (
           AND pg_get_userbyid(g.grantee)=c.role AND g.privilege=c.privilege)
     UNION ALL
     SELECT format('%s lacks SELECT on openmettle.%s', c.role, c.relation) FROM contract c
-    WHERE (c.relation IN (SELECT relation FROM quota_tables) OR c.role='openmettle_gateway' OR c.relation IN ('run_approvals','run_approval_decisions')) AND NOT EXISTS (
+    WHERE (c.relation IN (SELECT relation FROM quota_tables UNION ALL SELECT relation FROM capacity_tables)
+           OR c.role='openmettle_gateway' OR c.relation IN ('run_approvals','run_approval_decisions')) AND NOT EXISTS (
         SELECT FROM grants g WHERE g.kind='relation' AND g.schema_name='openmettle'
           AND g.object_name=c.relation AND pg_get_userbyid(g.grantee)=c.role AND g.privilege=c.privilege)
     UNION ALL

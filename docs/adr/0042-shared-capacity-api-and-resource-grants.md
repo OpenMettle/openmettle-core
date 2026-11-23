@@ -63,7 +63,9 @@ and safety headroom from total bytes, clamping spare capacity at zero.
 Deduplicate only overlap attributable to the same backing. Unattributed use
 remains charged. Virtual address reservations alone provide no physical backing.
 Group totals summarize the devices. A rank-constrained request must fit on each
-required device even when the group sum exceeds its requested bytes.
+required device even when the group sum exceeds its requested bytes. The store
+checks only necessary bounds on a published sample; the controller, which
+attributes measured use, is responsible for a conservative `grantable_bytes`.
 
 Reading a snapshot never reserves capacity. Within the group decision the
 controller includes commitments made since the measurement. Two callers citing
@@ -111,8 +113,9 @@ The charge survives that transition. Only confirmed backend release for the
 specific allocation and its devices permits `released` and the return of its
 bytes to the grantable pool, subject to fresh fit. If dispatch was ambiguous,
 positive evidence of non-allocation must also exclude delayed dispatch for that
-grant. Record the evidence durably. The worker settles the matching committed
-slot through `quota_release_device_slot` against that record, idempotently.
+grant. Record the evidence durably. The transaction that records the final
+confirmation settles the matching committed slot through
+`quota_release_device_slot` against that record; a repeat is a no-op.
 
 A lost reply, partial rank release or unidentifiable allocation leaves
 `unknown_allocation`. Preserve the charge and stop new burst/heavy grants in
