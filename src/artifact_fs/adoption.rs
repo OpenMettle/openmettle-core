@@ -1,5 +1,5 @@
 //! Offline verification of an existing artifact volume before pinning its identity.
-use super::volume::Volume;
+use super::volume::{self, Volume};
 use crate::runs::is_canonical_uuid;
 use rustix::fs::{self as at, AtFlags, Mode, OFlags};
 use sha2::{Digest, Sha256};
@@ -362,12 +362,12 @@ impl Evidence {
 
 fn qualify(v: &Volume, id: &str) -> Result<(), Failure> {
     let name = format!(".openmettle-volume-id.tmp.probe.{id}");
-    let f = File::from(at::openat(
+    let f = volume::open_at(
         &v.staging,
         name.as_str(),
         OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW,
         Mode::RUSR | Mode::WUSR,
-    )?);
+    )?;
     let result = (|| {
         f.try_lock()
             .map_err(|_| Failure("filesystem lock unavailable"))?;
