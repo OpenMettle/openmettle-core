@@ -193,8 +193,14 @@ impl<R: TurnRoutes> TurnExecutor<R> {
         }
     }
 
-    /// Reserve the model round before HTTP. A replacement holder cannot reset the round budget.
-    async fn next_round(&self, claim: &ClaimedRun, restarting: bool) -> Result<i64, StepResult> {
+    /// Reserve the model round before HTTP. A replacement holder cannot reset the round budget,
+    /// except when a metered predecessor never reached gateway handoff for its reserved round.
+    async fn next_round(
+        &self,
+        claim: &ClaimedRun,
+        restarting: bool,
+        metered: bool,
+    ) -> Result<i64, StepResult> {
         let mut c = self.pool.acquire().await.map_err(|_| FAILED)?;
         let number = leases::with_lease(&mut c, &claim.lease(), Fence::Step, async |tx, _| {
             let (used, has_effect): (i64,bool) = sqlx::query_as("SELECT
@@ -204,6 +210,36 @@ impl<R: TurnRoutes> TurnExecutor<R> {
             if restarting && has_effect {
                 // The in-memory tool transcript did not survive. Never redispatch a past effect.
                 return Err(crate::runs::Error::Conflict);
+            }
+            if restarting
+                && metered
+                && used > 0
+                && used <= i64::from(claim.round_limit)
+                && let Ok(prior_round) = i32::try_from(used)
+            {
+                let has_recover: bool = sqlx::query_scalar(
+                    "SELECT to_regprocedure(
+                         'openmettle.quota_recover_unsent_turn_round(uuid,uuid,uuid,integer)'
+                     ) IS NOT NULL",
+                )
+                .fetch_one(tx.connection()?)
+                .await?;
+                if has_recover {
+                    let reusable: bool = sqlx::query_scalar(
+                        "SELECT openmettle.quota_recover_unsent_turn_round(
+                             $1::uuid, $2::uuid, $3::uuid, $4
+                         )",
+                    )
+                    .bind(&claim.scope_id)
+                    .bind(&claim.run_id)
+                    .bind(&claim.claim_token)
+                    .bind(prior_round)
+                    .fetch_one(tx.connection()?)
+                    .await?;
+                    if reusable {
+                        return Ok(used);
+                    }
+                }
             }
             let round = used + 1;
             if round <= i64::from(claim.round_limit) {
@@ -358,7 +394,9 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 return Err(FAILED);
             }
         }
-        let round = self.next_round(claim, continuation.is_empty()).await?;
+        let round = self
+            .next_round(claim, continuation.is_empty(), route.metered.is_some())
+            .await?;
         self.authority(claim, config).await?;
         Ok((route, request, round, actor))
     }
@@ -432,40 +470,54 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                     .map_err(|_| FAILED)?
                     .requires_device_slot;
                 let round_i32 = i32::try_from(round).map_err(|_| FAILED)?;
-                let pending = crate::authz::gateway::reserve_turn_round(
-                    &self.pool,
-                    crate::authz::gateway::TurnRound {
-                        scope_id: &run.claim.scope_id,
-                        actor: &actor,
-                        approval: &run.claim.actor_approval_id,
-                        run_id: &run.claim.run_id,
-                        round: round_i32,
-                        claim_token: &run.claim.claim_token,
-                        installation: &metered.installation,
-                        model: &config.effective.model,
-                        round_tokens,
-                        round_cost,
-                        requires_device_slot,
-                    },
-                )
-                .await
-                .map_err(|_| FAILED)?;
-                if cx.stop.borrow().is_some() {
-                    let _ = pending.release(&self.pool).await;
-                    return Err(StepResult::Stopped);
-                }
-                let dispatch = match pending
-                    .handoff(
-                        &self.pool,
-                        &metered.keys,
-                        metered.device_grant_id.as_deref(),
-                    )
-                    .await
-                {
-                    Ok(dispatch) => dispatch,
-                    Err(_) => {
-                        let _ = pending.release(&self.pool).await;
-                        return Err(FAILED);
+                let dispatch = {
+                    let mut retried = false;
+                    loop {
+                        let pending = crate::authz::gateway::reserve_turn_round(
+                            &self.pool,
+                            crate::authz::gateway::TurnRound {
+                                scope_id: &run.claim.scope_id,
+                                actor: &actor,
+                                approval: &run.claim.actor_approval_id,
+                                run_id: &run.claim.run_id,
+                                round: round_i32,
+                                claim_token: &run.claim.claim_token,
+                                installation: &metered.installation,
+                                model: &config.effective.model,
+                                round_tokens,
+                                round_cost,
+                                requires_device_slot,
+                            },
+                        )
+                        .await
+                        .map_err(|_| FAILED)?;
+                        if cx.stop.borrow().is_some() {
+                            let _ = pending.release(&self.pool).await;
+                            return Err(StepResult::Stopped);
+                        }
+                        match pending
+                            .handoff(
+                                &self.pool,
+                                &metered.keys,
+                                metered.device_grant_id.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok(dispatch) => break dispatch,
+                            Err(crate::authz::gateway::Error::Refused)
+                                if !retried && !pending.enforced_at_bind =>
+                            {
+                                let _ = pending.release(&self.pool).await;
+                                if cx.stop.borrow().is_some() {
+                                    return Err(StepResult::Stopped);
+                                }
+                                retried = true;
+                            }
+                            Err(_) => {
+                                let _ = pending.release(&self.pool).await;
+                                return Err(FAILED);
+                            }
+                        }
                     }
                 };
                 crate::provider_http::BillableInferenceRef {

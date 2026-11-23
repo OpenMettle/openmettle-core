@@ -295,13 +295,25 @@ pub(crate) async fn cost_ceiling(
     .await
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BindOutcome {
+    /// Request holds were bound (`enforced_at_bind` is true when `metering_enforced` was already
+    /// active during binding so all required run-level and request-level holds are materialized).
+    Bound { enforced_at_bind: bool },
+    /// `metering_enforced` flipped `false -> true` after `quota_prepare_turn_round` skipped
+    /// creating run-level parent holds; caller must roll back and retry preparation with
+    /// `p_require_holds = true`.
+    NeedsParentHolds,
+}
+
 pub(crate) async fn bind_request(
     tx: &mut WriteTransaction<'_>,
     call: &Call<'_>,
     id: &str,
     secret: &[u8],
     spec: CostBoundSpec,
-) -> Result<(), Error> {
+    requires_device_slot: bool,
+) -> Result<BindOutcome, Error> {
     let enforced: bool =
         sqlx::query_scalar("SELECT metering_enforced FROM openmettle.quota_enforcement WHERE id")
             .fetch_one(tx.connection()?)
@@ -328,6 +340,9 @@ pub(crate) async fn bind_request(
                 .execute(tx.connection()?)
                 .await?;
             }
+            Ok(BindOutcome::Bound {
+                enforced_at_bind: true,
+            })
         }
         Authority::Lease { run, token, .. } => {
             // Query already-charged parent holds on this run in BOTH activation states and resolve
@@ -339,8 +354,10 @@ pub(crate) async fn bind_request(
                   WHERE scope_id = $1::uuid
                     AND run_id = $2::uuid
                     AND gateway_request_id IS NULL
-                    AND state = 'held'
-                    AND resource_kind IN ('usage_cost_micros', 'usage_tokens')
+                    AND (
+                        (resource_kind IN ('usage_cost_micros', 'usage_tokens') AND state = 'held')
+                        OR (resource_kind = 'device_reservations' AND state IN ('held', 'handoff_committed'))
+                    )
                   ORDER BY resource_kind ASC",
             )
             .bind(call.reservation.scope_id)
@@ -349,12 +366,17 @@ pub(crate) async fn bind_request(
             .await?;
             let mut parent_cost_held = None;
             let mut has_token_parent = false;
+            let mut has_device_parent = false;
             for (kind, held) in parents {
                 match kind.as_str() {
                     "usage_cost_micros" => parent_cost_held = Some(held),
                     "usage_tokens" => has_token_parent = true,
+                    "device_reservations" => has_device_parent = true,
                     _ => {}
                 }
+            }
+            if enforced && (!has_token_parent || (requires_device_slot && !has_device_parent)) {
+                return Ok(BindOutcome::NeedsParentHolds);
             }
             let state = cost_limit_state(
                 tx.connection()?,
@@ -376,6 +398,9 @@ pub(crate) async fn bind_request(
             if parent_cost_held.is_some() && cost.is_none() {
                 return Err(Error::Refused);
             }
+            if enforced && cost.is_some() && parent_cost_held.is_none() {
+                return Ok(BindOutcome::NeedsParentHolds);
+            }
             let tokens = (enforced || has_token_parent).then_some(call.units);
             for (resource, amount) in [("usage_cost_micros", cost), ("usage_tokens", tokens)] {
                 let Some(amount) = amount else { continue };
@@ -388,9 +413,11 @@ pub(crate) async fn bind_request(
                     .execute(tx.connection()?)
                     .await?;
             }
+            Ok(BindOutcome::Bound {
+                enforced_at_bind: enforced,
+            })
         }
     }
-    Ok(())
 }
 
 const NIL: &str = "00000000-0000-0000-0000-000000000000";

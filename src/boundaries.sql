@@ -138,6 +138,7 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.quota_run_round_cost_slice(uuid,uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.quota_authorize_unmetered_turn_round(uuid,uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.quota_lock_run_actor_prefix(uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.quota_recover_unsent_turn_round(uuid,uuid,uuid,integer)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.quota_lock_turn_handoff_prefix(uuid,bytea,uuid,uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.quota_commit_turn_handoff(uuid,bytea,uuid,uuid,uuid,boolean,uuid,boolean)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.quota_ensure_replayed_run_gateway_reservation(uuid,uuid,uuid,bigint)',true,ARRAY['openmettle_api']::text[]),

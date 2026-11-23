@@ -1103,6 +1103,48 @@ $$;
 REVOKE ALL ON FUNCTION openmettle.quota_lock_run_actor_prefix(uuid, uuid) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION openmettle.quota_lock_run_actor_prefix(uuid, uuid) TO openmettle_worker;
 
+-- On a metered worker restart, unwind any superseded `'reserved'` gateway/quota holds for the
+-- prior round and report whether that round never reached `'handed_off'` so the replacement worker
+-- can reuse the unsent round number without consuming an extra round against `round_limit`.
+CREATE FUNCTION openmettle.quota_recover_unsent_turn_round(
+    p_scope uuid,
+    p_run uuid,
+    p_claim uuid,
+    p_round integer
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+    v_reservation uuid;
+BEGIN
+    IF p_round IS NULL OR p_round <= 0 THEN
+        RETURN false;
+    END IF;
+
+    PERFORM openmettle.quota_unwind_superseded_round(p_scope, p_run, p_claim, p_round);
+
+    SELECT id INTO v_reservation
+      FROM openmettle.gateway_reservations
+     WHERE run_id = p_run;
+    IF NOT FOUND THEN
+        RETURN true;
+    END IF;
+
+    RETURN NOT EXISTS (
+        SELECT 1
+          FROM openmettle.gateway_requests
+         WHERE reservation_id = v_reservation
+           AND round = p_round
+           AND state = 'handed_off'
+    );
+END;
+$$;
+REVOKE ALL ON FUNCTION openmettle.quota_recover_unsent_turn_round(uuid, uuid, uuid, integer) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION openmettle.quota_recover_unsent_turn_round(uuid, uuid, uuid, integer) TO openmettle_worker;
+
 -- Atomically commit a worker turn round's quota_reservations in strict canonical lock order
 -- (`account_admin_lock..users..runs` -> `gateway_requests` -> `quota_reservations (resource_kind, id)`).
 -- Leaves `quota_gateway_handoffs -> quota_enforcement FOR SHARE` strictly to the deferred
