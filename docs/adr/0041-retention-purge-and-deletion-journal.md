@@ -209,7 +209,7 @@ ADR 0040's volume-pinned 3-stage physical purge on the durable worker path.
 PR2 is delivered in two increments (23 November 2026). **PR2a** (migration 28) adds the
 retention policy and `retention_set_grace`, `purge_after >= retained_at`, operator-only holds,
 the reference predicate (`artifact_revision_pinned`) used by `begin_purge` and by a claim guard
-for every writer, the attach/hold row lock, and the hash-chained `deletion_journal` holding purge
+for every application role (`openmettle_owner` stays the break-glass path), the attach/hold row lock, and the hash-chained `deletion_journal` holding purge
 records only (journal fields for revocations and tombstones arrive with those events). Every
 attachment counts as live because no conversation or project tombstone exists yet; no knowledge
 links exist yet. Its suite covers expiry boundaries, races, retries, duplicates, interrupted
