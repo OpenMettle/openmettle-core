@@ -760,16 +760,20 @@ impl Pending<'_> {
             ),
             Authority::Lease { token, .. } => (None, None, Some(token)),
         };
-        let row =
-            sqlx::query("SELECT * FROM openmettle.gateway_handoff($1::uuid,$2,$3,$4,$5::uuid)")
-                .bind(&self.id)
-                .bind(self.secret.as_slice())
-                .bind(proof.as_ref().map(SharedSecret::secret_bytes))
-                .bind(audience.map(|a| a.as_slice()))
-                .bind(lease)
-                .fetch_optional(tx.connection()?)
-                .await?
-                .ok_or(Error::Refused)?;
+        // `id` is caller-visible; dispatch the database-canonical spelling so the wire
+        // `x-request-id` always correlates with gateway usage reports.
+        let row = sqlx::query(
+            "SELECT h.*,$1::uuid::text AS request \
+             FROM openmettle.gateway_handoff($1::uuid,$2,$3,$4,$5::uuid) h",
+        )
+        .bind(&self.id)
+        .bind(self.secret.as_slice())
+        .bind(proof.as_ref().map(SharedSecret::secret_bytes))
+        .bind(audience.map(|a| a.as_slice()))
+        .bind(lease)
+        .fetch_optional(tx.connection()?)
+        .await?
+        .ok_or(Error::Refused)?;
         let ctx = Context {
             installation: row.try_get("installation")?,
             user_id: row.try_get("actor")?,
@@ -790,7 +794,7 @@ impl Pending<'_> {
             .map_err(|_| Error::Protection)?
             .authorization();
         Ok(Dispatch {
-            id: self.id.clone(),
+            id: row.try_get("request")?,
             installation: self.call.installation.into(),
             model: self.call.model.into(),
             server: lease.is_some(),

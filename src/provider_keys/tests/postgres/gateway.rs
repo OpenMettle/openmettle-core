@@ -425,7 +425,11 @@ async fn recovered_user_key_dispatches_only_after_acknowledged_commits_on_each_l
                 continue;
             }
             let prepared = client.prepare(&catalog, &effective, &req, server).unwrap();
-            let pending = gateway::reserve(pool, call).await.unwrap();
+            let mut pending = gateway::reserve(pool, call).await.unwrap();
+            // An equivalent noncanonical spelling of the public id still dispatches the
+            // database-canonical `x-request-id`.
+            let spelled = format!("{{{}}}", pending.id.to_uppercase());
+            let canonical = std::mem::replace(&mut pending.id, spelled);
             let ticket = pending
                 .handoff(pool, &ring, &client.as_ref(), prepared)
                 .await
@@ -453,8 +457,7 @@ async fn recovered_user_key_dispatches_only_after_acknowledged_commits_on_each_l
             };
             assert_eq!(peer.requests.load(Ordering::SeqCst), idx + 1);
             assert!(
-                peer.heads.lock().unwrap()[idx]
-                    .contains(&format!("x-request-id: {}\r\n", pending.id))
+                peer.heads.lock().unwrap()[idx].contains(&format!("x-request-id: {canonical}\r\n"))
             );
             assert!(!pending.release(pool).await.unwrap());
         }
