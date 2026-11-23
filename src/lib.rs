@@ -9,6 +9,7 @@ pub mod auth_config;
 pub mod authz;
 pub mod browser_auth;
 pub mod capabilities;
+pub mod capacity;
 pub mod grants;
 pub mod invitation;
 pub mod login;

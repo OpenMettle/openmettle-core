@@ -1070,7 +1070,11 @@ async fn quota_override_locks_single_audit_and_expired_override_warnings() {
     assert_eq!(active_limit_rev, 0);
 }
 
-async fn branch_and_message(api: &mut PgConnection, scope: &str, chat: &str) -> (String, String) {
+pub(super) async fn branch_and_message(
+    api: &mut PgConnection,
+    scope: &str,
+    chat: &str,
+) -> (String, String) {
     let msg = message(api, scope, chat, None).await.unwrap();
     let branch: String = sqlx::query_scalar(
         "INSERT INTO openmettle.conversation_branches (scope_id, conversation_id)

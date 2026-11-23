@@ -877,6 +877,31 @@ const ADDITIVE_TABLES: &[AdditiveTable] = &[
         table: "quota_warning_events",
         seed_row: None,
     },
+    AdditiveTable {
+        since: 27,
+        table: "capacity_groups",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 27,
+        table: "capacity_devices",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 27,
+        table: "capacity_observations",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 27,
+        table: "capacity_grants",
+        seed_row: None,
+    },
+    AdditiveTable {
+        since: 27,
+        table: "capacity_grant_devices",
+        seed_row: None,
+    },
 ];
 
 fn additive_columns_since(base_version: i64) -> impl Iterator<Item = &'static AdditiveColumn> {
@@ -1040,6 +1065,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "a6ea85d09af2c2aa7d267499623a46a3922e695b79bdf585cd8e2164d68e5d9a",
         "814d7832603fdb9752e55259c1c44b6815228ae5fb128b54ed5becf9fed508d7",
         "dad89ccf522802b8c572ec8947fdfede32e569a5e26004ecb593edf50c96711f",
+        "62d0eec831dd55d777a301cf467b0df46d9f818c9b094134ee76afe3b8b3f3c2",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
@@ -1165,7 +1191,7 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
     let after_14: Vec<(&str, Option<&str>)> = expected_added_tables_since(14)
         .map(|e| (e.table, e.seed_row))
         .collect();
-    assert_eq!(after_14.len(), 37);
+    assert_eq!(after_14.len(), 42);
     assert!(after_14.contains(&("account_admin_lock", Some(SINGLETON_LOCK_SEED))));
     assert!(after_14.contains(&("run_dispatch_lock", Some(SINGLETON_LOCK_SEED))));
     let after_18: Vec<(&str, Option<&str>)> = expected_added_tables_since(18)
@@ -1217,6 +1243,11 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
             ("quota_reservation_charges", None),
             ("quota_reconciliations", None),
             ("quota_warning_events", None),
+            ("capacity_groups", None),
+            ("capacity_devices", None),
+            ("capacity_observations", None),
+            ("capacity_grants", None),
+            ("capacity_grant_devices", None),
         ]
     );
 
@@ -2752,3 +2783,6 @@ mod gateway;
 
 #[path = "schema/quotas.rs"]
 mod quotas;
+
+#[path = "schema/capacity.rs"]
+mod capacity;

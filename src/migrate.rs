@@ -156,6 +156,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "quota override audit and locks",
         sql: include_str!("../migrations/0026_quota_override_audit_and_locks.sql"),
     },
+    Source {
+        version: 27,
+        description: "fenced capacity grants",
+        sql: include_str!("../migrations/0027_fenced_capacity_grants.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.
