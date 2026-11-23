@@ -4,9 +4,16 @@
 -- pg_catalog,pg_temp; see docs/adr/0003-schema-migrations.md.
 --
 -- Lock order (ADR 0005, ADR 0040): runs -> storage_reservations -> artifacts ->
--- artifact_revisions -> storage_volume_control -> storage_accounts -> storage_instance, then the
--- deletion journal head at commit. The policy row is read without a lock; policy writes lock
--- account_admin_lock and then the policy row and touch no storage row.
+-- artifact_revisions -> storage_volume_control -> storage_accounts -> storage_instance, then
+-- retention_policy FOR SHARE (a removal's deadline stamp) and the deletion journal head at
+-- commit. Policy writes lock account_admin_lock and then the policy row and touch no storage row.
+--
+-- Upgrade from 27: a purge claim ('purging') committed by the previous worker completes even if
+-- the revision is attached. It was valid under schema 27, which rechecked no reference, and its
+-- payload may already be truncated, so returning it to 'retained' would present damaged bytes as
+-- recoverable. Under this schema a 'purging' revision accepts no new attachment or hold, so only
+-- such pre-upgrade claims (and owner break-glass claims) complete while referenced. See
+-- docs/operator/storage-adoption-and-quota-upgrade.md.
 
 -- Installation-wide retention grace. openmettle_owner sets the deployment bounds; an
 -- account_admin chooses grace_seconds within them through retention_set_grace. Every change, by
@@ -57,8 +64,10 @@ ALTER TABLE openmettle.authorization_audit
 
 -- The audited account_admin change: one policy revision and one authorization_audit row, or an
 -- error (42501 not an active administrator, 23514 outside the deployment bounds or an invalid
--- reason/key, 23505 a reused request key) that aborts the caller's transaction. Changes govern
--- later disassociations only; no stored deadline moves.
+-- reason/key, 23505 a reused request key, 25000 not READ COMMITTED) that aborts the caller's
+-- transaction. Changes govern later disassociations only; no stored deadline moves. As in the
+-- administration store, the actor is checked in a statement after account_admin_lock, which
+-- demotion and disablement also take, so READ COMMITTED sees one committed during the wait.
 CREATE FUNCTION openmettle.retention_set_grace(
     p_actor uuid, p_grace_seconds integer, p_reason text, p_request_key text)
 RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
@@ -66,6 +75,9 @@ DECLARE
     prior openmettle.retention_policy%ROWTYPE;
     rev bigint;
 BEGIN
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'retention policy changes require READ COMMITTED' USING ERRCODE = '25000';
+    END IF;
     PERFORM FROM openmettle.account_admin_lock WHERE id FOR NO KEY UPDATE;
     IF NOT EXISTS (SELECT FROM openmettle.account_admins a JOIN openmettle.users u ON u.id = a.user_id
                     WHERE a.user_id = p_actor AND a.active AND u.disabled_at IS NULL) THEN
@@ -102,6 +114,32 @@ ALTER TABLE openmettle.artifact_revisions
             AND purging_at >= purge_after AND purged_at >= purging_at)
     );
 GRANT UPDATE (retention_policy_revision) ON openmettle.artifact_revisions TO openmettle_api;
+
+-- The database sets every removal's deadline: entering 'retained' from 'active' overwrites any
+-- caller-supplied retained_at, purge_after and policy stamp (the schema-27 helper wrote its own)
+-- with the wall clock read after the policy lock and the current policy. FOR SHARE waits for an
+-- in-flight policy change and then reads it under READ COMMITTED; under REPEATABLE READ or
+-- SERIALIZABLE a change committed after the snapshot fails with 40001 rather than applying the
+-- superseded grace. A missing policy row fails the removal. Only a caller allowed to write the
+-- retention columns (the API, ADR 0005's role split) gets a deadline: the WHEN clause runs as the
+-- caller, so a worker's 'retained' without one fails the lifecycle check.
+CREATE FUNCTION openmettle.retention_stamp_deadline()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE
+    p openmettle.retention_policy%ROWTYPE;
+BEGIN
+    SELECT * INTO STRICT p FROM openmettle.retention_policy WHERE id FOR SHARE;
+    NEW.retained_at := clock_timestamp();
+    NEW.purge_after := NEW.retained_at + p.grace_seconds * interval '1 second';
+    NEW.retention_policy_revision := p.revision;
+    RETURN NEW;
+END
+$$;
+REVOKE ALL ON FUNCTION openmettle.retention_stamp_deadline() FROM PUBLIC;
+CREATE TRIGGER artifact_revisions_retention_deadline BEFORE UPDATE OF state ON openmettle.artifact_revisions
+    FOR EACH ROW WHEN (OLD.state = 'active' AND NEW.state = 'retained'
+        AND pg_catalog.has_column_privilege('openmettle.artifact_revisions', 'purge_after', 'UPDATE'))
+    EXECUTE FUNCTION openmettle.retention_stamp_deadline();
 
 -- An operator hold keeps a revision from being claimed for purge. Only openmettle_owner places
 -- (INSERT) or releases (DELETE) holds in this release; no application role can change them.

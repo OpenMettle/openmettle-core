@@ -338,12 +338,13 @@ async fn retention_policy_changes_are_bounded_audited_and_stamped() {
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
-async fn expiry_boundaries_admit_zero_grace_and_the_exact_deadline() {
+async fn expiry_boundaries_admit_zero_grace_and_a_reached_deadline() {
     let f = Fixture::new().await;
     let exact = f.revision("exact", 10, None).await;
     let early = f.revision("early", 10, None).await;
-    // One owner transaction has one now(): grace 0 makes purge_after = retained_at = now(), and
-    // a claim at now() == purge_after is due.
+    // Grace 0 makes purge_after = retained_at, and a claim in the same transaction is already
+    // due: the wall clock has reached the deadline. The equal instant itself cannot be pinned
+    // against a running clock.
     let mut owner = connect(&f.db.0, OWNER).await;
     let mut tx = WriteTransaction::begin(&mut owner).await.unwrap();
     storage::retain_revision(&mut tx, &f.c.scope, &exact)
@@ -353,7 +354,7 @@ async fn expiry_boundaries_admit_zero_grace_and_the_exact_deadline() {
         .await
         .unwrap();
     let times: (bool, bool) = sqlx::query_as(
-        "SELECT purge_after = retained_at, purging_at = purge_after
+        "SELECT purge_after = retained_at, purging_at >= purge_after
            FROM openmettle.artifact_revisions WHERE id = $1::uuid",
     )
     .bind(&exact)
@@ -361,12 +362,12 @@ async fn expiry_boundaries_admit_zero_grace_and_the_exact_deadline() {
     .await
     .unwrap();
     assert_eq!(times, (true, true));
-    // One microsecond before its deadline a revision is not due.
+    // A deadline still ahead of the wall clock is not due.
     storage::retain_revision(&mut tx, &f.c.scope, &early)
         .await
         .unwrap();
     sqlx::query(
-        "UPDATE openmettle.artifact_revisions SET purge_after = purge_after + interval '1 microsecond'
+        "UPDATE openmettle.artifact_revisions SET purge_after = clock_timestamp() + interval '1 hour'
           WHERE id = $1::uuid",
     )
     .bind(&early)
@@ -377,13 +378,30 @@ async fn expiry_boundaries_admit_zero_grace_and_the_exact_deadline() {
         storage::begin_purge(&mut tx, &f.c.scope, &early).await,
         Err(Error::NotEligible)
     ));
+    // Reached by the next statement, it is.
+    sqlx::query(
+        "UPDATE openmettle.artifact_revisions SET purge_after = clock_timestamp() WHERE id = $1::uuid",
+    )
+    .bind(&early)
+    .execute(tx.connection().unwrap())
+    .await
+    .unwrap();
+    storage::begin_purge(&mut tx, &f.c.scope, &early)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
-    assert_eq!(f.state(&early).await, "retained");
     f.step(&exact, Step::Confirm).await.unwrap();
     // A zero-grace removal by the API is due to the worker's next transaction.
-    f.step(&early, Step::Claim).await.unwrap();
-    f.step(&early, Step::Confirm).await.unwrap();
-    assert_eq!(journal(&f.db).await, [exact, early]);
+    let api_removed = f.revision("api-removed", 10, None).await;
+    f.step(&api_removed, Step::Retain).await.unwrap();
+    for (rev, s) in [
+        (&early, Step::Confirm),
+        (&api_removed, Step::Claim),
+        (&api_removed, Step::Confirm),
+    ] {
+        f.step(rev, s).await.unwrap();
+    }
+    assert_eq!(journal(&f.db).await, [exact, early, api_removed]);
     assert_eq!(account(&f.db, &f.c.scope).await, (0, 0, 0));
     assert_totals(&f.db).await;
 }
@@ -592,35 +610,27 @@ async fn concurrent_references_and_restores_collide_with_the_purge_claim() {
         Err(Error::NotEligible)
     ));
 
-    // Restore and claim at the deadline: the restore transaction started a microsecond before
-    // purge_after and the claim after it, so each passes its own time check. Whichever locks
-    // the revision first wins; the other sees the committed state and is refused.
-    let deadline_after = async |rev: &str, now: String| {
-        sqlx::query(
-            "UPDATE openmettle.artifact_revisions
-                SET purge_after = $2::timestamptz + interval '1 microsecond' WHERE id = $1::uuid",
-        )
-        .bind(rev)
-        .bind(now)
-        .execute(&mut f.db.admin().await)
-        .await
-        .unwrap();
-    };
-    let now = "SELECT now()::text";
-    // The restore holds the revision: the claim waits, then sees it active.
+    // Restore and claim: both lock the revision row and judge the deadline by the wall clock
+    // after the lock, so the first to lock wins and the other sees its committed state.
+    // A restore holding the revision before its deadline: a claim arriving after the deadline
+    // waits, then finds the revision active.
     let rev = f.revision("restore-first", 10, None).await;
     f.step(&rev, Step::Retain).await.unwrap();
+    sqlx::query(
+        "UPDATE openmettle.artifact_revisions
+            SET purge_after = clock_timestamp() + interval '500 milliseconds' WHERE id = $1::uuid",
+    )
+    .bind(&rev)
+    .execute(&mut f.db.admin().await)
+    .await
+    .unwrap();
     let mut api = connect(&f.db.0, API).await;
     let restorer = pid(&mut api).await;
     let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
-    let started = sqlx::query_scalar(now)
-        .fetch_one(tx.connection().unwrap())
-        .await
-        .unwrap();
-    deadline_after(&rev, started).await;
     storage::restore_revision(&mut tx, &scope, &rev)
         .await
         .unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
     let claim = tokio::spawn({
         let (db, scope, rev) = (db.clone(), scope.clone(), rev.clone());
         async move { step(&db, &scope, &rev, Step::Claim).await }
@@ -629,34 +639,15 @@ async fn concurrent_references_and_restores_collide_with_the_purge_claim() {
     tx.commit().await.unwrap();
     assert!(matches!(claim.await.unwrap(), Err(Error::NotEligible)));
     assert_eq!(f.state(&rev).await, "active");
-    // The claim holds the revision: the restore, begun before the deadline, waits and is refused.
-    let rev = f.revision("claim-before-restore", 10, None).await;
+    // A claim holding the revision: a restore waits, then finds it purging.
+    let rev = f.revision("claim-first-restore", 10, None).await;
     f.step(&rev, Step::Retain).await.unwrap();
-    let (started, start) = tokio::sync::oneshot::channel::<String>();
-    let (go, proceed) = tokio::sync::oneshot::channel::<()>();
-    let restore = tokio::spawn({
-        let (db, scope, rev) = (db.clone(), scope.clone(), rev.clone());
-        async move {
-            let mut api = connect(&db, API).await;
-            let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
-            started
-                .send(
-                    sqlx::query_scalar(now)
-                        .fetch_one(tx.connection().unwrap())
-                        .await
-                        .unwrap(),
-                )
-                .unwrap();
-            proceed.await.unwrap();
-            let result = storage::restore_revision(&mut tx, &scope, &rev).await;
-            tx.commit().await.unwrap();
-            result
-        }
-    });
-    deadline_after(&rev, start.await.unwrap()).await;
     let mut tx = WriteTransaction::begin(&mut worker).await.unwrap();
     storage::begin_purge(&mut tx, &scope, &rev).await.unwrap();
-    go.send(()).unwrap();
+    let restore = tokio::spawn({
+        let (db, scope, rev) = (db.clone(), scope.clone(), rev.clone());
+        async move { step(&db, &scope, &rev, Step::Restore).await }
+    });
     wait_for_blocked_peer(&f.db, claimer).await;
     tx.commit().await.unwrap();
     assert!(matches!(restore.await.unwrap(), Err(Error::NotEligible)));
@@ -798,7 +789,7 @@ async fn purge_fails_closed_while_the_volume_is_being_adopted() {
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
-async fn schema_27_retained_revisions_purge_after_the_upgrade_with_a_journal_record() {
+async fn schema_27_removals_and_claims_complete_after_the_upgrade_with_one_journal_record() {
     let db = TestDb::new().await;
     let settings = db.settings(Duration::from_secs(10));
     migrate::apply(&settings, &MIGRATIONS[..27]).await.unwrap();
@@ -806,7 +797,7 @@ async fn schema_27_retained_revisions_purge_after_the_upgrade_with_a_journal_rec
     let c = Context::new(&db).await;
     let mut owner = connect(&db.0, OWNER).await;
     let mut revisions = Vec::new();
-    for key in ["legacy-free", "legacy-attached"] {
+    for key in ["legacy-free", "legacy-attached", "legacy-claimed"] {
         let doc = new_uuid(&db).await;
         let r = reserve(&db, API, &input(&c.scope, &c.actor, key, &doc, 10))
             .await
@@ -814,7 +805,7 @@ async fn schema_27_retained_revisions_purge_after_the_upgrade_with_a_journal_rec
         let rev = settle(&db, &c.scope, &r.id, 10, key.as_bytes(), "text/plain")
             .await
             .unwrap();
-        if key == "legacy-attached" {
+        if key != "legacy-free" {
             let mut api = connect(&db.0, API).await;
             let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
             attach(tx.connection().unwrap(), &c.scope, &c.actor, &rev)
@@ -840,6 +831,18 @@ async fn schema_27_retained_revisions_purge_after_the_upgrade_with_a_journal_rec
                 .await
                 .unwrap();
         }
+        // A claim the previous worker committed (schema 27 rechecked no reference) before it
+        // stopped, possibly after truncating the payload.
+        if key == "legacy-claimed" {
+            sqlx::query(
+                "UPDATE openmettle.artifact_revisions SET state = 'purging',
+                     purging_at = now() - interval '1 hour' WHERE id = $1::uuid",
+            )
+            .bind(&rev)
+            .execute(tx.connection().unwrap())
+            .await
+            .unwrap();
+        }
         tx.commit().await.unwrap();
         revisions.push(rev);
     }
@@ -855,23 +858,327 @@ async fn schema_27_retained_revisions_purge_after_the_upgrade_with_a_journal_rec
     .await
     .unwrap();
     assert_eq!(head, (1, 0));
-    let [free, attached] = &revisions[..] else {
+    let [free, attached, claimed] = &revisions[..] else {
         unreachable!()
     };
-    // The upgrade adds no reference exemption for rows written before it.
+    // The upgrade adds no reference exemption for a removal written before it.
     assert!(matches!(
         step(&db.0, &c.scope, attached, Step::Claim).await,
         Err(Error::NotEligible)
     ));
     step(&db.0, &c.scope, free, Step::Claim).await.unwrap();
     step(&db.0, &c.scope, free, Step::Confirm).await.unwrap();
-    let recorded: Vec<(String, Option<i64>)> =
-        sqlx::query_as("SELECT entity_id::text, policy_revision FROM openmettle.deletion_journal")
-            .fetch_all(&mut owner)
-            .await
-            .unwrap();
-    assert_eq!(recorded, [(free.clone(), None)]);
+    // A claim committed before the upgrade completes although the revision is attached: it was
+    // valid when made and its payload may already be gone, so it is not offered back as
+    // retained. The worker resumes it, it is journaled once and its bytes are released once.
+    for s in [Step::Claim, Step::Confirm, Step::Claim, Step::Confirm] {
+        step(&db.0, &c.scope, claimed, s).await.unwrap();
+    }
+    let recorded: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT entity_id::text, policy_revision FROM openmettle.deletion_journal ORDER BY journal_seq",
+    )
+    .fetch_all(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(recorded, [(free.clone(), None), (claimed.clone(), None)]);
+    // The operator query in docs/operator: purges of a referenced revision claimed before the
+    // upgrade.
+    let legacy: Vec<String> = sqlx::query_scalar(
+        "SELECT j.entity_id::text FROM openmettle.deletion_journal j
+           JOIN openmettle.artifact_revisions r ON r.id = j.entity_id
+          WHERE r.purging_at < (SELECT installed_on FROM openmettle._sqlx_migrations WHERE version = 28)
+            AND EXISTS (SELECT FROM openmettle.message_parts p
+                         WHERE p.scope_id = j.scope_id AND p.artifact_revision_id = j.entity_id)",
+    )
+    .fetch_all(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(legacy, std::slice::from_ref(claimed));
     assert_chain(&db).await;
     assert_eq!(account(&db, &c.scope).await, (0, 10, 0));
     assert_totals(&db).await;
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn the_database_sets_every_deadline_from_the_current_policy() {
+    let f = Fixture::new().await;
+    let mut owner = connect(&f.db.0, OWNER).await;
+    let set_grace = async |c: &mut PgConnection, grace: i32| {
+        sqlx::query("UPDATE openmettle.retention_policy SET grace_seconds = $1 WHERE id")
+            .bind(grace)
+            .execute(c)
+            .await
+            .unwrap();
+    };
+    let stamp = async |rev: &str| -> (i64, i64, bool) {
+        sqlx::query_as(
+            "SELECT extract(epoch FROM purge_after - retained_at)::bigint, retention_policy_revision,
+                    retained_at > clock_timestamp() - interval '1 minute'
+               FROM openmettle.artifact_revisions WHERE id = $1::uuid",
+        )
+        .bind(rev)
+        .fetch_one(&mut f.db.admin().await)
+        .await
+        .unwrap()
+    };
+    set_grace(&mut owner, 3600).await;
+    // A writer of the schema-27 helper supplies its own (already elapsed) deadline.
+    let own = f.revision("own-deadline", 10, None).await;
+    let mut api = connect(&f.db.0, API).await;
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    for sql in [
+        "UPDATE openmettle.artifact_revisions SET state = 'retained',
+             retained_at = now() - interval '1 day', purge_after = now() - interval '1 hour'
+          WHERE id = $1::uuid",
+        "UPDATE openmettle.storage_accounts a SET active_bytes = active_bytes - 10,
+             retained_bytes = retained_bytes + 10 FROM openmettle.artifact_revisions r
+          WHERE r.id = $1::uuid AND a.scope_id = r.scope_id",
+        "UPDATE openmettle.storage_instance SET active_bytes = active_bytes - 10,
+             retained_bytes = retained_bytes + 10 WHERE $1::uuid IS NOT NULL",
+    ] {
+        sqlx::query(sql)
+            .bind(&own)
+            .execute(tx.connection().unwrap())
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+    assert_eq!(stamp(&own).await, (3600, 3, true));
+    // The worker, which may not write retention columns, gets no deadline from the database.
+    let raw = f.revision("worker-raw", 10, None).await;
+    let refused = sqlx::query(
+        "UPDATE openmettle.artifact_revisions SET state = 'retained' WHERE id = $1::uuid",
+    )
+    .bind(&raw)
+    .execute(&mut connect(&f.db.0, WORKER).await)
+    .await;
+    assert_eq!(sqlstate(refused), "23514");
+
+    // A REPEATABLE READ snapshot older than a committed policy change cannot apply the old grace.
+    let stale = f.revision("stale-snapshot", 10, None).await;
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(tx.connection().unwrap())
+        .await
+        .unwrap();
+    sqlx::query("SELECT 1")
+        .execute(tx.connection().unwrap())
+        .await
+        .unwrap();
+    set_grace(&mut owner, 7200).await;
+    let refused = storage::retain_revision(&mut tx, &f.c.scope, &stale).await;
+    assert_eq!(code(&refused.unwrap_err()), "40001");
+    tx.rollback().await.unwrap();
+    f.step(&stale, Step::Retain).await.unwrap();
+    assert_eq!(stamp(&stale).await, (7200, 4, true));
+
+    // Under READ COMMITTED a removal waits for an in-flight policy change and then applies it.
+    let waiting = f.revision("in-flight", 10, None).await;
+    let changer = pid(&mut owner).await;
+    let mut tx = WriteTransaction::begin(&mut owner).await.unwrap();
+    set_grace(tx.connection().unwrap(), 60).await;
+    let retain = tokio::spawn({
+        let (db, scope, rev) = (f.db.0.clone(), f.c.scope.clone(), waiting.clone());
+        async move { step(&db, &scope, &rev, Step::Retain).await }
+    });
+    wait_for_blocked_peer(&f.db, changer).await;
+    tx.commit().await.unwrap();
+    retain.await.unwrap().unwrap();
+    assert_eq!(stamp(&waiting).await, (60, 5, true));
+    assert_totals(&f.db).await;
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_demoted_administrator_cannot_change_the_policy() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    let mut api = connect(&db.0, API).await;
+    let admin = new_user(&mut api).await;
+    sqlx::query("INSERT INTO openmettle.account_admins (user_id, active) VALUES ($1::uuid, true)")
+        .bind(&admin)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE openmettle.retention_policy SET min_grace_seconds = 0 WHERE id")
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    let revision = async |c: &mut PgConnection| -> i64 {
+        sqlx::query_scalar("SELECT revision FROM openmettle.retention_policy")
+            .fetch_one(c)
+            .await
+            .unwrap()
+    };
+    let before = revision(&mut owner).await;
+    // The demotion locks account_admin_lock first, as the administration store does.
+    let demote = async |c: &mut PgConnection, active: bool| {
+        sqlx::query("SELECT FROM openmettle.account_admin_lock WHERE id FOR UPDATE")
+            .execute(&mut *c)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.account_admins SET active = $2, revision = revision + 1
+              WHERE user_id = $1::uuid",
+        )
+        .bind(&admin)
+        .bind(active)
+        .execute(c)
+        .await
+        .unwrap();
+    };
+    for repeatable in [false, true] {
+        let mut demoter = connect(&db.0, OWNER).await;
+        let holder = pid(&mut demoter).await;
+        let mut tx = WriteTransaction::begin(&mut demoter).await.unwrap();
+        demote(tx.connection().unwrap(), false).await;
+        let (ready, snapshot) = tokio::sync::oneshot::channel::<()>();
+        let setter = tokio::spawn({
+            let (db, admin) = (db.0.clone(), admin.clone());
+            async move {
+                let mut api = connect(&db, API).await;
+                let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+                if repeatable {
+                    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                        .execute(tx.connection().unwrap())
+                        .await
+                        .unwrap();
+                }
+                // The snapshot predates the demotion's commit.
+                sqlx::query("SELECT 1")
+                    .execute(tx.connection().unwrap())
+                    .await
+                    .unwrap();
+                ready.send(()).unwrap();
+                let result = sqlx::query_scalar::<_, i64>(
+                    "SELECT openmettle.retention_set_grace($1::uuid, 60, 'synthetic', $2)",
+                )
+                .bind(&admin)
+                .bind(format!("demoted-{repeatable}"))
+                .fetch_one(tx.connection().unwrap())
+                .await;
+                if result.is_ok() {
+                    tx.commit().await.unwrap();
+                }
+                result
+            }
+        });
+        snapshot.await.unwrap();
+        if repeatable {
+            // Give the setter time to reach the lock; it may also refuse at once.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        } else {
+            wait_for_blocked_peer(&db, holder).await;
+        }
+        tx.commit().await.unwrap();
+        let expected = if repeatable { "25000" } else { "42501" };
+        assert_eq!(
+            sqlstate(setter.await.unwrap()),
+            expected,
+            "repeatable {repeatable}"
+        );
+        assert_eq!(revision(&mut owner).await, before);
+        demote(&mut owner, true).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn the_wall_clock_decides_restore_and_claim_in_long_transactions() {
+    let f = Fixture::new().await;
+    // A transaction that began before a zero-grace removal cannot restore it afterwards.
+    let rev = f.revision("old-restore", 10, None).await;
+    let mut api = connect(&f.db.0, API).await;
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    sqlx::query("SELECT 1")
+        .execute(tx.connection().unwrap())
+        .await
+        .unwrap();
+    f.step(&rev, Step::Retain).await.unwrap();
+    assert!(matches!(
+        storage::restore_revision(&mut tx, &f.c.scope, &rev).await,
+        Err(Error::NotEligible)
+    ));
+    tx.commit().await.unwrap();
+    assert_eq!(f.state(&rev).await, "retained");
+    // A transaction that began before a deadline may claim once the wall clock passes it.
+    let rev = f.revision("old-claim", 10, None).await;
+    f.step(&rev, Step::Retain).await.unwrap();
+    sqlx::query(
+        "UPDATE openmettle.artifact_revisions
+            SET purge_after = clock_timestamp() + interval '700 milliseconds' WHERE id = $1::uuid",
+    )
+    .bind(&rev)
+    .execute(&mut f.db.admin().await)
+    .await
+    .unwrap();
+    let mut worker = connect(&f.db.0, WORKER).await;
+    let mut tx = WriteTransaction::begin(&mut worker).await.unwrap();
+    assert!(matches!(
+        storage::begin_purge(&mut tx, &f.c.scope, &rev).await,
+        Err(Error::NotEligible)
+    ));
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    storage::begin_purge(&mut tx, &f.c.scope, &rev)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(f.state(&rev).await, "purging");
+
+    // The clock is read after every lock: a restore or removal that waits for the owner's
+    // storage account judges, or stamps, the time after the wait.
+    let mut owner = connect(&f.db.0, OWNER).await;
+    let holder = pid(&mut owner).await;
+    let lock_account =
+        "SELECT FROM openmettle.storage_accounts WHERE scope_id = $1::uuid FOR UPDATE";
+    let restored = f.revision("restore-after-wait", 10, None).await;
+    let removed = f.revision("retain-after-wait", 10, None).await;
+    f.step(&restored, Step::Retain).await.unwrap();
+    sqlx::query(
+        "UPDATE openmettle.artifact_revisions
+            SET purge_after = clock_timestamp() + interval '400 milliseconds' WHERE id = $1::uuid",
+    )
+    .bind(&restored)
+    .execute(&mut f.db.admin().await)
+    .await
+    .unwrap();
+    for (rev, s) in [(&restored, Step::Restore), (&removed, Step::Retain)] {
+        let mut tx = WriteTransaction::begin(&mut owner).await.unwrap();
+        sqlx::query(lock_account)
+            .bind(&f.c.scope)
+            .execute(tx.connection().unwrap())
+            .await
+            .unwrap();
+        let waiting = tokio::spawn({
+            let (db, scope, rev) = (f.db.0.clone(), f.c.scope.clone(), rev.clone());
+            async move { step(&db, &scope, &rev, s).await }
+        });
+        wait_for_blocked_peer(&f.db, holder).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let released: String = sqlx::query_scalar("SELECT clock_timestamp()::text")
+            .fetch_one(tx.connection().unwrap())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let result = waiting.await.unwrap();
+        if matches!(s, Step::Restore) {
+            // The deadline passed while the restore waited.
+            assert!(matches!(result, Err(Error::NotEligible)), "{result:?}");
+            assert_eq!(f.state(rev).await, "retained");
+        } else {
+            result.unwrap();
+            let after: bool = sqlx::query_scalar(
+                "SELECT retained_at >= $2::timestamptz FROM openmettle.artifact_revisions
+                  WHERE id = $1::uuid",
+            )
+            .bind(rev)
+            .bind(&released)
+            .fetch_one(&mut f.db.admin().await)
+            .await
+            .unwrap();
+            assert!(after, "the removal stamped a time before its last lock");
+        }
+    }
+    assert_totals(&f.db).await;
 }

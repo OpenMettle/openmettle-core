@@ -178,6 +178,7 @@ runtime_functions(signature,definer,roles) AS (
     UNION ALL SELECT * FROM (VALUES
         ('openmettle.retention_policy_bump_revision()',false,ARRAY[]::text[]),
         ('openmettle.retention_set_grace(uuid,integer,text,text)',true,ARRAY['openmettle_api']::text[]),
+        ('openmettle.retention_stamp_deadline()',true,ARRAY[]::text[]),
         ('openmettle.retention_lock_referenced_revision()',false,ARRAY[]::text[]),
         ('openmettle.artifact_revision_pinned(uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.retention_guard_purge_claim()',true,ARRAY[]::text[]),
