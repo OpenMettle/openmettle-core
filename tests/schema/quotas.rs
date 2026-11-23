@@ -6472,3 +6472,311 @@ async fn override_expiring_during_budget_lock_wait_is_refused_by_post_lock_clock
         "post-lock clock_timestamp() must see expired storage override and emit default 80% warning at limit_revision = 0"
     );
 }
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn two_pass_quota_reserve_post_lock_expiry_for_instance_wait_omq05_and_optional_project() {
+    use sqlx::postgres::PgPoolOptions;
+
+    let wait_blocked_on = async |owner: &mut PgConnection, lock_pid: i32| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let blocked: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1
+                       FROM pg_locks waiter
+                       JOIN pg_locks holder
+                         ON holder.locktype = waiter.locktype
+                        AND holder.transactionid = waiter.transactionid
+                        AND holder.granted
+                        AND holder.pid = $1
+                      WHERE waiter.locktype = 'transactionid'
+                        AND NOT waiter.granted
+                 )",
+            )
+            .bind(lock_pid)
+            .fetch_one(&mut *owner)
+            .await
+            .unwrap();
+            if blocked {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "quota_reserve did not block on lock_pid={lock_pid}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    let wait_expired = async |owner: &mut PgConnection, scope: &str, resource: &str| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let expired: bool = sqlx::query_scalar(
+                "SELECT clock_timestamp() > expires_at
+                   FROM openmettle.quota_overrides
+                  WHERE scope_id = $1::uuid AND resource_kind = $2",
+            )
+            .bind(scope)
+            .bind(resource)
+            .fetch_one(&mut *owner)
+            .await
+            .unwrap();
+            if expired {
+                return;
+            }
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let err_code_detail = |res: Result<String, sqlx::Error>| -> (String, Option<String>) {
+        let err = res.expect_err("expected database error");
+        let db_err = err.as_database_error().expect("pg database error");
+        (
+            db_err.code().unwrap_or_default().into_owned(),
+            db_err
+                .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
+                .and_then(|e| e.detail())
+                .map(str::to_owned),
+        )
+    };
+
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    let mut owner_lock = connect(&db.0, OWNER).await;
+    let lock_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut owner_lock)
+        .await
+        .unwrap();
+    authz_store::providers(&mut owner).await;
+    let alice =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let personal_scope = authz_runs::personal_of(&db, &alice).await;
+    let (_, project_scope) = project(&mut connect(&db.0, API).await, &alice.user).await;
+    let api_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(db.1.options(API));
+
+    // 1. Personal override expires while waiting on the INSTANCE budget lock -> OMQ01 (DETAIL=personal).
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 500),
+                    ('instance', 'usage_tokens', 50000)",
+        )
+        .await
+        .unwrap();
+    let seed1: String = sqlx::query_scalar(
+        "SELECT openmettle.quota_reserve(
+             $1::uuid, $2::uuid, 'usage_tokens', 1, 'rr13-seed-1',
+             NULL, NULL, NULL, clock_timestamp() + interval '5 minutes'
+         )::text",
+    )
+    .bind(&personal_scope)
+    .bind(&alice.user)
+    .fetch_one(&api_pool)
+    .await
+    .unwrap();
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT openmettle.quota_release_unsent($1::uuid)")
+            .bind(&seed1)
+            .fetch_one(&api_pool)
+            .await
+            .unwrap()
+    );
+    sqlx::query(
+        "INSERT INTO openmettle.quota_overrides
+             (scope_id, scope_kind, resource_kind, hard_limit, expires_at, reason, updated_by_user_id)
+         VALUES ($1::uuid, 'personal', 'usage_tokens', 2000,
+                 clock_timestamp() + interval '250 milliseconds', 'rr13-inst-wait', $2::uuid)",
+    )
+    .bind(&personal_scope)
+    .bind(&alice.user)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    // Connection 1 locks ONLY the instance budget row while personal override (2000) is active.
+    let mut inst_tx = owner_lock.begin().await.unwrap();
+    sqlx::query(
+        "SELECT id FROM openmettle.quota_budgets
+          WHERE target_kind = 'instance' AND scope_id IS NULL
+            AND resource_kind = 'usage_tokens'
+            FOR NO KEY UPDATE",
+    )
+    .fetch_one(&mut *inst_tx)
+    .await
+    .unwrap();
+
+    let api_c = api_pool.clone();
+    let ps_c = personal_scope.clone();
+    let u_c = alice.user.clone();
+    let t1 = tokio::spawn(async move {
+        sqlx::query_scalar::<_, String>(
+            "SELECT openmettle.quota_reserve(
+                 $1::uuid, $2::uuid, 'usage_tokens', 1000, 'rr13-personal-exp-on-inst-wait',
+                 NULL, NULL, NULL, clock_timestamp() + interval '5 minutes'
+             )::text",
+        )
+        .bind(&ps_c)
+        .bind(&u_c)
+        .fetch_one(&api_c)
+        .await
+    });
+    wait_blocked_on(&mut owner, lock_pid).await;
+    wait_expired(&mut owner, &personal_scope, "usage_tokens").await;
+    inst_tx.rollback().await.unwrap();
+    assert_eq!(
+        err_code_detail(t1.await.unwrap()),
+        ("OMQ01".into(), Some("personal".into())),
+        "personal override expiring while waiting on instance lock must fail closed with OMQ01 (personal)"
+    );
+
+    // 2. Only personal limit (no personal default) expires while waiting on instance lock ->
+    //    MUST raise OMQ05 (DETAIL=personal), NOT 40001.
+    owner
+        .execute(
+            "DELETE FROM openmettle.quota_defaults
+              WHERE scope_kind = 'personal' AND resource_kind = 'usage_tokens'",
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE openmettle.quota_overrides
+            SET hard_limit = 2000,
+                expires_at = clock_timestamp() + interval '250 milliseconds'
+          WHERE scope_id = $1::uuid AND resource_kind = 'usage_tokens'",
+    )
+    .bind(&personal_scope)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    let mut inst_tx2 = owner_lock.begin().await.unwrap();
+    sqlx::query(
+        "SELECT id FROM openmettle.quota_budgets
+          WHERE target_kind = 'instance' AND scope_id IS NULL
+            AND resource_kind = 'usage_tokens'
+            FOR NO KEY UPDATE",
+    )
+    .fetch_one(&mut *inst_tx2)
+    .await
+    .unwrap();
+
+    let api_c2 = api_pool.clone();
+    let ps_c2 = personal_scope.clone();
+    let u_c2 = alice.user.clone();
+    let t2 = tokio::spawn(async move {
+        sqlx::query_scalar::<_, String>(
+            "SELECT openmettle.quota_reserve(
+                 $1::uuid, $2::uuid, 'usage_tokens', 1000, 'rr13-only-personal-exp-omq05',
+                 NULL, NULL, NULL, clock_timestamp() + interval '5 minutes'
+             )::text",
+        )
+        .bind(&ps_c2)
+        .bind(&u_c2)
+        .fetch_one(&api_c2)
+        .await
+    });
+    wait_blocked_on(&mut owner, lock_pid).await;
+    wait_expired(&mut owner, &personal_scope, "usage_tokens").await;
+    inst_tx2.rollback().await.unwrap();
+    assert_eq!(
+        err_code_detail(t2.await.unwrap()),
+        ("OMQ05".into(), Some("personal".into())),
+        "expiring the sole personal limit during lock wait must raise OMQ05 (personal), not 40001"
+    );
+
+    // 3. Optional project override (with project default NULL) expires while waiting on instance
+    //    lock -> MUST skip charging project and succeed charging personal + instance cleanly!
+    sqlx::query(
+        "DELETE FROM openmettle.quota_overrides
+          WHERE scope_id = $1::uuid AND resource_kind = 'usage_tokens'",
+    )
+    .bind(&personal_scope)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 5000)",
+        )
+        .await
+        .unwrap();
+    // Temporary project override is lower (500) than requested 1000; once it expires during the
+    // instance lock wait, project reverts to NULL (unconfigured/optional) and is skipped cleanly.
+    sqlx::query(
+        "INSERT INTO openmettle.quota_overrides
+             (scope_id, scope_kind, resource_kind, hard_limit, expires_at, reason, updated_by_user_id)
+         VALUES ($1::uuid, 'project', 'usage_tokens', 500,
+                 clock_timestamp() + interval '250 milliseconds', 'rr13-opt-project-exp', $2::uuid)",
+    )
+    .bind(&project_scope)
+    .bind(&alice.user)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+
+    let mut inst_tx3 = owner_lock.begin().await.unwrap();
+    sqlx::query(
+        "SELECT id FROM openmettle.quota_budgets
+          WHERE target_kind = 'instance' AND scope_id IS NULL
+            AND resource_kind = 'usage_tokens'
+            FOR NO KEY UPDATE",
+    )
+    .fetch_one(&mut *inst_tx3)
+    .await
+    .unwrap();
+
+    let api_c3 = api_pool.clone();
+    let proj_c = project_scope.clone();
+    let u_c3 = alice.user.clone();
+    let t3 = tokio::spawn(async move {
+        sqlx::query_scalar::<_, String>(
+            "SELECT openmettle.quota_reserve(
+                 $1::uuid, $2::uuid, 'usage_tokens', 1000, 'rr13-opt-project-skip',
+                 NULL, NULL, NULL, clock_timestamp() + interval '5 minutes'
+             )::text",
+        )
+        .bind(&proj_c)
+        .bind(&u_c3)
+        .fetch_one(&api_c3)
+        .await
+    });
+    wait_blocked_on(&mut owner, lock_pid).await;
+    wait_expired(&mut owner, &project_scope, "usage_tokens").await;
+    inst_tx3.rollback().await.unwrap();
+    let hold_id = t3.await.unwrap().expect(
+        "expiring optional project override during lock wait must skip project and succeed",
+    );
+
+    let charge_roles: Vec<String> = sqlx::query_scalar(
+        "SELECT charge_role FROM openmettle.quota_reservation_charges
+          WHERE reservation_id = $1::uuid
+          ORDER BY charge_role ASC",
+    )
+    .bind(&hold_id)
+    .fetch_all(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        charge_roles,
+        vec!["actor_scope".to_owned(), "instance".to_owned()],
+        "expired optional project tier must not be charged"
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT openmettle.quota_release_unsent($1::uuid)")
+            .bind(&hold_id)
+            .fetch_one(&api_pool)
+            .await
+            .unwrap()
+    );
+    let drift: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
+           FROM openmettle.quota_verify_accounting_drift()",
+    )
+    .fetch_one(&mut connect(&db.0, WORKER).await)
+    .await
+    .unwrap();
+    assert_eq!(drift, (0, 0, 0, 0));
+}

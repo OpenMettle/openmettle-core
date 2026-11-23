@@ -220,8 +220,50 @@ $$;
 REVOKE ALL ON FUNCTION openmettle.quota_revoke_scope_override(uuid, uuid, text, text, text, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION openmettle.quota_revoke_scope_override(uuid, uuid, text, text, text, jsonb) TO openmettle_api;
 
--- Retain o.revision on explicitly revoked overrides so default-level threshold warnings re-arm
--- in the same bucket (ADR 0040), while naturally expired unrevoked overrides revert to 0.
+-- Internal owner-only helper evaluating effective hard_limit and limit_revision at a caller-chosen
+-- timestamp so multi-tier reservations can evaluate all locked tiers against one post-lock instant.
+-- Retains o.revision on explicitly revoked overrides so default-level threshold warnings re-arm in
+-- the same bucket (ADR 0040), while naturally expired unrevoked overrides revert to 0.
+CREATE FUNCTION openmettle.quota_limit_at(
+    p_scope uuid,
+    p_kind text,
+    p_resource text,
+    p_now timestamptz
+)
+RETURNS TABLE (
+    hard_limit bigint,
+    window_seconds integer,
+    warn1 smallint,
+    warn2 smallint,
+    config_revision bigint,
+    limit_revision bigint
+)
+LANGUAGE sql
+STABLE
+SET search_path = pg_catalog
+AS $$
+    SELECT coalesce(
+               CASE WHEN o.revoked_at IS NULL AND (o.expires_at IS NULL OR o.expires_at > p_now)
+                    THEN o.hard_limit END,
+               d.hard_limit
+           ),
+           d.window_seconds,
+           coalesce(d.warn_pct_1, 80)::smallint,
+           coalesce(d.warn_pct_2, 90)::smallint,
+           coalesce(d.config_revision, 1),
+           CASE
+               WHEN o.revoked_at IS NOT NULL THEN o.revision
+               WHEN o.expires_at IS NULL OR o.expires_at > p_now THEN coalesce(o.revision, 0)
+               ELSE 0
+           END
+      FROM (VALUES (1)) AS seed(id)
+      LEFT JOIN openmettle.quota_defaults d
+        ON d.scope_kind = p_kind AND d.resource_kind = p_resource
+      LEFT JOIN openmettle.quota_overrides o
+        ON o.scope_id = p_scope AND o.resource_kind = p_resource
+$$;
+REVOKE ALL ON FUNCTION openmettle.quota_limit_at(uuid, text, text, timestamptz) FROM PUBLIC;
+
 -- Evaluate expiry against one fresh clock_timestamp() so post-lock checks see overrides that
 -- expired while waiting on contended quota_budgets / storage locks.
 CREATE OR REPLACE FUNCTION openmettle.quota_limit(p_scope uuid, p_kind text, p_resource text)
@@ -237,28 +279,7 @@ LANGUAGE sql
 VOLATILE
 SET search_path = pg_catalog
 AS $$
-    WITH stamp AS MATERIALIZED (
-        SELECT clock_timestamp() AS ts
-    )
-    SELECT coalesce(
-               CASE WHEN o.revoked_at IS NULL AND (o.expires_at IS NULL OR o.expires_at > stamp.ts)
-                    THEN o.hard_limit END,
-               d.hard_limit
-           ),
-           d.window_seconds,
-           coalesce(d.warn_pct_1, 80)::smallint,
-           coalesce(d.warn_pct_2, 90)::smallint,
-           coalesce(d.config_revision, 1),
-           CASE
-               WHEN o.revoked_at IS NOT NULL THEN o.revision
-               WHEN o.expires_at IS NULL OR o.expires_at > stamp.ts THEN coalesce(o.revision, 0)
-               ELSE 0
-           END
-      FROM stamp
-      LEFT JOIN openmettle.quota_defaults d
-        ON d.scope_kind = p_kind AND d.resource_kind = p_resource
-      LEFT JOIN openmettle.quota_overrides o
-        ON o.scope_id = p_scope AND o.resource_kind = p_resource
+    SELECT * FROM openmettle.quota_limit_at(p_scope, p_kind, p_resource, clock_timestamp())
 $$;
 
 CREATE OR REPLACE FUNCTION openmettle.quota_record_storage_warning(p_scope uuid, p_added bigint)
@@ -337,8 +358,22 @@ DECLARE
     cfg record;
     budget openmettle.quota_budgets%ROWTYPE;
     stamp timestamptz := clock_timestamp();
+    post_lock_ts timestamptz;
     start_at timestamptz;
     win text;
+    post_win text;
+    post_start timestamptz;
+    v_scopes uuid[] := ARRAY[]::uuid[];
+    v_kinds text[] := ARRAY[]::text[];
+    v_charges text[] := ARRAY[]::text[];
+    v_budget_ids uuid[] := ARRAY[]::uuid[];
+    v_target_kinds text[] := ARRAY[]::text[];
+    v_wins text[] := ARRAY[]::text[];
+    v_starts timestamptz[] := ARRAY[]::timestamptz[];
+    v_active numeric[] := ARRAY[]::numeric[];
+    v_held numeric[] := ARRAY[]::numeric[];
+    v_locked boolean[] := ARRAY[]::boolean[];
+    idx integer;
 BEGIN
     origin := CASE WHEN pg_has_role(session_user, 'openmettle_api', 'USAGE') THEN 'api'
                    WHEN pg_has_role(session_user, 'openmettle_worker', 'USAGE') THEN 'worker' END;
@@ -408,6 +443,8 @@ BEGIN
         END IF;
         RETURN hold.id;
     END IF;
+
+    -- Pass 1: lock all applicable quota_budgets rows in canonical order (scope ASC NULLS LAST).
     FOR target IN
         SELECT * FROM (VALUES
             (p_scope, primary_kind, 'primary_scope'),
@@ -417,11 +454,24 @@ BEGIN
         WHERE charge <> 'actor_scope' OR actor_scope <> p_scope
         ORDER BY scope NULLS LAST
     LOOP
-        SELECT * INTO cfg FROM openmettle.quota_limit(target.scope, target.kind, p_resource);
+        SELECT * INTO cfg
+          FROM openmettle.quota_limit_at(target.scope, target.kind, p_resource, stamp);
         IF cfg.hard_limit IS NULL THEN
-            IF target.kind IN ('instance', 'project') THEN CONTINUE; END IF;
-            RAISE EXCEPTION 'quota limit unconfigured'
-                USING ERRCODE = 'OMQ05', DETAIL = target.kind;
+            IF target.kind = 'personal' THEN
+                RAISE EXCEPTION 'quota limit unconfigured'
+                    USING ERRCODE = 'OMQ05', DETAIL = target.kind;
+            END IF;
+            v_scopes := array_append(v_scopes, target.scope);
+            v_kinds := array_append(v_kinds, target.kind);
+            v_charges := array_append(v_charges, target.charge);
+            v_budget_ids := array_append(v_budget_ids, NULL::uuid);
+            v_target_kinds := array_append(v_target_kinds, NULL::text);
+            v_wins := array_append(v_wins, NULL::text);
+            v_starts := array_append(v_starts, NULL::timestamptz);
+            v_active := array_append(v_active, NULL::numeric);
+            v_held := array_append(v_held, NULL::numeric);
+            v_locked := array_append(v_locked, false);
+            CONTINUE;
         END IF;
         win := CASE WHEN p_resource = 'device_reservations' THEN 'concurrent'
                     WHEN cfg.window_seconds IS NULL THEN 'static'
@@ -445,25 +495,61 @@ BEGIN
            AND window_kind = win
            AND window_start = start_at
            FOR NO KEY UPDATE;
-        SELECT * INTO cfg FROM openmettle.quota_limit(target.scope, target.kind, p_resource);
+        v_scopes := array_append(v_scopes, target.scope);
+        v_kinds := array_append(v_kinds, target.kind);
+        v_charges := array_append(v_charges, target.charge);
+        v_budget_ids := array_append(v_budget_ids, budget.id);
+        v_target_kinds := array_append(v_target_kinds, budget.target_kind);
+        v_wins := array_append(v_wins, win);
+        v_starts := array_append(v_starts, start_at);
+        v_active := array_append(v_active, budget.active_used);
+        v_held := array_append(v_held, budget.reserved_held);
+        v_locked := array_append(v_locked, true);
+    END LOOP;
+
+    -- Pass 2: once ALL budget locks are held, evaluate every tier against ONE post-lock
+    -- clock_timestamp() before charging so a scope override expiring while waiting on a later
+    -- tier lock (e.g. instance) can never admit above the restored limit.
+    post_lock_ts := clock_timestamp();
+    FOR idx IN 1 .. coalesce(array_length(v_kinds, 1), 0) LOOP
+        SELECT * INTO cfg
+          FROM openmettle.quota_limit_at(v_scopes[idx], v_kinds[idx], p_resource, post_lock_ts);
         IF cfg.hard_limit IS NULL THEN
+            IF v_kinds[idx] IN ('instance', 'project') THEN
+                CONTINUE;
+            END IF;
+            RAISE EXCEPTION 'quota limit unconfigured'
+                USING ERRCODE = 'OMQ05', DETAIL = v_kinds[idx];
+        END IF;
+        IF NOT v_locked[idx] THEN
             RAISE EXCEPTION 'quota configuration changed' USING ERRCODE = '40001';
         END IF;
-        IF budget.active_used + budget.reserved_held + p_units > cfg.hard_limit THEN
-            RAISE EXCEPTION 'quota limit exceeded'
-                USING ERRCODE = 'OMQ01', DETAIL = target.kind;
+        post_win := CASE WHEN p_resource = 'device_reservations' THEN 'concurrent'
+                         WHEN cfg.window_seconds IS NULL THEN 'static'
+                         ELSE 'windowed' END;
+        post_start := CASE WHEN post_win = 'windowed'
+                           THEN date_bin(make_interval(secs => cfg.window_seconds), post_lock_ts, 'epoch')
+                           ELSE 'epoch'::timestamptz END;
+        IF post_win <> v_wins[idx] OR post_start <> v_starts[idx] THEN
+            RAISE EXCEPTION 'quota configuration changed' USING ERRCODE = '40001';
         END IF;
-        INSERT INTO openmettle.quota_reservation_charges VALUES (hold.id, budget.id, target.charge);
+        IF v_active[idx] + v_held[idx] + p_units > cfg.hard_limit THEN
+            RAISE EXCEPTION 'quota limit exceeded'
+                USING ERRCODE = 'OMQ01', DETAIL = v_kinds[idx];
+        END IF;
+        INSERT INTO openmettle.quota_reservation_charges
+        VALUES (hold.id, v_budget_ids[idx], v_charges[idx]);
         UPDATE openmettle.quota_budgets
            SET reserved_held = reserved_held + p_units,
                revision = revision + 1,
-               updated_at = stamp
-         WHERE id = budget.id;
+               updated_at = post_lock_ts
+         WHERE id = v_budget_ids[idx];
         PERFORM openmettle.quota_warn(
-            budget.target_kind, target.scope, p_resource,
-            CASE WHEN win = 'windowed' THEN start_at ELSE date_trunc('day', stamp, 'UTC') END,
-            budget.active_used + budget.reserved_held,
-            budget.active_used + budget.reserved_held + p_units,
+            v_target_kinds[idx], v_scopes[idx], p_resource,
+            CASE WHEN v_wins[idx] = 'windowed' THEN v_starts[idx]
+                 ELSE date_trunc('day', post_lock_ts, 'UTC') END,
+            v_active[idx] + v_held[idx],
+            v_active[idx] + v_held[idx] + p_units,
             cfg.hard_limit, cfg.warn1, cfg.warn2, cfg.config_revision, cfg.limit_revision
         );
     END LOOP;

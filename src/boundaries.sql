@@ -133,6 +133,7 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.resolve_abandoned_repeatable_reads()',true)
     ) t(signature,definer) WHERE $1 >= 25
     UNION ALL SELECT * FROM (VALUES
+        ('openmettle.quota_limit_at(uuid,text,text,timestamptz)',false,ARRAY[]::text[]),
         ('openmettle.storage_lock_not_adopting()',true,ARRAY['openmettle_api']::text[]),
         ('openmettle.quota_prepare_turn_round(uuid,uuid,uuid,bigint,bigint,boolean,boolean,boolean,boolean)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.quota_run_round_cost_slice(uuid,uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),

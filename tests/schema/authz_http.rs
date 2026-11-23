@@ -3789,5 +3789,204 @@ async fn revoked_override_rearms_default_threshold_warnings_over_http() {
     }
 }
 
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn post_runs_maps_lock_wait_personal_override_expiry_to_503_provisioning() {
+    use crate::{auth_config_support::Dir, ca::Ca};
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    let mut owner_lock = connect(&db.0, OWNER).await;
+    let lock_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut owner_lock)
+        .await
+        .unwrap();
+    authz_store::providers(&mut owner).await;
+    let alice = authz_store::account(&mut owner, PROVIDER, true, FUTURE).await;
+    let scope = personal_of(&db, &alice).await;
+    let alice_cookie = browser(&db, &alice, 1).await;
+    let alice_b = As::Browser(&alice_cookie);
+
+    // Instance default is configured; personal usage_tokens has NO default — only a temporary override.
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('instance', 'usage_tokens', 100000)",
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.quota_overrides
+             (scope_id, scope_kind, resource_kind, hard_limit, expires_at, reason, updated_by_user_id)
+         VALUES ($1::uuid, 'personal', 'usage_tokens', 100000,
+                 clock_timestamp() + interval '1 hour', 'seed-only-personal', $2::uuid)",
+    )
+    .bind(&scope)
+    .bind(&alice.user)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    let mut api_conn = connect(&db.0, API).await;
+    let seed: String = sqlx::query_scalar(
+        "SELECT openmettle.quota_reserve(
+             $1::uuid, $2::uuid, 'usage_tokens', 1, 'rr13-http-seed',
+             NULL, NULL, NULL, clock_timestamp() + interval '5 minutes'
+         )::text",
+    )
+    .bind(&scope)
+    .bind(&alice.user)
+    .fetch_one(&mut api_conn)
+    .await
+    .unwrap();
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT openmettle.quota_release_unsent($1::uuid)")
+            .bind(&seed)
+            .fetch_one(&mut api_conn)
+            .await
+            .unwrap()
+    );
+
+    let dir = Dir::new();
+    std::fs::create_dir(dir.path("artifacts")).unwrap();
+    let mut doc = auth_config_support::document_v2_native(&dir, &Ca::new().pem());
+    doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+    let mut catalog: Value =
+        serde_json::from_slice(include_bytes!("../fixtures/conversation-catalog-v1.json")).unwrap();
+    catalog["models"]["a"]["prompt_bound"] = json!({
+        "fixed_tokens": 4,
+        "tokens_per_turn": 4,
+        "tokens_per_part": 2,
+        "tokens_per_byte": 1,
+        "tokens_per_attachment": 10
+    });
+    doc["catalog_file"] = json!(dir.write("catalog.json", &serde_json::to_vec(&catalog).unwrap()));
+    doc["admission_limits"] = json!({
+        "live_per_actor": 4,
+        "live_per_scope": 8,
+        "queued_in_instance": 32,
+        "queue_timeout_seconds": 300,
+        "round_cap": 10
+    });
+    let api = Api::configured(&db, dir, doc, 4);
+    let conv = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/conversations",
+            Some("rr13-http-conv"),
+            Some(&json!({})),
+        ),
+        201,
+    );
+    let run_body = json!({
+        "conversation_id": conv["conversation_id"],
+        "branch_id": conv["branch_id"],
+        "proposal": {
+            "expected_head_message_id": null,
+            "turn": {
+                "mode": "append",
+                "input_message_id": "00000000-0000-4000-8000-00000000f013",
+                "parts": [{"text": "expiring sole personal override during instance lock wait"}]
+            },
+            "selection": {
+                "model": "a",
+                "layer": {"controls": {"context_window": "450", "output_reserve": "100"}}
+            },
+            "requested_rounds": 1
+        }
+    });
+
+    // Shorten the sole personal override to expire in 250ms, then lock the instance budget row.
+    sqlx::query(
+        "UPDATE openmettle.quota_overrides
+            SET expires_at = clock_timestamp() + interval '250 milliseconds'
+          WHERE scope_id = $1::uuid AND resource_kind = 'usage_tokens'",
+    )
+    .bind(&scope)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    let mut inst_tx = owner_lock.begin().await.unwrap();
+    sqlx::query(
+        "SELECT id FROM openmettle.quota_budgets
+          WHERE target_kind = 'instance' AND scope_id IS NULL
+            AND resource_kind = 'usage_tokens'
+            FOR NO KEY UPDATE",
+    )
+    .fetch_one(&mut *inst_tx)
+    .await
+    .unwrap();
+
+    // Send POST /v1/runs on a blocking thread so it enters quota_reserve while override is active
+    // and blocks on the instance budget lock.
+    let api = std::sync::Arc::new(api);
+    let api_c = std::sync::Arc::clone(&api);
+    let cookie_c = alice_cookie.clone();
+    let http_task = tokio::task::spawn_blocking(move || {
+        api_c.call(
+            As::Browser(&cookie_c),
+            "POST",
+            "/v1/runs",
+            Some("rr13-http-omq05"),
+            Some(&run_body),
+        )
+    });
+
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1
+                   FROM pg_locks waiter
+                   JOIN pg_locks holder
+                     ON holder.locktype = waiter.locktype
+                    AND holder.transactionid = waiter.transactionid
+                    AND holder.granted
+                    AND holder.pid = $1
+                  WHERE waiter.locktype = 'transactionid'
+                    AND NOT waiter.granted
+             )",
+        )
+        .bind(lock_pid)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        if blocked {
+            break;
+        }
+        assert!(Instant::now() < wait_deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let exp_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let expired: bool = sqlx::query_scalar(
+            "SELECT clock_timestamp() > expires_at
+               FROM openmettle.quota_overrides
+              WHERE scope_id = $1::uuid AND resource_kind = 'usage_tokens'",
+        )
+        .bind(&scope)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        if expired {
+            break;
+        }
+        assert!(Instant::now() < exp_deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    inst_tx.rollback().await.unwrap();
+
+    let (status, body) = http_task.await.unwrap();
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["code"], "provisioning");
+    assert_eq!(
+        body["quota"],
+        json!({"resource_kind": "usage_tokens", "scope_kind": "personal"})
+    );
+    assert!(validate_openapi_schema(
+        "#/components/schemas/Problem",
+        &body
+    ));
+}
+
 #[path = "run_events_http.rs"]
 mod run_events_http;
