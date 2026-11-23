@@ -200,16 +200,35 @@ pub struct PreparedRequest<'a> {
     profile: &'a crate::model_config::Profile,
     request: &'a Request,
     server: bool,
+    round_tokens: Option<i64>,
+    round_cost: Option<u128>,
+    requires_device_slot: bool,
     body: Vec<u8>,
 }
 
-impl PreparedRequest<'_> {
+impl<'a> PreparedRequest<'a> {
+    pub(crate) fn gateway(&self) -> &'a Gateway {
+        self.gateway
+    }
+
     pub(crate) fn model_name(&self) -> &str {
         &self.model
     }
 
     pub(crate) fn is_server(&self) -> bool {
         self.server
+    }
+
+    pub(crate) fn round_tokens(&self) -> Option<i64> {
+        self.round_tokens
+    }
+
+    pub(crate) fn round_cost(&self) -> Option<u128> {
+        self.round_cost
+    }
+
+    pub(crate) fn requires_device_slot(&self) -> bool {
+        self.requires_device_slot
     }
 }
 
@@ -353,6 +372,18 @@ impl Gateway {
                     && self.qualification.model == effective.model
             })
             .ok_or(Error::Validation)?;
+        let round_tokens = effective
+            .ceiling
+            .value
+            .and_then(|n| i64::try_from(n).ok())
+            .filter(|&n| n > 0);
+        let round_cost = match effective.ceiling.value {
+            Some(tokens) => profile
+                .round_cost_ceiling(tokens)
+                .map_err(|_| Error::Validation)?,
+            None => None,
+        };
+        let requires_device_slot = profile.requires_device_slot;
         let body = request.encode(&self.qualification, profile, effective, server)?;
         Ok(PreparedRequest {
             gateway: self,
@@ -360,6 +391,9 @@ impl Gateway {
             profile,
             request,
             server,
+            round_tokens,
+            round_cost,
+            requires_device_slot,
             body,
         })
     }

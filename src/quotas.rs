@@ -205,6 +205,35 @@ async fn resolve_cost_from_state(
         if state.denomination.is_none() || !state.personal_limit {
             return Err(Error::Refused);
         }
+        if let Some(held) = parent_cost_held {
+            let amount = match spec {
+                CostBoundSpec::Profile(Some(n)) => {
+                    let Ok(n) = i64::try_from(n) else {
+                        return Err(Error::Refused);
+                    };
+                    if n <= 0 || n > held {
+                        return Err(Error::Refused);
+                    }
+                    n
+                }
+                CostBoundSpec::Profile(None) => return Err(Error::Refused),
+                CostBoundSpec::Legacy => {
+                    let slice = if let Some(run_id) = run {
+                        round_cost_slice(c, owner.scope_id, run_id, current_request_id)
+                            .await?
+                            .unwrap_or(held)
+                    } else {
+                        held
+                    }
+                    .min(held);
+                    if slice <= 0 {
+                        return Err(Error::Refused);
+                    }
+                    slice
+                }
+            };
+            return Ok(Some(amount));
+        }
         let Some(limit) = state.min_limit.filter(|&l| l > 0) else {
             return Err(Error::Refused);
         };
@@ -214,11 +243,6 @@ async fn resolve_cost_from_state(
                     return Err(Error::Refused);
                 };
                 if n <= 0 || n > limit {
-                    return Err(Error::Refused);
-                }
-                if let Some(held) = parent_cost_held
-                    && n > held
-                {
                     return Err(Error::Refused);
                 }
                 n
@@ -233,7 +257,6 @@ async fn resolve_cost_from_state(
                 } else {
                     limit
                 };
-                let slice = parent_cost_held.map_or(slice, |held| slice.min(held));
                 if slice <= 0 {
                     return Err(Error::Refused);
                 }

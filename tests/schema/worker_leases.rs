@@ -5124,4 +5124,411 @@ mod live_turns {
         .unwrap();
         assert_eq!(held, 0);
     }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn funded_parent_cost_hold_completes_both_rounds_after_limit_lowered_and_refuses_new_admission()
+     {
+        use crate::authz_http::{Api, As, browser, success};
+        use openmettle_core::{
+            authz::gateway::settlement,
+            provider_http::gateway::UsageReport,
+            provider_keys::gateway::{Bearer, Context, GatewayKeys, GatewaySealer},
+        };
+        use sqlx::postgres::PgPoolOptions;
+
+        const INSTALL: &str = "00000000-0000-4000-8000-000000001920";
+        const PRINCIPAL: &str = "00000000-0000-4000-8000-000000001921";
+        const BUDGET: &str = "00000000-0000-4000-8000-000000001922";
+        const KEY_BYTES: [u8; 32] = [0x71; 32];
+
+        let db = TestDb::migrated().await;
+        let mut owner = connect(&db.0, OWNER).await;
+        providers(&mut owner).await;
+        let admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+        crate::authz_store::make_admin(&mut owner, &admin).await;
+        let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+        let scope = personal_of(&db, &alice).await;
+        let admin_cookie = browser(&db, &admin, 2).await;
+        let admin_n = As::Browser(&admin_cookie);
+        let alice_cookie = browser(&db, &alice, 1).await;
+        let alice_b = As::Browser(&alice_cookie);
+
+        owner
+            .execute(
+                "UPDATE openmettle.quota_defaults
+                    SET cost_denomination = 'usd_micros'
+                  WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'",
+            )
+            .await
+            .unwrap();
+        owner
+            .execute(
+                "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+                 VALUES ('personal', 'usage_tokens', 100000),
+                        ('personal', 'usage_cost_micros', 500)",
+            )
+            .await
+            .unwrap();
+
+        let g_pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy_with(db.1.options(pg::GATEWAY));
+        let binding: String = sqlx::query_scalar(
+            "INSERT INTO openmettle.gateway_bindings (installation, user_id, principal, budget)
+             VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid) RETURNING id::text",
+        )
+        .bind(INSTALL)
+        .bind(&alice.user)
+        .bind(PRINCIPAL)
+        .bind(BUDGET)
+        .fetch_one(&g_pool)
+        .await
+        .unwrap();
+        let report_source: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+        let keys = GatewayKeys::new(&[("lowered-k1".into(), KEY_BYTES)]).unwrap();
+        let (finger, env) = GatewaySealer::new(keys, g_pool.clone())
+            .seal(
+                &Context {
+                    installation: INSTALL,
+                    user_id: &alice.user,
+                    binding_id: &binding,
+                    principal: PRINCIPAL,
+                    generation: 1,
+                },
+                &Bearer::new(b"lowered-limit-bearer").unwrap(),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_generations
+                 (binding_id, generation, remote_key, expires_at, key_id, key_fingerprint, nonce, ciphertext)
+             VALUES ($1::uuid, 1, gen_random_uuid(), clock_timestamp() + interval '1 hour', $2, $3, $4, $5)",
+        )
+        .bind(&binding)
+        .bind(&env.key_id)
+        .bind(finger.as_slice())
+        .bind(env.nonce.as_slice())
+        .bind(env.ciphertext)
+        .execute(&g_pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_policy
+                 (binding_id, revision, scope_id, approval_id, model, report_source,
+                  provider_generation, approval_generation, user_generation, capabilities)
+             VALUES ($1::uuid, 1, $2::uuid, $3::uuid, 'a', $4::uuid, 0, 0, 0, '{}'::jsonb)",
+        )
+        .bind(&binding)
+        .bind(&scope)
+        .bind(&alice.approval)
+        .bind(&report_source)
+        .execute(&g_pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.gateway_bindings
+                SET active_generation = 1, observed_revision = 1, state = 'ready'
+              WHERE id = $1::uuid",
+        )
+        .bind(&binding)
+        .execute(&g_pool)
+        .await
+        .unwrap();
+
+        let dir = Dir::new();
+        std::fs::create_dir(dir.path("artifacts")).unwrap();
+        let mut doc = auth_config_support::document_v2_native(&dir, &Ca::new().pem());
+        doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+        let mut catalog: Value =
+            serde_json::from_slice(include_bytes!("../fixtures/conversation-catalog-v1.json"))
+                .unwrap();
+        catalog["models"]["a"]["pin"]["provider"] = "synthetic-sglang".into();
+        catalog["models"]["a"]["prompt_bound"] = json!({
+            "fixed_tokens": 4,
+            "tokens_per_turn": 4,
+            "tokens_per_part": 2,
+            "tokens_per_byte": 1,
+            "tokens_per_attachment": 10
+        });
+        catalog["models"]["a"]["cost_bound"] = json!({
+            "fixed_micros": 100,
+            "micros_per_token": 0
+        });
+        doc["catalog_file"] =
+            json!(dir.write("catalog.json", &serde_json::to_vec(&catalog).unwrap()));
+        doc["admission_limits"] = json!({
+            "live_per_actor": 4,
+            "live_per_scope": 8,
+            "queued_in_instance": 32,
+            "queue_timeout_seconds": 300,
+            "round_cap": 10
+        });
+        let http_api = Api::configured(&db, dir, doc, 4);
+
+        // Admit a 2-round run with 100 micros/round -> reserves 200 funded cost micro-units.
+        let conv = success(
+            http_api.call(
+                alice_b,
+                "POST",
+                "/v1/conversations",
+                Some("lowered-conv"),
+                Some(&json!({})),
+            ),
+            201,
+        );
+        let conv_id = conv["conversation_id"].as_str().unwrap();
+        let branch_id = conv["branch_id"].as_str().unwrap();
+        let make_run = |msg_id: &str, rounds: i64| {
+            json!({
+                "conversation_id": conv_id,
+                "branch_id": branch_id,
+                "proposal": {
+                    "expected_head_message_id": null,
+                    "turn": {
+                        "mode": "append",
+                        "input_message_id": msg_id,
+                        "parts": [{"text": "two rounds under lowered limit"}]
+                    },
+                    "selection": {
+                        "model": "a",
+                        "layer": {"controls": {"context_window": "8192", "output_reserve": "1024"}}
+                    },
+                    "requested_rounds": rounds
+                }
+            })
+        };
+        let admitted = success(
+            http_api.call(
+                alice_b,
+                "POST",
+                "/v1/runs",
+                Some("lowered-run-1"),
+                Some(&make_run("00000000-0000-4000-8000-00000000c001", 2)),
+            ),
+            201,
+        );
+        let run_id = admitted["run_id"].as_str().unwrap().to_owned();
+
+        // Lower personal usage_cost_micros override to 50 while the run is in flight.
+        success(
+            http_api.call(
+                admin_n,
+                "PUT",
+                &format!("/v1/admin/scopes/{scope}/quotas/usage_cost_micros"),
+                Some("lowered-override-50"),
+                Some(&json!({"hard_limit": "50", "reason": "lower cost limit below funded round"})),
+            ),
+            200,
+        );
+
+        // A NEW run admission on a second conversation MUST fail closed with 429 quota.
+        let conv2 = success(
+            http_api.call(
+                alice_b,
+                "POST",
+                "/v1/conversations",
+                Some("lowered-conv-2"),
+                Some(&json!({})),
+            ),
+            201,
+        );
+        let (refused_status, refused_body) = http_api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some("lowered-run-new-refused"),
+            Some(&json!({
+                "conversation_id": conv2["conversation_id"],
+                "branch_id": conv2["branch_id"],
+                "proposal": {
+                    "expected_head_message_id": null,
+                    "turn": {
+                        "mode": "append",
+                        "input_message_id": "00000000-0000-4000-8000-00000000c002",
+                        "parts": [{"text": "new run must fail under lowered limit"}]
+                    },
+                    "selection": {
+                        "model": "a",
+                        "layer": {"controls": {"context_window": "8192", "output_reserve": "1024"}}
+                    },
+                    "requested_rounds": 1
+                }
+            })),
+        );
+        assert_eq!(refused_status, 429, "{refused_body}");
+        assert_eq!(refused_body["code"], "quota");
+        assert_eq!(refused_body["quota"]["resource_kind"], "usage_cost_micros");
+        assert_eq!(refused_body["quota"]["scope_kind"], "personal");
+
+        // Start real TurnExecutor worker with tools enabled (2 rounds) against TLS Provider.
+        let mut provider = Provider::with_bearer("lowered-limit-bearer".into()).await;
+        let mut child = Command::new(worker_binary())
+            .env("OPENMETTLE_TEST_TURN_WORKER", "1")
+            .args([
+                "--ignored",
+                "--exact",
+                "worker::turns::schema_fixture::worker_process",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.as_mut().unwrap();
+        serde_json::to_writer(
+            &mut *stdin,
+            &json!({
+                "database": db.url(WORKER),
+                "catalog": catalog,
+                "tools": true,
+                "scope": scope,
+                "actor": alice.user,
+                "ca": String::from_utf8(provider.ca.pem()).unwrap(),
+                "port": provider.port,
+                "artifacts": null,
+                "stop_during_observation": false,
+                "metered": {
+                    "installation": INSTALL,
+                    "key_id": "lowered-k1",
+                    "key_bytes": KEY_BYTES,
+                }
+            }),
+        )
+        .unwrap();
+        writeln!(stdin).unwrap();
+        let _worker_proc = Process(child);
+
+        // Round 1 allocates 100 micros from funded parent hold despite active limit = 50,
+        // hands off via TurnDispatch::send, and reaches the TLS provider with x-request-id.
+        let req1 = provider.request().await;
+        let req1_id = req1
+            .request_id
+            .clone()
+            .expect("round 1 TurnDispatch::send must attach x-request-id");
+
+        // Lower personal usage_cost_micros override further to 0 BEFORE Round 2!
+        success(
+            http_api.call(
+                admin_n,
+                "PUT",
+                &format!("/v1/admin/scopes/{scope}/quotas/usage_cost_micros"),
+                Some("lowered-override-0"),
+                Some(&json!({"hard_limit": "0", "reason": "zero cost limit before round 2"})),
+            ),
+            200,
+        );
+        let report1: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+        assert_eq!(
+            settlement::ingest(
+                &g_pool,
+                &UsageReport {
+                    request: req1_id,
+                    installation: INSTALL.into(),
+                    principal: PRINCIPAL.into(),
+                    scope: scope.clone(),
+                    source: report_source.clone(),
+                    report_id: report1,
+                    revision: 0,
+                    r#final: true,
+                    prompt_tokens: Some(40),
+                    completion_tokens: Some(20),
+                    reasoning_tokens: None,
+                    reasoning_included: None,
+                    cost: Some("60".into()),
+                    unit: Some("usd_micros".into()),
+                },
+            )
+            .await
+            .unwrap(),
+            settlement::Outcome::Applied
+        );
+        req1.respond(tool_call("lookup", "{}"));
+
+        // Round 2 allocates the remaining 100 funded parent micros despite active limit = 0,
+        // hands off via TurnDispatch::send, and completes the run.
+        let req2 = provider.request().await;
+        let req2_id = req2
+            .request_id
+            .clone()
+            .expect("round 2 TurnDispatch::send must attach x-request-id");
+        let report2: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+        assert_eq!(
+            settlement::ingest(
+                &g_pool,
+                &UsageReport {
+                    request: req2_id,
+                    installation: INSTALL.into(),
+                    principal: PRINCIPAL.into(),
+                    scope: scope.clone(),
+                    source: report_source.clone(),
+                    report_id: report2,
+                    revision: 0,
+                    r#final: true,
+                    prompt_tokens: Some(50),
+                    completion_tokens: Some(30),
+                    reasoning_tokens: None,
+                    reasoning_included: None,
+                    cost: Some("55".into()),
+                    unit: Some("usd_micros".into()),
+                },
+            )
+            .await
+            .unwrap(),
+            settlement::Outcome::Applied
+        );
+        req2.respond(completion(
+            json!("completed both rounds"),
+            None,
+            Value::Null,
+        ));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let state: String =
+                sqlx::query_scalar("SELECT state FROM openmettle.runs WHERE id = $1::uuid")
+                    .bind(&run_id)
+                    .fetch_one(&mut owner)
+                    .await
+                    .unwrap();
+            if state == "succeeded" {
+                break;
+            }
+            assert_eq!(state, "running", "unexpected run state: {state}");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for two-round funded run to succeed"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let cost_totals: (i64, i64) = sqlx::query_as(
+            "SELECT active_used::bigint, reserved_held::bigint
+               FROM openmettle.quota_budgets
+              WHERE target_kind = 'scope' AND scope_id = $1::uuid
+                AND resource_kind = 'usage_cost_micros'",
+        )
+        .bind(&scope)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(cost_totals, (115, 0));
+
+        let drift: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
+               FROM openmettle.quota_verify_accounting_drift()",
+        )
+        .fetch_one(&mut worker(&db).await)
+        .await
+        .unwrap();
+        assert_eq!(drift, (0, 0, 0, 0));
+    }
 }

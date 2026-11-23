@@ -1,6 +1,6 @@
 # Upgrade storage and activate metering
 
-Use this procedure when an existing database moves from migration 0023 or earlier to 0024. It applies even if the deployment has never accepted an upload or gateway request. Schedule a maintenance window and retain a matched database backup and artifact volume snapshot. Record the filesystem UUID and the device and inode of the original revisions directory independently of the tree you intend to adopt.
+Sections 1 through 4 cover upgrading an existing database from migration 0023 or earlier to the current quota schema (0026). Deployments already on migration 0024 or 0025 should follow [Upgrade from 0024 or 0025 to 0026](#upgrade-from-0024-or-0025-to-0026) instead. This procedure applies even if the deployment has never accepted an upload or gateway request. Schedule a maintenance window and retain a matched database backup and artifact volume snapshot. Record the filesystem UUID and the device and inode of the original revisions directory independently of the tree you intend to adopt.
 
 ## 1. Stop all legacy artifact cleaners
 
@@ -64,8 +64,19 @@ Existing `0024` or `0025` deployments, including installations that already have
 
 1. Apply migration `0026` with `openmettle-migrate` using its existing owner connection.
 2. Roll all API and worker deployments to the `0026` binaries and confirm that every `0024`/`0025` API and worker replica and job has exited.
-3. Rerun `openmettle-admin quota activate`. The command is idempotent, preserves the original `metering_enforced_at` timestamp, and sets `overrides_enforced = true` and `overrides_enforced_at`.
-4. Verify in SQL that all four columns are active and non-null:
+3. Inspect the current adoption and enforcement markers:
+
+```sql
+SELECT volume_id, adoption_run_id,
+       metering_enforced, metering_enforced_at,
+       overrides_enforced, overrides_enforced_at
+FROM openmettle.storage_volume_control CROSS JOIN openmettle.quota_enforcement;
+```
+
+4. Activate according to the observed `metering_enforced` state:
+   - **If `metering_enforced = true`:** rerun `openmettle-admin quota activate`. The command is idempotent, preserves the original `metering_enforced_at` timestamp, and sets `overrides_enforced = true` and `overrides_enforced_at`.
+   - **If `metering_enforced = false`:** do **not** run `openmettle-admin quota activate` yet. First configure operator-approved quota limits and the permanent instance `cost_denomination` (Section 2), then complete volume adoption (if storage is enabled or nonempty) and `openmettle-admin quota drain-orphans` (Section 4), and finally run `openmettle-admin quota activate` to enable both `metering_enforced` and `overrides_enforced`.
+5. Verify in SQL that all four enforcement columns are active and non-null:
 
 ```sql
 SELECT metering_enforced, metering_enforced_at, overrides_enforced, overrides_enforced_at

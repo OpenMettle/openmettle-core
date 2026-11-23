@@ -474,29 +474,16 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 };
                 // Validate and wire-encode the outbound payload BEFORE reserving or committing a
                 // gateway handoff so oversized/invalid payloads never strand handoff_committed holds.
-                let prepared = billable
+                let mut prepared = billable
                     .prepare(&self.catalog, &config.effective, &request, true)
                     .map_err(inference::Error::step_result)?;
-                let round_tokens = config
-                    .effective
-                    .ceiling
-                    .value
-                    .and_then(|n| i64::try_from(n).ok())
-                    .filter(|&n| n > 0)
-                    .ok_or(FAILED)?;
-                let round_cost = self
-                    .catalog
-                    .round_cost_ceiling(&config.effective)
-                    .map_err(|_| FAILED)?;
-                let requires_device_slot = self
-                    .catalog
-                    .target(&config.effective)
-                    .map_err(|_| FAILED)?
-                    .requires_device_slot;
+                let round_tokens = prepared.round_tokens().ok_or(FAILED)?;
+                let round_cost = prepared.round_cost();
+                let requires_device_slot = prepared.requires_device_slot();
                 const MAX_RETRYABLE_RESERVE_ATTEMPTS: u8 = 4;
                 const MAX_MISSING_HOLD_HANDOFF_RETRIES: u8 = 2;
                 let round_i32 = i32::try_from(round).map_err(|_| FAILED)?;
-                let dispatch = {
+                let turn_dispatch = {
                     let mut missing_hold_retries: u8 = 0;
                     let mut retryable_attempts: u8 = 0;
                     loop {
@@ -540,14 +527,18 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                                 &metered.keys,
                                 metered.device_grant_id.as_deref(),
                                 &billable,
-                                &prepared,
+                                prepared,
                             )
                             .await
                         {
-                            Ok(dispatch) => break dispatch,
-                            Err(crate::authz::gateway::TurnHandoffError::MissingHold)
-                                if missing_hold_retries < MAX_MISSING_HOLD_HANDOFF_RETRIES =>
+                            Ok(turn_dispatch) => break turn_dispatch,
+                            Err(err)
+                                if matches!(
+                                    err.0,
+                                    crate::authz::gateway::TurnHandoffError::MissingHold
+                                ) && missing_hold_retries < MAX_MISSING_HOLD_HANDOFF_RETRIES =>
                             {
+                                prepared = err.1;
                                 if !matches!(pending.release(&self.pool).await, Ok(true)) {
                                     return Err(FAILED);
                                 }
@@ -563,13 +554,8 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                         }
                     }
                 };
-                billable
-                    .send_prepared(
-                        dispatch,
-                        prepared,
-                        Some(RunStop::from_worker(run, cx.stop.clone())),
-                        |_| async {},
-                    )
+                turn_dispatch
+                    .send(RunStop::from_worker(run, cx.stop.clone()), |_| async {})
                     .await
                     .map_err(inference::Error::step_result)?
             } else {

@@ -12,6 +12,10 @@ impl TurnHandoffFixture {
     fn new(
         installation: &str,
         protocol: openmettle_core::provider_http::inference::Protocol,
+        model: &str,
+        round_tokens: i64,
+        round_cost: Option<u128>,
+        requires_device_slot: bool,
     ) -> Self {
         use openmettle_core::{
             model_config::{Catalog, Selection},
@@ -21,8 +25,25 @@ impl TurnHandoffFixture {
             },
         };
         let ca = crate::ca::Ca::new();
-        let catalog =
-            Catalog::load(include_bytes!("../fixtures/conversation-catalog-v1.json")).unwrap();
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../fixtures/conversation-catalog-v1.json"))
+                .unwrap();
+        let entry = &mut doc["models"][model];
+        entry["context_window"] = serde_json::json!(round_tokens);
+        entry["output_limit"] = serde_json::json!(round_tokens);
+        entry["requires_device_slot"] = serde_json::json!(requires_device_slot);
+        if let Some(cost) = round_cost {
+            entry["cost_bound"] = serde_json::json!({
+                "fixed_micros": u64::try_from(cost).unwrap(),
+                "micros_per_token": 0
+            });
+        } else {
+            entry.as_object_mut().unwrap().remove("cost_bound");
+        }
+        doc["presets"]["study"]["model"] = serde_json::json!(model);
+        doc["presets"]["study"]["defaults"]["controls"]["output_reserve"] =
+            serde_json::json!((round_tokens / 2).max(1));
+        let catalog = Catalog::load(&serde_json::to_vec(&doc).unwrap()).unwrap();
         let effective = catalog
             .resolve(
                 &Selection::default(),
@@ -73,10 +94,20 @@ impl TurnHandoffFixture {
         }
     }
 
-    fn chat(installation: &str) -> Self {
+    fn chat(
+        installation: &str,
+        model: &str,
+        round_tokens: i64,
+        round_cost: Option<u128>,
+        requires_device_slot: bool,
+    ) -> Self {
         Self::new(
             installation,
             openmettle_core::provider_http::inference::Protocol::Chat,
+            model,
+            round_tokens,
+            round_cost,
+            requires_device_slot,
         )
     }
 
@@ -2806,14 +2837,14 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
     )
     .await
     .unwrap();
-    let fx = TurnHandoffFixture::chat(INSTALL);
+    let fx = TurnHandoffFixture::chat(INSTALL, "a", 100, Some(100), true);
     let _disp1 = p1
         .handoff(
             &worker_pool,
             &keys,
             Some(GRANT_1),
             &fx.billable(),
-            &fx.prepare(),
+            fx.prepare(),
         )
         .await
         .unwrap();
@@ -2858,7 +2889,7 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
             &keys,
             Some(GRANT_1),
             &fx.billable(),
-            &fx.prepare(),
+            fx.prepare(),
         )
         .await,
         Err(gateway::Error::Refused)
@@ -2927,7 +2958,7 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
                 &keys,
                 Some(GRANT_2),
                 &fx.billable(),
-                &fx.prepare(),
+                fx.prepare(),
             )
             .await,
         Err(gateway::Error::Refused)
@@ -3615,9 +3646,9 @@ async fn pre_activation_charged_parents_pre26_replay_savepoint_and_n1_legacy_hol
     )
     .await
     .unwrap();
-    let fx = TurnHandoffFixture::chat(INSTALL);
+    let fx = TurnHandoffFixture::chat(INSTALL, "a", 200, Some(300), false);
     let _disp = pending_held
-        .handoff(&worker_pool, &keys, None, &fx.billable(), &fx.prepare())
+        .handoff(&worker_pool, &keys, None, &fx.billable(), fx.prepare())
         .await
         .unwrap();
     let child_rows: Vec<(String, i64, String)> = sqlx::query_as(
@@ -4090,9 +4121,9 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
     )
     .await
     .unwrap();
-    let fx = TurnHandoffFixture::chat(INSTALL);
+    let fx = TurnHandoffFixture::chat(INSTALL, "a", 200, Some(300), false);
     let _disp1 = p1
-        .handoff(&worker_pool, &keys, None, &fx.billable(), &fx.prepare())
+        .handoff(&worker_pool, &keys, None, &fx.billable(), fx.prepare())
         .await
         .unwrap();
     let r1_child_cost: (i64, String) = sqlx::query_as(
@@ -4427,7 +4458,7 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
         )
         .await
         .unwrap();
-    let fx = TurnHandoffFixture::chat(INSTALL);
+    let fx = TurnHandoffFixture::chat(INSTALL, "a", 100, None, true);
     assert!(matches!(
         p_race
             .handoff(
@@ -4435,7 +4466,7 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
                 &keys_up,
                 Some(GRANT_RACE),
                 &fx.billable(),
-                &fx.prepare(),
+                fx.prepare(),
             )
             .await,
         Err(gateway::Error::Refused)
@@ -4766,10 +4797,10 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
     .execute(&mut owner)
     .await
     .unwrap();
-    let fx = TurnHandoffFixture::chat(INSTALL);
+    let fx = TurnHandoffFixture::chat(INSTALL, "a", 100, None, false);
     assert!(matches!(
         p_unqual
-            .handoff(&worker_pool, &keys, None, &fx.billable(), &fx.prepare())
+            .handoff(&worker_pool, &keys, None, &fx.billable(), fx.prepare())
             .await,
         Err(gateway::Error::Refused)
     ));
@@ -4977,10 +5008,10 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
             )
             .await
             .unwrap();
-        let fx = TurnHandoffFixture::chat(INSTALL);
+        let fx = TurnHandoffFixture::chat(INSTALL, "a", 100, Some(500), false);
         assert!(matches!(
             p_null_denom
-                .handoff(&wp2, &keys2, None, &fx.billable(), &fx.prepare())
+                .handoff(&wp2, &keys2, None, &fx.billable(), fx.prepare())
                 .await,
             Err(gateway::Error::Refused)
         ));
@@ -5401,10 +5432,10 @@ async fn stale_lease_on_reserve_turn_round_and_gateway_reserve_returns_refused()
     )
     .await
     .unwrap();
-    let fx = TurnHandoffFixture::chat(INSTALL);
+    let fx = TurnHandoffFixture::chat(INSTALL, "a", 100, None, true);
     assert!(matches!(
         p_dev
-            .handoff(&worker_pool, &keys, None, &fx.billable(), &fx.prepare())
+            .handoff(&worker_pool, &keys, None, &fx.billable(), fx.prepare())
             .await,
         Err(gateway::Error::Refused)
     ));
@@ -6071,14 +6102,14 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
                 ("usage_tokens".into(), 100, "held".into()),
             ]
         );
-        let fx = TurnHandoffFixture::chat(INSTALL);
+        let fx = TurnHandoffFixture::chat(INSTALL, "a", 100, Some(300), true);
         let _disp = pending
             .handoff(
                 &worker_pool,
                 &keys,
                 Some(GRANT_1),
                 &fx.billable(),
-                &fx.prepare(),
+                fx.prepare(),
             )
             .await
             .unwrap();
@@ -6297,7 +6328,7 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
             )
             .await
             .unwrap();
-        let fx = TurnHandoffFixture::chat(INSTALL);
+        let fx = TurnHandoffFixture::chat(INSTALL, "a", 100, Some(300), true);
         assert!(matches!(
             p_pre
                 .handoff(
@@ -6305,7 +6336,7 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
                     &keys,
                     Some(GRANT_2),
                     &fx.billable(),
-                    &fx.prepare(),
+                    fx.prepare(),
                 )
                 .await,
             Err(gateway::Error::Refused)
@@ -6337,7 +6368,7 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
                 &keys,
                 Some(GRANT_2),
                 &fx.billable(),
-                &fx.prepare(),
+                fx.prepare(),
             )
             .await
             .unwrap();
@@ -7296,9 +7327,9 @@ async fn reserve_turn_round_returns_retryable_on_40001_and_succeeds_on_retry() {
     )
     .await
     .expect("immediate retry after Error::Retryable must succeed");
-    let fx = TurnHandoffFixture::chat(INSTALL);
+    let fx = TurnHandoffFixture::chat(INSTALL, "a", 200, None, false);
     let _disp = pending
-        .handoff(&worker_pool, &keys, None, &fx.billable(), &fx.prepare())
+        .handoff(&worker_pool, &keys, None, &fx.billable(), fx.prepare())
         .await
         .unwrap();
     let charge_roles: Vec<String> = sqlx::query_scalar(
@@ -7626,9 +7657,9 @@ async fn replacement_holds_and_cost_slice_account_for_prior_bearer_rounds() {
         ]
     );
 
-    let fx = TurnHandoffFixture::chat(INSTALL);
+    let fx = TurnHandoffFixture::chat(INSTALL, "a", 450, Some(450), false);
     let _disp_a = pending_a
-        .handoff(&worker_pool, &keys, None, &fx.billable(), &fx.prepare())
+        .handoff(&worker_pool, &keys, None, &fx.billable(), fx.prepare())
         .await
         .unwrap();
     let report_id_a: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
@@ -7998,11 +8029,14 @@ async fn public_turn_handoff_rejects_oversized_bearer_and_cross_gateway_prepared
         executing_per_scope: 8,
     };
 
-    let chat_fx = TurnHandoffFixture::chat(INSTALL);
-    let resp_fx = TurnHandoffFixture::new(INSTALL, Protocol::Responses);
+    let chat_fx = TurnHandoffFixture::chat(INSTALL, "a", 450, Some(450), false);
+    let resp_fx = TurnHandoffFixture::new(INSTALL, Protocol::Responses, "a", 450, Some(450), false);
+    let wrong_tokens_fx = TurnHandoffFixture::chat(INSTALL, "a", 1024, Some(450), false);
+    let wrong_cost_none_fx = TurnHandoffFixture::chat(INSTALL, "a", 450, None, false);
+    let wrong_cost_val_fx = TurnHandoffFixture::chat(INSTALL, "a", 450, Some(600), false);
+    let wrong_device_fx = TurnHandoffFixture::chat(INSTALL, "a", 450, Some(450), true);
     let chat_billable = chat_fx.billable();
     let resp_billable = resp_fx.billable();
-    let chat_prepared = chat_fx.prepare();
 
     // Part A (P2 #1): Public TurnPending::handoff rejects an oversized 896-byte Bearer BEFORE
     // committing gateway_requests or quota_reservations handoff_committed holds.
@@ -8083,7 +8117,7 @@ async fn public_turn_handoff_rejects_oversized_bearer_and_cross_gateway_prepared
     .unwrap();
     assert!(matches!(
         pending_a
-            .handoff(&worker_pool, &keys, None, &chat_billable, &chat_prepared)
+            .handoff(&worker_pool, &keys, None, &chat_billable, chat_fx.prepare(),)
             .await,
         Err(gateway::Error::Protection)
     ));
@@ -8245,12 +8279,22 @@ async fn public_turn_handoff_rejects_oversized_bearer_and_cross_gateway_prepared
     )
     .await
     .unwrap();
-    assert!(matches!(
-        pending_b
-            .handoff(&worker_pool, &keys, None, &resp_billable, &chat_prepared)
-            .await,
-        Err(gateway::Error::Refused)
-    ));
+    // Mismatched reservation bounds (round_tokens, round_cost None / 600, requires_device_slot)
+    // and cross-gateway same-pin dispatch MUST all fail closed BEFORE handoff commit.
+    for (bad_billable, bad_prepared) in [
+        (wrong_tokens_fx.billable(), wrong_tokens_fx.prepare()),
+        (wrong_cost_none_fx.billable(), wrong_cost_none_fx.prepare()),
+        (wrong_cost_val_fx.billable(), wrong_cost_val_fx.prepare()),
+        (wrong_device_fx.billable(), wrong_device_fx.prepare()),
+        (resp_billable, chat_fx.prepare()),
+    ] {
+        assert!(matches!(
+            pending_b
+                .handoff(&worker_pool, &keys, None, &bad_billable, bad_prepared)
+                .await,
+            Err(gateway::Error::Refused)
+        ));
+    }
     let req_b_state: String =
         sqlx::query_scalar("SELECT state FROM openmettle.gateway_requests WHERE id = $1::uuid")
             .bind(&pending_b.id)
@@ -8268,9 +8312,9 @@ async fn public_turn_handoff_rejects_oversized_bearer_and_cross_gateway_prepared
     .unwrap();
     assert_eq!(committed_b, 0);
 
-    // Matching originating Chat route hands off cleanly.
-    let _disp_b = pending_b
-        .handoff(&worker_pool, &keys, None, &chat_billable, &chat_prepared)
+    // Matching originating Chat route hands off cleanly and returns single-use TurnDispatch.
+    let _turn_dispatch_b: gateway::TurnDispatch<'_> = pending_b
+        .handoff(&worker_pool, &keys, None, &chat_billable, chat_fx.prepare())
         .await
         .unwrap();
     let report_id_b: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")

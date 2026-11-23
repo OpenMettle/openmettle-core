@@ -357,6 +357,47 @@ mod tests;
 #[path = "../tests/provider_inference/redaction.rs"]
 mod inference_redaction;
 
+/// Single-use committed turn handoff bound to its originating inference route and prepared
+/// wire payload. Consumed by [`Self::send`] so the dispatched credential and `x-request-id`
+/// cannot be redirected to a different gateway endpoint.
+pub struct TurnDispatch<'a> {
+    dispatch: Dispatch,
+    prepared: inference::PreparedRequest<'a>,
+}
+
+impl<'a> TurnDispatch<'a> {
+    pub(crate) fn new(dispatch: Dispatch, prepared: inference::PreparedRequest<'a>) -> Self {
+        Self { dispatch, prepared }
+    }
+
+    /// Transmit the committed turn request through its originating [`inference::Gateway`]
+    /// with the single-use `Authorization` credential and `x-request-id` correlation header.
+    pub async fn send<F: Future<Output = ()>>(
+        self,
+        run: inference::RunStop,
+        visible: impl FnMut(inference::VisibleDelta) -> F,
+    ) -> Result<inference::Turn, inference::Error> {
+        let gateway = self.prepared.gateway();
+        let id =
+            HeaderValue::from_str(&self.dispatch.id).map_err(|_| inference::Error::Credential)?;
+        let token = self
+            .dispatch
+            .authorization
+            .to_str()
+            .ok()
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .ok_or(inference::Error::Credential)?;
+        let cred = inference::Credential::Bearer(token);
+        transport::BILLABLE_REQUEST
+            .scope(std::cell::Cell::new(Some(id)), async {
+                gateway
+                    .server_prepared(self.prepared, cred, run, visible)
+                    .await
+            })
+            .await
+    }
+}
+
 /// Borrowed view over an installation and pinned inference route for single-use billable sends.
 pub struct BillableInferenceRef<'a> {
     pub installation: &'a str,

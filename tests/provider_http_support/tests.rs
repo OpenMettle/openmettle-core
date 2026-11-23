@@ -883,3 +883,129 @@ async fn document_get_capabilities_keep_destination_method_and_stream_bounds() {
     let documents = ProviderDocuments::configured(&token, &url, &url).unwrap();
     assert_eq!(documents.fetch_jwks().await.unwrap_err(), Error::TooLarge);
 }
+
+#[tokio::test]
+async fn turn_dispatch_sends_to_originating_gateway_with_bound_request_id() {
+    use crate::model_config::{Catalog, Selection};
+    use crate::provider_http::inference::{
+        Gateway, History, Protocol, Qualification, Request, RunStop, Timeouts,
+    };
+    use crate::worker::ActiveRun;
+    use tokio::sync::watch;
+
+    let ca = fixture::Ca::new();
+    let expected_id = "00000000-0000-4000-8000-000000001919";
+    let expected_bearer = "turn-dispatch-wire-bearer";
+    let server = fixture::Server::start(ca.leaf(fixture::HOST, false), move |received| {
+        assert!(
+            received
+                .head
+                .starts_with("POST /v1/chat/completions HTTP/1.1\r\n")
+        );
+        let header_val = |name: &str| {
+            received
+                .head
+                .lines()
+                .filter_map(|l| l.split_once(':'))
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.trim().to_owned())
+        };
+        assert_eq!(
+            header_val("authorization").as_deref(),
+            Some(format!("Bearer {expected_bearer}").as_str())
+        );
+        assert_eq!(header_val("x-request-id").as_deref(), Some(expected_id));
+        let body = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "bound ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2}
+        });
+        fixture::Reply::Bytes(fixture::response(
+            200,
+            &[("content-type", "application/json")],
+            body.to_string().as_bytes(),
+        ))
+    })
+    .await;
+
+    let catalog =
+        Catalog::load(include_bytes!("../fixtures/conversation-catalog-v1.json")).unwrap();
+    let effective = catalog
+        .resolve(
+            &Selection::default(),
+            &serde_json::from_value(serde_json::json!({"preset": "study"})).unwrap(),
+            None,
+            |_, _| true,
+        )
+        .unwrap();
+    let mut gateway = Gateway::new(
+        &format!(
+            "https://{}:{}/v1/chat/completions",
+            fixture::HOST,
+            server.port
+        ),
+        Trust::Bundle(&ca.pem()),
+        &[],
+        Qualification {
+            model: effective.model.clone(),
+            pin: effective.profile.clone(),
+            protocol: Protocol::Chat,
+            json: true,
+            sse: false,
+            functions: None,
+            images: false,
+            parallel: false,
+            usage: true,
+            tool_separator_whitespace: false,
+        },
+        Timeouts {
+            setup: Duration::from_secs(5),
+            idle: Duration::from_secs(5),
+            overall: Duration::from_secs(10),
+        },
+    )
+    .unwrap();
+    let port = server.port;
+    gateway.fixture_lookup(Arc::new(move |_, _| {
+        Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))])
+    }));
+
+    let req = Request {
+        history: vec![History::User("hello turn dispatch".into())],
+        tools: None,
+        parallel: None,
+        stream: false,
+    };
+    let prepared = gateway.prepare(&catalog, &effective, &req, true).unwrap();
+    let dispatch = Dispatch {
+        id: expected_id.to_owned(),
+        installation: "00000000-0000-4000-8000-000000001918".to_owned(),
+        model: effective.model.clone(),
+        server: true,
+        authorization: HeaderValue::from_str(&format!("Bearer {expected_bearer}")).unwrap(),
+    };
+    let turn_dispatch = TurnDispatch::new(dispatch, prepared);
+    let (_tx, stop_rx) = watch::channel(None);
+    let run = ActiveRun {
+        claim: crate::authz::runs::ClaimedRun {
+            scope_id: "s".into(),
+            run_id: "r".into(),
+            claim_token: "t".into(),
+            actor_approval_id: "a".into(),
+            round_limit: 1,
+            lease_remaining: Duration::from_secs(10),
+            execution_remaining: Duration::from_secs(10),
+        },
+        state: crate::authz::leases::ExecState::Running,
+        execution_deadline: tokio::time::Instant::now() + Duration::from_secs(10),
+    };
+    let turn = turn_dispatch
+        .send(RunStop::from_worker(&run, stop_rx), |_| async {})
+        .await
+        .unwrap();
+    assert_eq!(turn.answers[0].parts, ["bound ok"]);
+    assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+}

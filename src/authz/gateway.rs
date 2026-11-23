@@ -193,6 +193,8 @@ pub struct TurnRound<'a> {
     pub requires_device_slot: bool,
 }
 
+pub use crate::provider_http::TurnDispatch;
+
 /// Owned unsent turn-round reservation handle. Never cloned or serialized.
 pub struct TurnPending {
     pub id: String,
@@ -207,7 +209,7 @@ pub struct TurnPending {
     installation: String,
     model: String,
     units: i64,
-    cost_bound_missing: bool,
+    round_cost: Option<u128>,
     requires_device_slot: bool,
     pub(crate) enforced_at_bind: bool,
     pub(crate) cost_bound_at_bind: bool,
@@ -252,27 +254,52 @@ impl TurnPending {
     /// Atomically commit gateway handoff, optional device-slot handoff, and round usage child
     /// holds in a single write transaction following strict ADR 0040 lock order:
     /// `account_admin_lock..users..runs -> gateway_requests -> quota_reservations (resource_kind, id)
-    /// -> quota_gateway_handoffs -> quota_enforcement`. Validates route binding and complete
-    /// outbound headers against `billable` and `prepared` before committing. Any pre-commit or
+    /// -> quota_gateway_handoffs -> quota_enforcement`. Verifies reserved `(units, round_cost,
+    /// requires_device_slot)` bounds, route binding, and complete outbound headers against
+    /// `billable` and `prepared` before committing, returning a single-use [`TurnDispatch`] bound
+    /// to `prepared`'s originating [`crate::provider_http::inference::Gateway`]. Any pre-commit or
     /// deferred OMQ04 failure rolls back `gateway_requests` to `'reserved'` so `release()` can
     /// immediately unwind the round.
-    pub async fn handoff(
+    pub async fn handoff<'a>(
         &self,
         pool: &PgPool,
         keys: &GatewayKeys,
         device_grant_id: Option<&str>,
         billable: &crate::provider_http::BillableInferenceRef<'_>,
-        prepared: &crate::provider_http::inference::PreparedRequest<'_>,
-    ) -> Result<Dispatch, Error> {
+        prepared: crate::provider_http::inference::PreparedRequest<'a>,
+    ) -> Result<TurnDispatch<'a>, Error> {
         self.handoff_turn(pool, keys, device_grant_id, billable, prepared)
             .await
-            .map_err(|err| match err {
+            .map_err(|err| match err.0 {
                 TurnHandoffError::MissingHold => Error::Refused,
                 TurnHandoffError::Other(err) => err,
             })
     }
 
-    pub(crate) async fn handoff_turn(
+    pub(crate) async fn handoff_turn<'a>(
+        &self,
+        pool: &PgPool,
+        keys: &GatewayKeys,
+        device_grant_id: Option<&str>,
+        billable: &crate::provider_http::BillableInferenceRef<'_>,
+        prepared: crate::provider_http::inference::PreparedRequest<'a>,
+    ) -> Result<
+        TurnDispatch<'a>,
+        Box<(
+            TurnHandoffError,
+            crate::provider_http::inference::PreparedRequest<'a>,
+        )>,
+    > {
+        match self
+            .handoff_turn_inner(pool, keys, device_grant_id, billable, &prepared)
+            .await
+        {
+            Ok(dispatch) => Ok(TurnDispatch::new(dispatch, prepared)),
+            Err(err) => Err(Box::new((err, prepared))),
+        }
+    }
+
+    async fn handoff_turn_inner(
         &self,
         pool: &PgPool,
         keys: &GatewayKeys,
@@ -280,8 +307,12 @@ impl TurnPending {
         billable: &crate::provider_http::BillableInferenceRef<'_>,
         prepared: &crate::provider_http::inference::PreparedRequest<'_>,
     ) -> Result<Dispatch, TurnHandoffError> {
-        if self.requires_device_slot
-            && device_grant_id.is_some_and(|g| !crate::runs::is_canonical_uuid(g))
+        if (self.requires_device_slot
+            && device_grant_id.is_some_and(|g| !crate::runs::is_canonical_uuid(g)))
+            || !prepared.is_server()
+            || prepared.round_tokens() != Some(self.units)
+            || prepared.round_cost() != self.round_cost
+            || prepared.requires_device_slot() != self.requires_device_slot
         {
             return Err(TurnHandoffError::Other(Error::Refused));
         }
@@ -339,7 +370,7 @@ impl TurnPending {
         .bind(&self.claim_token)
         .bind(self.requires_device_slot)
         .bind(device_grant_id)
-        .bind(self.cost_bound_missing)
+        .bind(self.round_cost.is_none())
         .execute(
             tx.connection()
                 .map_err(|err| TurnHandoffError::Other(Error::from(err)))?,
@@ -359,7 +390,7 @@ impl TurnPending {
                 && db.as_database_error().and_then(|e| e.code()).as_deref() == Some("OMQ04")
             {
                 let retryable_missing_hold = (!self.enforced_at_bind
-                    || (!self.cost_bound_at_bind && !self.cost_bound_missing))
+                    || (!self.cost_bound_at_bind && self.round_cost.is_some()))
                     && (!self.requires_device_slot || device_grant_id.is_some());
                 return Err(if retryable_missing_hold {
                     TurnHandoffError::MissingHold
@@ -470,7 +501,7 @@ pub async fn reserve_turn_round(pool: &PgPool, round: TurnRound<'_>) -> Result<T
                     installation: round.installation.to_owned(),
                     model: round.model.to_owned(),
                     units: round.round_tokens,
-                    cost_bound_missing: round.round_cost.is_none(),
+                    round_cost: round.round_cost,
                     requires_device_slot: round.requires_device_slot,
                     enforced_at_bind,
                     cost_bound_at_bind,

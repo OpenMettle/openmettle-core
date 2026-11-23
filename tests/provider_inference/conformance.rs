@@ -605,8 +605,15 @@ async fn prepared_request_decodes_tool_calls_against_bound_request_tools() {
 
         // caller_prepared decodes the tool call strictly against the prepared request's bound tools.
         let prepared_caller = g.prepare(&c, &e, &r, false).unwrap();
+        assert!(std::ptr::eq(prepared_caller.gateway(), &g));
         assert_eq!(prepared_caller.model_name(), e.model);
         assert!(!prepared_caller.is_server());
+        assert_eq!(
+            prepared_caller.round_tokens(),
+            e.ceiling.value.map(|v| v as i64)
+        );
+        assert_eq!(prepared_caller.round_cost(), None);
+        assert!(!prepared_caller.requires_device_slot());
         g.validate_outbound_headers(Credential::Bearer(TOKEN), &prepared_caller)
             .unwrap();
         let oversized_bearer = "b".repeat(940);
