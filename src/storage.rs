@@ -3,9 +3,10 @@
 //! inside a savepoint and never commit. They keep counters consistent only for writers that
 //! use them; direct SQL by an application role can bypass that protocol.
 //!
-//! Lock order across helpers: run, reservation, artifact, revision, volume control, owner
-//! account, instance, then the retention policy (shared, for a removal's deadline) and at commit
-//! the deletion journal head (ADR 0040, ADR 0041). Each helper follows it. Callers composing several helpers or owners in one transaction can
+//! Lock order across helpers: run, reservation, artifact, revision, the restore gate (shared,
+//! on a move into `purging` or `purged`), volume control, owner account, instance, then the
+//! retention policy (shared, for a removal's deadline) and at commit the deletion journal head
+//! (ADR 0040, ADR 0041). Each helper follows it. Callers composing several helpers or owners in one transaction can
 //! still deadlock (SQLSTATE 40P01): abandon the whole transaction and retry it with the same
 //! idempotency keys. Never infer success from a failed or interrupted commit.
 use crate::{
@@ -685,8 +686,9 @@ pub async fn restore_revision(
 /// Requires `READ COMMITTED`; migration 28's claim guard fails the claim with SQLSTATE 25000
 /// under any other level, because the recheck must see references that other sessions commit
 /// while this one waits for the revision lock. Lock order: the revision row `FOR UPDATE`, then
-/// `storage_volume_control` `FOR SHARE` through migration 24's pin guard on the claim (OMQ03
-/// while unpinned or adopting). Every new attachment or hold first locks the revision row
+/// the restore gate `FOR SHARE` through migration 29's guard (OMR02 while a restore awaits
+/// journal replay), then `storage_volume_control` `FOR SHARE` through migration 24's pin guard
+/// on the claim (OMQ03 while unpinned or adopting). Every new attachment or hold first locks the revision row
 /// `FOR SHARE`, so it either commits before this lock is granted and the recheck (a later
 /// statement, with a newer snapshot) sees it, or it waits and then fails on `purging` (OMR01).
 /// Runs only move towards an outcome. The guarantee holds while this transaction keeps the row

@@ -166,6 +166,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "retention purge journal",
         sql: include_str!("../migrations/0028_retention_purge_journal.sql"),
     },
+    Source {
+        version: 29,
+        description: "restore reconciliation gate",
+        sql: include_str!("../migrations/0029_restore_reconciliation_gate.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

@@ -21,6 +21,7 @@ pub mod multipart;
 pub mod provider_http;
 pub mod provider_keys;
 pub mod quotas;
+pub mod restore;
 pub mod runs;
 pub mod sessions;
 pub mod storage;

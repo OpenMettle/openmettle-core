@@ -8,7 +8,7 @@ use super::*;
 use openmettle_core::storage;
 
 #[derive(Clone, Copy, Debug)]
-enum Step {
+pub(super) enum Step {
     Retain,
     Restore,
     Claim,
@@ -35,7 +35,7 @@ impl Step {
 }
 
 /// One step in its own transaction. The result includes the commit, where the journal appends.
-async fn step(db: &str, scope: &str, rev: &str, step: Step) -> Result<(), Error> {
+pub(super) async fn step(db: &str, scope: &str, rev: &str, step: Step) -> Result<(), Error> {
     let mut cn = connect(db, step.role()).await;
     let mut tx = WriteTransaction::begin(&mut cn).await.unwrap();
     let result = step.run(&mut tx, scope, rev).await;
@@ -43,7 +43,7 @@ async fn step(db: &str, scope: &str, rev: &str, step: Step) -> Result<(), Error>
     result.and(committed)
 }
 
-async fn pid(c: &mut PgConnection) -> i32 {
+pub(super) async fn pid(c: &mut PgConnection) -> i32 {
     sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(c)
         .await
@@ -190,7 +190,7 @@ type JournalRow = (
 
 /// Recomputes every chain digest from the encoding migration 28 documents, checks the sequence
 /// is gapless and the head names the last record.
-async fn assert_chain(db: &TestDb) {
+pub(super) async fn assert_chain(db: &TestDb) {
     let mut admin = db.admin().await;
     let rows: Vec<JournalRow> = sqlx::query_as(
         "SELECT journal_seq, event_kind, entity_id::text, scope_id::text,

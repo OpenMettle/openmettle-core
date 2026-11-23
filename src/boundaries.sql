@@ -6,6 +6,7 @@
 -- Version 27 adds the worker-only fenced capacity store (ADR 0042).
 -- Version 28 adds the retention policy, operator holds and the deletion journal (ADR 0041); no
 -- role other than the owner may hold any privilege on the holds or journal tables.
+-- Version 29 adds the restore reconciliation gate (ADR 0041); only the worker may read it.
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -70,6 +71,8 @@ capacity_tables (relation,role,privilege) AS (
 -- Version 28 (ADR 0041): the API reads the grace it applies and stamps its revision.
 retention_tables (relation,role,privilege) AS (
     SELECT 'retention_policy','openmettle_api','SELECT' WHERE $1 >= 28
+    -- Version 29: the worker claims no run and runs no purge sweep while the gate is closed.
+    UNION ALL SELECT 'restore_reconciliation_gate','openmettle_worker','SELECT' WHERE $1 >= 29
 ),
 retention_columns (relation,attribute,role,privilege) AS (
     SELECT 'artifact_revisions','retention_policy_revision','openmettle_api','UPDATE' WHERE $1 >= 28
@@ -183,6 +186,12 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.artifact_revision_pinned(uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.retention_guard_purge_claim()',true,ARRAY[]::text[]),
         ('openmettle.deletion_journal_append_purge()',true,ARRAY[]::text[])) AS f WHERE $1 >= 28
+    UNION ALL SELECT * FROM (VALUES
+        ('openmettle.restore_gate_guard_purge()',true,ARRAY[]::text[]),
+        ('openmettle.deletion_journal_digest(bytea,openmettle.deletion_journal)',false,ARRAY[]::text[]),
+        ('openmettle.restore_gate_lock(bigint)',false,ARRAY[]::text[]),
+        ('openmettle.deletion_journal_replay(bigint,bigint,text,uuid,uuid,bigint,bigint,bytea,bigint,bytea)',false,ARRAY[]::text[]),
+        ('openmettle.restore_gate_open(bigint,bytea)',false,ARRAY[]::text[])) AS f WHERE $1 >= 29
 ),
 gateway_functions (signature,definer,inference) AS (
     SELECT * FROM (VALUES ('openmettle.gateway_allocate()',true,false), ('openmettle.gateway_run_hold()',true,false),
@@ -715,7 +724,8 @@ violations (violation) AS (
                     (g.object_name LIKE 'quota\_%' OR g.object_name='storage_volume_control'))
                     OR ($1>=27 AND g.object_name LIKE 'capacity\_%')
                     OR ($1>=28 AND (g.object_name LIKE 'deletion\_journal%' OR g.object_name LIKE 'retention\_%'
-                                    OR g.object_name='artifact_retention_holds')))
+                                    OR g.object_name='artifact_retention_holds'))
+                    OR ($1>=29 AND g.object_name LIKE 'restore\_%'))
                AND g.grantee NOT IN (SELECT oid FROM owner_role)))
       AND NOT (g.kind = 'database' AND g.grantee <> 0 AND g.privilege = 'CONNECT')
       AND NOT (g.kind = 'database' AND g.grantee = 0 AND $1 < 1

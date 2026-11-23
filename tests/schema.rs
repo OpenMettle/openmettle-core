@@ -408,6 +408,7 @@ struct AdditiveTable {
 const SINGLETON_LOCK_SEED: &str = r#"{"id": true, "lock_guard": false}"#;
 const RETENTION_POLICY_SEED: &str = r#"{"id":true,"revision":1,"grace_seconds":2592000,"min_grace_seconds":2592000,"max_grace_seconds":2592000}"#;
 const DELETION_JOURNAL_HEAD_SEED: &str = r#"{"id":true,"journal_seq":0,"chain_digest":"\\x0000000000000000000000000000000000000000000000000000000000000000"}"#;
+const RESTORE_GATE_SEED: &str = r#"{"id":true,"open":true,"snapshot_journal_seq":null,"required_journal_seq":null,"locked_at":null,"opened_at":null}"#;
 
 /// Single declarative registry of every column added to an existing table by migrations after
 /// the early schema baselines, ordered by `since` migration version. Adding entries here
@@ -930,6 +931,11 @@ const ADDITIVE_TABLES: &[AdditiveTable] = &[
         table: "deletion_journal_head",
         seed_row: Some(DELETION_JOURNAL_HEAD_SEED),
     },
+    AdditiveTable {
+        since: 29,
+        table: "restore_reconciliation_gate",
+        seed_row: Some(RESTORE_GATE_SEED),
+    },
 ];
 
 fn additive_columns_since(base_version: i64) -> impl Iterator<Item = &'static AdditiveColumn> {
@@ -1095,6 +1101,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "dad89ccf522802b8c572ec8947fdfede32e569a5e26004ecb593edf50c96711f",
         "f420dac4231768d9eab1c1e1d21f156864c98af88335380ee1de392f7ba7e6d0",
         "feda63e3c2ed89d787e6e5a978a15208068598085fe8de52a8620b583c5789a6",
+        "10231461a3454b1f71f82b566abb3d3fcb06ac307339852b172268f3619093bd",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
@@ -1220,7 +1227,7 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
     let after_14: Vec<(&str, Option<&str>)> = expected_added_tables_since(14)
         .map(|e| (e.table, e.seed_row))
         .collect();
-    assert_eq!(after_14.len(), 46);
+    assert_eq!(after_14.len(), 47);
     assert!(after_14.contains(&("account_admin_lock", Some(SINGLETON_LOCK_SEED))));
     assert!(after_14.contains(&("run_dispatch_lock", Some(SINGLETON_LOCK_SEED))));
     let after_18: Vec<(&str, Option<&str>)> = expected_added_tables_since(18)
@@ -1281,6 +1288,7 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
             ("artifact_retention_holds", None),
             ("deletion_journal", None),
             ("deletion_journal_head", Some(DELETION_JOURNAL_HEAD_SEED)),
+            ("restore_reconciliation_gate", Some(RESTORE_GATE_SEED)),
         ]
     );
 

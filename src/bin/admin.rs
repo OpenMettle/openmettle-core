@@ -1,7 +1,10 @@
 //! Owner-operated offline maintenance.
-use openmettle_core::artifact_fs::adoption::{self, Options};
-use sqlx::{Connection, PgConnection};
-use std::{env, path::Path, process::ExitCode};
+use openmettle_core::{
+    artifact_fs::adoption::{self, Options},
+    restore,
+};
+use sqlx::{Connection, PgConnection, PgPool};
+use std::{env, fs, path::Path, process::ExitCode};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
@@ -13,9 +16,99 @@ async fn main() -> ExitCode {
         }
     }
 }
+async fn pool(connections: u32) -> Result<PgPool, &'static str> {
+    let url = env::var("OPENMETTLE_ADMIN_DATABASE_URL")
+        .map_err(|_| "OPENMETTLE_ADMIN_DATABASE_URL is required")?;
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(connections)
+        .connect(&url)
+        .await
+        .map_err(|_| "database connection failed")
+}
+
+/// Reports a journal or restore step's failure by kind and SQLSTATE only, never record contents,
+/// and returns the step's own message.
+fn failed(step: &'static str) -> impl FnOnce(restore::Error) -> &'static str {
+    move |e| {
+        match e {
+            restore::Error::Export(why) => eprintln!("{step}: invalid export: {why}"),
+            restore::Error::Database(sqlx::Error::Database(d)) => {
+                eprintln!("{step}: SQLSTATE {}", d.code().unwrap_or_default())
+            }
+            restore::Error::Drift => eprintln!("{step}: accounting drift detected"),
+            restore::Error::ArtifactRootRequired => {
+                eprintln!("{step}: the volume is pinned; pass its artifact root")
+            }
+            _ => eprintln!("{step}: database or volume failure"),
+        }
+        match step {
+            "journal export" => "journal export failed",
+            "restore lock" => "restore lock failed; the gate state is unchanged",
+            _ => "restore replay failed; the restore gate was not opened",
+        }
+    }
+}
+
+/// ADR 0041: `journal export FILE`, `restore lock --required-seq N`, `restore replay FILE [ROOT]`.
+async fn journal(
+    command: (Option<String>, Option<String>),
+    args: &[String],
+) -> Result<(), &'static str> {
+    match (command.0.as_deref(), command.1.as_deref(), args) {
+        (Some("journal"), Some("export"), [file]) => {
+            let text = restore::export(&pool(1).await?)
+                .await
+                .map_err(failed("journal export"))?;
+            // Never overwrite an earlier export.
+            fs::File::create_new(file)
+                .and_then(|mut f| {
+                    std::io::Write::write_all(&mut f, text.as_bytes()).and(f.sync_all())
+                })
+                .map_err(|_| "export file could not be created")?;
+            println!("{}", text.lines().rev().nth(1).unwrap_or_default());
+        }
+        (Some("restore"), Some("lock"), [flag, n]) if flag == "--required-seq" => {
+            let required = n.parse().map_err(|_| "invalid sequence")?;
+            let (snapshot, required) = restore::lock(&pool(1).await?, required)
+                .await
+                .map_err(failed("restore lock"))?;
+            println!("restore gate closed: snapshot {snapshot}, required {required}");
+        }
+        (Some("restore"), Some("replay"), [file, root @ ..]) if root.len() <= 1 => {
+            let store = root
+                .first()
+                .map(|root| openmettle_core::artifact_fs::Store::open_existing(Path::new(root)))
+                .transpose()
+                .map_err(|_| "volume unavailable")?;
+            let text = fs::read_to_string(file).map_err(|_| "export file unreadable")?;
+            let export = restore::Export::parse(&text).map_err(failed("restore replay"))?;
+            let pool = pool(2).await?;
+            let applied = restore::apply(&pool, &export)
+                .await
+                .map_err(failed("restore replay"))?;
+            restore::finish(&pool, store.as_ref(), &export)
+                .await
+                .map_err(failed("restore replay"))?;
+            println!(
+                "replayed {applied} records through {}; restore gate open",
+                export.seq
+            );
+        }
+        _ => {
+            return Err(
+                "usage: openmettle-admin journal export FILE | restore lock --required-seq N | restore replay FILE [ROOT]",
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn run() -> Result<(), &'static str> {
     let mut args = env::args().skip(1);
     let command = (args.next(), args.next());
+    if matches!(command.0.as_deref(), Some("journal" | "restore")) {
+        return journal(command, &args.collect::<Vec<_>>()).await;
+    }
     if command.0.as_deref() == Some("quota") {
         let artifact_root = args.next();
         if args.next().is_some()
@@ -23,13 +116,7 @@ async fn run() -> Result<(), &'static str> {
         {
             return Err("unexpected quota command argument");
         }
-        let url = env::var("OPENMETTLE_ADMIN_DATABASE_URL")
-            .map_err(|_| "OPENMETTLE_ADMIN_DATABASE_URL is required")?;
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&url)
-            .await
-            .map_err(|_| "database connection failed")?;
+        let pool = pool(1).await?;
         match command.1.as_deref() {
             Some("drain-orphans") => {
                 let released = openmettle_core::quotas::drain_gateway_orphans(&pool)

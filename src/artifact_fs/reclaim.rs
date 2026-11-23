@@ -633,3 +633,35 @@ pub async fn purge_due(pool: &PgPool, store: &Store, limit: i64) -> Result<usize
     anchors?;
     count
 }
+
+/// Restore replay (ADR 0041): finishes, through the same stages, every revision named by a
+/// journal record that is not yet purged. Replay moved each to `purging`, so no reference or
+/// deadline is rechecked; one without a verified payload binding stays and keeps the gate shut.
+pub async fn purge_journaled(pool: &PgPool, store: &Store) -> Result<usize, Error> {
+    let Some(pin) = store.prepare(pool, false).await? else {
+        return Err(Error::Io);
+    };
+    let page = sqlx::query_as::<_, (String, String, String, String)>(
+        "SELECT r.id::text, r.scope_id::text, r.reservation_id::text, sr.payload_ino::text
+           FROM openmettle.deletion_journal j
+           JOIN openmettle.artifact_revisions r ON r.scope_id = j.scope_id AND r.id = j.entity_id
+           JOIN openmettle.storage_reservations sr ON sr.scope_id = r.scope_id AND sr.id = r.reservation_id
+          WHERE r.state = 'purging' AND sr.payload_ino IS NOT NULL ORDER BY j.journal_seq",
+    )
+    .fetch_all(pool)
+    .await?;
+    let pin = pin.as_str();
+    sweep_items(page, |(id, scope, res, ino)| async move {
+        purge_one(
+            pool,
+            store,
+            pin,
+            &scope,
+            &id,
+            &res,
+            ino.parse().map_err(|_| Error::Io)?,
+        )
+        .await
+    })
+    .await
+}

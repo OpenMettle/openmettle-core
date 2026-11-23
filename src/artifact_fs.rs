@@ -713,6 +713,6 @@ async fn sweep_items<T, F: Future<Output = Result<bool, Error>>>(
     first_error.map_or(Ok(count), Err)
 }
 
-pub use reclaim::{purge_due, reconcile_expired, reconcile_run_spills};
+pub use reclaim::{purge_due, purge_journaled, reconcile_expired, reconcile_run_spills};
 #[cfg(test)]
 mod tests;
