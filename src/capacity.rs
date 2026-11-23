@@ -18,11 +18,11 @@
 //! level: inside `REPEATABLE READ` it returns the transaction's snapshot, possibly older than
 //! committed state, with `admits_bursts` evaluated on that snapshot at the current time.
 //!
-//! Every `Err` from a write means PostgreSQL raised an error, which aborts the caller's
-//! transaction: its earlier writes are lost and its next statement fails until it rolls back.
-//! That includes expiries detected after a write's last lock wait (`LeaseLost`, `Fenced`,
-//! `Expired`). An `Ok` outcome, including `Decision::Insufficient` and `Decision::Unavailable`,
-//! leaves the transaction intact.
+//! On any `Err` from a write, roll the caller's transaction back and never commit it. An error
+//! PostgreSQL raised (including expiries detected after a write's last lock wait: `LeaseLost`,
+//! `Fenced`, `Expired`) has already aborted the transaction, losing its earlier writes; an
+//! `Invalid` the Rust API returns before sending any SQL has not. An `Ok` outcome, including
+//! `Decision::Insufficient` and `Decision::Unavailable`, leaves the transaction intact.
 use crate::runs::is_canonical_uuid;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::Serialize;
@@ -135,8 +135,9 @@ impl Controller {
         })
     }
 
-    /// Extend the live lease within this epoch. After expiry or takeover this returns
-    /// [`Error::Fenced`]: acquire again for a new epoch.
+    /// Extend the live lease within this epoch. After expiry or takeover, including expiry while
+    /// the renewal waits for a lock, this returns [`Error::Fenced`] and leaves the deadline
+    /// unchanged: acquire again for a new epoch.
     pub async fn renew(&self, c: &mut PgConnection, lease: Duration) -> Result<(), Error> {
         sqlx::query("SELECT openmettle.capacity_renew_controller($1::uuid, $2, $3, $4)")
             .bind(&self.group_id)
@@ -278,8 +279,8 @@ pub enum Decision {
 /// Decide a grant under the group fence and the run's active lease. A new grant charges its full
 /// footprint and binds the run's `device_reservations` slot before the caller dispatches. If
 /// the run lease, controller lease or sample expires while the decision waits for its last lock,
-/// it returns `LeaseLost`, `Fenced` or `Expired`; like every `Err`, that aborts the caller's
-/// transaction, including writes it made earlier.
+/// it returns `LeaseLost`, `Fenced` or `Expired`, raised by PostgreSQL: the caller's transaction,
+/// including writes it made earlier, is already aborted. Roll back on any `Err`.
 pub async fn grant(
     c: &mut PgConnection,
     controller: &Controller,
@@ -345,8 +346,8 @@ pub enum Evidence<'a> {
 
 /// Record fenced evidence for a grant. The grant reaches `released`, and its device slot is
 /// settled in the same transaction, only when every device of its footprint has confirmed. If
-/// the controller lease expires while settlement waits for the slot's rows, it returns `Fenced`
-/// and the caller's transaction is aborted.
+/// the controller lease expires while any step waits for a lock, every change rolls back and it
+/// returns `Fenced`, with the caller's transaction already aborted.
 pub async fn reconcile(
     c: &mut PgConnection,
     controller: &Controller,

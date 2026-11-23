@@ -388,6 +388,41 @@ async fn admits(c: &mut PgConnection) -> bool {
         .admits_bursts
 }
 
+/// Hold `lock` (with `bind`, if any) in another session, run `write`, and release the lock
+/// 1.5 s after `write` starts waiting on it.
+async fn behind_lock<T>(
+    db: &TestDb,
+    lock: &str,
+    bind: Option<&str>,
+    write: impl std::future::Future<Output = T>,
+) -> T {
+    let mut blocker = connect(&db.0, OWNER).await;
+    let mut held = blocker.begin().await.unwrap();
+    let mut query = sqlx::query(AssertSqlSafe(lock.to_owned()));
+    if let Some(bind) = bind {
+        query = query.bind(bind.to_owned());
+    }
+    query.execute(&mut *held).await.unwrap();
+    let (out, ()) = tokio::join!(write, async move {
+        authz_store::wait_for_lock_waiters(db, 1).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        held.commit().await.unwrap();
+    });
+    out
+}
+
+/// The group row's epoch, deadline, revision and ready epoch.
+async fn group_state(c: &mut PgConnection) -> (i64, String, i64, Option<i64>) {
+    sqlx::query_as(
+        "SELECT controller_epoch, lease_expires_at::text, observation_revision, ready_epoch
+           FROM openmettle.capacity_groups WHERE id = $1::uuid",
+    )
+    .bind(GROUP)
+    .fetch_one(c)
+    .await
+    .unwrap()
+}
+
 /// Acquire, publish a full-spare snapshot at `revision` and resume: the group admits bursts.
 async fn open_group(c: &mut PgConnection, revision: i64, devices: &[&str]) -> Controller {
     let controller = Controller::acquire(c, GROUP, LEASE).await.unwrap();
@@ -1851,6 +1886,141 @@ async fn device_configuration_locks_only_its_own_visible_group() {
     assert_eq!(sqlstate(refused), "23503");
     creating.commit().await.unwrap();
     add(GPU3, GROUP_C).execute(&mut other).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn group_writes_waiting_past_expiry_behind_a_share_lock_are_refused() {
+    let f = Fixture::new(&[GPU0], 0).await;
+    let mut c = f.worker().await;
+    let share = "LOCK TABLE openmettle.capacity_groups IN SHARE MODE";
+    let short = Duration::from_millis(1000);
+    let devices = [sample(GPU0, 0, SPARE)];
+    // Renewal's deadline write waits past the lease and must not revive the epoch.
+    let first = open_group(&mut c, 1, &[GPU0]).await;
+    first.renew(&mut c, short).await.unwrap();
+    let before = group_state(&mut c).await;
+    let renewed = behind_lock(&f.db, share, None, first.renew(&mut c, LEASE)).await;
+    assert_eq!(renewed, Err(Error::Fenced));
+    assert_eq!(group_state(&mut c).await, before);
+    // Publication's group write waits past the lease.
+    let second = Controller::acquire(&mut c, GROUP, short).await.unwrap();
+    let before = group_state(&mut c).await;
+    let observation = Observation {
+        revision: 2,
+        observed_at_us: db_now_us(&mut c).await,
+        commit_watermark: 0,
+        devices: &devices,
+    };
+    let published = behind_lock(
+        &f.db,
+        share,
+        None,
+        capacity::publish(&mut c, &second, &observation),
+    )
+    .await;
+    assert_eq!(published, Err(Error::Fenced));
+    assert_eq!(group_state(&mut c).await, before);
+    // Resume's ready write waits past the lease.
+    let third = Controller::acquire(&mut c, GROUP, short).await.unwrap();
+    assert!(publish(&mut c, &third, 2, 0, &devices).await.unwrap());
+    let before = group_state(&mut c).await;
+    let resumed = behind_lock(&f.db, share, None, capacity::resume(&mut c, &third)).await;
+    assert_eq!(resumed, Err(Error::Fenced));
+    assert_eq!(group_state(&mut c).await, before);
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn unmetered_release_evidence_rolls_back_when_the_lease_lapses_during_its_wait() {
+    let mut f = Fixture::with(&[GPU0, GPU1], 2, false).await;
+    let mut c = f.worker().await;
+    let first = open_group(&mut c, 1, &[GPU0, GPU1]).await;
+    let whole = granted(
+        capacity::grant(&mut c, &first, &f.request(0, "whole", &[bytes(GPU0, GIB)]))
+            .await
+            .unwrap(),
+    );
+    let split = granted(
+        capacity::grant(
+            &mut c,
+            &first,
+            &f.request(1, "split", &[bytes(GPU0, GIB), bytes(GPU1, GIB)]),
+        )
+        .await
+        .unwrap(),
+    );
+    let row_lock = "SELECT FROM openmettle.capacity_grants WHERE id = $1::uuid FOR UPDATE";
+    let gpu0 = [GPU0.to_string()];
+    // Complete evidence for a grant without a device slot.
+    first
+        .renew(&mut c, Duration::from_millis(1000))
+        .await
+        .unwrap();
+    let released = behind_lock(
+        &f.db,
+        row_lock,
+        Some(&whole),
+        capacity::reconcile(&mut c, &first, &whole, Evidence::Released(&gpu0)),
+    )
+    .await;
+    assert_eq!(released, Err(Error::Fenced));
+    // Partial evidence, from the next controller.
+    let second = Controller::acquire(&mut c, GROUP, Duration::from_millis(1000))
+        .await
+        .unwrap();
+    let partial = behind_lock(
+        &f.db,
+        row_lock,
+        Some(&split),
+        capacity::reconcile(&mut c, &second, &split, Evidence::Released(&gpu0)),
+    )
+    .await;
+    assert_eq!(partial, Err(Error::Fenced));
+    // Neither grant changed.
+    let unchanged: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM openmettle.capacity_grants WHERE state = 'granted'),
+                (SELECT count(*) FROM openmettle.capacity_grant_devices
+                  WHERE release_evidence IS NOT NULL)",
+    )
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(unchanged, (2, 0));
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_recreated_group_never_reuses_a_controller_epoch() {
+    // GROUP_B has no devices, so the operator may delete and recreate it.
+    let mut f = Fixture::new(&[GPU0], 0).await;
+    let mut c = f.worker().await;
+    let first = Controller::acquire(&mut c, GROUP_B, LEASE).await.unwrap();
+    f.owner_exec(
+        "UPDATE openmettle.capacity_groups
+            SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1::uuid",
+        &[GROUP_B],
+    )
+    .await;
+    let second = Controller::acquire(&mut c, GROUP_B, LEASE).await.unwrap();
+    assert!(second.epoch() > first.epoch());
+    f.owner_exec(
+        "DELETE FROM openmettle.capacity_groups WHERE id = $1::uuid",
+        &[GROUP_B],
+    )
+    .await;
+    f.owner_exec(
+        "INSERT INTO openmettle.capacity_groups (id, observation_ttl_ms) VALUES ($1::uuid, 60000)",
+        &[GROUP_B],
+    )
+    .await;
+    let third = Controller::acquire(&mut c, GROUP_B, LEASE).await.unwrap();
+    assert!(
+        third.epoch() > second.epoch(),
+        "epoch {} after {}",
+        third.epoch(),
+        second.epoch()
+    );
 }
 
 #[tokio::test]
