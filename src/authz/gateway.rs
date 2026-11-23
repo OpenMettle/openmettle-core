@@ -37,6 +37,14 @@ impl From<sqlx::Error> for Error {
         }
     }
 }
+
+/// Map SQLSTATE `42501` (stale run lease) and `P0002` (run no longer live/running) to `Refused`.
+pub(crate) fn map_stale_lease(err: sqlx::Error) -> Error {
+    match err.as_database_error().and_then(|e| e.code()).as_deref() {
+        Some("42501" | "P0002") => Error::Refused,
+        _ => Error::from(err),
+    }
+}
 impl From<crate::runs::Error> for Error {
     fn from(_: crate::runs::Error) -> Self {
         Self::Database
@@ -169,6 +177,7 @@ pub struct TurnPending {
     model: String,
     units: i64,
     cost_bound_missing: bool,
+    requires_device_slot: bool,
 }
 
 impl TurnPending {
@@ -208,10 +217,9 @@ impl TurnPending {
         &self,
         pool: &PgPool,
         keys: &GatewayKeys,
-        requires_device_slot: bool,
         device_grant_id: Option<&str>,
     ) -> Result<Dispatch, Error> {
-        if requires_device_slot
+        if self.requires_device_slot
             && device_grant_id.is_some_and(|g| !crate::runs::is_canonical_uuid(g))
         {
             return Err(Error::Refused);
@@ -247,7 +255,7 @@ impl TurnPending {
         .bind(&self.scope_id)
         .bind(&self.run_id)
         .bind(&self.claim_token)
-        .bind(requires_device_slot)
+        .bind(self.requires_device_slot)
         .bind(device_grant_id)
         .bind(self.cost_bound_missing)
         .execute(tx.connection()?)
@@ -292,10 +300,11 @@ pub async fn reserve_turn_round(pool: &PgPool, round: TurnRound<'_>) -> Result<T
     .bind(round.claim_token)
     .bind(round.round)
     .execute(tx.connection()?)
-    .await?;
+    .await
+    .map_err(map_stale_lease)?;
     let round_cost_i64 = round.round_cost.and_then(|c| i64::try_from(c).ok());
     let round_cost_overflow = round.round_cost.is_some_and(|c| i64::try_from(c).is_err());
-    let reservation_id: String = match sqlx::query_scalar(
+    let reservation_id: String = sqlx::query_scalar(
         "SELECT openmettle.quota_prepare_turn_round(
              $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, false
          )::text",
@@ -310,15 +319,7 @@ pub async fn reserve_turn_round(pool: &PgPool, round: TurnRound<'_>) -> Result<T
     .bind(round.requires_device_slot)
     .fetch_one(tx.connection()?)
     .await
-    {
-        Ok(id) => id,
-        Err(err) => {
-            return match err.as_database_error().and_then(|e| e.code()).as_deref() {
-                Some("P0002" | "42501") => Err(Error::Refused),
-                _ => Err(Error::from(err)),
-            };
-        }
-    };
+    .map_err(map_stale_lease)?;
     let call = Call {
         reservation: Reservation {
             id: &reservation_id,
@@ -361,6 +362,7 @@ pub async fn reserve_turn_round(pool: &PgPool, round: TurnRound<'_>) -> Result<T
         model: round.model.to_owned(),
         units: round.round_tokens,
         cost_bound_missing: round.round_cost.is_none(),
+        requires_device_slot: round.requires_device_slot,
     })
 }
 

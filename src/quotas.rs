@@ -42,7 +42,8 @@ pub(crate) async fn prepare_round(
         .bind(token)
         .bind(round)
         .execute(tx.connection()?)
-        .await?;
+        .await
+        .map_err(crate::authz::gateway::map_stale_lease)?;
         let has_v26_prepare: bool = sqlx::query_scalar(
             "SELECT to_regprocedure(
                  'openmettle.quota_prepare_turn_round(uuid,uuid,uuid,bigint,bigint,boolean,boolean,boolean,boolean)'
@@ -62,7 +63,8 @@ pub(crate) async fn prepare_round(
             .bind(call.units)
             .bind(cost_ceiling)
             .execute(tx.connection()?)
-            .await?;
+            .await
+            .map_err(crate::authz::gateway::map_stale_lease)?;
         } else {
             sqlx::query(
                 "SELECT openmettle.quota_ensure_legacy_run_holds($1::uuid,$2::uuid,$3::uuid)",
@@ -71,7 +73,8 @@ pub(crate) async fn prepare_round(
             .bind(run)
             .bind(token)
             .execute(tx.connection()?)
-            .await?;
+            .await
+            .map_err(crate::authz::gateway::map_stale_lease)?;
         }
     }
     Ok(())
@@ -868,11 +871,11 @@ pub(crate) async fn read_summary_in_tx(
                      THEN o.hard_limit END AS override_limit,
                 CASE WHEN o.revoked_at IS NULL AND (o.expires_at IS NULL OR o.expires_at > $3::text::timestamptz)
                      THEN (extract(epoch FROM o.expires_at) * 1000000)::bigint END AS override_expires_us,
-                coalesce(
-                    CASE WHEN o.revoked_at IS NULL AND (o.expires_at IS NULL OR o.expires_at > $3::text::timestamptz)
-                         THEN o.revision END,
-                    0
-                ) AS limit_revision
+                CASE
+                    WHEN o.revoked_at IS NOT NULL THEN o.revision
+                    WHEN o.expires_at IS NULL OR o.expires_at > $3::text::timestamptz THEN coalesce(o.revision, 0)
+                    ELSE 0
+                END AS limit_revision
            FROM (VALUES (1)) AS seed(id)
            LEFT JOIN openmettle.storage_accounts a ON a.scope_id = $1::uuid
            LEFT JOIN openmettle.storage_instance i ON i.id
@@ -944,11 +947,11 @@ pub(crate) async fn read_summary_in_tx(
                          THEN o.hard_limit END AS override_limit,
                     CASE WHEN o.revoked_at IS NULL AND (o.expires_at IS NULL OR o.expires_at > $3::text::timestamptz)
                          THEN (extract(epoch FROM o.expires_at) * 1000000)::bigint END AS override_expires_us,
-                    coalesce(
-                        CASE WHEN o.revoked_at IS NULL AND (o.expires_at IS NULL OR o.expires_at > $3::text::timestamptz)
-                             THEN o.revision END,
-                        0
-                    ) AS limit_revision,
+                    CASE
+                        WHEN o.revoked_at IS NOT NULL THEN o.revision
+                        WHEN o.expires_at IS NULL OR o.expires_at > $3::text::timestamptz THEN coalesce(o.revision, 0)
+                        ELSE 0
+                    END AS limit_revision,
                     CASE WHEN d.window_seconds IS NULL THEN 'static' ELSE 'windowed' END AS window_kind,
                     CASE WHEN d.window_seconds IS NULL THEN 'epoch'::timestamptz
                          ELSE date_bin(make_interval(secs => d.window_seconds), $3::text::timestamptz, 'epoch')
@@ -1061,11 +1064,11 @@ pub(crate) async fn read_summary_in_tx(
                      THEN (extract(epoch FROM o.expires_at) * 1000000)::bigint END AS override_expires_us,
                 coalesce(d.warn_pct_1, 80)::smallint AS warn_pct_1,
                 coalesce(d.warn_pct_2, 90)::smallint AS warn_pct_2,
-                coalesce(
-                    CASE WHEN o.revoked_at IS NULL AND (o.expires_at IS NULL OR o.expires_at > $3::text::timestamptz)
-                         THEN o.revision END,
-                    0
-                ) AS limit_revision,
+                CASE
+                    WHEN o.revoked_at IS NOT NULL THEN o.revision
+                    WHEN o.expires_at IS NULL OR o.expires_at > $3::text::timestamptz THEN coalesce(o.revision, 0)
+                    ELSE 0
+                END AS limit_revision,
                 coalesce(d.config_revision, 1) AS config_revision
            FROM (VALUES (1)) AS seed(id)
            LEFT JOIN openmettle.quota_defaults d

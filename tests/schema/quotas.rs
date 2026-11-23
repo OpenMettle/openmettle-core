@@ -2704,7 +2704,7 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
     .await
     .unwrap();
     let _disp1 = p1
-        .handoff(&worker_pool, &keys, true, Some(GRANT_1))
+        .handoff(&worker_pool, &keys, Some(GRANT_1))
         .await
         .unwrap();
 
@@ -2743,7 +2743,7 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
     .await
     .unwrap();
     assert!(matches!(
-        p2.handoff(&worker_pool, &keys, true, Some(GRANT_1)).await,
+        p2.handoff(&worker_pool, &keys, Some(GRANT_1)).await,
         Err(gateway::Error::Refused)
     ));
     let req2_state: String =
@@ -2804,9 +2804,7 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
         .await
         .unwrap();
     assert!(matches!(
-        p2_cancel
-            .handoff(&worker_pool, &keys, true, Some(GRANT_2))
-            .await,
+        p2_cancel.handoff(&worker_pool, &keys, Some(GRANT_2)).await,
         Err(gateway::Error::Refused)
     ));
     let req2c_state: String =
@@ -3493,7 +3491,7 @@ async fn pre_activation_charged_parents_pre26_replay_savepoint_and_n1_legacy_hol
     .await
     .unwrap();
     let _disp = pending_held
-        .handoff(&worker_pool, &keys, false, None)
+        .handoff(&worker_pool, &keys, None)
         .await
         .unwrap();
     let child_rows: Vec<(String, i64, String)> = sqlx::query_as(
@@ -3966,7 +3964,7 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
     )
     .await
     .unwrap();
-    let _disp1 = p1.handoff(&worker_pool, &keys, false, None).await.unwrap();
+    let _disp1 = p1.handoff(&worker_pool, &keys, None).await.unwrap();
     let r1_child_cost: (i64, String) = sqlx::query_as(
         "SELECT reserved_units, state FROM openmettle.quota_reservations
           WHERE gateway_request_id = $1::uuid AND resource_kind = 'usage_cost_micros'",
@@ -4300,9 +4298,7 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
         .await
         .unwrap();
     assert!(matches!(
-        p_race
-            .handoff(&wp_up, &keys_up, true, Some(GRANT_RACE))
-            .await,
+        p_race.handoff(&wp_up, &keys_up, Some(GRANT_RACE)).await,
         Err(gateway::Error::Refused)
     ));
     let race_req_state: String =
@@ -4632,7 +4628,7 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
     .await
     .unwrap();
     assert!(matches!(
-        p_unqual.handoff(&worker_pool, &keys, false, None).await,
+        p_unqual.handoff(&worker_pool, &keys, None).await,
         Err(gateway::Error::Refused)
     ));
     let unqual_state: String =
@@ -4840,7 +4836,7 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
             .await
             .unwrap();
         assert!(matches!(
-            p_null_denom.handoff(&wp2, &keys2, false, None).await,
+            p_null_denom.handoff(&wp2, &keys2, None).await,
             Err(gateway::Error::Refused)
         ));
         let null_denom_state: String =
@@ -4999,6 +4995,395 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
     }
     assert_eq!(reserved_wins + disabled_wins, 8);
 
+    let drift: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
+           FROM openmettle.quota_verify_accounting_drift()",
+    )
+    .fetch_one(&mut worker)
+    .await
+    .unwrap();
+    assert_eq!(drift, (0, 0, 0, 0));
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn stale_lease_on_reserve_turn_round_and_gateway_reserve_returns_refused() {
+    use openmettle_core::{
+        authz::{
+            gateway::{self, Authority, Call, Reservation, TurnRound},
+            leases::{self, LeaseSettings, Settle},
+            runs::{self as authz_queue, Admission, AdmissionLimits, ClaimLimits, RunAdmission},
+        },
+        provider_keys::gateway::{Bearer, Context, GatewayKeys, GatewaySealer},
+        quotas::{self, RunBudgetReservation},
+        runs::{RunInput, WriteTransaction},
+    };
+    use sqlx::postgres::PgPoolOptions;
+
+    const INSTALL: &str = "00000000-0000-4000-8000-000000000091";
+    const PRINCIPAL: &str = "00000000-0000-4000-8000-000000000092";
+    const BUDGET: &str = "00000000-0000-4000-8000-000000000093";
+    const STALE_CLAIM: &str = "00000000-0000-4000-8000-000000000099";
+    const KEY_BYTES: [u8; 32] = [91u8; 32];
+
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut owner).await;
+    let alice =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let scope = authz_runs::personal_of(&db, &alice).await;
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 100000),
+                    ('personal', 'device_reservations', 1)",
+        )
+        .await
+        .unwrap();
+
+    let g_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(db.1.options(pg::GATEWAY));
+    let binding: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.gateway_bindings (installation, user_id, principal, budget)
+         VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid) RETURNING id::text",
+    )
+    .bind(INSTALL)
+    .bind(&alice.user)
+    .bind(PRINCIPAL)
+    .bind(BUDGET)
+    .fetch_one(&g_pool)
+    .await
+    .unwrap();
+    let report_source: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+    let keys = GatewayKeys::new(&[("rr9-k1".into(), KEY_BYTES)]).unwrap();
+    let (finger, env) = GatewaySealer::new(
+        GatewayKeys::new(&[("rr9-k1".into(), KEY_BYTES)]).unwrap(),
+        g_pool.clone(),
+    )
+    .seal(
+        &Context {
+            installation: INSTALL,
+            user_id: &alice.user,
+            binding_id: &binding,
+            principal: PRINCIPAL,
+            generation: 1,
+        },
+        &Bearer::new(b"rr9-bearer").unwrap(),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_generations
+             (binding_id, generation, remote_key, expires_at, key_id, key_fingerprint, nonce, ciphertext)
+         VALUES ($1::uuid, 1, gen_random_uuid(), clock_timestamp() + interval '1 hour', $2, $3, $4, $5)",
+    )
+    .bind(&binding)
+    .bind(&env.key_id)
+    .bind(finger.as_slice())
+    .bind(env.nonce.as_slice())
+    .bind(env.ciphertext)
+    .execute(&g_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_policy
+             (binding_id, revision, scope_id, approval_id, model, report_source,
+              provider_generation, approval_generation, user_generation, capabilities)
+         VALUES ($1::uuid, 1, $2::uuid, $3::uuid, 'a', $4::uuid, 0, 0, 0, '{}'::jsonb)",
+    )
+    .bind(&binding)
+    .bind(&scope)
+    .bind(&alice.approval)
+    .bind(&report_source)
+    .execute(&g_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE openmettle.gateway_bindings
+            SET active_generation = 1, observed_revision = 1, state = 'ready'
+          WHERE id = $1::uuid",
+    )
+    .bind(&binding)
+    .execute(&g_pool)
+    .await
+    .unwrap();
+
+    let mut api = connect(&db.0, API).await;
+    let mut worker = connect(&db.0, WORKER).await;
+    let worker_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(db.1.options(WORKER));
+    let chat = authz_runs::chat(&db, &scope, "personal", &alice).await;
+    let (branch, msg) = branch_and_message(&mut api, &scope, &chat).await;
+    let limits = AdmissionLimits {
+        live_per_actor: 8,
+        live_per_scope: 8,
+        queued_in_instance: 32,
+        queue_timeout: Duration::from_secs(300),
+        round_cap: 4,
+    };
+    let lease_cfg = LeaseSettings {
+        lease: Duration::from_secs(60),
+        execution_timeout: Duration::from_secs(600),
+    };
+    let claim_cfg = ClaimLimits {
+        executing_per_actor: 4,
+        executing_per_scope: 8,
+    };
+
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    let Admission::Admitted { run_id: r1, .. } = authz_queue::admit_run(
+        &mut tx,
+        &RunAdmission {
+            input: RunInput {
+                scope: &scope,
+                actor: &alice.user,
+                conversation: &chat,
+                branch: &branch,
+                message: &msg,
+                key: "rr9-stale-lease",
+                format: "openmettle.conversation",
+                version: 1,
+                input: b"{}",
+                config: br#"{"effective":{"ceiling":{"value":100}}}"#,
+            },
+            actor_approval_id: &alice.approval,
+            capabilities: &[],
+            requested_rounds: Some(1),
+            now_ms: authz_store::NOW,
+            cost_qualified: None,
+        },
+        &limits,
+    )
+    .await
+    .unwrap() else {
+        panic!("expected admission");
+    };
+    assert!(
+        quotas::reserve_admitted_run_budget(
+            &mut tx,
+            &RunBudgetReservation {
+                scope_id: &scope,
+                scope_kind: "personal",
+                actor_user_id: &alice.user,
+                actor_approval_id: &alice.approval,
+                run_id: &r1,
+                token_units: 100,
+                per_round_cost_micros: None,
+                round_limit: 1,
+                requires_device_slot: true,
+            },
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    tx.commit().await.unwrap();
+
+    let claim1 = authz_queue::claim_next(&mut worker, &claim_cfg, &lease_cfg)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim1.run_id, r1);
+
+    // 1. Stale/mismatched claim_token (42501 in quota_unwind_superseded_round) maps to Error::Refused.
+    assert!(matches!(
+        gateway::reserve_turn_round(
+            &worker_pool,
+            TurnRound {
+                scope_id: &scope,
+                actor: &alice.user,
+                approval: &alice.approval,
+                run_id: &r1,
+                round: 1,
+                claim_token: STALE_CLAIM,
+                installation: INSTALL,
+                model: "a",
+                round_tokens: 100,
+                round_cost: None,
+                requires_device_slot: true,
+            },
+        )
+        .await,
+        Err(gateway::Error::Refused)
+    ));
+    assert!(matches!(
+        gateway::reserve(
+            &worker_pool,
+            Call {
+                reservation: Reservation {
+                    id: &r1,
+                    scope_id: &scope,
+                    actor: &alice.user,
+                    approval: &alice.approval,
+                },
+                installation: INSTALL,
+                model: "a",
+                units: 100,
+                authority: Authority::Lease {
+                    run: &r1,
+                    round: 1,
+                    token: STALE_CLAIM,
+                },
+            },
+        )
+        .await,
+        Err(gateway::Error::Refused)
+    ));
+
+    // 2. TurnPending stores requires_device_slot from reservation so handoff without a grant fails
+    // closed with Error::Refused without callers re-supplying the boolean flag.
+    let p_dev = gateway::reserve_turn_round(
+        &worker_pool,
+        TurnRound {
+            scope_id: &scope,
+            actor: &alice.user,
+            approval: &alice.approval,
+            run_id: &r1,
+            round: 1,
+            claim_token: &claim1.claim_token,
+            installation: INSTALL,
+            model: "a",
+            round_tokens: 100,
+            round_cost: None,
+            requires_device_slot: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        p_dev.handoff(&worker_pool, &keys, None).await,
+        Err(gateway::Error::Refused)
+    ));
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.gateway_requests WHERE id = $1::uuid")
+            .bind(&p_dev.id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    assert_eq!(state, "reserved");
+    assert!(p_dev.release(&worker_pool).await.unwrap());
+
+    // 3. Expired lease (42501 in quota_unwind_superseded_round) maps to Error::Refused on both paths.
+    sqlx::query(
+        "UPDATE openmettle.runs
+            SET lease_expires_at = clock_timestamp() - interval '1 second'
+          WHERE id = $1::uuid",
+    )
+    .bind(&r1)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    assert!(matches!(
+        gateway::reserve_turn_round(
+            &worker_pool,
+            TurnRound {
+                scope_id: &scope,
+                actor: &alice.user,
+                approval: &alice.approval,
+                run_id: &r1,
+                round: 2,
+                claim_token: &claim1.claim_token,
+                installation: INSTALL,
+                model: "a",
+                round_tokens: 100,
+                round_cost: None,
+                requires_device_slot: true,
+            },
+        )
+        .await,
+        Err(gateway::Error::Refused)
+    ));
+    assert!(matches!(
+        gateway::reserve(
+            &worker_pool,
+            Call {
+                reservation: Reservation {
+                    id: &r1,
+                    scope_id: &scope,
+                    actor: &alice.user,
+                    approval: &alice.approval,
+                },
+                installation: INSTALL,
+                model: "a",
+                units: 100,
+                authority: Authority::Lease {
+                    run: &r1,
+                    round: 2,
+                    token: &claim1.claim_token,
+                },
+            },
+        )
+        .await,
+        Err(gateway::Error::Refused)
+    ));
+
+    // 4. Cancelling run with live lease (quota_unwind_superseded_round passes, then
+    // quota_prepare_turn_round raises P0002) maps to Error::Refused on both paths.
+    sqlx::query(
+        "UPDATE openmettle.runs
+            SET lease_expires_at = clock_timestamp() + interval '1 minute'
+          WHERE id = $1::uuid",
+    )
+    .bind(&r1)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    let actor = authz_store::principal(&db, &alice).await;
+    authz_queue::cancel_run(&mut api, &actor, &scope, &r1)
+        .await
+        .unwrap();
+    assert!(matches!(
+        gateway::reserve_turn_round(
+            &worker_pool,
+            TurnRound {
+                scope_id: &scope,
+                actor: &alice.user,
+                approval: &alice.approval,
+                run_id: &r1,
+                round: 3,
+                claim_token: &claim1.claim_token,
+                installation: INSTALL,
+                model: "a",
+                round_tokens: 100,
+                round_cost: None,
+                requires_device_slot: true,
+            },
+        )
+        .await,
+        Err(gateway::Error::Refused)
+    ));
+    assert!(matches!(
+        gateway::reserve(
+            &worker_pool,
+            Call {
+                reservation: Reservation {
+                    id: &r1,
+                    scope_id: &scope,
+                    actor: &alice.user,
+                    approval: &alice.approval,
+                },
+                installation: INSTALL,
+                model: "a",
+                units: 100,
+                authority: Authority::Lease {
+                    run: &r1,
+                    round: 3,
+                    token: &claim1.claim_token,
+                },
+            },
+        )
+        .await,
+        Err(gateway::Error::Refused)
+    ));
+
+    leases::settle(&mut worker, &claim1.lease(), &lease_cfg, Settle::Stopped)
+        .await
+        .unwrap();
     let drift: (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
            FROM openmettle.quota_verify_accounting_drift()",

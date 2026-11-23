@@ -220,8 +220,8 @@ $$;
 REVOKE ALL ON FUNCTION openmettle.quota_revoke_scope_override(uuid, uuid, text, text, text, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION openmettle.quota_revoke_scope_override(uuid, uuid, text, text, text, jsonb) TO openmettle_api;
 
--- Ensure expired or revoked overrides revert limit_revision to 0 so default-level threshold
--- warnings re-arm cleanly and obsolete override warnings drop out of quota summaries.
+-- Retain o.revision on explicitly revoked overrides so default-level threshold warnings re-arm
+-- in the same bucket (ADR 0040), while naturally expired unrevoked overrides revert to 0.
 CREATE OR REPLACE FUNCTION openmettle.quota_limit(p_scope uuid, p_kind text, p_resource text)
 RETURNS TABLE (
     hard_limit bigint,
@@ -244,11 +244,11 @@ AS $$
            coalesce(d.warn_pct_1, 80)::smallint,
            coalesce(d.warn_pct_2, 90)::smallint,
            coalesce(d.config_revision, 1),
-           coalesce(
-               CASE WHEN o.revoked_at IS NULL AND (o.expires_at IS NULL OR o.expires_at > statement_timestamp())
-                    THEN o.revision END,
-               0
-           )
+           CASE
+               WHEN o.revoked_at IS NOT NULL THEN o.revision
+               WHEN o.expires_at IS NULL OR o.expires_at > statement_timestamp() THEN coalesce(o.revision, 0)
+               ELSE 0
+           END
       FROM (VALUES (1)) AS seed(id)
       LEFT JOIN openmettle.quota_defaults d
         ON d.scope_kind = p_kind AND d.resource_kind = p_resource
@@ -277,11 +277,11 @@ BEGIN
                     THEN o.hard_limit END,
                CASE WHEN s.kind = 'personal' THEN i.personal_limit_bytes ELSE i.project_limit_bytes END
            ),
-           coalesce(
-               CASE WHEN o.revoked_at IS NULL AND (o.expires_at IS NULL OR o.expires_at > statement_timestamp())
-                    THEN o.revision END,
-               0
-           )
+           CASE
+               WHEN o.revoked_at IS NOT NULL THEN o.revision
+               WHEN o.expires_at IS NULL OR o.expires_at > statement_timestamp() THEN coalesce(o.revision, 0)
+               ELSE 0
+           END
       INTO STRICT lim, rev
       FROM openmettle.scopes s
       LEFT JOIN openmettle.quota_overrides o

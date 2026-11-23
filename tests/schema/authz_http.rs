@@ -1926,8 +1926,10 @@ async fn quota_summary_wide_counters_privacy_warnings_and_hard_limit_reads_work_
     );
     assert_eq!(storage_warns(&s3), vec![80]);
 
-    // Revoke override -> reverts active limit_revision to 0 (default 2000 bytes); because Alice is
-    // still at 1900/2000 (95% >= 80%), the default-level 80% warning stays active.
+    // Revoke override -> retains o.revision (2) as limit_revision while restoring the default
+    // 2000-byte limit, re-arming default-level threshold warnings in the same bucket (ADR 0040).
+    // Alice is still at 1900/2000 (95% >= 80%), so status remains "warning" with no warning
+    // emitted yet at the new limit_revision.
     success(
         api.call(
             admin_n,
@@ -1943,7 +1945,7 @@ async fn quota_summary_wide_counters_privacy_warnings_and_hard_limit_reads_work_
         200,
     );
     assert_eq!(s4["storage"]["status"], "warning");
-    assert_eq!(storage_warns(&s4), vec![80]);
+    assert!(storage_warns(&s4).is_empty());
 
     // Config edit (storage_instance.config_revision bump) re-arms warnings for the new threshold.
     limits(&db, Some(2_500), Some(100_000)).await;
@@ -3547,6 +3549,244 @@ async fn extreme_per_round_cost_bound_admits_on_token_only_and_returns_429_when_
         body["quota"],
         json!({"resource_kind": "usage_cost_micros", "scope_kind": "personal"})
     );
+}
+
+#[tokio::test]
+#[ignore = "isolated CI PostgreSQL 18 required"]
+async fn revoked_override_rearms_default_threshold_warnings_over_http() {
+    use openmettle_core::{
+        runs::WriteTransaction,
+        storage::{self, ReservationInput},
+    };
+
+    let (db, api) = mounted().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    let mut api_conn = connect(&db.0, API).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &admin).await;
+
+    let a_b = browser(&db, &alice, 1).await;
+    let adm_b = browser(&db, &admin, 2).await;
+    let (alice_b, admin_b) = (As::Browser(&a_b), As::Browser(&adm_b));
+    let scope = personal_of(&db, &alice).await;
+
+    // Seed personal defaults: storage_bytes = 1000, usage_tokens = 1000, device_reservations = 10.
+    limits(&db, Some(1_000), Some(100_000)).await;
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 1000),
+                    ('personal', 'device_reservations', 10)",
+        )
+        .await
+        .unwrap();
+
+    let warnings_for = |summary: &Value, resource: &str| -> Vec<i64> {
+        summary["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|w| w["resource_kind"] == resource)
+            .map(|w| w["threshold_pct"].as_i64().unwrap())
+            .collect()
+    };
+
+    // 1. Cross default 80% threshold for all three resources -> warnings emitted at limit_revision = 0.
+    let mut tx = WriteTransaction::begin(&mut api_conn).await.unwrap();
+    let s_res1 = storage::reserve(
+        &mut tx,
+        &ReservationInput {
+            scope: &scope,
+            actor: &alice.user,
+            key: "rearm-s-1",
+            artifact: "00000000-0000-4000-8000-00000000a101",
+            max_bytes: 850,
+            run: None,
+            operation: None,
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let tok_res1: String = sqlx::query_scalar(
+        "SELECT openmettle.quota_reserve(
+             $1::uuid, $2::uuid, 'usage_tokens', 850, 'rearm-tok-1',
+             NULL, NULL, NULL, clock_timestamp() + interval '10 minutes'
+         )::text",
+    )
+    .bind(&scope)
+    .bind(&alice.user)
+    .fetch_one(&mut api_conn)
+    .await
+    .unwrap();
+    let dev_res1: String = sqlx::query_scalar(
+        "SELECT openmettle.quota_reserve(
+             $1::uuid, $2::uuid, 'device_reservations', 8, 'rearm-dev-1',
+             NULL, NULL, NULL, clock_timestamp() + interval '10 minutes'
+         )::text",
+    )
+    .bind(&scope)
+    .bind(&alice.user)
+    .fetch_one(&mut api_conn)
+    .await
+    .unwrap();
+
+    let summary1 = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    for resource in ["storage_bytes", "usage_tokens", "device_reservations"] {
+        assert_eq!(warnings_for(&summary1, resource), vec![80], "{resource}");
+        let revs: Vec<i64> = sqlx::query_scalar(
+            "SELECT limit_revision
+               FROM openmettle.quota_warning_events
+              WHERE scope_id = $1::uuid AND resource_kind = $2 AND threshold_pct = 80
+              ORDER BY limit_revision ASC",
+        )
+        .bind(&scope)
+        .bind(resource)
+        .fetch_all(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(revs, vec![0], "{resource}");
+    }
+
+    // 2. Release holds below 80%, apply higher overrides (revision = 1), then revoke (revision = 2).
+    let mut tx_rel = WriteTransaction::begin(&mut api_conn).await.unwrap();
+    storage::release(&mut tx_rel, &scope, &s_res1.id)
+        .await
+        .unwrap();
+    tx_rel.commit().await.unwrap();
+    for hold_id in [&tok_res1, &dev_res1] {
+        let released: bool = sqlx::query_scalar("SELECT openmettle.quota_release_unsent($1::uuid)")
+            .bind(hold_id)
+            .fetch_one(&mut api_conn)
+            .await
+            .unwrap();
+        assert!(released);
+    }
+
+    for (resource, high_limit) in [
+        ("storage_bytes", "2000"),
+        ("usage_tokens", "2000"),
+        ("device_reservations", "20"),
+    ] {
+        let ov_path = format!("/v1/admin/scopes/{scope}/quotas/{resource}");
+        success(
+            api.call(
+                admin_b,
+                "PUT",
+                &ov_path,
+                Some(&format!("rearm-put-{resource}")),
+                Some(&json!({"hard_limit": high_limit, "reason": "temporary bump"})),
+            ),
+            200,
+        );
+        success(
+            api.call(
+                admin_b,
+                "POST",
+                &format!("{ov_path}/revoke"),
+                Some(&format!("rearm-rev-{resource}")),
+                Some(&json!({"reason": "restore default"})),
+            ),
+            200,
+        );
+        let active_rev: i64 = sqlx::query_scalar(
+            "SELECT limit_revision FROM openmettle.quota_limit($1::uuid, 'personal', $2)",
+        )
+        .bind(&scope)
+        .bind(resource)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(
+            active_rev, 2,
+            "{resource} revoked override must retain o.revision = 2"
+        );
+    }
+
+    let summary_between = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert_eq!(summary_between["storage"]["limit_source"], "default");
+    assert_eq!(summary_between["storage"]["limit_bytes"], "1000");
+    assert!(summary_between["warnings"].as_array().unwrap().is_empty());
+
+    // 3. Cross default 80% threshold again in the SAME bucket -> new quota_warning_events row at
+    // limit_revision = 2 for every resource, surfaced by GET /v1/quotas/personal.
+    let mut tx2 = WriteTransaction::begin(&mut api_conn).await.unwrap();
+    let _s_res2 = storage::reserve(
+        &mut tx2,
+        &ReservationInput {
+            scope: &scope,
+            actor: &alice.user,
+            key: "rearm-s-2",
+            artifact: "00000000-0000-4000-8000-00000000a102",
+            max_bytes: 850,
+            run: None,
+            operation: None,
+        },
+    )
+    .await
+    .unwrap();
+    tx2.commit().await.unwrap();
+    let _: String = sqlx::query_scalar(
+        "SELECT openmettle.quota_reserve(
+             $1::uuid, $2::uuid, 'usage_tokens', 850, 'rearm-tok-2',
+             NULL, NULL, NULL, clock_timestamp() + interval '10 minutes'
+         )::text",
+    )
+    .bind(&scope)
+    .bind(&alice.user)
+    .fetch_one(&mut api_conn)
+    .await
+    .unwrap();
+    let _: String = sqlx::query_scalar(
+        "SELECT openmettle.quota_reserve(
+             $1::uuid, $2::uuid, 'device_reservations', 8, 'rearm-dev-2',
+             NULL, NULL, NULL, clock_timestamp() + interval '10 minutes'
+         )::text",
+    )
+    .bind(&scope)
+    .bind(&alice.user)
+    .fetch_one(&mut api_conn)
+    .await
+    .unwrap();
+
+    let summary2 = success(
+        api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
+        200,
+    );
+    assert!(validate_openapi_schema(
+        "#/components/schemas/QuotaSummary",
+        &summary2
+    ));
+    for resource in ["storage_bytes", "usage_tokens", "device_reservations"] {
+        assert_eq!(
+            warnings_for(&summary2, resource),
+            vec![80],
+            "revoked override must re-arm default 80% warning for {resource}: {summary2}"
+        );
+        let revs: Vec<i64> = sqlx::query_scalar(
+            "SELECT limit_revision
+               FROM openmettle.quota_warning_events
+              WHERE scope_id = $1::uuid AND resource_kind = $2 AND threshold_pct = 80
+              ORDER BY limit_revision ASC",
+        )
+        .bind(&scope)
+        .bind(resource)
+        .fetch_all(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(
+            revs,
+            vec![0, 2],
+            "{resource} must emit a fresh warning row at limit_revision = 2 in the same bucket"
+        );
+    }
 }
 
 #[path = "run_events_http.rs"]

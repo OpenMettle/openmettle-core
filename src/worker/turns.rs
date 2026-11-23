@@ -458,7 +458,6 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                     .handoff(
                         &self.pool,
                         &metered.keys,
-                        requires_device_slot,
                         metered.device_grant_id.as_deref(),
                     )
                     .await
