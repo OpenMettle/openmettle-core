@@ -119,8 +119,15 @@ impl TurnHandoffFixture {
     }
 
     fn prepare(&self) -> openmettle_core::provider_http::inference::PreparedRequest<'_> {
+        self.prepare_mode(true)
+    }
+
+    fn prepare_mode(
+        &self,
+        server: bool,
+    ) -> openmettle_core::provider_http::inference::PreparedRequest<'_> {
         self.billable()
-            .prepare(&self.catalog, &self.effective, &self.request, true)
+            .prepare(&self.catalog, &self.effective, &self.request, server)
             .unwrap()
     }
 }
@@ -566,7 +573,29 @@ pub(super) async fn settle_oversized_three_column_tokens(
     )
     .await
     .unwrap();
-    call.handoff(&api_pool, &ring).await.unwrap();
+    let fx = TurnHandoffFixture::chat(INSTALL, "a", 100, None, false);
+    let dev_fx = TurnHandoffFixture::chat(INSTALL, "a", 100, None, true);
+    // Caller sessions cannot hand off device-slot profiles and stay reserved on refusal.
+    assert!(matches!(
+        call.handoff(
+            &api_pool,
+            &ring,
+            &dev_fx.billable(),
+            dev_fx.prepare_mode(false)
+        )
+        .await,
+        Err(gateway::Error::Refused)
+    ));
+    let pre_state: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.gateway_requests WHERE id = $1::uuid")
+            .bind(&call.id)
+            .fetch_one(&gw_pool)
+            .await
+            .unwrap();
+    assert_eq!(pre_state, "reserved");
+    call.handoff(&api_pool, &ring, &fx.billable(), fx.prepare_mode(false))
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO openmettle.gateway_usage_reports
              (request_id, source, report_id, revision, final,
@@ -5668,8 +5697,19 @@ async fn stale_lease_on_reserve_turn_round_and_gateway_reserve_returns_refused()
     )
     .await
     .unwrap();
+    let dev_fx = TurnHandoffFixture::chat(INSTALL, "a", 100, None, true);
+    let resp_dev_fx = TurnHandoffFixture::new(
+        INSTALL,
+        openmettle_core::provider_http::inference::Protocol::Responses,
+        "a",
+        100,
+        None,
+        true,
+    );
     assert!(matches!(
-        pending_blocked.handoff(&worker_pool, &keys).await,
+        pending_blocked
+            .handoff(&worker_pool, &keys, &dev_fx.billable(), dev_fx.prepare())
+            .await,
         Err(gateway::Error::Refused)
     ));
     let blocked_state: String =
@@ -5688,7 +5728,8 @@ async fn stale_lease_on_reserve_turn_round_and_gateway_reserve_returns_refused()
             .unwrap();
     assert_eq!(released_state, "released");
 
-    // Commit the run's device_reservations grant, then verify Pending::handoff succeeds.
+    // Commit the run's device_reservations grant, then verify Pending::handoff still rejects a
+    // cross-gateway PreparedRequest before commit and succeeds with the matching route.
     let dev_hold_id: String = sqlx::query_scalar(
         "SELECT id::text FROM openmettle.quota_reservations
           WHERE scope_id = $1::uuid AND run_id = $2::uuid
@@ -5733,7 +5774,28 @@ async fn stale_lease_on_reserve_turn_round_and_gateway_reserve_returns_refused()
     )
     .await
     .unwrap();
-    let _disp_ok = pending_ok.handoff(&worker_pool, &keys).await.unwrap();
+    assert!(matches!(
+        pending_ok
+            .handoff(
+                &worker_pool,
+                &keys,
+                &resp_dev_fx.billable(),
+                dev_fx.prepare()
+            )
+            .await,
+        Err(gateway::Error::Refused)
+    ));
+    let cross_gw_state: String =
+        sqlx::query_scalar("SELECT state FROM openmettle.gateway_requests WHERE id = $1::uuid")
+            .bind(&pending_ok.id)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    assert_eq!(cross_gw_state, "reserved");
+    let _disp_ok: gateway::BillableDispatch<'_> = pending_ok
+        .handoff(&worker_pool, &keys, &dev_fx.billable(), dev_fx.prepare())
+        .await
+        .unwrap();
     let ok_state: String =
         sqlx::query_scalar("SELECT state FROM openmettle.gateway_requests WHERE id = $1::uuid")
             .bind(&pending_ok.id)

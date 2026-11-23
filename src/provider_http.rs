@@ -357,6 +357,44 @@ mod tests;
 #[path = "../tests/provider_inference/redaction.rs"]
 mod inference_redaction;
 
+/// Split a committed dispatch into its `x-request-id` correlation header and bearer credential.
+fn dispatch_credential(
+    dispatch: &Dispatch,
+) -> Result<(HeaderValue, inference::Credential<'_>), inference::Error> {
+    let id = HeaderValue::from_str(&dispatch.id).map_err(|_| inference::Error::Credential)?;
+    let token = dispatch
+        .authorization
+        .to_str()
+        .ok()
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or(inference::Error::Credential)?;
+    Ok((id, inference::Credential::Bearer(token)))
+}
+
+/// Transmit a committed dispatch through `prepared`'s originating [`inference::Gateway`] with the
+/// single-use `Authorization` credential and `x-request-id` correlation header. A leased server
+/// send requires `run`; a caller-session send must not supply one.
+async fn transmit<F: Future<Output = ()>>(
+    dispatch: Dispatch,
+    prepared: inference::PreparedRequest<'_>,
+    run: Option<inference::RunStop>,
+    visible: impl FnMut(inference::VisibleDelta) -> F,
+) -> Result<inference::Turn, inference::Error> {
+    if dispatch.server != run.is_some() || prepared.is_server() != run.is_some() {
+        return Err(inference::Error::Credential);
+    }
+    let gateway = prepared.gateway();
+    let (id, cred) = dispatch_credential(&dispatch)?;
+    transport::BILLABLE_REQUEST
+        .scope(std::cell::Cell::new(Some(id)), async {
+            match run {
+                Some(run) => gateway.server_prepared(prepared, cred, run, visible).await,
+                None => gateway.caller_prepared(prepared, cred, visible).await,
+            }
+        })
+        .await
+}
+
 /// Single-use committed turn handoff bound to its originating inference route and prepared
 /// wire payload. Consumed by [`Self::send`] so the dispatched credential and `x-request-id`
 /// cannot be redirected to a different gateway endpoint.
@@ -377,24 +415,39 @@ impl<'a> TurnDispatch<'a> {
         run: inference::RunStop,
         visible: impl FnMut(inference::VisibleDelta) -> F,
     ) -> Result<inference::Turn, inference::Error> {
-        let gateway = self.prepared.gateway();
-        let id =
-            HeaderValue::from_str(&self.dispatch.id).map_err(|_| inference::Error::Credential)?;
-        let token = self
-            .dispatch
-            .authorization
-            .to_str()
-            .ok()
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .ok_or(inference::Error::Credential)?;
-        let cred = inference::Credential::Bearer(token);
-        transport::BILLABLE_REQUEST
-            .scope(std::cell::Cell::new(Some(id)), async {
-                gateway
-                    .server_prepared(self.prepared, cred, run, visible)
-                    .await
-            })
-            .await
+        transmit(self.dispatch, self.prepared, Some(run), visible).await
+    }
+}
+
+/// Single-use committed billable handoff returned by [`crate::authz::gateway::Pending::handoff`],
+/// bound to its originating inference route and the prepared wire payload whose token, output and
+/// cost bounds were checked against the funded reservation. Consumed by [`Self::send_caller`] or
+/// [`Self::send_server`] so the dispatched credential and `x-request-id` cannot be redirected.
+pub struct BillableDispatch<'a> {
+    dispatch: Dispatch,
+    prepared: inference::PreparedRequest<'a>,
+}
+
+impl<'a> BillableDispatch<'a> {
+    pub(crate) fn new(dispatch: Dispatch, prepared: inference::PreparedRequest<'a>) -> Self {
+        Self { dispatch, prepared }
+    }
+
+    /// Transmit a committed caller-session request; a leased handoff returns `Credential`.
+    pub async fn send_caller<F: Future<Output = ()>>(
+        self,
+        visible: impl FnMut(inference::VisibleDelta) -> F,
+    ) -> Result<inference::Turn, inference::Error> {
+        transmit(self.dispatch, self.prepared, None, visible).await
+    }
+
+    /// Transmit a committed leased server-run request; a caller handoff returns `Credential`.
+    pub async fn send_server<F: Future<Output = ()>>(
+        self,
+        run: inference::RunStop,
+        visible: impl FnMut(inference::VisibleDelta) -> F,
+    ) -> Result<inference::Turn, inference::Error> {
+        transmit(self.dispatch, self.prepared, Some(run), visible).await
     }
 }
 
@@ -416,11 +469,10 @@ impl<'r> BillableInferenceRef<'r> {
         'r: 'a,
     {
         let prepared = self.route.prepare(catalog, effective, request, server)?;
-        if server
-            && !prepared
-                .round_tokens()
-                .zip(prepared.output_reserve())
-                .is_some_and(|(ceil, out)| out > 0 && out <= ceil)
+        if !prepared
+            .round_tokens()
+            .zip(prepared.output_reserve())
+            .is_some_and(|(ceil, out)| out > 0 && out <= ceil)
         {
             return Err(inference::Error::Validation);
         }
@@ -438,71 +490,10 @@ impl<'r> BillableInferenceRef<'r> {
         {
             return Err(inference::Error::Credential);
         }
-        let id = HeaderValue::from_str(&dispatch.id).map_err(|_| inference::Error::Credential)?;
-        let token = dispatch
-            .authorization
-            .to_str()
-            .ok()
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .ok_or(inference::Error::Credential)?;
-        let cred = inference::Credential::Bearer(token);
+        let (id, cred) = dispatch_credential(dispatch)?;
         transport::BILLABLE_REQUEST.sync_scope(std::cell::Cell::new(Some(id)), || {
             self.route.validate_outbound_headers(cred, prepared)
         })
-    }
-
-    pub async fn send<F: Future<Output = ()>>(
-        &self,
-        dispatch: Dispatch,
-        catalog: &Catalog,
-        effective: &Effective,
-        request: &inference::Request,
-        run: Option<inference::RunStop>,
-        visible: impl FnMut(inference::VisibleDelta) -> F,
-    ) -> Result<inference::Turn, inference::Error> {
-        if self.installation != dispatch.installation
-            || effective.model != dispatch.model
-            || dispatch.server != run.is_some()
-        {
-            return Err(inference::Error::Credential);
-        }
-        let prepared = self.prepare(catalog, effective, request, run.is_some())?;
-        self.send_prepared(dispatch, prepared, run, visible).await
-    }
-
-    pub async fn send_prepared<F: Future<Output = ()>>(
-        &self,
-        dispatch: Dispatch,
-        prepared: inference::PreparedRequest<'_>,
-        run: Option<inference::RunStop>,
-        visible: impl FnMut(inference::VisibleDelta) -> F,
-    ) -> Result<inference::Turn, inference::Error> {
-        if self.installation != dispatch.installation
-            || prepared.model_name() != dispatch.model
-            || dispatch.server != run.is_some()
-        {
-            return Err(inference::Error::Credential);
-        }
-        let id = HeaderValue::from_str(&dispatch.id).map_err(|_| inference::Error::Credential)?;
-        let token = dispatch
-            .authorization
-            .to_str()
-            .ok()
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .ok_or(inference::Error::Credential)?;
-        let cred = inference::Credential::Bearer(token);
-        transport::BILLABLE_REQUEST
-            .scope(std::cell::Cell::new(Some(id)), async {
-                match run {
-                    Some(stop) => {
-                        self.route
-                            .server_prepared(prepared, cred, stop, visible)
-                            .await
-                    }
-                    None => self.route.caller_prepared(prepared, cred, visible).await,
-                }
-            })
-            .await
     }
 }
 
@@ -513,6 +504,13 @@ pub struct BillableInference {
     pub route: inference::Gateway,
 }
 impl BillableInference {
+    pub fn as_ref(&self) -> BillableInferenceRef<'_> {
+        BillableInferenceRef {
+            installation: &self.installation,
+            route: &self.route,
+        }
+    }
+
     pub fn prepare<'a>(
         &'a self,
         catalog: &'a Catalog,
@@ -520,11 +518,7 @@ impl BillableInference {
         request: &'a inference::Request,
         server: bool,
     ) -> Result<inference::PreparedRequest<'a>, inference::Error> {
-        BillableInferenceRef {
-            installation: &self.installation,
-            route: &self.route,
-        }
-        .prepare(catalog, effective, request, server)
+        self.as_ref().prepare(catalog, effective, request, server)
     }
 
     pub fn validate_dispatch(
@@ -532,42 +526,6 @@ impl BillableInference {
         dispatch: &Dispatch,
         prepared: &inference::PreparedRequest<'_>,
     ) -> Result<(), inference::Error> {
-        BillableInferenceRef {
-            installation: &self.installation,
-            route: &self.route,
-        }
-        .validate_dispatch(dispatch, prepared)
-    }
-
-    pub async fn send<F: Future<Output = ()>>(
-        &self,
-        dispatch: Dispatch,
-        catalog: &Catalog,
-        effective: &Effective,
-        request: &inference::Request,
-        run: Option<inference::RunStop>,
-        visible: impl FnMut(inference::VisibleDelta) -> F,
-    ) -> Result<inference::Turn, inference::Error> {
-        BillableInferenceRef {
-            installation: &self.installation,
-            route: &self.route,
-        }
-        .send(dispatch, catalog, effective, request, run, visible)
-        .await
-    }
-
-    pub async fn send_prepared<F: Future<Output = ()>>(
-        &self,
-        dispatch: Dispatch,
-        prepared: inference::PreparedRequest<'_>,
-        run: Option<inference::RunStop>,
-        visible: impl FnMut(inference::VisibleDelta) -> F,
-    ) -> Result<inference::Turn, inference::Error> {
-        BillableInferenceRef {
-            installation: &self.installation,
-            route: &self.route,
-        }
-        .send_prepared(dispatch, prepared, run, visible)
-        .await
+        self.as_ref().validate_dispatch(dispatch, prepared)
     }
 }

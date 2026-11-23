@@ -453,6 +453,106 @@ async fn handoff_rechecks_authority_and_only_a_released_run_round_can_retry() {
     sqlx::query("INSERT INTO openmettle.user_capability_grants (user_id,capability,granted,updated_by_user_id)
         VALUES ($1::uuid,'inference',true,$1::uuid)").bind(&actor.user).execute(&api).await.unwrap();
     let ring = keys();
+    struct GatewayHandoffFx {
+        catalog: openmettle_core::model_config::Catalog,
+        effective: openmettle_core::model_config::Effective,
+        request: openmettle_core::provider_http::inference::Request,
+        route: openmettle_core::provider_http::inference::Gateway,
+    }
+    impl GatewayHandoffFx {
+        fn new(units: i64, cost: Option<u64>, requires_device_slot: bool) -> Self {
+            use openmettle_core::{
+                model_config::{Catalog, Selection},
+                provider_http::{
+                    Trust,
+                    inference::{Gateway, History, Protocol, Qualification, Request, Timeouts},
+                },
+            };
+            let ca = crate::ca::Ca::new();
+            let mut doc: serde_json::Value =
+                serde_json::from_slice(include_bytes!("../fixtures/conversation-catalog-v1.json"))
+                    .unwrap();
+            let entry = &mut doc["models"]["a"];
+            entry["context_window"] = serde_json::json!(units);
+            entry["output_limit"] = serde_json::json!(units);
+            entry["requires_device_slot"] = serde_json::json!(requires_device_slot);
+            if let Some(c) = cost {
+                entry["cost_bound"] = serde_json::json!({
+                    "fixed_micros": c,
+                    "micros_per_token": 0
+                });
+            } else {
+                entry.as_object_mut().unwrap().remove("cost_bound");
+            }
+            doc["presets"]["study"]["defaults"]["controls"]["output_reserve"] =
+                serde_json::json!((units / 2).max(1));
+            let catalog = Catalog::load(&serde_json::to_vec(&doc).unwrap()).unwrap();
+            let effective = catalog
+                .resolve(
+                    &Selection::default(),
+                    &serde_json::from_value(serde_json::json!({
+                        "model": "a",
+                        "layer": {"controls": {"context_window": units, "output_reserve": (units / 2).max(1)}}
+                    }))
+                    .unwrap(),
+                    None,
+                    |_, _| true,
+                )
+                .unwrap();
+            let route = Gateway::new(
+                "https://provider.example.test/v1/chat/completions",
+                Trust::Bundle(&ca.pem()),
+                &[],
+                Qualification {
+                    model: effective.model.clone(),
+                    pin: effective.profile.clone(),
+                    protocol: Protocol::Chat,
+                    json: true,
+                    sse: false,
+                    functions: None,
+                    images: false,
+                    parallel: false,
+                    usage: true,
+                    tool_separator_whitespace: false,
+                },
+                Timeouts {
+                    setup: Duration::from_secs(5),
+                    idle: Duration::from_secs(30),
+                    overall: Duration::from_secs(45),
+                },
+            )
+            .unwrap();
+            let request = Request {
+                history: vec![History::User("gateway handoff fixture".into())],
+                tools: None,
+                parallel: None,
+                stream: false,
+            };
+            Self {
+                catalog,
+                effective,
+                request,
+                route,
+            }
+        }
+        fn billable(&self) -> openmettle_core::provider_http::BillableInferenceRef<'_> {
+            openmettle_core::provider_http::BillableInferenceRef {
+                installation: INSTALL,
+                route: &self.route,
+            }
+        }
+        fn prepare(
+            &self,
+            server: bool,
+        ) -> openmettle_core::provider_http::inference::PreparedRequest<'_> {
+            self.billable()
+                .prepare(&self.catalog, &self.effective, &self.request, server)
+                .unwrap()
+        }
+    }
+    let fx = GatewayHandoffFx::new(10, None, false);
+    let dev_fx = GatewayHandoffFx::new(10, None, true);
+    let cost_fx = GatewayHandoffFx::new(10, Some(80), false);
     // Same identity and reservation across every read: toggling current authority
     // immediately changes eligibility, even though the request already committed.
     let id = uuid(&mut c).await;
@@ -482,7 +582,9 @@ async fn handoff_rechecks_authority_and_only_a_released_run_round_can_retry() {
         .await
         .unwrap();
     assert!(matches!(
-        pending.handoff(&api, &ring).await,
+        pending
+            .handoff(&api, &ring, &fx.billable(), fx.prepare(false))
+            .await,
         Err(gateway::Error::Refused)
     ));
     sqlx::query("UPDATE openmettle.gateway_bindings SET active_generation=1,observed_revision=1,state='ready'").execute(&g).await.unwrap();
@@ -515,7 +617,9 @@ async fn handoff_rechecks_authority_and_only_a_released_run_round_can_retry() {
         c.execute(deny).await.unwrap();
         assert!(
             matches!(
-                pending.handoff(&api, &ring).await,
+                pending
+                    .handoff(&api, &ring, &fx.billable(), fx.prepare(false))
+                    .await,
                 Err(gateway::Error::Refused)
             ),
             "{deny}"
@@ -528,7 +632,8 @@ async fn handoff_rechecks_authority_and_only_a_released_run_round_can_retry() {
             .await
             .unwrap();
         assert!(matches!(
-            p.handoff(&api, &ring).await,
+            p.handoff(&api, &ring, &fx.billable(), fx.prepare(false))
+                .await,
             Err(gateway::Error::Refused)
         ));
         let (a, b) = tokio::join!(p.release(&api), p.release(&api));
@@ -541,17 +646,28 @@ async fn handoff_rechecks_authority_and_only_a_released_run_round_can_retry() {
             .execute(&api).await), "23505");
     }
     assert!(!pending.release(&worker).await.unwrap());
-    assert!(pending.handoff(&api, &ring).await.is_ok());
+    assert!(
+        pending
+            .handoff(&api, &ring, &fx.billable(), fx.prepare(false))
+            .await
+            .is_ok()
+    );
     assert!(!pending.release(&api).await.unwrap());
     assert!(matches!(
-        pending.handoff(&api, &ring).await,
+        pending
+            .handoff(&api, &ring, &fx.billable(), fx.prepare(false))
+            .await,
         Err(gateway::Error::Refused)
     ));
     let race_id = uuid(&mut c).await;
     let race = gateway::reserve(&api, caller(&actor, &credential, &scope, &race_id))
         .await
         .unwrap();
-    let (released, handed) = tokio::join!(race.release(&api), race.handoff(&api, &ring));
+    let race_billable = fx.billable();
+    let (released, handed) = tokio::join!(
+        race.release(&api),
+        race.handoff(&api, &ring, &race_billable, fx.prepare(false))
+    );
     assert_ne!(released.unwrap(), handed.is_ok());
 
     // A confirmed project policy pins one editor grant cycle. Removing and
@@ -587,7 +703,10 @@ async fn handoff_rechecks_authority_and_only_a_released_run_round_can_retry() {
         .execute(&mut c)
         .await
         .unwrap();
-    project_call.handoff(&api, &ring).await.unwrap();
+    project_call
+        .handoff(&api, &ring, &fx.billable(), fx.prepare(false))
+        .await
+        .unwrap();
     let id = uuid(&mut c).await;
     let next = gateway::reserve(&api, caller(&actor, &credential, &project_scope, &id))
         .await
@@ -602,7 +721,8 @@ async fn handoff_rechecks_authority_and_only_a_released_run_round_can_retry() {
         .await,
     );
     assert!(matches!(
-        next.handoff(&api, &ring).await,
+        next.handoff(&api, &ring, &fx.billable(), fx.prepare(false))
+            .await,
         Err(gateway::Error::Refused)
     ));
     authz_store::applied(
@@ -616,7 +736,8 @@ async fn handoff_rechecks_authority_and_only_a_released_run_round_can_retry() {
         .await,
     );
     assert!(matches!(
-        next.handoff(&api, &ring).await,
+        next.handoff(&api, &ring, &fx.billable(), fx.prepare(false))
+            .await,
         Err(gateway::Error::Refused)
     ));
 
@@ -709,20 +830,31 @@ async fn handoff_rechecks_authority_and_only_a_released_run_round_can_retry() {
         "23505"
     );
     assert!(matches!(
-        p.handoff(&api, &ring).await,
+        p.handoff(&api, &ring, &fx.billable(), fx.prepare(true))
+            .await,
         Err(gateway::Error::Refused)
     ));
     c.execute("UPDATE openmettle.runs SET lease_expires_at=clock_timestamp()")
         .await
         .unwrap();
     assert!(matches!(
-        p.handoff(&worker, &ring).await,
+        p.handoff(&worker, &ring, &fx.billable(), fx.prepare(true))
+            .await,
         Err(gateway::Error::Refused)
     ));
     c.execute("UPDATE openmettle.runs SET lease_expires_at=execution_expires_at")
         .await
         .unwrap();
-    p.handoff(&worker, &ring).await.unwrap();
+    // A leased run with no committed device_reservations hold MUST reject a device-slot profile
+    // before committing gateway_requests.
+    assert!(matches!(
+        p.handoff(&worker, &ring, &dev_fx.billable(), dev_fx.prepare(true))
+            .await,
+        Err(gateway::Error::Refused)
+    ));
+    p.handoff(&worker, &ring, &fx.billable(), fx.prepare(true))
+        .await
+        .unwrap();
     assert!(!p.release(&worker).await.unwrap());
     assert_eq!(
         sqlstate(insert_round(&scope).execute(&worker).await),
@@ -800,7 +932,10 @@ async fn handoff_rechecks_authority_and_only_a_released_run_round_can_retry() {
     )
     .await
     .unwrap();
-    cost_call.handoff(&api, &ring).await.unwrap();
+    cost_call
+        .handoff(&api, &ring, &cost_fx.billable(), cost_fx.prepare(false))
+        .await
+        .unwrap();
     let request = &cost_call.id;
     for (rev, tokens, cost, token_total, cost_total) in [
         (0, Some(20_i64), None, "40", "0"),

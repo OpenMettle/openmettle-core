@@ -132,6 +132,8 @@ pub struct Pending<'a> {
     pub id: String,
     secret: [u8; 32],
     call: Call<'a>,
+    explicit_cost: Option<u128>,
+    bound_cost: Option<u128>,
 }
 pub async fn reserve<'a>(pool: &PgPool, call: Call<'a>) -> Result<Pending<'a>, Error> {
     reserve_with_cost(pool, call, None).await
@@ -142,28 +144,34 @@ pub async fn reserve_with_cost<'a>(
     call: Call<'a>,
     cost_ceiling: Option<i64>,
 ) -> Result<Pending<'a>, Error> {
+    let explicit_cost = match cost_ceiling {
+        Some(c) if c > 0 => Some(u128::try_from(c).map_err(|_| Error::Refused)?),
+        Some(_) => return Err(Error::Refused),
+        None => None,
+    };
     let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
     let res = async {
         crate::quotas::prepare_round(&mut tx, &call, cost_ceiling).await?;
-        let pending = reserve_in(&mut tx, call).await?;
-        let spec = match cost_ceiling {
-            Some(c) => crate::quotas::CostBoundSpec::Profile(Some(u128::try_from(c).unwrap_or(0))),
+        let mut pending = reserve_in(&mut tx, call).await?;
+        let spec = match explicit_cost {
+            Some(c) => crate::quotas::CostBoundSpec::Profile(Some(c)),
             None => crate::quotas::CostBoundSpec::Legacy,
         };
-        if matches!(
-            crate::quotas::bind_request(
-                &mut tx,
-                &pending.call,
-                &pending.id,
-                &pending.secret,
-                spec,
-                false,
-            )
-            .await?,
-            crate::quotas::BindOutcome::NeedsParentHolds
-        ) {
-            return Err(Error::Refused);
-        }
+        let bound_cost = match crate::quotas::bind_request(
+            &mut tx,
+            &pending.call,
+            &pending.id,
+            &pending.secret,
+            spec,
+            false,
+        )
+        .await?
+        {
+            crate::quotas::BindOutcome::NeedsParentHolds => return Err(Error::Refused),
+            crate::quotas::BindOutcome::Bound { bound_cost, .. } => bound_cost,
+        };
+        pending.explicit_cost = explicit_cost;
+        pending.bound_cost = bound_cost;
         Ok(pending)
     }
     .await;
@@ -193,7 +201,7 @@ pub struct TurnRound<'a> {
     pub requires_device_slot: bool,
 }
 
-pub use crate::provider_http::TurnDispatch;
+pub use crate::provider_http::{BillableDispatch, TurnDispatch};
 
 /// Owned unsent turn-round reservation handle. Never cloned or serialized.
 pub struct TurnPending {
@@ -244,6 +252,8 @@ impl TurnPending {
                     token: &self.claim_token,
                 },
             },
+            explicit_cost: self.round_cost,
+            bound_cost: self.cost_bound_at_bind.then_some(self.round_cost).flatten(),
         }
     }
 
@@ -310,10 +320,7 @@ impl TurnPending {
         if (self.requires_device_slot
             && device_grant_id.is_some_and(|g| !crate::runs::is_canonical_uuid(g)))
             || !prepared.is_server()
-            || prepared.round_tokens() != Some(self.units)
-            || !prepared
-                .output_reserve()
-                .is_some_and(|out| out > 0 && out <= self.units)
+            || !round_fits(prepared, self.units)
             || prepared.round_cost() != self.round_cost
             || prepared.requires_device_slot() != self.requires_device_slot
         {
@@ -354,12 +361,9 @@ impl TurnPending {
                 return Err(TurnHandoffError::Other(err));
             }
         };
-        if let Err(err) = billable.validate_dispatch(&dispatch, prepared) {
+        if let Err(err) = validate_bound(billable, &dispatch, prepared) {
             let _ = tx.rollback().await;
-            return Err(TurnHandoffError::Other(match err {
-                crate::provider_http::inference::Error::Validation => Error::Refused,
-                _ => Error::Protection,
-            }));
+            return Err(TurnHandoffError::Other(err));
         }
         let res = sqlx::query(
             "SELECT openmettle.quota_commit_turn_handoff(
@@ -491,6 +495,7 @@ pub async fn reserve_turn_round(pool: &PgPool, round: TurnRound<'_>) -> Result<T
                 crate::quotas::BindOutcome::Bound {
                     enforced_at_bind,
                     cost_bound_at_bind,
+                    ..
                 } => Ok(Some(TurnPending {
                     id: pending.id,
                     secret: pending.secret,
@@ -573,8 +578,37 @@ async fn reserve_in<'a>(
     }
     .execute(tx.connection()?)
     .await?;
-    Ok(Pending { id, secret, call })
+    Ok(Pending {
+        id,
+        secret,
+        call,
+        explicit_cost: None,
+        bound_cost: None,
+    })
 }
+/// The prepared wire round equals the reserved token units and carries a positive output cap
+/// within them, so the funded hold bounds what the provider may generate.
+fn round_fits(prepared: &crate::provider_http::inference::PreparedRequest<'_>, units: i64) -> bool {
+    prepared.round_tokens() == Some(units)
+        && prepared
+            .output_reserve()
+            .is_some_and(|out| out > 0 && out <= units)
+}
+
+/// Validate the opened dispatch against the prepared route and outbound headers before commit.
+fn validate_bound(
+    billable: &crate::provider_http::BillableInferenceRef<'_>,
+    dispatch: &Dispatch,
+    prepared: &crate::provider_http::inference::PreparedRequest<'_>,
+) -> Result<(), Error> {
+    billable
+        .validate_dispatch(dispatch, prepared)
+        .map_err(|err| match err {
+            crate::provider_http::inference::Error::Validation => Error::Refused,
+            _ => Error::Protection,
+        })
+}
+
 /// Single-use credential for the pinned inference client. The caller cannot construct it.
 pub struct Dispatch {
     pub(crate) id: String,
@@ -607,14 +641,74 @@ impl Pending<'_> {
         }
         Ok(released)
     }
-    pub async fn handoff(&self, pool: &PgPool, keys: &GatewayKeys) -> Result<Dispatch, Error> {
+    /// Commit the gateway handoff and quota holds only after `prepared` is proven to fit them:
+    /// the request mode matches the authority, the wire round equals the reserved units with a
+    /// positive output cap inside it, a caller session never needs a device slot, and the round
+    /// cost matches the explicit ceiling or fits the cost hold bound at reservation. The route
+    /// binding and complete outbound headers are validated inside the transaction; cost-unqualified
+    /// and device-slot requests are marked so the deferred `enforce_gateway_handoff_holds` trigger
+    /// raises `OMQ04` when a cost limit or required device hold is missing at commit. Every refusal
+    /// rolls back and leaves the request `reserved` for [`Self::release`]. Returns a single-use
+    /// [`BillableDispatch`] bound to `prepared`'s originating gateway.
+    pub async fn handoff<'p>(
+        &self,
+        pool: &PgPool,
+        keys: &GatewayKeys,
+        billable: &crate::provider_http::BillableInferenceRef<'_>,
+        prepared: crate::provider_http::inference::PreparedRequest<'p>,
+    ) -> Result<BillableDispatch<'p>, Error> {
+        let server = matches!(self.call.authority, Authority::Lease { .. });
+        let cost_ok = match (self.explicit_cost, self.bound_cost, prepared.round_cost()) {
+            (Some(explicit), _, cost) => cost == Some(explicit),
+            (None, Some(held), cost) => cost.is_some_and(|c| c > 0 && c <= held),
+            (None, None, _) => true,
+        };
+        if prepared.is_server() != server
+            || !round_fits(&prepared, self.call.units)
+            || (!server && prepared.requires_device_slot())
+            || !cost_ok
+        {
+            return Err(Error::Refused);
+        }
         let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
-        let dispatch = self.handoff_in(&mut tx, keys).await?;
-        sqlx::query("SELECT openmettle.quota_commit_handoff($1::uuid,$2::bytea)")
-            .bind(&self.id)
-            .bind(self.secret.as_slice())
-            .execute(tx.connection()?)
-            .await?;
+        let res = async {
+            let dispatch = self.handoff_in(&mut tx, keys).await?;
+            validate_bound(billable, &dispatch, &prepared)?;
+            for (setting, mark) in [
+                (
+                    "openmettle.turn_cost_unqualified_requests",
+                    prepared.round_cost().is_none(),
+                ),
+                (
+                    "openmettle.turn_device_required_requests",
+                    prepared.requires_device_slot(),
+                ),
+            ] {
+                if mark {
+                    sqlx::query(
+                        "SELECT set_config($1, coalesce(current_setting($1, true), '') || ',' || $2 || ',', true)",
+                    )
+                    .bind(setting)
+                    .bind(&self.id)
+                    .execute(tx.connection()?)
+                    .await?;
+                }
+            }
+            sqlx::query("SELECT openmettle.quota_commit_handoff($1::uuid,$2::bytea)")
+                .bind(&self.id)
+                .bind(self.secret.as_slice())
+                .execute(tx.connection()?)
+                .await?;
+            Ok::<_, Error>(dispatch)
+        }
+        .await;
+        let dispatch = match res {
+            Ok(dispatch) => dispatch,
+            Err(err) => {
+                let _ = tx.rollback().await;
+                return Err(err);
+            }
+        };
         if let Err(err) = tx.commit().await {
             if let crate::runs::Error::Database(ref db) = err
                 && db.as_database_error().and_then(|e| e.code()).as_deref() == Some("OMQ04")
@@ -626,7 +720,7 @@ impl Pending<'_> {
             recovery.commit().await?;
             return Err(Error::Database);
         }
-        Ok(dispatch)
+        Ok(BillableDispatch::new(dispatch, prepared))
     }
     async fn recover_in(&self, tx: &mut WriteTransaction<'_>) -> Result<String, Error> {
         let run = match self.call.authority {
