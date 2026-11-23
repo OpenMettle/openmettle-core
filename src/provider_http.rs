@@ -364,12 +364,46 @@ pub struct BillableInferenceRef<'a> {
 }
 
 impl BillableInferenceRef<'_> {
+    pub fn prepare(
+        &self,
+        catalog: &Catalog,
+        effective: &Effective,
+        request: &inference::Request,
+        server: bool,
+    ) -> Result<inference::PreparedRequest, inference::Error> {
+        self.route.prepare(catalog, effective, request, server)
+    }
+
     pub async fn send<F: Future<Output = ()>>(
         &self,
         dispatch: Dispatch,
         catalog: &Catalog,
         effective: &Effective,
         request: &inference::Request,
+        run: Option<inference::RunStop>,
+        visible: impl FnMut(inference::VisibleDelta) -> F,
+    ) -> Result<inference::Turn, inference::Error> {
+        if self.installation != dispatch.installation
+            || effective.model != dispatch.model
+            || dispatch.server != run.is_some()
+        {
+            return Err(inference::Error::Credential);
+        }
+        let prepared = self.prepare(catalog, effective, request, run.is_some())?;
+        self.send_prepared(
+            dispatch, catalog, effective, request, prepared, run, visible,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_prepared<F: Future<Output = ()>>(
+        &self,
+        dispatch: Dispatch,
+        catalog: &Catalog,
+        effective: &Effective,
+        request: &inference::Request,
+        prepared: inference::PreparedRequest,
         run: Option<inference::RunStop>,
         visible: impl FnMut(inference::VisibleDelta) -> F,
     ) -> Result<inference::Turn, inference::Error> {
@@ -392,12 +426,14 @@ impl BillableInferenceRef<'_> {
                 match run {
                     Some(stop) => {
                         self.route
-                            .server(catalog, effective, request, cred, stop, visible)
+                            .server_prepared(
+                                catalog, effective, request, prepared, cred, stop, visible,
+                            )
                             .await
                     }
                     None => {
                         self.route
-                            .caller(catalog, effective, request, cred, visible)
+                            .caller_prepared(catalog, effective, request, prepared, cred, visible)
                             .await
                     }
                 }
@@ -413,6 +449,20 @@ pub struct BillableInference {
     pub route: inference::Gateway,
 }
 impl BillableInference {
+    pub fn prepare(
+        &self,
+        catalog: &Catalog,
+        effective: &Effective,
+        request: &inference::Request,
+        server: bool,
+    ) -> Result<inference::PreparedRequest, inference::Error> {
+        BillableInferenceRef {
+            installation: &self.installation,
+            route: &self.route,
+        }
+        .prepare(catalog, effective, request, server)
+    }
+
     pub async fn send<F: Future<Output = ()>>(
         &self,
         dispatch: Dispatch,
@@ -427,6 +477,27 @@ impl BillableInference {
             route: &self.route,
         }
         .send(dispatch, catalog, effective, request, run, visible)
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_prepared<F: Future<Output = ()>>(
+        &self,
+        dispatch: Dispatch,
+        catalog: &Catalog,
+        effective: &Effective,
+        request: &inference::Request,
+        prepared: inference::PreparedRequest,
+        run: Option<inference::RunStop>,
+        visible: impl FnMut(inference::VisibleDelta) -> F,
+    ) -> Result<inference::Turn, inference::Error> {
+        BillableInferenceRef {
+            installation: &self.installation,
+            route: &self.route,
+        }
+        .send_prepared(
+            dispatch, catalog, effective, request, prepared, run, visible,
+        )
         .await
     }
 }

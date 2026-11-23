@@ -191,6 +191,16 @@ impl RunStop {
     }
 }
 
+/// Validated and wire-encoded inference request ready to transmit without re-encoding once a
+/// dispatch credential is obtained.
+pub struct PreparedRequest {
+    model: String,
+    profile: ProfilePin,
+    stream: bool,
+    server: bool,
+    body: Vec<u8>,
+}
+
 pub struct Gateway {
     endpoint: transport::Endpoint,
     allowed: Vec<transport::Range>,
@@ -240,6 +250,53 @@ impl Gateway {
         self
     }
 
+    /// Validate model/profile selection against this route and wire-encode the outbound JSON body
+    /// before reserving or committing a billable gateway handoff.
+    pub fn prepare(
+        &self,
+        catalog: &Catalog,
+        effective: &Effective,
+        request: &Request,
+        server: bool,
+    ) -> Result<PreparedRequest, Error> {
+        self.prepare_inner(catalog, effective, request, server)
+            .map(|(_, prepared)| prepared)
+            .map_err(|e| e.for_profile(self.family_policy_v1))
+    }
+
+    fn prepare_inner<'a>(
+        &self,
+        catalog: &'a Catalog,
+        effective: &Effective,
+        request: &Request,
+        server: bool,
+    ) -> Result<(&'a crate::model_config::Profile, PreparedRequest), Error> {
+        // The catalog checks both snapshot revision and profile pin, even for a caller
+        // with unknown capacity. Admission owns the populated path and prompt estimate.
+        catalog
+            .budget(effective, &[], None)
+            .map_err(|_| Error::Validation)?;
+        let profile = catalog
+            .model(&effective.model)
+            .filter(|p| {
+                p.pin == effective.profile
+                    && p.pin == self.qualification.pin
+                    && self.qualification.model == effective.model
+            })
+            .ok_or(Error::Validation)?;
+        let body = request.encode(&self.qualification, profile, effective, server)?;
+        Ok((
+            profile,
+            PreparedRequest {
+                model: effective.model.clone(),
+                profile: effective.profile.clone(),
+                stream: request.stream,
+                server,
+                body,
+            },
+        ))
+    }
+
     /// The facade captures its tool list at entry. It may forward visible deltas under
     /// backpressure, then release proposed calls on success. Project an error with
     /// `problem` before headers or `stream_error` in a stream that has already started.
@@ -251,10 +308,34 @@ impl Gateway {
         credential: Credential<'_>,
         visible: impl FnMut(VisibleDelta) -> F,
     ) -> Result<Turn, Error> {
-        self.complete(catalog, effective, request, credential, None, visible)
+        self.complete_prepared(catalog, effective, request, None, credential, None, visible)
             .await
             .map_err(|e| e.for_profile(self.family_policy_v1))
     }
+
+    /// Transmit a pre-validated, pre-encoded caller request without repeating wire encoding.
+    pub async fn caller_prepared<F: Future<Output = ()>>(
+        &self,
+        catalog: &Catalog,
+        effective: &Effective,
+        request: &Request,
+        prepared: PreparedRequest,
+        credential: Credential<'_>,
+        visible: impl FnMut(VisibleDelta) -> F,
+    ) -> Result<Turn, Error> {
+        self.complete_prepared(
+            catalog,
+            effective,
+            request,
+            Some(prepared),
+            credential,
+            None,
+            visible,
+        )
+        .await
+        .map_err(|e| e.for_profile(self.family_policy_v1))
+    }
+
     /// One model step after the executor's leased authority check. The executor owns
     /// rounds, approvals, fenced effects and publication. Map an error with `step_result`.
     pub async fn server<F: Future<Output = ()>>(
@@ -266,16 +347,51 @@ impl Gateway {
         run: RunStop,
         visible: impl FnMut(VisibleDelta) -> F,
     ) -> Result<Turn, Error> {
-        self.complete(catalog, effective, request, credential, Some(run), visible)
-            .await
-            .map_err(|e| e.for_profile(self.family_policy_v1))
+        self.complete_prepared(
+            catalog,
+            effective,
+            request,
+            None,
+            credential,
+            Some(run),
+            visible,
+        )
+        .await
+        .map_err(|e| e.for_profile(self.family_policy_v1))
     }
 
-    async fn complete<F: Future<Output = ()>>(
+    /// Transmit a pre-validated, pre-encoded leased server request without repeating wire encoding.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn server_prepared<F: Future<Output = ()>>(
         &self,
         catalog: &Catalog,
         effective: &Effective,
         request: &Request,
+        prepared: PreparedRequest,
+        credential: Credential<'_>,
+        run: RunStop,
+        visible: impl FnMut(VisibleDelta) -> F,
+    ) -> Result<Turn, Error> {
+        self.complete_prepared(
+            catalog,
+            effective,
+            request,
+            Some(prepared),
+            credential,
+            Some(run),
+            visible,
+        )
+        .await
+        .map_err(|e| e.for_profile(self.family_policy_v1))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_prepared<F: Future<Output = ()>>(
+        &self,
+        catalog: &Catalog,
+        effective: &Effective,
+        request: &Request,
+        prepared: Option<PreparedRequest>,
         credential: Credential<'_>,
         mut run: Option<RunStop>,
         visible: impl FnMut(VisibleDelta) -> F,
@@ -285,20 +401,31 @@ impl Gateway {
         let dispatch = async {
             // Provisioning or a broken credential takes precedence over model selection.
             let headers = headers(credential, request.stream)?;
-            // The catalog checks both snapshot revision and profile pin, even for a caller
-            // with unknown capacity. Admission owns the populated path and prompt estimate.
-            catalog
-                .budget(effective, &[], None)
-                .map_err(|_| Error::Validation)?;
-            let profile = catalog
-                .model(&effective.model)
-                .filter(|p| {
-                    p.pin == effective.profile
-                        && p.pin == self.qualification.pin
-                        && self.qualification.model == effective.model
-                })
-                .ok_or(Error::Validation)?;
-            let body = request.encode(&self.qualification, profile, effective, server)?;
+            let (profile, body) = match prepared {
+                Some(prepared) => {
+                    if prepared.model != effective.model
+                        || prepared.profile != effective.profile
+                        || prepared.stream != request.stream
+                        || prepared.server != server
+                    {
+                        return Err(Error::Validation);
+                    }
+                    let profile = catalog
+                        .model(&effective.model)
+                        .filter(|p| {
+                            p.pin == effective.profile
+                                && p.pin == self.qualification.pin
+                                && self.qualification.model == effective.model
+                        })
+                        .ok_or(Error::Validation)?;
+                    (profile, prepared.body)
+                }
+                None => {
+                    let (profile, prepared) =
+                        self.prepare_inner(catalog, effective, request, server)?;
+                    (profile, prepared.body)
+                }
+            };
             let route = transport::Route {
                 endpoint: &self.endpoint,
                 allowed: &self.allowed,

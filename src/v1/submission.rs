@@ -526,7 +526,7 @@ async fn admission(
         let (round_cost, device_slot) = match catalog {
             Some(cat) => match cat.target(&config.effective) {
                 Ok(profile) => (
-                    cat.round_cost_ceiling(&config.effective)?,
+                    cat.round_cost_ceiling(&config.effective).ok().flatten(),
                     profile.requires_device_slot,
                 ),
                 Err(_) => (None, false),
@@ -668,7 +668,9 @@ async fn admission(
             round_limit,
         } if state == "queued" => {
             let effective_rounds = round_limit.unwrap_or(limits.round_cap);
-            let token_units = build_token_units(effective_rounds)?;
+            let Ok(token_units) = build_token_units(effective_rounds) else {
+                return Ok((admitted, false));
+            };
             let (committed, refusal) = crate::quotas::backfill_replayed_run_budget(
                 tx,
                 &crate::quotas::RunBudgetReservation {
@@ -684,8 +686,8 @@ async fn admission(
                 },
             )
             .await?;
-            if let Some(limit) = refusal {
-                return Ok((Admission::Refused(limit), false));
+            if refusal.is_some() {
+                return Ok((admitted, false));
             }
             Ok((admitted, committed))
         }

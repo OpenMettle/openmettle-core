@@ -468,6 +468,15 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 }
             }
             let turn = if let Some(metered) = &route.metered {
+                let billable = crate::provider_http::BillableInferenceRef {
+                    installation: &metered.installation,
+                    route: &route.gateway,
+                };
+                // Validate and wire-encode the outbound payload BEFORE reserving or committing a
+                // gateway handoff so oversized/invalid payloads never strand handoff_committed holds.
+                let prepared = billable
+                    .prepare(&self.catalog, &config.effective, &request, true)
+                    .map_err(inference::Error::step_result)?;
                 let round_tokens = config
                     .effective
                     .ceiling
@@ -552,20 +561,18 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                         }
                     }
                 };
-                crate::provider_http::BillableInferenceRef {
-                    installation: &metered.installation,
-                    route: &route.gateway,
-                }
-                .send(
-                    dispatch,
-                    &self.catalog,
-                    &config.effective,
-                    &request,
-                    Some(RunStop::from_worker(run, cx.stop.clone())),
-                    |_| async {},
-                )
-                .await
-                .map_err(inference::Error::step_result)?
+                billable
+                    .send_prepared(
+                        dispatch,
+                        &self.catalog,
+                        &config.effective,
+                        &request,
+                        prepared,
+                        Some(RunStop::from_worker(run, cx.stop.clone())),
+                        |_| async {},
+                    )
+                    .await
+                    .map_err(inference::Error::step_result)?
             } else {
                 if cx.stop.borrow().is_some() {
                     return Err(StepResult::Stopped);

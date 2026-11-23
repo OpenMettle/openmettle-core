@@ -1681,9 +1681,11 @@ pub async fn reserve_admitted_run_budget(
 /// for an already-`queued` run on exact HTTP `Idempotency-Key` replay (e.g. a queued run
 /// admitted by an `N-1` server or before migration 0024).
 ///
+/// Runs inside a savepoint so partial writes are rolled back atomically whenever backfill is a
+/// no-op, refused by quota/provisioning, or encounters a retryable `40001` serialization conflict.
 /// Returns `Ok((true, None))` when at least one missing row was backfilled and the caller must
-/// commit `tx`; `Ok((false, None))` when the run already has its budget rows (normal replay,
-/// stay read-only); or `Ok((false, Some(limit)))` when backfill is refused by quota/provisioning.
+/// commit `tx`; `Ok((false, None))` when the run already has its budget rows or hit a best-effort
+/// `40001` conflict (stay read-only); or `Ok((false, Some(limit)))` when backfill was refused.
 pub async fn backfill_replayed_run_budget(
     tx: &mut WriteTransaction<'_>,
     input: &RunBudgetReservation<'_>,
@@ -1695,6 +1697,34 @@ pub async fn backfill_replayed_run_budget(
 }
 
 async fn backfill_replayed_run_budget_inner(
+    outer: &mut Transaction<'_, Postgres>,
+    input: &RunBudgetReservation<'_>,
+) -> Result<(bool, Option<RunLimit>), StoreError> {
+    let mut sp = outer.begin().await?;
+    let outcome = backfill_replayed_run_budget_savepoint(&mut sp, input).await;
+    match outcome {
+        Ok((true, None)) => {
+            sp.commit().await?;
+            Ok((true, None))
+        }
+        Ok((_, refusal)) => {
+            sp.rollback().await?;
+            Ok((false, refusal))
+        }
+        Err(StoreError::Database(ref err))
+            if err.as_database_error().and_then(|e| e.code()).as_deref() == Some("40001") =>
+        {
+            sp.rollback().await?;
+            Ok((false, None))
+        }
+        Err(err) => {
+            sp.rollback().await?;
+            Err(err)
+        }
+    }
+}
+
+async fn backfill_replayed_run_budget_savepoint(
     outer: &mut Transaction<'_, Postgres>,
     input: &RunBudgetReservation<'_>,
 ) -> Result<(bool, Option<RunLimit>), StoreError> {

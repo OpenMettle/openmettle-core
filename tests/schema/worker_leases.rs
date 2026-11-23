@@ -3829,6 +3829,186 @@ mod live_turns {
 
     #[tokio::test]
     #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn oversized_image_wire_body_fails_before_gateway_reservation_or_handoff() {
+        use openmettle_core::quotas::{self, RunBudgetReservation};
+
+        // 1,572,864 raw PNG bytes (= 1536 KiB = BODY / 4 * 3) fits both worker_prompt's 1536 KiB
+        // image budget and request.rs per-image cap, then expands via base64 + JSON envelope past
+        // the 2 MiB BODY wire limit inside BillableInferenceRef::prepare.
+        const RAW_PNG_LEN: usize = 1536 * 1024;
+
+        let dir = Dir::new();
+        let mut chat = Chat::new().await;
+        chat.catalog["models"]["a"]["cost_bound"] = json!({
+            "fixed_micros": 0,
+            "micros_per_token": 1
+        });
+        let mut owner = connect(&chat.f.db.0, OWNER).await;
+        owner
+            .execute(
+                "UPDATE openmettle.storage_instance
+                    SET instance_budget_bytes = 8388608,
+                        personal_limit_bytes = 8388608,
+                        project_limit_bytes = 8388608",
+            )
+            .await
+            .unwrap();
+        owner
+            .execute(
+                "UPDATE openmettle.quota_defaults
+                    SET cost_denomination = 'usd_micros'
+                  WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'",
+            )
+            .await
+            .unwrap();
+        owner
+            .execute(
+                "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+                 VALUES ('personal', 'usage_cost_micros', 1000000)",
+            )
+            .await
+            .unwrap();
+
+        let root = PathBuf::from(dir.path(""));
+        let store = artifact_fs::Store::open(&root).unwrap();
+        let mut api_c = api(&chat.f.db).await;
+        let artifact = openmettle_core::storage::upload_artifact(
+            &mut api_c,
+            &chat.f.scope,
+            &chat.f.actor.user,
+            "oversized-wire-img",
+        )
+        .await
+        .unwrap();
+        let upload = Upload {
+            scope: &chat.f.scope,
+            actor: &chat.f.actor.user,
+            key: "oversized-wire-img",
+            artifact: &artifact,
+            max_bytes: (RAW_PNG_LEN + 4096) as i64,
+            content_type: "multipart/form-data; boundary=sample",
+        };
+        let mut multipart = Vec::with_capacity(RAW_PNG_LEN + 256);
+        multipart.extend_from_slice(
+            b"--sample\r\nContent-Disposition: form-data; name=\"file\"; filename=\"large.png\"\r\nContent-Type: image/png\r\n\r\n",
+        );
+        // Valid PNG signature prefix + deterministic payload totaling RAW_PNG_LEN bytes.
+        const PNG_SIG: &[u8] = b"\x89PNG\r\n\x1a\n";
+        multipart.extend_from_slice(PNG_SIG);
+        multipart.resize(multipart.len() + (RAW_PNG_LEN - PNG_SIG.len()), 0x42);
+        multipart.extend_from_slice(
+            b"\r\n--sample\r\nContent-Disposition: form-data; name=\"metadata\"\r\nContent-Type: application/json\r\n\r\n{}\r\n--sample--\r\n",
+        );
+        let pool = sqlx::PgPool::connect(&chat.f.db.url(API)).await.unwrap();
+        let image = artifact_fs::ingest(
+            &pool,
+            &store,
+            &upload,
+            http_body_util::Full::new(bytes::Bytes::from(multipart)),
+            |_| true,
+        )
+        .await
+        .unwrap();
+        chat.artifacts = Some(root);
+
+        let parts = [
+            Part::Text("describe this large image".into()),
+            Part::Attachment(image.revision),
+        ];
+        let (run_id, _) = chat
+            .submit_parts("oversized-wire-run", "a", 1, &parts)
+            .await;
+        {
+            let mut tx = WriteTransaction::begin(&mut api_c).await.unwrap();
+            assert!(
+                quotas::reserve_admitted_run_budget(
+                    &mut tx,
+                    &RunBudgetReservation {
+                        scope_id: &chat.f.scope,
+                        scope_kind: "personal",
+                        actor_user_id: &chat.f.actor.user,
+                        actor_approval_id: &chat.f.actor.approval,
+                        run_id: &run_id,
+                        token_units: 16384,
+                        per_round_cost_micros: Some(16384),
+                        round_limit: 1,
+                        requires_device_slot: false,
+                    },
+                )
+                .await
+                .unwrap()
+                .is_none()
+            );
+            tx.commit().await.unwrap();
+        }
+
+        let mut server = Provider::new().await;
+        let _worker = chat.start(&server).await;
+        chat.done(&run_id, "failed", Some("step_failed")).await;
+
+        assert!(
+            server.requests.try_recv().is_err(),
+            "oversized wire body must never open an HTTP connection to provider"
+        );
+        // Confirm prompt hydration succeeded and recorded Round 1, then prepare() rejected the
+        // oversized encoded wire body BEFORE reserve_turn_round / handoff_turn created any row.
+        let (round_events, gw_requests, committed_holds): (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM openmettle.run_events
+                      WHERE scope_id = $1::uuid AND run_id = $2::uuid
+                        AND format = 'openmettle.model-round'),
+                    (SELECT count(*) FROM openmettle.gateway_requests
+                      WHERE run_id = $2::uuid),
+                    (SELECT count(*) FROM openmettle.quota_reservations
+                      WHERE run_id = $2::uuid AND state = 'handoff_committed')",
+        )
+        .bind(&chat.f.scope)
+        .bind(&run_id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!((round_events, gw_requests, committed_holds), (1, 0, 0));
+
+        let parent_holds: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT resource_kind, state, held_units
+               FROM openmettle.quota_reservations
+              WHERE run_id = $1::uuid AND gateway_request_id IS NULL
+              ORDER BY resource_kind ASC",
+        )
+        .bind(&run_id)
+        .fetch_all(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(
+            parent_holds,
+            vec![
+                ("usage_cost_micros".to_owned(), "released".to_owned(), 0),
+                ("usage_tokens".to_owned(), "released".to_owned(), 0),
+            ]
+        );
+
+        let usage_totals: (i64, i64) = sqlx::query_as(
+            "SELECT coalesce(sum(reserved_held), 0)::bigint,
+                    coalesce(sum(active_used), 0)::bigint
+               FROM openmettle.quota_budgets
+              WHERE resource_kind IN ('usage_tokens', 'usage_cost_micros')",
+        )
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        assert_eq!(usage_totals, (0, 0));
+
+        let drift: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
+               FROM openmettle.quota_verify_accounting_drift()",
+        )
+        .fetch_one(&mut worker(&chat.f.db).await)
+        .await
+        .unwrap();
+        assert_eq!(drift, (0, 0, 0, 0));
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
     async fn deadline_and_mid_stream_cancel_close_inference_without_answers() {
         for cancel in [true, false] {
             let chat = Chat::new().await;

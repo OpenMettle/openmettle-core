@@ -3973,5 +3973,345 @@ async fn post_runs_maps_lock_wait_personal_override_expiry_to_503_provisioning()
     ));
 }
 
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn post_runs_exact_replay_returns_200_when_backfill_refused_and_worker_enforces_quota() {
+    use crate::{auth_config_support::Dir, ca::Ca};
+    use openmettle_core::{
+        authz::{
+            gateway::{self, TurnRound},
+            leases::{self, FailReason, LeaseSettings, Settle},
+            runs::{self as authz_queue, ClaimLimits, RunLimit},
+        },
+        migrate,
+        quotas::{self, RunBudgetReservation},
+        runs::WriteTransaction,
+    };
+    use sqlx::postgres::PgPoolOptions;
+
+    const INSTALL: &str = "00000000-0000-4000-8000-0000000000fa";
+
+    // Upgrade from schema 23 -> latest so metering_enforced starts false and POST /v1/runs admits
+    // a queued run without quota_reservations parent holds.
+    let db = TestDb::new().await;
+    let settings = db.settings(Duration::from_secs(10));
+    migrate::apply(&settings, &migrate::MIGRATIONS[..23])
+        .await
+        .unwrap();
+    let mut owner = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut owner).await;
+    let admin =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    authz_store::make_admin(&mut owner, &admin).await;
+    let alice =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let scope = authz_runs::personal_of(&db, &alice).await;
+    migrate::apply(&settings, migrate::MIGRATIONS)
+        .await
+        .unwrap();
+
+    owner
+        .execute(
+            "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
+             VALUES ('personal', 'usage_tokens', 100000),
+                    ('personal', 'device_reservations', 1)",
+        )
+        .await
+        .unwrap();
+
+    let dir = Dir::new();
+    std::fs::create_dir(dir.path("artifacts")).unwrap();
+    let mut doc = auth_config_support::document_v2_native(&dir, &Ca::new().pem());
+    doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+    let mut catalog: Value =
+        serde_json::from_slice(include_bytes!("../fixtures/conversation-catalog-v1.json")).unwrap();
+    catalog["models"]["a"]["pin"]["provider"] = "synthetic-sglang".into();
+    catalog["models"]["a"]["prompt_bound"] = json!({
+        "fixed_tokens": 4,
+        "tokens_per_turn": 4,
+        "tokens_per_part": 2,
+        "tokens_per_byte": 1,
+        "tokens_per_attachment": 10
+    });
+    doc["catalog_file"] = json!(dir.write("catalog.json", &serde_json::to_vec(&catalog).unwrap()));
+    doc["admission_limits"] = json!({
+        "live_per_actor": 4,
+        "live_per_scope": 8,
+        "queued_in_instance": 32,
+        "queue_timeout_seconds": 300,
+        "round_cap": 10
+    });
+    let api = Api::configured(&db, dir, doc, 4);
+    let admin_tok = native(&db, &admin, 1).await;
+    let admin_n = As::Native(&admin_tok);
+    let alice_cookie = browser(&db, &alice, 2).await;
+    let alice_b = As::Browser(&alice_cookie);
+
+    let conv = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/conversations",
+            Some("rr16-replay-conv"),
+            Some(&json!({})),
+        ),
+        201,
+    );
+    let conv_id = conv["conversation_id"].as_str().unwrap();
+    let branch_id = conv["branch_id"].as_str().unwrap();
+    let run_body = json!({
+        "conversation_id": conv_id,
+        "branch_id": branch_id,
+        "proposal": {
+            "expected_head_message_id": null,
+            "turn": {
+                "mode": "append",
+                "input_message_id": "00000000-0000-4000-8000-00000000fa01",
+                "parts": [{"text": "pre-activation queued run"}]
+            },
+            "selection": {
+                "model": "a",
+                "layer": {"controls": {"context_window": "450", "output_reserve": "100"}}
+            },
+            "requested_rounds": 1
+        }
+    });
+    let admitted = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some("rr16-replay-key"),
+            Some(&run_body),
+        ),
+        201,
+    );
+    let run_id = admitted["run_id"].as_str().unwrap().to_owned();
+    let (pre_gw, pre_qr): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM openmettle.gateway_reservations WHERE run_id = $1::uuid),
+                (SELECT count(*) FROM openmettle.quota_reservations WHERE run_id = $1::uuid)",
+    )
+    .bind(&run_id)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!((pre_gw, pre_qr), (1, 0));
+
+    // Also admit a second pre-activation queued run missing BOTH gateway_reservations and
+    // quota_reservations so we can verify direct backfill_replayed_run_budget savepoint rollback.
+    let mut api_c = connect(&db.0, API).await;
+    let conv2 = authz_runs::chat(&db, &scope, "personal", &alice).await;
+    let msg2 = message(&mut api_c, &scope, &conv2, None).await.unwrap();
+    let branch2: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.conversation_branches (scope_id, conversation_id)
+         VALUES ($1::uuid, $2::uuid) RETURNING id::text",
+    )
+    .bind(&scope)
+    .bind(&conv2)
+    .fetch_one(&mut api_c)
+    .await
+    .unwrap();
+    let mut tx = WriteTransaction::begin(&mut api_c).await.unwrap();
+    let authz_queue::Admission::Admitted { run_id: run2, .. } = authz_queue::admit_run(
+        &mut tx,
+        &authz_queue::RunAdmission {
+            input: openmettle_core::runs::RunInput {
+                scope: &scope,
+                actor: &alice.user,
+                conversation: &conv2,
+                branch: &branch2,
+                message: &msg2,
+                key: "rr16-savepoint-run2",
+                format: openmettle_core::model_config::SNAPSHOT_FORMAT,
+                version: openmettle_core::model_config::SNAPSHOT_VERSION,
+                input: b"{}",
+                config: br#"{"effective":{"ceiling":{"value":450}}}"#,
+            },
+            actor_approval_id: &alice.approval,
+            capabilities: &[],
+            requested_rounds: Some(1),
+            now_ms: authz_store::NOW,
+            cost_qualified: None,
+        },
+        &authz_queue::AdmissionLimits {
+            live_per_actor: 4,
+            live_per_scope: 8,
+            queued_in_instance: 32,
+            queue_timeout: Duration::from_secs(300),
+            round_cap: 10,
+        },
+    )
+    .await
+    .unwrap() else {
+        panic!("expected admission");
+    };
+    tx.commit().await.unwrap();
+
+    // Activate metering and lower personal usage_tokens override to 0.
+    owner
+        .execute(
+            "UPDATE openmettle.quota_enforcement
+                SET metering_enforced = true, metering_enforced_at = clock_timestamp()
+              WHERE id",
+        )
+        .await
+        .unwrap();
+    success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{scope}/quotas/usage_tokens"),
+            Some("rr16-zero-tokens"),
+            Some(&json!({"hard_limit": "0", "reason": "zero tokens before replay"})),
+        ),
+        200,
+    );
+
+    // Exact replay MUST return 200 OK with the original run_id even though backfill is refused.
+    let replayed = success(
+        api.call(
+            alice_b,
+            "POST",
+            "/v1/runs",
+            Some("rr16-replay-key"),
+            Some(&run_body),
+        ),
+        200,
+    );
+    assert_eq!(replayed["run_id"], run_id);
+
+    let (post_state, post_gw, post_qr): (String, i64, i64) = sqlx::query_as(
+        "SELECT state,
+                (SELECT count(*) FROM openmettle.gateway_reservations WHERE run_id = $1::uuid),
+                (SELECT count(*) FROM openmettle.quota_reservations WHERE run_id = $1::uuid)
+           FROM openmettle.runs
+          WHERE id = $1::uuid",
+    )
+    .bind(&run_id)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!((post_state.as_str(), post_gw, post_qr), ("queued", 1, 0));
+
+    // Verify direct backfill_replayed_run_budget rolls back partial gateway_reservations +
+    // device_reservations writes atomically via savepoint when usage_tokens refuses, even if the
+    // caller commits the outer transaction.
+    {
+        let mut btx = WriteTransaction::begin(&mut api_c).await.unwrap();
+        let (committed, refusal) = quotas::backfill_replayed_run_budget(
+            &mut btx,
+            &RunBudgetReservation {
+                scope_id: &scope,
+                scope_kind: "personal",
+                actor_user_id: &alice.user,
+                actor_approval_id: &alice.approval,
+                run_id: &run2,
+                token_units: 450,
+                per_round_cost_micros: None,
+                round_limit: 1,
+                requires_device_slot: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!committed);
+        assert_eq!(
+            refusal,
+            Some(RunLimit::Quota {
+                resource_kind: "usage_tokens",
+                scope_kind: "personal",
+            })
+        );
+        // Commit the outer tx to prove the internal savepoint already rolled back both
+        // gateway_reservations and device_reservations holds.
+        btx.commit().await.unwrap();
+    }
+    let (r2_gw, r2_qr): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM openmettle.gateway_reservations WHERE run_id = $1::uuid),
+                (SELECT count(*) FROM openmettle.quota_reservations WHERE run_id = $1::uuid)",
+    )
+    .bind(&run2)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!((r2_gw, r2_qr), (0, 0));
+
+    let actor_principal = authz_store::principal(&db, &alice).await;
+    authz_queue::cancel_run(&mut api_c, &actor_principal, &scope, &run2)
+        .await
+        .unwrap();
+
+    // Worker claims the replayed queued run and enforces the 0 usage_tokens quota at dispatch time
+    // without stranding holds or gateway_requests.
+    let mut worker = connect(&db.0, WORKER).await;
+    let worker_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(db.1.options(WORKER));
+    let lease_cfg = LeaseSettings {
+        lease: Duration::from_secs(60),
+        execution_timeout: Duration::from_secs(600),
+    };
+    let claim = authz_queue::claim_next(
+        &mut worker,
+        &ClaimLimits {
+            executing_per_actor: 4,
+            executing_per_scope: 8,
+        },
+        &lease_cfg,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(claim.run_id, run_id);
+    assert!(matches!(
+        gateway::reserve_turn_round(
+            &worker_pool,
+            TurnRound {
+                scope_id: &scope,
+                actor: &alice.user,
+                approval: &alice.approval,
+                run_id: &run_id,
+                round: 1,
+                claim_token: &claim.claim_token,
+                installation: INSTALL,
+                model: "a",
+                round_tokens: 450,
+                round_cost: None,
+                requires_device_slot: false,
+            },
+        )
+        .await,
+        Err(gateway::Error::Refused)
+    ));
+    leases::settle(
+        &mut worker,
+        &claim.lease(),
+        &lease_cfg,
+        Settle::Failed(FailReason::StepFailed),
+    )
+    .await
+    .unwrap();
+
+    let (req_count, hold_count, total_held): (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM openmettle.gateway_requests WHERE run_id = $1::uuid),
+                (SELECT count(*) FROM openmettle.quota_reservations WHERE run_id = $1::uuid),
+                (SELECT coalesce(sum(reserved_held), 0)::bigint FROM openmettle.quota_budgets)",
+    )
+    .bind(&run_id)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!((req_count, hold_count, total_held), (0, 0, 0));
+
+    let drift: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
+           FROM openmettle.quota_verify_accounting_drift()",
+    )
+    .fetch_one(&mut worker)
+    .await
+    .unwrap();
+    assert_eq!(drift, (0, 0, 0, 0));
+}
+
 #[path = "run_events_http.rs"]
 mod run_events_http;
