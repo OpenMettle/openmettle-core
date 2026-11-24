@@ -830,6 +830,8 @@ struct HistoryItem {
     input_count: Option<String>,
     #[serde(deserialize_with = "required_nullable")]
     output_count: Option<String>,
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 #[derive(Deserialize)]
 struct Descriptor {
@@ -876,6 +878,12 @@ fn decode_message(v: &Value) -> Result<(), String> {
     let m: HistoryItem = serde_json::from_value(v.clone()).map_err(|e| e.to_string())?;
     if m.message_id.is_empty() || m.role.is_empty() {
         return Err("missing turn identity".into());
+    }
+    if m.stop_reason.as_deref().is_some_and(str::is_empty) {
+        return Err("empty stop_reason".into());
+    }
+    if m.role == "user" && m.stop_reason.is_some() {
+        return Err("user message cannot have stop_reason".into());
     }
     for n in [m.input_count, m.output_count].into_iter().flatten() {
         parse_decimal(&n, true)?;

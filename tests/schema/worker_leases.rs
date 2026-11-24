@@ -2224,6 +2224,7 @@ mod live_turns {
                     reasoning: None,
                     input_count: Some(4),
                     output_count: Some(2),
+                    stop_reason: None,
                 },
             )
             .await
@@ -2291,6 +2292,7 @@ mod live_turns {
                 reasoning: None,
                 input_count: Some(9),
                 output_count: Some(2),
+                stop_reason: None,
             },
         )
         .await;
@@ -2525,6 +2527,7 @@ mod live_turns {
                     reasoning: None,
                     input_count: None,
                     output_count: None,
+                    stop_reason: None,
                 }
             )
             .await,
@@ -6638,6 +6641,194 @@ mod live_turns {
             json!({"prompt_tokens": 88, "completion_tokens": 4}),
         ));
         chat.done(&id, "succeeded", None).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn reasoning_only_token_limit_stop_publishes_and_supports_followup_turns() {
+        let chat = Chat::new().await;
+        let mut server = Provider::new().await;
+        let _worker = chat.start(&server).await;
+
+        // Round 1 hits finish_reason="length" inside reasoning with empty visible content.
+        let (one, input) = chat.submit("reason-cutoff", "a", 2).await;
+        server.request().await.respond(json!({
+            "choices": [{
+                "index": 0,
+                "finish_reason": "length",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "thinking until token limit..."
+                }
+            }],
+            "usage": {"prompt_tokens": 21, "completion_tokens": 12}
+        }));
+        chat.done(&one, "succeeded", None).await;
+
+        let mut w = worker(&chat.f.db).await;
+        let (answer_id, parent, bytes, i, o, stop_reason): (
+            String,
+            String,
+            i32,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT t.message_id::text, m.parent_message_id::text, t.reasoning_bytes,
+                    t.input_count, t.output_count, t.stop_reason
+               FROM openmettle.message_turns t
+               JOIN openmettle.messages m ON m.id = t.message_id
+              WHERE t.run_id = $1::uuid",
+        )
+        .bind(&one)
+        .fetch_one(&mut w)
+        .await
+        .unwrap();
+        assert_eq!(chat.graph().await, (2, 2, 1, Some(answer_id)));
+        assert_eq!(parent, input);
+        assert!(bytes > 0);
+        assert_eq!(
+            (i, o, stop_reason.as_deref()),
+            (Some(21), Some(12), Some("limit"))
+        );
+
+        // Follow-up turn on the same branch using replay-qualified model `a` succeeds and replays
+        // the prior reasoning_content without failing on zero visible parts.
+        let (two, _) = chat.submit("followup-qualified", "a", 2).await;
+        let second = server.request().await;
+        let msgs = second.body["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs[msgs.len() - 3..],
+            [
+                json!({"role": "user", "content": "reason-cutoff"}),
+                json!({"role": "assistant", "reasoning_content": "thinking until token limit..."}),
+                json!({"role": "user", "content": "followup-qualified"}),
+            ]
+        );
+        second.respond(completion(
+            json!("continued"),
+            None,
+            json!({"prompt_tokens": 35, "completion_tokens": 4}),
+        ));
+        chat.done(&two, "succeeded", None).await;
+
+        // Follow-up turn on the same branch using non-replay-qualified model `b` cleanly omits
+        // the reasoning-only assistant turn (zero visible parts, unqualified replay) and succeeds.
+        let (three, _) = chat.submit("followup-unqualified", "b", 2).await;
+        let third = server.request().await;
+        assert_eq!(third.path, "/v1/responses");
+        assert!(
+            !third
+                .body
+                .to_string()
+                .contains("thinking until token limit...")
+        );
+        let roles: Vec<_> = third.body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "user", "assistant", "user"]);
+        third.respond(json!({
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "id": "reply",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "done"}]
+            }],
+            "usage": {"input_tokens": 40, "output_tokens": 2}
+        }));
+        chat.done(&three, "succeeded", None).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn token_limit_stop_drops_partial_tool_calls_without_execution() {
+        let chat = Chat::new().await.with_tools().await;
+        let mut server = Provider::new().await;
+        let _worker = chat.start(&server).await;
+
+        // 1. Zero text, zero reasoning, and only a half-generated tool call at finish_reason="length":
+        // the partial call is dropped, no tool operation runs, and the worker fails cleanly.
+        let (empty_run, input1) = chat.submit("cutoff-tool-only", "a", 3).await;
+        let req = server.request().await;
+        req.respond(json!({
+            "choices": [{
+                "index": 0,
+                "finish_reason": "length",
+                "message": {
+                    "role": "assistant",
+                    "content": Value::Null,
+                    "tool_calls": [{
+                        "id": "call-cut-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{\"q\":\"half"}
+                    }]
+                }
+            }],
+            "usage": {"prompt_tokens": 30, "completion_tokens": 9}
+        }));
+        chat.done(&empty_run, "failed", Some("step_failed")).await;
+        assert_eq!(chat.graph().await, (1, 1, 1, Some(input1)));
+        let ops: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM openmettle.operations WHERE run_id = $1::uuid",
+        )
+        .bind(&empty_run)
+        .fetch_one(&mut worker(&chat.f.db).await)
+        .await
+        .unwrap();
+        assert_eq!(ops, 0);
+        assert!(server.requests.try_recv().is_err());
+
+        // 2. Partial text alongside a half-generated tool call at finish_reason="length":
+        // the partial call is dropped (never executed), and the partial text is published with
+        // stop_reason='limit' and the reported usage.
+        let (text_run, _) = chat.submit("cutoff-text-and-tool", "a", 3).await;
+        let req2 = server.request().await;
+        req2.respond(json!({
+            "choices": [{
+                "index": 0,
+                "finish_reason": "length",
+                "message": {
+                    "role": "assistant",
+                    "content": "partial before call",
+                    "tool_calls": [{
+                        "id": "call-cut-2",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{"}
+                    }]
+                }
+            }],
+            "usage": {"prompt_tokens": 41, "completion_tokens": 11}
+        }));
+        chat.done(&text_run, "succeeded", None).await;
+        let (text, stop_reason, out_count): (String, Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT p.text_value, t.stop_reason, t.output_count
+               FROM openmettle.message_parts p
+               JOIN openmettle.message_turns t USING (message_id)
+              WHERE t.run_id = $1::uuid",
+        )
+        .bind(&text_run)
+        .fetch_one(&mut worker(&chat.f.db).await)
+        .await
+        .unwrap();
+        assert_eq!(
+            (text.as_str(), stop_reason.as_deref(), out_count),
+            ("partial before call", Some("limit"), Some(11))
+        );
+        let ops2: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM openmettle.operations WHERE run_id = $1::uuid",
+        )
+        .bind(&text_run)
+        .fetch_one(&mut worker(&chat.f.db).await)
+        .await
+        .unwrap();
+        assert_eq!(ops2, 0);
+        assert!(server.requests.try_recv().is_err());
     }
 
     #[path = "worker_gateway.rs"]

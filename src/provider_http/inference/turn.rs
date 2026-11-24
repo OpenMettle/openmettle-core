@@ -57,6 +57,18 @@ impl ToolError {
         json!({"error":{"code":"invalid_tool_arguments"}})
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopReason {
+    /// Generation stopped because it reached the model's output token limit.
+    Limit,
+}
+impl StopReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Limit => "limit",
+        }
+    }
+}
 pub enum CallGroup {
     Valid(Vec<Call>),
     InvalidArguments(Vec<ToolError>),
@@ -67,6 +79,7 @@ pub struct Answer {
     pub parts: Vec<String>,
     pub reasoning: Option<Reasoning>,
     pub calls: CallGroup,
+    pub stop_reason: Option<StopReason>,
 }
 pub struct Usage {
     pub input: Option<u64>,
@@ -160,9 +173,22 @@ pub(super) struct Output {
     pub blocks: Vec<Value>,
     reasoning_bytes: usize,
     pub calls: BTreeMap<usize, PendingCall>,
+    pub discarded_calls: usize,
+    pub discarded_call_ids: Vec<String>,
     pub finished: bool,
+    pub stop_reason: Option<StopReason>,
 }
 impl Output {
+    pub fn discard_calls(&mut self) {
+        let dropped = std::mem::take(&mut self.calls);
+        self.discarded_calls += dropped.len();
+        self.discarded_call_ids.extend(
+            dropped
+                .into_values()
+                .map(|c| c.id)
+                .filter(|id| !id.is_empty()),
+        );
+    }
     pub fn text(&mut self, key: (usize, usize), s: &str) -> Result<(), Error> {
         if s.is_empty() {
             return Ok(());
@@ -282,7 +308,10 @@ impl Assembly {
         request: &Request,
         server: bool,
     ) -> Result<Turn, Error> {
-        if !self.terminal || self.choices.is_empty() {
+        if !self.terminal {
+            return Err(Error::Incomplete);
+        }
+        if self.choices.is_empty() {
             return Err(Error::Malformed);
         }
         let tools = request.tools.as_deref().unwrap_or_default();
@@ -300,12 +329,18 @@ impl Assembly {
         }
         let mut count = 0;
         for out in self.choices.values() {
-            count += out.calls.len();
+            let choice_calls = out.calls.len() + out.discarded_calls;
+            count += choice_calls;
             if !out.finished
                 || count > MAX_CALLS
-                || out.calls.len() > 1 && (!q.parallel || request.parallel == Some(false))
+                || choice_calls > 1 && (!q.parallel || request.parallel == Some(false))
             {
                 return Err(Error::Malformed);
+            }
+            for id in &out.discarded_call_ids {
+                if !identifier(id) || !used.insert(id.as_str()) {
+                    return Err(Error::Malformed);
+                }
             }
             for c in out.calls.values() {
                 if !identifier(&c.id)
@@ -366,6 +401,7 @@ impl Assembly {
                 parts: out.parts.into_values().collect(),
                 reasoning,
                 calls,
+                stop_reason: out.stop_reason,
             });
         }
         let usage = self

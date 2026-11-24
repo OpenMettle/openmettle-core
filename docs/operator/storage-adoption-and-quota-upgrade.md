@@ -142,6 +142,14 @@ Migration `0032` ([ADR 0044](../adr/0044-own-inference-proxy-and-binding-free-di
 - Once workers of this release run on schema `0032`, the maintenance loop closes undispatched unbound requests as `not_dispatched` as soon as their run can no longer dispatch them, and closes dispatched unbound requests with no settlement as `unreported` once 15 minutes have passed after their run's execution deadline (releasing token and cost holds at zero charged; a late proxy report at revision 1 supersedes `unreported`).
 - Migration `0032` acquires `EXCLUSIVE` on `gateway_requests`, `ACCESS EXCLUSIVE` on `gateway_usage_reports` (validating `gateway_usage_reports_incomplete_check` against existing rows), and `SHARE` on `gateway_settlements` before its upgrade preflight and partial index build, blocking writes and row-locking reads on `gateway_requests` until the migration transaction commits; lock duration scales with table size.
 
+## Upgrade from 0032 to 0033 (message turn stop reason)
+
+Migration `0033` ([ADR 0036](../adr/0036-conversation-branches-presets-and-effective-model-config.md), [ADR 0038](../adr/0038-sglang-and-external-provider-conformance-adapter.md), [ADR 0044](../adr/0044-own-inference-proxy-and-binding-free-dispatch.md) increment 3c) needs no activation step and no backfill. It adds the nullable `stop_reason text` column to `openmettle.message_turns` with `message_turns_stop_reason_check` (`stop_reason IS NULL OR (author_user_id IS NULL AND stop_reason IN ('limit'))`), grants `SELECT (stop_reason)` to `openmettle_api`, and grants `INSERT (stop_reason)` to `openmettle_worker`.
+
+- Apply migration `0033` with `openmettle-migrate` before rolling API and worker binaries of this release so token-limit stops can persist and expose `stop_reason = 'limit'`. On a pre-`0033` database, history reads return `stop_reason: null`, normal turns publish normally, and token-limit turns fail closed rather than silently dropping `stop_reason`.
+- API and worker binaries of the previous release (`0032`) continue working unchanged on schema `0033`: pre-existing and older-writer rows leave `stop_reason` null.
+- Adding the CHECK validates `openmettle.message_turns` once under `ACCESS EXCLUSIVE` without rewriting the table.
+
 ## Monitor overdue handoffs
 
 The worker records up to 100 overdue committed handoffs per maintenance sweep in `openmettle_quota_overdue_handoffs_total`. The counter measures observations across sweeps. An outstanding handoff can contribute more than once. Use the database ledger to identify the holds. The observation leaves quota charges intact.

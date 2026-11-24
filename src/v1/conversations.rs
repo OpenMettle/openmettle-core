@@ -358,5 +358,5 @@ fn turn_json(t: &HistoryTurn) -> Value {
         })
         .collect::<Vec<_>>();
     json!({"message_id":t.metadata.message_id,"parent_message_id":t.parent_message_id,"role":if t.author_user_id.is_some(){"user"}else{"assistant"},
-        "parts":parts,"run_id":t.metadata.run_id,"input_count":decimal(t.metadata.input_count),"output_count":decimal(t.metadata.output_count)})
+        "parts":parts,"run_id":t.metadata.run_id,"input_count":decimal(t.metadata.input_count),"output_count":decimal(t.metadata.output_count),"stop_reason":t.stop_reason})
 }

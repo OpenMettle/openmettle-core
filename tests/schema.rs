@@ -714,6 +714,12 @@ const ADDITIVE_COLUMNS: &[AdditiveColumn] = &[
         column: "incomplete",
         default: ColumnDefault::Null,
     },
+    AdditiveColumn {
+        since: 33,
+        table: "message_turns",
+        column: "stop_reason",
+        default: ColumnDefault::Null,
+    },
 ];
 
 /// Single declarative registry of every table added after migration 14, ordered by `since`
@@ -1124,6 +1130,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "919f48899eccb9b3b4ebe9a92fef7e06c0a926be54999904d3030aeaadd90c08",
         "18e596e46611b4b88479e4553550277fb79292d447fe4ae018ed37739a2f4f80",
         "27c5fd521de087cec5a1d6b2218db88ebddcae87f28a8e186e5706d23569cfdd",
+        "02ebc991fda07c990dc47a0e321368379d6ce80d940e8771491f74af24f34c54",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));

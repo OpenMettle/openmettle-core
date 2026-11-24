@@ -210,9 +210,67 @@ async fn reports(
     .unwrap()
 }
 
+/// Reads `GET /v1/conversations/{id}/branches/{branch_id}/messages` through a real `openmettle-api`
+/// binary authenticated as the chat's actor, verifying the API's JSON wire projection.
+async fn fetch_branch_messages(chat: &Chat) -> Value {
+    use std::io::{BufRead, BufReader};
+    let dir = Dir::new();
+    let doc = crate::auth_config_support::document_v2_native(&dir, &Ca::new().pem());
+    let auth_path = dir.write("auth.json", &serde_json::to_vec(&doc).unwrap());
+    let bind = address();
+    let mut api = Process(
+        binary("api")
+            .env("OPENMETTLE_API_AUTH_CONFIG", auth_path)
+            .env("OPENMETTLE_API_BIND", &bind)
+            .env("OPENMETTLE_API_DATABASE_URL", chat.f.db.url(API))
+            .env(
+                "OPENMETTLE_API_ISSUANCE_DATABASE_URL",
+                chat.f.db.url(ISSUANCE),
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_ready(&mut api, &bind);
+    let cookie = crate::authz_runs::seeded_session(&chat.f.db, &chat.f.actor, 77, None).await;
+    let path = format!(
+        "/v1/conversations/{}/branches/{}/messages",
+        chat.root.conversation_id, chat.root.branch_id
+    );
+    let mut stream = TcpStream::connect(&bind).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: app.example.test\r\nCookie: __Host-openmettle-session={cookie}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut headers = String::new();
+    loop {
+        let n = reader.read_line(&mut headers).unwrap();
+        assert!(n > 0, "incomplete API response headers");
+        if headers.ends_with("\r\n\r\n") {
+            break;
+        }
+    }
+    assert!(headers.starts_with("HTTP/1.1 200 "), "{headers}");
+    let mut body = String::new();
+    reader.read_to_string(&mut body).unwrap();
+    signal(&api.0, "-TERM");
+    assert!(api.0.wait().unwrap().success());
+    serde_json::from_str(&body).unwrap()
+}
+
 /// A queued run whose recorded answer `case` reaches the worker through the gateway over
 /// `transport`, settled at the usage that answer reports.
-async fn settles_through_the_gateway(transport: Transport, case: &'static str, content: &str) {
+async fn settles_through_the_gateway(
+    transport: Transport,
+    case: &'static str,
+    content: &str,
+    expected_stop_reason: Option<&str>,
+) {
     let (_, prompt, completion, reasoning) = *SETTLED.iter().find(|(c, ..)| *c == case).unwrap();
     let stream = crate::sglang_recorded::chunked(case);
     let (chat, run, input) = queued().await;
@@ -277,13 +335,13 @@ async fn settles_through_the_gateway(transport: Transport, case: &'static str, c
     );
     let measured = (prompt + completion).to_string();
     assert_eq!(hold(&chat, &id).await, ("settled".to_owned(), 0, measured));
-    // The run's turn holds the recorded content and counts.
+    // The run's turn holds the recorded content, counts and stop_reason.
     let (messages, turns, parts, head) = chat.graph().await;
     assert_eq!((messages, turns, parts), (2, 2, 2));
     assert_ne!(head.as_deref(), Some(input.as_str()));
     let mut owner = connect(&chat.f.db.0, OWNER).await;
-    let answer: (String, Option<i64>, Option<i64>) = sqlx::query_as(
-        "SELECT p.text_value, t.input_count, t.output_count
+    let answer: (String, Option<i64>, Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT p.text_value, t.input_count, t.output_count, t.stop_reason
            FROM openmettle.message_parts p JOIN openmettle.message_turns t USING (message_id)
           WHERE t.run_id = $1::uuid",
     )
@@ -291,7 +349,27 @@ async fn settles_through_the_gateway(transport: Transport, case: &'static str, c
     .fetch_one(&mut owner)
     .await
     .unwrap();
-    assert_eq!(answer, (content.to_owned(), Some(prompt), Some(completion)));
+    assert_eq!(
+        answer,
+        (
+            content.to_owned(),
+            Some(prompt),
+            Some(completion),
+            expected_stop_reason.map(str::to_owned),
+        )
+    );
+    // The mounted API exposes the assistant message's stop_reason (and null on user turns).
+    let page = fetch_branch_messages(&chat).await;
+    crate::consumer::decode_conversation_operation("listMessages", &page).unwrap();
+    let items = page["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["role"], "assistant");
+    assert_eq!(items[0]["parts"][0]["text"], content);
+    assert_eq!(items[0]["input_count"], prompt.to_string());
+    assert_eq!(items[0]["output_count"], completion.to_string());
+    assert_eq!(items[0]["stop_reason"], json!(expected_stop_reason));
+    assert_eq!(items[1]["role"], "user");
+    assert_eq!(items[1]["stop_reason"], Value::Null);
     // No ADR 0037 provisioning took part, and the accounting has no drift.
     let provisioned: i64 = sqlx::query_scalar(
         "SELECT (SELECT count(*) FROM openmettle.gateway_bindings)
@@ -319,14 +397,29 @@ async fn settles_through_the_gateway(transport: Transport, case: &'static str, c
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 and TEST_GATEWAY_HOST"]
 async fn a_queued_run_settles_through_the_gateway_over_plain_http() {
-    settles_through_the_gateway(Transport::Plain, "02-chat-plain", "ok").await;
+    settles_through_the_gateway(Transport::Plain, "02-chat-plain", "ok", None).await;
 }
 
 /// The `https://` option: TLS terminated in front of the gateway, here with a streamed answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 and TEST_GATEWAY_HOST"]
 async fn a_queued_run_settles_through_the_gateway_behind_tls() {
-    settles_through_the_gateway(Transport::Tls, "03-chat-stream-usage", "12345").await;
+    settles_through_the_gateway(Transport::Tls, "03-chat-stream-usage", "12345", None).await;
+}
+
+/// Recorded `07-chat-stream-length`: a streamed response stopped at its output token limit
+/// settles through the gateway at actual usage (`21 + 12 = 33`), succeeds with partial text,
+/// stores `stop_reason = 'limit'`, and exposes `"stop_reason": "limit"` over the API.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 and TEST_GATEWAY_HOST"]
+async fn a_token_limit_stop_publishes_partial_output_and_settles_through_the_gateway() {
+    settles_through_the_gateway(
+        Transport::Plain,
+        "07-chat-stream-length",
+        "The lighthouse did not merely stand on the island of Oak",
+        Some("limit"),
+    )
+    .await;
 }
 
 /// A gateway serving another model than the run's spends the dispatch, refuses the round with

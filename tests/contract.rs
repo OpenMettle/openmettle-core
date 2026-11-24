@@ -715,10 +715,13 @@ fn consumer_decodes_every_valid_and_newer_compatible_response() {
 type Decode = fn(&Value) -> Result<(), String>;
 
 /// The consumer's decoders of the V1-05 project, conversation, artifact and V1-17 quota responses.
-fn v1_decoders() -> [(&'static str, Decode); 9] {
+fn v1_decoders() -> [(&'static str, Decode); 10] {
     [
         ("#/components/schemas/Run", |v| {
             consumer::decode_run(v).map(drop)
+        }),
+        ("#/components/schemas/MessagePage", |v| {
+            consumer::decode_conversation_operation("listMessages", v)
         }),
         ("#/components/schemas/Project", |v| {
             consumer::decode_project(v).map(drop)
@@ -833,6 +836,47 @@ fn consumer_reads_projects_and_items_without_inferring_access() {
         let mut bad = fixture("ArtifactRevisionActive");
         bad[member] = value;
         assert!(consumer::decode_revision(&bad).is_err(), "{member}");
+    }
+
+    // MessagePage fixtures cover normal null stop_reason, assistant limit stop, open-vocabulary
+    // forward compatibility, legacy omitted stop_reason, and rejection of non-string or user
+    // non-null stop_reason.
+    for name in [
+        "VisibleMessagePage",
+        "VisibleMessagePage--assistant-limit-stop",
+        "VisibleMessagePage--unrecognized-stop-reason",
+    ] {
+        consumer::decode_conversation_operation("listMessages", &fixture(name)).unwrap();
+    }
+    let mut legacy_user = fixture("VisibleMessagePage");
+    legacy_user["items"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("stop_reason");
+    let message_page_validator = build(&json!({
+        "$ref": format!("{CONTRACT_URI}#/components/schemas/MessagePage")
+    }))
+    .unwrap();
+    assert!(message_page_validator.is_valid(&legacy_user));
+    consumer::decode_conversation_operation("listMessages", &legacy_user).unwrap();
+    let mut bad_user = fixture("VisibleMessagePage");
+    bad_user["items"][0]["stop_reason"] = json!("limit");
+    assert!(
+        !message_page_validator.is_valid(&bad_user),
+        "user message with non-null stop_reason must fail MessagePage schema"
+    );
+    assert!(
+        consumer::decode_conversation_operation("listMessages", &bad_user).is_err(),
+        "user message with non-null stop_reason must fail consumer decode"
+    );
+    for name in [
+        "VisibleMessagePage--invalid-stop-reason",
+        "VisibleMessagePage--user-non-null-stop-reason",
+    ] {
+        assert!(
+            consumer::decode_conversation_operation("listMessages", &fixture(name)).is_err(),
+            "{name} must fail consumer decode"
+        );
     }
 }
 

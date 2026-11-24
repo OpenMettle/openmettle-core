@@ -805,6 +805,7 @@ async fn shares_catalog_preview_history_and_cancellation() {
             reasoning: Some(&blocks),
             input_count: Some(21),
             output_count: Some(3),
+            stop_reason: None,
         },
     )
     .await
@@ -814,6 +815,7 @@ async fn shares_catalog_preview_history_and_cancellation() {
     let page = api.get(&u.other, &format!("{history}?limit=1")).expect(200);
     assert_eq!(page["items"][0]["message_id"], ANSWER);
     assert_eq!(page["items"][0]["input_count"], "21");
+    assert_eq!(page["items"][0]["stop_reason"], Value::Null);
     assert!(!page.to_string().contains("reasoning"));
     let next = format!(
         "{history}?limit=1&cursor={}",

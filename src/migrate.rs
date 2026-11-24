@@ -186,6 +186,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "gateway unreported request sweep",
         sql: include_str!("../migrations/0032_gateway_unreported_request_sweep.sql"),
     },
+    Source {
+        version: 33,
+        description: "message turn stop reason",
+        sql: include_str!("../migrations/0033_message_turn_stop_reason.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.
