@@ -1016,6 +1016,19 @@ mod live_turns {
         .unwrap()
     }
 
+    /// Records the dispatch of round `id` as the proxy would, with the bearer the worker sent:
+    /// settlement accepts a report for a request without a binding only after its dispatch.
+    async fn spend_dispatch(gateway: &sqlx::PgPool, id: &str, bearer: &str) {
+        let replayed: bool =
+            sqlx::query_scalar("SELECT replayed FROM openmettle.gateway_dispatch($1::uuid,$2)")
+                .bind(id)
+                .bind(dispatch_secret(bearer).expect("a dispatch secret"))
+                .fetch_one(gateway)
+                .await
+                .unwrap();
+        assert!(!replayed);
+    }
+
     impl Provider {
         async fn new() -> Self {
             let loopback = IpAddr::from([127, 0, 0, 1]);
@@ -3018,6 +3031,7 @@ mod live_turns {
                 .fetch_one(&mut owner)
                 .await
                 .unwrap();
+            spend_dispatch(&g_pool, &req_id, &req.bearer).await;
             assert_eq!(
                 settlement::ingest(
                     &g_pool,
@@ -3577,6 +3591,7 @@ mod live_turns {
             .fetch_one(&mut owner)
             .await
             .unwrap();
+        spend_dispatch(&g_pool, &req_id, &req.bearer).await;
         assert_eq!(
             settlement::ingest(
                 &g_pool,
@@ -3960,6 +3975,7 @@ mod live_turns {
             .fetch_one(&mut owner)
             .await
             .unwrap();
+        spend_dispatch(&g_pool, &req2_id, &req2.bearer).await;
         assert_eq!(
             settlement::ingest(
                 &g_pool,
@@ -4192,6 +4208,7 @@ mod live_turns {
             .fetch_one(&mut owner)
             .await
             .unwrap();
+        spend_dispatch(&g_pool, &req_id, &req.bearer).await;
         assert_eq!(
             settlement::ingest(
                 &g_pool,
@@ -4734,6 +4751,7 @@ mod live_turns {
             .fetch_one(&mut owner)
             .await
             .unwrap();
+        spend_dispatch(&g_pool, &req_id, &req.bearer).await;
         let outcome = settlement::ingest(
             &g_pool,
             &UsageReport {
@@ -5148,6 +5166,7 @@ mod live_turns {
             .fetch_one(&mut owner)
             .await
             .unwrap();
+        spend_dispatch(&g_pool, &req_id, &req.bearer).await;
         assert_eq!(
             settlement::ingest(
                 &g_pool,
@@ -5722,6 +5741,7 @@ mod live_turns {
             .fetch_one(&mut owner)
             .await
             .unwrap();
+        spend_dispatch(&g_pool, &req1_id, &req1.bearer).await;
         assert_eq!(
             settlement::ingest(
                 &g_pool,
@@ -5759,6 +5779,7 @@ mod live_turns {
             .fetch_one(&mut owner)
             .await
             .unwrap();
+        spend_dispatch(&g_pool, &req2_id, &req2.bearer).await;
         assert_eq!(
             settlement::ingest(
                 &g_pool,

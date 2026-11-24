@@ -4,8 +4,28 @@ use super::*;
 /// and capabilities a round is handed off against (ADR 0044), with the round token ceiling the
 /// quota functions read.
 pub(super) fn snapshot(ceiling: u64) -> Vec<u8> {
+    snapshot_of("a", ceiling)
+}
+
+/// Records the dispatch of a handed-off request, as the proxy does before it reports usage.
+/// These tests settle a round without the proxy, and the library keeps the round's dispatch
+/// secret to itself, so the fixture writes the mark as the database owner.
+async fn dispatched(owner: &mut PgConnection, request: &str) {
+    let marked = sqlx::query(
+        "UPDATE openmettle.gateway_requests SET dispatched_at=clock_timestamp()
+          WHERE id=$1::uuid AND state='handed_off' AND dispatched_at IS NULL",
+    )
+    .bind(request)
+    .execute(owner)
+    .await
+    .unwrap();
+    assert_eq!(marked.rows_affected(), 1);
+}
+
+/// [`snapshot`] for another model.
+pub(super) fn snapshot_of(model: &str, ceiling: u64) -> Vec<u8> {
     serde_json::json!({
-        "effective": {"model": "a", "ceiling": {"value": ceiling}},
+        "effective": {"model": model, "ceiling": {"value": ceiling}},
         "required_capabilities": {},
     })
     .to_string()
@@ -40,6 +60,10 @@ impl TurnHandoffFixture {
         let mut doc: serde_json::Value =
             serde_json::from_slice(include_bytes!("../fixtures/conversation-catalog-v1.json"))
                 .unwrap();
+        // A model the fixture catalog lacks takes the profile of `a`.
+        if doc["models"][model].is_null() {
+            doc["models"][model] = doc["models"]["a"].clone();
+        }
         let entry = &mut doc["models"][model];
         entry["context_window"] = serde_json::json!(round_tokens);
         entry["output_limit"] = serde_json::json!(round_tokens);
@@ -3721,6 +3745,7 @@ async fn pre_activation_charged_parents_pre26_replay_savepoint_and_n1_legacy_hol
         .fetch_one(&mut owner)
         .await
         .unwrap();
+    dispatched(&mut owner, &pending_held.id).await;
     assert_eq!(
         settlement::ingest(
             &g_pool,
@@ -4339,6 +4364,7 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
         .fetch_one(&mut owner)
         .await
         .unwrap();
+    dispatched(&mut owner, &p1.id).await;
     assert_eq!(
         settlement::ingest(
             &g_pool,
@@ -6333,6 +6359,7 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
             .fetch_one(&mut owner)
             .await
             .unwrap();
+        dispatched(&mut owner, &pending.id).await;
         assert_eq!(
             settlement::ingest(
                 &g_pool,
@@ -6579,6 +6606,7 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
             .fetch_one(&mut owner)
             .await
             .unwrap();
+        dispatched(&mut owner, &p_retry.id).await;
         assert_eq!(
             settlement::ingest(
                 &g_pool,
@@ -7559,6 +7587,7 @@ async fn reserve_turn_round_returns_retryable_on_40001_and_succeeds_on_retry() {
         .fetch_one(&mut owner)
         .await
         .unwrap();
+    dispatched(&mut owner, &pending.id).await;
     assert_eq!(
         settlement::ingest(
             &g_pool,
@@ -7867,6 +7896,7 @@ async fn replacement_holds_and_cost_slice_account_for_prior_bearer_rounds() {
         .fetch_one(&mut owner)
         .await
         .unwrap();
+    dispatched(&mut owner, &pending_a.id).await;
     assert_eq!(
         settlement::ingest(
             &g_pool,
@@ -8347,6 +8377,7 @@ async fn public_turn_handoff_rejects_mismatched_and_cross_gateway_prepared_befor
         .fetch_one(&mut owner)
         .await
         .unwrap();
+    dispatched(&mut owner, &pending_b.id).await;
     assert_eq!(
         settlement::ingest(
             &g_pool,

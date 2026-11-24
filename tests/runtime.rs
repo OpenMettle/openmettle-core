@@ -2131,9 +2131,17 @@ fn gateway_refuses_incomplete_or_unsupported_settings_with_a_fixed_line() {
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
     let database = ("DATABASE_URL", "postgres://localhost/test");
     let upstream = ("UPSTREAM_URL", "http://127.0.0.1:30000");
+    let model = ("MODEL", "synthetic-model");
+    let oversized = "m".repeat(129);
     let cases: &[(&[(&str, &str)], &str)] = &[
-        (&[upstream], "DATABASE_URL is required"),
-        (&[database], "UPSTREAM_URL is required"),
+        (&[upstream, model], "DATABASE_URL is required"),
+        (&[database, model], "UPSTREAM_URL is required"),
+        (&[database, upstream], "MODEL is required"),
+        (&[database, upstream, ("MODEL", "")], "invalid MODEL"),
+        (
+            &[database, upstream, ("MODEL", &oversized)],
+            "invalid MODEL",
+        ),
         (
             &[
                 database,
@@ -2156,7 +2164,7 @@ fn gateway_refuses_incomplete_or_unsupported_settings_with_a_fixed_line() {
             "invalid UPSTREAM_URL",
         ),
         (
-            &[database, upstream, ("UPSTREAM_IDLE_TIMEOUT_MS", "0")],
+            &[database, upstream, model, ("UPSTREAM_IDLE_TIMEOUT_MS", "0")],
             "configuration outside allowed range",
         ),
     ];
@@ -2181,6 +2189,7 @@ fn gateway_refuses_incomplete_or_unsupported_settings_with_a_fixed_line() {
     let output = gateway()
         .env("OPENMETTLE_GATEWAY_DATABASE_URL", database.1)
         .env("OPENMETTLE_GATEWAY_UPSTREAM_URL", upstream.1)
+        .env("OPENMETTLE_GATEWAY_MODEL", model.1)
         .env(
             "OPENMETTLE_API_ISSUANCE_DATABASE_URL",
             "postgres://CANARY@localhost/test",
@@ -2213,6 +2222,7 @@ fn gateway_serves_probes_and_its_route_and_stops_on_a_signal() {
             .env("OPENMETTLE_GATEWAY_DB_TIMEOUT_MS", "150")
             .env("OPENMETTLE_GATEWAY_SHUTDOWN_TIMEOUT_MS", "1000")
             .env("OPENMETTLE_GATEWAY_UPSTREAM_URL", "http://127.0.0.1:9")
+            .env("OPENMETTLE_GATEWAY_MODEL", "synthetic-model")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -2247,13 +2257,53 @@ fn gateway_serves_probes_and_its_route_and_stops_on_a_signal() {
     .unwrap();
     assert!(reply.starts_with("HTTP/1.1 400"));
     assert!(reply.contains("\"code\":\"validation\""));
+    // So is a request without a usable credential: one `Authorization: Bearer` header holding
+    // 32 bytes as unpadded base64url.
+    let id = "0f8fad5b-d9cb-469f-a165-70867728950e";
+    let request = |credential: &str| {
+        format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: {id}\r\n\
+             {credential}Content-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        )
+    };
+    let secret = "A".repeat(43);
+    for credential in [
+        String::new(),
+        "Authorization: Bearer canary-credential\r\n".to_owned(),
+        format!("Authorization: Basic {secret}\r\n"),
+        format!("Authorization: Bearer {secret}\r\n").repeat(2),
+    ] {
+        let reply = send(&bind, &request(&credential)).unwrap();
+        assert!(reply.starts_with("HTTP/1.1 401"), "{credential}");
+        assert!(reply.contains("\"code\":\"unauthenticated\""));
+        assert!(
+            reply
+                .to_ascii_lowercase()
+                .contains("www-authenticate: bearer\r\n")
+        );
+    }
+    // A well-formed credential reaches the database, which is unavailable: the dispatch is
+    // unconfirmed and nothing is forwarded.
+    let reply = send(
+        &bind,
+        &request(&format!("Authorization: Bearer {secret}\r\n")),
+    )
+    .unwrap();
+    assert!(reply.starts_with("HTTP/1.1 503"), "{reply}");
     stop(&mut process, "-TERM");
     let (stdout, stderr) = drain(&mut process);
     assert!(stdout.is_empty());
+    assert!(!stderr.contains(&secret) && !stderr.contains("canary-credential"));
     let events: Vec<serde_json::Value> = stderr
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
+    let unconfirmed: Vec<_> = events
+        .iter()
+        .filter(|e| e["event"] == "gateway.usage.unrecorded")
+        .map(|e| (e["gateway.request_id"].as_str(), e["error.type"].as_str()))
+        .collect();
+    assert_eq!(unconfirmed, [(Some(id), Some("dispatch_unconfirmed"))]);
     let lifecycle: Vec<_> = events
         .iter()
         .filter(|e| e["role"] == "gateway")

@@ -1,17 +1,26 @@
-//! `openmettle-gateway`, increment 1 of the V1-06 proxy. The real binary, whose only database
-//! login is `openmettle_gateway`, forwards requests to a stand-in upstream that replays the
-//! responses recorded from a real SGLang deployment (`tests/fixtures/sglang-recorded/`), and
-//! settles the usage they report. Every case uses its own handed-off gateway request.
+//! `openmettle-gateway`, the V1-06 proxy (ADR 0044). The real binary, whose only database
+//! login is `openmettle_gateway`, authenticates each caller by its request's dispatch secret,
+//! forwards the request once to a stand-in upstream that replays the responses recorded from a
+//! real SGLang deployment (`tests/fixtures/sglang-recorded/`), and settles the usage they
+//! report. Every case uses its own run round, reserved and handed off through the library with
+//! its quota holds and without any gateway binding, generation or policy row.
 use super::*;
 use crate::{
-    quotas::TurnHandoffFixture,
+    quotas::{TurnHandoffFixture, snapshot_of},
     sglang_recorded::{self as recorded, ABORTED},
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use openmettle_core::{
-    authz::gateway::{self, Authority, Call, Reservation},
-    provider_keys::gateway::{Bearer, Context, GatewayKeys, GatewaySealer},
+    authz::{
+        gateway::{self, TurnRound},
+        leases::LeaseSettings,
+        runs::{self as queue, Admission, AdmissionLimits, ClaimLimits, RunAdmission},
+    },
+    quotas::{self as budgets, RunBudgetReservation},
+    runs::{RunInput, WriteTransaction},
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::sync::{
     Mutex,
@@ -22,16 +31,31 @@ use tokio::{
     sync::Notify,
 };
 
+/// The installation of every request, which is also its report source.
 const INSTALL: &str = "00000000-0000-4000-8000-0000000000a1";
-const PRINCIPAL: &str = "00000000-0000-4000-8000-0000000000a2";
-const BUDGET: &str = "00000000-0000-4000-8000-0000000000a3";
-/// The report source of the gateway policy, stored on every handed-off request.
-const SOURCE: &str = "00000000-0000-4000-8000-0000000000a4";
+/// The model the recorded requests name, which the gateway under test serves.
+const MODEL: &str = "recorded-sglang-model";
+/// A catalog model this gateway does not serve.
+const OTHER_MODEL: &str = "a";
 /// Token hold of each request: room for every recorded answer.
 const UNITS: i64 = 1000;
-/// Synthetic caller credentials that must reach neither the upstream nor the logs.
-const CREDENTIAL: &str = "canary-caller-credential-gateway-proxy";
+/// A synthetic caller cookie that must reach neither the upstream nor the logs.
 const COOKIE: &str = "canary-cookie-gateway-proxy";
+const LIMITS: AdmissionLimits = AdmissionLimits {
+    live_per_actor: 64,
+    live_per_scope: 64,
+    queued_in_instance: 64,
+    queue_timeout: Duration::from_secs(300),
+    round_cap: 4,
+};
+const CLAIMS: ClaimLimits = ClaimLimits {
+    executing_per_actor: 64,
+    executing_per_scope: 64,
+};
+const LEASES: LeaseSettings = LeaseSettings {
+    lease: Duration::from_secs(120),
+    execution_timeout: Duration::from_secs(600),
+};
 
 /// Recorded 200 answers and the usage each reports: prompt, completion and reasoning tokens.
 /// Reasoning is already inside the completion count on this server.
@@ -53,19 +77,32 @@ fn pool(db: &TestDb, role: &str) -> PgPool {
         .connect_lazy_with(db.1.options(role))
 }
 
-fn keys() -> GatewayKeys {
-    GatewayKeys::new(&[("fixture".into(), [42; 32])]).unwrap()
+/// The dispatch secret the fixture gives request `id`. The library keeps the secret it created
+/// private to the worker's dispatch, so the fixture re-keys each request as the database owner
+/// with one the test can present: only the stored hash changes. Increment 2c replaces this with
+/// the packaged worker dispatching to the proxy.
+fn secret(id: &str) -> [u8; 32] {
+    Sha256::digest(format!("gateway-proxy-fixture:{id}")).into()
 }
 
-/// One account with a ready gateway binding whose session reserves and hands off requests.
+/// The credential of request `id`: its dispatch secret as unpadded base64url.
+fn bearer(id: &str) -> String {
+    URL_SAFE_NO_PAD.encode(secret(id))
+}
+
+/// One account whose run rounds are reserved and handed off without any gateway binding.
 struct Fixture {
     db: TestDb,
-    api: PgPool,
     owner: PgPool,
+    worker: PgPool,
     actor: authz_store::Account,
     scope: String,
-    session: String,
+    /// The route of [`MODEL`] and of [`OTHER_MODEL`].
     route: TurnHandoffFixture,
+    other_route: TurnHandoffFixture,
+    runs: AtomicUsize,
+    /// Every request issued, to check that no credential is logged.
+    issued: Mutex<Vec<String>>,
 }
 
 impl Fixture {
@@ -84,90 +121,161 @@ impl Fixture {
         let actor =
             authz_store::account(&mut c, authz_store::PROVIDER, true, authz_store::FUTURE).await;
         let scope = authz_runs::personal_of(&db, &actor).await;
-        let session = authz_runs::seeded_session(&db, &actor, 4, None).await;
-        let api = pool(&db, API);
-        let g = pool(&db, pg::GATEWAY);
-        let binding: String = sqlx::query_scalar(
-            "INSERT INTO openmettle.gateway_bindings (installation,user_id,principal,budget)
-             VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid) RETURNING id::text",
-        )
-        .bind(INSTALL)
-        .bind(&actor.user)
-        .bind(PRINCIPAL)
-        .bind(BUDGET)
-        .fetch_one(&g)
-        .await
-        .unwrap();
-        let context = Context {
-            installation: INSTALL,
-            user_id: &actor.user,
-            binding_id: &binding,
-            principal: PRINCIPAL,
-            generation: 1,
-        };
-        let (fingerprint, sealed) = GatewaySealer::new(keys(), g.clone())
-            .seal(&context, &Bearer::generate().unwrap())
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO openmettle.gateway_generations (binding_id,generation,remote_key,expires_at,key_id,key_fingerprint,nonce,ciphertext)
-            VALUES ($1::uuid,1,gen_random_uuid(),clock_timestamp()+interval '1 hour',$2,$3,$4,$5)")
-            .bind(&binding).bind(&sealed.key_id).bind(fingerprint.as_slice()).bind(sealed.nonce.as_slice())
-            .bind(sealed.ciphertext).execute(&g).await.unwrap();
-        sqlx::query("INSERT INTO openmettle.gateway_policy (binding_id,revision,scope_id,approval_id,model,report_source,provider_generation,approval_generation,user_generation,capabilities)
-            VALUES ($1::uuid,1,$2::uuid,$3::uuid,'a',$4::uuid,0,0,0,'{\"inference\":true}')")
-            .bind(&binding).bind(&scope).bind(&actor.approval).bind(SOURCE).execute(&g).await.unwrap();
-        sqlx::query("INSERT INTO openmettle.user_capability_grants (user_id,capability,granted,updated_by_user_id)
-            VALUES ($1::uuid,'inference',true,$1::uuid)").bind(&actor.user).execute(&api).await.unwrap();
-        g.execute("UPDATE openmettle.gateway_bindings SET active_generation=1,observed_revision=1,state='ready'")
-            .await
-            .unwrap();
-        // From here on, every `openmettle_gateway` connection belongs to the binary.
-        g.close().await;
         Self {
             owner: pool(&db, OWNER),
-            route: TurnHandoffFixture::chat(INSTALL, "a", UNITS, None, false),
+            worker: pool(&db, WORKER),
+            route: TurnHandoffFixture::chat(INSTALL, MODEL, UNITS, None, false),
+            other_route: TurnHandoffFixture::chat(INSTALL, OTHER_MODEL, UNITS, None, false),
+            runs: AtomicUsize::new(0),
+            issued: Mutex::default(),
             db,
-            api,
             actor,
             scope,
-            session,
         }
     }
 
-    /// A new caller request of `UNITS` tokens, handed off unless `reserved_only`.
+    /// A new request of `UNITS` tokens for [`MODEL`], handed off unless `reserved_only`.
     async fn request(&self, reserved_only: bool) -> String {
-        let reservation: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
-            .fetch_one(&self.owner)
-            .await
-            .unwrap();
-        let call = Call {
-            installation: INSTALL,
-            model: "a",
-            units: UNITS,
-            reservation: Reservation {
-                id: &reservation,
-                scope_id: &self.scope,
-                actor: &self.actor.user,
-                approval: &self.actor.approval,
+        self.request_for(MODEL, reserved_only).await
+    }
+
+    /// Round 1 of a new one-round run admitted for `model`, with its run and round holds,
+    /// handed off unless `reserved_only`, and re-keyed to [`secret`].
+    async fn request_for(&self, model: &str, reserved_only: bool) -> String {
+        let (actor, scope) = (&self.actor, self.scope.as_str());
+        let chat = authz_runs::chat(&self.db, scope, "personal", actor).await;
+        let mut api = connect(&self.db.0, API).await;
+        let (branch, message) = quotas::branch_and_message(&mut api, scope, &chat).await;
+        let key = format!("proxy-{}", self.runs.fetch_add(1, Ordering::SeqCst));
+        let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+        let admitted = queue::admit_run(
+            &mut tx,
+            &RunAdmission {
+                input: RunInput {
+                    scope,
+                    actor: &actor.user,
+                    conversation: &chat,
+                    branch: &branch,
+                    message: &message,
+                    key: &key,
+                    format: "openmettle.conversation",
+                    version: 1,
+                    input: b"{}",
+                    config: &snapshot_of(model, UNITS as u64),
+                },
+                actor_approval_id: &actor.approval,
+                capabilities: &[],
+                requested_rounds: Some(1),
+                now_ms: authz_store::NOW,
+                cost_qualified: None,
             },
-            authority: Authority::Session {
-                credential: &self.session,
-                native_audience: None,
-            },
+            &LIMITS,
+        )
+        .await
+        .unwrap();
+        let run = match admitted {
+            Admission::Admitted { run_id, .. } => run_id,
+            other => panic!("expected an admission, got {other:?}"),
         };
-        let pending = gateway::reserve(&self.api, call).await.unwrap();
+        let refused = budgets::reserve_admitted_run_budget(
+            &mut tx,
+            &RunBudgetReservation {
+                scope_id: scope,
+                scope_kind: "personal",
+                actor_user_id: &actor.user,
+                actor_approval_id: &actor.approval,
+                run_id: &run,
+                token_units: UNITS,
+                per_round_cost_micros: None,
+                round_limit: 1,
+                requires_device_slot: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(refused.is_none(), "{refused:?}");
+        tx.commit().await.unwrap();
+        let claim = queue::claim_next(&mut connect(&self.db.0, WORKER).await, &CLAIMS, &LEASES)
+            .await
+            .unwrap()
+            .expect("a queued run");
+        assert_eq!(claim.run_id, run);
+        let pending = gateway::reserve_turn_round(
+            &self.worker,
+            TurnRound {
+                scope_id: scope,
+                actor: &actor.user,
+                approval: &actor.approval,
+                run_id: &run,
+                round: 1,
+                claim_token: &claim.claim_token,
+                installation: INSTALL,
+                model,
+                round_tokens: UNITS,
+                round_cost: None,
+                requires_device_slot: false,
+            },
+        )
+        .await
+        .unwrap();
         if !reserved_only {
+            let route = match model {
+                MODEL => &self.route,
+                _ => &self.other_route,
+            };
             let handed_off = pending
                 .handoff(
-                    &self.api,
-                    &keys(),
-                    &self.route.billable(),
-                    self.route.prepare_mode(false),
+                    &self.worker,
+                    None,
+                    &route.billable(),
+                    route.prepare_mode(true),
                 )
                 .await;
             assert!(handed_off.is_ok());
         }
+        let rekeyed = sqlx::query(
+            "UPDATE openmettle.gateway_requests SET dispatch_hash=sha256($2) WHERE id=$1::uuid",
+        )
+        .bind(&pending.id)
+        .bind(secret(&pending.id).as_slice())
+        .execute(&self.owner)
+        .await
+        .unwrap();
+        assert_eq!(rekeyed.rows_affected(), 1);
+        self.issued.lock().unwrap().push(pending.id.clone());
         pending.id.clone()
+    }
+
+    /// The run of request `id`.
+    async fn run_of(&self, id: &str) -> String {
+        sqlx::query_scalar("SELECT run_id::text FROM openmettle.gateway_requests WHERE id=$1::uuid")
+            .bind(id)
+            .fetch_one(&self.owner)
+            .await
+            .unwrap()
+    }
+
+    /// Whether the one dispatch of `id` is spent.
+    async fn dispatched(&self, id: &str) -> bool {
+        sqlx::query_scalar(
+            "SELECT dispatched_at IS NOT NULL FROM openmettle.gateway_requests WHERE id=$1::uuid",
+        )
+        .bind(id)
+        .fetch_one(&self.owner)
+        .await
+        .unwrap()
+    }
+
+    /// Rows in the ADR 0037 provisioning tables: none is ever needed.
+    async fn provisioned(&self) -> i64 {
+        sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM openmettle.gateway_bindings)
+                  + (SELECT count(*) FROM openmettle.gateway_generations)
+                  + (SELECT count(*) FROM openmettle.gateway_policy)",
+        )
+        .fetch_one(&self.owner)
+        .await
+        .unwrap()
     }
 
     /// Every stored report of `id`: report ID, source, revision, finality and token counts.
@@ -220,10 +328,10 @@ impl Fixture {
         .unwrap()
     }
 
-    /// The account's token budget: used and held units.
-    async fn budget(&self) -> (i64, i64) {
-        sqlx::query_as(
-            "SELECT active_used::bigint,reserved_held::bigint FROM openmettle.quota_budgets
+    /// The token units the account's budget counts as used.
+    async fn used(&self) -> i64 {
+        sqlx::query_scalar(
+            "SELECT active_used::bigint FROM openmettle.quota_budgets
               WHERE scope_id=$1::uuid AND resource_kind='usage_tokens'",
         )
         .bind(&self.scope)
@@ -296,8 +404,8 @@ fn continuous_event(content: &str, completion: usize) -> Vec<u8> {
     .into_bytes()
 }
 
-/// A recorded answer for its recorded request, a synthetic one for `{"synthetic":"…"}`, and
-/// otherwise none.
+/// A recorded answer for its recorded request, a synthetic one for a body naming one in
+/// `synthetic`, and otherwise none.
 fn script(body: &[u8]) -> Option<Script> {
     let recorded_case = SETTLED
         .iter()
@@ -493,7 +601,7 @@ const SETTLEMENT_LOCK: &[u8] = b"quota_lock_gateway_request_for_settlement";
 /// The simple query that opens every transaction.
 const BEGIN: &[u8] = b"BEGIN\0";
 
-/// What happens to the first connection that sends the trigger.
+/// What happens to the connection that sends the faulted occurrence of the trigger.
 #[derive(Clone, Copy)]
 enum Fault {
     /// Nothing more is forwarded either way; the sockets stay open until released.
@@ -502,11 +610,11 @@ enum Fault {
     Delay(Duration),
 }
 
-/// Forwards connections to the test PostgreSQL service, with one [`Fault`] on the first
-/// connection that sends `trigger`.
+/// Forwards connections to the test PostgreSQL service, with one [`Fault`] on the connection
+/// that sends `trigger` for the `skip + 1`th time.
 struct FaultyPostgres {
     address: String,
-    /// Times the trigger was seen; only the first was faulted.
+    /// Times the trigger was seen; only one was faulted.
     attempts: Arc<AtomicUsize>,
     /// Held-back replies delivered after a [`Fault::Delay`].
     late: Arc<AtomicUsize>,
@@ -514,7 +622,7 @@ struct FaultyPostgres {
 }
 
 impl FaultyPostgres {
-    async fn start(trigger: &'static [u8], fault: Fault) -> Self {
+    async fn start(trigger: &'static [u8], skip: usize, fault: Fault) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let admin = pg::admin_options();
@@ -524,6 +632,7 @@ impl FaultyPostgres {
         let release = Arc::new(Notify::new());
         let faults = Faults {
             trigger,
+            skip,
             fault,
             attempts: attempts.clone(),
             late: late.clone(),
@@ -551,6 +660,8 @@ impl FaultyPostgres {
 #[derive(Clone)]
 struct Faults {
     trigger: &'static [u8],
+    /// Earlier occurrences of the trigger that pass unfaulted.
+    skip: usize,
     fault: Fault,
     attempts: Arc<AtomicUsize>,
     late: Arc<AtomicUsize>,
@@ -588,7 +699,7 @@ async fn forward(client: tokio::net::TcpStream, server: tokio::net::TcpStream, f
             if seen
                 .windows(faults.trigger.len())
                 .any(|w| w == faults.trigger)
-                && faults.attempts.fetch_add(1, Ordering::SeqCst) == 0
+                && faults.attempts.fetch_add(1, Ordering::SeqCst) == faults.skip
             {
                 match faults.fault {
                     Fault::Silence => {
@@ -603,7 +714,8 @@ async fn forward(client: tokio::net::TcpStream, server: tokio::net::TcpStream, f
                     }
                 }
             }
-            seen.drain(..seen.len().saturating_sub(faults.trigger.len()));
+            // Keep less than one trigger, so an occurrence is counted once.
+            seen.drain(..seen.len().saturating_sub(faults.trigger.len() - 1));
             if server_write.write_all(&buffer[..n]).await.is_err() {
                 return;
             }
@@ -722,6 +834,7 @@ impl Harness {
                 "OPENMETTLE_GATEWAY_UPSTREAM_URL",
                 format!("http://{}", upstream.address),
             )
+            .env("OPENMETTLE_GATEWAY_MODEL", MODEL)
             .env("OPENMETTLE_GATEWAY_SHUTDOWN_TIMEOUT_MS", "10000");
         for (key, value) in settings {
             command.env(format!("OPENMETTLE_GATEWAY_{key}"), value);
@@ -744,16 +857,31 @@ impl Harness {
         }
     }
 
-    /// Sends `body` with the synthetic credentials and any `extra` header lines, then follows
-    /// `then`. Without a `Connection` line in `extra`, the request asks to close.
+    /// [`Self::send_with`] under the fixture's credential for `id`.
     async fn send(&self, id: Option<&str>, body: &[u8], extra: &str, then: Then<'_>) -> Reply {
+        let credential = id.map_or_else(String::new, |id| {
+            format!("Authorization: Bearer {}\r\n", bearer(id))
+        });
+        self.send_with(id, &credential, body, extra, then).await
+    }
+
+    /// Sends `body` with the `credential` header lines, the synthetic cookie and any `extra`
+    /// header lines, then follows `then`. Without a `Connection` line in `extra`, the request
+    /// asks to close.
+    async fn send_with(
+        &self,
+        id: Option<&str>,
+        credential: &str,
+        body: &[u8],
+        extra: &str,
+        then: Then<'_>,
+    ) -> Reply {
         let finished = self.upstream.gate.finished.load(Ordering::SeqCst);
         let mut socket = tokio::net::TcpStream::connect(&self.bind).await.unwrap();
         let mut request = format!(
             "POST /v1/chat/completions HTTP/1.1\r\nHost: gateway.test\r\n\
              Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\n\
-             Authorization: Bearer {CREDENTIAL}\r\nCookie: session={COOKIE}\r\n\
-             Content-Length: {}\r\n{extra}",
+             {credential}Cookie: session={COOKIE}\r\nContent-Length: {}\r\n{extra}",
             body.len()
         );
         if !extra.to_ascii_lowercase().contains("connection:") {
@@ -844,7 +972,7 @@ impl Harness {
     }
 
     async fn send_synthetic(&self, name: &str, id: &str, then: Then<'_>) -> Reply {
-        let request = format!(r#"{{"synthetic":"{name}"}}"#);
+        let request = format!(r#"{{"model":"{MODEL}","synthetic":"{name}"}}"#);
         self.send(Some(id), request.as_bytes(), "", then).await
     }
 
@@ -862,8 +990,14 @@ impl Harness {
         let status = tokio::task::block_in_place(|| gateway.0.wait()).unwrap();
         assert!(status.success());
         let stderr = stderr.join().unwrap();
-        for secret in [CREDENTIAL, COOKIE, "Count from 1 to 5"] {
+        for secret in [COOKIE, "Count from 1 to 5"] {
             assert!(!stderr.contains(secret), "logged: {secret}");
+        }
+        for id in fixture.issued.lock().unwrap().iter() {
+            assert!(
+                !stderr.contains(&bearer(id)),
+                "logged the credential of {id}"
+            );
         }
         let mut events: Vec<_> = stderr
             .lines()
@@ -940,7 +1074,8 @@ async fn relays_recorded_answers_unchanged_and_settles_their_usage_as_the_gatewa
             ] {
                 assert_eq!(header(&received.head, name), Some(value), "{case}: {name}");
             }
-            for withheld in ["authorization", "cookie", CREDENTIAL, COOKIE] {
+            let credential = bearer(&id).to_ascii_lowercase();
+            for withheld in ["authorization", "cookie", &credential, COOKIE] {
                 assert!(!received.head.contains(withheld), "{case}: {withheld}");
             }
         }
@@ -953,12 +1088,15 @@ async fn relays_recorded_answers_unchanged_and_settles_their_usage_as_the_gatewa
     );
     assert!(h.fixture.gateway_connections().await > 0);
     let (fixture, _, events) = h.stop().await;
+    // Every request was authorized, dispatched and settled without a gateway binding.
+    assert_eq!(fixture.provisioned().await, 0);
     for ((case, prompt, completion, reasoning), id) in SETTLED.into_iter().zip(&ids) {
+        assert!(fixture.dispatched(id).await, "{case}");
         assert_eq!(
             fixture.reports(id).await,
             [(
                 id.clone(),
-                SOURCE.to_owned(),
+                INSTALL.to_owned(),
                 0,
                 true,
                 Some(prompt),
@@ -1032,26 +1170,37 @@ async fn relays_but_leaves_the_hold_when_no_usage_was_observed() {
     assert_eq!(events, expected);
 }
 
+/// The status, problem code and `WWW-Authenticate` value of a refusal.
+fn refusal(reply: &Reply) -> (u16, String, Option<String>) {
+    assert_eq!(
+        content_type(&reply.head).as_deref(),
+        Some("application/problem+json")
+    );
+    let problem: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(problem["status"].as_u64(), Some(u64::from(reply.status)));
+    (
+        reply.status,
+        problem["code"].as_str().unwrap().to_owned(),
+        header(&reply.head, "www-authenticate").map(str::to_owned),
+    )
+}
+
+fn unauthenticated() -> (u16, String, Option<String>) {
+    (401, "unauthenticated".to_owned(), Some("bearer".to_owned()))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 required"]
-async fn refuses_unusable_or_unready_request_ids_before_forwarding() {
+async fn refuses_unusable_requests_before_spending_or_forwarding_anything() {
     let h = Harness::start().await;
-    let reserved = h.fixture.request(true).await;
     let handed_off = h.fixture.request(false).await;
-    let unknown: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
-        .fetch_one(&h.fixture.owner)
-        .await
-        .unwrap();
     let body = recorded::file("02-chat-plain", "request.json");
     let uppercase = "0F8FAD5B-D9CB-469F-A165-70867728950E".to_owned();
     for (id, extra, status, code) in [
         (None, "", 400, "validation"),
         (Some("not-a-request-id".to_owned()), "", 400, "validation"),
         (Some(uppercase), "", 400, "validation"),
-        (Some(unknown), "", 404, "not_found"),
-        // Reserved but not yet handed off.
-        (Some(reserved.clone()), "", 404, "not_found"),
-        // Only identity bodies are forwarded in this increment.
+        // Only identity bodies are forwarded.
         (
             Some(handed_off.clone()),
             "Content-Encoding: gzip\r\n",
@@ -1067,15 +1216,10 @@ async fn refuses_unusable_or_unready_request_ids_before_forwarding() {
         ),
     ] {
         let reply = h.send(id.as_deref(), &body, extra, Then::Read).await;
-        assert_eq!(reply.status, status, "{id:?}");
         assert_eq!(
-            content_type(&reply.head).as_deref(),
-            Some("application/problem+json")
-        );
-        let problem: Value = serde_json::from_slice(&reply.body).unwrap();
-        assert_eq!(
-            (problem["status"].as_u64(), problem["code"].as_str()),
-            (Some(u64::from(status)), Some(code))
+            refusal(&reply),
+            (status, code.to_owned(), None),
+            "{id:?} {extra}"
         );
     }
     // HTTP/1.0 could not mark a cut stream, and only `chunked` may frame a request body.
@@ -1098,35 +1242,139 @@ async fn refuses_unusable_or_unready_request_ids_before_forwarding() {
     ] {
         let mut request = format!(
             "{head}Host: gateway.test\r\nContent-Type: application/json\r\n\
-             X-Request-Id: {handed_off}\r\nConnection: close\r\n\r\n"
+             X-Request-Id: {handed_off}\r\nAuthorization: Bearer {}\r\n\
+             Connection: close\r\n\r\n",
+            bearer(&handed_off)
         )
         .into_bytes();
         request.extend_from_slice(if status == 505 { &body } else { &chunked_body });
         let reply = h.raw(&request).await;
-        assert_eq!(reply.status, status, "{head}");
-        let problem: Value = serde_json::from_slice(&reply.body).unwrap();
-        assert_eq!(problem["code"], code, "{head}");
+        assert_eq!(refusal(&reply), (status, code.to_owned(), None), "{head}");
     }
     assert_eq!(h.upstream.count(), 0, "nothing was forwarded");
+    assert!(!h.fixture.dispatched(&handed_off).await);
+    // None of these refusals spent the dispatch.
+    let reply = h.send(Some(&handed_off), &body, "", Then::Read).await;
+    assert_eq!(reply.status, 200);
     let (fixture, _, events) = h.stop().await;
-    assert_eq!(fixture.reports(&reserved).await, []);
-    assert_eq!(fixture.reports(&handed_off).await, []);
+    assert_eq!(fixture.reports(&handed_off).await.len(), 1);
     assert_eq!(events, []);
 }
 
-/// Increment 2 makes a second dispatch of one request impossible. Until then the proxy
-/// forwards it, and settlement accepts the identical report once.
+/// A caller that cannot prove the dispatch secret of the request it names gets the same 401,
+/// whether the credential is unusable, the secret wrong, or the request unknown or not handed
+/// off: nothing is sent upstream and nothing is spent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 required"]
-async fn a_repeated_dispatch_of_one_request_is_settled_once() {
+async fn refuses_a_caller_without_the_dispatch_secret_of_its_request() {
+    let h = Harness::start().await;
+    let reserved = h.fixture.request(true).await;
+    let handed_off = h.fixture.request(false).await;
+    let other = h.fixture.request(false).await;
+    let unknown: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(&h.fixture.owner)
+        .await
+        .unwrap();
+    let body = recorded::file("02-chat-plain", "request.json");
+    let right = bearer(&handed_off);
+    let header = |value: &str| format!("Authorization: {value}\r\n");
+    for (id, credential, extra) in [
+        // Missing, malformed and duplicated credentials.
+        (&handed_off, String::new(), ""),
+        (&handed_off, header(&right), ""),
+        (&handed_off, header(&format!("Basic {right}")), ""),
+        (&handed_off, header(&format!("bearer {right}")), ""),
+        (&handed_off, header(&format!("Bearer {right}=")), ""),
+        (&handed_off, header(&format!("Bearer {}", &right[..42])), ""),
+        (&handed_off, header("Bearer not-a-dispatch-secret"), ""),
+        (
+            &handed_off,
+            header(&format!("Bearer {right}")).repeat(2),
+            "",
+        ),
+        // A credential named as hop-by-hop counts as absent.
+        (
+            &handed_off,
+            header(&format!("Bearer {right}")),
+            "Connection: close, Authorization\r\n",
+        ),
+        // Another request's secret, and a well-formed secret of no request.
+        (
+            &handed_off,
+            header(&format!("Bearer {}", bearer(&other))),
+            "",
+        ),
+        (
+            &handed_off,
+            header(&format!("Bearer {}", bearer(&unknown))),
+            "",
+        ),
+        // The right secret for an unknown request, and for one reserved but not handed off.
+        (
+            &unknown,
+            header(&format!("Bearer {}", bearer(&unknown))),
+            "",
+        ),
+        (
+            &reserved,
+            header(&format!("Bearer {}", bearer(&reserved))),
+            "",
+        ),
+    ] {
+        let reply = h
+            .send_with(Some(id), &credential, &body, extra, Then::Read)
+            .await;
+        assert_eq!(refusal(&reply), unauthenticated(), "{id} {credential}");
+    }
+    assert_eq!(h.upstream.count(), 0, "nothing was forwarded");
+    for id in [&reserved, &handed_off, &other] {
+        assert!(!h.fixture.dispatched(id).await);
+    }
+    // The holder of the secret is still served.
+    let reply = h.send(Some(&handed_off), &body, "", Then::Read).await;
+    assert_eq!(reply.status, 200);
+    assert_eq!(h.upstream.count(), 1);
+    let (fixture, _, events) = h.stop().await;
+    assert_eq!(fixture.reports(&reserved).await, []);
+    assert_eq!(fixture.reports(&other).await, []);
+    assert_eq!(fixture.reports(&handed_off).await.len(), 1);
+    assert_eq!(events, []);
+}
+
+/// One request reaches the upstream once: a later dispatch with the right secret is a
+/// conflict, and of two concurrent ones exactly one is forwarded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn one_request_is_dispatched_and_settled_exactly_once() {
     let h = Harness::start().await;
     let id = h.fixture.request(false).await;
+    let reply = h.send_case("03-chat-stream-usage", &id).await;
+    assert_eq!(reply.status, 200);
+    assert!(reply.body == recorded::body("03-chat-stream-usage") && reply.complete);
+    let replayed = recorded::file("03-chat-stream-usage", "request.json");
     for _ in 0..2 {
-        let reply = h.send_case("03-chat-stream-usage", &id).await;
-        assert_eq!(reply.status, 200);
-        assert!(reply.body == recorded::body("03-chat-stream-usage") && reply.complete);
+        let reply = h.send(Some(&id), &replayed, "", Then::Read).await;
+        assert_eq!(refusal(&reply), (409, "conflict".to_owned(), None));
     }
+    // A replay is reported only to the holder of the secret.
+    let stranger = format!("Authorization: Bearer {}\r\n", bearer("another"));
+    let reply = h
+        .send_with(Some(&id), &stranger, &replayed, "", Then::Read)
+        .await;
+    assert_eq!(refusal(&reply), unauthenticated());
+    assert_eq!(h.upstream.count(), 1);
+
+    let raced = h.fixture.request(false).await;
+    let plain = recorded::file("02-chat-plain", "request.json");
+    let (first, second) = tokio::join!(
+        h.send(Some(&raced), &plain, "", Then::Read),
+        h.send(Some(&raced), &plain, "", Then::Read)
+    );
+    let mut statuses = [first.status, second.status];
+    statuses.sort();
+    assert_eq!(statuses, [200, 409]);
     assert_eq!(h.upstream.count(), 2);
+
     let (fixture, _, events) = h.stop().await;
     let reports = fixture.reports(&id).await;
     assert_eq!(reports.len(), 1, "{reports:?}");
@@ -1138,7 +1386,105 @@ async fn a_repeated_dispatch_of_one_request_is_settled_once() {
         fixture.hold(&id).await,
         ("settled".to_owned(), 0, "29".to_owned())
     );
-    assert_eq!(fixture.budget().await, (29, 0));
+    assert_eq!(
+        fixture.settlement(&raced).await,
+        Some((0, true, Some("19".to_owned()), 0))
+    );
+    assert_eq!(fixture.used().await, 29 + 19);
+    assert_eq!(events, []);
+}
+
+/// The upstream answers any model name from its loaded model (recorded case 11), so the proxy
+/// is the only model check. A request reserved for a model this gateway does not serve, and a
+/// body that does not name the reserved model exactly once, are refused with nothing sent
+/// upstream. Each refusal comes after the dispatch was spent and is logged with its reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn refuses_a_model_other_than_the_one_reserved_and_served() {
+    let h = Harness::start().await;
+    let served = recorded::file("02-chat-plain", "request.json");
+    let not_served = h.fixture.request_for(OTHER_MODEL, false).await;
+    let reply = h
+        .send(
+            Some(&not_served),
+            br#"{"model":"a","messages":[]}"#,
+            "",
+            Then::Read,
+        )
+        .await;
+    assert_eq!(refusal(&reply), (403, "policy".to_owned(), None));
+    // Also when the body names the model this gateway serves.
+    let also_not_served = h.fixture.request_for(OTHER_MODEL, false).await;
+    let reply = h
+        .send(Some(&also_not_served), &served, "", Then::Read)
+        .await;
+    assert_eq!(refusal(&reply), (403, "policy".to_owned(), None));
+
+    let mut mismatched = Vec::new();
+    let twice = format!(r#"{{"model":"{MODEL}","model":"no-such-model","messages":[]}}"#);
+    for body in [
+        recorded::file("11-chat-bad-model", "request.json"),
+        twice.into_bytes(),
+        br#"{"messages":[]}"#.to_vec(),
+        b"not json".to_vec(),
+    ] {
+        let id = h.fixture.request(false).await;
+        let reply = h.send(Some(&id), &body, "", Then::Read).await;
+        assert_eq!(
+            refusal(&reply),
+            (400, "validation".to_owned(), None),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        mismatched.push(id);
+    }
+    assert_eq!(h.upstream.count(), 0, "nothing was forwarded");
+    // The dispatch is spent: the corrected request is a replay.
+    let reply = h.send(Some(&mismatched[0]), &served, "", Then::Read).await;
+    assert_eq!(refusal(&reply), (409, "conflict".to_owned(), None));
+    assert_eq!(h.upstream.count(), 0);
+
+    let (fixture, _, events) = h.stop().await;
+    let mut expected = vec![
+        unrecorded(&not_served, "model_not_served"),
+        unrecorded(&also_not_served, "model_not_served"),
+    ];
+    for id in &mismatched {
+        assert!(fixture.dispatched(id).await);
+        assert_eq!(fixture.reports(id).await, []);
+        assert_eq!(
+            fixture.hold(id).await,
+            ("handoff_committed".to_owned(), UNITS, "0".to_owned())
+        );
+        expected.push(unrecorded(id, "model_mismatch"));
+    }
+    expected.sort();
+    assert_eq!(events, expected);
+}
+
+/// A run cancelled after its round was handed off is not dispatched: the caller is refused
+/// like one without the secret, and the dispatch stays unspent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_cancelled_run_is_refused_without_forwarding() {
+    let h = Harness::start().await;
+    let id = h.fixture.request(false).await;
+    let run = h.fixture.run_of(&id).await;
+    let principal = authz_store::principal(&h.fixture.db, &h.fixture.actor).await;
+    queue::cancel_run(
+        &mut connect(&h.fixture.db.0, API).await,
+        &principal,
+        &h.fixture.scope,
+        &run,
+    )
+    .await
+    .unwrap();
+    let body = recorded::file("02-chat-plain", "request.json");
+    let reply = h.send(Some(&id), &body, "", Then::Read).await;
+    assert_eq!(refusal(&reply), unauthenticated());
+    assert_eq!(h.upstream.count(), 0);
+    assert!(!h.fixture.dispatched(&id).await);
+    let (_, _, events) = h.stop().await;
     assert_eq!(events, []);
 }
 
@@ -1156,20 +1502,25 @@ async fn blocked_attempts(fixture: &Fixture) -> Vec<String> {
 }
 
 /// A report write still retrying at SIGTERM finishes before the pool closes. The test holds the
-/// request's settlement lock, sees the first attempt wait for it, signals, and releases the
-/// lock only once a second, distinct attempt is waiting: the first has hit settlement's lock
-/// timeout and the relay is retrying while the process drains.
+/// request's token hold, which settlement locks and the dispatch does not, sees the first
+/// attempt wait for it, signals, and releases the lock only once a second, distinct attempt is
+/// waiting: the first has hit settlement's lock timeout and the relay is retrying while the
+/// process drains.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn shutdown_waits_for_a_report_write_that_is_retrying() {
     let h = Harness::start().await;
     let id = h.fixture.request(false).await;
     let mut lock = h.fixture.owner.begin().await.unwrap();
-    sqlx::query("SELECT FROM openmettle.gateway_requests WHERE id=$1::uuid FOR NO KEY UPDATE")
-        .bind(&id)
-        .execute(&mut *lock)
-        .await
-        .unwrap();
+    let locked = sqlx::query(
+        "SELECT FROM openmettle.quota_reservations WHERE gateway_request_id=$1::uuid
+            FOR NO KEY UPDATE",
+    )
+    .bind(&id)
+    .execute(&mut *lock)
+    .await
+    .unwrap();
+    assert_eq!(locked.rows_affected(), 1);
     let reply = h.send_case("02-chat-plain", &id).await;
     assert_eq!(reply.status, 200);
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -1255,8 +1606,9 @@ fn relayed_usage(body: &[u8]) -> Option<(i64, i64, Option<i64>)> {
 }
 
 /// Opt-in live check: with `TEST_GATEWAY_UPSTREAM_URL` set to a real SGLang `http://` origin,
-/// sends the recorded requests through the binary and checks each stored report against the
-/// usage in the bytes the caller received. Without it, returns at once.
+/// sends the recorded requests through the binary, each under its request's credential, and
+/// checks each stored report against the usage in the bytes the caller received. The gateway
+/// serves the model name the recordings carry. Without the variable, returns at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn live_upstream_usage_matches_what_the_caller_received() {
@@ -1285,7 +1637,7 @@ async fn live_upstream_usage_matches_what_the_caller_received() {
             fixture.reports(&id).await,
             [(
                 id.clone(),
-                SOURCE.to_owned(),
+                INSTALL.to_owned(),
                 0,
                 true,
                 Some(prompt),
@@ -1313,15 +1665,17 @@ async fn a_caller_leaving_before_the_response_head_drops_the_upstream() {
     let h = Harness::start().await;
     let id = h.fixture.request(false).await;
     let held = h.fixture.hold(&id).await;
-    let body = br#"{"stall":true}"#;
+    let body = format!(r#"{{"model":"{MODEL}","stall":true}}"#);
     let mut socket = tokio::net::TcpStream::connect(&h.bind).await.unwrap();
     let request = format!(
         "POST /v1/chat/completions HTTP/1.1\r\nHost: gateway.test\r\n\
-         Content-Type: application/json\r\nX-Request-Id: {id}\r\nContent-Length: {}\r\n\r\n",
+         Content-Type: application/json\r\nX-Request-Id: {id}\r\n\
+         Authorization: Bearer {}\r\nContent-Length: {}\r\n\r\n",
+        bearer(&id),
         body.len()
     );
     socket.write_all(request.as_bytes()).await.unwrap();
-    socket.write_all(body).await.unwrap();
+    socket.write_all(body.as_bytes()).await.unwrap();
     eventually(
         Duration::from_secs(5),
         "the request was not forwarded",
@@ -1341,7 +1695,7 @@ async fn a_caller_leaving_before_the_response_head_drops_the_upstream() {
     assert_eq!(events, [unrecorded(&id, "caller_disconnected")]);
 }
 
-/// Only identity bodies are relayed in this increment: the upstream is asked for one, and an
+/// Only identity bodies are relayed: the upstream is asked for one, and an
 /// answer with a content coding, or a transfer coding other than `chunked`, is refused with 502,
 /// its connection closed without reading it, and recorded as nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1413,7 +1767,7 @@ async fn a_detached_relay_gives_the_upstream_one_idle_timeout_to_finish() {
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn a_report_write_on_a_silent_database_connection_is_retried() {
     let fixture = Fixture::new().await;
-    let silencer = FaultyPostgres::start(SETTLEMENT_LOCK, Fault::Silence).await;
+    let silencer = FaultyPostgres::start(SETTLEMENT_LOCK, 0, Fault::Silence).await;
     let url = format!(
         "postgres://{}:{PASSWORD}@{}/{}?sslmode=disable",
         pg::GATEWAY,
@@ -1474,7 +1828,8 @@ async fn connection_nominated_fields_are_not_forwarded() {
     assert_eq!(events, []);
 }
 
-/// A handed-off request whose body never arrives in full is refused and logged as unrecorded.
+/// A handed-off request whose body never arrives in full is refused and logged as unrecorded:
+/// its dispatch was spent before the body was read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn an_unread_request_body_is_logged_as_unrecorded() {
@@ -1484,7 +1839,9 @@ async fn an_unread_request_body_is_logged_as_unrecorded() {
     let request = format!(
         "POST /v1/chat/completions HTTP/1.1\r\nHost: gateway.test\r\n\
          Content-Type: application/json\r\nX-Request-Id: {id}\r\n\
+         Authorization: Bearer {}\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n",
+        bearer(&id),
         2 * 1024 * 1024 + 1
     );
     socket.write_all(request.as_bytes()).await.unwrap();
@@ -1493,7 +1850,8 @@ async fn an_unread_request_body_is_logged_as_unrecorded() {
     let reply = parse(&raw);
     assert_eq!(reply.status, 400);
     assert_eq!(h.upstream.count(), 0);
-    let (_, _, events) = h.stop().await;
+    let (fixture, _, events) = h.stop().await;
+    assert!(fixture.dispatched(&id).await);
     assert_eq!(events, [unrecorded(&id, "request_body")]);
 }
 
@@ -1530,8 +1888,9 @@ async fn idle_in_transaction(fixture: &Fixture) -> i64 {
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn a_late_begin_never_leaves_a_pooled_connection_in_a_transaction() {
     let fixture = Fixture::new().await;
-    // Two seconds per attempt (five `DB_TIMEOUT_MS`); the first `BEGIN` is answered after three.
-    let postgres = FaultyPostgres::start(BEGIN, Fault::Delay(Duration::from_secs(3))).await;
+    // Two seconds per attempt (five `DB_TIMEOUT_MS`). The first `BEGIN` spends the dispatch;
+    // the second, the first attempt to store the report, is answered after three seconds.
+    let postgres = FaultyPostgres::start(BEGIN, 1, Fault::Delay(Duration::from_secs(3))).await;
     let url = format!(
         "postgres://{}:{PASSWORD}@{}/{}?sslmode=disable",
         pg::GATEWAY,
@@ -1555,8 +1914,8 @@ async fn a_late_begin_never_leaves_a_pooled_connection_in_a_transaction() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // The delayed attempt and its retry each sent `BEGIN`.
-    assert!(postgres.attempts.load(Ordering::SeqCst) >= 2);
+    // The dispatch, the delayed attempt and its retry each sent `BEGIN`.
+    assert!(postgres.attempts.load(Ordering::SeqCst) >= 3);
     // The next borrowers of the pool serve another request as usual.
     let next = h.fixture.request(false).await;
     assert_eq!(h.send_case("02-chat-plain", &next).await.status, 200);
@@ -1568,6 +1927,42 @@ async fn a_late_begin_never_leaves_a_pooled_connection_in_a_transaction() {
             Some((0, true, Some("19".to_owned()), 0))
         );
     }
-    assert_eq!(fixture.budget().await, (38, 0));
+    assert_eq!(fixture.used().await, 38);
     assert_eq!(events, []);
+}
+
+/// Text of the statement that spends a dispatch.
+const DISPATCH: &[u8] = b"gateway_dispatch";
+
+/// A dispatch whose database exchange never answers is not forwarded: the caller gets 503
+/// after the proxy stops waiting (five `DB_TIMEOUT_MS`), and the request is logged because its
+/// dispatch may be spent. Here the statement never reached the server, so the caller's retry
+/// is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn an_unanswered_dispatch_is_not_forwarded_and_is_logged() {
+    let fixture = Fixture::new().await;
+    let silencer = FaultyPostgres::start(DISPATCH, 0, Fault::Silence).await;
+    let url = format!(
+        "postgres://{}:{PASSWORD}@{}/{}?sslmode=disable",
+        pg::GATEWAY,
+        silencer.address,
+        fixture.db.0
+    );
+    let settings = [("DATABASE_URL", url), ("DB_TIMEOUT_MS", "400".to_owned())];
+    let h = Harness::launch(fixture, StandIn::start().await, &settings).await;
+    let id = h.fixture.request(false).await;
+    let body = recorded::file("02-chat-plain", "request.json");
+    let reply = h.send(Some(&id), &body, "", Then::Read).await;
+    assert_eq!(refusal(&reply), (503, "unavailable".to_owned(), None));
+    assert_eq!(h.upstream.count(), 0);
+    assert!(!h.fixture.dispatched(&id).await);
+    let reply = h.send(Some(&id), &body, "", Then::Read).await;
+    assert_eq!(reply.status, 200);
+    assert_eq!(silencer.attempts.load(Ordering::SeqCst), 2);
+    // Let the silent connection go, so the pool can close at shutdown.
+    silencer.release();
+    let (fixture, _, events) = h.stop().await;
+    assert_eq!(fixture.reports(&id).await.len(), 1);
+    assert_eq!(events, [unrecorded(&id, "dispatch_unconfirmed")]);
 }

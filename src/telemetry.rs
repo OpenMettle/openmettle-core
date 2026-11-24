@@ -749,10 +749,17 @@ pub fn migration_interrupted(signal: Signal) {
 #[cfg(test)]
 pub(crate) mod tests;
 
-/// Why the gateway proxy wrote no usage report for a request it relayed. The hold stays as it
-/// was; explicit incomplete reports are a later increment.
+/// Why the gateway proxy wrote no usage report for a request whose one dispatch it spent, or may
+/// have spent. The hold stays as it was; explicit incomplete reports are a later increment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UsageGap {
+    /// The database exchange that spends the dispatch failed, timed out, or lost its caller
+    /// before it answered. The dispatch may be spent.
+    DispatchUnconfirmed,
+    /// The request was reserved for a model this gateway does not serve.
+    ModelNotServed,
+    /// The request body is not a JSON object naming the model the request was reserved for.
+    ModelMismatch,
     /// The caller's request body was too large, too slow, or cut off by the caller leaving.
     RequestBody,
     /// The upstream answered with a status other than 200.
@@ -778,6 +785,9 @@ pub enum UsageGap {
 impl UsageGap {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::DispatchUnconfirmed => "dispatch_unconfirmed",
+            Self::ModelNotServed => "model_not_served",
+            Self::ModelMismatch => "model_mismatch",
             Self::RequestBody => "request_body",
             Self::UpstreamStatus => "upstream_status",
             Self::UpstreamTransport => "upstream_transport",
@@ -792,12 +802,14 @@ impl UsageGap {
 }
 
 /// A gateway request identifier, recorded only in canonical lowercase UUID form. The proxy
-/// accepts one only after finding it as a handed-off request in the database.
+/// logs one only after its caller proved the request's dispatch secret, or, for
+/// `dispatch_unconfirmed`, when that proof could not be completed.
 fn gateway_request(id: &str) -> Option<&str> {
     crate::runs::is_canonical_uuid(id).then_some(id)
 }
 
-/// The gateway proxy relayed `request` but observed no usage to report.
+/// The gateway proxy spent, or may have spent, the dispatch of `request` and has no usage to
+/// report.
 pub(crate) fn gateway_usage_unrecorded(request: &str, gap: UsageGap) {
     tracing::warn!(target: TARGET, event = "gateway.usage.unrecorded",
         "gateway.request_id" = gateway_request(request), "error.type" = gap.as_str());
