@@ -568,7 +568,7 @@ async fn post(transport: &SharedTransport, endpoint: &Endpoint, body: Vec<u8>) -
     let route = Route {
         endpoint,
         allowed: &transport.allowed,
-        tls: &transport.tls,
+        tls: Some(&transport.tls),
         lookup: &transport.lookup,
         slots: &transport.slots,
         #[cfg(test)]

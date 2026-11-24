@@ -43,7 +43,7 @@ impl Owner {
         Route {
             endpoint: &self.endpoint,
             allowed: &[],
-            tls: &self.tls,
+            tls: Some(&self.tls),
             lookup: &self.lookup,
             slots: &self.slots,
             loopback: self.loopback,
@@ -501,5 +501,65 @@ fn core_ignores_environment_proxies() {
         proxy.accept().unwrap_err().kind(),
         io::ErrorKind::WouldBlock,
         "a proxy connection was made"
+    );
+}
+
+/// Resolves `endpoint` against `answers` under the private ranges `allowed`, as a route with
+/// TLS exactly when the endpoint is `https://`. Nothing is connected.
+async fn resolved(
+    endpoint: &Endpoint,
+    allowed: &[Range],
+    answers: Vec<SocketAddr>,
+) -> Result<(), Error> {
+    let tls = client_config(roots(Trust::Bundle(&Ca::new().pem())).unwrap()).unwrap();
+    let lookup: Lookup = Arc::new(move |_, _| Ok(answers.clone()));
+    Route {
+        endpoint,
+        allowed,
+        tls: endpoint.tls.then_some(&tls),
+        lookup: &lookup,
+        slots: &slots(1),
+        loopback: false,
+    }
+    .resolve(Instant::now() + Duration::from_secs(1))
+    .await
+    .map(|_| ())
+}
+
+/// Plain HTTP stays inside the cluster (ADR 0044): every DNS answer of an `http://` gateway
+/// endpoint must lie inside a configured range, so a public answer, alone or beside a private
+/// one, is refused before any connection. An `https://` route keeps admitting public answers.
+/// The hard denies apply inside a configured range too.
+#[tokio::test]
+async fn a_plain_gateway_route_only_reaches_its_configured_ranges() {
+    let at = |ip: &str| SocketAddr::new(ip.parse().unwrap(), 8082);
+    let plain = gateway_endpoint("http://gateway.example.test:8082/v1/chat/completions").unwrap();
+    let secure = endpoint("https://gateway.example.test:8082/v1/chat/completions").unwrap();
+    let allowed = [
+        private_range("10.20.0.0/16").unwrap(),
+        private_range("100.64.0.0/10").unwrap(),
+    ];
+    for answers in [
+        vec![at("8.8.8.8")],
+        vec![at("10.20.0.5"), at("8.8.8.8")],
+        vec![at("2001:4860::8888")],
+        vec![at("10.30.0.5")],
+        vec![at("100.100.100.200")],
+    ] {
+        assert_eq!(
+            resolved(&plain, &allowed, answers.clone()).await,
+            Err(Error::Address),
+            "{answers:?}"
+        );
+    }
+    let inside = vec![at("10.20.0.5"), at("100.64.1.1")];
+    assert_eq!(resolved(&plain, &allowed, inside).await, Ok(()));
+    assert_eq!(
+        resolved(&secure, &allowed, vec![at("8.8.8.8")]).await,
+        Ok(())
+    );
+    assert_eq!(
+        resolved(&secure, &allowed, vec![at("10.20.0.5")]).await,
+        Ok(())
     );
 }

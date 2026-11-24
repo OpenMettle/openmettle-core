@@ -22,9 +22,9 @@
 //!   on the caller staying connected. A response that is not a completed 200 with a usage object
 //!   leaves no report and one `gateway.usage.unrecorded` event; the hold stays as it was.
 //!
-//! Not deployable: the listener is plain HTTP, so the bearer would cross the network
-//! in cleartext, and nothing reconciles a spent dispatch that left no report. See
-//! `docs/operator/gateway-proxy.md`.
+//! The listener is plain HTTP. The packaged worker may call it so inside the cluster, or
+//! through a TLS terminator in front of it. Not deployable: nothing reconciles a spent dispatch
+//! that left no report. See `docs/operator/gateway-proxy.md`.
 mod usage;
 
 use crate::{

@@ -8,6 +8,17 @@ handoff and settlement) and [ADR 0038](0038-sglang-and-external-provider-conform
 (route qualification). The dispatch credential source in this record is provisional; see
 [Dispatch credential](#dispatch-credential-provisional).
 
+> **24 November 2026, superseded in part by
+> [ADR 0044](0044-own-inference-proxy-and-binding-free-dispatch.md) (increment 2c).** The
+> [dispatch credential](#dispatch-credential-provisional) is no longer provisional: each round
+> carries a bearer made at handoff, and no binding, sealed key or ring is involved. The
+> document's `gateway_keys` member is removed, and a document that still has it is refused as
+> an unknown field; deploy no longer mounts a ring. `installation` stays and is also the usage
+> report source. By the owner's decision of the same day, a route to `openmettle-gateway` may
+> use an `http://` endpoint inside the cluster, with no `trust` member and with every resolved
+> address inside its `private_cidrs`; `https://` remains the option, and every other
+> transport rule is unchanged. The rest of this record stands.
+
 ## Problem
 
 The library has a tested turn executor (`worker::turns::TurnExecutor`) that claims runs under

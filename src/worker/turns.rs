@@ -12,10 +12,10 @@ use crate::{
 };
 use serde_json::{Map, Value};
 
-/// Metered gateway dispatch settings for a leased worker turn route.
+/// Metered gateway dispatch settings for a leased worker turn route. The round's bearer is made
+/// at handoff (ADR 0044), so the route carries no credential.
 pub struct MeteredRoute {
     pub installation: String,
-    pub keys: Arc<crate::provider_keys::gateway::GatewayKeys>,
     pub device_grant_id: Option<String>,
 }
 
@@ -37,19 +37,13 @@ impl Route {
         }
     }
 
-    pub fn metered(
-        gateway: Arc<Gateway>,
-        installation: String,
-        keys: Arc<crate::provider_keys::gateway::GatewayKeys>,
-        stream: bool,
-    ) -> Self {
+    pub fn metered(gateway: Arc<Gateway>, installation: String, stream: bool) -> Self {
         Self {
             gateway,
             bearer: String::new(),
             stream,
             metered: Some(MeteredRoute {
                 installation,
-                keys,
                 device_grant_id: None,
             }),
         }

@@ -1,6 +1,7 @@
 # 0044 — OpenMettle's own inference proxy and binding-free dispatch
 
-Accepted with its implementation, 23 November 2026 (V1-06 proxy increments 2a and 2b). Refs #7.
+Accepted with its implementation, 23 November 2026 (V1-06 proxy increments 2a and 2b); increment
+2c delivered 24 November 2026. Refs #7.
 Supersedes [ADR 0037](0037-gateway-provisioning-and-usage-reconciliation.md) in part: see
 [What ADR 0037 still decides](#what-adr-0037-still-decides) and [Superseded](#superseded).
 Builds on [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md) (leases),
@@ -198,8 +199,8 @@ following exists and nothing in a deployment reaches it:
 - The usage backfill (`settlement::Backfill`) and its `backfill.sql` and `legacy_backfill.sql`.
 - The admin client (`src/provider_http/gateway.rs`) and `gateway/profile.rs`, except
   `UsageReport`, which settlement uses.
-- The gateway key ring and sealer (`src/provider_keys/gateway.rs`), and the worker document's
-  `gateway_keys` member, which the worker still loads and no longer uses.
+- The gateway key ring and sealer (`src/provider_keys/gateway.rs`) and the API document's
+  `gateway_keys` member. The worker no longer has either (increment 2c).
 - The family-policy client flag.
 
 ### Session callers
@@ -237,8 +238,9 @@ exists.
 - Migration 29 adds three columns and four functions and replaces one CHECK. It needs no
   activation step and no backfill, and it must be applied before workers of this release run.
 - ADR 0043 said the replacement would change `installation`, `gateway_keys` and one method of
-  the worker and nothing else. `installation` stays and is now also the report source, and the
-  turn executor's handoff call lost its key ring argument. Increment 2c updates that record.
+  the worker and nothing else. `installation` stays and is now also the report source, the
+  turn executor's handoff call lost its key ring argument, and increment 2c removed
+  `gateway_keys` from the worker document and its routes. ADR 0043 carries a dated note.
 
 ## Delivery
 
@@ -247,7 +249,7 @@ exists.
 | 1 | Forward one request and record its usage (merged). |
 | 2a | Migration 29: binding-free run-round handoff and the dispatch function; a per-round bearer for the worker. |
 | 2b | Proxy authentication, single dispatch and model check. |
-| 2c | Worker document cleanup; packaged worker to TLS terminator to proxy end-to-end test; update ADR 0043 and the worker page. |
+| 2c | The worker reaches the proxy over `http://` inside the cluster or `https://` through a TLS terminator; `gateway_keys` removed from the worker document; packaged worker to proxy end-to-end tests; ADR 0043 note and the worker page (delivered 24 November 2026). |
 | 3 | Explicit reports for incomplete responses. |
 | 4 | Family policy tables. |
 | 5 | Cache separation. |
@@ -256,9 +258,18 @@ exists.
 
 ## Open points
 
-- **Cleartext bearer.** The worker's transport requires `https://` and the proxy listens on
-  plain HTTP, so the two cannot be connected yet. Connected without TLS, the bearer would
-  cross the network in cleartext. The proxy stays undeployable until increment 7.
+- **Plain HTTP in the cluster.** On 24 November 2026 the owner decided that HTTPS need not be
+  enforced inside the cluster and stays an option. The worker's route to the proxy may
+  therefore be `http://`, and only that route of the shared provider transport: every other
+  client built on it keeps `https://`. The proxy's own client for its SGLang upstream is plain
+  HTTP by design (increment 1). A plain route reaches only addresses inside its configured
+  ranges, never a public one, and sends only a round that was handed off. The round's bearer
+  and the prompt and response bodies then cross the cluster network unencrypted, and an
+  interceptor could alter the answer and token counts the worker stores; the proxy settles
+  the upstream's own usage. The bearer authorizes one dispatch of one request; a NetworkPolicy admitting
+  only workers to the proxy is the mitigation, and TLS terminated in front of the proxy is
+  the stricter option. The proxy has no TLS listener of its own, and mutual TLS is a possible
+  later option. The proxy stays undeployable until increments 3 and 7.
 - **Holds without a final report.** A handed-off request keeps its hold until a final report
   arrives. A round that is never dispatched, is refused after its dispatch was spent, or whose
   response carries no usage keeps that hold indefinitely until increment 3.
@@ -275,6 +286,14 @@ exists.
   a reclaim in flight, a lease that runs out during a lock wait, the CHECK and settlement.
 - `tests/schema/gateway_proxy.rs`: the binary against the recorded SGLang stand-in, with rounds
   reserved and handed off through the library and their quota holds.
+- `tests/schema/live_turns/worker_gateway.rs`: the packaged worker binary claims a queued run
+  and dispatches its round to the proxy binary with the bearer it made, over plain HTTP and
+  through a TLS terminator; the usage report equals the recorded answer's, the hold settles
+  and the answer is published. A proxy serving another model and an unreachable proxy fail
+  the turn and leave the hold.
+- `tests/provider_http_support/tests.rs`, `tests/provider_inference/authentication.rs` and
+  `tests/provider_gateway.rs`: every other client refuses `http://`, and the gateway route
+  pairs its scheme with trust anchors and sends its bearer and request ID without TLS.
 - `tests/schema/gateway.rs`: a bound request handed off at version 23 passes migration 29 and
   settles under its binding's principal, and is never given a dispatch.
 - `tests/schema/worker_leases.rs` and `tests/schema/quotas.rs`: the worker and the library hand

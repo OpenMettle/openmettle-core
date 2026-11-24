@@ -12,8 +12,6 @@ use std::{collections::BTreeMap, io::BufRead};
 #[derive(Deserialize)]
 struct MeteredSetup {
     installation: String,
-    key_id: String,
-    key_bytes: [u8; 32],
     #[serde(default)]
     device_grant_id: Option<String>,
 }
@@ -37,11 +35,7 @@ struct Routes {
     gateways: BTreeMap<String, Arc<Gateway>>,
     scope: String,
     actor: String,
-    metered: Option<(
-        String,
-        Arc<crate::provider_keys::gateway::GatewayKeys>,
-        Option<String>,
-    )>,
+    metered: Option<MeteredSetup>,
 }
 impl TurnRoutes for Routes {
     async fn route(
@@ -58,9 +52,9 @@ impl TurnRoutes for Routes {
             .get(&model.model)
             .ok_or(inference::Error::Provisioning)?
             .clone();
-        if let Some((installation, keys, device_grant_id)) = &self.metered {
-            let mut route = Route::metered(gateway, installation.clone(), keys.clone(), false);
-            if let Some(grant) = device_grant_id {
+        if let Some(metered) = &self.metered {
+            let mut route = Route::metered(gateway, metered.installation.clone(), false);
+            if let Some(grant) = &metered.device_grant_id {
                 route = route.with_device_grant(grant.clone());
             }
             Ok(route)
@@ -231,21 +225,11 @@ async fn worker_process() {
         })
     })
     .unwrap();
-    let metered = setup.metered.map(|m| {
-        (
-            m.installation,
-            Arc::new(
-                crate::provider_keys::gateway::GatewayKeys::new(&[(m.key_id, m.key_bytes)])
-                    .unwrap(),
-            ),
-            m.device_grant_id,
-        )
-    });
     let routes = Routes {
         gateways,
         actor: setup.actor,
         scope: setup.scope,
-        metered,
+        metered: setup.metered,
     };
     let mut executor = TurnExecutor::new(
         pool.clone(),

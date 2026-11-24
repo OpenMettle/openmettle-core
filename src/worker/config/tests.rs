@@ -84,12 +84,62 @@ fn valid_document_routes_every_catalog_model_through_metered_gateways() {
         .map(|(m, (_, s))| (m.as_str(), *s))
         .collect();
     assert_eq!(streams, [("a", false), ("b", true)]);
-    // Three previous keys are the most the ring holds besides the active one.
+}
+
+/// Inside the cluster a route may reach the gateway over plain HTTP (ADR 0044). It then has no
+/// TLS, so it names no trust anchors; every other transport rule still applies.
+#[test]
+fn a_route_may_use_plain_http_without_trust_anchors() {
     let mut fixture = Fixture::new();
-    fixture.document["gateway_keys"]["decrypt_only"] = json!((0..3)
-        .map(|i| json!({"id": format!("old-{i}"), "path": fixture.dir.write(&format!("old-{i}"), &[i + 1; 32])}))
-        .collect::<Vec<_>>());
+    let route = &mut fixture.document["routes"]["a"];
+    route["endpoint"] = json!("http://gw.example.test:8082/v1/chat/completions");
+    route.as_object_mut().unwrap().remove("trust");
+    route["private_cidrs"] = json!(["10.20.0.0/16"]);
     fixture.load().unwrap();
+    // A plain route with trust anchors is not a TLS route: the member is unknown there.
+    let mut anchored = fixture.document.clone();
+    anchored["routes"]["a"]["trust"] = json!({"roots": "native"});
+    assert_eq!(
+        refusal(fixture.load_bytes(anchored.to_string().as_bytes())),
+        shape(Shape::UnknownField)
+    );
+    for endpoint in [
+        "http://10.0.0.1/v1/chat/completions",
+        "http://localhost/v1/chat/completions",
+        "http://gw.example.test:80/v1/chat/completions",
+        "http://gw.example.test/v1/chat/completions?model=a",
+        "http://user@gw.example.test/v1/chat/completions",
+        "http://GW.example.test/v1/chat/completions",
+    ] {
+        assert_eq!(
+            fixture.with("/routes/a/endpoint", json!(endpoint)),
+            Error::Route,
+            "{endpoint}"
+        );
+    }
+    // Plain HTTP stays inside the cluster: a plain route must name the ranges of every
+    // gateway address, so one without ranges is refused at start-up.
+    assert_eq!(
+        fixture.with("/routes/a/private_cidrs", json!([])),
+        Error::PlainRange
+    );
+    // Every other scheme is refused, with trust anchors or without.
+    let mut other = Fixture::new();
+    for endpoint in ["ftp://gw.example.test/v1", "HTTP://gw.example.test/v1"] {
+        assert_eq!(
+            other.with("/routes/a/endpoint", json!(endpoint)),
+            Error::Route,
+            "{endpoint}"
+        );
+    }
+    other.document["routes"]["a"]
+        .as_object_mut()
+        .unwrap()
+        .remove("trust");
+    assert_eq!(
+        other.with("/routes/a/endpoint", json!("ftp://gw.example.test/v1")),
+        shape(Shape::MissingField)
+    );
 }
 
 #[test]
@@ -110,9 +160,6 @@ fn document_shape_is_strict() {
     for pointer in [
         "/catalog_file",
         "/installation",
-        "/gateway_keys",
-        "/gateway_keys/active",
-        "/gateway_keys/decrypt_only",
         "/routes",
         "/routes/a/endpoint",
         "/routes/a/trust",
@@ -133,19 +180,24 @@ fn document_shape_is_strict() {
             "{pointer}"
         );
     }
-    for pointer in [
-        "",
-        "/gateway_keys",
-        "/routes/a",
-        "/routes/a/pin",
-        "/routes/a/trust",
-    ] {
+    for pointer in ["", "/routes/a", "/routes/a/pin", "/routes/a/trust"] {
         let mut document = fixture.document.clone();
         let target = document.pointer_mut(pointer).unwrap();
         target["unexpected"] = json!(true);
         let error = refusal(fixture.load_bytes(document.to_string().as_bytes()));
         assert_eq!(error, shape(Shape::UnknownField), "{pointer}");
     }
+    // The key ring ADR 0044 superseded is no longer a member: a document still carrying it is
+    // refused rather than read or ignored.
+    let mut ring = fixture.document.clone();
+    ring["gateway_keys"] = json!({
+        "active": {"id": "gateway-b", "path": fixture.dir.write("gateway-key-b", &[0xc2; 32])},
+        "decrypt_only": []
+    });
+    assert_eq!(
+        refusal(fixture.load_bytes(ring.to_string().as_bytes())),
+        shape(Shape::UnknownField)
+    );
     for (pointer, value) in [
         ("/routes", json!([])),
         ("/routes/a", json!("route")),
@@ -249,7 +301,6 @@ fn repeated_models_and_routes_are_refused() {
 fn routes_keep_the_transport_rules_and_bounded_timeouts() {
     let fixture = Fixture::new();
     for endpoint in [
-        "http://gw.example.test:8443/v1/chat/completions",
         "https://10.0.0.1/v1/chat/completions",
         "https://localhost/v1/chat/completions",
         "https://gw.example.test/v1/chat/completions?model=a",
@@ -321,37 +372,6 @@ fn routes_keep_the_transport_rules_and_bounded_timeouts() {
 }
 
 #[test]
-fn gateway_ring_is_bounded_and_distinct() {
-    let fixture = Fixture::new();
-    let short = fixture.dir.write("short", &[7; 31]);
-    let reused = fixture.document["gateway_keys"]["active"]["path"].clone();
-    for (pointer, value) in [
-        ("/gateway_keys/active/path", json!(short)),
-        (
-            "/gateway_keys/active/path",
-            json!(fixture.dir.path("absent")),
-        ),
-        ("/gateway_keys/active/path", json!("gateway-key")),
-        ("/gateway_keys/active/id", json!("gateway-a")),
-        ("/gateway_keys/active/id", json!("not valid")),
-        ("/gateway_keys/decrypt_only/0/path", reused),
-    ] {
-        assert_eq!(
-            fixture.with(pointer, value),
-            shape(Shape::GatewayKeyRing),
-            "{pointer}"
-        );
-    }
-    let four = json!((0..4)
-        .map(|i| json!({"id": format!("old-{i}"), "path": fixture.dir.write(&format!("old-{i}"), &[i + 1; 32])}))
-        .collect::<Vec<_>>());
-    assert_eq!(
-        fixture.with("/gateway_keys/decrypt_only", four),
-        shape(Shape::GatewayKeyRing)
-    );
-}
-
-#[test]
 fn refusals_carry_no_configuration_values() {
     let fixture = Fixture::new();
     let canary = "CANARY";
@@ -366,13 +386,79 @@ fn refusals_carry_no_configuration_values() {
         fixture.with("/routes/a/protocol", json!(canary)),
         fixture.with("/catalog_file", json!(fixture.dir.path("CANARY"))),
         fixture.with(
-            "/gateway_keys/active/path",
-            json!(fixture.dir.path("CANARY")),
+            "/routes/a/endpoint",
+            json!("http://canary.example.test/CANARY?CANARY"),
         ),
+        {
+            let mut plain = fixture.document.clone();
+            let route = &mut plain["routes"]["a"];
+            route["endpoint"] = json!("http://canary.example.test:8082/CANARY");
+            route.as_object_mut().unwrap().remove("trust");
+            refusal(fixture.load_bytes(plain.to_string().as_bytes()))
+        },
     ];
     for error in errors {
         let text = error.to_string();
         assert!(!text.contains(canary) && !text.contains("/"), "{text}");
         assert!(!format!("{error:?}").contains(canary));
     }
+}
+
+/// The gateway a loaded route holds sends over plain HTTP only with a committed round dispatch
+/// (ADR 0044). Its ordinary caller path, with a bearer but no dispatch, is refused before name
+/// resolution and before any connection, and nothing reaches the server.
+#[tokio::test]
+async fn a_plain_route_refuses_a_send_without_a_committed_dispatch() {
+    use crate::{
+        model_config::Selection,
+        provider_http::inference::{Credential, History, Request},
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut fixture = Fixture::new();
+    let route = &mut fixture.document["routes"]["a"];
+    route["endpoint"] = json!(format!("http://gw.example.test:{port}/v1/chat/completions"));
+    route.as_object_mut().unwrap().remove("trust");
+    route["private_cidrs"] = json!(["10.20.0.0/16"]);
+    let config = fixture.load().unwrap();
+    let InferenceConfig { catalog, routes } = config;
+    let (gateway, _) = routes.models.into_iter().next().unwrap().1;
+    let mut gateway = Arc::try_unwrap(gateway).ok().unwrap();
+    let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&lookups);
+    gateway.fixture_lookup(Arc::new(move |_, _| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))])
+    }));
+    let effective = catalog
+        .resolve(
+            &Selection::default(),
+            &serde_json::from_value(json!({"preset": "study"})).unwrap(),
+            None,
+            |_, _| true,
+        )
+        .unwrap();
+    let request = Request {
+        history: vec![History::User("no dispatch".into())],
+        tools: None,
+        parallel: None,
+        stream: false,
+    };
+    let sent = gateway
+        .caller(
+            &catalog,
+            &effective,
+            &request,
+            Credential::Bearer("synthetic-bearer-without-a-dispatch"),
+            |_| async {},
+        )
+        .await;
+    assert!(sent.is_err());
+    assert_eq!(
+        lookups.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the refusal came after name resolution"
+    );
+    let reached = tokio::time::timeout(Duration::from_millis(300), listener.accept()).await;
+    assert!(reached.is_err(), "the plain route reached the server");
 }

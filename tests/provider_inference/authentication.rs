@@ -13,6 +13,42 @@ use tokio::{
     net::TcpStream,
 };
 
+/// The metered gateway route chooses TLS by its scheme (ADR 0044): `http://` takes no trust
+/// anchors but at least one range, and `https://` needs trust anchors. The general constructor
+/// keeps `https://` only.
+#[test]
+fn only_the_metered_gateway_route_may_be_plain_http() {
+    let c = catalog(Protocol::Chat, true);
+    let e = effective(&c, false);
+    let ca = fixture::Ca::new();
+    let pem = ca.pem();
+    let qualification = || Qualification {
+        model: e.model.clone(),
+        pin: e.profile.clone(),
+        protocol: Protocol::Chat,
+        json: true,
+        sse: false,
+        functions: None,
+        images: false,
+        parallel: false,
+        usage: true,
+        tool_separator_whitespace: false,
+    };
+    let plain = format!("http://{}:8082{}", fixture::HOST, path(Protocol::Chat));
+    let secure = format!("https://{}{}", fixture::HOST, path(Protocol::Chat));
+    let metered = |url: &str, trust, ranges: &[&str]| {
+        Gateway::metered(url, trust, ranges, qualification(), NORMAL)
+    };
+    let range = ["10.20.0.0/16"];
+    assert!(metered(&plain, None, &range).is_ok());
+    // A plain route reaches only its configured ranges, so it needs one.
+    assert!(metered(&plain, None, &[]).is_err());
+    assert!(metered(&plain, Some(Trust::Bundle(&pem)), &range).is_err());
+    assert!(metered(&secure, None, &range).is_err());
+    assert!(metered(&secure, Some(Trust::Bundle(&pem)), &[]).is_ok());
+    assert!(Gateway::new(&plain, Trust::Bundle(&pem), &[], qualification(), NORMAL).is_err());
+}
+
 /// Exercise the same inferred operation without the internal credential. This raw client exists
 /// only in the test; the adapter cannot send an unauthenticated request.
 async fn denial(mock: &Mock, body: &[u8], auth: &str) -> u16 {

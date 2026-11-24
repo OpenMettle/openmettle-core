@@ -1,15 +1,9 @@
 # Gateway proxy (not deployable)
 
-> **Not deployable**, for two reasons:
->
-> - **The bearer would travel in cleartext.** The worker's transport requires an
->   `https://` endpoint and the proxy listens on plain HTTP, so the two cannot be connected
->   until increment 7.
-> - **A hold without a final report stays forever.** A handed-off request keeps its hold until
->   a final usage report arrives, and nothing reconciles one that never does until increment 3.
->
-> Run it only on an isolated test host with synthetic data. There is no image target, chart
-> or network policy for it yet.
+> **Not deployable.** A handed-off request keeps its hold until a final usage report
+> arrives, and nothing reconciles one that never does until increment 3. There is no image
+> target, chart or network policy for it yet (increment 7). Run it only on an isolated test
+> host with synthetic data.
 
 `openmettle-gateway` is OpenMettle's own inference proxy (V1-06,
 [ADR 0044](../adr/0044-own-inference-proxy-and-binding-free-dispatch.md)). It sits between a
@@ -192,9 +186,15 @@ stopped answering: the pool waits for every connection when closing.
 
 ## Known gaps
 
-- **Plain HTTP on both sides.** The packaged worker's transport requires an `https://`
-  endpoint, so it cannot use this proxy yet, and without TLS the bearer would cross
-  the network in cleartext. The default bind is loopback.
+- **Plain HTTP on both sides.** The proxy listens on plain HTTP. The packaged worker may call
+  it with an `http://` route inside the cluster, whose `private_cidrs` must hold every address
+  the proxy's name resolves to; a public address is never reached. The round's bearer and the
+  prompt and response bodies then cross the cluster network unencrypted, and an interceptor
+  could alter the answer and token counts the worker stores, while the proxy settles the
+  upstream's own usage. The bearer authorizes one dispatch of one request. Admit only the worker pods with a NetworkPolicy, or terminate TLS in front
+  of the proxy and give the worker an `https://` route; see
+  [plain HTTP inside the cluster](worker-turn-execution.md#plain-http-inside-the-cluster).
+  The default bind is loopback.
 - **Holds without a final report stay.** A request that was handed off and never dispatched,
   refused after its dispatch was recorded, cancelled, cut or failed keeps its hold. Nothing
   releases or reconciles it until increment 3.
@@ -209,11 +209,24 @@ stopped answering: the pool waits for every connection when closing.
 
 `tests/schema/gateway_proxy.rs` runs the binary as `openmettle_gateway` against a stand-in that
 replays the recorded SGLang responses in `tests/fixtures/sglang-recorded/`. Its requests are
-run rounds reserved and handed off through the library, without a gateway binding. It needs
-an isolated PostgreSQL 18 service in `TEST_DATABASE_URL`, like the other schema tests:
+run rounds reserved and handed off through the library, without a gateway binding, and given
+a bearer the test knows, because each test presents a request the worker would not send. It
+needs an isolated PostgreSQL 18 service in `TEST_DATABASE_URL`, like the other schema tests:
 
 ```sh
 cargo test --locked --test schema gateway_proxy -- --ignored
+```
+
+`tests/schema/live_turns/worker_gateway.rs` runs the real path: the packaged worker claims a
+queued run and sends its round, with the bearer it made, to this binary over plain HTTP and,
+in a second case, through a TLS terminator; the stand-in answers with a recorded response
+and the test checks the stored usage, the dispatch, the settled hold and the published
+answer. Two more cases cover a proxy serving another model and an unreachable proxy. Like
+the packaged-worker tests, they need `TEST_GATEWAY_HOST` naming a private address of the
+host (see `.github/workflows/checks.yml`):
+
+```sh
+cargo test --locked --test schema worker_gateway -- --ignored
 ```
 
 With `TEST_GATEWAY_UPSTREAM_URL` set to an `http://` SGLang origin, the

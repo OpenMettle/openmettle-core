@@ -339,6 +339,11 @@ impl Provider {
 /// The `trust` object and `private_cidrs` array of one configured HTTPS destination: `None`
 /// selects the native roots, a path exactly one PEM bundle (ADR 0010).
 pub(crate) fn destination(object: &mut Object) -> Result<(Option<String>, Vec<String>), Error> {
+    Ok((trust(object)?, private_cidrs(object)?))
+}
+
+/// The `trust` member: `None` for the native roots, or the bundle path.
+pub(crate) fn trust(object: &mut Object) -> Result<Option<String>, Error> {
     let mut trust = object.object("trust")?;
     let bundle_path = match trust.string("roots")?.as_str() {
         "native" => None,
@@ -346,15 +351,19 @@ pub(crate) fn destination(object: &mut Object) -> Result<(Option<String>, Vec<St
         _ => return Err(Error::Field),
     };
     trust.end()?;
-    let private_cidrs = object
+    Ok(bundle_path)
+}
+
+/// The `private_cidrs` member, as written; the transport checks each range.
+pub(crate) fn private_cidrs(object: &mut Object) -> Result<Vec<String>, Error> {
+    object
         .array("private_cidrs")?
         .into_iter()
         .map(|range| match range {
             Value::String(range) => Ok(range),
             _ => Err(Error::Field),
         })
-        .collect::<Result<_, _>>()?;
-    Ok((bundle_path, private_cidrs))
+        .collect()
 }
 
 /// Reads a configured PEM trust bundle within the transport's ceiling.

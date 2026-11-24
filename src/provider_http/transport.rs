@@ -7,6 +7,11 @@
 //! retry, strict response framing and caller-supplied size and deadline bounds. The connection is
 //! driven inside the caller's future; dropping it closes the socket. Callers apply any stricter
 //! request admission of their own before calling [`Route::send`].
+//!
+//! The one exception to HTTPS is [`gateway_endpoint`], the route of metered turns to OpenMettle's
+//! own gateway inside the cluster (ADR 0044): it may also be `http://`, and then has no TLS. Such
+//! a route reaches only addresses inside its configured ranges and carries only a committed
+//! round dispatch. Every other rule applies to it unchanged.
 use super::{Error, MAX_ADDRESSES, MAX_TRUST_BUNDLE_BYTES, Trust};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
@@ -20,7 +25,12 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{net::TcpStream, sync::Semaphore, time::Instant};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::TcpStream,
+    sync::Semaphore,
+    time::Instant,
+};
 
 /// hyper's minimum permitted connection read buffer.
 const MAX_READ_BUFFER: usize = 8 * 1024;
@@ -210,8 +220,19 @@ pub(crate) struct Endpoint {
     port: u16,
     authority: String,
     pub(super) path: String,
+    /// `https://`. Only [`gateway_endpoint`] makes one without TLS.
+    tls: bool,
 }
 pub(crate) fn endpoint(value: &str) -> Result<Endpoint, Error> {
+    parse(value, false)
+}
+/// [`endpoint`], except that `http://` is accepted as well and then means no TLS. Only for the
+/// route of metered turns to OpenMettle's own gateway (`inference::Gateway::metered`); every
+/// other client keeps [`endpoint`].
+pub(super) fn gateway_endpoint(value: &str) -> Result<Endpoint, Error> {
+    parse(value, true)
+}
+fn parse(value: &str, plain: bool) -> Result<Endpoint, Error> {
     if value.is_empty()
         || value.len() > MAX_ENDPOINT_BYTES
         || value.bytes().any(|b| b <= 0x20 || b >= 0x7f)
@@ -220,8 +241,13 @@ pub(crate) fn endpoint(value: &str) -> Result<Endpoint, Error> {
         return Err(Error::Configuration);
     }
     let parsed = url::Url::parse(value).map_err(|_| Error::Configuration)?;
+    let tls = match parsed.scheme() {
+        "https" => true,
+        "http" if plain => false,
+        _ => return Err(Error::Configuration),
+    };
     // Canonical input only: no case, default-port, dot-segment or encoding variants.
-    if parsed.as_str() != value || parsed.scheme() != "https" || parsed.cannot_be_a_base() {
+    if parsed.as_str() != value || parsed.cannot_be_a_base() {
         return Err(Error::Configuration);
     }
     let Some(url::Host::Domain(host)) = parsed.host() else {
@@ -250,7 +276,14 @@ pub(crate) fn endpoint(value: &str) -> Result<Endpoint, Error> {
         port,
         authority,
         path: parsed.path().to_owned(),
+        tls,
     })
+}
+impl Endpoint {
+    /// Whether this endpoint is `https://`.
+    pub(super) fn tls(&self) -> bool {
+        self.tls
+    }
 }
 
 pub(crate) fn roots(trust: Trust<'_>) -> Result<rustls::RootCertStore, Error> {
@@ -327,16 +360,23 @@ pub(crate) struct Limits {
 
 /// One configured destination, borrowed from its owner for a request. `slots` is the owner's DNS
 /// lookup pool: separate owners pass separate semaphores so one cannot exhaust another's slots.
+/// `tls` is present exactly when the endpoint is `https://`; [`Route::connect`] refuses any other
+/// pairing, so an `https://` endpoint is never sent without TLS.
 pub(crate) struct Route<'a> {
     pub(crate) endpoint: &'a Endpoint,
     pub(crate) allowed: &'a [Range],
-    pub(crate) tls: &'a Arc<rustls::ClientConfig>,
+    pub(crate) tls: Option<&'a Arc<rustls::ClientConfig>>,
     pub(crate) lookup: &'a Lookup,
     pub(crate) slots: &'a Arc<Semaphore>,
     /// Test fixture seam: additionally permits 127.0.0.1 and ::1. Absent from production builds.
     #[cfg(test)]
     pub(crate) loopback: bool,
 }
+
+/// An open connection to a configured destination: TLS, or plain TCP for an `http://` gateway
+/// endpoint.
+pub(crate) trait Connection: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Connection for T {}
 
 // Scoped to construction of one existing inference request. Its codec owns the
 // headers; consume the ID before any stream callback or other request can run.
@@ -383,10 +423,10 @@ impl Route<'_> {
             return Err(Error::TooLarge);
         }
         let outbound = self.request(method, headers, body)?;
-        let tls = self.connect(setup).await?;
+        let connection = self.connect(setup).await?;
         tokio::time::timeout_at(
             total,
-            self.exchange(tls, outbound, total, limits, |response| {
+            self.exchange(connection, outbound, total, limits, |response| {
                 read(response, limits.response_body)
             }),
         )
@@ -394,10 +434,10 @@ impl Route<'_> {
         .map_err(|_| Error::Timeout)?
     }
 
-    pub(super) async fn connect(
-        &self,
-        setup: Instant,
-    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, Error> {
+    pub(super) async fn connect(&self, setup: Instant) -> Result<Box<dyn Connection>, Error> {
+        if self.endpoint.tls != self.tls.is_some() {
+            return Err(Error::Configuration);
+        }
         let answers = self.resolve(setup).await?;
         // Alternate only on TCP failure, before any TLS or HTTP bytes; connect to validated
         // addresses only, so a later DNS answer cannot redirect this request.
@@ -414,16 +454,22 @@ impl Route<'_> {
         }
         let tcp = tcp.ok_or(Error::Connect)?;
         tcp.set_nodelay(true).map_err(|_| Error::Connect)?;
+        // A plain `http://` gateway endpoint: no certificate, so the host name only selects the
+        // DNS answers checked above and the `Host` header.
+        let Some(tls) = self.tls else {
+            return Ok(Box::new(tcp));
+        };
         // Certificate validation uses the configured host name, never the connected address.
         let name =
             ServerName::try_from(self.endpoint.host.clone()).map_err(|_| Error::Configuration)?;
-        tokio::time::timeout_at(
+        let stream = tokio::time::timeout_at(
             setup,
-            tokio_rustls::TlsConnector::from(self.tls.clone()).connect(name, tcp),
+            tokio_rustls::TlsConnector::from(tls.clone()).connect(name, tcp),
         )
         .await
         .map_err(|_| Error::Timeout)?
-        .map_err(|_| Error::Tls)
+        .map_err(|_| Error::Tls)?;
+        Ok(Box::new(stream))
     }
 
     fn address_permitted(&self, ip: IpAddr) -> bool {
@@ -433,7 +479,10 @@ impl Route<'_> {
         {
             return true;
         }
+        // Plain HTTP stays inside the cluster: an `http://` gateway endpoint reaches only the
+        // ranges configured for it, never a public address.
         permitted(ip, self.allowed)
+            && (self.endpoint.tls || self.allowed.iter().any(|r| r.contains(ip)))
     }
 
     /// The OS lookup runs on Tokio's blocking pool and cannot be cancelled. Its slot permit moves
@@ -484,9 +533,22 @@ impl Route<'_> {
             .uri(self.endpoint.path.as_str())
             .header(header::HOST, self.endpoint.authority.as_str())
             .header(header::CONNECTION, "close");
-        if headers.contains_key(header::AUTHORIZATION)
-            && let Ok(Some(id)) = BILLABLE_REQUEST.try_with(std::cell::Cell::take)
-        {
+        let billable = headers
+            .contains_key(header::AUTHORIZATION)
+            .then(|| {
+                BILLABLE_REQUEST
+                    .try_with(std::cell::Cell::take)
+                    .ok()
+                    .flatten()
+            })
+            .flatten();
+        // A plain `http://` gateway endpoint carries only a committed round dispatch, whose
+        // request ID the metered send scoped here (ADR 0044); any other use of it is refused
+        // before any DNS work or connection.
+        if !self.endpoint.tls && billable.is_none() {
+            return Err(Error::Destination);
+        }
+        if let Some(id) = billable {
             outbound = outbound.header("x-request-id", id);
         }
         for (name, value) in headers {
@@ -499,7 +561,7 @@ impl Route<'_> {
 
     pub(super) async fn exchange<T, E: From<Error>, F: Future<Output = Result<T, E>>>(
         &self,
-        tls: tokio_rustls::client::TlsStream<TcpStream>,
+        connection: Box<dyn Connection>,
         outbound: http::Request<Full<Bytes>>,
         header_deadline: Instant,
         limits: &Limits,
@@ -509,7 +571,7 @@ impl Route<'_> {
             .max_headers(limits.response_headers)
             .max_header_size(limits.response_header_bytes)
             .max_buf_size(MAX_READ_BUFFER)
-            .handshake::<_, Full<Bytes>>(TokioIo::new(tls))
+            .handshake::<_, Full<Bytes>>(TokioIo::new(connection))
             .await
             .map_err(|_| Error::Protocol)?;
         // Driven here, never spawned: the connection lives exactly as long as this future.

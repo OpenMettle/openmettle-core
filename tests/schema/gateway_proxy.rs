@@ -59,7 +59,7 @@ const LEASES: LeaseSettings = LeaseSettings {
 
 /// Recorded 200 answers and the usage each reports: prompt, completion and reasoning tokens.
 /// Reasoning is already inside the completion count on this server.
-const SETTLED: [(&str, i64, i64, i64); 5] = [
+pub(crate) const SETTLED: [(&str, i64, i64, i64); 5] = [
     ("02-chat-plain", 17, 2, 0),
     ("03-chat-stream-usage", 23, 6, 0),
     ("04-chat-stream-reasoning", 67, 37, 33),
@@ -82,8 +82,13 @@ fn pool(db: &TestDb, role: &str) -> PgPool {
 /// keeps the dispatch secret private too, so the fixture cannot choose the bearer through the
 /// handoff. It replaces the stored `bearer_hash` of each handed-off request, as the database
 /// owner, with the hash of a bearer the test can present. A request that is only reserved has
-/// no bearer hash and gets none. Increment 2c replaces this with the packaged worker
-/// dispatching to the proxy.
+/// no bearer hash and gets none.
+///
+/// Every test in this file needs that known bearer: each presents a request the worker would
+/// never send (a recorded or synthetic body, a missing, wrong or repeated credential, a
+/// malformed header), or looks for the bearer in logs or database traffic. The bearer the
+/// worker makes reaches the proxy unaltered in `worker_leases::live_turns::worker_gateway`,
+/// where the packaged worker dispatches to this binary and nothing is re-keyed.
 fn bearer_bytes(id: &str) -> [u8; 32] {
     Sha256::digest(format!("gateway-proxy-fixture:{id}")).into()
 }
@@ -422,6 +427,30 @@ fn continuous_event(content: &str, completion: usize) -> Vec<u8> {
     .into_bytes()
 }
 
+/// The recorded answer of `case`: a stream one event per chunk, and held after its first event
+/// when `hold` is set; a JSON body in two writes.
+fn recorded_script(case: &str, hold: bool) -> Script {
+    let response = recorded::body(case);
+    let mut writes = vec![recorded::head(case).into_bytes()];
+    let chunked = recorded::chunked(case);
+    if chunked {
+        writes.extend(recorded::events(&response).into_iter().map(chunk));
+        // The aborted recording closes without the terminal chunk.
+        if case != ABORTED {
+            writes.push(b"0\r\n\r\n".to_vec());
+        }
+    } else {
+        let (first, rest) = response.split_at(response.len() / 2);
+        writes.extend([first.to_vec(), rest.to_vec()]);
+    }
+    Script {
+        writes: Box::new(writes.into_iter()),
+        held: hold && chunked,
+        pause: Duration::ZERO,
+        linger: false,
+    }
+}
+
 /// A recorded answer for its recorded request, a synthetic one for a body naming one in
 /// `synthetic`, and otherwise none.
 fn script(body: &[u8]) -> Option<Script> {
@@ -431,25 +460,7 @@ fn script(body: &[u8]) -> Option<Script> {
         .chain([ABORTED, UPSTREAM_500])
         .find(|case| recorded::file(case, "request.json") == body);
     if let Some(case) = recorded_case {
-        let response = recorded::body(case);
-        let mut writes = vec![recorded::head(case).into_bytes()];
-        let held = recorded::chunked(case);
-        if held {
-            writes.extend(recorded::events(&response).into_iter().map(chunk));
-            // The aborted recording closes without the terminal chunk.
-            if case != ABORTED {
-                writes.push(b"0\r\n\r\n".to_vec());
-            }
-        } else {
-            let (first, rest) = response.split_at(response.len() / 2);
-            writes.extend([first.to_vec(), rest.to_vec()]);
-        }
-        return Some(Script {
-            writes: Box::new(writes.into_iter()),
-            held,
-            pause: Duration::ZERO,
-            linger: false,
-        });
+        return Some(recorded_script(case, true));
     }
     let name = serde_json::from_slice::<Value>(body).ok()?["synthetic"].take();
     let (writes, held, pause, linger): (Box<dyn Iterator<Item = Vec<u8>> + Send>, _, _, _) =
@@ -500,7 +511,7 @@ fn script(body: &[u8]) -> Option<Script> {
 }
 
 /// Answers each request with its script, in separate TCP writes.
-struct StandIn {
+pub(crate) struct StandIn {
     address: String,
     received: Arc<Mutex<Vec<Received>>>,
     gate: Arc<Gate>,
@@ -508,6 +519,17 @@ struct StandIn {
 
 impl StandIn {
     async fn start() -> Self {
+        Self::serve(None).await
+    }
+
+    /// A stand-in that answers every request, whatever its body, with the recorded answer of
+    /// `case`, never held: for a caller such as the worker, whose requests are not the
+    /// recorded ones.
+    pub(crate) async fn answering(case: &'static str) -> Self {
+        Self::serve(Some(case)).await
+    }
+
+    async fn serve(answer: Option<&'static str>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let received = Arc::new(Mutex::new(Vec::new()));
@@ -515,7 +537,7 @@ impl StandIn {
         let (log, held) = (received.clone(), gate.clone());
         tokio::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
-                tokio::spawn(replay(socket, log.clone(), held.clone()));
+                tokio::spawn(replay(socket, answer, log.clone(), held.clone()));
             }
         });
         Self {
@@ -525,25 +547,34 @@ impl StandIn {
         }
     }
 
-    fn count(&self) -> usize {
+    pub(crate) fn count(&self) -> usize {
         self.received.lock().unwrap().len()
     }
 
     /// The lowercased head of the `n`th request received.
-    fn head(&self, n: usize) -> String {
+    pub(crate) fn head(&self, n: usize) -> String {
         self.received.lock().unwrap()[n].head.clone()
+    }
+
+    /// The body of the `n`th request received.
+    pub(crate) fn body(&self, n: usize) -> Vec<u8> {
+        self.received.lock().unwrap()[n].body.clone()
     }
 }
 
 async fn replay(
     mut socket: tokio::net::TcpStream,
+    answer: Option<&'static str>,
     received: Arc<Mutex<Vec<Received>>>,
     gate: Arc<Gate>,
 ) {
     let Some((head, body)) = read_request(&mut socket).await else {
         return;
     };
-    let script = script(&body);
+    let script = match answer {
+        Some(case) => Some(recorded_script(case, false)),
+        None => script(&body),
+    };
     received.lock().unwrap().push(Received { head, body });
     let mut probe = [0; 1];
     let Some(script) = script else {
@@ -606,7 +637,7 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<(String, Vec
 }
 
 /// The first value of header `name` in a lowercased head.
-fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+pub(crate) fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     head.lines()
         .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))
         .map(str::trim)
@@ -879,31 +910,7 @@ impl Harness {
     /// applied last.
     async fn launch(fixture: Fixture, upstream: StandIn, settings: &[(&str, String)]) -> Self {
         let bind = address();
-        let mut command = binary("gateway");
-        command
-            .env("OPENMETTLE_GATEWAY_BIND", &bind)
-            .env(
-                "OPENMETTLE_GATEWAY_DATABASE_URL",
-                fixture.db.url(pg::GATEWAY),
-            )
-            .env(
-                "OPENMETTLE_GATEWAY_UPSTREAM_URL",
-                format!("http://{}", upstream.address),
-            )
-            .env("OPENMETTLE_GATEWAY_MODEL", MODEL)
-            .env("OPENMETTLE_GATEWAY_SHUTDOWN_TIMEOUT_MS", "10000");
-        for (key, value) in settings {
-            command.env(format!("OPENMETTLE_GATEWAY_{key}"), value);
-        }
-        let mut child = command.stdout(Stdio::null()).spawn().unwrap();
-        let mut pipe = child.stderr.take().unwrap();
-        let stderr = thread::spawn(move || {
-            let mut text = String::new();
-            pipe.read_to_string(&mut text).unwrap();
-            text
-        });
-        let mut gateway = Process(child);
-        tokio::task::block_in_place(|| wait_ready(&mut gateway, &bind));
+        let (gateway, stderr) = launch_gateway(&fixture.db, &bind, &upstream, MODEL, settings);
         Self {
             fixture,
             upstream,
@@ -1071,6 +1078,41 @@ impl Harness {
         events.sort();
         (fixture, upstream, events)
     }
+}
+
+/// The gateway binary listening on `bind`, serving `db` as `openmettle_gateway` for `model`
+/// through `upstream`, with extra `OPENMETTLE_GATEWAY_` settings applied last. It is ready when
+/// this returns; the thread returns its complete stderr once it has exited.
+pub(crate) fn launch_gateway(
+    db: &TestDb,
+    bind: &str,
+    upstream: &StandIn,
+    model: &str,
+    settings: &[(&str, String)],
+) -> (Process, thread::JoinHandle<String>) {
+    let mut command = binary("gateway");
+    command
+        .env("OPENMETTLE_GATEWAY_BIND", bind)
+        .env("OPENMETTLE_GATEWAY_DATABASE_URL", db.url(pg::GATEWAY))
+        .env(
+            "OPENMETTLE_GATEWAY_UPSTREAM_URL",
+            format!("http://{}", upstream.address),
+        )
+        .env("OPENMETTLE_GATEWAY_MODEL", model)
+        .env("OPENMETTLE_GATEWAY_SHUTDOWN_TIMEOUT_MS", "10000");
+    for (key, value) in settings {
+        command.env(format!("OPENMETTLE_GATEWAY_{key}"), value);
+    }
+    let mut child = command.stdout(Stdio::null()).spawn().unwrap();
+    let mut pipe = child.stderr.take().unwrap();
+    let stderr = thread::spawn(move || {
+        let mut text = String::new();
+        pipe.read_to_string(&mut text).unwrap();
+        text
+    });
+    let mut gateway = Process(child);
+    tokio::task::block_in_place(|| wait_ready(&mut gateway, bind));
+    (gateway, stderr)
 }
 
 /// The content type of a lowercased response head.
