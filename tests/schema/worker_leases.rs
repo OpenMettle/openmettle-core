@@ -974,6 +974,8 @@ mod live_turns {
     struct ModelRequest {
         path: String,
         request_id: Option<String>,
+        /// The bearer credential the worker sent.
+        bearer: String,
         body: Value,
         reply: oneshot::Sender<Value>,
     }
@@ -989,19 +991,101 @@ mod live_turns {
         ca: Ca,
         requests: mpsc::Receiver<ModelRequest>,
     }
+    /// The fixed bearer of the library fixture's unmetered route.
+    const UNMETERED_BEARER: &str = "synthetic-turn-credential";
+
+    /// The 32 bytes of a round's bearer spelled as 43 unpadded base64url characters.
+    fn round_bearer(bearer: &str) -> Option<Vec<u8>> {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        URL_SAFE_NO_PAD
+            .decode(bearer)
+            .ok()
+            .filter(|bytes| bearer.len() == 43 && bytes.len() == 32)
+    }
+
+    /// Whether `bearer` is the bearer the handoff of gateway request `id` recorded, and is not
+    /// its dispatch secret: the stand-in has no database handle, so tests that hold one compare
+    /// hashes with the stored ones.
+    async fn is_round_bearer(db: &TestDb, id: &str, bearer: &str) -> bool {
+        sqlx::query_scalar(
+            "SELECT bearer_hash = sha256($2) AND dispatch_hash <> sha256($2)
+               FROM openmettle.gateway_requests WHERE id = $1::uuid",
+        )
+        .bind(id)
+        .bind(round_bearer(bearer).expect("a round bearer"))
+        .fetch_one(&mut connect(&db.0, OWNER).await)
+        .await
+        .unwrap()
+    }
+
+    /// Relays connections to the test PostgreSQL service and keeps, per connection, every byte
+    /// sent towards it.
+    struct RecordedPostgres {
+        address: std::net::SocketAddr,
+        sent: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl RecordedPostgres {
+        async fn start() -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let admin = pg::admin_options();
+            let server = format!("{}:{}", admin.get_host(), admin.get_port());
+            let sent = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+            let record = sent.clone();
+            tokio::spawn(async move {
+                while let Ok((client, _)) = listener.accept().await {
+                    let server = tokio::net::TcpStream::connect(&server).await.unwrap();
+                    let record = record.clone();
+                    let connection = {
+                        let mut all = record.lock().unwrap();
+                        all.push(Vec::new());
+                        all.len() - 1
+                    };
+                    tokio::spawn(async move {
+                        let (mut from_client, mut to_client) = client.into_split();
+                        let (mut from_server, mut to_server) = server.into_split();
+                        let requests = async {
+                            let mut buffer = [0; 8192];
+                            while let Ok(n @ 1..) = from_client.read(&mut buffer).await {
+                                record.lock().unwrap()[connection].extend_from_slice(&buffer[..n]);
+                                if to_server.write_all(&buffer[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                            let _ = to_server.shutdown().await;
+                        };
+                        let replies = async {
+                            let _ = tokio::io::copy(&mut from_server, &mut to_client).await;
+                        };
+                        tokio::join!(requests, replies);
+                    });
+                }
+            });
+            Self { address, sent }
+        }
+
+        /// The address of `role` on `db` through this relay.
+        fn url(&self, db: &TestDb, role: &str) -> String {
+            let admin = pg::admin_options();
+            let direct = format!("@{}:{}/", admin.get_host(), admin.get_port());
+            let url = db.url(role);
+            assert!(url.contains(&direct));
+            url.replace(&direct, &format!("@{}/", self.address))
+        }
+    }
+
     impl Provider {
         async fn new() -> Self {
-            Self::with_bearer("synthetic-turn-credential".into()).await
-        }
-        async fn with_bearer(expected_bearer: String) -> Self {
             let loopback = IpAddr::from([127, 0, 0, 1]);
-            Self::on("provider.example.test", loopback, expected_bearer).await
+            Self::on("provider.example.test", loopback).await
         }
         /// The packaged worker's transport refuses loopback (ADR 0010), so its gateway listens
         /// on the one private address `TEST_GATEWAY_HOST` resolves to through the system
         /// resolver. CI assigns that address to the loopback interface and names it in
         /// `/etc/hosts`; the worker opts in to exactly that address.
-        async fn packaged(expected_bearer: &str) -> Self {
+        async fn packaged() -> Self {
             let host = std::env::var("TEST_GATEWAY_HOST")
                 .expect("TEST_GATEWAY_HOST must name a private address of this host");
             let mut ips: Vec<IpAddr> = std::net::ToSocketAddrs::to_socket_addrs(&(&*host, 0))
@@ -1013,7 +1097,7 @@ mod live_turns {
             let [ip] = ips[..] else {
                 panic!("TEST_GATEWAY_HOST must resolve to exactly one address")
             };
-            Self::on(&host, ip, expected_bearer.into()).await
+            Self::on(&host, ip).await
         }
         fn authority(&self) -> String {
             format!("{}:{}", self.host, self.port)
@@ -1022,11 +1106,13 @@ mod live_turns {
             let prefix = if self.ip.is_ipv4() { 32 } else { 128 };
             format!("{}/{prefix}", self.ip)
         }
-        async fn on(host: &str, ip: IpAddr, expected_bearer: String) -> Self {
+        /// Every request must carry a bearer credential. A metered round, the one with an
+        /// `x-request-id`, carries its own bearer (ADR 0044), checked here for its encoding
+        /// only; an unmetered round carries the fixture's fixed bearer.
+        async fn on(host: &str, ip: IpAddr) -> Self {
             use http_body_util::{BodyExt, Full};
             use hyper::{Response, server::conn::http1, service::service_fn};
             use hyper_util::rt::TokioIo;
-            let expected_header = Arc::new(format!("Bearer {expected_bearer}"));
             let ca = Ca::new();
             let identity = ca.leaf(host, false);
             let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -1045,13 +1131,11 @@ mod live_turns {
                 while let Ok((stream, _)) = listener.accept().await {
                     let acceptor = acceptor.clone();
                     let send = send.clone();
-                    let expected_header = expected_header.clone();
                     tokio::spawn(async move {
                         let tls = acceptor.accept(stream).await.unwrap();
                         let service =
                             service_fn(move |r: hyper::Request<hyper::body::Incoming>| {
                                 let send = send.clone();
-                                let expected_header = expected_header.clone();
                                 async move {
                                     let path = r.uri().path().to_owned();
                                     let request_id = r
@@ -1059,15 +1143,25 @@ mod live_turns {
                                         .get("x-request-id")
                                         .and_then(|v| v.to_str().ok())
                                         .map(str::to_owned);
-                                    assert_eq!(
-                                        r.headers()["authorization"],
-                                        expected_header.as_str()
-                                    );
+                                    let bearer = r.headers()["authorization"]
+                                        .to_str()
+                                        .ok()
+                                        .and_then(|value| value.strip_prefix("Bearer "))
+                                        .expect("a bearer credential")
+                                        .to_owned();
+                                    match &request_id {
+                                        Some(_) => assert!(
+                                            round_bearer(&bearer).is_some(),
+                                            "a metered round carries its own bearer"
+                                        ),
+                                        None => assert_eq!(bearer, UNMETERED_BEARER),
+                                    }
                                     let bytes = r.into_body().collect().await.unwrap().to_bytes();
                                     let (reply, rx) = oneshot::channel();
                                     send.send(ModelRequest {
                                         path,
                                         request_id,
+                                        bearer,
                                         body: serde_json::from_slice(&bytes).unwrap(),
                                         reply,
                                     })
@@ -1247,6 +1341,8 @@ mod live_turns {
         stop_during_observation: bool,
         unmetered: bool,
         device_grant_id: Option<String>,
+        /// The worker's database address, when it is not the test service itself.
+        database: Option<String>,
     }
 
     impl Chat {
@@ -1281,6 +1377,7 @@ mod live_turns {
                 stop_during_observation: false,
                 unmetered: false,
                 device_grant_id: None,
+                database: None,
             }
         }
 
@@ -1574,7 +1671,9 @@ mod live_turns {
                 .spawn()
                 .unwrap();
             let input = child.stdin.as_mut().unwrap();
-            serde_json::to_writer(&mut *input,&json!({"database":self.f.db.url(WORKER),"catalog":self.catalog,
+            let database = self.database.clone();
+            let database = database.unwrap_or_else(|| self.f.db.url(WORKER));
+            serde_json::to_writer(&mut *input,&json!({"database":database,"catalog":self.catalog,
                 "tools":self.session.is_some(),"scope":self.f.scope,"actor":self.f.actor.user,"ca":String::from_utf8(provider.ca.pem()).unwrap(),"port":provider.port,
                 "artifacts":self.artifacts,"stop_during_observation":self.stop_during_observation,"metered":metered})).unwrap();
             writeln!(input).unwrap();
@@ -2428,6 +2527,74 @@ mod live_turns {
         }
     }
 
+    /// ADR 0044: the bearer of a metered round is made in the worker and only its SHA-256 goes
+    /// to PostgreSQL. Every byte this worker process sends to PostgreSQL is recorded on the
+    /// wire. The dispatch secret, the worker's proof to the database, is in the recording as 32
+    /// raw bytes, so a bearer sent the same way would be found too. The bearer is not there
+    /// raw, nor in the base64url spelling the gateway receives, nor in hexadecimal.
+    ///
+    /// The forwarder runs on this test's runtime. On one thread the test took more than twice
+    /// as long, so the runtime has two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn the_round_bearer_never_crosses_the_workers_database_connection() {
+        use sha2::{Digest, Sha256};
+
+        let mut chat = Chat::new().await;
+        let relay = RecordedPostgres::start().await;
+        chat.database = Some(relay.url(&chat.f.db, WORKER));
+        let mut provider = Provider::new().await;
+        let (id, _) = chat.submit("bearer stays in the worker", "a", 2).await;
+        let _worker = chat.start(&provider).await;
+        let mut sent = provider.request().await;
+        let request_id = sent.request_id.take().expect("metered round x-request-id");
+        let spelled = sent.bearer.clone();
+        let bearer = round_bearer(&spelled).expect("a round bearer");
+        assert!(is_round_bearer(&chat.f.db, &request_id, &spelled).await);
+        sent.respond(completion(
+            json!("done"),
+            None,
+            json!({"prompt_tokens": 9, "completion_tokens": 3}),
+        ));
+        chat.done(&id, "succeeded", None).await;
+
+        let (dispatch_hash, bearer_hash): (Vec<u8>, Vec<u8>) = sqlx::query_as(
+            "SELECT dispatch_hash,bearer_hash FROM openmettle.gateway_requests WHERE id=$1::uuid",
+        )
+        .bind(&request_id)
+        .fetch_one(&mut connect(&chat.f.db.0, OWNER).await)
+        .await
+        .unwrap();
+        assert_eq!(bearer_hash, Sha256::digest(&bearer).as_slice());
+        let connections = relay.sent.lock().unwrap().clone();
+        let found = |needle: &[u8]| {
+            connections.iter().any(|bytes| {
+                bytes
+                    .windows(needle.len())
+                    .any(|window| window.eq_ignore_ascii_case(needle))
+            })
+        };
+        let hex: String = bearer.iter().map(|byte| format!("{byte:02x}")).collect();
+        for (spelling, bytes) in [
+            ("raw", bearer.as_slice()),
+            ("base64url", spelled.as_bytes()),
+            ("hexadecimal", hex.as_bytes()),
+        ] {
+            assert!(!found(bytes), "the {spelling} bearer reached PostgreSQL");
+        }
+        // The handoff statement went through the relay: it carried the hash of the bearer.
+        assert!(found(&bearer_hash));
+        // The test knows the dispatch secret by its hash only: look for it where a 32-byte
+        // binary statement parameter is, after its length.
+        let secret_sent = connections.iter().any(|bytes| {
+            bytes.windows(36).any(|window| {
+                window[..4] == [0, 0, 0, 32]
+                    && Sha256::digest(&window[4..]).as_slice() == dispatch_hash
+            })
+        });
+        assert!(secret_sent, "the recording holds the dispatch secret");
+    }
+
     /// ADR 0033 shutdown through the packaged binary (ADR 0043): SIGTERM during a sent metered
     /// round closes the gateway request, keeps answering probes while the run drains, hands the
     /// lease back and exits 0. A replacement reclaims without waiting for expiry and sends the
@@ -2436,13 +2603,15 @@ mod live_turns {
     #[ignore = "isolated PostgreSQL 18, synthetic TLS gateway and TEST_GATEWAY_HOST"]
     async fn packaged_worker_hands_off_on_sigterm_and_a_replacement_completes() {
         let chat = Chat::new().await;
-        let mut provider = Provider::packaged("synthetic-turn-credential").await;
+        let mut provider = Provider::packaged().await;
         let (id, input) = chat.submit("packaged handoff", "a", 2).await;
         let dir = Dir::new();
         let first = chat.start_packaged(&provider, &dir, &[]).await;
         let mut sent = provider.request().await;
         assert_eq!(sent.path, "/v1/chat/completions");
         let sent_id = sent.request_id.take().expect("metered round x-request-id");
+        let sent_bearer = sent.bearer.clone();
+        assert!(is_round_bearer(&chat.f.db, &sent_id, &sent_bearer).await);
         // Hold the run row briefly (under the 2-second lock timeout) so the handoff waits
         // inside the drain while the probe runs.
         let mut holder = connect(&chat.f.db.0, OWNER).await;
@@ -2471,7 +2640,7 @@ mod live_turns {
         hold.rollback().await.unwrap();
         let (status, stderr) = exited(first.process).await;
         assert!(status.success(), "{stderr}");
-        assert!(!stderr.contains("synthetic-turn-credential"), "{stderr}");
+        assert!(!stderr.contains(&sent_bearer), "{stderr}");
         let (state, due): (String, bool) = sqlx::query_as(
             "SELECT state, lease_expires_at <= clock_timestamp() FROM openmettle.runs
               WHERE id = $1::uuid",
@@ -2485,6 +2654,9 @@ mod live_turns {
         let _replacement = chat.start_packaged(&provider, &dir, &[]).await;
         let mut next = provider.request().await;
         let next_id = next.request_id.take().expect("metered round x-request-id");
+        // Each round has its own bearer.
+        assert!(is_round_bearer(&chat.f.db, &next_id, &next.bearer).await);
+        assert_ne!(next.bearer, sent_bearer);
         next.respond(completion(
             json!("after handoff"),
             None,
@@ -2535,7 +2707,7 @@ mod live_turns {
     #[ignore = "isolated PostgreSQL 18, synthetic TLS gateway and TEST_GATEWAY_HOST"]
     async fn packaged_worker_crash_waits_for_the_lease_and_never_replays_a_sent_round() {
         let chat = Chat::new().await;
-        let mut provider = Provider::packaged("synthetic-turn-credential").await;
+        let mut provider = Provider::packaged().await;
         let (id, input) = chat.submit("packaged crash", "a", 1).await;
         let dir = Dir::new();
         let crashed = chat.start_packaged(&provider, &dir, &[]).await;
@@ -2614,7 +2786,7 @@ mod live_turns {
     async fn packaged_worker_reads_an_image_turn_on_a_single_connection_pool() {
         let dir = Dir::new();
         let (chat, _, _, revision) = shared_image_chat(&dir).await;
-        let mut provider = Provider::packaged("synthetic-turn-credential").await;
+        let mut provider = Provider::packaged().await;
         let parts = [Part::Text("describe".into()), Part::Attachment(revision)];
         let (id, _) = chat.submit_parts("single connection", "a", 1, &parts).await;
         let worker_dir = Dir::new();
@@ -2922,7 +3094,7 @@ mod live_turns {
             .await;
 
             // Start replacement Worker 2 against loopback TLS provider.
-            let mut provider = Provider::with_bearer("prehandoff-round-token".into()).await;
+            let mut provider = Provider::new().await;
             let mut child = Command::new(worker_binary())
                 .env("OPENMETTLE_TEST_TURN_WORKER", "1")
                 .args([
@@ -2985,9 +3157,9 @@ mod live_turns {
                     &UsageReport {
                         request: req_id,
                         installation: INSTALL.into(),
-                        principal: PRINCIPAL.into(),
+                        principal: alice.user.clone(),
                         scope: scope.clone(),
-                        source: report_source,
+                        source: INSTALL.into(),
                         report_id,
                         revision: 0,
                         r#final: true,
@@ -3463,18 +3635,8 @@ mod live_turns {
         let g_pool = PgPoolOptions::new()
             .max_connections(2)
             .connect_lazy_with(db.1.options(pg::GATEWAY));
-        let (principal, report_source): (String, String) = sqlx::query_as(
-            "SELECT b.principal::text, p.report_source::text
-               FROM openmettle.gateway_bindings b
-               JOIN openmettle.gateway_policy p ON p.binding_id = b.id
-              WHERE b.installation = $1::uuid AND b.user_id = $2::uuid AND p.model = 'a'
-              LIMIT 1",
-        )
-        .bind(&installation)
-        .bind(&chat.f.actor.user)
-        .fetch_one(&g_pool)
-        .await
-        .unwrap();
+        // A round handed off without a binding reports under its actor and its installation.
+        let (principal, report_source) = (chat.f.actor.user.clone(), installation.clone());
 
         // Admit a pre-activation/legacy run WITHOUT parent quota holds so TurnExecutor triggers
         // quota_prepare_turn_round -> quota_reserve on Round 1.
@@ -3937,9 +4099,9 @@ mod live_turns {
                 &UsageReport {
                     request: req2_id,
                     installation: INSTALL.into(),
-                    principal: PRINCIPAL.into(),
+                    principal: alice.user.clone(),
                     scope: scope.clone(),
-                    source: report_source,
+                    source: INSTALL.into(),
                     report_id,
                     revision: 0,
                     r#final: true,
@@ -4016,18 +4178,8 @@ mod live_turns {
         let g_pool = PgPoolOptions::new()
             .max_connections(2)
             .connect_lazy_with(db.1.options(pg::GATEWAY));
-        let (principal, report_source): (String, String) = sqlx::query_as(
-            "SELECT b.principal::text, p.report_source::text
-               FROM openmettle.gateway_bindings b
-               JOIN openmettle.gateway_policy p ON p.binding_id = b.id
-              WHERE b.installation = $1::uuid AND b.user_id = $2::uuid AND p.model = 'a'
-              LIMIT 1",
-        )
-        .bind(&installation)
-        .bind(&chat.f.actor.user)
-        .fetch_one(&g_pool)
-        .await
-        .unwrap();
+        // A round handed off without a binding reports under its actor and its installation.
+        let (principal, report_source) = (chat.f.actor.user.clone(), installation.clone());
 
         let (run_id, _) = chat
             .submit("rr15-first-cost-limit-handoff-retry", "a", 1)
@@ -4412,175 +4564,6 @@ mod live_turns {
 
     #[tokio::test]
     #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
-    async fn oversized_bearer_header_rolls_back_handoff_before_commit() {
-        use openmettle_core::{
-            provider_keys::gateway::{Bearer, Context, GatewayKeys, GatewaySealer},
-            quotas::{self, RunBudgetReservation},
-        };
-        use sqlx::postgres::PgPoolOptions;
-
-        let mut chat = Chat::new().await;
-        chat.catalog["models"]["a"]["cost_bound"] = json!({
-            "fixed_micros": 0,
-            "micros_per_token": 1
-        });
-        let mut owner = connect(&chat.f.db.0, OWNER).await;
-        owner
-            .execute(
-                "UPDATE openmettle.quota_defaults
-                    SET cost_denomination = 'usd_micros'
-                  WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'",
-            )
-            .await
-            .unwrap();
-        owner
-            .execute(
-                "INSERT INTO openmettle.quota_defaults (scope_kind, resource_kind, hard_limit)
-                 VALUES ('personal', 'usage_cost_micros', 1000000)",
-            )
-            .await
-            .unwrap();
-
-        let (installation, key_id, key_bytes) = chat.ensure_metered_gateway().await;
-        let g_pool = PgPoolOptions::new()
-            .max_connections(2)
-            .connect_lazy_with(chat.f.db.1.options(pg::GATEWAY));
-        let (binding_id, principal): (String, String) = sqlx::query_as(
-            "SELECT id::text, principal::text
-               FROM openmettle.gateway_bindings
-              WHERE installation = $1::uuid AND user_id = $2::uuid",
-        )
-        .bind(&installation)
-        .bind(&chat.f.actor.user)
-        .fetch_one(&g_pool)
-        .await
-        .unwrap();
-        // Seal an 896-byte valid Bearer (accepted by Bearer::new) whose complete outbound HTTP
-        // headers (Host + Connection + x-request-id + Authorization + Accept + Content-Type +
-        // Content-Length) exceed MAX_REQUEST_HEADER_BYTES (1024).
-        let keys = GatewayKeys::new(&[(key_id, key_bytes)]).unwrap();
-        let long_bearer = Bearer::new(&[b'b'; 896]).expect("896-byte bearer is valid");
-        let (finger, env) = GatewaySealer::new(keys, g_pool.clone())
-            .seal(
-                &Context {
-                    installation: &installation,
-                    user_id: &chat.f.actor.user,
-                    binding_id: &binding_id,
-                    principal: &principal,
-                    generation: 1,
-                },
-                &long_bearer,
-            )
-            .await
-            .unwrap();
-        sqlx::query(
-            "UPDATE openmettle.gateway_generations
-                SET key_id = $2, key_fingerprint = $3, nonce = $4, ciphertext = $5
-              WHERE binding_id = $1::uuid AND generation = 1",
-        )
-        .bind(&binding_id)
-        .bind(&env.key_id)
-        .bind(finger.as_slice())
-        .bind(env.nonce.as_slice())
-        .bind(env.ciphertext)
-        .execute(&g_pool)
-        .await
-        .unwrap();
-
-        let (run_id, _) = chat.submit("oversized-bearer-run", "a", 1).await;
-        {
-            let mut api_c = api(&chat.f.db).await;
-            let mut tx = WriteTransaction::begin(&mut api_c).await.unwrap();
-            assert!(
-                quotas::reserve_admitted_run_budget(
-                    &mut tx,
-                    &RunBudgetReservation {
-                        scope_id: &chat.f.scope,
-                        scope_kind: "personal",
-                        actor_user_id: &chat.f.actor.user,
-                        actor_approval_id: &chat.f.actor.approval,
-                        run_id: &run_id,
-                        token_units: 16384,
-                        per_round_cost_micros: Some(16384),
-                        round_limit: 1,
-                        requires_device_slot: false,
-                    },
-                )
-                .await
-                .unwrap()
-                .is_none()
-            );
-            tx.commit().await.unwrap();
-        }
-
-        let mut server = Provider::new().await;
-        let _worker = chat.start(&server).await;
-        chat.done(&run_id, "failed", Some("step_failed")).await;
-
-        assert!(
-            server.requests.try_recv().is_err(),
-            "oversized Authorization header must fail before opening provider TLS connection"
-        );
-        let req_states: Vec<String> = sqlx::query_scalar(
-            "SELECT state FROM openmettle.gateway_requests WHERE run_id = $1::uuid",
-        )
-        .bind(&run_id)
-        .fetch_all(&mut owner)
-        .await
-        .unwrap();
-        assert_eq!(req_states, vec!["released".to_owned()]);
-
-        let committed_holds: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM openmettle.quota_reservations
-              WHERE run_id = $1::uuid AND state = 'handoff_committed'",
-        )
-        .bind(&run_id)
-        .fetch_one(&mut owner)
-        .await
-        .unwrap();
-        assert_eq!(committed_holds, 0);
-
-        let parent_holds: Vec<(String, String, i64)> = sqlx::query_as(
-            "SELECT resource_kind, state, held_units
-               FROM openmettle.quota_reservations
-              WHERE run_id = $1::uuid AND gateway_request_id IS NULL
-              ORDER BY resource_kind ASC",
-        )
-        .bind(&run_id)
-        .fetch_all(&mut owner)
-        .await
-        .unwrap();
-        assert_eq!(
-            parent_holds,
-            vec![
-                ("usage_cost_micros".to_owned(), "released".to_owned(), 0),
-                ("usage_tokens".to_owned(), "released".to_owned(), 0),
-            ]
-        );
-
-        let usage_totals: (i64, i64) = sqlx::query_as(
-            "SELECT coalesce(sum(reserved_held), 0)::bigint,
-                    coalesce(sum(active_used), 0)::bigint
-               FROM openmettle.quota_budgets
-              WHERE resource_kind IN ('usage_tokens', 'usage_cost_micros')",
-        )
-        .fetch_one(&mut owner)
-        .await
-        .unwrap();
-        assert_eq!(usage_totals, (0, 0));
-
-        let drift: (i64, i64, i64, i64) = sqlx::query_as(
-            "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
-               FROM openmettle.quota_verify_accounting_drift()",
-        )
-        .fetch_one(&mut worker(&chat.f.db).await)
-        .await
-        .unwrap();
-        assert_eq!(drift, (0, 0, 0, 0));
-    }
-
-    #[tokio::test]
-    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
     async fn deadline_and_mid_stream_cancel_close_inference_without_answers() {
         for cancel in [true, false] {
             let chat = Chat::new().await;
@@ -4813,12 +4796,12 @@ mod live_turns {
         // packaged binary, or the library test fixture with its loopback resolver.
         let worker_dir = Dir::new();
         let (mut provider, worker_proc) = if packaged {
-            let provider = Provider::packaged("metered-round-token").await;
+            let provider = Provider::packaged().await;
             let key = ("metered-k1", KEY_BYTES);
             let worker = packaged_worker(&db, &worker_dir, &catalog, &provider, INSTALL, key, &[]);
             (provider, worker.process)
         } else {
-            let provider = Provider::with_bearer("metered-round-token".into()).await;
+            let provider = Provider::new().await;
             let mut child = Command::new(worker_binary())
                 .env("OPENMETTLE_TEST_TURN_WORKER", "1")
                 .args([
@@ -4855,13 +4838,16 @@ mod live_turns {
             (provider, Process(child))
         };
 
-        // Round 1 reaches TLS provider with decrypted gateway bearer AND x-request-id header;
-        // feed the peer-observed x-request-id directly into settlement::ingest (proving real wire correlation).
+        // Round 1 reaches TLS provider with its own bearer AND x-request-id
+        // header; feed the peer-observed x-request-id directly into settlement::ingest (proving
+        // real wire correlation).
         let req = provider.request().await;
         let req_id = req
             .request_id
             .clone()
             .expect("metered send must attach x-request-id header");
+        let req_bearer = req.bearer.clone();
+        assert!(is_round_bearer(&db, &req_id, &req_bearer).await);
         let (child_cost, parent_rem): (i64, i64) = sqlx::query_as(
             "SELECT (SELECT reserved_units FROM openmettle.quota_reservations
                       WHERE gateway_request_id = $1::uuid AND resource_kind = 'usage_cost_micros'),
@@ -4886,9 +4872,9 @@ mod live_turns {
             &UsageReport {
                 request: req_id.clone(),
                 installation: INSTALL.into(),
-                principal: PRINCIPAL.into(),
+                principal: alice.user.clone(),
                 scope: scope.clone(),
-                source: report_source,
+                source: INSTALL.into(),
                 report_id,
                 revision: 0,
                 r#final: true,
@@ -4989,7 +4975,7 @@ mod live_turns {
             // The worker may hold the second run's round in flight; SIGTERM hands it back.
             let (status, stderr) = terminate(worker_proc).await;
             assert!(status.success(), "{stderr}");
-            assert!(!stderr.contains("metered-round-token"), "{stderr}");
+            assert!(!stderr.contains(&req_bearer), "{stderr}");
             assert!(!stderr.contains(&provider.host), "{stderr}");
         }
     }
@@ -5240,7 +5226,7 @@ mod live_turns {
         );
         let run_id = admitted["run_id"].as_str().unwrap().to_owned();
 
-        let mut provider = Provider::with_bearer("token-only-round-bearer".into()).await;
+        let mut provider = Provider::new().await;
         let mut child = Command::new(worker_binary())
             .env("OPENMETTLE_TEST_TURN_WORKER", "1")
             .args([
@@ -5301,9 +5287,9 @@ mod live_turns {
                 &UsageReport {
                     request: req_id,
                     installation: INSTALL.into(),
-                    principal: PRINCIPAL.into(),
+                    principal: alice.user.clone(),
                     scope: scope.clone(),
-                    source: report_source,
+                    source: INSTALL.into(),
                     report_id,
                     revision: 0,
                     r#final: true,
@@ -5491,18 +5477,63 @@ mod live_turns {
     #[tokio::test]
     #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
     async fn refused_handoff_immediately_releases_unsent_round_hold() {
-        use openmettle_core::quotas::{self, RunBudgetReservation};
-        use sqlx::postgres::PgPoolOptions;
-
-        let chat = Chat::new().await;
-        let _ = chat.ensure_metered_gateway().await;
-        // Suspend the binding so reserve_turn_round allocates Round 1 child hold cleanly, then
+        // The worker rechecks the run's capabilities itself before it reserves a round, so a
+        // capability denied beforehand would stop it there. Deny it as the round's request is
+        // inserted instead: reserve_turn_round allocates the Round 1 child hold cleanly, then
         // pending.handoff returns Refused and must release the unsent round hold immediately.
-        let g_pool = PgPoolOptions::new()
-            .max_connections(2)
-            .connect_lazy_with(chat.f.db.1.options(pg::GATEWAY));
-        sqlx::query("UPDATE openmettle.gateway_bindings SET state = 'suspended'")
-            .execute(&g_pool)
+        refused_round(
+            r#"CREATE FUNCTION openmettle.test_deny_on_reserve()
+               RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+               BEGIN
+                   INSERT INTO openmettle.user_capability_denies
+                       (user_id, capability, denied, updated_by_user_id)
+                   VALUES (NEW.actor_user_id, 'fixture.round', true, NEW.actor_user_id);
+                   RETURN NULL;
+               END;
+               $$;
+               CREATE TRIGGER test_deny_on_reserve_trg
+                   AFTER INSERT ON openmettle.gateway_requests
+                   FOR EACH ROW EXECUTE FUNCTION openmettle.test_deny_on_reserve();"#,
+        )
+        .await;
+    }
+
+    /// The handoff transaction ends by reading the round's authority again, after everything
+    /// in it that can wait. Here the approval expires inside that transaction, once the round
+    /// is marked handed off: the handoff must not commit, and the worker releases the round.
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn authority_lost_inside_the_handoff_transaction_is_not_committed() {
+        refused_round(
+            r#"CREATE FUNCTION openmettle.test_expire_on_handoff()
+               RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+               BEGIN
+                   UPDATE openmettle.local_identity_approvals SET expires_ms = 1
+                    WHERE id = NEW.approval_id;
+                   RETURN NULL;
+               END;
+               $$;
+               CREATE TRIGGER test_expire_on_handoff_trg
+                   AFTER UPDATE OF state ON openmettle.gateway_requests
+                   FOR EACH ROW WHEN (NEW.state = 'handed_off')
+                   EXECUTE FUNCTION openmettle.test_expire_on_handoff();"#,
+        )
+        .await;
+    }
+
+    /// A metered round of a model that requires one capability, with the test trigger
+    /// `trigger` installed. The round is reserved, its handoff is refused, and the worker
+    /// releases the unsent round at once and fails the run without reaching the gateway.
+    async fn refused_round(trigger: &'static str) {
+        use openmettle_core::quotas::{self, RunBudgetReservation};
+
+        let mut chat = Chat::new().await;
+        chat.catalog["models"]["a"]["required_capabilities"] =
+            json!({"fixture.round": "on_by_default"});
+        let _ = chat.ensure_metered_gateway().await;
+        connect(&chat.f.db.0, OWNER)
+            .await
+            .execute(trigger)
             .await
             .unwrap();
 
@@ -5796,7 +5827,7 @@ mod live_turns {
         assert_eq!(refused_body["quota"]["scope_kind"], "personal");
 
         // Start real TurnExecutor worker with tools enabled (2 rounds) against TLS Provider.
-        let mut provider = Provider::with_bearer("lowered-limit-bearer".into()).await;
+        let mut provider = Provider::new().await;
         let mut child = Command::new(worker_binary())
             .env("OPENMETTLE_TEST_TURN_WORKER", "1")
             .args([
@@ -5861,9 +5892,9 @@ mod live_turns {
                 &UsageReport {
                     request: req1_id,
                     installation: INSTALL.into(),
-                    principal: PRINCIPAL.into(),
+                    principal: alice.user.clone(),
                     scope: scope.clone(),
-                    source: report_source.clone(),
+                    source: INSTALL.into(),
                     report_id: report1,
                     revision: 0,
                     r#final: true,
@@ -5898,9 +5929,9 @@ mod live_turns {
                 &UsageReport {
                     request: req2_id,
                     installation: INSTALL.into(),
-                    principal: PRINCIPAL.into(),
+                    principal: alice.user.clone(),
                     scope: scope.clone(),
-                    source: report_source.clone(),
+                    source: INSTALL.into(),
                     report_id: report2,
                     revision: 0,
                     r#final: true,

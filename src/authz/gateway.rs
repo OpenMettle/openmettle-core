@@ -1,4 +1,6 @@
-//! Gateway reservation, credential handoff and reconciliation store (ADR 0037).
+//! Gateway reservation, handoff and settlement store (ADRs 0037 and 0044). A run round is handed
+//! off without a gateway binding, under a per-round bearer of which the database holds a hash.
+//! The ADR 0037 provisioning and sealed-key code here has no caller and awaits removal.
 use crate::{
     provider_keys::gateway::{Context, Envelope, GatewayKeys},
     runs::WriteTransaction,
@@ -270,15 +272,17 @@ impl TurnPending {
     /// to `prepared`'s originating [`crate::provider_http::inference::Gateway`]. Any pre-commit or
     /// deferred OMQ04 failure rolls back `gateway_requests` to `'reserved'` so `release()` can
     /// immediately unwind the round.
+    ///
+    /// The round is authorized without a gateway binding, and the dispatch carries a bearer
+    /// credential made for this handoff, independent of the dispatch secret (ADR 0044).
     pub async fn handoff<'a>(
         &self,
         pool: &PgPool,
-        keys: &GatewayKeys,
         device_grant_id: Option<&str>,
         billable: &crate::provider_http::BillableInferenceRef<'_>,
         prepared: crate::provider_http::inference::PreparedRequest<'a>,
     ) -> Result<TurnDispatch<'a>, Error> {
-        self.handoff_turn(pool, keys, device_grant_id, billable, prepared)
+        self.handoff_turn(pool, device_grant_id, billable, prepared)
             .await
             .map_err(|err| match err.0 {
                 TurnHandoffError::MissingHold => Error::Refused,
@@ -289,7 +293,6 @@ impl TurnPending {
     pub(crate) async fn handoff_turn<'a>(
         &self,
         pool: &PgPool,
-        keys: &GatewayKeys,
         device_grant_id: Option<&str>,
         billable: &crate::provider_http::BillableInferenceRef<'_>,
         prepared: crate::provider_http::inference::PreparedRequest<'a>,
@@ -301,7 +304,7 @@ impl TurnPending {
         )>,
     > {
         match self
-            .handoff_turn_inner(pool, keys, device_grant_id, billable, &prepared)
+            .handoff_turn_inner(pool, device_grant_id, billable, &prepared)
             .await
         {
             Ok(dispatch) => Ok(TurnDispatch::new(dispatch, prepared)),
@@ -312,7 +315,6 @@ impl TurnPending {
     async fn handoff_turn_inner(
         &self,
         pool: &PgPool,
-        keys: &GatewayKeys,
         device_grant_id: Option<&str>,
         billable: &crate::provider_http::BillableInferenceRef<'_>,
         prepared: &crate::provider_http::inference::PreparedRequest<'_>,
@@ -354,7 +356,7 @@ impl TurnPending {
                 },
             ));
         }
-        let dispatch = match pending.handoff_in(&mut tx, keys).await {
+        let dispatch = match self.authorize_in(&mut tx).await {
             Ok(dispatch) => dispatch,
             Err(err) => {
                 let _ = tx.rollback().await;
@@ -392,18 +394,47 @@ impl TurnPending {
                 },
             ));
         }
+        // A deferred `OMQ04` means a hold the round needs is missing. It is retryable when
+        // enforcement or the first cost limit activated after the round was reserved.
+        let missing_hold = || {
+            let retryable = (!self.enforced_at_bind
+                || (!self.cost_bound_at_bind && self.round_cost.is_some()))
+                && (!self.requires_device_slot || device_grant_id.is_some());
+            if retryable {
+                TurnHandoffError::MissingHold
+            } else {
+                TurnHandoffError::Other(Error::Refused)
+            }
+        };
+        // The last statement: it runs the deferred handoff checks, which can wait on quota
+        // locks, and then reads the authority again on a new clock reading. Nothing that can
+        // wait on a lock follows it, so no approval, lease or membership observation that
+        // lapsed during a wait is committed (`openmettle.gateway_handoff_round_confirm`).
+        let confirmed =
+            sqlx::query("SELECT openmettle.gateway_handoff_round_confirm($1::uuid,$2,$3::uuid)")
+                .bind(&pending.id)
+                .bind(pending.secret.as_slice())
+                .bind(&self.claim_token)
+                .execute(
+                    tx.connection()
+                        .map_err(|err| TurnHandoffError::Other(Error::from(err)))?,
+                )
+                .await;
+        if let Err(err) = confirmed {
+            let _ = tx.rollback().await;
+            return Err(
+                match err.as_database_error().and_then(|e| e.code()).as_deref() {
+                    Some("OMQ04") => missing_hold(),
+                    Some("42501") => TurnHandoffError::Other(Error::Refused),
+                    _ => TurnHandoffError::Other(Error::from(err)),
+                },
+            );
+        }
         if let Err(err) = tx.commit().await {
             if let crate::runs::Error::Database(ref db) = err
                 && db.as_database_error().and_then(|e| e.code()).as_deref() == Some("OMQ04")
             {
-                let retryable_missing_hold = (!self.enforced_at_bind
-                    || (!self.cost_bound_at_bind && self.round_cost.is_some()))
-                    && (!self.requires_device_slot || device_grant_id.is_some());
-                return Err(if retryable_missing_hold {
-                    TurnHandoffError::MissingHold
-                } else {
-                    TurnHandoffError::Other(Error::Refused)
-                });
+                return Err(missing_hold());
             }
             let mut recovery = WriteTransaction::begin_bounded_pool(pool, false)
                 .await
@@ -419,6 +450,48 @@ impl TurnPending {
             return Err(TurnHandoffError::Other(Error::Database));
         }
         Ok(dispatch)
+    }
+
+    /// Recheck the round's authorization without a gateway binding and mark it handed off
+    /// (`openmettle.gateway_handoff_round`, ADR 0044). The transaction must end with
+    /// `openmettle.gateway_handoff_round_confirm`.
+    ///
+    /// The bearer the worker presents to the proxy is a new random value, independent of the
+    /// dispatch secret. Only its SHA-256 is sent to the database, which stores it for the proxy
+    /// to compare. The bearer itself is kept in the returned [`Dispatch`], is sent to the proxy
+    /// over HTTP, and never crosses a database connection. The dispatch secret stays this
+    /// caller's proof to the database and is never sent over HTTP.
+    async fn authorize_in(&self, tx: &mut WriteTransaction<'_>) -> Result<Dispatch, Error> {
+        let mut bearer = [0; 32];
+        SystemRandom::new()
+            .fill(&mut bearer)
+            .map_err(|_| Error::Protection)?;
+        // `id` is caller-visible; dispatch the database-canonical spelling so the wire
+        // `x-request-id` always correlates with the stored request.
+        let id: String = sqlx::query_scalar(
+            "SELECT $1::uuid::text \
+              WHERE openmettle.gateway_handoff_round($1::uuid,$2,$3::uuid,$4)",
+        )
+        .bind(&self.id)
+        .bind(self.secret.as_slice())
+        .bind(&self.claim_token)
+        .bind(Sha256::digest(bearer).as_slice())
+        .fetch_optional(tx.connection()?)
+        .await?
+        .ok_or(Error::Refused)?;
+        let mut authorization = hyper::header::HeaderValue::try_from(format!(
+            "Bearer {}",
+            URL_SAFE_NO_PAD.encode(bearer)
+        ))
+        .map_err(|_| Error::Protection)?;
+        authorization.set_sensitive(true);
+        Ok(Dispatch {
+            id,
+            installation: self.installation.clone(),
+            model: self.model.clone(),
+            server: true,
+            authorization,
+        })
     }
 }
 

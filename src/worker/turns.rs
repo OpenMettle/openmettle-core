@@ -524,7 +524,6 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                         match pending
                             .handoff_turn(
                                 &self.pool,
-                                &metered.keys,
                                 metered.device_grant_id.as_deref(),
                                 &billable,
                                 prepared,

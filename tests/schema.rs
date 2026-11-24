@@ -690,6 +690,24 @@ const ADDITIVE_COLUMNS: &[AdditiveColumn] = &[
         column: "retention_policy_revision",
         default: ColumnDefault::Null,
     },
+    AdditiveColumn {
+        since: 29,
+        table: "gateway_requests",
+        column: "dispatched_at",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 29,
+        table: "gateway_requests",
+        column: "bearer_hash",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 29,
+        table: "gateway_requests",
+        column: "claim_hash",
+        default: ColumnDefault::Null,
+    },
 ];
 
 /// Single declarative registry of every table added after migration 14, ordered by `since`
@@ -1096,6 +1114,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "dad89ccf522802b8c572ec8947fdfede32e569a5e26004ecb593edf50c96711f",
         "f420dac4231768d9eab1c1e1d21f156864c98af88335380ee1de392f7ba7e6d0",
         "feda63e3c2ed89d787e6e5a978a15208068598085fe8de52a8620b583c5789a6",
+        "4aadf4df1c8594c81aaa0d3af5fd0bf8bc636f698fd966b489a45df2ce805ccc",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
@@ -2817,6 +2836,9 @@ mod gateway;
 
 #[path = "schema/gateway_proxy.rs"]
 mod gateway_proxy;
+
+#[path = "schema/gateway_rounds.rs"]
+mod gateway_rounds;
 
 #[path = "support/sglang_recorded.rs"]
 mod sglang_recorded;

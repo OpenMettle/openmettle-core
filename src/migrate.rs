@@ -166,6 +166,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "retention purge journal",
         sql: include_str!("../migrations/0028_retention_purge_journal.sql"),
     },
+    Source {
+        version: 29,
+        description: "gateway binding free authorization and dispatch",
+        sql: include_str!("../migrations/0029_gateway_binding_free_authorization_and_dispatch.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

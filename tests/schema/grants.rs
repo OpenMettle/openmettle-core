@@ -390,6 +390,9 @@ async fn gateway_usage_and_settlement_column_grants() {
         ("gateway_settlements", "final", true, true),
         ("gateway_settlements", "updated_at", false, false),
         ("gateway_requests", "settled_final", false, false),
+        ("gateway_requests", "dispatched_at", false, false),
+        ("gateway_requests", "bearer_hash", false, false),
+        ("gateway_requests", "claim_hash", false, false),
     ] {
         for role in [pg::GATEWAY, API, WORKER, ISSUANCE, "public"] {
             let writes: (bool, bool) = sqlx::query_as(
