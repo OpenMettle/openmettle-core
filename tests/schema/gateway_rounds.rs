@@ -2905,18 +2905,83 @@ async fn migration_32_cleans_unaccepted_rev0_and_reserves_unbound_rev0_to_owner(
     let mut f = Rounds::at(31).await;
     let plain = quotas::snapshot(100);
     let historical_rev0 = f.round(&plain).await;
+    let historical_partial_final = f.round(&plain).await;
     let dangling_undisp = f.round(&plain).await;
     let dangling_unrep = f.round(&plain).await;
-    for r in [&historical_rev0, &dangling_undisp, &dangling_unrep] {
+    for r in [
+        &historical_rev0,
+        &historical_partial_final,
+        &dangling_undisp,
+        &dangling_unrep,
+    ] {
         f.authorized(r, "a live run round").await;
     }
     assert_eq!(f.dispatch(&historical_rev0).await, [f.routed()]);
+    assert_eq!(f.dispatch(&historical_partial_final).await, [f.routed()]);
     assert_eq!(f.dispatch(&dangling_unrep).await, [f.routed()]);
     for sql in SETTLED {
         f.owner_exec(sql, &historical_rev0.request).await;
     }
-    // Simulate a gateway writer that left unaccepted raw revision-0 rows under schema 31.
+    let historical_rev0_report_id: String = sqlx::query_scalar(
+        "SELECT report_id::text FROM openmettle.gateway_usage_reports
+          WHERE request_id=$1::uuid AND revision=0",
+    )
+    .bind(&historical_rev0.request)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+
+    // Schema 31 accepted a single-count final correction at revision 2 after revision 1 had
+    // already closed the fold. Seed that schema-31 state as `openmettle_gateway` so migration 32
+    // upgrades across it, then verify exact replay of revision 2 AND a subsequent complete
+    // revision-3 correction under the new binary.
     let mut gw = connect(&f.db.0, pg::GATEWAY).await;
+    let gateway_v31 = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(f.db.1.options(pg::GATEWAY));
+    assert_eq!(
+        settlement::ingest(
+            &gateway_v31,
+            &report_of(&f, &historical_partial_final, Some((10, 5)))
+        )
+        .await,
+        Ok(Outcome::Applied)
+    );
+    let mut partial_rev2 = report_of(&f, &historical_partial_final, None);
+    partial_rev2.revision = 2;
+    partial_rev2.prompt_tokens = Some(12);
+    partial_rev2.completion_tokens = None;
+    {
+        let mut tx = gw.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,prompt_tokens)
+             VALUES ($1::uuid,$2::uuid,$1::uuid,2,true,12)",
+        )
+        .bind(&historical_partial_final.request)
+        .bind(INSTALL)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.gateway_settlements
+                SET revision=2,final=true,measured=12,outstanding=0
+              WHERE request_id=$1::uuid",
+        )
+        .bind(&historical_partial_final.request)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("SELECT openmettle.quota_settle_gateway_usage($1::uuid,$2::uuid,$1::uuid,2)")
+            .bind(&historical_partial_final.request)
+            .bind(INSTALL)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    // Simulate a gateway writer that left unaccepted raw revision-0 rows under schema 31.
     for r in [&dangling_undisp, &dangling_unrep] {
         sqlx::query(
             "INSERT INTO openmettle.gateway_usage_reports
@@ -2979,10 +3044,61 @@ async fn migration_32_cleans_unaccepted_rev0_and_reserves_unbound_rev0_to_owner(
     );
 
     // 2. Unmetered bare/single-count final correction after `unreported` is refused by both
-    //    `settlement::ingest` and direct SQL.
+    //    `settlement::ingest` and direct SQL, while exact replays of historical schema <= 31
+    //    revision-0 and single-count final reports return `Duplicate` and a subsequent complete
+    //    revision-3 correction succeeds.
     let gateway = PgPoolOptions::new()
         .max_connections(2)
         .connect_lazy_with(f.db.1.options(pg::GATEWAY));
+    let exact_rev0 = UsageReport {
+        report_id: historical_rev0_report_id,
+        revision: 0,
+        ..report_of(&f, &historical_rev0, Some((1, 1)))
+    };
+    assert_eq!(
+        settlement::ingest(&gateway, &exact_rev0).await,
+        Ok(Outcome::Duplicate)
+    );
+    assert_eq!(
+        settlement::ingest(
+            &gateway,
+            &UsageReport {
+                prompt_tokens: Some(9),
+                ..exact_rev0.clone()
+            }
+        )
+        .await,
+        Err(StoreError::Conflict)
+    );
+    assert_eq!(
+        settlement::ingest(&gateway, &partial_rev2).await,
+        Ok(Outcome::Duplicate)
+    );
+    let complete_rev3 = UsageReport {
+        revision: 3,
+        ..report_of(&f, &historical_partial_final, Some((12, 6)))
+    };
+    assert_eq!(
+        settlement::ingest(&gateway, &complete_rev3).await,
+        Ok(Outcome::Applied)
+    );
+    assert_eq!(
+        settlement::ingest(&gateway, &partial_rev2).await,
+        Ok(Outcome::Duplicate)
+    );
+    assert_eq!(
+        settlement::ingest(
+            &gateway,
+            &UsageReport {
+                revision: 4,
+                prompt_tokens: Some(15),
+                completion_tokens: None,
+                ..report_of(&f, &historical_partial_final, None)
+            }
+        )
+        .await,
+        Err(StoreError::Refused)
+    );
     for (prompt, completion) in [(None, None), (Some(5), None), (None, Some(3))] {
         let mut r = report_of(&f, &dangling_unrep, None);
         r.prompt_tokens = prompt;

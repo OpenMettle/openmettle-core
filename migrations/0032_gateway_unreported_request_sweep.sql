@@ -9,6 +9,14 @@
 -- its quota holds through the existing settlement and fold mechanics, keeping `state =
 -- 'handed_off'`. Revision 1 remains open for a late proxy report to supersede `unreported`.
 
+-- Acquire the writer-excluding table locks in runtime lock order (`gateway_requests` ->
+-- `gateway_usage_reports` -> `gateway_settlements`) before the upgrade preflight and cleanup so no
+-- concurrent schema-31 writer can hold an uncommitted revision-0 row past `DELETE` and commit it
+-- before the new constraint and trigger take effect.
+LOCK TABLE openmettle.gateway_requests IN SHARE MODE;
+LOCK TABLE openmettle.gateway_usage_reports IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE openmettle.gateway_settlements IN SHARE MODE;
+
 -- Fail closed on upgrade if an unsettled unbound request already has an accepted revision-0
 -- report or revision-0 settlement; historical schema 29–30 requests that already settled at
 -- revision 0 (`settled_final = true`) stay intact.
@@ -99,12 +107,12 @@ CREATE TRIGGER gateway_usage_reports_sweep_only_guard
 --     never receive a proxy report).
 --   * Every other incomplete reason (the 12 proxy reasons and `unreported`) requires a
 --     dispatched request without a binding.
---   * On an unbound request, every accepted final report must carry either an incomplete
---     reason or both prompt and completion counts (so a bare or partial final report cannot
---     replace `unreported`), every quota hold must have folded `latest.revision`
---     (`accepted_source_revision = latest.revision`), `latest.outstanding` must be 0,
---     `quota_gateway_fold` must end `settled`, and its token hold (and any cost hold when any
---     accepted report carries a reason) must be `settled`.
+--   * On an unbound request, each newly accepted final report must carry either an incomplete
+--     reason or both prompt and completion counts (preserving historical schema <= 31 rows while
+--     preventing a bare or partial final report from replacing `unreported`), every quota hold
+--     must have folded `latest.revision` (`accepted_source_revision = latest.revision`),
+--     `latest.outstanding` must be 0, `quota_gateway_fold` must end `settled`, and its token hold
+--     (and any cost hold when any accepted report carries a reason) must be `settled`.
 -- Signature, security and privileges are unchanged.
 CREATE OR REPLACE FUNCTION openmettle.enforce_gateway_final_settlement_closes() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
@@ -142,13 +150,14 @@ BEGIN
             USING ERRCODE='23514';
     END IF;
     IF req.binding_id IS NOT NULL THEN RETURN NULL; END IF;
-    IF EXISTS (
-        SELECT FROM openmettle.quota_accepted_gateway_reports a
-          JOIN openmettle.gateway_usage_reports g USING (request_id,revision,final)
-         WHERE a.request_id=latest.request_id AND a.final
-           AND g.incomplete IS NULL
-           AND (g.prompt_tokens IS NULL OR g.completion_tokens IS NULL)
-    ) THEN
+    IF (TG_OP='INSERT' OR (NEW.revision,NEW.final) IS DISTINCT FROM (OLD.revision,OLD.final))
+       AND EXISTS (
+           SELECT FROM openmettle.quota_accepted_gateway_reports a
+             JOIN openmettle.gateway_usage_reports g USING (request_id,revision,final)
+            WHERE a.request_id=NEW.request_id AND a.revision=NEW.revision AND a.final
+              AND g.incomplete IS NULL
+              AND (g.prompt_tokens IS NULL OR g.completion_tokens IS NULL)
+       ) THEN
         RAISE EXCEPTION 'a final settlement must close its request' USING ERRCODE='23514';
     END IF;
     SELECT f.state INTO folded

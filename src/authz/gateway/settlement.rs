@@ -132,6 +132,52 @@ impl TokenFold {
     }
 }
 
+async fn is_accepted_report(
+    c: &mut PgConnection,
+    request: &str,
+    source: &str,
+    report_id: &str,
+    revision: i64,
+) -> Result<bool, Error> {
+    // The gateway login can replay accepted reports (and repair interrupted quota consumption)
+    // through `quota_settle_gateway_usage`, which fails with `'unknown accepted report'` for a
+    // superseded or unaccepted raw report without exposing `quota_accepted_gateway_reports`.
+    sqlx::query("SAVEPOINT accepted_report")
+        .execute(&mut *c)
+        .await?;
+    let check =
+        sqlx::query("SELECT openmettle.quota_settle_gateway_usage($1::uuid,$2::uuid,$3::uuid,$4)")
+            .bind(request)
+            .bind(source)
+            .bind(report_id)
+            .bind(revision)
+            .execute(&mut *c)
+            .await;
+    match check {
+        Ok(_) => {
+            sqlx::query("RELEASE SAVEPOINT accepted_report")
+                .execute(&mut *c)
+                .await?;
+            Ok(true)
+        }
+        Err(error) => {
+            if !error
+                .as_database_error()
+                .is_some_and(|e| e.is_check_violation() && e.message() == "unknown accepted report")
+            {
+                return Err(error.into());
+            }
+            sqlx::query("ROLLBACK TO SAVEPOINT accepted_report")
+                .execute(&mut *c)
+                .await?;
+            sqlx::query("RELEASE SAVEPOINT accepted_report")
+                .execute(&mut *c)
+                .await?;
+            Ok(false)
+        }
+    }
+}
+
 /// The units still outstanding for a request without a metered hold, and whether the accepted
 /// reports closed it.
 async fn legacy_outstanding(
@@ -149,38 +195,17 @@ async fn legacy_outstanding(
         let count = rows.len();
         for row in rows {
             after = row.try_get("revision")?;
-            if after != r.revision {
-                // The gateway login can replay accepted reports but cannot read the
-                // private acceptance ledger. A superseded raw report fails this check.
-                sqlx::query("SAVEPOINT accepted_report")
-                    .execute(&mut *c)
-                    .await?;
-                let check = sqlx::query(
-                    "SELECT openmettle.quota_settle_gateway_usage($1::uuid,$2::uuid,$3::uuid,$4)",
+            if after != r.revision
+                && !is_accepted_report(
+                    c,
+                    &r.request,
+                    &r.source,
+                    row.try_get::<&str, _>("report_id")?,
+                    after,
                 )
-                .bind(&r.request)
-                .bind(&r.source)
-                .bind(row.try_get::<&str, _>("report_id")?)
-                .bind(after)
-                .execute(&mut *c)
-                .await;
-                if let Err(error) = check {
-                    if !error.as_database_error().is_some_and(|e| {
-                        e.is_check_violation() && e.message() == "unknown accepted report"
-                    }) {
-                        return Err(error.into());
-                    }
-                    sqlx::query("ROLLBACK TO SAVEPOINT accepted_report")
-                        .execute(&mut *c)
-                        .await?;
-                    sqlx::query("RELEASE SAVEPOINT accepted_report")
-                        .execute(&mut *c)
-                        .await?;
-                    continue;
-                }
-                sqlx::query("RELEASE SAVEPOINT accepted_report")
-                    .execute(&mut *c)
-                    .await?;
+                .await?
+            {
+                continue;
             }
             fold.observe(&row)?;
         }
@@ -262,42 +287,68 @@ async fn store(pool: &PgPool, r: &UsageReport, incomplete: Option<&str>) -> Resu
     if incomplete.is_some() && !unbound {
         return Err(Error::Refused);
     }
-    // Revision 0 on unbound requests is reserved to the worker sweep (ADR 0044, migration 32).
-    if unbound && r.revision == 0 {
-        return Err(Error::Refused);
-    }
-    let inserted = evidence(INSERT_REPORT, r, incomplete)
-        .execute(&mut *c)
-        .await
-        .map_err(|e| {
-            if e.as_database_error()
-                .is_some_and(|d| d.is_check_violation())
-            {
-                Error::Refused
-            } else {
-                e.into()
-            }
-        })?
-        .rows_affected();
-    if inserted == 0
-        && !evidence(EXACT_REPORT, r, incomplete)
+    // Recognize an exact replay of a previously accepted historical report (for example, a
+    // schema 29–30 unbound revision-0 report or a schema 31 single-count final correction) under
+    // the request lock before enforcing the new-write shape and revision-0 guards.
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT FROM openmettle.gateway_usage_reports
+         WHERE (source,report_id,revision)=($2::uuid,$3::uuid,$4)
+            OR (request_id,revision)=($1::uuid,$4))",
+    )
+    .bind(&r.request)
+    .bind(&r.source)
+    .bind(&r.report_id)
+    .bind(r.revision)
+    .fetch_one(&mut *c)
+    .await?;
+    let reject_unbound_shape = unbound
+        && (r.revision == 0
+            || (r.r#final
+                && incomplete.is_none()
+                && (r.prompt_tokens.is_none() || r.completion_tokens.is_none())));
+    let inserted = if exists {
+        if !evidence(EXACT_REPORT, r, incomplete)
             .fetch_one(&mut *c)
             .await?
             .try_get::<bool, _>(0)?
-    {
-        return Err(Error::Conflict);
-    }
-    // Every final report on an unbound request must carry either an incomplete reason or both
-    // prompt and completion counts, so a bare or partial final report cannot overwrite an earlier
-    // revision-0 `unreported` settlement. Checked after the exact-identity conflict test so a
-    // mismatched payload at an existing revision still reports `Conflict`.
-    if unbound
-        && r.r#final
-        && incomplete.is_none()
-        && (r.prompt_tokens.is_none() || r.completion_tokens.is_none())
-    {
-        return Err(Error::Refused);
-    }
+        {
+            return Err(Error::Conflict);
+        }
+        if is_accepted_report(c, &r.request, &r.source, &r.report_id, r.revision).await? {
+            tx.commit().await?;
+            return Ok(Outcome::Duplicate);
+        }
+        if reject_unbound_shape {
+            return Err(Error::Refused);
+        }
+        0
+    } else {
+        if reject_unbound_shape {
+            return Err(Error::Refused);
+        }
+        let rows = evidence(INSERT_REPORT, r, incomplete)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| {
+                if e.as_database_error()
+                    .is_some_and(|d| d.is_check_violation())
+                {
+                    Error::Refused
+                } else {
+                    e.into()
+                }
+            })?
+            .rows_affected();
+        if rows == 0
+            && !evidence(EXACT_REPORT, r, incomplete)
+                .fetch_one(&mut *c)
+                .await?
+                .try_get::<bool, _>(0)?
+        {
+            return Err(Error::Conflict);
+        }
+        rows
+    };
     let previous_revision = row.try_get::<Option<i64>, _>("revision")?;
     let outcome = if previous_revision == Some(r.revision) {
         // Repair a previous writer's accepted report whose quota consumption was interrupted.
