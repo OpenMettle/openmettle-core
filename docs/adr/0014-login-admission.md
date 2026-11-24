@@ -1,6 +1,6 @@
 # 0014 — Outstanding login admission
 
-Status: coordinator-agreed V1-04 implementation contract, 17 November 2026.
+Status: accepted with its implementation; V1-04 implementation contract, 17 November 2026.
 Refs #5; Refs #34. Independent review and CI acceptance are separate gates. #5 remains open.
 
 ## Problem

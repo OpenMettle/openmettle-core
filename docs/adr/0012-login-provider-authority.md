@@ -1,6 +1,6 @@
 # 0012 — Durable login provider authority
 
-Status: coordinator-approved V1-04 implementation contract, 17 November 2026.
+Status: accepted with its implementation; V1-04 implementation contract, 17 November 2026.
 Refs #5; Refs #34. Independent review remains required. #5 remains open.
 Supersedes only ADR 0011's process-local registration-serial binding and its
 "identical re-registration clears keys" behaviour. Every other ADR 0011 rule stands.

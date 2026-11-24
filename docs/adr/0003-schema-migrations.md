@@ -1,6 +1,6 @@
 # 0003 — Schema ownership, migrations and bounded database roles
 
-Status: implementation decision for review, 17 November 2026. Implements the first increment of V1-02 (#3); follows ADR 0002 and architecture v1. V1-02 remains open. ADR 0004 extends this first increment with run/event/operation persistence; admission, grants, artifacts and reservations remain outstanding.
+Status: accepted with its implementation, 17 November 2026. Implements the first increment of V1-02 (#3); follows ADR 0002 and architecture v1. V1-02 remains open. ADR 0004 extends this first increment with run/event/operation persistence; admission, grants, artifacts and reservations remain outstanding.
 
 ## Decision
 

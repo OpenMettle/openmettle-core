@@ -1,6 +1,6 @@
 # 0033 — Worker leases, deadlines, fencing and restart recovery
 
-Status: proposed V1-11 design (PR1), 20 November 2026. Agent-authored; owner approval,
+Status: accepted with its implementation; V1-11 design (PR1), 20 November 2026. Agent-authored; owner approval,
 independent review and CI acceptance are separate gates. Refs #11; Refs #15. PR1 recorded this
 design and a pointer from ADR 0004. Implementation status: PR2 (migration 0020 and lease store
 functions) and PR3 (worker loop and sweeps; [Delivery](#delivery-and-evidence)) are implemented

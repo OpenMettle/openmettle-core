@@ -1,6 +1,6 @@
 # 0004 — Run, event and operation persistence
 
-Status: implementation of the coordinator-agreed V1-02 persistence increment, 17 November
+Status: accepted with its implementation; V1-02 persistence increment, 17 November
 2026; independent review and qualification remain required. Related: core #3 and sprint #34.
 This does not complete #3 or enable product APIs. Follow ADR 0003 for migration and role
 provisioning. Migrations 1 and 2 are unchanged.

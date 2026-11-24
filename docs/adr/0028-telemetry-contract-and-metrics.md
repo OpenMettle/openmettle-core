@@ -1,6 +1,6 @@
 # 0028 — Telemetry contract v1 and bounded operational metrics
 
-Status: proposed V1-29 increments 3–4 of 4, 20 November 2026. Agent-authored; implements the
+Status: accepted with its implementation; V1-29 increments 3–4 of 4, 20 November 2026. Agent-authored; implements the
 V1-29 increment plan recorded on #26. Owner approval of this record, independent review and
 CI acceptance are separate gates. Refs #26; Refs #34. #26 remains open until owner acceptance.
 
@@ -53,6 +53,10 @@ by pre-allocated `AtomicU64` counters and fixed-bucket histograms (`DURATION_BUC
   OTLP data-point streams per process, expanding to at most **1,022** Prometheus series per
   process (each 11-boundary histogram stream expands to 12 `_bucket` + `_sum` + `_count` = 14
   series, excluding `target_info`), multiplied by active replica count via `service.instance.id`.
+  *Update, 24 November 2026:* the contract has since grown to 12 metrics, **412** data-point
+  streams and **1,075** Prometheus series per process. `policy.max_data_point_streams` and
+  `policy.max_prometheus_series_per_process` in `contracts/telemetry/v1.json` define the current
+  ceilings; `tests/telemetry_contract.rs` checks them against `metrics::DESCRIPTORS`.
 - Histogram snapshots derive `count` from the sum of loaded bucket counts so the OTLP
   invariant `count == sum(bucket_counts)` holds even under concurrent writers.
 - Log-line drops (`signal="log_lines"`) are counted once at the point a line is actually lost

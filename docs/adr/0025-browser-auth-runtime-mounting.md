@@ -1,6 +1,6 @@
 # 0025 — Browser sign-in runtime mounting, off by default
 
-Status: proposed V1-04 implementation contract, 19 November 2026. Agent-authored; owner
+Status: accepted with its implementation; V1-04 implementation contract, 19 November 2026. Agent-authored; owner
 approval, independent review and CI acceptance are separate gates. Refs #5; Refs #34.
 #5 remains open.
 

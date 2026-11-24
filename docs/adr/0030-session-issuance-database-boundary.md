@@ -1,9 +1,9 @@
 # 0030 — Session issuance database boundary
 
-Status: proposed AUTHSEC-01 design, 20 November 2026. Agent-authored; owner approval,
+Status: accepted with its implementation; AUTHSEC-01 design, 20 November 2026. Agent-authored; owner approval,
 independent review and CI acceptance are separate gates. Refs #73; Refs #5. Core PR2
 implements migration 18, the boundary audit, the issuance pool and its settings (see
-[Remaining](#remaining)). #73 remains open.
+[Remaining](#remaining)). #73 was closed as completed on 24 November 2026.
 
 ## Problem
 
@@ -271,6 +271,8 @@ Where PR2 provides it:
 
 ## Remaining
 
-Core PR2 is implemented: migration 18, `boundaries.sql`, the issuance pool and settings,
-tests, README and operator guides. `openmettle-deploy` still needs the Secret and the
-connection budget. #73 stays open until both land and the owner accepts.
+Nothing remains under this record. Core PR #100 (`aca5316`) merged this record. Core PR2
+(#104, `2c62e8a`) implemented migration 18, `boundaries.sql`, the issuance pool and settings,
+tests, README and operator guides. `OpenMettle/openmettle-deploy` PR #19 (`56cfcfd`) added the
+issuance Secret and connection budget (`database.issuance` values), chart tests and a four-role
+smoke check. #73 was closed as completed on 24 November 2026 after an acceptance audit.

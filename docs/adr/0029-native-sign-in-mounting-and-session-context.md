@@ -1,6 +1,6 @@
 # 0029 — Native sign-in profile, runtime mounting and session authorization context
 
-Status: proposed V1-04/V1-05 implementation contract, 20 November 2026. Agent-authored; owner
+Status: accepted with its implementation; V1-04/V1-05 implementation contract, 20 November 2026. Agent-authored; owner
 approval, independent review and CI acceptance are separate gates. Refs #5; Refs #6;
 Refs #34. #5 and #6 remain open.
 

@@ -1,6 +1,6 @@
 # 0032 — Durable run admission and fair PostgreSQL work queue
 
-Status: proposed V1-10 design (PR1) with its PR2 implementation and PR3 measurement harness,
+Status: accepted with its implementation; V1-10 design (PR1) with its PR2 implementation and PR3 measurement harness,
 20 November 2026. Agent-authored; owner approval, independent review and CI acceptance are
 separate gates. Refs #10. PR2 adds migration 19, the store functions and their PostgreSQL 18
 schema tests (see [Implementation](#implementation-pr2)); PR3 adds the

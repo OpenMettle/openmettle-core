@@ -1,6 +1,6 @@
 # 0002 — CPU process and database health runtime
 
-Status: implementation decision for review, 16 November 2026. Implements the bounded runtime portion of V1-01 (#2); follows decision 0001 and architecture v1.
+Status: accepted with its implementation, 16 November 2026. Implements the bounded runtime portion of V1-01 (#2); follows decision 0001 and architecture v1.
 
 ## Decision
 

@@ -1,6 +1,6 @@
 # 0009 — Protected browser login transactions
 
-Status: coordinator-approved development contract, 17 November 2026. V1-04 core #5;
+Status: accepted with its implementation; development contract, 17 November 2026. V1-04 core #5;
 sprint #34. Implementation and independent qualification are separate gates.
 
 [ADR 0022](0022-home-invitation-codes.md) adds a second sealed format that also carries an
