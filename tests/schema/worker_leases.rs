@@ -6593,6 +6593,53 @@ mod live_turns {
         assert_eq!(drift, (0, 0, 0, 0));
     }
 
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn parallel_repeated_calls_to_same_tool_record_distinct_observations() {
+        let mut chat = Chat::new().await.with_tools().await;
+        chat.parallel = true;
+        let mut server = Provider::new().await;
+        let _worker = chat.start(&server).await;
+        let (id, _) = chat.submit("repeated lookup", "a", 2).await;
+
+        let req1 = server.request().await;
+        settle_recorded_round(&chat, &req1, 71, 12).await;
+        req1.respond(json!({
+            "choices": [{
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"id": "call-1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}},
+                        {"id": "call-2", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+                    ]
+                }
+            }],
+            "usage": {"prompt_tokens": 71, "completion_tokens": 12}
+        }));
+
+        let req2 = server.request().await;
+        assert_eq!(outcomes(&chat, &id).await, ["succeeded", "succeeded"]);
+        let messages = req2.body["messages"].as_array().unwrap();
+        assert_eq!(
+            messages[messages.len() - 2],
+            json!({"role": "tool", "tool_call_id": "call-1", "content": "registered result"})
+        );
+        assert_eq!(
+            messages[messages.len() - 1],
+            json!({"role": "tool", "tool_call_id": "call-2", "content": "registered result"})
+        );
+
+        settle_recorded_round(&chat, &req2, 88, 4).await;
+        req2.respond(completion(
+            json!("done"),
+            None,
+            json!({"prompt_tokens": 88, "completion_tokens": 4}),
+        ));
+        chat.done(&id, "succeeded", None).await;
+    }
+
     #[path = "worker_gateway.rs"]
     mod worker_gateway;
 }

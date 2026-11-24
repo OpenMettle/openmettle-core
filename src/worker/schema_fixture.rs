@@ -193,15 +193,13 @@ impl ApprovedAdapter for Lookup {
             .fetch_one(&mut *c)
             .await
             .unwrap();
-            let (obs_key, output) = if target == r#"["v1","fixture","test","read","get_weather"]"# {
-                (format!("fixture-result:{op}"), "weather:Paris".to_owned())
+            let obs_key = format!("fixture-result:{op}");
+            let output = if target == r#"["v1","fixture","test","read","get_weather"]"# {
+                "weather:Paris".to_owned()
             } else if target == r#"["v1","fixture","test","read","get_time"]"# {
-                (format!("fixture-result:{op}"), "time:Paris".to_owned())
+                "time:Paris".to_owned()
             } else {
-                (
-                    "fixture-lookup-result".to_owned(),
-                    "registered result".to_owned(),
-                )
+                "registered result".to_owned()
             };
             leases::with_lease(&mut c, &lease, Fence::Hold, async |tx, _| {
                 record_observation(
