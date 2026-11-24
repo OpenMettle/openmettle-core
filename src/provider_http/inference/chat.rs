@@ -107,7 +107,7 @@ pub(super) fn accept(
                 "tool_calls" if !out.calls.is_empty() => {}
                 "length" => {
                     out.stop_reason = Some(StopReason::Limit);
-                    out.calls.clear();
+                    out.discard_calls();
                 }
                 "content_filter" => return Err(Error::Filtered),
                 _ => return Err(Error::Malformed),

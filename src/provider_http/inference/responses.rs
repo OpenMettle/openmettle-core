@@ -46,13 +46,22 @@ fn item_texts<'a>(item: &'a Value, key: &str, kind: &str) -> Result<Vec<&'a str>
         })
         .collect()
 }
+fn incomplete_reason(v: &Value) -> Result<Option<&str>, Error> {
+    let details = &v["incomplete_details"];
+    if details.is_null() {
+        return Ok(None);
+    }
+    if !details.is_object() {
+        return Err(Error::Malformed);
+    }
+    optional(details, "reason")
+}
 fn response_status(v: &Value) -> Result<Option<StopReason>, Error> {
+    let reason = incomplete_reason(v)?;
     match string(v, "status")? {
-        "completed" => Ok(None),
-        "incomplete" => match v
-            .pointer("/incomplete_details/reason")
-            .and_then(Value::as_str)
-        {
+        "completed" if v["incomplete_details"].is_null() => Ok(None),
+        "completed" => Err(Error::Malformed),
+        "incomplete" => match reason {
             Some("max_output_tokens") => Ok(Some(StopReason::Limit)),
             Some("content_filter") => Err(Error::Filtered),
             _ => Err(Error::Incomplete),
@@ -62,12 +71,18 @@ fn response_status(v: &Value) -> Result<Option<StopReason>, Error> {
     }
 }
 fn item_status(v: &Value, allow_limit: bool) -> Result<(), Error> {
+    let reason = incomplete_reason(v)?;
+    if v["status"].is_null() {
+        return if v["incomplete_details"].is_null() {
+            Ok(())
+        } else {
+            Err(Error::Malformed)
+        };
+    }
     match string(v, "status")? {
-        "completed" => Ok(()),
-        "incomplete" => match v
-            .pointer("/incomplete_details/reason")
-            .and_then(Value::as_str)
-        {
+        "completed" if v["incomplete_details"].is_null() => Ok(()),
+        "completed" => Err(Error::Malformed),
+        "incomplete" => match reason {
             Some("content_filter") => Err(Error::Filtered),
             None | Some("max_output_tokens") if allow_limit => Ok(()),
             _ => Err(Error::Incomplete),
@@ -327,9 +342,7 @@ impl Events {
             if let Some(lane) = observed {
                 lane.verify(item)?;
             }
-            if !item["status"].is_null() {
-                item_status(item, stop_reason.is_some())?;
-            }
+            item_status(item, stop_reason.is_some())?;
             match string(item, "type")? {
                 "message" if item["role"] == "assistant" => {
                     for (n, s) in item_texts(item, "content", "output_text")?
@@ -351,21 +364,18 @@ impl Events {
                     }
                 }
                 "function_call" => {
-                    if !identifier(string(item, "id")?) {
+                    let call_id = string(item, "call_id")?;
+                    let name = string(item, "name")?;
+                    if !identifier(string(item, "id")?) || !identifier(call_id) || !identifier(name)
+                    {
                         return Err(Error::Malformed);
                     }
                     let args = string(item, "arguments")?;
                     if out.calls.len() >= MAX_CALLS || args.len() > MAX_ARGUMENT {
                         return Err(Error::Malformed);
                     }
-                    out.calls.insert(
-                        i,
-                        PendingCall::complete(
-                            string(item, "call_id")?,
-                            string(item, "name")?,
-                            args,
-                        ),
-                    );
+                    out.calls
+                        .insert(i, PendingCall::complete(call_id, name, args));
                 }
                 "reasoning" => {
                     let block = reasoning_block(item)?;
@@ -375,7 +385,7 @@ impl Events {
             }
         }
         if stop_reason.is_some() {
-            out.calls.clear();
+            out.discard_calls();
         }
         out.stop_reason = stop_reason;
         out.finished = true;

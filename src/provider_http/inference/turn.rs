@@ -173,10 +173,22 @@ pub(super) struct Output {
     pub blocks: Vec<Value>,
     reasoning_bytes: usize,
     pub calls: BTreeMap<usize, PendingCall>,
+    pub discarded_calls: usize,
+    pub discarded_call_ids: Vec<String>,
     pub finished: bool,
     pub stop_reason: Option<StopReason>,
 }
 impl Output {
+    pub fn discard_calls(&mut self) {
+        let dropped = std::mem::take(&mut self.calls);
+        self.discarded_calls += dropped.len();
+        self.discarded_call_ids.extend(
+            dropped
+                .into_values()
+                .map(|c| c.id)
+                .filter(|id| !id.is_empty()),
+        );
+    }
     pub fn text(&mut self, key: (usize, usize), s: &str) -> Result<(), Error> {
         if s.is_empty() {
             return Ok(());
@@ -317,12 +329,18 @@ impl Assembly {
         }
         let mut count = 0;
         for out in self.choices.values() {
-            count += out.calls.len();
+            let choice_calls = out.calls.len() + out.discarded_calls;
+            count += choice_calls;
             if !out.finished
                 || count > MAX_CALLS
-                || out.calls.len() > 1 && (!q.parallel || request.parallel == Some(false))
+                || choice_calls > 1 && (!q.parallel || request.parallel == Some(false))
             {
                 return Err(Error::Malformed);
+            }
+            for id in &out.discarded_call_ids {
+                if !identifier(id) || !used.insert(id.as_str()) {
+                    return Err(Error::Malformed);
+                }
             }
             for c in out.calls.values() {
                 if !identifier(&c.id)

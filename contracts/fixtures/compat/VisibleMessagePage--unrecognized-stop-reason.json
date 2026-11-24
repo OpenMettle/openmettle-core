@@ -9,19 +9,19 @@
   "instance": {
     "items": [
       {
-        "input_count": null,
-        "message_id": "0f0e0d0c-0b0a-4908-8706-050403020102",
-        "output_count": null,
-        "parent_message_id": null,
+        "input_count": "21",
+        "message_id": "0f0e0d0c-0b0a-4908-8706-050403020103",
+        "output_count": "12",
+        "parent_message_id": "0f0e0d0c-0b0a-4908-8706-050403020102",
         "parts": [
           {
             "kind": "text",
-            "part_id": "0f0e0d0c-0b0a-4908-8706-050403020101",
-            "text": "Example question."
+            "part_id": "0f0e0d0c-0b0a-4908-8706-050403020104",
+            "text": "Partial answer stopped for a newer reason."
           }
         ],
-        "role": "user",
-        "run_id": null,
+        "role": "assistant",
+        "run_id": "0f0e0d0c-0b0a-4908-8706-050403020105",
         "stop_reason": "future_stop_reason"
       }
     ],
@@ -32,8 +32,23 @@
   "mutation": {
     "name": "unrecognized-stop-reason",
     "op": "set",
-    "path": "/items/0/stop_reason",
-    "value": "future_stop_reason"
+    "path": "/items/0",
+    "value": {
+      "input_count": "21",
+      "message_id": "0f0e0d0c-0b0a-4908-8706-050403020103",
+      "output_count": "12",
+      "parent_message_id": "0f0e0d0c-0b0a-4908-8706-050403020102",
+      "parts": [
+        {
+          "kind": "text",
+          "part_id": "0f0e0d0c-0b0a-4908-8706-050403020104",
+          "text": "Partial answer stopped for a newer reason."
+        }
+      ],
+      "role": "assistant",
+      "run_id": "0f0e0d0c-0b0a-4908-8706-050403020105",
+      "stop_reason": "future_stop_reason"
+    }
   },
   "schema": "#/components/schemas/MessagePage",
   "source": "#/components/examples/VisibleMessagePage"

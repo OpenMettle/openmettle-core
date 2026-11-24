@@ -1125,45 +1125,45 @@ async fn chat_non_streamed_tool_call_arguments_require_json_string() {
     );
 }
 
+fn limit_wire(p: Protocol, stream: bool, msg: Value, items: Vec<Value>) -> Vec<u8> {
+    match (p, stream) {
+        (Protocol::Chat, false) => {
+            let mut v = chat_json(msg, "length".into());
+            v["usage"] = json!({"prompt_tokens": 21, "completion_tokens": 12});
+            fixture::json(v.to_string().as_bytes())
+        }
+        (Protocol::Chat, true) => {
+            let usage = event(json!({
+                "choices": [],
+                "usage": {"prompt_tokens": 21, "completion_tokens": 12}
+            }));
+            sse(&(delta(msg, "length".into()) + &usage + "data: [DONE]\r\n\r\n"))
+        }
+        (Protocol::Responses, false) => {
+            let v = json!({
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": items,
+                "usage": {"input_tokens": 21, "output_tokens": 12}
+            });
+            fixture::json(v.to_string().as_bytes())
+        }
+        (Protocol::Responses, true) => {
+            let v = json!({
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": items,
+                "usage": {"input_tokens": 21, "output_tokens": 12}
+            });
+            sse(&event(
+                json!({"type": "response.incomplete", "response": v}),
+            ))
+        }
+    }
+}
+
 #[tokio::test]
 async fn token_limit_stop_preserves_partial_output_and_usage_and_drops_calls() {
-    let limit_wire = |p: Protocol, stream: bool, msg: Value, items: Vec<Value>| -> Vec<u8> {
-        match (p, stream) {
-            (Protocol::Chat, false) => {
-                let mut v = chat_json(msg, "length".into());
-                v["usage"] = json!({"prompt_tokens": 21, "completion_tokens": 12});
-                fixture::json(v.to_string().as_bytes())
-            }
-            (Protocol::Chat, true) => {
-                let usage = event(json!({
-                    "choices": [],
-                    "usage": {"prompt_tokens": 21, "completion_tokens": 12}
-                }));
-                sse(&(delta(msg, "length".into()) + &usage + "data: [DONE]\r\n\r\n"))
-            }
-            (Protocol::Responses, false) => {
-                let v = json!({
-                    "status": "incomplete",
-                    "incomplete_details": {"reason": "max_output_tokens"},
-                    "output": items,
-                    "usage": {"input_tokens": 21, "output_tokens": 12}
-                });
-                fixture::json(v.to_string().as_bytes())
-            }
-            (Protocol::Responses, true) => {
-                let v = json!({
-                    "status": "incomplete",
-                    "incomplete_details": {"reason": "max_output_tokens"},
-                    "output": items,
-                    "usage": {"input_tokens": 21, "output_tokens": 12}
-                });
-                sse(&event(
-                    json!({"type": "response.incomplete", "response": v}),
-                ))
-            }
-        }
-    };
-
     for (p, stream) in MODES {
         // 1. Partial visible text alongside a half-generated tool call: keep partial text and
         // usage, mark StopReason::Limit, and drop the truncated call in BOTH caller and server
@@ -1278,4 +1278,294 @@ async fn token_limit_stop_preserves_partial_output_and_usage_and_drops_calls() {
         once(Protocol::Responses, true, content_filter).await.err(),
         Some(Error::Filtered)
     );
+}
+
+#[tokio::test]
+async fn corrupt_chunk_framing_is_malformed_and_truncated_chunks_are_incomplete() {
+    for (p, stream) in MODES {
+        let media = if stream {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
+        let bad_chunk = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: {media}\r\n\r\nZZZ\r\n"
+        );
+        assert_eq!(
+            once(p, stream, bad_chunk.into_bytes()).await.err(),
+            Some(Error::Malformed),
+            "corrupt chunk size must be Malformed ({p:?}, stream={stream})"
+        );
+        let mid_chunk_eof = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: {media}\r\n\r\na\r\n1234"
+        );
+        assert_eq!(
+            once(p, stream, mid_chunk_eof.into_bytes()).await.err(),
+            Some(Error::Incomplete),
+            "mid-chunk EOF must be Incomplete ({p:?}, stream={stream})"
+        );
+        let missing_zero_chunk = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: {media}\r\n\r\n2\r\n{{}}\r\n"
+        );
+        assert_eq!(
+            once(p, stream, missing_zero_chunk.into_bytes()).await.err(),
+            Some(Error::Incomplete),
+            "EOF before terminal 0 chunk must be Incomplete ({p:?}, stream={stream})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bodyless_2xx_is_malformed_while_empty_200_sse_is_incomplete() {
+    for (p, stream) in MODES {
+        let media = if stream {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
+        for status_line in ["204 No Content", "205 Reset Content"] {
+            let bodyless = format!("HTTP/1.1 {status_line}\r\nContent-Type: {media}\r\n\r\n");
+            assert_eq!(
+                once(p, stream, bodyless.into_bytes()).await.err(),
+                Some(Error::Malformed),
+                "{status_line} must be Malformed ({p:?}, stream={stream})"
+            );
+        }
+    }
+    let eof_200_sse =
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\n\r\n".to_vec();
+    assert_eq!(
+        once(Protocol::Chat, true, eof_200_sse).await.err(),
+        Some(Error::Incomplete)
+    );
+}
+
+#[tokio::test]
+async fn responses_rejects_malformed_incomplete_details_on_envelope_and_items() {
+    let encode_responses = |stream: bool, v: &Value| -> Vec<u8> {
+        if stream {
+            sse(&event(
+                json!({"type": "response.incomplete", "response": v}),
+            ))
+        } else {
+            fixture::json(v.to_string().as_bytes())
+        }
+    };
+    for stream in [false, true] {
+        for bad_details in [
+            json!("bad"),
+            json!({"reason": 123}),
+            json!({"reason": true}),
+        ] {
+            let bad_envelope = json!({
+                "status": "incomplete",
+                "incomplete_details": bad_details,
+                "output": [message("partial")]
+            });
+            assert_eq!(
+                once(
+                    Protocol::Responses,
+                    stream,
+                    encode_responses(stream, &bad_envelope)
+                )
+                .await
+                .err(),
+                Some(Error::Malformed),
+                "malformed envelope incomplete_details={bad_details} (stream={stream})"
+            );
+
+            for item_status in [
+                Some(json!("incomplete")),
+                Some(json!("completed")),
+                Some(Value::Null),
+                None,
+            ] {
+                let mut bad_item = message("partial");
+                match &item_status {
+                    Some(s) => bad_item["status"] = s.clone(),
+                    None => {
+                        bad_item.as_object_mut().unwrap().remove("status");
+                    }
+                }
+                bad_item["incomplete_details"] = bad_details.clone();
+                let envelope = json!({
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "output": [bad_item]
+                });
+                assert_eq!(
+                    once(
+                        Protocol::Responses,
+                        stream,
+                        encode_responses(stream, &envelope)
+                    )
+                    .await
+                    .err(),
+                    Some(Error::Malformed),
+                    "malformed item incomplete_details={bad_details}, status={item_status:?} (stream={stream})"
+                );
+            }
+        }
+
+        let completed_with_details = json!({
+            "status": "completed",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [message("done")]
+        });
+        let completed_bytes = if stream {
+            sse(&event(json!({
+                "type": "response.completed",
+                "response": completed_with_details
+            })))
+        } else {
+            fixture::json(completed_with_details.to_string().as_bytes())
+        };
+        assert_eq!(
+            once(Protocol::Responses, stream, completed_bytes)
+                .await
+                .err(),
+            Some(Error::Malformed),
+            "completed response carrying incomplete_details must be Malformed (stream={stream})"
+        );
+
+        for allowed_details in [
+            None,
+            Some(Value::Null),
+            Some(json!({"reason": Value::Null})),
+        ] {
+            let mut ok_item = message("partial");
+            ok_item["status"] = json!("incomplete");
+            if let Some(d) = allowed_details {
+                ok_item["incomplete_details"] = d;
+            }
+            let envelope = json!({
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [ok_item]
+            });
+            let turn = once(
+                Protocol::Responses,
+                stream,
+                encode_responses(stream, &envelope),
+            )
+            .await
+            .unwrap();
+            assert_eq!(turn.answers[0].stop_reason, Some(StopReason::Limit));
+            assert_eq!(turn.answers[0].parts, ["partial"]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn chat_length_stop_preserves_bound_call_ids_for_cross_choice_collision_checks() {
+    for (limit_first, stream) in [(true, false), (false, false), (true, true), (false, true)] {
+        let limit_msg = json!({
+            "role": "assistant",
+            "content": "cut off",
+            "tool_calls": [{
+                "index": 0,
+                "id": "dup-call",
+                "type": "function",
+                "function": {"name": "left", "arguments": "{\"v\":\"half"}
+            }]
+        });
+        let tool_msg = json!({
+            "role": "assistant",
+            "tool_calls": [{
+                "index": 0,
+                "id": "dup-call",
+                "type": "function",
+                "function": {"name": "left", "arguments": "{\"v\":\"ok\"}"}
+            }]
+        });
+        let (first, second) = if limit_first {
+            ((limit_msg, "length"), (tool_msg, "tool_calls"))
+        } else {
+            ((tool_msg, "tool_calls"), (limit_msg, "length"))
+        };
+        let bytes = if stream {
+            let chunk = event(json!({
+                "choices": [
+                    {"index": 0, "delta": first.0, "finish_reason": first.1},
+                    {"index": 1, "delta": second.0, "finish_reason": second.1}
+                ]
+            }));
+            sse(&(chunk + "data: [DONE]\r\n\r\n"))
+        } else {
+            let body = json!({
+                "choices": [
+                    {"index": 0, "message": first.0, "finish_reason": first.1},
+                    {"index": 1, "message": second.0, "finish_reason": second.1}
+                ]
+            });
+            fixture::json(body.to_string().as_bytes())
+        };
+        assert_eq!(
+            once(Protocol::Chat, stream, bytes).await.err(),
+            Some(Error::Malformed),
+            "cross-choice duplicate call id must be Malformed (limit_first={limit_first}, stream={stream})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn limit_stop_validates_discarded_responses_call_ids_and_parallel_call_gates() {
+    for stream in [false, true] {
+        for (call_id, name) in [("", "left"), ("call-ok", "")] {
+            let mut bad_fn = function(call_id, name, "{\"v\":\"half");
+            bad_fn["status"] = json!("incomplete");
+            let envelope = json!({
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [message("partial"), bad_fn]
+            });
+            let bytes = if stream {
+                sse(&event(json!({
+                    "type": "response.incomplete",
+                    "response": envelope
+                })))
+            } else {
+                fixture::json(envelope.to_string().as_bytes())
+            };
+            assert_eq!(
+                once(Protocol::Responses, stream, bytes).await.err(),
+                Some(Error::Malformed),
+                "discarded Responses call with call_id={call_id:?}, name={name:?} must be Malformed (stream={stream})"
+            );
+        }
+
+        let two_chat_calls = json!({
+            "role": "assistant",
+            "content": "partial",
+            "tool_calls": [
+                {"index": 0, "id": "call-1", "type": "function", "function": {"name": "left", "arguments": "{\"v\":\"a"}},
+                {"index": 1, "id": "call-2", "type": "function", "function": {"name": "left", "arguments": "{\"v\":\"b"}}
+            ]
+        });
+        let mut fn1 = function("call-1", "left", "{\"v\":\"a");
+        fn1["status"] = json!("incomplete");
+        let mut fn2 = function("call-2", "left", "{\"v\":\"b");
+        fn2["status"] = json!("incomplete");
+        for p in [Protocol::Chat, Protocol::Responses] {
+            let bytes = limit_wire(
+                p,
+                stream,
+                two_chat_calls.clone(),
+                vec![message("partial"), fn1.clone(), fn2.clone()],
+            );
+            let mock = Mock::new(p, move |_| Reply::Bytes(bytes.clone())).await;
+            let c = catalog(p, true);
+            let e = effective(&c, false);
+            let g = mock.gateway(&e, NORMAL);
+            let mut r = request(stream);
+            r.parallel = Some(false);
+            assert_eq!(
+                g.caller(&c, &e, &r, Credential::Bearer(TOKEN), |_| async {})
+                    .await
+                    .err(),
+                Some(Error::Malformed),
+                "two discarded calls must violate parallel=Some(false) ({p:?}, stream={stream})"
+            );
+        }
+    }
 }

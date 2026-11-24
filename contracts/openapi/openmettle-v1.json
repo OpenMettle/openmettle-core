@@ -5130,6 +5130,27 @@
           "run_id",
           "input_count",
           "output_count"
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "role": {
+                  "const": "user"
+                }
+              },
+              "required": [
+                "role"
+              ]
+            },
+            "then": {
+              "properties": {
+                "stop_reason": {
+                  "type": "null"
+                }
+              }
+            }
+          }
         ]
       },
       "ProfilePin": {
@@ -9175,8 +9196,34 @@
               "name": "unrecognized-stop-reason",
               "class": "compat",
               "op": "set",
+              "path": "/items/0",
+              "value": {
+                "message_id": "0f0e0d0c-0b0a-4908-8706-050403020103",
+                "parent_message_id": "0f0e0d0c-0b0a-4908-8706-050403020102",
+                "role": "assistant",
+                "parts": [
+                  {
+                    "part_id": "0f0e0d0c-0b0a-4908-8706-050403020104",
+                    "kind": "text",
+                    "text": "Partial answer stopped for a newer reason."
+                  }
+                ],
+                "run_id": "0f0e0d0c-0b0a-4908-8706-050403020105",
+                "input_count": "21",
+                "output_count": "12",
+                "stop_reason": "future_stop_reason"
+              }
+            },
+            {
+              "name": "user-non-null-stop-reason",
+              "class": "invalid",
+              "op": "set",
               "path": "/items/0/stop_reason",
-              "value": "future_stop_reason"
+              "value": "limit",
+              "expect": {
+                "instancePath": "/items/0/stop_reason",
+                "keyword": "type"
+              }
             },
             {
               "name": "invalid-stop-reason",
