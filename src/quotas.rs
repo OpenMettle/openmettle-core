@@ -558,10 +558,11 @@ pub async fn drain_gateway_orphans(pool: &PgPool) -> Result<u64, crate::runs::Er
     }
 }
 
-/// Sweep up to `limit` eligible unbound handed-off gateway requests (never dispatched once no
-/// longer dispatchable, or dispatched with no settlement 15 minutes past the run's execution
-/// deadline) and close each one in its own short transaction at revision 0 (ADR 0044 increment
-/// 3b, migration 32).
+/// Inspect one bounded raw page of up to `limit` unbound handed-off gateway requests, advance
+/// `pass` across every inspected key (including in-grace or still-live prefixes), and close each
+/// eligible request (never dispatched once no longer dispatchable, or dispatched with no
+/// settlement 15 minutes past the run's execution deadline) in its own short transaction at
+/// revision 0 (ADR 0044 increment 3b, migration 32).
 pub async fn sweep_unreported_gateway_requests(
     pool: &PgPool,
     pass: &mut Pass,
@@ -578,8 +579,8 @@ pub async fn sweep_unreported_gateway_requests(
         );
     }
     let (at, id) = pass.cursor();
-    let page: Vec<(String, String)> = sqlx::query_as(
-        "SELECT created_at::text, id::text
+    let page: Vec<(String, String, bool)> = sqlx::query_as(
+        "SELECT created_at::text, id::text, eligible
            FROM openmettle.gateway_unreported_candidates(
                $1::text::timestamptz, $2::uuid, $3::text::timestamptz, $4::uuid, $5
            )",
@@ -593,8 +594,11 @@ pub async fn sweep_unreported_gateway_requests(
     .await?;
     let count = page.len();
     let mut closed = 0_u64;
-    for (created_at, req_id) in page {
+    for (created_at, req_id, eligible) in page {
         pass.after = Some((created_at, req_id.clone()));
+        if !eligible {
+            continue;
+        }
         let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
         let reason: Option<String> =
             sqlx::query_scalar("SELECT openmettle.gateway_close_unreported($1::uuid)")

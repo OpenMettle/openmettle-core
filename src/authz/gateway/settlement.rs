@@ -262,6 +262,10 @@ async fn store(pool: &PgPool, r: &UsageReport, incomplete: Option<&str>) -> Resu
     if incomplete.is_some() && !unbound {
         return Err(Error::Refused);
     }
+    // Revision 0 on unbound requests is reserved to the worker sweep (ADR 0044, migration 32).
+    if unbound && r.revision == 0 {
+        return Err(Error::Refused);
+    }
     let inserted = evidence(INSERT_REPORT, r, incomplete)
         .execute(&mut *c)
         .await
@@ -282,6 +286,17 @@ async fn store(pool: &PgPool, r: &UsageReport, incomplete: Option<&str>) -> Resu
             .try_get::<bool, _>(0)?
     {
         return Err(Error::Conflict);
+    }
+    // Every final report on an unbound request must carry either an incomplete reason or both
+    // prompt and completion counts, so a bare or partial final report cannot overwrite an earlier
+    // revision-0 `unreported` settlement. Checked after the exact-identity conflict test so a
+    // mismatched payload at an existing revision still reports `Conflict`.
+    if unbound
+        && r.r#final
+        && incomplete.is_none()
+        && (r.prompt_tokens.is_none() || r.completion_tokens.is_none())
+    {
+        return Err(Error::Refused);
     }
     let previous_revision = row.try_get::<Option<i64>, _>("revision")?;
     let outcome = if previous_revision == Some(r.revision) {

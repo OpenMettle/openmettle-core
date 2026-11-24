@@ -364,17 +364,21 @@ owned by the worker's bounded maintenance sweep (`gateway_unreported_candidates`
   lower one, so a late proxy report at revision 1 (with usage or a proxy reason) supersedes
   the sweep's revision-0 `unreported` record, and the sweep never overwrites revision 1.
 - **Role boundary and lock order.** A `BEFORE INSERT OR UPDATE` trigger on
-  `gateway_usage_reports` restricts `not_dispatched` and `unreported` to `openmettle_owner`
-  (including the sweep function) so `openmettle_gateway` cannot emit them. Each closed request
-  commits in its own short transaction (`runs FOR SHARE SKIP LOCKED` -> `gateway_requests FOR
-  UPDATE SKIP LOCKED` -> `quota_reservations` -> `quota_budgets`), and candidate discovery
-  filters eligibility before `LIMIT` under a fixed per-pass upper bound so in-grace dispatched
-  requests cannot starve eligible rows behind them. Bound ADR 0037 rows are untouched.
+  `gateway_usage_reports` restricts `not_dispatched`, `unreported`, and revision 0 on unbound
+  requests to `openmettle_owner` (including the sweep function) so `openmettle_gateway` cannot
+  emit sweep reasons or occupy revision 0 to block the sweep, while bound ADR 0037 rows keep
+  revision 0 available. Each closed request commits in its own short transaction (`runs FOR
+  SHARE SKIP LOCKED` -> `gateway_requests FOR UPDATE SKIP LOCKED` -> `quota_reservations` ->
+  `quota_budgets`). Candidate discovery materializes at most `p_limit` raw index entries per
+  page and returns each key with its `eligible` flag so the worker advances its pass cursor
+  across in-grace or live prefixes under a fixed per-pass upper bound without unbounded index
+  scans or head-of-line starvation. Bound ADR 0037 rows are untouched.
 
-**No bare final report.** Settlement and a deferred database trigger refuse a final report
-that would leave a request without a binding open: one without both counts and without a
-reason, or one whose quota fold was not run. The proxy builds a report without counts only
-together with its reason.
+**No bare final report.** Settlement and a deferred database trigger refuse any final report on
+a request without a binding that lacks both an `incomplete` reason and complete prompt and
+completion counts (even when correcting an earlier `unreported` settlement), or that fails to
+fold every quota hold on the request to `latest.revision`. The proxy builds a report without
+counts only together with its reason.
 
 ### Who closes what
 

@@ -9,6 +9,40 @@
 -- its quota holds through the existing settlement and fold mechanics, keeping `state =
 -- 'handed_off'`. Revision 1 remains open for a late proxy report to supersede `unreported`.
 
+-- Fail closed on upgrade if an unsettled unbound request already has an accepted revision-0
+-- report or revision-0 settlement; historical schema 29–30 requests that already settled at
+-- revision 0 (`settled_final = true`) stay intact.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT FROM openmettle.gateway_requests q
+         WHERE q.binding_id IS NULL
+           AND NOT q.settled_final
+           AND (EXISTS (SELECT FROM openmettle.gateway_settlements s
+                         WHERE s.request_id = q.id AND s.revision = 0)
+                OR EXISTS (SELECT FROM openmettle.quota_accepted_gateway_reports a
+                            WHERE a.request_id = q.id AND a.revision = 0))
+    ) THEN
+        RAISE EXCEPTION 'migration 32 cannot proceed with an accepted revision-0 report on an unsettled unbound request'
+            USING ERRCODE = '23514';
+    END IF;
+END
+$$;
+
+-- Remove unaccepted raw revision-0 reports on unbound unsettled requests so the sweep's
+-- revision-0 insert cannot collide with a pre-existing dangling row after upgrade.
+DELETE FROM openmettle.gateway_usage_reports g
+ USING openmettle.gateway_requests q
+ WHERE g.request_id = q.id
+   AND q.binding_id IS NULL
+   AND NOT q.settled_final
+   AND g.revision = 0
+   AND NOT EXISTS (SELECT FROM openmettle.gateway_settlements s WHERE s.request_id = q.id)
+   AND NOT EXISTS (
+       SELECT FROM openmettle.quota_accepted_gateway_reports a
+        WHERE a.request_id = q.id AND a.revision = 0
+   );
+
 -- Extend migration 31's closed vocabulary with the two sweep-only revision-0 reasons:
 --   * Group 1 (nothing was sent upstream): `model_not_served`, `model_mismatch`,
 --     `request_body`, `upstream_connect`, `not_dispatched`;
@@ -28,12 +62,24 @@ ALTER TABLE openmettle.gateway_usage_reports
                 OR (revision = 0 AND incomplete IN ('not_dispatched','unreported')))));
 
 -- Only `openmettle_owner` (and its `SECURITY DEFINER` sweep function) may write the two
--- sweep-only reasons; `openmettle_gateway` cannot forge them to close a round early.
+-- sweep-only reasons or revision 0 on an unbound request; `openmettle_gateway` cannot forge
+-- sweep reasons or occupy revision 0 to block the sweep. Bound ADR 0037 requests keep
+-- revision 0 available to `openmettle_gateway`.
 CREATE FUNCTION openmettle.enforce_gateway_report_sweep_only() RETURNS trigger
 LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog AS $$
 BEGIN
-    IF NOT pg_catalog.pg_has_role(current_user, 'openmettle_owner', 'USAGE') THEN
+    IF pg_catalog.pg_has_role(current_user, 'openmettle_owner', 'USAGE') THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.incomplete IN ('not_dispatched', 'unreported') THEN
         RAISE EXCEPTION 'sweep-only incomplete reason requires openmettle_owner'
+            USING ERRCODE = '42501';
+    END IF;
+    IF NEW.revision = 0 AND EXISTS (
+        SELECT FROM openmettle.gateway_requests q
+         WHERE q.id = NEW.request_id AND q.binding_id IS NULL
+    ) THEN
+        RAISE EXCEPTION 'revision 0 on an unbound request requires openmettle_owner'
             USING ERRCODE = '42501';
     END IF;
     RETURN NEW;
@@ -43,18 +89,22 @@ REVOKE ALL ON FUNCTION openmettle.enforce_gateway_report_sweep_only() FROM PUBLI
 CREATE TRIGGER gateway_usage_reports_sweep_only_guard
     BEFORE INSERT OR UPDATE ON openmettle.gateway_usage_reports
     FOR EACH ROW
-    WHEN (NEW.incomplete IN ('not_dispatched', 'unreported'))
+    WHEN (NEW.incomplete IN ('not_dispatched', 'unreported') OR NEW.revision = 0)
     EXECUTE FUNCTION openmettle.enforce_gateway_report_sweep_only();
 
--- Update migration 31's deferred final-settlement check for the two sweep reasons:
+-- Update migration 31's deferred final-settlement check for the two sweep reasons and
+-- post-sweep revision-1 corrections:
 --   * `not_dispatched` requires an undispatched request without a binding, at revision 0 only,
 --     with no measured usage and no other accepted revision (a never-dispatched request can
 --     never receive a proxy report).
 --   * Every other incomplete reason (the 12 proxy reasons and `unreported`) requires a
 --     dispatched request without a binding.
---   * As in migration 31, a final settlement of a request without a binding must leave zero
---     outstanding, end `settled` in `quota_gateway_fold`, and settle its token hold (and any
---     cost hold when any accepted report carries a reason).
+--   * On an unbound request, every accepted final report must carry either an incomplete
+--     reason or both prompt and completion counts (so a bare or partial final report cannot
+--     replace `unreported`), every quota hold must have folded `latest.revision`
+--     (`accepted_source_revision = latest.revision`), `latest.outstanding` must be 0,
+--     `quota_gateway_fold` must end `settled`, and its token hold (and any cost hold when any
+--     accepted report carries a reason) must be `settled`.
 -- Signature, security and privileges are unchanged.
 CREATE OR REPLACE FUNCTION openmettle.enforce_gateway_final_settlement_closes() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
@@ -92,14 +142,24 @@ BEGIN
             USING ERRCODE='23514';
     END IF;
     IF req.binding_id IS NOT NULL THEN RETURN NULL; END IF;
+    IF EXISTS (
+        SELECT FROM openmettle.quota_accepted_gateway_reports a
+          JOIN openmettle.gateway_usage_reports g USING (request_id,revision,final)
+         WHERE a.request_id=latest.request_id AND a.final
+           AND g.incomplete IS NULL
+           AND (g.prompt_tokens IS NULL OR g.completion_tokens IS NULL)
+    ) THEN
+        RAISE EXCEPTION 'a final settlement must close its request' USING ERRCODE='23514';
+    END IF;
     SELECT f.state INTO folded
       FROM openmettle.quota_gateway_fold(latest.request_id,'usage_tokens',req.units,latest.revision) f
      ORDER BY f.rev DESC LIMIT 1;
     IF latest.outstanding<>0 OR folded IS DISTINCT FROM 'settled' OR EXISTS (
         SELECT FROM openmettle.quota_reservations h WHERE h.gateway_request_id=latest.request_id
-           AND h.state<>'settled'
-           AND (h.resource_kind='usage_tokens'
-                OR (has_reason AND h.resource_kind='usage_cost_micros'))) THEN
+           AND (h.accepted_source_revision IS DISTINCT FROM latest.revision
+                OR (h.state<>'settled'
+                    AND (h.resource_kind='usage_tokens'
+                         OR (has_reason AND h.resource_kind='usage_cost_micros'))))) THEN
         RAISE EXCEPTION 'a final settlement must close its request' USING ERRCODE='23514';
     END IF;
     RETURN NULL;
@@ -112,9 +172,10 @@ CREATE INDEX gateway_requests_unbound_outstanding_idx
     ON openmettle.gateway_requests (created_at, id)
     WHERE state = 'handed_off' AND binding_id IS NULL AND NOT settled_final;
 
--- Bounded, cursor-paged candidate discovery for the worker sweep. Filtering eligibility before
--- `LIMIT` prevents dispatched requests still within their 15-minute grace window from starving
--- newer undispatched or past-grace requests behind them; the fixed upper bound prevents a
+-- Bounded, cursor-paged candidate discovery for the worker sweep. Materializing at most
+-- `p_limit` raw index entries first keeps every scan O(p_limit) and returns each key with its
+-- `eligible` flag so callers advance the pass cursor across in-grace or still-live prefixes
+-- without unbounded scans or head-of-line starvation. The fixed upper bound prevents a
 -- continuous stream of arrivals from starving older rows across passes.
 CREATE FUNCTION openmettle.gateway_unreported_candidates(
     p_after_created_at timestamptz,
@@ -122,7 +183,7 @@ CREATE FUNCTION openmettle.gateway_unreported_candidates(
     p_upper_created_at timestamptz,
     p_upper_id uuid,
     p_limit integer)
-RETURNS TABLE (created_at timestamptz, id uuid)
+RETURNS TABLE (created_at timestamptz, id uuid, eligible boolean)
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
@@ -137,37 +198,43 @@ BEGIN
         RAISE EXCEPTION 'invalid gateway unreported page' USING ERRCODE = '22023';
     END IF;
     RETURN QUERY
-    WITH clock AS MATERIALIZED (SELECT clock_timestamp() AS t)
-    SELECT q.created_at, q.id
-      FROM openmettle.gateway_requests q
-      JOIN openmettle.runs r ON r.id = q.run_id
+    WITH page AS MATERIALIZED (
+        SELECT q.created_at, q.id, q.run_id, q.dispatched_at, q.claim_hash
+          FROM openmettle.gateway_requests q
+         WHERE q.state = 'handed_off'
+           AND q.binding_id IS NULL
+           AND NOT q.settled_final
+           AND (q.created_at, q.id) > (p_after_created_at, p_after_id)
+           AND (q.created_at, q.id) <= (p_upper_created_at, p_upper_id)
+         ORDER BY q.created_at, q.id
+         LIMIT p_limit
+    ),
+    clock AS MATERIALIZED (SELECT clock_timestamp() AS t)
+    SELECT p.created_at,
+           p.id,
+           (NOT EXISTS (
+                SELECT FROM openmettle.gateway_settlements s WHERE s.request_id = p.id
+            )
+            AND (
+                (p.dispatched_at IS NULL AND (
+                    r.state <> 'running'
+                    OR r.cancel_reason IS NOT NULL
+                    OR r.claim_token IS NULL
+                    OR sha256(uuid_send(r.claim_token)) <> p.claim_hash
+                    OR r.lease_expires_at IS NULL
+                    OR r.lease_expires_at <= clock.t
+                    OR r.execution_expires_at IS NULL
+                    OR r.execution_expires_at <= clock.t
+                ))
+                OR (p.dispatched_at IS NOT NULL AND
+                    coalesce(r.execution_expires_at, a.resume_execution_expires_at, p.dispatched_at)
+                        + interval '15 minutes' <= clock.t)
+            )) AS eligible
+      FROM page p
+      JOIN openmettle.runs r ON r.id = p.run_id
       LEFT JOIN openmettle.run_approvals a ON a.id = r.approval_wait_id
       CROSS JOIN clock
-     WHERE q.state = 'handed_off'
-       AND q.binding_id IS NULL
-       AND NOT q.settled_final
-       AND (q.created_at, q.id) > (p_after_created_at, p_after_id)
-       AND (q.created_at, q.id) <= (p_upper_created_at, p_upper_id)
-       AND NOT EXISTS (
-           SELECT FROM openmettle.gateway_settlements s WHERE s.request_id = q.id
-       )
-       AND (
-           (q.dispatched_at IS NULL AND (
-               r.state <> 'running'
-               OR r.cancel_reason IS NOT NULL
-               OR r.claim_token IS NULL
-               OR sha256(uuid_send(r.claim_token)) <> q.claim_hash
-               OR r.lease_expires_at IS NULL
-               OR r.lease_expires_at <= clock.t
-               OR r.execution_expires_at IS NULL
-               OR r.execution_expires_at <= clock.t
-           ))
-           OR (q.dispatched_at IS NOT NULL AND
-               coalesce(r.execution_expires_at, a.resume_execution_expires_at, q.dispatched_at)
-                   + interval '15 minutes' <= clock.t)
-       )
-     ORDER BY q.created_at, q.id
-     LIMIT p_limit;
+     ORDER BY p.created_at, p.id;
 END
 $$;
 REVOKE ALL ON FUNCTION openmettle.gateway_unreported_candidates(timestamptz,uuid,timestamptz,uuid,integer) FROM PUBLIC;

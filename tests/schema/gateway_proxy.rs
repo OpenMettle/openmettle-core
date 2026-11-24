@@ -2531,11 +2531,11 @@ async fn a_later_report_corrects_an_incomplete_one_and_nothing_reopens_a_complet
     let usage = Some((7, 5));
     let charged = ("settled".to_owned(), 0, "12".to_owned());
 
-    // The sweep's record first, then the proxy's late report with usage.
+    // An incomplete report first, then a higher revision with usage.
     let swept = f.request(false).await;
     f.dispatch(&swept).await;
     assert_eq!(
-        settlement::ingest_incomplete(&gateway, &f.report(&swept, 0, None), "upstream_timeout")
+        settlement::ingest_incomplete(&gateway, &f.report(&swept, 1, None), "upstream_timeout")
             .await,
         Ok(Outcome::Applied)
     );
@@ -2545,13 +2545,13 @@ async fn a_later_report_corrects_an_incomplete_one_and_nothing_reopens_a_complet
     );
     assert_eq!((f.used().await, f.reserved().await), (0, 0));
     assert_eq!(
-        settlement::ingest(&gateway, &f.report(&swept, 1, usage)).await,
+        settlement::ingest(&gateway, &f.report(&swept, 2, usage)).await,
         Ok(Outcome::Applied)
     );
     assert_eq!(f.hold(&swept).await, charged);
     assert_eq!(
         f.settlement(&swept).await,
-        Some((1, true, Some("12".to_owned()), 0))
+        Some((2, true, Some("12".to_owned()), 0))
     );
     assert_eq!(
         f.transitions(&swept).await,
@@ -2559,10 +2559,10 @@ async fn a_later_report_corrects_an_incomplete_one_and_nothing_reopens_a_complet
     );
     assert_eq!(f.used().await, 12);
 
-    // The sweep's record first, then the proxy's late report with a reason: still nothing.
+    // An incomplete report first, then a higher revision with another reason: still nothing.
     let unknown = f.request(false).await;
     f.dispatch(&unknown).await;
-    for (revision, reason) in [(0, "upstream_timeout"), (1, "caller_disconnected")] {
+    for (revision, reason) in [(1, "upstream_timeout"), (2, "caller_disconnected")] {
         assert_eq!(
             settlement::ingest_incomplete(&gateway, &f.report(&unknown, revision, None), reason)
                 .await,
@@ -2583,23 +2583,28 @@ async fn a_later_report_corrects_an_incomplete_one_and_nothing_reopens_a_complet
     );
     assert_eq!(f.transitions(&unknown).await, ["final_settle"]);
 
-    // A complete report first: no later report without usage changes what it charged.
+    // A complete report first: no later report without usage changes what it charged, and
+    // revision 0 on an unbound request is reserved to the worker sweep.
     let complete = f.request(false).await;
     f.dispatch(&complete).await;
     assert_eq!(
-        settlement::ingest(&gateway, &f.report(&complete, 1, usage)).await,
+        settlement::ingest(&gateway, &f.report(&complete, 2, usage)).await,
         Ok(Outcome::Applied)
     );
     assert_eq!(
-        settlement::ingest_incomplete(&gateway, &f.report(&complete, 1, None), "incomplete").await,
+        settlement::ingest_incomplete(&gateway, &f.report(&complete, 2, None), "incomplete").await,
         Err(StoreError::Conflict)
     );
     assert_eq!(
-        settlement::ingest_incomplete(&gateway, &f.report(&complete, 0, None), "incomplete").await,
+        settlement::ingest_incomplete(&gateway, &f.report(&complete, 1, None), "incomplete").await,
         Ok(Outcome::Superseded)
     );
     assert_eq!(
-        settlement::ingest_incomplete(&gateway, &f.report(&complete, 2, None), "incomplete").await,
+        settlement::ingest_incomplete(&gateway, &f.report(&complete, 0, None), "incomplete").await,
+        Err(StoreError::Refused)
+    );
+    assert_eq!(
+        settlement::ingest_incomplete(&gateway, &f.report(&complete, 3, None), "incomplete").await,
         Ok(Outcome::Applied)
     );
     assert_eq!(f.hold(&complete).await, charged);
@@ -2841,7 +2846,7 @@ async fn the_database_refuses_a_final_settlement_that_leaves_the_hold_open() {
         sqlx::query(
             "INSERT INTO openmettle.gateway_usage_reports
                  (request_id,source,report_id,revision,final,incomplete)
-             VALUES ($1::uuid,$2::uuid,$1::uuid,0,true,'no_usage')",
+             VALUES ($1::uuid,$2::uuid,$1::uuid,1,true,'no_usage')",
         )
         .bind(&undispatched)
         .bind(INSTALL)
@@ -2851,16 +2856,16 @@ async fn the_database_refuses_a_final_settlement_that_leaves_the_hold_open() {
         sqlx::query(
             "INSERT INTO openmettle.gateway_settlements
                  (request_id,revision,final,measured,outstanding)
-             VALUES ($1::uuid,0,true,NULL,0)",
+             VALUES ($1::uuid,1,true,NULL,0)",
         )
         .bind(&undispatched)
         .execute(&mut *tx)
         .await
         .unwrap();
-        let rev1_report: String = sqlx::query_scalar(
+        let rev2_report: String = sqlx::query_scalar(
             "INSERT INTO openmettle.gateway_usage_reports
                  (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens)
-             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),1,true,7,5)
+             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),2,true,7,5)
              RETURNING report_id::text",
         )
         .bind(&undispatched)
@@ -2870,17 +2875,17 @@ async fn the_database_refuses_a_final_settlement_that_leaves_the_hold_open() {
         .unwrap();
         sqlx::query(
             "UPDATE openmettle.gateway_settlements
-                SET revision=1,final=true,measured=12,outstanding=0
+                SET revision=2,final=true,measured=12,outstanding=0
               WHERE request_id=$1::uuid",
         )
         .bind(&undispatched)
         .execute(&mut *tx)
         .await
         .unwrap();
-        sqlx::query("SELECT openmettle.quota_settle_gateway_usage($1::uuid,$2::uuid,$3::uuid,1)")
+        sqlx::query("SELECT openmettle.quota_settle_gateway_usage($1::uuid,$2::uuid,$3::uuid,2)")
             .bind(&undispatched)
             .bind(INSTALL)
-            .bind(&rev1_report)
+            .bind(&rev2_report)
             .execute(&mut *tx)
             .await
             .unwrap();
@@ -3306,9 +3311,22 @@ async fn in_grace_dispatched_requests_do_not_starve_eligible_requests_behind_the
         eligible_unrep.push(id);
     }
 
-    // Limit 3 is smaller than the 6 older in-grace rows, yet the first tick closes 3 eligible
-    // rows immediately and the second tick finishes the 4th and resets the pass.
+    // Limit 3 is smaller than the 6 older in-grace rows: the first two ticks scan 3 raw keys
+    // each and return 0 while advancing `pass` past the all-ineligible prefix, then ticks 3 and
+    // 4 close the 4 trailing eligible rows and reset `pass` once fewer than 3 raw keys remain.
     let mut pass = budgets::Pass::default();
+    assert_eq!(
+        budgets::sweep_unreported_gateway_requests(&f.worker, &mut pass, 3)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        budgets::sweep_unreported_gateway_requests(&f.worker, &mut pass, 3)
+            .await
+            .unwrap(),
+        0
+    );
     assert_eq!(
         budgets::sweep_unreported_gateway_requests(&f.worker, &mut pass, 3)
             .await
@@ -3320,12 +3338,6 @@ async fn in_grace_dispatched_requests_do_not_starve_eligible_requests_behind_the
             .await
             .unwrap(),
         1
-    );
-    assert_eq!(
-        budgets::sweep_unreported_gateway_requests(&f.worker, &mut pass, 3)
-            .await
-            .unwrap(),
-        0
     );
     for id in &eligible_undisp {
         assert_eq!(
@@ -3377,5 +3389,276 @@ async fn in_grace_dispatched_requests_do_not_starve_eligible_requests_behind_the
         0
     );
     assert_eq!((f.used().await, f.reserved().await), (0, 0));
+    assert_eq!(f.drift().await, (0, 0, 0, 0));
+}
+
+/// After the worker sweep settles a dispatched request as `unreported` at revision 0, its holds
+/// are already `settled`. A direct-SQL `openmettle_gateway` correction at revision 1 MUST still
+/// fold those holds through `quota_settle_gateway_usage(..., 1)` so `accepted_source_revision`
+/// matches `latest.revision`; skipping the fold is refused at commit with 23514.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_direct_sql_correction_after_unreported_must_fold_its_holds() {
+    use sqlx::Connection;
+
+    let f = Fixture::new().await;
+    let mut admin = f.db.admin().await;
+    admin
+        .execute(
+            "UPDATE openmettle.quota_defaults SET cost_denomination='usd_micros'
+              WHERE scope_kind='instance' AND resource_kind='usage_cost_micros'",
+        )
+        .await
+        .unwrap();
+    admin
+        .execute(
+            "INSERT INTO openmettle.quota_defaults(scope_kind,resource_kind,hard_limit)
+             VALUES ('personal','usage_cost_micros',100000)",
+        )
+        .await
+        .unwrap();
+
+    let id = f.request_with_cost(MODEL, false, Some(250)).await;
+    f.dispatch(&id).await;
+    let run = f.run_of(&id).await;
+    sqlx::query(
+        "UPDATE openmettle.runs
+            SET lease_expires_at=clock_timestamp()-interval '16 minutes',
+                execution_expires_at=clock_timestamp()-interval '16 minutes'
+          WHERE id=$1::uuid",
+    )
+    .bind(&run)
+    .execute(&f.owner)
+    .await
+    .unwrap();
+    let mut pass = budgets::Pass::default();
+    assert_eq!(
+        budgets::sweep_unreported_gateway_requests(&f.worker, &mut pass, 100)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(f.hold(&id).await, ("settled".to_owned(), 0, "0".to_owned()));
+    assert_eq!(
+        f.hold_of(&id, "usage_cost_micros").await,
+        ("settled".to_owned(), 0, "0".to_owned())
+    );
+
+    // Direct SQL as openmettle_gateway: write measured revision 1 + settlement WITHOUT folding.
+    let mut direct = connect(&f.db.0, pg::GATEWAY).await;
+    {
+        let mut tx = direct.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens)
+             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),1,true,17,2)",
+        )
+        .bind(&id)
+        .bind(INSTALL)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.gateway_settlements
+                SET revision=1,final=true,measured=19,outstanding=0
+              WHERE request_id=$1::uuid",
+        )
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let Err(sqlx::Error::Database(error)) = tx.commit().await else {
+            panic!("revision-1 correction committed without folding already-settled holds");
+        };
+        assert_eq!(error.code().as_deref(), Some("23514"));
+    }
+    assert_eq!(f.settlement(&id).await, Some((0, true, None, 0)));
+    assert_eq!(f.used().await, 0);
+    assert_eq!(f.drift().await, (0, 0, 0, 0));
+
+    // Running `quota_settle_gateway_usage(..., 1)` in the same transaction folds both holds to
+    // revision 1 and commits cleanly with zero drift.
+    {
+        let mut tx = direct.begin().await.unwrap();
+        let report_id: String = sqlx::query_scalar(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens)
+             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),1,true,17,2)
+             RETURNING report_id::text",
+        )
+        .bind(&id)
+        .bind(INSTALL)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.gateway_settlements
+                SET revision=1,final=true,measured=19,outstanding=0
+              WHERE request_id=$1::uuid",
+        )
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("SELECT openmettle.quota_settle_gateway_usage($1::uuid,$2::uuid,$3::uuid,1)")
+            .bind(&id)
+            .bind(INSTALL)
+            .bind(&report_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    assert_eq!(
+        f.settlement(&id).await,
+        Some((1, true, Some("19".to_owned()), 0))
+    );
+    assert_eq!(
+        f.hold(&id).await,
+        ("settled".to_owned(), 0, "19".to_owned())
+    );
+    assert_eq!(
+        f.hold_of(&id, "usage_cost_micros").await,
+        ("settled".to_owned(), 0, "0".to_owned())
+    );
+    let revs: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT resource_kind, accepted_source_revision
+           FROM openmettle.quota_reservations
+          WHERE gateway_request_id=$1::uuid
+          ORDER BY resource_kind",
+    )
+    .bind(&id)
+    .fetch_all(&f.owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        revs,
+        [
+            ("usage_cost_micros".to_owned(), Some(1)),
+            ("usage_tokens".to_owned(), Some(1)),
+        ]
+    );
+    assert_eq!(f.drift().await, (0, 0, 0, 0));
+}
+
+/// After revision 0 (`unreported`) closes the fold, a bare or single-count final report at
+/// revision 1 without an `incomplete` reason must be refused by both `settlement::ingest` and
+/// PostgreSQL's deferred trigger, leaving `unreported` visible in the operator query.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_bare_or_partial_final_report_cannot_replace_unreported() {
+    use sqlx::Connection;
+
+    let f = Fixture::new().await;
+    let gateway = pool(&f.db, pg::GATEWAY);
+    let id = f.request(false).await;
+    f.dispatch(&id).await;
+    let run = f.run_of(&id).await;
+    sqlx::query(
+        "UPDATE openmettle.runs
+            SET lease_expires_at=clock_timestamp()-interval '16 minutes',
+                execution_expires_at=clock_timestamp()-interval '16 minutes'
+          WHERE id=$1::uuid",
+    )
+    .bind(&run)
+    .execute(&f.owner)
+    .await
+    .unwrap();
+    let mut pass = budgets::Pass::default();
+    assert_eq!(
+        budgets::sweep_unreported_gateway_requests(&f.worker, &mut pass, 100)
+            .await
+            .unwrap(),
+        1
+    );
+
+    // Through `settlement::ingest`: bare, prompt-only, and completion-only final reports are
+    // refused and leave no row at revision 1.
+    for (prompt, completion) in [(None, None), (Some(10), None), (None, Some(5))] {
+        let mut r = f.report(&id, 1, None);
+        r.prompt_tokens = prompt;
+        r.completion_tokens = completion;
+        assert_eq!(
+            settlement::ingest(&gateway, &r).await,
+            Err(StoreError::Refused),
+            "ingest accepted ({prompt:?}, {completion:?}) after unreported"
+        );
+    }
+    assert_eq!(
+        f.reasons(&id).await,
+        [(id.clone(), 0, true, Some("unreported".to_owned()), 0)]
+    );
+
+    // Through direct SQL as `openmettle_gateway` even with `quota_settle_gateway_usage(..., 1)`:
+    // bare and single-count final reports are refused at commit with 23514.
+    let mut direct = connect(&f.db.0, pg::GATEWAY).await;
+    for (what, cols, vals, measured) in [
+        ("bare", "", "", None::<i64>),
+        ("prompt_only", ",prompt_tokens", ",10", Some(10)),
+        ("completion_only", ",completion_tokens", ",5", Some(5)),
+    ] {
+        let mut tx = direct.begin().await.unwrap();
+        let report_id: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final{cols})
+             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),1,true{vals})
+             RETURNING report_id::text"
+        )))
+        .bind(&id)
+        .bind(INSTALL)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.gateway_settlements
+                SET revision=1,final=true,measured=$2,outstanding=0
+              WHERE request_id=$1::uuid",
+        )
+        .bind(&id)
+        .bind(measured)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("SELECT openmettle.quota_settle_gateway_usage($1::uuid,$2::uuid,$3::uuid,1)")
+            .bind(&id)
+            .bind(INSTALL)
+            .bind(&report_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let Err(sqlx::Error::Database(error)) = tx.commit().await else {
+            panic!("direct SQL accepted {what} final report after unreported");
+        };
+        assert_eq!(error.code().as_deref(), Some("23514"), "{what}");
+    }
+
+    // Operator query still shows `unreported`, and a real complete revision-1 report succeeds.
+    let page = include_str!("../../docs/operator/gateway-proxy.md");
+    let (_, query) = page.split_once("```sql\n").unwrap();
+    let (query, _) = query.split_once("```").unwrap();
+    let query = query.trim().trim_end_matches(';');
+    let listed: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT request_id::text,incomplete FROM ({query}) AS listed"
+    )))
+    .fetch_all(&f.owner)
+    .await
+    .unwrap();
+    assert_eq!(listed, [(id.clone(), "unreported".to_owned())]);
+
+    assert_eq!(
+        settlement::ingest(&gateway, &f.report(&id, 1, Some((17, 2)))).await,
+        Ok(Outcome::Applied)
+    );
+    let after: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT request_id::text,incomplete FROM ({query}) AS listed"
+    )))
+    .fetch_all(&f.owner)
+    .await
+    .unwrap();
+    assert_eq!(after, []);
+    assert_eq!(
+        f.hold(&id).await,
+        ("settled".to_owned(), 0, "19".to_owned())
+    );
     assert_eq!(f.drift().await, (0, 0, 0, 0));
 }

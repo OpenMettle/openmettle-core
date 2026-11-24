@@ -89,7 +89,7 @@ policy is provisioned for it.
 | Report field | Value |
 | --- | --- |
 | `request`, `installation`, `principal`, `scope`, `source` | The stored handed-off request: `source` is its installation and `principal` the user it acts for |
-| `report_id`, `revision`, `final` | The request ID, `1` and `true`. Revision `0` is written by the worker's maintenance sweep (increment 3b): a higher final revision corrects a lower one, so a report of the proxy that arrives late replaces the sweep's `unreported` record |
+| `report_id`, `revision`, `final` | The request ID, `1` and `true`. Revision `0` on unbound requests is reserved to the worker's maintenance sweep (`openmettle_owner`, increment 3b): a higher final revision with both counts or a proxy reason corrects a lower one, so a report of the proxy that arrives late replaces the sweep's `unreported` record |
 | `prompt_tokens`, `completion_tokens` | The upstream's counts. A report with usage has both; a report without usage has neither |
 | `incomplete` | Empty for a report with usage. Otherwise the reason the request has none, from the table under [When there is no usage](#when-there-is-no-usage) |
 | `reasoning_tokens` | Top-level `reasoning_tokens` or `completion_tokens_details.reasoning_tokens`, which must agree when both are present and cannot exceed `completion_tokens` |
