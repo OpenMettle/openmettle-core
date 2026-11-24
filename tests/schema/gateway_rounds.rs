@@ -373,6 +373,54 @@ impl Rounds {
             .unwrap()
     }
 
+    /// Starts a dispatch of `round` on a gateway connection of its own, already open.
+    async fn dispatching(&self, round: &Round) -> tokio::task::JoinHandle<Vec<Dispatched>> {
+        let mut c = connect(&self.db.0, pg::GATEWAY).await;
+        let (request, bearer) = (round.request.clone(), round.bearer);
+        tokio::spawn(async move {
+            sqlx::query_as(DISPATCH)
+                .bind(request)
+                .bind(bearer.as_slice())
+                .fetch_all(&mut c)
+                .await
+                .unwrap()
+        })
+    }
+
+    /// Starts the library's lease release of `round`'s run on `worker`.
+    fn releasing(
+        &self,
+        mut worker: PgConnection,
+        round: &Round,
+    ) -> tokio::task::JoinHandle<Result<(), leases::LeaseError>> {
+        let (scope, run, claim) = (self.scope.clone(), round.run.clone(), round.lease.clone());
+        tokio::spawn(async move {
+            let lease = Lease {
+                scope_id: &scope,
+                run_id: &run,
+                claim_token: &claim,
+            };
+            leases::release_lease(&mut worker, &lease).await
+        })
+    }
+
+    /// Waits until `sql`, with `$1` bound to `id`, is true on the database's own clock.
+    async fn until(&mut self, sql: &'static str, id: &str, why: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let done: bool = sqlx::query_scalar(sql)
+                .bind(id)
+                .fetch_one(&mut self.owner)
+                .await
+                .unwrap();
+            if done {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{why}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// The row of a first dispatch of a round of the fixture's account.
     fn routed(&self) -> Dispatched {
         (
@@ -400,6 +448,23 @@ impl Rounds {
 }
 
 const REPLAY: Dispatched = (true, None, None, None, None, None);
+
+/// A final usage report and its settlement for request `$1`, written as the owner.
+const SETTLED: [&str; 2] = [
+    "INSERT INTO openmettle.gateway_usage_reports
+         (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens)
+     SELECT id,report_source,gen_random_uuid(),0,true,1,1
+       FROM openmettle.gateway_requests WHERE id=$1::uuid",
+    "INSERT INTO openmettle.gateway_settlements (request_id,revision,final,measured,outstanding)
+     VALUES ($1::uuid,0,true,2,0)",
+];
+
+async fn backend_pid(c: &mut PgConnection) -> i32 {
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(c)
+        .await
+        .unwrap()
+}
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
@@ -819,9 +884,12 @@ async fn a_project_round_needs_a_live_editor_role_in_a_project_that_is_not_archi
 /// change, before it locks any row; that change shortens the expiry and commits, so the handoff
 /// reads an authority that is still live. The confirm step then waits behind a quota
 /// administration change, which commits only after the expiry is seen to have passed. Once the
-/// handoff holds its row locks nothing can write the expiry, so only time can withdraw it: the
-/// expiry is the one interval left, and it has to outlast only the server's own work between
-/// the first holder's commit and the handoff's read.
+/// handoff holds its row locks nothing can write the expiry, so only time can withdraw it.
+///
+/// The expiry is three seconds after the statement that sets it. A handoff that reads the
+/// authority later than that is refused, and says so at once: the attempt is dropped and
+/// started over, three times at most. An attempt whose handoff was accepted must be seen
+/// waiting on the quota holder and must outlast the expiry.
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn authority_that_lapses_during_a_quota_wait_is_not_handed_off() {
@@ -832,7 +900,7 @@ async fn authority_that_lapses_during_a_quota_wait_is_not_handed_off() {
         (
             "an approval that expired during the wait",
             "UPDATE openmettle.local_identity_approvals
-                SET expires_ms=floor(extract(epoch FROM clock_timestamp())*1000)::bigint+1000
+                SET expires_ms=floor(extract(epoch FROM clock_timestamp())*1000)::bigint+3000
               WHERE id=$1::uuid",
             "SELECT expires_ms<floor(extract(epoch FROM clock_timestamp())*1000)::bigint
                FROM openmettle.local_identity_approvals WHERE id=$1::uuid",
@@ -843,7 +911,7 @@ async fn authority_that_lapses_during_a_quota_wait_is_not_handed_off() {
         (
             "a lease that lapsed during the wait",
             "UPDATE openmettle.runs
-                SET lease_expires_at=clock_timestamp()+interval '1000 milliseconds'
+                SET lease_expires_at=clock_timestamp()+interval '3000 milliseconds'
               WHERE id=$1::uuid",
             "SELECT lease_expires_at<clock_timestamp() FROM openmettle.runs WHERE id=$1::uuid",
             "UPDATE openmettle.runs SET lease_expires_at=clock_timestamp()+interval '1 minute'
@@ -857,76 +925,86 @@ async fn authority_that_lapses_during_a_quota_wait_is_not_handed_off() {
         } else {
             round.run.clone()
         };
-        let mut holders = Vec::new();
-        for lock in [
-            "SELECT FROM openmettle.account_admin_lock FOR UPDATE",
-            "SELECT FROM openmettle.quota_enforcement FOR UPDATE",
-        ] {
-            let mut holder = connect(&f.db.0, OWNER).await;
-            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-                .fetch_one(&mut holder)
-                .await
-                .unwrap();
-            holder.execute("BEGIN").await.unwrap();
-            holder.execute(lock).await.unwrap();
-            holders.push((holder, pid));
-        }
-        let (mut quota, quota_pid) = holders.pop().unwrap();
-        let (mut accounts, accounts_pid) = holders.pop().unwrap();
-        let options = role_options(&f.db.0, WORKER);
-        let (request, secret, bearer, lease) = (
-            round.request.clone(),
-            round.secret,
-            round.bearer,
-            round.lease.clone(),
-        );
-        let waiting = tokio::spawn(async move {
-            let mut c = PgConnection::connect_with(&options).await.unwrap();
-            c.execute("BEGIN").await.unwrap();
-            // Waits for the account holder before it locks or reads anything it checks.
-            let handed: bool = sqlx::query_scalar(HANDOFF)
-                .bind(&request)
-                .bind(secret.as_slice())
-                .bind(&lease)
-                .bind(bearer.as_slice())
-                .fetch_one(&mut c)
-                .await
-                .unwrap();
-            // Waits for the quota holder inside the deferred handoff check.
-            let confirmed = sqlx::query(CONFIRM)
-                .bind(&request)
-                .bind(secret.as_slice())
-                .bind(&lease)
-                .execute(&mut c)
-                .await;
-            let _ = c.execute("ROLLBACK").await;
-            (handed, confirmed.map(|_| ()))
-        });
-        wait_for_blocked_peer(&f.db, accounts_pid).await;
-        let shortened = sqlx::query(shorten)
-            .bind(&id)
-            .execute(&mut accounts)
-            .await
-            .unwrap();
-        assert_eq!(shortened.rows_affected(), 1, "{why}");
-        accounts.execute("COMMIT").await.unwrap();
-        wait_for_blocked_peer(&f.db, quota_pid).await;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let done: bool = sqlx::query_scalar(lapsed)
-                .bind(&id)
-                .fetch_one(&mut f.owner)
-                .await
-                .unwrap();
-            if done {
-                break;
+        let mut attempts = 0;
+        let confirmed = loop {
+            attempts += 1;
+            assert!(
+                attempts <= 3,
+                "{why}: the handoff missed the expiry three times"
+            );
+            let mut accounts = connect(&f.db.0, OWNER).await;
+            let mut quota = connect(&f.db.0, OWNER).await;
+            let accounts_pid = backend_pid(&mut accounts).await;
+            let quota_pid = backend_pid(&mut quota).await;
+            for (holder, lock) in [
+                (
+                    &mut accounts,
+                    "SELECT FROM openmettle.account_admin_lock FOR UPDATE",
+                ),
+                (
+                    &mut quota,
+                    "SELECT FROM openmettle.quota_enforcement FOR UPDATE",
+                ),
+            ] {
+                holder.execute("BEGIN").await.unwrap();
+                holder.execute(lock).await.unwrap();
             }
-            assert!(Instant::now() < deadline, "{why}: never lapsed");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        quota.execute("COMMIT").await.unwrap();
-        let (handed, confirmed) = waiting.await.unwrap();
-        assert!(handed, "{why}: authorized before the wait");
+            let mut c = connect(&f.db.0, WORKER).await;
+            let (request, secret, bearer, lease) = (
+                round.request.clone(),
+                round.secret,
+                round.bearer,
+                round.lease.clone(),
+            );
+            let (report, first) = tokio::sync::oneshot::channel();
+            let waiting = tokio::spawn(async move {
+                c.execute("BEGIN").await.unwrap();
+                // Waits for the account holder before it locks or reads anything it checks.
+                let handed: bool = sqlx::query_scalar(HANDOFF)
+                    .bind(&request)
+                    .bind(secret.as_slice())
+                    .bind(&lease)
+                    .bind(bearer.as_slice())
+                    .fetch_one(&mut c)
+                    .await
+                    .unwrap();
+                report.send(handed).unwrap();
+                // Waits for the quota holder inside the deferred handoff check.
+                let confirmed = match handed {
+                    true => Some(
+                        sqlx::query(CONFIRM)
+                            .bind(&request)
+                            .bind(secret.as_slice())
+                            .bind(&lease)
+                            .execute(&mut c)
+                            .await
+                            .map(|_| ()),
+                    ),
+                    false => None,
+                };
+                let _ = c.execute("ROLLBACK").await;
+                confirmed
+            });
+            wait_for_blocked_peer(&f.db, accounts_pid).await;
+            let shortened = sqlx::query(shorten)
+                .bind(&id)
+                .execute(&mut accounts)
+                .await
+                .unwrap();
+            assert_eq!(shortened.rows_affected(), 1, "{why}");
+            accounts.execute("COMMIT").await.unwrap();
+            if !first.await.unwrap() {
+                // The handoff read the authority after the expiry: nothing was tested.
+                quota.execute("ROLLBACK").await.unwrap();
+                assert!(waiting.await.unwrap().is_none());
+                f.owner_exec(restore, &id).await;
+                continue;
+            }
+            wait_for_blocked_peer(&f.db, quota_pid).await;
+            f.until(lapsed, &id, why).await;
+            quota.execute("COMMIT").await.unwrap();
+            break waiting.await.unwrap().expect("the confirm step ran");
+        };
         assert_eq!(sqlstate(confirmed), "42501", "{why}");
         assert_eq!(
             f.stored(&round).await,
@@ -1171,9 +1249,12 @@ async fn a_reclaimed_run_does_not_dispatch_the_previous_holders_round() {
 /// The dispatch reads its clock inside the updating statement, which by then holds its
 /// relation lock: a lease that ran out while the dispatch waited for that lock is not
 /// dispatched. The holder stands for a schema change or an explicit table lock in flight; a
-/// `SHARE` lock admits the function's row lock and blocks its update. The lease is set to the
-/// current time only after the dispatch is seen waiting, so a clock read before the wait would
-/// still be inside it.
+/// `SHARE` lock admits the function's row locks and blocks its update.
+///
+/// The waiting dispatch holds the run, so nothing but time can end the lease: it is set to run
+/// out two seconds after the dispatch starts, and the table lock is released only once the
+/// database's clock is past it. The outcome does not depend on those two seconds. Only a clock
+/// read before the wait would have to be read within them to be caught.
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn a_lease_that_lapsed_while_the_dispatch_waited_for_its_table_lock_is_not_dispatched() {
@@ -1181,35 +1262,138 @@ async fn a_lease_that_lapsed_while_the_dispatch_waited_for_its_table_lock_is_not
     let round = f.round(&quotas::snapshot(100)).await;
     f.authorized(&round, "a live run round").await;
     let mut holder = connect(&f.db.0, OWNER).await;
-    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut holder)
-        .await
-        .unwrap();
+    let pid = backend_pid(&mut holder).await;
     holder.execute("BEGIN").await.unwrap();
     holder
         .execute("LOCK TABLE openmettle.gateway_requests IN SHARE MODE")
         .await
         .unwrap();
-    let options = role_options(&f.db.0, pg::GATEWAY);
-    let (request, bearer) = (round.request.clone(), round.bearer);
-    let waiting = tokio::spawn(async move {
-        let mut c = PgConnection::connect_with(&options).await.unwrap();
-        sqlx::query_as::<_, Dispatched>(DISPATCH)
-            .bind(request)
-            .bind(bearer.as_slice())
-            .fetch_all(&mut c)
-            .await
-            .unwrap()
-    });
-    wait_for_blocked_peer(&f.db, pid).await;
     f.owner_exec(
-        "UPDATE openmettle.runs SET lease_expires_at=clock_timestamp() WHERE id=$1::uuid",
+        "UPDATE openmettle.runs SET lease_expires_at=clock_timestamp()+interval '2 seconds'
+          WHERE id=$1::uuid",
         &round.run,
+    )
+    .await;
+    let waiting = f.dispatching(&round).await;
+    wait_for_blocked_peer(&f.db, pid).await;
+    f.until(
+        "SELECT lease_expires_at<clock_timestamp() FROM openmettle.runs WHERE id=$1::uuid",
+        &round.run,
+        "the lease never ran out",
     )
     .await;
     holder.execute("COMMIT").await.unwrap();
     assert_eq!(waiting.await.unwrap(), []);
     assert!(!f.stored(&round).await.3);
+}
+
+/// A lease release in flight when the dispatch starts: the dispatch waits for it on the run
+/// row and is refused once it has committed.
+///
+/// The release is the library's. A `SHARE` lock on `runs`, held by the test, admits its row
+/// lock and blocks its update, which keeps its transaction open with the run locked. That
+/// transaction waits two seconds for a lock at most: the test has that long to see the
+/// dispatch blocked, and past it the release fails and the test with it.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_dispatch_waits_for_a_lease_release_in_flight_and_is_refused() {
+    let mut f = Rounds::new().await;
+    let round = f.round(&quotas::snapshot(100)).await;
+    f.authorized(&round, "a live run round").await;
+    let mut holder = connect(&f.db.0, OWNER).await;
+    let holder_pid = backend_pid(&mut holder).await;
+    holder.execute("BEGIN").await.unwrap();
+    holder
+        .execute("LOCK TABLE openmettle.runs IN SHARE MODE")
+        .await
+        .unwrap();
+    let mut worker = connect(&f.db.0, WORKER).await;
+    let worker_pid = backend_pid(&mut worker).await;
+    let releasing = f.releasing(worker, &round);
+    wait_for_blocked_peer(&f.db, holder_pid).await;
+    // A caller that does not prove the bearer locks nothing, so it waits for nothing.
+    let stranger = f.dispatch_as(pg::GATEWAY, &round.request, &[0xee; 32]);
+    assert_eq!(stranger.await.unwrap(), []);
+    let dispatching = f.dispatching(&round).await;
+    wait_for_blocked_peer(&f.db, worker_pid).await;
+    holder.execute("COMMIT").await.unwrap();
+    releasing.await.unwrap().unwrap();
+    assert_eq!(dispatching.await.unwrap(), []);
+    assert!(!f.stored(&round).await.3);
+}
+
+/// The same with a reclaim in flight: the dispatch waits for the new holder's claim on the run
+/// row and is refused once it has committed, although the run is then live again.
+///
+/// The reclaim is the library's. It writes the new claim and then appends an event; a `SHARE`
+/// lock on `run_events` blocks that insert and keeps its transaction open, for two seconds at
+/// most as above.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_dispatch_waits_for_a_reclaim_in_flight_and_is_refused() {
+    let mut f = Rounds::new().await;
+    let round = f.round(&quotas::snapshot(100)).await;
+    f.authorized(&round, "a live run round").await;
+    f.owner_exec(
+        "UPDATE openmettle.runs SET lease_expires_at=clock_timestamp()-interval '1 second'
+          WHERE id=$1::uuid",
+        &round.run,
+    )
+    .await;
+    let mut holder = connect(&f.db.0, OWNER).await;
+    let holder_pid = backend_pid(&mut holder).await;
+    holder.execute("BEGIN").await.unwrap();
+    holder
+        .execute("LOCK TABLE openmettle.run_events IN SHARE MODE")
+        .await
+        .unwrap();
+    let mut worker = connect(&f.db.0, WORKER).await;
+    let worker_pid = backend_pid(&mut worker).await;
+    let reclaiming = tokio::spawn(async move { leases::reclaim_next(&mut worker, &LEASES).await });
+    wait_for_blocked_peer(&f.db, holder_pid).await;
+    let dispatching = f.dispatching(&round).await;
+    wait_for_blocked_peer(&f.db, worker_pid).await;
+    holder.execute("COMMIT").await.unwrap();
+    let reclaimed = reclaiming.await.unwrap().unwrap().expect("the lapsed run");
+    assert_eq!(reclaimed.run.run_id, round.run);
+    assert_ne!(reclaimed.run.claim_token, round.lease);
+    assert_eq!(dispatching.await.unwrap(), []);
+    assert!(!f.stored(&round).await.3);
+}
+
+/// A dispatch in flight when the release starts: the release waits for it on the run row. The
+/// dispatch was granted and stays granted. The release then completes, another holder reclaims
+/// the run, and the round it finds is spent.
+///
+/// No reclaim can wait behind a granted dispatch: a reclaim takes only a lease that has run
+/// out and skips a locked run, and a dispatch is granted only inside the lease.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_lease_release_waits_for_a_dispatch_in_flight_which_stays_granted() {
+    let mut f = Rounds::new().await;
+    let round = f.round(&quotas::snapshot(100)).await;
+    f.authorized(&round, "a live run round").await;
+    let mut gateway = connect(&f.db.0, pg::GATEWAY).await;
+    let gateway_pid = backend_pid(&mut gateway).await;
+    gateway.execute("BEGIN").await.unwrap();
+    let granted: Vec<Dispatched> = sqlx::query_as(DISPATCH)
+        .bind(&round.request)
+        .bind(round.bearer.as_slice())
+        .fetch_all(&mut gateway)
+        .await
+        .unwrap();
+    assert_eq!(granted, [f.routed()]);
+    let releasing = f.releasing(connect(&f.db.0, WORKER).await, &round);
+    wait_for_blocked_peer(&f.db, gateway_pid).await;
+    gateway.execute("COMMIT").await.unwrap();
+    releasing.await.unwrap().unwrap();
+    assert!(f.stored(&round).await.3);
+    let reclaimed = leases::reclaim_next(&mut connect(&f.db.0, WORKER).await, &LEASES)
+        .await
+        .unwrap()
+        .expect("the released run");
+    assert_eq!(reclaimed.run.run_id, round.run);
+    assert_eq!(f.dispatch(&round).await, [REPLAY]);
 }
 
 /// A request handed off with a gateway binding, the ADR 0037 way, has no bearer hash and is
@@ -1273,64 +1457,39 @@ async fn a_settled_request_is_not_dispatched() {
     let mut f = Rounds::new().await;
     let round = f.round(&quotas::snapshot(100)).await;
     f.authorized(&round, "a live run round").await;
-    f.owner_exec(
-        "INSERT INTO openmettle.gateway_usage_reports
-             (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens)
-         SELECT id,report_source,gen_random_uuid(),0,true,1,1
-           FROM openmettle.gateway_requests WHERE id=$1::uuid",
-        &round.request,
-    )
-    .await;
-    f.owner_exec(
-        "INSERT INTO openmettle.gateway_settlements (request_id,revision,final,measured,outstanding)
-         VALUES ($1::uuid,0,true,2,0)",
-        &round.request,
-    )
-    .await;
+    for sql in SETTLED {
+        f.owner_exec(sql, &round.request).await;
+    }
     assert_eq!(f.dispatch(&round).await, []);
     assert!(!f.stored(&round).await.3);
 }
 
-/// A dispatch that waits for the request row decides after the wait: a cancellation committed
-/// meanwhile is seen. The holder stands for a settlement or another dispatch in flight.
+/// A dispatch that waits for the request row decides after the wait: a settlement committed
+/// meanwhile is seen. The holder is that settlement in flight: it locks the request first and
+/// never the run, so the dispatch, which holds the run by then, waits for it here.
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
-async fn a_run_cancelled_while_its_dispatch_waited_is_not_dispatched() {
+async fn a_request_settled_while_its_dispatch_waited_is_not_dispatched() {
     let mut f = Rounds::new().await;
     let round = f.round(&quotas::snapshot(100)).await;
     f.authorized(&round, "a live run round").await;
     let mut holder = connect(&f.db.0, OWNER).await;
-    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut holder)
-        .await
-        .unwrap();
+    let pid = backend_pid(&mut holder).await;
     holder.execute("BEGIN").await.unwrap();
     sqlx::query("SELECT FROM openmettle.gateway_requests WHERE id=$1::uuid FOR NO KEY UPDATE")
         .bind(&round.request)
         .execute(&mut holder)
         .await
         .unwrap();
-    let options = role_options(&f.db.0, pg::GATEWAY);
-    let (request, bearer) = (round.request.clone(), round.bearer);
-    let waiting = tokio::spawn(async move {
-        let mut c = PgConnection::connect_with(&options).await.unwrap();
-        sqlx::query_as::<_, Dispatched>(DISPATCH)
-            .bind(request)
-            .bind(bearer.as_slice())
-            .fetch_all(&mut c)
-            .await
-            .unwrap()
-    });
+    let waiting = f.dispatching(&round).await;
     wait_for_blocked_peer(&f.db, pid).await;
-    let principal = authz_store::principal(&f.db, &f.actor).await;
-    queue::cancel_run(
-        &mut connect(&f.db.0, API).await,
-        &principal,
-        &f.scope,
-        &round.run,
-    )
-    .await
-    .unwrap();
+    for sql in SETTLED {
+        sqlx::query(sql)
+            .bind(&round.request)
+            .execute(&mut holder)
+            .await
+            .unwrap();
+    }
     holder.execute("COMMIT").await.unwrap();
     assert_eq!(waiting.await.unwrap(), []);
     assert!(!f.stored(&round).await.3);

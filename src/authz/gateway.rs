@@ -458,9 +458,9 @@ impl TurnPending {
     ///
     /// The bearer the worker presents to the proxy is a new random value, independent of the
     /// dispatch secret. Only its SHA-256 is sent to the database, which stores it for the proxy
-    /// to compare: the bearer itself lives in the returned [`Dispatch`] alone and never crosses
-    /// a database connection. The dispatch secret stays this caller's proof to the database and
-    /// is never sent over HTTP.
+    /// to compare. The bearer itself is kept in the returned [`Dispatch`], is sent to the proxy
+    /// over HTTP, and never crosses a database connection. The dispatch secret stays this
+    /// caller's proof to the database and is never sent over HTTP.
     async fn authorize_in(&self, tx: &mut WriteTransaction<'_>) -> Result<Dispatch, Error> {
         let mut bearer = [0; 32];
         SystemRandom::new()
