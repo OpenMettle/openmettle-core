@@ -300,11 +300,11 @@ async fn recovers(tool: &str) {
         "{tool} did not preserve the hard link between the two names of one upload"
     );
     let path = root.to_str().unwrap();
-    assert!(
-        !admin(&f.db, OWNER, &["quota", "verify", path])
-            .status
-            .success()
-    );
+    // The read-only check an operator may reach for first is refused too, and says why.
+    let early = admin(&f.db, OWNER, &["quota", "verify", path]);
+    assert!(!early.status.success());
+    let early = String::from_utf8_lossy(&early.stderr).into_owned();
+    assert!(early.contains("storage rebind"), "{early}");
 
     let (ok, out, err) = rebind(&f.db, &root, &[]);
     assert!(ok, "{out}{err}");
@@ -486,6 +486,13 @@ async fn rebind_keeps_the_volume_closed_until_every_payload_verifies() {
         ],
     );
     assert!(!adopt.status.success());
+    // Adoption is not behind the store's copy check: it inspected the copied files itself.
+    let refusal = String::from_utf8_lossy(&adopt.stderr).into_owned();
+    assert!(
+        refusal.contains("OMQ03: intra_reservation_inode_mismatch")
+            || refusal.contains("OMQ03: missing revision"),
+        "{refusal}"
+    );
     assert_eq!(barrier(&f.db).await.as_deref(), Some(held.as_str()));
 
     // Repairing one payload is not enough.
@@ -773,20 +780,37 @@ async fn rebind_reports_a_layout_the_lifecycle_does_not_allow() {
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
-async fn rebind_releases_the_barrier_only_when_the_drift_check_is_healthy() {
+async fn rebind_keeps_the_barrier_for_a_file_mismatch_not_for_quarantine_or_accounting_drift() {
     let f = Fixture::new().await;
     let live = f.stored("live", b"live payload").await;
-    let held = f.crashed("held", b"partial upload", false).await;
+    // States the system tolerated before the backup: a quarantined reservation and a ledger
+    // total that does not add up.
+    let quarantined = f.crashed("quarantined", b"quarantined upload", false).await;
+    let mut owner = connect(&f.db.0, OWNER).await;
+    sqlx::query(
+        "UPDATE openmettle.storage_reservations SET adoption_unverified=true WHERE id=$1::uuid",
+    )
+    .bind(&quarantined)
+    .execute(&mut owner)
+    .await
+    .unwrap();
+    owner
+        .execute("UPDATE openmettle.storage_instance SET reserved_bytes=reserved_bytes+1")
+        .await
+        .unwrap();
     let dir = Dir::new();
     let root = copy_tree("cp", &f.root, &dir).unwrap();
-    // A file no reservation owns: every row verifies, and the drift check still rejects it.
+    let staged = root.join("staging").join(&quarantined);
+    let stale = bound(&f.db, &quarantined).await;
+    // A file no reservation owns: every row verifies, and the volume still has a file
+    // mismatch, which is rebind's to refuse.
     let orphan = root.join("revisions").join(new_uuid(&f.db).await);
     fs::write(&orphan, b"orphan").unwrap();
 
     let (ok, out, err) = rebind(&f.db, &root, &[]);
     assert!(!ok, "{out}");
     assert!(
-        out.contains("rebound 2, emptied 1, unchanged 0, quarantined 0, failed 0"),
+        out.contains("rebound 1, emptied 0, unchanged 0, quarantined 1, failed 0"),
         "{out}"
     );
     assert!(out.contains("file mismatches 1"), "{out}");
@@ -795,40 +819,44 @@ async fn rebind_releases_the_barrier_only_when_the_drift_check_is_healthy() {
         err.contains(&format!("--replace-adoption-run {kept}")),
         "{err}"
     );
-    // The verified rows are kept.
+    // The verified row is kept.
     assert_eq!(
         bound(&f.db, &live.reservation).await,
         ino(root.join("revisions").join(&live.reservation))
     );
 
-    // A quarantined reservation fails the drift check too, so it keeps the volume closed.
+    // Without the file mismatch the volume opens. The quarantine and the accounting drift
+    // are reported, left exactly as they were, and do not fail the run.
     fs::remove_file(&orphan).unwrap();
-    let quarantine = async |on: bool| {
-        sqlx::query(
-            "UPDATE openmettle.storage_reservations SET adoption_unverified=$2 WHERE id=$1::uuid",
-        )
-        .bind(&held)
-        .bind(on)
-        .execute(&mut connect(&f.db.0, OWNER).await)
-        .await
-        .unwrap();
-    };
-    quarantine(true).await;
-    let (ok, out, _) = rebind(&f.db, &root, &["--replace-adoption-run", &kept]);
-    assert!(!ok, "{out}");
+    let (ok, out, err) = rebind(&f.db, &root, &["--replace-adoption-run", &kept]);
+    assert!(ok, "{out}{err}");
     assert!(
         out.contains("rebound 0, emptied 0, unchanged 1, quarantined 1, failed 0"),
         "{out}"
     );
-    let kept = barrier(&f.db).await.expect("the barrier was released");
-
-    quarantine(false).await;
-    let (ok, out, err) = rebind(&f.db, &root, &["--replace-adoption-run", &kept]);
-    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains(&format!("quarantined {quarantined}: left unchanged")),
+        "{out}"
+    );
+    assert!(
+        out.contains("storage mismatches 1,") && out.contains("file mismatches 0, quarantined 1"),
+        "{out}"
+    );
     assert_eq!(barrier(&f.db).await, None);
+    assert_eq!(fs::read(&staged).unwrap(), b"quarantined upload");
+    assert_eq!(bound(&f.db, &quarantined).await, stale);
+    assert_eq!(
+        reservation_row(&f.db, &quarantined).await,
+        ("reserved".into(), false, true, 0)
+    );
+    // The store serves the volume, and the drift check stays unhealthy for the same reasons
+    // as before the backup.
+    let store = Store::open(&root).unwrap();
+    store.initialize_api(&f.api).await.unwrap();
+    assert_eq!(read(&store, &live, 0, 12).await.unwrap(), b"live payload");
     let path = root.to_str().unwrap();
     assert!(
-        admin(&f.db, OWNER, &["quota", "verify", path])
+        !admin(&f.db, OWNER, &["quota", "verify", path])
             .status
             .success()
     );
@@ -1039,6 +1067,10 @@ async fn a_worker_refuses_a_copied_volume_until_rebind_has_run() {
     let mut refusal = String::new();
     std::io::Read::read_to_string(early.0.stderr.as_mut().unwrap(), &mut refusal).unwrap();
     assert!(refusal.contains("invalid ARTIFACTS_DIR"), "{refusal}");
+    assert!(
+        refusal.contains("openmettle-admin storage rebind"),
+        "{refusal}"
+    );
     assert_eq!(
         reservation_row(&f.db, &held).await,
         ("reserved".into(), false, false, 0)

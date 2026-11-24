@@ -34,8 +34,8 @@ pub struct Report {
     pub emptied: usize,
     /// Reservations that verified under the inode they already carried.
     pub unchanged: usize,
-    /// Quarantined reservations, which are left to the owner.
-    pub quarantined: usize,
+    /// Quarantined reservations. They are reported and left exactly as they were.
+    pub quarantined: Vec<String>,
     /// Reservations left untouched, each with its reason.
     pub failures: Vec<(String, &'static str)>,
     /// The filesystem drift check on the result. Not run when a reservation failed.
@@ -45,10 +45,12 @@ pub struct Report {
 }
 
 impl Report {
-    /// Every reservation verified and the drift check accepts the volume. Only then is the
-    /// barrier released.
+    /// Every reservation verified and the drift check finds no file mismatch: no recorded
+    /// inode, size or name that disagrees with the volume. Only then is the barrier released.
+    /// Quarantined reservations and accounting drift are states a running system tolerates;
+    /// they are reported and do not keep a restored volume closed.
     pub fn complete(&self) -> bool {
-        self.failures.is_empty() && self.drift.as_ref().is_some_and(Drift::healthy)
+        self.failures.is_empty() && self.drift.as_ref().is_some_and(|drift| drift.files == 0)
     }
 }
 
@@ -299,7 +301,7 @@ impl Scan {
     ) -> Result<(), Failure> {
         let id: &str = row.try_get("id")?;
         if row.try_get("adoption_unverified")? {
-            self.report.quarantined += 1;
+            self.report.quarantined.push(id.to_owned());
             return Ok(());
         }
         // Binding a reservation that never had an inode is adoption's decision.
@@ -561,7 +563,7 @@ async fn scan_and_apply(
             return Err(Failure("ledger changed during rebind"));
         }
     }
-    // The barrier is never released on a volume the filesystem drift check would reject.
+    // The barrier is never released on a volume where the drift check finds a file mismatch.
     if report.failures.is_empty() {
         let drift = drift::verify_volume(&mut tx, v, pin)
             .await

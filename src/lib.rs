@@ -557,7 +557,13 @@ pub async fn run(role: Role) -> u8 {
         )
         .await
         {
-            eprintln!("configuration error: invalid ARTIFACTS_DIR");
+            if store.awaits_rebind() {
+                eprintln!(
+                    "configuration error: invalid ARTIFACTS_DIR: the volume was restored by file copy; run `openmettle-admin storage rebind` first"
+                );
+            } else {
+                eprintln!("configuration error: invalid ARTIFACTS_DIR");
+            }
             return 78;
         }
     }

@@ -6,6 +6,8 @@ use openmettle_core::artifact_fs::{
 use sqlx::{Connection, PgConnection};
 use std::{env, path::Path, process::ExitCode};
 
+const REBIND_FIRST: &str = "the artifact volume was restored by file copy and is not rebound; run `openmettle-admin storage rebind` first";
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     match run().await {
@@ -49,7 +51,13 @@ async fn run() -> Result<(), &'static str> {
                 let report =
                     openmettle_core::artifact_fs::verify_accounting_drift(&pool, store.as_ref())
                         .await
-                        .map_err(|_| "volume or ledger verification failed")?;
+                        .map_err(|_| {
+                            if store.as_ref().is_some_and(|store| store.awaits_rebind()) {
+                                REBIND_FIRST
+                            } else {
+                                "volume or ledger verification failed"
+                            }
+                        })?;
                 print_drift(&report);
                 if !report.healthy() {
                     return Err("accounting drift detected");
@@ -162,17 +170,26 @@ async fn rebind_volume(root: &Path, replace: Option<&str>) -> Result<(), &'stati
         report.rebound,
         report.emptied,
         report.unchanged,
-        report.quarantined,
+        report.quarantined.len(),
         report.failures.len()
     );
     for (reservation, reason) in &report.failures {
         println!("failed {reservation}: {reason}");
     }
-    if report.complete() {
-        return Ok(());
+    for reservation in &report.quarantined {
+        println!("quarantined {reservation}: left unchanged");
     }
-    if let Some(drift) = &report.drift {
+    let drift = report.drift.as_ref().filter(|drift| !drift.healthy());
+    if let Some(drift) = drift {
         print_drift(drift);
+    }
+    if report.complete() {
+        if drift.is_some() {
+            println!(
+                "rebind did not change the quarantined reservations or the accounting drift reported above"
+            );
+        }
+        return Ok(());
     }
     eprintln!(
         "the volume stays closed; resolve what is reported and re-run with --replace-adoption-run {}",

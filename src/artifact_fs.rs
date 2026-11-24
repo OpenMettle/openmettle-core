@@ -122,6 +122,8 @@ pub struct Store {
     anchor_pass: Arc<[tokio::sync::Mutex<reclaim::AnchorPass>; 2]>,
     /// Set once the copy check has passed; see [`Self::check_not_copied`].
     not_copied: Arc<AtomicBool>,
+    /// Set while the last copy check found a published payload under another inode.
+    copied: Arc<AtomicBool>,
 }
 impl Store {
     pub fn open(root: &Path) -> Result<Self, InvalidDirectory> {
@@ -140,6 +142,7 @@ impl Store {
             expiry_pass: Default::default(),
             anchor_pass: Default::default(),
             not_copied: Default::default(),
+            copied: Default::default(),
         })
     }
     /// Initializes a fresh installation from the API role and verifies an existing pin.
@@ -168,11 +171,19 @@ impl Store {
         for (id, bound) in sample {
             let found = self.volume.inode(&self.volume.revisions, &id);
             if matches!(found, Ok(Some(ino)) if ino.to_string() != bound) {
+                self.copied.store(true, Ordering::Relaxed);
                 return Err(Error::Io);
             }
         }
+        self.copied.store(false, Ordering::Relaxed);
         self.not_copied.store(true, Ordering::Relaxed);
         Ok(())
+    }
+    /// The last operation was refused because the volume was restored by file copy and
+    /// `openmettle-admin storage rebind` has not completed on it. Callers that report to an
+    /// operator use this to say what to do.
+    pub fn awaits_rebind(&self) -> bool {
+        self.copied.load(Ordering::Relaxed)
     }
     pub(crate) fn attach(&self, pool: &PgPool) {
         self.pool.get_or_init(|| pool.clone());

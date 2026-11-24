@@ -34,16 +34,18 @@ Rebind is a post-restore command. Do not run it on a volume in service. It alway
    | `rebound` | Reservations now bound to another inode number. |
    | `emptied` | Unsettled uploads whose bytes were discarded (see below). |
    | `unchanged` | Reservations that verified under the inode number they already carried. |
-   | `quarantined` | Reservations that were already quarantined. Rebind leaves them alone, and they keep the volume closed. |
+   | `quarantined` | Reservations that were already quarantined. Rebind lists each one and leaves it exactly as it was. |
    | `failed` | Reservations that did not verify. Each is listed with its reason. |
 
-3. Run the filesystem drift check. It is the required post-restore check and must exit with status 0.
+   A run can also exit with status 0 and report states it did not change (see [Quarantines and accounting drift](#quarantines-and-accounting-drift)).
+
+3. Run the filesystem drift check. It is the required post-restore check.
 
    ```sh
    openmettle-admin quota verify "$ARTIFACT_ROOT"
    ```
 
-   Rebind runs the same check as its last step and opens the volume only when it passes, so a failure here means the volume changed after rebind. The SQL function `openmettle.quota_verify_accounting_drift()` is not sufficient on its own. It compares no file and reports a copied volume as healthy.
+   Run it after rebind, not before: on a copied volume it is refused until rebind has completed, with a message that names `storage rebind`. It must report `file mismatches 0`. Rebind makes the same verification as its last step and opens the volume only when there is no file mismatch, so a file mismatch here means the volume changed after rebind. The SQL function `openmettle.quota_verify_accounting_drift()` is not sufficient on its own. It compares no file and reports a copied volume as healthy.
 
 4. Continue with the rest of the restore checklist, then start the API and worker.
 
@@ -59,7 +61,7 @@ Rebind never empties a file that another reservation or a name outside the reser
 
 ## When the volume stays closed
 
-Rebind opens the volume only when every reservation verified **and** the filesystem drift check accepts the result. Otherwise it exits with status 1, keeps every reservation that verified, leaves the others untouched, and keeps its database barrier: the API and worker refuse to start and every artifact operation fails. The error output names the value to continue with:
+Rebind opens the volume only when every reservation verified **and** the filesystem verification finds no file mismatch: no recorded inode number, size or hash that disagrees with a file, and no file the reservations' states do not allow. Otherwise it exits with status 1, keeps every reservation that verified, leaves the others untouched, and keeps its database barrier: the API and worker refuse to start and every artifact operation fails. The error output names the value to continue with:
 
 ```text
 rebound 6, emptied 2, unchanged 0, quarantined 0, failed 1
@@ -85,14 +87,28 @@ SELECT adoption_run_id FROM openmettle.storage_volume_control;
 | `unexpected payload`, `unexpected reclaim anchor`, `unexpected purge anchor`, `anchor is not empty`, `truncated_visible_name_present`, `invalid volume entry` | A file is present that the reservation's state does not allow, or a cleanup marker is not in a state the store writes. |
 | `cannot read revision digest` | The payload could not be read. |
 
-When every reservation verified but the drift check rejects the volume, rebind prints the same line as `quota verify` instead of `failed` lines:
+When every reservation verified but a file mismatch remains, rebind prints the same line as `quota verify` instead of `failed` lines. It usually means a file that no reservation owns:
 
 ```text
 rebound 2, emptied 1, unchanged 0, quarantined 0, failed 0
 storage mismatches 0, budget mismatches 0, settlement mismatches 0, pending gateway 0, file mismatches 1, quarantined 0, unsettled payloads 0
 ```
 
-A non-zero `file mismatches` usually means a file that no reservation owns. A non-zero `quarantined` means a reservation was quarantined before the backup or by a process started too early.
+### Quarantines and accounting drift
+
+Quarantined reservations and accounting drift that is not a file mismatch do not keep the volume closed. A running system tolerates both; they are alarms, not outages. Rebind lists them, states that it did not change them, and exits with status 0 if nothing else failed:
+
+```text
+rebound 4, emptied 0, unchanged 0, quarantined 1, failed 0
+quarantined 5f0c2f0e-7d0a-4c55-9a43-3d0b8a2f6c11: left unchanged
+storage mismatches 1, budget mismatches 0, settlement mismatches 0, pending gateway 0, file mismatches 0, quarantined 1, unsettled payloads 0
+rebind did not change the quarantined reservations or the accounting drift reported above
+```
+
+`quota verify` then exits with a non-zero status for the same reasons. Compare its result with the state at the recovery point:
+
+- **Quarantined reservations or accounting drift that already existed at the recovery point** are the state the system was in before the backup. The restore is complete; handle them with the normal procedures for those conditions ([Verify accounting](storage-adoption-and-quota-upgrade.md#verify-accounting)).
+- **Quarantines that were not there before the backup** mean a service was started on the volume before rebind. Restore the database again from the same recovery point and run rebind before starting anything.
 
 ### Refused runs
 
@@ -114,13 +130,27 @@ If rebind is killed, the barrier stays set. Read `adoption_run_id` as above and 
 
 ## Start-up check
 
-The API and worker compare up to 16 live settled payloads with the ledger before they do any artifact work. When a published file has another inode number than the ledger, start-up exits with status 78 (`configuration error: invalid ARTIFACTS_DIR`). If the database cannot be reached at start-up, the process starts, and each artifact operation repeats the check and fails until it has passed once. `openmettle-admin quota verify` makes the same check, so on a copied volume it fails with `volume or ledger verification failed` until rebind has run.
+The API and worker compare up to 16 live settled payloads with the ledger before they do any artifact work. When a published file has another inode number than the ledger, start-up exits with status 78 and says what to do:
+
+```text
+configuration error: invalid ARTIFACTS_DIR: the volume was restored by file copy; run `openmettle-admin storage rebind` first
+```
+
+If the database cannot be reached at start-up, the process starts, and each artifact operation repeats the check and fails until it has passed once. Those later failures carry the store's general I/O error (`worker.sweep.failed`, a 500 for an API request), not this message.
+
+`openmettle-admin quota verify ROOT` makes the same check. On a copied volume it is refused until rebind has completed, so it cannot be used as a diagnostic before rebind:
+
+```text
+openmettle-admin: the artifact volume was restored by file copy and is not rebound; run `openmettle-admin storage rebind` first
+```
+
+`storage rebind` and `storage adopt` are not behind this check. They read the volume and the ledger directly.
 
 The check never refuses a healthy volume. It is best effort: it can miss a copied volume that holds no live settled payload, or one whose sampled files received the same inode numbers by chance.
 
 ## Known gaps
 
 - **A payload that cannot be recovered keeps the volume closed.** If a settled payload is lost or damaged in every copy, rebind cannot complete until the owner resolves that reservation by hand. A supported step to declare a payload lost does not exist yet.
-- **A quarantined reservation keeps the volume closed.** The drift check rejects a volume with a quarantined reservation, and nothing supported clears a quarantine on a copied volume. The owner resolves it by hand.
+- **A quarantined reservation stays quarantined.** Rebind does not verify or rebind it, and nothing supported clears a quarantine on a copied volume. It does not keep the volume closed; the owner resolves it by hand, as before the backup.
 - **A process that got past the start-up check before rebind can cause damage that rebind does not undo.** A worker quarantines unsettled uploads whose files changed and claims due revisions for purge. You see `worker.sweep.failed`, reads answering 500 and a non-zero `quarantined` count. The supported recovery is to restore the database again from the same recovery point and run rebind before starting anything.
 - **Exercised copy tools:** `cp -a`, GNU `tar` 1.34 and restic 0.14 on Linux, on a local filesystem. Velero file backup, NFS volumes, CSI snapshots and a real cluster restore have not been tested.

@@ -4538,11 +4538,16 @@ the run is an operator precondition.
   cannot be opened is such a failure, not a refusal of the run. Rebind writes no accounting row.
 - Before the commit, every file whose inode is recorded and the root, `staging/` and
   `revisions/` directories are synced.
-- **Rebind never releases the barrier on a volume that the filesystem drift check would
-  reject.** Its last step, inside the same transaction, is the verification that
-  `openmettle-admin quota verify ROOT` performs. The barrier is released only when every
-  reservation verified and that check is healthy. Otherwise the run keeps it, and the volume
+- **Rebind never releases the barrier on a volume with a file mismatch.** Its last step,
+  inside the same transaction, is the verification that `openmettle-admin quota verify ROOT`
+  performs. The barrier is released only when every reservation verified and that
+  verification finds no file mismatch: no recorded inode, size or digest that disagrees with a
+  file, and no name the lifecycle does not allow. Otherwise the run keeps it, and the volume
   stays closed until a later run that names the barrier completes.
+- Quarantined reservations and accounting drift that is not a file mismatch do not keep the
+  barrier. A running system tolerates both, and a restore must not turn a state the system
+  tolerated before the backup into a volume that cannot reopen. Rebind reports them, with the
+  quarantined reservation ids, leaves them unchanged and exits 0 if nothing else failed.
 - A refused run (wrong login, unpinned volume, a locked payload, a changed ledger) changes no
   file and no row and hands the barrier back as it found it. Once a run has started to empty
   a file, any later failure keeps the barrier and reports its value.
@@ -4556,7 +4561,8 @@ the run is an operator precondition.
   refuse the volume when a published name carries another inode than the ledger. The check
   runs in the path every store operation takes, so a process whose start-up check could not
   complete repeats it until it has passed once. It cannot refuse a healthy volume and can
-  miss a copied one.
+  miss a copied one. The start-up refusal and `quota verify ROOT`, which is refused the same
+  way, name `storage rebind`. `storage rebind` and `storage adopt` are not behind the check.
 
 **Restore validation.** The filesystem drift check (`openmettle-admin quota verify ROOT`) is the
 required post-restore check. `quota_verify_accounting_drift()` alone compares no file and
@@ -4564,7 +4570,7 @@ reports a copied, unbound volume as healthy.
 
 **Consequences and known gaps.** A settled payload that cannot be recovered keeps the volume
 closed until the owner resolves that row by hand; a supported step to declare a payload lost
-does not exist yet. A quarantined reservation fails the drift check and therefore also keeps
-the volume closed until the owner resolves it. A worker that got past the start-up check
+does not exist yet. A quarantined reservation stays quarantined, and `quota verify ROOT` stays
+unhealthy for it as it was before the backup. A worker that got past the start-up check
 before rebind can quarantine unsettled uploads, which rebind leaves quarantined. Only `cp -a`,
 GNU `tar` and restic 0.14 copies were exercised; Velero, NFS and CSI snapshots were not.
