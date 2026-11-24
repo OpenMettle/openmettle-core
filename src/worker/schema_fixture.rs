@@ -7,7 +7,11 @@ use crate::provider_http::{
     inference::{Protocol, Qualification, Timeouts},
 };
 use serde::Deserialize;
-use std::{collections::BTreeMap, io::BufRead};
+use std::{
+    collections::BTreeMap,
+    io::BufRead,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 #[derive(Deserialize)]
 struct MeteredSetup {
@@ -29,6 +33,16 @@ struct Setup {
     stop_during_observation: bool,
     #[serde(default)]
     metered: Option<MeteredSetup>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    parallel: bool,
+    #[serde(default)]
+    tool_separator_whitespace: bool,
+    #[serde(default)]
+    recorded_tools: bool,
+    #[serde(default)]
+    pause_after_first_tool_lock: Option<i64>,
 }
 
 struct Routes {
@@ -36,6 +50,8 @@ struct Routes {
     scope: String,
     actor: String,
     metered: Option<MeteredSetup>,
+    stream: bool,
+    recorded_tools: bool,
 }
 impl TurnRoutes for Routes {
     async fn route(
@@ -53,7 +69,7 @@ impl TurnRoutes for Routes {
             .ok_or(inference::Error::Provisioning)?
             .clone();
         if let Some(metered) = &self.metered {
-            let mut route = Route::metered(gateway, metered.installation.clone(), false);
+            let mut route = Route::metered(gateway, metered.installation.clone(), self.stream);
             if let Some(grant) = &metered.device_grant_id {
                 route = route.with_device_grant(grant.clone());
             }
@@ -62,11 +78,30 @@ impl TurnRoutes for Routes {
             Ok(Route::bearer(
                 gateway,
                 "synthetic-turn-credential".into(),
-                false,
+                self.stream,
             ))
         }
     }
     fn tools(&self, _: &ClaimedRun) -> Vec<Tool> {
+        if self.recorded_tools {
+            let params = serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            });
+            return vec![
+                Tool {
+                    name: "get_weather".into(),
+                    description: "Get the weather for a city".into(),
+                    parameters: params.clone(),
+                },
+                Tool {
+                    name: "get_time".into(),
+                    description: "Get the local time for a city".into(),
+                    parameters: params,
+                },
+            ];
+        }
         vec![Tool {
             name: "lookup".into(),
             description: "Read a synthetic value".into(),
@@ -74,11 +109,16 @@ impl TurnRoutes for Routes {
         }]
     }
     fn tool_prompt_bound(&self, _: &Effective, request: &Request) -> Option<u64> {
-        // The fixture offers one empty-argument tool with a fixed short result. Bound
+        // The fixture offers short-argument tools with fixed short results. Bound
         // the synthetic template only for the short transcripts exercised by the suite.
         (request.history.len() <= 16).then_some(4096)
     }
     fn proposal(&self, _: &ClaimedRun, call: &Call) -> Option<Proposal> {
+        let resource = if call.name == "lookup" {
+            "sample"
+        } else {
+            call.name.as_str()
+        };
         Proposal::new(
             &call.id,
             &call.name,
@@ -88,7 +128,7 @@ impl TurnRoutes for Routes {
                 connection: "fixture",
                 account: "test",
                 action: "read",
-                resource: "sample",
+                resource,
             },
         )
         .ok()
@@ -98,26 +138,38 @@ impl TurnRoutes for Routes {
 struct Lookup {
     pool: PgPool,
     shutdown: Option<Arc<tokio::sync::Notify>>,
+    recorded_tools: bool,
+    pause_after_first_tool_lock: Option<i64>,
+    completed: AtomicUsize,
 }
 impl EffectPolicy for Lookup {
     fn review(&self, _: &str, _: &str, p: &Proposal) -> Result<Option<Review>, StoreError> {
-        Ok((p.tool == "lookup"
-            && p.version == "1"
-            && p.arguments() == &serde_json::json!({})
-            && p.destination() == r#"["v1","fixture","test","read","sample"]"#)
-            .then(|| Review {
-                class: approvals::EffectClass::Read,
-                capability: "tool.lookup".into(),
-                gate: crate::authz::CapabilityGate::OnByDefault,
-                tool_policy: "1".into(),
-                destination_policy: "1".into(),
-                endpoint_id: "fixture".into(),
-                endpoint_version: "1".into(),
-                endpoint_key: approvals::EndpointKey::Unsupported,
-                authoritative_lookup: false,
-                artifact: None,
-                reservation: None,
-            }))
+        let valid = if self.recorded_tools {
+            matches!(p.tool.as_str(), "get_weather" | "get_time")
+                && p.version == "1"
+                && p.arguments().as_object().is_some_and(|m| {
+                    m.len() == 1 && m.get("city").and_then(Value::as_str).is_some()
+                })
+                && p.destination() == format!(r#"["v1","fixture","test","read","{}"]"#, p.tool)
+        } else {
+            p.tool == "lookup"
+                && p.version == "1"
+                && p.arguments() == &serde_json::json!({})
+                && p.destination() == r#"["v1","fixture","test","read","sample"]"#
+        };
+        Ok(valid.then(|| Review {
+            class: approvals::EffectClass::Read,
+            capability: format!("tool.{}", p.tool),
+            gate: crate::authz::CapabilityGate::OnByDefault,
+            tool_policy: "1".into(),
+            destination_policy: "1".into(),
+            endpoint_id: "fixture".into(),
+            endpoint_version: "1".into(),
+            endpoint_key: approvals::EndpointKey::Unsupported,
+            authoritative_lookup: false,
+            artifact: None,
+            reservation: None,
+        }))
     }
 }
 impl ApprovedAdapter for Lookup {
@@ -131,6 +183,26 @@ impl ApprovedAdapter for Lookup {
         Box::pin(async move {
             let mut c = self.pool.acquire().await.unwrap();
             let lease = run.claim.lease();
+            let target: String = sqlx::query_scalar(
+                "SELECT target FROM openmettle.operations
+                  WHERE scope_id = $1::uuid AND run_id = $2::uuid AND id = $3::uuid",
+            )
+            .bind(lease.scope_id)
+            .bind(lease.run_id)
+            .bind(&op)
+            .fetch_one(&mut *c)
+            .await
+            .unwrap();
+            let (obs_key, output) = if target == r#"["v1","fixture","test","read","get_weather"]"# {
+                (format!("fixture-result:{op}"), "weather:Paris".to_owned())
+            } else if target == r#"["v1","fixture","test","read","get_time"]"# {
+                (format!("fixture-result:{op}"), "time:Paris".to_owned())
+            } else {
+                (
+                    "fixture-lookup-result".to_owned(),
+                    "registered result".to_owned(),
+                )
+            };
             leases::with_lease(&mut c, &lease, Fence::Hold, async |tx, _| {
                 record_observation(
                     tx,
@@ -138,7 +210,7 @@ impl ApprovedAdapter for Lookup {
                         scope: lease.scope_id,
                         run: lease.run_id,
                         operation: &op,
-                        key: "fixture-lookup-result",
+                        key: &obs_key,
                         expected_revision: 0,
                         outcome: "succeeded",
                         handle: None,
@@ -159,10 +231,24 @@ impl ApprovedAdapter for Lookup {
             })
             .await
             .unwrap();
+            if let Some(lock_key) = self.pause_after_first_tool_lock
+                && self.completed.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                sqlx::query("SELECT pg_advisory_lock($1)")
+                    .bind(lock_key)
+                    .execute(&mut *c)
+                    .await
+                    .unwrap();
+                sqlx::query("SELECT pg_advisory_unlock($1)")
+                    .bind(lock_key)
+                    .execute(&mut *c)
+                    .await
+                    .unwrap();
+            }
             if step.stop.borrow().is_some() {
                 StepResult::Stopped
             } else {
-                StepResult::ToolOutput("registered result".into())
+                StepResult::ToolOutput(output)
             }
         })
     }
@@ -179,25 +265,27 @@ async fn worker_process() {
     let setup: Setup = serde_json::from_str(&line).expect("schema worker setup");
     let catalog = Arc::new(Catalog::load(&serde_json::to_vec(&setup.catalog).unwrap()).unwrap());
     let mut gateways = BTreeMap::new();
-    for (model, protocol, path) in [
-        ("a", Protocol::Chat, "/v1/chat/completions"),
-        ("b", Protocol::Responses, "/v1/responses"),
-    ] {
+    for model in catalog.models().keys() {
+        let (protocol, path) = if model == "b" {
+            (Protocol::Responses, "/v1/responses")
+        } else {
+            (Protocol::Chat, "/v1/chat/completions")
+        };
         let mut gateway = Gateway::new(
             &format!("https://provider.example.test:{}{path}", setup.port),
             Trust::Bundle(setup.ca.as_bytes()),
             &[],
             Qualification {
-                model: model.into(),
+                model: model.clone(),
                 pin: catalog.model(model).unwrap().pin.clone(),
                 protocol,
-                json: true,
-                sse: false,
+                json: !setup.stream,
+                sse: setup.stream,
                 functions: Some(inference::SchemaSubset::Flat),
                 images: setup.artifacts.is_some(),
-                parallel: false,
+                parallel: setup.parallel,
                 usage: true,
-                tool_separator_whitespace: false,
+                tool_separator_whitespace: setup.tool_separator_whitespace,
             },
             Timeouts {
                 setup: Duration::from_secs(5),
@@ -207,7 +295,7 @@ async fn worker_process() {
         )
         .unwrap();
         gateway.fixture_lookup(Arc::new(loopback));
-        gateways.insert(model.to_string(), Arc::new(gateway));
+        gateways.insert(model.clone(), Arc::new(gateway));
     }
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
@@ -230,6 +318,8 @@ async fn worker_process() {
         actor: setup.actor,
         scope: setup.scope,
         metered: setup.metered,
+        stream: setup.stream,
+        recorded_tools: setup.recorded_tools,
     };
     let mut executor = TurnExecutor::new(
         pool.clone(),
@@ -247,6 +337,9 @@ async fn worker_process() {
             shutdown: setup
                 .stop_during_observation
                 .then(|| observation_shutdown.clone()),
+            recorded_tools: setup.recorded_tools,
+            pause_after_first_tool_lock: setup.pause_after_first_tool_lock,
+            completed: AtomicUsize::new(0),
         });
         executor = executor.with_effects(Arc::new(ApprovedEffects {
             policy: lookup.clone(),

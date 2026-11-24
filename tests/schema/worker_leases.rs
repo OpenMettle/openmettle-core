@@ -971,17 +971,70 @@ mod live_turns {
     };
     use tokio::sync::{mpsc, oneshot};
 
+    #[derive(Debug)]
+    enum ProviderReply {
+        Json(Value),
+        Recorded {
+            content_type: String,
+            chunks: Vec<Vec<u8>>,
+            chunked: bool,
+        },
+    }
+    struct ChunkedBody(std::collections::VecDeque<bytes::Bytes>);
+    impl hyper::body::Body for ChunkedBody {
+        type Data = bytes::Bytes;
+        type Error = std::convert::Infallible;
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            std::task::Poll::Ready(self.0.pop_front().map(|b| Ok(hyper::body::Frame::data(b))))
+        }
+        fn is_end_stream(&self) -> bool {
+            self.0.is_empty()
+        }
+    }
     struct ModelRequest {
         path: String,
         request_id: Option<String>,
         /// The bearer credential the worker sent.
         bearer: String,
         body: Value,
-        reply: oneshot::Sender<Value>,
+        reply: oneshot::Sender<ProviderReply>,
     }
     impl ModelRequest {
         fn respond(self, value: Value) {
-            self.reply.send(value).expect("gateway request still open");
+            self.reply
+                .send(ProviderReply::Json(value))
+                .expect("gateway request still open");
+        }
+        fn respond_recorded(self, case: &str) {
+            let head = crate::sglang_recorded::head(case);
+            let content_type = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-type")
+                        .then(|| value.trim().to_owned())
+                })
+                .expect("recorded fixture content-type");
+            let body = crate::sglang_recorded::body(case);
+            let chunked = crate::sglang_recorded::chunked(case);
+            let chunks = if chunked {
+                crate::sglang_recorded::events(&body)
+                    .into_iter()
+                    .map(<[u8]>::to_vec)
+                    .collect()
+            } else {
+                vec![body]
+            };
+            self.reply
+                .send(ProviderReply::Recorded {
+                    content_type,
+                    chunks,
+                    chunked,
+                })
+                .expect("gateway request still open");
         }
     }
     struct Provider {
@@ -1054,7 +1107,7 @@ mod live_turns {
         /// `x-request-id`, carries its own bearer (ADR 0044), checked here for its encoding
         /// only; an unmetered round carries the fixture's fixed bearer.
         async fn on(host: &str, ip: IpAddr) -> Self {
-            use http_body_util::{BodyExt, Full};
+            use http_body_util::{BodyExt, Either, Full};
             use hyper::{Response, server::conn::http1, service::service_fn};
             use hyper_util::rt::TokioIo;
             let (acceptor, ca) = tls_acceptor(host);
@@ -1102,13 +1155,40 @@ mod live_turns {
                                     .await
                                     .ok()
                                     .unwrap();
-                                    let value = rx.await.unwrap_or(Value::Null);
-                                    Ok::<_, std::convert::Infallible>(
-                                        Response::builder()
+                                    let response = match rx
+                                        .await
+                                        .unwrap_or(ProviderReply::Json(Value::Null))
+                                    {
+                                        ProviderReply::Json(value) => Response::builder()
                                             .header("content-type", "application/json")
-                                            .body(Full::new(bytes::Bytes::from(value.to_string())))
+                                            .body(Either::Left(Full::new(bytes::Bytes::from(
+                                                value.to_string(),
+                                            ))))
                                             .unwrap(),
-                                    )
+                                        ProviderReply::Recorded {
+                                            content_type,
+                                            chunks,
+                                            chunked,
+                                        } => {
+                                            let body = if chunked {
+                                                Either::Right(ChunkedBody(
+                                                    chunks
+                                                        .into_iter()
+                                                        .map(bytes::Bytes::from)
+                                                        .collect(),
+                                                ))
+                                            } else {
+                                                let flat: Vec<u8> =
+                                                    chunks.into_iter().flatten().collect();
+                                                Either::Left(Full::new(bytes::Bytes::from(flat)))
+                                            };
+                                            Response::builder()
+                                                .header("content-type", content_type)
+                                                .body(body)
+                                                .unwrap()
+                                        }
+                                    };
+                                    Ok::<_, std::convert::Infallible>(response)
                                 }
                             });
                         let _ = http1::Builder::new()
@@ -1315,6 +1395,11 @@ mod live_turns {
         device_grant_id: Option<String>,
         /// The worker's database address, when it is not the test service itself.
         database: Option<String>,
+        stream: bool,
+        parallel: bool,
+        tool_separator_whitespace: bool,
+        recorded_tools: bool,
+        pause_after_first_tool_lock: Option<i64>,
     }
 
     impl Chat {
@@ -1350,6 +1435,11 @@ mod live_turns {
                 unmetered: false,
                 device_grant_id: None,
                 database: None,
+                stream: false,
+                parallel: false,
+                tool_separator_whitespace: false,
+                recorded_tools: false,
+                pause_after_first_tool_lock: None,
             }
         }
 
@@ -1645,7 +1735,9 @@ mod live_turns {
             let database = database.unwrap_or_else(|| self.f.db.url(WORKER));
             serde_json::to_writer(&mut *input,&json!({"database":database,"catalog":self.catalog,
                 "tools":self.session.is_some(),"scope":self.f.scope,"actor":self.f.actor.user,"ca":String::from_utf8(provider.ca.pem()).unwrap(),"port":provider.port,
-                "artifacts":self.artifacts,"stop_during_observation":self.stop_during_observation,"metered":metered})).unwrap();
+                "artifacts":self.artifacts,"stop_during_observation":self.stop_during_observation,"metered":metered,
+                "stream":self.stream,"parallel":self.parallel,"tool_separator_whitespace":self.tool_separator_whitespace,
+                "recorded_tools":self.recorded_tools,"pause_after_first_tool_lock":self.pause_after_first_tool_lock})).unwrap();
             writeln!(input).unwrap();
             Process(child)
         }
@@ -5953,6 +6045,549 @@ mod live_turns {
                FROM openmettle.quota_verify_accounting_drift()",
         )
         .fetch_one(&mut worker(&db).await)
+        .await
+        .unwrap();
+        assert_eq!(drift, (0, 0, 0, 0));
+    }
+
+    async fn settle_recorded_round(
+        chat: &Chat,
+        req: &ModelRequest,
+        prompt_tokens: i64,
+        completion_tokens: i64,
+    ) {
+        use openmettle_core::{authz::gateway::settlement, provider_http::gateway::UsageReport};
+        use sqlx::postgres::PgPoolOptions;
+
+        const INSTALL: &str = "00000000-0000-4000-8000-000000000091";
+        let req_id = req
+            .request_id
+            .clone()
+            .expect("metered round must carry x-request-id");
+        assert!(is_round_bearer(&chat.f.db, &req_id, &req.bearer).await);
+        let g_pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy_with(chat.f.db.1.options(pg::GATEWAY));
+        spend_dispatch(&g_pool, &req_id, &req.bearer).await;
+        let report_id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+            .fetch_one(&mut connect(&chat.f.db.0, OWNER).await)
+            .await
+            .unwrap();
+        assert_eq!(
+            settlement::ingest(
+                &g_pool,
+                &UsageReport {
+                    request: req_id,
+                    installation: INSTALL.into(),
+                    principal: chat.f.actor.user.clone(),
+                    scope: chat.f.scope.clone(),
+                    source: INSTALL.into(),
+                    report_id,
+                    revision: 0,
+                    r#final: true,
+                    prompt_tokens: Some(prompt_tokens),
+                    completion_tokens: Some(completion_tokens),
+                    reasoning_tokens: Some(0),
+                    reasoning_included: Some(true),
+                    cost: None,
+                    unit: None,
+                },
+            )
+            .await
+            .unwrap(),
+            settlement::Outcome::Applied
+        );
+    }
+
+    async fn recorded_parallel_chat(stream: bool) -> Chat {
+        let mut chat = Chat::new().await.with_tools().await;
+        let mut profile = chat.catalog["models"]["a"].clone();
+        profile["pin"]["revision"] = json!("recorded/1");
+        profile["replay"] = json!([]);
+        chat.catalog["models"]["recorded-sglang-model"] = profile;
+        chat.stream = stream;
+        chat.parallel = true;
+        chat.tool_separator_whitespace = stream;
+        chat.recorded_tools = true;
+        chat
+    }
+
+    async fn assert_recorded_sglang_parallel_tool_turn(
+        round1_case: &str,
+        expected_calls: [(&str, &str); 2],
+        round2_case: &str,
+        expected_answer: &str,
+        round2_usage: (i64, i64),
+    ) {
+        let stream = crate::sglang_recorded::chunked(round1_case);
+        let chat = recorded_parallel_chat(stream).await;
+        let mut server = Provider::new().await;
+        let _worker = chat.start(&server).await;
+        let (id, _) = chat
+            .submit(
+                "Call get_weather and get_time for Paris, both in one turn.",
+                "recorded-sglang-model",
+                2,
+            )
+            .await;
+
+        let req1 = server.request().await;
+        assert_eq!(req1.path, "/v1/chat/completions");
+        assert_eq!(req1.body["model"], "recorded-sglang-model");
+        assert_eq!(req1.body["stream"], stream);
+        assert!(req1.body.get("parallel_tool_calls").is_none());
+        let offered: Vec<&str> = req1.body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(offered, ["get_weather", "get_time"]);
+        settle_recorded_round(&chat, &req1, 354, 52).await;
+        req1.respond_recorded(round1_case);
+
+        let req2 = server.request().await;
+        let mut w = worker(&chat.f.db).await;
+        let ops: Vec<(String, String, String, String, i64)> = sqlx::query_as(
+            "SELECT id::text, logical_key, target, outcome, revision
+               FROM openmettle.operations
+              WHERE scope_id = $1::uuid AND run_id = $2::uuid
+              ORDER BY created_at, id",
+        )
+        .bind(&chat.f.scope)
+        .bind(&id)
+        .fetch_all(&mut w)
+        .await
+        .unwrap();
+        assert_eq!(
+            ops.len(),
+            2,
+            "both parallel tool calls must record operations"
+        );
+        let op1_id = ops
+            .iter()
+            .find(|o| o.1 == expected_calls[0].0)
+            .expect("first call operation")
+            .0
+            .clone();
+        let op2_id = ops
+            .iter()
+            .find(|o| o.1 == expected_calls[1].0)
+            .expect("second call operation")
+            .0
+            .clone();
+        for ((call_id, tool_name), op_id) in expected_calls.iter().zip([&op1_id, &op2_id]) {
+            let op = ops.iter().find(|o| &o.0 == op_id).unwrap();
+            assert_eq!(op.1, *call_id);
+            assert_eq!(
+                op.2,
+                format!(r#"["v1","fixture","test","read","{tool_name}"]"#)
+            );
+            assert_eq!(op.3, "succeeded");
+            assert_eq!(op.4, 1);
+        }
+        // Run-event sequence order proves call 1 finished before call 2 recorded its intent.
+        let op_keys: Vec<String> = events(&chat.f.db, &id)
+            .await
+            .into_iter()
+            .map(|(_, key, _, _)| key)
+            .filter(|k| k.starts_with("intent:") || k.starts_with("fixture-result:"))
+            .collect();
+        assert_eq!(
+            op_keys,
+            [
+                format!("intent:{op1_id}"),
+                format!("fixture-result:{op1_id}"),
+                format!("intent:{op2_id}"),
+                format!("fixture-result:{op2_id}"),
+            ]
+        );
+
+        let messages = req2.body["messages"].as_array().unwrap();
+        let assistant = &messages[messages.len() - 3];
+        assert_eq!(assistant["role"], "assistant");
+        assert!(
+            assistant.get("content").is_none(),
+            "tool separator whitespace must stay out of assistant content: {assistant}"
+        );
+        let calls = assistant["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        for (i, (call_id, tool_name)) in expected_calls.iter().enumerate() {
+            assert_eq!(calls[i]["id"], *call_id);
+            assert_eq!(calls[i]["type"], "function");
+            assert_eq!(calls[i]["function"]["name"], *tool_name);
+            let args: Value =
+                serde_json::from_str(calls[i]["function"]["arguments"].as_str().unwrap()).unwrap();
+            assert_eq!(args, json!({"city": "Paris"}));
+        }
+        assert_eq!(
+            messages[messages.len() - 2],
+            json!({
+                "role": "tool",
+                "tool_call_id": expected_calls[0].0,
+                "content": "weather:Paris"
+            })
+        );
+        assert_eq!(
+            messages[messages.len() - 1],
+            json!({
+                "role": "tool",
+                "tool_call_id": expected_calls[1].0,
+                "content": "time:Paris"
+            })
+        );
+
+        settle_recorded_round(&chat, &req2, round2_usage.0, round2_usage.1).await;
+        req2.respond_recorded(round2_case);
+        chat.done(&id, "succeeded", None).await;
+
+        let answer: (String, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT p.text_value, t.input_count, t.output_count
+               FROM openmettle.message_parts p
+               JOIN openmettle.message_turns t USING (message_id)
+              WHERE t.run_id = $1::uuid",
+        )
+        .bind(&id)
+        .fetch_one(&mut w)
+        .await
+        .unwrap();
+        assert_eq!(
+            answer,
+            (
+                expected_answer.to_owned(),
+                Some(round2_usage.0),
+                Some(round2_usage.1)
+            )
+        );
+
+        let drift: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT storage_mismatches, budget_mismatches, settlement_mismatches,
+                    pending_gateway_reconciliations
+               FROM openmettle.quota_verify_accounting_drift()",
+        )
+        .fetch_one(&mut w)
+        .await
+        .unwrap();
+        assert_eq!(drift, (0, 0, 0, 0));
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn recorded_sglang_parallel_tool_calls_streamed() {
+        assert_recorded_sglang_parallel_tool_turn(
+            "05-chat-stream-tools",
+            [
+                ("call_34ecef725cee46718265ef1a", "get_weather"),
+                ("call_db80d6f4519142a3a89c2452", "get_time"),
+            ],
+            "03-chat-stream-usage",
+            "12345",
+            (23, 6),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn recorded_sglang_parallel_tool_calls_nonstreamed() {
+        assert_recorded_sglang_parallel_tool_turn(
+            "06-chat-tools-nonstream",
+            [
+                ("call_f59554f62f6a45daa936011e", "get_weather"),
+                ("call_d69cae8333724ead850bb51a", "get_time"),
+            ],
+            "02-chat-plain",
+            "ok",
+            (17, 2),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn parallel_tool_call_partial_refusal_sends_terminal_refusal_for_second_call() {
+        let chat = recorded_parallel_chat(false).await;
+        owner_exec(
+            &chat.f.db,
+            "INSERT INTO openmettle.user_capability_denies(user_id,capability,denied,updated_by_user_id)
+             VALUES ($1::uuid,'tool.get_time',true,$1::uuid)",
+            &chat.f.actor.user,
+        )
+        .await;
+        let mut server = Provider::new().await;
+        let _worker = chat.start(&server).await;
+        let (id, _) = chat
+            .submit("partial refusal", "recorded-sglang-model", 2)
+            .await;
+
+        let req1 = server.request().await;
+        settle_recorded_round(&chat, &req1, 354, 52).await;
+        req1.respond_recorded("06-chat-tools-nonstream");
+
+        let req2 = server.request().await;
+        let mut w = worker(&chat.f.db).await;
+        let ops: Vec<(String, String)> = sqlx::query_as(
+            "SELECT logical_key, outcome FROM openmettle.operations
+              WHERE scope_id = $1::uuid AND run_id = $2::uuid",
+        )
+        .bind(&chat.f.scope)
+        .bind(&id)
+        .fetch_all(&mut w)
+        .await
+        .unwrap();
+        assert_eq!(
+            ops,
+            [(
+                "call_f59554f62f6a45daa936011e".to_owned(),
+                "succeeded".to_owned()
+            )]
+        );
+
+        let messages = req2.body["messages"].as_array().unwrap();
+        let assistant = &messages[messages.len() - 3];
+        assert_eq!(assistant["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            messages[messages.len() - 2],
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_f59554f62f6a45daa936011e",
+                "content": "weather:Paris"
+            })
+        );
+        assert_eq!(
+            messages[messages.len() - 1],
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_d69cae8333724ead850bb51a",
+                "content": openmettle_core::mcp::ToolFault::TerminalRefusal.envelope()
+            })
+        );
+
+        settle_recorded_round(&chat, &req2, 17, 2).await;
+        req2.respond_recorded("02-chat-plain");
+        chat.done(&id, "succeeded", None).await;
+
+        let drift: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT storage_mismatches, budget_mismatches, settlement_mismatches,
+                    pending_gateway_reconciliations
+               FROM openmettle.quota_verify_accounting_drift()",
+        )
+        .fetch_one(&mut w)
+        .await
+        .unwrap();
+        assert_eq!(drift, (0, 0, 0, 0));
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn parallel_tool_call_stop_and_lease_loss_after_first_skip_second() {
+        // 1. Cancellation after call 1 commits prevents call 2 from executing.
+        {
+            const LOCK_KEY: i64 = 15301;
+            let mut chat = recorded_parallel_chat(false).await;
+            chat.pause_after_first_tool_lock = Some(LOCK_KEY);
+            let mut holder = connect(&chat.f.db.0, OWNER).await;
+            sqlx::query("SELECT pg_advisory_lock($1)")
+                .bind(LOCK_KEY)
+                .execute(&mut holder)
+                .await
+                .unwrap();
+            let mut server = Provider::new().await;
+            let _worker = chat.start(&server).await;
+            let (id, input) = chat
+                .submit("cancel after call 1", "recorded-sglang-model", 2)
+                .await;
+            let req1 = server.request().await;
+            settle_recorded_round(&chat, &req1, 354, 52).await;
+            req1.respond_recorded("06-chat-tools-nonstream");
+
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while outcomes(&chat, &id).await != ["succeeded"] {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("call 1 committed observation");
+            crate::authz_store::wait_for_lock_waiters(&chat.f.db, 1).await;
+
+            let actor = principal(&chat.f.db, &chat.f.actor).await;
+            queue::cancel_run(&mut api(&chat.f.db).await, &actor, &chat.f.scope, &id)
+                .await
+                .unwrap();
+            sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(LOCK_KEY)
+                .execute(&mut holder)
+                .await
+                .unwrap();
+
+            chat.done(&id, "cancelled", Some("requested")).await;
+            assert_eq!(outcomes(&chat, &id).await, ["succeeded"]);
+            assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
+            assert!(server.requests.try_recv().is_err());
+        }
+
+        // 2. Lease loss (expired + reclaimed) after call 1 commits prevents call 2 from executing.
+        {
+            const LOCK_KEY: i64 = 15302;
+            let mut chat = recorded_parallel_chat(false).await;
+            chat.pause_after_first_tool_lock = Some(LOCK_KEY);
+            let mut holder = connect(&chat.f.db.0, OWNER).await;
+            sqlx::query("SELECT pg_advisory_lock($1)")
+                .bind(LOCK_KEY)
+                .execute(&mut holder)
+                .await
+                .unwrap();
+            let mut server = Provider::new().await;
+            let mut child = chat.start(&server).await;
+            let (id, input) = chat
+                .submit("lease loss after call 1", "recorded-sglang-model", 2)
+                .await;
+            let req1 = server.request().await;
+            settle_recorded_round(&chat, &req1, 354, 52).await;
+            req1.respond_recorded("06-chat-tools-nonstream");
+
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while outcomes(&chat, &id).await != ["succeeded"] {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("call 1 committed observation");
+            crate::authz_store::wait_for_lock_waiters(&chat.f.db, 1).await;
+
+            owner_exec(
+                &chat.f.db,
+                "UPDATE openmettle.runs SET lease_expires_at = clock_timestamp() WHERE id = $1::uuid",
+                &id,
+            )
+            .await;
+            let reclaimed = reclaim_next(&mut worker(&chat.f.db).await, &LEASES)
+                .await
+                .unwrap()
+                .expect("replacement holder reclaimed expired lease");
+            assert_eq!(reclaimed.run.run_id, id);
+
+            sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(LOCK_KEY)
+                .execute(&mut holder)
+                .await
+                .unwrap();
+            // Let the deposed worker finish its LeaseLost exit before closing stdin.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(child.0.stdin.take());
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(status) = child.0.try_wait().unwrap() {
+                        assert!(status.success());
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("deposed worker exited cleanly");
+
+            let (state, token): (String, String) = sqlx::query_as(
+                "SELECT state, claim_token::text FROM openmettle.runs WHERE id = $1::uuid",
+            )
+            .bind(&id)
+            .fetch_one(&mut worker(&chat.f.db).await)
+            .await
+            .unwrap();
+            assert_eq!(state, "running");
+            assert_eq!(token, reclaimed.run.claim_token);
+            assert_eq!(outcomes(&chat, &id).await, ["succeeded"]);
+            assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
+            assert!(server.requests.try_recv().is_err());
+        }
+
+        // 3. Shutdown during call 1 observation commits call 1, hands off lease, and skips call 2.
+        {
+            let mut chat = recorded_parallel_chat(false).await;
+            chat.stop_during_observation = true;
+            let mut server = Provider::new().await;
+            let mut child = chat.start(&server).await;
+            let (id, input) = chat
+                .submit("shutdown during call 1", "recorded-sglang-model", 2)
+                .await;
+            let req1 = server.request().await;
+            settle_recorded_round(&chat, &req1, 354, 52).await;
+            req1.respond_recorded("06-chat-tools-nonstream");
+
+            tokio::time::timeout(Duration::from_secs(12), async {
+                loop {
+                    if let Some(status) = child.0.try_wait().unwrap() {
+                        assert!(status.success());
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("worker shut down after call 1 observation");
+            assert_eq!(outcomes(&chat, &id).await, ["succeeded"]);
+            assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
+            assert!(terminal_events(&chat.f.db, &id).await.is_empty());
+            assert!(server.requests.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn parallel_tool_call_round2_rechecks_second_tool_authority() {
+        let chat = recorded_parallel_chat(false).await;
+        let mut server = Provider::new().await;
+        let _worker = chat.start(&server).await;
+        let (id, input) = chat
+            .submit(
+                "revoke second tool before round 2",
+                "recorded-sglang-model",
+                2,
+            )
+            .await;
+
+        let req1 = server.request().await;
+        settle_recorded_round(&chat, &req1, 354, 52).await;
+
+        // Pause Round 2's prompt hydration on branch_heads after both Round 1 tools complete.
+        let mut owner = connect(&chat.f.db.0, OWNER).await;
+        let mut hold = owner.begin().await.unwrap();
+        hold.execute("LOCK TABLE openmettle.branch_heads IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        req1.respond_recorded("06-chat-tools-nonstream");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while outcomes(&chat, &id).await != ["succeeded", "succeeded"] {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("both parallel tools completed before round 2");
+        crate::authz_store::wait_for_lock_waiters(&chat.f.db, 1).await;
+
+        // Revoke ONLY the second tool's capability while leaving the first tool allowed.
+        sqlx::query(
+            "INSERT INTO openmettle.user_capability_denies(user_id,capability,denied,updated_by_user_id)
+             VALUES ($1::uuid,'tool.get_time',true,$1::uuid)",
+        )
+        .bind(&chat.f.actor.user)
+        .execute(&mut *hold)
+        .await
+        .unwrap();
+        hold.commit().await.unwrap();
+
+        chat.done(&id, "cancelled", Some("revoked")).await;
+        assert_eq!(outcomes(&chat, &id).await, ["succeeded", "succeeded"]);
+        assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
+        assert!(server.requests.try_recv().is_err());
+
+        let drift: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT storage_mismatches, budget_mismatches, settlement_mismatches,
+                    pending_gateway_reconciliations
+               FROM openmettle.quota_verify_accounting_drift()",
+        )
+        .fetch_one(&mut worker(&chat.f.db).await)
         .await
         .unwrap();
         assert_eq!(drift, (0, 0, 0, 0));
