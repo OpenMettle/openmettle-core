@@ -255,7 +255,7 @@ async fn settles_through_the_gateway(transport: Transport, case: &'static str, c
         reports(&chat, &id).await,
         [(
             INSTALL.to_owned(),
-            0,
+            1,
             true,
             Some(prompt),
             Some(completion),
@@ -318,11 +318,12 @@ async fn a_queued_run_settles_through_the_gateway_behind_tls() {
 }
 
 /// A gateway serving another model than the run's spends the dispatch, refuses the round with
-/// `403 policy` and forwards nothing. The worker fails the turn, and the request keeps its hold
-/// with no report, as the gateway page says for `model_not_served`, until increment 3.
+/// `403 policy` and forwards nothing. The worker fails the turn. The gateway closes the request
+/// with a final report that carries the reason `model_not_served` and no count: the hold is
+/// released, nothing is charged and the accounting has no drift.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 and TEST_GATEWAY_HOST"]
-async fn a_gateway_serving_another_model_refuses_the_round_and_keeps_its_hold() {
+async fn a_gateway_serving_another_model_refuses_the_round_and_closes_its_hold() {
     let (chat, run, _) = queued().await;
     let upstream = StandIn::answering("02-chat-plain").await;
     let (host, ip) = gateway_host();
@@ -344,13 +345,42 @@ async fn a_gateway_serving_another_model_refuses_the_round_and_keeps_its_hold() 
     let (id, state, dispatched, _) = round(&chat, &run).await;
     assert_eq!((state.as_str(), dispatched), ("handed_off", true));
     assert_eq!(upstream.count(), 0);
-    assert_eq!(reports(&chat, &id).await, []);
-    let (state, held, settled) = hold(&chat, &id).await;
     assert_eq!(
-        (state.as_str(), settled.as_str()),
-        ("handoff_committed", "0")
+        reports(&chat, &id).await,
+        [(INSTALL.to_owned(), 1, true, None, None, None, None)]
     );
-    assert!(held > 0);
+    let mut owner = connect(&chat.f.db.0, OWNER).await;
+    let closed: (Option<String>, bool) = sqlx::query_as(
+        "SELECT r.incomplete, q.settled_final FROM openmettle.gateway_usage_reports r
+           JOIN openmettle.gateway_requests q ON q.id = r.request_id
+          WHERE r.request_id = $1::uuid",
+    )
+    .bind(&id)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(closed, (Some("model_not_served".to_owned()), true));
+    assert_eq!(
+        hold(&chat, &id).await,
+        ("settled".to_owned(), 0, "0".to_owned())
+    );
+    let charged: i64 = sqlx::query_scalar(
+        "SELECT coalesce(sum(active_used + reserved_held), 0)::bigint
+           FROM openmettle.quota_budgets WHERE resource_kind = 'usage_tokens'",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(charged, 0, "nothing is charged and nothing stays reserved");
+    let drift: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT storage_mismatches, budget_mismatches, settlement_mismatches,
+                pending_gateway_reconciliations
+           FROM openmettle.quota_verify_accounting_drift()",
+    )
+    .fetch_one(&mut self::worker(&chat.f.db).await)
+    .await
+    .unwrap();
+    assert_eq!(drift, (0, 0, 0, 0));
     let (status, stderr) = terminate(worker.process).await;
     assert!(status.success(), "{stderr}");
     assert_eq!(
@@ -364,8 +394,9 @@ async fn a_gateway_serving_another_model_refuses_the_round_and_keeps_its_hold() 
 }
 
 /// With nothing listening at the gateway's address, and its port held so that nothing else can
-/// take it, the round was already handed off when the connection fails. The worker fails the turn without retrying it, and the request, never
-/// dispatched, keeps its hold until increment 3.
+/// take it, the round was already handed off when the connection fails. The worker fails the
+/// turn without retrying it, and the request, never dispatched, keeps its hold: no gateway saw
+/// it, so nothing reports it. The sweep of increment 3b closes such a request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 and TEST_GATEWAY_HOST"]
 async fn an_unreachable_gateway_fails_the_turn_and_keeps_the_handed_off_hold() {

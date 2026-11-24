@@ -708,6 +708,12 @@ const ADDITIVE_COLUMNS: &[AdditiveColumn] = &[
         column: "claim_hash",
         default: ColumnDefault::Null,
     },
+    AdditiveColumn {
+        since: 31,
+        table: "gateway_usage_reports",
+        column: "incomplete",
+        default: ColumnDefault::Null,
+    },
 ];
 
 /// Single declarative registry of every table added after migration 14, ordered by `since`
@@ -1116,6 +1122,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "feda63e3c2ed89d787e6e5a978a15208068598085fe8de52a8620b583c5789a6",
         "4aadf4df1c8594c81aaa0d3af5fd0bf8bc636f698fd966b489a45df2ce805ccc",
         "919f48899eccb9b3b4ebe9a92fef7e06c0a926be54999904d3030aeaadd90c08",
+        "18e596e46611b4b88479e4553550277fb79292d447fe4ae018ed37739a2f4f80",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));

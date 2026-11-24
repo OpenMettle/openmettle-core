@@ -749,8 +749,11 @@ pub fn migration_interrupted(signal: Signal) {
 #[cfg(test)]
 pub(crate) mod tests;
 
-/// Why the gateway proxy wrote no usage report for a request whose one dispatch it spent, or may
-/// have spent. The hold stays as it was; explicit incomplete reports are a later increment.
+/// Why the gateway proxy has no usage for a request whose one dispatch it spent, or may have
+/// spent. Each value except `DispatchUnconfirmed` is also the reason of the final incomplete
+/// report that closes the request's hold (`gateway_usage_reports.incomplete`, migration 31).
+/// `ModelNotServed`, `ModelMismatch`, `RequestBody` and `UpstreamConnect` mean that nothing was
+/// sent upstream; every other reported value means the request was or may have been sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UsageGap {
     /// The database exchange that spends the dispatch failed, timed out, or lost its caller
@@ -762,15 +765,17 @@ pub enum UsageGap {
     ModelMismatch,
     /// The caller's request body was too large, too slow, or cut off by the caller leaving.
     RequestBody,
+    /// No connection to the upstream was made, in time or at all.
+    UpstreamConnect,
     /// The upstream answered with a status other than 200.
     UpstreamStatus,
-    /// The upstream could not be reached, or the exchange failed before a response head.
+    /// The exchange on an open upstream connection failed before a response head.
     UpstreamTransport,
     /// The upstream answered with a content coding other than `identity` or a transfer coding
     /// other than `chunked`.
     UpstreamEncoding,
-    /// Connecting, waiting for the head or the next body bytes, or finishing the body after the
-    /// caller left, took too long.
+    /// Waiting for the head or the next body bytes, or finishing the body after the caller left,
+    /// took too long.
     UpstreamTimeout,
     /// The body ended early or without the stream's `[DONE]` event.
     Incomplete,
@@ -789,6 +794,7 @@ impl UsageGap {
             Self::ModelNotServed => "model_not_served",
             Self::ModelMismatch => "model_mismatch",
             Self::RequestBody => "request_body",
+            Self::UpstreamConnect => "upstream_connect",
             Self::UpstreamStatus => "upstream_status",
             Self::UpstreamTransport => "upstream_transport",
             Self::UpstreamEncoding => "upstream_encoding",
@@ -809,14 +815,14 @@ fn gateway_request(id: &str) -> Option<&str> {
 }
 
 /// The gateway proxy spent, or may have spent, the dispatch of `request` and has no usage to
-/// report.
+/// report. Except for `dispatch_unconfirmed`, it then stores a final incomplete report.
 pub(crate) fn gateway_usage_unrecorded(request: &str, gap: UsageGap) {
     tracing::warn!(target: TARGET, event = "gateway.usage.unrecorded",
         "gateway.request_id" = gateway_request(request), "error.type" = gap.as_str());
 }
 
-/// The gateway proxy observed usage for `request` but could not store it, after bounded
-/// retries of a transient failure. `error`, so every configured level shows it.
+/// The gateway proxy could not store the report of `request`, complete or incomplete, after
+/// bounded retries of a transient failure. `error`, so every configured level shows it.
 pub(crate) fn gateway_usage_failed(request: &str, error: &crate::authz::gateway::Error) {
     use crate::authz::gateway::Error;
     let cause = match error {

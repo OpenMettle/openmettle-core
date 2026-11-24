@@ -18,13 +18,16 @@
 //!   `Content-Type` and body are relayed chunk by chunk as they arrive. Only identity bodies
 //!   pass in either direction, and only HTTP/1.1 callers are served.
 //! - **Usage.** One relay task per request copies each upstream chunk to the caller and to the
-//!   usage reader and then writes at most one final report itself, so the write does not depend
-//!   on the caller staying connected. A response that is not a completed 200 with a usage object
-//!   leaves no report and one `gateway.usage.unrecorded` event; the hold stays as it was.
+//!   usage reader and then writes one final report itself, so the write does not depend on the
+//!   caller staying connected. A completed 200 with a usage object is reported with its counts.
+//!   Any other end of a request whose dispatch was spent is reported without counts and with
+//!   the reason, which closes the hold (ADR 0044, amendment of 24 November 2026), and logs one
+//!   `gateway.usage.unrecorded` event.
 //!
 //! The listener is plain HTTP. The packaged worker may call it so inside the cluster, or
-//! through a TLS terminator in front of it. Not deployable: nothing reconciles a spent dispatch
-//! that left no report. See `docs/operator/gateway-proxy.md`.
+//! through a TLS terminator in front of it. Not deployable: nothing yet closes a request that
+//! was never dispatched, or one whose report the proxy could not write. See
+//! `docs/operator/gateway-proxy.md`.
 mod usage;
 
 use crate::{
@@ -64,6 +67,7 @@ use std::{
 };
 use tokio::{
     net::TcpStream,
+    runtime::Handle,
     sync::{mpsc, watch},
     time::{Instant, sleep_until, timeout},
 };
@@ -86,6 +90,11 @@ const WRITE_ATTEMPT_TIMEOUTS: u32 = 5;
 /// SGLang counts reasoning tokens inside `completion_tokens` (recorded 23 Nov 2026), so
 /// settlement must not add them again.
 const REASONING_INCLUDED: bool = true;
+/// The revision of the one report the proxy writes for a request. Revision 0 is left to the
+/// sweep that closes a request nobody reported: settlement lets a higher final revision correct
+/// a lower one, so a report of the proxy that arrives late replaces the sweep's record, and the
+/// sweep can never replace the proxy's.
+const REPORT_REVISION: i64 = 1;
 
 const CORRELATION: Problem = problem(
     StatusCode::BAD_REQUEST,
@@ -191,14 +200,14 @@ impl Settings {
         })
     }
 
-    async fn connect(&self) -> Result<TcpStream, UsageGap> {
+    async fn connect(&self) -> Result<TcpStream, Problem> {
         let host = self.upstream.host();
         let host = host.trim_start_matches('[').trim_end_matches(']');
         let port = self.upstream.port_u16().unwrap_or(80);
         match timeout(self.connect_timeout, TcpStream::connect((host, port))).await {
             Ok(Ok(stream)) => Ok(stream),
-            Ok(Err(_)) => Err(UsageGap::UpstreamTransport),
-            Err(_) => Err(UsageGap::UpstreamTimeout),
+            Ok(Err(_)) => Err(UPSTREAM),
+            Err(_) => Err(UPSTREAM_TIMEOUT),
         }
     }
 }
@@ -423,10 +432,13 @@ impl Proxy {
             return Err(ENCODED_REQUEST);
         }
         // From here on the request's one dispatch is spent, or may be. Every early end,
-        // including the server dropping this handler because the caller left, logs why nothing
-        // was recorded.
+        // including the server dropping this handler because the caller left, logs why there is
+        // no usage and, once the dispatch is known to be spent, closes the request with that
+        // reason.
         let mut unrecorded = Unrecorded {
+            proxy: self,
             id: &id,
+            routing: None,
             gap: Some(UsageGap::DispatchUnconfirmed),
         };
         // The caller is authenticated and the dispatch spent before any body is buffered.
@@ -440,6 +452,7 @@ impl Proxy {
                 return Err(problem);
             }
         };
+        unrecorded.routing = Some(routing.clone());
         if routing.model != self.settings.model {
             unrecorded.gap = Some(UsageGap::ModelNotServed);
             return Err(NOT_SERVED);
@@ -466,8 +479,11 @@ impl Proxy {
                 outbound.headers_mut().append(name.clone(), value.clone());
             }
         }
+        // Nothing is sent before the connection exists, also when the caller leaves meanwhile.
+        unrecorded.gap = Some(UsageGap::UpstreamConnect);
+        let stream = self.settings.connect().await?;
         unrecorded.gap = Some(UsageGap::CallerDisconnected);
-        let (upstream, response) = match self.exchange(outbound).await {
+        let (upstream, response) = match self.exchange(stream, outbound).await {
             Ok(exchanged) => exchanged,
             Err(gap) => {
                 unrecorded.gap = Some(gap);
@@ -534,12 +550,12 @@ impl Proxy {
         }
     }
 
-    /// Sends `outbound` on a new connection and waits for the response head.
+    /// Sends `outbound` on the new connection `stream` and waits for the response head.
     async fn exchange(
         &self,
+        stream: TcpStream,
         outbound: hyper::Request<Full<Bytes>>,
     ) -> Result<(Upstream, hyper::Response<Incoming>), UsageGap> {
-        let stream = self.settings.connect().await?;
         let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
             .await
             .map_err(|_| UsageGap::UpstreamTransport)?;
@@ -556,18 +572,31 @@ impl Proxy {
     }
 }
 
-/// Logs `gap` for a handled request that ends before its relay starts: a refusal once the
+/// Ends a handled request that stops before its relay starts with `gap`: a refusal once the
 /// dispatch is or may be spent, or the server dropping the handler because the caller left,
-/// which also closes the upstream connection.
+/// which also closes the upstream connection. The gap is logged. Once `routing` is set the
+/// dispatch is known to be spent, and a task of its own then stores the final incomplete
+/// report, which shutdown waits for like a relay.
 struct Unrecorded<'a> {
+    proxy: &'a Proxy,
     id: &'a str,
+    routing: Option<Routing>,
     gap: Option<UsageGap>,
 }
 
 impl Drop for Unrecorded<'_> {
     fn drop(&mut self) {
-        if let Some(gap) = self.gap {
-            telemetry::gateway_usage_unrecorded(self.id, gap);
+        let Some(gap) = self.gap else { return };
+        telemetry::gateway_usage_unrecorded(self.id, gap);
+        // Without a runtime the process is ending and nothing can be written any more.
+        if let (Some(routing), Ok(runtime)) = (self.routing.take(), Handle::try_current()) {
+            let (pool, id) = (self.proxy.pool.clone(), self.id.to_owned());
+            let limit = self.proxy.database_timeout * WRITE_ATTEMPT_TIMEOUTS;
+            let running = self.proxy.relays.start();
+            runtime.spawn(async move {
+                record(&pool, id, routing, Err(gap), limit).await;
+                drop(running);
+            });
         }
     }
 }
@@ -686,10 +715,10 @@ impl Relay {
             (Some(_), Err(gap)) => Err(gap),
             (Some(extract), Ok(())) => extract.finish(),
         };
-        match usage {
-            Ok(usage) => record(&pool, &report(id, routing, usage), write_limit).await,
-            Err(gap) => telemetry::gateway_usage_unrecorded(&id, gap),
+        if let Err(gap) = usage {
+            telemetry::gateway_usage_unrecorded(&id, gap);
         }
+        record(&pool, id, routing, usage, write_limit).await;
     }
 
     /// Reads the upstream body to its end. The caller gets every chunk until it leaves or stops
@@ -756,10 +785,12 @@ impl Relay {
     }
 }
 
-/// One final report built from the stored routing fields. A request is dispatched once and the
-/// proxy writes at most one report for it, so the report takes the request's own ID at
-/// revision 0: a retried write stores the identical report, which settlement accepts once.
-fn report(id: String, routing: Routing, usage: Usage) -> UsageReport {
+/// One final report built from the stored routing fields, with the counts of `usage` or, for a
+/// request that ended without usage, with none. A request is dispatched once and the proxy
+/// writes one report for it, so the report takes the request's own ID at [`REPORT_REVISION`]: a
+/// retried write stores the identical report, which settlement accepts once.
+fn report(id: String, routing: Routing, usage: Option<Usage>) -> UsageReport {
+    let reasoning = usage.and_then(|usage| usage.reasoning);
     UsageReport {
         report_id: id.clone(),
         request: id,
@@ -767,18 +798,21 @@ fn report(id: String, routing: Routing, usage: Usage) -> UsageReport {
         principal: routing.principal,
         scope: routing.scope,
         source: routing.source,
-        revision: 0,
+        revision: REPORT_REVISION,
         r#final: true,
-        prompt_tokens: Some(usage.prompt),
-        completion_tokens: Some(usage.completion),
-        reasoning_tokens: usage.reasoning,
-        reasoning_included: usage.reasoning.map(|_| REASONING_INCLUDED),
+        prompt_tokens: usage.map(|usage| usage.prompt),
+        completion_tokens: usage.map(|usage| usage.completion),
+        reasoning_tokens: reasoning,
+        reasoning_included: reasoning.map(|_| REASONING_INCLUDED),
         cost: None,
         unit: None,
     }
 }
 
-/// Stores `report`, retrying a transient database failure twice. No local spool.
+/// Stores the one report of request `id`: the usage the upstream reported, or the reason there
+/// is none. Either closes the request's token hold; a report without counts is never written
+/// without its reason, because settlement would then keep the hold for good. A transient
+/// database failure is retried twice. No local spool.
 ///
 /// Each attempt runs in its own task and is never cancelled in flight: sqlx counts a transaction
 /// only once the server acknowledges `BEGIN`, so a cancelled `BEGIN` could put its connection
@@ -786,11 +820,24 @@ fn report(id: String, routing: Routing, usage: Usage) -> UsageReport {
 /// retries while the abandoned attempt finishes or fails on its own, bounded by settlement's
 /// lock and statement timeouts unless its connection has gone silent. Overlap is safe:
 /// settlement locks the request and accepts the identical report once.
-async fn record(pool: &PgPool, report: &UsageReport, limit: Duration) {
+async fn record(
+    pool: &PgPool,
+    id: String,
+    routing: Routing,
+    usage: Result<Usage, UsageGap>,
+    limit: Duration,
+) {
+    let report = report(id, routing, usage.ok());
+    let reason = usage.err().map(UsageGap::as_str);
     let mut attempt = 0;
     loop {
         let (pool, owned) = (pool.clone(), report.clone());
-        let task = tokio::spawn(async move { settlement::ingest(&pool, &owned).await });
+        let task = tokio::spawn(async move {
+            match reason {
+                None => settlement::ingest(&pool, &owned).await,
+                Some(reason) => settlement::ingest_incomplete(&pool, &owned, reason).await,
+            }
+        });
         let outcome = match timeout(limit, task).await {
             Ok(Ok(outcome)) => outcome,
             // Abandoned past `limit`, or the attempt panicked.
@@ -1051,12 +1098,13 @@ mod tests {
             completion: 37,
             reasoning: Some(33),
         };
-        let first = report(id.into(), routing(), usage);
-        let again = report(id.into(), routing(), usage);
+        let first = report(id.into(), routing(), Some(usage));
+        let again = report(id.into(), routing(), Some(usage));
         assert!(first.valid());
+        // Revision 0 is the sweep's, so that the proxy's report always supersedes it.
         assert_eq!(
             (first.report_id.as_str(), first.revision, first.r#final),
-            (id, 0, true)
+            (id, 1, true)
         );
         assert_eq!(
             serde_json::to_value(&first).unwrap(),
@@ -1068,15 +1116,72 @@ mod tests {
         let plain = report(
             id.into(),
             routing(),
-            Usage {
+            Some(Usage {
                 reasoning: None,
                 ..usage
-            },
+            }),
         );
         assert_eq!(
             (plain.reasoning_tokens, plain.reasoning_included),
             (None, None)
         );
+    }
+
+    /// The report of a request that ended without usage has the same identity, revision and
+    /// finality as a complete one and no count at all: it never passes for a measurement.
+    /// `record` stores it only together with its reason.
+    #[test]
+    fn a_report_without_usage_carries_no_count() {
+        let none = report(ID.into(), routing(), None);
+        assert!(none.valid());
+        assert_eq!(
+            (none.report_id.as_str(), none.revision, none.r#final),
+            (ID, 1, true)
+        );
+        assert_eq!(
+            (
+                none.prompt_tokens,
+                none.completion_tokens,
+                none.reasoning_tokens,
+                none.reasoning_included,
+                none.measured()
+            ),
+            (None, None, None, None, None)
+        );
+    }
+
+    /// The reasons the proxy reports are the vocabulary of migration 31's CHECK on
+    /// `gateway_usage_reports.incomplete`; `dispatch_unconfirmed` is only ever logged.
+    #[test]
+    fn the_reported_reasons_are_the_vocabulary_of_migration_31() {
+        let migration = include_str!("../migrations/0031_gateway_incomplete_usage_reports.sql");
+        let (_, list) = migration.split_once("incomplete IN (").unwrap();
+        let (list, _) = list.split_once(')').unwrap();
+        let mut stored: Vec<&str> = list
+            .split(',')
+            .map(|v| v.trim().trim_matches('\''))
+            .collect();
+        stored.sort_unstable();
+        let mut reported: Vec<&str> = [
+            UsageGap::ModelNotServed,
+            UsageGap::ModelMismatch,
+            UsageGap::RequestBody,
+            UsageGap::UpstreamConnect,
+            UsageGap::UpstreamStatus,
+            UsageGap::UpstreamTransport,
+            UsageGap::UpstreamEncoding,
+            UsageGap::UpstreamTimeout,
+            UsageGap::Incomplete,
+            UsageGap::CallerDisconnected,
+            UsageGap::NoUsage,
+            UsageGap::Unparsable,
+        ]
+        .into_iter()
+        .map(UsageGap::as_str)
+        .collect();
+        reported.sort_unstable();
+        assert_eq!(stored, reported);
+        assert!(!stored.contains(&UsageGap::DispatchUnconfirmed.as_str()));
     }
 
     fn chunk(data: &[u8]) -> Vec<u8> {
@@ -1158,7 +1263,8 @@ mod tests {
             .header(header::HOST, address)
             .body(Full::new(Bytes::new()))
             .unwrap();
-        let (upstream, response) = proxy.exchange(outbound).await.unwrap();
+        let stream = proxy.settings.connect().await.unwrap();
+        let (upstream, response) = proxy.exchange(stream, outbound).await.unwrap();
         let (head, body) = response.into_parts();
         let (frames, receiver) = mpsc::channel(RELAY_BUFFER);
         let relay = Relay {

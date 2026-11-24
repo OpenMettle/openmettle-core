@@ -124,6 +124,15 @@ Migration `0030` replaces only `openmettle.quota_lock_override`. The signature, 
 - If the disable locks it first and commits within the override's lock wait limit (2 seconds for the API), the override sees the disabled administrator and is refused with `42501`.
 - If that limit expires first, the override fails with a lock timeout (`55P03`) and changes nothing.
 
+## Upgrade from 0030 to 0031 (incomplete usage reports)
+
+Migration `0031` ([ADR 0044](../adr/0044-own-inference-proxy-and-binding-free-dispatch.md), amendment of 24 November 2026) needs no activation step and no backfill. It adds the nullable column `gateway_usage_reports.incomplete` with a CHECK on its closed list of reasons, grants `openmettle_gateway` the insert on it, and replaces `openmettle.quota_gateway_fold` with the same signature, security and privileges. Stored reports keep their counts and get no reason; settled holds are unchanged.
+
+- Apply it with `openmettle-migrate` before rolling the gateway proxy. A proxy of this release on schema `0030` cannot store any report, because its insert names the new column: each request then logs `gateway.usage.failed` and keeps its hold.
+- A proxy of the previous release still works on schema `0031`. It writes its reports at revision 0 and writes none for a request without usage, as before.
+- From this release the proxy closes a dispatched request that ended without usage: its token hold becomes `settled` with nothing charged, and the report names the reason. [Gateway proxy](gateway-proxy.md#when-there-is-no-usage) lists the reasons and the cases that still keep their hold.
+- Adding the CHECK reads `gateway_usage_reports` once under an exclusive lock on that table.
+
 ## Monitor overdue handoffs
 
 The worker records up to 100 overdue committed handoffs per maintenance sweep in `openmettle_quota_overdue_handoffs_total`. The counter measures observations across sweeps. An outstanding handoff can contribute more than once. Use the database ledger to identify the holds. The observation leaves quota charges intact.

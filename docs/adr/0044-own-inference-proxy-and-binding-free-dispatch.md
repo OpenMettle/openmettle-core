@@ -1,7 +1,9 @@
 # 0044 — OpenMettle's own inference proxy and binding-free dispatch
 
 Accepted with its implementation, 23 November 2026 (V1-06 proxy increments 2a and 2b); increment
-2c delivered 24 November 2026. Refs #7.
+2c delivered 24 November 2026. Amended 24 November 2026 with increment 3a: see
+[requests that end without usage](#amendment-24-november-2026-requests-that-end-without-usage).
+Refs #7.
 Supersedes [ADR 0037](0037-gateway-provisioning-and-usage-reconciliation.md) in part: see
 [What ADR 0037 still decides](#what-adr-0037-still-decides) and [Superseded](#superseded).
 Builds on [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md) (leases),
@@ -166,7 +168,8 @@ serves. It refuses a request reserved for another model, and a body whose top-le
 not that model exactly once. The body is still forwarded byte for byte.
 
 A refusal after the dispatch was spent, and a dispatch whose database exchange did not answer,
-leave the hold in place and one `gateway.usage.unrecorded` event with a fixed reason.
+leave one `gateway.usage.unrecorded` event with a fixed reason. Since increment 3a the refusal
+also closes the hold (see the amendment); the unanswered dispatch still leaves it in place.
 
 No other component observes usage. The proxy writes the one final report of a request from the
 upstream's own usage object, as in increment 1.
@@ -250,7 +253,10 @@ exists.
 | 2a | Migration 29: binding-free run-round handoff and the dispatch function; a per-round bearer for the worker. |
 | 2b | Proxy authentication, single dispatch and model check. |
 | 2c | The worker reaches the proxy over `http://` inside the cluster or `https://` through a TLS terminator; `gateway_keys` removed from the worker document; packaged worker to proxy end-to-end tests; ADR 0043 note and the worker page (delivered 24 November 2026). |
-| 3 | Explicit reports for incomplete responses. |
+| 3a | A dispatched request that ends without usage is closed by a final report with its reason; migration 31 (delivered 24 November 2026, see the amendment). |
+| 3b | A sweep closes the requests the proxy cannot: never dispatched, or never reported. |
+| 3c | A response stopped at its token limit ends the turn with its partial output and a marker. |
+| 3d | Running usage for cut streams. |
 | 4 | Family policy tables. |
 | 5 | Cache separation. |
 | 6 | Removal of the superseded code and tables. |
@@ -270,13 +276,111 @@ exists.
   only workers to the proxy is the mitigation, and TLS terminated in front of the proxy is
   the stricter option. The proxy has no TLS listener of its own, and mutual TLS is a possible
   later option. The proxy stays undeployable until increments 3 and 7.
-- **Holds without a final report.** A handed-off request keeps its hold until a final report
-  arrives. A round that is never dispatched, is refused after its dispatch was spent, or whose
-  response carries no usage keeps that hold indefinitely until increment 3.
+- **Holds without a final report.** Increment 3a closes a dispatched request that ends without
+  usage. A round that is never dispatched, and one the proxy could not report, keep their hold
+  until increment 3b; the amendment lists the cases.
+- **Cost holds.** A cost hold never settles on a report with usage, because the proxy reports
+  no cost ([issue 166](https://github.com/OpenMettle/openmettle-core/issues/166)).
 - **Broad database role.** `openmettle_gateway` still has the grants the reconciler needed. A
   network-facing process needs only the dispatch and settlement functions. Increment 6
   narrows the role.
 - **Family policy** is enforced nowhere until increment 4.
+
+## Amendment, 24 November 2026: requests that end without usage
+
+Increment 3a, with migration 31. Refs #7.
+
+### Problem
+
+A handed-off request kept its hold until a final report with both token counts arrived, and
+the proxy wrote one only for a completed 200 that carried usage. Every other end of a
+dispatched request (a refusal after the dispatch was spent, an upstream error, a cut stream, a
+caller that left, an answer without usage) left one log line and the hold, for good: the
+remote reconciliation that was to close such requests under ADR 0037 will never exist.
+
+A final report without counts was no way out. Settlement accepted it, marked the request
+settled, removed it from the scan of outstanding requests and refused its dispatch, while the
+quota fold skipped it and kept the hold.
+
+### Decision
+
+**One record.** A request that ends without usage is closed by a final usage report that
+carries the reason in `gateway_usage_reports.incomplete` and no usage, cost or unit fields
+of its own. The request stays `handed_off`: releasing it would contradict the handoff CHECK
+and the handoff receipt the drift verifier checks. The column is the only place the reason is
+stored; a report that carries it must be final and leave all six usage, cost and unit columns
+null.
+
+**A closed vocabulary in two groups**, so that the database can tell by value whether the
+model server may have worked for the request:
+
+| Group | Reasons |
+| --- | --- |
+| Nothing was sent upstream | `model_not_served`, `model_mismatch`, `request_body`, `upstream_connect` |
+| The request was or may have been sent, and its usage is unknown | `upstream_transport`, `upstream_timeout`, `upstream_status`, `upstream_encoding`, `incomplete`, `caller_disconnected`, `no_usage`, `unparsable` |
+
+**The fold closes the hold.** `quota_gateway_fold` gains one rule: a report that carries a
+reason adds no measurement of its own—it carries no usage, cost or unit fields—and settles
+the hold at what earlier accepted reports measured (nothing when none carried a
+count), releasing the rest. The rule applies to token and cost holds alike. A later final
+report with counts still corrects the charge, and no later report without counts lowers one.
+The fold is the only place that decides the charge.
+
+**Charging rule: nothing is charged for a request without usage, in either group.** The owner
+decided this on 24 November 2026 for now, to be revisited. For the second group the
+alternatives are:
+
+- *The last running usage.* The recorded server accepts `continuous_usage_stats` (observed
+  24 November 2026): every content chunk then carries a running usage object. It is a lower
+  bound: for a client that left after 1.5 s it showed 127 completion tokens where the server's
+  own counters showed 208. It needs the worker to ask for it and to accept changing counts,
+  and it gives nothing for a non-streamed answer or before the first chunk. Because the fold
+  preserves measurements from earlier accepted non-final reports, adopting it needs no schema
+  change: a non-final report carries the running counts, followed by the final report carrying
+  the reason (increment 3d).
+- *The reserved amount.* Nobody gains from leaving early, but a cancelled run, an upstream
+  error or a proxy fault costs the user the round's full cap.
+- *An estimate* from the bytes relayed. Rejected: it would record numbers nobody measured.
+
+With nothing charged, a user who cancels a run gets the model server's work on it for free.
+No partial output reaches a user today, so the gain is unbilled load, bounded by the
+concurrency limits. Changing the rule for the second group is a change to the fold's
+`incomplete` branch alone.
+
+**Revisions.** The proxy writes its one report of a request, with usage or without, at
+revision 1 under the request's own ID. Revision 0 is left to the sweep of increment 3b.
+Settlement lets a higher final revision correct a lower one, so a report of the proxy that
+arrives after the sweep closed the request replaces the sweep's record, and the sweep can
+never replace the proxy's.
+
+**No bare final report.** Settlement and a deferred database trigger refuse a final report
+that would leave a request without a binding open: one without both counts and without a
+reason, or one whose quota fold was not run. The proxy builds a report without counts only
+together with its reason.
+
+### Who closes what
+
+| End of the request | After increment 3a |
+| --- | --- |
+| Completed 200 with usage | The proxy reports the usage, as before. This includes a response stopped at its token limit: the recorded server stops at exactly the requested `max_completion_tokens` and still reports usage (observed 24 November 2026). |
+| Dispatch spent, nothing sent, or sent and no usage (the twelve reasons) | The proxy writes the incomplete report at once, also when its caller has gone. |
+| Never dispatched: the worker did not reach the proxy, or the proxy refused the bearer | Nothing. The hold stays until increment 3b. |
+| Dispatch recorded but unconfirmed to the proxy (`dispatch_unconfirmed`) | Logged only. The hold stays until increment 3b. |
+| The proxy could not write its report, or stopped while relaying | `gateway.usage.failed`, or nothing. The hold stays until increment 3b. |
+
+There is still no local spool: when the database is unavailable the report is lost, the hold
+stays, and the failure is logged.
+
+### Evidence
+
+- `tests/schema/gateway_proxy.rs`: every reason through the binary, among them the recorded
+  aborted stream and the recorded 500; the hold settled with nothing charged, the request no
+  longer outstanding and no accounting drift. Revisions, corrections and the refused bare
+  final report through settlement on a metered request.
+- `tests/schema/gateway_rounds.rs`: the same for a request without a quota hold, the refusal
+  for a request that was never dispatched, and the upgrade from schema 30 with the CHECK.
+- `tests/schema/live_turns/worker_gateway.rs`: the packaged worker's round refused by a proxy
+  that serves another model is closed with `model_not_served`.
 
 ## Evidence
 
@@ -289,8 +393,9 @@ exists.
 - `tests/schema/live_turns/worker_gateway.rs`: the packaged worker binary claims a queued run
   and dispatches its round to the proxy binary with the bearer it made, over plain HTTP and
   through a TLS terminator; the usage report equals the recorded answer's, the hold settles
-  and the answer is published. A proxy serving another model and an unreachable proxy fail
-  the turn and leave the hold.
+  and the answer is published. A proxy serving another model fails the turn and closes the
+  hold with `model_not_served`; an unreachable proxy fails the turn and leaves the hold
+  until increment 3b.
 - `tests/provider_http_support/tests.rs`, `tests/provider_inference/authentication.rs` and
   `tests/provider_gateway.rs`: every other client refuses `http://`, and the gateway route
   pairs its scheme with trust anchors and sends its bearer and request ID without TLS.
