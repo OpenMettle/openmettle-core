@@ -887,30 +887,30 @@ pub(crate) struct Routing {
     pub model: String,
 }
 
-/// What presenting a dispatch secret established.
+/// What presenting a round bearer established.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Consumed {
     /// The request's one dispatch, now spent.
     Once(Routing),
-    /// The secret is the request's, and its dispatch was spent earlier.
+    /// The bearer is the request's, and its dispatch was spent earlier.
     Replay,
-    /// No handed-off request of a live run matches the ID and the secret.
+    /// No handed-off request of a live run matches the ID and the bearer.
     Refused,
 }
 
-/// Spend the one dispatch of a handed-off request for the caller holding its dispatch secret
+/// Spend the one dispatch of a handed-off request for the caller presenting its round bearer
 /// (`openmettle.gateway_dispatch`), as an `openmettle_gateway` login. It returns `Ok` only after
 /// the commit, so nothing is forwarded on a consume that did not become durable.
 ///
-/// Only the SHA-256 of the secret is sent, which is what the request row already stores. The
-/// secret itself never crosses the database connection, so a server that logs statement
+/// Only the SHA-256 of the bearer is sent, which is what the handoff stored in the request row.
+/// The bearer itself never crosses the database connection, so a server that logs statement
 /// parameters records nothing a caller could present.
 pub(crate) async fn consume(
     pool: &PgPool,
     request: &str,
-    secret: &[u8; 32],
+    bearer: &[u8; 32],
 ) -> Result<Consumed, Error> {
-    let hash = Sha256::digest(secret);
+    let hash = Sha256::digest(bearer);
     let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
     let row = sqlx::query(
         "SELECT replayed,installation,scope,source,principal,model \

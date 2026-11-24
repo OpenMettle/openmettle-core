@@ -1,5 +1,5 @@
 //! `openmettle-gateway`, the V1-06 proxy (ADR 0044). The real binary, whose only database
-//! login is `openmettle_gateway`, authenticates each caller by its request's dispatch secret,
+//! login is `openmettle_gateway`, authenticates each caller by its request's round bearer,
 //! forwards the request once to a stand-in upstream that replays the responses recorded from a
 //! real SGLang deployment (`tests/fixtures/sglang-recorded/`), and settles the usage they
 //! report. Every case uses its own run round, reserved and handed off through the library with
@@ -77,17 +77,20 @@ fn pool(db: &TestDb, role: &str) -> PgPool {
         .connect_lazy_with(db.1.options(role))
 }
 
-/// The dispatch secret the fixture gives request `id`. The library keeps the secret it created
-/// private to the worker's dispatch, so the fixture re-keys each request as the database owner
-/// with one the test can present: only the stored hash changes. Increment 2c replaces this with
-/// the packaged worker dispatching to the proxy.
-fn secret(id: &str) -> [u8; 32] {
+/// The round bearer the fixture gives request `id`. The library makes the bearer inside the
+/// handoff, stores only its hash and keeps the bearer private to the worker's dispatch, and it
+/// keeps the dispatch secret private too, so the fixture cannot choose the bearer through the
+/// handoff. It replaces the stored `bearer_hash` of each handed-off request, as the database
+/// owner, with the hash of a bearer the test can present. A request that is only reserved has
+/// no bearer hash and gets none. Increment 2c replaces this with the packaged worker
+/// dispatching to the proxy.
+fn bearer_bytes(id: &str) -> [u8; 32] {
     Sha256::digest(format!("gateway-proxy-fixture:{id}")).into()
 }
 
-/// The credential of request `id`: its dispatch secret as unpadded base64url.
+/// The credential of request `id`: its round bearer as unpadded base64url.
 fn bearer(id: &str) -> String {
-    URL_SAFE_NO_PAD.encode(secret(id))
+    URL_SAFE_NO_PAD.encode(bearer_bytes(id))
 }
 
 /// One account whose run rounds are reserved and handed off without any gateway binding.
@@ -140,7 +143,7 @@ impl Fixture {
     }
 
     /// Round 1 of a new one-round run admitted for `model`, with its run and round holds,
-    /// handed off unless `reserved_only`, and re-keyed to [`secret`].
+    /// handed off unless `reserved_only`, and then given the bearer of [`bearer_bytes`].
     async fn request_for(&self, model: &str, reserved_only: bool) -> String {
         let (actor, scope) = (&self.actor, self.scope.as_str());
         let chat = authz_runs::chat(&self.db, scope, "personal", actor).await;
@@ -232,18 +235,33 @@ impl Fixture {
                 )
                 .await;
             assert!(handed_off.is_ok());
+            let rekeyed = sqlx::query(
+                "UPDATE openmettle.gateway_requests SET bearer_hash=sha256($2)
+                  WHERE id=$1::uuid AND state='handed_off' AND bearer_hash IS NOT NULL",
+            )
+            .bind(&pending.id)
+            .bind(bearer_bytes(&pending.id).as_slice())
+            .execute(&self.owner)
+            .await
+            .unwrap();
+            assert_eq!(rekeyed.rows_affected(), 1);
         }
+        self.issued.lock().unwrap().push(pending.id.clone());
+        pending.id.clone()
+    }
+
+    /// Replaces the dispatch secret of request `id` with `secret`, as the database owner: the
+    /// library keeps the one it created private.
+    async fn set_dispatch_secret(&self, id: &str, secret: &[u8; 32]) {
         let rekeyed = sqlx::query(
             "UPDATE openmettle.gateway_requests SET dispatch_hash=sha256($2) WHERE id=$1::uuid",
         )
-        .bind(&pending.id)
-        .bind(secret(&pending.id).as_slice())
+        .bind(id)
+        .bind(secret.as_slice())
         .execute(&self.owner)
         .await
         .unwrap();
         assert_eq!(rekeyed.rows_affected(), 1);
-        self.issued.lock().unwrap().push(pending.id.clone());
-        pending.id.clone()
     }
 
     /// The run of request `id`.
@@ -608,22 +626,38 @@ enum Fault {
     Silence,
     /// The trigger reaches the server, but every reply from then on is held back this long.
     Delay(Duration),
+    /// The trigger reaches the server, but the next reply is held back until released.
+    Hold,
 }
 
 /// Forwards connections to the test PostgreSQL service, with one [`Fault`] on the connection
 /// that sends `trigger` for the `skip + 1`th time.
-struct FaultyPostgres {
+pub(crate) struct FaultyPostgres {
     address: String,
     /// Times the trigger was seen; only one was faulted.
     attempts: Arc<AtomicUsize>,
-    /// Held-back replies delivered after a [`Fault::Delay`].
+    /// Held-back replies delivered after a [`Fault::Delay`] or a [`Fault::Hold`].
     late: Arc<AtomicUsize>,
-    /// Every byte the gateway sent towards PostgreSQL.
-    sent: Arc<Mutex<Vec<u8>>>,
+    /// Every byte the client sent towards PostgreSQL, on every connection.
+    pub(crate) sent: Arc<Mutex<Vec<u8>>>,
     release: Arc<Notify>,
 }
 
 impl FaultyPostgres {
+    /// A forwarder that faults nothing and only records what the client sends.
+    pub(crate) async fn recording() -> Self {
+        Self::start(DISPATCH, usize::MAX, Fault::Silence).await
+    }
+
+    /// The address of `role` on `db` through this forwarder.
+    pub(crate) fn url(&self, db: &TestDb, role: &str) -> String {
+        let admin = pg::admin_options();
+        let direct = format!("@{}:{}/", admin.get_host(), admin.get_port());
+        let url = db.url(role);
+        assert!(url.contains(&direct));
+        url.replace(&direct, &format!("@{}/", self.address))
+    }
+
     async fn start(trigger: &'static [u8], skip: usize, fault: Fault) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
@@ -657,8 +691,10 @@ impl FaultyPostgres {
         }
     }
 
+    /// Lets the one faulted connection go. The permit is kept, so a release that comes before
+    /// the connection waits for it is not lost.
     fn release(&self) {
-        self.release.notify_waiters();
+        self.release.notify_one();
     }
 }
 
@@ -679,7 +715,9 @@ async fn forward(client: tokio::net::TcpStream, server: tokio::net::TcpStream, f
     let (mut server_read, mut server_write) = server.into_split();
     let silent = Arc::new(AtomicBool::new(false));
     let hold = Arc::new(Mutex::new(None::<tokio::time::Instant>));
+    let gate = Arc::new(AtomicBool::new(false));
     let (quiet, held, late) = (silent.clone(), hold.clone(), faults.late.clone());
+    let (gated, released) = (gate.clone(), faults.release.clone());
     // Each direction ends when its source does; a silent connection's replies are discarded.
     let replies = async move {
         let mut buffer = [0; 8192];
@@ -690,6 +728,10 @@ async fn forward(client: tokio::net::TcpStream, server: tokio::net::TcpStream, f
             let until = held.lock().unwrap().take();
             if let Some(until) = until {
                 tokio::time::sleep_until(until).await;
+                late.fetch_add(1, Ordering::SeqCst);
+            }
+            if gated.swap(false, Ordering::SeqCst) {
+                released.notified().await;
                 late.fetch_add(1, Ordering::SeqCst);
             }
             if client_write.write_all(&buffer[..n]).await.is_err() {
@@ -719,6 +761,7 @@ async fn forward(client: tokio::net::TcpStream, server: tokio::net::TcpStream, f
                     Fault::Delay(delay) => {
                         *hold.lock().unwrap() = Some(tokio::time::Instant::now() + delay);
                     }
+                    Fault::Hold => gate.store(true, Ordering::SeqCst),
                 }
             }
             // Keep less than one trigger, so an occurrence is counted once.
@@ -1283,16 +1326,23 @@ async fn refuses_unusable_requests_before_spending_or_forwarding_anything() {
     assert_eq!(events, []);
 }
 
-/// A caller that cannot prove the dispatch secret of the request it names gets the same 401,
-/// whether the credential is unusable, the secret wrong, or the request unknown or not handed
-/// off: nothing is sent upstream and nothing is spent.
+/// A caller that cannot present the bearer of the request it names gets the same 401, whether
+/// the credential is unusable, the bearer wrong, or the request unknown or not handed off:
+/// nothing is sent upstream and nothing is spent. The request's dispatch secret is not its
+/// bearer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 required"]
-async fn refuses_a_caller_without_the_dispatch_secret_of_its_request() {
+async fn refuses_a_caller_without_the_bearer_of_its_request() {
     let h = Harness::start().await;
     let reserved = h.fixture.request(true).await;
     let handed_off = h.fixture.request(false).await;
     let other = h.fixture.request(false).await;
+    // A handed-off request whose dispatch secret the test knows.
+    let keyed = h.fixture.request(false).await;
+    let dispatch_secret = [0x5a; 32];
+    h.fixture
+        .set_dispatch_secret(&keyed, &dispatch_secret)
+        .await;
     let unknown: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
         .fetch_one(&h.fixture.owner)
         .await
@@ -1308,7 +1358,7 @@ async fn refuses_a_caller_without_the_dispatch_secret_of_its_request() {
         (&handed_off, header(&format!("bearer {right}")), ""),
         (&handed_off, header(&format!("Bearer {right}=")), ""),
         (&handed_off, header(&format!("Bearer {}", &right[..42])), ""),
-        (&handed_off, header("Bearer not-a-dispatch-secret"), ""),
+        (&handed_off, header("Bearer not-a-round-bearer"), ""),
         (
             &handed_off,
             header(&format!("Bearer {right}")).repeat(2),
@@ -1320,7 +1370,7 @@ async fn refuses_a_caller_without_the_dispatch_secret_of_its_request() {
             header(&format!("Bearer {right}")),
             "Connection: close, Authorization\r\n",
         ),
-        // Another request's secret, and a well-formed secret of no request.
+        // Another request's bearer, and a well-formed bearer of no request.
         (
             &handed_off,
             header(&format!("Bearer {}", bearer(&other))),
@@ -1331,7 +1381,8 @@ async fn refuses_a_caller_without_the_dispatch_secret_of_its_request() {
             header(&format!("Bearer {}", bearer(&unknown))),
             "",
         ),
-        // The right secret for an unknown request, and for one reserved but not handed off.
+        // The fixture's bearer for an unknown request, and for one reserved but not handed off,
+        // which has no bearer yet.
         (
             &unknown,
             header(&format!("Bearer {}", bearer(&unknown))),
@@ -1342,6 +1393,16 @@ async fn refuses_a_caller_without_the_dispatch_secret_of_its_request() {
             header(&format!("Bearer {}", bearer(&reserved))),
             "",
         ),
+        // The dispatch secret of a handed-off request: the worker's proof to the database, which
+        // the proxy does not accept.
+        (
+            &keyed,
+            header(&format!(
+                "Bearer {}",
+                URL_SAFE_NO_PAD.encode(dispatch_secret)
+            )),
+            "",
+        ),
     ] {
         let reply = h
             .send_with(Some(id), &credential, &body, extra, Then::Read)
@@ -1349,10 +1410,10 @@ async fn refuses_a_caller_without_the_dispatch_secret_of_its_request() {
         assert_eq!(refusal(&reply), unauthenticated(), "{id} {credential}");
     }
     assert_eq!(h.upstream.count(), 0, "nothing was forwarded");
-    for id in [&reserved, &handed_off, &other] {
+    for id in [&reserved, &handed_off, &other, &keyed] {
         assert!(!h.fixture.dispatched(id).await);
     }
-    // The holder of the secret is still served.
+    // The holder of the bearer is still served.
     let reply = h.send(Some(&handed_off), &body, "", Then::Read).await;
     assert_eq!(reply.status, 200);
     assert_eq!(h.upstream.count(), 1);
@@ -1363,8 +1424,9 @@ async fn refuses_a_caller_without_the_dispatch_secret_of_its_request() {
     assert_eq!(events, []);
 }
 
-/// One request reaches the upstream once: a later dispatch with the right secret is a
-/// conflict, and of two concurrent ones exactly one is forwarded.
+/// One request reaches the upstream once: a later dispatch with the right bearer is a
+/// conflict, and of two concurrent ones at most one is forwarded. Here nothing else refuses
+/// either of the two, so one is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn one_request_is_dispatched_and_settled_exactly_once() {
@@ -1378,7 +1440,7 @@ async fn one_request_is_dispatched_and_settled_exactly_once() {
         let reply = h.send(Some(&id), &replayed, "", Then::Read).await;
         assert_eq!(refusal(&reply), (409, "conflict".to_owned(), None));
     }
-    // A replay is reported only to the holder of the secret.
+    // A replay is reported only to the holder of the bearer.
     let stranger = format!("Authorization: Bearer {}\r\n", bearer("another"));
     let reply = h
         .send_with(Some(&id), &stranger, &replayed, "", Then::Read)
@@ -1485,7 +1547,7 @@ async fn refuses_a_model_other_than_the_one_reserved_and_served() {
 }
 
 /// A run cancelled after its round was handed off is not dispatched: the caller is refused
-/// like one without the secret, and the dispatch stays unspent.
+/// like one without the bearer, and the dispatch stays unspent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn a_cancelled_run_is_refused_without_forwarding() {
@@ -1995,13 +2057,16 @@ const COMMIT: &[u8] = b"COMMIT\0";
 /// A dispatch whose commit reached the database, but whose acknowledgement came after the
 /// proxy stopped waiting, is spent: the caller gets 503, nothing is forwarded, a retry is a
 /// replay, and the request is logged once because nobody saw it succeed.
+///
+/// The order is not timed. The acknowledgement of the `COMMIT` is held in the forwarder until
+/// the test releases it, and the test releases it only after it has read the 503 and the
+/// retry's 409: neither can have followed the acknowledgement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn a_dispatch_committed_but_unacknowledged_is_spent_and_logged() {
     let fixture = Fixture::new().await;
-    // The proxy waits two seconds for the dispatch (five `DB_TIMEOUT_MS`); the reply to its
-    // `COMMIT` is held back for three.
-    let postgres = FaultyPostgres::start(COMMIT, 0, Fault::Delay(Duration::from_secs(3))).await;
+    // The proxy waits two seconds for the dispatch (five `DB_TIMEOUT_MS`).
+    let postgres = FaultyPostgres::start(COMMIT, 0, Fault::Hold).await;
     let url = format!(
         "postgres://{}:{PASSWORD}@{}/{}?sslmode=disable",
         pg::GATEWAY,
@@ -2015,7 +2080,12 @@ async fn a_dispatch_committed_but_unacknowledged_is_spent_and_logged() {
     let reply = h.send(Some(&id), &body, "", Then::Read).await;
     assert_eq!(refusal(&reply), (503, "unavailable".to_owned(), None));
     assert_eq!(h.upstream.count(), 0);
-    // The commit itself was not delayed, only its acknowledgement.
+    // The 503 was read while the forwarder held the acknowledgement: the `COMMIT` had passed
+    // it, and no held reply had been let through.
+    let late = &postgres.late;
+    assert_eq!(postgres.attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(late.load(Ordering::SeqCst), 0);
+    // The commit itself was not held, only its acknowledgement.
     let deadline = Instant::now() + Duration::from_secs(10);
     while !h.fixture.dispatched(&id).await {
         assert!(Instant::now() < deadline, "the dispatch never committed");
@@ -2024,7 +2094,9 @@ async fn a_dispatch_committed_but_unacknowledged_is_spent_and_logged() {
     let reply = h.send(Some(&id), &body, "", Then::Read).await;
     assert_eq!(refusal(&reply), (409, "conflict".to_owned(), None));
     assert_eq!(h.upstream.count(), 0);
-    let late = &postgres.late;
+    // Still held: the retry was refused on the committed row alone.
+    assert_eq!(late.load(Ordering::SeqCst), 0);
+    postgres.release();
     eventually(
         Duration::from_secs(10),
         "the late acknowledgement never came",
@@ -2036,14 +2108,14 @@ async fn a_dispatch_committed_but_unacknowledged_is_spent_and_logged() {
     assert_eq!(events, [unrecorded(&id, "dispatch_unconfirmed")]);
 }
 
-/// The proxy sends PostgreSQL the SHA-256 of the dispatch secret and never the secret: a server
-/// that logs statement parameters then records nothing a caller could present. Every byte the
+/// The proxy sends PostgreSQL the SHA-256 of the bearer and never the bearer: a server that
+/// logs statement parameters then records nothing a caller could present. Every byte the
 /// gateway sends to the database is recorded here, with nothing faulted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 required"]
-async fn the_dispatch_secret_never_reaches_the_database() {
+async fn the_bearer_never_reaches_the_database() {
     let fixture = Fixture::new().await;
-    let postgres = FaultyPostgres::start(DISPATCH, usize::MAX, Fault::Silence).await;
+    let postgres = FaultyPostgres::recording().await;
     let url = format!(
         "postgres://{}:{PASSWORD}@{}/{}?sslmode=disable",
         pg::GATEWAY,
@@ -2058,18 +2130,22 @@ async fn the_dispatch_secret_never_reaches_the_database() {
     assert_eq!(events, []);
     let sent = postgres.sent.lock().unwrap().clone();
     let carried = |needle: &[u8]| sent.windows(needle.len()).any(|w| w == needle);
-    // The call that spent the dispatch went through this connection and carried the hash.
+    // The call that spent the dispatch went through this connection.
     assert!(carried(DISPATCH));
-    assert!(carried(&Sha256::digest(secret(&id))));
-    let hex: String = secret(&id).iter().map(|b| format!("{b:02x}")).collect();
+    let hex: String = bearer_bytes(&id)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     for (form, spelled) in [
-        ("raw", secret(&id).to_vec()),
+        ("raw", bearer_bytes(&id).to_vec()),
         ("hexadecimal", hex.into_bytes()),
         ("base64url", bearer(&id).into_bytes()),
     ] {
         assert!(
             !carried(&spelled),
-            "the secret reached the database, {form}"
+            "the bearer reached the database, {form}"
         );
     }
+    // What it carried is the hash.
+    assert!(carried(&Sha256::digest(bearer_bytes(&id))));
 }

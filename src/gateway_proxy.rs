@@ -4,10 +4,11 @@
 //! `openmettle_gateway`.
 //!
 //! - **Authentication and single dispatch.** The caller names a handed-off gateway request in
-//!   `x-request-id` and proves it holds that request's dispatch secret in `Authorization`. The
-//!   database spends the request's one dispatch before the body is read: an unknown request or
-//!   a wrong secret is refused alike, and a second dispatch is a conflict. The report's routing
-//!   fields come from the stored row, never from the caller.
+//!   `x-request-id` and presents that request's bearer in `Authorization`: the per-round value
+//!   whose hash the handoff stored, never the dispatch secret. The database spends the
+//!   request's one dispatch before the body is read: an unknown request or a wrong bearer is
+//!   refused alike, and a second dispatch is a conflict. The report's routing fields come from
+//!   the stored row, never from the caller.
 //! - **Model.** The stored model must be the one this gateway serves, and the body's top-level
 //!   `model` must equal it. The upstream answers any model name from its loaded model, so
 //!   nothing else checks it.
@@ -21,7 +22,7 @@
 //!   on the caller staying connected. A response that is not a completed 200 with a usage object
 //!   leaves no report and one `gateway.usage.unrecorded` event; the hold stays as it was.
 //!
-//! Not deployable: the listener is plain HTTP, so the dispatch secret would cross the network
+//! Not deployable: the listener is plain HTTP, so the bearer would cross the network
 //! in cleartext, and nothing reconciles a spent dispatch that left no report. See
 //! `docs/operator/gateway-proxy.md`.
 mod usage;
@@ -99,7 +100,7 @@ const CONNECTION: Problem = problem(
 const UNAUTHENTICATED: Problem = problem(
     StatusCode::UNAUTHORIZED,
     "unauthenticated",
-    "The request needs one Authorization header with the dispatch secret of the request named in x-request-id.",
+    "The request needs one Authorization header with the bearer of the request named in x-request-id.",
 );
 const REPLAY: Problem = problem(
     StatusCode::CONFLICT,
@@ -240,12 +241,15 @@ fn origin(url: &str) -> Result<Authority, &'static str> {
     }
 }
 
-/// Whether every `Connection` value is visible ASCII, so its nominations can all be read.
+/// Whether every `Connection` value is visible ASCII and spaces only, so its nominations can
+/// all be read. A horizontal tab is refused too, although a header value may hold one.
 fn connection_readable(headers: &HeaderMap) -> bool {
-    headers
-        .get_all(header::CONNECTION)
-        .iter()
-        .all(|value| value.to_str().is_ok())
+    headers.get_all(header::CONNECTION).iter().all(|value| {
+        value
+            .as_bytes()
+            .iter()
+            .all(|byte| (0x20..=0x7e).contains(byte))
+    })
 }
 
 /// The values of `name`, unless the message's `Connection` field names it as hop-by-hop. The
@@ -373,7 +377,7 @@ fn correlation(headers: &HeaderMap) -> Result<String, Problem> {
     }
 }
 
-/// The dispatch secret of exactly one `Authorization: Bearer` header: 32 bytes as 43 unpadded
+/// The round bearer of exactly one `Authorization: Bearer` header: 32 bytes as 43 unpadded
 /// base64url characters, in their one canonical spelling. A header named in `Connection` is
 /// hop-by-hop and counts as absent.
 fn credential(headers: &HeaderMap) -> Result<[u8; 32], Problem> {
@@ -385,7 +389,7 @@ fn credential(headers: &HeaderMap) -> Result<[u8; 32], Problem> {
         .as_bytes()
         .strip_prefix(b"Bearer ")
         .and_then(|token| URL_SAFE_NO_PAD.decode(token).ok())
-        .and_then(|secret| secret.try_into().ok())
+        .and_then(|bearer| bearer.try_into().ok())
         .ok_or(UNAUTHENTICATED)
 }
 
@@ -414,7 +418,7 @@ impl Proxy {
             return Err(CONNECTION);
         }
         let id = correlation(&parts.headers)?;
-        let secret = credential(&parts.headers)?;
+        let bearer = credential(&parts.headers)?;
         if !identity(&parts.headers) {
             return Err(ENCODED_REQUEST);
         }
@@ -426,7 +430,7 @@ impl Proxy {
             gap: Some(UsageGap::DispatchUnconfirmed),
         };
         // The caller is authenticated and the dispatch spent before any body is buffered.
-        let routing = match self.consume(&id, secret).await {
+        let routing = match self.consume(&id, bearer).await {
             Ok(routing) => routing,
             Err(problem) => {
                 if problem != UNAVAILABLE {
@@ -515,13 +519,13 @@ impl Proxy {
         Ok(relayed)
     }
 
-    /// Spends the one dispatch of `id` for the holder of `secret` and returns the stored
+    /// Spends the one dispatch of `id` for the holder of `bearer` and returns the stored
     /// routing fields. Like every database exchange here, the transaction runs in its own task:
     /// past the deadline the proxy stops waiting for it but never cancels it in flight, so an
     /// unanswered exchange may still spend the dispatch.
-    async fn consume(&self, id: &str, secret: [u8; 32]) -> Result<Routing, Problem> {
+    async fn consume(&self, id: &str, bearer: [u8; 32]) -> Result<Routing, Problem> {
         let (pool, id) = (self.pool.clone(), id.to_owned());
-        let spent = tokio::spawn(async move { gateway::consume(&pool, &id, &secret).await });
+        let spent = tokio::spawn(async move { gateway::consume(&pool, &id, &bearer).await });
         match timeout(self.database_timeout * WRITE_ATTEMPT_TIMEOUTS, spent).await {
             Ok(Ok(Ok(Consumed::Once(routing)))) => Ok(routing),
             Ok(Ok(Ok(Consumed::Replay))) => Err(REPLAY),
@@ -936,17 +940,17 @@ mod tests {
     }
 
     /// Its base64url spelling uses both characters the standard alphabet lacks.
-    const SECRET: [u8; 32] = [0xfb; 32];
+    const BEARER: [u8; 32] = [0xfb; 32];
 
     #[test]
-    fn the_credential_is_exactly_one_canonical_bearer_secret() {
-        let token = URL_SAFE_NO_PAD.encode(SECRET);
+    fn the_credential_is_exactly_one_canonical_bearer() {
+        let token = URL_SAFE_NO_PAD.encode(BEARER);
         assert_eq!(token, "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s");
         let bearer = |token: &str| format!("Bearer {token}").parse::<HeaderValue>().unwrap();
         let mut headers = HeaderMap::new();
         assert_eq!(credential(&headers), Err(UNAUTHENTICATED));
         headers.insert(header::AUTHORIZATION, bearer(&token));
-        assert_eq!(credential(&headers), Ok(SECRET));
+        assert_eq!(credential(&headers), Ok(BEARER));
         // Named as hop-by-hop, it counts as absent.
         headers.insert(header::CONNECTION, "close, Authorization".parse().unwrap());
         assert_eq!(credential(&headers), Err(UNAUTHENTICATED));
@@ -987,6 +991,18 @@ mod tests {
         let hidden = HeaderValue::from_bytes(b"Authorization\xff").unwrap();
         headers.append(header::CONNECTION, hidden);
         assert!(!connection_readable(&headers));
+        // A tab is a legal header byte, and still not one a nomination is read through.
+        for tabbed in [
+            &b"close,\tAuthorization"[..],
+            b"Authori\tzation",
+            b"\tclose",
+        ] {
+            let mut headers = HeaderMap::new();
+            let value = HeaderValue::from_bytes(tabbed).unwrap();
+            assert!(value.to_str().is_ok());
+            headers.insert(header::CONNECTION, value);
+            assert!(!connection_readable(&headers));
+        }
     }
 
     #[test]

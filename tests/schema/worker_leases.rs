@@ -1032,68 +1032,6 @@ mod live_turns {
         assert!(!replayed);
     }
 
-    /// Relays connections to the test PostgreSQL service and keeps, per connection, every byte
-    /// sent towards it.
-    struct RecordedPostgres {
-        address: std::net::SocketAddr,
-        sent: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
-    }
-
-    impl RecordedPostgres {
-        async fn start() -> Self {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let admin = pg::admin_options();
-            let server = format!("{}:{}", admin.get_host(), admin.get_port());
-            let sent = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
-            let record = sent.clone();
-            tokio::spawn(async move {
-                while let Ok((client, _)) = listener.accept().await {
-                    let server = tokio::net::TcpStream::connect(&server).await.unwrap();
-                    // Without this, each exchange waits for a delayed acknowledgement.
-                    for socket in [&client, &server] {
-                        socket.set_nodelay(true).unwrap();
-                    }
-                    let record = record.clone();
-                    let connection = {
-                        let mut all = record.lock().unwrap();
-                        all.push(Vec::new());
-                        all.len() - 1
-                    };
-                    tokio::spawn(async move {
-                        let (mut from_client, mut to_client) = client.into_split();
-                        let (mut from_server, mut to_server) = server.into_split();
-                        let requests = async {
-                            let mut buffer = [0; 8192];
-                            while let Ok(n @ 1..) = from_client.read(&mut buffer).await {
-                                record.lock().unwrap()[connection].extend_from_slice(&buffer[..n]);
-                                if to_server.write_all(&buffer[..n]).await.is_err() {
-                                    break;
-                                }
-                            }
-                            let _ = to_server.shutdown().await;
-                        };
-                        let replies = async {
-                            let _ = tokio::io::copy(&mut from_server, &mut to_client).await;
-                        };
-                        tokio::join!(requests, replies);
-                    });
-                }
-            });
-            Self { address, sent }
-        }
-
-        /// The address of `role` on `db` through this relay.
-        fn url(&self, db: &TestDb, role: &str) -> String {
-            let admin = pg::admin_options();
-            let direct = format!("@{}:{}/", admin.get_host(), admin.get_port());
-            let url = db.url(role);
-            assert!(url.contains(&direct));
-            url.replace(&direct, &format!("@{}/", self.address))
-        }
-    }
-
     impl Provider {
         async fn new() -> Self {
             let loopback = IpAddr::from([127, 0, 0, 1]);
@@ -2550,13 +2488,16 @@ mod live_turns {
     /// wire. The dispatch secret, the worker's proof to the database, is in the recording as 32
     /// raw bytes, so a bearer sent the same way would be found too. The bearer is not there
     /// raw, nor in the base64url spelling the gateway receives, nor in hexadecimal.
-    #[tokio::test]
+    ///
+    /// The forwarder runs on this test's runtime. On one thread the test took more than twice
+    /// as long, so the runtime has two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
     async fn the_round_bearer_never_crosses_the_workers_database_connection() {
         use sha2::{Digest, Sha256};
 
         let mut chat = Chat::new().await;
-        let relay = RecordedPostgres::start().await;
+        let relay = crate::gateway_proxy::FaultyPostgres::recording().await;
         chat.database = Some(relay.url(&chat.f.db, WORKER));
         let mut provider = Provider::new().await;
         let (id, _) = chat.submit("bearer stays in the worker", "a", 2).await;
@@ -2581,13 +2522,11 @@ mod live_turns {
         .await
         .unwrap();
         assert_eq!(bearer_hash, Sha256::digest(&bearer).as_slice());
-        let connections = relay.sent.lock().unwrap().clone();
+        let recorded = relay.sent.lock().unwrap().clone();
         let found = |needle: &[u8]| {
-            connections.iter().any(|bytes| {
-                bytes
-                    .windows(needle.len())
-                    .any(|window| window.eq_ignore_ascii_case(needle))
-            })
+            recorded
+                .windows(needle.len())
+                .any(|window| window.eq_ignore_ascii_case(needle))
         };
         let hex: String = bearer.iter().map(|byte| format!("{byte:02x}")).collect();
         for (spelling, bytes) in [
@@ -2601,11 +2540,8 @@ mod live_turns {
         assert!(found(&bearer_hash));
         // The test knows the dispatch secret by its hash only: look for it where a 32-byte
         // binary statement parameter is, after its length.
-        let secret_sent = connections.iter().any(|bytes| {
-            bytes.windows(36).any(|window| {
-                window[..4] == [0, 0, 0, 32]
-                    && Sha256::digest(&window[4..]).as_slice() == dispatch_hash
-            })
+        let secret_sent = recorded.windows(36).any(|window| {
+            window[..4] == [0, 0, 0, 32] && Sha256::digest(&window[4..]).as_slice() == dispatch_hash
         });
         assert!(secret_sent, "the recording holds the dispatch secret");
     }

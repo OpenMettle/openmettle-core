@@ -2,7 +2,7 @@
 
 > **Not deployable**, for two reasons:
 >
-> - **The dispatch secret would travel in cleartext.** The worker's transport requires an
+> - **The bearer would travel in cleartext.** The worker's transport requires an
 >   `https://` endpoint and the proxy listens on plain HTTP, so the two cannot be connected
 >   until increment 7.
 > - **A hold without a final report stays forever.** A handed-off request keeps its hold until
@@ -13,7 +13,7 @@
 
 `openmettle-gateway` is OpenMettle's own inference proxy (V1-06,
 [ADR 0044](../adr/0044-own-inference-proxy-and-binding-free-dispatch.md)). It sits between a
-caller and one SGLang server. It authenticates the caller by the dispatch secret of one
+caller and one SGLang server. It authenticates the caller by the round bearer of one
 handed-off gateway request, allows that request one dispatch, checks the model, and turns the
 usage the server reports into a usage report for the request's hold, through the settlement
 path of [ADR 0037](../adr/0037-gateway-provisioning-and-usage-reconciliation.md). Caller
@@ -28,25 +28,28 @@ policy is provisioned for it.
 - **Correlation.** The caller sends exactly one `x-request-id` holding the canonical lowercase
   UUID of a gateway request; an ID the caller names in `Connection` counts as absent. A
   missing or malformed ID is refused with `400 validation`. So is a request with a
-  `Connection` value that is not visible ASCII, before the ID or the credential is looked at:
-  such a value could hide a nomination. Refusals use the application API's problem document
-  (`application/problem+json`).
+  `Connection` value holding anything but visible ASCII and spaces, a tab included, before
+  the ID or the credential is looked at: such a value could hide a nomination. Refusals use
+  the application API's problem document (`application/problem+json`).
 - **Authentication.** The caller sends exactly one `Authorization: Bearer` header holding the
-  request's 32-byte dispatch secret as 43 unpadded base64url characters. Only the worker that
-  reserved the round holds that secret. A missing, repeated or malformed header, one named in
-  `Connection`, a wrong secret, an unknown request and a request not handed off are all
-  refused alike with `401 unauthenticated` and `WWW-Authenticate: Bearer`. So is a request
-  that was not dispatched yet and whose run is cancelled, finished, or past its lease or its
-  execution deadline. Nothing is sent upstream, and the answer does not reveal whether the
-  request exists.
+  request's 32-byte round bearer as 43 unpadded base64url characters. The worker makes that
+  bearer when it hands the round off, and only that worker holds it; the database stores
+  its SHA-256. The request's dispatch secret is a different value and is not accepted. A
+  missing, repeated or malformed header, one named in `Connection`, a wrong bearer, an
+  unknown request and a request not handed off are all refused alike with
+  `401 unauthenticated` and `WWW-Authenticate: Bearer`. So is a request that was not
+  dispatched yet and whose run is cancelled, finished, claimed again by another worker, or
+  past its lease or its execution deadline. Nothing is sent upstream, and the answer does not
+  reveal whether the request exists.
 - **Single dispatch.** The database records the request's one dispatch before the body is
-  read. A second dispatch with the right secret is refused with `409 conflict`, also after
-  the run was cancelled or has finished. Of two concurrent dispatches exactly one is
+  read. A second dispatch with the right bearer is refused with `409 conflict`, also after
+  the run was cancelled or has finished. Of two concurrent dispatches at most one is
   forwarded.
-- **The secret stays in the proxy.** The proxy sends PostgreSQL the SHA-256 of the secret,
-  which is what the request row stores, and never the secret. A server that logs statement
-  parameters therefore records nothing a caller could present, and no logging setting is
-  required for the gateway's login.
+- **The bearer stays out of the database.** The proxy sends PostgreSQL the SHA-256 of the
+  bearer, which is what the request row stores, and never the bearer; the worker does the
+  same when it hands the round off. A server that logs statement parameters therefore
+  records nothing a caller could present, and no logging setting is required for the
+  gateway's login.
 - **Routing fields.** The installation, scope, report source, principal and model of the
   report come from the stored request; nothing else is taken from the caller. The report
   source is the request's installation, and the principal is the user the request acts for.
@@ -188,7 +191,7 @@ stopped answering: the pool waits for every connection when closing.
 ## Known gaps
 
 - **Plain HTTP on both sides.** The packaged worker's transport requires an `https://`
-  endpoint, so it cannot use this proxy yet, and without TLS the dispatch secret would cross
+  endpoint, so it cannot use this proxy yet, and without TLS the bearer would cross
   the network in cleartext. The default bind is loopback.
 - **Holds without a final report stay.** A request that was handed off and never dispatched,
   refused after its dispatch was recorded, cancelled, cut or failed keeps its hold. Nothing
