@@ -1557,6 +1557,56 @@
         "assessment": "redistributable",
         "basis": "Apache-2.0 recorded from contracts/vendor/oas-3.2/LICENSE; Apache-2.0 permits redistribution with the licence retained. The upstream repository has no NOTICE file."
       }
+    },
+    {
+      "id": "sglang-recorded-fixtures",
+      "name": "Recorded SGLang HTTP responses (decoder replay test fixtures)",
+      "kind": "asset",
+      "review_group": "core",
+      "distribution": "included",
+      "version": "recorded 2026-11-23",
+      "pin": "Git tree 0a8a88f4529525ee4f929a75353da4c19455eca8 (tests/fixtures/sglang-recorded); the recorded files are unchanged since 583bcf55acd506ef367a55ceb826534ad376fdc1 (tree 5a5f0a13f1611e29bb5ff2c88cdfc9abdbce2e0a), and only README.md gained its provenance section",
+      "origin": "Recorded by the OpenMettle owner, as operator of their own SGLang deployment (a patched fork of sgl-project/sglang serving one model), with synthetic prompts written for the capture, and contributed to openmettle-core as test data",
+      "source_evidence": [
+        "tests/fixtures/sglang-recorded/README.md",
+        "tests/provider_inference/recorded_sglang.rs",
+        "openmettle-core commit 583bcf55acd506ef367a55ceb826534ad376fdc1 (23 Nov 2026, merged in #146), the only commit that touches the directory at this head",
+        "https://github.com/OpenMettle/openmettle-core/issues/9",
+        "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7132587306"
+      ],
+      "licence": {
+        "expression": "MIT",
+        "evidence": [
+          "LICENSE",
+          "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7132587306"
+        ]
+      },
+      "notices": {
+        "status": "recorded",
+        "files": [
+          "LICENSE"
+        ],
+        "obligations": [
+          "Retain the MIT copyright notice 'Copyright (c) 2026 OpenMettle contributors' and the permission notice from LICENSE in all copies or substantial portions."
+        ]
+      },
+      "review": {
+        "status": "reviewed",
+        "reviewer": "OpenMettle owner (GitHub Drgr33nSenior)",
+        "date": "2026-11-24",
+        "evidence": [
+          "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7132587306"
+        ],
+        "notes": "Owner review recorded by an agent from the owner's decision comment, which also states the agent's application to these fixtures; merging the pull request that records this entry is the owner's confirmation of that application. Contributed by the owner as test data under the project's MIT licence and distributed as public openmettle-core source under the 19 Nov 2026 boundary. The fixtures contain server-generated JSON and SSE framing and a small amount of model-generated text, reasoning and tool-call arguments. By the owner decision, the model is the operator's choice and outside the project's scope: it is not named here, the operator accepted its licence, and this register takes no position on its terms. Not verified: the SGLang fork commit that served the capture. Reviewed against policy as licence bookkeeping, not legal clearance."
+      },
+      "tracking": [
+        "V1-08",
+        "V1-42"
+      ],
+      "redistribution": {
+        "assessment": "redistributable",
+        "basis": "MIT recorded from LICENSE and the owner decision that the fixtures are contributed under the project's licence; MIT permits redistribution with the copyright and permission notice."
+      }
     }
   ]
 }

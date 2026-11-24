@@ -48,3 +48,11 @@ For each case `NN-name`:
 a client disconnect, and any successful Responses API output. Core's own requests differ
 from these: it sends its catalog model name, system guidance and `max_completion_tokens`.
 The fixtures show how this server answers; they do not show how it answers core's request.
+
+## Provenance
+
+The project owner recorded these responses on their own deployment, as its operator, using
+synthetic prompts written for the capture, and contributed them under the repository's MIT
+licence. The model is not named: OpenMettle does not distribute or select a model, so the model
+and its licence are the operator's choice and outside the project's scope
+([owner decision](https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7132587306)).
