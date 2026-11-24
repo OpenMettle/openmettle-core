@@ -245,7 +245,8 @@ enum Outbound<'a> {
 pub struct Gateway {
     endpoint: transport::Endpoint,
     allowed: Vec<transport::Range>,
-    tls: Arc<rustls::ClientConfig>,
+    /// Absent exactly for a plain `http://` route made by [`Self::metered`].
+    tls: Option<Arc<rustls::ClientConfig>>,
     lookup: transport::Lookup,
     qualification: Qualification,
     family_policy_v1: bool,
@@ -254,6 +255,7 @@ pub struct Gateway {
     loopback: bool,
 }
 impl Gateway {
+    /// A canonical `https://` route with the given trust anchors.
     pub fn new(
         endpoint: &str,
         trust: Trust<'_>,
@@ -261,7 +263,44 @@ impl Gateway {
         qualification: Qualification,
         timeouts: Timeouts,
     ) -> Result<Self, Error> {
-        if ranges.len() > super::MAX_PRIVATE_RANGES
+        Self::build(
+            transport::endpoint(endpoint)?,
+            Some(trust),
+            ranges,
+            qualification,
+            timeouts,
+        )
+    }
+
+    /// The route of metered turns to OpenMettle's own gateway (ADR 0044): [`Self::new`], except
+    /// that inside the cluster the endpoint may also be `http://`. `trust` is required for an
+    /// `https://` endpoint and refused for an `http://` one, which has no TLS. Only the packaged
+    /// worker's inference configuration calls this; every other client keeps `https://`.
+    pub(crate) fn metered(
+        endpoint: &str,
+        trust: Option<Trust<'_>>,
+        ranges: &[&str],
+        qualification: Qualification,
+        timeouts: Timeouts,
+    ) -> Result<Self, Error> {
+        Self::build(
+            transport::gateway_endpoint(endpoint)?,
+            trust,
+            ranges,
+            qualification,
+            timeouts,
+        )
+    }
+
+    fn build(
+        endpoint: transport::Endpoint,
+        trust: Option<Trust<'_>>,
+        ranges: &[&str],
+        qualification: Qualification,
+        timeouts: Timeouts,
+    ) -> Result<Self, Error> {
+        if endpoint.tls() != trust.is_some()
+            || ranges.len() > super::MAX_PRIVATE_RANGES
             || [timeouts.setup, timeouts.idle, timeouts.overall]
                 .iter()
                 .any(|t| t.is_zero() || Instant::now().checked_add(*t).is_none())
@@ -269,12 +308,14 @@ impl Gateway {
             return Err(Error::Validation);
         }
         Ok(Self {
-            endpoint: transport::endpoint(endpoint)?,
+            endpoint,
             allowed: ranges
                 .iter()
                 .map(|r| transport::private_range(r))
                 .collect::<Result<_, _>>()?,
-            tls: transport::client_config(transport::roots(trust)?)?,
+            tls: trust
+                .map(|trust| transport::client_config(transport::roots(trust)?))
+                .transpose()?,
             lookup: Arc::new(transport::system_lookup),
             qualification,
             family_policy_v1: false,
@@ -295,7 +336,7 @@ impl Gateway {
         transport::Route {
             endpoint: &self.endpoint,
             allowed: &self.allowed,
-            tls: &self.tls,
+            tls: self.tls.as_ref(),
             lookup: &self.lookup,
             slots: &DNS_SLOTS,
             #[cfg(test)]
@@ -524,18 +565,19 @@ impl Gateway {
                 setup: self.timeouts.setup,
                 total: self.timeouts.overall,
             };
-            let tls = route
-                .connect(start + self.timeouts.setup)
-                .await
-                .map_err(|e| match e {
-                    super::Error::Tls | super::Error::Address if self.family_policy_v1 => {
-                        Error::Unavailable
-                    }
-                    e => Error::from(e),
-                })?;
+            let connection =
+                route
+                    .connect(start + self.timeouts.setup)
+                    .await
+                    .map_err(|e| match e {
+                        super::Error::Tls | super::Error::Address if self.family_policy_v1 => {
+                            Error::Unavailable
+                        }
+                        e => Error::from(e),
+                    })?;
             route
                 .exchange(
-                    tls,
+                    connection,
                     outbound,
                     Instant::now() + self.timeouts.idle,
                     &limits,

@@ -3,21 +3,21 @@
 //! `OPENMETTLE_WORKER_INFERENCE_CONFIG` names one strict JSON document. The document and the
 //! files it names are read once at startup, before telemetry, the listener or any database, DNS
 //! or network work. It carries only what turn execution needs: the model catalog the API admits
-//! against (ADR 0036), one qualified HTTPS route per catalog model (ADR 0038) and, provisionally,
-//! the dispatch credential source of the library's metered path: the gateway installation and the
-//! API document's `gateway_keys` ring format (ADR 0037). A later gateway-authorization increment
-//! replaces that source. Login, cursor and session material stays in the API's document.
-//! Refusals are fixed categories that never carry a path, URL, identifier or key byte.
+//! against (ADR 0036), one qualified route per catalog model to OpenMettle's own gateway
+//! (ADR 0038, ADR 0044) and the gateway installation each round is reserved and reported under.
+//! The per-round bearer is made at handoff (ADR 0044), so the document holds no credential.
+//! Login, cursor and session material stays in the API's document. Refusals are fixed
+//! categories that never carry a path, URL, identifier or key byte.
 use super::turns::{Route, TurnRoutes};
 use crate::{
-    auth_config::{self, CursorFiles, Error as Shape, Object},
+    auth_config::{self, Error as Shape, Object},
     authz::runs::ClaimedRun,
     model_config::{Catalog, Effective, ProfilePin},
     provider_http::{
         Trust,
         inference::{self, Gateway, Protocol, Qualification, Timeouts},
     },
-    provider_keys::{documents, gateway::GatewayKeys},
+    provider_keys::documents,
 };
 use serde_json::{Value, error::Category};
 use std::{collections::BTreeMap, fmt, path::Path, sync::Arc, time::Duration};
@@ -27,7 +27,7 @@ pub const VERSION: u64 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// A shape, path, file, catalog or key-ring refusal, with the auth document's fixed text.
+    /// A shape, path, file or catalog refusal, with the auth document's fixed text.
     Document(Shape),
     Installation,
     Coverage,
@@ -67,10 +67,6 @@ pub struct InferenceConfig {
 /// Metered routes for one gateway installation.
 pub struct GatewayRoutes {
     installation: String,
-    /// Provisional dispatch credential source (ADR 0043): the library's metered handoff unseals
-    /// the admitted actor's gateway key with this ring. [`TurnRoutes::route`] below is the only
-    /// place the worker supplies it; the gateway-authorization increment replaces both.
-    keys: Arc<GatewayKeys>,
     models: BTreeMap<String, (Arc<Gateway>, bool)>,
 }
 
@@ -90,7 +86,6 @@ impl TurnRoutes for GatewayRoutes {
         Ok(Route::metered(
             gateway.clone(),
             self.installation.clone(),
-            self.keys.clone(),
             *stream,
         ))
     }
@@ -99,7 +94,9 @@ impl TurnRoutes for GatewayRoutes {
 /// One `routes` member, checked for shape before any file is read.
 struct RouteFile {
     endpoint: String,
-    bundle_path: Option<String>,
+    /// `None` for an `http://` endpoint, which has no TLS and therefore no `trust` member;
+    /// otherwise the bundle path, or `None` within for the native roots.
+    trust: Option<Option<String>>,
     private_cidrs: Vec<String>,
     pin: ProfilePin,
     protocol: Protocol,
@@ -111,11 +108,19 @@ struct RouteFile {
 impl RouteFile {
     fn parse(value: Value) -> Result<Self, Shape> {
         let mut route = Object::new(value)?;
-        let (bundle_path, private_cidrs) = auth_config::destination(&mut route)?;
+        let endpoint = route.string("endpoint")?;
+        // An `http://` route has no TLS and so no `trust` member: `end` refuses one as unknown.
+        // Every other route needs it. `Gateway::metered` checks that pairing again on the
+        // parsed endpoint.
+        let trust = match endpoint.starts_with("http://") {
+            true => None,
+            false => Some(auth_config::trust(&mut route)?),
+        };
+        let private_cidrs = auth_config::private_cidrs(&mut route)?;
         let mut pin = route.object("pin")?;
         let parsed = Self {
-            endpoint: route.string("endpoint")?,
-            bundle_path,
+            endpoint,
+            trust,
             private_cidrs,
             pin: ProfilePin {
                 provider: pin.string("provider")?,
@@ -174,7 +179,6 @@ pub fn load(path: &Path) -> Result<InferenceConfig, Error> {
     }
     let catalog_file = root.string("catalog_file")?;
     let installation = root.string("installation")?;
-    let keys = CursorFiles::parse(root.object("gateway_keys")?, "decrypt_only")?;
     let Value::Object(members) = root.take("routes")? else {
         return Err(Shape::Field.into());
     };
@@ -203,10 +207,15 @@ pub fn load(path: &Path) -> Result<InferenceConfig, Error> {
         }
         let timeouts = route.timeouts().ok_or(Error::Route)?;
         let bundle = route
-            .bundle_path
-            .as_deref()
+            .trust
+            .as_ref()
+            .and_then(Option::as_deref)
             .map(auth_config::trust_bundle)
             .transpose()?;
+        let trust = route
+            .trust
+            .as_ref()
+            .map(|_| bundle.as_deref().map_or(Trust::Native, Trust::Bundle));
         let ranges: Vec<&str> = route.private_cidrs.iter().map(String::as_str).collect();
         // The worker offers no tools until reviewed tool rounds are wired (V1-14), so the
         // function, parallel-call and separator qualifications stay off.
@@ -222,23 +231,14 @@ pub fn load(path: &Path) -> Result<InferenceConfig, Error> {
             usage: route.usage,
             tool_separator_whitespace: false,
         };
-        let gateway = Gateway::new(
-            &route.endpoint,
-            bundle.as_deref().map_or(Trust::Native, Trust::Bundle),
-            &ranges,
-            qualification,
-            timeouts,
-        )
-        .map_err(|_| Error::Route)?;
+        let gateway = Gateway::metered(&route.endpoint, trust, &ranges, qualification, timeouts)
+            .map_err(|_| Error::Route)?;
         models.insert(model, (Arc::new(gateway), route.stream));
     }
-    // Provisional (ADR 0043): the API document's ring format, read last and only here.
-    let keys = Arc::new(auth_config::gateway_keys(&keys.gateway_material()?)?);
     Ok(InferenceConfig {
         catalog: Arc::new(catalog),
         routes: GatewayRoutes {
             installation,
-            keys,
             models,
         },
     })

@@ -30,6 +30,17 @@ pub mod provider_http {
         assert_eq!(transport::endpoint(url).unwrap().url, url);
         assert!(transport::endpoint(&format!("{url}?page=1")).is_err());
     }
+
+    /// The admin origin, like every generic endpoint, is `https://` only. Plain HTTP is the
+    /// metered gateway route's option alone (ADR 0044), and its endpoint then has no TLS.
+    #[test]
+    fn plain_http_is_the_metered_gateway_routes_option_alone() {
+        let plain = "http://gateway.example.test/";
+        assert!(transport::endpoint(plain).is_err());
+        assert!(!transport::gateway_endpoint(plain).unwrap().tls());
+        let secure = "https://gateway.example.test/";
+        assert!(transport::gateway_endpoint(secure).unwrap().tls());
+    }
 }
 use admin::{Admin, Create, Resource};
 use fixture::{Ca, Reply, Server};

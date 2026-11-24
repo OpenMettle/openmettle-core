@@ -208,7 +208,7 @@ impl ProviderTransport {
             let route = Route {
                 endpoint: &self.endpoint,
                 allowed: &self.allowed,
-                tls: &self.tls,
+                tls: Some(&self.tls),
                 lookup: &self.lookup,
                 slots: &self.slots,
                 #[cfg(test)]

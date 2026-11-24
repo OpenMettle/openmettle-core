@@ -13,6 +13,36 @@ use tokio::{
     net::TcpStream,
 };
 
+/// The metered gateway route chooses TLS by its scheme (ADR 0044): `http://` takes no trust
+/// anchors and `https://` needs them. The general constructor keeps `https://` only.
+#[test]
+fn only_the_metered_gateway_route_may_be_plain_http() {
+    let c = catalog(Protocol::Chat, true);
+    let e = effective(&c, false);
+    let ca = fixture::Ca::new();
+    let pem = ca.pem();
+    let qualification = || Qualification {
+        model: e.model.clone(),
+        pin: e.profile.clone(),
+        protocol: Protocol::Chat,
+        json: true,
+        sse: false,
+        functions: None,
+        images: false,
+        parallel: false,
+        usage: true,
+        tool_separator_whitespace: false,
+    };
+    let plain = format!("http://{}:8082{}", fixture::HOST, path(Protocol::Chat));
+    let secure = format!("https://{}{}", fixture::HOST, path(Protocol::Chat));
+    let metered = |url: &str, trust| Gateway::metered(url, trust, &[], qualification(), NORMAL);
+    assert!(metered(&plain, None).is_ok());
+    assert!(metered(&plain, Some(Trust::Bundle(&pem))).is_err());
+    assert!(metered(&secure, None).is_err());
+    assert!(metered(&secure, Some(Trust::Bundle(&pem))).is_ok());
+    assert!(Gateway::new(&plain, Trust::Bundle(&pem), &[], qualification(), NORMAL).is_err());
+}
+
 /// Exercise the same inferred operation without the internal credential. This raw client exists
 /// only in the test; the adapter cannot send an unauthenticated request.
 async fn denial(mock: &Mock, body: &[u8], auth: &str) -> u16 {

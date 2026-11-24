@@ -2733,7 +2733,7 @@ fn worker_validates_its_inference_document_before_serving() {
             json_with(
                 &valid,
                 "/routes/a/endpoint",
-                "http://canary-gateway.example.test/CANARY",
+                "https://canary-gateway.example.test/CANARY?CANARY",
             ),
             "an inference route endpoint, trust, address policy or timeout is invalid",
         ),
@@ -2741,11 +2741,14 @@ fn worker_validates_its_inference_document_before_serving() {
             json_with(&valid, "/routes/b/pin/revision", "CANARY-revision"),
             "an inference route does not match its catalog profile",
         ),
-        (
-            json_with(&valid, "/gateway_keys/active/path", &dir.path("CANARY-key")),
-            "gateway key files, identifiers or key separation are invalid",
-        ),
     ];
+    // A document that still carries the key ring ADR 0044 superseded is refused.
+    let mut ring = valid.clone();
+    ring["gateway_keys"] = serde_json::json!({
+        "active": {"id": "gateway-b", "path": dir.write("CANARY-key", &[0xc2; 32])},
+        "decrypt_only": []
+    });
+    cases.push((ring, "configuration has an unknown field"));
     let mut uncovered = valid.clone();
     uncovered["routes"].as_object_mut().unwrap().remove("b");
     cases.push((

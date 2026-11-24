@@ -177,7 +177,7 @@ impl Admin {
         let route = transport::Route {
             endpoint: &endpoint,
             allowed: &self.allowed,
-            tls: &self.tls,
+            tls: Some(&self.tls),
             lookup: &self.lookup,
             slots: &DNS,
             #[cfg(test)]

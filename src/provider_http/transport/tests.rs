@@ -43,7 +43,7 @@ impl Owner {
         Route {
             endpoint: &self.endpoint,
             allowed: &[],
-            tls: &self.tls,
+            tls: Some(&self.tls),
             lookup: &self.lookup,
             slots: &self.slots,
             loopback: self.loopback,

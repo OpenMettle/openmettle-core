@@ -136,9 +136,9 @@ pub fn cursor_keys(dir: &Dir) -> Value {
 }
 
 /// A valid worker inference document (ADR 0043) for every model of `catalog`: the catalog
-/// file, one synthetic gateway key and `bundle` written to `dir`, and one non-streamed Chat
-/// Completions route per model at `https://{authority}/v1/chat/completions`. Tests set the
-/// installation, key ring and private ranges through JSON pointers.
+/// file and `bundle` written to `dir`, and one non-streamed Chat Completions route per model at
+/// `https://{authority}/v1/chat/completions`. Tests set the installation, private ranges or a
+/// plain `http://` endpoint through JSON pointers.
 #[allow(dead_code)] // The contract tests start no worker.
 pub fn inference_document(dir: &Dir, catalog: &Value, bundle: &[u8], authority: &str) -> Value {
     let bundle = dir.write("gateway-ca.pem", bundle);
@@ -167,10 +167,6 @@ pub fn inference_document(dir: &Dir, catalog: &Value, bundle: &[u8], authority: 
         "version": 1,
         "catalog_file": dir.write("catalog.json", catalog.to_string().as_bytes()),
         "installation": "00000000-0000-4000-8000-0000000000c1",
-        "gateway_keys": {
-            "active": {"id": "gateway-b", "path": dir.write("gateway-key-b", &[0xc2; 32])},
-            "decrypt_only": [{"id": "gateway-a", "path": dir.write("gateway-key-a", &[0xc1; 32])}]
-        },
         "routes": routes
     })
 }

@@ -205,6 +205,86 @@ fn endpoints_are_canonical_https_dns_names_only() {
     }
 }
 
+/// Plain HTTP is an option of the metered gateway route alone (ADR 0044). Every other client
+/// built on the transport core keeps `https://`; the OTLP exporter's refusal is in its own
+/// tests, and it cannot reach the gateway route's parser, which is private to `provider_http`.
+#[test]
+fn only_the_metered_gateway_route_accepts_plain_http() {
+    use crate::provider_http::{
+        gateway::Admin,
+        inference::{Gateway, Protocol, Qualification, Timeouts},
+    };
+    let ca = Ca::new();
+    let pem = ca.pem();
+    let plain = "http://gateway.example.test:8082/v1/chat/completions";
+    let secure = "https://gateway.example.test/v1/chat/completions";
+    let catalog = crate::model_config::Catalog::load(include_bytes!(
+        "../fixtures/conversation-catalog-v1.json"
+    ))
+    .unwrap();
+    let qualification = || Qualification {
+        model: "a".into(),
+        pin: catalog.model("a").unwrap().pin.clone(),
+        protocol: Protocol::Chat,
+        json: true,
+        sse: false,
+        functions: None,
+        images: false,
+        parallel: false,
+        usage: true,
+        tool_separator_whitespace: false,
+    };
+    let timeouts = Timeouts {
+        setup: Duration::from_secs(1),
+        idle: Duration::from_secs(1),
+        overall: Duration::from_secs(1),
+    };
+
+    assert!(endpoint(plain).is_err());
+    assert!(ProviderTransport::new(plain, Trust::Bundle(&pem), &[]).is_err());
+    let token = ProviderTransport::new(&fixture::url(8443), Trust::Bundle(&pem), &[]).unwrap();
+    let document = "http://provider.example.test/.well-known/openid-configuration";
+    assert!(ProviderDocuments::configured(&token, document, &fixture::url(8443)).is_err());
+    assert!(ProviderDocuments::configured(&token, &fixture::url(8443), document).is_err());
+    let admin = || crate::provider_keys::gateway::Bearer::new(b"synthetic-admin").unwrap();
+    assert!(
+        Admin::new(
+            "http://gateway.example.test/",
+            Trust::Bundle(&pem),
+            &[],
+            admin()
+        )
+        .is_err()
+    );
+    assert!(
+        Admin::new(
+            "https://gateway.example.test/",
+            Trust::Bundle(&pem),
+            &[],
+            admin()
+        )
+        .is_ok()
+    );
+    assert!(Gateway::new(plain, Trust::Bundle(&pem), &[], qualification(), timeouts).is_err());
+    assert!(Gateway::new(secure, Trust::Bundle(&pem), &[], qualification(), timeouts).is_ok());
+
+    assert!(!transport::gateway_endpoint(plain).unwrap().tls());
+    assert!(transport::gateway_endpoint(secure).unwrap().tls());
+    for bad in [
+        "http://gateway.example.test:80/v1/chat/completions",
+        "http://10.0.0.1/v1/chat/completions",
+        "http://localhost/v1/chat/completions",
+        "http://user@gateway.example.test/v1/chat/completions",
+        "HTTP://gateway.example.test/v1/chat/completions",
+        "ftp://gateway.example.test/v1/chat/completions",
+        "ws://gateway.example.test/v1/chat/completions",
+    ] {
+        assert!(transport::gateway_endpoint(bad).is_err(), "{bad}");
+    }
+    // How `Gateway::metered` pairs the scheme with trust anchors is tested with the inference
+    // codec, in `provider_inference`'s authentication tests.
+}
+
 #[test]
 fn trust_bundles_replace_roots_and_fail_closed() {
     let ca = Ca::new();
@@ -1008,6 +1088,135 @@ async fn turn_dispatch_sends_to_originating_gateway_with_bound_request_id() {
         .unwrap();
     assert_eq!(turn.answers[0].parts, ["bound ok"]);
     assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+}
+
+/// The metered gateway route over plain HTTP (ADR 0044): the committed dispatch's bearer and
+/// `x-request-id` reach the server on a TCP connection that carries no TLS handshake.
+#[tokio::test]
+async fn plain_http_turn_dispatch_sends_its_bearer_and_request_id_without_tls() {
+    use crate::model_config::{Catalog, Selection};
+    use crate::provider_http::inference::{
+        Gateway, History, Protocol, Qualification, Request, RunStop, Timeouts,
+    };
+    use crate::worker::ActiveRun;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        sync::watch,
+    };
+
+    let id = "00000000-0000-4000-8000-000000001920";
+    let bearer = "plain-turn-dispatch-wire-bearer";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut received = Vec::new();
+        let mut buffer = [0; 4096];
+        let head = loop {
+            let n = socket.read(&mut buffer).await.unwrap();
+            assert!(n > 0, "the request head ended early");
+            received.extend_from_slice(&buffer[..n]);
+            if let Some(end) = received.windows(4).position(|w| w == b"\r\n\r\n") {
+                break String::from_utf8(received[..end + 4].to_vec()).unwrap();
+            }
+        };
+        let body = br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"plain ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2}}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+        socket.write_all(body).await.unwrap();
+        // A TLS client would have opened with a handshake record (0x16), not a request line.
+        (received[0], head)
+    });
+
+    let catalog =
+        Catalog::load(include_bytes!("../fixtures/conversation-catalog-v1.json")).unwrap();
+    let effective = catalog
+        .resolve(
+            &Selection::default(),
+            &serde_json::from_value(serde_json::json!({"preset": "study"})).unwrap(),
+            None,
+            |_, _| true,
+        )
+        .unwrap();
+    let mut gateway = Gateway::metered(
+        &format!("http://{}:{port}/v1/chat/completions", fixture::HOST),
+        None,
+        &[],
+        Qualification {
+            model: effective.model.clone(),
+            pin: effective.profile.clone(),
+            protocol: Protocol::Chat,
+            json: true,
+            sse: false,
+            functions: None,
+            images: false,
+            parallel: false,
+            usage: true,
+            tool_separator_whitespace: false,
+        },
+        Timeouts {
+            setup: Duration::from_secs(5),
+            idle: Duration::from_secs(5),
+            overall: Duration::from_secs(10),
+        },
+    )
+    .unwrap();
+    gateway.fixture_lookup(Arc::new(move |_, _| {
+        Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))])
+    }));
+    let request = Request {
+        history: vec![History::User("hello plain dispatch".into())],
+        tools: None,
+        parallel: None,
+        stream: false,
+    };
+    let prepared = gateway
+        .prepare(&catalog, &effective, &request, true)
+        .unwrap();
+    let dispatch = Dispatch {
+        id: id.to_owned(),
+        installation: "00000000-0000-4000-8000-000000001918".to_owned(),
+        model: effective.model.clone(),
+        server: true,
+        authorization: HeaderValue::from_str(&format!("Bearer {bearer}")).unwrap(),
+    };
+    let (_stop, stop) = watch::channel(None);
+    let run = ActiveRun {
+        claim: crate::authz::runs::ClaimedRun {
+            scope_id: "s".into(),
+            run_id: "r".into(),
+            claim_token: "t".into(),
+            actor_approval_id: "a".into(),
+            round_limit: 1,
+            lease_remaining: Duration::from_secs(10),
+            execution_remaining: Duration::from_secs(10),
+        },
+        state: crate::authz::leases::ExecState::Running,
+        execution_deadline: tokio::time::Instant::now() + Duration::from_secs(10),
+    };
+    let turn = TurnDispatch::new(dispatch, prepared)
+        .send(RunStop::from_worker(&run, stop), |_| async {})
+        .await
+        .unwrap();
+    assert_eq!(turn.answers[0].parts, ["plain ok"]);
+    let (first, head) = server.await.unwrap();
+    assert_eq!(first, b'P');
+    let head = head.to_ascii_lowercase();
+    assert!(
+        head.starts_with("post /v1/chat/completions http/1.1\r\n"),
+        "{head}"
+    );
+    for line in [
+        format!("host: {}:{port}", fixture::HOST),
+        format!("authorization: bearer {bearer}"),
+        format!("x-request-id: {id}"),
+        "connection: close".to_owned(),
+    ] {
+        assert!(head.contains(&format!("\r\n{line}\r\n")), "{line}: {head}");
+    }
 }
 
 #[tokio::test]
