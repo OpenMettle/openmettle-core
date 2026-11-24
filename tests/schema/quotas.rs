@@ -24,12 +24,26 @@ async fn dispatched(owner: &mut PgConnection, request: &str) {
 
 /// [`snapshot`] for another model.
 pub(super) fn snapshot_of(model: &str, ceiling: u64) -> Vec<u8> {
-    serde_json::json!({
+    snapshot_priced(model, ceiling, None)
+}
+
+/// [`snapshot_of`] with an optional admission-pinned [`openmettle_core::model_config::CostBound`].
+pub(super) fn snapshot_priced(
+    model: &str,
+    ceiling: u64,
+    cost_bound: Option<openmettle_core::model_config::CostBound>,
+) -> Vec<u8> {
+    let mut doc = serde_json::json!({
         "effective": {"model": model, "ceiling": {"value": ceiling}},
         "required_capabilities": {},
-    })
-    .to_string()
-    .into_bytes()
+    });
+    if let Some(cb) = cost_bound {
+        doc["cost_bound"] = serde_json::json!({
+            "fixed_micros": cb.fixed_micros,
+            "micros_per_token": cb.micros_per_token,
+        });
+    }
+    doc.to_string().into_bytes()
 }
 
 pub(super) struct TurnHandoffFixture {
@@ -1694,6 +1708,10 @@ async fn schema_23_cost_device_upgrade_pre_pr3_worker_recovery_and_gateway_reser
             model: "a",
             round_tokens: 450,
             round_cost: Some(450),
+            cost_bound: Some(openmettle_core::model_config::CostBound {
+                fixed_micros: 450,
+                micros_per_token: 0,
+            }),
             requires_device_slot: true,
         },
     )
@@ -1821,6 +1839,10 @@ async fn schema_23_cost_device_upgrade_pre_pr3_worker_recovery_and_gateway_reser
             model: "a",
             round_tokens: 300,
             round_cost: Some(300),
+            cost_bound: Some(openmettle_core::model_config::CostBound {
+                fixed_micros: 300,
+                micros_per_token: 0,
+            }),
             requires_device_slot: true,
         },
     )
@@ -2878,7 +2900,14 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
                     format: "openmettle.conversation",
                     version: 1,
                     input: b"{}",
-                    config: &snapshot(100),
+                    config: &snapshot_priced(
+                        "a",
+                        100,
+                        Some(openmettle_core::model_config::CostBound {
+                            fixed_micros: 100,
+                            micros_per_token: 0,
+                        }),
+                    ),
                 },
                 actor_approval_id: &alice.approval,
                 capabilities: &[],
@@ -2943,6 +2972,10 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
             model: "a",
             round_tokens: 100,
             round_cost: Some(100),
+            cost_bound: Some(openmettle_core::model_config::CostBound {
+                fixed_micros: 100,
+                micros_per_token: 0,
+            }),
             requires_device_slot: true,
         },
     )
@@ -2983,6 +3016,10 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
             model: "a",
             round_tokens: 100,
             round_cost: Some(100),
+            cost_bound: Some(openmettle_core::model_config::CostBound {
+                fixed_micros: 100,
+                micros_per_token: 0,
+            }),
             requires_device_slot: true,
         },
     )
@@ -3041,6 +3078,10 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
             model: "a",
             round_tokens: 100,
             round_cost: Some(100),
+            cost_bound: Some(openmettle_core::model_config::CostBound {
+                fixed_micros: 100,
+                micros_per_token: 0,
+            }),
             requires_device_slot: true,
         },
     )
@@ -3166,6 +3207,10 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
             model: "a",
             round_tokens: 100,
             round_cost: Some(200),
+            cost_bound: Some(openmettle_core::model_config::CostBound {
+                fixed_micros: 200,
+                micros_per_token: 0,
+            }),
             requires_device_slot: false,
         },
     )
@@ -3205,6 +3250,10 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
                 model: "a",
                 round_tokens: 100,
                 round_cost: Some(200),
+                cost_bound: Some(openmettle_core::model_config::CostBound {
+                    fixed_micros: 200,
+                    micros_per_token: 0,
+                }),
                 requires_device_slot: false,
             },
         )
@@ -3686,7 +3735,14 @@ async fn pre_activation_charged_parents_pre26_replay_savepoint_and_n1_legacy_hol
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: &snapshot(200),
+                config: &snapshot_priced(
+                    "a",
+                    200,
+                    Some(openmettle_core::model_config::CostBound {
+                        fixed_micros: 100,
+                        micros_per_token: 1,
+                    }),
+                ),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -3734,6 +3790,10 @@ async fn pre_activation_charged_parents_pre26_replay_savepoint_and_n1_legacy_hol
             model: "a",
             round_tokens: 200,
             round_cost: Some(300),
+            cost_bound: Some(openmettle_core::model_config::CostBound {
+                fixed_micros: 100,
+                micros_per_token: 1,
+            }),
             requires_device_slot: false,
         },
     )
@@ -3891,7 +3951,14 @@ async fn pre_activation_charged_parents_pre26_replay_savepoint_and_n1_legacy_hol
                     format: "openmettle.conversation",
                     version: 1,
                     input: b"{}",
-                    config: &snapshot(100),
+                    config: &snapshot_priced(
+                        "a",
+                        100,
+                        Some(openmettle_core::model_config::CostBound {
+                            fixed_micros: 100,
+                            micros_per_token: 0,
+                        }),
+                    ),
                 },
                 actor_approval_id: &alice.approval,
                 capabilities: &[],
@@ -4305,7 +4372,14 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: &snapshot(200),
+                config: &snapshot_priced(
+                    "a",
+                    200,
+                    Some(openmettle_core::model_config::CostBound {
+                        fixed_micros: 100,
+                        micros_per_token: 1,
+                    }),
+                ),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -4369,6 +4443,10 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
             model: "a",
             round_tokens: 200,
             round_cost: Some(300),
+            cost_bound: Some(openmettle_core::model_config::CostBound {
+                fixed_micros: 100,
+                micros_per_token: 1,
+            }),
             requires_device_slot: false,
         },
     )
@@ -4517,6 +4595,7 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
                 model: "a",
                 round_tokens: 200,
                 round_cost: None,
+                cost_bound: None,
                 requires_device_slot: false,
             },
         )
@@ -4705,6 +4784,7 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
             model: "a",
             round_tokens: 100,
             round_cost: None,
+            cost_bound: None,
             requires_device_slot: true,
         },
     )
@@ -4982,6 +5062,10 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
                 model: "a",
                 round_tokens: 100,
                 round_cost: Some(750),
+                cost_bound: Some(openmettle_core::model_config::CostBound {
+                    fixed_micros: 750,
+                    micros_per_token: 0,
+                }),
                 requires_device_slot: false,
             },
         )
@@ -5040,6 +5124,7 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
                 model: "a",
                 round_tokens: 100,
                 round_cost: None,
+                cost_bound: None,
                 requires_device_slot: false,
             },
         )
@@ -5121,6 +5206,7 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
             model: "a",
             round_tokens: 100,
             round_cost: None,
+            cost_bound: None,
             requires_device_slot: false,
         },
     )
@@ -5281,7 +5367,14 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
                     format: "openmettle.conversation",
                     version: 1,
                     input: b"{}",
-                    config: &snapshot(100),
+                    config: &snapshot_priced(
+                        "a",
+                        100,
+                        Some(openmettle_core::model_config::CostBound {
+                            fixed_micros: 500,
+                            micros_per_token: 0,
+                        }),
+                    ),
                 },
                 actor_approval_id: &bob.approval,
                 capabilities: &[],
@@ -5333,6 +5426,10 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
                 model: "a",
                 round_tokens: 100,
                 round_cost: Some(500),
+                cost_bound: Some(openmettle_core::model_config::CostBound {
+                    fixed_micros: 500,
+                    micros_per_token: 0,
+                }),
                 requires_device_slot: false,
             },
         )
@@ -5478,6 +5575,7 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
                     model: "a",
                     round_tokens: 100,
                     round_cost: None,
+                    cost_bound: None,
                     requires_device_slot: false,
                 },
             )
@@ -5720,6 +5818,7 @@ async fn stale_lease_on_reserve_turn_round_and_gateway_reserve_returns_refused()
                 model: "a",
                 round_tokens: 100,
                 round_cost: None,
+                cost_bound: None,
                 requires_device_slot: true,
             },
         )
@@ -5765,6 +5864,7 @@ async fn stale_lease_on_reserve_turn_round_and_gateway_reserve_returns_refused()
             model: "a",
             round_tokens: 100,
             round_cost: None,
+            cost_bound: None,
             requires_device_slot: true,
         },
     )
@@ -5810,6 +5910,7 @@ async fn stale_lease_on_reserve_turn_round_and_gateway_reserve_returns_refused()
                 model: "a",
                 round_tokens: 100,
                 round_cost: None,
+                cost_bound: None,
                 requires_device_slot: true,
             },
         )
@@ -5869,6 +5970,7 @@ async fn stale_lease_on_reserve_turn_round_and_gateway_reserve_returns_refused()
                 model: "a",
                 round_tokens: 100,
                 round_cost: None,
+                cost_bound: None,
                 requires_device_slot: true,
             },
         )
@@ -6318,7 +6420,14 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
                     format: "openmettle.conversation",
                     version: 1,
                     input: b"{}",
-                    config: &snapshot(100),
+                    config: &snapshot_priced(
+                        "a",
+                        100,
+                        Some(openmettle_core::model_config::CostBound {
+                            fixed_micros: 100,
+                            micros_per_token: 2,
+                        }),
+                    ),
                 },
                 actor_approval_id: &alice.approval,
                 capabilities: &[],
@@ -6387,6 +6496,10 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
                     model: "a",
                     round_tokens: 100,
                     round_cost: Some(300),
+                    cost_bound: Some(openmettle_core::model_config::CostBound {
+                        fixed_micros: 100,
+                        micros_per_token: 2,
+                    }),
                     requires_device_slot: true,
                 },
             )
@@ -6653,7 +6766,14 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
                     format: "openmettle.conversation",
                     version: 1,
                     input: b"{}",
-                    config: &snapshot(100),
+                    config: &snapshot_priced(
+                        "a",
+                        100,
+                        Some(openmettle_core::model_config::CostBound {
+                            fixed_micros: 100,
+                            micros_per_token: 2,
+                        }),
+                    ),
                 },
                 actor_approval_id: &bob.approval,
                 capabilities: &[],
@@ -6687,6 +6807,10 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
                 model: "a",
                 round_tokens: 100,
                 round_cost: Some(300),
+                cost_bound: Some(openmettle_core::model_config::CostBound {
+                    fixed_micros: 100,
+                    micros_per_token: 2,
+                }),
                 requires_device_slot: true,
             },
         )
@@ -6733,6 +6857,10 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
                 model: "a",
                 round_tokens: 100,
                 round_cost: Some(300),
+                cost_bound: Some(openmettle_core::model_config::CostBound {
+                    fixed_micros: 100,
+                    micros_per_token: 2,
+                }),
                 requires_device_slot: true,
             },
         )
@@ -7626,6 +7754,7 @@ async fn reserve_turn_round_returns_retryable_on_40001_and_succeeds_on_retry() {
                 model: "a",
                 round_tokens: 200,
                 round_cost: None,
+                cost_bound: None,
                 requires_device_slot: false,
             },
         )
@@ -7692,6 +7821,7 @@ async fn reserve_turn_round_returns_retryable_on_40001_and_succeeds_on_retry() {
             model: "a",
             round_tokens: 200,
             round_cost: None,
+            cost_bound: None,
             requires_device_slot: false,
         },
     )
@@ -7922,7 +8052,14 @@ async fn replacement_holds_and_cost_slice_account_for_prior_bearer_rounds() {
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: &snapshot(450),
+                config: &snapshot_priced(
+                    "a",
+                    450,
+                    Some(openmettle_core::model_config::CostBound {
+                        fixed_micros: 0,
+                        micros_per_token: 1,
+                    }),
+                ),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -8003,6 +8140,10 @@ async fn replacement_holds_and_cost_slice_account_for_prior_bearer_rounds() {
             model: "a",
             round_tokens: 450,
             round_cost: Some(450),
+            cost_bound: Some(openmettle_core::model_config::CostBound {
+                fixed_micros: 0,
+                micros_per_token: 1,
+            }),
             requires_device_slot: false,
         },
     )
@@ -8380,7 +8521,14 @@ async fn public_turn_handoff_rejects_mismatched_and_cross_gateway_prepared_befor
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: &snapshot(450),
+                config: &snapshot_priced(
+                    "a",
+                    450,
+                    Some(openmettle_core::model_config::CostBound {
+                        fixed_micros: 0,
+                        micros_per_token: 1,
+                    }),
+                ),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -8434,6 +8582,10 @@ async fn public_turn_handoff_rejects_mismatched_and_cross_gateway_prepared_befor
             model: "a",
             round_tokens: 450,
             round_cost: Some(450),
+            cost_bound: Some(openmettle_core::model_config::CostBound {
+                fixed_micros: 0,
+                micros_per_token: 1,
+            }),
             requires_device_slot: false,
         },
     )

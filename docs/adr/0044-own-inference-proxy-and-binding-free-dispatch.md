@@ -452,16 +452,23 @@ Instead of duplicating catalog pricing into `openmettle-gateway`, record the imm
 `Profile.cost_bound` on `openmettle.gateway_requests` when the worker hands off a binding-free
 round and compute `usage_cost_micros` inside PostgreSQL's `quota_gateway_fold`:
 
-- **Recorded pricing at handoff.** Migration 34 adds nullable `cost_fixed_micros bigint` and
-  `cost_micros_per_token bigint` to `openmettle.gateway_requests` (`gateway_requests_cost_bound_check`:
-  both null or both non-null, only on unbound handed-off rows, both `>= 0` and at least one
-  `> 0`), with no new table or column grants. A 6-arg overload
+- **Admission-pinned and recorded pricing.** `ConfigSnapshot` pins the model profile's optional
+  `cost_bound` (`fixed_micros`, `micros_per_token`) inside `openmettle.runs.config_snapshot` at
+  admission (`openmettle_api` only; `openmettle_worker` has no write grant on `runs.config_snapshot`).
+  Migration 34 adds nullable `cost_fixed_micros bigint` and `cost_micros_per_token bigint` to
+  `openmettle.gateway_requests` (`gateway_requests_cost_bound_check`: both null or both non-null,
+  only on unbound handed-off rows, both `>= 0` and at least one `> 0`), with no new table or
+  column grants, plus the internal `openmettle.gateway_snapshot_cost_bound(jsonb)` parser.
+  `gateway_round_authority` rejects malformed snapshot `cost_bound` values; the 6-arg overload
   `openmettle.gateway_handoff_round(request, dispatch, lease, bearer_hash, cost_fixed_micros, cost_micros_per_token)`
-  (`openmettle_worker` only) records `PreparedRequest::cost_bound()` alongside handoff; the
-  4-arg overload delegates with `(NULL, NULL)` for draining token-only workers and tests.
-- **Handoff and drift invariants.** `enforce_gateway_handoff_holds()` requires non-null
-  recorded pricing on every unbound round where a `usage_cost_micros` hold is required or bound,
-  and verifies `qr.reserved_units::numeric = NEW.units::numeric * NEW.cost_micros_per_token + NEW.cost_fixed_micros`
+  (`openmettle_worker` only) validates BOTH coefficients individually against the locked run's
+  `config_snapshot` before recording `PreparedRequest::cost_bound()` alongside handoff (so a
+  worker cannot substitute an alternate `(fixed, rate)` split with the same ceiling). The 4-arg
+  overload delegates with `(NULL, NULL)` for draining token-only workers and tests.
+- **Handoff and drift invariants.** `enforce_gateway_handoff_holds()` verifies for every unbound
+  round that `(NEW.cost_fixed_micros, NEW.cost_micros_per_token)` matches the run snapshot's
+  `cost_bound`, requires non-null recorded pricing whenever a `usage_cost_micros` hold is required
+  or bound, and verifies `qr.reserved_units::numeric = NEW.units::numeric * NEW.cost_micros_per_token + NEW.cost_fixed_micros`
   (raising `OMQ04` otherwise, while permitting large `cost_bound` values on token-only
   deployments without `bigint` overflow). `quota_recover_lost_handoff` and
   `quota_verify_accounting_drift` enforce the same consistency check while preserving pre-34
@@ -473,22 +480,36 @@ round and compute `usage_cost_micros` inside PostgreSQL's `quota_gateway_fold`:
   `measured = tokens * cost_micros_per_token + cost_fixed_micros` (failing closed with `23514`
   if `measured >= 1e38`). Incomplete and swept reports keep `measured = NULL` so they settle
   at `0` (or prior accepted usage), never `cost_fixed_micros`, while a late revision-1 complete
-  report superseding revision-0 `unreported` charges the derived cost. Bound ADR 0037 rows and
-  pre-34 rows without recorded prices retain `ceil(step.cost)`.
-- **No caller-supplied cost on unbound requests.** Both `settlement::ingest` (after exact
-  historical replay recognition) and a `BEFORE INSERT OR UPDATE` trigger
-  (`gateway_usage_reports_bound_cost_guard` -> `enforce_gateway_report_bound_cost`, no role
-  bypass including `openmettle_owner`) refuse non-null `cost` or `unit` on unbound requests
-  (`23514`), while bound ADR 0037 requests continue to accept them.
+  report superseding revision-0 `unreported` charges the derived cost. Tracking
+  `complete_final_seen` ensures a late revision-1 token report arriving after a schema-33
+  `unreported` sweep on an unpriced (`cost_fixed_micros IS NULL`) cost hold fails closed
+  (`23514` / `Error::Refused`) instead of silently settling at `0` micros; an operator can
+  reconcile such a legacy request via the owner-only
+  `openmettle.gateway_backfill_legacy_request_cost_bound(request, fixed_micros, micros_per_token)`
+  function before re-ingesting the late report. Bound ADR 0037 rows and pre-34 rows without
+  recorded prices retain `ceil(step.cost)`.
+- **No caller-supplied cost or undispatched settlement on unbound requests.** Both
+  `settlement::ingest` (after exact historical replay recognition) and a `BEFORE INSERT OR UPDATE`
+  trigger (`gateway_usage_reports_bound_cost_guard` -> `enforce_gateway_report_bound_cost`, no
+  role bypass including `openmettle_owner`) refuse non-null `cost` or `unit` on unbound requests
+  (`23514`), while bound ADR 0037 requests continue to accept them. Migration 34 also removes any
+  unaccepted historical raw unbound usage reports carrying `cost`/`unit`, and widens the deferred
+  `gateway_final_settlement_closes` trigger to fire on BOTH final and non-final settlements so
+  `enforce_gateway_final_settlement_closes()` blocks direct `openmettle_gateway` SQL from
+  settling an undispatched unbound request (other than the revision-0 `not_dispatched` sweep) or
+  newly accepting a cost/unit-bearing report on an unbound request.
 - **No `#166` carve-out at commit.** `enforce_gateway_final_settlement_closes()` now requires
   every bound hold (`usage_tokens` and `usage_cost_micros`) on an unbound final settlement to
-  have folded `latest.revision` and reached `state = 'settled'`, and verifies the
-  `usage_cost_micros` fold ends `settled` whenever recorded pricing is present.
-- **Fail-closed upgrade preflight.** Inside an autocommit-safe `DO` block locking
-  `gateway_requests`, `gateway_usage_reports`, `gateway_settlements` and `quota_reservations`,
-  migration 34 refuses (`23514`) if any unbound request still carries an unsettled
-  `usage_cost_micros` hold (`state IN ('held', 'handoff_committed')`), preserving all
-  already-settled historical rows.
+  have folded `latest.revision` and reached `state = 'settled'`, running the `usage_cost_micros`
+  fold iff a `usage_cost_micros` hold exists on the request (so large unused `cost_bound` values
+  never reject token-only settlement).
+- **Fail-closed upgrade preflight without lock-order deadlock.** Inside an autocommit-safe `DO`
+  block acquiring `ACCESS EXCLUSIVE` on `gateway_requests`, `gateway_usage_reports` and
+  `gateway_settlements` and `SHARE` on `quota_reservations` via a bounded `NOWAIT` retry loop
+  (rolling back subtransactions on `lock_not_available` so concurrent schema-33 report writers
+  never deadlock on the FK lock order), migration 34 refuses (`23514`) if any unbound request
+  still carries an unsettled `usage_cost_micros` hold (`state IN ('held', 'handoff_committed')`),
+  preserving all already-settled historical rows.
 
 ### Evidence
 

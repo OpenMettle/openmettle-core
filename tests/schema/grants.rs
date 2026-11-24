@@ -422,6 +422,11 @@ async fn gateway_usage_and_settlement_column_grants() {
             true,
         ),
         ("openmettle.enforce_gateway_report_bound_cost()", false),
+        ("openmettle.gateway_snapshot_cost_bound(jsonb)", false),
+        (
+            "openmettle.gateway_backfill_legacy_request_cost_bound(uuid,bigint,bigint)",
+            false,
+        ),
     ] {
         for role in [pg::GATEWAY, API, WORKER, ISSUANCE, "public"] {
             let can_exec: bool =

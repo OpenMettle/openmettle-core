@@ -476,8 +476,14 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                 let mut prepared = billable
                     .prepare(&self.catalog, &config.effective, &request, true)
                     .map_err(inference::Error::step_result)?;
+                if let Some(snap_cb) = config.cost_bound
+                    && prepared.cost_bound() != Some(snap_cb)
+                {
+                    return Err(FAILED);
+                }
                 let round_tokens = prepared.round_tokens().ok_or(FAILED)?;
                 let round_cost = prepared.round_cost();
+                let cost_bound = prepared.cost_bound();
                 let requires_device_slot = prepared.requires_device_slot();
                 const MAX_RETRYABLE_RESERVE_ATTEMPTS: u8 = 4;
                 const MAX_MISSING_HOLD_HANDOFF_RETRIES: u8 = 2;
@@ -499,6 +505,7 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                                 model: &config.effective.model,
                                 round_tokens,
                                 round_cost,
+                                cost_bound,
                                 requires_device_slot,
                             },
                         )

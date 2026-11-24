@@ -677,6 +677,7 @@ async fn a_cost_metered_turn_settles_through_the_gateway_with_recorded_prices() 
         effective,
         required_capabilities: catalog.model(MODEL).unwrap().required_capabilities.clone(),
         policy_revision: "openmettle.authz/1".into(),
+        cost_bound: catalog.model(MODEL).unwrap().cost_bound,
     };
     let actor = principal(&f.db, &f.actor).await;
     let mut tx = WriteTransaction::begin(&mut api_c).await.unwrap();

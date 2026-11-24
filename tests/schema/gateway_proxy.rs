@@ -8,7 +8,7 @@
 //! gateway binding, generation or policy row.
 use super::*;
 use crate::{
-    quotas::{TurnHandoffFixture, snapshot_of},
+    quotas::{TurnHandoffFixture, snapshot_priced},
     sglang_recorded::{self as recorded, ABORTED},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -220,7 +220,7 @@ impl Fixture {
                     format: "openmettle.conversation",
                     version: 1,
                     input: b"{}",
-                    config: &snapshot_of(model, UNITS as u64),
+                    config: &snapshot_priced(model, UNITS as u64, cost_bound),
                 },
                 actor_approval_id: &actor.approval,
                 capabilities: &[],
@@ -272,6 +272,7 @@ impl Fixture {
                 model,
                 round_tokens: UNITS,
                 round_cost: cost_micros,
+                cost_bound,
                 requires_device_slot: false,
             },
         )

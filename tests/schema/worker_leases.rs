@@ -1508,6 +1508,7 @@ mod live_turns {
                     .unwrap(),
                 required_capabilities: catalog.model(model).unwrap().required_capabilities.clone(),
                 policy_revision: "openmettle.authz/1".into(),
+                cost_bound: catalog.model(model).unwrap().cost_bound,
             };
             let actor = principal(&f.db, &f.actor).await;
             let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
@@ -3143,6 +3144,10 @@ mod live_turns {
                     model: "a",
                     round_tokens: 450,
                     round_cost: Some(450),
+                    cost_bound: Some(openmettle_core::model_config::CostBound {
+                        fixed_micros: 0,
+                        micros_per_token: 1,
+                    }),
                     requires_device_slot: false,
                 },
             )

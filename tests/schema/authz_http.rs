@@ -4343,6 +4343,7 @@ async fn post_runs_exact_replay_returns_200_when_backfill_refused_and_worker_enf
                 model: "a",
                 round_tokens: 450,
                 round_cost: None,
+                cost_bound: None,
                 requires_device_slot: false,
             },
         )
