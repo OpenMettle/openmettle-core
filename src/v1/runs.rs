@@ -692,4 +692,54 @@ mod tests {
             "id: id\ndata: {\"text\":\"x\\r\\ny\"}\n\n"
         );
     }
+
+    #[tokio::test]
+    async fn full_channel_write_timeout_releases_stream_permit_and_preserves_queued_frames() {
+        use http_body_util::BodyExt;
+
+        let streams = Arc::new(Semaphore::new(1));
+        let permit = streams.clone().try_acquire_owned().unwrap();
+        let (tx, rx) = mpsc::channel(CHANNEL_FRAMES);
+        for index in 0..CHANNEL_FRAMES {
+            tx.try_send(Bytes::from(format!("frame-{index}"))).unwrap();
+        }
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let started = Instant::now();
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            tokio::select! {
+                biased;
+                _ = stopping(Some(stop_rx)) => Ok(()),
+                _ = tx.closed() => Ok(()),
+                result = send(&tx, Bytes::from_static(b"overflow")) => result,
+            }
+        });
+
+        // While the channel stays full within `WRITE_TIMEOUT`, the stream task stays alive and
+        // retains its permit.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!task.is_finished());
+        assert!(streams.clone().try_acquire_owned().is_err());
+
+        let result =
+            tokio::time::timeout_at(started + WRITE_TIMEOUT + Duration::from_secs(5), task)
+                .await
+                .expect("full-channel send did not time out within WRITE_TIMEOUT")
+                .unwrap();
+        assert_eq!(result, Err(TIMEOUT));
+        assert!(started.elapsed() >= WRITE_TIMEOUT);
+        // Exiting on `WRITE_TIMEOUT` drops `_permit` immediately while `Frames(rx)` retains
+        // the `CHANNEL_FRAMES` already-queued frames followed by clean EOF.
+        assert!(streams.try_acquire_owned().is_ok());
+
+        let mut body = Frames(rx);
+        let mut drained = Vec::new();
+        while let Some(frame) = body.frame().await {
+            drained.push(frame.unwrap().into_data().unwrap());
+        }
+        let expected: Vec<Bytes> = (0..CHANNEL_FRAMES)
+            .map(|index| Bytes::from(format!("frame-{index}")))
+            .collect();
+        assert_eq!(drained, expected);
+    }
 }
