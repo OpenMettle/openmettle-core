@@ -15,8 +15,9 @@ handoff and settlement) and [ADR 0038](0038-sglang-and-external-provider-conform
 > document's `gateway_keys` member is removed, and a document that still has it is refused as
 > an unknown field; deploy no longer mounts a ring. `installation` stays and is also the usage
 > report source. By the owner's decision of the same day, a route to `openmettle-gateway` may
-> use an `http://` endpoint inside the cluster, with no `trust` member; `https://` remains the
-> option, and every other transport rule is unchanged. The rest of this record stands.
+> use an `http://` endpoint inside the cluster, with no `trust` member and with every resolved
+> address inside its `private_cidrs`; `https://` remains the option, and every other
+> transport rule is unchanged. The rest of this record stands.
 
 ## Problem
 

@@ -187,9 +187,11 @@ stopped answering: the pool waits for every connection when closing.
 ## Known gaps
 
 - **Plain HTTP on both sides.** The proxy listens on plain HTTP. The packaged worker may call
-  it with an `http://` route inside the cluster, so the round's bearer and the prompt and
-  response bodies cross the cluster network unencrypted; the bearer authorizes one dispatch
-  of one request. Admit only the worker pods with a NetworkPolicy, or terminate TLS in front
+  it with an `http://` route inside the cluster, whose `private_cidrs` must hold every address
+  the proxy's name resolves to; a public address is never reached. The round's bearer and the
+  prompt and response bodies then cross the cluster network unencrypted, and an interceptor
+  could alter the answer and token counts the worker stores, while the proxy settles the
+  upstream's own usage. The bearer authorizes one dispatch of one request. Admit only the worker pods with a NetworkPolicy, or terminate TLS in front
   of the proxy and give the worker an `https://` route; see
   [plain HTTP inside the cluster](worker-turn-execution.md#plain-http-inside-the-cluster).
   The default bind is loopback.

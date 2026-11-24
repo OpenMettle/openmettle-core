@@ -60,8 +60,12 @@ cluster DNS name in `endpoint` (a name without a dot is refused) and add its Ser
 
 ### Plain HTTP inside the cluster
 
-A route may name `openmettle-gateway` with an `http://` endpoint and no `trust` member. The
-worker then connects without TLS, and the following cross the cluster network unencrypted:
+A route may name `openmettle-gateway` with an `http://` endpoint and no `trust` member. Its
+`private_cidrs` must hold every address the gateway's name resolves to: such a route never
+reaches a public address, every DNS answer outside its ranges refuses the round before any
+connection, and a route without ranges stops the worker at startup. It sends only a round
+that was handed off. The worker then connects without TLS, and the following cross the
+cluster network unencrypted:
 
 - the round's bearer, in `Authorization`;
 - the request ID, and the prompt the worker sends, including conversation history and
@@ -70,11 +74,14 @@ worker then connects without TLS, and the following cross the cluster network un
 
 The bearer authorizes one dispatch of one handed-off request: the gateway spends it before
 reading the body, and it is worthless after that dispatch or once the run's lease or deadline
-has passed. Someone who can observe the traffic can still read every prompt and response, and
-someone who can intercept it can replace a request before the gateway receives it.
+has passed. Someone who can observe the traffic can still read every prompt and response.
+Someone who can intercept it can replace a request before the gateway receives it, or alter
+the answer and the token counts the worker stores with the turn; the gateway still settles the
+hold at the usage its upstream reported.
 
 Mitigate with a NetworkPolicy that admits only the worker pods to the gateway's port, and the
-gateway's egress only to its SGLang upstream, PostgreSQL and cluster DNS. For anything stricter, use TLS:
+gateway's egress only to its SGLang upstream, PostgreSQL and cluster DNS. For anything
+stricter, use TLS:
 terminate it in front of the gateway, for example in a sidecar, and give the route an
 `https://` endpoint with the terminator's trust anchors. The gateway itself has no TLS
 listener. Mutual TLS is not supported.

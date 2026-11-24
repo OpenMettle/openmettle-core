@@ -260,9 +260,13 @@ exists.
 
 - **Plain HTTP in the cluster.** On 24 November 2026 the owner decided that HTTPS need not be
   enforced inside the cluster and stays an option. The worker's route to the proxy may
-  therefore be `http://`, and only that route: every other outbound client keeps `https://`.
-  The round's bearer and the prompt and response bodies then cross the cluster network
-  unencrypted. The bearer authorizes one dispatch of one request; a NetworkPolicy admitting
+  therefore be `http://`, and only that route of the shared provider transport: every other
+  client built on it keeps `https://`. The proxy's own client for its SGLang upstream is plain
+  HTTP by design (increment 1). A plain route reaches only addresses inside its configured
+  ranges, never a public one, and sends only a round that was handed off. The round's bearer
+  and the prompt and response bodies then cross the cluster network unencrypted, and an
+  interceptor could alter the answer and token counts the worker stores; the proxy settles
+  the upstream's own usage. The bearer authorizes one dispatch of one request; a NetworkPolicy admitting
   only workers to the proxy is the mitigation, and TLS terminated in front of the proxy is
   the stricter option. The proxy has no TLS listener of its own, and mutual TLS is a possible
   later option. The proxy stays undeployable until increments 3 and 7.
