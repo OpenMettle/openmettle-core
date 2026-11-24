@@ -405,8 +405,8 @@ fn refusals_carry_no_configuration_values() {
 }
 
 /// The gateway a loaded route holds sends over plain HTTP only with a committed round dispatch
-/// (ADR 0044). Its ordinary caller path, with a bearer but no dispatch, is refused before any
-/// connection, and nothing reaches the server.
+/// (ADR 0044). Its ordinary caller path, with a bearer but no dispatch, is refused before name
+/// resolution and before any connection, and nothing reaches the server.
 #[tokio::test]
 async fn a_plain_route_refuses_a_send_without_a_committed_dispatch() {
     use crate::{
@@ -424,7 +424,10 @@ async fn a_plain_route_refuses_a_send_without_a_committed_dispatch() {
     let InferenceConfig { catalog, routes } = config;
     let (gateway, _) = routes.models.into_iter().next().unwrap().1;
     let mut gateway = Arc::try_unwrap(gateway).ok().unwrap();
+    let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&lookups);
     gateway.fixture_lookup(Arc::new(move |_, _| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))])
     }));
     let effective = catalog
@@ -451,6 +454,11 @@ async fn a_plain_route_refuses_a_send_without_a_committed_dispatch() {
         )
         .await;
     assert!(sent.is_err());
+    assert_eq!(
+        lookups.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the refusal came after name resolution"
+    );
     let reached = tokio::time::timeout(Duration::from_millis(300), listener.accept()).await;
     assert!(reached.is_err(), "the plain route reached the server");
 }
