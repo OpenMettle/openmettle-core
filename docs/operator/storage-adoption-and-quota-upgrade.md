@@ -133,6 +133,15 @@ Migration `0031` ([ADR 0044](../adr/0044-own-inference-proxy-and-binding-free-di
 - From this release the proxy closes a dispatched request that ended without usage: its token hold becomes `settled` with nothing charged, and the report names the reason. [Gateway proxy](gateway-proxy.md#when-there-is-no-usage) lists the reasons and the cases that still keep their hold.
 - Adding the CHECK reads `gateway_usage_reports` once under an exclusive lock on that table.
 
+## Upgrade from 0031 to 0032 (unreported request sweep)
+
+Migration `0032` ([ADR 0044](../adr/0044-own-inference-proxy-and-binding-free-dispatch.md), increment 3b) needs no activation step and no backfill. It extends `gateway_usage_reports_incomplete_check` with the two sweep-only revision-0 reasons (`not_dispatched` and `unreported`), adds a `BEFORE INSERT OR UPDATE` trigger restricting those two reasons to `openmettle_owner`, updates `openmettle.enforce_gateway_final_settlement_closes` with the same signature, security and privileges, adds a partial index on unbound outstanding `gateway_requests`, and grants `openmettle_worker` execution on `openmettle.gateway_unreported_candidates` and `openmettle.gateway_close_unreported`.
+
+- Apply migration `0032` with `openmettle-migrate` before rolling workers of this release. A worker of this release running against schema `0031` logs `worker.sweep.failed` (`reconcile_stale_quotas`) on the sweep until `0032` applies, without interrupting run execution.
+- Workers and proxies of the previous release (`0031`) continue working unchanged on schema `0032`.
+- Once workers of this release run on schema `0032`, the maintenance loop closes undispatched unbound requests as `not_dispatched` as soon as their run can no longer dispatch them, and closes dispatched unbound requests with no settlement as `unreported` once 15 minutes have passed after their run's execution deadline (releasing token and cost holds at zero charged; a late proxy report at revision 1 supersedes `unreported`).
+- Replacing the CHECK on `gateway_usage_reports` and building `gateway_requests_unbound_outstanding_idx` take brief table locks during the migration transaction.
+
 ## Monitor overdue handoffs
 
 The worker records up to 100 overdue committed handoffs per maintenance sweep in `openmettle_quota_overdue_handoffs_total`. The counter measures observations across sweeps. An outstanding handoff can contribute more than once. Use the database ledger to identify the holds. The observation leaves quota charges intact.

@@ -457,7 +457,7 @@ const MAX: &str = "ffffffff-ffff-ffff-ffff-ffffffffffff";
 
 /// One fixed upper bound per pass. Timestamps travel as PostgreSQL text to preserve precision.
 #[derive(Default)]
-pub(crate) struct Pass {
+pub struct Pass {
     upper: Option<String>,
     after: Option<(String, String)>,
 }
@@ -556,6 +556,60 @@ pub async fn drain_gateway_orphans(pool: &PgPool) -> Result<u64, crate::runs::Er
             return Ok(total);
         }
     }
+}
+
+/// Sweep up to `limit` eligible unbound handed-off gateway requests (never dispatched once no
+/// longer dispatchable, or dispatched with no settlement 15 minutes past the run's execution
+/// deadline) and close each one in its own short transaction at revision 0 (ADR 0044 increment
+/// 3b, migration 32).
+pub async fn sweep_unreported_gateway_requests(
+    pool: &PgPool,
+    pass: &mut Pass,
+    limit: i32,
+) -> Result<u64, crate::runs::Error> {
+    if !(1..=1000).contains(&limit) {
+        return Err(crate::runs::Error::Invalid);
+    }
+    if pass.upper.is_none() {
+        pass.upper = Some(
+            sqlx::query_scalar("SELECT clock_timestamp()::text")
+                .fetch_one(pool)
+                .await?,
+        );
+    }
+    let (at, id) = pass.cursor();
+    let page: Vec<(String, String)> = sqlx::query_as(
+        "SELECT created_at::text, id::text
+           FROM openmettle.gateway_unreported_candidates(
+               $1::text::timestamptz, $2::uuid, $3::text::timestamptz, $4::uuid, $5
+           )",
+    )
+    .bind(at)
+    .bind(id)
+    .bind(&pass.upper)
+    .bind(MAX)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    let count = page.len();
+    let mut closed = 0_u64;
+    for (created_at, req_id) in page {
+        pass.after = Some((created_at, req_id.clone()));
+        let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT openmettle.gateway_close_unreported($1::uuid)")
+                .bind(&req_id)
+                .fetch_one(tx.connection()?)
+                .await?;
+        tx.commit().await?;
+        if reason.is_some() {
+            closed += 1;
+        }
+    }
+    if count < limit as usize {
+        *pass = Pass::default();
+    }
+    Ok(closed)
 }
 
 pub(crate) async fn emit_warnings(pool: &PgPool) -> Result<(), sqlx::Error> {

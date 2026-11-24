@@ -206,11 +206,12 @@ pub async fn ingest(pool: &PgPool, r: &UsageReport) -> Result<Outcome, Error> {
 }
 
 /// [`ingest`] for a request that ended without usage (ADR 0044, amendment of 24 November
-/// 2026): the final report `r` carries `reason`, one of the values the
+/// 2026): the final report `r` carries `reason`, one of the proxy values the
 /// `gateway_usage_reports.incomplete` CHECK lists, and closes the request's holds at what
-/// earlier accepted reports measured. Refused: an unknown reason, a report that is not final,
-/// one that carries a count, cost or unit of its own, and a request this proxy did not
-/// dispatch, which includes every request handed off with a binding.
+/// earlier accepted reports measured. Refused: an unknown or sweep-only reason
+/// (`not_dispatched`, `unreported`), a report that is not final, one that carries a count, cost
+/// or unit of its own, and a request this proxy did not dispatch, which includes every request
+/// handed off with a binding.
 pub async fn ingest_incomplete(
     pool: &PgPool,
     r: &UsageReport,
@@ -226,7 +227,11 @@ async fn store(pool: &PgPool, r: &UsageReport, incomplete: Option<&str>) -> Resu
         || r.reasoning_included.is_some()
         || r.cost.is_some()
         || r.unit.is_some();
-    if !r.valid() || incomplete.is_some() && carries_usage {
+    if !r.valid()
+        || incomplete.is_some_and(|reason| {
+            carries_usage || matches!(reason, "not_dispatched" | "unreported")
+        })
+    {
         return Err(Error::Refused);
     }
     let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;

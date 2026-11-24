@@ -217,6 +217,7 @@ pub(crate) async fn maintenance(
 ) {
     let mut held = crate::quotas::Pass::default();
     let mut orphans = crate::quotas::Pass::default();
+    let mut unreported = crate::quotas::Pass::default();
     let verify_interval = Duration::from_secs(3600);
     let mut next_verification = Instant::now() + verify_interval;
     loop {
@@ -236,6 +237,12 @@ pub(crate) async fn maintenance(
         }
         let holds_ok = sweep(crate::quotas::reconcile_stale_quotas(pool, &mut held, 100)).await;
         let orphans_ok = sweep(crate::quotas::orphan_page(pool, &mut orphans, 100)).await;
+        let unreported_ok = sweep(crate::quotas::sweep_unreported_gateway_requests(
+            pool,
+            &mut unreported,
+            100,
+        ))
+        .await;
         let warnings_ok = sweep(crate::quotas::emit_warnings(pool)).await;
         let overdue_ok = sweep(crate::quotas::observe_overdue_handoffs(pool, 100)).await;
         let mut drift_ok = true;
@@ -244,7 +251,7 @@ pub(crate) async fn maintenance(
             drift_ok = matches!(timeout(Duration::from_secs(15),
                 artifact_fs::verify_accounting_drift(pool, store)).await, Ok(Ok(report)) if report.healthy());
         }
-        if !(holds_ok && orphans_ok && warnings_ok && overdue_ok && drift_ok) {
+        if !(holds_ok && orphans_ok && unreported_ok && warnings_ok && overdue_ok && drift_ok) {
             crate::telemetry::metrics::quota_sweep_failed();
         }
         if let Some(store) = store {

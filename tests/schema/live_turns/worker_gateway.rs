@@ -92,6 +92,18 @@ fn start_worker(
     ca: Option<&Ca>,
     stream: bool,
 ) -> Packaged {
+    start_worker_with(chat, dir, transport, (host, ip, port), ca, stream, &[])
+}
+
+fn start_worker_with(
+    chat: &Chat,
+    dir: &Dir,
+    transport: Transport,
+    (host, ip, port): (&str, IpAddr, u16),
+    ca: Option<&Ca>,
+    stream: bool,
+    settings: &[(&str, &str)],
+) -> Packaged {
     let bundle = ca.map_or_else(|| Ca::new().pem(), Ca::pem);
     let authority = format!("{host}:{port}");
     let mut document =
@@ -106,7 +118,7 @@ fn start_worker(
             route.as_object_mut().unwrap().remove("trust");
         }
     }
-    launch_packaged(&chat.f.db, dir, &document, &[])
+    launch_packaged(&chat.f.db, dir, &document, settings)
 }
 
 /// Stops the gateway with SIGTERM, which drains running relays and their report writes, and
@@ -395,11 +407,13 @@ async fn a_gateway_serving_another_model_refuses_the_round_and_closes_its_hold()
 
 /// With nothing listening at the gateway's address, and its port held so that nothing else can
 /// take it, the round was already handed off when the connection fails. The worker fails the
-/// turn without retrying it, and the request, never dispatched, keeps its hold: no gateway saw
-/// it, so nothing reports it. The sweep of increment 3b closes such a request.
+/// turn without retrying it, and the request is never dispatched. The packaged worker's own
+/// maintenance sweep (increment 3b, migration 32) then closes the request with a revision-0
+/// final report carrying `not_dispatched`, releases the hold with nothing charged, and leaves
+/// zero accounting drift.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 and TEST_GATEWAY_HOST"]
-async fn an_unreachable_gateway_fails_the_turn_and_keeps_the_handed_off_hold() {
+async fn an_unreachable_gateway_fails_the_turn_and_the_sweep_closes_its_hold() {
     let (chat, run, _) = queued().await;
     let (host, ip) = gateway_host();
     let (_held, port) = reserved_port(ip);
@@ -408,25 +422,80 @@ async fn an_unreachable_gateway_fails_the_turn_and_keeps_the_handed_off_hold() {
         "nothing else can take the gateway's port during the case"
     );
     let dir = Dir::new();
-    let worker = start_worker(
+    let worker = start_worker_with(
         &chat,
         &dir,
         Transport::Plain,
         (&host, ip, port),
         None,
         false,
+        &[("SWEEP_MS", "1000")],
     );
     chat.done(&run, "failed", Some("step_failed")).await;
 
     let (id, state, dispatched, _) = round(&chat, &run).await;
     assert_eq!((state.as_str(), dispatched), ("handed_off", false));
-    assert_eq!(reports(&chat, &id).await, []);
-    let (state, held, settled) = hold(&chat, &id).await;
+    let mut owner = connect(&chat.f.db.0, OWNER).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let settled: bool = sqlx::query_scalar(
+            "SELECT settled_final FROM openmettle.gateway_requests WHERE id = $1::uuid",
+        )
+        .bind(&id)
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        if settled {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker maintenance sweep did not close the undispatched request"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
     assert_eq!(
-        (state.as_str(), settled.as_str()),
-        ("handoff_committed", "0")
+        reports(&chat, &id).await,
+        [(INSTALL.to_owned(), 0, true, None, None, None, None)]
     );
-    assert!(held > 0);
+    let closed: (Option<String>, bool, i64, bool, Option<String>, i64) = sqlx::query_as(
+        "SELECT r.incomplete, q.settled_final, s.revision, s.final, s.measured::text, s.outstanding
+           FROM openmettle.gateway_usage_reports r
+           JOIN openmettle.gateway_requests q ON q.id = r.request_id
+           JOIN openmettle.gateway_settlements s ON s.request_id = r.request_id
+          WHERE r.request_id = $1::uuid",
+    )
+    .bind(&id)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        closed,
+        (Some("not_dispatched".to_owned()), true, 0, true, None, 0)
+    );
+    assert_eq!(
+        hold(&chat, &id).await,
+        ("settled".to_owned(), 0, "0".to_owned())
+    );
+    let charged: i64 = sqlx::query_scalar(
+        "SELECT coalesce(sum(active_used + reserved_held), 0)::bigint
+           FROM openmettle.quota_budgets WHERE resource_kind = 'usage_tokens'",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(charged, 0, "nothing is charged and nothing stays reserved");
+    let drift: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT storage_mismatches, budget_mismatches, settlement_mismatches,
+                pending_gateway_reconciliations
+           FROM openmettle.quota_verify_accounting_drift()",
+    )
+    .fetch_one(&mut self::worker(&chat.f.db).await)
+    .await
+    .unwrap();
+    assert_eq!(drift, (0, 0, 0, 0));
     let (status, stderr) = terminate(worker.process).await;
     assert!(status.success(), "{stderr}");
+    assert!(!stderr.contains("worker.sweep.failed"), "{stderr}");
 }
