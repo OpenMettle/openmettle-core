@@ -64,7 +64,16 @@ async fn settle_quota(c: &mut PgConnection, r: &UsageReport) -> Result<(), Error
         .bind(&r.report_id)
         .bind(r.revision)
         .execute(c)
-        .await?;
+        .await
+        .map_err(|e| {
+            if e.as_database_error()
+                .is_some_and(|d| d.is_check_violation())
+            {
+                Error::Refused
+            } else {
+                e.into()
+            }
+        })?;
     Ok(())
 }
 
@@ -303,6 +312,8 @@ async fn store(pool: &PgPool, r: &UsageReport, incomplete: Option<&str>) -> Resu
     .await?;
     let reject_unbound_shape = unbound
         && (r.revision == 0
+            || r.cost.is_some()
+            || r.unit.is_some()
             || (r.r#final
                 && incomplete.is_none()
                 && (r.prompt_tokens.is_none() || r.completion_tokens.is_none())));
@@ -409,7 +420,16 @@ async fn store(pool: &PgPool, r: &UsageReport, incomplete: Option<&str>) -> Resu
             .bind(&r.request).bind(&r.report_id).bind(r.revision).execute(&mut *c).await?;
         Outcome::Applied
     };
-    tx.commit().await?;
+    tx.commit().await.map_err(|e| match e {
+        crate::runs::Error::Database(ref db)
+            if db
+                .as_database_error()
+                .is_some_and(|d| d.is_check_violation()) =>
+        {
+            Error::Refused
+        }
+        other => other.into(),
+    })?;
     Ok(outcome)
 }
 

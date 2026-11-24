@@ -394,6 +394,8 @@ async fn gateway_usage_and_settlement_column_grants() {
         ("gateway_requests", "dispatched_at", false, false),
         ("gateway_requests", "bearer_hash", false, false),
         ("gateway_requests", "claim_hash", false, false),
+        ("gateway_requests", "cost_fixed_micros", false, false),
+        ("gateway_requests", "cost_micros_per_token", false, false),
     ] {
         for role in [pg::GATEWAY, API, WORKER, ISSUANCE, "public"] {
             let writes: (bool, bool) = sqlx::query_as(
@@ -415,6 +417,16 @@ async fn gateway_usage_and_settlement_column_grants() {
         ),
         ("openmettle.gateway_close_unreported(uuid)", true),
         ("openmettle.enforce_gateway_report_sweep_only()", false),
+        (
+            "openmettle.gateway_handoff_round(uuid,bytea,uuid,bytea,bigint,bigint)",
+            true,
+        ),
+        ("openmettle.enforce_gateway_report_bound_cost()", false),
+        ("openmettle.gateway_snapshot_cost_bound(text)", false),
+        (
+            "openmettle.gateway_backfill_legacy_request_cost_bound(uuid,bigint,bigint)",
+            false,
+        ),
     ] {
         for role in [pg::GATEWAY, API, WORKER, ISSUANCE, "public"] {
             let can_exec: bool =

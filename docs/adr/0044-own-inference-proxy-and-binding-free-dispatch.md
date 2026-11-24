@@ -2,9 +2,10 @@
 
 Accepted with its implementation, 23 November 2026 (V1-06 proxy increments 2a and 2b); increment
 2c delivered 24 November 2026. Amended 24 November 2026 with increments 3a (migration 31),
-3b (migration 32) and 3c (migration 33): see
-[requests that end without usage](#amendment-24-november-2026-requests-that-end-without-usage).
-Refs #7, #9.
+3b (migration 32), 3c (migration 33) and proxy cost-hold settlement (migration 34, issue #166): see
+[requests that end without usage](#amendment-24-november-2026-requests-that-end-without-usage) and
+[cost-hold settlement from recorded profile pricing](#amendment-24-november-2026-cost-hold-settlement-from-recorded-profile-pricing).
+Refs #7, #9, #17, #166.
 Supersedes [ADR 0037](0037-gateway-provisioning-and-usage-reconciliation.md) in part: see
 [What ADR 0037 still decides](#what-adr-0037-still-decides) and [Superseded](#superseded).
 Builds on [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md) (leases),
@@ -258,6 +259,7 @@ exists.
 | 3a | A dispatched request that ends without usage is closed by a final report with its reason; migration 31 (delivered 24 November 2026, see the amendment). |
 | 3b | A bounded worker sweep closes requests the proxy cannot report (`not_dispatched` immediately once undispatchable, `unreported` 15 minutes past the run's execution deadline); migration 32 (delivered 24 November 2026, see the amendment). |
 | 3c | A response stopped at its output token limit ends the turn with its partial output, usage and `stop_reason = 'limit'` (dropping partial tool calls); aborted/cut streams map to `Error::Incomplete`; migration 33 (delivered 24 November 2026; see ADR 0036 and ADR 0038). |
+| 3e | Proxy cost-hold settlement (issue #166): record immutable `Profile.cost_bound` (`cost_fixed_micros`, `cost_micros_per_token`) on `gateway_requests` at `gateway_handoff_round`, derive `usage_cost_micros` in `quota_gateway_fold` from reported tokens and forbid caller-supplied `cost`/`unit` on unbound requests; migration 34 (delivered 24 November 2026, see the amendment). |
 | 3d | Running usage for cut streams. |
 | 4 | Family policy tables. |
 | 5 | Cache separation. |
@@ -278,8 +280,6 @@ exists.
   only workers to the proxy is the mitigation, and TLS terminated in front of the proxy is
   the stricter option. The proxy has no TLS listener of its own, and mutual TLS is a possible
   later option. The proxy stays undeployable until increments 3 and 7.
-- **Cost holds.** A cost hold never settles on a report with usage, because the proxy reports
-  no cost ([issue 166](https://github.com/OpenMettle/openmettle-core/issues/166)).
 - **Broad database role.** `openmettle_gateway` still has the grants the reconciler needed. A
   network-facing process needs only the dispatch and settlement functions. Increment 6
   narrows the role.
@@ -433,3 +433,101 @@ and the worker sweep reconciles any request left without a report after its grac
   PostgreSQL holds the dispatch secret and the bearer's hash, and not the bearer.
 - `src/gateway_proxy.rs` and `tests/runtime.rs`: credential and model parsing, the model
   setting, and refusals through the binary without a database.
+
+## Amendment, 24 November 2026: cost-hold settlement from recorded profile pricing
+
+Migration 34. Refs #7, #17, #166.
+
+### Problem
+
+`openmettle-gateway` is the only usage witness on binding-free rounds, holds no model catalog
+file, and writes `cost = NULL, unit = NULL` on every usage report. Before migration 34,
+`openmettle.quota_gateway_fold` settled `usage_cost_micros` holds strictly from
+`ceil(step.cost)`, so a complete proxy usage report settled `usage_tokens` while leaving any
+`usage_cost_micros` hold stuck in `handoff_committed` indefinitely (issue #166).
+
+### Decision
+
+Instead of duplicating catalog pricing into `openmettle-gateway`, record the immutable
+`Profile.cost_bound` on `openmettle.gateway_requests` when the worker hands off a binding-free
+round and compute `usage_cost_micros` inside PostgreSQL's `quota_gateway_fold`:
+
+- **Admission-pinned and recorded pricing.** `ConfigSnapshot` pins the model profile's optional
+  `cost_bound` (`fixed_micros`, `micros_per_token`) inside `openmettle.runs.config_snapshot` at
+  admission (`openmettle_api` only; `openmettle_worker` has no write grant on `runs.config_snapshot`).
+  Migration 34 adds nullable `cost_fixed_micros bigint` and `cost_micros_per_token bigint` to
+  `openmettle.gateway_requests` (`gateway_requests_cost_bound_check`: both null or both non-null,
+  only on unbound handed-off rows, both `>= 0` and at least one `> 0`), with no new table or
+  column grants, plus the internal `openmettle.gateway_snapshot_cost_bound(text)` parser
+  (validating canonical base-10 integer tokens on raw JSON before `jsonb` normalization).
+  `gateway_round_authority` rejects malformed snapshot `cost_bound` values; the 6-arg overload
+  `openmettle.gateway_handoff_round(request, dispatch, lease, bearer_hash, cost_fixed_micros, cost_micros_per_token)`
+  (`openmettle_worker` only) validates BOTH coefficients individually against the locked run's
+  `config_snapshot` before recording `PreparedRequest::cost_bound()` alongside handoff (so a
+  worker cannot substitute an alternate `(fixed, rate)` split with the same ceiling). The 4-arg
+  overload delegates with `(NULL, NULL)` for draining token-only workers and tests.
+- **Handoff and drift invariants.** `enforce_gateway_handoff_holds()` verifies for every unbound
+  round that `(NEW.cost_fixed_micros, NEW.cost_micros_per_token)` matches the run snapshot's
+  `cost_bound`, requires non-null recorded pricing whenever a `usage_cost_micros` hold is required
+  or bound, and verifies `qr.reserved_units::numeric = NEW.units::numeric * NEW.cost_micros_per_token + NEW.cost_fixed_micros`
+  (raising `OMQ04` otherwise, while permitting large `cost_bound` values on token-only
+  deployments without `bigint` overflow). `quota_recover_lost_handoff` and
+  `quota_verify_accounting_drift` enforce the same consistency check while preserving pre-34
+  settled history. `resolve_cost_from_state` fails closed if a profile lacking `cost_bound`
+  attempts to slice an existing run cost hold even after cost limits expire.
+- **Cost fold from reported tokens.** On unbound requests with recorded prices
+  (`binding_id IS NULL AND cost_fixed_micros IS NOT NULL`), `quota_gateway_fold` folds token
+  counts with the exact `usage_tokens` rules and derives
+  `measured = tokens * cost_micros_per_token + cost_fixed_micros` (failing closed with `23514`
+  if `measured >= 1e38`). Incomplete and swept reports keep `measured = NULL` so they settle
+  at `0` (or prior accepted usage), never `cost_fixed_micros`, while a late revision-1 complete
+  report superseding revision-0 `unreported` charges the derived cost. Bound ADR 0037 rows and
+  pre-34 rows without recorded prices retain `ceil(step.cost)` and migration 31's historical fold
+  transitions (preserving zero drift across `33 -> 34` even if a schema-33 `unreported` sweep was
+  followed by a token-only report before upgrade), while `enforce_gateway_final_settlement_closes()`
+  refuses (`23514` / `Error::Refused`) any newly accepted count-bearing settlement on an unpriced
+  (`cost_fixed_micros IS NULL`) cost-held unbound request; an operator can reconcile such a legacy
+  request via the owner-only
+  `openmettle.gateway_backfill_legacy_request_cost_bound(request, fixed_micros, micros_per_token)`
+  function (which stamps pricing and reconciles any already-accepted token-only usage against the
+  cost hold and budgets).
+- **No caller-supplied cost or undispatched settlement on unbound requests.** Both
+  `settlement::ingest` (after exact historical replay recognition) and a `BEFORE INSERT OR UPDATE`
+  trigger (`gateway_usage_reports_bound_cost_guard` -> `enforce_gateway_report_bound_cost`, no
+  role bypass including `openmettle_owner`) refuse non-null `cost` or `unit` on unbound requests
+  (`23514`), while bound ADR 0037 requests continue to accept them. Migration 34 also removes any
+  unaccepted historical raw unbound usage reports carrying `cost`/`unit`, and widens the deferred
+  `gateway_final_settlement_closes` trigger to fire on BOTH final and non-final settlements so
+  `enforce_gateway_final_settlement_closes()` blocks direct `openmettle_gateway` SQL from
+  settling an undispatched unbound request (other than the revision-0 `not_dispatched` sweep) or
+  newly accepting a cost/unit-bearing report on an unbound request.
+- **No `#166` carve-out at commit.** `enforce_gateway_final_settlement_closes()` now requires
+  every bound hold (`usage_tokens` and `usage_cost_micros`) on an unbound final settlement to
+  have folded `latest.revision` and reached `state = 'settled'`, running the `usage_cost_micros`
+  fold iff a `usage_cost_micros` hold exists on the request (so large unused `cost_bound` values
+  never reject token-only settlement).
+- **Fail-closed upgrade preflight without lock-order deadlock.** Inside an autocommit-safe `DO`
+  block acquiring `ACCESS EXCLUSIVE` on `gateway_requests`, `gateway_usage_reports` and
+  `gateway_settlements` and `SHARE` on `quota_reservations` via a bounded `NOWAIT` retry loop
+  (rolling back subtransactions on `lock_not_available` so concurrent schema-33 report writers
+  never deadlock on the FK lock order), migration 34 refuses (`23514`) if any unbound request
+  still carries an unsettled `usage_cost_micros` hold (`state IN ('held', 'handoff_committed')`),
+  preserving all already-settled historical rows.
+
+### Evidence
+
+- `tests/schema/gateway_proxy.rs`: real `openmettle-gateway` binary settling `02-chat-plain`
+  and `04-chat-stream-reasoning` cost holds across personal, project and instance budgets from
+  recorded `(fixed_micros, micros_per_token)` pricing; `UPSTREAM_500`, `not_dispatched` and
+  `unreported` settling at `0` (not `fixed_micros`); late revision-1 correction charging the
+  derived cost; caller-supplied `cost`/`unit` refused via `settlement::ingest`,
+  `openmettle_gateway` and `openmettle_owner` SQL; direct SQL skipping the fold refused at
+  commit.
+- `tests/schema/live_turns/worker_gateway.rs`: packaged `openmettle-worker` +
+  `openmettle-gateway` end-to-end cost-metered 2-round run recording `Profile.cost_bound` at
+  handoff, settling Round 1 tokens and cost through the proxy, unwinding unused Round 2 parent
+  holds at completion, and reporting zero accounting drift.
+- `tests/schema/gateway_rounds.rs` and `tests/schema/grants.rs`: `33 -> 34` upgrade preflight
+  refusal and historical replay preservation, `measured >= 1e38` overflow refusal, bound
+  ADR 0037 cost acceptance, `OMQ04` pricing mismatch refusal, expired-limit unqualified refusal,
+  and column/function grant boundaries.

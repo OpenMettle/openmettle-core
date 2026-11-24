@@ -1508,6 +1508,7 @@ mod live_turns {
                     .unwrap(),
                 required_capabilities: catalog.model(model).unwrap().required_capabilities.clone(),
                 policy_revision: "openmettle.authz/1".into(),
+                cost_bound: catalog.model(model).unwrap().cost_bound,
             };
             let actor = principal(&f.db, &f.actor).await;
             let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
@@ -3143,6 +3144,10 @@ mod live_turns {
                     model: "a",
                     round_tokens: 450,
                     round_cost: Some(450),
+                    cost_bound: Some(openmettle_core::model_config::CostBound {
+                        fixed_micros: 0,
+                        micros_per_token: 1,
+                    }),
                     requires_device_slot: false,
                 },
             )
@@ -3230,8 +3235,8 @@ mod live_turns {
                         completion_tokens: Some(20),
                         reasoning_tokens: None,
                         reasoning_included: None,
-                        cost: Some("120".into()),
-                        unit: Some("usd_micros".into()),
+                        cost: None,
+                        unit: None,
                     },
                 )
                 .await
@@ -4170,8 +4175,8 @@ mod live_turns {
                     completion_tokens: Some(40),
                     reasoning_tokens: None,
                     reasoning_included: None,
-                    cost: Some("120".into()),
-                    unit: Some("usd_micros".into()),
+                    cost: None,
+                    unit: None,
                 },
             )
             .await
@@ -4403,8 +4408,8 @@ mod live_turns {
                     completion_tokens: Some(15),
                     reasoning_tokens: None,
                     reasoning_included: None,
-                    cost: Some("210".into()),
-                    unit: Some("usd_micros".into()),
+                    cost: None,
+                    unit: None,
                 },
             )
             .await
@@ -4921,7 +4926,8 @@ mod live_turns {
         .unwrap();
         assert_eq!((child_cost, parent_rem), (450, 450));
 
-        // Settle Round 1 at 200 micros (150 tokens) through real gateway::settlement::ingest.
+        // Settle Round 1 at 150 tokens -> 150 micros (micros_per_token=1, fixed_micros=0) through
+        // real gateway::settlement::ingest.
         let report_id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
             .fetch_one(&mut owner)
             .await
@@ -4942,8 +4948,8 @@ mod live_turns {
                 completion_tokens: Some(50),
                 reasoning_tokens: None,
                 reasoning_included: None,
-                cost: Some("200".into()),
-                unit: Some("usd_micros".into()),
+                cost: None,
+                unit: None,
             },
         )
         .await
@@ -4976,7 +4982,7 @@ mod live_turns {
         .await
         .expect("worker settled metered run");
 
-        // Zero accounting drift and unused Round 2 hold released -> 200 active, 0 held, 800 remaining.
+        // Zero accounting drift and unused Round 2 hold released -> 150 active, 0 held, 850 remaining.
         let drift: (i64, i64, i64, i64) = sqlx::query_as(
             "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
                FROM openmettle.quota_verify_accounting_drift()",
@@ -4989,9 +4995,9 @@ mod live_turns {
             http_api.call(alice_b, "GET", "/v1/quotas/personal", None, None),
             200,
         );
-        assert_eq!(q_after["usage"][1]["active_used"], "200");
+        assert_eq!(q_after["usage"][1]["active_used"], "150");
         assert_eq!(q_after["usage"][1]["reserved_held"], "0");
-        assert_eq!(q_after["usage"][1]["remaining"], "800");
+        assert_eq!(q_after["usage"][1]["remaining"], "850");
 
         // Subsequent 450-micro POST /v1/runs succeeds with 201 Created (200 + 450 = 650 <= 1000).
         let conv2 = success(
@@ -5960,8 +5966,8 @@ mod live_turns {
                     completion_tokens: Some(20),
                     reasoning_tokens: None,
                     reasoning_included: None,
-                    cost: Some("60".into()),
-                    unit: Some("usd_micros".into()),
+                    cost: None,
+                    unit: None,
                 },
             )
             .await
@@ -5998,8 +6004,8 @@ mod live_turns {
                     completion_tokens: Some(30),
                     reasoning_tokens: None,
                     reasoning_included: None,
-                    cost: Some("55".into()),
-                    unit: Some("usd_micros".into()),
+                    cost: None,
+                    unit: None,
                 },
             )
             .await
@@ -6041,7 +6047,7 @@ mod live_turns {
         .fetch_one(&mut owner)
         .await
         .unwrap();
-        assert_eq!(cost_totals, (115, 0));
+        assert_eq!(cost_totals, (200, 0));
 
         let drift: (i64, i64, i64, i64) = sqlx::query_as(
             "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations

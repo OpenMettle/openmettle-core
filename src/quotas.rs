@@ -273,7 +273,8 @@ async fn resolve_cost_from_state(
                 }
                 s
             }
-            CostBoundSpec::Legacy | CostBoundSpec::Profile(None) => {
+            CostBoundSpec::Profile(None) => return Err(Error::Refused),
+            CostBoundSpec::Legacy => {
                 let slice = if let Some(run_id) = run {
                     round_cost_slice(c, owner.scope_id, run_id, current_request_id)
                         .await?

@@ -156,6 +156,7 @@ async fn published_paths_replay_revisions_and_budget_survive_forks() {
             .unwrap(),
         policy_revision: "fixture-v1".into(),
         required_capabilities: Default::default(),
+        cost_bound: None,
     };
     use branches::snapshot::{Intent, Snapshots};
     let intent = Intent {

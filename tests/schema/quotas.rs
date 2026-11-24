@@ -24,12 +24,26 @@ async fn dispatched(owner: &mut PgConnection, request: &str) {
 
 /// [`snapshot`] for another model.
 pub(super) fn snapshot_of(model: &str, ceiling: u64) -> Vec<u8> {
-    serde_json::json!({
+    snapshot_priced(model, ceiling, None)
+}
+
+/// [`snapshot_of`] with an optional admission-pinned [`openmettle_core::model_config::CostBound`].
+pub(super) fn snapshot_priced(
+    model: &str,
+    ceiling: u64,
+    cost_bound: Option<openmettle_core::model_config::CostBound>,
+) -> Vec<u8> {
+    let mut doc = serde_json::json!({
         "effective": {"model": model, "ceiling": {"value": ceiling}},
         "required_capabilities": {},
-    })
-    .to_string()
-    .into_bytes()
+    });
+    if let Some(cb) = cost_bound {
+        doc["cost_bound"] = serde_json::json!({
+            "fixed_micros": cb.fixed_micros,
+            "micros_per_token": cb.micros_per_token,
+        });
+    }
+    doc.to_string().into_bytes()
 }
 
 pub(super) struct TurnHandoffFixture {
@@ -46,7 +60,7 @@ impl TurnHandoffFixture {
         protocol: openmettle_core::provider_http::inference::Protocol,
         model: &str,
         round_tokens: i64,
-        round_cost: Option<u128>,
+        cost_bound: Option<openmettle_core::model_config::CostBound>,
         requires_device_slot: bool,
     ) -> Self {
         use openmettle_core::{
@@ -68,10 +82,10 @@ impl TurnHandoffFixture {
         entry["context_window"] = serde_json::json!(round_tokens);
         entry["output_limit"] = serde_json::json!(round_tokens);
         entry["requires_device_slot"] = serde_json::json!(requires_device_slot);
-        if let Some(cost) = round_cost {
+        if let Some(cb) = cost_bound {
             entry["cost_bound"] = serde_json::json!({
-                "fixed_micros": u64::try_from(cost).unwrap(),
-                "micros_per_token": 0
+                "fixed_micros": cb.fixed_micros,
+                "micros_per_token": cb.micros_per_token
             });
         } else {
             entry.as_object_mut().unwrap().remove("cost_bound");
@@ -142,7 +156,27 @@ impl TurnHandoffFixture {
             openmettle_core::provider_http::inference::Protocol::Chat,
             model,
             round_tokens,
-            round_cost,
+            round_cost.map(|cost| openmettle_core::model_config::CostBound {
+                fixed_micros: u64::try_from(cost).unwrap(),
+                micros_per_token: 0,
+            }),
+            requires_device_slot,
+        )
+    }
+
+    pub(super) fn chat_priced(
+        installation: &str,
+        model: &str,
+        round_tokens: i64,
+        cost_bound: openmettle_core::model_config::CostBound,
+        requires_device_slot: bool,
+    ) -> Self {
+        Self::new(
+            installation,
+            openmettle_core::provider_http::inference::Protocol::Chat,
+            model,
+            round_tokens,
+            Some(cost_bound),
             requires_device_slot,
         )
     }
@@ -1674,6 +1708,10 @@ async fn schema_23_cost_device_upgrade_pre_pr3_worker_recovery_and_gateway_reser
             model: "a",
             round_tokens: 450,
             round_cost: Some(450),
+            cost_bound: Some(openmettle_core::model_config::CostBound {
+                fixed_micros: 450,
+                micros_per_token: 0,
+            }),
             requires_device_slot: true,
         },
     )
@@ -1801,6 +1839,10 @@ async fn schema_23_cost_device_upgrade_pre_pr3_worker_recovery_and_gateway_reser
             model: "a",
             round_tokens: 300,
             round_cost: Some(300),
+            cost_bound: Some(openmettle_core::model_config::CostBound {
+                fixed_micros: 300,
+                micros_per_token: 0,
+            }),
             requires_device_slot: true,
         },
     )
@@ -2858,7 +2900,14 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
                     format: "openmettle.conversation",
                     version: 1,
                     input: b"{}",
-                    config: &snapshot(100),
+                    config: &snapshot_priced(
+                        "a",
+                        100,
+                        Some(openmettle_core::model_config::CostBound {
+                            fixed_micros: 100,
+                            micros_per_token: 0,
+                        }),
+                    ),
                 },
                 actor_approval_id: &alice.approval,
                 capabilities: &[],
@@ -2923,6 +2972,10 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
             model: "a",
             round_tokens: 100,
             round_cost: Some(100),
+            cost_bound: Some(openmettle_core::model_config::CostBound {
+                fixed_micros: 100,
+                micros_per_token: 0,
+            }),
             requires_device_slot: true,
         },
     )
@@ -2963,6 +3016,10 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
             model: "a",
             round_tokens: 100,
             round_cost: Some(100),
+            cost_bound: Some(openmettle_core::model_config::CostBound {
+                fixed_micros: 100,
+                micros_per_token: 0,
+            }),
             requires_device_slot: true,
         },
     )
@@ -3021,6 +3078,10 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
             model: "a",
             round_tokens: 100,
             round_cost: Some(100),
+            cost_bound: Some(openmettle_core::model_config::CostBound {
+                fixed_micros: 100,
+                micros_per_token: 0,
+            }),
             requires_device_slot: true,
         },
     )
@@ -3146,6 +3207,10 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
             model: "a",
             round_tokens: 100,
             round_cost: Some(200),
+            cost_bound: Some(openmettle_core::model_config::CostBound {
+                fixed_micros: 200,
+                micros_per_token: 0,
+            }),
             requires_device_slot: false,
         },
     )
@@ -3185,6 +3250,10 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
                 model: "a",
                 round_tokens: 100,
                 round_cost: Some(200),
+                cost_bound: Some(openmettle_core::model_config::CostBound {
+                    fixed_micros: 200,
+                    micros_per_token: 0,
+                }),
                 requires_device_slot: false,
             },
         )
@@ -3666,7 +3735,14 @@ async fn pre_activation_charged_parents_pre26_replay_savepoint_and_n1_legacy_hol
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: &snapshot(200),
+                config: &snapshot_priced(
+                    "a",
+                    200,
+                    Some(openmettle_core::model_config::CostBound {
+                        fixed_micros: 100,
+                        micros_per_token: 1,
+                    }),
+                ),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -3714,12 +3790,25 @@ async fn pre_activation_charged_parents_pre26_replay_savepoint_and_n1_legacy_hol
             model: "a",
             round_tokens: 200,
             round_cost: Some(300),
+            cost_bound: Some(openmettle_core::model_config::CostBound {
+                fixed_micros: 100,
+                micros_per_token: 1,
+            }),
             requires_device_slot: false,
         },
     )
     .await
     .unwrap();
-    let fx = TurnHandoffFixture::chat(INSTALL, "a", 200, Some(300), false);
+    let fx = TurnHandoffFixture::chat_priced(
+        INSTALL,
+        "a",
+        200,
+        openmettle_core::model_config::CostBound {
+            fixed_micros: 100,
+            micros_per_token: 1,
+        },
+        false,
+    );
     let _disp = pending_held
         .handoff(&worker_pool, None, &fx.billable(), fx.prepare())
         .await
@@ -3762,8 +3851,8 @@ async fn pre_activation_charged_parents_pre26_replay_savepoint_and_n1_legacy_hol
                 completion_tokens: Some(30),
                 reasoning_tokens: None,
                 reasoning_included: None,
-                cost: Some("175".into()),
-                unit: Some("usd_micros".into()),
+                cost: None,
+                unit: None,
             },
         )
         .await
@@ -3791,7 +3880,7 @@ async fn pre_activation_charged_parents_pre26_replay_savepoint_and_n1_legacy_hol
     assert_eq!(
         settled_budgets,
         vec![
-            ("usage_cost_micros".into(), 175, 0),
+            ("usage_cost_micros".into(), 220, 0),
             ("usage_tokens".into(), 120, 0),
         ]
     );
@@ -3862,7 +3951,14 @@ async fn pre_activation_charged_parents_pre26_replay_savepoint_and_n1_legacy_hol
                     format: "openmettle.conversation",
                     version: 1,
                     input: b"{}",
-                    config: &snapshot(100),
+                    config: &snapshot_priced(
+                        "a",
+                        100,
+                        Some(openmettle_core::model_config::CostBound {
+                            fixed_micros: 100,
+                            micros_per_token: 0,
+                        }),
+                    ),
                 },
                 actor_approval_id: &alice.approval,
                 capabilities: &[],
@@ -4276,7 +4372,14 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: &snapshot(200),
+                config: &snapshot_priced(
+                    "a",
+                    200,
+                    Some(openmettle_core::model_config::CostBound {
+                        fixed_micros: 100,
+                        micros_per_token: 1,
+                    }),
+                ),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -4340,12 +4443,25 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
             model: "a",
             round_tokens: 200,
             round_cost: Some(300),
+            cost_bound: Some(openmettle_core::model_config::CostBound {
+                fixed_micros: 100,
+                micros_per_token: 1,
+            }),
             requires_device_slot: false,
         },
     )
     .await
     .unwrap();
-    let fx = TurnHandoffFixture::chat(INSTALL, "a", 200, Some(300), false);
+    let fx = TurnHandoffFixture::chat_priced(
+        INSTALL,
+        "a",
+        200,
+        openmettle_core::model_config::CostBound {
+            fixed_micros: 100,
+            micros_per_token: 1,
+        },
+        false,
+    );
     let _disp1 = p1
         .handoff(&worker_pool, None, &fx.billable(), fx.prepare())
         .await
@@ -4381,8 +4497,8 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
                 completion_tokens: Some(30),
                 reasoning_tokens: None,
                 reasoning_included: None,
-                cost: Some("175".into()),
-                unit: Some("usd_micros".into()),
+                cost: None,
+                unit: None,
             },
         )
         .await
@@ -4400,7 +4516,7 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
     .fetch_one(&mut owner)
     .await
     .unwrap();
-    assert_eq!(cost_budget, (175, 0));
+    assert_eq!(cost_budget, (200, 0));
 
     // Part B (P2 #5): With a cost limit active and an existing usage_cost_micros parent hold on
     // the run, reserve_turn_round for a catalog profile lacking cost_bound (round_cost = None)
@@ -4479,6 +4595,7 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
                 model: "a",
                 round_tokens: 200,
                 round_cost: None,
+                cost_bound: None,
                 requires_device_slot: false,
             },
         )
@@ -4667,6 +4784,7 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
             model: "a",
             round_tokens: 100,
             round_cost: None,
+            cost_bound: None,
             requires_device_slot: true,
         },
     )
@@ -4944,6 +5062,10 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
                 model: "a",
                 round_tokens: 100,
                 round_cost: Some(750),
+                cost_bound: Some(openmettle_core::model_config::CostBound {
+                    fixed_micros: 750,
+                    micros_per_token: 0,
+                }),
                 requires_device_slot: false,
             },
         )
@@ -4972,11 +5094,13 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
 
-    // Part B1 (P2 #2): With all cost limits now expired/NULL, reserve_turn_round with an
-    // unqualified profile (round_cost = None) succeeds and slices the legacy cost parent. If an
-    // admin activates a cost override before TurnPending::handoff, deferred
-    // enforce_gateway_handoff_holds MUST reject the handoff with OMQ04 (Error::Refused), leaving
-    // gateway_requests in 'reserved' so pending.release() cleanly unwinds it.
+    // Part B1 (P2 #2 + issue #166): With all cost limits now expired/NULL, an unqualified profile
+    // (`round_cost = None`) MUST NOT slice `r1`'s existing parent `usage_cost_micros` hold into an
+    // unpriced unbound round (`Err(Error::Refused)`). On a fresh run without a parent cost hold,
+    // `reserve_turn_round` with `round_cost = None` succeeds without a cost hold, and if an admin
+    // activates a cost override before `TurnPending::handoff`, deferred
+    // `enforce_gateway_handoff_holds` MUST reject the handoff with OMQ04 (`Error::Refused`),
+    // leaving `gateway_requests` in `'reserved'` so `pending.release()` cleanly unwinds it.
     sqlx::query(
         "UPDATE openmettle.quota_overrides
             SET expires_at = clock_timestamp() - interval '1 second'
@@ -4986,19 +5110,103 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
     .execute(&mut owner)
     .await
     .unwrap();
+    assert!(matches!(
+        gateway::reserve_turn_round(
+            &worker_pool,
+            TurnRound {
+                scope_id: &scope,
+                actor: &alice.user,
+                approval: &alice.approval,
+                run_id: &r1,
+                round: 7,
+                claim_token: &claim1.claim_token,
+                installation: INSTALL,
+                model: "a",
+                round_tokens: 100,
+                round_cost: None,
+                cost_bound: None,
+                requires_device_slot: false,
+            },
+        )
+        .await,
+        Err(gateway::Error::Refused)
+    ));
+    leases::settle(
+        &mut worker,
+        &claim1.lease(),
+        &lease_cfg,
+        Settle::Failed(leases::FailReason::StepFailed),
+    )
+    .await
+    .unwrap();
+
+    let mut tx_u = WriteTransaction::begin(&mut api).await.unwrap();
+    let Admission::Admitted { run_id: r_u, .. } = authz_queue::admit_run(
+        &mut tx_u,
+        &RunAdmission {
+            input: RunInput {
+                scope: &scope,
+                actor: &alice.user,
+                conversation: &chat,
+                branch: &branch,
+                message: &msg,
+                key: "rr8-unqual-activation-race",
+                format: "openmettle.conversation",
+                version: 1,
+                input: b"{}",
+                config: &snapshot(100),
+            },
+            actor_approval_id: &alice.approval,
+            capabilities: &[],
+            requested_rounds: Some(1),
+            now_ms: authz_store::NOW,
+            cost_qualified: Some(false),
+        },
+        &limits,
+    )
+    .await
+    .unwrap() else {
+        panic!("expected admission");
+    };
+    assert!(
+        quotas::reserve_admitted_run_budget(
+            &mut tx_u,
+            &RunBudgetReservation {
+                scope_id: &scope,
+                scope_kind: "personal",
+                actor_user_id: &alice.user,
+                actor_approval_id: &alice.approval,
+                run_id: &r_u,
+                token_units: 100,
+                per_round_cost_micros: None,
+                round_limit: 1,
+                requires_device_slot: false,
+            },
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    tx_u.commit().await.unwrap();
+    let claim_u = authz_queue::claim_next(&mut worker, &claim_cfg, &lease_cfg)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim_u.run_id, r_u);
     let p_unqual = gateway::reserve_turn_round(
         &worker_pool,
         TurnRound {
             scope_id: &scope,
             actor: &alice.user,
             approval: &alice.approval,
-            run_id: &r1,
-            round: 7,
-            claim_token: &claim1.claim_token,
+            run_id: &r_u,
+            round: 1,
+            claim_token: &claim_u.claim_token,
             installation: INSTALL,
             model: "a",
             round_tokens: 100,
             round_cost: None,
+            cost_bound: None,
             requires_device_slot: false,
         },
     )
@@ -5038,7 +5246,7 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
     assert_eq!(unqual_released, "released");
     leases::settle(
         &mut worker,
-        &claim1.lease(),
+        &claim_u.lease(),
         &lease_cfg,
         Settle::Failed(leases::FailReason::StepFailed),
     )
@@ -5159,7 +5367,14 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
                     format: "openmettle.conversation",
                     version: 1,
                     input: b"{}",
-                    config: &snapshot(100),
+                    config: &snapshot_priced(
+                        "a",
+                        100,
+                        Some(openmettle_core::model_config::CostBound {
+                            fixed_micros: 500,
+                            micros_per_token: 0,
+                        }),
+                    ),
                 },
                 actor_approval_id: &bob.approval,
                 capabilities: &[],
@@ -5211,6 +5426,10 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
                 model: "a",
                 round_tokens: 100,
                 round_cost: Some(500),
+                cost_bound: Some(openmettle_core::model_config::CostBound {
+                    fixed_micros: 500,
+                    micros_per_token: 0,
+                }),
                 requires_device_slot: false,
             },
         )
@@ -5356,6 +5575,7 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
                     model: "a",
                     round_tokens: 100,
                     round_cost: None,
+                    cost_bound: None,
                     requires_device_slot: false,
                 },
             )
@@ -5598,6 +5818,7 @@ async fn stale_lease_on_reserve_turn_round_and_gateway_reserve_returns_refused()
                 model: "a",
                 round_tokens: 100,
                 round_cost: None,
+                cost_bound: None,
                 requires_device_slot: true,
             },
         )
@@ -5643,6 +5864,7 @@ async fn stale_lease_on_reserve_turn_round_and_gateway_reserve_returns_refused()
             model: "a",
             round_tokens: 100,
             round_cost: None,
+            cost_bound: None,
             requires_device_slot: true,
         },
     )
@@ -5688,6 +5910,7 @@ async fn stale_lease_on_reserve_turn_round_and_gateway_reserve_returns_refused()
                 model: "a",
                 round_tokens: 100,
                 round_cost: None,
+                cost_bound: None,
                 requires_device_slot: true,
             },
         )
@@ -5747,6 +5970,7 @@ async fn stale_lease_on_reserve_turn_round_and_gateway_reserve_returns_refused()
                 model: "a",
                 round_tokens: 100,
                 round_cost: None,
+                cost_bound: None,
                 requires_device_slot: true,
             },
         )
@@ -6196,7 +6420,14 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
                     format: "openmettle.conversation",
                     version: 1,
                     input: b"{}",
-                    config: &snapshot(100),
+                    config: &snapshot_priced(
+                        "a",
+                        100,
+                        Some(openmettle_core::model_config::CostBound {
+                            fixed_micros: 100,
+                            micros_per_token: 2,
+                        }),
+                    ),
                 },
                 actor_approval_id: &alice.approval,
                 capabilities: &[],
@@ -6265,6 +6496,10 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
                     model: "a",
                     round_tokens: 100,
                     round_cost: Some(300),
+                    cost_bound: Some(openmettle_core::model_config::CostBound {
+                        fixed_micros: 100,
+                        micros_per_token: 2,
+                    }),
                     requires_device_slot: true,
                 },
             )
@@ -6350,7 +6585,16 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
                 ("usage_tokens".into(), 100, "held".into()),
             ]
         );
-        let fx = TurnHandoffFixture::chat(INSTALL, "a", 100, Some(300), true);
+        let fx = TurnHandoffFixture::chat_priced(
+            INSTALL,
+            "a",
+            100,
+            openmettle_core::model_config::CostBound {
+                fixed_micros: 100,
+                micros_per_token: 2,
+            },
+            true,
+        );
         let _disp = pending
             .handoff(&worker_pool, Some(GRANT_1), &fx.billable(), fx.prepare())
             .await
@@ -6376,8 +6620,8 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
                     completion_tokens: Some(20),
                     reasoning_tokens: None,
                     reasoning_included: None,
-                    cost: Some("120".into()),
-                    unit: Some("usd_micros".into()),
+                    cost: None,
+                    unit: None,
                 },
             )
             .await
@@ -6522,7 +6766,14 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
                     format: "openmettle.conversation",
                     version: 1,
                     input: b"{}",
-                    config: &snapshot(100),
+                    config: &snapshot_priced(
+                        "a",
+                        100,
+                        Some(openmettle_core::model_config::CostBound {
+                            fixed_micros: 100,
+                            micros_per_token: 2,
+                        }),
+                    ),
                 },
                 actor_approval_id: &bob.approval,
                 capabilities: &[],
@@ -6556,6 +6807,10 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
                 model: "a",
                 round_tokens: 100,
                 round_cost: Some(300),
+                cost_bound: Some(openmettle_core::model_config::CostBound {
+                    fixed_micros: 100,
+                    micros_per_token: 2,
+                }),
                 requires_device_slot: true,
             },
         )
@@ -6570,7 +6825,16 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
             )
             .await
             .unwrap();
-        let fx = TurnHandoffFixture::chat(INSTALL, "a", 100, Some(300), true);
+        let fx = TurnHandoffFixture::chat_priced(
+            INSTALL,
+            "a",
+            100,
+            openmettle_core::model_config::CostBound {
+                fixed_micros: 100,
+                micros_per_token: 2,
+            },
+            true,
+        );
         assert!(matches!(
             p_pre
                 .handoff(&worker_pool, Some(GRANT_2), &fx.billable(), fx.prepare(),)
@@ -6593,6 +6857,10 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
                 model: "a",
                 round_tokens: 100,
                 round_cost: Some(300),
+                cost_bound: Some(openmettle_core::model_config::CostBound {
+                    fixed_micros: 100,
+                    micros_per_token: 2,
+                }),
                 requires_device_slot: true,
             },
         )
@@ -6623,8 +6891,8 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
                     completion_tokens: Some(15),
                     reasoning_tokens: None,
                     reasoning_included: None,
-                    cost: Some("110".into()),
-                    unit: Some("usd_micros".into()),
+                    cost: None,
+                    unit: None,
                 },
             )
             .await
@@ -7486,6 +7754,7 @@ async fn reserve_turn_round_returns_retryable_on_40001_and_succeeds_on_retry() {
                 model: "a",
                 round_tokens: 200,
                 round_cost: None,
+                cost_bound: None,
                 requires_device_slot: false,
             },
         )
@@ -7552,6 +7821,7 @@ async fn reserve_turn_round_returns_retryable_on_40001_and_succeeds_on_retry() {
             model: "a",
             round_tokens: 200,
             round_cost: None,
+            cost_bound: None,
             requires_device_slot: false,
         },
     )
@@ -7782,7 +8052,14 @@ async fn replacement_holds_and_cost_slice_account_for_prior_bearer_rounds() {
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: &snapshot(450),
+                config: &snapshot_priced(
+                    "a",
+                    450,
+                    Some(openmettle_core::model_config::CostBound {
+                        fixed_micros: 0,
+                        micros_per_token: 1,
+                    }),
+                ),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -7863,6 +8140,10 @@ async fn replacement_holds_and_cost_slice_account_for_prior_bearer_rounds() {
             model: "a",
             round_tokens: 450,
             round_cost: Some(450),
+            cost_bound: Some(openmettle_core::model_config::CostBound {
+                fixed_micros: 0,
+                micros_per_token: 1,
+            }),
             requires_device_slot: false,
         },
     )
@@ -7887,7 +8168,16 @@ async fn replacement_holds_and_cost_slice_account_for_prior_bearer_rounds() {
         ]
     );
 
-    let fx = TurnHandoffFixture::chat(INSTALL, "a", 450, Some(450), false);
+    let fx = TurnHandoffFixture::chat_priced(
+        INSTALL,
+        "a",
+        450,
+        openmettle_core::model_config::CostBound {
+            fixed_micros: 0,
+            micros_per_token: 1,
+        },
+        false,
+    );
     let _disp_a = pending_a
         .handoff(&worker_pool, None, &fx.billable(), fx.prepare())
         .await
@@ -7913,8 +8203,8 @@ async fn replacement_holds_and_cost_slice_account_for_prior_bearer_rounds() {
                 completion_tokens: Some(40),
                 reasoning_tokens: None,
                 reasoning_included: None,
-                cost: Some("120".into()),
-                unit: Some("usd_micros".into()),
+                cost: None,
+                unit: None,
             },
         )
         .await
@@ -8184,8 +8474,27 @@ async fn public_turn_handoff_rejects_mismatched_and_cross_gateway_prepared_befor
         executing_per_scope: 8,
     };
 
-    let chat_fx = TurnHandoffFixture::chat(INSTALL, "a", 450, Some(450), false);
-    let resp_fx = TurnHandoffFixture::new(INSTALL, Protocol::Responses, "a", 450, Some(450), false);
+    let chat_fx = TurnHandoffFixture::chat_priced(
+        INSTALL,
+        "a",
+        450,
+        openmettle_core::model_config::CostBound {
+            fixed_micros: 0,
+            micros_per_token: 1,
+        },
+        false,
+    );
+    let resp_fx = TurnHandoffFixture::new(
+        INSTALL,
+        Protocol::Responses,
+        "a",
+        450,
+        Some(openmettle_core::model_config::CostBound {
+            fixed_micros: 450,
+            micros_per_token: 0,
+        }),
+        false,
+    );
     let wrong_tokens_fx = TurnHandoffFixture::chat(INSTALL, "a", 1024, Some(450), false);
     let wrong_cost_none_fx = TurnHandoffFixture::chat(INSTALL, "a", 450, None, false);
     let wrong_cost_val_fx = TurnHandoffFixture::chat(INSTALL, "a", 450, Some(600), false);
@@ -8212,7 +8521,14 @@ async fn public_turn_handoff_rejects_mismatched_and_cross_gateway_prepared_befor
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: &snapshot(450),
+                config: &snapshot_priced(
+                    "a",
+                    450,
+                    Some(openmettle_core::model_config::CostBound {
+                        fixed_micros: 0,
+                        micros_per_token: 1,
+                    }),
+                ),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -8266,6 +8582,10 @@ async fn public_turn_handoff_rejects_mismatched_and_cross_gateway_prepared_befor
             model: "a",
             round_tokens: 450,
             round_cost: Some(450),
+            cost_bound: Some(openmettle_core::model_config::CostBound {
+                fixed_micros: 0,
+                micros_per_token: 1,
+            }),
             requires_device_slot: false,
         },
     )
@@ -8394,8 +8714,8 @@ async fn public_turn_handoff_rejects_mismatched_and_cross_gateway_prepared_befor
                 completion_tokens: Some(50),
                 reasoning_tokens: None,
                 reasoning_included: None,
-                cost: Some("120".into()),
-                unit: Some("usd_micros".into()),
+                cost: None,
+                unit: None,
             },
         )
         .await

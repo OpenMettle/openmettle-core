@@ -224,10 +224,12 @@ async fn resolve(
     })?;
     let required_capabilities =
         catalog::capabilities(catalog, &effective.model, effective.preset.as_deref())?;
+    let cost_bound = catalog.target(&effective)?.cost_bound;
     Ok(ConfigSnapshot {
         effective,
         required_capabilities,
         policy_revision: "openmettle.authz/1".into(),
+        cost_bound,
     })
 }
 
@@ -523,15 +525,23 @@ async fn admission(
         if mode.execution_mode != r.execution_mode || !previous.matches(&intent) {
             return Err(KEY_CONFLICT);
         }
+        let pinned_cost = config.cost_bound.and_then(|cb| {
+            config
+                .effective
+                .ceiling
+                .value
+                .and_then(|tokens| cb.round_ceiling(tokens).ok())
+        });
         let (round_cost, device_slot) = match catalog {
             Some(cat) => match cat.target(&config.effective) {
                 Ok(profile) => (
-                    cat.round_cost_ceiling(&config.effective).ok().flatten(),
+                    pinned_cost
+                        .or_else(|| cat.round_cost_ceiling(&config.effective).ok().flatten()),
                     profile.requires_device_slot,
                 ),
-                Err(_) => (None, false),
+                Err(_) => (pinned_cost, false),
             },
-            None => (None, false),
+            None => (pinned_cost, false),
         };
         (
             found.branch_id,

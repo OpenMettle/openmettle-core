@@ -82,6 +82,25 @@ pub struct CostBound {
     pub micros_per_token: u64,
 }
 
+impl CostBound {
+    /// Qualified upper-bound cost in micro-units for one round of up to `round_tokens` tokens,
+    /// computed in `u128` so token-only installations without cost limits never reject valid large
+    /// `cost_bound` profiles; callers enforce `i64::MAX` bounds only when a cost tier applies.
+    pub fn round_ceiling(self, round_tokens: u64) -> Result<u128, Error> {
+        if self.fixed_micros > i64::MAX as u64
+            || self.micros_per_token > i64::MAX as u64
+            || (self.fixed_micros == 0 && self.micros_per_token == 0)
+        {
+            return Err(Error::Invalid("cost budget"));
+        }
+        u128::from(round_tokens)
+            .checked_mul(u128::from(self.micros_per_token))
+            .and_then(|v| v.checked_add(u128::from(self.fixed_micros)))
+            .filter(|&n| n > 0)
+            .ok_or(Error::Invalid("cost budget"))
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
@@ -672,15 +691,9 @@ impl Profile {
     /// token-only installations without cost limits never reject valid large `cost_bound` profiles;
     /// callers enforce `i64::MAX` bounds only when a cost tier applies.
     pub fn round_cost_ceiling(&self, round_tokens: u64) -> Result<Option<u128>, Error> {
-        let Some(cb) = self.cost_bound else {
-            return Ok(None);
-        };
-        let total = u128::from(round_tokens)
-            .checked_mul(u128::from(cb.micros_per_token))
-            .and_then(|v| v.checked_add(u128::from(cb.fixed_micros)))
-            .filter(|&n| n > 0)
-            .ok_or(Error::Invalid("cost budget"))?;
-        Ok(Some(total))
+        self.cost_bound
+            .map(|cb| cb.round_ceiling(round_tokens))
+            .transpose()
     }
 }
 
@@ -691,6 +704,8 @@ pub struct ConfigSnapshot {
     pub effective: Effective,
     pub required_capabilities: BTreeMap<String, crate::authz::CapabilityGate>,
     pub policy_revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_bound: Option<CostBound>,
 }
 
 #[derive(Clone)]

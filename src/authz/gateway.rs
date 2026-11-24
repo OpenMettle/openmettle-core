@@ -201,6 +201,7 @@ pub struct TurnRound<'a> {
     pub model: &'a str,
     pub round_tokens: i64,
     pub round_cost: Option<u128>,
+    pub cost_bound: Option<crate::model_config::CostBound>,
     pub requires_device_slot: bool,
 }
 
@@ -221,6 +222,7 @@ pub struct TurnPending {
     model: String,
     units: i64,
     round_cost: Option<u128>,
+    cost_bound: Option<crate::model_config::CostBound>,
     requires_device_slot: bool,
     pub(crate) enforced_at_bind: bool,
     pub(crate) cost_bound_at_bind: bool,
@@ -325,6 +327,7 @@ impl TurnPending {
             || !prepared.is_server()
             || !round_fits(prepared, self.units)
             || prepared.round_cost() != self.round_cost
+            || prepared.cost_bound() != self.cost_bound
             || prepared.requires_device_slot() != self.requires_device_slot
         {
             return Err(TurnHandoffError::Other(Error::Refused));
@@ -357,7 +360,7 @@ impl TurnPending {
                 },
             ));
         }
-        let dispatch = match self.authorize_in(&mut tx).await {
+        let dispatch = match self.authorize_in(&mut tx, prepared.cost_bound()).await {
             Ok(dispatch) => dispatch,
             Err(err) => {
                 let _ = tx.rollback().await;
@@ -462,24 +465,112 @@ impl TurnPending {
     /// to compare. The bearer itself is kept in the returned [`Dispatch`], is sent to the proxy
     /// over HTTP, and never crosses a database connection. The dispatch secret stays this
     /// caller's proof to the database and is never sent over HTTP.
-    async fn authorize_in(&self, tx: &mut WriteTransaction<'_>) -> Result<Dispatch, Error> {
+    async fn authorize_in(
+        &self,
+        tx: &mut WriteTransaction<'_>,
+        cost_bound: Option<crate::model_config::CostBound>,
+    ) -> Result<Dispatch, Error> {
         let mut bearer = [0; 32];
         SystemRandom::new()
             .fill(&mut bearer)
             .map_err(|_| Error::Protection)?;
+        let cost_args = match cost_bound {
+            Some(cb) => {
+                let fixed = i64::try_from(cb.fixed_micros).map_err(|_| Error::Refused)?;
+                let rate = i64::try_from(cb.micros_per_token).map_err(|_| Error::Refused)?;
+                if fixed == 0 && rate == 0 {
+                    return Err(Error::Refused);
+                }
+                Some((fixed, rate))
+            }
+            None => None,
+        };
+        let has_priced_handoff: bool = sqlx::query_scalar(
+            "SELECT to_regprocedure(
+                 'openmettle.gateway_handoff_round(uuid,bytea,uuid,bytea,bigint,bigint)'
+             ) IS NOT NULL",
+        )
+        .fetch_one(tx.connection()?)
+        .await?;
         // `id` is caller-visible; dispatch the database-canonical spelling so the wire
         // `x-request-id` always correlates with the stored request.
-        let id: String = sqlx::query_scalar(
-            "SELECT $1::uuid::text \
-              WHERE openmettle.gateway_handoff_round($1::uuid,$2,$3::uuid,$4)",
-        )
-        .bind(&self.id)
-        .bind(self.secret.as_slice())
-        .bind(&self.claim_token)
-        .bind(Sha256::digest(bearer).as_slice())
-        .fetch_optional(tx.connection()?)
-        .await?
-        .ok_or(Error::Refused)?;
+        let id: String = if has_priced_handoff {
+            #[derive(serde::Deserialize)]
+            struct SnapshotCostBound {
+                #[serde(default)]
+                cost_bound: Option<crate::model_config::CostBound>,
+            }
+            let raw_snapshot: Vec<u8> = sqlx::query_scalar(
+                "SELECT config_snapshot FROM openmettle.runs WHERE id = $1::uuid",
+            )
+            .bind(&self.run_id)
+            .fetch_optional(tx.connection()?)
+            .await?
+            .ok_or(Error::Refused)?;
+            let snap_val = crate::provider_keys::documents::unique(&raw_snapshot)
+                .map_err(|_| Error::Refused)?;
+            let snap: SnapshotCostBound =
+                serde_json::from_value(snap_val).map_err(|_| Error::Refused)?;
+            let effective_cost_args = match snap.cost_bound {
+                Some(snap_cb) => {
+                    if cost_bound != Some(snap_cb) {
+                        return Err(Error::Refused);
+                    }
+                    cost_args
+                }
+                None => {
+                    // Pre-34 snapshots omit `cost_bound`. Refuse if a cost hold is bound; on
+                    // token-only rounds pass `(NULL, NULL)` so 6-arg `gateway_handoff_round`
+                    // matches the snapshot (deferred `enforce_gateway_handoff_holds` still raises
+                    // `OMQ04` if a cost limit activated mid-flight).
+                    if self.cost_bound_at_bind {
+                        return Err(Error::Refused);
+                    }
+                    None
+                }
+            };
+            sqlx::query_scalar(
+                "SELECT $1::uuid::text \
+                  WHERE openmettle.gateway_handoff_round($1::uuid,$2,$3::uuid,$4,$5,$6)",
+            )
+            .bind(&self.id)
+            .bind(self.secret.as_slice())
+            .bind(&self.claim_token)
+            .bind(Sha256::digest(bearer).as_slice())
+            .bind(effective_cost_args.map(|(fixed, _)| fixed))
+            .bind(effective_cost_args.map(|(_, rate)| rate))
+            .fetch_optional(tx.connection()?)
+            .await
+            .map_err(|err| {
+                if err
+                    .as_database_error()
+                    .is_some_and(|e| e.is_check_violation())
+                {
+                    Error::Refused
+                } else {
+                    Error::from(err)
+                }
+            })?
+            .ok_or(Error::Refused)?
+        } else {
+            // Pre-migration-0034 schemas cannot record profile prices on `gateway_requests`,
+            // so refuse any round that carries a bound `usage_cost_micros` hold rather than
+            // handing off an unsettleable hold.
+            if self.cost_bound_at_bind {
+                return Err(Error::Refused);
+            }
+            sqlx::query_scalar(
+                "SELECT $1::uuid::text \
+                  WHERE openmettle.gateway_handoff_round($1::uuid,$2,$3::uuid,$4)",
+            )
+            .bind(&self.id)
+            .bind(self.secret.as_slice())
+            .bind(&self.claim_token)
+            .bind(Sha256::digest(bearer).as_slice())
+            .fetch_optional(tx.connection()?)
+            .await?
+            .ok_or(Error::Refused)?
+        };
         let mut authorization = hyper::header::HeaderValue::try_from(format!(
             "Bearer {}",
             URL_SAFE_NO_PAD.encode(bearer)
@@ -501,6 +592,19 @@ impl TurnPending {
 /// `cost_bound` and `requires_device_slot`), insert the round `gateway_requests` row, and bind
 /// its metered quota slice.
 pub async fn reserve_turn_round(pool: &PgPool, round: TurnRound<'_>) -> Result<TurnPending, Error> {
+    let valid_cost = match (round.cost_bound, round.round_cost) {
+        (None, None) => true,
+        (Some(cb), Some(rc)) => {
+            u64::try_from(round.round_tokens)
+                .ok()
+                .and_then(|t| cb.round_ceiling(t).ok())
+                == Some(rc)
+        }
+        _ => false,
+    };
+    if !valid_cost {
+        return Err(Error::Refused);
+    }
     let round_cost_i64 = round.round_cost.and_then(|c| i64::try_from(c).ok());
     let round_cost_overflow = round.round_cost.is_some_and(|c| i64::try_from(c).is_err());
     for force_holds in [false, true] {
@@ -584,6 +688,7 @@ pub async fn reserve_turn_round(pool: &PgPool, round: TurnRound<'_>) -> Result<T
                     model: round.model.to_owned(),
                     units: round.round_tokens,
                     round_cost: round.round_cost,
+                    cost_bound: round.cost_bound,
                     requires_device_slot: round.requires_device_slot,
                     enforced_at_bind,
                     cost_bound_at_bind,
