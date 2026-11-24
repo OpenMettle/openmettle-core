@@ -57,6 +57,18 @@ impl ToolError {
         json!({"error":{"code":"invalid_tool_arguments"}})
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopReason {
+    /// Generation stopped because it reached the model's output token limit.
+    Limit,
+}
+impl StopReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Limit => "limit",
+        }
+    }
+}
 pub enum CallGroup {
     Valid(Vec<Call>),
     InvalidArguments(Vec<ToolError>),
@@ -67,6 +79,7 @@ pub struct Answer {
     pub parts: Vec<String>,
     pub reasoning: Option<Reasoning>,
     pub calls: CallGroup,
+    pub stop_reason: Option<StopReason>,
 }
 pub struct Usage {
     pub input: Option<u64>,
@@ -161,6 +174,7 @@ pub(super) struct Output {
     reasoning_bytes: usize,
     pub calls: BTreeMap<usize, PendingCall>,
     pub finished: bool,
+    pub stop_reason: Option<StopReason>,
 }
 impl Output {
     pub fn text(&mut self, key: (usize, usize), s: &str) -> Result<(), Error> {
@@ -282,7 +296,10 @@ impl Assembly {
         request: &Request,
         server: bool,
     ) -> Result<Turn, Error> {
-        if !self.terminal || self.choices.is_empty() {
+        if !self.terminal {
+            return Err(Error::Incomplete);
+        }
+        if self.choices.is_empty() {
             return Err(Error::Malformed);
         }
         let tools = request.tools.as_deref().unwrap_or_default();
@@ -366,6 +383,7 @@ impl Assembly {
                 parts: out.parts.into_values().collect(),
                 reasoning,
                 calls,
+                stop_reason: out.stop_reason,
             });
         }
         let usage = self

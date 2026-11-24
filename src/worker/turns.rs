@@ -94,6 +94,7 @@ pub struct FinalAnswer {
     reasoning: Option<Vec<Map<String, Value>>>,
     input_count: Option<i64>,
     output_count: Option<i64>,
+    stop_reason: Option<inference::StopReason>,
 }
 
 pub(super) async fn publish(
@@ -116,6 +117,7 @@ pub(super) async fn publish(
             reasoning: answer.reasoning.as_deref(),
             input_count: answer.input_count,
             output_count: answer.output_count,
+            stop_reason: answer.stop_reason.map(inference::StopReason::as_str),
         },
     )
     .await
@@ -628,6 +630,7 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                         reasoning,
                         input_count: turn.usage.as_ref().and_then(|u| u.input).map(|n| n as i64),
                         output_count: turn.usage.and_then(|u| u.output).map(|n| n as i64),
+                        stop_reason: answer.stop_reason,
                     });
                 }
                 _ if round >= i64::from(run.claim.round_limit) => {

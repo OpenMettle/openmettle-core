@@ -128,7 +128,7 @@ non-UTF-8 charset as malformed upstream content before decoding.
 | Request | For Chat Completions, encode ordered `messages` and correlate tool-role results by `tool_call_id`. For Responses, encode `input` items and correlate `function_call_output` by `call_id`. Validate history, schemas and call/result pairing before sending either request. |
 | Non-streamed JSON | Decode one bounded `application/json` response and check its finish state. Map Chat Completions message content and tool calls, or Responses output items and function calls, into the same turn result. Preserve item order, reasoning and usage. An error, incomplete response or malformed envelope fails the turn. |
 | Server-sent events (SSE) | Require `text/event-stream`. Frame bytes incrementally across HTTP chunks, split UTF-8 characters and split line endings. Join SSE `data:` lines within one event, then decode the complete payload. Handle comments, blank lines, empty deltas and usage-only chunks. Enforce finite limits before growing a line, event, call buffer or assembled turn, and cap total response bytes and call count. |
-| Stream completion and failure | For Chat Completions require each returned choice to finish and the terminal `[DONE]`. For Responses require the declared terminal event (for success, `response.completed`). An explicit error, failed/incomplete event, malformed JSON, invalid UTF-8, exceeded bound or premature EOF ends the turn with a typed failure. After streaming begins, signal failure in the active protocol. Never convert a partial stream into a successful answer or dispatch its calls. |
+| Stream completion and failure | For Chat Completions require each returned choice to finish and the terminal `[DONE]`. For Responses require the declared terminal event (`response.completed`, or `response.incomplete` with `incomplete_details.reason = "max_output_tokens"`). An explicit error, failed/cancelled/other-incomplete event, malformed JSON, invalid UTF-8, or exceeded bound ends the turn with a typed failure; a cut HTTP body or stream ending before its terminator reports `Error::Incomplete` (distinct from corrupt syntax `Error::Malformed`). After streaming begins, signal failure in the active protocol. Never convert an aborted stream into a successful answer or dispatch its calls. |
 | Parallel calls | Key Chat deltas by choice and tool index, bind each stable call ID and name, and append argument fragments in arrival order for that call. For Responses, bind output items and argument deltas to their item/call IDs. A content delta cannot close a call. In the `qwen3_coder` regression, separator whitespace arrives before the first call's closing brace. Exercise this ordering incrementally. The patched profile must yield two distinct named calls with intact arguments, preserve genuine answer text and emit no separator as answer text. |
 | Tool validation | At completion, validate the whole call group against the offered names and schemas. Unsolicited calls and calls with missing or conflicting IDs fail the turn. Reject duplicate keys, incomplete or non-object arguments, and mismatched results. Never repair arguments or dispatch from an invalid group. For invalid arguments, a server run may return a fixed, structured model-visible tool error and continue within its round limit only if it offered tools and every call has a non-conflicting ID. Otherwise fail the turn. |
 
@@ -139,7 +139,7 @@ For Chat Completions, apply these rules to each choice in JSON and SSE. A null o
 | --- | --- |
 | `stop` | Complete an answer, including a reasoning-only answer. Tool calls on this choice make the response malformed. |
 | `tool_calls` | Close a nonempty call group and apply whole-group validation. An empty group is malformed. |
-| `length` | Fail the turn as incomplete. Discard partial calls. |
+| `length` | Mark the choice finished with `StopReason::Limit`, continue reading any trailing usage chunk and `[DONE]`, and discard all partial tool calls (never executed or returned as `InvalidArguments`). In `TurnExecutor`, publish partial visible text or reasoning with `message_turns.stop_reason = 'limit'` and settle `succeeded`; fail as `step_failed` if neither visible text nor reasoning was produced. The same rule applies to Responses `status = "incomplete"` with `incomplete_details.reason = "max_output_tokens"` (migration 0033, 24 November 2026). |
 | `content_filter` | Fail the turn as filtered. Discard partial calls. |
 | Unknown, or missing at completion | Fail the turn as malformed, including `[DONE]` with an unfinished choice. |
 
@@ -223,11 +223,14 @@ PR2's passing adapter suite unblocks V1-07 PR4's live turn executor in `src/work
 **Recorded fixtures.** `tests/fixtures/sglang-recorded/` holds responses recorded on
 23 Nov 2026 from one real SGLang deployment (patched fork, commit unverified).
 `tests/provider_inference/recorded_sglang.rs` replays them through `Gateway::caller`, with
-each stream re-chunked per event and per byte. They cover plain, streamed, reasoning and
-parallel tool-call Chat turns. `known_gap_*` tests pin the length cut-off, an aborted stream,
-unread reasoning tokens, the unchecked response model, Responses HTTP 500 and the tool-call
-separator. They are evidence from one deployment, not qualification. They contain no
-successful Responses output and do not replace PR3's live harness. See the fixture README.
+each stream re-chunked per event and per byte. They cover plain, streamed, reasoning,
+parallel tool-call, token-limit cut-off (`07-chat-stream-length`, preserving partial text,
+`StopReason::Limit` and usage) and aborted-stream (`08-chat-stream-abort`, classified as
+`Error::Incomplete`) Chat turns. Remaining `known_gap_*` tests pin unread reasoning tokens,
+the unchecked response model (`11-chat-bad-model`, which now decodes its partial reasoning
+and usage), Responses HTTP 500 and the tool-call separator. They are evidence from one
+deployment, not qualification. They contain no successful Responses output and do not replace
+PR3's live harness. See the fixture README.
 
 **PR3** delivers the owner-gated live harness. Run the applicable matrix against both
 the pinned SGLang profile and a documented compatible external endpoint through the

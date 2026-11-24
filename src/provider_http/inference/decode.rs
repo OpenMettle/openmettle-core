@@ -73,7 +73,13 @@ pub(super) async fn receive<F: Future<Output = ()>>(
         .map_err(|_| Error::Timeout)?
     {
         let data = frame
-            .map_err(|_| Error::Malformed)?
+            .map_err(|e| {
+                if e.is_parse() {
+                    Error::Malformed
+                } else {
+                    Error::Incomplete
+                }
+            })?
             .into_data()
             .map_err(|_| Error::Malformed)?;
         if data.len() > BODY - total {
@@ -116,8 +122,15 @@ pub(super) async fn receive<F: Future<Output = ()>>(
             }
         }
     }
-    if length.is_some_and(|n| n != total as u64) || !sse.ended() {
-        return Err(Error::Malformed);
+    if length.is_some_and(|n| n != total as u64) {
+        return Err(Error::Incomplete);
+    }
+    if !sse.ended() {
+        return Err(if state.terminal {
+            Error::Malformed
+        } else {
+            Error::Incomplete
+        });
     }
     if request.stream {
         return state.finish(q, p, request, server);

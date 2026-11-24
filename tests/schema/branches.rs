@@ -304,6 +304,7 @@ async fn published_paths_replay_revisions_and_budget_survive_forks() {
             reasoning: Some(&blocks),
             input_count: Some(88),
             output_count: None,
+            stop_reason: None,
         },
     )
     .await
@@ -818,7 +819,7 @@ async fn graph_column_grants_and_sealed_content() {
          WHERE c.relnamespace='openmettle'::regnamespace AND c.relname IN ('branch_heads','message_parts','message_turns')
            AND a.attnum>0 AND NOT a.attisdropped AND r.rolname IN ('openmettle_api','openmettle_worker','openmettle_issuance','openmettle_gateway')")
         .fetch_all(&mut db.admin().await).await.unwrap();
-    assert_eq!(grants.len(), (5 + 9 + 8) * 4);
+    assert_eq!(grants.len(), (5 + 10 + 8) * 4);
     for row in grants {
         let (rel, col, role): (&str, &str, &str) = (row.get(0), row.get(1), row.get(2));
         let actual = (
@@ -862,6 +863,12 @@ async fn graph_column_grants_and_sealed_content() {
         "42501",
     )
     .await;
+    expect_state(
+        &mut c,
+        "INSERT INTO openmettle.message_turns (stop_reason) VALUES ('limit')",
+        "42501",
+    )
+    .await;
     let mut w = worker(&db).await;
     expect_state(
         &mut w,
@@ -878,6 +885,7 @@ async fn graph_column_grants_and_sealed_content() {
     for con in [&mut c, &mut w] {
         for sql in [
             "UPDATE openmettle.message_turns SET input_count=0",
+            "UPDATE openmettle.message_turns SET stop_reason='limit'",
             "UPDATE openmettle.message_parts SET text_value='changed'",
             "DELETE FROM openmettle.message_parts",
             "DELETE FROM openmettle.message_turns",
@@ -1073,6 +1081,297 @@ async fn archived_project_allows_authorized_create_replay_and_refuses_new_graph_
     );
     assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM openmettle.authorization_audit WHERE request_key IN ('another-chat','another-fork')")
         .fetch_one(&mut c).await.unwrap(),0);
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18"]
+async fn populated_v32_upgrade_adds_stop_reason_and_enforces_constraint() {
+    let db = TestDb::new().await;
+    migrate::apply(&db.settings(Duration::from_secs(10)), &MIGRATIONS[..32])
+        .await
+        .unwrap();
+    super::run_admission::seed_token_budget(&db).await;
+    let f = Fixture::new(&db).await;
+    let chat = f.chat();
+    let root = &f.root.branch_id;
+    let mut c = api(&db).await;
+    let mut w = worker(&db).await;
+    let mut owner = connect(&db.0, OWNER).await;
+    let actor = authz_store::principal(&db, &f.actor).await;
+
+    // Populate a user turn and an assistant turn at schema 32 before migrating to 33.
+    let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+    let prepared = branches::prepare_turn(
+        &mut tx,
+        &ctx(&f.actor, "pre-33-submit"),
+        chat,
+        root,
+        None,
+        Operation::Append(UserInput {
+            id: INPUT,
+            parts: &[Part::Text("before upgrade".into())],
+        }),
+    )
+    .await
+    .unwrap();
+    let limits = AdmissionLimits {
+        live_per_actor: 10,
+        live_per_scope: 10,
+        queued_in_instance: 10,
+        queue_timeout: Duration::from_secs(60),
+        round_cap: 10,
+    };
+    let Admission::Admitted { .. } = queue::admit_run(
+        &mut tx,
+        &RunAdmission {
+            input: RunInput {
+                scope: &f.scope,
+                actor: &f.actor.user,
+                conversation: chat.id,
+                branch: &prepared.branch_id,
+                message: &prepared.input_message_id,
+                key: "pre-33-submit",
+                format: "legacy",
+                version: 1,
+                input: b"{}",
+                config: b"{}",
+            },
+            actor_approval_id: &f.actor.approval,
+            capabilities: &[],
+            requested_rounds: None,
+            now_ms: NOW,
+            cost_qualified: None,
+        },
+        &limits,
+    )
+    .await
+    .unwrap() else {
+        panic!("admission")
+    };
+    tx.commit().await.unwrap();
+    let claim = queue::claim_next(
+        &mut w,
+        &super::run_admission::OPEN,
+        &super::run_admission::LEASES,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    // Pre-migration-33 binaries / schema 32 fail closed on stop_reason = Some("limit"),
+    // while normal turns (stop_reason = None) and history reads continue working cleanly.
+    let mut pre_limit_tx = WriteTransaction::begin(&mut w).await.unwrap();
+    let pre_limit_err = branches::publish_answer(
+        &mut pre_limit_tx,
+        &claim.lease(),
+        &Answer {
+            id: ANSWER,
+            parts: &[Part::Text("cannot persist limit on v32".into())],
+            reasoning: None,
+            input_count: Some(10),
+            output_count: Some(5),
+            stop_reason: Some("limit"),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        pre_limit_err,
+        openmettle_core::authz::leases::LeaseError::Store(StoreError::InvalidInput(
+            "assistant turn"
+        ))
+    ));
+    pre_limit_tx.rollback().await.unwrap();
+
+    let mut wtx = WriteTransaction::begin(&mut w).await.unwrap();
+    branches::publish_answer(
+        &mut wtx,
+        &claim.lease(),
+        &Answer {
+            id: ANSWER,
+            parts: &[Part::Text("pre-upgrade answer".into())],
+            reasoning: None,
+            input_count: Some(10),
+            output_count: Some(5),
+            stop_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+    wtx.commit().await.unwrap();
+    openmettle_core::authz::leases::settle(
+        &mut w,
+        &claim.lease(),
+        &super::run_admission::LEASES,
+        openmettle_core::authz::leases::Settle::Succeeded,
+    )
+    .await
+    .unwrap();
+    let pre_history = branches::history(&mut c, &actor, chat, root, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pre_history.turns.len(), 2);
+    assert_eq!(pre_history.turns[0].stop_reason, None);
+    assert_eq!(pre_history.turns[1].stop_reason, None);
+
+    let before = snapshot_nonempty_at(&mut owner, &["message_turns"], 32).await;
+    migrate::apply(&db.settings(Duration::from_secs(10)), MIGRATIONS)
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot_nonempty_at(&mut owner, &["message_turns"], 32).await,
+        before
+    );
+
+    // Pre-existing rows read back with stop_reason = None.
+    let history = branches::history(&mut c, &actor, chat, root, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(history.turns.len(), 2);
+    assert_eq!(history.turns[0].stop_reason, None);
+    assert_eq!(history.turns[1].stop_reason, None);
+
+    // Admit a second run and verify the new CHECK constraint and library validation.
+    let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+    let second = branches::prepare_turn(
+        &mut tx,
+        &ctx(&f.actor, "post-33-submit"),
+        chat,
+        root,
+        Some(ANSWER),
+        Operation::Append(UserInput {
+            id: NEXT,
+            parts: &[Part::Text("after upgrade".into())],
+        }),
+    )
+    .await
+    .unwrap();
+    let Admission::Admitted { run_id: run2, .. } = queue::admit_run(
+        &mut tx,
+        &RunAdmission {
+            input: RunInput {
+                scope: &f.scope,
+                actor: &f.actor.user,
+                conversation: chat.id,
+                branch: &second.branch_id,
+                message: &second.input_message_id,
+                key: "post-33-submit",
+                format: "legacy",
+                version: 1,
+                input: b"{}",
+                config: b"{}",
+            },
+            actor_approval_id: &f.actor.approval,
+            capabilities: &[],
+            requested_rounds: None,
+            now_ms: NOW,
+            cost_qualified: None,
+        },
+        &limits,
+    )
+    .await
+    .unwrap() else {
+        panic!("admission")
+    };
+    tx.commit().await.unwrap();
+    let claim2 = queue::claim_next(
+        &mut w,
+        &super::run_admission::OPEN,
+        &super::run_admission::LEASES,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    // Unknown stop_reason values fail closed at both the library and SQL CHECK layers.
+    for bad in ["other", "length", ""] {
+        let mut bad_tx = WriteTransaction::begin(&mut w).await.unwrap();
+        let err = branches::publish_answer(
+            &mut bad_tx,
+            &claim2.lease(),
+            &Answer {
+                id: EDIT,
+                parts: &[Part::Text("bad".into())],
+                reasoning: None,
+                input_count: None,
+                output_count: None,
+                stop_reason: Some(bad),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            openmettle_core::authz::leases::LeaseError::Store(StoreError::InvalidInput(
+                "assistant turn"
+            ))
+        ));
+        bad_tx.rollback().await.unwrap();
+
+        let mut sql_tx = WriteTransaction::begin(&mut w).await.unwrap();
+        let con = sql_tx.connection().unwrap();
+        let msg = message(con, &f.scope, chat.id, Some(NEXT)).await.unwrap();
+        let res = sqlx::query(
+            "INSERT INTO openmettle.message_turns
+             (scope_id,conversation_id,message_id,run_id,stop_reason)
+             VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5)",
+        )
+        .bind(&f.scope)
+        .bind(chat.id)
+        .bind(msg)
+        .bind(&run2)
+        .bind(bad)
+        .execute(con)
+        .await;
+        assert_eq!(sqlstate(res), "23514", "stop_reason={bad:?}");
+        sql_tx.rollback().await.unwrap();
+    }
+
+    // Even openmettle_owner cannot set stop_reason on a user turn.
+    let mut owner_tx = WriteTransaction::begin(&mut owner).await.unwrap();
+    let ocon = owner_tx.connection().unwrap();
+    let user_msg = message(ocon, &f.scope, chat.id, Some(NEXT)).await.unwrap();
+    let user_res = sqlx::query(
+        "INSERT INTO openmettle.message_turns
+         (scope_id,conversation_id,message_id,author_user_id,stop_reason)
+         VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,'limit')",
+    )
+    .bind(&f.scope)
+    .bind(chat.id)
+    .bind(user_msg)
+    .bind(&f.actor.user)
+    .execute(ocon)
+    .await;
+    assert_eq!(sqlstate(user_res), "23514");
+    owner_tx.rollback().await.unwrap();
+
+    // Valid assistant turn with stop_reason = Some("limit") publishes and reads back cleanly.
+    let mut ok_tx = WriteTransaction::begin(&mut w).await.unwrap();
+    branches::publish_answer(
+        &mut ok_tx,
+        &claim2.lease(),
+        &Answer {
+            id: EDIT,
+            parts: &[Part::Text("cut off at limit".into())],
+            reasoning: None,
+            input_count: Some(21),
+            output_count: Some(12),
+            stop_reason: Some("limit"),
+        },
+    )
+    .await
+    .unwrap();
+    ok_tx.commit().await.unwrap();
+
+    let updated = branches::history(&mut c, &actor, chat, root, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.turns[0].metadata.message_id, EDIT);
+    assert_eq!(updated.turns[0].stop_reason.as_deref(), Some("limit"));
+    assert_eq!(updated.turns[1].stop_reason, None);
+    assert_eq!(updated.turns[2].stop_reason, None);
 }
 
 #[path = "branches_http.rs"]

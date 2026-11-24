@@ -715,10 +715,13 @@ fn consumer_decodes_every_valid_and_newer_compatible_response() {
 type Decode = fn(&Value) -> Result<(), String>;
 
 /// The consumer's decoders of the V1-05 project, conversation, artifact and V1-17 quota responses.
-fn v1_decoders() -> [(&'static str, Decode); 9] {
+fn v1_decoders() -> [(&'static str, Decode); 10] {
     [
         ("#/components/schemas/Run", |v| {
             consumer::decode_run(v).map(drop)
+        }),
+        ("#/components/schemas/MessagePage", |v| {
+            consumer::decode_conversation_operation("listMessages", v)
         }),
         ("#/components/schemas/Project", |v| {
             consumer::decode_project(v).map(drop)
@@ -834,6 +837,23 @@ fn consumer_reads_projects_and_items_without_inferring_access() {
         bad[member] = value;
         assert!(consumer::decode_revision(&bad).is_err(), "{member}");
     }
+
+    // MessagePage fixtures cover normal null stop_reason, assistant limit stop, open-vocabulary
+    // forward compatibility, and invalid non-string stop_reason.
+    for name in [
+        "VisibleMessagePage",
+        "VisibleMessagePage--assistant-limit-stop",
+        "VisibleMessagePage--unrecognized-stop-reason",
+    ] {
+        consumer::decode_conversation_operation("listMessages", &fixture(name)).unwrap();
+    }
+    assert!(
+        consumer::decode_conversation_operation(
+            "listMessages",
+            &fixture("VisibleMessagePage--invalid-stop-reason"),
+        )
+        .is_err()
+    );
 }
 
 /// The contract's multipart examples of `createArtifact`, as a client sends them: the boundary

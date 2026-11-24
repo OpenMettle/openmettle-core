@@ -23,7 +23,8 @@
           }
         ],
         "role": "user",
-        "run_id": null
+        "run_id": null,
+        "stop_reason": null
       }
     ]
   },

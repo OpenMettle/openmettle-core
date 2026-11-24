@@ -17,6 +17,9 @@
 -- reasons guarded by a trigger no role may call, replaces enforce_gateway_final_settlement_closes
 -- with the same signature, security and privileges, and adds the worker-only unreported request
 -- sweep functions (ADR 0044, increment 3b).
+-- Version 33 adds `message_turns.stop_reason` for assistant turns stopped at their output token
+-- limit, readable by `openmettle_api` and insertable by `openmettle_worker` (ADR 0038 / ADR 0044,
+-- increment 3c).
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -383,6 +386,10 @@ column_contract (relation, attribute, role, privilege) AS (
         ('openmettle_worker', 'INSERT', ARRAY['scope_id','conversation_id','message_id','run_id',
             'reasoning_blocks','reasoning_bytes','input_count','output_count'])
     ) AS t(role,privilege,columns), unnest(columns) attribute WHERE $1 >= 21
+    UNION ALL
+    SELECT 'message_turns', 'stop_reason', 'openmettle_api', 'SELECT' WHERE $1 >= 33
+    UNION ALL
+    SELECT 'message_turns', 'stop_reason', 'openmettle_worker', 'INSERT' WHERE $1 >= 33
     UNION ALL
     SELECT * FROM quota_columns
     UNION ALL

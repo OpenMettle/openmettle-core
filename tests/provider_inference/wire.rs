@@ -16,7 +16,6 @@ async fn terminal_state_machines_fail_closed_in_json_and_sse() {
         for (reason, calls, error) in [
             (Value::Null, false, Error::Malformed),
             ("other".into(), false, Error::Malformed),
-            ("length".into(), true, Error::Incomplete),
             ("content_filter".into(), true, Error::Filtered),
             ("stop".into(), true, Error::Malformed),
             ("tool_calls".into(), false, Error::Malformed),
@@ -50,16 +49,24 @@ async fn terminal_state_machines_fail_closed_in_json_and_sse() {
     }
     let p = Protocol::Chat;
     let open = delta(json!({"content":"unfinished"}), Value::Null);
-    for data in [
-        open.clone(),
-        open.clone() + "data: [DONE]\n\n",
-        delta(json!({"content":"ok"}), "stop".into()),
-        delta(json!({}), "stop".into()) + &delta(json!({}), "stop".into()) + "data: [DONE]\n\n",
+    for (data, expected) in [
+        (open.clone(), Error::Incomplete),
+        (open.clone() + "data: [DONE]\n\n", Error::Malformed),
+        (
+            delta(json!({"content":"ok"}), "stop".into()),
+            Error::Incomplete,
+        ),
+        ("data: {\"choices\":[{\"index\":0".into(), Error::Incomplete),
+        (
+            delta(json!({"content":"ok"}), "stop".into()) + "data: [DONE]\n\njunk",
+            Error::Malformed,
+        ),
+        (
+            delta(json!({}), "stop".into()) + &delta(json!({}), "stop".into()) + "data: [DONE]\n\n",
+            Error::Malformed,
+        ),
     ] {
-        assert_eq!(
-            once(p, true, sse(&data)).await.err(),
-            Some(Error::Malformed)
-        );
+        assert_eq!(once(p, true, sse(&data)).await.err(), Some(expected));
     }
     for p in [Protocol::Chat, Protocol::Responses] {
         let first = if p == Protocol::Chat {
@@ -120,8 +127,13 @@ async fn json_duplicate_keys_truncation_framing_and_bounds() {
         } else {
             "application/json"
         };
+        let truncated =
+            format!("HTTP/1.1 200 OK\r\nContent-Type: {media}\r\nContent-Length: 200\r\n\r\n{{}}");
+        assert_eq!(
+            once(p, stream, truncated.into_bytes()).await.err(),
+            Some(Error::Incomplete)
+        );
         for raw in [
-            format!("HTTP/1.1 200 OK\r\nContent-Type: {media}\r\nContent-Length: 200\r\n\r\n{{}}"),
             format!("HTTP/1.1 200 OK\r\nContent-Type: {media}\r\nContent-Length: 2097153\r\n\r\n"),
             format!("HTTP/1.1 200 OK\r\nContent-Type: {media}\r\n\r\n{{}}"),
             format!(
@@ -1110,5 +1122,160 @@ async fn chat_non_streamed_tool_call_arguments_require_json_string() {
     assert_eq!(
         once(Protocol::Chat, true, sse(&streamed_bad)).await.err(),
         Some(Error::Malformed)
+    );
+}
+
+#[tokio::test]
+async fn token_limit_stop_preserves_partial_output_and_usage_and_drops_calls() {
+    let limit_wire = |p: Protocol, stream: bool, msg: Value, items: Vec<Value>| -> Vec<u8> {
+        match (p, stream) {
+            (Protocol::Chat, false) => {
+                let mut v = chat_json(msg, "length".into());
+                v["usage"] = json!({"prompt_tokens": 21, "completion_tokens": 12});
+                fixture::json(v.to_string().as_bytes())
+            }
+            (Protocol::Chat, true) => {
+                let usage = event(json!({
+                    "choices": [],
+                    "usage": {"prompt_tokens": 21, "completion_tokens": 12}
+                }));
+                sse(&(delta(msg, "length".into()) + &usage + "data: [DONE]\r\n\r\n"))
+            }
+            (Protocol::Responses, false) => {
+                let v = json!({
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "output": items,
+                    "usage": {"input_tokens": 21, "output_tokens": 12}
+                });
+                fixture::json(v.to_string().as_bytes())
+            }
+            (Protocol::Responses, true) => {
+                let v = json!({
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "output": items,
+                    "usage": {"input_tokens": 21, "output_tokens": 12}
+                });
+                sse(&event(
+                    json!({"type": "response.incomplete", "response": v}),
+                ))
+            }
+        }
+    };
+
+    for (p, stream) in MODES {
+        // 1. Partial visible text alongside a half-generated tool call: keep partial text and
+        // usage, mark StopReason::Limit, and drop the truncated call in BOTH caller and server
+        // modes (never CallGroup::InvalidArguments and never executable).
+        let mut partial_msg = message("partial");
+        partial_msg["status"] = json!("incomplete");
+        let mut partial_fn = function("call-cut", "left", "{\"v\":\"half");
+        partial_fn["status"] = json!("incomplete");
+        let bytes = limit_wire(
+            p,
+            stream,
+            json!({
+                "role": "assistant",
+                "content": "partial",
+                "tool_calls": [{"type": "function", "index": 0, "id": "call-cut", "function": {"name": "left", "arguments": "{\"v\":\"half"}}]
+            }),
+            vec![partial_msg, partial_fn],
+        );
+        let mock = Mock::new(p, move |_| Reply::Bytes(bytes.clone())).await;
+        let c = catalog(p, true);
+        let e = effective(&c, false);
+        let g = mock.gateway(&e, NORMAL);
+        let r = request(stream);
+        for is_server in [false, true] {
+            let turn = if is_server {
+                let (_tx, stop) = run_stop(Instant::now() + Duration::from_secs(5));
+                g.server(&c, &e, &r, Credential::Bearer(TOKEN), stop, |_| async {})
+                    .await
+                    .unwrap()
+            } else {
+                g.caller(&c, &e, &r, Credential::Bearer(TOKEN), |_| async {})
+                    .await
+                    .unwrap()
+            };
+            let a = &turn.answers[0];
+            assert_eq!(a.stop_reason, Some(StopReason::Limit));
+            assert_eq!(a.parts, ["partial"]);
+            assert!(a.reasoning.is_none());
+            assert!(matches!(&a.calls, CallGroup::Valid(calls) if calls.is_empty()));
+            let u = turn.usage.as_ref().unwrap();
+            assert_eq!((u.input, u.output), (Some(21), Some(12)));
+        }
+        mock.assert_inference_only(2);
+
+        // 2. Reasoning-only token-limit stop: zero visible text parts, preserved reasoning block
+        // and usage, StopReason::Limit.
+        let mut partial_reason = reasoning("thinking until cutoff");
+        partial_reason["status"] = json!("incomplete");
+        let bytes = limit_wire(
+            p,
+            stream,
+            json!({
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "thinking until cutoff"
+            }),
+            vec![partial_reason],
+        );
+        let turn = once(p, stream, bytes).await.unwrap();
+        let a = &turn.answers[0];
+        assert_eq!(a.stop_reason, Some(StopReason::Limit));
+        assert!(a.parts.is_empty());
+        assert!(a.reasoning.is_some());
+        assert!(matches!(&a.calls, CallGroup::Valid(calls) if calls.is_empty()));
+        let u = turn.usage.as_ref().unwrap();
+        assert_eq!((u.input, u.output), (Some(21), Some(12)));
+
+        // 3. Only a half-generated tool call and zero text / zero reasoning: call is dropped,
+        // leaving empty parts + None reasoning (which TurnExecutor fails as step_failed).
+        let mut only_fn = function("call-only", "left", "{");
+        only_fn["status"] = json!("incomplete");
+        let bytes = limit_wire(
+            p,
+            stream,
+            json!({
+                "role": "assistant",
+                "content": Value::Null,
+                "tool_calls": [{"type": "function", "index": 0, "id": "call-only", "function": {"name": "left", "arguments": "{"}}]
+            }),
+            vec![only_fn],
+        );
+        let turn = once(p, stream, bytes).await.unwrap();
+        let a = &turn.answers[0];
+        assert_eq!(a.stop_reason, Some(StopReason::Limit));
+        assert!(a.parts.is_empty());
+        assert!(a.reasoning.is_none());
+        assert!(matches!(&a.calls, CallGroup::Valid(calls) if calls.is_empty()));
+    }
+
+    // Streamed Responses rejects mismatched event type vs response status.
+    let mismatch = sse(&event(json!({
+        "type": "response.completed",
+        "response": {
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [message("partial")]
+        }
+    })));
+    assert_eq!(
+        once(Protocol::Responses, true, mismatch).await.err(),
+        Some(Error::Malformed)
+    );
+    let content_filter = sse(&event(json!({
+        "type": "response.incomplete",
+        "response": {
+            "status": "incomplete",
+            "incomplete_details": {"reason": "content_filter"},
+            "output": [message("partial")]
+        }
+    })));
+    assert_eq!(
+        once(Protocol::Responses, true, content_filter).await.err(),
+        Some(Error::Filtered)
     );
 }

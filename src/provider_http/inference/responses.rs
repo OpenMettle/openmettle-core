@@ -46,19 +46,32 @@ fn item_texts<'a>(item: &'a Value, key: &str, kind: &str) -> Result<Vec<&'a str>
         })
         .collect()
 }
-fn compatible_status(v: &Value) -> Result<(), Error> {
+fn response_status(v: &Value) -> Result<Option<StopReason>, Error> {
+    match string(v, "status")? {
+        "completed" => Ok(None),
+        "incomplete" => match v
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+        {
+            Some("max_output_tokens") => Ok(Some(StopReason::Limit)),
+            Some("content_filter") => Err(Error::Filtered),
+            _ => Err(Error::Incomplete),
+        },
+        "failed" | "cancelled" => Err(Error::Provider),
+        _ => Err(Error::Malformed),
+    }
+}
+fn item_status(v: &Value, allow_limit: bool) -> Result<(), Error> {
     match string(v, "status")? {
         "completed" => Ok(()),
-        "incomplete" => Err(
-            if v.pointer("/incomplete_details/reason")
-                .and_then(Value::as_str)
-                == Some("content_filter")
-            {
-                Error::Filtered
-            } else {
-                Error::Incomplete
-            },
-        ),
+        "incomplete" => match v
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+        {
+            Some("content_filter") => Err(Error::Filtered),
+            None | Some("max_output_tokens") if allow_limit => Ok(()),
+            _ => Err(Error::Incomplete),
+        },
         "failed" | "cancelled" => Err(Error::Provider),
         _ => Err(Error::Malformed),
     }
@@ -74,19 +87,20 @@ impl Events {
                 return Err(Error::Provider);
             }
             "response.incomplete" => {
-                return Err(
-                    if v.pointer("/response/incomplete_details/reason")
-                        .and_then(Value::as_str)
-                        == Some("content_filter")
-                    {
-                        Error::Filtered
-                    } else {
-                        Error::Incomplete
-                    },
-                );
+                let response = &v["response"];
+                if response_status(response)? == Some(StopReason::Limit) {
+                    return self.complete(state, response);
+                }
+                return Err(Error::Malformed);
             }
             "response.created" | "response.in_progress" | "response.queued" => return Ok(vec![]),
-            "response.completed" => return self.complete(state, &v["response"]),
+            "response.completed" => {
+                let response = &v["response"];
+                if response_status(response)?.is_some() {
+                    return Err(Error::Malformed);
+                }
+                return self.complete(state, response);
+            }
             _ => {}
         }
         let i = index(v, "output_index")?;
@@ -292,9 +306,12 @@ impl Events {
         if !response["error"].is_null() {
             return Err(Error::Provider);
         }
-        compatible_status(response)?;
+        let stop_reason = response_status(response)?;
         let items = array(response, "output")?;
-        if items.is_empty() || items.len() > ITEMS || self.items.keys().any(|i| *i >= items.len()) {
+        if (items.is_empty() && stop_reason.is_none())
+            || items.len() > ITEMS
+            || self.items.keys().any(|i| *i >= items.len())
+        {
             return Err(Error::Malformed);
         }
         let mut ids = HashSet::new();
@@ -311,7 +328,7 @@ impl Events {
                 lane.verify(item)?;
             }
             if !item["status"].is_null() {
-                compatible_status(item)?;
+                item_status(item, stop_reason.is_some())?;
             }
             match string(item, "type")? {
                 "message" if item["role"] == "assistant" => {
@@ -357,6 +374,10 @@ impl Events {
                 _ => return Err(Error::Malformed),
             }
         }
+        if stop_reason.is_some() {
+            out.calls.clear();
+        }
+        out.stop_reason = stop_reason;
         out.finished = true;
         state.choices.insert(0, out);
         state.usage(&response["usage"], "input_tokens", "output_tokens")?;
