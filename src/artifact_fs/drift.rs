@@ -118,25 +118,40 @@ fn check(v: &Volume, row: &sqlx::postgres::PgRow) -> Result<bool, Error> {
     }
 }
 
-pub async fn verify_accounting_drift(pool: &PgPool, store: Option<&Store>) -> Result<Drift, Error> {
+async fn ledgers(c: &mut PgConnection) -> Result<Drift, Error> {
     let (storage_accounts,budgets,settlements,pending_gateway):(i64,i64,i64,i64)=sqlx::query_as(
         "SELECT storage_mismatches,budget_mismatches,settlement_mismatches,pending_gateway_reconciliations
-        FROM openmettle.quota_verify_accounting_drift()").fetch_one(pool).await?;
-    let mut report = Drift {
+        FROM openmettle.quota_verify_accounting_drift()").fetch_one(c).await?;
+    Ok(Drift {
         storage_accounts,
         budgets,
         settlements,
         pending_gateway,
         ..Drift::default()
-    };
+    })
+}
+
+pub async fn verify_accounting_drift(pool: &PgPool, store: Option<&Store>) -> Result<Drift, Error> {
     let Some(store) = store else {
+        let mut c = pool.acquire().await?;
+        let report = ledgers(&mut c).await?;
         let disabled:bool=sqlx::query_scalar("SELECT volume_id IS NULL AND adoption_run_id IS NULL
             AND NOT EXISTS (SELECT FROM openmettle.storage_reservations) AND NOT EXISTS (SELECT FROM openmettle.artifact_revisions)
-            FROM openmettle.storage_volume_control WHERE id").fetch_one(pool).await?;
+            FROM openmettle.storage_volume_control WHERE id").fetch_one(&mut *c).await?;
         return if disabled { Ok(report) } else { Err(Error::Io) };
     };
     let pin = store.prepare(pool, false).await?.ok_or(Error::Io)?;
-    let v = &store.volume;
+    verify_volume(&mut *pool.acquire().await?, &store.volume, &pin).await
+}
+
+/// The ledgers and every directory entry of the pinned volume, on a connection the caller
+/// holds. Rebind runs it inside its own transaction, under the adoption barrier.
+pub(super) async fn verify_volume(
+    c: &mut PgConnection,
+    v: &Volume,
+    pin: &str,
+) -> Result<Drift, Error> {
+    let mut report = ledgers(c).await?;
     let by_id = sqlx::AssertSqlSafe(format!("{INVENTORY} WHERE s.id=$1::uuid"));
     let paged = sqlx::AssertSqlSafe(format!(
         "{INVENTORY} WHERE s.id>$1::uuid ORDER BY s.id LIMIT 100"
@@ -145,7 +160,7 @@ pub async fn verify_accounting_drift(pool: &PgPool, store: Option<&Store>) -> Re
     loop {
         let page = sqlx::query(sqlx::AssertSqlSafe(paged.0.as_str()))
             .bind(&cursor)
-            .fetch_all(pool)
+            .fetch_all(&mut *c)
             .await?;
         if page.is_empty() {
             break;
@@ -161,7 +176,7 @@ pub async fn verify_accounting_drift(pool: &PgPool, store: Option<&Store>) -> Re
                 // A retained row may have finished purging since the original inventory snapshot.
                 let updated = sqlx::query(sqlx::AssertSqlSafe(by_id.0.as_str()))
                     .bind(&cursor)
-                    .fetch_one(pool)
+                    .fetch_one(&mut *c)
                     .await?;
                 if updated.get::<bool, _>("adoption_unverified") {
                     report.quarantined += 1;
@@ -195,13 +210,13 @@ pub async fn verify_accounting_drift(pool: &PgPool, store: Option<&Store>) -> Re
             }
             let row = sqlx::query(sqlx::AssertSqlSafe(by_id.0.as_str()))
                 .bind(id)
-                .fetch_optional(pool)
+                .fetch_optional(&mut *c)
                 .await?;
             if row.is_none() && !matches!(v.inode(dir, name), Ok(None)) {
                 report.files += 1;
             }
         }
     }
-    v.verify(&pin)?;
+    v.verify(pin)?;
     Ok(report)
 }

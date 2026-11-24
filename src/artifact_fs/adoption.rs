@@ -50,7 +50,7 @@ const INVENTORY: &str =
 // A same-length rewrite can preserve the inode. Include both change timestamps when
 // deciding whether the unlocked digest is still evidence for the locked inventory.
 #[derive(PartialEq, Eq)]
-struct FileStamp {
+pub(super) struct FileStamp {
     device: u64,
     inode: u64,
     length: u64,
@@ -70,15 +70,17 @@ impl From<&std::fs::Metadata> for FileStamp {
 }
 
 #[derive(Default)]
-struct RevisionDigests {
+pub(super) struct RevisionDigests {
     results: HashMap<String, (FileStamp, bool)>,
-    recheck: bool,
+    pub(super) recheck: bool,
 }
-const RESCAN: &str = "revision changed during inspection";
-const READ_FAILED: &str = "cannot read revision digest";
+pub(super) const RESCAN: &str = "revision changed during inspection";
+pub(super) const READ_FAILED: &str = "cannot read revision digest";
+/// A commit got no answer or an error. Whether it took effect is known only to the database.
+pub(super) const COMMIT_UNKNOWN: &str = "commit outcome unknown";
 
 impl RevisionDigests {
-    fn verify(
+    pub(super) fn verify(
         &mut self,
         id: &str,
         file: &mut File,
@@ -411,8 +413,8 @@ fn independent_identity(v: &Volume, opts: &Options<'_>) -> bool {
             .is_ok_and(|m| m.file_type().is_block_device() && m.rdev() == v.dev)
 }
 
-pub async fn adopt(c: &mut PgConnection, opts: &Options<'_>) -> Result<(), Failure> {
-    let v = Volume::open(opts.root, false)?;
+/// Requires the owner login and returns a fresh identifier for this run.
+pub(super) async fn owner_run(c: &mut PgConnection) -> Result<String, Failure> {
     let (owner, run): (bool, String) =
         sqlx::query_as("SELECT current_user='openmettle_owner',gen_random_uuid()::text")
             .fetch_one(&mut *c)
@@ -420,15 +422,17 @@ pub async fn adopt(c: &mut PgConnection, opts: &Options<'_>) -> Result<(), Failu
     if !owner {
         return Err(Failure("owner login required"));
     }
-    let existing: Option<String> = sqlx::query_scalar(
-        "SELECT volume_id::text FROM openmettle.storage_volume_control WHERE id",
-    )
-    .fetch_one(&mut *c)
-    .await?;
-    if let Some(id) = existing.as_deref() {
-        v.verify(id)?;
-    }
-    qualify(&v, &run)?;
+    Ok(run)
+}
+
+/// Commit `run` as the adoption barrier, which every runtime storage operation refuses to
+/// pass. `replace` must name the barrier currently held, if any. Returns the pinned volume.
+pub(super) async fn take_barrier(
+    c: &mut PgConnection,
+    v: &Volume,
+    run: &str,
+    replace: Option<&str>,
+) -> Result<Option<String>, Failure> {
     let mut barrier = c.begin().await?;
     let (pin, prior): (Option<String>, Option<String>) = sqlx::query_as(
         "SELECT volume_id::text,adoption_run_id::text
@@ -439,20 +443,56 @@ pub async fn adopt(c: &mut PgConnection, opts: &Options<'_>) -> Result<(), Failu
     if let Some(id) = &pin {
         v.verify(id)?;
     }
-    if prior.as_deref() != opts.replace {
+    if prior.as_deref() != replace {
         return Err(Failure("adoption ownership mismatch"));
     }
     sqlx::query("UPDATE openmettle.storage_volume_control SET adoption_run_id=$1::uuid WHERE id")
-        .bind(&run)
+        .bind(run)
         .execute(&mut *barrier)
         .await?;
-    barrier.commit().await?;
+    barrier
+        .commit()
+        .await
+        .map_err(|_| Failure(COMMIT_UNKNOWN))?;
+    Ok(pin)
+}
+
+pub async fn adopt(c: &mut PgConnection, opts: &Options<'_>) -> Result<(), Failure> {
+    let v = Volume::open(opts.root, false)?;
+    let run = owner_run(c).await?;
+    let existing: Option<String> = sqlx::query_scalar(
+        "SELECT volume_id::text FROM openmettle.storage_volume_control WHERE id",
+    )
+    .fetch_one(&mut *c)
+    .await?;
+    if let Some(id) = existing.as_deref() {
+        v.verify(id)?;
+    }
+    qualify(&v, &run)?;
+    let pin = take_barrier(c, &v, &run, opts.replace).await?;
     let result = verify_and_pin(c, opts, &v, &run, pin.as_deref()).await;
     if result.is_err() {
-        sqlx::query("UPDATE openmettle.storage_volume_control SET adoption_run_id=NULL WHERE id AND adoption_run_id=$1::uuid")
-            .bind(&run).execute(c).await?;
+        restore_barrier(c, &run, opts.replace).await?;
     }
     result
+}
+
+/// Hand the barrier back as `run` found it. A refusal must not release a barrier that an
+/// earlier, incomplete run still holds.
+pub(super) async fn restore_barrier(
+    c: &mut PgConnection,
+    run: &str,
+    prior: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE openmettle.storage_volume_control SET adoption_run_id=$2::uuid
+         WHERE id AND adoption_run_id=$1::uuid",
+    )
+    .bind(run)
+    .bind(prior)
+    .execute(c)
+    .await?;
+    Ok(())
 }
 
 async fn verify_and_pin(
@@ -586,8 +626,10 @@ async fn verify_and_pin(
             sqlx::query("UPDATE openmettle.storage_volume_control SET volume_id=$1::uuid,bootstrap_auto_pin_allowed=false WHERE id")
             .bind(id).execute(&mut *tx).await?;
         }
-        sqlx::query("UPDATE openmettle.storage_volume_control SET adoption_run_id=NULL WHERE id AND adoption_run_id=$1::uuid")
-        .bind(run).execute(&mut *tx).await?;
+        // Only a verified volume releases the barrier. A failed verification commits its
+        // quarantines and hands the barrier back as this run found it.
+        let prior = evidence.mismatch.and(opts.replace);
+        restore_barrier(&mut tx, run, prior).await?;
         tx.commit().await?;
         return evidence.mismatch.map_or(Ok(()), |e| Err(Failure(e)));
     }
@@ -613,6 +655,33 @@ mod tests {
         let mut file = File::options().write(true).open(&path).unwrap();
         cache.verify("rev", &mut file, 7, &hash).unwrap();
         file.set_len(2).unwrap();
+        assert_eq!(
+            cache.verify("rev", &mut file, 7, &hash).unwrap_err().0,
+            RESCAN
+        );
+    }
+
+    #[test]
+    fn a_same_length_rewrite_that_keeps_the_modification_time_restarts_the_inventory() {
+        use std::io::Write;
+        let dir = Dir::new();
+        let path = dir.path("revision");
+        std::fs::write(&path, b"payload").unwrap();
+        let hash = Sha256::digest(b"payload");
+        let mut cache = RevisionDigests::default();
+        cache
+            .verify("rev", &mut File::open(&path).unwrap(), 7, &hash)
+            .unwrap();
+        cache.recheck = true;
+        // Same inode and length, other bytes, and the modification time put back: only the
+        // change time shows the rewrite.
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut file = File::options().write(true).open(&path).unwrap();
+        file.write_all(b"PAYLOAD").unwrap();
+        file.set_modified(modified).unwrap();
+        let after = file.metadata().unwrap();
+        assert_eq!((after.len(), after.modified().unwrap()), (7, modified));
         assert_eq!(
             cache.verify("rev", &mut file, 7, &hash).unwrap_err().0,
             RESCAN

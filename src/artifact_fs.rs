@@ -3,6 +3,7 @@
 pub mod adoption;
 mod drift;
 pub use drift::{Drift, verify_accounting_drift};
+pub mod rebind;
 mod reclaim;
 mod spill;
 pub(crate) use spill::configure_slots;
@@ -31,7 +32,10 @@ use std::{
 };
 use std::{
     os::unix::fs::MetadataExt,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::task::JoinHandle;
 use volume::Volume;
@@ -116,6 +120,10 @@ pub struct Store {
     expiry_pass: Arc<[tokio::sync::Mutex<reclaim::AnchorPass>; 5]>,
     staging_pass: Arc<tokio::sync::Mutex<staging::StagingSweepState>>,
     anchor_pass: Arc<[tokio::sync::Mutex<reclaim::AnchorPass>; 2]>,
+    /// Set once the copy check has passed; see [`Self::check_not_copied`].
+    not_copied: Arc<AtomicBool>,
+    /// Set while the last copy check found a published payload under another inode.
+    copied: Arc<AtomicBool>,
 }
 impl Store {
     pub fn open(root: &Path) -> Result<Self, InvalidDirectory> {
@@ -133,6 +141,8 @@ impl Store {
             purge_pass: Default::default(),
             expiry_pass: Default::default(),
             anchor_pass: Default::default(),
+            not_copied: Default::default(),
+            copied: Default::default(),
         })
     }
     /// Initializes a fresh installation from the API role and verifies an existing pin.
@@ -141,6 +151,44 @@ impl Store {
     }
     pub(crate) async fn verify_startup(&self, pool: &PgPool, api: bool) -> Result<(), Error> {
         self.prepare(pool, api).await.map(|_| ())
+    }
+    /// Refuse a volume that was copied but not yet rebound. Every operation passes here, so a
+    /// process whose start-up check could not complete does no artifact work until the check
+    /// has succeeded once. The check is a bounded sample and can miss a copy. It never refuses
+    /// a healthy volume, because the published name of a live settled revision always carries
+    /// the bound inode.
+    async fn check_not_copied(&self, c: &mut PgConnection) -> Result<(), Error> {
+        if self.not_copied.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let sample: Vec<(String, String)> = sqlx::query_as(
+            "SELECT s.id::text,s.payload_ino::text FROM openmettle.artifact_revisions r
+             JOIN openmettle.storage_reservations s ON s.scope_id=r.scope_id AND s.id=r.reservation_id
+             WHERE r.state IN ('active','retained') AND s.payload_ino IS NOT NULL LIMIT 16",
+        )
+        .fetch_all(c)
+        .await?;
+        for (id, bound) in sample {
+            match self.volume.inode(&self.volume.revisions, &id) {
+                Ok(Some(ino)) if ino.to_string() != bound => {
+                    self.copied.store(true, Ordering::Relaxed);
+                    return Err(Error::Io);
+                }
+                // The bound inode, or no name because the revision was purged meanwhile.
+                Ok(_) => {}
+                // A probe that failed decides nothing: the check runs again next time.
+                Err(_) => return Err(Error::Io),
+            }
+        }
+        self.copied.store(false, Ordering::Relaxed);
+        self.not_copied.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+    /// The last operation was refused because the volume was restored by file copy and
+    /// `openmettle-admin storage rebind` has not completed on it. Callers that report to an
+    /// operator use this to say what to do.
+    pub fn awaits_rebind(&self) -> bool {
+        self.copied.load(Ordering::Relaxed)
     }
     pub(crate) fn attach(&self, pool: &PgPool) {
         self.pool.get_or_init(|| pool.clone());
@@ -168,6 +216,7 @@ impl Store {
         }
         if let Some(id) = pin {
             self.volume.verify(&id)?;
+            self.check_not_copied(c).await?;
             return Ok(Some(id));
         }
         if auto && bootstrap && empty {

@@ -95,13 +95,17 @@ impl Volume {
         Ok(())
     }
     pub fn inode(&self, dir: &File, name: impl AsRef<OsStr>) -> io::Result<Option<u64>> {
+        Ok(self.stat(dir, name)?.map(|s| s.st_ino))
+    }
+    /// A regular file on this volume, or `None` when the name is absent.
+    pub fn stat(&self, dir: &File, name: impl AsRef<OsStr>) -> io::Result<Option<at::Stat>> {
         let name = name.as_ref();
         match at::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(s)
                 if FileType::from_raw_mode(s.st_mode) == FileType::RegularFile
                     && stat_dev(&s) == self.dev =>
             {
-                Ok(Some(s.st_ino))
+                Ok(Some(s))
             }
             Ok(_) => Err(invalid()),
             Err(Errno::NOENT) => Ok(None),

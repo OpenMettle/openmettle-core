@@ -1735,3 +1735,6 @@ async fn locked_adoption_discards_a_transient_pre_scan_digest_mismatch() {
     result.unwrap();
     assert_eq!(fs::read(path).unwrap(), b"original");
 }
+
+#[path = "artifact_rebind.rs"]
+mod rebind;
