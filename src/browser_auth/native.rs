@@ -601,14 +601,18 @@ impl NativeAuth {
     }
 
     pub async fn validate(&self, bearer: &str) -> Result<sessions::Context, Error> {
+        sessions::well_formed(bearer)?;
+        let _slot = self.operations.try_acquire().map_err(|_| Error::Capacity)?;
         Ok(self.validate_effect(bearer).await?.into_context())
     }
+    /// `/v1` bounds its own concurrency (`MAX_IN_FLIGHT` and `SSE_MAX_IN_FLIGHT`) and validates
+    /// browser cookies through `BrowserAuth::validate_effect` without taking the sign-in router's
+    /// in-flight cap; native bearers follow the same rule here so `SSE_MAX_IN_FLIGHT` streams are
+    /// not evicted when `native.max_in_flight` is smaller.
     pub(crate) async fn validate_effect(
         &self,
         bearer: &str,
     ) -> Result<crate::authz::approvals::EffectSession, Error> {
-        sessions::well_formed(bearer)?;
-        let _slot = self.operations.try_acquire().map_err(|_| Error::Capacity)?;
         self.auth.validate_effect(bearer, Some(self.audience)).await
     }
     pub async fn logout(&self, bearer: &str) -> Result<(), Error> {
@@ -625,5 +629,48 @@ impl NativeAuth {
         })
         .await
         .map_err(|_| Error::Timeout)?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{auth_config, auth_config::tests::support, provider_http::fixture::Ca};
+    use sqlx::postgres::PgPoolOptions;
+    use std::{net::TcpListener, time::Duration};
+
+    #[tokio::test]
+    async fn validate_effect_is_not_gated_by_native_signin_max_in_flight() {
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let dir = support::Dir::new();
+        let mut doc = support::document_v2_native(&dir, &Ca::new().pem());
+        doc["native"]["max_in_flight"] = serde_json::json!(1);
+        doc["session"]["deadline_milliseconds"] = serde_json::json!(200);
+        let path = dir.write("auth.json", doc.to_string().as_bytes());
+        let settings = auth_config::load(std::path::Path::new(&path)).unwrap();
+        let profile = settings.native().unwrap().clone();
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(100))
+            .connect_lazy(&format!(
+                "postgres://fixture:fixture@127.0.0.1:{port}/fixture?sslmode=disable"
+            ))
+            .unwrap();
+        let browser = Arc::new(BrowserAuth::new(settings, pool.clone(), pool));
+        let native = NativeAuth::checked(browser, profile.settings(), profile.rate()).unwrap();
+
+        let _occupied = native.operations.try_acquire().unwrap();
+        let bearer = format!("{}.{}", B64.encode([1u8; 32]), B64.encode([2u8; 32]));
+
+        // Direct native session validation still enforces `native.max_in_flight`.
+        assert_eq!(native.validate(&bearer).await.err(), Some(Error::Capacity));
+        // `/v1` effect validation uses `/v1`'s own permits and must not fail with `Capacity`.
+        let effect_error = native.validate_effect(&bearer).await.err();
+        assert!(
+            matches!(effect_error, Some(Error::Database | Error::Timeout)),
+            "expected database/timeout against closed port, got {effect_error:?}"
+        );
     }
 }

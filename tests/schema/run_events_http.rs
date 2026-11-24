@@ -4,7 +4,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http_body_util::{BodyExt, Empty};
 use hyper::{
     Request,
-    body::{Bytes, Incoming},
+    body::{Body as _, Bytes, Incoming},
     client::conn::http1,
 };
 use hyper_util::rt::TokioIo;
@@ -12,6 +12,7 @@ use openmettle_core::{
     authz::runs as queue,
     runs::{self, Payload},
 };
+use std::{pin::Pin, task::Poll};
 use tokio::net::TcpSocket;
 
 fn replica(db: &TestDb, configure: impl FnOnce(&mut Value)) -> Api {
@@ -168,10 +169,20 @@ impl Fixture {
     }
 }
 
+/// Abort a spawned Hyper client connection when its `Stream` handle drops, so quiet streams
+/// close their TCP socket immediately instead of waiting for the next server heartbeat.
+struct AbortOnDrop(tokio::task::JoinHandle<hyper::Result<()>>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Decode chunked transport with Hyper. SSE blocks may cross transport frames.
 struct Stream {
     body: Incoming,
     buffered: Vec<u8>,
+    _connection: AbortOnDrop,
 }
 impl Stream {
     async fn open(api: &Api, who: As<'_>, path: &str, last: Option<&str>) -> Self {
@@ -179,7 +190,7 @@ impl Stream {
         socket.set_recv_buffer_size(8192).unwrap();
         let tcp = socket.connect(api.bind.parse().unwrap()).await.unwrap();
         let (mut sender, connection) = http1::handshake(TokioIo::new(tcp)).await.unwrap();
-        tokio::spawn(connection);
+        let _connection = AbortOnDrop(tokio::spawn(connection));
         let mut req = Request::get(path).header("host", "app.example.test");
         req = match who {
             As::Browser(cookie) => {
@@ -208,9 +219,29 @@ impl Stream {
         let mut stream = Self {
             body: response.into_body(),
             buffered: vec![],
+            _connection,
         };
         assert_eq!(stream.block().await.as_deref(), Some(": heartbeat"));
         stream
+    }
+    /// Drain any immediately buffered heartbeat frames and fail if the server closed this stream.
+    async fn assert_open(&mut self) {
+        loop {
+            match std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut self.body).poll_frame(cx)))
+                .await
+            {
+                Poll::Pending => return,
+                Poll::Ready(Some(Ok(frame))) => {
+                    self.buffered.extend_from_slice(&frame.into_data().unwrap());
+                    while let Some(i) = self.buffered.windows(2).position(|b| b == b"\n\n") {
+                        let bytes: Vec<_> = self.buffered.drain(..i + 2).collect();
+                        assert_eq!(&bytes[..i], b": heartbeat");
+                    }
+                }
+                Poll::Ready(Some(Err(err))) => panic!("idle stream errored: {err}"),
+                Poll::Ready(None) => panic!("idle stream closed prematurely"),
+            }
+        }
     }
     async fn block(&mut self) -> Option<String> {
         tokio::time::timeout(Duration::from_secs(25), async {
@@ -234,18 +265,24 @@ impl Stream {
         .expect("stream did not send a frame or finish")
     }
     async fn next(&mut self) -> Option<(String, Value)> {
-        while let Some(block) = self.block().await {
-            if let Some(item) = consumer::sse_item(&block) {
-                let lines: Vec<_> = block.lines().collect();
-                assert_eq!(lines.len(), 2);
-                assert!(lines[0].starts_with("id: ") && lines[1].starts_with("data: "));
-                consumer::EventCursor::default().apply(&item).unwrap();
-                let data = serde_json::from_str(item["data"].as_str().unwrap()).unwrap();
-                return Some((item["id"].as_str().unwrap().to_owned(), data));
+        // Bound the heartbeat-skipping loop as a whole so a stream that stays open emitting
+        // 15s heartbeats fails promptly instead of looping forever and holding `ROLE_STATE_LOCK`.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(block) = self.block().await {
+                if let Some(item) = consumer::sse_item(&block) {
+                    let lines: Vec<_> = block.lines().collect();
+                    assert_eq!(lines.len(), 2);
+                    assert!(lines[0].starts_with("id: ") && lines[1].starts_with("data: "));
+                    consumer::EventCursor::default().apply(&item).unwrap();
+                    let data = serde_json::from_str(item["data"].as_str().unwrap()).unwrap();
+                    return Some((item["id"].as_str().unwrap().to_owned(), data));
+                }
+                assert_eq!(block, ": heartbeat");
             }
-            assert_eq!(block, ": heartbeat");
-        }
-        None
+            None
+        })
+        .await
+        .expect("stream stayed open emitting heartbeats without an event or EOF")
     }
 }
 
@@ -698,13 +735,23 @@ async fn indexed_batch_seeks_in_a_many_run_history_without_a_sort() {
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL for disposable PostgreSQL 18"]
 async fn slow_reader_times_out_releases_capacity_and_resumes_without_loss() {
-    let f = Fixture::new().await;
+    let mut f = Fixture::new().await;
+    // Keep the one-connection primary pool and default `native.max_in_flight=65` (below
+    // `SSE_MAX_IN_FLIGHT=128`), while matching DB/session acquire budgets to `OPERATION_TIMEOUT`
+    // (10s) so 128 streams contending under full parallel suite load do not spuriously evict
+    // quiet streams on the 2s pool timeout.
+    let dir = auth_config_support::Dir::new();
+    let mut doc = auth_config_support::document_v2_native(&dir, &ca::Ca::new().pem());
+    doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+    doc["session"]["deadline_milliseconds"] = json!(10_000);
+    f.api = Api::configured_with_db_timeout(&f.db, dir, doc, 1, 10_000);
+
     let mut owner = connect(&f.db.0, OWNER).await;
     let path = f.events();
     let mut stalled = Stream::open(&f.api, f.browser(), &path, None).await;
     let (mut cursor, _) = stalled.next().await.unwrap();
-    // Hold the other 127 slots with quiet streams on a separate run. HEAD exercises
-    // admission without creating another task or consuming the remaining socket data.
+    // Hold the other 127 slots with quiet streams on a separate run, opened at its current
+    // cursor so they carry only heartbeats and any unexpected EOF is detected directly.
     project_run(&f.db, &f.scope, &f.account).await;
     let idle_run: String =
         sqlx::query_scalar("SELECT id::text FROM openmettle.runs WHERE id<>$1::uuid")
@@ -712,43 +759,98 @@ async fn slow_reader_times_out_releases_capacity_and_resumes_without_loss() {
             .fetch_one(&mut owner)
             .await
             .unwrap();
+    let idle_cursor = success(
+        f.api.call(
+            f.native(),
+            "GET",
+            &format!("/v1/runs/{idle_run}"),
+            None,
+            None,
+        ),
+        200,
+    )["resume_cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let idle_path = format!("/v1/runs/{idle_run}/events");
     let mut idle = Vec::new();
     for _ in 1..128 {
-        idle.push(Stream::open(&f.api, f.native(), &idle_path, None).await);
+        idle.push(Stream::open(&f.api, f.native(), &idle_path, Some(&idle_cursor)).await);
     }
     assert_eq!(f.api.send(f.browser(), "HEAD", &path, "", "").0, 503);
-    // Enough compact synthetic claim rows to fill both TCP windows and the eight-frame
-    // channel. Insert atomically, leaving the run live so EOF proves a write timeout.
-    let total = 50_000_i64;
-    let mut tx = owner.begin().await.unwrap();
-    sqlx::query(
-        "UPDATE openmettle.runs SET state='running', last_event_sequence=$2 WHERE id=$1::uuid",
-    )
-    .bind(&f.run)
-    .bind(total)
-    .execute(&mut *tx)
-    .await
-    .unwrap();
-    sqlx::query("INSERT INTO openmettle.run_events (scope_id,run_id,sequence,append_key,format,format_version,payload,identity,digest)
-        SELECT $1::uuid,$2::uuid,n,'claim:'||gen_random_uuid(),'openmettle.run-claimed',1,'{}'::bytea,''::bytea,sha256(''::bytea)
-        FROM generate_series(2,$3::bigint) n").bind(&f.scope).bind(&f.run).bind(total).execute(&mut *tx).await.unwrap();
-    tx.commit().await.unwrap();
+
+    async fn append_backlog(owner: &mut PgConnection, scope: &str, run: &str, from: i64, to: i64) {
+        let mut tx = owner.begin().await.unwrap();
+        sqlx::query(
+            "UPDATE openmettle.runs SET state='running', last_event_sequence=$2 WHERE id=$1::uuid",
+        )
+        .bind(run)
+        .bind(to)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO openmettle.run_events (scope_id,run_id,sequence,append_key,format,format_version,payload,identity,digest)
+            SELECT $1::uuid,$2::uuid,n,'claim:'||gen_random_uuid(),'openmettle.run-claimed',1,'{}'::bytea,''::bytea,sha256(''::bytea)
+            FROM generate_series($3::bigint,$4::bigint) n")
+            .bind(scope)
+            .bind(run)
+            .bind(from)
+            .bind(to)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    // Start with enough compact claim rows (~3.7 MiB) to saturate a 4 MiB Linux loopback
+    // `SO_SNDBUF` plus the eight-frame channel while keeping resume work fast; grow the backlog
+    // if a host with a larger `tcp_wmem` ceiling has not backpressured yet.
+    let mut total = 15_001_i64;
+    append_backlog(&mut owner, &f.scope, &f.run, 2, total).await;
+
     // No application reads on the stalled response. A freed permit and successful
     // authorization on the one-connection pool must precede its next read.
-    let deadline = Instant::now() + Duration::from_secs(75);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(90);
+    let mut expansions = 0_u8;
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
         if f.api.send(f.native(), "HEAD", &path, "", "").0 == 200 {
             break;
+        }
+        let elapsed = started.elapsed();
+        if expansions == 0 && elapsed >= Duration::from_secs(25) {
+            let next_total = total + 25_000;
+            append_backlog(&mut owner, &f.scope, &f.run, total + 1, next_total).await;
+            total = next_total;
+            expansions = 1;
+        } else if expansions == 1 && elapsed >= Duration::from_secs(50) {
+            let next_total = total + 40_000;
+            append_backlog(&mut owner, &f.scope, &f.run, total + 1, next_total).await;
+            total = next_total;
+            expansions = 2;
         }
         assert!(
             Instant::now() < deadline,
             "slow reader retained the stream permit"
         );
     }
+    // Prove the freed permit belongs to `stalled`, not a dropped `idle` stream, BEFORE touching
+    // `stalled.next()`: taking 1 slot must saturate all 128 permits again, and every `idle`
+    // stream must remain open across a two-pass check (draining any pending heartbeat before
+    // checking for EOF behind it).
+    let probe = Stream::open(&f.api, f.native(), &idle_path, Some(&idle_cursor)).await;
+    assert_eq!(f.api.send(f.browser(), "HEAD", &path, "", "").0, 503);
+    for stream in &mut idle {
+        stream.assert_open().await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    for stream in &mut idle {
+        stream.assert_open().await;
+    }
+
     assert_eq!(f.snapshot()["last_sequence"], total.to_string());
-    drop(idle);
+    drop((probe, idle));
     let mut observer = admin(Some(&f.db.0)).await;
     // On quiet HTTP/1.1 streams, the first Linux TCP write after FIN can elicit RST.
     // EPIPE may surface on the second heartbeat, over 30s after disconnect.
@@ -1056,4 +1158,110 @@ async fn invalid_wait_failure_snapshot_matches_reconnected_stream() {
     assert_eq!(snapshot["terminal"], event);
     assert_eq!(event["type"], "run.failed");
     assert_eq!(event["data"], json!({"reason":"invalid_wait"}));
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL for disposable PostgreSQL 18"]
+async fn native_sse_reauth_is_not_evicted_by_native_signin_max_in_flight() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let account = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let cookie = browser(&db, &account, 1).await;
+    let bearer = native(&db, &account, 2).await;
+
+    let dir = auth_config_support::Dir::new();
+    let mut doc = auth_config_support::document_v2_native(&dir, &ca::Ca::new().pem());
+    doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
+    doc["native"]["max_in_flight"] = json!(1);
+    let api = Api::configured(&db, dir, doc, 4);
+
+    let p = success(
+        api.call(
+            As::Browser(&cookie),
+            "POST",
+            "/v1/projects",
+            Some("new"),
+            Some(&json!({"name":"NativeReauth"})),
+        ),
+        201,
+    );
+    let scope = p["scope_id"].as_str().unwrap().to_owned();
+    project_run(&db, &scope, &account).await;
+    let run: String =
+        sqlx::query_scalar("SELECT id::text FROM openmettle.runs WHERE scope_id=$1::uuid")
+            .bind(&scope)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    let path = format!("/v1/runs/{run}/events");
+    let cursor = success(
+        api.call(
+            As::Native(&bearer),
+            "GET",
+            &format!("/v1/runs/{run}"),
+            None,
+            None,
+        ),
+        200,
+    )["resume_cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut streams = Vec::new();
+    for _ in 0..3 {
+        streams.push(Stream::open(&api, As::Native(&bearer), &path, Some(&cursor)).await);
+    }
+
+    // Hold `local_sessions` briefly (< DB_TIMEOUT_MS) while appending a run event so all 3
+    // native SSE streams concurrently enter `NativeAuth::validate_effect` past `max_in_flight=1`.
+    let mut locker = admin(Some(&db.0)).await;
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut locker)
+        .await
+        .unwrap();
+    let mut lock_tx = locker.begin().await.unwrap();
+    sqlx::query("LOCK TABLE openmettle.local_sessions IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock_tx)
+        .await
+        .unwrap();
+
+    let mut w = connect(&db.0, WORKER).await;
+    let mut wtx = WriteTransaction::begin(&mut w).await.unwrap();
+    let token: String = sqlx::query_scalar(
+        "UPDATE openmettle.runs SET state='running' WHERE scope_id=$1::uuid AND id=$2::uuid AND state='queued' RETURNING gen_random_uuid()::text",
+    )
+    .bind(&scope)
+    .bind(&run)
+    .fetch_one(wtx.connection().unwrap())
+    .await
+    .unwrap();
+    runs::append_event(
+        &mut wtx,
+        &scope,
+        &run,
+        &format!("claim:{token}"),
+        Payload {
+            format: "openmettle.run-claimed",
+            version: 1,
+            bytes: b"{}",
+        },
+    )
+    .await
+    .unwrap();
+    wtx.commit().await.unwrap();
+
+    wait_for_blocked_peer(&db, holder_pid).await;
+    // Let the remaining native SSE streams cross one 500ms poll interval and hit re-auth concurrently.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    lock_tx.rollback().await.unwrap();
+
+    for (index, stream) in streams.iter_mut().enumerate() {
+        let (_, event) = stream.next().await.unwrap_or_else(|| {
+            panic!("native SSE stream #{index} closed during concurrent re-auth")
+        });
+        assert_eq!(event["type"], "run.started");
+        assert_eq!(event["sequence"], "2");
+    }
 }
