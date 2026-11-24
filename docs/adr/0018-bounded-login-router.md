@@ -1,6 +1,6 @@
 # 0018 — Bounded browser login router
 
-Status: proposed V1-04 implementation contract, 18 November 2026.
+Status: accepted with its implementation; V1-04 implementation contract, 18 November 2026.
 Refs #5; Refs #34. Independent review and CI acceptance are separate gates. #5 remains open.
 
 [ADR 0022](0022-home-invitation-codes.md) lets the initiation route accept one small form

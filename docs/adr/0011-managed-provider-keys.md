@@ -1,6 +1,6 @@
 # 0011 — Configured discovery and managed signing keys
 
-Status: coordinator-agreed V1-04 implementation contract, 17 November 2026.
+Status: accepted with its implementation; V1-04 implementation contract, 17 November 2026.
 Refs #5; Refs #34. Independent review remains required. #5 remains open.
 [ADR 0012](0012-login-provider-authority.md) replaces the process-generation login binding
 and makes identical re-registration a no-op; the rest of this record still applies.

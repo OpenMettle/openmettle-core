@@ -1,6 +1,6 @@
 # 0008 — Offline OIDC ID-token verification core
 
-Status: coordinator-agreed first V1-04 increment, 17 November 2026. Related: core #5 and
+Status: accepted with its implementation; first V1-04 increment, 17 November 2026. Related: core #5 and
 sprint #34. Independent review remains required. This increment partly addresses the first
 #5 acceptance criterion only. #5 stays open.
 

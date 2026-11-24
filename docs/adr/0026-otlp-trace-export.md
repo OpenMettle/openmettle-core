@@ -1,6 +1,6 @@
 # 0026 — OTLP/HTTP protobuf trace export, off by default
 
-Status: proposed V1-29 increment 2 of 4, 19 November 2026. Agent-authored; implements the
+Status: accepted with its implementation; V1-29 increment 2 of 4, 19 November 2026. Agent-authored; implements the
 owner decisions recorded on #26 the same day. Owner approval of this record, independent
 review and CI acceptance are separate gates. Refs #26. #26 remains open.
 

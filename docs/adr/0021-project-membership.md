@@ -1,6 +1,6 @@
 # 0021 — Login-time project membership for approved identities
 
-Proposed V1-04 increment for #5 and #34. Migration 11 builds on schema 10.
+Accepted with its implementation, 18 November 2026. V1-04 increment for #5 and #34. Migration 11 builds on schema 10.
 
 ## Deployment and enrollment
 

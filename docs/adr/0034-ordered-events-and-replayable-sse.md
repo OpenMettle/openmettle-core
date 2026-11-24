@@ -1,6 +1,6 @@
 # 0034 — Ordered run events, cursor MACs and replayable `/v1` SSE
 
-Status: proposed V1-12 design (PR1), 20 November 2026. Agent-authored; owner approval,
+Status: accepted with its implementation; V1-12 design (PR1), 20 November 2026. Agent-authored; owner approval,
 independent review and CI acceptance are separate gates. Refs #12 and #63. PR1 recorded this
 design and a pointer from ADR 0007. Implementation status: PR2 implemented the cursor MAC codec,
 `cursor_keys` configuration, and `GET /v1/runs/{run_id}` / `GET /v1/runs/{run_id}/events`

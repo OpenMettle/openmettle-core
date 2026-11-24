@@ -1,6 +1,6 @@
 # 0007 — Application API contract and consumer fixtures
 
-Status: coordinator-agreed first V1-03 increment, 17 November 2026. Related: core #4 and
+Status: accepted with its implementation; first V1-03 increment, 17 November 2026. Related: core #4 and
 sprint #34. Independent review remains required. The first increment published the contract
 and its checks. The second adds an internal
 capability evaluator and qualification tests. Neither adds a route, authentication,

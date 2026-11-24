@@ -1,6 +1,6 @@
 # 0010 — Provider token transport
 
-Status: coordinator-agreed V1-04 increment, 17 November 2026. Related: core #5 and sprint #34.
+Status: accepted with its implementation; V1-04 increment, 17 November 2026. Related: core #5 and sprint #34.
 Independent review is required. This increment partly addresses the first #5 acceptance
 criterion; #5 stays open.
 

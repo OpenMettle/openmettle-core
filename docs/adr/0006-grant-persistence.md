@@ -1,6 +1,6 @@
 # 0006 — Grant persistence and immutable provenance
 
-Status: coordinator-agreed V1-02 implementation contract, 17 November 2026. Related: core
+Status: accepted with its implementation; V1-02 implementation contract, 17 November 2026. Related: core
 #3 and sprint #34. Independent review and qualification remain required. This increment
 adds migration 5 without changing released migrations 1–4. It exposes no product API.
 

@@ -1,6 +1,6 @@
 # 0036 — Conversation branches, presets and effective model configuration
 
-Proposed for V1-07 PR1, 21 November 2026. [Core #8](https://github.com/OpenMettle/openmettle-core/issues/8)
+Accepted with its implementation; recorded for V1-07 PR1, 21 November 2026. [Core #8](https://github.com/OpenMettle/openmettle-core/issues/8)
 depends on the V1-03 application contract and V1-05 resource authorization. PR1 recorded the
 design. Implementation status: PR2 (migration 0021, managed branches, and model/preset resolver)
 and PR3 (`/v1/conversations`, `/v1/conversations/{conversation_id}/branches`, `/v1/models`,

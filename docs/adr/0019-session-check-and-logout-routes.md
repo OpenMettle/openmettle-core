@@ -1,6 +1,6 @@
 # 0019 — Session check and local logout routes
 
-Status: proposed V1-04 implementation contract, 18 November 2026.
+Status: accepted with its implementation; V1-04 implementation contract, 18 November 2026.
 Refs #5; Refs #34. Independent review and CI acceptance are separate gates. #5 remains open.
 
 ## Problem

@@ -1,6 +1,6 @@
 # 0038 — SGLang and external-provider conformance adapter
 
-Proposed for Wave 18d, V1-08 PR1, 21 November 2026. Refs #9. PR1 recorded the design.
+Accepted with its implementation; recorded for Wave 18d, V1-08 PR1, 21 November 2026. Refs #9. PR1 recorded the design.
 Implementation status: PR2 (`provider_http::inference` bounded gateway inference adapter and
 wire conformance fixtures) is merged on `main`; PR3 qualifies each deployed profile.
 [V1-08 acceptance and dependencies](https://github.com/OpenMettle/openmettle-core/issues/9).

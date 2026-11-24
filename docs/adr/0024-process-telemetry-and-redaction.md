@@ -1,6 +1,6 @@
 # 0024 — Process telemetry and default-deny redaction
 
-Status: proposed V1-29 increment 1 of 4, 19 November 2026. Agent-authored; owner approval,
+Status: accepted with its implementation; V1-29 increment 1 of 4, 19 November 2026. Agent-authored; owner approval,
 independent review and CI acceptance are separate gates. Refs #26; Refs #34. #26 remains
 open. Number 0023 is reserved for native sign-in (V1-04 block C).
 

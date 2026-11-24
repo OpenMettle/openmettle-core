@@ -1,6 +1,6 @@
 # 0005 — Artifact revisions, storage reservations and byte accounting
 
-Status: implementation of the coordinator-agreed V1-02 storage increment, 17 November 2026;
+Status: accepted with its implementation; V1-02 storage increment, 17 November 2026;
 independent review and qualification remain required. Related: core #3 and sprint #34. This
 does not complete #3: grants remain outstanding. It enables no product API, upload service,
 quota policy, retention job or filesystem work. Follow ADR 0003 for migration and role
