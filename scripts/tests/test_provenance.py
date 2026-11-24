@@ -953,8 +953,9 @@ class RepositoryRegisterTests(unittest.TestCase):
             collect(f"cargo_reviews.{review['name']} {review['version']}", review["review"])
         for comp in register["components"]:
             collect(f"components.{comp['id']}", comp["review"])
-        boundary, policy, forks, serving = (f"{ISSUE_32}#issuecomment-{n}" for n in
-                                            (7005620131, 7006023083, 7006271314, 7008299248))
+        boundary, policy, forks, serving, models = (f"{ISSUE_32}#issuecomment-{n}" for n in
+                                                    (7005620131, 7006023083, 7006271314, 7008299248,
+                                                     7132587306))
         self.assertEqual(reviewed, {
             "distribution_boundary": [boundary, policy, forks, serving],
             "review_groups.core": [policy],
@@ -969,6 +970,7 @@ class RepositoryRegisterTests(unittest.TestCase):
             "cargo_reviews.openmettle-core 0.1.0": [policy],
             "components.repository-template": [policy],
             "components.openapi-3.2-schemas": [policy],
+            "components.sglang-recorded-fixtures": [models],
         })
 
     def test_repository_register_records_the_19_nov_boundary(self):
