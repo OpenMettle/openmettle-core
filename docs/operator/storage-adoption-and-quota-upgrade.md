@@ -47,7 +47,7 @@ SELECT (SELECT count(*) FROM openmettle.storage_reservations) AS reservations,
        (SELECT count(*) FROM openmettle.artifact_revisions) AS revisions;
 ```
 
-After adoption, check that `volume_id` is set and `adoption_run_id` is null. Review every quarantined reservation. Each stays charged until verified on the restored tree. Preserve surviving files and anchors when investigating a mismatch. If an adopter crashed, read the recorded adoption UUID, establish that its process exited, and retry with `--replace-adoption-run` and that UUID. Use the same volume and evidence options as the first attempt.
+After adoption, check that `volume_id` is set and `adoption_run_id` is null. Review every quarantined reservation. Each stays charged until verified on the restored tree. Preserve surviving files and anchors when investigating a mismatch. If an adopter crashed, read the recorded adoption UUID, establish that its process exited, and retry with `--replace-adoption-run` and that UUID. Use the same volume and evidence options as the first attempt. An adoption that is refused or fails verification hands the marker back as it found it: after a failed retry the recorded UUID is still set, and the next retry names it again.
 
 Drain legacy request producers and allow 15 minutes for recent reserved requests to age. Run the orphan sweep. It processes one fixed upper bound in bounded transactions. Repeat after outstanding leases or locked rows clear. Activate metering in a separate invocation.
 
@@ -122,7 +122,7 @@ The worker records up to 100 overdue committed handoffs per maintenance sweep in
 
 ## Verify accounting
 
-Run `openmettle-admin quota verify "$ARTIFACT_ROOT"` after restore to check the pinned volume and ledgers. This filesystem check is the required post-restore check. A volume restored by file copy must first be rebound, following [Restore the artifact volume](restore-artifact-volume.md); until then the check reports file mismatches. Omit the root on a storage-disabled deployment. A failed verification exits with a nonzero status. For a database-only investigation, run the read below as the owner or worker. It compares no file, so it reports a copied volume as healthy and does not replace the filesystem check. The storage, budget and settlement mismatch counts must be zero. Pending gateway reconciliations and their oldest age identify accepted evidence awaiting application. Investigate mismatches against the same backup and volume before resuming writers.
+Run `openmettle-admin quota verify "$ARTIFACT_ROOT"` after restore to check the pinned volume and ledgers. This filesystem check is the required post-restore check. A volume restored by file copy must first be rebound, following [Restore the artifact volume](restore-artifact-volume.md); until then the check fails. Omit the root on a storage-disabled deployment. A failed verification exits with a nonzero status. For a database-only investigation, run the read below as the owner or worker. It compares no file, so it reports a copied volume as healthy and does not replace the filesystem check. The storage, budget and settlement mismatch counts must be zero. Pending gateway reconciliations and their oldest age identify accepted evidence awaiting application. Investigate mismatches against the same backup and volume before resuming writers.
 
 ```sql
 SELECT * FROM openmettle.quota_verify_accounting_drift();

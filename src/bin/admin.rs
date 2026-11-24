@@ -50,16 +50,7 @@ async fn run() -> Result<(), &'static str> {
                     openmettle_core::artifact_fs::verify_accounting_drift(&pool, store.as_ref())
                         .await
                         .map_err(|_| "volume or ledger verification failed")?;
-                println!(
-                    "storage mismatches {}, budget mismatches {}, settlement mismatches {}, pending gateway {}, file mismatches {}, quarantined {}, unsettled payloads {}",
-                    report.storage_accounts,
-                    report.budgets,
-                    report.settlements,
-                    report.pending_gateway,
-                    report.files,
-                    report.quarantined,
-                    report.unsettled_payloads
-                );
+                print_drift(&report);
                 if !report.healthy() {
                     return Err("accounting drift detected");
                 }
@@ -153,12 +144,19 @@ async fn rebind_volume(root: &Path, replace: Option<&str>) -> Result<(), &'stati
     let mut c = PgConnection::connect(&url)
         .await
         .map_err(|_| "owner connection failed")?;
-    let report = rebind::rebind(&mut c, &rebind::Options { root, replace })
-        .await
-        .map_err(|failure| {
-            eprintln!("OMQ03: {}", failure.0);
-            "storage rebind refused; the ledger is unchanged"
-        })?;
+    let report = match rebind::rebind(&mut c, &rebind::Options { root, replace }).await {
+        Ok(report) => report,
+        Err(stopped) => {
+            eprintln!("OMQ03: {}", stopped.reason);
+            let Some(run) = stopped.run else {
+                return Err("storage rebind refused; nothing was changed");
+            };
+            eprintln!(
+                "the volume stays closed and uploads may already be emptied; re-run with --replace-adoption-run {run}"
+            );
+            return Err("storage rebind incomplete");
+        }
+    };
     println!(
         "rebound {}, emptied {}, unchanged {}, quarantined {}, failed {}",
         report.rebound,
@@ -167,15 +165,31 @@ async fn rebind_volume(root: &Path, replace: Option<&str>) -> Result<(), &'stati
         report.quarantined,
         report.failures.len()
     );
-    if report.failures.is_empty() {
-        return Ok(());
-    }
     for (reservation, reason) in &report.failures {
         println!("failed {reservation}: {reason}");
     }
+    if report.complete() {
+        return Ok(());
+    }
+    if let Some(drift) = &report.drift {
+        print_drift(drift);
+    }
     eprintln!(
-        "the volume stays closed; repair the listed payloads and re-run with --replace-adoption-run {}",
+        "the volume stays closed; resolve what is reported and re-run with --replace-adoption-run {}",
         report.run
     );
     Err("storage rebind incomplete")
+}
+
+fn print_drift(report: &openmettle_core::artifact_fs::Drift) {
+    println!(
+        "storage mismatches {}, budget mismatches {}, settlement mismatches {}, pending gateway {}, file mismatches {}, quarantined {}, unsettled payloads {}",
+        report.storage_accounts,
+        report.budgets,
+        report.settlements,
+        report.pending_gateway,
+        report.files,
+        report.quarantined,
+        report.unsettled_payloads
+    );
 }

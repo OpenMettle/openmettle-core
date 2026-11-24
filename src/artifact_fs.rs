@@ -32,7 +32,10 @@ use std::{
 };
 use std::{
     os::unix::fs::MetadataExt,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::task::JoinHandle;
 use volume::Volume;
@@ -117,6 +120,8 @@ pub struct Store {
     expiry_pass: Arc<[tokio::sync::Mutex<reclaim::AnchorPass>; 5]>,
     staging_pass: Arc<tokio::sync::Mutex<staging::StagingSweepState>>,
     anchor_pass: Arc<[tokio::sync::Mutex<reclaim::AnchorPass>; 2]>,
+    /// Set once the copy check has passed; see [`Self::check_not_copied`].
+    not_copied: Arc<AtomicBool>,
 }
 impl Store {
     pub fn open(root: &Path) -> Result<Self, InvalidDirectory> {
@@ -134,17 +139,23 @@ impl Store {
             purge_pass: Default::default(),
             expiry_pass: Default::default(),
             anchor_pass: Default::default(),
+            not_copied: Default::default(),
         })
     }
     /// Initializes a fresh installation from the API role and verifies an existing pin.
     pub async fn initialize_api(&self, pool: &PgPool) -> Result<(), Error> {
         self.prepare(pool, true).await.map(|_| ())
     }
-    /// Verify the pin and refuse a volume that was copied but not yet rebound. The copy check
-    /// is a bounded sample, so it can miss a copy; it never refuses a healthy volume, because
-    /// the published name of a live settled revision always carries the bound inode.
     pub(crate) async fn verify_startup(&self, pool: &PgPool, api: bool) -> Result<(), Error> {
-        if self.prepare(pool, api).await?.is_none() {
+        self.prepare(pool, api).await.map(|_| ())
+    }
+    /// Refuse a volume that was copied but not yet rebound. Every operation passes here, so a
+    /// process whose start-up check could not complete does no artifact work until the check
+    /// has succeeded once. The check is a bounded sample and can miss a copy. It never refuses
+    /// a healthy volume, because the published name of a live settled revision always carries
+    /// the bound inode.
+    async fn check_not_copied(&self, c: &mut PgConnection) -> Result<(), Error> {
+        if self.not_copied.load(Ordering::Relaxed) {
             return Ok(());
         }
         let sample: Vec<(String, String)> = sqlx::query_as(
@@ -152,7 +163,7 @@ impl Store {
              JOIN openmettle.storage_reservations s ON s.scope_id=r.scope_id AND s.id=r.reservation_id
              WHERE r.state IN ('active','retained') AND s.payload_ino IS NOT NULL LIMIT 16",
         )
-        .fetch_all(pool)
+        .fetch_all(c)
         .await?;
         for (id, bound) in sample {
             let found = self.volume.inode(&self.volume.revisions, &id);
@@ -160,6 +171,7 @@ impl Store {
                 return Err(Error::Io);
             }
         }
+        self.not_copied.store(true, Ordering::Relaxed);
         Ok(())
     }
     pub(crate) fn attach(&self, pool: &PgPool) {
@@ -188,6 +200,7 @@ impl Store {
         }
         if let Some(id) = pin {
             self.volume.verify(&id)?;
+            self.check_not_copied(c).await?;
             return Ok(Some(id));
         }
         if auto && bootstrap && empty {

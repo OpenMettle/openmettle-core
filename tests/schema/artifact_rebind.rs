@@ -154,6 +154,16 @@ impl Fixture {
         id
     }
 
+    /// Claim a retained, due revision for purge without touching its payload.
+    async fn claim_purge(&self, s: &Stored) {
+        let mut cn = connect(&self.db.0, WORKER).await;
+        let mut tx = WriteTransaction::begin(&mut cn).await.unwrap();
+        storage::begin_purge(&mut tx, &self.c.scope, &s.revision)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
     async fn expire_reservations(&self) {
         self.db
             .admin()
@@ -177,6 +187,36 @@ async fn reservation_row(db: &TestDb, id: &str) -> (String, bool, bool, i64) {
     .fetch_one(&mut db.admin().await)
     .await
     .unwrap()
+}
+
+/// The writer's own settlement of an emptied upload is refused.
+async fn assert_cannot_settle(f: &Fixture, reservation: &str, body: &[u8]) {
+    let mut api = connect(&f.db.0, API).await;
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    let digest = Sha256::digest(body);
+    assert!(matches!(
+        storage::settle(
+            &mut tx,
+            &Settlement {
+                scope: &f.c.scope,
+                reservation,
+                size_bytes: body.len() as i64,
+                content_digest: &digest,
+                media_type: "text/plain",
+                display_name: None,
+            },
+        )
+        .await,
+        Err(Error::Conflict)
+    ));
+}
+
+async fn revision_state(db: &TestDb, s: &Stored) -> String {
+    sqlx::query_scalar("SELECT state FROM openmettle.artifact_revisions WHERE id=$1::uuid")
+        .bind(&s.revision)
+        .fetch_one(&mut db.admin().await)
+        .await
+        .unwrap()
 }
 
 /// Every state a recovery point can hold, copied with `tool` and rebound.
@@ -214,12 +254,7 @@ async fn recovers(tool: &str) {
     f.retain(&retained).await;
     let truncated = f.stored("truncated", b"purging payload").await;
     f.retain(&truncated).await;
-    let mut cn = connect(&f.db.0, WORKER).await;
-    let mut tx = WriteTransaction::begin(&mut cn).await.unwrap();
-    storage::begin_purge(&mut tx, &f.c.scope, &truncated.revision)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
+    f.claim_purge(&truncated).await;
     let purge = format!(".purge.{}", truncated.reservation);
     let payload = f.root.join("revisions").join(&truncated.reservation);
     fs::hard_link(&payload, f.root.join("revisions").join(&purge)).unwrap();
@@ -245,7 +280,10 @@ async fn recovers(tool: &str) {
     let revisions = root.join("revisions");
     // The copy carries the volume identity and every byte, under new inode numbers.
     let store = Store::open(&root).unwrap();
-    store.initialize_api(&f.api).await.unwrap();
+    assert!(matches!(
+        store.initialize_api(&f.api).await,
+        Err(artifact_fs::Error::Io)
+    ));
     for s in [&first, &second, &retained] {
         assert_ne!(
             ino(revisions.join(&s.reservation)),
@@ -307,25 +345,7 @@ async fn recovers(tool: &str) {
     }
     assert_eq!(fs::metadata(revisions.join(&published)).unwrap().len(), 0);
     assert_eq!(account(&f.db, &f.c.scope).await, before);
-    let mut api = connect(&f.db.0, API).await;
-    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
-    let digest = Sha256::digest(b"unsettled payload");
-    assert!(matches!(
-        storage::settle(
-            &mut tx,
-            &Settlement {
-                scope: &f.c.scope,
-                reservation: &published,
-                size_bytes: 17,
-                content_digest: &digest,
-                media_type: "text/plain",
-                display_name: None,
-            },
-        )
-        .await,
-        Err(Error::Conflict)
-    ));
-    drop(tx);
+    assert_cannot_settle(&f, &published, b"unsettled payload").await;
 
     // The required post-restore check passes, and the reconciler and the purge finish
     // every state under their normal rules.
@@ -453,6 +473,21 @@ async fn rebind_keeps_the_volume_closed_until_every_payload_verifies() {
     assert!(err.contains("adoption ownership mismatch"), "{err}");
     assert_eq!(barrier(&f.db).await.as_deref(), Some(held.as_str()));
 
+    // Adoption cannot take the barrier away either: its refusal hands it back.
+    let adopt = admin(
+        &f.db,
+        OWNER,
+        &[
+            "storage",
+            "adopt",
+            root.to_str().unwrap(),
+            "--replace-adoption-run",
+            &held,
+        ],
+    );
+    assert!(!adopt.status.success());
+    assert_eq!(barrier(&f.db).await.as_deref(), Some(held.as_str()));
+
     // Repairing one payload is not enough.
     fs::write(revisions.join(&corrupt.reservation), b"original bytes").unwrap();
     let (ok, out, err) = rebind(&f.db, &root, &["--replace-adoption-run", &held]);
@@ -487,16 +522,18 @@ async fn rebind_keeps_the_volume_closed_until_every_payload_verifies() {
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
-async fn rebind_changes_nothing_on_the_original_volume_and_refuses_without_changes() {
+async fn rebind_on_a_volume_that_was_not_copied_keeps_settled_payloads_and_empties_uploads() {
     let f = Fixture::new().await;
     let settled = f.stored("settled", b"settled payload").await;
     let held = f.crashed("held", b"partial upload", false).await;
-    let staged = f.root.join("staging").join(&held);
+    let published = f.crashed("published", b"unsettled payload", true).await;
+    let staging = f.root.join("staging");
     let payload = f.root.join("revisions").join(&settled.reservation);
-    let inodes = [
-        bound(&f.db, &settled.reservation).await,
-        bound(&f.db, &held).await,
-    ];
+    let ids = [&settled.reservation, &held, &published];
+    let mut inodes = Vec::new();
+    for id in ids {
+        inodes.push(bound(&f.db, id).await);
+    }
 
     // Every runtime role stays write-once.
     for role in [API, WORKER] {
@@ -513,36 +550,31 @@ async fn rebind_changes_nothing_on_the_original_volume_and_refuses_without_chang
         );
     }
 
-    let unchanged = async |f: &Fixture| {
+    // A refused run changes neither a row nor a file, and hands the barrier back.
+    let untouched = async || {
         assert_eq!(barrier(&f.db).await, None);
-        assert_eq!(bound(&f.db, &settled.reservation).await, inodes[0]);
-        assert_eq!(bound(&f.db, &held).await, inodes[1]);
-        assert_eq!(fs::read(&staged).unwrap(), b"partial upload");
-        assert_eq!(fs::read(&payload).unwrap(), b"settled payload");
-    };
-    // A volume that was not copied: the payload is verified, nothing is written, and an
-    // in-flight upload whose file still matches is left to the reconciler with its bytes.
-    for _ in 0..2 {
-        let (ok, out, err) = rebind(&f.db, &f.root, &[]);
-        assert!(ok, "{out}{err}");
+        for (id, inode) in ids.iter().zip(&inodes) {
+            assert_eq!(&bound(&f.db, id).await, inode);
+        }
+        assert_eq!(fs::read(staging.join(&held)).unwrap(), b"partial upload");
         assert_eq!(
-            out.trim(),
-            "rebound 0, emptied 0, unchanged 2, quarantined 0, failed 0"
+            fs::read(staging.join(&published)).unwrap(),
+            b"unsettled payload"
         );
-        unchanged(&f).await;
-    }
-
+        assert!(reservation_row(&f.db, &published).await.1);
+    };
     let path = f.root.to_str().unwrap();
     let refused = |output: Output, reason: &str| {
         assert!(!output.status.success());
         let err = String::from_utf8_lossy(&output.stderr).into_owned();
         assert!(err.contains(reason), "{err}");
+        assert!(err.contains("nothing was changed"), "{err}");
     };
     refused(
         admin(&f.db, API, &["storage", "rebind", path]),
         "owner login required",
     );
-    unchanged(&f).await;
+    untouched().await;
     // Another process still streams a payload.
     let reader = fs::File::open(&payload).unwrap();
     reader.lock_shared().unwrap();
@@ -551,7 +583,7 @@ async fn rebind_changes_nothing_on_the_original_volume_and_refuses_without_chang
         "reservation in use",
     );
     drop(reader);
-    unchanged(&f).await;
+    untouched().await;
     // A volume that was never adopted or pinned belongs to `storage adopt`.
     let mut owner = connect(&f.db.0, OWNER).await;
     let pin: String = sqlx::query_scalar(
@@ -570,10 +602,354 @@ async fn rebind_changes_nothing_on_the_original_volume_and_refuses_without_chang
         .execute(&mut owner)
         .await
         .unwrap();
-    unchanged(&f).await;
-    refused(
-        admin(&f.db, OWNER, &["storage", "rebind", path, "--unknown"]),
-        "unknown rebind option",
+    untouched().await;
+    let unknown = admin(&f.db, OWNER, &["storage", "rebind", path, "--unknown"]);
+    assert!(!unknown.status.success());
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("unknown rebind option"));
+    untouched().await;
+
+    // Rebind is a post-restore command. An inode number that still matches is no evidence:
+    // the settled payload is verified and kept, and every interrupted upload is emptied.
+    let (ok, out, err) = rebind(&f.db, &f.root, &[]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(
+        out.trim(),
+        "rebound 0, emptied 2, unchanged 3, quarantined 0, failed 0"
+    );
+    assert_eq!(barrier(&f.db).await, None);
+    for (id, inode) in ids.iter().zip(&inodes) {
+        assert_eq!(&bound(&f.db, id).await, inode);
+    }
+    assert_eq!(fs::read(&payload).unwrap(), b"settled payload");
+    for id in [&held, &published] {
+        assert_eq!(fs::metadata(staging.join(id)).unwrap().len(), 0);
+        assert_eq!(
+            reservation_row(&f.db, id).await,
+            ("reserved".into(), false, false, 0)
+        );
+    }
+    assert_cannot_settle(&f, &published, b"unsettled payload").await;
+    let (ok, out, _) = rebind(&f.db, &f.root, &[]);
+    assert!(ok);
+    assert_eq!(
+        out.trim(),
+        "rebound 0, emptied 0, unchanged 3, quarantined 0, failed 0"
+    );
+}
+
+/// Make the ledger carry the copied file's inode number, as a copy onto a fresh filesystem
+/// can do by chance.
+async fn carry_copied_inode(db: &TestDb, reservation: &str, copied: &Path) {
+    sqlx::query(
+        "UPDATE openmettle.storage_reservations SET payload_ino=$2::text::numeric WHERE id=$1::uuid",
+    )
+    .bind(reservation)
+    .bind(ino(copied))
+    .execute(&mut db.admin().await)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn rebind_takes_no_evidence_from_an_equal_inode_number() {
+    let f = Fixture::new().await;
+    retention_grace(&f.db, 0).await;
+    let purging = f.stored("purging", b"purging payload").await;
+    f.retain(&purging).await;
+    f.claim_purge(&purging).await;
+    let published = f.crashed("published", b"unsettled payload", true).await;
+    let dir = Dir::new();
+    let root = copy_tree("cp", &f.root, &dir).unwrap();
+    let payload = root.join("revisions").join(&purging.reservation);
+    let staged = root.join("staging").join(&published);
+    // The copied payload has other bytes of the same length under the number the ledger holds.
+    fs::write(&payload, b"damaged payload").unwrap();
+    carry_copied_inode(&f.db, &purging.reservation, &payload).await;
+    carry_copied_inode(&f.db, &published, &staged).await;
+
+    let (ok, out, _) = rebind(&f.db, &root, &[]);
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("rebound 0, emptied 1, unchanged 1, quarantined 0, failed 1"),
+        "{out}"
+    );
+    assert!(out.contains(&format!(
+        "failed {}: size_or_digest_mismatch",
+        purging.reservation
+    )));
+    // The damaged payload is neither accepted nor purged, and the volume stays closed.
+    let held = barrier(&f.db).await.unwrap();
+    assert_eq!(fs::read(&payload).unwrap(), b"damaged payload");
+    assert_eq!(revision_state(&f.db, &purging).await, "purging");
+    // The unsettled upload is emptied although its number matched, and cannot be settled.
+    assert_eq!(fs::metadata(&staged).unwrap().len(), 0);
+    assert_eq!(
+        reservation_row(&f.db, &published).await,
+        ("reserved".into(), false, false, 0)
+    );
+    assert_cannot_settle(&f, &published, b"unsettled payload").await;
+
+    fs::write(&payload, b"purging payload").unwrap();
+    let (ok, out, err) = rebind(&f.db, &root, &["--replace-adoption-run", &held]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(
+        out.trim(),
+        "rebound 0, emptied 0, unchanged 2, quarantined 0, failed 0"
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn rebind_keeps_the_barrier_when_it_fails_after_emptying_an_upload() {
+    let f = Fixture::new().await;
+    let held = f.crashed("held", b"partial upload", false).await;
+    let dir = Dir::new();
+    let root = copy_tree("cp", &f.root, &dir).unwrap();
+    let staged = root.join("staging").join(&held);
+    // The ledger write fails after the file was emptied.
+    let mut admin_db = f.db.admin().await;
+    for sql in [
+        "CREATE FUNCTION openmettle.synthetic_refusal() RETURNS trigger LANGUAGE plpgsql
+         AS $$ BEGIN RAISE EXCEPTION 'synthetic'; END $$",
+        "CREATE TRIGGER synthetic_refusal BEFORE UPDATE OF payload_ino
+         ON openmettle.storage_reservations FOR EACH ROW
+         EXECUTE FUNCTION openmettle.synthetic_refusal()",
+    ] {
+        admin_db.execute(sql).await.unwrap();
+    }
+    let stale = bound(&f.db, &held).await;
+
+    let (ok, _, err) = rebind(&f.db, &root, &[]);
+    assert!(!ok);
+    assert_eq!(fs::metadata(&staged).unwrap().len(), 0);
+    assert_eq!(bound(&f.db, &held).await, stale);
+    // A file was modified, so the volume stays closed and the run names its recovery value.
+    let kept = barrier(&f.db).await.expect("the barrier was released");
+    assert!(
+        err.contains(&format!("--replace-adoption-run {kept}")),
+        "{err}"
+    );
+    assert!(!err.contains("nothing was changed"), "{err}");
+
+    admin_db
+        .execute("DROP TRIGGER synthetic_refusal ON openmettle.storage_reservations")
+        .await
+        .unwrap();
+    let (ok, out, err) = rebind(&f.db, &root, &["--replace-adoption-run", &kept]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(
+        out.trim(),
+        "rebound 1, emptied 0, unchanged 0, quarantined 0, failed 0"
+    );
+    assert_eq!(barrier(&f.db).await, None);
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn rebind_reports_a_layout_the_lifecycle_does_not_allow() {
+    let f = Fixture::new().await;
+    retention_grace(&f.db, 0).await;
+    let purging = f.stored("purging", b"purging payload").await;
+    f.retain(&purging).await;
+    f.claim_purge(&purging).await;
+    let dir = Dir::new();
+    let root = copy_tree("cp", &f.root, &dir).unwrap();
+    let payload = root.join("revisions").join(&purging.reservation);
+    // A purge needs the published file or its anchor; an empty staging file is neither.
+    fs::remove_file(&payload).unwrap();
+    fs::write(root.join("staging").join(&purging.reservation), b"").unwrap();
+    let stale = bound(&f.db, &purging.reservation).await;
+
+    let (ok, out, _) = rebind(&f.db, &root, &[]);
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains(&format!("failed {}: missing revision", purging.reservation)),
+        "{out}"
+    );
+    assert!(barrier(&f.db).await.is_some());
+    assert_eq!(bound(&f.db, &purging.reservation).await, stale);
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn rebind_releases_the_barrier_only_when_the_drift_check_is_healthy() {
+    let f = Fixture::new().await;
+    let live = f.stored("live", b"live payload").await;
+    let held = f.crashed("held", b"partial upload", false).await;
+    let dir = Dir::new();
+    let root = copy_tree("cp", &f.root, &dir).unwrap();
+    // A file no reservation owns: every row verifies, and the drift check still rejects it.
+    let orphan = root.join("revisions").join(new_uuid(&f.db).await);
+    fs::write(&orphan, b"orphan").unwrap();
+
+    let (ok, out, err) = rebind(&f.db, &root, &[]);
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("rebound 2, emptied 1, unchanged 0, quarantined 0, failed 0"),
+        "{out}"
+    );
+    assert!(out.contains("file mismatches 1"), "{out}");
+    let kept = barrier(&f.db).await.expect("the barrier was released");
+    assert!(
+        err.contains(&format!("--replace-adoption-run {kept}")),
+        "{err}"
+    );
+    // The verified rows are kept.
+    assert_eq!(
+        bound(&f.db, &live.reservation).await,
+        ino(root.join("revisions").join(&live.reservation))
+    );
+
+    // A quarantined reservation fails the drift check too, so it keeps the volume closed.
+    fs::remove_file(&orphan).unwrap();
+    let quarantine = async |on: bool| {
+        sqlx::query(
+            "UPDATE openmettle.storage_reservations SET adoption_unverified=$2 WHERE id=$1::uuid",
+        )
+        .bind(&held)
+        .bind(on)
+        .execute(&mut connect(&f.db.0, OWNER).await)
+        .await
+        .unwrap();
+    };
+    quarantine(true).await;
+    let (ok, out, _) = rebind(&f.db, &root, &["--replace-adoption-run", &kept]);
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("rebound 0, emptied 0, unchanged 1, quarantined 1, failed 0"),
+        "{out}"
+    );
+    let kept = barrier(&f.db).await.expect("the barrier was released");
+
+    quarantine(false).await;
+    let (ok, out, err) = rebind(&f.db, &root, &["--replace-adoption-run", &kept]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(barrier(&f.db).await, None);
+    let path = root.to_str().unwrap();
+    assert!(
+        admin(&f.db, OWNER, &["quota", "verify", path])
+            .status
+            .success()
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn rebind_reports_a_payload_it_cannot_open_as_a_row_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new().await;
+    let open = f.stored("open", b"readable payload").await;
+    let closed = f.stored("closed", b"restored with a wrong mode").await;
+    let dir = Dir::new();
+    let root = copy_tree("cp", &f.root, &dir).unwrap();
+    let payload = root.join("revisions").join(&closed.reservation);
+    let mode = |mode| fs::set_permissions(&payload, fs::Permissions::from_mode(mode)).unwrap();
+    mode(0o000);
+    if fs::OpenOptions::new().read(true).open(&payload).is_ok() {
+        eprintln!("running as root: an inaccessible payload cannot be simulated; not exercised");
+        return;
+    }
+
+    let (ok, out, _) = rebind(&f.db, &root, &[]);
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("rebound 1, emptied 0, unchanged 0, quarantined 0, failed 1"),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "failed {}: payload is not accessible",
+            closed.reservation
+        )),
+        "{out}"
+    );
+    assert_eq!(
+        bound(&f.db, &open.reservation).await,
+        ino(root.join("revisions").join(&open.reservation))
+    );
+    let kept = barrier(&f.db).await.unwrap();
+
+    mode(0o600);
+    let (ok, out, err) = rebind(&f.db, &root, &["--replace-adoption-run", &kept]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(barrier(&f.db).await, None);
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn rebind_holds_a_bounded_number_of_descriptors() {
+    let f = Fixture::new().await;
+    for n in 0..80 {
+        f.crashed(&format!("held-{n}"), b"partial upload", false)
+            .await;
+    }
+    let dir = Dir::new();
+    let root = copy_tree("cp", &f.root, &dir).unwrap();
+    // More interrupted uploads than the process may hold open files.
+    let output = Command::new("sh")
+        .args(["-c", "ulimit -n 64 && exec \"$@\"", "sh"])
+        .arg(env!("CARGO_BIN_EXE_openmettle-admin"))
+        .env("OPENMETTLE_ADMIN_DATABASE_URL", f.db.url(OWNER))
+        .args(["storage", "rebind", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "rebound 80, emptied 80, unchanged 0, quarantined 0, failed 0"
+    );
+    assert_eq!(barrier(&f.db).await, None);
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_store_does_no_artifact_work_on_a_copied_volume_until_the_copy_check_passes() {
+    let f = Fixture::new().await;
+    retention_grace(&f.db, 0).await;
+    let _live = f.stored("live", b"live payload").await;
+    let retained = f.stored("retained", b"retained payload").await;
+    f.retain(&retained).await;
+    let held = f.crashed("held", b"partial upload", false).await;
+    f.expire_reservations().await;
+    let dir = Dir::new();
+    let root = copy_tree("cp", &f.root, &dir).unwrap();
+    // A process whose start-up check could not complete (a database timeout) holds a store
+    // that was never verified. Its first sweeps must not touch the ledger.
+    let store = Store::open(&root).unwrap();
+    let worker = pool(&f.db, WORKER).await;
+    for _ in 0..2 {
+        assert!(matches!(
+            artifact_fs::reconcile_expired(&worker, &store, Duration::ZERO, 10).await,
+            Err(artifact_fs::Error::Io)
+        ));
+        assert!(matches!(
+            artifact_fs::purge_due(&worker, &store, 10).await,
+            Err(artifact_fs::Error::Io)
+        ));
+        assert_eq!(
+            reservation_row(&f.db, &held).await,
+            ("reserved".into(), false, false, 0)
+        );
+        assert_eq!(revision_state(&f.db, &retained).await, "retained");
+    }
+
+    let (ok, out, err) = rebind(&f.db, &root, &[]);
+    assert!(ok, "{out}{err}");
+    // The same store now passes the check on its next operation and works normally.
+    assert_eq!(
+        artifact_fs::reconcile_expired(&worker, &store, Duration::ZERO, 10)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        artifact_fs::purge_due(&worker, &store, 10).await.unwrap(),
+        1
     );
 }
 
@@ -646,14 +1022,6 @@ async fn a_worker_refuses_a_copied_volume_until_rebind_has_run() {
             .env("OPENMETTLE_WORKER_ARTIFACTS_DIR", root);
         Process(command.spawn().unwrap())
     };
-    let revision_state = async |s: &Stored| -> String {
-        sqlx::query_scalar("SELECT state FROM openmettle.artifact_revisions WHERE id=$1::uuid")
-            .bind(&s.revision)
-            .fetch_one(&mut f.db.admin().await)
-            .await
-            .unwrap()
-    };
-
     // Started before rebind, the worker exits instead of sweeping: its reconciler would
     // quarantine the crashed upload and its purge would claim the retained revision.
     let mut early = worker(&root);
@@ -675,7 +1043,7 @@ async fn a_worker_refuses_a_copied_volume_until_rebind_has_run() {
         reservation_row(&f.db, &held).await,
         ("reserved".into(), false, false, 0)
     );
-    assert_eq!(revision_state(&retained).await, "retained");
+    assert_eq!(revision_state(&f.db, &retained).await, "retained");
 
     let (ok, out, err) = rebind(&f.db, &root, &[]);
     assert!(ok, "{out}{err}");
@@ -692,7 +1060,7 @@ async fn a_worker_refuses_a_copied_volume_until_rebind_has_run() {
     let started = worker(&root);
     tokio::time::timeout(Duration::from_secs(15), async {
         while reservation_row(&f.db, &held).await.0 != "released"
-            || revision_state(&retained).await != "purged"
+            || revision_state(&f.db, &retained).await != "purged"
         {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

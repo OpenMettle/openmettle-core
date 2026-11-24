@@ -467,10 +467,27 @@ pub async fn adopt(c: &mut PgConnection, opts: &Options<'_>) -> Result<(), Failu
     let pin = take_barrier(c, &v, &run, opts.replace).await?;
     let result = verify_and_pin(c, opts, &v, &run, pin.as_deref()).await;
     if result.is_err() {
-        sqlx::query("UPDATE openmettle.storage_volume_control SET adoption_run_id=NULL WHERE id AND adoption_run_id=$1::uuid")
-            .bind(&run).execute(c).await?;
+        restore_barrier(c, &run, opts.replace).await?;
     }
     result
+}
+
+/// Hand the barrier back as `run` found it. A refusal must not release a barrier that an
+/// earlier, incomplete run still holds.
+pub(super) async fn restore_barrier(
+    c: &mut PgConnection,
+    run: &str,
+    prior: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE openmettle.storage_volume_control SET adoption_run_id=$2::uuid
+         WHERE id AND adoption_run_id=$1::uuid",
+    )
+    .bind(run)
+    .bind(prior)
+    .execute(c)
+    .await?;
+    Ok(())
 }
 
 async fn verify_and_pin(
@@ -604,8 +621,10 @@ async fn verify_and_pin(
             sqlx::query("UPDATE openmettle.storage_volume_control SET volume_id=$1::uuid,bootstrap_auto_pin_allowed=false WHERE id")
             .bind(id).execute(&mut *tx).await?;
         }
-        sqlx::query("UPDATE openmettle.storage_volume_control SET adoption_run_id=NULL WHERE id AND adoption_run_id=$1::uuid")
-        .bind(run).execute(&mut *tx).await?;
+        // Only a verified volume releases the barrier. A failed verification commits its
+        // quarantines and hands the barrier back as this run found it.
+        let prior = evidence.mismatch.and(opts.replace);
+        restore_barrier(&mut tx, run, prior).await?;
         tx.commit().await?;
         return evidence.mismatch.map_or(Ok(()), |e| Err(Failure(e)));
     }
