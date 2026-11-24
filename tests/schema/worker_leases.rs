@@ -1038,21 +1038,9 @@ mod live_turns {
             Self::on("provider.example.test", loopback).await
         }
         /// The packaged worker's transport refuses loopback (ADR 0010), so its gateway listens
-        /// on the one private address `TEST_GATEWAY_HOST` resolves to through the system
-        /// resolver. CI assigns that address to the loopback interface and names it in
-        /// `/etc/hosts`; the worker opts in to exactly that address.
+        /// on the one private address of [`gateway_host`].
         async fn packaged() -> Self {
-            let host = std::env::var("TEST_GATEWAY_HOST")
-                .expect("TEST_GATEWAY_HOST must name a private address of this host");
-            let mut ips: Vec<IpAddr> = std::net::ToSocketAddrs::to_socket_addrs(&(&*host, 0))
-                .expect("TEST_GATEWAY_HOST resolves")
-                .map(|a| a.ip())
-                .collect();
-            ips.sort();
-            ips.dedup();
-            let [ip] = ips[..] else {
-                panic!("TEST_GATEWAY_HOST must resolve to exactly one address")
-            };
+            let (host, ip) = gateway_host();
             Self::on(&host, ip).await
         }
         fn authority(&self) -> String {
@@ -1069,17 +1057,7 @@ mod live_turns {
             use http_body_util::{BodyExt, Full};
             use hyper::{Response, server::conn::http1, service::service_fn};
             use hyper_util::rt::TokioIo;
-            let ca = Ca::new();
-            let identity = ca.leaf(host, false);
-            let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(identity.chain, identity.key)
-            .unwrap();
-            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+            let (acceptor, ca) = tls_acceptor(host);
             let listener = tokio::net::TcpListener::bind((ip, 0)).await.unwrap();
             let port = listener.local_addr().unwrap().port();
             let (send, requests) = mpsc::channel(4);
@@ -1155,6 +1133,39 @@ mod live_turns {
         }
     }
 
+    /// The name `TEST_GATEWAY_HOST` gives the one private address of this host that it resolves
+    /// to through the system resolver. CI assigns that address to the loopback interface and
+    /// names it in `/etc/hosts`; a packaged worker opts in to exactly that address.
+    fn gateway_host() -> (String, IpAddr) {
+        let host = std::env::var("TEST_GATEWAY_HOST")
+            .expect("TEST_GATEWAY_HOST must name a private address of this host");
+        let mut ips: Vec<IpAddr> = std::net::ToSocketAddrs::to_socket_addrs(&(&*host, 0))
+            .expect("TEST_GATEWAY_HOST resolves")
+            .map(|a| a.ip())
+            .collect();
+        ips.sort();
+        ips.dedup();
+        let [ip] = ips[..] else {
+            panic!("TEST_GATEWAY_HOST must resolve to exactly one address")
+        };
+        (host, ip)
+    }
+
+    /// A TLS acceptor presenting a certificate for `host` from a new synthetic CA.
+    fn tls_acceptor(host: &str) -> (tokio_rustls::TlsAcceptor, Ca) {
+        let ca = Ca::new();
+        let identity = ca.leaf(host, false);
+        let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(identity.chain, identity.key)
+        .unwrap();
+        (tokio_rustls::TlsAcceptor::from(Arc::new(tls)), ca)
+    }
+
     fn worker_binary() -> &'static Path {
         static BINARY: OnceLock<PathBuf> = OnceLock::new();
         BINARY.get_or_init(|| {
@@ -1198,15 +1209,14 @@ mod live_turns {
 
     /// The packaged `openmettle-worker` binary with one run slot and a version-1 inference
     /// document (ADR 0043) routing every catalog model to `provider` under the given gateway
-    /// installation and unseal key, plus `settings` under its prefix. Only the gateway's own
-    /// address is opted in, and its routes accept the fixture's inline images.
+    /// installation, plus `settings` under its prefix. Only the gateway's own address is opted
+    /// in, and its routes accept the fixture's inline images.
     fn packaged_worker(
         db: &TestDb,
         dir: &Dir,
         catalog: &Value,
         provider: &Provider,
         installation: &str,
-        (key_id, key_bytes): (&str, [u8; 32]),
         settings: &[(&str, &str)],
     ) -> Packaged {
         let mut document = crate::auth_config_support::inference_document(
@@ -1216,14 +1226,20 @@ mod live_turns {
             &provider.authority(),
         );
         document["installation"] = json!(installation);
-        document["gateway_keys"] = json!({
-            "active": {"id": key_id, "path": dir.write("gateway-key", &key_bytes)},
-            "decrypt_only": []
-        });
         for route in document["routes"].as_object_mut().unwrap().values_mut() {
             route["private_cidrs"] = json!([provider.private_range()]);
             route["images"] = json!(true);
         }
+        launch_packaged(db, dir, &document, settings)
+    }
+
+    /// The packaged worker with the inference `document`, written to `dir`.
+    fn launch_packaged(
+        db: &TestDb,
+        dir: &Dir,
+        document: &Value,
+        settings: &[(&str, &str)],
+    ) -> Packaged {
         let bind = address();
         let mut command = binary("worker");
         command
@@ -1465,7 +1481,7 @@ mod live_turns {
             (run_id, input)
         }
 
-        async fn ensure_metered_gateway(&self) -> (String, String, [u8; 32]) {
+        async fn ensure_metered_gateway(&self) -> String {
             use openmettle_core::provider_keys::gateway::{
                 Bearer, Context, GatewayKeys, GatewaySealer,
             };
@@ -1490,7 +1506,7 @@ mod live_turns {
             .await
             .unwrap();
             if existing.is_some() {
-                return (INSTALL.into(), KEY_ID.into(), KEY_BYTES);
+                return INSTALL.into();
             }
             let binding: String = sqlx::query_scalar(
                 "INSERT INTO openmettle.gateway_bindings (installation, user_id, principal, budget)
@@ -1600,18 +1616,16 @@ mod live_turns {
             .execute(&g_pool)
             .await
             .unwrap();
-            (INSTALL.into(), KEY_ID.into(), KEY_BYTES)
+            INSTALL.into()
         }
 
         async fn start(&self, provider: &Provider) -> Process {
             let metered = if self.unmetered {
                 None
             } else {
-                let (installation, key_id, key_bytes) = self.ensure_metered_gateway().await;
+                let installation = self.ensure_metered_gateway().await;
                 Some(json!({
                     "installation": installation,
-                    "key_id": key_id,
-                    "key_bytes": key_bytes,
                     "device_grant_id": self.device_grant_id,
                 }))
             };
@@ -1642,7 +1656,7 @@ mod live_turns {
             dir: &Dir,
             settings: &[(&str, &str)],
         ) -> Packaged {
-            let (installation, key_id, key_bytes) = self.ensure_metered_gateway().await;
+            let installation = self.ensure_metered_gateway().await;
             let root = self
                 .artifacts
                 .as_ref()
@@ -1655,7 +1669,6 @@ mod live_turns {
                 &self.catalog,
                 provider,
                 &installation,
-                (&key_id, key_bytes),
                 &settings,
             )
         }
@@ -3077,8 +3090,6 @@ mod live_turns {
                     "stop_during_observation": false,
                     "metered": {
                         "installation": INSTALL,
-                        "key_id": "prehandoff-k1",
-                        "key_bytes": KEY_BYTES,
                     }
                 }),
             )
@@ -3454,8 +3465,6 @@ mod live_turns {
                     "stop_during_observation": false,
                     "metered": {
                         "installation": INSTALL,
-                        "key_id": "b2m-k1",
-                        "key_bytes": KEY_BYTES,
                     }
                 }),
             )
@@ -3588,7 +3597,7 @@ mod live_turns {
             .await
             .unwrap();
 
-        let (installation, _, _) = chat.ensure_metered_gateway().await;
+        let installation = chat.ensure_metered_gateway().await;
         let g_pool = PgPoolOptions::new()
             .max_connections(2)
             .connect_lazy_with(db.1.options(pg::GATEWAY));
@@ -4014,8 +4023,6 @@ mod live_turns {
                 "stop_during_observation": false,
                 "metered": {
                     "installation": INSTALL,
-                    "key_id": "b2m-tight-k1",
-                    "key_bytes": KEY_BYTES,
                 }
             }),
         )
@@ -4133,7 +4140,7 @@ mod live_turns {
             .await
             .unwrap();
 
-        let (installation, _, _) = chat.ensure_metered_gateway().await;
+        let installation = chat.ensure_metered_gateway().await;
         let g_pool = PgPoolOptions::new()
             .max_connections(2)
             .connect_lazy_with(db.1.options(pg::GATEWAY));
@@ -4757,8 +4764,7 @@ mod live_turns {
         let worker_dir = Dir::new();
         let (mut provider, worker_proc) = if packaged {
             let provider = Provider::packaged().await;
-            let key = ("metered-k1", KEY_BYTES);
-            let worker = packaged_worker(&db, &worker_dir, &catalog, &provider, INSTALL, key, &[]);
+            let worker = packaged_worker(&db, &worker_dir, &catalog, &provider, INSTALL, &[]);
             (provider, worker.process)
         } else {
             let provider = Provider::new().await;
@@ -4788,8 +4794,6 @@ mod live_turns {
                     "stop_during_observation": false,
                     "metered": {
                         "installation": INSTALL,
-                        "key_id": "metered-k1",
-                        "key_bytes": KEY_BYTES,
                     }
                 }),
             )
@@ -5214,8 +5218,6 @@ mod live_turns {
                 "stop_during_observation": false,
                 "metered": {
                     "installation": INSTALL,
-                    "key_id": "token-only-k1",
-                    "key_bytes": KEY_BYTES,
                 }
             }),
         )
@@ -5816,8 +5818,6 @@ mod live_turns {
                 "stop_during_observation": false,
                 "metered": {
                     "installation": INSTALL,
-                    "key_id": "lowered-k1",
-                    "key_bytes": KEY_BYTES,
                 }
             }),
         )
@@ -5957,4 +5957,7 @@ mod live_turns {
         .unwrap();
         assert_eq!(drift, (0, 0, 0, 0));
     }
+
+    #[path = "worker_gateway.rs"]
+    mod worker_gateway;
 }
