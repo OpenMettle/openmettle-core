@@ -102,16 +102,18 @@ also be what the proxy accepts.
 For each handoff the worker therefore makes a second, independent 32-byte random value, the
 bearer. It passes only the bearer's SHA-256 to the handoff, which stores it in
 `gateway_requests.bearer_hash`. The column is written by the handoff alone, together with the
-handed-off state, and only for a request without a binding. The bearer exists in worker memory
-only, in the single-use dispatch handle that cannot be cloned, printed or serialized, and no
-function returns it. The worker sends it as `Authorization: Bearer`, in unpadded base64url, on
-the request the handoff committed, with the request ID in `x-request-id`.
+handed-off state, and only for a request without a binding. The worker keeps the bearer in
+the single-use dispatch handle, which cannot be cloned, printed or serialized, and no database
+function returns it.
 
-- The bearer never crosses a database connection, on the worker's side or on the proxy's.
-  Both send its SHA-256.
-- The dispatch secret still crosses the worker's database connection. It is never sent over
+- The worker generates the bearer and sends it to the proxy over HTTP, as
+  `Authorization: Bearer` in unpadded base64url, on the request the handoff committed, with
+  the request ID in `x-request-id`. The proxy receives and decodes it.
+- Both components send only its SHA-256 to PostgreSQL.
+- The dispatch secret crosses only the worker's database connection. It is never sent over
   HTTP and the proxy does not accept it: the dispatch compares `bearer_hash` only, and the
   CHECK keeps that hash different from the dispatch secret's.
+- No zeroization guarantee is made for either value in either process.
 
 The handoff also stores `claim_hash`, the SHA-256 of the run claim that authorized it. The claim
 token itself is not stored there, because the gateway role can read the table.
@@ -130,16 +132,21 @@ A first dispatch is granted only to a request that was handed off without a bind
 settlement, and whose run is running, not cancelled, still held under the claim that
 authorized the handoff, and inside its lease and its execution deadline. A run that another
 holder reclaimed does not make the previous holder's unspent round dispatchable again; a
-holder that renews its lease keeps its claim. The clock is read once, inside the statement that
-records the dispatch, after that statement holds its relation locks and after the wait for the
-row lock: that one reading is compared with the deadlines and stored. A request handed off
-under ADR 0037 has no bearer hash and is never dispatched here: its transport may already have
-sent it. It remains eligible for settlement only.
+holder that renews its lease keeps its claim.
+
+The dispatch locks the run row for share, then the request row, and decides after both. It
+waits for a release, reclaim, renewal or cancellation in flight, and none can commit between
+its decision and its own commit. Run before request is the order of the handoff, the release
+and the recovery functions; settlement locks the request and never a run. A caller that does
+not prove the bearer locks nothing. The clock is read once, inside the statement that records
+the dispatch, after both row locks and that statement's relation locks: that one reading is
+compared with the deadlines and stored. A request handed off under ADR 0037 has no bearer
+hash and is never dispatched here: its transport may already have sent it. It remains
+eligible for settlement only.
 
 `dispatched_at` is a column, not a state: settlement and the quota functions test
-`state = 'handed_off'`. The function locks only the request row, which is also settlement's
-first lock, waits for it before deciding, and never writes `state`, so the deferred handoff
-trigger does not fire.
+`state = 'handed_off'`. The function never writes `state`, so the deferred handoff trigger
+does not fire.
 
 The principal of a dispatched request is the actor's user ID. Settlement accepts the binding's
 principal where a binding exists and the actor otherwise, so rows handed off under ADR 0037
@@ -225,6 +232,8 @@ exists.
 - A dispatch that is spent and then fails before the upstream answers cannot be retried under
   the same request. Neither can a round whose run was reclaimed before the dispatch: the new
   holder reserves a round of its own.
+- A dispatch in flight holds its run: a release, renewal or cancellation waits for it to
+  commit, and a reclaim skips the run meanwhile.
 - Migration 29 adds three columns and four functions and replaces one CHECK. It needs no
   activation step and no backfill, and it must be applied before workers of this release run.
 - ADR 0043 said the replacement would change `installation`, `gateway_keys` and one method of
@@ -262,8 +271,8 @@ exists.
 
 - `tests/schema/gateway_rounds.rs`: both functions under the provisioned role logins, with no
   binding, generation or policy row: each withdrawn authority, snapshot shapes, role and
-  isolation restrictions, concurrent dispatch, a reclaimed and a renewed run, a lease that
-  runs out during a lock wait, the CHECK and settlement.
+  isolation restrictions, concurrent dispatch, a reclaimed and a renewed run, a release and
+  a reclaim in flight, a lease that runs out during a lock wait, the CHECK and settlement.
 - `tests/schema/gateway_proxy.rs`: the binary against the recorded SGLang stand-in, with rounds
   reserved and handed off through the library and their quota holds.
 - `tests/schema/gateway.rs`: a bound request handed off at version 23 passes migration 29 and

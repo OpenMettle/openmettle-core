@@ -243,18 +243,34 @@ GRANT EXECUTE ON FUNCTION openmettle.gateway_handoff_round_confirm(uuid,bytea,uu
 -- a replay. Every other call returns no row, whether or not the request exists. A request
 -- handed off under ADR 0037 has no bearer hash and is never dispatched here: its transport may
 -- already have sent it.
--- The function locks only the request row, which is also settlement's first lock, and it waits
--- for that lock before deciding: a dispatch, settlement or cancellation that committed during
--- the wait is seen. The clock is read once, inside the updating statement, which by then holds
--- its relation locks: that reading is compared with the deadlines and stored. The function
--- does not write `state`, so the deferred handoff trigger does not fire.
+-- Lock order: the request's run row `FOR SHARE`, then the request row. Run before request is
+-- the order of the handoff, the release and the quota recovery functions. Settlement locks the
+-- request first and never a run, so no order is inverted.
+--   * The run lock makes the dispatch wait for a release, reclaim, renewal, cancellation or
+--     end of the run that is in flight, and holds the next one off until the dispatch commits:
+--     the run conditions are decided on a row nobody is changing.
+--   * The request lock does the same for another dispatch and for a settlement.
+-- The request is first read without a lock, to find its run. Its bearer hash and its run never
+-- change once the handoff committed them, so a caller that does not prove the bearer takes no
+-- lock at all. A caller that does also locks the run of a request that is already spent or no
+-- longer eligible, for the length of this transaction.
+-- The clock is read once, inside the updating statement, after both row locks and that
+-- statement's relation locks: that reading is compared with the deadlines and stored. The
+-- function does not write `state`, so the deferred handoff trigger does not fire.
 CREATE FUNCTION openmettle.gateway_dispatch(p_request uuid,p_bearer_hash bytea)
 RETURNS TABLE (replayed boolean,installation text,scope text,source text,principal text,model text)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE
+    v_run uuid;
 BEGIN
     IF current_setting('transaction_isolation') <> 'read committed' THEN
         RAISE EXCEPTION 'gateway dispatch requires READ COMMITTED' USING ERRCODE = '25000';
     END IF;
+    SELECT q.run_id INTO v_run FROM openmettle.gateway_requests q WHERE q.id=p_request
+        AND q.bearer_hash=p_bearer_hash
+        AND pg_has_role(session_user,'openmettle_gateway','USAGE');
+    IF NOT FOUND THEN RETURN; END IF;
+    PERFORM FROM openmettle.runs r WHERE r.id=v_run FOR SHARE;
     PERFORM FROM openmettle.gateway_requests q WHERE q.id=p_request
         AND q.bearer_hash=p_bearer_hash AND q.state='handed_off'
         AND pg_has_role(session_user,'openmettle_gateway','USAGE') FOR NO KEY UPDATE;
