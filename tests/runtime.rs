@@ -2282,6 +2282,31 @@ fn gateway_serves_probes_and_its_route_and_stops_on_a_signal() {
                 .contains("www-authenticate: bearer\r\n")
         );
     }
+    // A `Connection` field that cannot be parsed could hide a hop-by-hop nomination of the
+    // credential. The request is refused before the credential or the database is consulted.
+    let mut malformed = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: {id}\r\n\
+         Authorization: Bearer {secret}\r\nContent-Length: 2\r\nConnection: close, Authorization"
+    )
+    .into_bytes();
+    malformed.extend_from_slice(b"\xff\r\n\r\n{}");
+    let mut stream = TcpStream::connect(&bind).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    stream.write_all(&malformed).unwrap();
+    // The server cannot read `close` from this field, so it keeps the connection open: read
+    // up to the end of the problem document, not to the end of the stream.
+    let (mut raw, mut chunk) = (Vec::new(), [0; 4096]);
+    while !raw.ends_with(b"}") {
+        match stream.read(&mut chunk) {
+            Ok(n @ 1..) => raw.extend_from_slice(&chunk[..n]),
+            _ => break,
+        }
+    }
+    let reply = String::from_utf8_lossy(&raw);
+    assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
+    assert!(reply.contains("\"code\":\"validation\""));
     // A well-formed credential reaches the database, which is unavailable: the dispatch is
     // unconfirmed and nothing is forwarded.
     let reply = send(

@@ -1019,13 +1019,14 @@ mod live_turns {
     /// Records the dispatch of round `id` as the proxy would, with the bearer the worker sent:
     /// settlement accepts a report for a request without a binding only after its dispatch.
     async fn spend_dispatch(gateway: &sqlx::PgPool, id: &str, bearer: &str) {
-        let replayed: bool =
-            sqlx::query_scalar("SELECT replayed FROM openmettle.gateway_dispatch($1::uuid,$2)")
-                .bind(id)
-                .bind(dispatch_secret(bearer).expect("a dispatch secret"))
-                .fetch_one(gateway)
-                .await
-                .unwrap();
+        let replayed: bool = sqlx::query_scalar(
+            "SELECT replayed FROM openmettle.gateway_dispatch($1::uuid,sha256($2))",
+        )
+        .bind(id)
+        .bind(dispatch_secret(bearer).expect("a dispatch secret"))
+        .fetch_one(gateway)
+        .await
+        .unwrap();
         assert!(!replayed);
     }
 

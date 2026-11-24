@@ -618,6 +618,8 @@ struct FaultyPostgres {
     attempts: Arc<AtomicUsize>,
     /// Held-back replies delivered after a [`Fault::Delay`].
     late: Arc<AtomicUsize>,
+    /// Every byte the gateway sent towards PostgreSQL.
+    sent: Arc<Mutex<Vec<u8>>>,
     release: Arc<Notify>,
 }
 
@@ -629,6 +631,7 @@ impl FaultyPostgres {
         let server = format!("{}:{}", admin.get_host(), admin.get_port());
         let attempts = Arc::new(AtomicUsize::new(0));
         let late = Arc::new(AtomicUsize::new(0));
+        let sent = Arc::new(Mutex::new(Vec::new()));
         let release = Arc::new(Notify::new());
         let faults = Faults {
             trigger,
@@ -636,6 +639,7 @@ impl FaultyPostgres {
             fault,
             attempts: attempts.clone(),
             late: late.clone(),
+            sent: sent.clone(),
             release: release.clone(),
         };
         tokio::spawn(async move {
@@ -648,6 +652,7 @@ impl FaultyPostgres {
             address,
             attempts,
             late,
+            sent,
             release,
         }
     }
@@ -665,6 +670,7 @@ struct Faults {
     fault: Fault,
     attempts: Arc<AtomicUsize>,
     late: Arc<AtomicUsize>,
+    sent: Arc<Mutex<Vec<u8>>>,
     release: Arc<Notify>,
 }
 
@@ -695,6 +701,7 @@ async fn forward(client: tokio::net::TcpStream, server: tokio::net::TcpStream, f
         let mut buffer = [0; 8192];
         let mut seen = Vec::new();
         while let Ok(n @ 1..) = client_read.read(&mut buffer).await {
+            faults.sent.lock().unwrap().extend_from_slice(&buffer[..n]);
             seen.extend_from_slice(&buffer[..n]);
             if seen
                 .windows(faults.trigger.len())
@@ -1251,6 +1258,21 @@ async fn refuses_unusable_requests_before_spending_or_forwarding_anything() {
         let reply = h.raw(&request).await;
         assert_eq!(refusal(&reply), (status, code.to_owned(), None), "{head}");
     }
+    // A `Connection` value that cannot be read could hide a nomination of the credential: the
+    // request is refused whatever it names. The readable value lets the server close.
+    let mut hidden = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: gateway.test\r\n\
+         Content-Type: application/json\r\nX-Request-Id: {handed_off}\r\n\
+         Authorization: Bearer {}\r\nContent-Length: {}\r\nConnection: close\r\n\
+         Connection: Authorization",
+        bearer(&handed_off),
+        body.len()
+    )
+    .into_bytes();
+    hidden.extend_from_slice(b"\xff\r\n\r\n");
+    hidden.extend_from_slice(&body);
+    let reply = h.raw(&hidden).await;
+    assert_eq!(refusal(&reply), (400, "validation".to_owned(), None));
     assert_eq!(h.upstream.count(), 0, "nothing was forwarded");
     assert!(!h.fixture.dispatched(&handed_off).await);
     // None of these refusals spent the dispatch.
@@ -1965,4 +1987,89 @@ async fn an_unanswered_dispatch_is_not_forwarded_and_is_logged() {
     let (fixture, _, events) = h.stop().await;
     assert_eq!(fixture.reports(&id).await.len(), 1);
     assert_eq!(events, [unrecorded(&id, "dispatch_unconfirmed")]);
+}
+
+/// Text of the statement that makes a transaction durable.
+const COMMIT: &[u8] = b"COMMIT\0";
+
+/// A dispatch whose commit reached the database, but whose acknowledgement came after the
+/// proxy stopped waiting, is spent: the caller gets 503, nothing is forwarded, a retry is a
+/// replay, and the request is logged once because nobody saw it succeed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_dispatch_committed_but_unacknowledged_is_spent_and_logged() {
+    let fixture = Fixture::new().await;
+    // The proxy waits two seconds for the dispatch (five `DB_TIMEOUT_MS`); the reply to its
+    // `COMMIT` is held back for three.
+    let postgres = FaultyPostgres::start(COMMIT, 0, Fault::Delay(Duration::from_secs(3))).await;
+    let url = format!(
+        "postgres://{}:{PASSWORD}@{}/{}?sslmode=disable",
+        pg::GATEWAY,
+        postgres.address,
+        fixture.db.0
+    );
+    let settings = [("DATABASE_URL", url), ("DB_TIMEOUT_MS", "400".to_owned())];
+    let h = Harness::launch(fixture, StandIn::start().await, &settings).await;
+    let id = h.fixture.request(false).await;
+    let body = recorded::file("02-chat-plain", "request.json");
+    let reply = h.send(Some(&id), &body, "", Then::Read).await;
+    assert_eq!(refusal(&reply), (503, "unavailable".to_owned(), None));
+    assert_eq!(h.upstream.count(), 0);
+    // The commit itself was not delayed, only its acknowledgement.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !h.fixture.dispatched(&id).await {
+        assert!(Instant::now() < deadline, "the dispatch never committed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let reply = h.send(Some(&id), &body, "", Then::Read).await;
+    assert_eq!(refusal(&reply), (409, "conflict".to_owned(), None));
+    assert_eq!(h.upstream.count(), 0);
+    let late = &postgres.late;
+    eventually(
+        Duration::from_secs(10),
+        "the late acknowledgement never came",
+        || late.load(Ordering::SeqCst) > 0,
+    )
+    .await;
+    let (fixture, _, events) = h.stop().await;
+    assert_eq!(fixture.reports(&id).await, []);
+    assert_eq!(events, [unrecorded(&id, "dispatch_unconfirmed")]);
+}
+
+/// The proxy sends PostgreSQL the SHA-256 of the dispatch secret and never the secret: a server
+/// that logs statement parameters then records nothing a caller could present. Every byte the
+/// gateway sends to the database is recorded here, with nothing faulted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn the_dispatch_secret_never_reaches_the_database() {
+    let fixture = Fixture::new().await;
+    let postgres = FaultyPostgres::start(DISPATCH, usize::MAX, Fault::Silence).await;
+    let url = format!(
+        "postgres://{}:{PASSWORD}@{}/{}?sslmode=disable",
+        pg::GATEWAY,
+        postgres.address,
+        fixture.db.0
+    );
+    let h = Harness::launch(fixture, StandIn::start().await, &[("DATABASE_URL", url)]).await;
+    let id = h.fixture.request(false).await;
+    assert_eq!(h.send_case("02-chat-plain", &id).await.status, 200);
+    let (fixture, _, events) = h.stop().await;
+    assert_eq!(fixture.reports(&id).await.len(), 1);
+    assert_eq!(events, []);
+    let sent = postgres.sent.lock().unwrap().clone();
+    let carried = |needle: &[u8]| sent.windows(needle.len()).any(|w| w == needle);
+    // The call that spent the dispatch went through this connection and carried the hash.
+    assert!(carried(DISPATCH));
+    assert!(carried(&Sha256::digest(secret(&id))));
+    let hex: String = secret(&id).iter().map(|b| format!("{b:02x}")).collect();
+    for (form, spelled) in [
+        ("raw", secret(&id).to_vec()),
+        ("hexadecimal", hex.into_bytes()),
+        ("base64url", bearer(&id).into_bytes()),
+    ] {
+        assert!(
+            !carried(&spelled),
+            "the secret reached the database, {form}"
+        );
+    }
 }

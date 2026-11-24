@@ -27,18 +27,26 @@ policy is provisioned for it.
   500) and `/v1/models`. `/healthz` and `/readyz` behave as in the API and the worker.
 - **Correlation.** The caller sends exactly one `x-request-id` holding the canonical lowercase
   UUID of a gateway request; an ID the caller names in `Connection` counts as absent. A
-  missing or malformed ID is refused with `400 validation`. Refusals use the application
-  API's problem document (`application/problem+json`).
+  missing or malformed ID is refused with `400 validation`. So is a request with a
+  `Connection` value that is not visible ASCII, before the ID or the credential is looked at:
+  such a value could hide a nomination. Refusals use the application API's problem document
+  (`application/problem+json`).
 - **Authentication.** The caller sends exactly one `Authorization: Bearer` header holding the
   request's 32-byte dispatch secret as 43 unpadded base64url characters. Only the worker that
   reserved the round holds that secret. A missing, repeated or malformed header, one named in
-  `Connection`, a wrong secret, an unknown request, a request not handed off, and a request
-  whose run is no longer running or is cancelled are all refused alike with
-  `401 unauthenticated` and `WWW-Authenticate: Bearer`. Nothing is sent upstream, and the
-  answer does not reveal whether the request exists.
+  `Connection`, a wrong secret, an unknown request and a request not handed off are all
+  refused alike with `401 unauthenticated` and `WWW-Authenticate: Bearer`. So is a request
+  that was not dispatched yet and whose run is cancelled, finished, or past its lease or its
+  execution deadline. Nothing is sent upstream, and the answer does not reveal whether the
+  request exists.
 - **Single dispatch.** The database records the request's one dispatch before the body is
-  read. A second dispatch with the right secret is refused with `409 conflict`. Of two
-  concurrent dispatches exactly one is forwarded.
+  read. A second dispatch with the right secret is refused with `409 conflict`, also after
+  the run was cancelled or has finished. Of two concurrent dispatches exactly one is
+  forwarded.
+- **The secret stays in the proxy.** The proxy sends PostgreSQL the SHA-256 of the secret,
+  which is what the request row stores, and never the secret. A server that logs statement
+  parameters therefore records nothing a caller could present, and no logging setting is
+  required for the gateway's login.
 - **Routing fields.** The installation, scope, report source, principal and model of the
   report come from the stored request; nothing else is taken from the caller. The report
   source is the request's installation, and the principal is the user the request acts for.
@@ -107,8 +115,9 @@ The report identity is derived from the request, so a retried write stores the s
 
 ### When nothing is recorded
 
-A request is dispatched once, so every case below spends the request: it cannot be sent
-again. Nothing is written, the hold stays in place until increment 3 reconciles it, and one
+A request is dispatched once. Every case below except `dispatch_unconfirmed` has spent the
+request: it cannot be sent again. `dispatch_unconfirmed` may or may not have. Nothing is
+written, the hold stays in place until increment 3 reconciles it, and one
 `gateway.usage.unrecorded` event (warn) names the gateway request and the reason
 (`error.type`):
 

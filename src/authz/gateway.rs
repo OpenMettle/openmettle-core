@@ -889,18 +889,23 @@ pub(crate) enum Consumed {
 /// Spend the one dispatch of a handed-off request for the caller holding its dispatch secret
 /// (`openmettle.gateway_dispatch`), as an `openmettle_gateway` login. It returns `Ok` only after
 /// the commit, so nothing is forwarded on a consume that did not become durable.
+///
+/// Only the SHA-256 of the secret is sent, which is what the request row already stores. The
+/// secret itself never crosses the database connection, so a server that logs statement
+/// parameters records nothing a caller could present.
 pub(crate) async fn consume(
     pool: &PgPool,
     request: &str,
     secret: &[u8; 32],
 ) -> Result<Consumed, Error> {
+    let hash = Sha256::digest(secret);
     let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
     let row = sqlx::query(
         "SELECT replayed,installation,scope,source,principal,model \
          FROM openmettle.gateway_dispatch($1::uuid,$2)",
     )
     .bind(request)
-    .bind(secret.as_slice())
+    .bind(hash.as_slice())
     .fetch_optional(tx.connection()?)
     .await?;
     let consumed = match row {

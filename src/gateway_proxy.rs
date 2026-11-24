@@ -91,6 +91,11 @@ const CORRELATION: Problem = problem(
     "validation",
     "The request needs one x-request-id header holding a canonical lowercase UUID.",
 );
+const CONNECTION: Problem = problem(
+    StatusCode::BAD_REQUEST,
+    "validation",
+    "The Connection header could not be read.",
+);
 const UNAUTHENTICATED: Problem = problem(
     StatusCode::UNAUTHORIZED,
     "unauthenticated",
@@ -235,7 +240,16 @@ fn origin(url: &str) -> Result<Authority, &'static str> {
     }
 }
 
-/// The values of `name`, unless the message's `Connection` field names it as hop-by-hop.
+/// Whether every `Connection` value is visible ASCII, so its nominations can all be read.
+fn connection_readable(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .all(|value| value.to_str().is_ok())
+}
+
+/// The values of `name`, unless the message's `Connection` field names it as hop-by-hop. The
+/// caller's request is first checked with [`connection_readable`].
 fn end_to_end<'h>(
     headers: &'h HeaderMap,
     name: &HeaderName,
@@ -393,6 +407,11 @@ impl Proxy {
         // complete to the caller.
         if parts.version != Version::HTTP_11 {
             return Err(VERSION);
+        }
+        // An unreadable `Connection` value could name `Authorization` or the request ID as
+        // hop-by-hop without `end_to_end` seeing it. Refuse before either is looked at.
+        if !connection_readable(&parts.headers) {
+            return Err(CONNECTION);
         }
         let id = correlation(&parts.headers)?;
         let secret = credential(&parts.headers)?;
@@ -956,6 +975,18 @@ mod tests {
             headers.insert(header::AUTHORIZATION, other.parse().unwrap());
             assert_eq!(credential(&headers), Err(UNAUTHENTICATED), "{other}");
         }
+    }
+
+    #[test]
+    fn a_connection_field_that_cannot_be_read_is_not_trusted() {
+        let mut headers = HeaderMap::new();
+        assert!(connection_readable(&headers));
+        headers.insert(header::CONNECTION, "close, Authorization".parse().unwrap());
+        assert!(connection_readable(&headers));
+        // One readable value does not excuse an unreadable one.
+        let hidden = HeaderValue::from_bytes(b"Authorization\xff").unwrap();
+        headers.append(header::CONNECTION, hidden);
+        assert!(!connection_readable(&headers));
     }
 
     #[test]
