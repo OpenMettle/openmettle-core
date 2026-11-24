@@ -758,11 +758,13 @@ $$;
 
 -- Owner-only administrative reconciliation for a pre-34 unbound request whose `usage_cost_micros`
 -- hold was closed at `0` without caller-supplied `cost` (e.g. by a schema-33 `unreported` sweep,
--- with or without a pre-upgrade token-only correction). Verifies `openmettle_owner`, valid
--- positive pricing, snapshot agreement when pinned, exact match against the request's
--- `usage_cost_micros` reservation ceiling, zero settled cost, and absence of any caller-priced
--- report (`cost` or `unit`), then stamps `(cost_fixed_micros, cost_micros_per_token)` and
--- reconciles any already-accepted token-only usage against the cost hold and budgets.
+-- or a schema-31 `incomplete` closure with consumed or unconsumed later token-only revisions).
+-- Locks `runs`, `gateway_requests`, and all bound `quota_reservations` (`ORDER BY resource_kind,
+-- id FOR NO KEY UPDATE`) before touching `quota_budgets`, verifies `openmettle_owner`, valid
+-- positive pricing, snapshot agreement when pinned, exact ceiling match, zero settled cost, and
+-- absence of caller-priced (`cost`/`unit`) reports, stamps `(cost_fixed_micros,
+-- cost_micros_per_token)`, and reconciles through the latest accepted revision in
+-- `quota_accepted_gateway_reports`.
 CREATE FUNCTION openmettle.gateway_backfill_legacy_request_cost_bound(
     p_request uuid,
     p_cost_fixed_micros bigint,
@@ -777,6 +779,9 @@ DECLARE
     h openmettle.quota_reservations%ROWTYPE;
     v_cfg_txt text;
     v_snap record;
+    v_latest_rev bigint;
+    v_latest_source uuid;
+    v_latest_report uuid;
     f record;
     v_source_key text;
 BEGIN
@@ -827,6 +832,11 @@ BEGIN
                 USING ERRCODE = '23514';
         END IF;
     END IF;
+    PERFORM FROM openmettle.quota_reservations qr
+      WHERE qr.gateway_request_id = q.id
+        AND qr.state IN ('handoff_committed', 'settled')
+      ORDER BY qr.resource_kind, qr.id
+        FOR NO KEY UPDATE;
     SELECT * INTO h
       FROM openmettle.quota_reservations qr
      WHERE qr.gateway_request_id = q.id
@@ -835,8 +845,7 @@ BEGIN
        AND qr.settled_units = 0
        AND qr.held_units = 0
        AND qr.reserved_units::numeric
-           = q.units::numeric * p_cost_micros_per_token + p_cost_fixed_micros
-       FOR NO KEY UPDATE;
+           = q.units::numeric * p_cost_micros_per_token + p_cost_fixed_micros;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'legacy request cost hold does not match backfill cost_bound'
             USING ERRCODE = '23514';
@@ -855,46 +864,79 @@ BEGIN
        SET cost_fixed_micros = p_cost_fixed_micros,
            cost_micros_per_token = p_cost_micros_per_token
      WHERE qr.id = q.id;
-    IF h.accepted_source_revision IS NOT NULL THEN
-        SELECT * INTO f
-          FROM openmettle.quota_gateway_fold(
-                   q.id,
-                   'usage_cost_micros',
-                   h.reserved_units,
-                   h.accepted_source_revision
-               )
-         ORDER BY rev DESC LIMIT 1;
-        IF FOUND THEN
-            IF f.state IS DISTINCT FROM 'settled' OR f.held <> 0 THEN
-                RAISE EXCEPTION 'legacy request accepted history does not close its cost hold'
+
+    SELECT a.revision, g.source, g.report_id
+      INTO v_latest_rev, v_latest_source, v_latest_report
+      FROM openmettle.quota_accepted_gateway_reports a
+      JOIN openmettle.gateway_usage_reports g USING (request_id, revision, final)
+     WHERE a.request_id = q.id
+     ORDER BY a.revision DESC
+     LIMIT 1;
+    IF FOUND THEN
+        IF h.accepted_source_revision IS NOT NULL THEN
+            IF h.accepted_source_revision > v_latest_rev THEN
+                RAISE EXCEPTION 'legacy request cost hold revision exceeds accepted history'
                     USING ERRCODE = '23514';
             END IF;
-            IF f.settled <> 0 THEN
-                PERFORM openmettle.quota_adjust(h.id, f.settled, 0);
-                h.revision := h.revision + 1;
-                v_source_key := CASE
-                    WHEN EXISTS (
-                        SELECT 1
-                          FROM openmettle.quota_reconciliations rec
-                         WHERE rec.reservation_id = h.id
-                           AND rec.source_key = 'gateway:' || f.rev
-                    ) THEN 'backfill:' || f.rev
-                    ELSE 'gateway:' || f.rev
-                END;
-                INSERT INTO openmettle.quota_reconciliations (
-                    reservation_id, transition_revision, source_key,
-                    gateway_request_id, gateway_report_source, gateway_report_id,
-                    source_revision, kind, cumulative_units, delta_active, delta_reserved
-                ) VALUES (
-                    h.id, h.revision, v_source_key,
-                    q.id, f.source, f.report,
-                    f.rev, 'final_correction', f.settled, f.settled, 0
-                );
-                UPDATE openmettle.quota_reservations
-                   SET settled_units = f.settled,
-                       revision = h.revision
-                 WHERE id = h.id;
+            SELECT * INTO f
+              FROM openmettle.quota_gateway_fold(
+                       q.id,
+                       'usage_cost_micros',
+                       h.reserved_units,
+                       h.accepted_source_revision
+                   )
+             ORDER BY rev DESC LIMIT 1;
+            IF FOUND THEN
+                IF f.state IS DISTINCT FROM 'settled' OR f.held <> 0 THEN
+                    RAISE EXCEPTION 'legacy request accepted history does not close its cost hold'
+                        USING ERRCODE = '23514';
+                END IF;
+                IF f.settled <> 0 THEN
+                    PERFORM openmettle.quota_adjust(h.id, f.settled, 0);
+                    h.revision := h.revision + 1;
+                    v_source_key := CASE
+                        WHEN EXISTS (
+                            SELECT 1
+                              FROM openmettle.quota_reconciliations rec
+                             WHERE rec.reservation_id = h.id
+                               AND rec.source_key = 'gateway:' || f.rev
+                        ) THEN 'backfill:' || f.rev
+                        ELSE 'gateway:' || f.rev
+                    END;
+                    INSERT INTO openmettle.quota_reconciliations (
+                        reservation_id, transition_revision, source_key,
+                        gateway_request_id, gateway_report_source, gateway_report_id,
+                        source_revision, kind, cumulative_units, delta_active, delta_reserved
+                    ) VALUES (
+                        h.id, h.revision, v_source_key,
+                        q.id, f.source, f.report,
+                        f.rev, 'final_correction', f.settled, f.settled, 0
+                    );
+                    UPDATE openmettle.quota_reservations
+                       SET settled_units = f.settled,
+                           revision = h.revision
+                     WHERE id = h.id;
+                END IF;
             END IF;
+        END IF;
+
+        PERFORM openmettle.quota_settle_gateway_usage(
+            q.id,
+            v_latest_source,
+            v_latest_report,
+            v_latest_rev
+        );
+
+        IF EXISTS (
+            SELECT 1
+              FROM openmettle.quota_reservations qr
+             WHERE qr.gateway_request_id = q.id
+               AND (qr.state <> 'settled'
+                    OR qr.held_units <> 0
+                    OR qr.accepted_source_revision IS DISTINCT FROM v_latest_rev)
+        ) THEN
+            RAISE EXCEPTION 'legacy request accepted history does not close its holds'
+                USING ERRCODE = '23514';
         END IF;
     END IF;
 END;

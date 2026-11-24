@@ -5772,3 +5772,339 @@ async fn review_2_p2_snapshot_cost_bound_rejects_exponent_and_negative_zero_toke
         );
     }
 }
+
+/// Review #3 P2: on schema 31 an `incomplete` report at rev 1 could close both holds (`settled` at
+/// `0`, `accepted_source_revision = 1`) and a direct SQL writer could then commit rev 2 (`30`
+/// tokens) into `gateway_usage_reports` + `gateway_settlements` without calling
+/// `quota_settle_gateway_usage` (leaving `max(quota_accepted_gateway_reports.revision) = 2` while
+/// both holds stay at `accepted_source_revision = 1`). After upgrading through 33 to 34,
+/// `gateway_backfill_legacy_request_cost_bound` must reconcile through the latest accepted revision
+/// (`2`) in canonical hold-before-budget lock order, charging `80` micros and `30` tokens with zero
+/// pending reconciliations and zero accounting drift.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn review_3_p2_backfill_reconciles_unconsumed_schema_31_accepted_revisions() {
+    use openmettle_core::{
+        authz::gateway::{self, TurnRound},
+        model_config::CostBound,
+    };
+    use sqlx::Connection;
+
+    let mut f = Rounds::at(31).await;
+    enable_cost_metering_defaults(&mut f.owner, 1_000_000).await;
+    let worker_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(f.db.1.options(WORKER));
+    let gw_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(f.db.1.options(pg::GATEWAY));
+    let cb = CostBound {
+        fixed_micros: 50,
+        micros_per_token: 1,
+    };
+    let (run_id, claim) = admit_and_claim_priced(&mut f, 100, Some(cb), 1, true).await;
+    let pending = gateway::reserve_turn_round(
+        &worker_pool,
+        TurnRound {
+            scope_id: &f.scope,
+            actor: &f.actor.user,
+            approval: &f.actor.approval,
+            run_id: &run_id,
+            round: 1,
+            claim_token: &claim,
+            installation: INSTALL,
+            model: "a",
+            round_tokens: 100,
+            round_cost: Some(150),
+            cost_bound: Some(cb),
+            requires_device_slot: false,
+        },
+    )
+    .await
+    .unwrap();
+    let secret = [0xc1_u8; 32];
+    let bearer = [0xc2_u8; 32];
+    sqlx::query(
+        "UPDATE openmettle.gateway_requests SET dispatch_hash = sha256($2) WHERE id = $1::uuid",
+    )
+    .bind(&pending.id)
+    .bind(secret.as_slice())
+    .execute(&mut f.owner)
+    .await
+    .unwrap();
+    {
+        let mut w = connect(&f.db.0, WORKER).await;
+        let mut tx = w.begin().await.unwrap();
+        sqlx::query(
+            "SELECT openmettle.quota_lock_turn_handoff_prefix($1::uuid,$2,$3::uuid,$4::uuid,$5::uuid)",
+        )
+        .bind(&pending.id)
+        .bind(secret.as_slice())
+        .bind(&f.scope)
+        .bind(&run_id)
+        .bind(&claim)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        assert!(
+            sqlx::query_scalar::<_, bool>(HANDOFF)
+                .bind(&pending.id)
+                .bind(secret.as_slice())
+                .bind(&claim)
+                .bind(bearer.as_slice())
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap()
+        );
+        sqlx::query(
+            "SELECT openmettle.quota_commit_turn_handoff($1::uuid,$2,$3::uuid,$4::uuid,$5::uuid,false,NULL,false)",
+        )
+        .bind(&pending.id)
+        .bind(secret.as_slice())
+        .bind(&f.scope)
+        .bind(&run_id)
+        .bind(&claim)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(CONFIRM)
+            .bind(&pending.id)
+            .bind(secret.as_slice())
+            .bind(&claim)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let mut gw = connect(&f.db.0, pg::GATEWAY).await;
+    sqlx::query("SELECT FROM openmettle.gateway_dispatch($1::uuid, sha256($2))")
+        .bind(&pending.id)
+        .bind(bearer.as_slice())
+        .execute(&mut gw)
+        .await
+        .unwrap();
+    let rev1 = UsageReport {
+        request: pending.id.clone(),
+        installation: INSTALL.into(),
+        principal: f.actor.user.clone(),
+        scope: f.scope.clone(),
+        source: INSTALL.into(),
+        report_id: pending.id.clone(),
+        revision: 1,
+        r#final: true,
+        prompt_tokens: None,
+        completion_tokens: None,
+        reasoning_tokens: None,
+        reasoning_included: None,
+        cost: None,
+        unit: None,
+    };
+    assert_eq!(
+        settlement::ingest_incomplete(&gw_pool, &rev1, "no_usage").await,
+        Ok(Outcome::Applied)
+    );
+
+    // On schema 31, commit an accepted rev-2 token report without calling
+    // `quota_settle_gateway_usage` (leaving both holds at `accepted_source_revision = 1`), and also
+    // seed a second schema-31 request where rev 1 (`incomplete`) + rev 2 (`15` tokens) WERE
+    // consumed (`accepted_source_revision = 2`) and rev 3 (`30` tokens) was accepted without
+    // calling `quota_settle_gateway_usage` (verifying consumed + unconsumed revisions compose
+    // without undercharging or double-charging).
+    let (run_b, claim_b) = admit_and_claim_priced(&mut f, 100, Some(cb), 1, true).await;
+    let pending_b = gateway::reserve_turn_round(
+        &worker_pool,
+        TurnRound {
+            scope_id: &f.scope,
+            actor: &f.actor.user,
+            approval: &f.actor.approval,
+            run_id: &run_b,
+            round: 1,
+            claim_token: &claim_b,
+            installation: INSTALL,
+            model: "a",
+            round_tokens: 100,
+            round_cost: Some(150),
+            cost_bound: Some(cb),
+            requires_device_slot: false,
+        },
+    )
+    .await
+    .unwrap();
+    let secret_b = [0xc3_u8; 32];
+    let bearer_b = [0xc4_u8; 32];
+    sqlx::query(
+        "UPDATE openmettle.gateway_requests SET dispatch_hash = sha256($2) WHERE id = $1::uuid",
+    )
+    .bind(&pending_b.id)
+    .bind(secret_b.as_slice())
+    .execute(&mut f.owner)
+    .await
+    .unwrap();
+    {
+        let mut w = connect(&f.db.0, WORKER).await;
+        let mut tx = w.begin().await.unwrap();
+        sqlx::query(
+            "SELECT openmettle.quota_lock_turn_handoff_prefix($1::uuid,$2,$3::uuid,$4::uuid,$5::uuid)",
+        )
+        .bind(&pending_b.id)
+        .bind(secret_b.as_slice())
+        .bind(&f.scope)
+        .bind(&run_b)
+        .bind(&claim_b)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        assert!(
+            sqlx::query_scalar::<_, bool>(HANDOFF)
+                .bind(&pending_b.id)
+                .bind(secret_b.as_slice())
+                .bind(&claim_b)
+                .bind(bearer_b.as_slice())
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap()
+        );
+        sqlx::query(
+            "SELECT openmettle.quota_commit_turn_handoff($1::uuid,$2,$3::uuid,$4::uuid,$5::uuid,false,NULL,false)",
+        )
+        .bind(&pending_b.id)
+        .bind(secret_b.as_slice())
+        .bind(&f.scope)
+        .bind(&run_b)
+        .bind(&claim_b)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(CONFIRM)
+            .bind(&pending_b.id)
+            .bind(secret_b.as_slice())
+            .bind(&claim_b)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    sqlx::query("SELECT FROM openmettle.gateway_dispatch($1::uuid, sha256($2))")
+        .bind(&pending_b.id)
+        .bind(bearer_b.as_slice())
+        .execute(&mut gw)
+        .await
+        .unwrap();
+    let rev1_b = UsageReport {
+        request: pending_b.id.clone(),
+        report_id: pending_b.id.clone(),
+        ..rev1.clone()
+    };
+    assert_eq!(
+        settlement::ingest_incomplete(&gw_pool, &rev1_b, "no_usage").await,
+        Ok(Outcome::Applied)
+    );
+    assert_eq!(
+        settlement::ingest(
+            &gw_pool,
+            &UsageReport {
+                revision: 2,
+                prompt_tokens: Some(10),
+                completion_tokens: Some(5),
+                ..rev1_b.clone()
+            },
+        )
+        .await,
+        Ok(Outcome::Applied)
+    );
+    {
+        let mut tx = gw.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens)
+             VALUES ($1::uuid,$2::uuid,$1::uuid,2,true,20,10),
+                    ($3::uuid,$2::uuid,$3::uuid,3,true,20,10)",
+        )
+        .bind(&pending.id)
+        .bind(INSTALL)
+        .bind(&pending_b.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.gateway_settlements
+                SET revision = 2, final = true, measured = 30, outstanding = 0
+              WHERE request_id = $1::uuid",
+        )
+        .bind(&pending.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.gateway_settlements
+                SET revision = 3, final = true, measured = 30, outstanding = 0
+              WHERE request_id = $1::uuid",
+        )
+        .bind(&pending_b.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let settings = f.db.settings(Duration::from_secs(10));
+    migrate::apply(&settings, &MIGRATIONS[..33]).await.unwrap();
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+
+    // Snapshot-mismatched pricing is refused because `runs.config_snapshot` pinned (50, 1).
+    assert_eq!(
+        sqlstate(
+            sqlx::query(
+                "SELECT openmettle.gateway_backfill_legacy_request_cost_bound($1::uuid, 150, 0)"
+            )
+            .bind(&pending.id)
+            .execute(&mut f.owner)
+            .await
+        ),
+        "23514"
+    );
+
+    // Backfill with (50, 1) must reconcile BOTH requests' holds through their latest accepted
+    // revisions (rev 2 on `pending`, rev 3 on `pending_b`: 80 micros + 30 tokens each, 0 pending
+    // reconciliations, 0 drift).
+    for (req_id, expected_rev) in [(&pending.id, 2_i64), (&pending_b.id, 3_i64)] {
+        sqlx::query(
+            "SELECT openmettle.gateway_backfill_legacy_request_cost_bound($1::uuid, 50, 1)",
+        )
+        .bind(req_id)
+        .execute(&mut f.owner)
+        .await
+        .unwrap();
+        let cost_hold: (String, i64, String) = sqlx::query_as(
+            "SELECT settled_units::text, accepted_source_revision, state
+               FROM openmettle.quota_reservations
+              WHERE gateway_request_id = $1::uuid AND resource_kind = 'usage_cost_micros'",
+        )
+        .bind(req_id)
+        .fetch_one(&mut f.owner)
+        .await
+        .unwrap();
+        assert_eq!(cost_hold, ("80".into(), expected_rev, "settled".into()));
+        let tok_hold: (String, i64, String) = sqlx::query_as(
+            "SELECT settled_units::text, accepted_source_revision, state
+               FROM openmettle.quota_reservations
+              WHERE gateway_request_id = $1::uuid AND resource_kind = 'usage_tokens'",
+        )
+        .bind(req_id)
+        .fetch_one(&mut f.owner)
+        .await
+        .unwrap();
+        assert_eq!(tok_hold, ("30".into(), expected_rev, "settled".into()));
+    }
+
+    let mut worker_c = connect(&f.db.0, WORKER).await;
+    let drift: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT storage_mismatches, budget_mismatches, settlement_mismatches,
+                pending_gateway_reconciliations
+           FROM openmettle.quota_verify_accounting_drift()",
+    )
+    .fetch_one(&mut worker_c)
+    .await
+    .unwrap();
+    assert_eq!(drift, (0, 0, 0, 0));
+}
