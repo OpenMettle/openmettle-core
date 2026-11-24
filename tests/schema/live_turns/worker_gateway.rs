@@ -38,13 +38,26 @@ async fn queued() -> (Chat, String, String) {
     (chat, run, input)
 }
 
-/// A port on `ip` that nothing listens on when this returns.
+/// A port on `ip` that nothing listens on when this returns, for the gateway to bind.
 fn free_port(ip: IpAddr) -> u16 {
     std::net::TcpListener::bind((ip, 0))
         .unwrap()
         .local_addr()
         .unwrap()
         .port()
+}
+
+/// A port on `ip` held by the returned socket, bound but never listening: while it lives, a
+/// connection to the port is refused and nothing else can bind it.
+fn reserved_port(ip: IpAddr) -> (tokio::net::TcpSocket, u16) {
+    let socket = match ip {
+        IpAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
+        IpAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
+    }
+    .unwrap();
+    socket.bind(SocketAddr::new(ip, 0)).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    (socket, port)
 }
 
 /// Terminates TLS for `host` on `ip` and relays each connection's bytes to `backend` and back:
@@ -96,18 +109,28 @@ fn start_worker(
     launch_packaged(&chat.f.db, dir, &document, &[])
 }
 
-/// Stops the gateway with SIGTERM and returns every `gateway.usage.*` event as (event, request
-/// ID, reason).
-fn stop_gateway(
-    gateway: Process,
+/// Stops the gateway with SIGTERM, which drains running relays and their report writes, and
+/// returns every `gateway.usage.*` event as (event, request ID, reason). The wait is bounded
+/// like the worker's [`exited`]: past the deadline the panic drops the guard, which kills and
+/// reaps the gateway, so a stuck gateway fails the case instead of hanging it.
+async fn stop_gateway(
+    mut gateway: Process,
     stderr: thread::JoinHandle<String>,
 ) -> Vec<(String, String, String)> {
-    let mut gateway = gateway;
     signal(&gateway.0, "-TERM");
-    let status = tokio::task::block_in_place(|| gateway.0.wait()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = gateway.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the gateway outlived its shutdown budget"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     assert!(status.success());
-    stderr
-        .join()
+    tokio::task::block_in_place(|| stderr.join())
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
@@ -207,6 +230,9 @@ async fn settles_through_the_gateway(transport: Transport, case: &'static str, c
         stream,
     );
     chat.done(&run, "succeeded", None).await;
+    // The gateway ends the worker's response before it writes the report, so stop it, which
+    // drains that write, before reading what it stored.
+    assert_eq!(stop_gateway(gateway, logs).await, []);
 
     // One round, handed off without a binding and dispatched once by the gateway.
     let (id, state, dispatched, bound) = round(&chat, &run).await;
@@ -276,7 +302,6 @@ async fn settles_through_the_gateway(transport: Transport, case: &'static str, c
 
     let (status, stderr) = terminate(packaged.process).await;
     assert!(status.success(), "{stderr}");
-    assert_eq!(stop_gateway(gateway, logs), []);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -314,6 +339,7 @@ async fn a_gateway_serving_another_model_refuses_the_round_and_keeps_its_hold() 
         false,
     );
     chat.done(&run, "failed", Some("step_failed")).await;
+    let events = stop_gateway(gateway, logs).await;
 
     let (id, state, dispatched, _) = round(&chat, &run).await;
     assert_eq!((state.as_str(), dispatched), ("handed_off", true));
@@ -328,7 +354,7 @@ async fn a_gateway_serving_another_model_refuses_the_round_and_keeps_its_hold() 
     let (status, stderr) = terminate(worker.process).await;
     assert!(status.success(), "{stderr}");
     assert_eq!(
-        stop_gateway(gateway, logs),
+        events,
         [(
             "gateway.usage.unrecorded".to_owned(),
             id,
@@ -337,15 +363,19 @@ async fn a_gateway_serving_another_model_refuses_the_round_and_keeps_its_hold() 
     );
 }
 
-/// With nothing listening at the gateway's address, the round was already handed off when the
-/// connection fails. The worker fails the turn without retrying it, and the request, never
+/// With nothing listening at the gateway's address, and its port held so that nothing else can
+/// take it, the round was already handed off when the connection fails. The worker fails the turn without retrying it, and the request, never
 /// dispatched, keeps its hold until increment 3.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 and TEST_GATEWAY_HOST"]
 async fn an_unreachable_gateway_fails_the_turn_and_keeps_the_handed_off_hold() {
     let (chat, run, _) = queued().await;
     let (host, ip) = gateway_host();
-    let port = free_port(ip);
+    let (_held, port) = reserved_port(ip);
+    assert!(
+        std::net::TcpListener::bind((ip, port)).is_err(),
+        "nothing else can take the gateway's port during the case"
+    );
     let dir = Dir::new();
     let worker = start_worker(
         &chat,
