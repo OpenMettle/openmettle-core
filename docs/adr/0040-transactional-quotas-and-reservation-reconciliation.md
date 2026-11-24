@@ -1532,6 +1532,13 @@ account_admin_lock -> run_dispatch_lock -> projects -> users -> runs -> branch_h
                         openmettle_owner holding zero other locks)
 ```
 
+Each `src/storage.rs` helper call locks one owner's `storage_accounts` row before
+`storage_instance`, so a transaction that composes helpers for several owners locks a later
+owner's account after the instance row, outside this order: it can deadlock (SQLSTATE 40P01) and
+must be retried whole as [ADR 0005](0005-artifact-storage-accounting.md) requires; no runtime path
+composes owners, and the schema test `cross_owner_deadlock_is_retried_as_a_whole_transaction`
+provokes that deadlock on purpose.
+
 | Path | Exact lock sequence |
 | --- | --- |
 | Run admission with usage/device hold (`openmettle_api`) | `projects` (if project, `FOR NO KEY UPDATE`) -> actor `users` (`FOR NO KEY UPDATE`) -> new `runs` row -> inside `quota_reserve(...)` (`SECURITY DEFINER`): upsert and `FOR NO KEY UPDATE` affected `quota_budgets` (scope rows asc, then instance row last) -> non-locking `SELECT` on `quota_overrides` and `quota_defaults` -> insert `quota_reservations` + `quota_reservation_charges` -> update `reserved_held` and evaluate `quota_warning_events`. |
