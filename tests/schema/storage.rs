@@ -536,6 +536,8 @@ async fn concurrent_owners_and_limit_reduction_never_oversubscribe() {
     assert_totals(&db).await;
 }
 
+// ADR 0005 composition: owner a's account and the instance, then owner b's account, against a
+// peer holding b's account. The server logs this intended deadlock as `deadlock detected`.
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn cross_owner_deadlock_is_retried_as_a_whole_transaction() {
