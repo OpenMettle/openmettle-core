@@ -1387,6 +1387,90 @@
       }
     },
     {
+      "id": "prometheus-test-image",
+      "name": "Prometheus v3.5.0 image (promtool alert checks and telemetry qualification)",
+      "kind": "container-image",
+      "review_group": "core",
+      "distribution": "not-distributed",
+      "version": "v3.5.0",
+      "pin": "sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996",
+      "origin": "docker.io/prom/prometheus",
+      "source_evidence": [
+        ".github/workflows/telemetry-qualification.yml",
+        "tests/telemetry_kind/qualify.py",
+        "tests/telemetry_kind/README.md",
+        "Docker Hub prom/prometheus tag v3.5.0 multi-arch index digest, resolved 2026-11-20 (tests/telemetry_kind/README.md) and re-confirmed read-only on 2026-11-24 from the registry Docker-Content-Digest",
+        "linux/amd64 manifest sha256:8672a850efe2f9874702406c8318704edb363587f8c2ca88586b4c8fdb5cea24: config labels name org.opencontainers.image.source https://github.com/prometheus/prometheus and carry no licence or revision label (read-only, 2026-11-24)"
+      ],
+      "licence": {
+        "expression": null,
+        "evidence": []
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "CI-only fixture for the V1-29 telemetry contract: promtool rule checks in a no-network container and the Prometheus server on an ephemeral kind cluster (tests/telemetry_kind); never shipped or part of any release. Recorded by an agent; no review performed. No image-wide licence is asserted. Prometheus itself is Apache-2.0 (prometheus/prometheus v3.5.0 LICENSE); its v3.5.0 NOTICE lists bundled third-party components."
+      },
+      "tracking": [
+        "V1-29",
+        "V1-42"
+      ],
+      "exclusion_reason": "CI or test tooling: never part of a distribution, and outside the 19 Nov 2026 boundary.",
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "No licence evidence is recorded in this register. The image's base layers and bundled packages are not reviewed."
+      }
+    },
+    {
+      "id": "grafana-alloy-test-image",
+      "name": "Grafana Alloy v1.10.0 image (telemetry qualification collector)",
+      "kind": "container-image",
+      "review_group": "core",
+      "distribution": "not-distributed",
+      "version": "v1.10.0",
+      "pin": "sha256:1bc130e909116a4bf950eb5187a346007d3b796f96832b529acb14a64e41230f",
+      "origin": "docker.io/grafana/alloy",
+      "source_evidence": [
+        "tests/telemetry_kind/qualify.py",
+        "tests/telemetry_kind/README.md",
+        ".github/workflows/telemetry-qualification.yml",
+        "Docker Hub grafana/alloy tag v1.10.0 multi-arch index digest, resolved 2026-11-20 (tests/telemetry_kind/README.md) and re-confirmed read-only on 2026-11-24 from the registry Docker-Content-Digest",
+        "linux/amd64 manifest sha256:c4028d72a89457075f6ab314be7eafb2d268ed2d12faa520a8df690cf4e1cbb5: config labels name org.opencontainers.image.source https://github.com/grafana/alloy and org.opencontainers.image.ref.name ubuntu, version 24.04, and carry no licence label (read-only, 2026-11-24)"
+      ],
+      "licence": {
+        "expression": null,
+        "evidence": []
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "CI-only OTLP collector fixture for the V1-29 telemetry contract on an ephemeral kind cluster (tests/telemetry_kind); never shipped or part of any release. Recorded by an agent; no review performed. The config labels indicate an Ubuntu 24.04 base whose packages carry individual licences; no image-wide licence is asserted. Grafana Alloy itself is Apache-2.0 (grafana/alloy v1.10.0 LICENSE); no NOTICE file was found at that tag."
+      },
+      "tracking": [
+        "V1-29",
+        "V1-42"
+      ],
+      "exclusion_reason": "CI or test tooling: never part of a distribution, and outside the 19 Nov 2026 boundary.",
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "No licence evidence is recorded in this register. The image's base layers and bundled packages are not reviewed."
+      }
+    },
+    {
       "id": "github-actions-cache",
       "name": "GitHub Actions cache (restore/save)",
       "kind": "tooling",
