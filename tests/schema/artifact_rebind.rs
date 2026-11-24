@@ -624,3 +624,85 @@ async fn rebind_never_empties_a_file_that_another_name_shares() {
     assert_eq!(fs::read(staging.join(&split)).unwrap(), b"split upload");
     assert_eq!(fs::read(revisions.join(&split)).unwrap(), b"split upload");
 }
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_worker_refuses_a_copied_volume_until_rebind_has_run() {
+    let f = Fixture::new().await;
+    retention_grace(&f.db, 0).await;
+    let live = f.stored("live", b"live payload").await;
+    let retained = f.stored("retained", b"retained payload").await;
+    f.retain(&retained).await;
+    let held = f.crashed("held", b"partial upload", false).await;
+    f.expire_reservations().await;
+    let dir = Dir::new();
+    let root = copy_tree("cp", &f.root, &dir).unwrap();
+    let worker = |root: &Path| {
+        let mut command = binary("worker");
+        command
+            .env("OPENMETTLE_WORKER_BIND", address())
+            .env("OPENMETTLE_WORKER_DATABASE_URL", f.db.url(WORKER))
+            .env("OPENMETTLE_WORKER_SWEEP_MS", "1000")
+            .env("OPENMETTLE_WORKER_ARTIFACTS_DIR", root);
+        Process(command.spawn().unwrap())
+    };
+    let revision_state = async |s: &Stored| -> String {
+        sqlx::query_scalar("SELECT state FROM openmettle.artifact_revisions WHERE id=$1::uuid")
+            .bind(&s.revision)
+            .fetch_one(&mut f.db.admin().await)
+            .await
+            .unwrap()
+    };
+
+    // Started before rebind, the worker exits instead of sweeping: its reconciler would
+    // quarantine the crashed upload and its purge would claim the retained revision.
+    let mut early = worker(&root);
+    let status = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(status) = early.0.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the worker started on a copied volume");
+    assert_eq!(status.code(), Some(78));
+    let mut refusal = String::new();
+    std::io::Read::read_to_string(early.0.stderr.as_mut().unwrap(), &mut refusal).unwrap();
+    assert!(refusal.contains("invalid ARTIFACTS_DIR"), "{refusal}");
+    assert_eq!(
+        reservation_row(&f.db, &held).await,
+        ("reserved".into(), false, false, 0)
+    );
+    assert_eq!(revision_state(&retained).await, "retained");
+
+    let (ok, out, err) = rebind(&f.db, &root, &[]);
+    assert!(ok, "{out}{err}");
+    // A reservation quarantined for an unrelated reason names no published payload and does
+    // not keep a healthy store from starting.
+    let quarantined = f.crashed("quarantined", b"unrelated", false).await;
+    sqlx::query(
+        "UPDATE openmettle.storage_reservations SET adoption_unverified=true WHERE id=$1::uuid",
+    )
+    .bind(&quarantined)
+    .execute(&mut f.db.admin().await)
+    .await
+    .unwrap();
+    let started = worker(&root);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while reservation_row(&f.db, &held).await.0 != "released"
+            || revision_state(&retained).await != "purged"
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the worker did not sweep the rebound volume");
+    let mut started = started;
+    signal(&started.0, "-TERM");
+    assert!(started.0.wait().unwrap().success());
+    let store = Store::open(&root).unwrap();
+    store.initialize_api(&f.api).await.unwrap();
+    assert_eq!(read(&store, &live, 0, 12).await.unwrap(), b"live payload");
+}

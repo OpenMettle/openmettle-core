@@ -140,8 +140,27 @@ impl Store {
     pub async fn initialize_api(&self, pool: &PgPool) -> Result<(), Error> {
         self.prepare(pool, true).await.map(|_| ())
     }
+    /// Verify the pin and refuse a volume that was copied but not yet rebound. The copy check
+    /// is a bounded sample, so it can miss a copy; it never refuses a healthy volume, because
+    /// the published name of a live settled revision always carries the bound inode.
     pub(crate) async fn verify_startup(&self, pool: &PgPool, api: bool) -> Result<(), Error> {
-        self.prepare(pool, api).await.map(|_| ())
+        if self.prepare(pool, api).await?.is_none() {
+            return Ok(());
+        }
+        let sample: Vec<(String, String)> = sqlx::query_as(
+            "SELECT s.id::text,s.payload_ino::text FROM openmettle.artifact_revisions r
+             JOIN openmettle.storage_reservations s ON s.scope_id=r.scope_id AND s.id=r.reservation_id
+             WHERE r.state IN ('active','retained') AND s.payload_ino IS NOT NULL LIMIT 16",
+        )
+        .fetch_all(pool)
+        .await?;
+        for (id, bound) in sample {
+            let found = self.volume.inode(&self.volume.revisions, &id);
+            if matches!(found, Ok(Some(ino)) if ino.to_string() != bound) {
+                return Err(Error::Io);
+            }
+        }
+        Ok(())
     }
     pub(crate) fn attach(&self, pool: &PgPool) {
         self.pool.get_or_init(|| pool.clone());

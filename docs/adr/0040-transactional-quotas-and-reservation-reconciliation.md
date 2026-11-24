@@ -4531,6 +4531,9 @@ the number of that reservation's own names.
   the barrier back as it found it.
 - It does not repair a copy that split hard links, bind a reservation that never had an inode
   (adoption's task), or clear a quarantine.
+- API and worker start-up sample up to 16 live settled revisions and exit when a published name
+  carries another inode than the ledger. The sample cannot refuse a healthy volume and can miss
+  a copied one.
 
 **Restore validation.** The filesystem drift check (`openmettle-admin quota verify ROOT`) is the
 required post-restore check. `quota_verify_accounting_drift()` alone compares no file and
