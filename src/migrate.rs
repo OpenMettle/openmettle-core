@@ -181,6 +181,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "gateway incomplete usage reports",
         sql: include_str!("../migrations/0031_gateway_incomplete_usage_reports.sql"),
     },
+    Source {
+        version: 32,
+        description: "gateway unreported request sweep",
+        sql: include_str!("../migrations/0032_gateway_unreported_request_sweep.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

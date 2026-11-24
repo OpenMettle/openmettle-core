@@ -2420,6 +2420,45 @@ async fn a_dispatch_committed_but_unacknowledged_is_spent_and_logged() {
         ("handoff_committed".to_owned(), UNITS, "0".to_owned())
     );
     assert_eq!(events, [unrecorded(&id, "dispatch_unconfirmed")]);
+
+    // Inside its 15-minute grace window the sweep leaves the dispatch_unconfirmed hold open;
+    // once 15 minutes pass after the run's execution deadline, the sweep closes it as
+    // `unreported` at revision 0 with zero charged and zero drift.
+    let mut pass = budgets::Pass::default();
+    assert_eq!(
+        budgets::sweep_unreported_gateway_requests(&fixture.worker, &mut pass, 100)
+            .await
+            .unwrap(),
+        0
+    );
+    let run = fixture.run_of(&id).await;
+    sqlx::query(
+        "UPDATE openmettle.runs
+            SET lease_expires_at=clock_timestamp()-interval '16 minutes',
+                execution_expires_at=clock_timestamp()-interval '16 minutes'
+          WHERE id=$1::uuid",
+    )
+    .bind(&run)
+    .execute(&fixture.owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        budgets::sweep_unreported_gateway_requests(&fixture.worker, &mut pass, 100)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        fixture.reasons(&id).await,
+        [(id.clone(), 0, true, Some("unreported".to_owned()), 0)]
+    );
+    assert_eq!(fixture.settlement(&id).await, Some((0, true, None, 0)));
+    assert_eq!(
+        fixture.hold(&id).await,
+        ("settled".to_owned(), 0, "0".to_owned())
+    );
+    assert_eq!((fixture.used().await, fixture.reserved().await), (0, 0));
+    assert_eq!(fixture.drift().await, (0, 0, 0, 0));
 }
 
 /// The proxy sends PostgreSQL the SHA-256 of the bearer and never the bearer: a server that
@@ -2492,11 +2531,11 @@ async fn a_later_report_corrects_an_incomplete_one_and_nothing_reopens_a_complet
     let usage = Some((7, 5));
     let charged = ("settled".to_owned(), 0, "12".to_owned());
 
-    // The sweep's record first, then the proxy's late report with usage.
+    // An incomplete report first, then a higher revision with usage.
     let swept = f.request(false).await;
     f.dispatch(&swept).await;
     assert_eq!(
-        settlement::ingest_incomplete(&gateway, &f.report(&swept, 0, None), "upstream_timeout")
+        settlement::ingest_incomplete(&gateway, &f.report(&swept, 1, None), "upstream_timeout")
             .await,
         Ok(Outcome::Applied)
     );
@@ -2506,13 +2545,13 @@ async fn a_later_report_corrects_an_incomplete_one_and_nothing_reopens_a_complet
     );
     assert_eq!((f.used().await, f.reserved().await), (0, 0));
     assert_eq!(
-        settlement::ingest(&gateway, &f.report(&swept, 1, usage)).await,
+        settlement::ingest(&gateway, &f.report(&swept, 2, usage)).await,
         Ok(Outcome::Applied)
     );
     assert_eq!(f.hold(&swept).await, charged);
     assert_eq!(
         f.settlement(&swept).await,
-        Some((1, true, Some("12".to_owned()), 0))
+        Some((2, true, Some("12".to_owned()), 0))
     );
     assert_eq!(
         f.transitions(&swept).await,
@@ -2520,10 +2559,10 @@ async fn a_later_report_corrects_an_incomplete_one_and_nothing_reopens_a_complet
     );
     assert_eq!(f.used().await, 12);
 
-    // The sweep's record first, then the proxy's late report with a reason: still nothing.
+    // An incomplete report first, then a higher revision with another reason: still nothing.
     let unknown = f.request(false).await;
     f.dispatch(&unknown).await;
-    for (revision, reason) in [(0, "upstream_timeout"), (1, "caller_disconnected")] {
+    for (revision, reason) in [(1, "upstream_timeout"), (2, "caller_disconnected")] {
         assert_eq!(
             settlement::ingest_incomplete(&gateway, &f.report(&unknown, revision, None), reason)
                 .await,
@@ -2544,23 +2583,28 @@ async fn a_later_report_corrects_an_incomplete_one_and_nothing_reopens_a_complet
     );
     assert_eq!(f.transitions(&unknown).await, ["final_settle"]);
 
-    // A complete report first: no later report without usage changes what it charged.
+    // A complete report first: no later report without usage changes what it charged, and
+    // revision 0 on an unbound request is reserved to the worker sweep.
     let complete = f.request(false).await;
     f.dispatch(&complete).await;
     assert_eq!(
-        settlement::ingest(&gateway, &f.report(&complete, 1, usage)).await,
+        settlement::ingest(&gateway, &f.report(&complete, 2, usage)).await,
         Ok(Outcome::Applied)
     );
     assert_eq!(
-        settlement::ingest_incomplete(&gateway, &f.report(&complete, 1, None), "incomplete").await,
+        settlement::ingest_incomplete(&gateway, &f.report(&complete, 2, None), "incomplete").await,
         Err(StoreError::Conflict)
     );
     assert_eq!(
-        settlement::ingest_incomplete(&gateway, &f.report(&complete, 0, None), "incomplete").await,
+        settlement::ingest_incomplete(&gateway, &f.report(&complete, 1, None), "incomplete").await,
         Ok(Outcome::Superseded)
     );
     assert_eq!(
-        settlement::ingest_incomplete(&gateway, &f.report(&complete, 2, None), "incomplete").await,
+        settlement::ingest_incomplete(&gateway, &f.report(&complete, 0, None), "incomplete").await,
+        Err(StoreError::Refused)
+    );
+    assert_eq!(
+        settlement::ingest_incomplete(&gateway, &f.report(&complete, 3, None), "incomplete").await,
         Ok(Outcome::Applied)
     );
     assert_eq!(f.hold(&complete).await, charged);
@@ -2802,7 +2846,7 @@ async fn the_database_refuses_a_final_settlement_that_leaves_the_hold_open() {
         sqlx::query(
             "INSERT INTO openmettle.gateway_usage_reports
                  (request_id,source,report_id,revision,final,incomplete)
-             VALUES ($1::uuid,$2::uuid,$1::uuid,0,true,'no_usage')",
+             VALUES ($1::uuid,$2::uuid,$1::uuid,1,true,'no_usage')",
         )
         .bind(&undispatched)
         .bind(INSTALL)
@@ -2812,16 +2856,16 @@ async fn the_database_refuses_a_final_settlement_that_leaves_the_hold_open() {
         sqlx::query(
             "INSERT INTO openmettle.gateway_settlements
                  (request_id,revision,final,measured,outstanding)
-             VALUES ($1::uuid,0,true,NULL,0)",
+             VALUES ($1::uuid,1,true,NULL,0)",
         )
         .bind(&undispatched)
         .execute(&mut *tx)
         .await
         .unwrap();
-        let rev1_report: String = sqlx::query_scalar(
+        let rev2_report: String = sqlx::query_scalar(
             "INSERT INTO openmettle.gateway_usage_reports
                  (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens)
-             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),1,true,7,5)
+             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),2,true,7,5)
              RETURNING report_id::text",
         )
         .bind(&undispatched)
@@ -2831,17 +2875,17 @@ async fn the_database_refuses_a_final_settlement_that_leaves_the_hold_open() {
         .unwrap();
         sqlx::query(
             "UPDATE openmettle.gateway_settlements
-                SET revision=1,final=true,measured=12,outstanding=0
+                SET revision=2,final=true,measured=12,outstanding=0
               WHERE request_id=$1::uuid",
         )
         .bind(&undispatched)
         .execute(&mut *tx)
         .await
         .unwrap();
-        sqlx::query("SELECT openmettle.quota_settle_gateway_usage($1::uuid,$2::uuid,$3::uuid,1)")
+        sqlx::query("SELECT openmettle.quota_settle_gateway_usage($1::uuid,$2::uuid,$3::uuid,2)")
             .bind(&undispatched)
             .bind(INSTALL)
-            .bind(&rev1_report)
+            .bind(&rev2_report)
             .execute(&mut *tx)
             .await
             .unwrap();
@@ -2936,5 +2980,685 @@ async fn the_database_refuses_a_final_settlement_that_leaves_the_hold_open() {
     );
 
     assert_eq!((f.used().await, f.reserved().await), (12, 6 * UNITS));
+    assert_eq!(f.drift().await, (0, 0, 0, 0));
+}
+
+/// ADR 0044, increment 3b (migration 32): the worker sweep settles both token and cost holds
+/// at revision 0 for undispatched (`not_dispatched`) and past-grace dispatched (`unreported`)
+/// requests. A late proxy report at revision 1 (with usage or with a proxy reason) cleanly
+/// supersedes a revision-0 `unreported` sweep without collisions or drift, and once revision 1
+/// is stored the sweep never touches the request again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn the_worker_sweep_settles_metered_holds_and_late_proxy_reports_correct_unreported() {
+    let f = Fixture::new().await;
+    let mut admin = f.db.admin().await;
+    admin
+        .execute(
+            "UPDATE openmettle.quota_defaults SET cost_denomination='usd_micros'
+              WHERE scope_kind='instance' AND resource_kind='usage_cost_micros'",
+        )
+        .await
+        .unwrap();
+    admin
+        .execute(
+            "INSERT INTO openmettle.quota_defaults(scope_kind,resource_kind,hard_limit)
+             VALUES ('personal','usage_cost_micros',100000)",
+        )
+        .await
+        .unwrap();
+    let gateway = pool(&f.db, pg::GATEWAY);
+    let mut pass = budgets::Pass::default();
+
+    // 1. Undispatched request with both token and cost holds: untouched while live, then
+    //    closed at revision 0 with `not_dispatched` once the run fails.
+    let undisp = f.request_with_cost(MODEL, false, Some(250)).await;
+    let undisp_run = f.run_of(&undisp).await;
+    assert_eq!(
+        budgets::sweep_unreported_gateway_requests(&f.worker, &mut pass, 100)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        f.hold(&undisp).await,
+        ("handoff_committed".to_owned(), UNITS, "0".to_owned())
+    );
+    assert_eq!(
+        f.hold_of(&undisp, "usage_cost_micros").await,
+        ("handoff_committed".to_owned(), 250, "0".to_owned())
+    );
+    sqlx::query("UPDATE openmettle.runs SET state='failed' WHERE id=$1::uuid")
+        .bind(&undisp_run)
+        .execute(&f.owner)
+        .await
+        .unwrap();
+    assert_eq!(
+        budgets::sweep_unreported_gateway_requests(&f.worker, &mut pass, 100)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        f.reasons(&undisp).await,
+        [(
+            undisp.clone(),
+            0,
+            true,
+            Some("not_dispatched".to_owned()),
+            0
+        )]
+    );
+    assert_eq!(f.settlement(&undisp).await, Some((0, true, None, 0)));
+    assert_eq!(
+        f.hold(&undisp).await,
+        ("settled".to_owned(), 0, "0".to_owned())
+    );
+    assert_eq!(
+        f.hold_of(&undisp, "usage_cost_micros").await,
+        ("settled".to_owned(), 0, "0".to_owned())
+    );
+    assert!(!f.outstanding(&undisp).await);
+    // Original bearer cannot dispatch it afterwards.
+    let rejected: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM openmettle.gateway_dispatch($1::uuid,sha256($2))")
+            .bind(&undisp)
+            .bind(bearer_bytes(&undisp).as_slice())
+            .fetch_one(&gateway)
+            .await
+            .unwrap();
+    assert_eq!(rejected, 0);
+
+    // 2. Dispatched request swept as `unreported` at revision 0, then superseded by a late
+    //    complete proxy report at revision 1 with the SAME report_id = request_id: charges
+    //    actual tokens, updates gateway_settlements to revision 1, keeps cost hold settled at 0.
+    let late_usage = f.request_with_cost(MODEL, false, Some(250)).await;
+    f.dispatch(&late_usage).await;
+    let late_usage_run = f.run_of(&late_usage).await;
+    sqlx::query("UPDATE openmettle.runs SET state='failed' WHERE id=$1::uuid")
+        .bind(&late_usage_run)
+        .execute(&f.owner)
+        .await
+        .unwrap();
+    // Not swept before execution_expires_at + 15 minutes.
+    assert_eq!(
+        budgets::sweep_unreported_gateway_requests(&f.worker, &mut pass, 100)
+            .await
+            .unwrap(),
+        0
+    );
+    sqlx::query(
+        "UPDATE openmettle.runs
+            SET lease_expires_at=clock_timestamp()-interval '16 minutes',
+                execution_expires_at=clock_timestamp()-interval '16 minutes'
+          WHERE id=$1::uuid",
+    )
+    .bind(&late_usage_run)
+    .execute(&f.owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        budgets::sweep_unreported_gateway_requests(&f.worker, &mut pass, 100)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        f.reasons(&late_usage).await,
+        [(
+            late_usage.clone(),
+            0,
+            true,
+            Some("unreported".to_owned()),
+            0
+        )]
+    );
+    assert_eq!(
+        f.hold(&late_usage).await,
+        ("settled".to_owned(), 0, "0".to_owned())
+    );
+    assert_eq!(
+        f.hold_of(&late_usage, "usage_cost_micros").await,
+        ("settled".to_owned(), 0, "0".to_owned())
+    );
+    assert_eq!(f.drift().await, (0, 0, 0, 0));
+
+    // Late proxy report arrives at revision 1 with report_id = request_id and complete counts.
+    assert_eq!(
+        settlement::ingest(&gateway, &f.report(&late_usage, 1, Some((17, 2)))).await,
+        Ok(Outcome::Applied)
+    );
+    assert_eq!(
+        f.settlement(&late_usage).await,
+        Some((1, true, Some("19".to_owned()), 0))
+    );
+    assert_eq!(
+        f.hold(&late_usage).await,
+        ("settled".to_owned(), 0, "19".to_owned())
+    );
+    assert_eq!(
+        f.hold_of(&late_usage, "usage_cost_micros").await,
+        ("settled".to_owned(), 0, "0".to_owned())
+    );
+    assert_eq!(
+        f.transitions(&late_usage).await,
+        ["final_settle", "final_correction"]
+    );
+    assert_eq!((f.used().await, f.reserved().await), (19, 0));
+    assert_eq!(f.drift().await, (0, 0, 0, 0));
+
+    // 3. Dispatched request swept as `unreported` at revision 0, then superseded by a late
+    //    incomplete proxy report at revision 1 (`upstream_timeout`) with report_id = request_id.
+    let late_reason = f.request_with_cost(MODEL, false, Some(250)).await;
+    f.dispatch(&late_reason).await;
+    let late_reason_run = f.run_of(&late_reason).await;
+    sqlx::query(
+        "UPDATE openmettle.runs
+            SET lease_expires_at=clock_timestamp()-interval '16 minutes',
+                execution_expires_at=clock_timestamp()-interval '16 minutes'
+          WHERE id=$1::uuid",
+    )
+    .bind(&late_reason_run)
+    .execute(&f.owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        budgets::sweep_unreported_gateway_requests(&f.worker, &mut pass, 100)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        settlement::ingest_incomplete(
+            &gateway,
+            &f.report(&late_reason, 1, None),
+            "upstream_timeout"
+        )
+        .await,
+        Ok(Outcome::Applied)
+    );
+    assert_eq!(
+        f.reasons(&late_reason).await,
+        [
+            (
+                late_reason.clone(),
+                0,
+                true,
+                Some("unreported".to_owned()),
+                0
+            ),
+            (
+                late_reason.clone(),
+                1,
+                true,
+                Some("upstream_timeout".to_owned()),
+                0
+            ),
+        ]
+    );
+    assert_eq!(f.settlement(&late_reason).await, Some((1, true, None, 0)));
+    assert_eq!(
+        f.hold(&late_reason).await,
+        ("settled".to_owned(), 0, "0".to_owned())
+    );
+    assert_eq!(f.transitions(&late_reason).await, ["final_settle"]);
+
+    // 4. Reverse order: proxy already settled revision 1 (complete and incomplete); even past
+    //    the 15-minute grace window the sweep never overwrites or re-touches them.
+    let rev1_complete = f.request_with_cost(MODEL, false, Some(250)).await;
+    let rev1_incomplete = f.request_with_cost(MODEL, false, Some(250)).await;
+    for id in [&rev1_complete, &rev1_incomplete] {
+        f.dispatch(id).await;
+    }
+    assert_eq!(
+        settlement::ingest(&gateway, &f.report(&rev1_complete, 1, Some((5, 6)))).await,
+        Ok(Outcome::Applied)
+    );
+    assert_eq!(
+        settlement::ingest_incomplete(
+            &gateway,
+            &f.report(&rev1_incomplete, 1, None),
+            "caller_disconnected"
+        )
+        .await,
+        Ok(Outcome::Applied)
+    );
+    for id in [&rev1_complete, &rev1_incomplete] {
+        let run = f.run_of(id).await;
+        sqlx::query(
+            "UPDATE openmettle.runs
+                SET lease_expires_at=clock_timestamp()-interval '20 minutes',
+                    execution_expires_at=clock_timestamp()-interval '20 minutes'
+              WHERE id=$1::uuid",
+        )
+        .bind(&run)
+        .execute(&f.owner)
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        budgets::sweep_unreported_gateway_requests(&f.worker, &mut pass, 100)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(f.reasons(&rev1_complete).await.len(), 1);
+    assert_eq!(f.reasons(&rev1_incomplete).await.len(), 1);
+    assert_eq!((f.used().await, f.reserved().await), (30, 0));
+    assert_eq!(f.drift().await, (0, 0, 0, 0));
+
+    // Operator query shows each current incomplete settlement with its active reason, omitting
+    // the request whose late complete proxy report corrected `unreported`.
+    let page = include_str!("../../docs/operator/gateway-proxy.md");
+    let (_, query) = page.split_once("```sql\n").unwrap();
+    let (query, _) = query.split_once("```").unwrap();
+    let query = query.trim().trim_end_matches(';');
+    let mut listed: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT request_id::text,incomplete FROM ({query}) AS listed"
+    )))
+    .fetch_all(&f.owner)
+    .await
+    .unwrap();
+    listed.sort();
+    let mut expected = vec![
+        (undisp.clone(), "not_dispatched".to_owned()),
+        (late_reason.clone(), "upstream_timeout".to_owned()),
+        (rev1_incomplete.clone(), "caller_disconnected".to_owned()),
+    ];
+    expected.sort();
+    assert_eq!(listed, expected);
+}
+
+/// Older dispatched requests sitting inside their 15-minute grace window must never starve
+/// newer eligible `not_dispatched` or past-grace `unreported` requests behind them when the
+/// page limit is smaller than the number of in-grace rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn in_grace_dispatched_requests_do_not_starve_eligible_requests_behind_them() {
+    let f = Fixture::new().await;
+    let mut in_grace = Vec::new();
+    for _ in 0..6 {
+        let id = f.request(false).await;
+        f.dispatch(&id).await;
+        in_grace.push(id);
+    }
+    let mut eligible_undisp = Vec::new();
+    for _ in 0..2 {
+        let id = f.request(false).await;
+        let run = f.run_of(&id).await;
+        sqlx::query("UPDATE openmettle.runs SET state='failed' WHERE id=$1::uuid")
+            .bind(&run)
+            .execute(&f.owner)
+            .await
+            .unwrap();
+        eligible_undisp.push(id);
+    }
+    let mut eligible_unrep = Vec::new();
+    for _ in 0..2 {
+        let id = f.request(false).await;
+        f.dispatch(&id).await;
+        let run = f.run_of(&id).await;
+        sqlx::query(
+            "UPDATE openmettle.runs
+                SET lease_expires_at=clock_timestamp()-interval '16 minutes',
+                    execution_expires_at=clock_timestamp()-interval '16 minutes'
+              WHERE id=$1::uuid",
+        )
+        .bind(&run)
+        .execute(&f.owner)
+        .await
+        .unwrap();
+        eligible_unrep.push(id);
+    }
+
+    // Limit 3 is smaller than the 6 older in-grace rows: the first two ticks scan 3 raw keys
+    // each and return 0 while advancing `pass` past the all-ineligible prefix, then ticks 3 and
+    // 4 close the 4 trailing eligible rows and reset `pass` once fewer than 3 raw keys remain.
+    let mut pass = budgets::Pass::default();
+    assert_eq!(
+        budgets::sweep_unreported_gateway_requests(&f.worker, &mut pass, 3)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        budgets::sweep_unreported_gateway_requests(&f.worker, &mut pass, 3)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        budgets::sweep_unreported_gateway_requests(&f.worker, &mut pass, 3)
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        budgets::sweep_unreported_gateway_requests(&f.worker, &mut pass, 3)
+            .await
+            .unwrap(),
+        1
+    );
+    for id in &eligible_undisp {
+        assert_eq!(
+            f.reasons(id).await,
+            [(id.clone(), 0, true, Some("not_dispatched".to_owned()), 0)]
+        );
+    }
+    for id in &eligible_unrep {
+        assert_eq!(
+            f.reasons(id).await,
+            [(id.clone(), 0, true, Some("unreported".to_owned()), 0)]
+        );
+    }
+    for id in &in_grace {
+        assert!(f.outstanding(id).await);
+        assert_eq!(f.reasons(id).await, []);
+    }
+
+    // Once the 6 in-grace rows age past 15 minutes, bounded pages of 3 drain all of them.
+    for id in &in_grace {
+        let run = f.run_of(id).await;
+        sqlx::query(
+            "UPDATE openmettle.runs
+                SET lease_expires_at=clock_timestamp()-interval '16 minutes',
+                    execution_expires_at=clock_timestamp()-interval '16 minutes'
+              WHERE id=$1::uuid",
+        )
+        .bind(&run)
+        .execute(&f.owner)
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        budgets::sweep_unreported_gateway_requests(&f.worker, &mut pass, 3)
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        budgets::sweep_unreported_gateway_requests(&f.worker, &mut pass, 3)
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        budgets::sweep_unreported_gateway_requests(&f.worker, &mut pass, 3)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!((f.used().await, f.reserved().await), (0, 0));
+    assert_eq!(f.drift().await, (0, 0, 0, 0));
+}
+
+/// After the worker sweep settles a dispatched request as `unreported` at revision 0, its holds
+/// are already `settled`. A direct-SQL `openmettle_gateway` correction at revision 1 MUST still
+/// fold those holds through `quota_settle_gateway_usage(..., 1)` so `accepted_source_revision`
+/// matches `latest.revision`; skipping the fold is refused at commit with 23514.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_direct_sql_correction_after_unreported_must_fold_its_holds() {
+    use sqlx::Connection;
+
+    let f = Fixture::new().await;
+    let mut admin = f.db.admin().await;
+    admin
+        .execute(
+            "UPDATE openmettle.quota_defaults SET cost_denomination='usd_micros'
+              WHERE scope_kind='instance' AND resource_kind='usage_cost_micros'",
+        )
+        .await
+        .unwrap();
+    admin
+        .execute(
+            "INSERT INTO openmettle.quota_defaults(scope_kind,resource_kind,hard_limit)
+             VALUES ('personal','usage_cost_micros',100000)",
+        )
+        .await
+        .unwrap();
+
+    let id = f.request_with_cost(MODEL, false, Some(250)).await;
+    f.dispatch(&id).await;
+    let run = f.run_of(&id).await;
+    sqlx::query(
+        "UPDATE openmettle.runs
+            SET lease_expires_at=clock_timestamp()-interval '16 minutes',
+                execution_expires_at=clock_timestamp()-interval '16 minutes'
+          WHERE id=$1::uuid",
+    )
+    .bind(&run)
+    .execute(&f.owner)
+    .await
+    .unwrap();
+    let mut pass = budgets::Pass::default();
+    assert_eq!(
+        budgets::sweep_unreported_gateway_requests(&f.worker, &mut pass, 100)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(f.hold(&id).await, ("settled".to_owned(), 0, "0".to_owned()));
+    assert_eq!(
+        f.hold_of(&id, "usage_cost_micros").await,
+        ("settled".to_owned(), 0, "0".to_owned())
+    );
+
+    // Direct SQL as openmettle_gateway: write measured revision 1 + settlement WITHOUT folding.
+    let mut direct = connect(&f.db.0, pg::GATEWAY).await;
+    {
+        let mut tx = direct.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens)
+             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),1,true,17,2)",
+        )
+        .bind(&id)
+        .bind(INSTALL)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.gateway_settlements
+                SET revision=1,final=true,measured=19,outstanding=0
+              WHERE request_id=$1::uuid",
+        )
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let Err(sqlx::Error::Database(error)) = tx.commit().await else {
+            panic!("revision-1 correction committed without folding already-settled holds");
+        };
+        assert_eq!(error.code().as_deref(), Some("23514"));
+    }
+    assert_eq!(f.settlement(&id).await, Some((0, true, None, 0)));
+    assert_eq!(f.used().await, 0);
+    assert_eq!(f.drift().await, (0, 0, 0, 0));
+
+    // Running `quota_settle_gateway_usage(..., 1)` in the same transaction folds both holds to
+    // revision 1 and commits cleanly with zero drift.
+    {
+        let mut tx = direct.begin().await.unwrap();
+        let report_id: String = sqlx::query_scalar(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens)
+             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),1,true,17,2)
+             RETURNING report_id::text",
+        )
+        .bind(&id)
+        .bind(INSTALL)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.gateway_settlements
+                SET revision=1,final=true,measured=19,outstanding=0
+              WHERE request_id=$1::uuid",
+        )
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("SELECT openmettle.quota_settle_gateway_usage($1::uuid,$2::uuid,$3::uuid,1)")
+            .bind(&id)
+            .bind(INSTALL)
+            .bind(&report_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    assert_eq!(
+        f.settlement(&id).await,
+        Some((1, true, Some("19".to_owned()), 0))
+    );
+    assert_eq!(
+        f.hold(&id).await,
+        ("settled".to_owned(), 0, "19".to_owned())
+    );
+    assert_eq!(
+        f.hold_of(&id, "usage_cost_micros").await,
+        ("settled".to_owned(), 0, "0".to_owned())
+    );
+    let revs: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT resource_kind, accepted_source_revision
+           FROM openmettle.quota_reservations
+          WHERE gateway_request_id=$1::uuid
+          ORDER BY resource_kind",
+    )
+    .bind(&id)
+    .fetch_all(&f.owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        revs,
+        [
+            ("usage_cost_micros".to_owned(), Some(1)),
+            ("usage_tokens".to_owned(), Some(1)),
+        ]
+    );
+    assert_eq!(f.drift().await, (0, 0, 0, 0));
+}
+
+/// After revision 0 (`unreported`) closes the fold, a bare or single-count final report at
+/// revision 1 without an `incomplete` reason must be refused by both `settlement::ingest` and
+/// PostgreSQL's deferred trigger, leaving `unreported` visible in the operator query.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_bare_or_partial_final_report_cannot_replace_unreported() {
+    use sqlx::Connection;
+
+    let f = Fixture::new().await;
+    let gateway = pool(&f.db, pg::GATEWAY);
+    let id = f.request(false).await;
+    f.dispatch(&id).await;
+    let run = f.run_of(&id).await;
+    sqlx::query(
+        "UPDATE openmettle.runs
+            SET lease_expires_at=clock_timestamp()-interval '16 minutes',
+                execution_expires_at=clock_timestamp()-interval '16 minutes'
+          WHERE id=$1::uuid",
+    )
+    .bind(&run)
+    .execute(&f.owner)
+    .await
+    .unwrap();
+    let mut pass = budgets::Pass::default();
+    assert_eq!(
+        budgets::sweep_unreported_gateway_requests(&f.worker, &mut pass, 100)
+            .await
+            .unwrap(),
+        1
+    );
+
+    // Through `settlement::ingest`: bare, prompt-only, and completion-only final reports are
+    // refused and leave no row at revision 1.
+    for (prompt, completion) in [(None, None), (Some(10), None), (None, Some(5))] {
+        let mut r = f.report(&id, 1, None);
+        r.prompt_tokens = prompt;
+        r.completion_tokens = completion;
+        assert_eq!(
+            settlement::ingest(&gateway, &r).await,
+            Err(StoreError::Refused),
+            "ingest accepted ({prompt:?}, {completion:?}) after unreported"
+        );
+    }
+    assert_eq!(
+        f.reasons(&id).await,
+        [(id.clone(), 0, true, Some("unreported".to_owned()), 0)]
+    );
+
+    // Through direct SQL as `openmettle_gateway` even with `quota_settle_gateway_usage(..., 1)`:
+    // bare and single-count final reports are refused at commit with 23514.
+    let mut direct = connect(&f.db.0, pg::GATEWAY).await;
+    for (what, cols, vals, measured) in [
+        ("bare", "", "", None::<i64>),
+        ("prompt_only", ",prompt_tokens", ",10", Some(10)),
+        ("completion_only", ",completion_tokens", ",5", Some(5)),
+    ] {
+        let mut tx = direct.begin().await.unwrap();
+        let report_id: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final{cols})
+             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),1,true{vals})
+             RETURNING report_id::text"
+        )))
+        .bind(&id)
+        .bind(INSTALL)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.gateway_settlements
+                SET revision=1,final=true,measured=$2,outstanding=0
+              WHERE request_id=$1::uuid",
+        )
+        .bind(&id)
+        .bind(measured)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("SELECT openmettle.quota_settle_gateway_usage($1::uuid,$2::uuid,$3::uuid,1)")
+            .bind(&id)
+            .bind(INSTALL)
+            .bind(&report_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let Err(sqlx::Error::Database(error)) = tx.commit().await else {
+            panic!("direct SQL accepted {what} final report after unreported");
+        };
+        assert_eq!(error.code().as_deref(), Some("23514"), "{what}");
+    }
+
+    // Operator query still shows `unreported`, and a real complete revision-1 report succeeds.
+    let page = include_str!("../../docs/operator/gateway-proxy.md");
+    let (_, query) = page.split_once("```sql\n").unwrap();
+    let (query, _) = query.split_once("```").unwrap();
+    let query = query.trim().trim_end_matches(';');
+    let listed: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT request_id::text,incomplete FROM ({query}) AS listed"
+    )))
+    .fetch_all(&f.owner)
+    .await
+    .unwrap();
+    assert_eq!(listed, [(id.clone(), "unreported".to_owned())]);
+
+    assert_eq!(
+        settlement::ingest(&gateway, &f.report(&id, 1, Some((17, 2)))).await,
+        Ok(Outcome::Applied)
+    );
+    let after: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT request_id::text,incomplete FROM ({query}) AS listed"
+    )))
+    .fetch_all(&f.owner)
+    .await
+    .unwrap();
+    assert_eq!(after, []);
+    assert_eq!(
+        f.hold(&id).await,
+        ("settled".to_owned(), 0, "19".to_owned())
+    );
     assert_eq!(f.drift().await, (0, 0, 0, 0));
 }

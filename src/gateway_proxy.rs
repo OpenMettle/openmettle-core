@@ -25,9 +25,10 @@
 //!   `gateway.usage.unrecorded` event.
 //!
 //! The listener is plain HTTP. The packaged worker may call it so inside the cluster, or
-//! through a TLS terminator in front of it. Not deployable: nothing yet closes a request that
-//! was never dispatched, or one whose report the proxy could not write. See
-//! `docs/operator/gateway-proxy.md`.
+//! through a TLS terminator in front of it. Not deployable yet (no image target, chart or
+//! network policy, increment 7). Requests that were never dispatched, or whose report the proxy
+//! could not write, are closed by the worker's maintenance sweep at revision 0 (increment 3b).
+//! See `docs/operator/gateway-proxy.md`.
 mod usage;
 
 use crate::{
@@ -1182,6 +1183,20 @@ mod tests {
         reported.sort_unstable();
         assert_eq!(stored, reported);
         assert!(!stored.contains(&UsageGap::DispatchUnconfirmed.as_str()));
+
+        // Migration 32 adds only the two sweep-only revision-0 reasons, which the proxy never emits.
+        let m32 = include_str!("../migrations/0032_gateway_unreported_request_sweep.sql");
+        let (_, sweep_list) = m32.split_once("revision = 0 AND incomplete IN (").unwrap();
+        let (sweep_list, _) = sweep_list.split_once(')').unwrap();
+        let mut sweep_reasons: Vec<&str> = sweep_list
+            .split(',')
+            .map(|v| v.trim().trim_matches('\''))
+            .collect();
+        sweep_reasons.sort_unstable();
+        assert_eq!(sweep_reasons, ["not_dispatched", "unreported"]);
+        for reason in sweep_reasons {
+            assert!(!reported.contains(&reason));
+        }
     }
 
     fn chunk(data: &[u8]) -> Vec<u8> {

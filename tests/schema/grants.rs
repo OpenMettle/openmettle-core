@@ -408,6 +408,29 @@ async fn gateway_usage_and_settlement_column_grants() {
             );
         }
     }
+    for (function, worker_exec) in [
+        (
+            "openmettle.gateway_unreported_candidates(timestamptz,uuid,timestamptz,uuid,integer)",
+            true,
+        ),
+        ("openmettle.gateway_close_unreported(uuid)", true),
+        ("openmettle.enforce_gateway_report_sweep_only()", false),
+    ] {
+        for role in [pg::GATEWAY, API, WORKER, ISSUANCE, "public"] {
+            let can_exec: bool =
+                sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+                    .bind(role)
+                    .bind(function)
+                    .fetch_one(&mut c)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                can_exec,
+                worker_exec && role == WORKER,
+                "{role} EXECUTE {function}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

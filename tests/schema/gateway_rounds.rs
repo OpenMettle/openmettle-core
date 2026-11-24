@@ -1750,7 +1750,7 @@ async fn a_request_without_a_binding_settles_under_its_actor_and_installation() 
         scope: f.scope.clone(),
         source: INSTALL.into(),
         report_id: round.request.clone(),
-        revision: 0,
+        revision: 1,
         r#final: true,
         prompt_tokens: Some(4),
         completion_tokens: Some(3),
@@ -1807,7 +1807,7 @@ async fn a_request_without_a_binding_settles_under_its_actor_and_installation() 
     .fetch_one(&mut f.owner)
     .await
     .unwrap();
-    assert_eq!(settled, (0, true, Some("7".to_owned()), 0, true));
+    assert_eq!(settled, (1, true, Some("7".to_owned()), 0, true));
     assert_eq!(f.provisioned().await, 0);
 }
 
@@ -2127,4 +2127,1159 @@ async fn migration_31_keeps_stored_reports_and_adds_the_reason_of_an_incomplete_
             "{reason:?}"
         );
     }
+}
+
+const SWEEP_CANDIDATES: &str = "SELECT created_at::text, id::text, eligible
+    FROM openmettle.gateway_unreported_candidates(
+        '-infinity'::timestamptz,
+        '00000000-0000-0000-0000-000000000000'::uuid,
+        'infinity'::timestamptz,
+        'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid,
+        $1
+    )";
+const SWEEP_CLOSE: &str = "SELECT openmettle.gateway_close_unreported($1::uuid)";
+
+/// ADR 0044, increment 3b (migration 32): the worker sweep closes undispatched requests once
+/// `gateway_dispatch` can no longer grant them (`not_dispatched`, no grace) and dispatched
+/// requests 15 minutes past the run's execution deadline (`unreported`), while leaving live
+/// rounds, in-grace dispatched rounds, reserved requests, and bound ADR 0037 requests intact.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn the_unreported_sweep_closes_undispatched_and_past_grace_rounds_and_leaves_live_and_bound_ones()
+ {
+    let mut f = Rounds::new().await;
+    let plain = quotas::snapshot(100);
+
+    // Role and isolation boundaries on the sweep functions.
+    let probe = f.round(&plain).await;
+    f.authorized(&probe, "a live run round").await;
+    for role in [API, pg::GATEWAY, ISSUANCE] {
+        let mut c = connect(&f.db.0, role).await;
+        let denied_list = sqlx::query_as::<_, (String, String, bool)>(SWEEP_CANDIDATES)
+            .bind(10_i32)
+            .fetch_all(&mut c)
+            .await;
+        assert_eq!(sqlstate(denied_list), "42501", "{role} candidates");
+        let denied_close = sqlx::query_scalar::<_, Option<String>>(SWEEP_CLOSE)
+            .bind(&probe.request)
+            .fetch_one(&mut c)
+            .await;
+        assert_eq!(sqlstate(denied_close), "42501", "{role} close");
+    }
+    let mut worker = connect(&f.db.0, WORKER).await;
+    for bad_limit in [0_i32, 1001_i32] {
+        let invalid = sqlx::query_as::<_, (String, String, bool)>(SWEEP_CANDIDATES)
+            .bind(bad_limit)
+            .fetch_all(&mut worker)
+            .await;
+        assert_eq!(sqlstate(invalid), "22023", "limit {bad_limit}");
+    }
+    worker
+        .execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .unwrap();
+    let stale = sqlx::query_scalar::<_, Option<String>>(SWEEP_CLOSE)
+        .bind(&probe.request)
+        .fetch_one(&mut worker)
+        .await;
+    assert_eq!(sqlstate(stale), "25000");
+    worker.execute("ROLLBACK").await.unwrap();
+
+    // A reserved (not handed off) request is excluded from the index; a still-live undispatched
+    // round is returned with `eligible = false` (so the pass cursor advances past it) and is
+    // never closed.
+    let reserved = f.round(&plain).await;
+    let listed: Vec<(String, String, bool)> = sqlx::query_as(SWEEP_CANDIDATES)
+        .bind(100_i32)
+        .fetch_all(&mut worker)
+        .await
+        .unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|(_, id, eligible)| (id.as_str(), *eligible))
+            .collect::<Vec<_>>(),
+        [(probe.request.as_str(), false)]
+    );
+    for id in [&reserved.request, &probe.request] {
+        let closed: Option<String> = sqlx::query_scalar(SWEEP_CLOSE)
+            .bind(id)
+            .fetch_one(&mut worker)
+            .await
+            .unwrap();
+        assert_eq!(closed, None, "must not sweep {id}");
+    }
+    // Live round can still be dispatched afterwards.
+    assert_eq!(f.dispatch(&probe).await, [f.routed()]);
+
+    // Undispatched requests become eligible for `not_dispatched` as soon as the run cannot be
+    // dispatched: cancelled, reclaimed, settled/failed, lapsed lease, or past execution deadline.
+    let cancelled = f.round(&plain).await;
+    let reclaimed = f.round(&plain).await;
+    let failed = f.round(&plain).await;
+    let lapsed_lease = f.round(&plain).await;
+    let past_deadline = f.round(&plain).await;
+    for r in [
+        &cancelled,
+        &reclaimed,
+        &failed,
+        &lapsed_lease,
+        &past_deadline,
+    ] {
+        f.authorized(r, "a live run round").await;
+    }
+
+    let principal = authz_store::principal(&f.db, &f.actor).await;
+    queue::cancel_run(
+        &mut connect(&f.db.0, API).await,
+        &principal,
+        &f.scope,
+        &cancelled.run,
+    )
+    .await
+    .unwrap();
+    f.owner_exec(
+        "UPDATE openmettle.runs SET lease_expires_at=clock_timestamp()-interval '1 second'
+          WHERE id=$1::uuid",
+        &reclaimed.run,
+    )
+    .await;
+    let reclaimed_run = leases::reclaim_next(&mut worker, &LEASES)
+        .await
+        .unwrap()
+        .expect("reclaimable run");
+    assert_eq!(reclaimed_run.run.run_id, reclaimed.run);
+    leases::settle(
+        &mut worker,
+        &Lease {
+            scope_id: &f.scope,
+            run_id: &failed.run,
+            claim_token: &failed.lease,
+        },
+        &LEASES,
+        leases::Settle::Failed(leases::FailReason::StepFailed),
+    )
+    .await
+    .unwrap();
+    f.owner_exec(
+        "UPDATE openmettle.runs SET lease_expires_at=clock_timestamp()-interval '1 second'
+          WHERE id=$1::uuid",
+        &lapsed_lease.run,
+    )
+    .await;
+    f.owner_exec(
+        "UPDATE openmettle.runs SET lease_expires_at=clock_timestamp()-interval '2 seconds',
+                execution_expires_at=clock_timestamp()-interval '1 second'
+          WHERE id=$1::uuid",
+        &past_deadline.run,
+    )
+    .await;
+
+    let page: Vec<(String, String, bool)> = sqlx::query_as(SWEEP_CANDIDATES)
+        .bind(100_i32)
+        .fetch_all(&mut worker)
+        .await
+        .unwrap();
+    let mut found: Vec<String> = page
+        .iter()
+        .filter(|(_, _, eligible)| *eligible)
+        .map(|(_, id, _)| id.clone())
+        .collect();
+    let ineligible: Vec<&str> = page
+        .iter()
+        .filter(|(_, _, eligible)| !*eligible)
+        .map(|(_, id, _)| id.as_str())
+        .collect();
+    assert_eq!(ineligible, [probe.request.as_str()]);
+    found.sort();
+    let mut expected_not_dispatched = vec![
+        cancelled.request.clone(),
+        reclaimed.request.clone(),
+        failed.request.clone(),
+        lapsed_lease.request.clone(),
+        past_deadline.request.clone(),
+    ];
+    expected_not_dispatched.sort();
+    assert_eq!(found, expected_not_dispatched);
+
+    for (why, r) in [
+        ("cancelled", &cancelled),
+        ("reclaimed", &reclaimed),
+        ("failed", &failed),
+        ("lapsed lease", &lapsed_lease),
+        ("past execution deadline", &past_deadline),
+    ] {
+        let closed: Option<String> = sqlx::query_scalar(SWEEP_CLOSE)
+            .bind(&r.request)
+            .fetch_one(&mut worker)
+            .await
+            .unwrap();
+        assert_eq!(closed.as_deref(), Some("not_dispatched"), "{why}");
+        assert_eq!(
+            ledger(&mut f, &r.request).await,
+            (
+                vec![(0, Some("not_dispatched".to_owned()))],
+                Some((0, true, None, 0)),
+                true
+            ),
+            "{why}"
+        );
+        // Second call is a no-op, and the original bearer can never dispatch it.
+        let again: Option<String> = sqlx::query_scalar(SWEEP_CLOSE)
+            .bind(&r.request)
+            .fetch_one(&mut worker)
+            .await
+            .unwrap();
+        assert_eq!(again, None, "{why}");
+        assert_eq!(f.dispatch(r).await, [], "{why}");
+        assert_eq!(
+            f.stored(r).await,
+            (
+                "handed_off".to_owned(),
+                Some(INSTALL.to_owned()),
+                false,
+                false
+            ),
+            "{why}"
+        );
+    }
+
+    // Dispatched unreported request: NOT swept before execution_expires_at + 15 minutes even
+    // after the run fails; swept as `unreported` once that 15-minute grace passes.
+    let dispatched_round = f.round(&plain).await;
+    f.authorized(&dispatched_round, "a live run round").await;
+    assert_eq!(f.dispatch(&dispatched_round).await, [f.routed()]);
+    leases::settle(
+        &mut worker,
+        &Lease {
+            scope_id: &f.scope,
+            run_id: &dispatched_round.run,
+            claim_token: &dispatched_round.lease,
+        },
+        &LEASES,
+        leases::Settle::Failed(leases::FailReason::StepFailed),
+    )
+    .await
+    .unwrap();
+    // 14 minutes past execution_expires_at is still inside the 15-minute grace window.
+    f.owner_exec(
+        "UPDATE openmettle.runs
+            SET lease_expires_at=clock_timestamp()-interval '15 minutes',
+                execution_expires_at=clock_timestamp()-interval '14 minutes'
+          WHERE id=$1::uuid",
+        &dispatched_round.run,
+    )
+    .await;
+    let in_grace: Option<String> = sqlx::query_scalar(SWEEP_CLOSE)
+        .bind(&dispatched_round.request)
+        .fetch_one(&mut worker)
+        .await
+        .unwrap();
+    assert_eq!(in_grace, None, "must not sweep within 15-minute grace");
+
+    f.owner_exec(
+        "UPDATE openmettle.runs
+            SET lease_expires_at=clock_timestamp()-interval '16 minutes',
+                execution_expires_at=clock_timestamp()-interval '16 minutes'
+          WHERE id=$1::uuid",
+        &dispatched_round.run,
+    )
+    .await;
+    let past_grace: Option<String> = sqlx::query_scalar(SWEEP_CLOSE)
+        .bind(&dispatched_round.request)
+        .fetch_one(&mut worker)
+        .await
+        .unwrap();
+    assert_eq!(past_grace.as_deref(), Some("unreported"));
+    assert_eq!(
+        ledger(&mut f, &dispatched_round.request).await,
+        (
+            vec![(0, Some("unreported".to_owned()))],
+            Some((0, true, None, 0)),
+            true
+        )
+    );
+
+    // Parked-for-approval run (`runs.execution_expires_at IS NULL`, original deadline preserved
+    // in `run_approvals.resume_execution_expires_at`): waits 15 minutes past the preserved
+    // deadline, then sweeps as `unreported` even if the run failed without resuming.
+    let parked = f.round(&plain).await;
+    f.authorized(&parked, "a live run round").await;
+    assert_eq!(f.dispatch(&parked).await, [f.routed()]);
+    let approval_id: String = sqlx::query_scalar(
+        "INSERT INTO openmettle.run_approvals
+             (scope_id,run_id,actor_user_id,logical_key,tool_id,tool_version,
+              canonical_arguments,destination,authority_evidence,binding_digest,
+              approval_expires_at,resume_execution_expires_at)
+         SELECT scope_id,id,actor_user_id,'sweep-park-key','tool.x','1',
+                '{}'::text::bytea,'dest','{}'::text::bytea,sha256('bind'),
+                clock_timestamp()-interval '14 minutes',
+                clock_timestamp()-interval '14 minutes'
+           FROM openmettle.runs WHERE id=$1::uuid
+         RETURNING id::text",
+    )
+    .bind(&parked.run)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE openmettle.runs
+            SET state='failed', wait_reason=NULL, approval_wait_id=$2::uuid,
+                claim_token=NULL, claimed_at=NULL, lease_expires_at=NULL, execution_expires_at=NULL
+          WHERE id=$1::uuid",
+    )
+    .bind(&parked.run)
+    .bind(&approval_id)
+    .execute(&mut f.owner)
+    .await
+    .unwrap();
+    let parked_in_grace: Option<String> = sqlx::query_scalar(SWEEP_CLOSE)
+        .bind(&parked.request)
+        .fetch_one(&mut worker)
+        .await
+        .unwrap();
+    assert_eq!(
+        parked_in_grace, None,
+        "parked run uses resume_execution_expires_at + 15m grace"
+    );
+    sqlx::query(
+        "UPDATE openmettle.run_approvals
+            SET approval_expires_at=clock_timestamp()-interval '16 minutes',
+                resume_execution_expires_at=clock_timestamp()-interval '16 minutes'
+          WHERE id=$1::uuid",
+    )
+    .bind(&approval_id)
+    .execute(&mut f.owner)
+    .await
+    .unwrap();
+    let parked_past_grace: Option<String> = sqlx::query_scalar(SWEEP_CLOSE)
+        .bind(&parked.request)
+        .fetch_one(&mut worker)
+        .await
+        .unwrap();
+    assert_eq!(parked_past_grace.as_deref(), Some("unreported"));
+
+    // Bound ADR 0037 request is never listed or closed by the sweep, even on an expired failed run.
+    let bound = f.round(&plain).await;
+    for sql in [
+        "INSERT INTO openmettle.gateway_bindings (installation,user_id,principal,budget)
+         SELECT installation,actor_user_id,gen_random_uuid(),gen_random_uuid()
+           FROM openmettle.gateway_requests WHERE id=$1::uuid",
+        "INSERT INTO openmettle.gateway_nonces (key_fingerprint,nonce)
+         SELECT sha256('sweep-bound'),substring(sha256('sweep-nonce') FOR 12)
+           FROM openmettle.gateway_requests WHERE id=$1::uuid",
+        "INSERT INTO openmettle.gateway_generations
+             (binding_id,generation,remote_key,expires_at,key_id,key_fingerprint,nonce,ciphertext)
+         SELECT b.id,1,gen_random_uuid(),clock_timestamp()+interval '1 hour','sweep-bound',
+                sha256('sweep-bound'),substring(sha256('sweep-nonce') FOR 12),sha256('ct')
+           FROM openmettle.gateway_requests q
+           JOIN openmettle.gateway_bindings b ON b.user_id=q.actor_user_id WHERE q.id=$1::uuid",
+        "INSERT INTO openmettle.gateway_policy
+             (binding_id,revision,scope_id,approval_id,model,report_source,provider_generation,
+              approval_generation,user_generation,capabilities)
+         SELECT b.id,1,q.scope_id,q.approval_id,q.model,gen_random_uuid(),0,0,0,'{}'
+           FROM openmettle.gateway_requests q
+           JOIN openmettle.gateway_bindings b ON b.user_id=q.actor_user_id WHERE q.id=$1::uuid",
+        "UPDATE openmettle.gateway_requests q SET state='handed_off',binding_id=p.binding_id,
+                generation=1,policy_revision=1,report_source=p.report_source
+           FROM openmettle.gateway_policy p WHERE q.id=$1::uuid",
+    ] {
+        f.owner_exec(sql, &bound.request).await;
+    }
+    f.owner_exec(
+        "UPDATE openmettle.runs
+            SET state='failed',
+                lease_expires_at=clock_timestamp()-interval '30 minutes',
+                execution_expires_at=clock_timestamp()-interval '30 minutes'
+          WHERE id=$1::uuid",
+        &bound.run,
+    )
+    .await;
+    let remaining: Vec<(String, String, bool)> = sqlx::query_as(SWEEP_CANDIDATES)
+        .bind(100_i32)
+        .fetch_all(&mut worker)
+        .await
+        .unwrap();
+    assert_eq!(
+        remaining
+            .iter()
+            .map(|(_, id, eligible)| (id.as_str(), *eligible))
+            .collect::<Vec<_>>(),
+        [(probe.request.as_str(), false)]
+    );
+    let bound_closed: Option<String> = sqlx::query_scalar(SWEEP_CLOSE)
+        .bind(&bound.request)
+        .fetch_one(&mut worker)
+        .await
+        .unwrap();
+    assert_eq!(bound_closed, None);
+    assert_eq!(ledger(&mut f, &bound.request).await, (vec![], None, false));
+}
+
+/// Concurrent race between `gateway_dispatch` and `gateway_close_unreported` on the same
+/// request: deterministic lock ordering in both directions plus barrier races never deadlock,
+/// never double-close, and leave every request in one consistent state.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_concurrent_dispatch_and_unreported_sweep_never_deadlock_or_double_close() {
+    let mut f = Rounds::new().await;
+    let plain = quotas::snapshot(100);
+
+    // 1. Sweep holds `gateway_requests FOR UPDATE` (blocked behind a SHARE table lock on
+    //    `gateway_settlements`), and `gateway_dispatch` arrives behind it: sweep commits
+    //    `not_dispatched`, and `gateway_dispatch` unblocks and returns no row.
+    let sweep_first = f.round(&plain).await;
+    f.authorized(&sweep_first, "a live run round").await;
+    f.owner_exec(
+        "UPDATE openmettle.runs SET lease_expires_at=clock_timestamp()-interval '1 second'
+          WHERE id=$1::uuid",
+        &sweep_first.run,
+    )
+    .await;
+    let mut holder = connect(&f.db.0, OWNER).await;
+    let holder_pid = backend_pid(&mut holder).await;
+    holder.execute("BEGIN").await.unwrap();
+    holder
+        .execute("LOCK TABLE openmettle.gateway_settlements IN SHARE MODE")
+        .await
+        .unwrap();
+    let mut worker = connect(&f.db.0, WORKER).await;
+    let worker_pid = backend_pid(&mut worker).await;
+    let req_id = sweep_first.request.clone();
+    let sweeping = tokio::spawn(async move {
+        sqlx::query_scalar::<_, Option<String>>(SWEEP_CLOSE)
+            .bind(req_id)
+            .fetch_one(&mut worker)
+            .await
+            .unwrap()
+    });
+    wait_for_blocked_peer(&f.db, holder_pid).await;
+    let dispatching = f.dispatching(&sweep_first).await;
+    wait_for_blocked_peer(&f.db, worker_pid).await;
+    holder.execute("COMMIT").await.unwrap();
+    assert_eq!(sweeping.await.unwrap().as_deref(), Some("not_dispatched"));
+    assert_eq!(dispatching.await.unwrap(), []);
+    assert!(!f.stored(&sweep_first).await.3);
+
+    // 2. `gateway_dispatch` holds `gateway_requests` in an open transaction while the sweep
+    //    runs: the sweep uses SKIP LOCKED so it returns None without blocking, dispatch
+    //    commits, and a later sweep leaves the in-grace dispatched request open.
+    let dispatch_first = f.round(&plain).await;
+    f.authorized(&dispatch_first, "a live run round").await;
+    let mut gateway = connect(&f.db.0, pg::GATEWAY).await;
+    gateway.execute("BEGIN").await.unwrap();
+    let granted: Vec<Dispatched> = sqlx::query_as(DISPATCH)
+        .bind(&dispatch_first.request)
+        .bind(dispatch_first.bearer.as_slice())
+        .fetch_all(&mut gateway)
+        .await
+        .unwrap();
+    assert_eq!(granted, [f.routed()]);
+    let mut worker = connect(&f.db.0, WORKER).await;
+    let skipped: Option<String> = sqlx::query_scalar(SWEEP_CLOSE)
+        .bind(&dispatch_first.request)
+        .fetch_one(&mut worker)
+        .await
+        .unwrap();
+    assert_eq!(skipped, None);
+    gateway.execute("COMMIT").await.unwrap();
+    assert!(f.stored(&dispatch_first).await.3);
+    let after_commit: Option<String> = sqlx::query_scalar(SWEEP_CLOSE)
+        .bind(&dispatch_first.request)
+        .fetch_one(&mut worker)
+        .await
+        .unwrap();
+    assert_eq!(after_commit, None);
+
+    // 3. Barrier race across 6 rounds: cancel, dispatch, and sweep start together.
+    let principal = authz_store::principal(&f.db, &f.actor).await;
+    for _ in 0..6 {
+        let round = f.round(&plain).await;
+        f.authorized(&round, "a live run round").await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let (b1, b2, b3) = (barrier.clone(), barrier.clone(), barrier.clone());
+        let (db_cancel, db_disp, db_sweep) = (f.db.0.clone(), f.db.0.clone(), f.db.0.clone());
+        let (scope, run_id, principal_c) = (f.scope.clone(), round.run.clone(), principal.clone());
+        let (req_disp, bearer_disp) = (round.request.clone(), round.bearer);
+        let req_sweep = round.request.clone();
+
+        let t_cancel = tokio::spawn(async move {
+            let mut api = connect(&db_cancel, API).await;
+            b1.wait().await;
+            queue::cancel_run(&mut api, &principal_c, &scope, &run_id)
+                .await
+                .unwrap();
+        });
+        let t_dispatch = tokio::spawn(async move {
+            let mut gw = connect(&db_disp, pg::GATEWAY).await;
+            b2.wait().await;
+            sqlx::query_as::<_, Dispatched>(DISPATCH)
+                .bind(req_disp)
+                .bind(bearer_disp.as_slice())
+                .fetch_all(&mut gw)
+                .await
+                .unwrap()
+        });
+        let t_sweep = tokio::spawn(async move {
+            let mut wk = connect(&db_sweep, WORKER).await;
+            b3.wait().await;
+            sqlx::query_scalar::<_, Option<String>>(SWEEP_CLOSE)
+                .bind(req_sweep)
+                .fetch_one(&mut wk)
+                .await
+                .unwrap()
+        });
+        t_cancel.await.unwrap();
+        let disp_rows = t_dispatch.await.unwrap();
+        let sweep_reason = t_sweep.await.unwrap();
+
+        let (_, _, _, dispatched) = f.stored(&round).await;
+        if dispatched {
+            assert_eq!(disp_rows, [f.routed()]);
+            assert_eq!(sweep_reason, None);
+            assert_eq!(ledger(&mut f, &round.request).await, (vec![], None, false));
+        } else {
+            assert_eq!(disp_rows, []);
+            if sweep_reason.is_none() {
+                // Sweep skipped while cancel or dispatch held locks; closing now succeeds cleanly.
+                let closed: Option<String> = sqlx::query_scalar(SWEEP_CLOSE)
+                    .bind(&round.request)
+                    .fetch_one(&mut worker)
+                    .await
+                    .unwrap();
+                assert_eq!(closed.as_deref(), Some("not_dispatched"));
+            } else {
+                assert_eq!(sweep_reason.as_deref(), Some("not_dispatched"));
+            }
+            assert_eq!(f.dispatch(&round).await, []);
+            assert_eq!(
+                ledger(&mut f, &round.request).await,
+                (
+                    vec![(0, Some("not_dispatched".to_owned()))],
+                    Some((0, true, None, 0)),
+                    true
+                )
+            );
+        }
+    }
+}
+
+/// Upgrading from schema 31 to 32 preserves existing reports, enables the worker sweep, and
+/// enforces the sweep-only role guard, revision-0 CHECK, and dispatched/undispatched trigger rules.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn migration_32_upgrades_from_31_and_enforces_sweep_reason_guards() {
+    let mut f = Rounds::at(31).await;
+    let plain = quotas::snapshot(100);
+    let settled_usage = f.round(&plain).await;
+    let settled_reason = f.round(&plain).await;
+    let open_undispatched = f.round(&plain).await;
+    let open_unreported = f.round(&plain).await;
+    for r in [
+        &settled_usage,
+        &settled_reason,
+        &open_undispatched,
+        &open_unreported,
+    ] {
+        f.authorized(r, "a live run round").await;
+    }
+    let gateway = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(f.db.1.options(pg::GATEWAY));
+    for r in [&settled_usage, &settled_reason, &open_unreported] {
+        assert_eq!(f.dispatch(r).await, [f.routed()]);
+    }
+    assert_eq!(
+        settlement::ingest(&gateway, &report_of(&f, &settled_usage, Some((4, 3)))).await,
+        Ok(Outcome::Applied)
+    );
+    assert_eq!(
+        settlement::ingest_incomplete(&gateway, &report_of(&f, &settled_reason, None), "no_usage")
+            .await,
+        Ok(Outcome::Applied)
+    );
+    f.owner_exec(
+        "UPDATE openmettle.runs SET state='failed' WHERE id=$1::uuid",
+        &open_undispatched.run,
+    )
+    .await;
+    f.owner_exec(
+        "UPDATE openmettle.runs
+            SET state='failed',
+                lease_expires_at=clock_timestamp()-interval '20 minutes',
+                execution_expires_at=clock_timestamp()-interval '20 minutes'
+          WHERE id=$1::uuid",
+        &open_unreported.run,
+    )
+    .await;
+
+    let settings = f.db.settings(Duration::from_secs(10));
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+    assert_eq!(f.db.history().await, all_versions());
+
+    // Previously stored reports are untouched; open requests are swept cleanly.
+    assert_eq!(
+        ledger(&mut f, &settled_usage.request).await,
+        (
+            vec![(1, None)],
+            Some((1, true, Some("7".to_owned()), 0)),
+            true
+        )
+    );
+    assert_eq!(
+        ledger(&mut f, &settled_reason.request).await,
+        (
+            vec![(1, Some("no_usage".to_owned()))],
+            Some((1, true, None, 0)),
+            true
+        )
+    );
+    let mut worker = connect(&f.db.0, WORKER).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(SWEEP_CLOSE)
+            .bind(&open_undispatched.request)
+            .fetch_one(&mut worker)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("not_dispatched")
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(SWEEP_CLOSE)
+            .bind(&open_unreported.request)
+            .fetch_one(&mut worker)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("unreported")
+    );
+
+    // The gateway role cannot emit sweep-only reasons through the library or directly in SQL.
+    let probe_disp = f.round(&plain).await;
+    let probe_undisp = f.round(&plain).await;
+    f.authorized(&probe_disp, "live").await;
+    f.authorized(&probe_undisp, "live").await;
+    assert_eq!(f.dispatch(&probe_disp).await, [f.routed()]);
+    for reason in ["not_dispatched", "unreported"] {
+        assert_eq!(
+            settlement::ingest_incomplete(
+                &gateway,
+                &UsageReport {
+                    revision: 0,
+                    ..report_of(&f, &probe_disp, None)
+                },
+                reason,
+            )
+            .await,
+            Err(StoreError::Refused),
+            "{reason}"
+        );
+        let mut gw = connect(&f.db.0, pg::GATEWAY).await;
+        let forged = sqlx::query(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,incomplete)
+             VALUES ($1::uuid,$2::uuid,$1::uuid,0,true,$3)",
+        )
+        .bind(&probe_disp.request)
+        .bind(INSTALL)
+        .bind(reason)
+        .execute(&mut gw)
+        .await;
+        assert_eq!(sqlstate(forged), "42501", "gateway forged {reason}");
+    }
+
+    // Table CHECK rejects sweep-only reasons at revision != 0 or final = false even as owner.
+    for (rev, is_final, reason) in [
+        (1_i64, true, "not_dispatched"),
+        (1_i64, true, "unreported"),
+        (0_i64, false, "not_dispatched"),
+        (0_i64, false, "unreported"),
+    ] {
+        let refused = sqlx::query(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,incomplete)
+             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),$3,$4,$5)",
+        )
+        .bind(&probe_disp.request)
+        .bind(INSTALL)
+        .bind(rev)
+        .bind(is_final)
+        .bind(reason)
+        .execute(&mut f.owner)
+        .await;
+        let Err(sqlx::Error::Database(error)) = refused else {
+            panic!("accepted {reason} rev={rev} final={is_final}");
+        };
+        assert_eq!(
+            (error.code().as_deref(), error.constraint()),
+            (
+                Some("23514"),
+                Some("gateway_usage_reports_incomplete_check")
+            )
+        );
+    }
+
+    // Deferred trigger enforces dispatched_at IS NULL for `not_dispatched`, dispatched_at IS NOT
+    // NULL for `unreported`, and forbids a later revision alongside `not_dispatched`.
+    for (why, req_id, reason, with_rev1) in [
+        (
+            "not_dispatched on dispatched",
+            &probe_disp.request,
+            "not_dispatched",
+            false,
+        ),
+        (
+            "unreported on undispatched",
+            &probe_undisp.request,
+            "unreported",
+            false,
+        ),
+        (
+            "not_dispatched with rev 1",
+            &probe_undisp.request,
+            "not_dispatched",
+            true,
+        ),
+    ] {
+        use sqlx::Connection;
+        let mut tx = f.owner.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,incomplete)
+             VALUES ($1::uuid,$2::uuid,$1::uuid,0,true,$3)",
+        )
+        .bind(req_id)
+        .bind(INSTALL)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_settlements
+                 (request_id,revision,final,measured,outstanding)
+             VALUES ($1::uuid,0,true,NULL,0)",
+        )
+        .bind(req_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        if with_rev1 {
+            sqlx::query(
+                "INSERT INTO openmettle.gateway_usage_reports
+                     (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens)
+                 VALUES ($1::uuid,$2::uuid,gen_random_uuid(),1,true,3,2)",
+            )
+            .bind(req_id)
+            .bind(INSTALL)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            sqlx::query(
+                "UPDATE openmettle.gateway_settlements
+                    SET revision=1,final=true,measured=5,outstanding=0
+                  WHERE request_id=$1::uuid",
+            )
+            .bind(req_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        let Err(sqlx::Error::Database(error)) = tx.commit().await else {
+            panic!("{why}: committed");
+        };
+        assert_eq!(error.code().as_deref(), Some("23514"), "{why}");
+    }
+}
+
+/// Migration 32 cleans unaccepted raw revision-0 reports on unbound unsettled requests (leaving
+/// already-settled schema 29–30 revision-0 requests intact and failing closed if an unsettled
+/// unbound request has an accepted revision-0 report), reserves revision 0 on unbound requests to
+/// `openmettle_owner` while keeping revision 0 available on bound ADR 0037 requests, and blocks
+/// bare or single-count final corrections after `unreported` on unmetered requests.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn migration_32_cleans_unaccepted_rev0_and_reserves_unbound_rev0_to_owner() {
+    use sqlx::Connection;
+
+    // 1. Schema 31 -> 32 upgrade with historical settled rev-0 AND dangling raw rev-0 rows.
+    let mut f = Rounds::at(31).await;
+    let plain = quotas::snapshot(100);
+    let historical_rev0 = f.round(&plain).await;
+    let historical_partial_final = f.round(&plain).await;
+    let dangling_undisp = f.round(&plain).await;
+    let dangling_unrep = f.round(&plain).await;
+    for r in [
+        &historical_rev0,
+        &historical_partial_final,
+        &dangling_undisp,
+        &dangling_unrep,
+    ] {
+        f.authorized(r, "a live run round").await;
+    }
+    assert_eq!(f.dispatch(&historical_rev0).await, [f.routed()]);
+    assert_eq!(f.dispatch(&historical_partial_final).await, [f.routed()]);
+    assert_eq!(f.dispatch(&dangling_unrep).await, [f.routed()]);
+    for sql in SETTLED {
+        f.owner_exec(sql, &historical_rev0.request).await;
+    }
+    let historical_rev0_report_id: String = sqlx::query_scalar(
+        "SELECT report_id::text FROM openmettle.gateway_usage_reports
+          WHERE request_id=$1::uuid AND revision=0",
+    )
+    .bind(&historical_rev0.request)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+
+    // Schema 31 accepted a single-count final correction at revision 2 after revision 1 had
+    // already closed the fold. Seed that schema-31 state as `openmettle_gateway` so migration 32
+    // upgrades across it, then verify exact replay of revision 2 AND a subsequent complete
+    // revision-3 correction under the new binary.
+    let mut gw = connect(&f.db.0, pg::GATEWAY).await;
+    let gateway_v31 = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(f.db.1.options(pg::GATEWAY));
+    assert_eq!(
+        settlement::ingest(
+            &gateway_v31,
+            &report_of(&f, &historical_partial_final, Some((10, 5)))
+        )
+        .await,
+        Ok(Outcome::Applied)
+    );
+    let mut partial_rev2 = report_of(&f, &historical_partial_final, None);
+    partial_rev2.revision = 2;
+    partial_rev2.prompt_tokens = Some(12);
+    partial_rev2.completion_tokens = None;
+    {
+        let mut tx = gw.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,prompt_tokens)
+             VALUES ($1::uuid,$2::uuid,$1::uuid,2,true,12)",
+        )
+        .bind(&historical_partial_final.request)
+        .bind(INSTALL)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.gateway_settlements
+                SET revision=2,final=true,measured=12,outstanding=0
+              WHERE request_id=$1::uuid",
+        )
+        .bind(&historical_partial_final.request)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("SELECT openmettle.quota_settle_gateway_usage($1::uuid,$2::uuid,$1::uuid,2)")
+            .bind(&historical_partial_final.request)
+            .bind(INSTALL)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    // Simulate a gateway writer that left unaccepted raw revision-0 rows under schema 31.
+    for r in [&dangling_undisp, &dangling_unrep] {
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens)
+             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),0,true,4,3)",
+        )
+        .bind(&r.request)
+        .bind(INSTALL)
+        .execute(&mut gw)
+        .await
+        .unwrap();
+    }
+    f.owner_exec(
+        "UPDATE openmettle.runs SET state='failed' WHERE id=$1::uuid",
+        &dangling_undisp.run,
+    )
+    .await;
+    f.owner_exec(
+        "UPDATE openmettle.runs
+            SET state='failed',
+                lease_expires_at=clock_timestamp()-interval '20 minutes',
+                execution_expires_at=clock_timestamp()-interval '20 minutes'
+          WHERE id=$1::uuid",
+        &dangling_unrep.run,
+    )
+    .await;
+
+    let settings = f.db.settings(Duration::from_secs(10));
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+    assert_eq!(f.db.history().await, all_versions());
+
+    // Historical settled revision-0 row is preserved intact.
+    assert_eq!(
+        ledger(&mut f, &historical_rev0.request).await,
+        (
+            vec![(0, None)],
+            Some((0, true, Some("2".to_owned()), 0)),
+            true
+        )
+    );
+    // Dangling raw revision-0 rows were cleaned so the sweep closes both without 23505.
+    let mut worker = connect(&f.db.0, WORKER).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(SWEEP_CLOSE)
+            .bind(&dangling_undisp.request)
+            .fetch_one(&mut worker)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("not_dispatched")
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(SWEEP_CLOSE)
+            .bind(&dangling_unrep.request)
+            .fetch_one(&mut worker)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("unreported")
+    );
+
+    // 2. Unmetered bare/single-count final correction after `unreported` is refused by both
+    //    `settlement::ingest` and direct SQL, while exact replays of historical schema <= 31
+    //    revision-0 and single-count final reports return `Duplicate` and a subsequent complete
+    //    revision-3 correction succeeds.
+    let gateway = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(f.db.1.options(pg::GATEWAY));
+    let exact_rev0 = UsageReport {
+        report_id: historical_rev0_report_id,
+        revision: 0,
+        ..report_of(&f, &historical_rev0, Some((1, 1)))
+    };
+    assert_eq!(
+        settlement::ingest(&gateway, &exact_rev0).await,
+        Ok(Outcome::Duplicate)
+    );
+    assert_eq!(
+        settlement::ingest(
+            &gateway,
+            &UsageReport {
+                prompt_tokens: Some(9),
+                ..exact_rev0.clone()
+            }
+        )
+        .await,
+        Err(StoreError::Conflict)
+    );
+    assert_eq!(
+        settlement::ingest(&gateway, &partial_rev2).await,
+        Ok(Outcome::Duplicate)
+    );
+    let complete_rev3 = UsageReport {
+        revision: 3,
+        ..report_of(&f, &historical_partial_final, Some((12, 6)))
+    };
+    assert_eq!(
+        settlement::ingest(&gateway, &complete_rev3).await,
+        Ok(Outcome::Applied)
+    );
+    assert_eq!(
+        settlement::ingest(&gateway, &partial_rev2).await,
+        Ok(Outcome::Duplicate)
+    );
+    assert_eq!(
+        settlement::ingest(
+            &gateway,
+            &UsageReport {
+                revision: 4,
+                prompt_tokens: Some(15),
+                completion_tokens: None,
+                ..report_of(&f, &historical_partial_final, None)
+            }
+        )
+        .await,
+        Err(StoreError::Refused)
+    );
+    for (prompt, completion) in [(None, None), (Some(5), None), (None, Some(3))] {
+        let mut r = report_of(&f, &dangling_unrep, None);
+        r.prompt_tokens = prompt;
+        r.completion_tokens = completion;
+        assert_eq!(
+            settlement::ingest(&gateway, &r).await,
+            Err(StoreError::Refused)
+        );
+    }
+    {
+        let mut tx = gw.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final)
+             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),1,true)",
+        )
+        .bind(&dangling_unrep.request)
+        .bind(INSTALL)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.gateway_settlements
+                SET revision=1,final=true,measured=NULL,outstanding=0
+              WHERE request_id=$1::uuid",
+        )
+        .bind(&dangling_unrep.request)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let Err(sqlx::Error::Database(error)) = tx.commit().await else {
+            panic!("unmetered bare final report committed after unreported");
+        };
+        assert_eq!(error.code().as_deref(), Some("23514"));
+    }
+    assert_eq!(
+        ledger(&mut f, &dangling_unrep.request).await,
+        (
+            vec![(0, Some("unreported".to_owned()))],
+            Some((0, true, None, 0)),
+            true
+        )
+    );
+
+    // 3. Post-32: `openmettle_gateway` cannot write revision 0 on an unbound request through
+    //    either `settlement` or direct SQL, while bound ADR 0037 requests keep revision 0.
+    let fresh = f.round(&plain).await;
+    f.authorized(&fresh, "live").await;
+    assert_eq!(f.dispatch(&fresh).await, [f.routed()]);
+    assert_eq!(
+        settlement::ingest(
+            &gateway,
+            &UsageReport {
+                revision: 0,
+                ..report_of(&f, &fresh, Some((4, 3)))
+            },
+        )
+        .await,
+        Err(StoreError::Refused)
+    );
+    assert_eq!(
+        settlement::ingest_incomplete(
+            &gateway,
+            &UsageReport {
+                revision: 0,
+                ..report_of(&f, &fresh, None)
+            },
+            "no_usage",
+        )
+        .await,
+        Err(StoreError::Refused)
+    );
+    for (what, sql) in [
+        (
+            "measured rev 0",
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens)
+             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),0,true,4,3)",
+        ),
+        (
+            "non-final rev 0",
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,prompt_tokens)
+             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),0,false,4)",
+        ),
+        (
+            "proxy reason rev 0",
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,incomplete)
+             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),0,true,'no_usage')",
+        ),
+    ] {
+        let refused = sqlx::query(sql)
+            .bind(&fresh.request)
+            .bind(INSTALL)
+            .execute(&mut gw)
+            .await;
+        assert_eq!(sqlstate(refused), "42501", "{what}");
+    }
+
+    // Bound ADR 0037 request still accepts revision 0 from `openmettle_gateway`.
+    let bound = f.round(&plain).await;
+    for sql in [
+        "INSERT INTO openmettle.gateway_bindings (installation,user_id,principal,budget)
+         SELECT installation,actor_user_id,gen_random_uuid(),gen_random_uuid()
+           FROM openmettle.gateway_requests WHERE id=$1::uuid",
+        "INSERT INTO openmettle.gateway_nonces (key_fingerprint,nonce)
+         SELECT sha256('rev0-bound'),substring(sha256('rev0-nonce') FOR 12)
+           FROM openmettle.gateway_requests WHERE id=$1::uuid",
+        "INSERT INTO openmettle.gateway_generations
+             (binding_id,generation,remote_key,expires_at,key_id,key_fingerprint,nonce,ciphertext)
+         SELECT b.id,1,gen_random_uuid(),clock_timestamp()+interval '1 hour','rev0-bound',
+                sha256('rev0-bound'),substring(sha256('rev0-nonce') FOR 12),sha256('ct')
+           FROM openmettle.gateway_requests q
+           JOIN openmettle.gateway_bindings b ON b.user_id=q.actor_user_id WHERE q.id=$1::uuid",
+        "INSERT INTO openmettle.gateway_policy
+             (binding_id,revision,scope_id,approval_id,model,report_source,provider_generation,
+              approval_generation,user_generation,capabilities)
+         SELECT b.id,1,q.scope_id,q.approval_id,q.model,gen_random_uuid(),0,0,0,'{}'
+           FROM openmettle.gateway_requests q
+           JOIN openmettle.gateway_bindings b ON b.user_id=q.actor_user_id WHERE q.id=$1::uuid",
+        "UPDATE openmettle.gateway_requests q SET state='handed_off',binding_id=p.binding_id,
+                generation=1,policy_revision=1,report_source=p.report_source
+           FROM openmettle.gateway_policy p WHERE q.id=$1::uuid",
+    ] {
+        f.owner_exec(sql, &bound.request).await;
+    }
+    let (principal, source): (String, String) = sqlx::query_as(
+        "SELECT b.principal::text, q.report_source::text
+           FROM openmettle.gateway_requests q
+           JOIN openmettle.gateway_bindings b ON b.id=q.binding_id
+          WHERE q.id=$1::uuid",
+    )
+    .bind(&bound.request)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        settlement::ingest(
+            &gateway,
+            &UsageReport {
+                principal,
+                source,
+                revision: 0,
+                ..report_of(&f, &bound, Some((4, 3)))
+            },
+        )
+        .await,
+        Ok(Outcome::Applied)
+    );
+
+    // 4. Fail-closed upgrade: a non-final revision-0 settlement on an unbound unsettled request
+    //    blocks migration 32 with 23514.
+    let mut bad = Rounds::at(31).await;
+    let corrupt = bad.round(&plain).await;
+    bad.authorized(&corrupt, "live").await;
+    assert_eq!(bad.dispatch(&corrupt).await, [bad.routed()]);
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_usage_reports
+             (request_id,source,report_id,revision,final,prompt_tokens)
+         VALUES ($1::uuid,$2::uuid,gen_random_uuid(),0,false,4)",
+    )
+    .bind(&corrupt.request)
+    .bind(INSTALL)
+    .execute(&mut bad.owner)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_settlements
+             (request_id,revision,final,measured,outstanding)
+         VALUES ($1::uuid,0,false,4,96)",
+    )
+    .bind(&corrupt.request)
+    .execute(&mut bad.owner)
+    .await
+    .unwrap();
+    let bad_settings = bad.db.settings(Duration::from_secs(10));
+    let failed = migrate::apply(&bad_settings, MIGRATIONS).await;
+    let err = failed.expect_err("corrupt rev-0 non-final settlement must block migration 32");
+    assert!(
+        err.to_string().contains("accepted revision-0 report") || err.to_string().contains("23514"),
+        "unexpected migration error: {err:?}"
+    );
 }

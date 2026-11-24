@@ -1,7 +1,8 @@
 # 0044 — OpenMettle's own inference proxy and binding-free dispatch
 
 Accepted with its implementation, 23 November 2026 (V1-06 proxy increments 2a and 2b); increment
-2c delivered 24 November 2026. Amended 24 November 2026 with increment 3a: see
+2c delivered 24 November 2026. Amended 24 November 2026 with increments 3a (migration 31) and
+3b (migration 32): see
 [requests that end without usage](#amendment-24-november-2026-requests-that-end-without-usage).
 Refs #7.
 Supersedes [ADR 0037](0037-gateway-provisioning-and-usage-reconciliation.md) in part: see
@@ -169,7 +170,8 @@ not that model exactly once. The body is still forwarded byte for byte.
 
 A refusal after the dispatch was spent, and a dispatch whose database exchange did not answer,
 leave one `gateway.usage.unrecorded` event with a fixed reason. Since increment 3a the refusal
-also closes the hold (see the amendment); the unanswered dispatch still leaves it in place.
+also closes the hold (see the amendment); since increment 3b the worker's maintenance sweep
+closes an unanswered dispatch once 15 minutes have passed after its run's execution deadline.
 
 No other component observes usage. The proxy writes the one final report of a request from the
 upstream's own usage object, as in increment 1.
@@ -254,7 +256,7 @@ exists.
 | 2b | Proxy authentication, single dispatch and model check. |
 | 2c | The worker reaches the proxy over `http://` inside the cluster or `https://` through a TLS terminator; `gateway_keys` removed from the worker document; packaged worker to proxy end-to-end tests; ADR 0043 note and the worker page (delivered 24 November 2026). |
 | 3a | A dispatched request that ends without usage is closed by a final report with its reason; migration 31 (delivered 24 November 2026, see the amendment). |
-| 3b | A sweep closes the requests the proxy cannot: never dispatched, or never reported. |
+| 3b | A bounded worker sweep closes requests the proxy cannot report (`not_dispatched` immediately once undispatchable, `unreported` 15 minutes past the run's execution deadline); migration 32 (delivered 24 November 2026, see the amendment). |
 | 3c | A response stopped at its token limit ends the turn with its partial output and a marker. |
 | 3d | Running usage for cut streams. |
 | 4 | Family policy tables. |
@@ -276,9 +278,6 @@ exists.
   only workers to the proxy is the mitigation, and TLS terminated in front of the proxy is
   the stricter option. The proxy has no TLS listener of its own, and mutual TLS is a possible
   later option. The proxy stays undeployable until increments 3 and 7.
-- **Holds without a final report.** Increment 3a closes a dispatched request that ends without
-  usage. A round that is never dispatched, and one the proxy could not report, keep their hold
-  until increment 3b; the amendment lists the cases.
 - **Cost holds.** A cost hold never settles on a report with usage, because the proxy reports
   no cost ([issue 166](https://github.com/OpenMettle/openmettle-core/issues/166)).
 - **Broad database role.** `openmettle_gateway` still has the grants the reconciler needed. A
@@ -288,7 +287,7 @@ exists.
 
 ## Amendment, 24 November 2026: requests that end without usage
 
-Increment 3a, with migration 31. Refs #7.
+Increments 3a (migration 31) and 3b (migration 32). Refs #7.
 
 ### Problem
 
@@ -316,8 +315,8 @@ model server may have worked for the request:
 
 | Group | Reasons |
 | --- | --- |
-| Nothing was sent upstream | `model_not_served`, `model_mismatch`, `request_body`, `upstream_connect` |
-| The request was or may have been sent, and its usage is unknown | `upstream_transport`, `upstream_timeout`, `upstream_status`, `upstream_encoding`, `incomplete`, `caller_disconnected`, `no_usage`, `unparsable` |
+| Nothing was sent upstream | `model_not_served`, `model_mismatch`, `request_body`, `upstream_connect`, `not_dispatched` (sweep-only, revision 0) |
+| The request was or may have been sent, and its usage is unknown | `upstream_transport`, `upstream_timeout`, `upstream_status`, `upstream_encoding`, `incomplete`, `caller_disconnected`, `no_usage`, `unparsable`, `unreported` (sweep-only, revision 0) |
 
 **The fold closes the hold.** `quota_gateway_fold` gains one rule: a report that carries a
 reason adds no measurement of its own—it carries no usage, cost or unit fields—and settles
@@ -347,40 +346,65 @@ No partial output reaches a user today, so the gain is unbilled load, bounded by
 concurrency limits. Changing the rule for the second group is a change to the fold's
 `incomplete` branch alone.
 
-**Revisions.** The proxy writes its one report of a request, with usage or without, at
-revision 1 under the request's own ID. Revision 0 is left to the sweep of increment 3b.
-Settlement lets a higher final revision correct a lower one, so a report of the proxy that
-arrives after the sweep closed the request replaces the sweep's record, and the sweep can
-never replace the proxy's.
+**Revisions and worker sweep (increment 3b, migration 32).** The proxy writes its one report
+of a request, with usage or without, at revision 1 under the request's own ID. Revision 0 is
+owned by the worker's bounded maintenance sweep (`gateway_unreported_candidates` and
+`gateway_close_unreported`, `SECURITY DEFINER`, `openmettle_worker` only):
 
-**No bare final report.** Settlement and a deferred database trigger refuse a final report
-that would leave a request without a binding open: one without both counts and without a
-reason, or one whose quota fold was not run. The proxy builds a report without counts only
-together with its reason.
+- **Never dispatched (`dispatched_at IS NULL` -> `not_dispatched`, Group 1).** Closed with no
+  grace delay as soon as `gateway_dispatch` can no longer grant it under `runs FOR SHARE` ->
+  `gateway_requests FOR UPDATE` (run not `running`, `cancel_reason` set, claim mismatch or
+  null, or lease/execution deadline passed). A `not_dispatched` report is allowed only at
+  revision 0 on an undispatched unbound request with no other accepted revision, and
+  `gateway_dispatch` refuses any settled request.
+- **Dispatched and unreported (`dispatched_at IS NOT NULL` -> `unreported`, Group 2).** Closed
+  15 minutes past the run's execution deadline (preserving `run_approvals.resume_execution_expires_at`
+  when a run parked on approval), even if the run finished earlier, giving the proxy its full
+  upstream abort and write-retry budget. Settlement lets a higher final revision correct a
+  lower one, so a late proxy report at revision 1 (with usage or a proxy reason) supersedes
+  the sweep's revision-0 `unreported` record, and the sweep never overwrites revision 1.
+- **Role boundary and lock order.** A `BEFORE INSERT OR UPDATE` trigger on
+  `gateway_usage_reports` restricts `not_dispatched`, `unreported`, and revision 0 on unbound
+  requests to `openmettle_owner` (including the sweep function) so `openmettle_gateway` cannot
+  emit sweep reasons or occupy revision 0 to block the sweep, while bound ADR 0037 rows keep
+  revision 0 available. Each closed request commits in its own short transaction (`runs FOR
+  SHARE SKIP LOCKED` -> `gateway_requests FOR UPDATE SKIP LOCKED` -> `quota_reservations` ->
+  `quota_budgets`). Candidate discovery materializes at most `p_limit` raw index entries per
+  page and returns each key with its `eligible` flag so the worker advances its pass cursor
+  across in-grace or live prefixes under a fixed per-pass upper bound without unbounded index
+  scans or head-of-line starvation. Bound ADR 0037 rows are untouched.
+
+**No bare final report.** Settlement and a deferred database trigger refuse any final report on
+a request without a binding that lacks both an `incomplete` reason and complete prompt and
+completion counts (even when correcting an earlier `unreported` settlement), or that fails to
+fold every quota hold on the request to `latest.revision`. The proxy builds a report without
+counts only together with its reason.
 
 ### Who closes what
 
-| End of the request | After increment 3a |
+| End of the request | After increment 3b |
 | --- | --- |
-| Completed 200 with usage | The proxy reports the usage, as before. This includes a response stopped at its token limit: the recorded server stops at exactly the requested `max_completion_tokens` and still reports usage (observed 24 November 2026). |
-| Dispatch spent, nothing sent, or sent and no usage (the twelve reasons) | The proxy writes the incomplete report at once, also when its caller has gone. |
-| Never dispatched: the worker did not reach the proxy, or the proxy refused the bearer | Nothing. The hold stays until increment 3b. |
-| Dispatch recorded but unconfirmed to the proxy (`dispatch_unconfirmed`) | Logged only. The hold stays until increment 3b. |
-| The proxy could not write its report, or stopped while relaying | `gateway.usage.failed`, or nothing. The hold stays until increment 3b. |
+| Completed 200 with usage | The proxy reports the usage at revision 1, as before. This includes a response stopped at its token limit: the recorded server stops at exactly the requested `max_completion_tokens` and still reports usage (observed 24 November 2026). |
+| Dispatch spent, nothing sent, or sent and no usage (the twelve proxy reasons) | The proxy writes the incomplete report at revision 1 at once, also when its caller has gone. |
+| Never dispatched: the worker did not reach the proxy, or the proxy refused the bearer | The worker maintenance sweep closes it as `not_dispatched` (Group 1) at revision 0 once the run can no longer dispatch it. |
+| Dispatch recorded but unconfirmed (`dispatch_unconfirmed`), report write failed (`gateway.usage.failed`), or proxy stopped mid-relay | The worker maintenance sweep closes it as `unreported` (Group 2) at revision 0 once 15 minutes have passed after the run's execution deadline; a late proxy report at revision 1 still supersedes it. |
 
-There is still no local spool: when the database is unavailable the report is lost, the hold
-stays, and the failure is logged.
+There is still no local spool: when the database is unavailable the proxy logs the failure,
+and the worker sweep reconciles any request left without a report after its grace window.
 
 ### Evidence
 
-- `tests/schema/gateway_proxy.rs`: every reason through the binary, among them the recorded
-  aborted stream and the recorded 500; the hold settled with nothing charged, the request no
-  longer outstanding and no accounting drift. Revisions, corrections and the refused bare
-  final report through settlement on a metered request.
-- `tests/schema/gateway_rounds.rs`: the same for a request without a quota hold, the refusal
-  for a request that was never dispatched, and the upgrade from schema 30 with the CHECK.
+- `tests/schema/gateway_proxy.rs`: every proxy reason through the binary, among them the
+  recorded aborted stream and the recorded 500; metered token and cost holds settled by the
+  worker sweep (`not_dispatched` and `unreported`), late complete and incomplete revision-1
+  proxy reports superseding revision-0 `unreported`, `dispatch_unconfirmed` closed after grace,
+  head-of-line non-starvation across bounded pages, and zero accounting drift.
+- `tests/schema/gateway_rounds.rs`: unmetered eligibility across all run states (including
+  parked approval waits), concurrent `gateway_dispatch` vs sweep races, bound ADR 0037
+  exemption, role/isolation/trigger guards, and upgrades from schema 30 -> 31 and 31 -> 32.
 - `tests/schema/live_turns/worker_gateway.rs`: the packaged worker's round refused by a proxy
-  that serves another model is closed with `model_not_served`.
+  serving another model is closed with `model_not_served`; an unreachable proxy fails the turn
+  and the packaged worker's own maintenance sweep closes the hold as `not_dispatched`.
 
 ## Evidence
 
@@ -394,8 +418,8 @@ stays, and the failure is logged.
   and dispatches its round to the proxy binary with the bearer it made, over plain HTTP and
   through a TLS terminator; the usage report equals the recorded answer's, the hold settles
   and the answer is published. A proxy serving another model fails the turn and closes the
-  hold with `model_not_served`; an unreachable proxy fails the turn and leaves the hold
-  until increment 3b.
+  hold with `model_not_served`; an unreachable proxy fails the turn and the packaged worker's
+  maintenance sweep closes the hold with `not_dispatched`.
 - `tests/provider_http_support/tests.rs`, `tests/provider_inference/authentication.rs` and
   `tests/provider_gateway.rs`: every other client refuses `http://`, and the gateway route
   pairs its scheme with trust anchors and sends its bearer and request ID without TLS.
