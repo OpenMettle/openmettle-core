@@ -8,7 +8,7 @@
 -- role other than the owner may hold any privilege on the holds or journal tables.
 -- Version 29 adds the binding-free run-round handoff and its confirm step (worker only), the
 -- internal authority check both use, and the one-time dispatch (gateway only) (ADR 0044). It
--- adds no table or column grant.
+-- adds three columns to `gateway_requests` and no table or column grant.
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -188,7 +188,7 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.deletion_journal_append_purge()',true,ARRAY[]::text[])) AS f WHERE $1 >= 28
     UNION ALL SELECT * FROM (VALUES
         ('openmettle.gateway_round_authority(uuid,uuid,timestamptz)',false,ARRAY[]::text[]),
-        ('openmettle.gateway_handoff_round(uuid,bytea,uuid)',true,ARRAY['openmettle_worker']::text[]),
+        ('openmettle.gateway_handoff_round(uuid,bytea,uuid,bytea)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.gateway_handoff_round_confirm(uuid,bytea,uuid)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.gateway_dispatch(uuid,bytea)',true,ARRAY['openmettle_gateway']::text[])) AS f WHERE $1 >= 29
 ),

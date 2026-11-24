@@ -1550,8 +1550,9 @@ async fn unknown_child_zone_suspends_only_that_binding_and_advances_discovery() 
     );
 }
 
-/// Whether `gateway_dispatch` reports a replay for the request whose dispatch secret is
-/// `[8; 32]`; `None` when it returns no row.
+/// Whether `gateway_dispatch` reports a replay for a request when it is presented that
+/// request's dispatch secret, `[8; 32]`; `None` when it returns no row. A request handed off
+/// before migration 29 has no bearer hash, so nothing presented can match it.
 async fn legacy_dispatch(gateway: &PgPool, request: &str) -> Option<bool> {
     sqlx::query_scalar("SELECT replayed FROM openmettle.gateway_dispatch($1::uuid,sha256($2))")
         .bind(request)

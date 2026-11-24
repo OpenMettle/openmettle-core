@@ -1,6 +1,6 @@
 //! ADR 0044 (V1-06 proxy increment 2a): a run round is handed off without a gateway binding,
 //! generation or policy row (`openmettle.gateway_handoff_round`, worker only), and the proxy
-//! spends its one dispatch with the round's secret (`openmettle.gateway_dispatch`, gateway
+//! spends its one dispatch with the round's bearer (`openmettle.gateway_dispatch`, gateway
 //! only). Both functions are called directly, under the provisioned role logins.
 //!
 //! The fixture is a database upgraded from version 23 with one account, so metering is not
@@ -16,7 +16,7 @@ use openmettle_core::{
             Error as StoreError,
             settlement::{self, Outcome},
         },
-        leases::LeaseSettings,
+        leases::{self, Lease, LeaseSettings},
         projects,
         runs::{self as queue, Admission, AdmissionLimits, ClaimLimits, RunAdmission},
     },
@@ -43,10 +43,11 @@ const LEASES: LeaseSettings = LeaseSettings {
     lease: Duration::from_secs(120),
     execution_timeout: Duration::from_secs(600),
 };
-const HANDOFF: &str = "SELECT openmettle.gateway_handoff_round($1::uuid,$2,$3::uuid)";
+/// The worker sends the hash of the bearer it chose, never the bearer.
+const HANDOFF: &str = "SELECT openmettle.gateway_handoff_round($1::uuid,$2,$3::uuid,sha256($4))";
 /// The last statement of a handoff transaction.
 const CONFIRM: &str = "SELECT openmettle.gateway_handoff_round_confirm($1::uuid,$2,$3::uuid)";
-/// The proxy sends the hash of the secret its caller presented, never the secret.
+/// The proxy sends the hash of the bearer its caller presented, never the bearer.
 const DISPATCH: &str = "SELECT replayed,installation,scope,source,principal,model
     FROM openmettle.gateway_dispatch($1::uuid,sha256($2))";
 
@@ -80,7 +81,10 @@ struct Claimed {
 struct Round {
     run: String,
     request: String,
+    /// The dispatch secret: the reserving worker's proof to the database.
     secret: [u8; 32],
+    /// The bearer the worker would present to the proxy; the database stores its hash.
+    bearer: [u8; 32],
     lease: String,
 }
 
@@ -89,7 +93,7 @@ struct Rounds {
     owner: PgConnection,
     actor: Account,
     scope: String,
-    /// Numbers the admission keys and dispatch secrets of this fixture.
+    /// Numbers the admission keys, dispatch secrets and bearers of this fixture.
     next: u8,
 }
 
@@ -237,6 +241,7 @@ impl Rounds {
             run: run.id.clone(),
             request,
             secret,
+            bearer: [self.number(); 32],
             lease: run.lease.clone(),
         }
     }
@@ -268,6 +273,7 @@ impl Rounds {
             .bind(&round.request)
             .bind(secret)
             .bind(lease)
+            .bind(round.bearer.as_slice())
             .fetch_one(&mut c)
             .await?;
         if !handed {
@@ -347,22 +353,22 @@ impl Rounds {
         assert_eq!(done.rows_affected(), 1, "{sql}");
     }
 
-    /// Every row of `gateway_dispatch` for `request` and `secret`, called as `role`.
+    /// Every row of `gateway_dispatch` for `request` and `bearer`, called as `role`.
     async fn dispatch_as(
         &self,
         role: &str,
         request: &str,
-        secret: &[u8],
+        bearer: &[u8],
     ) -> Result<Vec<Dispatched>, sqlx::Error> {
         sqlx::query_as(DISPATCH)
             .bind(request)
-            .bind(secret)
+            .bind(bearer)
             .fetch_all(&mut connect(&self.db.0, role).await)
             .await
     }
 
     async fn dispatch(&self, round: &Round) -> Vec<Dispatched> {
-        self.dispatch_as(pg::GATEWAY, &round.request, &round.secret)
+        self.dispatch_as(pg::GATEWAY, &round.request, &round.bearer)
             .await
             .unwrap()
     }
@@ -409,12 +415,33 @@ async fn a_run_round_is_handed_off_without_a_binding_generation_or_policy() {
         let handed = f.handoff_as(WORKER, &round, secret, lease).await.unwrap();
         assert!(!handed);
     }
+    // The dispatch secret crosses the worker's database connection, so it is never the bearer.
+    let reused = Round {
+        run: round.run.clone(),
+        request: round.request.clone(),
+        secret: round.secret,
+        bearer: round.secret,
+        lease: round.lease.clone(),
+    };
+    assert!(!f.handoff(&reused).await);
     assert_eq!(
         f.stored(&round).await,
         ("reserved".to_owned(), None, false, false)
     );
     f.authorized(&round, "a live run round of an enabled, approved user")
         .await;
+    // The handoff stored the hash of the bearer and of the claim, and neither value.
+    let digests: (bool, bool) = sqlx::query_as(
+        "SELECT bearer_hash=sha256($2),claim_hash=sha256(uuid_send($3::uuid))
+           FROM openmettle.gateway_requests WHERE id=$1::uuid",
+    )
+    .bind(&round.request)
+    .bind(round.bearer.as_slice())
+    .bind(&round.lease)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(digests, (true, true));
     // The handoff cannot be repeated.
     assert!(!f.handoff(&round).await);
     assert_eq!(f.provisioned().await, 0);
@@ -441,6 +468,7 @@ async fn the_handoff_is_restricted_to_the_worker_and_to_read_committed() {
         .bind(&round.request)
         .bind(round.secret.as_slice())
         .bind(&round.lease)
+        .bind(round.bearer.as_slice())
         .fetch_one(&mut worker)
         .await;
     assert_eq!(sqlstate(stale), "25000");
@@ -785,7 +813,15 @@ async fn a_project_round_needs_a_live_editor_role_in_a_project_that_is_not_archi
 
 /// The quota commit and the deferred handoff check can wait on quota locks. An approval or a
 /// lease that lapses during that wait is not handed off: the confirm step reads the authority
-/// again after the wait. The holder stands for a quota administration change in flight.
+/// again after the wait.
+///
+/// Both waits are observed, not timed. The handoff first waits behind an account administration
+/// change, before it locks any row; that change shortens the expiry and commits, so the handoff
+/// reads an authority that is still live. The confirm step then waits behind a quota
+/// administration change, which commits only after the expiry is seen to have passed. Once the
+/// handoff holds its row locks nothing can write the expiry, so only time can withdraw it: the
+/// expiry is the one interval left, and it has to outlast only the server's own work between
+/// the first holder's commit and the handoff's read.
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn authority_that_lapses_during_a_quota_wait_is_not_handed_off() {
@@ -796,7 +832,7 @@ async fn authority_that_lapses_during_a_quota_wait_is_not_handed_off() {
         (
             "an approval that expired during the wait",
             "UPDATE openmettle.local_identity_approvals
-                SET expires_ms=floor(extract(epoch FROM clock_timestamp())*1000)::bigint+1500
+                SET expires_ms=floor(extract(epoch FROM clock_timestamp())*1000)::bigint+1000
               WHERE id=$1::uuid",
             "SELECT expires_ms<floor(extract(epoch FROM clock_timestamp())*1000)::bigint
                FROM openmettle.local_identity_approvals WHERE id=$1::uuid",
@@ -807,7 +843,7 @@ async fn authority_that_lapses_during_a_quota_wait_is_not_handed_off() {
         (
             "a lease that lapsed during the wait",
             "UPDATE openmettle.runs
-                SET lease_expires_at=clock_timestamp()+interval '1500 milliseconds'
+                SET lease_expires_at=clock_timestamp()+interval '1000 milliseconds'
               WHERE id=$1::uuid",
             "SELECT lease_expires_at<clock_timestamp() FROM openmettle.runs WHERE id=$1::uuid",
             "UPDATE openmettle.runs SET lease_expires_at=clock_timestamp()+interval '1 minute'
@@ -821,30 +857,42 @@ async fn authority_that_lapses_during_a_quota_wait_is_not_handed_off() {
         } else {
             round.run.clone()
         };
-        let mut holder = connect(&f.db.0, OWNER).await;
-        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-            .fetch_one(&mut holder)
-            .await
-            .unwrap();
-        holder.execute("BEGIN").await.unwrap();
-        holder
-            .execute("SELECT FROM openmettle.quota_enforcement FOR UPDATE")
-            .await
-            .unwrap();
-        f.owner_exec(shorten, &id).await;
+        let mut holders = Vec::new();
+        for lock in [
+            "SELECT FROM openmettle.account_admin_lock FOR UPDATE",
+            "SELECT FROM openmettle.quota_enforcement FOR UPDATE",
+        ] {
+            let mut holder = connect(&f.db.0, OWNER).await;
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut holder)
+                .await
+                .unwrap();
+            holder.execute("BEGIN").await.unwrap();
+            holder.execute(lock).await.unwrap();
+            holders.push((holder, pid));
+        }
+        let (mut quota, quota_pid) = holders.pop().unwrap();
+        let (mut accounts, accounts_pid) = holders.pop().unwrap();
         let options = role_options(&f.db.0, WORKER);
-        let (request, secret, lease) = (round.request.clone(), round.secret, round.lease.clone());
+        let (request, secret, bearer, lease) = (
+            round.request.clone(),
+            round.secret,
+            round.bearer,
+            round.lease.clone(),
+        );
         let waiting = tokio::spawn(async move {
             let mut c = PgConnection::connect_with(&options).await.unwrap();
             c.execute("BEGIN").await.unwrap();
+            // Waits for the account holder before it locks or reads anything it checks.
             let handed: bool = sqlx::query_scalar(HANDOFF)
                 .bind(&request)
                 .bind(secret.as_slice())
                 .bind(&lease)
+                .bind(bearer.as_slice())
                 .fetch_one(&mut c)
                 .await
                 .unwrap();
-            // Waits for the holder inside the deferred handoff check.
+            // Waits for the quota holder inside the deferred handoff check.
             let confirmed = sqlx::query(CONFIRM)
                 .bind(&request)
                 .bind(secret.as_slice())
@@ -854,7 +902,15 @@ async fn authority_that_lapses_during_a_quota_wait_is_not_handed_off() {
             let _ = c.execute("ROLLBACK").await;
             (handed, confirmed.map(|_| ()))
         });
-        wait_for_blocked_peer(&f.db, pid).await;
+        wait_for_blocked_peer(&f.db, accounts_pid).await;
+        let shortened = sqlx::query(shorten)
+            .bind(&id)
+            .execute(&mut accounts)
+            .await
+            .unwrap();
+        assert_eq!(shortened.rows_affected(), 1, "{why}");
+        accounts.execute("COMMIT").await.unwrap();
+        wait_for_blocked_peer(&f.db, quota_pid).await;
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let done: bool = sqlx::query_scalar(lapsed)
@@ -868,7 +924,7 @@ async fn authority_that_lapses_during_a_quota_wait_is_not_handed_off() {
             assert!(Instant::now() < deadline, "{why}: never lapsed");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        holder.execute("COMMIT").await.unwrap();
+        quota.execute("COMMIT").await.unwrap();
         let (handed, confirmed) = waiting.await.unwrap();
         assert!(handed, "{why}: authorized before the wait");
         assert_eq!(sqlstate(confirmed), "42501", "{why}");
@@ -884,14 +940,14 @@ async fn authority_that_lapses_during_a_quota_wait_is_not_handed_off() {
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
-async fn the_dispatch_is_restricted_to_the_gateway_and_proves_the_secret() {
+async fn the_dispatch_is_restricted_to_the_gateway_and_proves_the_bearer() {
     let mut f = Rounds::new().await;
     let plain = quotas::snapshot(100);
     let reserved = f.round(&plain).await;
     let round = f.round(&plain).await;
     f.authorized(&round, "a live run round").await;
     for role in [API, WORKER, ISSUANCE] {
-        let denied = f.dispatch_as(role, &round.request, &round.secret).await;
+        let denied = f.dispatch_as(role, &round.request, &round.bearer).await;
         assert_eq!(sqlstate(denied), "42501", "{role}");
     }
     let mut gateway = connect(&f.db.0, pg::GATEWAY).await;
@@ -901,22 +957,24 @@ async fn the_dispatch_is_restricted_to_the_gateway_and_proves_the_secret() {
         .unwrap();
     let stale = sqlx::query_as::<_, Dispatched>(DISPATCH)
         .bind(&round.request)
-        .bind(round.secret.as_slice())
+        .bind(round.bearer.as_slice())
         .fetch_all(&mut gateway)
         .await;
     assert_eq!(sqlstate(stale), "25000");
     gateway.execute("ROLLBACK").await.unwrap();
 
-    // A wrong secret, an unknown request and a request not handed off yet are refused alike:
+    // A wrong bearer, an unknown request and a request not handed off yet are refused alike:
     // no row, and nothing spent.
-    for (request, secret) in [
+    for (request, bearer) in [
         (round.request.as_str(), &[0xee; 32][..]),
-        (round.request.as_str(), &round.secret[..31]),
-        (round.request.as_str(), &reserved.secret[..]),
-        (UNKNOWN, &round.secret[..]),
-        (reserved.request.as_str(), &reserved.secret[..]),
+        (round.request.as_str(), &round.bearer[..31]),
+        (round.request.as_str(), &reserved.bearer[..]),
+        (UNKNOWN, &round.bearer[..]),
+        (reserved.request.as_str(), &reserved.bearer[..]),
+        // The dispatch secret is the worker's proof to the database, never a bearer.
+        (round.request.as_str(), &round.secret[..]),
     ] {
-        let rows = f.dispatch_as(pg::GATEWAY, request, secret).await.unwrap();
+        let rows = f.dispatch_as(pg::GATEWAY, request, bearer).await.unwrap();
         assert_eq!(rows, []);
     }
     assert!(!f.stored(&round).await.3);
@@ -928,12 +986,14 @@ async fn the_dispatch_is_restricted_to_the_gateway_and_proves_the_secret() {
     assert!(f.stored(&round).await.3);
     assert_eq!(f.dispatch(&round).await, [REPLAY]);
     assert_eq!(f.dispatch(&round).await, [REPLAY]);
-    // A replay is reported only to the holder of the secret.
-    let rows = f
-        .dispatch_as(pg::GATEWAY, &round.request, &[0xee; 32])
-        .await
-        .unwrap();
-    assert_eq!(rows, []);
+    // A replay is reported only to the holder of the bearer.
+    for other in [&[0xee; 32], &round.secret] {
+        let rows = f
+            .dispatch_as(pg::GATEWAY, &round.request, other)
+            .await
+            .unwrap();
+        assert_eq!(rows, []);
+    }
 }
 
 #[tokio::test]
@@ -949,13 +1009,13 @@ async fn concurrent_dispatches_of_one_round_spend_it_exactly_once() {
             .map(|_| {
                 let barrier = barrier.clone();
                 let options = role_options(&f.db.0, pg::GATEWAY);
-                let (request, secret) = (round.request.clone(), round.secret);
+                let (request, bearer) = (round.request.clone(), round.bearer);
                 tokio::spawn(async move {
                     let mut c = PgConnection::connect_with(&options).await.unwrap();
                     barrier.wait().await;
                     sqlx::query_as::<_, Dispatched>(DISPATCH)
                         .bind(request)
-                        .bind(secret.as_slice())
+                        .bind(bearer.as_slice())
                         .fetch_all(&mut c)
                         .await
                         .unwrap()
@@ -1033,8 +1093,127 @@ async fn an_expired_run_that_no_sweep_settled_is_not_dispatched() {
     assert_eq!(f.dispatch(&round).await, [f.routed()]);
 }
 
-/// A request handed off with a gateway binding, the ADR 0037 way, is never dispatched, even
-/// for a live run and the right secret: that transport may already have sent it.
+/// The handoff records which claim authorized it. A holder that renews its lease keeps that
+/// claim and its round still dispatches. A run reclaimed by another holder is `running`, not
+/// cancelled and inside a new lease, and the previous holder's unspent round is still not
+/// dispatched. A round spent before the reclaim still reports a replay.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_reclaimed_run_does_not_dispatch_the_previous_holders_round() {
+    let mut f = Rounds::new().await;
+    let plain = quotas::snapshot(100);
+    let mut worker = connect(&f.db.0, WORKER).await;
+
+    let renewed = f.round(&plain).await;
+    f.authorized(&renewed, "a live run round").await;
+    let before: String =
+        sqlx::query_scalar("SELECT lease_expires_at::text FROM openmettle.runs WHERE id=$1::uuid")
+            .bind(&renewed.run)
+            .fetch_one(&mut f.owner)
+            .await
+            .unwrap();
+    let lease = Lease {
+        scope_id: &f.scope,
+        run_id: &renewed.run,
+        claim_token: &renewed.lease,
+    };
+    leases::renew_lease(&mut worker, &lease, &LEASES)
+        .await
+        .unwrap();
+    let after: String =
+        sqlx::query_scalar("SELECT lease_expires_at::text FROM openmettle.runs WHERE id=$1::uuid")
+            .bind(&renewed.run)
+            .fetch_one(&mut f.owner)
+            .await
+            .unwrap();
+    assert_ne!(before, after, "the renewal moved the lease");
+    assert_eq!(f.dispatch(&renewed).await, [f.routed()]);
+
+    let unspent = f.round(&plain).await;
+    let spent = f.round(&plain).await;
+    for round in [&unspent, &spent] {
+        f.authorized(round, "a live run round").await;
+    }
+    assert_eq!(f.dispatch(&spent).await, [f.routed()]);
+    for round in [&unspent, &spent] {
+        f.owner_exec(
+            "UPDATE openmettle.runs SET lease_expires_at=clock_timestamp()-interval '1 second'
+              WHERE id=$1::uuid",
+            &round.run,
+        )
+        .await;
+    }
+    let mut reclaimed = Vec::new();
+    while let Some(next) = leases::reclaim_next(&mut worker, &LEASES).await.unwrap() {
+        assert!(![&unspent.lease, &spent.lease].contains(&&next.run.claim_token));
+        reclaimed.push(next.run.run_id);
+    }
+    reclaimed.sort();
+    let mut expected = [unspent.run.clone(), spent.run.clone()];
+    expected.sort();
+    assert_eq!(reclaimed, expected);
+    // The reclaimed run would pass every other dispatch condition.
+    let live: bool = sqlx::query_scalar(
+        "SELECT state='running' AND cancel_reason IS NULL AND lease_expires_at>clock_timestamp()
+                AND execution_expires_at>clock_timestamp()
+           FROM openmettle.runs WHERE id=$1::uuid",
+    )
+    .bind(&unspent.run)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert!(live);
+    assert_eq!(f.dispatch(&unspent).await, []);
+    assert!(!f.stored(&unspent).await.3);
+    assert_eq!(f.dispatch(&spent).await, [REPLAY]);
+}
+
+/// The dispatch reads its clock inside the updating statement, which by then holds its
+/// relation lock: a lease that ran out while the dispatch waited for that lock is not
+/// dispatched. The holder stands for a schema change or an explicit table lock in flight; a
+/// `SHARE` lock admits the function's row lock and blocks its update. The lease is set to the
+/// current time only after the dispatch is seen waiting, so a clock read before the wait would
+/// still be inside it.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_lease_that_lapsed_while_the_dispatch_waited_for_its_table_lock_is_not_dispatched() {
+    let mut f = Rounds::new().await;
+    let round = f.round(&quotas::snapshot(100)).await;
+    f.authorized(&round, "a live run round").await;
+    let mut holder = connect(&f.db.0, OWNER).await;
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut holder)
+        .await
+        .unwrap();
+    holder.execute("BEGIN").await.unwrap();
+    holder
+        .execute("LOCK TABLE openmettle.gateway_requests IN SHARE MODE")
+        .await
+        .unwrap();
+    let options = role_options(&f.db.0, pg::GATEWAY);
+    let (request, bearer) = (round.request.clone(), round.bearer);
+    let waiting = tokio::spawn(async move {
+        let mut c = PgConnection::connect_with(&options).await.unwrap();
+        sqlx::query_as::<_, Dispatched>(DISPATCH)
+            .bind(request)
+            .bind(bearer.as_slice())
+            .fetch_all(&mut c)
+            .await
+            .unwrap()
+    });
+    wait_for_blocked_peer(&f.db, pid).await;
+    f.owner_exec(
+        "UPDATE openmettle.runs SET lease_expires_at=clock_timestamp() WHERE id=$1::uuid",
+        &round.run,
+    )
+    .await;
+    holder.execute("COMMIT").await.unwrap();
+    assert_eq!(waiting.await.unwrap(), []);
+    assert!(!f.stored(&round).await.3);
+}
+
+/// A request handed off with a gateway binding, the ADR 0037 way, has no bearer hash and is
+/// never dispatched, even for a live run: that transport may already have sent it.
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn a_request_handed_off_with_a_binding_is_never_dispatched() {
@@ -1076,7 +1255,13 @@ async fn a_request_handed_off_with_a_binding_is_never_dispatched() {
     .await
     .unwrap();
     assert!(bound);
-    assert_eq!(f.dispatch(&round).await, []);
+    for presented in [&round.bearer, &round.secret] {
+        let rows = f
+            .dispatch_as(pg::GATEWAY, &round.request, presented)
+            .await
+            .unwrap();
+        assert_eq!(rows, []);
+    }
     assert!(!f.stored(&round).await.3);
 }
 
@@ -1126,12 +1311,12 @@ async fn a_run_cancelled_while_its_dispatch_waited_is_not_dispatched() {
         .await
         .unwrap();
     let options = role_options(&f.db.0, pg::GATEWAY);
-    let (request, secret) = (round.request.clone(), round.secret);
+    let (request, bearer) = (round.request.clone(), round.bearer);
     let waiting = tokio::spawn(async move {
         let mut c = PgConnection::connect_with(&options).await.unwrap();
         sqlx::query_as::<_, Dispatched>(DISPATCH)
             .bind(request)
-            .bind(secret.as_slice())
+            .bind(bearer.as_slice())
             .fetch_all(&mut c)
             .await
             .unwrap()
@@ -1152,7 +1337,8 @@ async fn a_run_cancelled_while_its_dispatch_waited_is_not_dispatched() {
 }
 
 /// The CHECK that replaced migration 23's unnamed one accepts a request without a binding and
-/// refuses every half-set combination. `gateway::unmetered_handoff_replays_only_accepted_token_
+/// refuses every half-set combination. A request handed off without a binding carries a bearer
+/// hash and a claim hash; no other request does, and the bearer hash is never the dispatch hash. `gateway::unmetered_handoff_replays_only_accepted_token_
 /// components_after_upgrade` carries a bound, handed-off row of version 23 through the upgrade.
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
@@ -1211,12 +1397,40 @@ async fn the_handoff_check_accepts_unbound_rows_and_rejects_half_set_ones() {
         // installation.
         (
             &session_owned,
+            "state='handed_off',report_source=installation,bearer_hash=sha256('b'),
+             claim_hash=sha256('c')",
+        ),
+        (
+            &reserved.request,
+            "state='handed_off',report_source=gen_random_uuid(),bearer_hash=sha256('b'),
+             claim_hash=sha256('c')",
+        ),
+        // Handed off without a binding and without the digests.
+        (
+            &reserved.request,
             "state='handed_off',report_source=installation",
         ),
         (
             &reserved.request,
-            "state='handed_off',report_source=gen_random_uuid()",
+            "state='handed_off',report_source=installation,bearer_hash=sha256('b')",
         ),
+        // A request that is not handed off carries neither digest.
+        (
+            &reserved.request,
+            "bearer_hash=sha256('b'),claim_hash=sha256('c')",
+        ),
+        // A request handed off with a binding carries neither digest.
+        (
+            &reserved.request,
+            "state='handed_off',report_source=gen_random_uuid(),binding_id=gen_random_uuid(),
+             generation=1,policy_revision=1,bearer_hash=sha256('b'),claim_hash=sha256('c')",
+        ),
+        (&handed.request, "bearer_hash=NULL"),
+        (&handed.request, "claim_hash=NULL"),
+        (&handed.request, "bearer_hash=NULL,claim_hash=NULL"),
+        (&handed.request, "bearer_hash=dispatch_hash"),
+        (&handed.request, "bearer_hash=sha256('b')||'\\x00'"),
+        (&handed.request, "claim_hash=substring(claim_hash FOR 31)"),
         (&reserved.request, "dispatched_at=clock_timestamp()"),
         (&reserved.request, "report_source=installation"),
         (

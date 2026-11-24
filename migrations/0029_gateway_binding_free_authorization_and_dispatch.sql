@@ -23,17 +23,31 @@ END
 $$;
 
 -- A handed-off request names its report source. The binding columns are set together, and only
--- by the ADR 0037 handoff. A request handed off without a binding belongs to a run and reports
--- under its installation. `dispatched_at` records the one dispatch the proxy allowed; it is not
--- a state, because settlement and the quota functions test `state = 'handed_off'`.
+-- by the ADR 0037 handoff. A request handed off without a binding belongs to a run, reports
+-- under its installation, and carries two digests the handoff wrote:
+--   * `bearer_hash`, the SHA-256 of the bearer the worker will present to the proxy. The bearer
+--     is a second random value, independent of the dispatch secret, and never reaches the
+--     database. The dispatch secret stays the reserving caller's proof to the database and is
+--     never a bearer: the two hashes must differ;
+--   * `claim_hash`, the SHA-256 of the run claim that authorized the handoff, so a later holder
+--     of the run cannot make this request dispatchable. The claim token itself is not stored:
+--     the gateway role can read this table.
+-- `dispatched_at` records the one dispatch the proxy allowed; it is not a state, because
+-- settlement and the quota functions test `state = 'handed_off'`.
 ALTER TABLE openmettle.gateway_requests
     ADD COLUMN dispatched_at timestamptz,
+    ADD COLUMN bearer_hash bytea,
+    ADD COLUMN claim_hash bytea,
     ADD CONSTRAINT gateway_requests_handoff_check CHECK (
         (binding_id IS NULL) = (generation IS NULL) AND (generation IS NULL) = (policy_revision IS NULL)
         AND (binding_id IS NULL OR state = 'handed_off')
         AND (state = 'handed_off') = (report_source IS NOT NULL)
         AND (binding_id IS NOT NULL OR state <> 'handed_off'
              OR (run_id IS NOT NULL AND report_source = installation))
+        AND (bearer_hash IS NOT NULL) = (state = 'handed_off' AND binding_id IS NULL)
+        AND (claim_hash IS NOT NULL) = (bearer_hash IS NOT NULL)
+        AND (bearer_hash IS NULL OR (octet_length(bearer_hash) = 32 AND octet_length(claim_hash) = 32
+                                     AND bearer_hash <> dispatch_hash))
         AND (dispatched_at IS NULL OR state = 'handed_off'));
 
 -- Internal: whether run round `p_request` is authorized at `p_at` under run lease `p_lease`.
@@ -148,12 +162,14 @@ REVOKE ALL ON FUNCTION openmettle.gateway_round_authority(uuid,uuid,timestamptz)
 
 -- `gateway_handoff` for a run round, without a binding: the holder of the round's dispatch
 -- secret and of the run's lease marks it handed off, reporting under the request's installation,
--- with the binding columns left null.
+-- with the binding columns left null. It stores the hash of the bearer the worker chose and of
+-- the claim it holds; the bearer itself is never sent here.
 -- Lock order: `gateway_handoff`'s, without the session and binding locks it no longer needs:
 -- account_admin_lock, project, provider and approval, user, run, reservation, request. Removing
 -- locks from an order cannot invert it. The authority is read after the last lock.
 -- The caller's transaction must end with `gateway_handoff_round_confirm`.
-CREATE FUNCTION openmettle.gateway_handoff_round(p_request uuid,p_dispatch bytea,p_lease uuid)
+CREATE FUNCTION openmettle.gateway_handoff_round(
+    p_request uuid,p_dispatch bytea,p_lease uuid,p_bearer_hash bytea)
 RETURNS boolean
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE
@@ -165,6 +181,7 @@ BEGIN
     END IF;
     SELECT * INTO req FROM openmettle.gateway_requests q WHERE q.id=p_request AND q.run_id IS NOT NULL
         AND octet_length(p_dispatch)=32 AND q.dispatch_hash=sha256(p_dispatch) AND q.state='reserved'
+        AND octet_length(p_bearer_hash)=32 AND p_bearer_hash<>q.dispatch_hash
         AND pg_has_role(session_user,'openmettle_worker','USAGE');
     IF NOT FOUND THEN RETURN false; END IF;
     PERFORM FROM openmettle.account_admin_lock FOR SHARE;
@@ -179,13 +196,14 @@ BEGIN
     IF NOT openmettle.gateway_round_authority(p_request,p_lease,clock_timestamp()) THEN
         RETURN false;
     END IF;
-    UPDATE openmettle.gateway_requests q SET state='handed_off',report_source=q.installation
+    UPDATE openmettle.gateway_requests q SET state='handed_off',report_source=q.installation,
+           bearer_hash=p_bearer_hash,claim_hash=sha256(uuid_send(p_lease))
      WHERE q.id=p_request AND q.state='reserved';
     RETURN FOUND;
 END
 $$;
-REVOKE ALL ON FUNCTION openmettle.gateway_handoff_round(uuid,bytea,uuid) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION openmettle.gateway_handoff_round(uuid,bytea,uuid) TO openmettle_worker;
+REVOKE ALL ON FUNCTION openmettle.gateway_handoff_round(uuid,bytea,uuid,bytea) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION openmettle.gateway_handoff_round(uuid,bytea,uuid,bytea) TO openmettle_worker;
 
 -- The last statement of a handoff transaction, after the quota commit. The quota commit and
 -- the deferred handoff trigger can wait on quota locks, and an approval, a lease or a membership
@@ -216,44 +234,47 @@ $$;
 REVOKE ALL ON FUNCTION openmettle.gateway_handoff_round_confirm(uuid,bytea,uuid) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION openmettle.gateway_handoff_round_confirm(uuid,bytea,uuid) TO openmettle_worker;
 
--- The proxy presents the SHA-256 of the dispatch secret its caller sent, never the secret: a
--- server that logs statement parameters then records nothing a caller could present. The first
--- call for a request handed off without a binding, not yet settled, whose run is running, not
--- cancelled and inside its lease and execution deadlines, consumes the one dispatch and returns
--- the stored routing fields. A later call with the same hash reports a replay. Every other call
--- returns no row, whether or not the request exists. A request handed off under ADR 0037 is
--- never dispatched here: its transport may already have sent it.
+-- The proxy presents the SHA-256 of the bearer its caller sent, never the bearer: a server that
+-- logs statement parameters then records nothing a caller could present. The dispatch secret
+-- is not a bearer: its hash matches no `bearer_hash`. The first call for a request handed off
+-- without a binding, not yet settled, whose run is running, not cancelled, still held under the
+-- claim that authorized the handoff and inside its lease and execution deadlines, consumes the
+-- one dispatch and returns the stored routing fields. A later call with the same hash reports
+-- a replay. Every other call returns no row, whether or not the request exists. A request
+-- handed off under ADR 0037 has no bearer hash and is never dispatched here: its transport may
+-- already have sent it.
 -- The function locks only the request row, which is also settlement's first lock, and it waits
--- for that lock before reading the clock and deciding: a dispatch, settlement or cancellation
--- that committed during the wait is seen. It does not write `state`, so the deferred handoff
--- trigger does not fire.
-CREATE FUNCTION openmettle.gateway_dispatch(p_request uuid,p_dispatch_hash bytea)
+-- for that lock before deciding: a dispatch, settlement or cancellation that committed during
+-- the wait is seen. The clock is read once, inside the updating statement, which by then holds
+-- its relation locks: that reading is compared with the deadlines and stored. The function
+-- does not write `state`, so the deferred handoff trigger does not fire.
+CREATE FUNCTION openmettle.gateway_dispatch(p_request uuid,p_bearer_hash bytea)
 RETURNS TABLE (replayed boolean,installation text,scope text,source text,principal text,model text)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
-DECLARE
-    t timestamptz;
 BEGIN
     IF current_setting('transaction_isolation') <> 'read committed' THEN
         RAISE EXCEPTION 'gateway dispatch requires READ COMMITTED' USING ERRCODE = '25000';
     END IF;
     PERFORM FROM openmettle.gateway_requests q WHERE q.id=p_request
-        AND q.dispatch_hash=p_dispatch_hash AND q.state='handed_off' AND q.binding_id IS NULL
+        AND q.bearer_hash=p_bearer_hash AND q.state='handed_off'
         AND pg_has_role(session_user,'openmettle_gateway','USAGE') FOR NO KEY UPDATE;
     IF NOT FOUND THEN RETURN; END IF;
-    t := clock_timestamp();
     RETURN QUERY
-    UPDATE openmettle.gateway_requests q SET dispatched_at=t
-     WHERE q.id=p_request AND q.dispatch_hash=p_dispatch_hash AND q.state='handed_off'
-       AND q.binding_id IS NULL AND q.dispatched_at IS NULL
+    WITH clock AS MATERIALIZED (SELECT clock_timestamp() AS t)
+    UPDATE openmettle.gateway_requests q SET dispatched_at=clock.t
+      FROM clock
+     WHERE q.id=p_request AND q.bearer_hash=p_bearer_hash AND q.state='handed_off'
+       AND q.dispatched_at IS NULL
        AND NOT EXISTS (SELECT FROM openmettle.gateway_settlements s WHERE s.request_id=q.id)
        AND EXISTS (SELECT FROM openmettle.runs r
             WHERE r.id=q.run_id AND r.state='running' AND r.cancel_reason IS NULL
-              AND r.lease_expires_at>t AND r.execution_expires_at>t)
+              AND sha256(uuid_send(r.claim_token))=q.claim_hash
+              AND r.lease_expires_at>clock.t AND r.execution_expires_at>clock.t)
     RETURNING false,q.installation::text,q.scope_id::text,q.report_source::text,
               q.actor_user_id::text,q.model;
     IF FOUND THEN RETURN; END IF;
     RETURN QUERY SELECT true,NULL::text,NULL::text,NULL::text,NULL::text,NULL::text
-      FROM openmettle.gateway_requests q WHERE q.id=p_request AND q.dispatch_hash=p_dispatch_hash
+      FROM openmettle.gateway_requests q WHERE q.id=p_request AND q.bearer_hash=p_bearer_hash
        AND q.dispatched_at IS NOT NULL;
 END
 $$;
