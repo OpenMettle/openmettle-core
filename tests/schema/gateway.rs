@@ -1692,4 +1692,23 @@ async fn unmetered_handoff_replays_only_accepted_token_components_after_upgrade(
     let drift:(i64,i64,i64,i64)=sqlx::query_as("SELECT storage_mismatches,budget_mismatches,settlement_mismatches,pending_gateway_reconciliations
         FROM openmettle.quota_verify_accounting_drift()").fetch_one(&mut owner).await.unwrap();
     assert_eq!(drift, (0, 0, 0, 0));
+    // ADR 0044: this bound row, handed off at version 23, passed migration 29's CHECK. It still
+    // reports under its binding's principal, in settlement and at dispatch alike; its actor is
+    // not accepted in that principal's place.
+    let mut as_actor = r.clone();
+    as_actor.revision = 8;
+    as_actor.principal = actor.user.clone();
+    assert_eq!(ingest(&g, &as_actor).await, Err(gateway::Error::Refused));
+    let dispatched: (bool, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT replayed,source,principal FROM openmettle.gateway_dispatch($1::uuid,$2)",
+    )
+    .bind(&request)
+    .bind([8_u8; 32].as_slice())
+    .fetch_one(&g)
+    .await
+    .unwrap();
+    assert_eq!(
+        dispatched,
+        (false, Some(LEASE.to_owned()), Some(PRINCIPAL.to_owned()))
+    );
 }

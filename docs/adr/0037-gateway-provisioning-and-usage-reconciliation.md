@@ -1,5 +1,10 @@
 # 0037 — Application-owned gateway provisioning and usage reconciliation
 
+> **Superseded in part by [ADR 0044](0044-own-inference-proxy-and-binding-free-dispatch.md)
+> (23 November 2026).** No third-party gateway is deployed. Per-user keys, sealing, remote
+> reconciliation and the admin profile are superseded; reservation, the handed-off state, the
+> settlement ledger and the error contract stand. The text below is unchanged.
+
 Proposed for Wave 18c, V1-06 PR1, 21 November 2026. Refs #7. This design depends on
 V1-04 identity admission and V1-05 authorization. Implementation and gateway qualification
 follow in separate increments. [Delivery contract](https://github.com/OpenMettle/openmettle-core/issues/7).

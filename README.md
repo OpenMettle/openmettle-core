@@ -12,7 +12,7 @@ Runtime qualification and deployment acceptance remain separate gates.
 ## Start here
 
 - [Accepted architecture v1](ARCHITECTURE-v1.md), including service diagrams and all 43 delivery tickets.
-- [Repository boundaries](REPOSITORIES.md), [decisions index (ADRs 0001–0038)](DECISIONS.md) and [provenance](UPSTREAM.md).
+- [Repository boundaries](REPOSITORIES.md), [decisions index (ADRs 0001–0044)](DECISIONS.md) and [provenance](UPSTREAM.md).
 - [Live delivery tracker](https://github.com/orgs/OpenMettle/projects/1/views/1?filterQuery=%5BV1-00%5D&pane=issue&itemId=307308630).
 
 ## Development
@@ -164,7 +164,7 @@ Unset, the process opens no directory and starts exactly as before. Set, it crea
 ```
 
 - **Catalog.** Mount the same catalog file as the API's `catalog_file`. `routes` must name exactly its model IDs, and each route's `pin` must equal that model's catalog `pin`. A changed profile therefore needs a re-qualified route before the worker starts. The packaged worker cannot serve a profile with `requires_device_slot`.
-- **Dispatch credential (provisional).** Every round reserves its budget, commits its `x-request-id` and is handed off for usage settlement ([ADR 0037](docs/adr/0037-gateway-provisioning-and-usage-reconciliation.md)). For now `installation` and `gateway_keys` feed the library's current credential path, which opens the admitted user's sealed gateway key in the handoff. `gateway_keys` reuses the API document's member format. A later gateway-authorization increment replaces both members; do not build tooling around them. The worker never reads the API's document, login keys or cursor keys.
+- **Dispatch credential (provisional).** Every round reserves its budget, commits its `x-request-id` and is handed off for usage settlement ([ADR 0037](docs/adr/0037-gateway-provisioning-and-usage-reconciliation.md)). Since [ADR 0044](docs/adr/0044-own-inference-proxy-and-binding-free-dispatch.md) the round is authorized without a gateway binding, the bearer the worker sends is the round's own dispatch secret, and `installation` is also the usage report source. `gateway_keys` is still required in the document, in the API document's member format, but no longer used: increment 2c removes it, so do not build tooling around it. The worker never reads the API's document, login keys or cursor keys.
 - **Routes.** Each endpoint follows the provider transport rules: a canonical `https://` URL with a DNS name, no loopback or metadata address, and private addresses only inside `private_cidrs`. `trust` selects the native roots or exactly one PEM bundle. `stream` selects SSE or JSON, the only mode qualified for the route. Timeouts: setup 100–30,000 ms, idle 1,000–3,600,000 ms, overall 1,000–86,400,000 ms and at least the other two.
 - **Tools.** The worker offers no tools until V1-14. A model tool call fails the turn.
 - **Refusals.** The document and every file it names are read once before telemetry, the listener or any database or network work. A refusal exits 78 with `inference configuration error: ` and one fixed category, never a value or path.

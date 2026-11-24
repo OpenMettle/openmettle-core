@@ -187,6 +187,8 @@ async fn legacy_outstanding(
 
 /// The caller supplies evidence from the authenticated reporting profile. Verify all routing
 /// fields against the immutable request, including after key rotation and account withdrawal.
+/// A request handed off without a binding (ADR 0044) reports under its actor as the principal,
+/// the same rule as `openmettle.gateway_dispatch`.
 pub async fn ingest(pool: &PgPool, r: &UsageReport) -> Result<Outcome, Error> {
     if !r.valid() {
         return Err(Error::Refused);
@@ -199,10 +201,11 @@ pub async fn ingest(pool: &PgPool, r: &UsageReport) -> Result<Outcome, Error> {
         .await?;
     let row = sqlx::query(
         "SELECT q.units,s.revision,s.final,s.outstanding FROM openmettle.gateway_requests q
-        JOIN openmettle.gateway_bindings b ON b.id=q.binding_id
+        LEFT JOIN openmettle.gateway_bindings b ON b.id=q.binding_id
         LEFT JOIN openmettle.gateway_settlements s ON s.request_id=q.id
         WHERE q.id=$1::uuid AND q.state='handed_off' AND q.report_source=$2::uuid
-        AND q.installation=$3::uuid AND b.principal=$4::uuid AND q.scope_id=$5::uuid",
+        AND q.installation=$3::uuid AND coalesce(b.principal,q.actor_user_id)=$4::uuid
+        AND q.scope_id=$5::uuid",
     )
     .bind(&r.request)
     .bind(&r.source)

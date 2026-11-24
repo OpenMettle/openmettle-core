@@ -107,6 +107,14 @@ SELECT j.journal_seq, j.entity_id
                 WHERE p.scope_id = j.scope_id AND p.artifact_revision_id = j.entity_id);
 ```
 
+## Upgrade from 0028 to 0029 (gateway dispatch)
+
+Migration `0029` ([ADR 0044](../adr/0044-own-inference-proxy-and-binding-free-dispatch.md)) needs no activation step and no backfill. It adds `gateway_requests.dispatched_at`, replaces the unnamed handoff CHECK on that table with `gateway_requests_handoff_check` and adds two functions. Existing rows satisfy the new CHECK.
+
+- Apply it with `openmettle-migrate` before rolling workers. A worker of this release on schema `0028` fails every metered round, because `openmettle.gateway_handoff_round` does not exist yet.
+- A worker of the previous release keeps calling `openmettle.gateway_handoff`, which still needs a gateway binding that no deployment can create. Its metered rounds fail as they did before the upgrade.
+- The migration finds the old CHECK by the columns it constrains and stops with `expected one gateway_requests handoff CHECK` if it finds none or several. That means the table was altered outside the migrations; inspect its constraints before retrying.
+
 ## Monitor overdue handoffs
 
 The worker records up to 100 overdue committed handoffs per maintenance sweep in `openmettle_quota_overdue_handoffs_total`. The counter measures observations across sweeps. An outstanding handoff can contribute more than once. Use the database ledger to identify the holds. The observation leaves quota charges intact.

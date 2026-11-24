@@ -1,5 +1,17 @@
 use super::*;
 
+/// The admission snapshot of a run on catalog model `a` that requires no capability: the model
+/// and capabilities a round is handed off against (ADR 0044), with the round token ceiling the
+/// quota functions read.
+pub(super) fn snapshot(ceiling: u64) -> Vec<u8> {
+    serde_json::json!({
+        "effective": {"model": "a", "ceiling": {"value": ceiling}},
+        "required_capabilities": {},
+    })
+    .to_string()
+    .into_bytes()
+}
+
 pub(super) struct TurnHandoffFixture {
     installation: String,
     catalog: openmettle_core::model_config::Catalog,
@@ -1531,7 +1543,7 @@ async fn schema_23_cost_device_upgrade_pre_pr3_worker_recovery_and_gateway_reser
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: br#"{"effective":{"ceiling":{"value":450}}}"#,
+                config: &snapshot(450),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -1722,7 +1734,7 @@ async fn schema_23_cost_device_upgrade_pre_pr3_worker_recovery_and_gateway_reser
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: br#"{"effective":{"ceiling":{"value":300}}}"#,
+                config: &snapshot(300),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -2255,7 +2267,7 @@ async fn mid_run_recovered_cost_hold_slice_replayed_backfill_and_single_run_expi
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: br#"{"effective":{"ceiling":{"value":100}}}"#,
+                config: &snapshot(100),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -2732,7 +2744,6 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
         .fetch_one(&mut owner)
         .await
         .unwrap();
-    let keys = GatewayKeys::new(&[("atomic-k1".into(), KEY_BYTES)]).unwrap();
     let (finger, env) = GatewaySealer::new(
         GatewayKeys::new(&[("atomic-k1".into(), KEY_BYTES)]).unwrap(),
         g_pool.clone(),
@@ -2823,7 +2834,7 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
                     format: "openmettle.conversation",
                     version: 1,
                     input: b"{}",
-                    config: br#"{"effective":{"ceiling":{"value":100}}}"#,
+                    config: &snapshot(100),
                 },
                 actor_approval_id: &alice.approval,
                 capabilities: &[],
@@ -2895,13 +2906,7 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
     .unwrap();
     let fx = TurnHandoffFixture::chat(INSTALL, "a", 100, Some(100), true);
     let _disp1 = p1
-        .handoff(
-            &worker_pool,
-            &keys,
-            Some(GRANT_1),
-            &fx.billable(),
-            fx.prepare(),
-        )
+        .handoff(&worker_pool, Some(GRANT_1), &fx.billable(), fx.prepare())
         .await
         .unwrap();
 
@@ -2940,14 +2945,8 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
     .await
     .unwrap();
     assert!(matches!(
-        p2.handoff(
-            &worker_pool,
-            &keys,
-            Some(GRANT_1),
-            &fx.billable(),
-            fx.prepare(),
-        )
-        .await,
+        p2.handoff(&worker_pool, Some(GRANT_1), &fx.billable(), fx.prepare(),)
+            .await,
         Err(gateway::Error::Refused)
     ));
     let req2_state: String =
@@ -3009,13 +3008,7 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
         .unwrap();
     assert!(matches!(
         p2_cancel
-            .handoff(
-                &worker_pool,
-                &keys,
-                Some(GRANT_2),
-                &fx.billable(),
-                fx.prepare(),
-            )
+            .handoff(&worker_pool, Some(GRANT_2), &fx.billable(), fx.prepare(),)
             .await,
         Err(gateway::Error::Refused)
     ));
@@ -3076,7 +3069,7 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: br#"{"effective":{"ceiling":{"value":100}}}"#,
+                config: &snapshot(100),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -3212,7 +3205,7 @@ async fn atomic_turn_handoff_rollback_unmetered_guard_personal_cost_expiry_and_l
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: br#"{"effective":{"ceiling":{"value":250}}}"#,
+                config: &snapshot(250),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -3561,7 +3554,7 @@ async fn pre_activation_charged_parents_pre26_replay_savepoint_and_n1_legacy_hol
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: br#"{"effective":{"ceiling":{"value":150}}}"#,
+                config: &snapshot(150),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -3649,7 +3642,7 @@ async fn pre_activation_charged_parents_pre26_replay_savepoint_and_n1_legacy_hol
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: br#"{"effective":{"ceiling":{"value":200}}}"#,
+                config: &snapshot(200),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -3704,7 +3697,7 @@ async fn pre_activation_charged_parents_pre26_replay_savepoint_and_n1_legacy_hol
     .unwrap();
     let fx = TurnHandoffFixture::chat(INSTALL, "a", 200, Some(300), false);
     let _disp = pending_held
-        .handoff(&worker_pool, &keys, None, &fx.billable(), fx.prepare())
+        .handoff(&worker_pool, None, &fx.billable(), fx.prepare())
         .await
         .unwrap();
     let child_rows: Vec<(String, i64, String)> = sqlx::query_as(
@@ -3734,9 +3727,9 @@ async fn pre_activation_charged_parents_pre26_replay_savepoint_and_n1_legacy_hol
             &UsageReport {
                 request: pending_held.id.clone(),
                 installation: INSTALL.into(),
-                principal: PRINCIPAL.into(),
+                principal: alice.user.clone(),
                 scope: scope.clone(),
-                source: report_source.clone(),
+                source: INSTALL.into(),
                 report_id,
                 revision: 0,
                 r#final: true,
@@ -3844,7 +3837,7 @@ async fn pre_activation_charged_parents_pre26_replay_savepoint_and_n1_legacy_hol
                     format: "openmettle.conversation",
                     version: 1,
                     input: b"{}",
-                    config: br#"{"effective":{"ceiling":{"value":100}}}"#,
+                    config: &snapshot(100),
                 },
                 actor_approval_id: &alice.approval,
                 capabilities: &[],
@@ -4181,7 +4174,6 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
         .fetch_one(&mut owner)
         .await
         .unwrap();
-    let keys = GatewayKeys::new(&[("exp-k1".into(), KEY_BYTES)]).unwrap();
     let (finger, env) = GatewaySealer::new(
         GatewayKeys::new(&[("exp-k1".into(), KEY_BYTES)]).unwrap(),
         g_pool.clone(),
@@ -4259,7 +4251,7 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: br#"{"effective":{"ceiling":{"value":200}}}"#,
+                config: &snapshot(200),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -4330,7 +4322,7 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
     .unwrap();
     let fx = TurnHandoffFixture::chat(INSTALL, "a", 200, Some(300), false);
     let _disp1 = p1
-        .handoff(&worker_pool, &keys, None, &fx.billable(), fx.prepare())
+        .handoff(&worker_pool, None, &fx.billable(), fx.prepare())
         .await
         .unwrap();
     let r1_child_cost: (i64, String) = sqlx::query_as(
@@ -4353,9 +4345,9 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
             &UsageReport {
                 request: p1.id.clone(),
                 installation: INSTALL.into(),
-                principal: PRINCIPAL.into(),
+                principal: alice.user.clone(),
                 scope: scope.clone(),
-                source: report_source.clone(),
+                source: INSTALL.into(),
                 report_id,
                 revision: 0,
                 r#final: true,
@@ -4408,7 +4400,7 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: br#"{"effective":{"ceiling":{"value":200}}}"#,
+                config: &snapshot(200),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -4521,7 +4513,6 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
         .fetch_one(&mut owner_up)
         .await
         .unwrap();
-    let keys_up = GatewayKeys::new(&[("race-k1".into(), KEY_BYTES)]).unwrap();
     let (f_up, e_up) = GatewaySealer::new(
         GatewayKeys::new(&[("race-k1".into(), KEY_BYTES)]).unwrap(),
         g_up.clone(),
@@ -4603,7 +4594,7 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: br#"{"effective":{"ceiling":{"value":100}}}"#,
+                config: &snapshot(100),
             },
             actor_approval_id: &bob.approval,
             capabilities: &[],
@@ -4668,13 +4659,7 @@ async fn expired_last_cost_limit_still_settles_parent_and_unqualified_turn_fails
     let fx = TurnHandoffFixture::chat(INSTALL, "a", 100, None, true);
     assert!(matches!(
         p_race
-            .handoff(
-                &wp_up,
-                &keys_up,
-                Some(GRANT_RACE),
-                &fx.billable(),
-                fx.prepare(),
-            )
+            .handoff(&wp_up, Some(GRANT_RACE), &fx.billable(), fx.prepare(),)
             .await,
         Err(gateway::Error::Refused)
     ));
@@ -4775,7 +4760,6 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
         .fetch_one(&mut owner)
         .await
         .unwrap();
-    let keys = GatewayKeys::new(&[("rr8-k1".into(), KEY_BYTES)]).unwrap();
     let (finger, env) = GatewaySealer::new(
         GatewayKeys::new(&[("rr8-k1".into(), KEY_BYTES)]).unwrap(),
         g_pool.clone(),
@@ -4868,7 +4852,7 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: br#"{"effective":{"ceiling":{"value":100}}}"#,
+                config: &snapshot(100),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -5007,7 +4991,7 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
     let fx = TurnHandoffFixture::chat(INSTALL, "a", 100, None, false);
     assert!(matches!(
         p_unqual
-            .handoff(&worker_pool, &keys, None, &fx.billable(), fx.prepare())
+            .handoff(&worker_pool, None, &fx.billable(), fx.prepare())
             .await,
         Err(gateway::Error::Refused)
     ));
@@ -5076,7 +5060,6 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
             .fetch_one(&mut owner2)
             .await
             .unwrap();
-        let keys2 = GatewayKeys::new(&[("rr8-k2".into(), KEY_BYTES)]).unwrap();
         let (f2, e2) = GatewaySealer::new(
             GatewayKeys::new(&[("rr8-k2".into(), KEY_BYTES)]).unwrap(),
             g2.clone(),
@@ -5150,7 +5133,7 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
                     format: "openmettle.conversation",
                     version: 1,
                     input: b"{}",
-                    config: br#"{"effective":{"ceiling":{"value":100}}}"#,
+                    config: &snapshot(100),
                 },
                 actor_approval_id: &bob.approval,
                 capabilities: &[],
@@ -5218,7 +5201,7 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
         let fx = TurnHandoffFixture::chat(INSTALL, "a", 100, Some(500), false);
         assert!(matches!(
             p_null_denom
-                .handoff(&wp2, &keys2, None, &fx.billable(), fx.prepare())
+                .handoff(&wp2, None, &fx.billable(), fx.prepare())
                 .await,
             Err(gateway::Error::Refused)
         ));
@@ -5291,7 +5274,7 @@ async fn re_review_8_single_snapshot_cost_unqualified_activation_race_and_disabl
                     format: "openmettle.conversation",
                     version: 1,
                     input: b"{}",
-                    config: br#"{"effective":{"ceiling":{"value":100}}}"#,
+                    config: &snapshot(100),
                 },
                 actor_approval_id: &alice.approval,
                 capabilities: &[],
@@ -5533,7 +5516,7 @@ async fn stale_lease_on_reserve_turn_round_and_gateway_reserve_returns_refused()
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: br#"{"effective":{"ceiling":{"value":100}}}"#,
+                config: &snapshot(100),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -5642,7 +5625,7 @@ async fn stale_lease_on_reserve_turn_round_and_gateway_reserve_returns_refused()
     let fx = TurnHandoffFixture::chat(INSTALL, "a", 100, None, true);
     assert!(matches!(
         p_dev
-            .handoff(&worker_pool, &keys, None, &fx.billable(), fx.prepare())
+            .handoff(&worker_pool, None, &fx.billable(), fx.prepare())
             .await,
         Err(gateway::Error::Refused)
     ));
@@ -5791,7 +5774,7 @@ async fn stale_lease_on_reserve_turn_round_and_gateway_reserve_returns_refused()
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: br#"{"effective":{"ceiling":{"value":100}}}"#,
+                config: &snapshot(100),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -6114,7 +6097,6 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
             .fetch_one(&mut owner)
             .await
             .unwrap();
-        let keys = GatewayKeys::new(&[("rr11-k1".into(), KEY_BYTES)]).unwrap();
         let (finger, env) = GatewaySealer::new(
             GatewayKeys::new(&[("rr11-k1".into(), KEY_BYTES)]).unwrap(),
             g_pool.clone(),
@@ -6188,7 +6170,7 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
                     format: "openmettle.conversation",
                     version: 1,
                     input: b"{}",
-                    config: br#"{"effective":{"ceiling":{"value":100}}}"#,
+                    config: &snapshot(100),
                 },
                 actor_approval_id: &alice.approval,
                 capabilities: &[],
@@ -6344,13 +6326,7 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
         );
         let fx = TurnHandoffFixture::chat(INSTALL, "a", 100, Some(300), true);
         let _disp = pending
-            .handoff(
-                &worker_pool,
-                &keys,
-                Some(GRANT_1),
-                &fx.billable(),
-                fx.prepare(),
-            )
+            .handoff(&worker_pool, Some(GRANT_1), &fx.billable(), fx.prepare())
             .await
             .unwrap();
         let report_id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
@@ -6363,9 +6339,9 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
                 &UsageReport {
                     request: pending.id.clone(),
                     installation: INSTALL.into(),
-                    principal: PRINCIPAL.into(),
+                    principal: alice.user.clone(),
                     scope: scope.clone(),
-                    source: report_source,
+                    source: INSTALL.into(),
                     report_id,
                     revision: 0,
                     r#final: true,
@@ -6446,7 +6422,6 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
             .fetch_one(&mut owner)
             .await
             .unwrap();
-        let keys = GatewayKeys::new(&[("rr11-k2".into(), KEY_BYTES)]).unwrap();
         let (finger, env) = GatewaySealer::new(
             GatewayKeys::new(&[("rr11-k2".into(), KEY_BYTES)]).unwrap(),
             g_pool.clone(),
@@ -6520,7 +6495,7 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
                     format: "openmettle.conversation",
                     version: 1,
                     input: b"{}",
-                    config: br#"{"effective":{"ceiling":{"value":100}}}"#,
+                    config: &snapshot(100),
                 },
                 actor_approval_id: &bob.approval,
                 capabilities: &[],
@@ -6571,13 +6546,7 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
         let fx = TurnHandoffFixture::chat(INSTALL, "a", 100, Some(300), true);
         assert!(matches!(
             p_pre
-                .handoff(
-                    &worker_pool,
-                    &keys,
-                    Some(GRANT_2),
-                    &fx.billable(),
-                    fx.prepare(),
-                )
+                .handoff(&worker_pool, Some(GRANT_2), &fx.billable(), fx.prepare(),)
                 .await,
             Err(gateway::Error::Refused)
         ));
@@ -6603,13 +6572,7 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
         .await
         .unwrap();
         let _disp = p_retry
-            .handoff(
-                &worker_pool,
-                &keys,
-                Some(GRANT_2),
-                &fx.billable(),
-                fx.prepare(),
-            )
+            .handoff(&worker_pool, Some(GRANT_2), &fx.billable(), fx.prepare())
             .await
             .unwrap();
         let report_id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
@@ -6622,9 +6585,9 @@ async fn mid_reservation_and_pre_handoff_metering_activation_retries_and_materia
                 &UsageReport {
                     request: p_retry.id.clone(),
                     installation: INSTALL.into(),
-                    principal: PRINCIPAL.into(),
+                    principal: bob.user.clone(),
                     scope: scope.clone(),
-                    source: report_source,
+                    source: INSTALL.into(),
                     report_id,
                     revision: 0,
                     r#final: true,
@@ -7351,7 +7314,6 @@ async fn reserve_turn_round_returns_retryable_on_40001_and_succeeds_on_retry() {
         .fetch_one(&mut owner)
         .await
         .unwrap();
-    let keys = GatewayKeys::new(&[("rr14-k1".into(), KEY_BYTES)]).unwrap();
     let (finger, env) = GatewaySealer::new(
         GatewayKeys::new(&[("rr14-k1".into(), KEY_BYTES)]).unwrap(),
         g_pool.clone(),
@@ -7443,7 +7405,7 @@ async fn reserve_turn_round_returns_retryable_on_40001_and_succeeds_on_retry() {
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: br#"{"effective":{"ceiling":{"value":200}}}"#,
+                config: &snapshot(200),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -7569,7 +7531,7 @@ async fn reserve_turn_round_returns_retryable_on_40001_and_succeeds_on_retry() {
     .expect("immediate retry after Error::Retryable must succeed");
     let fx = TurnHandoffFixture::chat(INSTALL, "a", 200, None, false);
     let _disp = pending
-        .handoff(&worker_pool, &keys, None, &fx.billable(), fx.prepare())
+        .handoff(&worker_pool, None, &fx.billable(), fx.prepare())
         .await
         .unwrap();
     let charge_roles: Vec<String> = sqlx::query_scalar(
@@ -7603,9 +7565,9 @@ async fn reserve_turn_round_returns_retryable_on_40001_and_succeeds_on_retry() {
             &UsageReport {
                 request: pending.id.clone(),
                 installation: INSTALL.into(),
-                principal: PRINCIPAL.into(),
+                principal: alice.user.clone(),
                 scope: project_scope.clone(),
-                source: report_source,
+                source: INSTALL.into(),
                 report_id,
                 revision: 0,
                 r#final: true,
@@ -7700,7 +7662,6 @@ async fn replacement_holds_and_cost_slice_account_for_prior_bearer_rounds() {
         .fetch_one(&mut owner)
         .await
         .unwrap();
-    let keys = GatewayKeys::new(&[("rr15-k1".into(), KEY_BYTES)]).unwrap();
     let (finger, env) = GatewaySealer::new(
         GatewayKeys::new(&[("rr15-k1".into(), KEY_BYTES)]).unwrap(),
         g_pool.clone(),
@@ -7792,7 +7753,7 @@ async fn replacement_holds_and_cost_slice_account_for_prior_bearer_rounds() {
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: br#"{"effective":{"ceiling":{"value":450}}}"#,
+                config: &snapshot(450),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -7899,7 +7860,7 @@ async fn replacement_holds_and_cost_slice_account_for_prior_bearer_rounds() {
 
     let fx = TurnHandoffFixture::chat(INSTALL, "a", 450, Some(450), false);
     let _disp_a = pending_a
-        .handoff(&worker_pool, &keys, None, &fx.billable(), fx.prepare())
+        .handoff(&worker_pool, None, &fx.billable(), fx.prepare())
         .await
         .unwrap();
     let report_id_a: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
@@ -7912,9 +7873,9 @@ async fn replacement_holds_and_cost_slice_account_for_prior_bearer_rounds() {
             &UsageReport {
                 request: pending_a.id.clone(),
                 installation: INSTALL.into(),
-                principal: PRINCIPAL.into(),
+                principal: alice.user.clone(),
                 scope: alice_scope.clone(),
-                source: report_source.clone(),
+                source: INSTALL.into(),
                 report_id: report_id_a,
                 revision: 0,
                 r#final: true,
@@ -7960,7 +7921,7 @@ async fn replacement_holds_and_cost_slice_account_for_prior_bearer_rounds() {
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: br#"{"effective":{"ceiling":{"value":450}}}"#,
+                config: &snapshot(450),
             },
             actor_approval_id: &bob.approval,
             capabilities: &[],
@@ -8124,24 +8085,20 @@ async fn replacement_holds_and_cost_slice_account_for_prior_bearer_rounds() {
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
-async fn public_turn_handoff_rejects_oversized_bearer_and_cross_gateway_prepared_before_commit() {
+async fn public_turn_handoff_rejects_mismatched_and_cross_gateway_prepared_before_commit() {
     use openmettle_core::{
         authz::{
             gateway::{self, TurnRound, settlement},
-            leases::{self, FailReason, LeaseSettings, Settle},
+            leases::{self, LeaseSettings, Settle},
             runs::{self as authz_queue, Admission, AdmissionLimits, ClaimLimits, RunAdmission},
         },
         provider_http::{gateway::UsageReport, inference::Protocol},
-        provider_keys::gateway::{Bearer, Context, GatewayKeys, GatewaySealer},
         quotas::{self, RunBudgetReservation},
         runs::{RunInput, WriteTransaction},
     };
     use sqlx::postgres::PgPoolOptions;
 
     const INSTALL: &str = "00000000-0000-4000-8000-000000001818";
-    const PRINCIPAL: &str = "00000000-0000-4000-8000-000000001819";
-    const BUDGET: &str = "00000000-0000-4000-8000-00000000181a";
-    const KEY_BYTES: [u8; 32] = [0x61; 32];
 
     let db = TestDb::migrated().await;
     let mut owner = connect(&db.0, OWNER).await;
@@ -8176,78 +8133,6 @@ async fn public_turn_handoff_rejects_oversized_bearer_and_cross_gateway_prepared
     let g_pool = PgPoolOptions::new()
         .max_connections(2)
         .connect_lazy_with(db.1.options(pg::GATEWAY));
-    let binding: String = sqlx::query_scalar(
-        "INSERT INTO openmettle.gateway_bindings (installation, user_id, principal, budget)
-         VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid)
-         RETURNING id::text",
-    )
-    .bind(INSTALL)
-    .bind(&alice.user)
-    .bind(PRINCIPAL)
-    .bind(BUDGET)
-    .fetch_one(&g_pool)
-    .await
-    .unwrap();
-    let report_source: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
-        .fetch_one(&mut owner)
-        .await
-        .unwrap();
-    let keys = GatewayKeys::new(&[("rr18-k1".into(), KEY_BYTES)]).unwrap();
-
-    // Generation 1: valid 896-byte Bearer whose complete outbound HTTP headers exceed 1024 bytes.
-    let long_bearer = Bearer::new(&[b'b'; 896]).expect("896-byte bearer is valid");
-    let (finger1, env1) = GatewaySealer::new(
-        GatewayKeys::new(&[("rr18-k1".into(), KEY_BYTES)]).unwrap(),
-        g_pool.clone(),
-    )
-    .seal(
-        &Context {
-            installation: INSTALL,
-            user_id: &alice.user,
-            binding_id: &binding,
-            principal: PRINCIPAL,
-            generation: 1,
-        },
-        &long_bearer,
-    )
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO openmettle.gateway_generations
-             (binding_id, generation, remote_key, expires_at, key_id, key_fingerprint, nonce, ciphertext)
-         VALUES ($1::uuid, 1, gen_random_uuid(), clock_timestamp() + interval '1 hour', $2, $3, $4, $5)",
-    )
-    .bind(&binding)
-    .bind(&env1.key_id)
-    .bind(finger1.as_slice())
-    .bind(env1.nonce.as_slice())
-    .bind(env1.ciphertext)
-    .execute(&g_pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO openmettle.gateway_policy
-             (binding_id, revision, scope_id, approval_id, model, report_source,
-              provider_generation, approval_generation, user_generation, capabilities)
-         VALUES ($1::uuid, 1, $2::uuid, $3::uuid, 'a', $4::uuid, 0, 0, 0, '{}'::jsonb)",
-    )
-    .bind(&binding)
-    .bind(&alice_scope)
-    .bind(&alice.approval)
-    .bind(&report_source)
-    .execute(&g_pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "UPDATE openmettle.gateway_bindings
-            SET active_generation = 1, observed_revision = 1, state = 'ready'
-          WHERE id = $1::uuid",
-    )
-    .bind(&binding)
-    .execute(&g_pool)
-    .await
-    .unwrap();
-
     let mut api = connect(&db.0, API).await;
     let mut worker = connect(&db.0, WORKER).await;
     let worker_pool = PgPoolOptions::new()
@@ -8278,172 +8163,9 @@ async fn public_turn_handoff_rejects_oversized_bearer_and_cross_gateway_prepared
     let chat_billable = chat_fx.billable();
     let resp_billable = resp_fx.billable();
 
-    // Part A (P2 #1): Public TurnPending::handoff rejects an oversized 896-byte Bearer BEFORE
-    // committing gateway_requests or quota_reservations handoff_committed holds.
-    let chat_a = authz_runs::chat(&db, &alice_scope, "personal", &alice).await;
-    let (branch_a, msg_a) = branch_and_message(&mut api, &alice_scope, &chat_a).await;
-    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
-    let Admission::Admitted { run_id: r_a, .. } = authz_queue::admit_run(
-        &mut tx,
-        &RunAdmission {
-            input: RunInput {
-                scope: &alice_scope,
-                actor: &alice.user,
-                conversation: &chat_a,
-                branch: &branch_a,
-                message: &msg_a,
-                key: "rr18-oversized-bearer",
-                format: "openmettle.conversation",
-                version: 1,
-                input: b"{}",
-                config: br#"{"effective":{"ceiling":{"value":450}}}"#,
-            },
-            actor_approval_id: &alice.approval,
-            capabilities: &[],
-            requested_rounds: Some(1),
-            now_ms: authz_store::NOW,
-            cost_qualified: None,
-        },
-        &limits,
-    )
-    .await
-    .unwrap() else {
-        panic!("expected admission");
-    };
-    assert!(
-        quotas::reserve_admitted_run_budget(
-            &mut tx,
-            &RunBudgetReservation {
-                scope_id: &alice_scope,
-                scope_kind: "personal",
-                actor_user_id: &alice.user,
-                actor_approval_id: &alice.approval,
-                run_id: &r_a,
-                token_units: 450,
-                per_round_cost_micros: Some(450),
-                round_limit: 1,
-                requires_device_slot: false,
-            },
-        )
-        .await
-        .unwrap()
-        .is_none()
-    );
-    tx.commit().await.unwrap();
-
-    let claim_a = authz_queue::claim_next(&mut worker, &claim_cfg, &lease_cfg)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(claim_a.run_id, r_a);
-
-    let pending_a = gateway::reserve_turn_round(
-        &worker_pool,
-        TurnRound {
-            scope_id: &alice_scope,
-            actor: &alice.user,
-            approval: &alice.approval,
-            run_id: &r_a,
-            round: 1,
-            claim_token: &claim_a.claim_token,
-            installation: INSTALL,
-            model: "a",
-            round_tokens: 450,
-            round_cost: Some(450),
-            requires_device_slot: false,
-        },
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        pending_a
-            .handoff(&worker_pool, &keys, None, &chat_billable, chat_fx.prepare(),)
-            .await,
-        Err(gateway::Error::Protection)
-    ));
-    let req_a_state: String =
-        sqlx::query_scalar("SELECT state FROM openmettle.gateway_requests WHERE id = $1::uuid")
-            .bind(&pending_a.id)
-            .fetch_one(&mut owner)
-            .await
-            .unwrap();
-    assert_eq!(req_a_state, "reserved");
-    let committed_a: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM openmettle.quota_reservations
-          WHERE run_id = $1::uuid AND state = 'handoff_committed'",
-    )
-    .bind(&r_a)
-    .fetch_one(&mut owner)
-    .await
-    .unwrap();
-    assert_eq!(committed_a, 0);
-    assert!(pending_a.release(&worker_pool).await.unwrap());
-    let req_a_after: String =
-        sqlx::query_scalar("SELECT state FROM openmettle.gateway_requests WHERE id = $1::uuid")
-            .bind(&pending_a.id)
-            .fetch_one(&mut owner)
-            .await
-            .unwrap();
-    assert_eq!(req_a_after, "released");
-    leases::settle(
-        &mut worker,
-        &claim_a.lease(),
-        &lease_cfg,
-        Settle::Failed(FailReason::StepFailed),
-    )
-    .await
-    .unwrap();
-    let drift_a: (i64, i64, i64, i64) = sqlx::query_as(
-        "SELECT storage_mismatches, budget_mismatches, settlement_mismatches, pending_gateway_reconciliations
-           FROM openmettle.quota_verify_accounting_drift()",
-    )
-    .fetch_one(&mut worker)
-    .await
-    .unwrap();
-    assert_eq!(drift_a, (0, 0, 0, 0));
-
-    // Part B (P2 #2): Rotate to a short valid Bearer and verify that passing a Chat-prepared
-    // PreparedRequest to a same-model, same-pin Responses BillableInferenceRef fails BEFORE
-    // handoff commit with Error::Refused, while the matching Chat route commits cleanly.
-    let (finger2, env2) = GatewaySealer::new(
-        GatewayKeys::new(&[("rr18-k1".into(), KEY_BYTES)]).unwrap(),
-        g_pool.clone(),
-    )
-    .seal(
-        &Context {
-            installation: INSTALL,
-            user_id: &alice.user,
-            binding_id: &binding,
-            principal: PRINCIPAL,
-            generation: 2,
-        },
-        &Bearer::new(b"rr18-short-bearer").unwrap(),
-    )
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO openmettle.gateway_generations
-             (binding_id, generation, remote_key, expires_at, key_id, key_fingerprint, nonce, ciphertext)
-         VALUES ($1::uuid, 2, gen_random_uuid(), clock_timestamp() + interval '1 hour', $2, $3, $4, $5)",
-    )
-    .bind(&binding)
-    .bind(&env2.key_id)
-    .bind(finger2.as_slice())
-    .bind(env2.nonce.as_slice())
-    .bind(env2.ciphertext)
-    .execute(&g_pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "UPDATE openmettle.gateway_bindings
-            SET active_generation = 2
-          WHERE id = $1::uuid",
-    )
-    .bind(&binding)
-    .execute(&g_pool)
-    .await
-    .unwrap();
-
+    // Passing a Chat-prepared PreparedRequest to a same-model, same-pin Responses
+    // BillableInferenceRef fails BEFORE handoff commit with Error::Refused, while the matching
+    // Chat route commits cleanly.
     let chat_b = authz_runs::chat(&db, &alice_scope, "personal", &alice).await;
     let (branch_b, msg_b) = branch_and_message(&mut api, &alice_scope, &chat_b).await;
     let mut tx_b = WriteTransaction::begin(&mut api).await.unwrap();
@@ -8460,7 +8182,7 @@ async fn public_turn_handoff_rejects_oversized_bearer_and_cross_gateway_prepared
                 format: "openmettle.conversation",
                 version: 1,
                 input: b"{}",
-                config: br#"{"effective":{"ceiling":{"value":450}}}"#,
+                config: &snapshot(450),
             },
             actor_approval_id: &alice.approval,
             capabilities: &[],
@@ -8530,7 +8252,7 @@ async fn public_turn_handoff_rejects_oversized_bearer_and_cross_gateway_prepared
     ] {
         assert!(matches!(
             pending_b
-                .handoff(&worker_pool, &keys, None, &bad_billable, bad_prepared)
+                .handoff(&worker_pool, None, &bad_billable, bad_prepared)
                 .await,
             Err(gateway::Error::Refused)
         ));
@@ -8563,13 +8285,7 @@ async fn public_turn_handoff_rejects_oversized_bearer_and_cross_gateway_prepared
         .unwrap();
     assert!(matches!(
         pending_b
-            .handoff(
-                &worker_pool,
-                &keys,
-                None,
-                &chat_billable,
-                direct_no_output_cap,
-            )
+            .handoff(&worker_pool, None, &chat_billable, direct_no_output_cap,)
             .await,
         Err(gateway::Error::Refused)
     ));
@@ -8601,13 +8317,7 @@ async fn public_turn_handoff_rejects_oversized_bearer_and_cross_gateway_prepared
         .unwrap();
     assert!(matches!(
         pending_b
-            .handoff(
-                &worker_pool,
-                &keys,
-                None,
-                &overcap_billable,
-                direct_over_cap,
-            )
+            .handoff(&worker_pool, None, &overcap_billable, direct_over_cap,)
             .await,
         Err(gateway::Error::Refused)
     ));
@@ -8630,7 +8340,7 @@ async fn public_turn_handoff_rejects_oversized_bearer_and_cross_gateway_prepared
 
     // Matching originating Chat route hands off cleanly and returns single-use TurnDispatch.
     let _turn_dispatch_b: gateway::TurnDispatch<'_> = pending_b
-        .handoff(&worker_pool, &keys, None, &chat_billable, chat_fx.prepare())
+        .handoff(&worker_pool, None, &chat_billable, chat_fx.prepare())
         .await
         .unwrap();
     let report_id_b: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
@@ -8643,9 +8353,9 @@ async fn public_turn_handoff_rejects_oversized_bearer_and_cross_gateway_prepared
             &UsageReport {
                 request: pending_b.id.clone(),
                 installation: INSTALL.into(),
-                principal: PRINCIPAL.into(),
+                principal: alice.user.clone(),
                 scope: alice_scope.clone(),
-                source: report_source.clone(),
+                source: INSTALL.into(),
                 report_id: report_id_b,
                 revision: 0,
                 r#final: true,

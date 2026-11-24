@@ -1,4 +1,6 @@
-//! Gateway reservation, credential handoff and reconciliation store (ADR 0037).
+//! Gateway reservation, handoff and settlement store (ADRs 0037 and 0044). A run round is handed
+//! off without a gateway binding, with its dispatch secret as the bearer the worker sends.
+//! The ADR 0037 provisioning and sealed-key code here has no caller and awaits removal.
 use crate::{
     provider_keys::gateway::{Context, Envelope, GatewayKeys},
     runs::WriteTransaction,
@@ -270,15 +272,17 @@ impl TurnPending {
     /// to `prepared`'s originating [`crate::provider_http::inference::Gateway`]. Any pre-commit or
     /// deferred OMQ04 failure rolls back `gateway_requests` to `'reserved'` so `release()` can
     /// immediately unwind the round.
+    ///
+    /// The round is authorized without a gateway binding, and the dispatch carries the round's
+    /// dispatch secret as its bearer credential (ADR 0044).
     pub async fn handoff<'a>(
         &self,
         pool: &PgPool,
-        keys: &GatewayKeys,
         device_grant_id: Option<&str>,
         billable: &crate::provider_http::BillableInferenceRef<'_>,
         prepared: crate::provider_http::inference::PreparedRequest<'a>,
     ) -> Result<TurnDispatch<'a>, Error> {
-        self.handoff_turn(pool, keys, device_grant_id, billable, prepared)
+        self.handoff_turn(pool, device_grant_id, billable, prepared)
             .await
             .map_err(|err| match err.0 {
                 TurnHandoffError::MissingHold => Error::Refused,
@@ -289,7 +293,6 @@ impl TurnPending {
     pub(crate) async fn handoff_turn<'a>(
         &self,
         pool: &PgPool,
-        keys: &GatewayKeys,
         device_grant_id: Option<&str>,
         billable: &crate::provider_http::BillableInferenceRef<'_>,
         prepared: crate::provider_http::inference::PreparedRequest<'a>,
@@ -301,7 +304,7 @@ impl TurnPending {
         )>,
     > {
         match self
-            .handoff_turn_inner(pool, keys, device_grant_id, billable, &prepared)
+            .handoff_turn_inner(pool, device_grant_id, billable, &prepared)
             .await
         {
             Ok(dispatch) => Ok(TurnDispatch::new(dispatch, prepared)),
@@ -312,7 +315,6 @@ impl TurnPending {
     async fn handoff_turn_inner(
         &self,
         pool: &PgPool,
-        keys: &GatewayKeys,
         device_grant_id: Option<&str>,
         billable: &crate::provider_http::BillableInferenceRef<'_>,
         prepared: &crate::provider_http::inference::PreparedRequest<'_>,
@@ -354,7 +356,7 @@ impl TurnPending {
                 },
             ));
         }
-        let dispatch = match pending.handoff_in(&mut tx, keys).await {
+        let dispatch = match self.authorize_in(&mut tx).await {
             Ok(dispatch) => dispatch,
             Err(err) => {
                 let _ = tx.rollback().await;
@@ -419,6 +421,36 @@ impl TurnPending {
             return Err(TurnHandoffError::Other(Error::Database));
         }
         Ok(dispatch)
+    }
+
+    /// Recheck the round's authorization without a gateway binding and mark it handed off
+    /// (`openmettle.gateway_handoff_round`, ADR 0044). The bearer is the round's dispatch secret,
+    /// which only this handle holds and the proxy accepts once.
+    async fn authorize_in(&self, tx: &mut WriteTransaction<'_>) -> Result<Dispatch, Error> {
+        // `id` is caller-visible; dispatch the database-canonical spelling so the wire
+        // `x-request-id` always correlates with the stored request.
+        let id: String = sqlx::query_scalar(
+            "SELECT $1::uuid::text WHERE openmettle.gateway_handoff_round($1::uuid,$2,$3::uuid)",
+        )
+        .bind(&self.id)
+        .bind(self.secret.as_slice())
+        .bind(&self.claim_token)
+        .fetch_optional(tx.connection()?)
+        .await?
+        .ok_or(Error::Refused)?;
+        let mut authorization = hyper::header::HeaderValue::try_from(format!(
+            "Bearer {}",
+            URL_SAFE_NO_PAD.encode(self.secret)
+        ))
+        .map_err(|_| Error::Protection)?;
+        authorization.set_sensitive(true);
+        Ok(Dispatch {
+            id,
+            installation: self.installation.clone(),
+            model: self.model.clone(),
+            server: true,
+            authorization,
+        })
     }
 }
 
