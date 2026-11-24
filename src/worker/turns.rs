@@ -273,6 +273,9 @@ impl<R: TurnRoutes> TurnExecutor<R> {
         prior_effects: &mut Vec<(String, Proposal)>,
     ) -> Result<String, StepResult> {
         let effects = self.effects.as_deref().ok_or(FAILED)?;
+        if let Some(why) = *cx.stop.borrow() {
+            return Err(stopped_step(why));
+        }
         self.authority(&run.claim, config).await?;
         let refused = || crate::mcp::ToolFault::TerminalRefusal.envelope();
         let Some(proposal) = self.routes.proposal(&run.claim, call) else {
@@ -301,8 +304,8 @@ impl<R: TurnRoutes> TurnExecutor<R> {
         }
         let intent = {
             let mut c = self.pool.acquire().await.map_err(|_| FAILED)?;
-            if cx.stop.borrow().is_some() {
-                return Err(StepResult::Stopped);
+            if let Some(why) = *cx.stop.borrow() {
+                return Err(stopped_step(why));
             }
             match approvals::record_fenced_intent(
                 &mut c,
@@ -634,19 +637,23 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                     continuation.push(History::RejectedGroup(errors))
                 }
                 CallGroup::Valid(calls) => {
-                    let [call] = calls.as_slice() else {
-                        return Err(FAILED);
-                    };
-                    let output = self
-                        .tool(run, &cx, &config, call, &mut prior_effects)
-                        .await?;
-                    let id = call.id.clone();
+                    let mut results = Vec::with_capacity(calls.len());
+                    for call in &calls {
+                        let output = self
+                            .tool(run, &cx, &config, call, &mut prior_effects)
+                            .await?;
+                        results.push((call.id.clone(), output));
+                    }
                     continuation.push(History::Assistant {
                         parts: answer.parts,
                         reasoning: answer.reasoning,
                         calls,
                     });
-                    continuation.push(History::ToolResult { id, output });
+                    continuation.extend(
+                        results
+                            .into_iter()
+                            .map(|(id, output)| History::ToolResult { id, output }),
+                    );
                 }
             }
         }
