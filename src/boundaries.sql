@@ -9,6 +9,7 @@
 -- Version 29 adds the binding-free run-round handoff and its confirm step (worker only), the
 -- internal authority check both use, and the one-time dispatch (gateway only) (ADR 0044). It
 -- adds three columns to `gateway_requests` and no table or column grant.
+-- Version 30 replaces quota_lock_override with the same signature, security and privileges.
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
