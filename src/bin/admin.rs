@@ -1,5 +1,8 @@
 //! Owner-operated offline maintenance.
-use openmettle_core::artifact_fs::adoption::{self, Options};
+use openmettle_core::artifact_fs::{
+    adoption::{self, Options},
+    rebind,
+};
 use sqlx::{Connection, PgConnection};
 use std::{env, path::Path, process::ExitCode};
 
@@ -82,12 +85,23 @@ async fn run() -> Result<(), &'static str> {
         }
         return Ok(());
     }
-    if command.0.as_deref() != Some("storage") || command.1.as_deref() != Some("adopt") {
+    let rebinding = command.1.as_deref() == Some("rebind");
+    if command.0.as_deref() != Some("storage")
+        || (command.1.as_deref() != Some("adopt") && !rebinding)
+    {
         return Err(
-            "usage: openmettle-admin storage adopt ROOT [--replace-adoption-run UUID] [--expected-fs-uuid UUID --expected-revisions-inode DEV:INO] [--confirm-no-on-disk-payloads]",
+            "usage: openmettle-admin storage adopt ROOT [--replace-adoption-run UUID] [--expected-fs-uuid UUID --expected-revisions-inode DEV:INO] [--confirm-no-on-disk-payloads] | storage rebind ROOT [--replace-adoption-run UUID]",
         );
     }
     let root = args.next().ok_or("missing artifact directory")?;
+    if rebinding {
+        let replace = match (args.next().as_deref(), args.next(), args.next()) {
+            (None, ..) => None,
+            (Some("--replace-adoption-run"), Some(run), None) => Some(run),
+            _ => return Err("unknown rebind option"),
+        };
+        return rebind_volume(Path::new(&root), replace.as_deref()).await;
+    }
     let mut replace = None;
     let mut expected_fs = None;
     let mut expected_directory = None;
@@ -130,4 +144,38 @@ async fn run() -> Result<(), &'static str> {
         eprintln!("OMQ03: {}", failure.0);
         "storage adoption failed"
     })
+}
+
+/// Rebind a copied artifact volume after a restore (ADR 0040, amendment of 24 November 2026).
+async fn rebind_volume(root: &Path, replace: Option<&str>) -> Result<(), &'static str> {
+    let url = env::var("OPENMETTLE_ADMIN_DATABASE_URL")
+        .map_err(|_| "OPENMETTLE_ADMIN_DATABASE_URL is required")?;
+    let mut c = PgConnection::connect(&url)
+        .await
+        .map_err(|_| "owner connection failed")?;
+    let report = rebind::rebind(&mut c, &rebind::Options { root, replace })
+        .await
+        .map_err(|failure| {
+            eprintln!("OMQ03: {}", failure.0);
+            "storage rebind refused; the ledger is unchanged"
+        })?;
+    println!(
+        "rebound {}, emptied {}, unchanged {}, quarantined {}, failed {}",
+        report.rebound,
+        report.emptied,
+        report.unchanged,
+        report.quarantined,
+        report.failures.len()
+    );
+    if report.failures.is_empty() {
+        return Ok(());
+    }
+    for (reservation, reason) in &report.failures {
+        println!("failed {reservation}: {reason}");
+    }
+    eprintln!(
+        "the volume stays closed; repair the listed payloads and re-run with --replace-adoption-run {}",
+        report.run
+    );
+    Err("storage rebind incomplete")
 }

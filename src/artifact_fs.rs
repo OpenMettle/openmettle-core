@@ -3,6 +3,7 @@
 pub mod adoption;
 mod drift;
 pub use drift::{Drift, verify_accounting_drift};
+pub mod rebind;
 mod reclaim;
 mod spill;
 pub(crate) use spill::configure_slots;

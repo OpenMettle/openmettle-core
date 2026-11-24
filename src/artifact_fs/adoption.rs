@@ -50,7 +50,7 @@ const INVENTORY: &str =
 // A same-length rewrite can preserve the inode. Include both change timestamps when
 // deciding whether the unlocked digest is still evidence for the locked inventory.
 #[derive(PartialEq, Eq)]
-struct FileStamp {
+pub(super) struct FileStamp {
     device: u64,
     inode: u64,
     length: u64,
@@ -70,15 +70,15 @@ impl From<&std::fs::Metadata> for FileStamp {
 }
 
 #[derive(Default)]
-struct RevisionDigests {
+pub(super) struct RevisionDigests {
     results: HashMap<String, (FileStamp, bool)>,
-    recheck: bool,
+    pub(super) recheck: bool,
 }
-const RESCAN: &str = "revision changed during inspection";
-const READ_FAILED: &str = "cannot read revision digest";
+pub(super) const RESCAN: &str = "revision changed during inspection";
+pub(super) const READ_FAILED: &str = "cannot read revision digest";
 
 impl RevisionDigests {
-    fn verify(
+    pub(super) fn verify(
         &mut self,
         id: &str,
         file: &mut File,
@@ -411,8 +411,8 @@ fn independent_identity(v: &Volume, opts: &Options<'_>) -> bool {
             .is_ok_and(|m| m.file_type().is_block_device() && m.rdev() == v.dev)
 }
 
-pub async fn adopt(c: &mut PgConnection, opts: &Options<'_>) -> Result<(), Failure> {
-    let v = Volume::open(opts.root, false)?;
+/// Requires the owner login and returns a fresh identifier for this run.
+pub(super) async fn owner_run(c: &mut PgConnection) -> Result<String, Failure> {
     let (owner, run): (bool, String) =
         sqlx::query_as("SELECT current_user='openmettle_owner',gen_random_uuid()::text")
             .fetch_one(&mut *c)
@@ -420,15 +420,17 @@ pub async fn adopt(c: &mut PgConnection, opts: &Options<'_>) -> Result<(), Failu
     if !owner {
         return Err(Failure("owner login required"));
     }
-    let existing: Option<String> = sqlx::query_scalar(
-        "SELECT volume_id::text FROM openmettle.storage_volume_control WHERE id",
-    )
-    .fetch_one(&mut *c)
-    .await?;
-    if let Some(id) = existing.as_deref() {
-        v.verify(id)?;
-    }
-    qualify(&v, &run)?;
+    Ok(run)
+}
+
+/// Commit `run` as the adoption barrier, which every runtime storage operation refuses to
+/// pass. `replace` must name the barrier currently held, if any. Returns the pinned volume.
+pub(super) async fn take_barrier(
+    c: &mut PgConnection,
+    v: &Volume,
+    run: &str,
+    replace: Option<&str>,
+) -> Result<Option<String>, Failure> {
     let mut barrier = c.begin().await?;
     let (pin, prior): (Option<String>, Option<String>) = sqlx::query_as(
         "SELECT volume_id::text,adoption_run_id::text
@@ -439,14 +441,30 @@ pub async fn adopt(c: &mut PgConnection, opts: &Options<'_>) -> Result<(), Failu
     if let Some(id) = &pin {
         v.verify(id)?;
     }
-    if prior.as_deref() != opts.replace {
+    if prior.as_deref() != replace {
         return Err(Failure("adoption ownership mismatch"));
     }
     sqlx::query("UPDATE openmettle.storage_volume_control SET adoption_run_id=$1::uuid WHERE id")
-        .bind(&run)
+        .bind(run)
         .execute(&mut *barrier)
         .await?;
     barrier.commit().await?;
+    Ok(pin)
+}
+
+pub async fn adopt(c: &mut PgConnection, opts: &Options<'_>) -> Result<(), Failure> {
+    let v = Volume::open(opts.root, false)?;
+    let run = owner_run(c).await?;
+    let existing: Option<String> = sqlx::query_scalar(
+        "SELECT volume_id::text FROM openmettle.storage_volume_control WHERE id",
+    )
+    .fetch_one(&mut *c)
+    .await?;
+    if let Some(id) = existing.as_deref() {
+        v.verify(id)?;
+    }
+    qualify(&v, &run)?;
+    let pin = take_barrier(c, &v, &run, opts.replace).await?;
     let result = verify_and_pin(c, opts, &v, &run, pin.as_deref()).await;
     if result.is_err() {
         sqlx::query("UPDATE openmettle.storage_volume_control SET adoption_run_id=NULL WHERE id AND adoption_run_id=$1::uuid")

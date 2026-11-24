@@ -4475,3 +4475,69 @@ via `reconcile_run_spills` (sequenced on V1-17 PR2's `storage_volume_control` / 
 owns the exact logical complement `(operation_id IS NULL OR idempotency_key NOT LIKE
 'tool-spill:%')`). V1-18 (`#18`) owns the active GPU controller, DRA claims and physical VRAM
 handoffs. V1-29 (`#26`) owns telemetry contract updates when PR2/PR3 register quota metrics.
+
+## Amendment (24 November 2026): rebind after a file-copy restore
+
+Refs #27, #16. Delivered with `openmettle-admin storage rebind`
+([`src/artifact_fs/rebind.rs`](../../src/artifact_fs/rebind.rs)); the operator procedure is
+[Restore the artifact volume](../operator/restore-artifact-volume.md).
+
+**Problem.** [Architecture backup and restore](../../ARCHITECTURE-v1.md#backup-and-restore)
+restores by file copy into fresh volumes. A copy keeps every byte and the volume sentinels and
+gives every file a new inode number. This record pins each payload to `payload_ino` and
+recognised only the "restored original directory tree", so on a copied volume every read,
+release and purge of an existing reservation failed closed, start-up accepted the volume, and
+no supported step recovered it. The owner decided on 24 November 2026 to keep file-copy
+restores and add a supported rebind step.
+
+**Amended invariant.** "Once bound, `payload_ino` is strictly write-once and never mutated"
+now reads: the owner-run rebind may replace a bound `payload_ino`, under the adoption barrier,
+on content or empty-file evidence. Every runtime role stays write-once, and `payload_ino` is
+still never written from an unverified tree. The schema already allowed this:
+`enforce_storage_reservation_monotonic_guards()` has always exempted `openmettle_owner`. The
+amendment makes one bounded procedure supported; it does not loosen the database, and it ships
+no migration.
+
+**Evidence.** Rebind accepts a changed inode on exactly one of two grounds.
+
+- *Content.* For a revision in `active` or `retained`, or in `purging` with its bytes still
+  present: `revisions/<id>` has the ledger's `size_bytes` and SHA-256 `content_digest`. These
+  payloads are verified on every run, also under an unchanged inode number.
+- *Empty file.* For every other bound reservation that owns a file (an unsettled upload, a
+  reclaim or purge anchor, a truncated purge): the file is empty. This is the evidence
+  `reclaim::release` already requires before it binds a file it did not create.
+
+The ledger holds no size or digest for an unsettled upload, and no writer survives a restore
+to settle it: a claimed reservation cannot be resumed by a retry, and a spill uses a fresh
+reservation per attempt. Rebind therefore discards those bytes. It truncates the file, binds
+the row to the emptied file and clears `publish_pending`. The row stays `reserved` and charged
+until the reconciler releases it under its normal lease, run and operation rules. Nothing that
+was acknowledged before the recovery point is touched, and nothing unsettled becomes settled.
+A file is truncated only when no other reservation shares its inode and its link count equals
+the number of that reservation's own names.
+
+**Procedure invariants.**
+
+- Owner login, a pinned volume and matching sentinels are required. Rebind takes the same
+  `adoption_run_id` barrier as adoption, so runtime storage operations fail closed while it runs.
+- It scans without SQL locks, then applies in one transaction that locks `storage_reservations`,
+  `artifact_revisions` and `storage_volume_control` (a prefix of adoption's order) and requires
+  the scanned ledger and files unchanged.
+- Results are per reservation. A reservation that verifies is rebound and committed. One that
+  does not is left untouched and reported with its reason. It writes no accounting row.
+- The barrier is released only by a run without failures. A run with failures keeps it, and
+  the volume stays closed until a later run that names the barrier completes. A refused run
+  (wrong login, unpinned volume, a locked payload, a changed ledger) changes no row and hands
+  the barrier back as it found it.
+- It does not repair a copy that split hard links, bind a reservation that never had an inode
+  (adoption's task), or clear a quarantine.
+
+**Restore validation.** The filesystem drift check (`openmettle-admin quota verify ROOT`) is the
+required post-restore check. `quota_verify_accounting_drift()` alone compares no file and
+reports a copied, unbound volume as healthy.
+
+**Consequences and known gaps.** A settled payload that cannot be recovered keeps the volume
+closed until the owner resolves that row by hand; a supported step to declare a payload lost
+does not exist yet. A worker started before rebind can quarantine unsettled uploads, which
+rebind leaves quarantined. Only `cp -a`, GNU `tar` and restic 0.14 copies were exercised; Velero,
+NFS and CSI snapshots were not.

@@ -122,7 +122,7 @@ The worker records up to 100 overdue committed handoffs per maintenance sweep in
 
 ## Verify accounting
 
-Run `openmettle-admin quota verify "$ARTIFACT_ROOT"` after restore to check the pinned volume and ledgers. Omit the root on a storage-disabled deployment. A failed verification exits with a nonzero status. For a database-only investigation, run this read as the owner or worker. The storage, budget and settlement mismatch counts must be zero. Pending gateway reconciliations and their oldest age identify accepted evidence awaiting application. Investigate mismatches against the same backup and volume before resuming writers.
+Run `openmettle-admin quota verify "$ARTIFACT_ROOT"` after restore to check the pinned volume and ledgers. This filesystem check is the required post-restore check. A volume restored by file copy must first be rebound, following [Restore the artifact volume](restore-artifact-volume.md); until then the check reports file mismatches. Omit the root on a storage-disabled deployment. A failed verification exits with a nonzero status. For a database-only investigation, run the read below as the owner or worker. It compares no file, so it reports a copied volume as healthy and does not replace the filesystem check. The storage, budget and settlement mismatch counts must be zero. Pending gateway reconciliations and their oldest age identify accepted evidence awaiting application. Investigate mismatches against the same backup and volume before resuming writers.
 
 ```sql
 SELECT * FROM openmettle.quota_verify_accounting_drift();
