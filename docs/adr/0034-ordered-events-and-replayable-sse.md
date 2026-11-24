@@ -356,11 +356,22 @@ phase, so open streams never pin connections and the ADR 0003 connection budget 
 **Slow and dead clients.** A frame that cannot enter the channel within `WRITE_TIMEOUT` ends
 the task, which releases the permit; queued frames are flushed if the client resumes reading,
 then the body ends and the client resumes from its last `id`. Durable events are never
-dropped, only not yet delivered. Heartbeats keep intermediaries from closing quiet streams and
-make the kernel detect a dead peer, which drops the body and ends the task through
-`Sender::closed`. A peer that keeps the TCP connection open but never reads still holds its
-socket until the kernel or ingress times it out, as an artifact download can; PR3 records the
-ingress idle and send timeouts.
+dropped, only not yet delivered. `WRITE_TIMEOUT` starts counting only once downstream write
+buffers fill (peer `SO_RCVBUF`, intermediary buffers, OS-autotuned server `SO_SNDBUF`, Hyper's
+HTTP/1.1 write buffer, and `CHANNEL_FRAMES`). On a quiet or low-volume stream whose unread
+bytes fit inside those buffers, 13-byte heartbeats every `HEARTBEAT_INTERVAL` do not fill
+downstream buffers promptly and a live non-reading peer can acknowledge TCP zero-window probes
+indefinitely; the application-enforced upper bound on permit occupancy for such a stream is
+therefore fixed session expiry (rechecked by the API every `REAUTH_INTERVAL` during idle
+re-authentication), with earlier exit on session or permission revocation, worker-persisted run
+termination (`queue_expires_at` / `EXECUTION_TIMEOUT_MS`), kernel `tcp_retries2` timeout on
+unacknowledged retransmissions (which ends the task through `Sender::closed`), or deployment
+ingress idle/send/stream timeouts. A peer that keeps the TCP connection open but never reads
+still holds its socket until the kernel or ingress times it out, as an artifact download can;
+PR3 records the ingress idle and send timeouts. Native bearer re-authentication on `/v1` streams
+uses `SSE_MAX_IN_FLIGHT` and the primary pool, not `native.max_in_flight`, matching the browser
+cookie channel so streams are not evicted when `native.max_in_flight` is smaller than
+`SSE_MAX_IN_FLIGHT`.
 
 **Known limit.** One user can hold every stream permit of a pod. A per-user stream limit
 belongs with V1-17 rate and quota limits; it is not claimed here.

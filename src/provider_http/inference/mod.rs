@@ -11,7 +11,9 @@ mod turn;
 
 pub use request::{History, ImageType, Request, Tool};
 pub use schema::SchemaSubset;
-pub use turn::{Answer, Call, CallGroup, Reasoning, ToolError, Turn, Usage, VisibleDelta};
+pub use turn::{
+    Answer, Call, CallGroup, Reasoning, StopReason, ToolError, Turn, Usage, VisibleDelta,
+};
 
 use super::{Trust, transport};
 use crate::authz::gateway::problem::{Cause, GatewayStep, Problem as GatewayProblem};

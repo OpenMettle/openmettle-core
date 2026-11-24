@@ -105,7 +105,10 @@ pub(super) fn accept(
             match string(choice, "finish_reason")? {
                 "stop" if out.calls.is_empty() => {}
                 "tool_calls" if !out.calls.is_empty() => {}
-                "length" => return Err(Error::Incomplete),
+                "length" => {
+                    out.stop_reason = Some(StopReason::Limit);
+                    out.discard_calls();
+                }
                 "content_filter" => return Err(Error::Filtered),
                 _ => return Err(Error::Malformed),
             }

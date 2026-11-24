@@ -43,6 +43,42 @@ fn media(h: &HeaderMap, stream: bool) -> Result<(), Error> {
     Ok(())
 }
 
+fn classify_io_kind(kind: std::io::ErrorKind) -> Error {
+    use std::io::ErrorKind;
+    match kind {
+        ErrorKind::InvalidData | ErrorKind::InvalidInput => Error::Malformed,
+        ErrorKind::UnexpectedEof
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::BrokenPipe
+        | ErrorKind::NotConnected
+        | ErrorKind::NetworkDown
+        | ErrorKind::NetworkUnreachable
+        | ErrorKind::HostUnreachable
+        | ErrorKind::TimedOut
+        | ErrorKind::Interrupted => Error::Incomplete,
+        _ => Error::Malformed,
+    }
+}
+
+fn body_error(e: &hyper::Error) -> Error {
+    if e.is_parse() {
+        return Error::Malformed;
+    }
+    let mut src = std::error::Error::source(e);
+    while let Some(err) = src {
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            return classify_io_kind(io.kind());
+        }
+        src = err.source();
+    }
+    if e.is_incomplete_message() || e.is_closed() || e.is_canceled() || e.is_body_write_aborted() {
+        Error::Incomplete
+    } else {
+        Error::Malformed
+    }
+}
+
 pub(super) async fn receive<F: Future<Output = ()>>(
     response: hyper::Response<Incoming>,
     gateway: &Gateway,
@@ -61,6 +97,9 @@ pub(super) async fn receive<F: Future<Output = ()>>(
             gateway.family_policy_v1,
         ));
     }
+    if head.status != hyper::StatusCode::OK {
+        return Err(Error::Malformed);
+    }
     let length = transport::framed_length(&head, BODY)?;
     media(&head.headers, request.stream)?;
     let mut total = 0;
@@ -73,7 +112,7 @@ pub(super) async fn receive<F: Future<Output = ()>>(
         .map_err(|_| Error::Timeout)?
     {
         let data = frame
-            .map_err(|_| Error::Malformed)?
+            .map_err(|e| body_error(&e))?
             .into_data()
             .map_err(|_| Error::Malformed)?;
         if data.len() > BODY - total {
@@ -116,8 +155,15 @@ pub(super) async fn receive<F: Future<Output = ()>>(
             }
         }
     }
-    if length.is_some_and(|n| n != total as u64) || !sse.ended() {
-        return Err(Error::Malformed);
+    if length.is_some_and(|n| n != total as u64) {
+        return Err(Error::Incomplete);
+    }
+    if !sse.ended() {
+        return Err(if state.terminal {
+            Error::Malformed
+        } else {
+            Error::Incomplete
+        });
     }
     if request.stream {
         return state.finish(q, p, request, server);
@@ -128,4 +174,35 @@ pub(super) async fn receive<F: Future<Output = ()>>(
         Protocol::Responses => responses.complete(&mut state, &v)?,
     };
     state.finish(q, p, request, server)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn io_interruption_kinds_including_network_loss_map_to_incomplete() {
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::NotConnected,
+            ErrorKind::NetworkDown,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::HostUnreachable,
+            ErrorKind::TimedOut,
+            ErrorKind::Interrupted,
+        ] {
+            assert_eq!(classify_io_kind(kind), Error::Incomplete, "{kind:?}");
+        }
+        for kind in [
+            ErrorKind::InvalidData,
+            ErrorKind::InvalidInput,
+            ErrorKind::Other,
+        ] {
+            assert_eq!(classify_io_kind(kind), Error::Malformed, "{kind:?}");
+        }
+    }
 }

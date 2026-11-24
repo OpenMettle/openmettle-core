@@ -83,6 +83,16 @@ impl Api {
         document: Value,
         connections: u32,
     ) -> Self {
+        Self::configured_with_db_timeout(db, dir, document, connections, 2000)
+    }
+
+    pub(super) fn configured_with_db_timeout(
+        db: &TestDb,
+        dir: auth_config_support::Dir,
+        document: Value,
+        connections: u32,
+        db_timeout_ms: u32,
+    ) -> Self {
         let auth = dir.write("auth.json", document.to_string().as_bytes());
         let bind = address();
         let mut cmd = binary("api");
@@ -93,7 +103,7 @@ impl Api {
             .env("OPENMETTLE_API_BIND", &bind)
             .env("OPENMETTLE_API_DATABASE_URL", db.url(API))
             .env("OPENMETTLE_API_DB_MAX_CONNECTIONS", connections.to_string())
-            .env("OPENMETTLE_API_DB_TIMEOUT_MS", "2000")
+            .env("OPENMETTLE_API_DB_TIMEOUT_MS", db_timeout_ms.to_string())
             .env("OPENMETTLE_API_AUTH_CONFIG", &auth)
             .env("OPENMETTLE_API_ISSUANCE_DATABASE_URL", db.url(ISSUANCE))
             .stdout(Stdio::null())

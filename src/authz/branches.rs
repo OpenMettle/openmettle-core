@@ -492,6 +492,7 @@ pub struct Answer<'a> {
     pub reasoning: Option<&'a [serde_json::Map<String, serde_json::Value>]>,
     pub input_count: Option<i64>,
     pub output_count: Option<i64>,
+    pub stop_reason: Option<&'a str>,
 }
 
 pub async fn publish_answer(
@@ -506,6 +507,20 @@ pub async fn publish_answer(
     Ok(())
 }
 
+async fn has_stop_reason(c: &mut PgConnection) -> Result<bool, StoreError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM pg_catalog.pg_attribute
+              WHERE attrelid = to_regclass('openmettle.message_turns')
+                AND attname = 'stop_reason'
+                AND NOT attisdropped
+         )",
+    )
+    .fetch_one(c)
+    .await?)
+}
+
 pub(super) async fn publish_locked_answer(
     c: &mut PgConnection,
     scope: &str,
@@ -514,11 +529,16 @@ pub(super) async fn publish_locked_answer(
 ) -> Result<(), StoreError> {
     validate_parts(answer.parts, false)?;
     if answer.reasoning.is_some_and(|r| r.len() > 128)
+        || answer.stop_reason.is_some_and(|r| r != "limit")
         || [answer.input_count, answer.output_count]
             .into_iter()
             .flatten()
             .any(|n| n < 0)
     {
+        return Err(StoreError::InvalidInput("assistant turn"));
+    }
+    let has_stop_reason = has_stop_reason(c).await?;
+    if !has_stop_reason && answer.stop_reason.is_some() {
         return Err(StoreError::InvalidInput("assistant turn"));
     }
     let row = sqlx::query(
@@ -568,14 +588,42 @@ pub(super) async fn publish_locked_answer(
         .map(serde_json::to_string)
         .transpose()
         .map_err(|_| StoreError::InvalidInput("reasoning blocks"))?;
-    let inserted = sqlx::query(
-        "INSERT INTO openmettle.message_turns
-        (scope_id,conversation_id,message_id,run_id,reasoning_blocks,reasoning_bytes,input_count,output_count)
-        SELECT $1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::jsonb,coalesce(octet_length($5::jsonb::text),0),$6,$7
-        WHERE coalesce(octet_length($5::jsonb::text),0)<=65536",
-    )
-        .bind(scope).bind(chat.id).bind(answer.id).bind(run).bind(blocks).bind(answer.input_count)
-        .bind(answer.output_count).execute(&mut *c).await?.rows_affected();
+    let inserted = if has_stop_reason {
+        sqlx::query(
+            "INSERT INTO openmettle.message_turns
+            (scope_id,conversation_id,message_id,run_id,reasoning_blocks,reasoning_bytes,input_count,output_count,stop_reason)
+            SELECT $1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::jsonb,coalesce(octet_length($5::jsonb::text),0),$6,$7,$8
+            WHERE coalesce(octet_length($5::jsonb::text),0)<=65536",
+        )
+        .bind(scope)
+        .bind(chat.id)
+        .bind(answer.id)
+        .bind(run)
+        .bind(blocks)
+        .bind(answer.input_count)
+        .bind(answer.output_count)
+        .bind(answer.stop_reason)
+        .execute(&mut *c)
+        .await?
+        .rows_affected()
+    } else {
+        sqlx::query(
+            "INSERT INTO openmettle.message_turns
+            (scope_id,conversation_id,message_id,run_id,reasoning_blocks,reasoning_bytes,input_count,output_count)
+            SELECT $1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::jsonb,coalesce(octet_length($5::jsonb::text),0),$6,$7
+            WHERE coalesce(octet_length($5::jsonb::text),0)<=65536",
+        )
+        .bind(scope)
+        .bind(chat.id)
+        .bind(answer.id)
+        .bind(run)
+        .bind(blocks)
+        .bind(answer.input_count)
+        .bind(answer.output_count)
+        .execute(&mut *c)
+        .await?
+        .rows_affected()
+    };
     if inserted != 1 {
         return Err(StoreError::InvalidInput("reasoning blocks"));
     }
@@ -597,6 +645,7 @@ pub struct VisiblePart {
 pub struct HistoryTurn {
     pub parent_message_id: Option<String>,
     pub author_user_id: Option<String>,
+    pub stop_reason: Option<String>,
     pub metadata: crate::model_config::PathTurn,
     pub parts: Vec<VisiblePart>,
 }
@@ -655,13 +704,24 @@ pub(crate) async fn path_turns(
     now: i64,
 ) -> Result<Vec<HistoryTurn>, StoreError> {
     use crate::model_config::PathTurn;
-    let rows = sqlx::query(concat!(
-        path!("WHERE p.depth+1 < $3"),
-        "SELECT p.id::text,p.parent_message_id::text,t.author_user_id::text,t.run_id::text,t.reasoning_bytes,t.input_count,
-        t.output_count,r.snapshot_format,r.snapshot_version,r.config_snapshot FROM path p
-        JOIN openmettle.message_turns t ON t.message_id=p.id LEFT JOIN openmettle.runs r ON r.id=t.run_id
-        ORDER BY p.depth"
-    ))
+    let has_stop_reason = has_stop_reason(c).await?;
+    let rows = sqlx::query(if has_stop_reason {
+        concat!(
+            path!("WHERE p.depth+1 < $3"),
+            "SELECT p.id::text,p.parent_message_id::text,t.author_user_id::text,t.run_id::text,t.reasoning_bytes,t.input_count,
+            t.output_count,t.stop_reason,r.snapshot_format,r.snapshot_version,r.config_snapshot FROM path p
+            JOIN openmettle.message_turns t ON t.message_id=p.id LEFT JOIN openmettle.runs r ON r.id=t.run_id
+            ORDER BY p.depth"
+        )
+    } else {
+        concat!(
+            path!("WHERE p.depth+1 < $3"),
+            "SELECT p.id::text,p.parent_message_id::text,t.author_user_id::text,t.run_id::text,t.reasoning_bytes,t.input_count,
+            t.output_count,NULL::text AS stop_reason,r.snapshot_format,r.snapshot_version,r.config_snapshot FROM path p
+            JOIN openmettle.message_turns t ON t.message_id=p.id LEFT JOIN openmettle.runs r ON r.id=t.run_id
+            ORDER BY p.depth"
+        )
+    })
         .bind(chat.id).bind(start).bind(limit).fetch_all(&mut *c).await?;
     let mut turns = Vec::with_capacity(rows.len());
     for r in rows {
@@ -679,6 +739,7 @@ pub(crate) async fn path_turns(
         turns.push(HistoryTurn {
             parent_message_id: r.try_get("parent_message_id")?,
             author_user_id: r.try_get("author_user_id")?,
+            stop_reason: r.try_get("stop_reason")?,
             metadata: PathTurn {
                 message_id: r.try_get("id")?,
                 run_id: r.try_get("run_id")?,

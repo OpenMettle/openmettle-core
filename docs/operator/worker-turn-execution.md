@@ -93,7 +93,11 @@ listener. Mutual TLS is not supported.
 2. Check `/readyz` on the worker port.
 3. Submit a run through `POST /v1/runs`. The run should reach `succeeded`, each round's
    gateway request should show `dispatched_at` and one final usage report, and its token hold
-   should be `settled`.
+   should be `settled`. If the model hits its output token limit (`finish_reason: "length"` or
+   Responses `max_output_tokens`) after emitting visible text or reasoning, the worker still
+   publishes the partial turn with `stop_reason = "limit"`, drops any partial tool calls, and
+   settles the run `succeeded`; if neither text nor reasoning was emitted, the run fails as
+   `step_failed`.
 
 ## Changes
 

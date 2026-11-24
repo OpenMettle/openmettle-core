@@ -218,6 +218,7 @@ async fn decodes(case: &str, expect: Expect) {
         assert_eq!(turn.answers.len(), 1, "{}", r.label);
         let a = &turn.answers[0];
         assert_eq!(a.choice, 0, "{}", r.label);
+        assert_eq!(a.stop_reason, None, "{}", r.label);
         assert_eq!(a.parts, expect.parts, "{}", r.label);
         // Only a streamed turn forwards visible deltas.
         let visible = if chunked(case) {
@@ -382,29 +383,42 @@ async fn recorded_chat_parallel_tool_calls_decode() {
     .await;
 }
 
-/// KNOWN GAP (issue #9): a stream cut by `max_tokens` fails the whole turn as `Incomplete`
-/// after its text was already forwarded, and the usage chunk SGLang sends after the `length`
-/// finish is never read. A later increment is expected to keep the partial output and usage.
+/// A stream stopped by `max_tokens` (`finish_reason: "length"`) preserves its partial visible text
+/// and reads the trailing usage chunk before `[DONE]`.
 #[tokio::test]
-async fn known_gap_length_cutoff_is_incomplete_and_loses_usage() {
+async fn recorded_chat_stream_length_preserves_partial_text_and_usage() {
     let case = "07-chat-stream-length";
     assert_eq!(recorded_finish(case).as_deref(), Some("length"));
     assert_eq!(recorded_usage(case).unwrap()["completion_tokens"], 12);
+    let expected_text = recorded_content(case);
+    assert!(!expected_text.is_empty());
     for r in replays(case, |_| {}).await {
-        r.failed(Error::Incomplete);
-        assert_eq!(r.visible, recorded_content(case), "{}", r.label);
+        let turn = r.turn();
+        assert_eq!(turn.answers.len(), 1, "{}", r.label);
+        let a = &turn.answers[0];
+        assert_eq!(a.stop_reason, Some(StopReason::Limit), "{}", r.label);
+        assert_eq!(a.parts, [expected_text.as_str()], "{}", r.label);
+        assert_eq!(r.visible, expected_text, "{}", r.label);
+        assert!(a.reasoning.is_none(), "{}", r.label);
+        assert!(
+            matches!(&a.calls, CallGroup::Valid(c) if c.is_empty()),
+            "{}",
+            r.label
+        );
+        let u = turn.usage.as_ref().expect("usage");
+        assert_eq!((u.input, u.output), (Some(21), Some(12)), "{}", r.label);
+        assert_eq!((u.source, u.semantics.as_str()), ("gateway", "final_call"));
     }
 }
 
-/// KNOWN GAP (issue #9): a stream that ends without a finish, `[DONE]` or usage is reported as
-/// `Malformed`, indistinguishable from corrupt output, with no usage and no partial outcome.
-/// A later increment is expected to report an interrupted stream distinctly.
+/// An aborted stream that closes without a finish reason, `[DONE]` or usage is reported as
+/// `Error::Incomplete`, distinct from corrupt syntax (`Error::Malformed`).
 #[tokio::test]
-async fn known_gap_aborted_stream_is_malformed_without_usage() {
+async fn recorded_aborted_stream_is_reported_as_incomplete() {
     assert_eq!(recorded_finish(ABORTED), None);
     assert_eq!(recorded_usage(ABORTED), None);
     for r in replays(ABORTED, |_| {}).await {
-        r.failed(Error::Malformed);
+        r.failed(Error::Incomplete);
         assert_eq!(r.visible, recorded_content(ABORTED), "{}", r.label);
     }
 }
@@ -435,7 +449,8 @@ async fn known_gap_reasoning_tokens_are_not_surfaced() {
 /// KNOWN GAP (issue #9): the response `model` field is never checked. Core accepts a body naming
 /// another model. SGLang also answered a request for an unknown model with HTTP 200 from the
 /// loaded model while echoing the requested name, so model enforcement has to happen in front
-/// of SGLang. Here that turn fails only because it hit `max_tokens` (`length`).
+/// of SGLang (`openmettle-gateway`). Here that turn hit `max_tokens` (`length`) inside reasoning
+/// and now decodes its partial reasoning and usage rather than failing as `Incomplete`.
 #[tokio::test]
 async fn known_gap_response_model_is_not_checked() {
     for r in replays("02-chat-plain", |_| {}).await {
@@ -447,7 +462,18 @@ async fn known_gap_response_model_is_not_checked() {
     assert_eq!(documents(case)[0]["model"], "no-such-model");
     assert_eq!(recorded_finish(case).as_deref(), Some("length"));
     for r in replays(case, |_| {}).await {
-        r.failed(Error::Incomplete);
+        let turn = r.turn();
+        let a = &turn.answers[0];
+        assert_eq!(a.stop_reason, Some(StopReason::Limit), "{}", r.label);
+        assert!(a.parts.is_empty(), "{}", r.label);
+        assert_eq!(
+            a.reasoning.as_ref().map(|x| x.blocks.clone()),
+            Some(vec![json!({"text": "The user said \"hi\". This is"})]),
+            "{}",
+            r.label
+        );
+        let u = turn.usage.as_ref().expect("usage");
+        assert_eq!((u.input, u.output), (Some(53), Some(8)), "{}", r.label);
     }
 }
 

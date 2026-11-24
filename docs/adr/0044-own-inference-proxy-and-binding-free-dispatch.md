@@ -1,10 +1,10 @@
 # 0044 — OpenMettle's own inference proxy and binding-free dispatch
 
 Accepted with its implementation, 23 November 2026 (V1-06 proxy increments 2a and 2b); increment
-2c delivered 24 November 2026. Amended 24 November 2026 with increments 3a (migration 31) and
-3b (migration 32): see
+2c delivered 24 November 2026. Amended 24 November 2026 with increments 3a (migration 31),
+3b (migration 32) and 3c (migration 33): see
 [requests that end without usage](#amendment-24-november-2026-requests-that-end-without-usage).
-Refs #7.
+Refs #7, #9.
 Supersedes [ADR 0037](0037-gateway-provisioning-and-usage-reconciliation.md) in part: see
 [What ADR 0037 still decides](#what-adr-0037-still-decides) and [Superseded](#superseded).
 Builds on [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md) (leases),
@@ -257,7 +257,7 @@ exists.
 | 2c | The worker reaches the proxy over `http://` inside the cluster or `https://` through a TLS terminator; `gateway_keys` removed from the worker document; packaged worker to proxy end-to-end tests; ADR 0043 note and the worker page (delivered 24 November 2026). |
 | 3a | A dispatched request that ends without usage is closed by a final report with its reason; migration 31 (delivered 24 November 2026, see the amendment). |
 | 3b | A bounded worker sweep closes requests the proxy cannot report (`not_dispatched` immediately once undispatchable, `unreported` 15 minutes past the run's execution deadline); migration 32 (delivered 24 November 2026, see the amendment). |
-| 3c | A response stopped at its token limit ends the turn with its partial output and a marker. |
+| 3c | A response stopped at its output token limit ends the turn with its partial output, usage and `stop_reason = 'limit'` (dropping partial tool calls); aborted/cut streams map to `Error::Incomplete`; migration 33 (delivered 24 November 2026; see ADR 0036 and ADR 0038). |
 | 3d | Running usage for cut streams. |
 | 4 | Family policy tables. |
 | 5 | Cache separation. |
@@ -404,7 +404,10 @@ and the worker sweep reconciles any request left without a report after its grac
   exemption, role/isolation/trigger guards, and upgrades from schema 30 -> 31 and 31 -> 32.
 - `tests/schema/live_turns/worker_gateway.rs`: the packaged worker's round refused by a proxy
   serving another model is closed with `model_not_served`; an unreachable proxy fails the turn
-  and the packaged worker's own maintenance sweep closes the hold as `not_dispatched`.
+  and the packaged worker's own maintenance sweep closes the hold as `not_dispatched`; a
+  recorded `07-chat-stream-length` token-limit stop settles at actual usage (`21 + 12`),
+  publishes partial text with `message_turns.stop_reason = 'limit'`, and exposes
+  `"stop_reason": "limit"` over `GET /v1/conversations/{id}/branches/{branch_id}/messages`.
 
 ## Evidence
 
