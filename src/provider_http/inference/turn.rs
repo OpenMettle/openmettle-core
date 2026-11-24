@@ -173,10 +173,19 @@ pub(super) struct Output {
     pub blocks: Vec<Value>,
     reasoning_bytes: usize,
     pub calls: BTreeMap<usize, PendingCall>,
+    pub discarded_call_ids: Vec<String>,
     pub finished: bool,
     pub stop_reason: Option<StopReason>,
 }
 impl Output {
+    pub fn discard_calls(&mut self) {
+        self.discarded_call_ids.extend(
+            std::mem::take(&mut self.calls)
+                .into_values()
+                .map(|c| c.id)
+                .filter(|id| !id.is_empty()),
+        );
+    }
     pub fn text(&mut self, key: (usize, usize), s: &str) -> Result<(), Error> {
         if s.is_empty() {
             return Ok(());
@@ -323,6 +332,11 @@ impl Assembly {
                 || out.calls.len() > 1 && (!q.parallel || request.parallel == Some(false))
             {
                 return Err(Error::Malformed);
+            }
+            for id in &out.discarded_call_ids {
+                if !identifier(id) || !used.insert(id.as_str()) {
+                    return Err(Error::Malformed);
+                }
             }
             for c in out.calls.values() {
                 if !identifier(&c.id)

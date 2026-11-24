@@ -46,13 +46,20 @@ fn item_texts<'a>(item: &'a Value, key: &str, kind: &str) -> Result<Vec<&'a str>
         })
         .collect()
 }
+fn incomplete_reason(v: &Value) -> Result<Option<&str>, Error> {
+    let details = &v["incomplete_details"];
+    if details.is_null() {
+        return Ok(None);
+    }
+    if !details.is_object() {
+        return Err(Error::Malformed);
+    }
+    optional(details, "reason")
+}
 fn response_status(v: &Value) -> Result<Option<StopReason>, Error> {
     match string(v, "status")? {
         "completed" => Ok(None),
-        "incomplete" => match v
-            .pointer("/incomplete_details/reason")
-            .and_then(Value::as_str)
-        {
+        "incomplete" => match incomplete_reason(v)? {
             Some("max_output_tokens") => Ok(Some(StopReason::Limit)),
             Some("content_filter") => Err(Error::Filtered),
             _ => Err(Error::Incomplete),
@@ -64,10 +71,7 @@ fn response_status(v: &Value) -> Result<Option<StopReason>, Error> {
 fn item_status(v: &Value, allow_limit: bool) -> Result<(), Error> {
     match string(v, "status")? {
         "completed" => Ok(()),
-        "incomplete" => match v
-            .pointer("/incomplete_details/reason")
-            .and_then(Value::as_str)
-        {
+        "incomplete" => match incomplete_reason(v)? {
             Some("content_filter") => Err(Error::Filtered),
             None | Some("max_output_tokens") if allow_limit => Ok(()),
             _ => Err(Error::Incomplete),
@@ -375,7 +379,7 @@ impl Events {
             }
         }
         if stop_reason.is_some() {
-            out.calls.clear();
+            out.discard_calls();
         }
         out.stop_reason = stop_reason;
         out.finished = true;

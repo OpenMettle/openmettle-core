@@ -839,7 +839,8 @@ fn consumer_reads_projects_and_items_without_inferring_access() {
     }
 
     // MessagePage fixtures cover normal null stop_reason, assistant limit stop, open-vocabulary
-    // forward compatibility, and invalid non-string stop_reason.
+    // forward compatibility, legacy omitted stop_reason, and rejection of non-string or user
+    // non-null stop_reason.
     for name in [
         "VisibleMessagePage",
         "VisibleMessagePage--assistant-limit-stop",
@@ -847,13 +848,36 @@ fn consumer_reads_projects_and_items_without_inferring_access() {
     ] {
         consumer::decode_conversation_operation("listMessages", &fixture(name)).unwrap();
     }
+    let mut legacy_user = fixture("VisibleMessagePage");
+    legacy_user["items"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("stop_reason");
+    let message_page_validator = build(&json!({
+        "$ref": format!("{CONTRACT_URI}#/components/schemas/MessagePage")
+    }))
+    .unwrap();
+    assert!(message_page_validator.is_valid(&legacy_user));
+    consumer::decode_conversation_operation("listMessages", &legacy_user).unwrap();
+    let mut bad_user = fixture("VisibleMessagePage");
+    bad_user["items"][0]["stop_reason"] = json!("limit");
     assert!(
-        consumer::decode_conversation_operation(
-            "listMessages",
-            &fixture("VisibleMessagePage--invalid-stop-reason"),
-        )
-        .is_err()
+        !message_page_validator.is_valid(&bad_user),
+        "user message with non-null stop_reason must fail MessagePage schema"
     );
+    assert!(
+        consumer::decode_conversation_operation("listMessages", &bad_user).is_err(),
+        "user message with non-null stop_reason must fail consumer decode"
+    );
+    for name in [
+        "VisibleMessagePage--invalid-stop-reason",
+        "VisibleMessagePage--user-non-null-stop-reason",
+    ] {
+        assert!(
+            consumer::decode_conversation_operation("listMessages", &fixture(name)).is_err(),
+            "{name} must fail consumer decode"
+        );
+    }
 }
 
 /// The contract's multipart examples of `createArtifact`, as a client sends them: the boundary

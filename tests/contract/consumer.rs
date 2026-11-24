@@ -882,6 +882,9 @@ fn decode_message(v: &Value) -> Result<(), String> {
     if m.stop_reason.as_deref().is_some_and(str::is_empty) {
         return Err("empty stop_reason".into());
     }
+    if m.role == "user" && m.stop_reason.is_some() {
+        return Err("user message cannot have stop_reason".into());
+    }
     for n in [m.input_count, m.output_count].into_iter().flatten() {
         parse_decimal(&n, true)?;
     }
