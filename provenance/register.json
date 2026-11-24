@@ -1557,6 +1557,46 @@
         "assessment": "redistributable",
         "basis": "Apache-2.0 recorded from contracts/vendor/oas-3.2/LICENSE; Apache-2.0 permits redistribution with the licence retained. The upstream repository has no NOTICE file."
       }
+    },
+    {
+      "id": "sglang-recorded-fixtures",
+      "name": "Recorded SGLang HTTP responses (decoder replay test fixtures)",
+      "kind": "asset",
+      "review_group": "core",
+      "distribution": "candidate",
+      "version": "recorded 2026-11-23",
+      "pin": "Git tree 5a5f0a13f1611e29bb5ff2c88cdfc9abdbce2e0a (tests/fixtures/sglang-recorded, added in 583bcf55acd506ef367a55ceb826534ad376fdc1)",
+      "origin": "Raw HTTP responses recorded from one SGLang deployment running a patched fork of sgl-project/sglang and serving a single model; the fork commit and the model are not recorded in this repository",
+      "source_evidence": [
+        "tests/fixtures/sglang-recorded/README.md",
+        "tests/provider_inference/recorded_sglang.rs",
+        "openmettle-core commit 583bcf55acd506ef367a55ceb826534ad376fdc1 (23 Nov 2026), the only commit that touches the directory at this head",
+        "https://github.com/OpenMettle/openmettle-core/issues/9"
+      ],
+      "licence": {
+        "expression": null,
+        "evidence": []
+      },
+      "notices": {
+        "status": "pending",
+        "files": [],
+        "obligations": []
+      },
+      "review": {
+        "status": "pending",
+        "reviewer": null,
+        "date": null,
+        "evidence": [],
+        "notes": "Committed in the public openmettle-core source tree, so it falls inside the 19 Nov 2026 boundary (source code); no owner decision covers it yet. The README states: 12 cases recorded on 23 Nov 2026 from one real SGLang deployment running a patched fork whose exact commit was not verified; each request used a small synthetic prompt; the served model name, a site value, is replaced with recorded-sglang-model in every body and request; content-length is recomputed; header CRLF is stored as LF; streamed bodies were de-chunked. The request bodies are the capture tool's synthetic requests. The response bodies contain server-generated JSON and SSE framing (server: uvicorn, owned_by sglang) and short model-generated text, reasoning and tool-call arguments. Not recorded or verified: the fork revision, the model's identity, revision and licence, and whether any licence or terms apply to the model output; this register asserts none. Recorded by an agent; no review performed."
+      },
+      "tracking": [
+        "V1-08",
+        "V1-42"
+      ],
+      "redistribution": {
+        "assessment": "undetermined",
+        "basis": "No licence evidence is recorded in this register. The model that produced the responses and any terms on its output are not recorded."
+      }
     }
   ]
 }
