@@ -140,7 +140,7 @@ Migration `0032` ([ADR 0044](../adr/0044-own-inference-proxy-and-binding-free-di
 - Apply migration `0032` with `openmettle-migrate` before rolling workers of this release. A worker of this release running against schema `0031` logs `worker.sweep.failed` (`reconcile_stale_quotas`) on the sweep until `0032` applies, without interrupting run execution.
 - Workers and proxies of the previous release (`0031`, writing reports at revision 1) continue working unchanged on schema `0032`.
 - Once workers of this release run on schema `0032`, the maintenance loop closes undispatched unbound requests as `not_dispatched` as soon as their run can no longer dispatch them, and closes dispatched unbound requests with no settlement as `unreported` once 15 minutes have passed after their run's execution deadline (releasing token and cost holds at zero charged; a late proxy report at revision 1 supersedes `unreported`).
-- Replacing `gateway_usage_reports_incomplete_check` validates against existing `gateway_usage_reports` rows under `ACCESS EXCLUSIVE`, and `CREATE INDEX gateway_requests_unbound_outstanding_idx` takes `SHARE` on `gateway_requests`, blocking writes to those tables until the migration transaction commits; lock duration scales with table size.
+- Migration `0032` acquires `EXCLUSIVE` on `gateway_requests`, `ACCESS EXCLUSIVE` on `gateway_usage_reports` (validating `gateway_usage_reports_incomplete_check` against existing rows), and `SHARE` on `gateway_settlements` before its upgrade preflight and partial index build, blocking writes and row-locking reads on `gateway_requests` until the migration transaction commits; lock duration scales with table size.
 
 ## Monitor overdue handoffs
 

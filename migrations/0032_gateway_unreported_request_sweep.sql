@@ -13,7 +13,7 @@
 -- `gateway_usage_reports` -> `gateway_settlements`) before the upgrade preflight and cleanup so no
 -- concurrent schema-31 writer can hold an uncommitted revision-0 row past `DELETE` and commit it
 -- before the new constraint and trigger take effect.
-LOCK TABLE openmettle.gateway_requests IN SHARE MODE;
+LOCK TABLE openmettle.gateway_requests IN EXCLUSIVE MODE;
 LOCK TABLE openmettle.gateway_usage_reports IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE openmettle.gateway_settlements IN SHARE MODE;
 
