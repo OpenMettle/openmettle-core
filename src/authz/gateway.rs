@@ -878,7 +878,7 @@ impl Pending<'_> {
 }
 
 /// The stored routing fields of a request the proxy forwards (ADR 0044).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Routing {
     pub installation: String,
     pub scope: String,

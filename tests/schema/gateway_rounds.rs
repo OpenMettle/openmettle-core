@@ -99,6 +99,11 @@ struct Rounds {
 
 impl Rounds {
     async fn new() -> Self {
+        Self::at(MIGRATIONS.len()).await
+    }
+
+    /// The fixture on a database migrated through version `through`.
+    async fn at(through: usize) -> Self {
         let db = TestDb::new().await;
         let settings = db.settings(Duration::from_secs(10));
         migrate::apply(&settings, &MIGRATIONS[..23]).await.unwrap();
@@ -106,7 +111,9 @@ impl Rounds {
         providers(&mut owner).await;
         let actor = account(&mut owner, PROVIDER, true, FUTURE).await;
         let scope = authz_runs::personal_of(&db, &actor).await;
-        migrate::apply(&settings, MIGRATIONS).await.unwrap();
+        migrate::apply(&settings, &MIGRATIONS[..through])
+            .await
+            .unwrap();
         let enforced: bool =
             sqlx::query_scalar("SELECT metering_enforced FROM openmettle.quota_enforcement")
                 .fetch_one(&mut owner)
@@ -1695,4 +1702,255 @@ async fn a_request_without_a_binding_settles_under_its_actor_and_installation() 
     .unwrap();
     assert_eq!(settled, (0, true, Some("7".to_owned()), 0, true));
     assert_eq!(f.provisioned().await, 0);
+}
+
+/// A final report of `round` at the proxy's revision, with the given token counts.
+fn report_of(f: &Rounds, round: &Round, counts: Option<(i64, i64)>) -> UsageReport {
+    UsageReport {
+        request: round.request.clone(),
+        installation: INSTALL.into(),
+        principal: f.actor.user.clone(),
+        scope: f.scope.clone(),
+        source: INSTALL.into(),
+        report_id: round.request.clone(),
+        revision: 1,
+        r#final: true,
+        prompt_tokens: counts.map(|(prompt, _)| prompt),
+        completion_tokens: counts.map(|(_, completion)| completion),
+        reasoning_tokens: None,
+        reasoning_included: None,
+        cost: None,
+        unit: None,
+    }
+}
+
+/// The reports of `request` (revision, reason), its settlement (revision, finality, measured
+/// units, outstanding units), and whether it left the scan of outstanding requests.
+#[allow(clippy::type_complexity)]
+async fn ledger(
+    f: &mut Rounds,
+    request: &str,
+) -> (
+    Vec<(i64, Option<String>)>,
+    Option<(i64, bool, Option<String>, i64)>,
+    bool,
+) {
+    let reports = sqlx::query_as(
+        "SELECT revision,incomplete FROM openmettle.gateway_usage_reports
+          WHERE request_id=$1::uuid ORDER BY revision",
+    )
+    .bind(request)
+    .fetch_all(&mut f.owner)
+    .await
+    .unwrap();
+    let settlement = sqlx::query_as(
+        "SELECT revision,final,measured::text,outstanding
+           FROM openmettle.gateway_settlements WHERE request_id=$1::uuid",
+    )
+    .bind(request)
+    .fetch_optional(&mut f.owner)
+    .await
+    .unwrap();
+    let settled_final = sqlx::query_scalar(
+        "SELECT settled_final FROM openmettle.gateway_requests WHERE id=$1::uuid",
+    )
+    .bind(request)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    (reports, settlement, settled_final)
+}
+
+/// ADR 0044, increment 3a. A dispatched request that ended without usage is closed by a final
+/// report that carries the reason and no count. Without the reason, a final report that would
+/// leave the request's units outstanding is refused: accepted, it would mark the request
+/// settled, hide it from every scan of outstanding requests and keep its hold for good.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_request_that_ended_without_usage_is_closed_by_its_reason_and_never_by_a_bare_final_report()
+ {
+    let mut f = Rounds::new().await;
+    let round = f.round(&quotas::snapshot(100)).await;
+    f.authorized(&round, "a live run round").await;
+    let gateway = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(f.db.1.options(pg::GATEWAY));
+    let unused = report_of(&f, &round, None);
+    let untouched = (vec![], None, false);
+
+    // The proxy reports only after it spent the dispatch, also when it has no usage to report.
+    assert_eq!(
+        settlement::ingest_incomplete(&gateway, &unused, "model_not_served").await,
+        Err(StoreError::Refused)
+    );
+    assert_eq!(f.dispatch(&round).await, [f.routed()]);
+
+    // The trap: a final report with no count and no reason, or with one count only.
+    let prompt_only = UsageReport {
+        prompt_tokens: Some(4),
+        ..unused.clone()
+    };
+    for bare in [&unused, &prompt_only] {
+        assert_eq!(
+            settlement::ingest(&gateway, bare).await,
+            Err(StoreError::Refused)
+        );
+    }
+    // The vocabulary is closed, and only a final report carries a reason.
+    for unknown in ["dispatch_unconfirmed", "no usage", ""] {
+        assert_eq!(
+            settlement::ingest_incomplete(&gateway, &unused, unknown).await,
+            Err(StoreError::Refused),
+            "{unknown}"
+        );
+    }
+    let interim = UsageReport {
+        r#final: false,
+        ..unused.clone()
+    };
+    assert_eq!(
+        settlement::ingest_incomplete(&gateway, &interim, "incomplete").await,
+        Err(StoreError::Refused)
+    );
+    assert_eq!(ledger(&mut f, &round.request).await, untouched);
+
+    assert_eq!(
+        settlement::ingest_incomplete(&gateway, &unused, "upstream_status").await,
+        Ok(Outcome::Applied)
+    );
+    // A retried write stores nothing new; another reason under the same identity conflicts.
+    assert_eq!(
+        settlement::ingest_incomplete(&gateway, &unused, "upstream_status").await,
+        Ok(Outcome::Duplicate)
+    );
+    assert_eq!(
+        settlement::ingest_incomplete(&gateway, &unused, "no_usage").await,
+        Err(StoreError::Conflict)
+    );
+    assert_eq!(
+        settlement::ingest(&gateway, &unused).await,
+        Err(StoreError::Conflict)
+    );
+    assert_eq!(
+        ledger(&mut f, &round.request).await,
+        (
+            vec![(1, Some("upstream_status".to_owned()))],
+            Some((1, true, None, 0)),
+            true
+        )
+    );
+    assert_eq!(f.provisioned().await, 0);
+}
+
+/// Migration 31 on a database that already holds reports: a settled report keeps its counts and
+/// gets no reason, a request that was dispatched and never reported can then be closed, and the
+/// new column takes exactly the reasons of its two groups, on a final report only.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn migration_31_keeps_stored_reports_and_adds_the_reason_of_an_incomplete_one() {
+    let mut f = Rounds::at(30).await;
+    let settled = f.round(&quotas::snapshot(100)).await;
+    let open = f.round(&quotas::snapshot(100)).await;
+    for round in [&settled, &open] {
+        f.authorized(round, "a live run round").await;
+        assert_eq!(f.dispatch(round).await, [f.routed()]);
+    }
+    for sql in SETTLED {
+        f.owner_exec(sql, &settled.request).await;
+    }
+    let has_column = "SELECT EXISTS (SELECT FROM information_schema.columns
+        WHERE table_schema='openmettle' AND table_name='gateway_usage_reports'
+          AND column_name=$1)";
+    let before: bool = sqlx::query_scalar(has_column)
+        .bind("incomplete")
+        .fetch_one(&mut f.owner)
+        .await
+        .unwrap();
+    assert!(!before);
+
+    let settings = f.db.settings(Duration::from_secs(10));
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+    assert_eq!(f.db.history().await, all_versions());
+    // The stored report and its settlement are as they were.
+    assert_eq!(
+        ledger(&mut f, &settled.request).await,
+        (
+            vec![(0, None)],
+            Some((0, true, Some("2".to_owned()), 0)),
+            true
+        )
+    );
+    // The request nobody reported is closed through the library, as the gateway.
+    let gateway = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(f.db.1.options(pg::GATEWAY));
+    let unused = report_of(&f, &open, None);
+    assert_eq!(
+        settlement::ingest_incomplete(&gateway, &unused, "caller_disconnected").await,
+        Ok(Outcome::Applied)
+    );
+    assert_eq!(
+        ledger(&mut f, &open.request).await,
+        (
+            vec![(1, Some("caller_disconnected".to_owned()))],
+            Some((1, true, None, 0)),
+            true
+        )
+    );
+
+    // The CHECK, written to as the owner: every reason of both groups on a final report, and
+    // nothing else.
+    let insert = "INSERT INTO openmettle.gateway_usage_reports
+            (request_id,source,report_id,revision,final,incomplete)
+        SELECT id,report_source,gen_random_uuid(),$2,$3,$4
+          FROM openmettle.gateway_requests WHERE id=$1::uuid";
+    let reasons = [
+        "model_not_served",
+        "model_mismatch",
+        "request_body",
+        "upstream_connect",
+        "upstream_transport",
+        "upstream_timeout",
+        "upstream_status",
+        "upstream_encoding",
+        "incomplete",
+        "caller_disconnected",
+        "no_usage",
+        "unparsable",
+    ];
+    for (n, reason) in reasons.into_iter().enumerate() {
+        let stored = sqlx::query(insert)
+            .bind(&open.request)
+            .bind(10 + n as i64)
+            .bind(true)
+            .bind(reason)
+            .execute(&mut f.owner)
+            .await;
+        assert!(stored.is_ok(), "{reason}: {stored:?}");
+    }
+    for (is_final, reason) in [
+        (true, "dispatch_unconfirmed"),
+        (true, "Incomplete"),
+        (true, ""),
+        (false, "incomplete"),
+    ] {
+        let refused = sqlx::query(insert)
+            .bind(&open.request)
+            .bind(99_i64)
+            .bind(is_final)
+            .bind(reason)
+            .execute(&mut f.owner)
+            .await;
+        let Err(sqlx::Error::Database(error)) = refused else {
+            panic!("{reason:?} on a report with final={is_final} was accepted");
+        };
+        assert_eq!(
+            (error.code().as_deref(), error.constraint()),
+            (
+                Some("23514"),
+                Some("gateway_usage_reports_incomplete_check")
+            ),
+            "{reason:?}"
+        );
+    }
 }

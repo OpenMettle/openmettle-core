@@ -1,9 +1,9 @@
 # Gateway proxy (not deployable)
 
-> **Not deployable.** A handed-off request keeps its hold until a final usage report
-> arrives, and nothing reconciles one that never does until increment 3. There is no image
-> target, chart or network policy for it yet (increment 7). Run it only on an isolated test
-> host with synthetic data.
+> **Not deployable.** A request that was handed off and never dispatched, and one whose
+> report the proxy could not write, keep their hold: nothing closes them until increment 3b.
+> There is no image target, chart or network policy for it yet (increment 7). Run it only on
+> an isolated test host with synthetic data.
 
 `openmettle-gateway` is OpenMettle's own inference proxy (V1-06,
 [ADR 0044](../adr/0044-own-inference-proxy-and-binding-free-dispatch.md)). It sits between a
@@ -76,10 +76,12 @@ policy is provisioned for it.
   valid usage object arrived, one final report is written. In a stream, only a usage object
   in the last data event before `[DONE]` counts; an earlier one may be interim. This holds
   whatever the `finish_reason`, including `length`: the proxy records what the upstream
-  reports it consumed.
+  reports it consumed. Every other end of a dispatched request is reported too, without
+  counts and with its reason: see [When there is no usage](#when-there-is-no-usage).
 - **Caller leaving.** A caller that disconnects, or takes no relayed chunk for an idle
   timeout, gets nothing more. If the usage is not in hand yet, the upstream connection is
-  closed so the server stops generating. If it may be (a stream whose last event carried
+  closed so the server stops generating, and the request is closed as `caller_disconnected`.
+  If it may be (a stream whose last event carried
   usage, or a JSON body within its parse bound), the relay reads on to finish the accounting,
   rechecking after every read, and stops once one idle timeout has passed since the caller
   left. A body that ends at that moment still counts.
@@ -89,8 +91,9 @@ policy is provisioned for it.
 | Report field | Value |
 | --- | --- |
 | `request`, `installation`, `principal`, `scope`, `source` | The stored handed-off request: `source` is its installation and `principal` the user it acts for |
-| `report_id`, `revision`, `final` | The request ID, `0` and `true` |
-| `prompt_tokens`, `completion_tokens` | The upstream's counts; both are required |
+| `report_id`, `revision`, `final` | The request ID, `1` and `true`. Revision `0` is left to the sweep of increment 3b: a higher final revision corrects a lower one, so a report of the proxy that arrives late replaces the sweep's record |
+| `prompt_tokens`, `completion_tokens` | The upstream's counts. A report with usage has both; a report without usage has neither |
+| `incomplete` | Empty for a report with usage. Otherwise the reason the request has none, from the table under [When there is no usage](#when-there-is-no-usage) |
 | `reasoning_tokens` | Top-level `reasoning_tokens` or `completion_tokens_details.reasoning_tokens`, which must agree when both are present and cannot exceed `completion_tokens` |
 | `reasoning_included` | `true` whenever reasoning tokens are recorded, because SGLang counts them inside `completion_tokens` (recorded 23 Nov 2026). Settlement then measures `prompt + max(completion, reasoning)` |
 | `cost`, `unit` | Not recorded |
@@ -107,35 +110,54 @@ flight: one past its bound is left to finish or fail on its own while the retry 
 safe because settlement accepts the identical report once. There is no local spool. If no
 attempt confirms the write, the proxy logs `gateway.usage.failed`: the gateway could not confirm
 the write, and an earlier attempt may still have committed it. Check the request's usage report
-and hold before acting. If no report exists, the hold stays in place: nothing releases or
-reconciles it until increment 3.
+and hold before acting. If no report exists, the hold stays in place: nothing closes it until
+the sweep of increment 3b. This applies to a report with usage and to one without.
 
 The report identity is derived from the request, so a retried write stores the same report.
 
-### When nothing is recorded
+### When there is no usage
 
 A request is dispatched once. Every case below except `dispatch_unconfirmed` has spent the
-request: it cannot be sent again. `dispatch_unconfirmed` may or may not have. Nothing is
-written, the hold stays in place until increment 3 reconciles it, and one
-`gateway.usage.unrecorded` event (warn) names the gateway request and the reason
-(`error.type`):
+request: it cannot be sent again. For each of them the proxy logs one
+`gateway.usage.unrecorded` event (warn) that names the gateway request and the reason
+(`error.type`), and stores one final report that carries the same reason in `incomplete` and
+no counts. That report closes the request:
+
+- the token hold becomes `settled` with nothing held and nothing charged, and a cost hold is
+  closed the same way;
+- the request leaves the scan of outstanding requests (`settled_final`).
+
+**Nothing is charged for a request without usage**, whether or not it reached the model
+server. The owner decided this on 24 November 2026 for now, to be revisited; ADR 0044 lists
+the alternatives. The reasons fall into two groups so that the rule can change for the second
+one alone:
+
+| Reason | Sent upstream | Cause |
+| --- | --- | --- |
+| `model_not_served` | No | The request was reserved for a model other than `MODEL` (`403 policy`) |
+| `model_mismatch` | No | The body was not a JSON object naming the reserved model exactly once (`400 validation`) |
+| `request_body` | No | The request body exceeded 2 MiB, did not arrive within 10 s, or the caller left while sending it (`400 validation`) |
+| `upstream_connect` | No | No connection to the upstream was made, in time or at all (`502 provider_failure` or `504 timeout`), or the caller left before one was |
+| `upstream_transport` | Yes or unknown | The exchange on an open upstream connection failed before a response head (`502 provider_failure`) |
+| `upstream_timeout` | Yes | No response head or no further body bytes within the idle timeout (`504 timeout` if no head arrived), or the upstream did not finish within one idle timeout after the caller left |
+| `upstream_status` | Yes | The upstream answered with a status other than 200; its response is still relayed |
+| `upstream_encoding` | Yes | The upstream answered with a content coding other than `identity` or a transfer coding other than `chunked` (`502 provider_failure`) |
+| `incomplete` | Yes | The body broke off, or a stream ended without `[DONE]` |
+| `caller_disconnected` | Yes or unknown | The caller left or stopped reading before the usage was in hand, or the usage went out of reach while the relay read on; the upstream connection is closed |
+| `no_usage` | Yes | The response completed without a usage object, for example a stream requested without `stream_options.include_usage`, or a stream whose last data event before `[DONE]` carried none |
+| `unparsable` | Yes | A parse bound was exceeded, or the usage was not a valid usage object |
+
+To list the requests that ended this way:
+
+```sql
+SELECT request_id, incomplete FROM openmettle.gateway_usage_reports WHERE incomplete IS NOT NULL;
+```
+
+One case is only logged, because the proxy never learned whether the dispatch was spent:
 
 | Reason | Cause |
 | --- | --- |
-| `dispatch_unconfirmed` | The database exchange that records the dispatch failed, did not answer within five `DB_TIMEOUT_MS`, or lost its caller first (`503 unavailable`). Nothing was forwarded. The dispatch may or may not have been consumed: if it was, the request stays handed off with its hold until increment 3, and a retry answers `409 conflict` |
-| `model_not_served` | The request was reserved for a model other than `MODEL` (`403 policy`); nothing was forwarded |
-| `model_mismatch` | The body was not a JSON object naming the reserved model exactly once (`400 validation`); nothing was forwarded |
-| `request_body` | The request body exceeded 2 MiB, did not arrive within 10 s, or the caller left while sending it (`400 validation`); nothing was forwarded |
-| `upstream_status` | The upstream answered with a status other than 200; its response is still relayed |
-| `upstream_transport` | The upstream could not be reached or failed before a response head (caller gets `502 provider_failure`) |
-| `upstream_encoding` | The upstream answered with a content coding other than `identity` or a transfer coding other than `chunked` (caller gets `502 provider_failure`) |
-| `upstream_timeout` | Connect, response-head or idle-read timeout (`504 timeout` if no head arrived), or the upstream did not finish within one idle timeout after the caller left |
-| `incomplete` | The body broke off, or a stream ended without `[DONE]` |
-| `caller_disconnected` | The caller left or stopped reading before the usage was in hand, or the usage went out of reach while the relay read on; the upstream connection is closed |
-| `no_usage` | The response completed without a usage object, for example a stream requested without `stream_options.include_usage`, or a stream whose last data event before `[DONE]` carried none |
-| `unparsable` | A parse bound was exceeded, or the usage was not a valid usage object |
-
-Increment 3 replaces these gaps with explicit incomplete reports.
+| `dispatch_unconfirmed` | The database exchange that records the dispatch failed, did not answer within five `DB_TIMEOUT_MS`, or lost its caller first (`503 unavailable`). Nothing was forwarded. If the dispatch was consumed, the request stays handed off with its hold until increment 3b, and a retry answers `409 conflict` |
 
 ## Configuration
 
@@ -181,7 +203,7 @@ invalid MODEL`. The line never contains the value.
 `SIGTERM` or `SIGINT` stops accepting connections. Responses in flight keep streaming, and
 reports whose usage was read are written before the database pool closes, all within
 `SHUTDOWN_TIMEOUT_MS`. A response still streaming at the deadline is cut and records nothing,
-and the process exits 1. So does a database exchange still running on a connection that
+so its request keeps its hold until increment 3b, and the process exits 1. So does a database exchange still running on a connection that
 stopped answering: the pool waits for every connection when closing.
 
 ## Known gaps
@@ -195,9 +217,16 @@ stopped answering: the pool waits for every connection when closing.
   of the proxy and give the worker an `https://` route; see
   [plain HTTP inside the cluster](worker-turn-execution.md#plain-http-inside-the-cluster).
   The default bind is loopback.
-- **Holds without a final report stay.** A request that was handed off and never dispatched,
-  refused after its dispatch was recorded, cancelled, cut or failed keeps its hold. Nothing
-  releases or reconciles it until increment 3.
+- **Some holds still stay.** A request keeps its hold when it was handed off and never
+  dispatched (the worker never reached the proxy, or the proxy refused it with `401`), when
+  its dispatch was recorded without the proxy learning of it (`dispatch_unconfirmed`), when
+  the proxy could not store its report (`gateway.usage.failed`), and when the proxy stopped
+  while relaying it. Nothing closes these until the sweep of increment 3b. The worker counts
+  them in `openmettle_quota_overdue_handoffs_total` once their run's deadline has passed.
+- **Cost holds never settle.** The proxy reports no cost, and the cost fold needs one, so a
+  cost hold stays in place even after a report with usage
+  ([issue 166](https://github.com/OpenMettle/openmettle-core/issues/166)). A report without
+  usage closes it.
 - **A broad database role.** `openmettle_gateway` still has the grants the superseded
   reconciler needed. Increment 6 narrows it to what the proxy uses.
 - **No family policy.** Quiet and study hours are enforced nowhere until increment 4.
@@ -210,8 +239,9 @@ stopped answering: the pool waits for every connection when closing.
 `tests/schema/gateway_proxy.rs` runs the binary as `openmettle_gateway` against a stand-in that
 replays the recorded SGLang responses in `tests/fixtures/sglang-recorded/`. Its requests are
 run rounds reserved and handed off through the library, without a gateway binding, and given
-a bearer the test knows, because each test presents a request the worker would not send. It
-needs an isolated PostgreSQL 18 service in `TEST_DATABASE_URL`, like the other schema tests:
+a bearer the test knows, because each test presents a request the worker would not send. Each
+reason above is produced through the binary and checked against the stored report, the hold
+and the accounting drift verifier. It needs an isolated PostgreSQL 18 service in `TEST_DATABASE_URL`, like the other schema tests:
 
 ```sh
 cargo test --locked --test schema gateway_proxy -- --ignored
@@ -221,7 +251,8 @@ cargo test --locked --test schema gateway_proxy -- --ignored
 queued run and sends its round, with the bearer it made, to this binary over plain HTTP and,
 in a second case, through a TLS terminator; the stand-in answers with a recorded response
 and the test checks the stored usage, the dispatch, the settled hold and the published
-answer. Two more cases cover a proxy serving another model and an unreachable proxy. Like
+answer. Two more cases cover a proxy serving another model, whose refusal closes the hold, and
+an unreachable proxy, whose request is never dispatched and keeps its hold. Like
 the packaged-worker tests, they need `TEST_GATEWAY_HOST` naming a private address of the
 host (see `.github/workflows/checks.yml`):
 

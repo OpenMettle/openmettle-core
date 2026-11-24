@@ -10,6 +10,8 @@
 -- internal authority check both use, and the one-time dispatch (gateway only) (ADR 0044). It
 -- adds three columns to `gateway_requests` and no table or column grant.
 -- Version 30 replaces quota_lock_override with the same signature, security and privileges.
+-- Version 31 adds `gateway_usage_reports.incomplete`, which the gateway may insert, and replaces
+-- quota_gateway_fold with the same signature, security and privileges (ADR 0044).
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -101,6 +103,7 @@ gateway_columns (relation,attribute,role,privilege) AS (
         ('gateway_requests','openmettle_api','INSERT',ARRAY['id','reservation_id','scope_id','actor_user_id','approval_id','installation','model','units','dispatch_hash','session_id']),
         ('gateway_requests','openmettle_worker','INSERT',ARRAY['id','reservation_id','scope_id','actor_user_id','approval_id','installation','model','units','dispatch_hash','run_id','round'])
     ) AS t(relation,role,privilege,columns), unnest(columns) attribute WHERE $1 >= 23
+    UNION ALL SELECT 'gateway_usage_reports','incomplete','openmettle_gateway','INSERT' WHERE $1 >= 31
 ),
 runtime_functions(signature,definer,roles) AS (
     SELECT * FROM (VALUES

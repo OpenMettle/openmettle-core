@@ -117,5 +117,7 @@ handoff window. Raise it, and the pod's termination grace period, when immediate
 matters.
 
 A round already handed to the gateway still counts against its run's round budget, and its
-gateway request keeps its hold until usage settles. After `SIGKILL` or a lost node, runs wait
+gateway request keeps its hold until the gateway reports it, with usage or with the reason
+there is none. A round the gateway never dispatched keeps its hold until increment 3b
+([gateway proxy](gateway-proxy.md#known-gaps)). After `SIGKILL` or a lost node, runs wait
 up to `LEASE_MS` before another worker claims them.

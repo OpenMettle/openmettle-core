@@ -176,6 +176,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "quota override actor lock",
         sql: include_str!("../migrations/0030_quota_override_actor_lock.sql"),
     },
+    Source {
+        version: 31,
+        description: "gateway incomplete usage reports",
+        sql: include_str!("../migrations/0031_gateway_incomplete_usage_reports.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

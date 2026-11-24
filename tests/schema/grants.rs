@@ -387,6 +387,7 @@ async fn gateway_usage_and_settlement_column_grants() {
     let mut c = db.admin().await;
     for (table, column, insert, update) in [
         ("gateway_usage_reports", "reasoning_included", true, false),
+        ("gateway_usage_reports", "incomplete", true, false),
         ("gateway_settlements", "final", true, true),
         ("gateway_settlements", "updated_at", false, false),
         ("gateway_requests", "settled_final", false, false),

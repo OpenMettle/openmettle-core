@@ -16,17 +16,18 @@ pub enum Outcome {
 }
 
 const INSERT_REPORT: &str = "INSERT INTO openmettle.gateway_usage_reports
-    (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens,reasoning_tokens,reasoning_included,cost,unit)
-    VALUES ($1::uuid,$2::uuid,$3::uuid,$4,$5,$6,$7,$8,$9,$10::text::numeric,$11) ON CONFLICT DO NOTHING";
+    (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens,reasoning_tokens,reasoning_included,cost,unit,incomplete)
+    VALUES ($1::uuid,$2::uuid,$3::uuid,$4,$5,$6,$7,$8,$9,$10::text::numeric,$11,$12) ON CONFLICT DO NOTHING";
 
 const EXACT_REPORT: &str = "SELECT EXISTS (SELECT FROM openmettle.gateway_usage_reports
     WHERE (request_id,source,report_id,revision) = ($1::uuid,$2::uuid,$3::uuid,$4)
-    AND (final,prompt_tokens,completion_tokens,reasoning_tokens,reasoning_included,cost,unit)
-    IS NOT DISTINCT FROM ($5::boolean,$6::bigint,$7::bigint,$8::bigint,$9::boolean,$10::text::numeric,$11::text))";
+    AND (final,prompt_tokens,completion_tokens,reasoning_tokens,reasoning_included,cost,unit,incomplete)
+    IS NOT DISTINCT FROM ($5::boolean,$6::bigint,$7::bigint,$8::bigint,$9::boolean,$10::text::numeric,$11::text,$12::text))";
 
 fn evidence<'a>(
     sql: &'static str,
     r: &'a UsageReport,
+    incomplete: Option<&'a str>,
 ) -> sqlx::query::Query<'a, sqlx::Postgres, sqlx::postgres::PgArguments> {
     sqlx::query(sql)
         .bind(&r.request)
@@ -40,6 +41,7 @@ fn evidence<'a>(
         .bind(r.reasoning_included)
         .bind(&r.cost)
         .bind(&r.unit)
+        .bind(incomplete)
 }
 
 async fn apply(
@@ -87,6 +89,8 @@ impl TokenFold {
         let completion_tokens: Option<i64> = row.try_get("completion_tokens")?;
         let reasoning_tokens: Option<i64> = row.try_get("reasoning_tokens")?;
         let reasoning_included: Option<bool> = row.try_get("reasoning_included")?;
+        // A report that says why the request has no usage ends it (migration 31's fold rule).
+        self.closed |= row.try_get::<Option<String>, _>("incomplete")?.is_some();
         if let Some(prompt) = prompt_tokens {
             self.prompt = prompt.into();
         }
@@ -133,7 +137,7 @@ async fn legacy_outstanding(
     let mut after = -1_i64;
     loop {
         let rows = sqlx::query("SELECT revision,report_id::text,final,
-            prompt_tokens,completion_tokens,reasoning_tokens,reasoning_included FROM openmettle.gateway_usage_reports
+            prompt_tokens,completion_tokens,reasoning_tokens,reasoning_included,incomplete FROM openmettle.gateway_usage_reports
             WHERE request_id=$1::uuid AND revision>$2 AND revision<=$3 ORDER BY revision LIMIT 64")
             .bind(&r.request).bind(after).bind(r.revision).fetch_all(&mut *c).await?;
         let count = rows.len();
@@ -191,6 +195,22 @@ async fn legacy_outstanding(
 /// the same rule as `openmettle.gateway_dispatch`, and only once it was dispatched: the proxy is
 /// the only reporter and reports after it spent the dispatch.
 pub async fn ingest(pool: &PgPool, r: &UsageReport) -> Result<Outcome, Error> {
+    store(pool, r, None).await
+}
+
+/// [`ingest`] for a request that ended without usage (ADR 0044, amendment of 24 November
+/// 2026): the final report `r` carries `reason`, one of the values the
+/// `gateway_usage_reports.incomplete` CHECK lists, and closes the request's holds at what was
+/// measured so far. An unknown reason or a report that is not final is refused.
+pub async fn ingest_incomplete(
+    pool: &PgPool,
+    r: &UsageReport,
+    reason: &str,
+) -> Result<Outcome, Error> {
+    store(pool, r, Some(reason)).await
+}
+
+async fn store(pool: &PgPool, r: &UsageReport, incomplete: Option<&str>) -> Result<Outcome, Error> {
     if !r.valid() {
         return Err(Error::Refused);
     }
@@ -201,7 +221,8 @@ pub async fn ingest(pool: &PgPool, r: &UsageReport) -> Result<Outcome, Error> {
         .execute(&mut *c)
         .await?;
     let row = sqlx::query(
-        "SELECT q.units,s.revision,s.final,s.outstanding FROM openmettle.gateway_requests q
+        "SELECT q.units,s.revision,s.final,s.outstanding,q.binding_id IS NULL AS unbound
+        FROM openmettle.gateway_requests q
         LEFT JOIN openmettle.gateway_bindings b ON b.id=q.binding_id
         LEFT JOIN openmettle.gateway_settlements s ON s.request_id=q.id
         WHERE q.id=$1::uuid AND q.state='handed_off' AND q.report_source=$2::uuid
@@ -216,7 +237,7 @@ pub async fn ingest(pool: &PgPool, r: &UsageReport) -> Result<Outcome, Error> {
     .fetch_optional(&mut *c)
     .await?
     .ok_or(Error::Refused)?;
-    let inserted = evidence(INSERT_REPORT, r)
+    let inserted = evidence(INSERT_REPORT, r, incomplete)
         .execute(&mut *c)
         .await
         .map_err(|e| {
@@ -230,7 +251,7 @@ pub async fn ingest(pool: &PgPool, r: &UsageReport) -> Result<Outcome, Error> {
         })?
         .rows_affected();
     if inserted == 0
-        && !evidence(EXACT_REPORT, r)
+        && !evidence(EXACT_REPORT, r, incomplete)
             .fetch_one(&mut *c)
             .await?
             .try_get::<bool, _>(0)?
@@ -273,6 +294,13 @@ pub async fn ingest(pool: &PgPool, r: &UsageReport) -> Result<Outcome, Error> {
             Some(held) => held,
             None => legacy_outstanding(c, r, units).await?,
         };
+        // A final report that leaves the token hold open would mark the request settled, hide
+        // it from every scan of outstanding requests and keep the hold for good. The proxy's
+        // reports never do: one with both counts and one with a reason both close the hold.
+        // Requests handed off under ADR 0037 keep their earlier behaviour.
+        if r.r#final && held != 0 && row.try_get("unbound")? {
+            return Err(Error::Refused);
+        }
         if held != previous {
             sqlx::query("ROLLBACK TO SAVEPOINT gateway_fold")
                 .execute(&mut *c)
