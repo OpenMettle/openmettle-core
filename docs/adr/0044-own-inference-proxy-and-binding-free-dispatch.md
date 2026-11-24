@@ -1,7 +1,6 @@
 # 0044 — OpenMettle's own inference proxy and binding-free dispatch
 
-Accepted, 23 November 2026, with the first half of its implementation (V1-06 proxy increment
-2a). Refs #7.
+Accepted with its implementation, 23 November 2026 (V1-06 proxy increments 2a and 2b). Refs #7.
 Supersedes [ADR 0037](0037-gateway-provisioning-and-usage-reconciliation.md) in part: see
 [What ADR 0037 still decides](#what-adr-0037-still-decides) and [Superseded](#superseded).
 Builds on [ADR 0033](0033-worker-leases-deadlines-and-restart-recovery.md) (leases),
@@ -36,13 +35,8 @@ authentication, forwarded the same request any number of times and did not check
 OpenMettle runs its own proxy. The proxy shares the application's PostgreSQL database under the
 existing `openmettle_gateway` role and holds no per-user state of its own.
 
-Increment 2a delivers the database and library half: the handoff, the worker's credential and
-the dispatch function `openmettle.gateway_dispatch`. The proxy half, described under
-[The proxy is the only usage witness and the only model check](#the-proxy-is-the-only-usage-witness-and-the-only-model-check),
-is decided here and delivered in increment 2b. Until then the increment 1 proxy is unchanged:
-it has no caller authentication, does not call `gateway_dispatch`, forwards a request any
-number of times, and looks a request up through its gateway binding, so it does not serve a
-round handed off without one.
+Increments 2a and 2b deliver this decision: 2a the database and library half (the handoff, the
+worker's credential and the dispatch function), 2b the proxy half.
 
 ### Authorization without a binding
 
@@ -156,8 +150,8 @@ does not fire.
 
 The principal of a dispatched request is the actor's user ID. Settlement accepts the binding's
 principal where a binding exists and the actor otherwise, so rows handed off under ADR 0037
-still settle. From increment 2b settlement also refuses a report for a request without a
-binding that was never dispatched; the increment 1 proxy does not record a dispatch.
+still settle. Settlement refuses a report for a request without a binding that was never
+dispatched: the proxy is the only reporter, and it reports after it spent the dispatch.
 
 ### The proxy is the only usage witness and the only model check
 
@@ -279,8 +273,12 @@ exists.
   binding, generation or policy row: each withdrawn authority, snapshot shapes, role and
   isolation restrictions, concurrent dispatch, a reclaimed and a renewed run, a release and
   a reclaim in flight, a lease that runs out during a lock wait, the CHECK and settlement.
+- `tests/schema/gateway_proxy.rs`: the binary against the recorded SGLang stand-in, with rounds
+  reserved and handed off through the library and their quota holds.
 - `tests/schema/gateway.rs`: a bound request handed off at version 23 passes migration 29 and
   settles under its binding's principal, and is never given a dispatch.
 - `tests/schema/worker_leases.rs` and `tests/schema/quotas.rs`: the worker and the library hand
   rounds off with their quota holds. A recording of every byte one worker process sends to
   PostgreSQL holds the dispatch secret and the bearer's hash, and not the bearer.
+- `src/gateway_proxy.rs` and `tests/runtime.rs`: credential and model parsing, the model
+  setting, and refusals through the binary without a database.

@@ -1,5 +1,6 @@
-//! Gateway reservation, handoff and settlement store (ADRs 0037 and 0044). A run round is handed
-//! off without a gateway binding, under a per-round bearer of which the database holds a hash.
+//! Gateway reservation, handoff, dispatch and settlement store (ADRs 0037 and 0044). A run round
+//! is handed off without a gateway binding, under a per-round bearer of which the database
+//! holds a hash, and dispatched once through OpenMettle's own proxy.
 //! The ADR 0037 provisioning and sealed-key code here has no caller and awaits removal.
 use crate::{
     provider_keys::gateway::{Context, Envelope, GatewayKeys},
@@ -874,6 +875,64 @@ impl Pending<'_> {
             authorization,
         })
     }
+}
+
+/// The stored routing fields of a request the proxy forwards (ADR 0044).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Routing {
+    pub installation: String,
+    pub scope: String,
+    pub source: String,
+    pub principal: String,
+    pub model: String,
+}
+
+/// What presenting a round bearer established.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Consumed {
+    /// The request's one dispatch, now spent.
+    Once(Routing),
+    /// The bearer is the request's, and its dispatch was spent earlier.
+    Replay,
+    /// No handed-off request of a live run matches the ID and the bearer.
+    Refused,
+}
+
+/// Spend the one dispatch of a handed-off request for the caller presenting its round bearer
+/// (`openmettle.gateway_dispatch`), as an `openmettle_gateway` login. It returns `Ok` only after
+/// the commit, so nothing is forwarded on a consume that did not become durable.
+///
+/// Only the SHA-256 of the bearer is sent, which is what the handoff stored in the request row.
+/// The bearer itself never crosses the database connection, so a server that logs statement
+/// parameters records nothing a caller could present.
+pub(crate) async fn consume(
+    pool: &PgPool,
+    request: &str,
+    bearer: &[u8; 32],
+) -> Result<Consumed, Error> {
+    let hash = Sha256::digest(bearer);
+    let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
+    let row = sqlx::query(
+        "SELECT replayed,installation,scope,source,principal,model \
+         FROM openmettle.gateway_dispatch($1::uuid,$2)",
+    )
+    .bind(request)
+    .bind(hash.as_slice())
+    .fetch_optional(tx.connection()?)
+    .await?;
+    let consumed = match row {
+        None => Consumed::Refused,
+        Some(row) if row.try_get("replayed")? => Consumed::Replay,
+        Some(row) => Consumed::Once(Routing {
+            installation: row.try_get("installation")?,
+            scope: row.try_get("scope")?,
+            source: row.try_get("source")?,
+            principal: row.try_get("principal")?,
+            model: row.try_get("model")?,
+        }),
+    };
+    tx.commit().await?;
+    Ok(consumed)
 }
 
 /// Coalesce a logical mutation under its immutable parameters. A conflict cannot

@@ -1018,62 +1018,18 @@ mod live_turns {
         .unwrap()
     }
 
-    /// Relays connections to the test PostgreSQL service and keeps, per connection, every byte
-    /// sent towards it.
-    struct RecordedPostgres {
-        address: std::net::SocketAddr,
-        sent: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
-    }
-
-    impl RecordedPostgres {
-        async fn start() -> Self {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let admin = pg::admin_options();
-            let server = format!("{}:{}", admin.get_host(), admin.get_port());
-            let sent = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
-            let record = sent.clone();
-            tokio::spawn(async move {
-                while let Ok((client, _)) = listener.accept().await {
-                    let server = tokio::net::TcpStream::connect(&server).await.unwrap();
-                    let record = record.clone();
-                    let connection = {
-                        let mut all = record.lock().unwrap();
-                        all.push(Vec::new());
-                        all.len() - 1
-                    };
-                    tokio::spawn(async move {
-                        let (mut from_client, mut to_client) = client.into_split();
-                        let (mut from_server, mut to_server) = server.into_split();
-                        let requests = async {
-                            let mut buffer = [0; 8192];
-                            while let Ok(n @ 1..) = from_client.read(&mut buffer).await {
-                                record.lock().unwrap()[connection].extend_from_slice(&buffer[..n]);
-                                if to_server.write_all(&buffer[..n]).await.is_err() {
-                                    break;
-                                }
-                            }
-                            let _ = to_server.shutdown().await;
-                        };
-                        let replies = async {
-                            let _ = tokio::io::copy(&mut from_server, &mut to_client).await;
-                        };
-                        tokio::join!(requests, replies);
-                    });
-                }
-            });
-            Self { address, sent }
-        }
-
-        /// The address of `role` on `db` through this relay.
-        fn url(&self, db: &TestDb, role: &str) -> String {
-            let admin = pg::admin_options();
-            let direct = format!("@{}:{}/", admin.get_host(), admin.get_port());
-            let url = db.url(role);
-            assert!(url.contains(&direct));
-            url.replace(&direct, &format!("@{}/", self.address))
-        }
+    /// Records the dispatch of round `id` as the proxy would, with the bearer the worker sent:
+    /// settlement accepts a report for a request without a binding only after its dispatch.
+    async fn spend_dispatch(gateway: &sqlx::PgPool, id: &str, bearer: &str) {
+        let replayed: bool = sqlx::query_scalar(
+            "SELECT replayed FROM openmettle.gateway_dispatch($1::uuid,sha256($2))",
+        )
+        .bind(id)
+        .bind(round_bearer(bearer).expect("a round bearer"))
+        .fetch_one(gateway)
+        .await
+        .unwrap();
+        assert!(!replayed);
     }
 
     impl Provider {
@@ -2541,7 +2497,7 @@ mod live_turns {
         use sha2::{Digest, Sha256};
 
         let mut chat = Chat::new().await;
-        let relay = RecordedPostgres::start().await;
+        let relay = crate::gateway_proxy::FaultyPostgres::recording().await;
         chat.database = Some(relay.url(&chat.f.db, WORKER));
         let mut provider = Provider::new().await;
         let (id, _) = chat.submit("bearer stays in the worker", "a", 2).await;
@@ -2566,10 +2522,10 @@ mod live_turns {
         .await
         .unwrap();
         assert_eq!(bearer_hash, Sha256::digest(&bearer).as_slice());
-        let connections = relay.sent.lock().unwrap().clone();
+        let recorded = relay.sent.lock().unwrap().clone();
         let found = |needle: &[u8]| {
-            connections.iter().any(|bytes| {
-                bytes
+            recorded.iter().any(|stream| {
+                stream
                     .windows(needle.len())
                     .any(|window| window.eq_ignore_ascii_case(needle))
             })
@@ -2586,8 +2542,8 @@ mod live_turns {
         assert!(found(&bearer_hash));
         // The test knows the dispatch secret by its hash only: look for it where a 32-byte
         // binary statement parameter is, after its length.
-        let secret_sent = connections.iter().any(|bytes| {
-            bytes.windows(36).any(|window| {
+        let secret_sent = recorded.iter().any(|stream| {
+            stream.windows(36).any(|window| {
                 window[..4] == [0, 0, 0, 32]
                     && Sha256::digest(&window[4..]).as_slice() == dispatch_hash
             })
@@ -3151,6 +3107,7 @@ mod live_turns {
                 .fetch_one(&mut owner)
                 .await
                 .unwrap();
+            spend_dispatch(&g_pool, &req_id, &req.bearer).await;
             assert_eq!(
                 settlement::ingest(
                     &g_pool,
@@ -3710,6 +3667,7 @@ mod live_turns {
             .fetch_one(&mut owner)
             .await
             .unwrap();
+        spend_dispatch(&g_pool, &req_id, &req.bearer).await;
         assert_eq!(
             settlement::ingest(
                 &g_pool,
@@ -4093,6 +4051,7 @@ mod live_turns {
             .fetch_one(&mut owner)
             .await
             .unwrap();
+        spend_dispatch(&g_pool, &req2_id, &req2.bearer).await;
         assert_eq!(
             settlement::ingest(
                 &g_pool,
@@ -4325,6 +4284,7 @@ mod live_turns {
             .fetch_one(&mut owner)
             .await
             .unwrap();
+        spend_dispatch(&g_pool, &req_id, &req.bearer).await;
         assert_eq!(
             settlement::ingest(
                 &g_pool,
@@ -4867,6 +4827,7 @@ mod live_turns {
             .fetch_one(&mut owner)
             .await
             .unwrap();
+        spend_dispatch(&g_pool, &req_id, &req.bearer).await;
         let outcome = settlement::ingest(
             &g_pool,
             &UsageReport {
@@ -5281,6 +5242,7 @@ mod live_turns {
             .fetch_one(&mut owner)
             .await
             .unwrap();
+        spend_dispatch(&g_pool, &req_id, &req.bearer).await;
         assert_eq!(
             settlement::ingest(
                 &g_pool,
@@ -5886,6 +5848,7 @@ mod live_turns {
             .fetch_one(&mut owner)
             .await
             .unwrap();
+        spend_dispatch(&g_pool, &req1_id, &req1.bearer).await;
         assert_eq!(
             settlement::ingest(
                 &g_pool,
@@ -5923,6 +5886,7 @@ mod live_turns {
             .fetch_one(&mut owner)
             .await
             .unwrap();
+        spend_dispatch(&g_pool, &req2_id, &req2.bearer).await;
         assert_eq!(
             settlement::ingest(
                 &g_pool,

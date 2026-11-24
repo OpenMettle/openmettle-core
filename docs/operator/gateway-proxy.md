@@ -1,13 +1,24 @@
-# Gateway proxy (increment 1, not deployable)
+# Gateway proxy (not deployable)
 
-> **Not deployable.** `openmettle-gateway` has no caller authentication, no TLS and no model
-> enforcement in this increment. Run it only on an isolated test host with synthetic data.
-> There is no image target, chart or network policy for it yet.
+> **Not deployable**, for two reasons:
+>
+> - **The bearer would travel in cleartext.** The worker's transport requires an
+>   `https://` endpoint and the proxy listens on plain HTTP, so the two cannot be connected
+>   until increment 7.
+> - **A hold without a final report stays forever.** A handed-off request keeps its hold until
+>   a final usage report arrives, and nothing reconciles one that never does until increment 3.
+>
+> Run it only on an isolated test host with synthetic data. There is no image target, chart
+> or network policy for it yet.
 
-`openmettle-gateway` is the first increment of OpenMettle's own inference proxy (V1-06). It
-sits between a caller and one SGLang server and turns the usage the server reports into a
-usage report for the request's gateway hold, through the same settlement path as
-[ADR 0037](../adr/0037-gateway-provisioning-and-usage-reconciliation.md).
+`openmettle-gateway` is OpenMettle's own inference proxy (V1-06,
+[ADR 0044](../adr/0044-own-inference-proxy-and-binding-free-dispatch.md)). It sits between a
+caller and one SGLang server. It authenticates the caller by the round bearer of one
+handed-off gateway request, allows that request one dispatch, checks the model, and turns the
+usage the server reports into a usage report for the request's hold, through the settlement
+path of [ADR 0037](../adr/0037-gateway-provisioning-and-usage-reconciliation.md). Caller
+authentication, single dispatch and the model check are delivered. No gateway binding, key or
+policy is provisioned for it.
 
 ## What it does
 
@@ -15,12 +26,39 @@ usage report for the request's gateway hold, through the same settlement path as
   Every other path answers 404, as do `/v1/responses` (the recorded server answers it with
   500) and `/v1/models`. `/healthz` and `/readyz` behave as in the API and the worker.
 - **Correlation.** The caller sends exactly one `x-request-id` holding the canonical lowercase
-  UUID of a gateway request in state `handed_off`; an ID the caller names in `Connection`
-  counts as absent. Its installation, scope, report source
-  and binding principal are read from the database; nothing else is taken from the caller. A
-  missing or malformed ID is refused with `400 validation`, and an unknown request or one not
-  handed off with `404 not_found`, before anything is sent upstream. Refusals use the
-  application API's problem document (`application/problem+json`).
+  UUID of a gateway request; an ID the caller names in `Connection` counts as absent. A
+  missing or malformed ID is refused with `400 validation`. So is a request with a
+  `Connection` value holding anything but visible ASCII and spaces, a tab included, before
+  the ID or the credential is looked at: such a value could hide a nomination. Refusals use
+  the application API's problem document (`application/problem+json`).
+- **Authentication.** The caller sends exactly one `Authorization: Bearer` header holding the
+  request's 32-byte round bearer as 43 unpadded base64url characters. The worker generates
+  that bearer when it hands the round off and sends it to this proxy over HTTP; the proxy
+  receives and decodes it. Both send only its SHA-256 to PostgreSQL, which stores that. The
+  request's dispatch secret is a different value: it crosses only the worker's database
+  connection and is not accepted here. No zeroization guarantee is made for either value. A
+  missing, repeated or malformed header, one named in `Connection`, a wrong bearer, an
+  unknown request and a request not handed off are all refused alike with
+  `401 unauthenticated` and `WWW-Authenticate: Bearer`. So is a request that was not
+  dispatched yet and whose run is cancelled, finished, claimed again by another worker, or
+  past its lease or its execution deadline. Nothing is sent upstream, and the answer does not
+  reveal whether the request exists.
+- **Single dispatch.** The database records the request's one dispatch before the body is
+  read. A second dispatch with the right bearer is refused with `409 conflict`, also after
+  the run was cancelled or has finished. Of two concurrent dispatches at most one is
+  forwarded.
+- **The bearer stays out of the database.** The proxy sends PostgreSQL the SHA-256 of the
+  bearer, which is what the request row stores, and never the bearer; the worker does the
+  same when it hands the round off. A server that logs statement parameters therefore
+  records nothing a caller could present, and no logging setting is required for the
+  gateway's login.
+- **Routing fields.** The installation, scope, report source, principal and model of the
+  report come from the stored request; nothing else is taken from the caller. The report
+  source is the request's installation, and the principal is the user the request acts for.
+- **Model.** The stored model must be the one in `MODEL`, or the request is refused with
+  `403 policy`. The body must be one JSON object whose top-level `model` is that model,
+  without a repeated `model` key, or it is refused with `400 validation`. SGLang answers any
+  model name from its loaded model, so nothing else checks it.
 - **Forwarding.** The request body (at most 2 MiB, read within 10 s) is sent upstream byte
   for byte on a new connection, with only `Content-Type`, `Accept`, `Accept-Encoding:
   identity` and the request ID. `Authorization`, cookies, other caller headers and any field
@@ -56,7 +94,7 @@ usage report for the request's gateway hold, through the same settlement path as
 
 | Report field | Value |
 | --- | --- |
-| `request`, `installation`, `principal`, `scope`, `source` | The stored handed-off request and its binding |
+| `request`, `installation`, `principal`, `scope`, `source` | The stored handed-off request: `source` is its installation and `principal` the user it acts for |
 | `report_id`, `revision`, `final` | The request ID, `0` and `true` |
 | `prompt_tokens`, `completion_tokens` | The upstream's counts; both are required |
 | `reasoning_tokens` | Top-level `reasoning_tokens` or `completion_tokens_details.reasoning_tokens`, which must agree when both are present and cannot exceed `completion_tokens` |
@@ -75,21 +113,24 @@ flight: one past its bound is left to finish or fail on its own while the retry 
 safe because settlement accepts the identical report once. There is no local spool. If no
 attempt confirms the write, the proxy logs `gateway.usage.failed`: the gateway could not confirm
 the write, and an earlier attempt may still have committed it. Check the request's usage report
-and hold before acting; if no report exists, the hold stays for reconciliation.
+and hold before acting. If no report exists, the hold stays in place: nothing releases or
+reconciles it until increment 3.
 
-The report identity is derived from the request, so a retry writes the same report. A second
-dispatch of the same request is still forwarded in this increment; if the upstream reports the
-same usage, settlement accepts the identical report once, and if it reports different usage
-the second write is refused as a conflict (`gateway.usage.failed`, `conflict`). Increment 2
-refuses a second dispatch.
+The report identity is derived from the request, so a retried write stores the same report.
 
 ### When nothing is recorded
 
-Nothing is written, the hold stays as it was and one `gateway.usage.unrecorded` event (warn)
-names the gateway request and the reason (`error.type`):
+A request is dispatched once. Every case below except `dispatch_unconfirmed` has spent the
+request: it cannot be sent again. `dispatch_unconfirmed` may or may not have. Nothing is
+written, the hold stays in place until increment 3 reconciles it, and one
+`gateway.usage.unrecorded` event (warn) names the gateway request and the reason
+(`error.type`):
 
 | Reason | Cause |
 | --- | --- |
+| `dispatch_unconfirmed` | The database exchange that records the dispatch failed, did not answer within five `DB_TIMEOUT_MS`, or lost its caller first (`503 unavailable`). Nothing was forwarded. The dispatch may or may not have been consumed: if it was, the request stays handed off with its hold until increment 3, and a retry answers `409 conflict` |
+| `model_not_served` | The request was reserved for a model other than `MODEL` (`403 policy`); nothing was forwarded |
+| `model_mismatch` | The body was not a JSON object naming the reserved model exactly once (`400 validation`); nothing was forwarded |
 | `request_body` | The request body exceeded 2 MiB, did not arrive within 10 s, or the caller left while sending it (`400 validation`); nothing was forwarded |
 | `upstream_status` | The upstream answered with a status other than 200; its response is still relayed |
 | `upstream_transport` | The upstream could not be reached or failed before a response head (caller gets `502 provider_failure`) |
@@ -115,6 +156,7 @@ The gateway reads the same process settings as the API and the worker under the
 | Setting (`OPENMETTLE_GATEWAY_` prefix) | Range | Default |
 | --- | --- | --- |
 | `UPSTREAM_URL` | `http://host[:port]` with at most a `/` path | Required |
+| `MODEL` | The catalog model ID the upstream serves, 1–128 bytes | Required |
 | `UPSTREAM_CONNECT_TIMEOUT_MS` | 1–30,000 ms | 5,000 |
 | `UPSTREAM_IDLE_TIMEOUT_MS` | 1–3,600,000 ms | 120,000 |
 
@@ -124,9 +166,13 @@ timeout bounds the wait for the response head (SGLang sends a non-streamed head 
 generating the whole answer), each later body read, a caller that does not accept a relayed
 chunk (it is then treated as gone), and how long the relay reads on once the caller has gone.
 
+`MODEL` must equal the model ID that run admission stores, which is the catalog's. One
+gateway process serves one model.
+
 A refusal exits 78 with one fixed line, for example `configuration error: UPSTREAM_URL is
-required`, `configuration error: UPSTREAM_URL must use http://` or `configuration error:
-invalid UPSTREAM_URL`. The line never contains the value.
+required`, `configuration error: UPSTREAM_URL must use http://`, `configuration error:
+invalid UPSTREAM_URL`, `configuration error: MODEL is required` or `configuration error:
+invalid MODEL`. The line never contains the value.
 
 ## Bounds
 
@@ -144,26 +190,27 @@ reports whose usage was read are written before the database pool closes, all wi
 and the process exits 1. So does a database exchange still running on a connection that
 stopped answering: the pool waits for every connection when closing.
 
-## Known gaps in this increment
+## Known gaps
 
-- **No caller authentication.** Anything that can reach the listener and knows a handed-off
-  request ID can spend upstream capacity against it. The default bind is loopback.
-- **No model enforcement.** The `model` field is forwarded unchecked, and the recorded server
-  answers an unknown model name from its loaded model.
-- **Incomplete responses record nothing.** Cancelled, cut and failed requests leave their
-  holds for reconciliation until increment 3.
 - **Plain HTTP on both sides.** The packaged worker's transport requires an `https://`
-  endpoint, so it cannot use this proxy yet.
+  endpoint, so it cannot use this proxy yet, and without TLS the bearer would cross
+  the network in cleartext. The default bind is loopback.
+- **Holds without a final report stay.** A request that was handed off and never dispatched,
+  refused after its dispatch was recorded, cancelled, cut or failed keeps its hold. Nothing
+  releases or reconciles it until increment 3.
+- **A broad database role.** `openmettle_gateway` still has the grants the superseded
+  reconciler needed. Increment 6 narrows it to what the proxy uses.
+- **No family policy.** Quiet and study hours are enforced nowhere until increment 4.
 - **Chat completions only.** The Responses API is not routed.
-- **A second dispatch of one request is forwarded.** Settlement does not double-charge it.
 - **No concurrency limit** on relayed requests.
 - **Identity bodies only.** Compressed requests and answers are refused rather than relayed.
 
 ## Testing
 
 `tests/schema/gateway_proxy.rs` runs the binary as `openmettle_gateway` against a stand-in that
-replays the recorded SGLang responses in `tests/fixtures/sglang-recorded/`. It needs an
-isolated PostgreSQL 18 service in `TEST_DATABASE_URL`, like the other schema tests:
+replays the recorded SGLang responses in `tests/fixtures/sglang-recorded/`. Its requests are
+run rounds reserved and handed off through the library, without a gateway binding. It needs
+an isolated PostgreSQL 18 service in `TEST_DATABASE_URL`, like the other schema tests:
 
 ```sh
 cargo test --locked --test schema gateway_proxy -- --ignored

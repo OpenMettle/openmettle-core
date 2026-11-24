@@ -1,11 +1,17 @@
-//! `openmettle-gateway`, increment 1 of OpenMettle's own inference proxy (V1-06). It accepts
+//! `openmettle-gateway`, OpenMettle's own inference proxy (V1-06, ADR 0044). It accepts
 //! `POST /v1/chat/completions`, forwards it to one plain-HTTP upstream (SGLang) and writes the
 //! usage the upstream reported through [`settlement::ingest`], connected as
 //! `openmettle_gateway`.
 //!
-//! - **Correlation.** The caller names a handed-off gateway request in `x-request-id`. The
-//!   report's routing fields come from that stored row, never from the caller. An unusable or
-//!   unknown ID is refused before anything is sent upstream.
+//! - **Authentication and single dispatch.** The caller names a handed-off gateway request in
+//!   `x-request-id` and presents that request's bearer in `Authorization`: the per-round value
+//!   whose hash the handoff stored, never the dispatch secret. The database spends the
+//!   request's one dispatch before the body is read: an unknown request or a wrong bearer is
+//!   refused alike, and a second dispatch is a conflict. The report's routing fields come from
+//!   the stored row, never from the caller.
+//! - **Model.** The stored model must be the one this gateway serves, and the body's top-level
+//!   `model` must equal it. The upstream answers any model name from its loaded model, so
+//!   nothing else checks it.
 //! - **Forwarding.** The request body goes upstream byte for byte, with only `Content-Type`,
 //!   `Accept`, `Accept-Encoding: identity` and the request ID; `Authorization`, cookies and
 //!   fields the caller names in `Connection` are not forwarded. The upstream status,
@@ -16,14 +22,15 @@
 //!   on the caller staying connected. A response that is not a completed 200 with a usage object
 //!   leaves no report and one `gateway.usage.unrecorded` event; the hold stays as it was.
 //!
-//! Not deployable: this increment has no caller authentication and no model enforcement. See
+//! Not deployable: the listener is plain HTTP, so the bearer would cross the network
+//! in cleartext, and nothing reconciles a spent dispatch that left no report. See
 //! `docs/operator/gateway-proxy.md`.
 mod usage;
 
 use crate::{
-    authz::gateway::{Error as StoreError, settlement},
+    authz::gateway::{self, Consumed, Error as StoreError, Routing, settlement},
     bounded_positive,
-    provider_http::gateway::UsageReport,
+    provider_http::{gateway::UsageReport, inference::json},
     runs::is_canonical_uuid,
     telemetry::{self, RequestId, UsageGap},
     v1::{Problem, problem},
@@ -36,6 +43,7 @@ use axum::{
     response::Response,
     routing::post,
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use http_body_util::{BodyExt, Full};
 use hyper::{
     body::{Body as _, Frame, Incoming, SizeHint},
@@ -71,8 +79,9 @@ const REQUEST_READ: Duration = Duration::from_secs(10);
 const RELAY_BUFFER: usize = 8;
 /// Pauses before the second and third attempt to store a report after a transient failure.
 const WRITE_RETRIES: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(500)];
-/// Each attempt to store a report gets this many `DB_TIMEOUT_MS` before it is abandoned and
-/// retried, also when its database connection has stopped answering.
+/// Each write transaction, spending a dispatch or storing a report, gets this many
+/// `DB_TIMEOUT_MS` before the proxy stops waiting for it, also when its database connection has
+/// stopped answering. A report write is then retried.
 const WRITE_ATTEMPT_TIMEOUTS: u32 = 5;
 /// SGLang counts reasoning tokens inside `completion_tokens` (recorded 23 Nov 2026), so
 /// settlement must not add them again.
@@ -83,10 +92,30 @@ const CORRELATION: Problem = problem(
     "validation",
     "The request needs one x-request-id header holding a canonical lowercase UUID.",
 );
-const UNKNOWN: Problem = problem(
-    StatusCode::NOT_FOUND,
-    "not_found",
-    "No handed-off gateway request matches the x-request-id header.",
+const CONNECTION: Problem = problem(
+    StatusCode::BAD_REQUEST,
+    "validation",
+    "The Connection header could not be read.",
+);
+const UNAUTHENTICATED: Problem = problem(
+    StatusCode::UNAUTHORIZED,
+    "unauthenticated",
+    "The request needs one Authorization header with the bearer of the request named in x-request-id.",
+);
+const REPLAY: Problem = problem(
+    StatusCode::CONFLICT,
+    "conflict",
+    "The request named in x-request-id was already dispatched.",
+);
+const NOT_SERVED: Problem = problem(
+    StatusCode::FORBIDDEN,
+    "policy",
+    "This gateway does not serve the model the request was reserved for.",
+);
+const MODEL: Problem = problem(
+    StatusCode::BAD_REQUEST,
+    "validation",
+    "The request body must be a JSON object whose model is the one the request was reserved for.",
 );
 const BODY: Problem = problem(
     StatusCode::BAD_REQUEST,
@@ -128,18 +157,25 @@ const UPSTREAM_TIMEOUT: Problem = problem(
 #[derive(Clone, Debug)]
 pub(crate) struct Settings {
     upstream: Authority,
+    /// The catalog model ID the upstream serves.
+    model: String,
     connect_timeout: Duration,
     idle_timeout: Duration,
 }
 
 impl Settings {
-    /// `UPSTREAM_URL` (required), `UPSTREAM_CONNECT_TIMEOUT_MS` and
+    /// `UPSTREAM_URL` and `MODEL` (both required), `UPSTREAM_CONNECT_TIMEOUT_MS` and
     /// `UPSTREAM_IDLE_TIMEOUT_MS`. Refusals name the key, never the value.
     pub(crate) fn parse(
         get: impl Fn(&str) -> Result<Option<String>, &'static str>,
     ) -> Result<Self, &'static str> {
         let url = get("UPSTREAM_URL")?.ok_or("UPSTREAM_URL is required")?;
         let upstream = origin(&url)?;
+        let model = get("MODEL")?.ok_or("MODEL is required")?;
+        // The bound of a stored request's model.
+        if model.is_empty() || model.len() > 128 {
+            return Err("invalid MODEL");
+        }
         let millis = |key, default, max| -> Result<Duration, &'static str> {
             Ok(Duration::from_millis(bounded_positive(
                 get(key)?,
@@ -149,6 +185,7 @@ impl Settings {
         };
         Ok(Self {
             upstream,
+            model,
             connect_timeout: millis("UPSTREAM_CONNECT_TIMEOUT_MS", 5_000, 30_000)?,
             idle_timeout: millis("UPSTREAM_IDLE_TIMEOUT_MS", 120_000, 3_600_000)?,
         })
@@ -204,7 +241,19 @@ fn origin(url: &str) -> Result<Authority, &'static str> {
     }
 }
 
-/// The values of `name`, unless the message's `Connection` field names it as hop-by-hop.
+/// Whether every `Connection` value is visible ASCII and spaces only, so its nominations can
+/// all be read. A horizontal tab is refused too, although a header value may hold one.
+fn connection_readable(headers: &HeaderMap) -> bool {
+    headers.get_all(header::CONNECTION).iter().all(|value| {
+        value
+            .as_bytes()
+            .iter()
+            .all(|byte| (0x20..=0x7e).contains(byte))
+    })
+}
+
+/// The values of `name`, unless the message's `Connection` field names it as hop-by-hop. The
+/// caller's request is first checked with [`connection_readable`].
 fn end_to_end<'h>(
     headers: &'h HeaderMap,
     name: &HeaderName,
@@ -300,16 +349,16 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
     let id = request.extensions().get::<RequestId>().copied();
     match proxy.forward(request).await {
         Ok(response) => response,
-        Err(problem) => problem.response(id),
+        Err(problem) => {
+            let mut response = problem.response(id);
+            if problem == UNAUTHENTICATED {
+                response
+                    .headers_mut()
+                    .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+            }
+            response
+        }
     }
-}
-
-/// The routing fields of a handed-off request, as stored.
-struct Routing {
-    installation: String,
-    principal: String,
-    scope: String,
-    source: String,
 }
 
 /// Exactly one `x-request-id` holding a canonical lowercase UUID. One named in `Connection` is
@@ -328,6 +377,33 @@ fn correlation(headers: &HeaderMap) -> Result<String, Problem> {
     }
 }
 
+/// The round bearer of exactly one `Authorization: Bearer` header: 32 bytes as 43 unpadded
+/// base64url characters, in their one canonical spelling. A header named in `Connection` is
+/// hop-by-hop and counts as absent.
+fn credential(headers: &HeaderMap) -> Result<[u8; 32], Problem> {
+    let mut values = end_to_end(headers, &header::AUTHORIZATION);
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return Err(UNAUTHENTICATED);
+    };
+    value
+        .as_bytes()
+        .strip_prefix(b"Bearer ")
+        .and_then(|token| URL_SAFE_NO_PAD.decode(token).ok())
+        .and_then(|bearer| bearer.try_into().ok())
+        .ok_or(UNAUTHENTICATED)
+}
+
+/// Whether `body` is one JSON object whose top-level `model` is the string `model`. Read with
+/// the worker decoder's parser, which refuses duplicate keys: no second `model` can reach an
+/// upstream that might prefer it.
+fn names_model(body: &[u8], model: &str) -> bool {
+    matches!(
+        json::parse(body),
+        Ok(serde_json::Value::Object(request))
+            if request.get("model").and_then(|named| named.as_str()) == Some(model)
+    )
+}
+
 impl Proxy {
     async fn forward(&self, request: Request) -> Result<Response, Problem> {
         let (parts, body) = request.into_parts();
@@ -336,22 +412,48 @@ impl Proxy {
         if parts.version != Version::HTTP_11 {
             return Err(VERSION);
         }
+        // An unreadable `Connection` value could name `Authorization` or the request ID as
+        // hop-by-hop without `end_to_end` seeing it. Refuse before either is looked at.
+        if !connection_readable(&parts.headers) {
+            return Err(CONNECTION);
+        }
         let id = correlation(&parts.headers)?;
+        let bearer = credential(&parts.headers)?;
         if !identity(&parts.headers) {
             return Err(ENCODED_REQUEST);
         }
-        let routing = self.routing(&id).await?;
-        // From here on, every early end, including the server dropping this handler because the
-        // caller left, logs why nothing was recorded.
+        // From here on the request's one dispatch is spent, or may be. Every early end,
+        // including the server dropping this handler because the caller left, logs why nothing
+        // was recorded.
         let mut unrecorded = Unrecorded {
             id: &id,
-            gap: Some(UsageGap::RequestBody),
+            gap: Some(UsageGap::DispatchUnconfirmed),
         };
+        // The caller is authenticated and the dispatch spent before any body is buffered.
+        let routing = match self.consume(&id, bearer).await {
+            Ok(routing) => routing,
+            Err(problem) => {
+                if problem != UNAVAILABLE {
+                    // Refused or a replay: this call spent nothing.
+                    unrecorded.gap = None;
+                }
+                return Err(problem);
+            }
+        };
+        if routing.model != self.settings.model {
+            unrecorded.gap = Some(UsageGap::ModelNotServed);
+            return Err(NOT_SERVED);
+        }
+        unrecorded.gap = Some(UsageGap::RequestBody);
         let body = match timeout(REQUEST_READ, axum::body::to_bytes(body, MAX_REQUEST_BYTES)).await
         {
             Ok(Ok(body)) => body,
             _ => return Err(BODY),
         };
+        if !names_model(&body, &routing.model) {
+            unrecorded.gap = Some(UsageGap::ModelMismatch);
+            return Err(MODEL);
+        }
         let mut outbound = hyper::Request::post(ROUTE)
             .header(header::HOST, self.settings.upstream.as_str())
             .header(header::CONNECTION, "close")
@@ -417,31 +519,17 @@ impl Proxy {
         Ok(relayed)
     }
 
-    /// The stored routing fields of `id` while it is handed off. Like every database exchange
-    /// here, the query runs in its own task: past the deadline the proxy stops waiting for it
-    /// but never cancels it in flight.
-    async fn routing(&self, id: &str) -> Result<Routing, Problem> {
+    /// Spends the one dispatch of `id` for the holder of `bearer` and returns the stored
+    /// routing fields. Like every database exchange here, the transaction runs in its own task:
+    /// past the deadline the proxy stops waiting for it but never cancels it in flight, so an
+    /// unanswered exchange may still spend the dispatch.
+    async fn consume(&self, id: &str, bearer: [u8; 32]) -> Result<Routing, Problem> {
         let (pool, id) = (self.pool.clone(), id.to_owned());
-        let row = tokio::spawn(async move {
-            sqlx::query_as::<_, (String, String, String, String)>(
-                "SELECT q.installation::text, b.principal::text, q.scope_id::text,
-                        q.report_source::text
-                   FROM openmettle.gateway_requests q
-                   JOIN openmettle.gateway_bindings b ON b.id = q.binding_id
-                  WHERE q.id = $1::uuid AND q.state = 'handed_off'",
-            )
-            .bind(id)
-            .fetch_optional(&pool)
-            .await
-        });
-        match timeout(self.database_timeout, row).await {
-            Ok(Ok(Ok(Some((installation, principal, scope, source))))) => Ok(Routing {
-                installation,
-                principal,
-                scope,
-                source,
-            }),
-            Ok(Ok(Ok(None))) => Err(UNKNOWN),
+        let spent = tokio::spawn(async move { gateway::consume(&pool, &id, &bearer).await });
+        match timeout(self.database_timeout * WRITE_ATTEMPT_TIMEOUTS, spent).await {
+            Ok(Ok(Ok(Consumed::Once(routing)))) => Ok(routing),
+            Ok(Ok(Ok(Consumed::Replay))) => Err(REPLAY),
+            Ok(Ok(Ok(Consumed::Refused))) => Err(UNAUTHENTICATED),
             _ => Err(UNAVAILABLE),
         }
     }
@@ -468,9 +556,9 @@ impl Proxy {
     }
 }
 
-/// Logs `gap` for a handled request that ends before its relay starts: a refusal after the
-/// lookup, or the server dropping the handler because the caller left, which also closes the
-/// upstream connection.
+/// Logs `gap` for a handled request that ends before its relay starts: a refusal once the
+/// dispatch is or may be spent, or the server dropping the handler because the caller left,
+/// which also closes the upstream connection.
 struct Unrecorded<'a> {
     id: &'a str,
     gap: Option<UsageGap>,
@@ -668,10 +756,9 @@ impl Relay {
     }
 }
 
-/// One final report built from the stored routing fields. The proxy writes at most one report
-/// per request, so the report takes the request's own ID at revision 0: a retry, or a repeated
-/// dispatch of the same request with the same usage, writes the identical report, which
-/// settlement accepts once.
+/// One final report built from the stored routing fields. A request is dispatched once and the
+/// proxy writes at most one report for it, so the report takes the request's own ID at
+/// revision 0: a retried write stores the identical report, which settlement accepts once.
 fn report(id: String, routing: Routing, usage: Usage) -> UsageReport {
     UsageReport {
         report_id: id.clone(),
@@ -730,11 +817,14 @@ mod tests {
         sync::oneshot,
     };
 
+    const SERVED: (&str, &str) = ("MODEL", "synthetic-model");
+
+    /// The settings in `pairs`, the last value of a repeated key winning.
     fn parse(pairs: &[(&str, &str)]) -> Result<Settings, &'static str> {
         Settings::parse(|key| {
             Ok(pairs
                 .iter()
-                .find(|(k, _)| *k == key)
+                .rfind(|(k, _)| *k == key)
                 .map(|(_, v)| (*v).to_owned()))
         })
     }
@@ -749,7 +839,7 @@ mod tests {
             ("http://[::1]", "[::1]"),
             ("http://localhost", "localhost"),
         ] {
-            let settings = parse(&[("UPSTREAM_URL", url)]).unwrap();
+            let settings = parse(&[("UPSTREAM_URL", url), SERVED]).unwrap();
             assert_eq!(settings.upstream.as_str(), host, "{url}");
             assert_eq!(settings.connect_timeout, Duration::from_secs(5));
             assert_eq!(settings.idle_timeout, Duration::from_secs(120));
@@ -775,12 +865,29 @@ mod tests {
             ("http://a]b:8080", "invalid UPSTREAM_URL"),
         ] {
             assert_eq!(
-                parse(&[("UPSTREAM_URL", url)]).err(),
+                parse(&[("UPSTREAM_URL", url), SERVED]).err(),
                 Some(refusal),
                 "{url}"
             );
         }
-        assert_eq!(parse(&[]).err(), Some("UPSTREAM_URL is required"));
+        assert_eq!(parse(&[SERVED]).err(), Some("UPSTREAM_URL is required"));
+    }
+
+    #[test]
+    fn the_served_model_is_required_and_bounded() {
+        let url = ("UPSTREAM_URL", "http://127.0.0.1:30000");
+        assert_eq!(parse(&[url, SERVED]).unwrap().model, "synthetic-model");
+        let longest = "m".repeat(128);
+        assert_eq!(parse(&[url, ("MODEL", &longest)]).unwrap().model, longest);
+        assert_eq!(parse(&[url]).err(), Some("MODEL is required"));
+        for model in ["", &"m".repeat(129)] {
+            assert_eq!(
+                parse(&[url, ("MODEL", model)]).err(),
+                Some("invalid MODEL"),
+                "{} bytes",
+                model.len()
+            );
+        }
     }
 
     #[test]
@@ -788,6 +895,7 @@ mod tests {
         let url = ("UPSTREAM_URL", "http://127.0.0.1:30000");
         let settings = parse(&[
             url,
+            SERVED,
             ("UPSTREAM_CONNECT_TIMEOUT_MS", "250"),
             ("UPSTREAM_IDLE_TIMEOUT_MS", "3600000"),
         ])
@@ -800,7 +908,14 @@ mod tests {
             ("UPSTREAM_IDLE_TIMEOUT_MS", "3600001"),
             ("UPSTREAM_IDLE_TIMEOUT_MS", "soon"),
         ] {
-            assert!(parse(&[url, (key, value)]).is_err(), "{key}={value}");
+            assert_eq!(
+                parse(&[url, SERVED, (key, value)]).err(),
+                Some(match value {
+                    "soon" => "invalid numeric configuration",
+                    _ => "configuration outside allowed range",
+                }),
+                "{key}={value}"
+            );
         }
     }
 
@@ -824,6 +939,98 @@ mod tests {
         }
     }
 
+    /// Its base64url spelling uses both characters the standard alphabet lacks.
+    const BEARER: [u8; 32] = [0xfb; 32];
+
+    #[test]
+    fn the_credential_is_exactly_one_canonical_bearer() {
+        let token = URL_SAFE_NO_PAD.encode(BEARER);
+        assert_eq!(token, "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s");
+        let bearer = |token: &str| format!("Bearer {token}").parse::<HeaderValue>().unwrap();
+        let mut headers = HeaderMap::new();
+        assert_eq!(credential(&headers), Err(UNAUTHENTICATED));
+        headers.insert(header::AUTHORIZATION, bearer(&token));
+        assert_eq!(credential(&headers), Ok(BEARER));
+        // Named as hop-by-hop, it counts as absent.
+        headers.insert(header::CONNECTION, "close, Authorization".parse().unwrap());
+        assert_eq!(credential(&headers), Err(UNAUTHENTICATED));
+        headers.remove(header::CONNECTION);
+        headers.append(header::AUTHORIZATION, bearer(&token));
+        assert_eq!(credential(&headers), Err(UNAUTHENTICATED));
+        for bad in [
+            token.clone() + "=",
+            // 31 and 33 bytes.
+            token[..42].to_owned(),
+            token.clone() + "AA",
+            // The standard alphabet, and the same 32 bytes spelled with a stray low bit.
+            token.replace('-', "+").replace('_', "/"),
+            token[..42].to_owned() + "t",
+            String::new(),
+        ] {
+            headers.insert(header::AUTHORIZATION, bearer(&bad));
+            assert_eq!(credential(&headers), Err(UNAUTHENTICATED), "{bad}");
+        }
+        for other in [
+            format!("bearer {token}"),
+            format!("Bearer  {token}"),
+            format!("Basic {token}"),
+            token,
+        ] {
+            headers.insert(header::AUTHORIZATION, other.parse().unwrap());
+            assert_eq!(credential(&headers), Err(UNAUTHENTICATED), "{other}");
+        }
+    }
+
+    #[test]
+    fn a_connection_field_that_cannot_be_read_is_not_trusted() {
+        let mut headers = HeaderMap::new();
+        assert!(connection_readable(&headers));
+        headers.insert(header::CONNECTION, "close, Authorization".parse().unwrap());
+        assert!(connection_readable(&headers));
+        // One readable value does not excuse an unreadable one.
+        let hidden = HeaderValue::from_bytes(b"Authorization\xff").unwrap();
+        headers.append(header::CONNECTION, hidden);
+        assert!(!connection_readable(&headers));
+        // A tab is a legal header byte, and still not one a nomination is read through.
+        for tabbed in [
+            &b"close,\tAuthorization"[..],
+            b"Authori\tzation",
+            b"\tclose",
+        ] {
+            let mut headers = HeaderMap::new();
+            let value = HeaderValue::from_bytes(tabbed).unwrap();
+            assert!(value.to_str().is_ok());
+            headers.insert(header::CONNECTION, value);
+            assert!(!connection_readable(&headers));
+        }
+    }
+
+    #[test]
+    fn the_body_must_name_the_reserved_model_once() {
+        assert!(names_model(br#"{"model":"a","messages":[]}"#, "a"));
+        assert!(names_model(br#" {"messages":[],"model":"a"} "#, "a"));
+        for body in [
+            &br#"{"model":"b","messages":[]}"#[..],
+            br#"{"messages":[]}"#,
+            br#"{"model":null}"#,
+            br#"{"model":["a"]}"#,
+            br#"{"model":"A"}"#,
+            br#"{"model":"a ","messages":[]}"#,
+            // A second `model` could be the one the upstream reads.
+            br#"{"model":"a","model":"b"}"#,
+            br#"{"model":"b","model":"a"}"#,
+            br#"{"model":"a","model":"a"}"#,
+            br#"{"request":{"model":"a"}}"#,
+            br#"[{"model":"a"}]"#,
+            br#""a""#,
+            br#"{"model":"a"}{"model":"a"}"#,
+            br#"{"model":"a""#,
+            b"",
+        ] {
+            assert!(!names_model(body, "a"), "{}", String::from_utf8_lossy(body));
+        }
+    }
+
     const ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
 
     fn routing() -> Routing {
@@ -832,6 +1039,7 @@ mod tests {
             principal: "00000000-0000-4000-8000-000000000002".into(),
             scope: "00000000-0000-4000-8000-000000000003".into(),
             source: "00000000-0000-4000-8000-000000000004".into(),
+            model: SERVED.1.into(),
         }
     }
 
@@ -935,6 +1143,7 @@ mod tests {
         let idle_ms = idle.as_millis().to_string();
         let settings = parse(&[
             ("UPSTREAM_URL", &url),
+            SERVED,
             ("UPSTREAM_IDLE_TIMEOUT_MS", &idle_ms),
         ])
         .unwrap();

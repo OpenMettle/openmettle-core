@@ -1645,6 +1645,11 @@ async fn a_request_without_a_binding_settles_under_its_actor_and_installation() 
         cost: None,
         unit: None,
     };
+    // No report is accepted before the proxy spent the dispatch: it is the only reporter.
+    assert_eq!(
+        settlement::ingest(&gateway, &report).await,
+        Err(StoreError::Refused)
+    );
     assert_eq!(f.dispatch(&round).await, [f.routed()]);
     // Another principal, source, installation or scope does not name this request.
     for wrong in [
