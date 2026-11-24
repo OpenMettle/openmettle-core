@@ -1550,6 +1550,17 @@ async fn unknown_child_zone_suspends_only_that_binding_and_advances_discovery() 
     );
 }
 
+/// Whether `gateway_dispatch` reports a replay for the request whose dispatch secret is
+/// `[8; 32]`; `None` when it returns no row.
+async fn legacy_dispatch(gateway: &PgPool, request: &str) -> Option<bool> {
+    sqlx::query_scalar("SELECT replayed FROM openmettle.gateway_dispatch($1::uuid,sha256($2))")
+        .bind(request)
+        .bind([8_u8; 32].as_slice())
+        .fetch_optional(gateway)
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn unmetered_handoff_replays_only_accepted_token_components_after_upgrade() {
@@ -1626,6 +1637,9 @@ async fn unmetered_handoff_replays_only_accepted_token_components_after_upgrade(
         .unwrap()
     );
     migrate::apply(&settings, MIGRATIONS).await.unwrap();
+    // A request handed off under ADR 0037 may already have been sent by that transport: the
+    // dispatch function of migration 29 never spends it, before or after a settlement.
+    assert_eq!(legacy_dispatch(&g, &request).await, None);
     let mut r = UsageReport {
         request,
         scope,
@@ -1693,22 +1707,11 @@ async fn unmetered_handoff_replays_only_accepted_token_components_after_upgrade(
         FROM openmettle.quota_verify_accounting_drift()").fetch_one(&mut owner).await.unwrap();
     assert_eq!(drift, (0, 0, 0, 0));
     // ADR 0044: this bound row, handed off at version 23, passed migration 29's CHECK. It still
-    // reports under its binding's principal, in settlement and at dispatch alike; its actor is
-    // not accepted in that principal's place.
+    // settles under its binding's principal; its actor is not accepted in that principal's place.
     let mut as_actor = r.clone();
     as_actor.revision = 8;
     as_actor.principal = actor.user.clone();
     assert_eq!(ingest(&g, &as_actor).await, Err(gateway::Error::Refused));
-    let dispatched: (bool, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT replayed,source,principal FROM openmettle.gateway_dispatch($1::uuid,$2)",
-    )
-    .bind(&request)
-    .bind([8_u8; 32].as_slice())
-    .fetch_one(&g)
-    .await
-    .unwrap();
-    assert_eq!(
-        dispatched,
-        (false, Some(LEASE.to_owned()), Some(PRINCIPAL.to_owned()))
-    );
+    // Settled or not, it is never given a dispatch.
+    assert_eq!(legacy_dispatch(&g, &request).await, None);
 }

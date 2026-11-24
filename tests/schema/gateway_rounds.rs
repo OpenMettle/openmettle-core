@@ -11,7 +11,7 @@ use super::authz_store::{Account, FUTURE, NOW, PROVIDER, account, applied, ctx, 
 use super::*;
 use openmettle_core::{
     authz::{
-        Grantee, ProjectRole,
+        Grantee, ProjectRole, ResourceAccess, ResourceKind,
         gateway::{
             Error as StoreError,
             settlement::{self, Outcome},
@@ -44,8 +44,11 @@ const LEASES: LeaseSettings = LeaseSettings {
     execution_timeout: Duration::from_secs(600),
 };
 const HANDOFF: &str = "SELECT openmettle.gateway_handoff_round($1::uuid,$2,$3::uuid)";
+/// The last statement of a handoff transaction.
+const CONFIRM: &str = "SELECT openmettle.gateway_handoff_round_confirm($1::uuid,$2,$3::uuid)";
+/// The proxy sends the hash of the secret its caller presented, never the secret.
 const DISPATCH: &str = "SELECT replayed,installation,scope,source,principal,model
-    FROM openmettle.gateway_dispatch($1::uuid,$2)";
+    FROM openmettle.gateway_dispatch($1::uuid,sha256($2))";
 
 /// One row of `gateway_dispatch`: whether it is a replay, then the routing fields.
 type Dispatched = (
@@ -130,8 +133,20 @@ impl Rounds {
         rounds: i64,
     ) -> Claimed {
         let chat = authz_runs::chat(&self.db, scope, kind, actor).await;
+        self.claimed_on(actor, (scope, &chat), (format, version, config), rounds)
+            .await
+    }
+
+    /// [`Self::claimed`] on the existing conversation `chat`, which `actor` need not own.
+    async fn claimed_on(
+        &mut self,
+        actor: &Account,
+        (scope, chat): (&str, &str),
+        (format, version, config): (&str, i32, &[u8]),
+        rounds: i64,
+    ) -> Claimed {
         let mut api = connect(&self.db.0, API).await;
-        let (branch, message) = quotas::branch_and_message(&mut api, scope, &chat).await;
+        let (branch, message) = quotas::branch_and_message(&mut api, scope, chat).await;
         let key = format!("round-{}", self.number());
         let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
         let admitted = queue::admit_run(
@@ -140,7 +155,7 @@ impl Rounds {
                 input: RunInput {
                     scope,
                     actor: &actor.user,
-                    conversation: &chat,
+                    conversation: chat,
                     branch: &branch,
                     message: &message,
                     key: &key,
@@ -237,7 +252,9 @@ impl Rounds {
         self.reserve(&run, 1, "a").await
     }
 
-    /// Calls `gateway_handoff_round` as `role`, in its own `READ COMMITTED` transaction.
+    /// Runs a handoff transaction as `role` under `READ COMMITTED`: `gateway_handoff_round`,
+    /// then `gateway_handoff_round_confirm`, then the commit. It is refused when the first
+    /// returns false or the second withdraws the authority (42501).
     async fn handoff_as(
         &self,
         role: &str,
@@ -245,12 +262,35 @@ impl Rounds {
         secret: &[u8],
         lease: &str,
     ) -> Result<bool, sqlx::Error> {
-        sqlx::query_scalar(HANDOFF)
+        let mut c = connect(&self.db.0, role).await;
+        c.execute("BEGIN").await?;
+        let handed: bool = sqlx::query_scalar(HANDOFF)
             .bind(&round.request)
             .bind(secret)
             .bind(lease)
-            .fetch_one(&mut connect(&self.db.0, role).await)
-            .await
+            .fetch_one(&mut c)
+            .await?;
+        if !handed {
+            c.execute("ROLLBACK").await?;
+            return Ok(false);
+        }
+        let confirmed = sqlx::query(CONFIRM)
+            .bind(&round.request)
+            .bind(secret)
+            .bind(lease)
+            .execute(&mut c)
+            .await;
+        match confirmed {
+            Ok(_) => {
+                c.execute("COMMIT").await?;
+                Ok(true)
+            }
+            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("42501") => {
+                c.execute("ROLLBACK").await?;
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn handoff(&self, round: &Round) -> bool {
@@ -450,6 +490,24 @@ async fn each_withdrawn_authority_refuses_the_round_and_leaves_it_reserved() {
         f.authorized(&round, why).await;
     }
 
+    // The provider's latest revision is disabled, then followed by a new one.
+    let round = f.round(&plain).await;
+    f.owner_exec(
+        "INSERT INTO openmettle.login_provider_revisions (provider_id,revision)
+         VALUES ($1::uuid,NULL)",
+        PROVIDER,
+    )
+    .await;
+    f.refused(&round, "a provider whose latest revision is disabled")
+        .await;
+    f.owner_exec(
+        "INSERT INTO openmettle.login_provider_revisions (provider_id,revision)
+         VALUES ($1::uuid,'v2')",
+        PROVIDER,
+    )
+    .await;
+    f.authorized(&round, "a provider with a new revision").await;
+
     // A stale lease: another holder's token, then this holder's after it expired.
     let round = f.round(&plain).await;
     let other = f
@@ -564,7 +622,34 @@ async fn an_unreadable_snapshot_refuses_the_round() {
     let mut f = Rounds::new().await;
     let (actor, scope) = (f.actor.clone(), f.scope.clone());
     let readable = quotas::snapshot(100);
-    let unreadable: [(&str, i32, &[u8]); 13] = [
+    let unreadable: [(&str, i32, &[u8]); 18] = [
+        // A repeated key, at any depth: jsonb would keep the last one, here the permissive one.
+        (
+            "openmettle.conversation",
+            1,
+            br#"{"effective":{"model":"a"},"required_capabilities":{"fixture.optin":"opt_in"},"required_capabilities":{}}"#,
+        ),
+        (
+            "openmettle.conversation",
+            1,
+            br#"{"effective":{"model":"b"},"effective":{"model":"a"},"required_capabilities":{}}"#,
+        ),
+        (
+            "openmettle.conversation",
+            1,
+            br#"{"effective":{"model":"b","model":"a"},"required_capabilities":{}}"#,
+        ),
+        // A capability name outside the rule matches no deny row.
+        (
+            "openmettle.conversation",
+            1,
+            br#"{"effective":{"model":"a"},"required_capabilities":{"Fixture.Round":"on_by_default"}}"#,
+        ),
+        (
+            "openmettle.conversation",
+            1,
+            br#"{"effective":{"model":"a"},"required_capabilities":{"":"on_by_default"}}"#,
+        ),
         ("openmettle.conversation", 1, b"{}"),
         ("openmettle.conversation", 1, b"null"),
         ("openmettle.conversation", 1, b"not json"),
@@ -673,7 +758,128 @@ async fn a_project_round_needs_a_live_editor_role_in_a_project_that_is_not_archi
     )
     .await;
     f.authorized(&round, "a restored project").await;
+
+    // An editor who does not own the conversation also needs a write share on it.
+    let chat = authz_runs::chat(&f.db, &scope, "project", &lead).await;
+    let share = async |key: &str, granted: bool| {
+        let mut api = connect(&database, API).await;
+        let (context, kind) = (ctx(&lead, key), ResourceKind::Conversation);
+        applied(if granted {
+            let write = ResourceAccess::Write;
+            projects::share_resource(&mut api, &context, kind, &chat, &grantee, write).await
+        } else {
+            projects::unshare_resource(&mut api, &context, kind, &chat, &grantee).await
+        });
+    };
+    share("rounds-share", true).await;
+    let run = f.claimed_on(&member, (&scope, &chat), snapshot, 1).await;
+    let round = f.reserve(&run, 1, "a").await;
+    share("rounds-unshare", false).await;
+    f.refused(&round, "an editor whose write share was revoked")
+        .await;
+    share("rounds-share-again", true).await;
+    f.authorized(&round, "an editor with a write share again")
+        .await;
     assert_eq!(f.provisioned().await, 0);
+}
+
+/// The quota commit and the deferred handoff check can wait on quota locks. An approval or a
+/// lease that lapses during that wait is not handed off: the confirm step reads the authority
+/// again after the wait. The holder stands for a quota administration change in flight.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn authority_that_lapses_during_a_quota_wait_is_not_handed_off() {
+    let mut f = Rounds::new().await;
+    let approval = f.actor.approval.clone();
+    let plain = quotas::snapshot(100);
+    for (why, shorten, lapsed, restore, by_approval) in [
+        (
+            "an approval that expired during the wait",
+            "UPDATE openmettle.local_identity_approvals
+                SET expires_ms=floor(extract(epoch FROM clock_timestamp())*1000)::bigint+1500
+              WHERE id=$1::uuid",
+            "SELECT expires_ms<floor(extract(epoch FROM clock_timestamp())*1000)::bigint
+               FROM openmettle.local_identity_approvals WHERE id=$1::uuid",
+            "UPDATE openmettle.local_identity_approvals SET expires_ms=4102444800000
+              WHERE id=$1::uuid",
+            true,
+        ),
+        (
+            "a lease that lapsed during the wait",
+            "UPDATE openmettle.runs
+                SET lease_expires_at=clock_timestamp()+interval '1500 milliseconds'
+              WHERE id=$1::uuid",
+            "SELECT lease_expires_at<clock_timestamp() FROM openmettle.runs WHERE id=$1::uuid",
+            "UPDATE openmettle.runs SET lease_expires_at=clock_timestamp()+interval '1 minute'
+              WHERE id=$1::uuid",
+            false,
+        ),
+    ] {
+        let round = f.round(&plain).await;
+        let id = if by_approval {
+            approval.clone()
+        } else {
+            round.run.clone()
+        };
+        let mut holder = connect(&f.db.0, OWNER).await;
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut holder)
+            .await
+            .unwrap();
+        holder.execute("BEGIN").await.unwrap();
+        holder
+            .execute("SELECT FROM openmettle.quota_enforcement FOR UPDATE")
+            .await
+            .unwrap();
+        f.owner_exec(shorten, &id).await;
+        let options = role_options(&f.db.0, WORKER);
+        let (request, secret, lease) = (round.request.clone(), round.secret, round.lease.clone());
+        let waiting = tokio::spawn(async move {
+            let mut c = PgConnection::connect_with(&options).await.unwrap();
+            c.execute("BEGIN").await.unwrap();
+            let handed: bool = sqlx::query_scalar(HANDOFF)
+                .bind(&request)
+                .bind(secret.as_slice())
+                .bind(&lease)
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+            // Waits for the holder inside the deferred handoff check.
+            let confirmed = sqlx::query(CONFIRM)
+                .bind(&request)
+                .bind(secret.as_slice())
+                .bind(&lease)
+                .execute(&mut c)
+                .await;
+            let _ = c.execute("ROLLBACK").await;
+            (handed, confirmed.map(|_| ()))
+        });
+        wait_for_blocked_peer(&f.db, pid).await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let done: bool = sqlx::query_scalar(lapsed)
+                .bind(&id)
+                .fetch_one(&mut f.owner)
+                .await
+                .unwrap();
+            if done {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{why}: never lapsed");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        holder.execute("COMMIT").await.unwrap();
+        let (handed, confirmed) = waiting.await.unwrap();
+        assert!(handed, "{why}: authorized before the wait");
+        assert_eq!(sqlstate(confirmed), "42501", "{why}");
+        assert_eq!(
+            f.stored(&round).await,
+            ("reserved".to_owned(), None, false, false),
+            "{why}"
+        );
+        f.owner_exec(restore, &id).await;
+        f.authorized(&round, why).await;
+    }
 }
 
 #[tokio::test]
@@ -792,6 +998,114 @@ async fn a_cancelled_run_is_not_dispatched() {
     );
 }
 
+/// A run past its lease or its execution deadline that no sweep has settled yet is still
+/// `running` and not cancelled. Its round is not dispatched.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn an_expired_run_that_no_sweep_settled_is_not_dispatched() {
+    let mut f = Rounds::new().await;
+    let round = f.round(&quotas::snapshot(100)).await;
+    f.authorized(&round, "a live run round").await;
+    for (why, expire) in [
+        (
+            "a lapsed lease",
+            "UPDATE openmettle.runs SET lease_expires_at=clock_timestamp()-interval '1 second'
+              WHERE id=$1::uuid",
+        ),
+        (
+            "a passed execution deadline",
+            "UPDATE openmettle.runs SET lease_expires_at=clock_timestamp()-interval '2 seconds',
+                    execution_expires_at=clock_timestamp()-interval '1 second'
+              WHERE id=$1::uuid",
+        ),
+    ] {
+        f.owner_exec(expire, &round.run).await;
+        assert_eq!(f.dispatch(&round).await, [], "{why}");
+        assert!(!f.stored(&round).await.3, "{why}");
+        f.owner_exec(
+            "UPDATE openmettle.runs SET lease_expires_at=clock_timestamp()+interval '1 minute',
+                    execution_expires_at=clock_timestamp()+interval '10 minutes'
+              WHERE id=$1::uuid",
+            &round.run,
+        )
+        .await;
+    }
+    assert_eq!(f.dispatch(&round).await, [f.routed()]);
+}
+
+/// A request handed off with a gateway binding, the ADR 0037 way, is never dispatched, even
+/// for a live run and the right secret: that transport may already have sent it.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_request_handed_off_with_a_binding_is_never_dispatched() {
+    let mut f = Rounds::new().await;
+    let round = f.round(&quotas::snapshot(100)).await;
+    let user = f.actor.user.clone();
+    for bind in [
+        "INSERT INTO openmettle.gateway_bindings (installation,user_id,principal,budget)
+         SELECT installation,actor_user_id,gen_random_uuid(),gen_random_uuid()
+           FROM openmettle.gateway_requests WHERE id=$1::uuid",
+        "INSERT INTO openmettle.gateway_nonces (key_fingerprint,nonce)
+         SELECT sha256('fixture'),substring(sha256('nonce') FOR 12)
+           FROM openmettle.gateway_requests WHERE id=$1::uuid",
+        "INSERT INTO openmettle.gateway_generations
+             (binding_id,generation,remote_key,expires_at,key_id,key_fingerprint,nonce,ciphertext)
+         SELECT b.id,1,gen_random_uuid(),clock_timestamp()+interval '1 hour','fixture',
+                sha256('fixture'),substring(sha256('nonce') FOR 12),sha256('ciphertext')
+           FROM openmettle.gateway_requests q
+           JOIN openmettle.gateway_bindings b ON b.user_id=q.actor_user_id WHERE q.id=$1::uuid",
+        "INSERT INTO openmettle.gateway_policy
+             (binding_id,revision,scope_id,approval_id,model,report_source,provider_generation,
+              approval_generation,user_generation,capabilities)
+         SELECT b.id,1,q.scope_id,q.approval_id,q.model,gen_random_uuid(),0,0,0,'{}'
+           FROM openmettle.gateway_requests q
+           JOIN openmettle.gateway_bindings b ON b.user_id=q.actor_user_id WHERE q.id=$1::uuid",
+        "UPDATE openmettle.gateway_requests q SET state='handed_off',binding_id=p.binding_id,
+                generation=1,policy_revision=1,report_source=p.report_source
+           FROM openmettle.gateway_policy p WHERE q.id=$1::uuid",
+    ] {
+        f.owner_exec(bind, &round.request).await;
+    }
+    let bound: bool = sqlx::query_scalar(
+        "SELECT state='handed_off' AND binding_id IS NOT NULL FROM openmettle.gateway_requests
+          WHERE id=$1::uuid AND actor_user_id=$2::uuid",
+    )
+    .bind(&round.request)
+    .bind(&user)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert!(bound);
+    assert_eq!(f.dispatch(&round).await, []);
+    assert!(!f.stored(&round).await.3);
+}
+
+/// A request that already has a settlement gets no first dispatch: whatever reported its usage
+/// already sent it.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn a_settled_request_is_not_dispatched() {
+    let mut f = Rounds::new().await;
+    let round = f.round(&quotas::snapshot(100)).await;
+    f.authorized(&round, "a live run round").await;
+    f.owner_exec(
+        "INSERT INTO openmettle.gateway_usage_reports
+             (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens)
+         SELECT id,report_source,gen_random_uuid(),0,true,1,1
+           FROM openmettle.gateway_requests WHERE id=$1::uuid",
+        &round.request,
+    )
+    .await;
+    f.owner_exec(
+        "INSERT INTO openmettle.gateway_settlements (request_id,revision,final,measured,outstanding)
+         VALUES ($1::uuid,0,true,2,0)",
+        &round.request,
+    )
+    .await;
+    assert_eq!(f.dispatch(&round).await, []);
+    assert!(!f.stored(&round).await.3);
+}
+
 /// A dispatch that waits for the request row decides after the wait: a cancellation committed
 /// meanwhile is seen. The holder stands for a settlement or another dispatch in flight.
 #[tokio::test]
@@ -858,7 +1172,51 @@ async fn the_handoff_check_accepts_unbound_rows_and_rejects_half_set_ones() {
     .await
     .unwrap();
     assert_eq!(checks, ["gateway_requests_handoff_check"]);
+    // A session-owned request, reserved by the API role.
+    let (session_owned, reservation): (String, String) =
+        sqlx::query_as("SELECT gen_random_uuid()::text,gen_random_uuid()::text")
+            .fetch_one(&mut f.owner)
+            .await
+            .unwrap();
+    let mut api = connect(&f.db.0, API).await;
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_reservations (id,scope_id,actor_user_id,approval_id,units)
+         VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,100)",
+    )
+    .bind(&reservation)
+    .bind(&f.scope)
+    .bind(&f.actor.user)
+    .bind(&f.actor.approval)
+    .execute(&mut api)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_requests
+             (id,reservation_id,scope_id,actor_user_id,approval_id,session_id,installation,model,
+              units,dispatch_hash)
+         VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,repeat('A',43),$6::uuid,'a',100,
+                 sha256('session'))",
+    )
+    .bind(&session_owned)
+    .bind(&reservation)
+    .bind(&f.scope)
+    .bind(&f.actor.user)
+    .bind(&f.actor.approval)
+    .bind(INSTALL)
+    .execute(&mut api)
+    .await
+    .unwrap();
     for (id, change) in [
+        // Without a binding, a handed-off request belongs to a run and reports under its
+        // installation.
+        (
+            &session_owned,
+            "state='handed_off',report_source=installation",
+        ),
+        (
+            &reserved.request,
+            "state='handed_off',report_source=gen_random_uuid()",
+        ),
         (&reserved.request, "dispatched_at=clock_timestamp()"),
         (&reserved.request, "report_source=installation"),
         (

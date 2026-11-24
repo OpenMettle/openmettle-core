@@ -60,20 +60,30 @@ What the policy row supplied now comes from sources that are already authoritati
 | `report_source` | The request's installation. |
 
 The snapshot must be an `openmettle.conversation` version 1 document with a string model and an
-object of known capability gates. Anything else refuses the round: there is no fallback to an
-unchecked model or to no required capability. A new snapshot format or version therefore
-requires a new version of this function before its runs can be dispatched.
+object of known capability gates under valid capability names, and no key may repeat at any
+depth: `jsonb` would silently keep the last one. Anything else refuses the round: there is no
+fallback to an unchecked model or to no required capability. A new snapshot format or version
+therefore requires a new version of this function before its runs can be dispatched.
 
-The function requires `READ COMMITTED`, takes its timestamp after its last lock and decides in
-one statement after that. Its lock order is `gateway_handoff`'s order without the session and
-binding locks: account administration, project, provider and approval, user, run, reservation,
-request. Removing locks from an established order cannot create an inversion. The worker's
-transaction is unchanged around it: the ADR 0040 prefix lock before, the outbound-header
-validation and the quota commit after.
+The function requires `READ COMMITTED` and reads the authority after its last lock. Its lock
+order is `gateway_handoff`'s order without the session and binding locks: account
+administration, project, provider and approval, user, run, reservation, request. Removing locks
+from an established order cannot create an inversion.
+
+**The last time check precedes nothing that can wait.** After the handoff the worker's
+transaction still commits the quota holds, and the deferred handoff check runs at commit. Both
+can wait on quota locks, and an approval, a lease or a membership observation can lapse during
+that wait. The transaction therefore ends with
+`openmettle.gateway_handoff_round_confirm(request, dispatch secret, lease)`: it runs every
+deferred check at once, then reads the same authority again on a new clock reading, and aborts
+the transaction if it is gone. That read takes no lock, and the commit that follows has no
+deferred work left, so no lock wait can follow the last time check. The time a commit spends
+on durability is not covered. The worker's order is: the ADR 0040 prefix lock, the handoff, the
+outbound-header validation, the quota commit, the confirm step, commit.
 
 A handed-off request without a binding keeps `binding_id`, `generation` and `policy_revision`
-null. A named CHECK replaces migration 23's unnamed one and allows exactly two shapes: all three
-set, or all three null.
+null, belongs to a run and reports under its installation. A named CHECK replaces migration
+23's unnamed one and allows exactly those two shapes of a handed-off request.
 
 ### The dispatch secret is the caller credential
 
@@ -85,22 +95,31 @@ reserved the round holds it, and it is useless for any other request.
 
 ### One dispatch per request
 
-`openmettle.gateway_dispatch(request, dispatch secret)`, callable by `openmettle_gateway` only,
-sets `gateway_requests.dispatched_at` once and returns the stored routing fields: installation,
-scope, report source, principal and model. A later call with the same secret reports a replay.
-Every other call returns no row, whether the request is unknown, not handed off, held by another
-secret or owned by a run that is no longer running or is cancelled. The caller cannot tell these
+`openmettle.gateway_dispatch(request, SHA-256 of the dispatch secret)`, callable by
+`openmettle_gateway` only, sets `gateway_requests.dispatched_at` once and returns the stored
+routing fields: installation, scope, report source, principal and model. A later call with the
+same hash reports a replay. Every other call returns no row. The caller cannot tell the reasons
 apart.
+
+The proxy hashes the secret its caller presented and sends only the hash. The secret itself
+never crosses a database connection, so a server that logs statement parameters records
+nothing a caller could present to the proxy. The hash is what the request row already stores.
+
+A first dispatch is granted only to a request that was handed off without a binding, has no
+settlement, and whose run is running, not cancelled and inside its lease and its execution
+deadline on a clock reading taken after the row lock. A request handed off under ADR 0037 is
+never dispatched here: its transport may already have sent it. It remains eligible for
+settlement only.
 
 `dispatched_at` is a column, not a state: settlement and the quota functions test
 `state = 'handed_off'`. The function locks only the request row, which is also settlement's
 first lock, waits for it before deciding, and never writes `state`, so the deferred handoff
 trigger does not fire.
 
-The principal is the binding's principal where a binding exists and the actor's user ID
-otherwise. Settlement applies the same rule, so rows handed off under ADR 0037 still settle.
-Settlement refuses a report for a request without a binding that was never dispatched: the
-proxy is the only reporter, and it reports after it spent the dispatch.
+The principal of a dispatched request is the actor's user ID. Settlement accepts the binding's
+principal where a binding exists and the actor otherwise, so rows handed off under ADR 0037
+still settle. Settlement refuses a report for a request without a binding that was never
+dispatched: the proxy is the only reporter, and it reports after it spent the dispatch.
 
 ### The proxy is the only usage witness and the only model check
 
@@ -177,7 +196,7 @@ exists.
   grant cycle did not.
 - A dispatch that is spent and then fails before the upstream answers cannot be retried under
   the same request.
-- Migration 29 adds one column and two functions and replaces one CHECK. It needs no
+- Migration 29 adds one column and four functions and replaces one CHECK. It needs no
   activation step and no backfill, and it must be applied before workers of this release run.
 - ADR 0043 said the replacement would change `installation`, `gateway_keys` and one method of
   the worker and nothing else. `installation` stays and is now also the report source, and the
@@ -218,7 +237,7 @@ exists.
 - `tests/schema/gateway_proxy.rs`: the binary against the recorded SGLang stand-in, with rounds
   reserved and handed off through the library and their quota holds.
 - `tests/schema/gateway.rs`: a bound request handed off at version 23 passes migration 29 and
-  settles and dispatches under its binding's principal.
+  settles under its binding's principal, and is never given a dispatch.
 - `tests/schema/worker_leases.rs` and `tests/schema/quotas.rs`: the worker and the library hand
   rounds off with their quota holds, and the worker sends the round's dispatch secret as its
   bearer.

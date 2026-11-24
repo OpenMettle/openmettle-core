@@ -5363,32 +5363,63 @@ mod live_turns {
     #[tokio::test]
     #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
     async fn refused_handoff_immediately_releases_unsent_round_hold() {
+        // The worker rechecks the run's capabilities itself before it reserves a round, so a
+        // capability denied beforehand would stop it there. Deny it as the round's request is
+        // inserted instead: reserve_turn_round allocates the Round 1 child hold cleanly, then
+        // pending.handoff returns Refused and must release the unsent round hold immediately.
+        refused_round(
+            r#"CREATE FUNCTION openmettle.test_deny_on_reserve()
+               RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+               BEGIN
+                   INSERT INTO openmettle.user_capability_denies
+                       (user_id, capability, denied, updated_by_user_id)
+                   VALUES (NEW.actor_user_id, 'fixture.round', true, NEW.actor_user_id);
+                   RETURN NULL;
+               END;
+               $$;
+               CREATE TRIGGER test_deny_on_reserve_trg
+                   AFTER INSERT ON openmettle.gateway_requests
+                   FOR EACH ROW EXECUTE FUNCTION openmettle.test_deny_on_reserve();"#,
+        )
+        .await;
+    }
+
+    /// The handoff transaction ends by reading the round's authority again, after everything
+    /// in it that can wait. Here the approval expires inside that transaction, once the round
+    /// is marked handed off: the handoff must not commit, and the worker releases the round.
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn authority_lost_inside_the_handoff_transaction_is_not_committed() {
+        refused_round(
+            r#"CREATE FUNCTION openmettle.test_expire_on_handoff()
+               RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+               BEGIN
+                   UPDATE openmettle.local_identity_approvals SET expires_ms = 1
+                    WHERE id = NEW.approval_id;
+                   RETURN NULL;
+               END;
+               $$;
+               CREATE TRIGGER test_expire_on_handoff_trg
+                   AFTER UPDATE OF state ON openmettle.gateway_requests
+                   FOR EACH ROW WHEN (NEW.state = 'handed_off')
+                   EXECUTE FUNCTION openmettle.test_expire_on_handoff();"#,
+        )
+        .await;
+    }
+
+    /// A metered round of a model that requires one capability, with the test trigger
+    /// `trigger` installed. The round is reserved, its handoff is refused, and the worker
+    /// releases the unsent round at once and fails the run without reaching the gateway.
+    async fn refused_round(trigger: &'static str) {
         use openmettle_core::quotas::{self, RunBudgetReservation};
 
         let mut chat = Chat::new().await;
         chat.catalog["models"]["a"]["required_capabilities"] =
             json!({"fixture.round": "on_by_default"});
         let _ = chat.ensure_metered_gateway().await;
-        // The worker rechecks the run's capabilities itself before it reserves a round, so a
-        // capability denied beforehand would stop it there. Deny it as the round's request is
-        // inserted instead: reserve_turn_round allocates the Round 1 child hold cleanly, then
-        // pending.handoff returns Refused and must release the unsent round hold immediately.
         connect(&chat.f.db.0, OWNER)
             .await
-            .execute(
-                r#"CREATE FUNCTION openmettle.test_deny_on_reserve()
-                   RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
-                   BEGIN
-                       INSERT INTO openmettle.user_capability_denies
-                           (user_id, capability, denied, updated_by_user_id)
-                       VALUES (NEW.actor_user_id, 'fixture.round', true, NEW.actor_user_id);
-                       RETURN NULL;
-                   END;
-                   $$;
-                   CREATE TRIGGER test_deny_on_reserve_trg
-                       AFTER INSERT ON openmettle.gateway_requests
-                       FOR EACH ROW EXECUTE FUNCTION openmettle.test_deny_on_reserve();"#,
-            )
+            .execute(trigger)
             .await
             .unwrap();
 
