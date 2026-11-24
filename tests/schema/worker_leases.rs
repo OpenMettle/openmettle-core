@@ -2524,9 +2524,11 @@ mod live_turns {
         assert_eq!(bearer_hash, Sha256::digest(&bearer).as_slice());
         let recorded = relay.sent.lock().unwrap().clone();
         let found = |needle: &[u8]| {
-            recorded
-                .windows(needle.len())
-                .any(|window| window.eq_ignore_ascii_case(needle))
+            recorded.iter().any(|stream| {
+                stream
+                    .windows(needle.len())
+                    .any(|window| window.eq_ignore_ascii_case(needle))
+            })
         };
         let hex: String = bearer.iter().map(|byte| format!("{byte:02x}")).collect();
         for (spelling, bytes) in [
@@ -2540,8 +2542,11 @@ mod live_turns {
         assert!(found(&bearer_hash));
         // The test knows the dispatch secret by its hash only: look for it where a 32-byte
         // binary statement parameter is, after its length.
-        let secret_sent = recorded.windows(36).any(|window| {
-            window[..4] == [0, 0, 0, 32] && Sha256::digest(&window[4..]).as_slice() == dispatch_hash
+        let secret_sent = recorded.iter().any(|stream| {
+            stream.windows(36).any(|window| {
+                window[..4] == [0, 0, 0, 32]
+                    && Sha256::digest(&window[4..]).as_slice() == dispatch_hash
+            })
         });
         assert!(secret_sent, "the recording holds the dispatch secret");
     }

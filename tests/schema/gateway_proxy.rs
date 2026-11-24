@@ -638,8 +638,9 @@ pub(crate) struct FaultyPostgres {
     attempts: Arc<AtomicUsize>,
     /// Held-back replies delivered after a [`Fault::Delay`] or a [`Fault::Hold`].
     late: Arc<AtomicUsize>,
-    /// Every byte the client sent towards PostgreSQL, on every connection.
-    pub(crate) sent: Arc<Mutex<Vec<u8>>>,
+    /// Every byte the client sent towards PostgreSQL, one stream per connection: a value
+    /// split across two reads stays contiguous in its own stream.
+    pub(crate) sent: Arc<Mutex<Vec<Vec<u8>>>>,
     release: Arc<Notify>,
 }
 
@@ -706,13 +707,18 @@ struct Faults {
     fault: Fault,
     attempts: Arc<AtomicUsize>,
     late: Arc<AtomicUsize>,
-    sent: Arc<Mutex<Vec<u8>>>,
+    sent: Arc<Mutex<Vec<Vec<u8>>>>,
     release: Arc<Notify>,
 }
 
 async fn forward(client: tokio::net::TcpStream, server: tokio::net::TcpStream, faults: Faults) {
     let (mut client_read, mut client_write) = client.into_split();
     let (mut server_read, mut server_write) = server.into_split();
+    let stream = {
+        let mut streams = faults.sent.lock().unwrap();
+        streams.push(Vec::new());
+        streams.len() - 1
+    };
     let silent = Arc::new(AtomicBool::new(false));
     let hold = Arc::new(Mutex::new(None::<tokio::time::Instant>));
     let gate = Arc::new(AtomicBool::new(false));
@@ -743,7 +749,7 @@ async fn forward(client: tokio::net::TcpStream, server: tokio::net::TcpStream, f
         let mut buffer = [0; 8192];
         let mut seen = Vec::new();
         while let Ok(n @ 1..) = client_read.read(&mut buffer).await {
-            faults.sent.lock().unwrap().extend_from_slice(&buffer[..n]);
+            faults.sent.lock().unwrap()[stream].extend_from_slice(&buffer[..n]);
             seen.extend_from_slice(&buffer[..n]);
             if seen
                 .windows(faults.trigger.len())
@@ -2129,7 +2135,10 @@ async fn the_bearer_never_reaches_the_database() {
     assert_eq!(fixture.reports(&id).await.len(), 1);
     assert_eq!(events, []);
     let sent = postgres.sent.lock().unwrap().clone();
-    let carried = |needle: &[u8]| sent.windows(needle.len()).any(|w| w == needle);
+    let carried = |needle: &[u8]| {
+        sent.iter()
+            .any(|stream| stream.windows(needle.len()).any(|w| w == needle))
+    };
     // The call that spent the dispatch went through this connection.
     assert!(carried(DISPATCH));
     let hex: String = bearer_bytes(&id)

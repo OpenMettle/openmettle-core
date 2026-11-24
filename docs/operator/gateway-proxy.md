@@ -32,9 +32,11 @@ policy is provisioned for it.
   the ID or the credential is looked at: such a value could hide a nomination. Refusals use
   the application API's problem document (`application/problem+json`).
 - **Authentication.** The caller sends exactly one `Authorization: Bearer` header holding the
-  request's 32-byte round bearer as 43 unpadded base64url characters. The worker makes that
-  bearer when it hands the round off, and only that worker holds it; the database stores
-  its SHA-256. The request's dispatch secret is a different value and is not accepted. A
+  request's 32-byte round bearer as 43 unpadded base64url characters. The worker generates
+  that bearer when it hands the round off and sends it to this proxy over HTTP; the proxy
+  receives and decodes it. Both send only its SHA-256 to PostgreSQL, which stores that. The
+  request's dispatch secret is a different value: it crosses only the worker's database
+  connection and is not accepted here. No zeroization guarantee is made for either value. A
   missing, repeated or malformed header, one named in `Connection`, a wrong bearer, an
   unknown request and a request not handed off are all refused alike with
   `401 unauthenticated` and `WWW-Authenticate: Bearer`. So is a request that was not
