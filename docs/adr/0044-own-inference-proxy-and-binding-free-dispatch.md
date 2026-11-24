@@ -321,7 +321,7 @@ model server may have worked for the request:
 
 **The fold closes the hold.** `quota_gateway_fold` gains one rule: a report that carries a
 reason adds no measurement of its own—it carries no usage, cost or unit fields—and settles
-the hold at what earlier accepted non-final reports measured (nothing when none carried a
+the hold at what earlier accepted reports measured (nothing when none carried a
 count), releasing the rest. The rule applies to token and cost holds alike. A later final
 report with counts still corrects the charge, and no later report without counts lowers one.
 The fold is the only place that decides the charge.

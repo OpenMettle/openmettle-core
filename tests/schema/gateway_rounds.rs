@@ -1941,6 +1941,34 @@ async fn a_request_that_ended_without_usage_is_closed_by_its_reason_and_never_by
             &round.request,
         )
         .await;
+
+        // Nor may a final settlement keep a positive outstanding balance, even with a valid
+        // reason that closes the fold on this unmetered request.
+        use sqlx::Connection;
+        let mut tx = direct.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,incomplete)
+             VALUES ($1::uuid,$2::uuid,$1::uuid,1,true,'no_usage')",
+        )
+        .bind(&round.request)
+        .bind(INSTALL)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_settlements
+                 (request_id,revision,final,measured,outstanding)
+             VALUES ($1::uuid,1,true,NULL,10)",
+        )
+        .bind(&round.request)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let Err(sqlx::Error::Database(error)) = tx.commit().await else {
+            panic!("a final settlement kept a positive outstanding balance");
+        };
+        assert_eq!(error.code().as_deref(), Some("23514"));
     }
     // The vocabulary is closed, and only a final report carries a reason.
     for unknown in ["dispatch_unconfirmed", "no usage", ""] {

@@ -2673,6 +2673,7 @@ async fn settle_in_sql(
     id: &str,
     (columns, values): (&str, &str),
     fold: bool,
+    outstanding: i64,
 ) -> Result<(), sqlx::Error> {
     use sqlx::Connection;
     let mut c = connect(&f.db.0, pg::GATEWAY).await;
@@ -2689,9 +2690,10 @@ async fn settle_in_sql(
         .await?;
     sqlx::query(
         "INSERT INTO openmettle.gateway_settlements (request_id,revision,final,measured,outstanding)
-         VALUES ($1::uuid,1,true,NULL,0)",
+         VALUES ($1::uuid,1,true,NULL,$2)",
     )
     .bind(id)
+    .bind(outstanding)
     .execute(&mut *tx)
     .await?;
     if fold {
@@ -2706,10 +2708,11 @@ async fn settle_in_sql(
 
 /// The rules of the settlement library hold in the database too, for a writer that has the
 /// gateway role's grants and does not go through the library. A final settlement of a request
-/// without a binding must leave its token hold closed, or the transaction is refused: no count
-/// and no reason; one count that covers the whole reservation; a reason whose quota fold was
-/// never run. A report with a reason carries no count, cost or unit, and needs a request this
-/// proxy dispatched. A report with a reason, folded, is accepted.
+/// without a binding must leave zero outstanding and its token hold closed, or the transaction
+/// is refused: no count and no reason; one count that covers the whole reservation; a reason
+/// whose quota fold was never run; a reason that leaves a positive outstanding balance. A report
+/// with a reason carries no count, cost or unit, and needs a request this proxy dispatched. A
+/// report with a reason, folded with zero outstanding, is accepted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn the_database_refuses_a_final_settlement_that_leaves_the_hold_open() {
@@ -2717,27 +2720,38 @@ async fn the_database_refuses_a_final_settlement_that_leaves_the_hold_open() {
     let held = ("handoff_committed".to_owned(), UNITS, "0".to_owned());
     let whole = format!(",{UNITS}");
     let reason = (",incomplete", ",'no_usage'");
-    for (what, fields, fold, dispatched) in [
-        ("no count and no reason", ("", ""), true, true),
+    for (what, fields, fold, dispatched, outstanding) in [
+        ("no count and no reason", ("", ""), true, true, 0),
         (
             "one count that covers the reservation",
             (",prompt_tokens", whole.as_str()),
             true,
             true,
+            0,
         ),
-        ("a reason without the quota fold", reason, false, true),
+        ("a reason without the quota fold", reason, false, true, 0),
+        (
+            "a reason with a positive outstanding balance",
+            reason,
+            true,
+            true,
+            UNITS,
+        ),
         (
             "a reason for a request never dispatched",
             reason,
             true,
             false,
+            0,
         ),
     ] {
         let id = f.request(false).await;
         if dispatched {
             f.dispatch(&id).await;
         }
-        let Err(sqlx::Error::Database(error)) = settle_in_sql(&f, &id, fields, fold).await else {
+        let Err(sqlx::Error::Database(error)) =
+            settle_in_sql(&f, &id, fields, fold, outstanding).await
+        else {
             panic!("{what}: the transaction committed");
         };
         assert_eq!(error.code().as_deref(), Some("23514"), "{what}");
@@ -2761,7 +2775,8 @@ async fn the_database_refuses_a_final_settlement_that_leaves_the_hold_open() {
         (",incomplete,reasoning_included", ",'no_usage',true"),
         (",incomplete,cost,unit", ",'no_usage',1,'unit'"),
     ] {
-        let Err(sqlx::Error::Database(error)) = settle_in_sql(&f, &id, fields, true).await else {
+        let Err(sqlx::Error::Database(error)) = settle_in_sql(&f, &id, fields, true, 0).await
+        else {
             panic!("{fields:?}: the transaction committed");
         };
         assert_eq!(
@@ -2774,7 +2789,7 @@ async fn the_database_refuses_a_final_settlement_that_leaves_the_hold_open() {
         );
     }
     assert_eq!(f.hold(&id).await, held);
-    settle_in_sql(&f, &id, reason, true).await.unwrap();
+    settle_in_sql(&f, &id, reason, true, 0).await.unwrap();
     f.assert_closed(&id, "no_usage").await;
 
     // An undispatched request cannot accept a reason even when a later revision in the same
@@ -2920,6 +2935,6 @@ async fn the_database_refuses_a_final_settlement_that_leaves_the_hold_open() {
         ("settled".to_owned(), 0, "0".to_owned())
     );
 
-    assert_eq!((f.used().await, f.reserved().await), (12, 5 * UNITS));
+    assert_eq!((f.used().await, f.reserved().await), (12, 6 * UNITS));
     assert_eq!(f.drift().await, (0, 0, 0, 0));
 }

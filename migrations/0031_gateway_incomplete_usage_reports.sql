@@ -80,14 +80,14 @@ $$;
 --   * No accepted report with a reason may settle a request this proxy did not dispatch:
 --     the request must have no binding and `dispatched_at` set. A request handed off under
 --     ADR 0037 has none to give.
---   * A final settlement of a request without a binding must close it: the fold of its accepted
---     reports ends `settled`, and its token hold, when it has one, is `settled` too. A final
---     report without both counts and without a reason does not, also when its one count empties
---     the hold; neither does a settlement whose quota fold was never run. Accepted, either
---     would mark the request settled, hide it from the scan of outstanding requests and keep
---     the hold. When any accepted report carries a reason, any cost hold is `settled` too;
---     otherwise a cost hold is left unchecked, because a report with usage carries no cost
---     (issue #166).
+--   * A final settlement of a request without a binding must close it: `outstanding` is zero,
+--     the fold of its accepted reports ends `settled`, and its token hold, when it has one, is
+--     `settled` too. A final report without both counts and without a reason does not, also
+--     when its one count empties the hold; neither does a settlement whose quota fold was never
+--     run or that leaves a positive outstanding balance. Accepted, any of them would mark the
+--     request settled while hiding or misstating its remaining hold. When any accepted report
+--     carries a reason, any cost hold is `settled` too; otherwise a cost hold is left
+--     unchecked, because a report with usage carries no cost (issue #166).
 -- A request handed off with a binding keeps migration 23's behaviour.
 CREATE FUNCTION openmettle.enforce_gateway_final_settlement_closes() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
@@ -115,7 +115,7 @@ BEGIN
     SELECT f.state INTO folded
       FROM openmettle.quota_gateway_fold(latest.request_id,'usage_tokens',req.units,latest.revision) f
      ORDER BY f.rev DESC LIMIT 1;
-    IF folded IS DISTINCT FROM 'settled' OR EXISTS (
+    IF latest.outstanding<>0 OR folded IS DISTINCT FROM 'settled' OR EXISTS (
         SELECT FROM openmettle.quota_reservations h WHERE h.gateway_request_id=latest.request_id
            AND h.state<>'settled'
            AND (h.resource_kind='usage_tokens'
