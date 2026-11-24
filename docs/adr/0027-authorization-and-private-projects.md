@@ -240,8 +240,12 @@ roles. It adds no migration, route or dependency.
 - **Writes** run only as `openmettle_api`, each in one READ COMMITTED transaction:
   1. Account-administrator changes and user disable or enable first lock
      `account_admin_lock`, matching `docs/operator/grant-account-admin.psql`.
-  2. The actor is re-hydrated inside the transaction and must pass `require` and
-     `authorize_admin`.
+  2. The actor's user row is locked `FOR SHARE`, so a disable in flight (including
+     `sessions::disable_user`, which locks only that row) is waited for and seen, and a later
+     disable waits for the write. A user disable or enable of the actor itself takes the
+     `FOR UPDATE` it needs here instead, so it never upgrades while another write by the same
+     actor waits on its audit key. The actor is then re-hydrated inside the transaction and
+     must pass `require` and `authorize_admin`.
   3. The `authorization_audit` row is inserted next with `ON CONFLICT DO NOTHING` on
      `(actor_user_id, request_key)`. A recorded key with the same action, target and details
      returns `Replayed` without writing. A different change returns `Conflict`.

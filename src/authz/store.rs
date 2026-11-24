@@ -383,7 +383,9 @@ pub(super) async fn record(
 
 /// The administration write protocol, in one transaction:
 /// 1. account administration and user lifecycle lock `account_admin_lock` before anything else;
-/// 2. the actor is re-hydrated from the primary and must be an active `account_admin`;
+/// 2. the actor's user row is locked `FOR SHARE` (`FOR UPDATE` when a user disable or enable
+///    targets the actor), then the actor is re-hydrated from the primary and must be an active
+///    `account_admin`;
 /// 3. the audit row is inserted first, so a reused request key is detected before any change;
 /// 4. `apply` checks the target and changes current state, or the whole transaction rolls back.
 async fn write(
@@ -393,6 +395,8 @@ async fn write(
     change: Change,
     apply: impl AsyncFnOnce(&mut PgConnection, &Principal, &str) -> Result<(), StoreError>,
 ) -> Result<WriteOutcome, StoreError> {
+    let self_lifecycle =
+        action == Action::ManageAccounts && change.target_id.as_deref() == Some(ctx.actor_user_id);
     transact(c, ctx, async move |tx| {
         let c = tx.connection()?;
         if matches!(action, Action::ManageAccountAdmin | Action::ManageAccounts) {
@@ -400,6 +404,19 @@ async fn write(
                 .fetch_one(&mut *c)
                 .await?;
         }
+        // sessions::disable_user locks only the user row: hold the actor's row so a disable in
+        // flight is waited for and seen, and a later one waits for this commit. User disable and
+        // enable lock their target FOR UPDATE: on their own actor they take it here, never
+        // upgrading from FOR SHARE while another write by the actor waits on their audit key.
+        let sql = if self_lifecycle {
+            "SELECT FROM openmettle.users WHERE id = $1::uuid FOR UPDATE"
+        } else {
+            "SELECT FROM openmettle.users WHERE id = $1::uuid FOR SHARE"
+        };
+        sqlx::query(sql)
+            .bind(ctx.actor_user_id)
+            .execute(&mut *c)
+            .await?;
         let actor = acting(c, ctx).await?;
         check(super::authorize_admin(
             &actor,
