@@ -10,8 +10,9 @@
 -- internal authority check both use, and the one-time dispatch (gateway only) (ADR 0044). It
 -- adds three columns to `gateway_requests` and no table or column grant.
 -- Version 30 replaces quota_lock_override with the same signature, security and privileges.
--- Version 31 adds `gateway_usage_reports.incomplete`, which the gateway may insert, and replaces
--- quota_gateway_fold with the same signature, security and privileges (ADR 0044).
+-- Version 31 adds `gateway_usage_reports.incomplete`, which the gateway may insert, replaces
+-- quota_gateway_fold with the same signature, security and privileges, and adds the deferred
+-- check that a final settlement closes its request, which no role may call (ADR 0044).
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -195,6 +196,7 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.gateway_handoff_round(uuid,bytea,uuid,bytea)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.gateway_handoff_round_confirm(uuid,bytea,uuid)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.gateway_dispatch(uuid,bytea)',true,ARRAY['openmettle_gateway']::text[])) AS f WHERE $1 >= 29
+    UNION ALL SELECT 'openmettle.enforce_gateway_final_settlement_closes()',true,ARRAY[]::text[] WHERE $1 >= 31
 ),
 gateway_functions (signature,definer,inference) AS (
     SELECT * FROM (VALUES ('openmettle.gateway_allocate()',true,false), ('openmettle.gateway_run_hold()',true,false),

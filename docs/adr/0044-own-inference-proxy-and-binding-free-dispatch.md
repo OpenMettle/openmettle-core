@@ -305,10 +305,11 @@ quota fold skipped it and kept the hold.
 ### Decision
 
 **One record.** A request that ends without usage is closed by a final usage report that
-carries the reason in `gateway_usage_reports.incomplete` and no counts. The request stays
-`handed_off`: releasing it would contradict the handoff CHECK and the handoff receipt the
-drift verifier checks. The column is the only place the reason is stored; a report that
-carries it must be final.
+carries the reason in `gateway_usage_reports.incomplete` and no usage, cost or unit fields
+of its own. The request stays `handed_off`: releasing it would contradict the handoff CHECK
+and the handoff receipt the drift verifier checks. The column is the only place the reason is
+stored; a report that carries it must be final and leave all six usage, cost and unit columns
+null.
 
 **A closed vocabulary in two groups**, so that the database can tell by value whether the
 model server may have worked for the request:
@@ -319,10 +320,11 @@ model server may have worked for the request:
 | The request was or may have been sent, and its usage is unknown | `upstream_transport`, `upstream_timeout`, `upstream_status`, `upstream_encoding`, `incomplete`, `caller_disconnected`, `no_usage`, `unparsable` |
 
 **The fold closes the hold.** `quota_gateway_fold` gains one rule: a report that carries a
-reason settles the hold at what the accepted reports measured so far, which is nothing when
-none carried a count, and releases the rest. The rule applies to token and cost holds alike.
-A later final report with counts still corrects the charge, and no later report without
-counts lowers one. The fold is the only place that decides the charge.
+reason adds no measurement of its own—it carries no usage, cost or unit fields—and settles
+the hold at what earlier accepted non-final reports measured (nothing when none carried a
+count), releasing the rest. The rule applies to token and cost holds alike. A later final
+report with counts still corrects the charge, and no later report without counts lowers one.
+The fold is the only place that decides the charge.
 
 **Charging rule: nothing is charged for a request without usage, in either group.** The owner
 decided this on 24 November 2026 for now, to be revisited. For the second group the
@@ -332,8 +334,10 @@ alternatives are:
   24 November 2026): every content chunk then carries a running usage object. It is a lower
   bound: for a client that left after 1.5 s it showed 127 completion tokens where the server's
   own counters showed 208. It needs the worker to ask for it and to accept changing counts,
-  and it gives nothing for a non-streamed answer or before the first chunk. The fold already
-  charges what was measured, so adopting it needs no schema change (increment 3d).
+  and it gives nothing for a non-streamed answer or before the first chunk. Because the fold
+  preserves measurements from earlier accepted non-final reports, adopting it needs no schema
+  change: a non-final report carries the running counts, followed by the final report carrying
+  the reason (increment 3d).
 - *The reserved amount.* Nobody gains from leaving early, but a cancelled run, an upstream
   error or a proxy fault costs the user the round's full cap.
 - *An estimate* from the bytes relayed. Rejected: it would record numbers nobody measured.
@@ -349,9 +353,10 @@ Settlement lets a higher final revision correct a lower one, so a report of the 
 arrives after the sweep closed the request replaces the sweep's record, and the sweep can
 never replace the proxy's.
 
-**No bare final report.** Settlement refuses a final report that would leave the token hold
-of a request without a binding open: one without both counts and without a reason. The proxy
-builds a report without counts only together with its reason.
+**No bare final report.** Settlement and a deferred database trigger refuse a final report
+that would leave a request without a binding open: one without both counts and without a
+reason, or one whose quota fold was not run. The proxy builds a report without counts only
+together with its reason.
 
 ### Who closes what
 
@@ -388,8 +393,9 @@ stays, and the failure is logged.
 - `tests/schema/live_turns/worker_gateway.rs`: the packaged worker binary claims a queued run
   and dispatches its round to the proxy binary with the bearer it made, over plain HTTP and
   through a TLS terminator; the usage report equals the recorded answer's, the hold settles
-  and the answer is published. A proxy serving another model and an unreachable proxy fail
-  the turn and leave the hold.
+  and the answer is published. A proxy serving another model fails the turn and closes the
+  hold with `model_not_served`; an unreachable proxy fails the turn and leaves the hold
+  until increment 3b.
 - `tests/provider_http_support/tests.rs`, `tests/provider_inference/authentication.rs` and
   `tests/provider_gateway.rs`: every other client refuses `http://`, and the gateway route
   pairs its scheme with trust anchors and sends its bearer and request ID without TLS.

@@ -1454,6 +1454,113 @@ async fn a_request_handed_off_with_a_binding_is_never_dispatched() {
         assert_eq!(rows, []);
     }
     assert!(!f.stored(&round).await.3);
+
+    // Nor can a report with a reason close it: this proxy never dispatched it, so it has no
+    // reason to give. Neither through the library nor written in SQL.
+    let (principal, source): (String, String) = sqlx::query_as(
+        "SELECT b.principal::text,q.report_source::text FROM openmettle.gateway_requests q
+           JOIN openmettle.gateway_bindings b ON b.id=q.binding_id WHERE q.id=$1::uuid",
+    )
+    .bind(&round.request)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    let gateway = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(f.db.1.options(pg::GATEWAY));
+    let without_usage = UsageReport {
+        principal,
+        source: source.clone(),
+        ..report_of(&f, &round, None)
+    };
+    assert_eq!(
+        settlement::ingest_incomplete(&gateway, &without_usage, "no_usage").await,
+        Err(StoreError::Refused)
+    );
+    {
+        use sqlx::Connection;
+        let mut tx = f.owner.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,incomplete)
+             VALUES ($1::uuid,$2::uuid,$1::uuid,1,true,'no_usage')",
+        )
+        .bind(&round.request)
+        .bind(&source)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_settlements
+                 (request_id,revision,final,measured,outstanding)
+             VALUES ($1::uuid,1,true,NULL,0)",
+        )
+        .bind(&round.request)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let Err(sqlx::Error::Database(error)) = tx.commit().await else {
+            panic!("a report with a reason settled a request handed off with a binding");
+        };
+        assert_eq!(error.code().as_deref(), Some("23514"));
+    }
+    // Nor when hidden behind a later revision with usage in the same transaction.
+    {
+        use sqlx::Connection;
+        let mut tx = f.owner.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,incomplete)
+             VALUES ($1::uuid,$2::uuid,$1::uuid,0,true,'no_usage')",
+        )
+        .bind(&round.request)
+        .bind(&source)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_settlements
+                 (request_id,revision,final,measured,outstanding)
+             VALUES ($1::uuid,0,true,NULL,0)",
+        )
+        .bind(&round.request)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens)
+             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),1,true,4,3)",
+        )
+        .bind(&round.request)
+        .bind(&source)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.gateway_settlements
+                SET revision=1,final=true,measured=7,outstanding=0
+              WHERE request_id=$1::uuid",
+        )
+        .bind(&round.request)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let Err(sqlx::Error::Database(error)) = tx.commit().await else {
+            panic!("a bound request accepted a reason hidden behind a later revision");
+        };
+        assert_eq!(error.code().as_deref(), Some("23514"));
+    }
+    // An ordinary report still settles it, as under ADR 0037.
+    let with_usage = UsageReport {
+        prompt_tokens: Some(4),
+        completion_tokens: Some(3),
+        ..without_usage
+    };
+    assert_eq!(
+        settlement::ingest(&gateway, &with_usage).await,
+        Ok(Outcome::Applied)
+    );
 }
 
 /// A request that already has a settlement gets no first dispatch: whatever reported its usage
@@ -1785,16 +1892,55 @@ async fn a_request_that_ended_without_usage_is_closed_by_its_reason_and_never_by
     );
     assert_eq!(f.dispatch(&round).await, [f.routed()]);
 
-    // The trap: a final report with no count and no reason, or with one count only.
+    // The trap: a final report with no count and no reason, or with one count only, also when
+    // that count covers all 10 units of the request and leaves nothing outstanding.
     let prompt_only = UsageReport {
         prompt_tokens: Some(4),
         ..unused.clone()
     };
-    for bare in [&unused, &prompt_only] {
+    let whole = UsageReport {
+        prompt_tokens: Some(10),
+        ..unused.clone()
+    };
+    for bare in [&unused, &prompt_only, &whole] {
         assert_eq!(
             settlement::ingest(&gateway, bare).await,
-            Err(StoreError::Refused)
+            Err(StoreError::Refused),
+            "{:?}",
+            bare.prompt_tokens
         );
+    }
+    // The database refuses the same written in SQL with the gateway role's grants: the
+    // settlement would not close the request.
+    {
+        let mut direct = connect(&f.db.0, pg::GATEWAY).await;
+        let stored = sqlx::query(
+            "INSERT INTO openmettle.gateway_usage_reports (request_id,source,report_id,revision,final)
+             VALUES ($1::uuid,$2::uuid,$1::uuid,1,true)",
+        )
+        .bind(&round.request)
+        .bind(INSTALL)
+        .execute(&mut direct)
+        .await;
+        assert!(stored.is_ok(), "{stored:?}");
+        let settled = sqlx::query(
+            "INSERT INTO openmettle.gateway_settlements
+                 (request_id,revision,final,measured,outstanding)
+             VALUES ($1::uuid,1,true,NULL,0)",
+        )
+        .bind(&round.request)
+        .execute(&mut direct)
+        .await;
+        let Err(sqlx::Error::Database(error)) = settled else {
+            panic!("a final settlement without counts or a reason was accepted");
+        };
+        assert_eq!(error.code().as_deref(), Some("23514"));
+        // The raw report has no settlement and counts for nothing; remove it as the owner.
+        f.owner_exec(
+            "DELETE FROM openmettle.gateway_usage_reports WHERE request_id=$1::uuid",
+            &round.request,
+        )
+        .await;
     }
     // The vocabulary is closed, and only a final report carries a reason.
     for unknown in ["dispatch_unconfirmed", "no usage", ""] {

@@ -139,7 +139,7 @@ one alone:
 | `request_body` | No | The request body exceeded 2 MiB, did not arrive within 10 s, or the caller left while sending it (`400 validation`) |
 | `upstream_connect` | No | No connection to the upstream was made, in time or at all (`502 provider_failure` or `504 timeout`), or the caller left before one was |
 | `upstream_transport` | Yes or unknown | The exchange on an open upstream connection failed before a response head (`502 provider_failure`) |
-| `upstream_timeout` | Yes | No response head or no further body bytes within the idle timeout (`504 timeout` if no head arrived), or the upstream did not finish within one idle timeout after the caller left |
+| `upstream_timeout` | Yes or unknown | No response head or no further body bytes within the idle timeout (`504 timeout` if no head arrived), or the upstream did not finish within one idle timeout after the caller left |
 | `upstream_status` | Yes | The upstream answered with a status other than 200; its response is still relayed |
 | `upstream_encoding` | Yes | The upstream answered with a content coding other than `identity` or a transfer coding other than `chunked` (`502 provider_failure`) |
 | `incomplete` | Yes | The body broke off, or a stream ended without `[DONE]` |
@@ -150,7 +150,10 @@ one alone:
 To list the requests that ended this way:
 
 ```sql
-SELECT request_id, incomplete FROM openmettle.gateway_usage_reports WHERE incomplete IS NOT NULL;
+SELECT r.request_id, r.incomplete
+  FROM openmettle.gateway_settlements s
+  JOIN openmettle.gateway_usage_reports r USING (request_id, revision, final)
+ WHERE r.incomplete IS NOT NULL;
 ```
 
 One case is only logged, because the proxy never learned whether the dispatch was spent:

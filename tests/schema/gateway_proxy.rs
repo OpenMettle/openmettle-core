@@ -150,12 +150,22 @@ impl Fixture {
 
     /// A new request of `UNITS` tokens for [`MODEL`], handed off unless `reserved_only`.
     async fn request(&self, reserved_only: bool) -> String {
-        self.request_for(MODEL, reserved_only).await
+        self.request_with_cost(MODEL, reserved_only, None).await
     }
 
     /// Round 1 of a new one-round run admitted for `model`, with its run and round holds,
     /// handed off unless `reserved_only`, and then given the bearer of [`bearer_bytes`].
     async fn request_for(&self, model: &str, reserved_only: bool) -> String {
+        self.request_with_cost(model, reserved_only, None).await
+    }
+
+    /// Like [`Self::request_for`], optionally reserving a `usage_cost_micros` hold as well.
+    async fn request_with_cost(
+        &self,
+        model: &str,
+        reserved_only: bool,
+        cost_micros: Option<u128>,
+    ) -> String {
         let (actor, scope) = (&self.actor, self.scope.as_str());
         let chat = authz_runs::chat(&self.db, scope, "personal", actor).await;
         let mut api = connect(&self.db.0, API).await;
@@ -181,7 +191,7 @@ impl Fixture {
                 capabilities: &[],
                 requested_rounds: Some(1),
                 now_ms: authz_store::NOW,
-                cost_qualified: None,
+                cost_qualified: cost_micros.map(|_| true),
             },
             &LIMITS,
         )
@@ -200,7 +210,7 @@ impl Fixture {
                 actor_approval_id: &actor.approval,
                 run_id: &run,
                 token_units: UNITS,
-                per_round_cost_micros: None,
+                per_round_cost_micros: cost_micros,
                 round_limit: 1,
                 requires_device_slot: false,
             },
@@ -226,16 +236,19 @@ impl Fixture {
                 installation: INSTALL,
                 model,
                 round_tokens: UNITS,
-                round_cost: None,
+                round_cost: cost_micros,
                 requires_device_slot: false,
             },
         )
         .await
         .unwrap();
         if !reserved_only {
-            let route = match model {
-                MODEL => &self.route,
-                _ => &self.other_route,
+            let cost_route = cost_micros
+                .map(|c| TurnHandoffFixture::chat(INSTALL, model, UNITS, Some(c), false));
+            let route = match (&cost_route, model) {
+                (Some(r), _) => r,
+                (None, MODEL) => &self.route,
+                (None, _) => &self.other_route,
             };
             let handed_off = pending
                 .handoff(
@@ -429,6 +442,17 @@ impl Fixture {
         assert!(settled_final, "{reason}");
     }
 
+    /// Whether `id` is still in the scan of outstanding requests.
+    async fn outstanding(&self, id: &str) -> bool {
+        sqlx::query_scalar(
+            "SELECT NOT settled_final FROM openmettle.gateway_requests WHERE id=$1::uuid",
+        )
+        .bind(id)
+        .fetch_one(&self.owner)
+        .await
+        .unwrap()
+    }
+
     /// What the worker's accounting verifier counts: storage, budget and settlement mismatches
     /// and accepted reports whose quota fold is still pending. All zero when the ledgers agree.
     async fn drift(&self) -> (i64, i64, i64, i64) {
@@ -469,11 +493,17 @@ impl Fixture {
 
     /// The token hold of `id`: state, held units and settled units.
     async fn hold(&self, id: &str) -> (String, i64, String) {
+        self.hold_of(id, "usage_tokens").await
+    }
+
+    /// The hold of `id` for `resource_kind`: state, held units and settled units.
+    async fn hold_of(&self, id: &str, resource_kind: &str) -> (String, i64, String) {
         sqlx::query_as(
             "SELECT state,held_units,settled_units::text FROM openmettle.quota_reservations
-              WHERE gateway_request_id=$1::uuid AND resource_kind='usage_tokens'",
+              WHERE gateway_request_id=$1::uuid AND resource_kind=$2",
         )
         .bind(id)
+        .bind(resource_kind)
         .fetch_one(&self.owner)
         .await
         .unwrap()
@@ -1472,11 +1502,15 @@ async fn an_upstream_that_fails_before_its_head_closes_the_hold() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn an_unreachable_upstream_closes_the_hold_with_nothing_sent() {
-    // A port that was bound and released: nothing listens on it.
-    let closed = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().to_string()
-    };
+    // A port held by a socket that is bound and never listens: for the whole case a connection
+    // to it is refused and nothing else can take it.
+    let held = tokio::net::TcpSocket::new_v4().unwrap();
+    held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let closed = held.local_addr().unwrap();
+    assert!(
+        std::net::TcpListener::bind(closed).is_err(),
+        "nothing else can take the upstream's port during the case"
+    );
     let settings = [("UPSTREAM_URL", format!("http://{closed}"))];
     let h = Harness::launch(Fixture::new().await, StandIn::start().await, &settings).await;
     let id = h.fixture.request(false).await;
@@ -1488,6 +1522,7 @@ async fn an_unreachable_upstream_closes_the_hold_with_nothing_sent() {
     fixture.assert_closed(&id, "upstream_connect").await;
     assert_eq!(fixture.drift().await, (0, 0, 0, 0));
     assert_eq!(events, [unrecorded(&id, "upstream_connect")]);
+    drop(held);
 }
 
 /// The status, problem code and `WWW-Authenticate` value of a refusal.
@@ -2046,6 +2081,7 @@ async fn a_caller_leaving_before_the_response_head_drops_the_upstream() {
     .await;
     let (fixture, _, events) = h.stop().await;
     fixture.assert_closed(&id, "caller_disconnected").await;
+    assert_eq!(fixture.drift().await, (0, 0, 0, 0));
     assert_eq!(events, [unrecorded(&id, "caller_disconnected")]);
 }
 
@@ -2085,6 +2121,7 @@ async fn a_compressed_answer_is_refused_and_closes_the_hold() {
         fixture.assert_closed(id, "upstream_encoding").await;
         expected.push(unrecorded(id, "upstream_encoding"));
     }
+    assert_eq!(fixture.drift().await, (0, 0, 0, 0));
     expected.sort();
     assert_eq!(events, expected);
 }
@@ -2110,6 +2147,7 @@ async fn a_detached_relay_gives_the_upstream_one_idle_timeout_to_finish() {
     .await;
     let (fixture, _, events) = h.stop().await;
     fixture.assert_closed(&id, "upstream_timeout").await;
+    assert_eq!(fixture.drift().await, (0, 0, 0, 0));
     assert_eq!(events, [unrecorded(&id, "upstream_timeout")]);
 }
 
@@ -2205,6 +2243,7 @@ async fn an_unread_request_body_closes_the_hold() {
     let (fixture, _, events) = h.stop().await;
     assert!(fixture.dispatched(&id).await);
     fixture.assert_closed(&id, "request_body").await;
+    assert_eq!(fixture.drift().await, (0, 0, 0, 0));
     assert_eq!(events, [unrecorded(&id, "request_body")]);
 }
 
@@ -2435,8 +2474,15 @@ async fn the_bearer_never_reaches_the_database() {
 ///   * Nothing reopens a request that a complete report closed: a second report under the same
 ///     identity conflicts, the sweep's revision is superseded, and a later incomplete report
 ///     keeps the charge.
-///   * A final report without counts and without a reason is refused and leaves the hold and
-///     the request as they were: accepted, it would hide the request and keep the hold for good.
+///   * A report with a reason carries no usage of its own. What an earlier accepted report
+///     measured is still charged: a running count in a report that is not final, then the
+///     reason.
+///   * A final report that does not close the hold is refused and leaves the hold and the
+///     request as they were: accepted, it would hide the request and keep the hold for good.
+///     That holds for no count at all, for one count, and for one count that covers the whole
+///     reservation, which empties the hold without closing it.
+///   * The operator's query lists a request by its current settlement, not by a record a later
+///     report corrected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn a_later_report_corrects_an_incomplete_one_and_nothing_reopens_a_complete_one() {
@@ -2521,10 +2567,64 @@ async fn a_later_report_corrects_an_incomplete_one_and_nothing_reopens_a_complet
     assert_eq!(f.transitions(&complete).await, ["final_settle"]);
     assert_eq!((f.used().await, f.reserved().await), (24, 0));
 
-    // The trap, on a metered request: no reason and no usable counts.
+    // A reason and usage, cost or unit in one report would contradict each other.
+    let running = f.request(false).await;
+    f.dispatch(&running).await;
+    for mixed in [
+        f.report(&running, 1, usage),
+        UsageReport {
+            reasoning_included: Some(true),
+            ..f.report(&running, 1, None)
+        },
+        UsageReport {
+            cost: Some("1".to_owned()),
+            unit: Some("usd_micros".to_owned()),
+            ..f.report(&running, 1, None)
+        },
+        UsageReport {
+            unit: Some("usd_micros".to_owned()),
+            ..f.report(&running, 1, None)
+        },
+    ] {
+        assert_eq!(
+            settlement::ingest_incomplete(&gateway, &mixed, "no_usage").await,
+            Err(StoreError::Refused)
+        );
+    }
+    assert_eq!(f.reports(&running).await, []);
+    assert_eq!(f.hold(&running).await, held);
+    // A running count arrives in a report that is not final; the reason then closes the hold at
+    // that count.
+    let mut interim = f.report(&running, 1, usage);
+    interim.r#final = false;
+    assert_eq!(
+        settlement::ingest(&gateway, &interim).await,
+        Ok(Outcome::Applied)
+    );
+    assert_eq!(
+        f.hold(&running).await,
+        ("handoff_committed".to_owned(), UNITS - 12, "12".to_owned())
+    );
+    assert_eq!(
+        settlement::ingest_incomplete(
+            &gateway,
+            &f.report(&running, 2, None),
+            "caller_disconnected"
+        )
+        .await,
+        Ok(Outcome::Applied)
+    );
+    assert_eq!(f.hold(&running).await, charged);
+    assert_eq!(
+        f.transitions(&running).await,
+        ["partial_settle", "final_settle"]
+    );
+    assert_eq!((f.used().await, f.reserved().await), (36, 0));
+
+    // The trap, on a metered request: no reason, and counts that do not close the hold.
     let trapped = f.request(false).await;
     f.dispatch(&trapped).await;
-    for counts in [None, Some((4, 0))] {
+    for counts in [None, Some((4, 0)), Some((UNITS, 0))] {
         let mut bare = f.report(&trapped, 1, counts);
         bare.completion_tokens = None;
         assert_eq!(
@@ -2536,14 +2636,290 @@ async fn a_later_report_corrects_an_incomplete_one_and_nothing_reopens_a_complet
     assert_eq!(f.reports(&trapped).await, []);
     assert_eq!(f.settlement(&trapped).await, None);
     assert_eq!(f.hold(&trapped).await, held);
-    let outstanding: bool = sqlx::query_scalar(
-        "SELECT NOT settled_final FROM openmettle.gateway_requests WHERE id=$1::uuid",
-    )
-    .bind(&trapped)
-    .fetch_one(&f.owner)
+    assert!(f.outstanding(&trapped).await);
+    assert_eq!((f.used().await, f.reserved().await), (36, UNITS));
+    assert_eq!(f.drift().await, (0, 0, 0, 0));
+
+    // The query the operator page gives, run as written: one row per request whose current
+    // settlement is a report without usage. The request the sweep closed and the proxy then
+    // reported with usage is not listed, and the one both closed is listed once, with the
+    // proxy's reason.
+    let page = include_str!("../../docs/operator/gateway-proxy.md");
+    let (_, query) = page.split_once("```sql\n").unwrap();
+    let (query, _) = query.split_once("```").unwrap();
+    let query = query.trim().trim_end_matches(';');
+    let mut listed: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT request_id::text,incomplete FROM ({query}) AS listed"
+    )))
+    .fetch_all(&f.owner)
     .await
     .unwrap();
-    assert!(outstanding);
-    assert_eq!((f.used().await, f.reserved().await), (24, UNITS));
+    listed.sort();
+    let mut expected = vec![
+        (unknown.clone(), "caller_disconnected".to_owned()),
+        (complete.clone(), "incomplete".to_owned()),
+        (running.clone(), "caller_disconnected".to_owned()),
+    ];
+    expected.sort();
+    assert_eq!(listed, expected);
+}
+
+/// One final report of `id` at revision 1 and its settlement, written directly in SQL as the
+/// gateway role in one transaction. `columns` and `values` continue the report's column and
+/// value lists, and `fold` says whether the quota fold is called. Returns the first error, the
+/// commit's included.
+async fn settle_in_sql(
+    f: &Fixture,
+    id: &str,
+    (columns, values): (&str, &str),
+    fold: bool,
+) -> Result<(), sqlx::Error> {
+    use sqlx::Connection;
+    let mut c = connect(&f.db.0, pg::GATEWAY).await;
+    let mut tx = c.begin().await?;
+    let report = format!(
+        "INSERT INTO openmettle.gateway_usage_reports
+             (request_id,source,report_id,revision,final{columns})
+         VALUES ($1::uuid,$2::uuid,$1::uuid,1,true{values})"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(report))
+        .bind(id)
+        .bind(INSTALL)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_settlements (request_id,revision,final,measured,outstanding)
+         VALUES ($1::uuid,1,true,NULL,0)",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    if fold {
+        sqlx::query("SELECT openmettle.quota_settle_gateway_usage($1::uuid,$2::uuid,$1::uuid,1)")
+            .bind(id)
+            .bind(INSTALL)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await
+}
+
+/// The rules of the settlement library hold in the database too, for a writer that has the
+/// gateway role's grants and does not go through the library. A final settlement of a request
+/// without a binding must leave its token hold closed, or the transaction is refused: no count
+/// and no reason; one count that covers the whole reservation; a reason whose quota fold was
+/// never run. A report with a reason carries no count, cost or unit, and needs a request this
+/// proxy dispatched. A report with a reason, folded, is accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn the_database_refuses_a_final_settlement_that_leaves_the_hold_open() {
+    let f = Fixture::new().await;
+    let held = ("handoff_committed".to_owned(), UNITS, "0".to_owned());
+    let whole = format!(",{UNITS}");
+    let reason = (",incomplete", ",'no_usage'");
+    for (what, fields, fold, dispatched) in [
+        ("no count and no reason", ("", ""), true, true),
+        (
+            "one count that covers the reservation",
+            (",prompt_tokens", whole.as_str()),
+            true,
+            true,
+        ),
+        ("a reason without the quota fold", reason, false, true),
+        (
+            "a reason for a request never dispatched",
+            reason,
+            true,
+            false,
+        ),
+    ] {
+        let id = f.request(false).await;
+        if dispatched {
+            f.dispatch(&id).await;
+        }
+        let Err(sqlx::Error::Database(error)) = settle_in_sql(&f, &id, fields, fold).await else {
+            panic!("{what}: the transaction committed");
+        };
+        assert_eq!(error.code().as_deref(), Some("23514"), "{what}");
+        assert_eq!(f.reports(&id).await, [], "{what}");
+        assert_eq!(f.settlement(&id).await, None, "{what}");
+        assert_eq!(f.hold(&id).await, held, "{what}");
+        assert!(f.outstanding(&id).await, "{what}");
+    }
+
+    let id = f.request(false).await;
+    f.dispatch(&id).await;
+    for fields in [
+        (
+            ",incomplete,prompt_tokens,completion_tokens",
+            ",'no_usage',7,5",
+        ),
+        (
+            ",incomplete,reasoning_tokens,reasoning_included",
+            ",'no_usage',1,true",
+        ),
+        (",incomplete,reasoning_included", ",'no_usage',true"),
+        (",incomplete,cost,unit", ",'no_usage',1,'unit'"),
+    ] {
+        let Err(sqlx::Error::Database(error)) = settle_in_sql(&f, &id, fields, true).await else {
+            panic!("{fields:?}: the transaction committed");
+        };
+        assert_eq!(
+            (error.code().as_deref(), error.constraint()),
+            (
+                Some("23514"),
+                Some("gateway_usage_reports_incomplete_check")
+            ),
+            "{fields:?}"
+        );
+    }
+    assert_eq!(f.hold(&id).await, held);
+    settle_in_sql(&f, &id, reason, true).await.unwrap();
+    f.assert_closed(&id, "no_usage").await;
+
+    // An undispatched request cannot accept a reason even when a later revision in the same
+    // transaction replaces it with usage before commit.
+    let undispatched = f.request(false).await;
+    {
+        use sqlx::Connection;
+        let mut c = connect(&f.db.0, pg::GATEWAY).await;
+        let mut tx = c.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,incomplete)
+             VALUES ($1::uuid,$2::uuid,$1::uuid,0,true,'no_usage')",
+        )
+        .bind(&undispatched)
+        .bind(INSTALL)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_settlements
+                 (request_id,revision,final,measured,outstanding)
+             VALUES ($1::uuid,0,true,NULL,0)",
+        )
+        .bind(&undispatched)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let rev1_report: String = sqlx::query_scalar(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens)
+             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),1,true,7,5)
+             RETURNING report_id::text",
+        )
+        .bind(&undispatched)
+        .bind(INSTALL)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.gateway_settlements
+                SET revision=1,final=true,measured=12,outstanding=0
+              WHERE request_id=$1::uuid",
+        )
+        .bind(&undispatched)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("SELECT openmettle.quota_settle_gateway_usage($1::uuid,$2::uuid,$3::uuid,1)")
+            .bind(&undispatched)
+            .bind(INSTALL)
+            .bind(&rev1_report)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let Err(sqlx::Error::Database(error)) = tx.commit().await else {
+            panic!("an undispatched request accepted a reason hidden behind a later revision");
+        };
+        assert_eq!(error.code().as_deref(), Some("23514"));
+        assert!(
+            error
+                .message()
+                .contains("an incomplete report needs a dispatched request without a binding"),
+            "{}",
+            error.message()
+        );
+        assert_eq!(f.reports(&undispatched).await, []);
+        assert_eq!(f.settlement(&undispatched).await, None);
+        assert_eq!(f.hold(&undispatched).await, held);
+    }
+
+    // With a cost hold present: a report with usage leaves the cost hold open (issue #166) and
+    // commits, while a report with a reason must close the cost hold too — skipping the quota
+    // fold on the reason is refused at commit.
+    let mut admin = f.db.admin().await;
+    admin
+        .execute(
+            "UPDATE openmettle.quota_defaults SET cost_denomination='usd_micros'
+              WHERE scope_kind='instance' AND resource_kind='usage_cost_micros'",
+        )
+        .await
+        .unwrap();
+    admin
+        .execute(
+            "INSERT INTO openmettle.quota_defaults(scope_kind,resource_kind,hard_limit)
+             VALUES ('personal','usage_cost_micros',100000)",
+        )
+        .await
+        .unwrap();
+    let costed = f.request_with_cost(MODEL, false, Some(250)).await;
+    f.dispatch(&costed).await;
+    let gateway = pool(&f.db, pg::GATEWAY);
+    assert_eq!(
+        settlement::ingest(&gateway, &f.report(&costed, 1, Some((7, 5)))).await,
+        Ok(Outcome::Applied)
+    );
+    assert_eq!(
+        f.hold(&costed).await,
+        ("settled".to_owned(), 0, "12".to_owned())
+    );
+    assert_eq!(
+        f.hold_of(&costed, "usage_cost_micros").await,
+        ("handoff_committed".to_owned(), 250, "0".to_owned())
+    );
+    {
+        use sqlx::Connection;
+        let mut c = connect(&f.db.0, pg::GATEWAY).await;
+        let mut tx = c.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,incomplete)
+             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),2,true,'incomplete')",
+        )
+        .bind(&costed)
+        .bind(INSTALL)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.gateway_settlements
+                SET revision=2,final=true,measured=NULL,outstanding=0
+              WHERE request_id=$1::uuid",
+        )
+        .bind(&costed)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let Err(sqlx::Error::Database(error)) = tx.commit().await else {
+            panic!("a reason left the cost hold open without running the quota fold");
+        };
+        assert_eq!(error.code().as_deref(), Some("23514"));
+        assert_eq!(
+            f.hold_of(&costed, "usage_cost_micros").await,
+            ("handoff_committed".to_owned(), 250, "0".to_owned())
+        );
+    }
+    assert_eq!(
+        settlement::ingest_incomplete(&gateway, &f.report(&costed, 2, None), "incomplete").await,
+        Ok(Outcome::Applied)
+    );
+    assert_eq!(
+        f.hold_of(&costed, "usage_cost_micros").await,
+        ("settled".to_owned(), 0, "0".to_owned())
+    );
+
+    assert_eq!((f.used().await, f.reserved().await), (12, 5 * UNITS));
     assert_eq!(f.drift().await, (0, 0, 0, 0));
 }

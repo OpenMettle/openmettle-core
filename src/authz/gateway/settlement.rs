@@ -85,12 +85,16 @@ struct TokenFold {
 
 impl TokenFold {
     fn observe(&mut self, row: &sqlx::postgres::PgRow) -> Result<(), Error> {
+        // A report that says why the request has no usage ends it without changing what earlier
+        // accepted reports measured (migration 31's fold rule).
+        if row.try_get::<Option<String>, _>("incomplete")?.is_some() {
+            self.closed = true;
+            return Ok(());
+        }
         let prompt_tokens: Option<i64> = row.try_get("prompt_tokens")?;
         let completion_tokens: Option<i64> = row.try_get("completion_tokens")?;
         let reasoning_tokens: Option<i64> = row.try_get("reasoning_tokens")?;
         let reasoning_included: Option<bool> = row.try_get("reasoning_included")?;
-        // A report that says why the request has no usage ends it (migration 31's fold rule).
-        self.closed |= row.try_get::<Option<String>, _>("incomplete")?.is_some();
         if let Some(prompt) = prompt_tokens {
             self.prompt = prompt.into();
         }
@@ -128,11 +132,13 @@ impl TokenFold {
     }
 }
 
+/// The units still outstanding for a request without a metered hold, and whether the accepted
+/// reports closed it.
 async fn legacy_outstanding(
     c: &mut PgConnection,
     r: &UsageReport,
     units: i64,
-) -> Result<i64, Error> {
+) -> Result<(i64, bool), Error> {
     let mut fold = TokenFold::default();
     let mut after = -1_i64;
     loop {
@@ -182,11 +188,12 @@ async fn legacy_outstanding(
             break;
         }
     }
-    Ok(if fold.closed {
+    let outstanding = if fold.closed {
         0
     } else {
         (i128::from(units) - fold.settled).max(0) as i64
-    })
+    };
+    Ok((outstanding, fold.closed))
 }
 
 /// The caller supplies evidence from the authenticated reporting profile. Verify all routing
@@ -200,8 +207,10 @@ pub async fn ingest(pool: &PgPool, r: &UsageReport) -> Result<Outcome, Error> {
 
 /// [`ingest`] for a request that ended without usage (ADR 0044, amendment of 24 November
 /// 2026): the final report `r` carries `reason`, one of the values the
-/// `gateway_usage_reports.incomplete` CHECK lists, and closes the request's holds at what was
-/// measured so far. An unknown reason or a report that is not final is refused.
+/// `gateway_usage_reports.incomplete` CHECK lists, and closes the request's holds at what
+/// earlier accepted reports measured. Refused: an unknown reason, a report that is not final,
+/// one that carries a count, cost or unit of its own, and a request this proxy did not
+/// dispatch, which includes every request handed off with a binding.
 pub async fn ingest_incomplete(
     pool: &PgPool,
     r: &UsageReport,
@@ -211,7 +220,13 @@ pub async fn ingest_incomplete(
 }
 
 async fn store(pool: &PgPool, r: &UsageReport, incomplete: Option<&str>) -> Result<Outcome, Error> {
-    if !r.valid() {
+    let carries_usage = r.prompt_tokens.is_some()
+        || r.completion_tokens.is_some()
+        || r.reasoning_tokens.is_some()
+        || r.reasoning_included.is_some()
+        || r.cost.is_some()
+        || r.unit.is_some();
+    if !r.valid() || incomplete.is_some() && carries_usage {
         return Err(Error::Refused);
     }
     let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
@@ -237,6 +252,11 @@ async fn store(pool: &PgPool, r: &UsageReport, incomplete: Option<&str>) -> Resu
     .fetch_optional(&mut *c)
     .await?
     .ok_or(Error::Refused)?;
+    // The query admits a request without a binding only once it was dispatched.
+    let unbound: bool = row.try_get("unbound")?;
+    if incomplete.is_some() && !unbound {
+        return Err(Error::Refused);
+    }
     let inserted = evidence(INSERT_REPORT, r, incomplete)
         .execute(&mut *c)
         .await
@@ -283,22 +303,25 @@ async fn store(pool: &PgPool, r: &UsageReport, incomplete: Option<&str>) -> Resu
             .execute(&mut *c)
             .await?;
         apply(c, r, amount.clone(), previous).await?;
-        let actual: Option<i64> = sqlx::query_scalar(
-            "SELECT held_units FROM openmettle.quota_reservations
+        let actual: Option<(i64, bool)> = sqlx::query_as(
+            "SELECT held_units,state='settled' FROM openmettle.quota_reservations
             WHERE gateway_request_id=$1::uuid AND resource_kind='usage_tokens'",
         )
         .bind(&r.request)
         .fetch_optional(&mut *c)
         .await?;
-        let held = match actual {
-            Some(held) => held,
+        let (held, closed) = match actual {
+            Some(folded) => folded,
             None => legacy_outstanding(c, r, units).await?,
         };
-        // A final report that leaves the token hold open would mark the request settled, hide
-        // it from every scan of outstanding requests and keep the hold for good. The proxy's
-        // reports never do: one with both counts and one with a reason both close the hold.
-        // Requests handed off under ADR 0037 keep their earlier behaviour.
-        if r.r#final && held != 0 && row.try_get("unbound")? {
+        // A final report that does not close the request would mark it settled, hide it from
+        // every scan of outstanding requests and keep its hold for good. Closed is the fold's
+        // verdict, not an empty balance: one count that covers the whole reservation empties
+        // the hold and leaves it open. The proxy's reports always close: one with both counts,
+        // and one with a reason. The database enforces the same at commit (migration 31); this
+        // is the early refusal. Requests handed off under ADR 0037 keep their earlier
+        // behaviour.
+        if r.r#final && !closed && unbound {
             return Err(Error::Refused);
         }
         if held != previous {
