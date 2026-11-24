@@ -4,9 +4,13 @@
 --
 -- quota_lock_override (migration 24) checked the actor without a row lock, and
 -- sessions::disable_user locks only the user row, not account_admin_lock. An override decided
--- while such a disable was in flight could commit after it. This replaces only that function,
--- with the same signature, owner, invoker security, search_path and privileges; its callers
--- quota_upsert_scope_override and quota_revoke_scope_override (migration 26) are unchanged.
+-- while such a disable was in flight could commit after it. The two are now ordered by the
+-- actor's row: if the override locks it first, the disable waits for the override to commit; if
+-- the disable locks it first and commits within the caller's lock wait limit, the override sees
+-- the disabled actor and is refused (42501); otherwise the override fails with a lock timeout
+-- and changes nothing. This replaces only that function, with the same signature, owner,
+-- invoker security, search_path and privileges; its callers quota_upsert_scope_override and
+-- quota_revoke_scope_override (migration 26) are unchanged.
 --
 -- Lock order of an override write: account_admin_lock -> storage_volume_control FOR SHARE (the
 -- caller) -> run_dispatch_lock (executing-run resources) -> projects | the personal owner's
@@ -32,8 +36,8 @@ BEGIN
     IF sc.kind='project' THEN PERFORM FROM openmettle.projects WHERE id=sc.project_id FOR NO KEY UPDATE;
     ELSE PERFORM FROM openmettle.users WHERE id=sc.personal_user_id FOR NO KEY UPDATE; END IF;
     -- sessions::disable_user locks only the user row: hold the actor's row FOR SHARE, after the
-    -- scope locks, and recheck under it, so a disable in flight is waited for and seen, and a
-    -- later one waits for this change to commit.
+    -- scope locks, and recheck under it. A disable holding the row is waited for and its commit
+    -- seen; a disable reaching the row after this lock waits for this change to commit.
     PERFORM FROM openmettle.account_admins a JOIN openmettle.users u ON u.id=a.user_id
      WHERE a.user_id=p_actor AND a.active AND u.disabled_at IS NULL FOR SHARE OF u;
     IF NOT FOUND THEN

@@ -118,7 +118,11 @@ Migration `0029` ([ADR 0044](../adr/0044-own-inference-proxy-and-binding-free-di
 
 ## Upgrade from 0029 to 0030 (quota override actor lock)
 
-Migration `0030` replaces only `openmettle.quota_lock_override`. The signature, security and privileges stay the same. No table, column, grant or row changes, so the upgrade needs no action beyond running `openmettle-migrate`. Afterwards, a quota override write by an account administrator who is being disabled at the same moment waits for the disable and is refused with `42501`. A disable that starts after the write waits for the write to commit.
+Migration `0030` replaces only `openmettle.quota_lock_override`. The signature, security and privileges stay the same. No table, column, grant or row changes, so the upgrade needs no action beyond running `openmettle-migrate`. Afterwards, a quota override and a disable of its acting administrator are ordered by the administrator's user row. The override locks that row after its scope locks, so the order in which the requests started does not decide the outcome:
+
+- If the override locks the row first, the disable waits for the override to commit.
+- If the disable locks it first and commits within the override's lock wait limit (2 seconds for the API), the override sees the disabled administrator and is refused with `42501`.
+- If that limit expires first, the override fails with a lock timeout (`55P03`) and changes nothing.
 
 ## Monitor overdue handoffs
 

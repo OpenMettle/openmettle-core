@@ -8438,7 +8438,9 @@ async fn waiter_on(db: &TestDb, holder: i32) -> i32 {
 /// Migration 30. `sessions::disable_user` locks only the user row, not `account_admin_lock`. On
 /// schema 29 a quota override decided while that disable is in flight, or before it starts,
 /// commits after the disable. From schema 30 the first waits for the disable and is refused, and
-/// in the second the disable waits for the override to commit.
+/// in the second the disable waits for the override to commit. Each paused override waits under
+/// the API's 2-second lock limit while the observer polls every 10 ms; an observer stalled past
+/// that limit fails the test with `55P03`, and cannot make it pass.
 #[tokio::test]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn quota_overrides_serialize_with_disabling_the_acting_administrator_from_schema_30() {
