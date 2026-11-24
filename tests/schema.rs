@@ -696,6 +696,18 @@ const ADDITIVE_COLUMNS: &[AdditiveColumn] = &[
         column: "dispatched_at",
         default: ColumnDefault::Null,
     },
+    AdditiveColumn {
+        since: 29,
+        table: "gateway_requests",
+        column: "bearer_hash",
+        default: ColumnDefault::Null,
+    },
+    AdditiveColumn {
+        since: 29,
+        table: "gateway_requests",
+        column: "claim_hash",
+        default: ColumnDefault::Null,
+    },
 ];
 
 /// Single declarative registry of every table added after migration 14, ordered by `since`
@@ -1102,7 +1114,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "dad89ccf522802b8c572ec8947fdfede32e569a5e26004ecb593edf50c96711f",
         "f420dac4231768d9eab1c1e1d21f156864c98af88335380ee1de392f7ba7e6d0",
         "feda63e3c2ed89d787e6e5a978a15208068598085fe8de52a8620b583c5789a6",
-        "dc2870278aaa03f7a2ef0c1ced87e9ff72bf7b3ac8b5279bed2234b02be5ce1c",
+        "86a43e9dc581d845be9d60eeddd5f12539c14c6a436add04cdce8f8e874d58d1",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));

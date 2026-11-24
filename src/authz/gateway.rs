@@ -1,5 +1,5 @@
 //! Gateway reservation, handoff and settlement store (ADRs 0037 and 0044). A run round is handed
-//! off without a gateway binding, with its dispatch secret as the bearer the worker sends.
+//! off without a gateway binding, under a per-round bearer of which the database holds a hash.
 //! The ADR 0037 provisioning and sealed-key code here has no caller and awaits removal.
 use crate::{
     provider_keys::gateway::{Context, Envelope, GatewayKeys},
@@ -273,8 +273,8 @@ impl TurnPending {
     /// deferred OMQ04 failure rolls back `gateway_requests` to `'reserved'` so `release()` can
     /// immediately unwind the round.
     ///
-    /// The round is authorized without a gateway binding, and the dispatch carries the round's
-    /// dispatch secret as its bearer credential (ADR 0044).
+    /// The round is authorized without a gateway binding, and the dispatch carries a bearer
+    /// credential made for this handoff, independent of the dispatch secret (ADR 0044).
     pub async fn handoff<'a>(
         &self,
         pool: &PgPool,
@@ -453,24 +453,35 @@ impl TurnPending {
     }
 
     /// Recheck the round's authorization without a gateway binding and mark it handed off
-    /// (`openmettle.gateway_handoff_round`, ADR 0044). The bearer is the round's dispatch secret,
-    /// which only this handle holds and the proxy accepts once. The transaction must end with
+    /// (`openmettle.gateway_handoff_round`, ADR 0044). The transaction must end with
     /// `openmettle.gateway_handoff_round_confirm`.
+    ///
+    /// The bearer the worker presents to the proxy is a new random value, independent of the
+    /// dispatch secret. Only its SHA-256 is sent to the database, which stores it for the proxy
+    /// to compare: the bearer itself lives in the returned [`Dispatch`] alone and never crosses
+    /// a database connection. The dispatch secret stays this caller's proof to the database and
+    /// is never sent over HTTP.
     async fn authorize_in(&self, tx: &mut WriteTransaction<'_>) -> Result<Dispatch, Error> {
+        let mut bearer = [0; 32];
+        SystemRandom::new()
+            .fill(&mut bearer)
+            .map_err(|_| Error::Protection)?;
         // `id` is caller-visible; dispatch the database-canonical spelling so the wire
         // `x-request-id` always correlates with the stored request.
         let id: String = sqlx::query_scalar(
-            "SELECT $1::uuid::text WHERE openmettle.gateway_handoff_round($1::uuid,$2,$3::uuid)",
+            "SELECT $1::uuid::text \
+              WHERE openmettle.gateway_handoff_round($1::uuid,$2,$3::uuid,$4)",
         )
         .bind(&self.id)
         .bind(self.secret.as_slice())
         .bind(&self.claim_token)
+        .bind(Sha256::digest(bearer).as_slice())
         .fetch_optional(tx.connection()?)
         .await?
         .ok_or(Error::Refused)?;
         let mut authorization = hyper::header::HeaderValue::try_from(format!(
             "Bearer {}",
-            URL_SAFE_NO_PAD.encode(self.secret)
+            URL_SAFE_NO_PAD.encode(bearer)
         ))
         .map_err(|_| Error::Protection)?;
         authorization.set_sensitive(true);

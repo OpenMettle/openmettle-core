@@ -109,7 +109,7 @@ SELECT j.journal_seq, j.entity_id
 
 ## Upgrade from 0028 to 0029 (gateway dispatch)
 
-Migration `0029` ([ADR 0044](../adr/0044-own-inference-proxy-and-binding-free-dispatch.md)) needs no activation step and no backfill. It adds `gateway_requests.dispatched_at`, replaces the unnamed handoff CHECK on that table with `gateway_requests_handoff_check` and adds four functions. Existing rows satisfy the new CHECK.
+Migration `0029` ([ADR 0044](../adr/0044-own-inference-proxy-and-binding-free-dispatch.md)) needs no activation step and no backfill. It adds the columns `dispatched_at`, `bearer_hash` and `claim_hash` to `gateway_requests`, replaces the unnamed handoff CHECK on that table with `gateway_requests_handoff_check` and adds four functions. Existing rows satisfy the new CHECK.
 
 - Apply it with `openmettle-migrate` before rolling workers. A worker of this release on schema `0028` fails every metered round, because `openmettle.gateway_handoff_round` does not exist yet.
 - A worker of the previous release keeps calling `openmettle.gateway_handoff`, which still needs a gateway binding that no deployment can create. Its metered rounds fail as they did before the upgrade.

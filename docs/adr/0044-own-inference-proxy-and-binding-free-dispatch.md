@@ -46,7 +46,8 @@ round handed off without one.
 
 ### Authorization without a binding
 
-A run round is handed off by `openmettle.gateway_handoff_round(request, dispatch secret, lease)`,
+A run round is handed off by
+`openmettle.gateway_handoff_round(request, dispatch secret, lease, SHA-256 of the bearer)`,
 callable by `openmettle_worker` only. It is `gateway_handoff` for a run-owned request, with the
 approval as the root of the check where a key generation and its policy row were. It keeps
 every check of that function that does not concern a binding, generation, policy or session:
@@ -87,35 +88,59 @@ deferred work left, so no lock wait can follow the last time check. The time a c
 on durability is not covered. The worker's order is: the ADR 0040 prefix lock, the handoff, the
 outbound-header validation, the quota commit, the confirm step, commit.
 
+That last check is a guarantee of the library's transaction, not of the database. A direct SQL
+caller with the worker role could call the handoff and commit without the confirm step. That
+is within ADR 0033's worker trust model, which excludes arbitrary SQL under the worker's
+credentials: that role can already forge any run transition.
+
 A handed-off request without a binding keeps `binding_id`, `generation` and `policy_revision`
-null, belongs to a run and reports under its installation. A named CHECK replaces migration
-23's unnamed one and allows exactly those two shapes of a handed-off request.
+null, belongs to a run, reports under its installation and carries the two digests described
+next. A named CHECK replaces migration 23's unnamed one and allows exactly those two shapes of
+a handed-off request.
 
-### The dispatch secret is the caller credential
+### A bearer of its own is the caller credential
 
-Reservation already creates a 32-byte random dispatch secret, stores only its SHA-256 and keeps
-the secret in a handle that cannot be cloned or serialized. That secret is now the caller's
-credential. The worker sends it as `Authorization: Bearer`, in unpadded base64url, on the
-request the handoff committed, with the request ID in `x-request-id`. Only the worker that
-reserved the round holds it, and it is useless for any other request.
+Reservation creates a 32-byte random dispatch secret and stores only its SHA-256. That secret
+stays what it was: the reserving caller's proof to the database for release, the quota commit
+and the handoff. The worker sends it to PostgreSQL as a statement parameter, so it must not
+also be what the proxy accepts.
+
+For each handoff the worker therefore makes a second, independent 32-byte random value, the
+bearer. It passes only the bearer's SHA-256 to the handoff, which stores it in
+`gateway_requests.bearer_hash`. The column is written by the handoff alone, together with the
+handed-off state, and only for a request without a binding. The bearer exists in worker memory
+only, in the single-use dispatch handle that cannot be cloned, printed or serialized, and no
+function returns it. The worker sends it as `Authorization: Bearer`, in unpadded base64url, on
+the request the handoff committed, with the request ID in `x-request-id`.
+
+- The bearer never crosses a database connection, on the worker's side or on the proxy's.
+  Both send its SHA-256.
+- The dispatch secret still crosses the worker's database connection. It is never sent over
+  HTTP and the proxy does not accept it: the dispatch compares `bearer_hash` only, and the
+  CHECK keeps that hash different from the dispatch secret's.
+
+The handoff also stores `claim_hash`, the SHA-256 of the run claim that authorized it. The claim
+token itself is not stored there, because the gateway role can read the table.
 
 ### One dispatch per request
 
-`openmettle.gateway_dispatch(request, SHA-256 of the dispatch secret)`, callable by
-`openmettle_gateway` only, sets `gateway_requests.dispatched_at` once and returns the stored
-routing fields: installation, scope, report source, principal and model. A later call with the
-same hash reports a replay. Every other call returns no row. The caller cannot tell the reasons
-apart.
+`openmettle.gateway_dispatch(request, SHA-256 of the bearer)`, callable by `openmettle_gateway`
+only, sets `gateway_requests.dispatched_at` once and returns the stored routing fields:
+installation, scope, report source, principal and model. A later call with the same hash
+reports a replay. Every other call returns no row. The caller cannot tell the reasons apart.
 
-The proxy hashes the secret its caller presented and sends only the hash. The secret itself
-never crosses a database connection, so a server that logs statement parameters records
-nothing a caller could present to the proxy. The hash is what the request row already stores.
+The proxy hashes the bearer its caller presented and sends only the hash, so a server that
+logs statement parameters records nothing a caller could present to the proxy.
 
 A first dispatch is granted only to a request that was handed off without a binding, has no
-settlement, and whose run is running, not cancelled and inside its lease and its execution
-deadline on a clock reading taken after the row lock. A request handed off under ADR 0037 is
-never dispatched here: its transport may already have sent it. It remains eligible for
-settlement only.
+settlement, and whose run is running, not cancelled, still held under the claim that
+authorized the handoff, and inside its lease and its execution deadline. A run that another
+holder reclaimed does not make the previous holder's unspent round dispatchable again; a
+holder that renews its lease keeps its claim. The clock is read once, inside the statement that
+records the dispatch, after that statement holds its relation locks and after the wait for the
+row lock: that one reading is compared with the deadlines and stored. A request handed off
+under ADR 0037 has no bearer hash and is never dispatched here: its transport may already have
+sent it. It remains eligible for settlement only.
 
 `dispatched_at` is a column, not a state: settlement and the quota functions test
 `state = 'handed_off'`. The function locks only the request row, which is also settlement's
@@ -186,7 +211,10 @@ exists.
 ## Alternatives
 
 - **Keep per-user keys and have the proxy verify them.** Rejected: it keeps sealing, rotation
-  and a key ring to protect a credential that the dispatch secret already is.
+  and a key ring to protect a credential that a per-round bearer replaces.
+- **The dispatch secret as the bearer.** Rejected in review: the worker sends that secret to
+  PostgreSQL as a statement parameter, so a server that logs parameters would record a
+  credential the proxy accepts.
 - **A shared static credential between worker and proxy.** Rejected: it authenticates the
   worker, not the request, and would not make a dispatch single-use.
 - **A new request state for dispatched.** Rejected: settlement and every quota function test
@@ -201,8 +229,9 @@ exists.
   handoff, so a role granted again after it was removed authorizes again; ADR 0037's pinned
   grant cycle did not.
 - A dispatch that is spent and then fails before the upstream answers cannot be retried under
-  the same request.
-- Migration 29 adds one column and four functions and replaces one CHECK. It needs no
+  the same request. Neither can a round whose run was reclaimed before the dispatch: the new
+  holder reserves a round of its own.
+- Migration 29 adds three columns and four functions and replaces one CHECK. It needs no
   activation step and no backfill, and it must be applied before workers of this release run.
 - ADR 0043 said the replacement would change `installation`, `gateway_keys` and one method of
   the worker and nothing else. `installation` stays and is now also the report source, and the
@@ -213,7 +242,7 @@ exists.
 | Increment | Content |
 | --- | --- |
 | 1 | Forward one request and record its usage (merged). |
-| 2a | Migration 29: binding-free run-round handoff and the dispatch function; the dispatch secret as the worker's bearer. |
+| 2a | Migration 29: binding-free run-round handoff and the dispatch function; a per-round bearer for the worker. |
 | 2b | Proxy authentication, single dispatch and model check. |
 | 2c | Worker document cleanup; packaged worker to TLS terminator to proxy end-to-end test; update ADR 0043 and the worker page. |
 | 3 | Explicit reports for incomplete responses. |
@@ -224,9 +253,9 @@ exists.
 
 ## Open points
 
-- **Cleartext secret.** The worker's transport requires `https://` and the proxy listens on
-  plain HTTP, so the two cannot be connected yet. Connected without TLS, the dispatch secret
-  would cross the network in cleartext. The proxy stays undeployable until increment 7.
+- **Cleartext bearer.** The worker's transport requires `https://` and the proxy listens on
+  plain HTTP, so the two cannot be connected yet. Connected without TLS, the bearer would
+  cross the network in cleartext. The proxy stays undeployable until increment 7.
 - **Holds without a final report.** A handed-off request keeps its hold until a final report
   arrives. A round that is never dispatched, is refused after its dispatch was spent, or whose
   response carries no usage keeps that hold indefinitely until increment 3.
@@ -239,9 +268,10 @@ exists.
 
 - `tests/schema/gateway_rounds.rs`: both functions under the provisioned role logins, with no
   binding, generation or policy row: each withdrawn authority, snapshot shapes, role and
-  isolation restrictions, concurrent dispatch, the CHECK and settlement.
+  isolation restrictions, concurrent dispatch, a reclaimed and a renewed run, a lease that
+  runs out during a lock wait, the CHECK and settlement.
 - `tests/schema/gateway.rs`: a bound request handed off at version 23 passes migration 29 and
   settles under its binding's principal, and is never given a dispatch.
 - `tests/schema/worker_leases.rs` and `tests/schema/quotas.rs`: the worker and the library hand
-  rounds off with their quota holds, and the worker sends the round's dispatch secret as its
-  bearer.
+  rounds off with their quota holds. A recording of every byte one worker process sends to
+  PostgreSQL holds the dispatch secret and the bearer's hash, and not the bearer.

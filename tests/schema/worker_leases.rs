@@ -994,26 +994,90 @@ mod live_turns {
     /// The fixed bearer of the library fixture's unmetered route.
     const UNMETERED_BEARER: &str = "synthetic-turn-credential";
 
-    /// The 32 bytes of a dispatch secret spelled as 43 unpadded base64url characters.
-    fn dispatch_secret(bearer: &str) -> Option<Vec<u8>> {
+    /// The 32 bytes of a round's bearer spelled as 43 unpadded base64url characters.
+    fn round_bearer(bearer: &str) -> Option<Vec<u8>> {
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         URL_SAFE_NO_PAD
             .decode(bearer)
             .ok()
-            .filter(|secret| bearer.len() == 43 && secret.len() == 32)
+            .filter(|bytes| bearer.len() == 43 && bytes.len() == 32)
     }
 
-    /// Whether `bearer` is the dispatch secret of gateway request `id`: the stand-in has no
-    /// database handle, so tests that hold one compare its hash with the stored one.
-    async fn is_dispatch_secret(db: &TestDb, id: &str, bearer: &str) -> bool {
+    /// Whether `bearer` is the bearer the handoff of gateway request `id` recorded, and is not
+    /// its dispatch secret: the stand-in has no database handle, so tests that hold one compare
+    /// hashes with the stored ones.
+    async fn is_round_bearer(db: &TestDb, id: &str, bearer: &str) -> bool {
         sqlx::query_scalar(
-            "SELECT dispatch_hash = sha256($2) FROM openmettle.gateway_requests WHERE id = $1::uuid",
+            "SELECT bearer_hash = sha256($2) AND dispatch_hash <> sha256($2)
+               FROM openmettle.gateway_requests WHERE id = $1::uuid",
         )
         .bind(id)
-        .bind(dispatch_secret(bearer).expect("a dispatch secret"))
+        .bind(round_bearer(bearer).expect("a round bearer"))
         .fetch_one(&mut connect(&db.0, OWNER).await)
         .await
         .unwrap()
+    }
+
+    /// Relays connections to the test PostgreSQL service and keeps, per connection, every byte
+    /// sent towards it.
+    struct RecordedPostgres {
+        address: std::net::SocketAddr,
+        sent: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl RecordedPostgres {
+        async fn start() -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let admin = pg::admin_options();
+            let server = format!("{}:{}", admin.get_host(), admin.get_port());
+            let sent = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+            let record = sent.clone();
+            tokio::spawn(async move {
+                while let Ok((client, _)) = listener.accept().await {
+                    let server = tokio::net::TcpStream::connect(&server).await.unwrap();
+                    // Without this, each exchange waits for a delayed acknowledgement.
+                    for socket in [&client, &server] {
+                        socket.set_nodelay(true).unwrap();
+                    }
+                    let record = record.clone();
+                    let connection = {
+                        let mut all = record.lock().unwrap();
+                        all.push(Vec::new());
+                        all.len() - 1
+                    };
+                    tokio::spawn(async move {
+                        let (mut from_client, mut to_client) = client.into_split();
+                        let (mut from_server, mut to_server) = server.into_split();
+                        let requests = async {
+                            let mut buffer = [0; 8192];
+                            while let Ok(n @ 1..) = from_client.read(&mut buffer).await {
+                                record.lock().unwrap()[connection].extend_from_slice(&buffer[..n]);
+                                if to_server.write_all(&buffer[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                            let _ = to_server.shutdown().await;
+                        };
+                        let replies = async {
+                            let _ = tokio::io::copy(&mut from_server, &mut to_client).await;
+                        };
+                        tokio::join!(requests, replies);
+                    });
+                }
+            });
+            Self { address, sent }
+        }
+
+        /// The address of `role` on `db` through this relay.
+        fn url(&self, db: &TestDb, role: &str) -> String {
+            let admin = pg::admin_options();
+            let direct = format!("@{}:{}/", admin.get_host(), admin.get_port());
+            let url = db.url(role);
+            assert!(url.contains(&direct));
+            url.replace(&direct, &format!("@{}/", self.address))
+        }
     }
 
     impl Provider {
@@ -1047,8 +1111,8 @@ mod live_turns {
             format!("{}/{prefix}", self.ip)
         }
         /// Every request must carry a bearer credential. A metered round, the one with an
-        /// `x-request-id`, carries its dispatch secret (ADR 0044), checked here for its
-        /// encoding only; an unmetered round carries the fixture's fixed bearer.
+        /// `x-request-id`, carries its own bearer (ADR 0044), checked here for its encoding
+        /// only; an unmetered round carries the fixture's fixed bearer.
         async fn on(host: &str, ip: IpAddr) -> Self {
             use http_body_util::{BodyExt, Full};
             use hyper::{Response, server::conn::http1, service::service_fn};
@@ -1091,8 +1155,8 @@ mod live_turns {
                                         .to_owned();
                                     match &request_id {
                                         Some(_) => assert!(
-                                            dispatch_secret(&bearer).is_some(),
-                                            "a metered round carries its dispatch secret"
+                                            round_bearer(&bearer).is_some(),
+                                            "a metered round carries its own bearer"
                                         ),
                                         None => assert_eq!(bearer, UNMETERED_BEARER),
                                     }
@@ -1281,6 +1345,8 @@ mod live_turns {
         stop_during_observation: bool,
         unmetered: bool,
         device_grant_id: Option<String>,
+        /// The worker's database address, when it is not the test service itself.
+        database: Option<String>,
     }
 
     impl Chat {
@@ -1315,6 +1381,7 @@ mod live_turns {
                 stop_during_observation: false,
                 unmetered: false,
                 device_grant_id: None,
+                database: None,
             }
         }
 
@@ -1608,7 +1675,9 @@ mod live_turns {
                 .spawn()
                 .unwrap();
             let input = child.stdin.as_mut().unwrap();
-            serde_json::to_writer(&mut *input,&json!({"database":self.f.db.url(WORKER),"catalog":self.catalog,
+            let database = self.database.clone();
+            let database = database.unwrap_or_else(|| self.f.db.url(WORKER));
+            serde_json::to_writer(&mut *input,&json!({"database":database,"catalog":self.catalog,
                 "tools":self.session.is_some(),"scope":self.f.scope,"actor":self.f.actor.user,"ca":String::from_utf8(provider.ca.pem()).unwrap(),"port":provider.port,
                 "artifacts":self.artifacts,"stop_during_observation":self.stop_during_observation,"metered":metered})).unwrap();
             writeln!(input).unwrap();
@@ -2462,6 +2531,71 @@ mod live_turns {
         }
     }
 
+    /// ADR 0044: the bearer of a metered round is made in the worker and only its SHA-256 goes
+    /// to PostgreSQL. Every byte this worker process sends to PostgreSQL is recorded on the
+    /// wire. The dispatch secret, the worker's proof to the database, is in the recording as 32
+    /// raw bytes, so a bearer sent the same way would be found too. The bearer is not there
+    /// raw, nor in the base64url spelling the gateway receives, nor in hexadecimal.
+    #[tokio::test]
+    #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
+    async fn the_round_bearer_never_crosses_the_workers_database_connection() {
+        use sha2::{Digest, Sha256};
+
+        let mut chat = Chat::new().await;
+        let relay = RecordedPostgres::start().await;
+        chat.database = Some(relay.url(&chat.f.db, WORKER));
+        let mut provider = Provider::new().await;
+        let (id, _) = chat.submit("bearer stays in the worker", "a", 2).await;
+        let _worker = chat.start(&provider).await;
+        let mut sent = provider.request().await;
+        let request_id = sent.request_id.take().expect("metered round x-request-id");
+        let spelled = sent.bearer.clone();
+        let bearer = round_bearer(&spelled).expect("a round bearer");
+        assert!(is_round_bearer(&chat.f.db, &request_id, &spelled).await);
+        sent.respond(completion(
+            json!("done"),
+            None,
+            json!({"prompt_tokens": 9, "completion_tokens": 3}),
+        ));
+        chat.done(&id, "succeeded", None).await;
+
+        let (dispatch_hash, bearer_hash): (Vec<u8>, Vec<u8>) = sqlx::query_as(
+            "SELECT dispatch_hash,bearer_hash FROM openmettle.gateway_requests WHERE id=$1::uuid",
+        )
+        .bind(&request_id)
+        .fetch_one(&mut connect(&chat.f.db.0, OWNER).await)
+        .await
+        .unwrap();
+        assert_eq!(bearer_hash, Sha256::digest(&bearer).as_slice());
+        let connections = relay.sent.lock().unwrap().clone();
+        let found = |needle: &[u8]| {
+            connections.iter().any(|bytes| {
+                bytes
+                    .windows(needle.len())
+                    .any(|window| window.eq_ignore_ascii_case(needle))
+            })
+        };
+        let hex: String = bearer.iter().map(|byte| format!("{byte:02x}")).collect();
+        for (spelling, bytes) in [
+            ("raw", bearer.as_slice()),
+            ("base64url", spelled.as_bytes()),
+            ("hexadecimal", hex.as_bytes()),
+        ] {
+            assert!(!found(bytes), "the {spelling} bearer reached PostgreSQL");
+        }
+        // The handoff statement went through the relay: it carried the hash of the bearer.
+        assert!(found(&bearer_hash));
+        // The test knows the dispatch secret by its hash only: look for it where a 32-byte
+        // binary statement parameter is, after its length.
+        let secret_sent = connections.iter().any(|bytes| {
+            bytes.windows(36).any(|window| {
+                window[..4] == [0, 0, 0, 32]
+                    && Sha256::digest(&window[4..]).as_slice() == dispatch_hash
+            })
+        });
+        assert!(secret_sent, "the recording holds the dispatch secret");
+    }
+
     /// ADR 0033 shutdown through the packaged binary (ADR 0043): SIGTERM during a sent metered
     /// round closes the gateway request, keeps answering probes while the run drains, hands the
     /// lease back and exits 0. A replacement reclaims without waiting for expiry and sends the
@@ -2478,7 +2612,7 @@ mod live_turns {
         assert_eq!(sent.path, "/v1/chat/completions");
         let sent_id = sent.request_id.take().expect("metered round x-request-id");
         let sent_bearer = sent.bearer.clone();
-        assert!(is_dispatch_secret(&chat.f.db, &sent_id, &sent_bearer).await);
+        assert!(is_round_bearer(&chat.f.db, &sent_id, &sent_bearer).await);
         // Hold the run row briefly (under the 2-second lock timeout) so the handoff waits
         // inside the drain while the probe runs.
         let mut holder = connect(&chat.f.db.0, OWNER).await;
@@ -2521,8 +2655,8 @@ mod live_turns {
         let _replacement = chat.start_packaged(&provider, &dir, &[]).await;
         let mut next = provider.request().await;
         let next_id = next.request_id.take().expect("metered round x-request-id");
-        // Each round has its own secret.
-        assert!(is_dispatch_secret(&chat.f.db, &next_id, &next.bearer).await);
+        // Each round has its own bearer.
+        assert!(is_round_bearer(&chat.f.db, &next_id, &next.bearer).await);
         assert_ne!(next.bearer, sent_bearer);
         next.respond(completion(
             json!("after handoff"),
@@ -4705,7 +4839,7 @@ mod live_turns {
             (provider, Process(child))
         };
 
-        // Round 1 reaches TLS provider with its dispatch secret as the bearer AND x-request-id
+        // Round 1 reaches TLS provider with its own bearer AND x-request-id
         // header; feed the peer-observed x-request-id directly into settlement::ingest (proving
         // real wire correlation).
         let req = provider.request().await;
@@ -4714,7 +4848,7 @@ mod live_turns {
             .clone()
             .expect("metered send must attach x-request-id header");
         let req_bearer = req.bearer.clone();
-        assert!(is_dispatch_secret(&db, &req_id, &req_bearer).await);
+        assert!(is_round_bearer(&db, &req_id, &req_bearer).await);
         let (child_cost, parent_rem): (i64, i64) = sqlx::query_as(
             "SELECT (SELECT reserved_units FROM openmettle.quota_reservations
                       WHERE gateway_request_id = $1::uuid AND resource_kind = 'usage_cost_micros'),
