@@ -383,7 +383,8 @@ pub(super) async fn record(
 
 /// The administration write protocol, in one transaction:
 /// 1. account administration and user lifecycle lock `account_admin_lock` before anything else;
-/// 2. the actor is re-hydrated from the primary and must be an active `account_admin`;
+/// 2. the actor's user row is locked `FOR SHARE`, then the actor is re-hydrated from the primary
+///    and must be an active `account_admin`;
 /// 3. the audit row is inserted first, so a reused request key is detected before any change;
 /// 4. `apply` checks the target and changes current state, or the whole transaction rolls back.
 async fn write(
@@ -400,6 +401,12 @@ async fn write(
                 .fetch_one(&mut *c)
                 .await?;
         }
+        // sessions::disable_user locks only the user row: hold the actor's row FOR SHARE so a
+        // disable in flight is waited for and seen, and a later one waits for this commit.
+        sqlx::query("SELECT FROM openmettle.users WHERE id = $1::uuid FOR SHARE")
+            .bind(ctx.actor_user_id)
+            .execute(&mut *c)
+            .await?;
         let actor = acting(c, ctx).await?;
         check(super::authorize_admin(
             &actor,

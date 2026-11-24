@@ -961,3 +961,239 @@ async fn account_admin_lock_serializes_removal_of_the_last_two_admins() {
         }
     }
 }
+
+async fn backend_pid(c: &mut PgConnection) -> i32 {
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(c)
+        .await
+        .unwrap()
+}
+
+/// The one session waiting on a lock that `holder` holds.
+async fn waiter_on(db: &TestDb, holder: i32) -> i32 {
+    wait_for_blocked_peer(db, holder).await;
+    sqlx::query_scalar(
+        "SELECT pid FROM pg_stat_activity
+          WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid))",
+    )
+    .bind(holder)
+    .fetch_one(&mut db.admin().await)
+    .await
+    .unwrap()
+}
+
+async fn reenable(owner: &mut PgConnection, account: &Account) {
+    sqlx::query("UPDATE openmettle.users SET disabled_at = NULL WHERE id = $1::uuid")
+        .bind(&account.user)
+        .execute(owner)
+        .await
+        .unwrap();
+}
+
+async fn session_generation(owner: &mut PgConnection, account: &Account) -> i64 {
+    sqlx::query_scalar("SELECT session_generation FROM openmettle.users WHERE id = $1::uuid")
+        .bind(&account.user)
+        .fetch_one(owner)
+        .await
+        .unwrap()
+}
+
+async fn group_name(owner: &mut PgConnection, group: &str) -> String {
+    sqlx::query_scalar("SELECT name FROM openmettle.local_groups WHERE id = $1::uuid")
+        .bind(group)
+        .fetch_one(owner)
+        .await
+        .unwrap()
+}
+
+/// `sessions::disable_user` locks only the user row, not `account_admin_lock`. A write that
+/// re-hydrates its actor while that disable is in flight waits for it and is then refused, both
+/// on a path that holds `account_admin_lock` and on one that does not.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn an_administrative_write_waits_for_a_disable_in_flight_and_is_refused() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let member = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &admin).await;
+    let group = applied(
+        store::create_local_group(&mut connect(&db.0, API).await, &ctx(&admin, "g"), "Before")
+            .await,
+    );
+    let audited = audit(&db).await.len();
+
+    for write in ["account_admin.grant", "local_group.rename"] {
+        // The statements of sessions::disable_user, held uncommitted.
+        let mut disabler = connect(&db.0, API).await;
+        let disabler_pid = backend_pid(&mut disabler).await;
+        let mut tx = WriteTransaction::begin(&mut disabler).await.unwrap();
+        for sql in [
+            "SELECT session_generation FROM openmettle.users WHERE id = $1::uuid FOR UPDATE",
+            "UPDATE openmettle.users SET disabled_at = GREATEST(created_at, clock_timestamp()),
+                 session_generation = session_generation + 1 WHERE id = $1::uuid",
+        ] {
+            sqlx::query(sql)
+                .bind(&admin.user)
+                .execute(tx.connection().unwrap())
+                .await
+                .unwrap();
+        }
+        let writer = tokio::spawn({
+            let (name, admin, member, group) =
+                (db.0.clone(), admin.clone(), member.clone(), group.clone());
+            async move {
+                let mut c = connect(&name, API).await;
+                let audit_ctx = ctx(&admin, write);
+                if write == "account_admin.grant" {
+                    store::grant_account_admin(&mut c, &audit_ctx, &member.user).await
+                } else {
+                    store::rename_local_group(&mut c, &audit_ctx, &group, "After").await
+                }
+            }
+        });
+        wait_for_blocked_peer(&db, disabler_pid).await;
+        tx.commit().await.unwrap();
+        assert_eq!(
+            denied(writer.await.unwrap()),
+            DenialReason::InactivePrincipal,
+            "{write}"
+        );
+        assert!(!principal(&db, &member).await.account_admin, "{write}");
+        assert_eq!(group_name(&mut owner, &group).await, "Before", "{write}");
+        assert_eq!(audit(&db).await.len(), audited, "{write}");
+        reenable(&mut owner, &admin).await;
+    }
+}
+
+/// The mirror ordering: a write that has decided waits for no disable. Either disable path
+/// waits for the write to commit, then disables the actor, advances the session generation and
+/// refuses the actor's next write.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn a_disable_waits_for_an_administrative_write_that_has_decided() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let boss = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let member = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &admin).await;
+    make_admin(&mut owner, &boss).await;
+    let group = applied(
+        store::create_local_group(&mut connect(&db.0, API).await, &ctx(&admin, "g"), "Before")
+            .await,
+    );
+    let policy = openmettle_core::sessions::Policy::new(
+        Duration::from_secs(60),
+        10,
+        Duration::from_secs(30),
+    )
+    .unwrap();
+
+    // (write, disable path): account_admin.grant holds account_admin_lock, which store's
+    // disable also takes, so it is raced with the session disable only.
+    for (round, (write, by_store)) in [
+        ("account_admin.grant", false),
+        ("local_group.rename", false),
+        ("local_group.rename", true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let generation = session_generation(&mut owner, &admin).await;
+        // The fixture holds the write's target, so the write stops after it has decided.
+        let mut fixture = connect(&db.0, OWNER).await;
+        let fixture_pid = backend_pid(&mut fixture).await;
+        fixture.execute("BEGIN").await.unwrap();
+        let (sql, target) = if write == "account_admin.grant" {
+            (
+                "SELECT FROM openmettle.users WHERE id = $1::uuid FOR UPDATE",
+                &member.user,
+            )
+        } else {
+            (
+                "SELECT FROM openmettle.local_groups WHERE id = $1::uuid FOR UPDATE",
+                &group,
+            )
+        };
+        sqlx::query(sql)
+            .bind(target)
+            .execute(&mut fixture)
+            .await
+            .unwrap();
+        let name = format!("After {round}");
+        let writer = tokio::spawn({
+            let (db_name, admin, member, group, name) = (
+                db.0.clone(),
+                admin.clone(),
+                member.clone(),
+                group.clone(),
+                name.clone(),
+            );
+            async move {
+                let mut c = connect(&db_name, API).await;
+                let key = format!("write-{round}");
+                let audit_ctx = ctx(&admin, &key);
+                if write == "account_admin.grant" {
+                    store::grant_account_admin(&mut c, &audit_ctx, &member.user).await
+                } else {
+                    store::rename_local_group(&mut c, &audit_ctx, &group, &name).await
+                }
+            }
+        });
+        let writer_pid = waiter_on(&db, fixture_pid).await;
+        let disabler = tokio::spawn({
+            let (db_name, admin, boss) = (db.0.clone(), admin.clone(), boss.clone());
+            async move {
+                let mut c = connect(&db_name, API).await;
+                if by_store {
+                    let key = format!("disable-{round}");
+                    store::disable_user(&mut c, &ctx(&boss, &key), &admin.user)
+                        .await
+                        .map(drop)
+                        .map_err(|e| format!("{e:?}"))
+                } else {
+                    openmettle_core::sessions::disable_user(
+                        &mut c,
+                        &admin.user,
+                        generation,
+                        &policy,
+                    )
+                    .await
+                    .map_err(|e| format!("{e:?}"))
+                }
+            }
+        });
+        wait_for_blocked_peer(&db, writer_pid).await;
+        fixture.execute("ROLLBACK").await.unwrap();
+        applied(writer.await.unwrap());
+        disabler.await.unwrap().unwrap();
+        assert_eq!(
+            session_generation(&mut owner, &admin).await,
+            generation + 1,
+            "{write}"
+        );
+        assert!(!hydrate(&db, API, &admin, NOW).await.unwrap().is_active());
+        if write == "account_admin.grant" {
+            assert!(principal(&db, &member).await.account_admin);
+        } else {
+            assert_eq!(group_name(&mut owner, &group).await, name);
+        }
+        let next = format!("next-{round}");
+        assert_eq!(
+            denied(
+                store::rename_local_group(
+                    &mut connect(&db.0, API).await,
+                    &ctx(&admin, &next),
+                    &group,
+                    "Refused",
+                )
+                .await
+            ),
+            DenialReason::InactivePrincipal
+        );
+        reenable(&mut owner, &admin).await;
+    }
+}
