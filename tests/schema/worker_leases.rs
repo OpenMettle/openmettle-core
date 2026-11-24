@@ -1037,10 +1037,6 @@ mod live_turns {
             tokio::spawn(async move {
                 while let Ok((client, _)) = listener.accept().await {
                     let server = tokio::net::TcpStream::connect(&server).await.unwrap();
-                    // Without this, each exchange waits for a delayed acknowledgement.
-                    for socket in [&client, &server] {
-                        socket.set_nodelay(true).unwrap();
-                    }
                     let record = record.clone();
                     let connection = {
                         let mut all = record.lock().unwrap();
@@ -2536,7 +2532,10 @@ mod live_turns {
     /// wire. The dispatch secret, the worker's proof to the database, is in the recording as 32
     /// raw bytes, so a bearer sent the same way would be found too. The bearer is not there
     /// raw, nor in the base64url spelling the gateway receives, nor in hexadecimal.
-    #[tokio::test]
+    ///
+    /// The forwarder runs on this test's runtime. On one thread the test took more than twice
+    /// as long, so the runtime has two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
     async fn the_round_bearer_never_crosses_the_workers_database_connection() {
         use sha2::{Digest, Sha256};
