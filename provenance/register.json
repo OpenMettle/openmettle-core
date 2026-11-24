@@ -1565,7 +1565,7 @@
       "review_group": "core",
       "distribution": "included",
       "version": "recorded 2026-11-23",
-      "pin": "Git tree 5a5f0a13f1611e29bb5ff2c88cdfc9abdbce2e0a (tests/fixtures/sglang-recorded, added in 583bcf55acd506ef367a55ceb826534ad376fdc1)",
+      "pin": "Git tree 0a8a88f4529525ee4f929a75353da4c19455eca8 (tests/fixtures/sglang-recorded); the recorded files are unchanged since 583bcf55acd506ef367a55ceb826534ad376fdc1 (tree 5a5f0a13f1611e29bb5ff2c88cdfc9abdbce2e0a), and only README.md gained its provenance section",
       "origin": "Recorded by the OpenMettle owner, as operator of their own SGLang deployment (a patched fork of sgl-project/sglang serving one model), with synthetic prompts written for the capture, and contributed to openmettle-core as test data",
       "source_evidence": [
         "tests/fixtures/sglang-recorded/README.md",
