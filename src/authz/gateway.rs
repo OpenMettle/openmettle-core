@@ -357,7 +357,7 @@ impl TurnPending {
                 },
             ));
         }
-        let dispatch = match self.authorize_in(&mut tx).await {
+        let dispatch = match self.authorize_in(&mut tx, prepared.cost_bound()).await {
             Ok(dispatch) => dispatch,
             Err(err) => {
                 let _ = tx.rollback().await;
@@ -462,24 +462,78 @@ impl TurnPending {
     /// to compare. The bearer itself is kept in the returned [`Dispatch`], is sent to the proxy
     /// over HTTP, and never crosses a database connection. The dispatch secret stays this
     /// caller's proof to the database and is never sent over HTTP.
-    async fn authorize_in(&self, tx: &mut WriteTransaction<'_>) -> Result<Dispatch, Error> {
+    async fn authorize_in(
+        &self,
+        tx: &mut WriteTransaction<'_>,
+        cost_bound: Option<crate::model_config::CostBound>,
+    ) -> Result<Dispatch, Error> {
         let mut bearer = [0; 32];
         SystemRandom::new()
             .fill(&mut bearer)
             .map_err(|_| Error::Protection)?;
+        let cost_args = match cost_bound {
+            Some(cb) => {
+                let fixed = i64::try_from(cb.fixed_micros).map_err(|_| Error::Refused)?;
+                let rate = i64::try_from(cb.micros_per_token).map_err(|_| Error::Refused)?;
+                if fixed == 0 && rate == 0 {
+                    return Err(Error::Refused);
+                }
+                Some((fixed, rate))
+            }
+            None => None,
+        };
+        let has_priced_handoff: bool = sqlx::query_scalar(
+            "SELECT to_regprocedure(
+                 'openmettle.gateway_handoff_round(uuid,bytea,uuid,bytea,bigint,bigint)'
+             ) IS NOT NULL",
+        )
+        .fetch_one(tx.connection()?)
+        .await?;
         // `id` is caller-visible; dispatch the database-canonical spelling so the wire
         // `x-request-id` always correlates with the stored request.
-        let id: String = sqlx::query_scalar(
-            "SELECT $1::uuid::text \
-              WHERE openmettle.gateway_handoff_round($1::uuid,$2,$3::uuid,$4)",
-        )
-        .bind(&self.id)
-        .bind(self.secret.as_slice())
-        .bind(&self.claim_token)
-        .bind(Sha256::digest(bearer).as_slice())
-        .fetch_optional(tx.connection()?)
-        .await?
-        .ok_or(Error::Refused)?;
+        let id: String = if has_priced_handoff {
+            sqlx::query_scalar(
+                "SELECT $1::uuid::text \
+                  WHERE openmettle.gateway_handoff_round($1::uuid,$2,$3::uuid,$4,$5,$6)",
+            )
+            .bind(&self.id)
+            .bind(self.secret.as_slice())
+            .bind(&self.claim_token)
+            .bind(Sha256::digest(bearer).as_slice())
+            .bind(cost_args.map(|(fixed, _)| fixed))
+            .bind(cost_args.map(|(_, rate)| rate))
+            .fetch_optional(tx.connection()?)
+            .await
+            .map_err(|err| {
+                if err
+                    .as_database_error()
+                    .is_some_and(|e| e.is_check_violation())
+                {
+                    Error::Refused
+                } else {
+                    Error::from(err)
+                }
+            })?
+            .ok_or(Error::Refused)?
+        } else {
+            // Pre-migration-0034 schemas cannot record profile prices on `gateway_requests`,
+            // so refuse any round that carries a bound `usage_cost_micros` hold rather than
+            // handing off an unsettleable hold.
+            if self.cost_bound_at_bind {
+                return Err(Error::Refused);
+            }
+            sqlx::query_scalar(
+                "SELECT $1::uuid::text \
+                  WHERE openmettle.gateway_handoff_round($1::uuid,$2,$3::uuid,$4)",
+            )
+            .bind(&self.id)
+            .bind(self.secret.as_slice())
+            .bind(&self.claim_token)
+            .bind(Sha256::digest(bearer).as_slice())
+            .fetch_optional(tx.connection()?)
+            .await?
+            .ok_or(Error::Refused)?
+        };
         let mut authorization = hyper::header::HeaderValue::try_from(format!(
             "Bearer {}",
             URL_SAFE_NO_PAD.encode(bearer)

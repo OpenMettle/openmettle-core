@@ -166,8 +166,43 @@ impl Fixture {
         reserved_only: bool,
         cost_micros: Option<u128>,
     ) -> String {
-        let (actor, scope) = (&self.actor, self.scope.as_str());
-        let chat = authz_runs::chat(&self.db, scope, "personal", actor).await;
+        self.request_with_pricing(
+            model,
+            reserved_only,
+            cost_micros.map(|c| openmettle_core::model_config::CostBound {
+                fixed_micros: u64::try_from(c).unwrap(),
+                micros_per_token: 0,
+            }),
+        )
+        .await
+    }
+
+    /// Like [`Self::request_for`], reserving a `usage_cost_micros` hold sized from an explicit
+    /// profile [`openmettle_core::model_config::CostBound`] (`fixed_micros + UNITS * micros_per_token`).
+    async fn request_with_pricing(
+        &self,
+        model: &str,
+        reserved_only: bool,
+        cost_bound: Option<openmettle_core::model_config::CostBound>,
+    ) -> String {
+        self.request_in_scope(&self.scope, "personal", model, reserved_only, cost_bound)
+            .await
+    }
+
+    /// Like [`Self::request_with_pricing`], admitted in an explicit `(scope, scope_kind)`.
+    async fn request_in_scope(
+        &self,
+        scope: &str,
+        scope_kind: &'static str,
+        model: &str,
+        reserved_only: bool,
+        cost_bound: Option<openmettle_core::model_config::CostBound>,
+    ) -> String {
+        let actor = &self.actor;
+        let cost_micros = cost_bound.map(|cb| {
+            u128::from(cb.fixed_micros) + u128::from(UNITS as u64) * u128::from(cb.micros_per_token)
+        });
+        let chat = authz_runs::chat(&self.db, scope, scope_kind, actor).await;
         let mut api = connect(&self.db.0, API).await;
         let (branch, message) = quotas::branch_and_message(&mut api, scope, &chat).await;
         let key = format!("proxy-{}", self.runs.fetch_add(1, Ordering::SeqCst));
@@ -205,7 +240,7 @@ impl Fixture {
             &mut tx,
             &RunBudgetReservation {
                 scope_id: scope,
-                scope_kind: "personal",
+                scope_kind,
                 actor_user_id: &actor.user,
                 actor_approval_id: &actor.approval,
                 run_id: &run,
@@ -243,8 +278,8 @@ impl Fixture {
         .await
         .unwrap();
         if !reserved_only {
-            let cost_route = cost_micros
-                .map(|c| TurnHandoffFixture::chat(INSTALL, model, UNITS, Some(c), false));
+            let cost_route = cost_bound
+                .map(|cb| TurnHandoffFixture::chat_priced(INSTALL, model, UNITS, cb, false));
             let route = match (&cost_route, model) {
                 (Some(r), _) => r,
                 (None, MODEL) => &self.route,
@@ -2905,9 +2940,10 @@ async fn the_database_refuses_a_final_settlement_that_leaves_the_hold_open() {
         assert_eq!(f.hold(&undispatched).await, held);
     }
 
-    // With a cost hold present: a report with usage leaves the cost hold open (issue #166) and
-    // commits, while a report with a reason must close the cost hold too — skipping the quota
-    // fold on the reason is refused at commit.
+    // With a cost hold present (migration 34 / issue #166): skipping the quota fold on either a
+    // complete usage report or an incomplete reason is refused at commit (23514); settling via
+    // `settlement::ingest` closes BOTH token and cost holds (deriving cost from the recorded
+    // profile price), while `settlement::ingest_incomplete` closes both at 0.
     let mut admin = f.db.admin().await;
     admin
         .execute(
@@ -2926,6 +2962,49 @@ async fn the_database_refuses_a_final_settlement_that_leaves_the_hold_open() {
     let costed = f.request_with_cost(MODEL, false, Some(250)).await;
     f.dispatch(&costed).await;
     let gateway = pool(&f.db, pg::GATEWAY);
+    // Direct SQL writing a complete report or an incomplete reason without folding is refused.
+    for (what, cols, vals, measured) in [
+        (
+            "complete",
+            ",prompt_tokens,completion_tokens",
+            ",7,5",
+            Some(12_i64),
+        ),
+        ("reason", ",incomplete", ",'incomplete'", None),
+    ] {
+        use sqlx::Connection;
+        let mut c = connect(&f.db.0, pg::GATEWAY).await;
+        let mut tx = c.begin().await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final{cols})
+             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),1,true{vals})"
+        )))
+        .bind(&costed)
+        .bind(INSTALL)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_settlements
+                 (request_id,revision,final,measured,outstanding)
+             VALUES ($1::uuid,1,true,$2,0)",
+        )
+        .bind(&costed)
+        .bind(measured)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let Err(sqlx::Error::Database(error)) = tx.commit().await else {
+            panic!("{what} left the cost hold open without running the quota fold");
+        };
+        assert_eq!(error.code().as_deref(), Some("23514"), "{what}");
+        assert_eq!(
+            f.hold_of(&costed, "usage_cost_micros").await,
+            ("handoff_committed".to_owned(), 250, "0".to_owned()),
+            "{what}"
+        );
+    }
     assert_eq!(
         settlement::ingest(&gateway, &f.report(&costed, 1, Some((7, 5)))).await,
         Ok(Outcome::Applied)
@@ -2936,46 +3015,21 @@ async fn the_database_refuses_a_final_settlement_that_leaves_the_hold_open() {
     );
     assert_eq!(
         f.hold_of(&costed, "usage_cost_micros").await,
-        ("handoff_committed".to_owned(), 250, "0".to_owned())
+        ("settled".to_owned(), 0, "250".to_owned())
     );
-    {
-        use sqlx::Connection;
-        let mut c = connect(&f.db.0, pg::GATEWAY).await;
-        let mut tx = c.begin().await.unwrap();
-        sqlx::query(
-            "INSERT INTO openmettle.gateway_usage_reports
-                 (request_id,source,report_id,revision,final,incomplete)
-             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),2,true,'incomplete')",
-        )
-        .bind(&costed)
-        .bind(INSTALL)
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE openmettle.gateway_settlements
-                SET revision=2,final=true,measured=NULL,outstanding=0
-              WHERE request_id=$1::uuid",
-        )
-        .bind(&costed)
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-        let Err(sqlx::Error::Database(error)) = tx.commit().await else {
-            panic!("a reason left the cost hold open without running the quota fold");
-        };
-        assert_eq!(error.code().as_deref(), Some("23514"));
-        assert_eq!(
-            f.hold_of(&costed, "usage_cost_micros").await,
-            ("handoff_committed".to_owned(), 250, "0".to_owned())
-        );
-    }
+    let costed_reason = f.request_with_cost(MODEL, false, Some(250)).await;
+    f.dispatch(&costed_reason).await;
     assert_eq!(
-        settlement::ingest_incomplete(&gateway, &f.report(&costed, 2, None), "incomplete").await,
+        settlement::ingest_incomplete(&gateway, &f.report(&costed_reason, 1, None), "incomplete")
+            .await,
         Ok(Outcome::Applied)
     );
     assert_eq!(
-        f.hold_of(&costed, "usage_cost_micros").await,
+        f.hold(&costed_reason).await,
+        ("settled".to_owned(), 0, "0".to_owned())
+    );
+    assert_eq!(
+        f.hold_of(&costed_reason, "usage_cost_micros").await,
         ("settled".to_owned(), 0, "0".to_owned())
     );
 
@@ -3071,7 +3125,8 @@ async fn the_worker_sweep_settles_metered_holds_and_late_proxy_reports_correct_u
 
     // 2. Dispatched request swept as `unreported` at revision 0, then superseded by a late
     //    complete proxy report at revision 1 with the SAME report_id = request_id: charges
-    //    actual tokens, updates gateway_settlements to revision 1, keeps cost hold settled at 0.
+    //    actual tokens, updates gateway_settlements to revision 1, and settles the cost hold
+    //    from the recorded profile price (fixed 250 micros).
     let late_usage = f.request_with_cost(MODEL, false, Some(250)).await;
     f.dispatch(&late_usage).await;
     let late_usage_run = f.run_of(&late_usage).await;
@@ -3138,7 +3193,7 @@ async fn the_worker_sweep_settles_metered_holds_and_late_proxy_reports_correct_u
     );
     assert_eq!(
         f.hold_of(&late_usage, "usage_cost_micros").await,
-        ("settled".to_owned(), 0, "0".to_owned())
+        ("settled".to_owned(), 0, "250".to_owned())
     );
     assert_eq!(
         f.transitions(&late_usage).await,
@@ -3519,7 +3574,7 @@ async fn a_direct_sql_correction_after_unreported_must_fold_its_holds() {
     );
     assert_eq!(
         f.hold_of(&id, "usage_cost_micros").await,
-        ("settled".to_owned(), 0, "0".to_owned())
+        ("settled".to_owned(), 0, "250".to_owned())
     );
     let revs: Vec<(String, Option<i64>)> = sqlx::query_as(
         "SELECT resource_kind, accepted_source_revision
@@ -3660,5 +3715,267 @@ async fn a_bare_or_partial_final_report_cannot_replace_unreported() {
         f.hold(&id).await,
         ("settled".to_owned(), 0, "19".to_owned())
     );
+    assert_eq!(f.drift().await, (0, 0, 0, 0));
+}
+
+/// Issue #166 (migration 34): binding-free rounds record `Profile.cost_bound` (`fixed_micros`
+/// and `micros_per_token`) on `gateway_requests` at handoff, and `quota_gateway_fold` derives
+/// `usage_cost_micros` settlement from the proxy's reported token counts and those recorded
+/// prices across personal, project and instance budgets. Incomplete/swept reports settle cost
+/// holds at 0 (never `fixed_micros`), late revision-1 complete reports supersede `unreported`
+/// and charge the derived cost, caller-supplied `cost`/`unit` is refused on unbound requests
+/// even for `openmettle_owner`, and skipping the cost fold on a complete report is refused at
+/// commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn cost_holds_settle_from_recorded_profile_prices_through_the_proxy() {
+    use openmettle_core::model_config::CostBound;
+    use sqlx::Connection;
+
+    let f = Fixture::new().await;
+    let mut admin = f.db.admin().await;
+    admin
+        .execute(
+            "UPDATE openmettle.quota_defaults SET cost_denomination='usd_micros', hard_limit=500000
+              WHERE scope_kind='instance' AND resource_kind='usage_cost_micros'",
+        )
+        .await
+        .unwrap();
+    admin
+        .execute(
+            "INSERT INTO openmettle.quota_defaults(scope_kind,resource_kind,hard_limit)
+             VALUES ('personal','usage_cost_micros',100000),
+                    ('project','usage_cost_micros',200000)",
+        )
+        .await
+        .unwrap();
+    let (_, project_scope) = run_admission::new_project(&f.db, &f.actor, "cost-proxy").await;
+    let pricing = CostBound {
+        fixed_micros: 50,
+        micros_per_token: 10,
+    };
+    let expected_hold = 50 + UNITS * 10; // 10_050
+
+    let h = Harness::launch(f, StandIn::start().await, &[]).await;
+
+    // 1. Complete 200 responses through the real proxy binary:
+    //    - `02-chat-plain` (personal scope): 17 + 2 = 19 tokens -> 19 * 10 + 50 = 240 micros.
+    //    - `04-chat-stream-reasoning` (project scope, reasoning_included=true): 67 + 37 = 104
+    //      tokens -> 104 * 10 + 50 = 1090 micros.
+    let plain_id = h
+        .fixture
+        .request_with_pricing(MODEL, false, Some(pricing))
+        .await;
+    let reasoning_id = h
+        .fixture
+        .request_in_scope(&project_scope, "project", MODEL, false, Some(pricing))
+        .await;
+    assert_eq!(
+        h.fixture.hold_of(&plain_id, "usage_cost_micros").await,
+        (
+            "handoff_committed".to_owned(),
+            expected_hold,
+            "0".to_owned()
+        )
+    );
+    assert_eq!(
+        h.fixture.hold_of(&reasoning_id, "usage_cost_micros").await,
+        (
+            "handoff_committed".to_owned(),
+            expected_hold,
+            "0".to_owned()
+        )
+    );
+    let plain_reply = h.send_case("02-chat-plain", &plain_id).await;
+    assert_eq!(plain_reply.status, 200);
+    let reasoning_reply = h.send_case("04-chat-stream-reasoning", &reasoning_id).await;
+    assert_eq!(reasoning_reply.status, 200);
+
+    // 2. Proxy incomplete report (`UPSTREAM_500` -> `upstream_status`) settles cost hold at 0
+    //    (NOT `fixed_micros = 50`) and releases all 10_050 held micros.
+    let err_id = h
+        .fixture
+        .request_with_pricing(MODEL, false, Some(pricing))
+        .await;
+    let err_reply = h.send_case(UPSTREAM_500, &err_id).await;
+    assert_eq!(err_reply.status, 500);
+
+    // Stop the proxy to drain all three report writes cleanly before reading DB state.
+    let (f, _upstream, events) = h.stop().await;
+    assert_eq!(
+        events,
+        [(
+            "gateway.usage.unrecorded".to_owned(),
+            err_id.clone(),
+            "upstream_status".to_owned(),
+        )]
+    );
+
+    assert_eq!(
+        f.hold(&plain_id).await,
+        ("settled".to_owned(), 0, "19".to_owned())
+    );
+    assert_eq!(
+        f.hold_of(&plain_id, "usage_cost_micros").await,
+        ("settled".to_owned(), 0, "240".to_owned())
+    );
+    assert_eq!(
+        f.hold(&reasoning_id).await,
+        ("settled".to_owned(), 0, "104".to_owned())
+    );
+    assert_eq!(
+        f.hold_of(&reasoning_id, "usage_cost_micros").await,
+        ("settled".to_owned(), 0, "1090".to_owned())
+    );
+    assert_eq!(
+        f.hold(&err_id).await,
+        ("settled".to_owned(), 0, "0".to_owned())
+    );
+    assert_eq!(
+        f.hold_of(&err_id, "usage_cost_micros").await,
+        ("settled".to_owned(), 0, "0".to_owned())
+    );
+
+    // Verify all three cost budget tiers (personal, project, instance) match exact charges and
+    // zero remaining reserved_held.
+    let budget_of = |scope_id: Option<&str>| {
+        let owner = f.owner.clone();
+        let scope_id = scope_id.map(str::to_owned);
+        async move {
+            sqlx::query_as::<_, (i64, i64)>(
+                "SELECT active_used::bigint, reserved_held::bigint
+                   FROM openmettle.quota_budgets
+                  WHERE scope_id IS NOT DISTINCT FROM $1::uuid
+                    AND resource_kind = 'usage_cost_micros'",
+            )
+            .bind(scope_id)
+            .fetch_one(&owner)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(budget_of(Some(&f.scope)).await, (240 + 1090, 0));
+    assert_eq!(budget_of(Some(&project_scope)).await, (1090, 0));
+    assert_eq!(budget_of(None).await, (240 + 1090, 0));
+    assert_eq!(f.drift().await, (0, 0, 0, 0));
+
+    // 3. Worker sweep (`not_dispatched` and `unreported`) settles cost hold at 0 (NOT 50), and
+    //    a late rev-1 complete report superseding `unreported` charges 240 micros cleanly.
+    let mut pass = budgets::Pass::default();
+    let undisp = f.request_with_pricing(MODEL, false, Some(pricing)).await;
+    let undisp_run = f.run_of(&undisp).await;
+    sqlx::query("UPDATE openmettle.runs SET state='failed' WHERE id=$1::uuid")
+        .bind(&undisp_run)
+        .execute(&f.owner)
+        .await
+        .unwrap();
+    let unrep = f.request_with_pricing(MODEL, false, Some(pricing)).await;
+    f.dispatch(&unrep).await;
+    let unrep_run = f.run_of(&unrep).await;
+    sqlx::query(
+        "UPDATE openmettle.runs
+            SET state='failed',
+                lease_expires_at=clock_timestamp()-interval '16 minutes',
+                execution_expires_at=clock_timestamp()-interval '16 minutes'
+          WHERE id=$1::uuid",
+    )
+    .bind(&unrep_run)
+    .execute(&f.owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        budgets::sweep_unreported_gateway_requests(&f.worker, &mut pass, 100)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        f.hold_of(&undisp, "usage_cost_micros").await,
+        ("settled".to_owned(), 0, "0".to_owned())
+    );
+    assert_eq!(
+        f.hold_of(&unrep, "usage_cost_micros").await,
+        ("settled".to_owned(), 0, "0".to_owned())
+    );
+    let gateway = pool(&f.db, pg::GATEWAY);
+    assert_eq!(
+        settlement::ingest(&gateway, &f.report(&unrep, 1, Some((17, 2)))).await,
+        Ok(Outcome::Applied)
+    );
+    assert_eq!(
+        f.hold_of(&unrep, "usage_cost_micros").await,
+        ("settled".to_owned(), 0, "240".to_owned())
+    );
+    assert_eq!(budget_of(Some(&f.scope)).await, (240 + 1090 + 240, 0));
+    assert_eq!(budget_of(None).await, (240 + 1090 + 240, 0));
+
+    // 4. Caller-supplied `cost`/`unit` is refused on unbound requests through settlement::ingest,
+    //    direct openmettle_gateway SQL, and even direct openmettle_owner SQL (23514). Direct SQL
+    //    omitting the quota fold on a complete report is refused at commit (23514).
+    let direct_id = f.request_with_pricing(MODEL, false, Some(pricing)).await;
+    f.dispatch(&direct_id).await;
+    let mut bad_report = f.report(&direct_id, 1, Some((17, 2)));
+    bad_report.cost = Some("1".into());
+    bad_report.unit = Some("usd_micros".into());
+    assert_eq!(
+        settlement::ingest(&gateway, &bad_report).await,
+        Err(StoreError::Refused)
+    );
+    for role in [pg::GATEWAY, OWNER] {
+        let mut c = connect(&f.db.0, role).await;
+        let err = sqlx::query(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens,cost,unit)
+             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),1,true,17,2,1,'usd_micros')",
+        )
+        .bind(&direct_id)
+        .bind(INSTALL)
+        .execute(&mut c)
+        .await;
+        assert_eq!(
+            sqlstate(err),
+            "23514",
+            "role {role} supplied cost on unbound"
+        );
+    }
+    // Direct SQL writing a complete report + settlement WITHOUT running quota_settle_gateway_usage
+    // is refused at commit by enforce_gateway_final_settlement_closes().
+    {
+        let mut c = connect(&f.db.0, pg::GATEWAY).await;
+        let mut tx = c.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens)
+             VALUES ($1::uuid,$2::uuid,gen_random_uuid(),1,true,17,2)",
+        )
+        .bind(&direct_id)
+        .bind(INSTALL)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_settlements
+                 (request_id,revision,final,measured,outstanding)
+             VALUES ($1::uuid,1,true,19,0)",
+        )
+        .bind(&direct_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let Err(sqlx::Error::Database(error)) = tx.commit().await else {
+            panic!("complete report committed without folding its cost and token holds");
+        };
+        assert_eq!(error.code().as_deref(), Some("23514"));
+    }
+    // Now settle `direct_id` properly through `settlement::ingest` and confirm zero drift.
+    assert_eq!(
+        settlement::ingest(&gateway, &f.report(&direct_id, 1, Some((17, 2)))).await,
+        Ok(Outcome::Applied)
+    );
+    assert_eq!(
+        f.hold_of(&direct_id, "usage_cost_micros").await,
+        ("settled".to_owned(), 0, "240".to_owned())
+    );
+    assert_eq!(budget_of(Some(&f.scope)).await, (240 + 1090 + 240 + 240, 0));
     assert_eq!(f.drift().await, (0, 0, 0, 0));
 }

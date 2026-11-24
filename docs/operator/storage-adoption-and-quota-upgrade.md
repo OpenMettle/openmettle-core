@@ -150,6 +150,14 @@ Migration `0033` ([ADR 0036](../adr/0036-conversation-branches-presets-and-effec
 - API and worker binaries of the previous release (`0032`) continue working unchanged on schema `0033`: pre-existing and older-writer rows leave `stop_reason` null.
 - Adding the CHECK validates `openmettle.message_turns` once under `ACCESS EXCLUSIVE` without rewriting the table.
 
+## Upgrade from 0033 to 0034 (gateway request cost settlement)
+
+Migration `0034` ([ADR 0044](../adr/0044-own-inference-proxy-and-binding-free-dispatch.md), issue `#166`) needs no activation step and no backfill. It records immutable `Profile.cost_bound` pricing (`cost_fixed_micros`, `cost_micros_per_token`) on `openmettle.gateway_requests` at binding-free round handoff, derives `usage_cost_micros` settlement inside `openmettle.quota_gateway_fold` from reported token counts and those recorded prices, forbids caller-supplied `cost`/`unit` on unbound usage reports (`gateway_usage_reports_bound_cost_guard`), and removes migration `0031`'s open-cost-hold carve-out from `openmettle.enforce_gateway_final_settlement_closes`.
+
+- **Upgrade preflight:** Inside an autocommit-safe `DO` block acquiring `ACCESS EXCLUSIVE` on `gateway_requests` and `gateway_usage_reports` and `SHARE` on `gateway_settlements` and `quota_reservations`, migration `0034` fails closed (`SQLSTATE 23514`) if any unbound request (`binding_id IS NULL`) still has an unsettled `usage_cost_micros` hold (`state IN ('held', 'handoff_committed')`), because pre-`0034` rows carry no recorded pricing. Already-settled and released historical rows are preserved intact, and bound ADR 0037 rows are unaffected.
+- **Rollout order:** Apply migration `0034` with `openmettle-migrate` before rolling workers of this release onto cost-metered deployments. A worker of this release on schema `0033` fails closed when handing off a round with a bound `usage_cost_micros` hold while continuing to serve token-only rounds; an older (`0033`) worker calling the 4-arg `gateway_handoff_round` on schema `0034` continues serving token-only rounds and fails closed (`OMQ04`) on cost-metered rounds until rolled to `0034`.
+- **Proxy configuration:** `openmettle-gateway` requires no catalog file or new environment variable; it continues reporting token counts with `cost = NULL, unit = NULL`, and PostgreSQL settles both `usage_tokens` and `usage_cost_micros` holds atomically.
+
 ## Monitor overdue handoffs
 
 The worker records up to 100 overdue committed handoffs per maintenance sweep in `openmettle_quota_overdue_handoffs_total`. The counter measures observations across sweeps. An outstanding handoff can contribute more than once. Use the database ledger to identify the holds. The observation leaves quota charges intact.

@@ -191,6 +191,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "message turn stop reason",
         sql: include_str!("../migrations/0033_message_turn_stop_reason.sql"),
     },
+    Source {
+        version: 34,
+        description: "gateway request cost settlement",
+        sql: include_str!("../migrations/0034_gateway_request_cost_settlement.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

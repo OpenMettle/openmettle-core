@@ -234,6 +234,10 @@ impl<'a> PreparedRequest<'a> {
         self.round_cost
     }
 
+    pub(crate) fn cost_bound(&self) -> Option<crate::model_config::CostBound> {
+        self.profile.cost_bound
+    }
+
     pub(crate) fn requires_device_slot(&self) -> bool {
         self.requires_device_slot
     }

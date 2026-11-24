@@ -94,7 +94,7 @@ policy is provisioned for it.
 | `incomplete` | Empty for a report with usage. Otherwise the reason the request has none, from the table under [When there is no usage](#when-there-is-no-usage) |
 | `reasoning_tokens` | Top-level `reasoning_tokens` or `completion_tokens_details.reasoning_tokens`, which must agree when both are present and cannot exceed `completion_tokens` |
 | `reasoning_included` | `true` whenever reasoning tokens are recorded, because SGLang counts them inside `completion_tokens` (recorded 23 Nov 2026). Settlement then measures `prompt + max(completion, reasoning)` |
-| `cost`, `unit` | Not recorded |
+| `cost`, `unit` | Not recorded (refused on unbound requests); `usage_cost_micros` holds settle inside PostgreSQL from the reported token counts and the `Profile.cost_bound` (`cost_fixed_micros`, `cost_micros_per_token`) the worker recorded on `gateway_requests` at handoff (migration 34) |
 
 A valid usage object is a JSON object inside a JSON object, with non-negative integer counts
 that fit a `bigint`, no duplicate keys, and a `completion_tokens_details` that is `null` or an
@@ -223,10 +223,6 @@ on a connection that stopped answering: the pool waits for every connection when
   of the proxy and give the worker an `https://` route; see
   [plain HTTP inside the cluster](worker-turn-execution.md#plain-http-inside-the-cluster).
   The default bind is loopback.
-- **Cost holds never settle.** The proxy reports no cost, and the cost fold needs one, so a
-  cost hold stays in place even after a report with usage
-  ([issue 166](https://github.com/OpenMettle/openmettle-core/issues/166)). A report without
-  usage (from the proxy or the worker sweep) closes it.
 - **A broad database role.** `openmettle_gateway` still has the grants the superseded
   reconciler needed. Increment 6 narrows it to what the proxy uses.
 - **No family policy.** Quiet and study hours are enforced nowhere until increment 4.

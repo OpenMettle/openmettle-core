@@ -20,6 +20,10 @@
 -- Version 33 adds `message_turns.stop_reason` for assistant turns stopped at their output token
 -- limit, readable by `openmettle_api` and insertable by `openmettle_worker` (ADR 0038 / ADR 0044,
 -- increment 3c).
+-- Version 34 adds `gateway_requests.cost_fixed_micros` and `gateway_requests.cost_micros_per_token`
+-- (no table or column grant), adds the 6-arg `gateway_handoff_round` overload (worker only) and
+-- the unbound caller-cost trigger (no role may call), and replaces handoff/fold/drift/settlement
+-- functions with unchanged signatures, security and privileges (ADR 0044, issue #166).
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -208,6 +212,9 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.enforce_gateway_report_sweep_only()',false,ARRAY[]::text[]),
         ('openmettle.gateway_unreported_candidates(timestamptz,uuid,timestamptz,uuid,integer)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.gateway_close_unreported(uuid)',true,ARRAY['openmettle_worker']::text[])) AS f WHERE $1 >= 32
+    UNION ALL SELECT * FROM (VALUES
+        ('openmettle.enforce_gateway_report_bound_cost()',true,ARRAY[]::text[]),
+        ('openmettle.gateway_handoff_round(uuid,bytea,uuid,bytea,bigint,bigint)',true,ARRAY['openmettle_worker']::text[])) AS f WHERE $1 >= 34
 ),
 gateway_functions (signature,definer,inference) AS (
     SELECT * FROM (VALUES ('openmettle.gateway_allocate()',true,false), ('openmettle.gateway_run_hold()',true,false),

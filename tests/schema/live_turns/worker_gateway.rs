@@ -592,3 +592,242 @@ async fn an_unreachable_gateway_fails_the_turn_and_the_sweep_closes_its_hold() {
     assert!(status.success(), "{stderr}");
     assert!(!stderr.contains("worker.sweep.failed"), "{stderr}");
 }
+
+/// Issue #166 (migration 34): end-to-end cost-metered turn through the packaged
+/// `openmettle-worker` and `openmettle-gateway` binaries. Admission holds a 2-round
+/// `usage_cost_micros` + `usage_tokens` parent budget, the worker hands off Round 1 recording
+/// `Profile.cost_bound = { fixed_micros: 50, micros_per_token: 10 }` on `gateway_requests`, the
+/// proxy settles `02-chat-plain` (`17 + 2 = 19` tokens -> `19 * 10 + 50 = 240` micros), and
+/// terminal parent unwind releases the unused Round 2 holds leaving exact token and cost
+/// `active_used`, `reserved_held = 0`, and zero accounting drift.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 and TEST_GATEWAY_HOST"]
+async fn a_cost_metered_turn_settles_through_the_gateway_with_recorded_prices() {
+    use openmettle_core::quotas::{self as budgets, RunBudgetReservation};
+
+    let mut chat = Chat::new().await;
+    let mut admin = chat.f.db.admin().await;
+    admin
+        .execute(
+            "UPDATE openmettle.quota_defaults SET cost_denomination='usd_micros'
+              WHERE scope_kind='instance' AND resource_kind='usage_cost_micros'",
+        )
+        .await
+        .unwrap();
+    admin
+        .execute(
+            "INSERT INTO openmettle.quota_defaults(scope_kind,resource_kind,hard_limit)
+             VALUES ('personal','usage_cost_micros',1000000)",
+        )
+        .await
+        .unwrap();
+
+    let mut profile = chat.catalog["models"]["a"].clone();
+    profile["pin"]["revision"] = json!("recorded/cost-1");
+    profile["replay"] = json!([]);
+    profile["cost_bound"] = json!({"fixed_micros": 50, "micros_per_token": 10});
+    chat.catalog["models"][MODEL] = profile;
+
+    // Admit a 2-round run with explicit admission-time token and cost parent holds.
+    let f = &chat.f;
+    let conv = Conversation {
+        scope: &f.scope,
+        id: &chat.root.conversation_id,
+    };
+    let branch = &chat.root.branch_id;
+    let mut api_c = api(&f.db).await;
+    let head: Option<String> = sqlx::query_scalar(
+        "SELECT head_message_id::text FROM openmettle.branch_heads WHERE branch_id=$1::uuid",
+    )
+    .bind(branch)
+    .fetch_one(&mut api_c)
+    .await
+    .unwrap();
+    let input: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(&mut api_c)
+        .await
+        .unwrap();
+    let selection: Selection = serde_json::from_value(
+        json!({"model": MODEL, "layer": {"controls": {"output_reserve": 256}}}),
+    )
+    .unwrap();
+    let parts = [Part::Text("cost metered turn".into())];
+    let op = Operation::Append(UserInput {
+        id: &input,
+        parts: &parts,
+    });
+    let intent = Intent {
+        source_branch_id: branch,
+        expected_head_message_id: head.as_deref(),
+        operation: op,
+        selection: &selection,
+        requested_rounds: Some(2),
+    };
+    let catalog = Catalog::load(&serde_json::to_vec(&chat.catalog).unwrap()).unwrap();
+    let effective = catalog
+        .resolve(&Selection::default(), &selection, None, |_, _| true)
+        .unwrap();
+    let round_tokens = i64::try_from(effective.ceiling.value.unwrap()).unwrap();
+    let per_round_cost = catalog.round_cost_ceiling(&effective).unwrap();
+    assert_eq!(
+        per_round_cost,
+        Some(50 + u128::try_from(round_tokens).unwrap() * 10)
+    );
+    let config = ConfigSnapshot {
+        effective,
+        required_capabilities: catalog.model(MODEL).unwrap().required_capabilities.clone(),
+        policy_revision: "openmettle.authz/1".into(),
+    };
+    let actor = principal(&f.db, &f.actor).await;
+    let mut tx = WriteTransaction::begin(&mut api_c).await.unwrap();
+    branches::prepare_turn(
+        &mut tx,
+        &ctx(&f.actor, "cost-turn"),
+        conv,
+        branch,
+        head.as_deref(),
+        op,
+    )
+    .await
+    .unwrap();
+    let history = branches::history(tx.connection().unwrap(), &actor, conv, branch, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    let pins = Snapshots::encode(&intent, &history, &catalog, &config).unwrap();
+    let capabilities: Vec<_> = config
+        .required_capabilities
+        .iter()
+        .map(|(name, gate)| queue::CapabilityUse { name, gate: *gate })
+        .collect();
+    let admission = queue::RunAdmission {
+        input: RunInput {
+            scope: &f.scope,
+            actor: &f.actor.user,
+            conversation: conv.id,
+            branch,
+            message: &input,
+            key: "cost-turn",
+            format: SNAPSHOT_FORMAT,
+            version: SNAPSHOT_VERSION,
+            input: &pins.input,
+            config: &pins.config,
+        },
+        actor_approval_id: &f.actor.approval,
+        capabilities: &capabilities,
+        requested_rounds: Some(2),
+        now_ms: NOW,
+        cost_qualified: Some(true),
+    };
+    let limits = queue::AdmissionLimits {
+        live_per_actor: 4,
+        live_per_scope: 4,
+        queued_in_instance: 4,
+        round_cap: 4,
+        queue_timeout: Duration::from_secs(60),
+    };
+    let queue::Admission::Admitted { run_id: run, .. } =
+        queue::admit_run(&mut tx, &admission, &limits)
+            .await
+            .unwrap()
+    else {
+        panic!("expected admission");
+    };
+    let refused = budgets::reserve_admitted_run_budget(
+        &mut tx,
+        &RunBudgetReservation {
+            scope_id: &f.scope,
+            scope_kind: "personal",
+            actor_user_id: &f.actor.user,
+            actor_approval_id: &f.actor.approval,
+            run_id: &run,
+            token_units: round_tokens * 2,
+            per_round_cost_micros: per_round_cost,
+            round_limit: 2,
+            requires_device_slot: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(refused.is_none(), "{refused:?}");
+    tx.commit().await.unwrap();
+
+    let upstream = StandIn::answering("02-chat-plain").await;
+    let (host, ip) = gateway_host();
+    let port = free_port(ip);
+    let bind = SocketAddr::new(ip, port).to_string();
+    let (gateway, logs) = launch_gateway(&chat.f.db, &bind, &upstream, MODEL, &[]);
+    let dir = Dir::new();
+    let packaged = start_worker(
+        &chat,
+        &dir,
+        Transport::Plain,
+        (&host, ip, port),
+        None,
+        false,
+    );
+
+    chat.done(&run, "succeeded", None).await;
+    assert_eq!(stop_gateway(gateway, logs).await, []);
+
+    let (id, state, dispatched, bound) = round(&chat, &run).await;
+    assert_eq!(
+        (state.as_str(), dispatched, bound),
+        ("handed_off", true, false)
+    );
+    assert_eq!(
+        hold(&chat, &id).await,
+        ("settled".to_owned(), 0, "19".to_owned())
+    );
+    let mut owner = connect(&chat.f.db.0, OWNER).await;
+    let recorded_pricing: (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT cost_fixed_micros, cost_micros_per_token
+           FROM openmettle.gateway_requests
+          WHERE id = $1::uuid",
+    )
+    .bind(&id)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(recorded_pricing, (Some(50), Some(10)));
+    let cost_hold: (String, i64, String) = sqlx::query_as(
+        "SELECT state, held_units, settled_units::text FROM openmettle.quota_reservations
+          WHERE gateway_request_id = $1::uuid AND resource_kind = 'usage_cost_micros'",
+    )
+    .bind(&id)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(cost_hold, ("settled".to_owned(), 0, "240".to_owned()));
+
+    let budgets: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT resource_kind, active_used::bigint, reserved_held::bigint
+           FROM openmettle.quota_budgets
+          WHERE scope_id = $1::uuid
+          ORDER BY resource_kind",
+    )
+    .bind(&chat.f.scope)
+    .fetch_all(&mut owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        budgets,
+        vec![
+            ("usage_cost_micros".to_owned(), 240, 0),
+            ("usage_tokens".to_owned(), 19, 0),
+        ]
+    );
+
+    let drift: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT storage_mismatches, budget_mismatches, settlement_mismatches,
+                pending_gateway_reconciliations
+           FROM openmettle.quota_verify_accounting_drift()",
+    )
+    .fetch_one(&mut self::worker(&chat.f.db).await)
+    .await
+    .unwrap();
+    assert_eq!(drift, (0, 0, 0, 0));
+
+    let (status, stderr) = terminate(packaged.process).await;
+    assert!(status.success(), "{stderr}");
+}
