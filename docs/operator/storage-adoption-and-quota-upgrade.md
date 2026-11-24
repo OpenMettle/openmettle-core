@@ -109,11 +109,12 @@ SELECT j.journal_seq, j.entity_id
 
 ## Upgrade from 0028 to 0029 (gateway dispatch)
 
-Migration `0029` ([ADR 0044](../adr/0044-own-inference-proxy-and-binding-free-dispatch.md)) needs no activation step and no backfill. It adds `gateway_requests.dispatched_at`, replaces the unnamed handoff CHECK on that table with `gateway_requests_handoff_check` and adds two functions. Existing rows satisfy the new CHECK.
+Migration `0029` ([ADR 0044](../adr/0044-own-inference-proxy-and-binding-free-dispatch.md)) needs no activation step and no backfill. It adds `gateway_requests.dispatched_at`, replaces the unnamed handoff CHECK on that table with `gateway_requests_handoff_check` and adds four functions. Existing rows satisfy the new CHECK.
 
 - Apply it with `openmettle-migrate` before rolling workers. A worker of this release on schema `0028` fails every metered round, because `openmettle.gateway_handoff_round` does not exist yet.
 - A worker of the previous release keeps calling `openmettle.gateway_handoff`, which still needs a gateway binding that no deployment can create. Its metered rounds fail as they did before the upgrade.
-- The migration finds the old CHECK by the columns it constrains and stops with `expected one gateway_requests handoff CHECK` if it finds none or several. That means the table was altered outside the migrations; inspect its constraints before retrying.
+- **Do not enable metered workers on schema `0029` against the increment 1 gateway proxy.** That proxy looks a request up through its gateway binding, so it cannot route a round handed off without one: it answers `404 not_found` after the handoff committed, and the round's hold then stays until increment 3 reconciles it. Wait for the proxy of increment 2b.
+- The migration finds the old CHECK by the columns it constrains and stops if it finds none or several. `openmettle-migrate` then prints `migration 29 failed (SQLSTATE P0001)`. The PostgreSQL server log carries the exception text, `expected one gateway_requests handoff CHECK, found N`. That means the table was altered outside the migrations; inspect its constraints before retrying.
 
 ## Monitor overdue handoffs
 

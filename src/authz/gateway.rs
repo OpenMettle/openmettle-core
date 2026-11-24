@@ -394,18 +394,47 @@ impl TurnPending {
                 },
             ));
         }
+        // A deferred `OMQ04` means a hold the round needs is missing. It is retryable when
+        // enforcement or the first cost limit activated after the round was reserved.
+        let missing_hold = || {
+            let retryable = (!self.enforced_at_bind
+                || (!self.cost_bound_at_bind && self.round_cost.is_some()))
+                && (!self.requires_device_slot || device_grant_id.is_some());
+            if retryable {
+                TurnHandoffError::MissingHold
+            } else {
+                TurnHandoffError::Other(Error::Refused)
+            }
+        };
+        // The last statement: it runs the deferred handoff checks, which can wait on quota
+        // locks, and then reads the authority again on a new clock reading. Nothing that can
+        // wait on a lock follows it, so no approval, lease or membership observation that
+        // lapsed during a wait is committed (`openmettle.gateway_handoff_round_confirm`).
+        let confirmed =
+            sqlx::query("SELECT openmettle.gateway_handoff_round_confirm($1::uuid,$2,$3::uuid)")
+                .bind(&pending.id)
+                .bind(pending.secret.as_slice())
+                .bind(&self.claim_token)
+                .execute(
+                    tx.connection()
+                        .map_err(|err| TurnHandoffError::Other(Error::from(err)))?,
+                )
+                .await;
+        if let Err(err) = confirmed {
+            let _ = tx.rollback().await;
+            return Err(
+                match err.as_database_error().and_then(|e| e.code()).as_deref() {
+                    Some("OMQ04") => missing_hold(),
+                    Some("42501") => TurnHandoffError::Other(Error::Refused),
+                    _ => TurnHandoffError::Other(Error::from(err)),
+                },
+            );
+        }
         if let Err(err) = tx.commit().await {
             if let crate::runs::Error::Database(ref db) = err
                 && db.as_database_error().and_then(|e| e.code()).as_deref() == Some("OMQ04")
             {
-                let retryable_missing_hold = (!self.enforced_at_bind
-                    || (!self.cost_bound_at_bind && self.round_cost.is_some()))
-                    && (!self.requires_device_slot || device_grant_id.is_some());
-                return Err(if retryable_missing_hold {
-                    TurnHandoffError::MissingHold
-                } else {
-                    TurnHandoffError::Other(Error::Refused)
-                });
+                return Err(missing_hold());
             }
             let mut recovery = WriteTransaction::begin_bounded_pool(pool, false)
                 .await
@@ -425,7 +454,8 @@ impl TurnPending {
 
     /// Recheck the round's authorization without a gateway binding and mark it handed off
     /// (`openmettle.gateway_handoff_round`, ADR 0044). The bearer is the round's dispatch secret,
-    /// which only this handle holds and the proxy accepts once.
+    /// which only this handle holds and the proxy accepts once. The transaction must end with
+    /// `openmettle.gateway_handoff_round_confirm`.
     async fn authorize_in(&self, tx: &mut WriteTransaction<'_>) -> Result<Dispatch, Error> {
         // `id` is caller-visible; dispatch the database-canonical spelling so the wire
         // `x-request-id` always correlates with the stored request.
