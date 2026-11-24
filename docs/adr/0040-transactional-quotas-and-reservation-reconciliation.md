@@ -4534,9 +4534,14 @@ the run is an operator precondition.
   files unchanged, and reopens, locks and revalidates each file before acting on it.
 - Every name of a reservation is validated against its lifecycle state, with the layouts the
   drift check accepts. Results are per reservation. A reservation that verifies is rebound and
-  committed. One that does not is left untouched and reported with its reason; a file that
-  cannot be opened is such a failure, not a refusal of the run. Rebind writes no accounting row.
-- Before the commit, every file whose inode is recorded and the root, `staging/` and
+  committed. One that does not is left untouched and reported with its reason; an open error
+  that concerns one file (a wrong mode, an I/O error) is such a failure, not a refusal of the
+  run, while lock contention, an identity change and descriptor exhaustion refuse the run.
+  Rebind writes no accounting row.
+- A reservation that never recorded an inode is validated too and never bound. One with bytes
+  under its staging name is reported as a warning that does not keep the barrier: the
+  reconciler quarantines it when it expires, as on a running system.
+- Before the commit, every accepted file, whatever its inode number, and the root, `staging/` and
   `revisions/` directories are synced.
 - **Rebind never releases the barrier on a volume with a file mismatch.** Its last step,
   inside the same transaction, is the verification that `openmettle-admin quota verify ROOT`
@@ -4550,9 +4555,14 @@ the run is an operator precondition.
   quarantined reservation ids, leaves them unchanged and exits 0 if nothing else failed.
 - A refused run (wrong login, unpinned volume, a locked payload, a changed ledger) changes no
   file and no row and hands the barrier back as it found it. Once a run has started to empty
-  a file, any later failure keeps the barrier and reports its value.
-- `storage adopt` hands the barrier back as it found it on every refusal and failed
-  verification, so it cannot release a barrier that an incomplete rebind holds. A replacement
+  a file, any later failure keeps the barrier and reports its value. The rule above therefore
+  holds for a run that reached its apply step: a run refused before any write restores the
+  barrier it found, even if its scan had already seen a damaged payload.
+- A commit that gets no answer is indeterminate. Rebind then claims neither barrier state: it
+  reports the value it used and directs the operator to read `adoption_run_id`.
+- A `storage adopt` that is refused or fails verification hands the barrier back as it found
+  it, so it cannot release a barrier that an incomplete rebind holds. A successful adoption
+  clears the barrier as before. A replacement
   UUID can take over a run that is still scanning; the takeover fences that run's apply
   (`adoption ownership changed`). No liveness check is added.
 - It does not repair a copy that split hard links, bind a reservation that never had an inode

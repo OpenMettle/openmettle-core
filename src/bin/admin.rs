@@ -156,13 +156,24 @@ async fn rebind_volume(root: &Path, replace: Option<&str>) -> Result<(), &'stati
         Ok(report) => report,
         Err(stopped) => {
             eprintln!("OMQ03: {}", stopped.reason);
-            let Some(run) = stopped.run else {
-                return Err("storage rebind refused; nothing was changed");
-            };
-            eprintln!(
-                "the volume stays closed and uploads may already be emptied; re-run with --replace-adoption-run {run}"
-            );
-            return Err("storage rebind incomplete");
+            return Err(match stopped.barrier {
+                rebind::Barrier::AsFound => "storage rebind refused; nothing was changed",
+                rebind::Barrier::Held(run) => {
+                    eprintln!(
+                        "the volume stays closed and uploads may already be emptied; re-run with --replace-adoption-run {run}"
+                    );
+                    "storage rebind incomplete"
+                }
+                rebind::Barrier::Unknown(run) => {
+                    eprintln!(
+                        "this run used the barrier value {run}; whether the volume is closed under it is not known"
+                    );
+                    eprintln!(
+                        "read the current value before the next command: SELECT adoption_run_id FROM openmettle.storage_volume_control;"
+                    );
+                    "storage rebind interrupted"
+                }
+            });
         }
     };
     println!(
@@ -178,6 +189,11 @@ async fn rebind_volume(root: &Path, replace: Option<&str>) -> Result<(), &'stati
     }
     for reservation in &report.quarantined {
         println!("quarantined {reservation}: left unchanged");
+    }
+    for reservation in &report.unbound_staged {
+        println!(
+            "warning {reservation}: unbound reservation with a staged file; left unchanged, the reconciler will quarantine it"
+        );
     }
     let drift = report.drift.as_ref().filter(|drift| !drift.healthy());
     if let Some(drift) = drift {

@@ -1106,3 +1106,154 @@ async fn a_worker_refuses_a_copied_volume_until_rebind_has_run() {
     store.initialize_api(&f.api).await.unwrap();
     assert_eq!(read(&store, &live, 0, 12).await.unwrap(), b"live payload");
 }
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn the_copy_check_does_not_pass_on_a_probe_that_failed() {
+    let f = Fixture::new().await;
+    let live = f.stored("live", b"live payload").await;
+    let payload = f.root.join("revisions").join(&live.reservation);
+    let aside = f.root.join("aside");
+    // The one sampled payload cannot be probed: its name is not a regular file.
+    fs::rename(&payload, &aside).unwrap();
+    std::os::unix::fs::symlink("missing", &payload).unwrap();
+    let store = Store::open(&f.root).unwrap();
+    assert!(matches!(
+        store.initialize_api(&f.api).await,
+        Err(artifact_fs::Error::Io)
+    ));
+    assert!(!store.awaits_rebind());
+    // The failed probe decided nothing: a copy under the name is still detected.
+    fs::remove_file(&payload).unwrap();
+    fs::copy(&aside, &payload).unwrap();
+    assert!(matches!(
+        store.initialize_api(&f.api).await,
+        Err(artifact_fs::Error::Io)
+    ));
+    assert!(store.awaits_rebind());
+    fs::rename(&aside, &payload).unwrap();
+    store.initialize_api(&f.api).await.unwrap();
+    assert!(!store.awaits_rebind());
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn rebind_warns_about_an_unbound_staged_file_and_leaves_it_to_the_reconciler() {
+    let f = Fixture::new().await;
+    let _live = f.stored("live", b"live payload").await;
+    // A reservation that never recorded an inode, with bytes under its staging name.
+    let doc = new_uuid(&f.db).await;
+    let unbound = f.reserve("unbound", &doc, 100).await;
+    fs::write(f.root.join("staging").join(&unbound), b"never bound").unwrap();
+    let dir = Dir::new();
+    let root = copy_tree("cp", &f.root, &dir).unwrap();
+    let staged = root.join("staging").join(&unbound);
+
+    let (ok, out, err) = rebind(&f.db, &root, &[]);
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains("rebound 1, emptied 0, unchanged 0, quarantined 0, failed 0"),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "warning {unbound}: unbound reservation with a staged file; left unchanged, the reconciler will quarantine it"
+        )),
+        "{out}"
+    );
+    assert_eq!(barrier(&f.db).await, None);
+    assert_eq!(fs::read(&staged).unwrap(), b"never bound");
+    let recorded: Option<String> = sqlx::query_scalar(
+        "SELECT payload_ino::text FROM openmettle.storage_reservations WHERE id=$1::uuid",
+    )
+    .bind(&unbound)
+    .fetch_one(&mut f.db.admin().await)
+    .await
+    .unwrap();
+    assert_eq!(recorded, None);
+
+    // The running system's own answer: the reconciler quarantines it and touches no byte.
+    f.expire_reservations().await;
+    let store = Store::open(&root).unwrap();
+    let worker = pool(&f.db, WORKER).await;
+    assert!(matches!(
+        artifact_fs::reconcile_expired(&worker, &store, Duration::ZERO, 10).await,
+        Err(artifact_fs::Error::Io)
+    ));
+    assert_eq!(
+        reservation_row(&f.db, &unbound).await,
+        ("reserved".into(), false, true, 0)
+    );
+    assert_eq!(fs::read(&staged).unwrap(), b"never bound");
+}
+
+/// Fail every commit that updated `table`, after the statements themselves succeeded.
+async fn fail_commits_on(db: &TestDb, table: &str) {
+    let mut admin_db = db.admin().await;
+    for sql in [
+        "CREATE FUNCTION openmettle.synthetic_refusal() RETURNS trigger LANGUAGE plpgsql
+         AS $$ BEGIN RAISE EXCEPTION 'synthetic'; END $$"
+            .to_owned(),
+        format!(
+            "CREATE CONSTRAINT TRIGGER synthetic_commit AFTER UPDATE ON openmettle.{table}
+             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+             EXECUTE FUNCTION openmettle.synthetic_refusal()"
+        ),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&mut admin_db)
+            .await
+            .unwrap();
+    }
+}
+
+const READ_BARRIER: &str = "SELECT adoption_run_id FROM openmettle.storage_volume_control";
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn rebind_does_not_claim_a_barrier_state_after_a_failed_acquisition_commit() {
+    let f = Fixture::new().await;
+    let _live = f.stored("live", b"live payload").await;
+    fail_commits_on(&f.db, "storage_volume_control").await;
+
+    let (ok, _, err) = rebind(&f.db, &f.root, &[]);
+    assert!(!ok);
+    assert!(err.contains("OMQ03: commit outcome unknown"), "{err}");
+    assert!(err.contains(READ_BARRIER), "{err}");
+    assert!(!err.contains("nothing was changed"), "{err}");
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn rebind_does_not_claim_a_barrier_state_after_a_failed_final_commit() {
+    let f = Fixture::new().await;
+    let held = f.crashed("held", b"partial upload", false).await;
+    let dir = Dir::new();
+    let root = copy_tree("cp", &f.root, &dir).unwrap();
+    fail_commits_on(&f.db, "storage_reservations").await;
+
+    let (ok, _, err) = rebind(&f.db, &root, &[]);
+    assert!(!ok);
+    // The upload is emptied and the commit's outcome is not known to the command. It names
+    // the value it used and how to read the real one, and promises neither state.
+    assert_eq!(
+        fs::metadata(root.join("staging").join(&held))
+            .unwrap()
+            .len(),
+        0
+    );
+    let attempted = barrier(&f.db).await.unwrap();
+    assert!(err.contains("OMQ03: commit outcome unknown"), "{err}");
+    assert!(err.contains(&attempted), "{err}");
+    assert!(err.contains(READ_BARRIER), "{err}");
+    assert!(!err.contains("the volume stays closed"), "{err}");
+
+    f.db.admin()
+        .await
+        .execute("DROP TRIGGER synthetic_commit ON openmettle.storage_reservations")
+        .await
+        .unwrap();
+    let (ok, out, err) = rebind(&f.db, &root, &["--replace-adoption-run", &attempted]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(barrier(&f.db).await, None);
+}

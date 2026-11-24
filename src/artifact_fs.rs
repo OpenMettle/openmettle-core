@@ -169,10 +169,15 @@ impl Store {
         .fetch_all(c)
         .await?;
         for (id, bound) in sample {
-            let found = self.volume.inode(&self.volume.revisions, &id);
-            if matches!(found, Ok(Some(ino)) if ino.to_string() != bound) {
-                self.copied.store(true, Ordering::Relaxed);
-                return Err(Error::Io);
+            match self.volume.inode(&self.volume.revisions, &id) {
+                Ok(Some(ino)) if ino.to_string() != bound => {
+                    self.copied.store(true, Ordering::Relaxed);
+                    return Err(Error::Io);
+                }
+                // The bound inode, or no name because the revision was purged meanwhile.
+                Ok(_) => {}
+                // A probe that failed decides nothing: the check runs again next time.
+                Err(_) => return Err(Error::Io),
             }
         }
         self.copied.store(false, Ordering::Relaxed);

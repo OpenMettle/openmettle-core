@@ -6,16 +6,15 @@
 //! its bytes are discarded and the row is bound to the emptied file: the same evidence the
 //! reconciler requires before it binds a file it did not create.
 use super::{
-    adoption::{self, Failure, READ_FAILED, RESCAN, RevisionDigests},
+    adoption::{self, COMMIT_UNKNOWN, Failure, READ_FAILED, RESCAN, RevisionDigests},
     drift::{self, Drift},
     volume::Volume,
 };
-use rustix::fs as at;
+use rustix::{fs as at, io::Errno};
 use sqlx::{Connection, PgConnection, Row, postgres::PgRow};
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, TryLockError},
-    io::ErrorKind,
     os::unix::fs::MetadataExt,
     path::Path,
 };
@@ -36,6 +35,9 @@ pub struct Report {
     pub unchanged: usize,
     /// Quarantined reservations. They are reported and left exactly as they were.
     pub quarantined: Vec<String>,
+    /// Reservations that never recorded an inode and have bytes under their staging name.
+    /// They are reported and left exactly as they were; the reconciler quarantines them.
+    pub unbound_staged: Vec<String>,
     /// Reservations left untouched, each with its reason.
     pub failures: Vec<(String, &'static str)>,
     /// The filesystem drift check on the result. Not run when a reservation failed.
@@ -58,12 +60,23 @@ impl Report {
 #[derive(Debug)]
 pub struct Stopped {
     pub reason: &'static str,
-    /// `None`: no file and no row changed, and the barrier is as the run found it. Otherwise
-    /// the run may already have emptied uploads and still holds the barrier under this value.
-    pub run: Option<String>,
+    pub barrier: Barrier,
+}
+
+/// What a stopped run knows about the barrier.
+#[derive(Debug)]
+pub enum Barrier {
+    /// No file and no row changed, and the barrier is as the run found it.
+    AsFound,
+    /// The run emptied uploads and still holds the barrier under this value.
+    Held(String),
+    /// A commit or the hand-back got no answer. The barrier may or may not carry this value,
+    /// which is the one the run used; only the database can tell.
+    Unknown(String),
 }
 
 const CHANGED: &str = "volume changed during rebind";
+const INACCESSIBLE: &str = "payload is not accessible";
 
 const INVENTORY: &str =
     "SELECT s.id::text,s.state,s.reclaim_state,s.payload_ino::text,s.adoption_unverified,
@@ -213,6 +226,28 @@ fn classify(l: &Ledger<'_>, n: &Names) -> Result<Plan, &'static str> {
     }
 }
 
+/// Validate a reservation that never recorded an inode. `true`: it is reserved and has
+/// bytes under its staging name, which the reconciler quarantines when the reservation
+/// expires (`reclaim::release`). Every other name is one the drift check rejects.
+fn classify_unbound(l: &Ledger<'_>, n: &Names) -> Result<bool, &'static str> {
+    if n.reclaim.is_some() {
+        return Err("unexpected reclaim anchor");
+    }
+    if n.purge.is_some() {
+        return Err("unexpected purge anchor");
+    }
+    match (l.state, l.revision) {
+        ("reserved", _) if n.revision.is_none() => Ok(n.staging.is_some_and(|e| e.len != 0)),
+        ("released", _) | ("settled", Some("purged"))
+            if n.staging.is_none() && n.revision.is_none() =>
+        {
+            Ok(false)
+        }
+        ("reserved" | "released", _) | ("settled", Some("purged")) => Err("unexpected payload"),
+        _ => Err("reservation has no recorded inode"),
+    }
+}
+
 enum Evidence {
     Content { size: u64, digest: Vec<u8> },
     Empty { truncate: bool },
@@ -241,6 +276,19 @@ fn directory(v: &Volume, revisions: bool) -> &File {
     if revisions { &v.revisions } else { &v.staging }
 }
 
+/// An open error that concerns this one file, such as a wrong mode or a read error. It fails
+/// the reservation, not the run. Not file-specific: the process ran out of descriptors or
+/// memory, the name vanished after the scan, or the volume's identity check failed (which
+/// carries no OS error).
+fn file_specific(error: &std::io::Error) -> bool {
+    error.raw_os_error().is_some_and(|code| {
+        !matches!(
+            Errno::from_raw_os_error(code),
+            Errno::MFILE | Errno::NFILE | Errno::NOMEM | Errno::NOENT
+        )
+    })
+}
+
 impl Binding {
     /// Open the file, take its exclusive lock and require every name the reservation owns to
     /// hold what the scan saw. `None`: the file exists but cannot be opened.
@@ -249,7 +297,7 @@ impl Binding {
         // Opened for writing so that the exclusive lock also works over NFS.
         let file = match v.regular(directory(v, *revisions), name, true) {
             Ok(file) => file,
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => return Ok(None),
+            Err(e) if file_specific(&e) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
         match file.try_lock() {
@@ -272,15 +320,21 @@ impl Binding {
     /// the link count of the descriptor being truncated are checked again: together they
     /// show that every link to the file is one of the reservation's own names. A process
     /// that changes the volume after this check is not detected.
-    fn truncate(&self, v: &Volume) -> Result<(), Failure> {
-        let file = self.open(v)?.ok_or(Failure(CHANGED))?;
+    /// `modified` is set immediately before the first byte is discarded. `false`: the file
+    /// could not be opened and nothing was discarded.
+    fn truncate(&self, v: &Volume, modified: &mut bool) -> Result<bool, Failure> {
+        let Some(file) = self.open(v)? else {
+            return Ok(false);
+        };
         let own = self.seen.iter().filter(|i| **i == Some(self.ino)).count() as u64;
         if file.metadata()?.nlink() != own {
             return Err(Failure(CHANGED));
         }
+        // From here a failing run keeps the barrier.
+        *modified = true;
         file.set_len(0)?;
         file.sync_all()?;
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -304,10 +358,7 @@ impl Scan {
             self.report.quarantined.push(id.to_owned());
             return Ok(());
         }
-        // Binding a reservation that never had an inode is adoption's decision.
-        let Some(bound) = row.try_get::<Option<&str>, _>("payload_ino")? else {
-            return Ok(());
-        };
+        let bound = row.try_get::<Option<&str>, _>("payload_ino")?;
         let mut fail = |reason| self.report.failures.push((id.to_owned(), reason));
         if aliased {
             fail("cross_reservation_inode_alias");
@@ -324,15 +375,23 @@ impl Scan {
             purge: row.try_get("purge_stage")?,
         };
         let [staging, reclaim, revision, purge] = entries;
-        let plan = classify(
-            &ledger,
-            &Names {
-                staging,
-                reclaim,
-                revision,
-                purge,
-            },
-        );
+        let names = Names {
+            staging,
+            reclaim,
+            revision,
+            purge,
+        };
+        // Binding a reservation that never had an inode is adoption's decision. Its layout
+        // is still validated, and its file is never touched.
+        let Some(bound) = bound else {
+            match classify_unbound(&ledger, &names) {
+                Err(reason) => fail(reason),
+                Ok(true) => self.report.unbound_staged.push(id.to_owned()),
+                Ok(false) => {}
+            }
+            return Ok(());
+        };
+        let plan = classify(&ledger, &names);
         let seen = entries.map(|e| e.map(|e| e.ino));
         let (ino, at, evidence) = match plan {
             Err(reason) => {
@@ -369,7 +428,7 @@ impl Scan {
         };
         // Opening also shows that no other process holds the file.
         let Some(mut file) = binding.open(v)? else {
-            fail("payload is not accessible");
+            fail(INACCESSIBLE);
             return Ok(());
         };
         if let Evidence::Content { size, digest } = &binding.evidence {
@@ -445,13 +504,21 @@ fn observe(v: &Volume, rows: &[PgRow]) -> Result<(Vec<Observed>, HashSet<String>
 pub async fn rebind(c: &mut PgConnection, opts: &Options<'_>) -> Result<Report, Stopped> {
     let refused = |failure: Failure| Stopped {
         reason: failure.0,
-        run: None,
+        barrier: Barrier::AsFound,
     };
     let v = Volume::open(opts.root, false).map_err(|e| refused(e.into()))?;
     let run = adoption::owner_run(c).await.map_err(refused)?;
-    let pin = adoption::take_barrier(c, &v, &run, opts.replace)
-        .await
-        .map_err(refused)?;
+    let pin = match adoption::take_barrier(c, &v, &run, opts.replace).await {
+        Ok(pin) => pin,
+        // The barrier may or may not have been installed.
+        Err(Failure(COMMIT_UNKNOWN)) => {
+            return Err(Stopped {
+                reason: COMMIT_UNKNOWN,
+                barrier: Barrier::Unknown(run),
+            });
+        }
+        Err(failure) => return Err(refused(failure)),
+    };
     let mut modified = false;
     let failure = match &pin {
         Some(pin) => match scan_and_apply(c, &v, &run, pin, &mut modified).await {
@@ -460,15 +527,25 @@ pub async fn rebind(c: &mut PgConnection, opts: &Options<'_>) -> Result<Report, 
         },
         None => Failure("volume is not pinned"),
     };
-    // Hand the barrier back only when no file was modified. The statement also confirms the
-    // rollback: it runs after the abandoned transaction on the same connection.
-    let untouched = !modified
-        && adoption::restore_barrier(c, &run, opts.replace)
-            .await
-            .is_ok();
+    let barrier = if failure.0 == COMMIT_UNKNOWN {
+        // The final commit may have released the barrier or kept it. Handing it back now
+        // could open a volume the commit had closed.
+        Barrier::Unknown(run)
+    } else if modified {
+        Barrier::Held(run)
+    } else if adoption::restore_barrier(c, &run, opts.replace)
+        .await
+        .is_ok()
+    {
+        // The statement also confirms the rollback: it runs after the abandoned transaction
+        // on the same connection.
+        Barrier::AsFound
+    } else {
+        Barrier::Unknown(run)
+    };
     Err(Stopped {
         reason: failure.0,
-        run: (!untouched).then_some(run),
+        barrier,
     })
 }
 
@@ -513,8 +590,14 @@ async fn scan_and_apply(
     // Before the first write: every file is still the one inspected, and every file whose
     // inode is about to be recorded is durable.
     scan.digests.recheck = true;
+    let mut report = scan.report;
+    let mut accepted = Vec::with_capacity(scan.bindings.len());
     for b in &scan.bindings {
-        let mut file = b.open(v)?.ok_or(Failure(CHANGED))?;
+        // A file that cannot be reopened fails its reservation, as in the scan.
+        let Some(mut file) = b.open(v)? else {
+            report.failures.push((b.id.clone(), INACCESSIBLE));
+            continue;
+        };
         match &b.evidence {
             Evidence::Content { size, digest } => {
                 scan.digests.verify(&b.id, &mut file, *size, digest)?
@@ -524,24 +607,26 @@ async fn scan_and_apply(
             }
             Evidence::Empty { .. } => {}
         }
-        if b.ino != b.bound {
-            file.sync_all()?;
-        }
+        // Whatever its inode number: an equal number does not show that the data is durable.
+        file.sync_all()?;
+        accepted.push(b);
     }
-    let mut report = scan.report;
-    for b in &scan.bindings {
+    let mut bound = Vec::with_capacity(accepted.len());
+    for b in accepted {
         if matches!(b.evidence, Evidence::Empty { truncate: true }) {
-            // From here a failing run keeps the barrier.
-            *modified = true;
-            b.truncate(v)?;
+            if !b.truncate(v, modified)? {
+                report.failures.push((b.id.clone(), INACCESSIBLE));
+                continue;
+            }
             report.emptied += 1;
         }
+        bound.push(b);
     }
     // The directory entries behind every recorded inode are durable before the commit.
     for dir in [&v.root, &v.staging, &v.revisions] {
         at::fsync(dir)?;
     }
-    for b in &scan.bindings {
+    for b in bound {
         if b.ino == b.bound {
             report.unchanged += 1;
             if !b.pending {
@@ -573,7 +658,7 @@ async fn scan_and_apply(
     if report.complete() {
         adoption::restore_barrier(&mut tx, run, None).await?;
     }
-    tx.commit().await?;
+    tx.commit().await.map_err(|_| Failure(COMMIT_UNKNOWN))?;
     report.run = run.to_owned();
     Ok(report)
 }
@@ -804,6 +889,51 @@ mod tests {
         assert_eq!(classify(&closed, &anchor), Err("unexpected reclaim anchor"));
     }
 
+    #[test]
+    fn an_unbound_reservation_is_validated_and_only_reported() {
+        let reserved = ledger("reserved", "none", None, None);
+        assert_eq!(classify_unbound(&reserved, &NONE), Ok(false));
+        // An empty staging file is one the reconciler binds and reclaims itself.
+        let empty = Names {
+            staging: entry(40, 0, 1),
+            ..NONE
+        };
+        assert_eq!(classify_unbound(&reserved, &empty), Ok(false));
+        // Bytes under the staging name: the reconciler quarantines the reservation.
+        let staged = Names {
+            staging: entry(40, 9, 1),
+            ..NONE
+        };
+        assert_eq!(classify_unbound(&reserved, &staged), Ok(true));
+        let published = Names {
+            revision: entry(40, 9, 1),
+            ..NONE
+        };
+        assert_eq!(
+            classify_unbound(&reserved, &published),
+            Err("unexpected payload")
+        );
+        let anchored = Names {
+            reclaim: entry(40, 0, 1),
+            ..NONE
+        };
+        assert_eq!(
+            classify_unbound(&reserved, &anchored),
+            Err("unexpected reclaim anchor")
+        );
+        let released = ledger("released", "none", None, None);
+        assert_eq!(classify_unbound(&released, &NONE), Ok(false));
+        assert_eq!(
+            classify_unbound(&released, &staged),
+            Err("unexpected payload")
+        );
+        let settled = ledger("settled", "none", Some("active"), Some("none"));
+        assert_eq!(
+            classify_unbound(&settled, &published),
+            Err("reservation has no recorded inode")
+        );
+    }
+
     /// A published, unsettled upload as the scan saw it: two names, one file.
     fn two_name_upload(dir: &Dir) -> (Volume, Binding) {
         let root = dir.path("volume");
@@ -836,11 +966,42 @@ mod tests {
     fn truncation_empties_a_file_only_its_reservation_links_to() {
         let dir = Dir::new();
         let (v, binding) = two_name_upload(&dir);
-        binding.truncate(&v).unwrap();
+        let mut modified = false;
+        assert!(binding.truncate(&v, &mut modified).unwrap());
+        assert!(modified);
         let staged = Path::new(&dir.path("volume"))
             .join("staging")
             .join(&binding.id);
         assert_eq!(std::fs::metadata(staged).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn truncation_refuses_a_link_the_reservations_names_do_not_explain() {
+        let dir = Dir::new();
+        let (v, binding) = two_name_upload(&dir);
+        let root = dir.path("volume");
+        let root = Path::new(&root);
+        // Both names are as the scan saw them; a third link appeared elsewhere.
+        let foreign = root.join("foreign");
+        std::fs::hard_link(root.join("staging").join(&binding.id), &foreign).unwrap();
+        let mut modified = false;
+        assert_eq!(binding.truncate(&v, &mut modified).unwrap_err().0, CHANGED);
+        assert!(!modified);
+        assert_eq!(std::fs::read(foreign).unwrap(), b"unsettled");
+    }
+
+    #[test]
+    fn only_an_error_about_the_file_itself_fails_the_reservation() {
+        let error = |errno: Errno| std::io::Error::from_raw_os_error(errno.raw_os_error());
+        for errno in [Errno::ACCESS, Errno::PERM, Errno::IO, Errno::ROFS] {
+            assert!(file_specific(&error(errno)), "{errno:?}");
+        }
+        // The process ran out of descriptors or memory, or the file vanished after the scan.
+        for errno in [Errno::MFILE, Errno::NFILE, Errno::NOMEM, Errno::NOENT] {
+            assert!(!file_specific(&error(errno)), "{errno:?}");
+        }
+        // The volume's own identity mismatch carries no OS error.
+        assert!(!file_specific(&std::io::Error::other("identity")));
     }
 
     #[test]
@@ -854,7 +1015,10 @@ mod tests {
         std::fs::remove_file(root.join("revisions").join(&binding.id)).unwrap();
         let foreign = root.join("foreign");
         std::fs::hard_link(root.join("staging").join(&binding.id), &foreign).unwrap();
-        assert_eq!(binding.truncate(&v).unwrap_err().0, CHANGED);
+        let mut modified = false;
+        assert_eq!(binding.truncate(&v, &mut modified).unwrap_err().0, CHANGED);
+        // A refused check modified nothing, so it must not keep a barrier that was clear.
+        assert!(!modified);
         assert_eq!(std::fs::read(foreign).unwrap(), b"unsettled");
     }
 }

@@ -76,6 +76,8 @@ pub(super) struct RevisionDigests {
 }
 pub(super) const RESCAN: &str = "revision changed during inspection";
 pub(super) const READ_FAILED: &str = "cannot read revision digest";
+/// A commit got no answer or an error. Whether it took effect is known only to the database.
+pub(super) const COMMIT_UNKNOWN: &str = "commit outcome unknown";
 
 impl RevisionDigests {
     pub(super) fn verify(
@@ -448,7 +450,10 @@ pub(super) async fn take_barrier(
         .bind(run)
         .execute(&mut *barrier)
         .await?;
-    barrier.commit().await?;
+    barrier
+        .commit()
+        .await
+        .map_err(|_| Failure(COMMIT_UNKNOWN))?;
     Ok(pin)
 }
 
@@ -650,6 +655,33 @@ mod tests {
         let mut file = File::options().write(true).open(&path).unwrap();
         cache.verify("rev", &mut file, 7, &hash).unwrap();
         file.set_len(2).unwrap();
+        assert_eq!(
+            cache.verify("rev", &mut file, 7, &hash).unwrap_err().0,
+            RESCAN
+        );
+    }
+
+    #[test]
+    fn a_same_length_rewrite_that_keeps_the_modification_time_restarts_the_inventory() {
+        use std::io::Write;
+        let dir = Dir::new();
+        let path = dir.path("revision");
+        std::fs::write(&path, b"payload").unwrap();
+        let hash = Sha256::digest(b"payload");
+        let mut cache = RevisionDigests::default();
+        cache
+            .verify("rev", &mut File::open(&path).unwrap(), 7, &hash)
+            .unwrap();
+        cache.recheck = true;
+        // Same inode and length, other bytes, and the modification time put back: only the
+        // change time shows the rewrite.
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut file = File::options().write(true).open(&path).unwrap();
+        file.write_all(b"PAYLOAD").unwrap();
+        file.set_modified(modified).unwrap();
+        let after = file.metadata().unwrap();
+        assert_eq!((after.len(), after.modified().unwrap()), (7, modified));
         assert_eq!(
             cache.verify("rev", &mut file, 7, &hash).unwrap_err().0,
             RESCAN
