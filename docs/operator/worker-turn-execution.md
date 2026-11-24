@@ -10,9 +10,10 @@ or deployment-private values; never commit site details or key files.
 
 - The schema is migrated, and the API serves run admission with `catalog_file`,
   `admission_limits` and `cursor_keys`.
-- Provisional, until the gateway-authorization increment: users who will run turns have
-  `ready` gateway bindings for the configured installation, with a sealed key generation and a
-  policy for each model they use (ADR 0037). The worker only reads them.
+- `openmettle-gateway` ([gateway proxy](gateway-proxy.md)) serves each catalog model and can
+  reach its SGLang upstream. Users need no gateway binding, key or policy: each round is
+  authorized at handoff and carries its own bearer
+  ([ADR 0044](../adr/0044-own-inference-proxy-and-binding-free-dispatch.md)).
 - Every model in the catalog has a route that was qualified for its exact `pin`. A profile with
   `requires_device_slot` stops the worker at startup.
 
@@ -22,10 +23,9 @@ Mount each file read-only into the worker pod only:
 
 | File | Source | Secret |
 | --- | --- | --- |
-| Inference document | Deployment configuration | No, but it names the secret files |
+| Inference document | Deployment configuration | No |
 | Catalog | The same file as the API's `catalog_file` | No |
-| Gateway ring (`gateway_keys`, provisional) | The ring the current credential path opens | Yes |
-| Trust bundles | The gateway's issuing CA, when `trust.roots` is `bundle` | No |
+| Trust bundles | The issuing CA of an `https://` route, when `trust.roots` is `bundle` | No |
 
 Do not mount the API's `auth.json`, login keys, cursor keys or issuance credential into the
 worker.
@@ -54,25 +54,48 @@ ready. How much throughput a given size sustains has not been measured.
 ## Network
 
 Limit the worker's inference egress to the gateway endpoints. Keep the rules it already needs
-for PostgreSQL and cluster DNS. For an in-cluster gateway Service, use its cluster DNS name in
-`endpoint` and add its Service range to `private_cidrs`. Loopback and cloud metadata addresses
-are always refused.
+for PostgreSQL and cluster DNS. For an in-cluster gateway Service, use its fully qualified
+cluster DNS name in `endpoint` (a name without a dot is refused) and add its Service range to
+`private_cidrs`. Loopback and cloud metadata addresses are always refused.
+
+### Plain HTTP inside the cluster
+
+A route may name `openmettle-gateway` with an `http://` endpoint and no `trust` member. The
+worker then connects without TLS, and the following cross the cluster network unencrypted:
+
+- the round's bearer, in `Authorization`;
+- the request ID, and the prompt the worker sends, including conversation history and
+  attachments;
+- the model's response.
+
+The bearer authorizes one dispatch of one handed-off request: the gateway spends it before
+reading the body, and it is worthless after that dispatch or once the run's lease or deadline
+has passed. Someone who can observe the traffic can still read every prompt and response.
+
+Mitigate with a NetworkPolicy that admits only the worker pods to the gateway's port, and the
+gateway's egress only to its SGLang upstream and PostgreSQL. For anything stricter, use TLS:
+terminate it in front of the gateway, for example in a sidecar, and give the route an
+`https://` endpoint with the terminator's trust anchors. The gateway itself has no TLS
+listener. Mutual TLS is not supported.
 
 ## Verify
 
 1. Start the worker. A refused document exits 78 with
    `inference configuration error: <category>`. Correct the named category and restart.
 2. Check `/readyz` on the worker port.
-3. Submit a run through `POST /v1/runs` as a user with a ready binding. The run should reach
-   `succeeded`, and the gateway should record one request per round with the run's
-   `x-request-id`.
+3. Submit a run through `POST /v1/runs`. The run should reach `succeeded`, each round's
+   gateway request should show `dispatched_at` and one final usage report, and its token hold
+   should be `settled`.
 
 ## Changes
 
 - **Catalog.** Update the catalog file and the route pins together, then restart the API and the
   worker. A run admitted under another catalog revision fails before its round is reserved.
-- **Dispatch credential.** `installation` and `gateway_keys` are provisional (ADR 0043). The
-  gateway-authorization increment replaces them and will document their successor.
+- **Upgrading from a document with `gateway_keys`.** The member was removed on
+  24 November 2026 (ADR 0044 increment 2c). A worker of this release refuses a document that
+  still has it (`inference configuration error: configuration has an unknown field`), and an
+  earlier worker refuses one without it, so change the document and the image together. The
+  ring's key files are no longer needed by the worker; unmount them.
 - **Routes.** Re-qualify a route before changing its endpoint, protocol, stream mode or pin.
 
 ## Stopping
