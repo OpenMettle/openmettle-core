@@ -4,7 +4,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http_body_util::{BodyExt, Empty};
 use hyper::{
     Request,
-    body::{Body as _, Bytes, Incoming},
+    body::{Bytes, Incoming},
     client::conn::http1,
 };
 use hyper_util::rt::TokioIo;
@@ -12,7 +12,6 @@ use openmettle_core::{
     authz::runs as queue,
     runs::{self, Payload},
 };
-use std::{pin::Pin, task::Poll};
 use tokio::net::TcpSocket;
 
 fn replica(db: &TestDb, configure: impl FnOnce(&mut Value)) -> Api {
@@ -22,6 +21,29 @@ fn replica(db: &TestDb, configure: impl FnOnce(&mut Value)) -> Api {
     doc["cursor_keys"] = auth_config_support::cursor_keys(&dir);
     configure(&mut doc["cursor_keys"]);
     Api::configured(db, dir, doc, 1)
+}
+
+async fn start_run(db: &TestDb, scope: &str, run: &str) {
+    // Both schema versions allow a running fixture without a claim token. Keep the
+    // state transition and its event under the same worker transaction and row lock.
+    let mut c = connect(&db.0, WORKER).await;
+    let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+    let token: String = sqlx::query_scalar("UPDATE openmettle.runs SET state='running' WHERE scope_id=$1::uuid AND id=$2::uuid AND state='queued' RETURNING gen_random_uuid()::text")
+        .bind(scope).bind(run).fetch_one(tx.connection().unwrap()).await.unwrap();
+    runs::append_event(
+        &mut tx,
+        scope,
+        run,
+        &format!("claim:{token}"),
+        Payload {
+            format: "openmettle.run-claimed",
+            version: 1,
+            bytes: b"{}",
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
 }
 
 struct Fixture {
@@ -110,26 +132,7 @@ impl Fixture {
         );
     }
     async fn start_run(&self) {
-        // Both schema versions allow a running fixture without a claim token. Keep the
-        // state transition and its event under the same worker transaction and row lock.
-        let mut c = connect(&self.db.0, WORKER).await;
-        let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
-        let token: String = sqlx::query_scalar("UPDATE openmettle.runs SET state='running' WHERE scope_id=$1::uuid AND id=$2::uuid AND state='queued' RETURNING gen_random_uuid()::text")
-            .bind(&self.scope).bind(&self.run).fetch_one(tx.connection().unwrap()).await.unwrap();
-        runs::append_event(
-            &mut tx,
-            &self.scope,
-            &self.run,
-            &format!("claim:{token}"),
-            Payload {
-                format: "openmettle.run-claimed",
-                version: 1,
-                bytes: b"{}",
-            },
-        )
-        .await
-        .unwrap();
-        tx.commit().await.unwrap();
+        start_run(&self.db, &self.scope, &self.run).await;
     }
     async fn hidden(&self) {
         let mut c = connect(&self.db.0, WORKER).await;
@@ -223,25 +226,6 @@ impl Stream {
         };
         assert_eq!(stream.block().await.as_deref(), Some(": heartbeat"));
         stream
-    }
-    /// Drain any immediately buffered heartbeat frames and fail if the server closed this stream.
-    async fn assert_open(&mut self) {
-        loop {
-            match std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut self.body).poll_frame(cx)))
-                .await
-            {
-                Poll::Pending => return,
-                Poll::Ready(Some(Ok(frame))) => {
-                    self.buffered.extend_from_slice(&frame.into_data().unwrap());
-                    while let Some(i) = self.buffered.windows(2).position(|b| b == b"\n\n") {
-                        let bytes: Vec<_> = self.buffered.drain(..i + 2).collect();
-                        assert_eq!(&bytes[..i], b": heartbeat");
-                    }
-                }
-                Poll::Ready(Some(Err(err))) => panic!("idle stream errored: {err}"),
-                Poll::Ready(None) => panic!("idle stream closed prematurely"),
-            }
-        }
     }
     async fn block(&mut self) -> Option<String> {
         tokio::time::timeout(Duration::from_secs(25), async {
@@ -836,18 +820,27 @@ async fn slow_reader_times_out_releases_capacity_and_resumes_without_loss() {
         );
     }
     // Prove the freed permit belongs to `stalled`, not a dropped `idle` stream, BEFORE touching
-    // `stalled.next()`: taking 1 slot must saturate all 128 permits again, and every `idle`
-    // stream must remain open across a two-pass check (draining any pending heartbeat before
-    // checking for EOF behind it).
-    let probe = Stream::open(&f.api, f.native(), &idle_path, Some(&idle_cursor)).await;
+    // `stalled.next()`: taking 1 slot must saturate all 128 permits again, and appending a real
+    // event on `idle_run` must be delivered to every one of the 127 original `idle` streams and
+    // `probe` while `stalled` has still not been read.
+    let mut probe = Stream::open(&f.api, f.native(), &idle_path, Some(&idle_cursor)).await;
     assert_eq!(f.api.send(f.browser(), "HEAD", &path, "", "").0, 503);
-    for stream in &mut idle {
-        stream.assert_open().await;
-    }
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    for stream in &mut idle {
-        stream.assert_open().await;
-    }
+    start_run(&f.db, &f.scope, &idle_run).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for (index, stream) in idle
+            .iter_mut()
+            .chain(std::iter::once(&mut probe))
+            .enumerate()
+        {
+            let (_, event) = stream.next().await.unwrap_or_else(|| {
+                panic!("quiet stream #{index} closed before slow reader timed out")
+            });
+            assert_eq!(event["type"], "run.started");
+            assert_eq!(event["sequence"], "2");
+        }
+    })
+    .await
+    .expect("quiet streams did not all deliver sequence 2");
 
     assert_eq!(f.snapshot()["last_sequence"], total.to_string());
     drop((probe, idle));
@@ -891,8 +884,8 @@ async fn slow_reader_times_out_releases_capacity_and_resumes_without_loss() {
         cursor = id;
     }
     assert!(
-        sequence < total,
-        "expected backpressure before the end of the backlog"
+        sequence > 1 && sequence < total,
+        "expected backpressure after streaming part of the backlog (got sequence={sequence}, total={total})"
     );
     let mut resumed = Stream::open(&f.api, f.native(), &path, Some(&cursor)).await;
     while sequence < total {
@@ -1227,34 +1220,30 @@ async fn native_sse_reauth_is_not_evicted_by_native_signin_max_in_flight() {
         .await
         .unwrap();
 
-    let mut w = connect(&db.0, WORKER).await;
-    let mut wtx = WriteTransaction::begin(&mut w).await.unwrap();
-    let token: String = sqlx::query_scalar(
-        "UPDATE openmettle.runs SET state='running' WHERE scope_id=$1::uuid AND id=$2::uuid AND state='queued' RETURNING gen_random_uuid()::text",
-    )
-    .bind(&scope)
-    .bind(&run)
-    .fetch_one(wtx.connection().unwrap())
-    .await
-    .unwrap();
-    runs::append_event(
-        &mut wtx,
-        &scope,
-        &run,
-        &format!("claim:{token}"),
-        Payload {
-            format: "openmettle.run-claimed",
-            version: 1,
-            bytes: b"{}",
-        },
-    )
-    .await
-    .unwrap();
-    wtx.commit().await.unwrap();
+    start_run(&db, &scope, &run).await;
 
-    wait_for_blocked_peer(&db, holder_pid).await;
-    // Let the remaining native SSE streams cross one 500ms poll interval and hit re-auth concurrently.
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    let mut observer = admin(Some(&db.0)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT count(DISTINCT pid) FROM pg_stat_activity
+                 WHERE datname = current_database()
+                   AND usename = $1
+                   AND $2 = ANY(pg_blocking_pids(pid))",
+            )
+            .bind(API)
+            .bind(holder_pid)
+            .fetch_one(&mut observer)
+            .await
+            .unwrap();
+            if blocked == 3 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("expected all 3 native SSE streams to block concurrently on local_sessions");
     lock_tx.rollback().await.unwrap();
 
     for (index, stream) in streams.iter_mut().enumerate() {
