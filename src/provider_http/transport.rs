@@ -9,8 +9,9 @@
 //! request admission of their own before calling [`Route::send`].
 //!
 //! The one exception to HTTPS is [`gateway_endpoint`], the route of metered turns to OpenMettle's
-//! own gateway inside the cluster (ADR 0044): it may also be `http://`, and then has no TLS. Every
-//! other rule applies to it unchanged.
+//! own gateway inside the cluster (ADR 0044): it may also be `http://`, and then has no TLS. Such
+//! a route reaches only addresses inside its configured ranges and carries only a committed
+//! round dispatch. Every other rule applies to it unchanged.
 use super::{Error, MAX_ADDRESSES, MAX_TRUST_BUNDLE_BYTES, Trust};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
@@ -478,7 +479,10 @@ impl Route<'_> {
         {
             return true;
         }
+        // Plain HTTP stays inside the cluster: an `http://` gateway endpoint reaches only the
+        // ranges configured for it, never a public address.
         permitted(ip, self.allowed)
+            && (self.endpoint.tls || self.allowed.iter().any(|r| r.contains(ip)))
     }
 
     /// The OS lookup runs on Tokio's blocking pool and cannot be cancelled. Its slot permit moves
@@ -529,9 +533,22 @@ impl Route<'_> {
             .uri(self.endpoint.path.as_str())
             .header(header::HOST, self.endpoint.authority.as_str())
             .header(header::CONNECTION, "close");
-        if headers.contains_key(header::AUTHORIZATION)
-            && let Ok(Some(id)) = BILLABLE_REQUEST.try_with(std::cell::Cell::take)
-        {
+        let billable = headers
+            .contains_key(header::AUTHORIZATION)
+            .then(|| {
+                BILLABLE_REQUEST
+                    .try_with(std::cell::Cell::take)
+                    .ok()
+                    .flatten()
+            })
+            .flatten();
+        // A plain `http://` gateway endpoint carries only a committed round dispatch, whose
+        // request ID the metered send scoped here (ADR 0044); any other use of it is refused
+        // before any DNS work or connection.
+        if !self.endpoint.tls && billable.is_none() {
+            return Err(Error::Destination);
+        }
+        if let Some(id) = billable {
             outbound = outbound.header("x-request-id", id);
         }
         for (name, value) in headers {

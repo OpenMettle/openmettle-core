@@ -14,7 +14,8 @@ use tokio::{
 };
 
 /// The metered gateway route chooses TLS by its scheme (ADR 0044): `http://` takes no trust
-/// anchors and `https://` needs them. The general constructor keeps `https://` only.
+/// anchors but at least one range, and `https://` needs trust anchors. The general constructor
+/// keeps `https://` only.
 #[test]
 fn only_the_metered_gateway_route_may_be_plain_http() {
     let c = catalog(Protocol::Chat, true);
@@ -35,11 +36,16 @@ fn only_the_metered_gateway_route_may_be_plain_http() {
     };
     let plain = format!("http://{}:8082{}", fixture::HOST, path(Protocol::Chat));
     let secure = format!("https://{}{}", fixture::HOST, path(Protocol::Chat));
-    let metered = |url: &str, trust| Gateway::metered(url, trust, &[], qualification(), NORMAL);
-    assert!(metered(&plain, None).is_ok());
-    assert!(metered(&plain, Some(Trust::Bundle(&pem))).is_err());
-    assert!(metered(&secure, None).is_err());
-    assert!(metered(&secure, Some(Trust::Bundle(&pem))).is_ok());
+    let metered = |url: &str, trust, ranges: &[&str]| {
+        Gateway::metered(url, trust, ranges, qualification(), NORMAL)
+    };
+    let range = ["10.20.0.0/16"];
+    assert!(metered(&plain, None, &range).is_ok());
+    // A plain route reaches only its configured ranges, so it needs one.
+    assert!(metered(&plain, None, &[]).is_err());
+    assert!(metered(&plain, Some(Trust::Bundle(&pem)), &range).is_err());
+    assert!(metered(&secure, None, &range).is_err());
+    assert!(metered(&secure, Some(Trust::Bundle(&pem)), &[]).is_ok());
     assert!(Gateway::new(&plain, Trust::Bundle(&pem), &[], qualification(), NORMAL).is_err());
 }
 

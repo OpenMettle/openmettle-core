@@ -274,8 +274,10 @@ impl Gateway {
 
     /// The route of metered turns to OpenMettle's own gateway (ADR 0044): [`Self::new`], except
     /// that inside the cluster the endpoint may also be `http://`. `trust` is required for an
-    /// `https://` endpoint and refused for an `http://` one, which has no TLS. Only the packaged
-    /// worker's inference configuration calls this; every other client keeps `https://`.
+    /// `https://` endpoint and refused for an `http://` one, which has no TLS, reaches only
+    /// addresses inside `ranges` (so it needs at least one) and sends only a committed round
+    /// dispatch. Only the packaged worker's inference configuration calls this; every other
+    /// client keeps `https://`.
     pub(crate) fn metered(
         endpoint: &str,
         trust: Option<Trust<'_>>,
@@ -300,6 +302,7 @@ impl Gateway {
         timeouts: Timeouts,
     ) -> Result<Self, Error> {
         if endpoint.tls() != trust.is_some()
+            || !endpoint.tls() && ranges.is_empty()
             || ranges.len() > super::MAX_PRIVATE_RANGES
             || [timeouts.setup, timeouts.idle, timeouts.overall]
                 .iter()

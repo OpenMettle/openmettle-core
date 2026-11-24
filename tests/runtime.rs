@@ -2749,6 +2749,17 @@ fn worker_validates_its_inference_document_before_serving() {
         "decrypt_only": []
     });
     cases.push((ring, "configuration has an unknown field"));
+    // A plain route names no range to hold the gateway's addresses.
+    let mut plain = valid.clone();
+    plain["routes"]["a"]["endpoint"] = "http://canary-gateway.example.test:8082/CANARY".into();
+    plain["routes"]["a"]
+        .as_object_mut()
+        .unwrap()
+        .remove("trust");
+    cases.push((
+        plain,
+        "a plain HTTP inference route needs private_cidrs holding every gateway address",
+    ));
     let mut uncovered = valid.clone();
     uncovered["routes"].as_object_mut().unwrap().remove("b");
     cases.push((

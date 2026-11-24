@@ -34,6 +34,8 @@ pub enum Error {
     Profile,
     DeviceSlot,
     Route,
+    /// An `http://` route without `private_cidrs` to hold every gateway address.
+    PlainRange,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -47,6 +49,9 @@ impl fmt::Display for Error {
             }
             Self::Route => {
                 "an inference route endpoint, trust, address policy or timeout is invalid"
+            }
+            Self::PlainRange => {
+                "a plain HTTP inference route needs private_cidrs holding every gateway address"
             }
         })
     }
@@ -216,6 +221,10 @@ pub fn load(path: &Path) -> Result<InferenceConfig, Error> {
             .trust
             .as_ref()
             .map(|_| bundle.as_deref().map_or(Trust::Native, Trust::Bundle));
+        // A plain route reaches only its configured ranges (ADR 0044).
+        if route.trust.is_none() && route.private_cidrs.is_empty() {
+            return Err(Error::PlainRange);
+        }
         let ranges: Vec<&str> = route.private_cidrs.iter().map(String::as_str).collect();
         // The worker offers no tools until reviewed tool rounds are wired (V1-14), so the
         // function, parallel-call and separator qualifications stay off.

@@ -1141,10 +1141,11 @@ async fn plain_http_turn_dispatch_sends_its_bearer_and_request_id_without_tls() 
             |_, _| true,
         )
         .unwrap();
+    // The fixture's loopback seam stands in for an address inside the route's range.
     let mut gateway = Gateway::metered(
         &format!("http://{}:{port}/v1/chat/completions", fixture::HOST),
         None,
-        &[],
+        &["10.0.0.0/8"],
         Qualification {
             model: effective.model.clone(),
             pin: effective.profile.clone(),

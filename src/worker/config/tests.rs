@@ -117,6 +117,12 @@ fn a_route_may_use_plain_http_without_trust_anchors() {
             "{endpoint}"
         );
     }
+    // Plain HTTP stays inside the cluster: a plain route must name the ranges of every
+    // gateway address, so one without ranges is refused at start-up.
+    assert_eq!(
+        fixture.with("/routes/a/private_cidrs", json!([])),
+        Error::PlainRange
+    );
     // Every other scheme is refused, with trust anchors or without.
     let mut other = Fixture::new();
     for endpoint in ["ftp://gw.example.test/v1", "HTTP://gw.example.test/v1"] {
@@ -383,10 +389,68 @@ fn refusals_carry_no_configuration_values() {
             "/routes/a/endpoint",
             json!("http://canary.example.test/CANARY?CANARY"),
         ),
+        {
+            let mut plain = fixture.document.clone();
+            let route = &mut plain["routes"]["a"];
+            route["endpoint"] = json!("http://canary.example.test:8082/CANARY");
+            route.as_object_mut().unwrap().remove("trust");
+            refusal(fixture.load_bytes(plain.to_string().as_bytes()))
+        },
     ];
     for error in errors {
         let text = error.to_string();
         assert!(!text.contains(canary) && !text.contains("/"), "{text}");
         assert!(!format!("{error:?}").contains(canary));
     }
+}
+
+/// The gateway a loaded route holds sends over plain HTTP only with a committed round dispatch
+/// (ADR 0044). Its ordinary caller path, with a bearer but no dispatch, is refused before any
+/// connection, and nothing reaches the server.
+#[tokio::test]
+async fn a_plain_route_refuses_a_send_without_a_committed_dispatch() {
+    use crate::{
+        model_config::Selection,
+        provider_http::inference::{Credential, History, Request},
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut fixture = Fixture::new();
+    let route = &mut fixture.document["routes"]["a"];
+    route["endpoint"] = json!(format!("http://gw.example.test:{port}/v1/chat/completions"));
+    route.as_object_mut().unwrap().remove("trust");
+    route["private_cidrs"] = json!(["10.20.0.0/16"]);
+    let config = fixture.load().unwrap();
+    let InferenceConfig { catalog, routes } = config;
+    let (gateway, _) = routes.models.into_iter().next().unwrap().1;
+    let mut gateway = Arc::try_unwrap(gateway).ok().unwrap();
+    gateway.fixture_lookup(Arc::new(move |_, _| {
+        Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))])
+    }));
+    let effective = catalog
+        .resolve(
+            &Selection::default(),
+            &serde_json::from_value(json!({"preset": "study"})).unwrap(),
+            None,
+            |_, _| true,
+        )
+        .unwrap();
+    let request = Request {
+        history: vec![History::User("no dispatch".into())],
+        tools: None,
+        parallel: None,
+        stream: false,
+    };
+    let sent = gateway
+        .caller(
+            &catalog,
+            &effective,
+            &request,
+            Credential::Bearer("synthetic-bearer-without-a-dispatch"),
+            |_| async {},
+        )
+        .await;
+    assert!(sent.is_err());
+    let reached = tokio::time::timeout(Duration::from_millis(300), listener.accept()).await;
+    assert!(reached.is_err(), "the plain route reached the server");
 }
