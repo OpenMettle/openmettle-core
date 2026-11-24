@@ -9,66 +9,6 @@
 -- its quota holds through the existing settlement and fold mechanics, keeping `state =
 -- 'handed_off'`. Revision 1 remains open for a late proxy report to supersede `unreported`.
 
--- Acquire the writer-excluding table locks in runtime lock order (`gateway_requests` ->
--- `gateway_usage_reports` -> `gateway_settlements`) before the upgrade preflight and cleanup so no
--- concurrent schema-31 writer can hold an uncommitted revision-0 row past `DELETE` and commit it
--- before the new constraint and trigger take effect.
-LOCK TABLE openmettle.gateway_requests IN EXCLUSIVE MODE;
-LOCK TABLE openmettle.gateway_usage_reports IN ACCESS EXCLUSIVE MODE;
-LOCK TABLE openmettle.gateway_settlements IN SHARE MODE;
-
--- Fail closed on upgrade if an unsettled unbound request already has an accepted revision-0
--- report or revision-0 settlement; historical schema 29–30 requests that already settled at
--- revision 0 (`settled_final = true`) stay intact.
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT FROM openmettle.gateway_requests q
-         WHERE q.binding_id IS NULL
-           AND NOT q.settled_final
-           AND (EXISTS (SELECT FROM openmettle.gateway_settlements s
-                         WHERE s.request_id = q.id AND s.revision = 0)
-                OR EXISTS (SELECT FROM openmettle.quota_accepted_gateway_reports a
-                            WHERE a.request_id = q.id AND a.revision = 0))
-    ) THEN
-        RAISE EXCEPTION 'migration 32 cannot proceed with an accepted revision-0 report on an unsettled unbound request'
-            USING ERRCODE = '23514';
-    END IF;
-END
-$$;
-
--- Remove unaccepted raw revision-0 reports on unbound unsettled requests so the sweep's
--- revision-0 insert cannot collide with a pre-existing dangling row after upgrade.
-DELETE FROM openmettle.gateway_usage_reports g
- USING openmettle.gateway_requests q
- WHERE g.request_id = q.id
-   AND q.binding_id IS NULL
-   AND NOT q.settled_final
-   AND g.revision = 0
-   AND NOT EXISTS (SELECT FROM openmettle.gateway_settlements s WHERE s.request_id = q.id)
-   AND NOT EXISTS (
-       SELECT FROM openmettle.quota_accepted_gateway_reports a
-        WHERE a.request_id = q.id AND a.revision = 0
-   );
-
--- Extend migration 31's closed vocabulary with the two sweep-only revision-0 reasons:
---   * Group 1 (nothing was sent upstream): `model_not_served`, `model_mismatch`,
---     `request_body`, `upstream_connect`, `not_dispatched`;
---   * Group 2 (the request was or may have been sent upstream and its usage is unknown):
---     `upstream_transport`, `upstream_timeout`, `upstream_status`, `upstream_encoding`,
---     `incomplete`, `caller_disconnected`, `no_usage`, `unparsable`, `unreported`.
-ALTER TABLE openmettle.gateway_usage_reports
-    DROP CONSTRAINT gateway_usage_reports_incomplete_check,
-    ADD CONSTRAINT gateway_usage_reports_incomplete_check CHECK (
-        incomplete IS NULL OR (final
-            AND num_nonnulls(prompt_tokens,completion_tokens,reasoning_tokens,
-                             reasoning_included,cost,unit) = 0
-            AND (incomplete IN (
-                'model_not_served','model_mismatch','request_body','upstream_connect',
-                'upstream_transport','upstream_timeout','upstream_status','upstream_encoding',
-                'incomplete','caller_disconnected','no_usage','unparsable')
-                OR (revision = 0 AND incomplete IN ('not_dispatched','unreported')))));
-
 -- Only `openmettle_owner` (and its `SECURITY DEFINER` sweep function) may write the two
 -- sweep-only reasons or revision 0 on an unbound request; `openmettle_gateway` cannot forge
 -- sweep reasons or occupy revision 0 to block the sweep. Bound ADR 0037 requests keep
@@ -94,11 +34,63 @@ BEGIN
 END
 $$;
 REVOKE ALL ON FUNCTION openmettle.enforce_gateway_report_sweep_only() FROM PUBLIC;
-CREATE TRIGGER gateway_usage_reports_sweep_only_guard
-    BEFORE INSERT OR UPDATE ON openmettle.gateway_usage_reports
-    FOR EACH ROW
-    WHEN (NEW.incomplete IN ('not_dispatched', 'unreported') OR NEW.revision = 0)
-    EXECUTE FUNCTION openmettle.enforce_gateway_report_sweep_only();
+
+-- Acquire the writer-excluding table locks (`gateway_requests` -> `gateway_usage_reports` ->
+-- `gateway_settlements`), run the upgrade preflight and dangling revision-0 cleanup, extend
+-- `gateway_usage_reports_incomplete_check` with `not_dispatched` (Group 1) and `unreported`
+-- (Group 2), and attach `gateway_usage_reports_sweep_only_guard` inside a single `DO` block so
+-- locks are always held inside a transaction block even when harness fixtures replay raw SQL
+-- files in autocommit mode.
+DO $$
+BEGIN
+    LOCK TABLE openmettle.gateway_requests IN EXCLUSIVE MODE;
+    LOCK TABLE openmettle.gateway_usage_reports IN ACCESS EXCLUSIVE MODE;
+    LOCK TABLE openmettle.gateway_settlements IN SHARE MODE;
+
+    IF EXISTS (
+        SELECT FROM openmettle.gateway_requests q
+         WHERE q.binding_id IS NULL
+           AND NOT q.settled_final
+           AND (EXISTS (SELECT FROM openmettle.gateway_settlements s
+                         WHERE s.request_id = q.id AND s.revision = 0)
+                OR EXISTS (SELECT FROM openmettle.quota_accepted_gateway_reports a
+                            WHERE a.request_id = q.id AND a.revision = 0))
+    ) THEN
+        RAISE EXCEPTION 'migration 32 cannot proceed with an accepted revision-0 report on an unsettled unbound request'
+            USING ERRCODE = '23514';
+    END IF;
+
+    DELETE FROM openmettle.gateway_usage_reports g
+     USING openmettle.gateway_requests q
+     WHERE g.request_id = q.id
+       AND q.binding_id IS NULL
+       AND NOT q.settled_final
+       AND g.revision = 0
+       AND NOT EXISTS (SELECT FROM openmettle.gateway_settlements s WHERE s.request_id = q.id)
+       AND NOT EXISTS (
+           SELECT FROM openmettle.quota_accepted_gateway_reports a
+            WHERE a.request_id = q.id AND a.revision = 0
+       );
+
+    ALTER TABLE openmettle.gateway_usage_reports
+        DROP CONSTRAINT gateway_usage_reports_incomplete_check,
+        ADD CONSTRAINT gateway_usage_reports_incomplete_check CHECK (
+            incomplete IS NULL OR (final
+                AND num_nonnulls(prompt_tokens,completion_tokens,reasoning_tokens,
+                                 reasoning_included,cost,unit) = 0
+                AND (incomplete IN (
+                    'model_not_served','model_mismatch','request_body','upstream_connect',
+                    'upstream_transport','upstream_timeout','upstream_status','upstream_encoding',
+                    'incomplete','caller_disconnected','no_usage','unparsable')
+                    OR (revision = 0 AND incomplete IN ('not_dispatched','unreported')))));
+
+    CREATE TRIGGER gateway_usage_reports_sweep_only_guard
+        BEFORE INSERT OR UPDATE ON openmettle.gateway_usage_reports
+        FOR EACH ROW
+        WHEN (NEW.incomplete IN ('not_dispatched', 'unreported') OR NEW.revision = 0)
+        EXECUTE FUNCTION openmettle.enforce_gateway_report_sweep_only();
+END
+$$;
 
 -- Update migration 31's deferred final-settlement check for the two sweep reasons and
 -- post-sweep revision-1 corrections:
