@@ -70,10 +70,11 @@ worker then connects without TLS, and the following cross the cluster network un
 
 The bearer authorizes one dispatch of one handed-off request: the gateway spends it before
 reading the body, and it is worthless after that dispatch or once the run's lease or deadline
-has passed. Someone who can observe the traffic can still read every prompt and response.
+has passed. Someone who can observe the traffic can still read every prompt and response, and
+someone who can intercept it can replace a request before the gateway receives it.
 
 Mitigate with a NetworkPolicy that admits only the worker pods to the gateway's port, and the
-gateway's egress only to its SGLang upstream and PostgreSQL. For anything stricter, use TLS:
+gateway's egress only to its SGLang upstream, PostgreSQL and cluster DNS. For anything stricter, use TLS:
 terminate it in front of the gateway, for example in a sidecar, and give the route an
 `https://` endpoint with the terminator's trust anchors. The gateway itself has no TLS
 listener. Mutual TLS is not supported.
