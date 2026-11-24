@@ -721,7 +721,11 @@ mod tests {
         assert!(!task.is_finished());
         assert!(streams.clone().try_acquire_owned().is_err());
 
-        let result = task.await.unwrap();
+        let result =
+            tokio::time::timeout_at(started + WRITE_TIMEOUT + Duration::from_secs(5), task)
+                .await
+                .expect("full-channel send did not time out within WRITE_TIMEOUT")
+                .unwrap();
         assert_eq!(result, Err(TIMEOUT));
         assert!(started.elapsed() >= WRITE_TIMEOUT);
         // Exiting on `WRITE_TIMEOUT` drops `_permit` immediately while `Frames(rx)` retains
