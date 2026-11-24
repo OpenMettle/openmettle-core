@@ -1197,3 +1197,85 @@ async fn a_disable_waits_for_an_administrative_write_that_has_decided() {
         reenable(&mut owner, &admin).await;
     }
 }
+
+/// Review #1: a self-disable needs its actor's row `FOR UPDATE`. Taking `FOR SHARE` first let
+/// another write by the same actor with the same request key share that row and then wait on
+/// the self-disable's audit key, while the self-disable waited for that share: a deadlock. The
+/// fixture's `FOR SHARE` holds the self-disable at its `FOR UPDATE` until the other write has
+/// reached its wait.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn a_self_disable_and_a_same_key_write_by_the_same_actor_do_not_deadlock() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let other = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &admin).await;
+    make_admin(&mut owner, &other).await;
+    let group = applied(
+        store::create_local_group(&mut connect(&db.0, API).await, &ctx(&admin, "g"), "Before")
+            .await,
+    );
+
+    let mut fixture = connect(&db.0, OWNER).await;
+    let fixture_pid = backend_pid(&mut fixture).await;
+    fixture.execute("BEGIN").await.unwrap();
+    sqlx::query("SELECT FROM openmettle.users WHERE id = $1::uuid FOR SHARE")
+        .bind(&admin.user)
+        .execute(&mut fixture)
+        .await
+        .unwrap();
+    let disable = tokio::spawn({
+        let (name, admin) = (db.0.clone(), admin.clone());
+        async move {
+            let mut c = connect(&name, API).await;
+            store::disable_user(&mut c, &ctx(&admin, "same-key"), &admin.user).await
+        }
+    });
+    let disable_pid = waiter_on(&db, fixture_pid).await;
+    let rename = tokio::spawn({
+        let (name, admin, group) = (db.0.clone(), admin.clone(), group.clone());
+        async move {
+            let mut c = connect(&name, API).await;
+            store::rename_local_group(&mut c, &ctx(&admin, "same-key"), &group, "After").await
+        }
+    });
+    // The rename either completes or waits behind the self-disable.
+    let mut observer = db.admin().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !rename.is_finished() {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT FROM pg_stat_activity WHERE datname = current_database()
+                    AND $1 = ANY(pg_blocking_pids(pid)))",
+            )
+            .bind(disable_pid)
+            .fetch_one(&mut observer)
+            .await
+            .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the rename neither completed nor waited on the self-disable");
+    fixture.execute("ROLLBACK").await.unwrap();
+
+    let results = [disable.await.unwrap(), rename.await.unwrap()];
+    // One applies; the other is refused as a reused key, or as inactive once the disable
+    // committed. Neither is a deadlock.
+    let applied = results
+        .iter()
+        .filter(|r| matches!(r, Ok(WriteOutcome::Applied { .. })))
+        .count();
+    let refused = results
+        .iter()
+        .filter(|r| {
+            matches!(r, Err(StoreError::Conflict(store::KEY_REUSED)))
+                || matches!(r, Err(StoreError::Denied(DenialReason::InactivePrincipal)))
+        })
+        .count();
+    assert_eq!((applied, refused), (1, 1), "{results:?}");
+}
