@@ -216,7 +216,7 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.gateway_close_unreported(uuid)',true,ARRAY['openmettle_worker']::text[])) AS f WHERE $1 >= 32
     UNION ALL SELECT * FROM (VALUES
         ('openmettle.enforce_gateway_report_bound_cost()',true,ARRAY[]::text[]),
-        ('openmettle.gateway_snapshot_cost_bound(jsonb)',false,ARRAY[]::text[]),
+        ('openmettle.gateway_snapshot_cost_bound(text)',false,ARRAY[]::text[]),
         ('openmettle.gateway_backfill_legacy_request_cost_bound(uuid,bigint,bigint)',false,ARRAY[]::text[]),
         ('openmettle.gateway_handoff_round(uuid,bytea,uuid,bytea,bigint,bigint)',true,ARRAY['openmettle_worker']::text[])) AS f WHERE $1 >= 34
 ),

@@ -458,7 +458,8 @@ round and compute `usage_cost_micros` inside PostgreSQL's `quota_gateway_fold`:
   Migration 34 adds nullable `cost_fixed_micros bigint` and `cost_micros_per_token bigint` to
   `openmettle.gateway_requests` (`gateway_requests_cost_bound_check`: both null or both non-null,
   only on unbound handed-off rows, both `>= 0` and at least one `> 0`), with no new table or
-  column grants, plus the internal `openmettle.gateway_snapshot_cost_bound(jsonb)` parser.
+  column grants, plus the internal `openmettle.gateway_snapshot_cost_bound(text)` parser
+  (validating canonical base-10 integer tokens on raw JSON before `jsonb` normalization).
   `gateway_round_authority` rejects malformed snapshot `cost_bound` values; the 6-arg overload
   `openmettle.gateway_handoff_round(request, dispatch, lease, bearer_hash, cost_fixed_micros, cost_micros_per_token)`
   (`openmettle_worker` only) validates BOTH coefficients individually against the locked run's
@@ -480,14 +481,16 @@ round and compute `usage_cost_micros` inside PostgreSQL's `quota_gateway_fold`:
   `measured = tokens * cost_micros_per_token + cost_fixed_micros` (failing closed with `23514`
   if `measured >= 1e38`). Incomplete and swept reports keep `measured = NULL` so they settle
   at `0` (or prior accepted usage), never `cost_fixed_micros`, while a late revision-1 complete
-  report superseding revision-0 `unreported` charges the derived cost. Tracking
-  `complete_final_seen` ensures a late revision-1 token report arriving after a schema-33
-  `unreported` sweep on an unpriced (`cost_fixed_micros IS NULL`) cost hold fails closed
-  (`23514` / `Error::Refused`) instead of silently settling at `0` micros; an operator can
-  reconcile such a legacy request via the owner-only
+  report superseding revision-0 `unreported` charges the derived cost. Bound ADR 0037 rows and
+  pre-34 rows without recorded prices retain `ceil(step.cost)` and migration 31's historical fold
+  transitions (preserving zero drift across `33 -> 34` even if a schema-33 `unreported` sweep was
+  followed by a token-only report before upgrade), while `enforce_gateway_final_settlement_closes()`
+  refuses (`23514` / `Error::Refused`) any newly accepted count-bearing settlement on an unpriced
+  (`cost_fixed_micros IS NULL`) cost-held unbound request; an operator can reconcile such a legacy
+  request via the owner-only
   `openmettle.gateway_backfill_legacy_request_cost_bound(request, fixed_micros, micros_per_token)`
-  function before re-ingesting the late report. Bound ADR 0037 rows and pre-34 rows without
-  recorded prices retain `ceil(step.cost)`.
+  function (which stamps pricing and reconciles any already-accepted token-only usage against the
+  cost hold and budgets).
 - **No caller-supplied cost or undispatched settlement on unbound requests.** Both
   `settlement::ingest` (after exact historical replay recognition) and a `BEFORE INSERT OR UPDATE`
   trigger (`gateway_usage_reports_bound_cost_guard` -> `enforce_gateway_report_bound_cost`, no

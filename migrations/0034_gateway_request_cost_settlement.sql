@@ -29,37 +29,47 @@ END;
 $$;
 REVOKE ALL ON FUNCTION openmettle.enforce_gateway_report_bound_cost() FROM PUBLIC;
 
--- Internal: parse and validate the optional admission-pinned `cost_bound` object in
--- `runs.config_snapshot`. Absent or JSON `null` returns `(true, NULL, NULL)` (preserving
--- pre-34 snapshots and profiles without a qualified `cost_bound`). When present and non-null,
--- requires a JSON object with keys subset of `('fixed_micros', 'micros_per_token')`,
--- `'micros_per_token'` present, exact integer JSON numbers (`scale = 0`) in
--- `0..=9223372036854775807` (defaulting `fixed_micros` to `0` when omitted), and at least one
--- coefficient strictly positive. Any malformed value returns `(false, NULL, NULL)`.
-CREATE FUNCTION openmettle.gateway_snapshot_cost_bound(p_cfg jsonb)
+-- Internal: parse and validate the optional admission-pinned `cost_bound` object in raw UTF-8
+-- `runs.config_snapshot` text BEFORE `jsonb` normalization (so exponent or signed-zero spellings
+-- like `1e2` and `-0` that Rust `CostBound` rejects are rejected identically in SQL). Absent or
+-- JSON `null` returns `(true, NULL, NULL)` (preserving pre-34 snapshots and profiles without a
+-- qualified `cost_bound`). When present and non-null, requires a JSON object with unique keys
+-- subset of `('fixed_micros', 'micros_per_token')`, `'micros_per_token'` present, canonical
+-- unsigned base-10 integer tokens (`^(0|[1-9][0-9]*)$`) in `0..=9223372036854775807` (defaulting
+-- `fixed_micros` to `0` when omitted), and at least one coefficient strictly positive. Any
+-- malformed value returns `(false, NULL, NULL)`.
+CREATE FUNCTION openmettle.gateway_snapshot_cost_bound(p_cfg_txt text)
 RETURNS TABLE(valid boolean, fixed_micros bigint, micros_per_token bigint)
 LANGUAGE plpgsql
 IMMUTABLE
 SET search_path = pg_catalog
 AS $$
 DECLARE
+    v_doc json;
+    v_cfg jsonb;
     v_cb jsonb;
-    v_fixed_json jsonb;
-    v_rate_json jsonb;
-    v_fixed_num numeric;
-    v_rate_num numeric;
+    v_cb_raw json;
+    v_rate_tok text;
+    v_fixed_tok text;
     v_fixed bigint;
     v_rate bigint;
 BEGIN
-    IF p_cfg IS NULL OR jsonb_typeof(p_cfg) <> 'object' THEN
+    IF p_cfg_txt IS NULL OR p_cfg_txt IS NOT JSON OBJECT WITH UNIQUE KEYS THEN
         RETURN QUERY SELECT false, NULL::bigint, NULL::bigint;
         RETURN;
     END IF;
-    IF NOT (p_cfg ? 'cost_bound') OR p_cfg -> 'cost_bound' = 'null'::jsonb THEN
+    BEGIN
+        v_doc := p_cfg_txt::json;
+        v_cfg := p_cfg_txt::jsonb;
+    EXCEPTION WHEN others THEN
+        RETURN QUERY SELECT false, NULL::bigint, NULL::bigint;
+        RETURN;
+    END;
+    IF NOT (v_cfg ? 'cost_bound') OR v_cfg -> 'cost_bound' = 'null'::jsonb THEN
         RETURN QUERY SELECT true, NULL::bigint, NULL::bigint;
         RETURN;
     END IF;
-    v_cb := p_cfg -> 'cost_bound';
+    v_cb := v_cfg -> 'cost_bound';
     IF jsonb_typeof(v_cb) <> 'object' THEN
         RETURN QUERY SELECT false, NULL::bigint, NULL::bigint;
         RETURN;
@@ -72,34 +82,34 @@ BEGIN
         RETURN QUERY SELECT false, NULL::bigint, NULL::bigint;
         RETURN;
     END IF;
-    v_rate_json := v_cb -> 'micros_per_token';
-    IF jsonb_typeof(v_rate_json) <> 'number' THEN
+
+    v_cb_raw := v_doc -> 'cost_bound';
+    IF json_typeof(v_cb_raw -> 'micros_per_token') IS DISTINCT FROM 'number' THEN
         RETURN QUERY SELECT false, NULL::bigint, NULL::bigint;
         RETURN;
     END IF;
-    v_rate_num := v_rate_json::numeric;
-    IF scale(v_rate_num) <> 0
-       OR v_rate_num < 0
-       OR v_rate_num > 9223372036854775807::numeric THEN
+    v_rate_tok := pg_catalog.btrim((v_cb_raw -> 'micros_per_token')::text, E' \t\n\r');
+    IF v_rate_tok IS NULL
+       OR v_rate_tok COLLATE "C" !~ '^(0|[1-9][0-9]*)$'
+       OR v_rate_tok::numeric > 9223372036854775807::numeric THEN
         RETURN QUERY SELECT false, NULL::bigint, NULL::bigint;
         RETURN;
     END IF;
-    v_rate := v_rate_num::bigint;
+    v_rate := v_rate_tok::bigint;
 
     IF v_cb ? 'fixed_micros' THEN
-        v_fixed_json := v_cb -> 'fixed_micros';
-        IF jsonb_typeof(v_fixed_json) <> 'number' THEN
+        IF json_typeof(v_cb_raw -> 'fixed_micros') IS DISTINCT FROM 'number' THEN
             RETURN QUERY SELECT false, NULL::bigint, NULL::bigint;
             RETURN;
         END IF;
-        v_fixed_num := v_fixed_json::numeric;
-        IF scale(v_fixed_num) <> 0
-           OR v_fixed_num < 0
-           OR v_fixed_num > 9223372036854775807::numeric THEN
+        v_fixed_tok := pg_catalog.btrim((v_cb_raw -> 'fixed_micros')::text, E' \t\n\r');
+        IF v_fixed_tok IS NULL
+           OR v_fixed_tok COLLATE "C" !~ '^(0|[1-9][0-9]*)$'
+           OR v_fixed_tok::numeric > 9223372036854775807::numeric THEN
             RETURN QUERY SELECT false, NULL::bigint, NULL::bigint;
             RETURN;
         END IF;
-        v_fixed := v_fixed_num::bigint;
+        v_fixed := v_fixed_tok::bigint;
     ELSE
         v_fixed := 0;
     END IF;
@@ -111,7 +121,7 @@ BEGIN
     RETURN QUERY SELECT true, v_fixed, v_rate;
 END;
 $$;
-REVOKE ALL ON FUNCTION openmettle.gateway_snapshot_cost_bound(jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION openmettle.gateway_snapshot_cost_bound(text) FROM PUBLIC;
 
 -- Acquire all four writer-excluding table locks atomically via a bounded `NOWAIT` retry loop
 -- (rolling back each failed subtransaction on `lock_not_available` so no partial table lock is
@@ -257,7 +267,7 @@ BEGIN
             OR cap.key COLLATE "C" !~ '^[abcdefghijklmnopqrstuvwxyz0123456789._-]+$') THEN
         RETURN false;
     END IF;
-    IF NOT (SELECT cb.valid FROM openmettle.gateway_snapshot_cost_bound(cfg) cb) THEN
+    IF NOT (SELECT cb.valid FROM openmettle.gateway_snapshot_cost_bound(txt) cb) THEN
         RETURN false;
     END IF;
 
@@ -344,7 +354,6 @@ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE
     req openmettle.gateway_requests%ROWTYPE;
     txt text;
-    cfg jsonb;
     snap record;
 BEGIN
     -- A snapshot taken before the locks could miss a committed revocation.
@@ -378,20 +387,12 @@ BEGIN
     IF NOT openmettle.gateway_round_authority(p_request,p_lease,clock_timestamp()) THEN
         RETURN false;
     END IF;
-    BEGIN
-        SELECT convert_from(r.config_snapshot, 'UTF8') INTO txt
-          FROM openmettle.runs r
-         WHERE r.id = req.run_id
-           AND r.snapshot_format = 'openmettle.conversation'
-           AND r.snapshot_version = 1;
-        IF txt IS NULL OR txt IS NOT JSON OBJECT WITH UNIQUE KEYS THEN
-            RETURN false;
-        END IF;
-        cfg := txt::jsonb;
-    EXCEPTION WHEN others THEN
-        RETURN false;
-    END;
-    SELECT * INTO snap FROM openmettle.gateway_snapshot_cost_bound(cfg);
+    SELECT convert_from(r.config_snapshot, 'UTF8') INTO txt
+      FROM openmettle.runs r
+     WHERE r.id = req.run_id
+       AND r.snapshot_format = 'openmettle.conversation'
+       AND r.snapshot_version = 1;
+    SELECT * INTO snap FROM openmettle.gateway_snapshot_cost_bound(txt);
     IF NOT snap.valid
        OR (p_cost_fixed_micros, p_cost_micros_per_token)
           IS DISTINCT FROM (snap.fixed_micros, snap.micros_per_token) THEN
@@ -440,7 +441,6 @@ DECLARE
     v_any_cost_limit boolean := false;
     v_cost_required boolean := false;
     v_cfg_txt text;
-    v_cfg jsonb;
     v_snap record;
 BEGIN
     IF EXISTS (
@@ -585,19 +585,16 @@ BEGIN
              WHERE r.id = NEW.run_id
                AND r.snapshot_format = 'openmettle.conversation'
                AND r.snapshot_version = 1;
-            IF v_cfg_txt IS NULL OR v_cfg_txt IS NOT JSON OBJECT WITH UNIQUE KEYS THEN
-                RAISE EXCEPTION 'invalid run config_snapshot for unbound gateway handoff'
-                    USING ERRCODE = 'OMQ04';
-            END IF;
-            v_cfg := v_cfg_txt::jsonb;
         EXCEPTION
-            WHEN SQLSTATE 'OMQ04' THEN
-                RAISE;
             WHEN others THEN
                 RAISE EXCEPTION 'invalid run config_snapshot for unbound gateway handoff'
                     USING ERRCODE = 'OMQ04';
         END;
-        SELECT * INTO v_snap FROM openmettle.gateway_snapshot_cost_bound(v_cfg);
+        IF v_cfg_txt IS NULL OR v_cfg_txt IS NOT JSON OBJECT WITH UNIQUE KEYS THEN
+            RAISE EXCEPTION 'invalid run config_snapshot for unbound gateway handoff'
+                USING ERRCODE = 'OMQ04';
+        END IF;
+        SELECT * INTO v_snap FROM openmettle.gateway_snapshot_cost_bound(v_cfg_txt);
         IF NOT v_snap.valid
            OR (NEW.cost_fixed_micros, NEW.cost_micros_per_token)
               IS DISTINCT FROM (v_snap.fixed_micros, v_snap.micros_per_token) THEN
@@ -691,18 +688,18 @@ $$;
 
 -- Derive `usage_cost_micros` settlement on priced unbound requests from reported token counts
 -- and the immutable `(cost_fixed_micros, cost_micros_per_token)` recorded on `gateway_requests`.
--- Bound ADR 0037 rows and historical pre-34 rows without recorded prices retain `ceil(step.cost)`.
--- Incomplete and swept reports keep charging nothing of their own (`0`, not `cost_fixed_micros`),
--- and `complete_final_seen` ensures a late non-incomplete report after a schema-33 `unreported`
--- sweep cannot stay `'settled'` at `0` micros without either recorded pricing or `step.cost`.
--- Signature, volatility, search path and privileges are unchanged.
+-- Bound ADR 0037 rows and historical pre-34 rows without recorded prices retain `ceil(step.cost)`
+-- and migration 31's exact transition rule (preserving already-accepted schema-33 `unreported` +
+-- token-report histories with zero drift), while `enforce_gateway_final_settlement_closes()`
+-- requires recorded pricing before accepting any new count-bearing report on a cost-held unbound
+-- request. Incomplete and swept reports keep charging nothing of their own (`0`, not
+-- `cost_fixed_micros`). Signature, volatility, search path and privileges are unchanged.
 CREATE OR REPLACE FUNCTION openmettle.quota_gateway_fold(p_request uuid,p_kind text,p_units bigint,p_through bigint)
 RETURNS TABLE(rev bigint,source uuid,report uuid,state text,settled numeric,held bigint)
 LANGUAGE plpgsql STABLE SET search_path=pg_catalog AS $$
 DECLARE
     step record; prompt numeric:=0; completion numeric:=0; reasoning numeric:=0;
     included boolean:=true; separate_seen boolean:=false; last_k bigint:=-1; last_r bigint:=-1;
-    complete_final_seen boolean:=false;
     v_priced boolean:=false; v_fixed bigint; v_rate bigint;
     tokens numeric; measured numeric; complete boolean;
 BEGIN
@@ -749,14 +746,9 @@ BEGIN
         END IF;
         IF step.incomplete IS NOT NULL THEN
             state:='settled'; held:=0;
-        ELSE
-            complete_final_seen:=complete_final_seen OR (complete AND step.final);
-            IF complete THEN
-                settled:=measured;
-            ELSIF measured IS NOT NULL THEN
-                settled:=greatest(measured,settled);
-            END IF;
-            state:=CASE WHEN complete_final_seen THEN 'settled' ELSE 'handoff_committed' END;
+        ELSIF measured IS NOT NULL THEN
+            settled:=CASE WHEN complete THEN measured ELSE greatest(measured,settled) END;
+            IF complete AND step.final THEN state:='settled'; END IF;
             held:=CASE WHEN state='settled' THEN 0 ELSE greatest(0,p_units-settled)::bigint END;
         END IF;
         RETURN NEXT;
@@ -765,11 +757,12 @@ END
 $$;
 
 -- Owner-only administrative reconciliation for a pre-34 unbound request whose `usage_cost_micros`
--- hold was closed at `0` (e.g. by a schema-33 `unreported` sweep) before a late revision-1 token
--- report arrived on schema 34. Verifies `openmettle_owner`, valid positive pricing, exact match
--- against the request's `usage_cost_micros` reservation ceiling, zero settled cost, and absence
--- of any accepted count-bearing (`incomplete IS NULL`) report before stamping the immutable
--- `(cost_fixed_micros, cost_micros_per_token)` columns.
+-- hold was closed at `0` without caller-supplied `cost` (e.g. by a schema-33 `unreported` sweep,
+-- with or without a pre-upgrade token-only correction). Verifies `openmettle_owner`, valid
+-- positive pricing, snapshot agreement when pinned, exact match against the request's
+-- `usage_cost_micros` reservation ceiling, zero settled cost, and absence of any caller-priced
+-- report (`cost` or `unit`), then stamps `(cost_fixed_micros, cost_micros_per_token)` and
+-- reconciles any already-accepted token-only usage against the cost hold and budgets.
 CREATE FUNCTION openmettle.gateway_backfill_legacy_request_cost_bound(
     p_request uuid,
     p_cost_fixed_micros bigint,
@@ -781,6 +774,11 @@ SET search_path = pg_catalog
 AS $$
 DECLARE
     q openmettle.gateway_requests%ROWTYPE;
+    h openmettle.quota_reservations%ROWTYPE;
+    v_cfg_txt text;
+    v_snap record;
+    f record;
+    v_source_key text;
 BEGIN
     IF NOT pg_catalog.pg_has_role(current_user, 'openmettle_owner', 'USAGE') THEN
         RAISE EXCEPTION 'gateway legacy cost_bound backfill requires openmettle_owner'
@@ -794,6 +792,9 @@ BEGIN
        OR (p_cost_fixed_micros = 0 AND p_cost_micros_per_token = 0) THEN
         RAISE EXCEPTION 'invalid gateway cost bound' USING ERRCODE = '23514';
     END IF;
+    PERFORM FROM openmettle.runs r
+      WHERE r.id = (SELECT qr.run_id FROM openmettle.gateway_requests qr WHERE qr.id = p_request)
+        FOR SHARE;
     SELECT * INTO q
       FROM openmettle.gateway_requests qr
      WHERE qr.id = p_request
@@ -805,14 +806,37 @@ BEGIN
         RAISE EXCEPTION 'legacy request is not eligible for cost_bound backfill'
             USING ERRCODE = '23514';
     END IF;
-    PERFORM FROM openmettle.quota_reservations h
-     WHERE h.gateway_request_id = q.id
-       AND h.resource_kind = 'usage_cost_micros'
-       AND h.state = 'settled'
-       AND h.settled_units = 0
-       AND h.reserved_units::numeric
+    IF q.run_id IS NOT NULL THEN
+        BEGIN
+            SELECT convert_from(r.config_snapshot, 'UTF8') INTO v_cfg_txt
+              FROM openmettle.runs r
+             WHERE r.id = q.run_id
+               AND r.snapshot_format = 'openmettle.conversation'
+               AND r.snapshot_version = 1;
+        EXCEPTION
+            WHEN others THEN
+                RAISE EXCEPTION 'backfill cost_bound does not match run snapshot'
+                    USING ERRCODE = '23514';
+        END;
+        SELECT * INTO v_snap FROM openmettle.gateway_snapshot_cost_bound(v_cfg_txt);
+        IF NOT v_snap.valid
+           OR (v_snap.fixed_micros IS NOT NULL
+               AND (p_cost_fixed_micros, p_cost_micros_per_token)
+                   IS DISTINCT FROM (v_snap.fixed_micros, v_snap.micros_per_token)) THEN
+            RAISE EXCEPTION 'backfill cost_bound does not match run snapshot'
+                USING ERRCODE = '23514';
+        END IF;
+    END IF;
+    SELECT * INTO h
+      FROM openmettle.quota_reservations qr
+     WHERE qr.gateway_request_id = q.id
+       AND qr.resource_kind = 'usage_cost_micros'
+       AND qr.state = 'settled'
+       AND qr.settled_units = 0
+       AND qr.held_units = 0
+       AND qr.reserved_units::numeric
            = q.units::numeric * p_cost_micros_per_token + p_cost_fixed_micros
-       FOR SHARE;
+       FOR NO KEY UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'legacy request cost hold does not match backfill cost_bound'
             USING ERRCODE = '23514';
@@ -822,15 +846,57 @@ BEGIN
           FROM openmettle.quota_accepted_gateway_reports a
           JOIN openmettle.gateway_usage_reports g USING (request_id, revision, final)
          WHERE a.request_id = q.id
-           AND g.incomplete IS NULL
+           AND (g.cost IS NOT NULL OR g.unit IS NOT NULL)
     ) THEN
-        RAISE EXCEPTION 'legacy request already accepted a count-bearing usage report'
+        RAISE EXCEPTION 'legacy request already accepted a caller-priced usage report'
             USING ERRCODE = '23514';
     END IF;
     UPDATE openmettle.gateway_requests qr
        SET cost_fixed_micros = p_cost_fixed_micros,
            cost_micros_per_token = p_cost_micros_per_token
      WHERE qr.id = q.id;
+    IF h.accepted_source_revision IS NOT NULL THEN
+        SELECT * INTO f
+          FROM openmettle.quota_gateway_fold(
+                   q.id,
+                   'usage_cost_micros',
+                   h.reserved_units,
+                   h.accepted_source_revision
+               )
+         ORDER BY rev DESC LIMIT 1;
+        IF FOUND THEN
+            IF f.state IS DISTINCT FROM 'settled' OR f.held <> 0 THEN
+                RAISE EXCEPTION 'legacy request accepted history does not close its cost hold'
+                    USING ERRCODE = '23514';
+            END IF;
+            IF f.settled <> 0 THEN
+                PERFORM openmettle.quota_adjust(h.id, f.settled, 0);
+                h.revision := h.revision + 1;
+                v_source_key := CASE
+                    WHEN EXISTS (
+                        SELECT 1
+                          FROM openmettle.quota_reconciliations rec
+                         WHERE rec.reservation_id = h.id
+                           AND rec.source_key = 'gateway:' || f.rev
+                    ) THEN 'backfill:' || f.rev
+                    ELSE 'gateway:' || f.rev
+                END;
+                INSERT INTO openmettle.quota_reconciliations (
+                    reservation_id, transition_revision, source_key,
+                    gateway_request_id, gateway_report_source, gateway_report_id,
+                    source_revision, kind, cumulative_units, delta_active, delta_reserved
+                ) VALUES (
+                    h.id, h.revision, v_source_key,
+                    q.id, f.source, f.report,
+                    f.rev, 'final_correction', f.settled, f.settled, 0
+                );
+                UPDATE openmettle.quota_reservations
+                   SET settled_units = f.settled,
+                       revision = h.revision
+                 WHERE id = h.id;
+            END IF;
+        END IF;
+    END IF;
 END;
 $$;
 REVOKE ALL ON FUNCTION openmettle.gateway_backfill_legacy_request_cost_bound(uuid,bigint,bigint) FROM PUBLIC;
@@ -987,6 +1053,26 @@ BEGIN
            AND (g.cost IS NOT NULL OR g.unit IS NOT NULL)
     ) THEN
         RAISE EXCEPTION 'unbound usage report cannot supply cost'
+            USING ERRCODE = '23514';
+    END IF;
+
+    IF req.binding_id IS NULL
+       AND advanced
+       AND req.cost_fixed_micros IS NULL
+       AND EXISTS (
+           SELECT 1
+             FROM openmettle.quota_reservations h
+            WHERE h.gateway_request_id = req.id
+              AND h.resource_kind = 'usage_cost_micros'
+       )
+       AND EXISTS (
+           SELECT 1
+             FROM openmettle.gateway_usage_reports g
+            WHERE g.request_id = NEW.request_id
+              AND g.revision = NEW.revision
+              AND g.incomplete IS NULL
+       ) THEN
+        RAISE EXCEPTION 'unbound cost-held request requires recorded cost_bound before accepting usage counts'
             USING ERRCODE = '23514';
     END IF;
 

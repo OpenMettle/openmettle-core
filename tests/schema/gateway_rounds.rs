@@ -5296,3 +5296,479 @@ async fn review_1_p3_6_token_only_request_ignores_overflowing_unused_cost_bound_
         );
     }
 }
+
+/// Review #2 P1 (Fix #4): a schema-33 cost-held request swept as `unreported` at rev 0 AND
+/// corrected by a complete token-only rev-1 report *before* migration 34 must preserve zero
+/// accounting drift across the 33 -> 34 upgrade, allow exact rev-1 duplicate replay, refuse a new
+/// rev-2 token correction until `gateway_backfill_legacy_request_cost_bound` runs, reconcile the
+/// already-accepted rev-1 cost upon backfill with zero drift, and then accept rev 2 cleanly.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn review_2_p1_pre_upgrade_unreported_plus_rev1_preserves_zero_drift_and_backfills() {
+    use openmettle_core::{
+        authz::gateway::{self, TurnRound},
+        model_config::CostBound,
+    };
+    use sqlx::Connection;
+
+    let mut f = Rounds::at(33).await;
+    enable_cost_metering_defaults(&mut f.owner, 1_000_000).await;
+    let worker_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(f.db.1.options(WORKER));
+    let gw_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(f.db.1.options(pg::GATEWAY));
+    let cb = CostBound {
+        fixed_micros: 50,
+        micros_per_token: 1,
+    };
+    let (run_id, claim) = admit_and_claim_priced(&mut f, 100, Some(cb), 1, false).await;
+    let pending = gateway::reserve_turn_round(
+        &worker_pool,
+        TurnRound {
+            scope_id: &f.scope,
+            actor: &f.actor.user,
+            approval: &f.actor.approval,
+            run_id: &run_id,
+            round: 1,
+            claim_token: &claim,
+            installation: INSTALL,
+            model: "a",
+            round_tokens: 100,
+            round_cost: Some(150),
+            cost_bound: Some(cb),
+            requires_device_slot: false,
+        },
+    )
+    .await
+    .unwrap();
+    let secret = [0xb1_u8; 32];
+    let bearer = [0xb2_u8; 32];
+    sqlx::query(
+        "UPDATE openmettle.gateway_requests SET dispatch_hash = sha256($2) WHERE id = $1::uuid",
+    )
+    .bind(&pending.id)
+    .bind(secret.as_slice())
+    .execute(&mut f.owner)
+    .await
+    .unwrap();
+    {
+        let mut w = connect(&f.db.0, WORKER).await;
+        let mut tx = w.begin().await.unwrap();
+        sqlx::query(
+            "SELECT openmettle.quota_lock_turn_handoff_prefix($1::uuid,$2,$3::uuid,$4::uuid,$5::uuid)",
+        )
+        .bind(&pending.id)
+        .bind(secret.as_slice())
+        .bind(&f.scope)
+        .bind(&run_id)
+        .bind(&claim)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let ok: bool = sqlx::query_scalar(HANDOFF)
+            .bind(&pending.id)
+            .bind(secret.as_slice())
+            .bind(&claim)
+            .bind(bearer.as_slice())
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert!(ok);
+        sqlx::query(
+            "SELECT openmettle.quota_commit_turn_handoff($1::uuid,$2,$3::uuid,$4::uuid,$5::uuid,false,NULL,false)",
+        )
+        .bind(&pending.id)
+        .bind(secret.as_slice())
+        .bind(&f.scope)
+        .bind(&run_id)
+        .bind(&claim)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(CONFIRM)
+            .bind(&pending.id)
+            .bind(secret.as_slice())
+            .bind(&claim)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let mut gw = connect(&f.db.0, pg::GATEWAY).await;
+    sqlx::query("SELECT FROM openmettle.gateway_dispatch($1::uuid, sha256($2))")
+        .bind(&pending.id)
+        .bind(bearer.as_slice())
+        .execute(&mut gw)
+        .await
+        .unwrap();
+    f.owner_exec(
+        "UPDATE openmettle.runs
+            SET claimed_at = clock_timestamp() - interval '30 minutes',
+                lease_expires_at = clock_timestamp() - interval '25 minutes',
+                execution_expires_at = clock_timestamp() - interval '20 minutes'
+          WHERE id = $1::uuid",
+        &run_id,
+    )
+    .await;
+    let mut worker_c = connect(&f.db.0, WORKER).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(SWEEP_CLOSE)
+            .bind(&pending.id)
+            .fetch_one(&mut worker_c)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("unreported")
+    );
+
+    // Accept rev 1 (20 + 10 = 30 tokens, cost = None) STILL ON SCHEMA 33 before upgrading.
+    let rev1 = UsageReport {
+        request: pending.id.clone(),
+        installation: INSTALL.into(),
+        principal: f.actor.user.clone(),
+        scope: f.scope.clone(),
+        source: INSTALL.into(),
+        report_id: pending.id.clone(),
+        revision: 1,
+        r#final: true,
+        prompt_tokens: Some(20),
+        completion_tokens: Some(10),
+        reasoning_tokens: None,
+        reasoning_included: None,
+        cost: None,
+        unit: None,
+    };
+    assert_eq!(
+        settlement::ingest(&gw_pool, &rev1).await,
+        Ok(Outcome::Applied)
+    );
+
+    // Also seed a schema-33 caller-priced cost=0 row so we verify backfill still refuses
+    // caller-priced histories (`cost IS NOT NULL`).
+    let (run_cp, claim_cp) = admit_and_claim_priced(&mut f, 100, Some(cb), 1, false).await;
+    let pending_cp = gateway::reserve_turn_round(
+        &worker_pool,
+        TurnRound {
+            scope_id: &f.scope,
+            actor: &f.actor.user,
+            approval: &f.actor.approval,
+            run_id: &run_cp,
+            round: 1,
+            claim_token: &claim_cp,
+            installation: INSTALL,
+            model: "a",
+            round_tokens: 100,
+            round_cost: Some(150),
+            cost_bound: Some(cb),
+            requires_device_slot: false,
+        },
+    )
+    .await
+    .unwrap();
+    let secret_cp = [0xb3_u8; 32];
+    let bearer_cp = [0xb4_u8; 32];
+    sqlx::query(
+        "UPDATE openmettle.gateway_requests SET dispatch_hash = sha256($2) WHERE id = $1::uuid",
+    )
+    .bind(&pending_cp.id)
+    .bind(secret_cp.as_slice())
+    .execute(&mut f.owner)
+    .await
+    .unwrap();
+    {
+        let mut w = connect(&f.db.0, WORKER).await;
+        let mut tx = w.begin().await.unwrap();
+        sqlx::query(
+            "SELECT openmettle.quota_lock_turn_handoff_prefix($1::uuid,$2,$3::uuid,$4::uuid,$5::uuid)",
+        )
+        .bind(&pending_cp.id)
+        .bind(secret_cp.as_slice())
+        .bind(&f.scope)
+        .bind(&run_cp)
+        .bind(&claim_cp)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        assert!(
+            sqlx::query_scalar::<_, bool>(HANDOFF)
+                .bind(&pending_cp.id)
+                .bind(secret_cp.as_slice())
+                .bind(&claim_cp)
+                .bind(bearer_cp.as_slice())
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap()
+        );
+        sqlx::query(
+            "SELECT openmettle.quota_commit_turn_handoff($1::uuid,$2,$3::uuid,$4::uuid,$5::uuid,false,NULL,false)",
+        )
+        .bind(&pending_cp.id)
+        .bind(secret_cp.as_slice())
+        .bind(&f.scope)
+        .bind(&run_cp)
+        .bind(&claim_cp)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(CONFIRM)
+            .bind(&pending_cp.id)
+            .bind(secret_cp.as_slice())
+            .bind(&claim_cp)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    sqlx::query("SELECT FROM openmettle.gateway_dispatch($1::uuid, sha256($2))")
+        .bind(&pending_cp.id)
+        .bind(bearer_cp.as_slice())
+        .execute(&mut gw)
+        .await
+        .unwrap();
+    {
+        let mut tx = gw.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_usage_reports
+                 (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens,cost,unit)
+             VALUES ($1::uuid,$2::uuid,$1::uuid,1,true,10,5,0,'usd_micros')",
+        )
+        .bind(&pending_cp.id)
+        .bind(INSTALL)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO openmettle.gateway_settlements
+                 (request_id,revision,final,measured,outstanding)
+             VALUES ($1::uuid,1,true,15,0)",
+        )
+        .bind(&pending_cp.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("SELECT openmettle.quota_settle_gateway_usage($1::uuid,$2::uuid,$1::uuid,1)")
+            .bind(&pending_cp.id)
+            .bind(INSTALL)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let pre_drift: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT storage_mismatches, budget_mismatches, settlement_mismatches,
+                pending_gateway_reconciliations
+           FROM openmettle.quota_verify_accounting_drift()",
+    )
+    .fetch_one(&mut worker_c)
+    .await
+    .unwrap();
+    assert_eq!(pre_drift, (0, 0, 0, 0));
+
+    // Upgrade 33 -> 34 must preserve zero accounting drift immediately!
+    let settings = f.db.settings(Duration::from_secs(10));
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+    let post_drift: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT storage_mismatches, budget_mismatches, settlement_mismatches,
+                pending_gateway_reconciliations
+           FROM openmettle.quota_verify_accounting_drift()",
+    )
+    .fetch_one(&mut worker_c)
+    .await
+    .unwrap();
+    assert_eq!(
+        post_drift,
+        (0, 0, 0, 0),
+        "33 -> 34 upgrade must preserve 0 accounting drift on pre-accepted unreported + rev-1 history"
+    );
+
+    // Exact replay of rev 1 returns Duplicate, while a new rev-2 token correction before backfill
+    // fails closed (`Error::Refused`) without advancing `accepted_source_revision`.
+    assert_eq!(
+        settlement::ingest(&gw_pool, &rev1).await,
+        Ok(Outcome::Duplicate)
+    );
+    let rev2 = UsageReport {
+        revision: 2,
+        prompt_tokens: Some(25),
+        completion_tokens: Some(15),
+        ..rev1.clone()
+    };
+    assert_eq!(
+        settlement::ingest(&gw_pool, &rev2).await,
+        Err(StoreError::Refused),
+        "new rev-2 token correction on unpriced legacy cost hold must be refused before backfill"
+    );
+
+    // Caller-priced cost=0 history is still refused by backfill (`23514`), whereas the unpriced
+    // swept + rev-1 history backfills cleanly, charging 30 * 1 + 50 = 80 micros with 0 drift!
+    assert_eq!(
+        sqlstate(
+            sqlx::query(
+                "SELECT openmettle.gateway_backfill_legacy_request_cost_bound($1::uuid, 50, 1)"
+            )
+            .bind(&pending_cp.id)
+            .execute(&mut f.owner)
+            .await
+        ),
+        "23514"
+    );
+    sqlx::query("SELECT openmettle.gateway_backfill_legacy_request_cost_bound($1::uuid, 50, 1)")
+        .bind(&pending.id)
+        .execute(&mut f.owner)
+        .await
+        .expect("owner backfill must reconcile pre-accepted rev-1 token report");
+    let after_backfill: (String, i64, String, Option<i64>) = sqlx::query_as(
+        "SELECT state, held_units, settled_units::text, accepted_source_revision
+           FROM openmettle.quota_reservations
+          WHERE gateway_request_id = $1::uuid AND resource_kind = 'usage_cost_micros'",
+    )
+    .bind(&pending.id)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(after_backfill, ("settled".into(), 0, "80".into(), Some(1)));
+    let drift_backfilled: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT storage_mismatches, budget_mismatches, settlement_mismatches,
+                pending_gateway_reconciliations
+           FROM openmettle.quota_verify_accounting_drift()",
+    )
+    .fetch_one(&mut worker_c)
+    .await
+    .unwrap();
+    assert_eq!(drift_backfilled, (0, 0, 0, 0));
+
+    // And rev 2 (25 + 15 = 40 tokens -> 90 micros) now applies cleanly with 0 drift!
+    assert_eq!(
+        settlement::ingest(&gw_pool, &rev2).await,
+        Ok(Outcome::Applied)
+    );
+    let after_rev2: (String, i64, String, Option<i64>) = sqlx::query_as(
+        "SELECT state, held_units, settled_units::text, accepted_source_revision
+           FROM openmettle.quota_reservations
+          WHERE gateway_request_id = $1::uuid AND resource_kind = 'usage_cost_micros'",
+    )
+    .bind(&pending.id)
+    .fetch_one(&mut f.owner)
+    .await
+    .unwrap();
+    assert_eq!(after_rev2, ("settled".into(), 0, "90".into(), Some(2)));
+    let drift_rev2: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT storage_mismatches, budget_mismatches, settlement_mismatches,
+                pending_gateway_reconciliations
+           FROM openmettle.quota_verify_accounting_drift()",
+    )
+    .fetch_one(&mut worker_c)
+    .await
+    .unwrap();
+    assert_eq!(drift_rev2, (0, 0, 0, 0));
+}
+
+/// Review #2 P2 (Fix #1): raw JSON `cost_bound` number spellings rejected by Rust (`1e2`, `1E2`,
+/// `-0`) must also be rejected by PostgreSQL handoff checks (`gateway_round_authority`,
+/// `gateway_handoff_round`, and `enforce_gateway_handoff_holds`) before `jsonb` normalization.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn review_2_p2_snapshot_cost_bound_rejects_exponent_and_negative_zero_tokens() {
+    use sqlx::Connection;
+
+    const HANDOFF_PRICED: &str =
+        "SELECT openmettle.gateway_handoff_round($1::uuid,$2,$3::uuid,sha256($4),$5,$6)";
+
+    assert!(
+        serde_json::from_str::<openmettle_core::model_config::CostBound>(
+            r#"{"fixed_micros":1,"micros_per_token":100}"#
+        )
+        .is_ok()
+    );
+    let mut f = Rounds::new().await;
+    for (label, raw_cb, norm_fixed, norm_rate) in [
+        (
+            "rate 1e2",
+            r#"{"fixed_micros":1,"micros_per_token":1e2}"#,
+            1_i64,
+            100_i64,
+        ),
+        (
+            "rate 1E2",
+            r#"{"fixed_micros":1,"micros_per_token":1E2}"#,
+            1_i64,
+            100_i64,
+        ),
+        (
+            "rate -0",
+            r#"{"fixed_micros":1,"micros_per_token":-0}"#,
+            1_i64,
+            0_i64,
+        ),
+        (
+            "fixed 1e2",
+            r#"{"fixed_micros":1e2,"micros_per_token":1}"#,
+            100_i64,
+            1_i64,
+        ),
+        (
+            "fixed -0",
+            r#"{"fixed_micros":-0,"micros_per_token":1}"#,
+            0_i64,
+            1_i64,
+        ),
+    ] {
+        assert!(
+            serde_json::from_str::<openmettle_core::model_config::CostBound>(raw_cb).is_err(),
+            "Rust CostBound must reject {label}"
+        );
+        let raw_snap = format!(
+            r#"{{"effective":{{"model":"a","ceiling":{{"value":100}}}},"required_capabilities":{{}},"cost_bound":{raw_cb}}}"#
+        );
+        let r = f.round(raw_snap.as_bytes()).await;
+
+        // 1. Worker SQL `gateway_handoff_round` must return false.
+        let mut worker = connect(&f.db.0, WORKER).await;
+        let mut tx = worker.begin().await.unwrap();
+        let ok: bool = sqlx::query_scalar(HANDOFF_PRICED)
+            .bind(&r.request)
+            .bind(r.secret.as_slice())
+            .bind(&r.lease)
+            .bind(r.bearer.as_slice())
+            .bind(Some(norm_fixed))
+            .bind(Some(norm_rate))
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        assert!(
+            !ok,
+            "gateway_handoff_round must reject malformed JSON number token ({label})"
+        );
+
+        // 2. Direct owner UPDATE bypassing `gateway_handoff_round` must also fail `OMQ04` at commit
+        // via `enforce_gateway_handoff_holds`.
+        let mut owner_tx = f.owner.begin().await.unwrap();
+        sqlx::query(
+            "UPDATE openmettle.gateway_requests
+                SET state = 'handed_off',
+                    report_source = installation,
+                    bearer_hash = sha256($2),
+                    claim_hash = sha256(uuid_send($3::uuid)),
+                    cost_fixed_micros = $4,
+                    cost_micros_per_token = $5
+              WHERE id = $1::uuid",
+        )
+        .bind(&r.request)
+        .bind(r.bearer.as_slice())
+        .bind(&r.lease)
+        .bind(norm_fixed)
+        .bind(norm_rate)
+        .execute(&mut *owner_tx)
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlstate(owner_tx.commit().await),
+            "OMQ04",
+            "enforce_gateway_handoff_holds must reject malformed JSON number token ({label})"
+        );
+    }
+}
