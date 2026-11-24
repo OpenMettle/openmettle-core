@@ -1563,39 +1563,49 @@
       "name": "Recorded SGLang HTTP responses (decoder replay test fixtures)",
       "kind": "asset",
       "review_group": "core",
-      "distribution": "candidate",
+      "distribution": "included",
       "version": "recorded 2026-11-23",
       "pin": "Git tree 5a5f0a13f1611e29bb5ff2c88cdfc9abdbce2e0a (tests/fixtures/sglang-recorded, added in 583bcf55acd506ef367a55ceb826534ad376fdc1)",
-      "origin": "Raw HTTP responses recorded from one SGLang deployment running a patched fork of sgl-project/sglang and serving a single model; the fork commit and the model are not recorded in this repository",
+      "origin": "Recorded by the OpenMettle owner, as operator of their own SGLang deployment (a patched fork of sgl-project/sglang serving one model), with synthetic prompts written for the capture, and contributed to openmettle-core as test data",
       "source_evidence": [
         "tests/fixtures/sglang-recorded/README.md",
         "tests/provider_inference/recorded_sglang.rs",
-        "openmettle-core commit 583bcf55acd506ef367a55ceb826534ad376fdc1 (23 Nov 2026), the only commit that touches the directory at this head",
-        "https://github.com/OpenMettle/openmettle-core/issues/9"
+        "openmettle-core commit 583bcf55acd506ef367a55ceb826534ad376fdc1 (23 Nov 2026, merged in #146), the only commit that touches the directory at this head",
+        "https://github.com/OpenMettle/openmettle-core/issues/9",
+        "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7132587306"
       ],
       "licence": {
-        "expression": null,
-        "evidence": []
+        "expression": "MIT",
+        "evidence": [
+          "LICENSE",
+          "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7132587306"
+        ]
       },
       "notices": {
-        "status": "pending",
-        "files": [],
-        "obligations": []
+        "status": "recorded",
+        "files": [
+          "LICENSE"
+        ],
+        "obligations": [
+          "Retain the MIT copyright notice 'Copyright (c) 2026 OpenMettle contributors' and the permission notice from LICENSE in all copies or substantial portions."
+        ]
       },
       "review": {
-        "status": "pending",
-        "reviewer": null,
-        "date": null,
-        "evidence": [],
-        "notes": "Committed in the public openmettle-core source tree, so it falls inside the 19 Nov 2026 boundary (source code); no owner decision covers it yet. The README states: 12 cases recorded on 23 Nov 2026 from one real SGLang deployment running a patched fork whose exact commit was not verified; each request used a small synthetic prompt; the served model name, a site value, is replaced with recorded-sglang-model in every body and request; content-length is recomputed; header CRLF is stored as LF; streamed bodies were de-chunked. The request bodies are the capture tool's synthetic requests. The response bodies contain server-generated JSON and SSE framing (server: uvicorn, owned_by sglang) and short model-generated text, reasoning and tool-call arguments. Not recorded or verified: the fork revision, the model's identity, revision and licence, and whether any licence or terms apply to the model output; this register asserts none. Recorded by an agent; no review performed."
+        "status": "reviewed",
+        "reviewer": "OpenMettle owner (GitHub Drgr33nSenior)",
+        "date": "2026-11-24",
+        "evidence": [
+          "https://github.com/OpenMettle/openmettle-core/issues/32#issuecomment-7132587306"
+        ],
+        "notes": "Owner review recorded by an agent from the owner's decision comment, which also states the agent's application to these fixtures; merging the pull request that records this entry is the owner's confirmation of that application. Contributed by the owner as test data under the project's MIT licence and distributed as public openmettle-core source under the 19 Nov 2026 boundary. The fixtures contain server-generated JSON and SSE framing and a small amount of model-generated text, reasoning and tool-call arguments. By the owner decision, the model is the operator's choice and outside the project's scope: it is not named here, the operator accepted its licence, and this register takes no position on its terms. Not verified: the SGLang fork commit that served the capture. Reviewed against policy as licence bookkeeping, not legal clearance."
       },
       "tracking": [
         "V1-08",
         "V1-42"
       ],
       "redistribution": {
-        "assessment": "undetermined",
-        "basis": "No licence evidence is recorded in this register. The model that produced the responses and any terms on its output are not recorded."
+        "assessment": "redistributable",
+        "basis": "MIT recorded from LICENSE and the owner decision that the fixtures are contributed under the project's licence; MIT permits redistribution with the copyright and permission notice."
       }
     }
   ]
