@@ -43,25 +43,32 @@ fn media(h: &HeaderMap, stream: bool) -> Result<(), Error> {
     Ok(())
 }
 
-fn body_error(e: &hyper::Error) -> Error {
+fn classify_io_kind(kind: std::io::ErrorKind) -> Error {
     use std::io::ErrorKind;
+    match kind {
+        ErrorKind::InvalidData | ErrorKind::InvalidInput => Error::Malformed,
+        ErrorKind::UnexpectedEof
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::BrokenPipe
+        | ErrorKind::NotConnected
+        | ErrorKind::NetworkDown
+        | ErrorKind::NetworkUnreachable
+        | ErrorKind::HostUnreachable
+        | ErrorKind::TimedOut
+        | ErrorKind::Interrupted => Error::Incomplete,
+        _ => Error::Malformed,
+    }
+}
+
+fn body_error(e: &hyper::Error) -> Error {
     if e.is_parse() {
         return Error::Malformed;
     }
     let mut src = std::error::Error::source(e);
     while let Some(err) = src {
         if let Some(io) = err.downcast_ref::<std::io::Error>() {
-            return match io.kind() {
-                ErrorKind::InvalidData | ErrorKind::InvalidInput => Error::Malformed,
-                ErrorKind::UnexpectedEof
-                | ErrorKind::ConnectionReset
-                | ErrorKind::ConnectionAborted
-                | ErrorKind::BrokenPipe
-                | ErrorKind::NotConnected
-                | ErrorKind::TimedOut
-                | ErrorKind::Interrupted => Error::Incomplete,
-                _ => Error::Malformed,
-            };
+            return classify_io_kind(io.kind());
         }
         src = err.source();
     }
@@ -167,4 +174,35 @@ pub(super) async fn receive<F: Future<Output = ()>>(
         Protocol::Responses => responses.complete(&mut state, &v)?,
     };
     state.finish(q, p, request, server)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn io_interruption_kinds_including_network_loss_map_to_incomplete() {
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::NotConnected,
+            ErrorKind::NetworkDown,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::HostUnreachable,
+            ErrorKind::TimedOut,
+            ErrorKind::Interrupted,
+        ] {
+            assert_eq!(classify_io_kind(kind), Error::Incomplete, "{kind:?}");
+        }
+        for kind in [
+            ErrorKind::InvalidData,
+            ErrorKind::InvalidInput,
+            ErrorKind::Other,
+        ] {
+            assert_eq!(classify_io_kind(kind), Error::Malformed, "{kind:?}");
+        }
+    }
 }

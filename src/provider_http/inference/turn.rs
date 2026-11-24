@@ -173,14 +173,17 @@ pub(super) struct Output {
     pub blocks: Vec<Value>,
     reasoning_bytes: usize,
     pub calls: BTreeMap<usize, PendingCall>,
+    pub discarded_calls: usize,
     pub discarded_call_ids: Vec<String>,
     pub finished: bool,
     pub stop_reason: Option<StopReason>,
 }
 impl Output {
     pub fn discard_calls(&mut self) {
+        let dropped = std::mem::take(&mut self.calls);
+        self.discarded_calls += dropped.len();
         self.discarded_call_ids.extend(
-            std::mem::take(&mut self.calls)
+            dropped
                 .into_values()
                 .map(|c| c.id)
                 .filter(|id| !id.is_empty()),
@@ -326,10 +329,11 @@ impl Assembly {
         }
         let mut count = 0;
         for out in self.choices.values() {
-            count += out.calls.len();
+            let choice_calls = out.calls.len() + out.discarded_calls;
+            count += choice_calls;
             if !out.finished
                 || count > MAX_CALLS
-                || out.calls.len() > 1 && (!q.parallel || request.parallel == Some(false))
+                || choice_calls > 1 && (!q.parallel || request.parallel == Some(false))
             {
                 return Err(Error::Malformed);
             }

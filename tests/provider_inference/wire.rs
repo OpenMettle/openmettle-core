@@ -1125,45 +1125,45 @@ async fn chat_non_streamed_tool_call_arguments_require_json_string() {
     );
 }
 
+fn limit_wire(p: Protocol, stream: bool, msg: Value, items: Vec<Value>) -> Vec<u8> {
+    match (p, stream) {
+        (Protocol::Chat, false) => {
+            let mut v = chat_json(msg, "length".into());
+            v["usage"] = json!({"prompt_tokens": 21, "completion_tokens": 12});
+            fixture::json(v.to_string().as_bytes())
+        }
+        (Protocol::Chat, true) => {
+            let usage = event(json!({
+                "choices": [],
+                "usage": {"prompt_tokens": 21, "completion_tokens": 12}
+            }));
+            sse(&(delta(msg, "length".into()) + &usage + "data: [DONE]\r\n\r\n"))
+        }
+        (Protocol::Responses, false) => {
+            let v = json!({
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": items,
+                "usage": {"input_tokens": 21, "output_tokens": 12}
+            });
+            fixture::json(v.to_string().as_bytes())
+        }
+        (Protocol::Responses, true) => {
+            let v = json!({
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": items,
+                "usage": {"input_tokens": 21, "output_tokens": 12}
+            });
+            sse(&event(
+                json!({"type": "response.incomplete", "response": v}),
+            ))
+        }
+    }
+}
+
 #[tokio::test]
 async fn token_limit_stop_preserves_partial_output_and_usage_and_drops_calls() {
-    let limit_wire = |p: Protocol, stream: bool, msg: Value, items: Vec<Value>| -> Vec<u8> {
-        match (p, stream) {
-            (Protocol::Chat, false) => {
-                let mut v = chat_json(msg, "length".into());
-                v["usage"] = json!({"prompt_tokens": 21, "completion_tokens": 12});
-                fixture::json(v.to_string().as_bytes())
-            }
-            (Protocol::Chat, true) => {
-                let usage = event(json!({
-                    "choices": [],
-                    "usage": {"prompt_tokens": 21, "completion_tokens": 12}
-                }));
-                sse(&(delta(msg, "length".into()) + &usage + "data: [DONE]\r\n\r\n"))
-            }
-            (Protocol::Responses, false) => {
-                let v = json!({
-                    "status": "incomplete",
-                    "incomplete_details": {"reason": "max_output_tokens"},
-                    "output": items,
-                    "usage": {"input_tokens": 21, "output_tokens": 12}
-                });
-                fixture::json(v.to_string().as_bytes())
-            }
-            (Protocol::Responses, true) => {
-                let v = json!({
-                    "status": "incomplete",
-                    "incomplete_details": {"reason": "max_output_tokens"},
-                    "output": items,
-                    "usage": {"input_tokens": 21, "output_tokens": 12}
-                });
-                sse(&event(
-                    json!({"type": "response.incomplete", "response": v}),
-                ))
-            }
-        }
-    };
-
     for (p, stream) in MODES {
         // 1. Partial visible text alongside a half-generated tool call: keep partial text and
         // usage, mark StopReason::Limit, and drop the truncated call in BOTH caller and server
@@ -1374,26 +1374,59 @@ async fn responses_rejects_malformed_incomplete_details_on_envelope_and_items() 
                 "malformed envelope incomplete_details={bad_details} (stream={stream})"
             );
 
-            let mut bad_item = message("partial");
-            bad_item["status"] = json!("incomplete");
-            bad_item["incomplete_details"] = bad_details.clone();
-            let envelope = json!({
-                "status": "incomplete",
-                "incomplete_details": {"reason": "max_output_tokens"},
-                "output": [bad_item]
-            });
-            assert_eq!(
-                once(
-                    Protocol::Responses,
-                    stream,
-                    encode_responses(stream, &envelope)
-                )
+            for item_status in [
+                Some(json!("incomplete")),
+                Some(json!("completed")),
+                Some(Value::Null),
+                None,
+            ] {
+                let mut bad_item = message("partial");
+                match &item_status {
+                    Some(s) => bad_item["status"] = s.clone(),
+                    None => {
+                        bad_item.as_object_mut().unwrap().remove("status");
+                    }
+                }
+                bad_item["incomplete_details"] = bad_details.clone();
+                let envelope = json!({
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "output": [bad_item]
+                });
+                assert_eq!(
+                    once(
+                        Protocol::Responses,
+                        stream,
+                        encode_responses(stream, &envelope)
+                    )
+                    .await
+                    .err(),
+                    Some(Error::Malformed),
+                    "malformed item incomplete_details={bad_details}, status={item_status:?} (stream={stream})"
+                );
+            }
+        }
+
+        let completed_with_details = json!({
+            "status": "completed",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [message("done")]
+        });
+        let completed_bytes = if stream {
+            sse(&event(json!({
+                "type": "response.completed",
+                "response": completed_with_details
+            })))
+        } else {
+            fixture::json(completed_with_details.to_string().as_bytes())
+        };
+        assert_eq!(
+            once(Protocol::Responses, stream, completed_bytes)
                 .await
                 .err(),
-                Some(Error::Malformed),
-                "malformed item incomplete_details={bad_details} (stream={stream})"
-            );
-        }
+            Some(Error::Malformed),
+            "completed response carrying incomplete_details must be Malformed (stream={stream})"
+        );
 
         for allowed_details in [
             None,
@@ -1472,5 +1505,67 @@ async fn chat_length_stop_preserves_bound_call_ids_for_cross_choice_collision_ch
             Some(Error::Malformed),
             "cross-choice duplicate call id must be Malformed (limit_first={limit_first}, stream={stream})"
         );
+    }
+}
+
+#[tokio::test]
+async fn limit_stop_validates_discarded_responses_call_ids_and_parallel_call_gates() {
+    for stream in [false, true] {
+        for (call_id, name) in [("", "left"), ("call-ok", "")] {
+            let mut bad_fn = function(call_id, name, "{\"v\":\"half");
+            bad_fn["status"] = json!("incomplete");
+            let envelope = json!({
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [message("partial"), bad_fn]
+            });
+            let bytes = if stream {
+                sse(&event(json!({
+                    "type": "response.incomplete",
+                    "response": envelope
+                })))
+            } else {
+                fixture::json(envelope.to_string().as_bytes())
+            };
+            assert_eq!(
+                once(Protocol::Responses, stream, bytes).await.err(),
+                Some(Error::Malformed),
+                "discarded Responses call with call_id={call_id:?}, name={name:?} must be Malformed (stream={stream})"
+            );
+        }
+
+        let two_chat_calls = json!({
+            "role": "assistant",
+            "content": "partial",
+            "tool_calls": [
+                {"index": 0, "id": "call-1", "type": "function", "function": {"name": "left", "arguments": "{\"v\":\"a"}},
+                {"index": 1, "id": "call-2", "type": "function", "function": {"name": "left", "arguments": "{\"v\":\"b"}}
+            ]
+        });
+        let mut fn1 = function("call-1", "left", "{\"v\":\"a");
+        fn1["status"] = json!("incomplete");
+        let mut fn2 = function("call-2", "left", "{\"v\":\"b");
+        fn2["status"] = json!("incomplete");
+        for p in [Protocol::Chat, Protocol::Responses] {
+            let bytes = limit_wire(
+                p,
+                stream,
+                two_chat_calls.clone(),
+                vec![message("partial"), fn1.clone(), fn2.clone()],
+            );
+            let mock = Mock::new(p, move |_| Reply::Bytes(bytes.clone())).await;
+            let c = catalog(p, true);
+            let e = effective(&c, false);
+            let g = mock.gateway(&e, NORMAL);
+            let mut r = request(stream);
+            r.parallel = Some(false);
+            assert_eq!(
+                g.caller(&c, &e, &r, Credential::Bearer(TOKEN), |_| async {})
+                    .await
+                    .err(),
+                Some(Error::Malformed),
+                "two discarded calls must violate parallel=Some(false) ({p:?}, stream={stream})"
+            );
+        }
     }
 }
