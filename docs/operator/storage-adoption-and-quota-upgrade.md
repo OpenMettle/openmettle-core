@@ -116,6 +116,14 @@ Migration `0029` ([ADR 0044](../adr/0044-own-inference-proxy-and-binding-free-di
 - **Do not enable metered workers on schema `0029` against the increment 1 gateway proxy.** That proxy looks a request up through its gateway binding, so it cannot route a round handed off without one: it answers `404 not_found` after the handoff committed, and the round's hold then stays until increment 3 reconciles it. Wait for the proxy of increment 2b.
 - The migration finds the old CHECK by the columns it constrains and stops if it finds none or several. `openmettle-migrate` then prints `migration 29 failed (SQLSTATE P0001)`. The PostgreSQL server log carries the exception text, `expected one gateway_requests handoff CHECK, found N`. That means the table was altered outside the migrations; inspect its constraints before retrying.
 
+## Upgrade from 0029 to 0030 (quota override actor lock)
+
+Migration `0030` replaces only `openmettle.quota_lock_override`. The signature, security and privileges stay the same. No table, column, grant or row changes, so the upgrade needs no action beyond running `openmettle-migrate`. Afterwards, a quota override and a disable of its acting administrator are ordered by the administrator's user row. The override locks that row after its scope locks, so the order in which the requests started does not decide the outcome:
+
+- If the override locks the row first, the disable waits for the override to commit.
+- If the disable locks it first and commits within the override's lock wait limit (2 seconds for the API), the override sees the disabled administrator and is refused with `42501`.
+- If that limit expires first, the override fails with a lock timeout (`55P03`) and changes nothing.
+
 ## Monitor overdue handoffs
 
 The worker records up to 100 overdue committed handoffs per maintenance sweep in `openmettle_quota_overdue_handoffs_total`. The counter measures observations across sweeps. An outstanding handoff can contribute more than once. Use the database ledger to identify the holds. The observation leaves quota charges intact.

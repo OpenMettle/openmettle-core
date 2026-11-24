@@ -171,6 +171,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "gateway binding free authorization and dispatch",
         sql: include_str!("../migrations/0029_gateway_binding_free_authorization_and_dispatch.sql"),
     },
+    Source {
+        version: 30,
+        description: "quota override actor lock",
+        sql: include_str!("../migrations/0030_quota_override_actor_lock.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.
