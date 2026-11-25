@@ -1,6 +1,6 @@
 # 0003 — Schema ownership, migrations and bounded database roles
 
-Status: accepted with its implementation, 17 November 2026. Implements the first increment of V1-02 (#3); follows ADR 0002 and architecture v1. V1-02 remains open. ADR 0004 extends this first increment with run/event/operation persistence; admission, grants, artifacts and reservations remain outstanding.
+Status: accepted with its implementation, 17 November 2026. Implements the first increment of V1-02 (#3); follows ADR 0002 and architecture v1. ADRs 0004–0006 completed run/event/operation, artifact/reservation/accounting and grant persistence (migrations 3–5); V1-02 (#3) was closed as completed on 17 November 2026.
 
 ## Decision
 
@@ -70,6 +70,6 @@ SQLx 0.9.0 always compiles `sqlx-core`'s migration code, so `sha2` and `crc` wer
 
 `tests/schema.rs` runs against the isolated CI PostgreSQL service: fresh install and idempotent rerun, populated version 1 → 2 upgrade preserving rows, four concurrent migrators, held-lock timeout (SQLSTATE 55P03), SIGTERM/SIGKILL of a lock waiter and of a migrator holding the lock inside migration 2's uncommitted DDL (rollback, session and lock removal, immediate rerun), failed and timed-out migrations leaving no partial state followed by an immediate retry, refusal of non-transactional migrations including a CR-terminated comment and a committed `standard_conforming_strings` change, checksum drift and newer databases, wrong-login refusal before bootstrap followed by an immediate owner success, refused role memberships (direct, `SET`-only, indirect, login roles, both privilege roles, owner) and attributes, refused database, schema, table, column, default and ownership privileges on fresh and migrated databases, a post-migration over-grant, the privilege matrix and actual denied operations, cross-scope and wrong-parent rejection, a concurrent unique identity race, a role connection limit, and API/worker readiness under the bounded roles without migrating. `runtime/verify-migrate-image.sh` checks the image's non-root user, exit 78, fresh install and rerun.
 
-Not covered by the original increment (run/event/operation extensions are in ADR 0004): grants, artifacts, reservations, admission policy, a schema-compatibility readiness gate, Helm Job/hook and production role provisioning (V1-32), backup/restore of roles (V1-30/V1-31), and connection sizing under load.
+Not covered by the original increment (extended by ADRs 0004–0006 for runs/events/operations, artifacts/reservations and grants): grants, artifacts, reservations, admission policy, a schema-compatibility readiness gate, Helm Job/hook and production role provisioning (V1-32), backup/restore of roles (V1-30/V1-31), and connection sizing under load.
 
 The dedicated migrator connection holds the SQLx advisory lock from before boundary validation until connection closure, including between version steps. This prevents concurrent upgrades from changing grants between reading migration history and checking ACLs. SQLx version steps acquire the same lock reentrantly; their unlock does not release the outer acquisition.
