@@ -1289,11 +1289,14 @@ async fn admit(
     {
         return Ok((Admission::Refused(refusal), now));
     }
-    let effect = match session {
-        Some(session) => Some(
-            super::approvals::admission(c, request, session, &principal, &platform, now).await?,
-        ),
-        None => None,
+    let (effect, pre_insert_now) = match session {
+        Some(session) => {
+            let (eff, snap_now) =
+                super::approvals::admission(c, request, session, &principal, &platform, now)
+                    .await?;
+            (Some(eff), now.max(snap_now))
+        }
+        None => (None, now),
     };
     // Step 7: the new row is the reservation of the run slot.
     let columns = AdmissionColumns {
@@ -1315,7 +1318,7 @@ async fn admit(
         personal_owner.as_deref(),
         project_id.as_deref(),
         session,
-        now,
+        pre_insert_now,
     )
     .await?;
     if !inserted {

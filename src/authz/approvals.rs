@@ -444,7 +444,9 @@ impl<'a> Proof<'a> {
     async fn snapshot(&self, c: &mut PgConnection) -> Result<Snapshot, StoreError> {
         let now_ms = self.effective_clock(c).await?;
         let sql = format!(
-            "{AUTH} SELECT * FROM snap WHERE octet_length(base)<=32768 AND octet_length(tool)<=32768"
+            "{AUTH} SELECT snap.*, floor(extract(epoch FROM t.at)*1000)::bigint AS now_ms
+                    FROM snap, t
+                    WHERE octet_length(snap.base)<=32768 AND octet_length(snap.tool)<=32768"
         );
         let row = self
             .query_at(&sql, now_ms)
@@ -457,6 +459,7 @@ impl<'a> Proof<'a> {
             yolo: row.try_get("yolo")?,
             eligible: row.try_get("eligible")?,
             reserved_bytes: row.try_get("reserved_bytes")?,
+            now_ms: row.try_get("now_ms")?,
             now: row.try_get("now_us")?,
             until: row.try_get("until_us")?,
         })
@@ -468,6 +471,7 @@ struct Snapshot {
     yolo: String,
     eligible: bool,
     reserved_bytes: Option<i64>,
+    now_ms: i64,
     now: i64,
     until: i64,
 }
@@ -544,7 +548,7 @@ pub(super) async fn admission<'a>(
     principal: &Principal,
     platform: &PlatformPolicy,
     min_now_ms: i64,
-) -> Result<EffectAdmission<'a>, StoreError> {
+) -> Result<(EffectAdmission<'a>, i64), StoreError> {
     let config = unique(r.input.config).map_err(|_| INVALID)?;
     let mode = match config.as_object().ok_or(INVALID)?.get("execution_mode") {
         None => "ordinary",
@@ -570,11 +574,14 @@ pub(super) async fn admission<'a>(
     if evidence.len() > 16384 {
         return Err(INVALID);
     }
-    Ok(EffectAdmission {
-        mode,
-        session,
-        evidence,
-    })
+    Ok((
+        EffectAdmission {
+            mode,
+            session,
+            evidence,
+        },
+        snap.now_ms,
+    ))
 }
 
 const RUN: &str = "SELECT actor_user_id::text, actor_approval_id::text, conversation_id::text,

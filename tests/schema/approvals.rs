@@ -2324,22 +2324,24 @@ async fn session_bound_admission_honors_monotonic_min_now_ms_floor() {
         .unwrap();
     assert_eq!(run_count, 0);
 
-    // 3. Review #3 P2 #2: `admit_run_with_mode_at` carries the post-insert verified timestamp out
-    //    of admission so a subsequent post-reservation check cannot step its decision floor backward.
+    // 3. Review #3 P2 #2 & Review #4 P3: `admit_run_with_mode_at` carries the post-insert verified
+    //    timestamp out of admission so a subsequent post-reservation check cannot step its decision
+    //    floor backward. Sample the DB clock ONLY AFTER observing the insert blocked on
+    //    `openmettle.runs` (after connection setup, Step 3, and `approvals::admission` have already
+    //    run), wait for the clock to advance past that post-block sample, then release the lock.
     let pre_lock_ms: i64 =
         sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
             .fetch_one(&mut owner)
             .await
             .unwrap();
-    let target_post_insert_ms = pre_lock_ms + 150;
     let mut lock_conn = connect(&f.db.0, OWNER).await;
     let lock_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut lock_conn)
         .await
         .unwrap();
     let mut lock_tx = lock_conn.begin().await.unwrap();
-    // SHARE ROW EXCLUSIVE allows SELECT (Steps 3, 4, 6) while blocking INSERT INTO openmettle.runs
-    // (Step 7) right before the post-insert authority check.
+    // SHARE ROW EXCLUSIVE allows SELECT (Steps 3, 4, 6 and approvals::admission) while blocking
+    // INSERT INTO openmettle.runs (Step 7) right before the post-insert authority check.
     sqlx::query("LOCK TABLE openmettle.runs IN SHARE ROW EXCLUSIVE MODE")
         .execute(&mut *lock_tx)
         .await
@@ -2400,6 +2402,15 @@ async fn session_bound_admission_honors_monotonic_min_now_ms_floor() {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        // Every pre-insert DB read (`now` and `snap_now`) has already completed before `admit_fut`
+        // blocked on `INSERT INTO openmettle.runs`, so both are `<= blocked_at_ms`.
+        let blocked_at_ms: i64 = sqlx::query_scalar(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+        )
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        let target_post_insert_ms = blocked_at_ms + 50;
         while sqlx::query_scalar::<_, i64>(
             "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
         )
@@ -2411,9 +2422,10 @@ async fn session_bound_admission_honors_monotonic_min_now_ms_floor() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         lock_tx.rollback().await.unwrap();
+        target_post_insert_ms
     };
 
-    let (admit_res, ()) = tokio::join!(admit_fut, release_fut);
+    let (admit_res, target_post_insert_ms) = tokio::join!(admit_fut, release_fut);
     let (admitted, verified_post_insert_ms) = admit_res.unwrap();
     assert!(matches!(admitted, Admission::Admitted { .. }));
     assert!(
