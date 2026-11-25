@@ -3346,44 +3346,52 @@ fn bounded_process_helpers_time_out_kill_and_name_configuration() {
     assert_eq!(output.stdout.len(), 128 * 1024);
     assert_eq!(output.stderr.len(), 128 * 1024);
 
-    // 8. Continuously readable pipes cannot defeat deadlines in `read_string_bounded`,
-    //    `PipeDrain::finish_string`, or `run_bounded` / `wait_output_bounded`.
-    let spawn_continuous_pipe = |duration: Duration| {
-        let (reader, mut writer) = std::io::pipe().unwrap();
-        let flags = rustix::fs::fcntl_getfl(&writer).unwrap();
-        rustix::fs::fcntl_setfl(&writer, flags | rustix::fs::OFlags::NONBLOCK).unwrap();
-        let handle = thread::spawn(move || {
-            let until = Instant::now() + duration;
-            let buf = [b'x'; 4096];
-            while Instant::now() < until {
-                match writer.write(&buf) {
-                    Ok(_) => {}
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(1));
-                    }
-                    Err(_) => break,
-                }
+    // 8. Continuously readable streams (never returning `WouldBlock` through the assertion window,
+    //    with an independent cutoff), `Interrupted` storms, and empty pipes closing during the
+    //    final wait window all obey their exact deadline/read contracts.
+    struct AlwaysReadable {
+        fd: std::io::PipeReader,
+        cutoff: Instant,
+    }
+    impl std::os::fd::AsFd for AlwaysReadable {
+        fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.fd.as_fd()
+        }
+    }
+    impl std::io::Read for AlwaysReadable {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if Instant::now() >= self.cutoff {
+                return Ok(0);
             }
-        });
-        (reader, handle)
+            thread::sleep(Duration::from_millis(5));
+            let n = buf.len().min(64);
+            buf[..n].fill(b'x');
+            Ok(n)
+        }
+    }
+
+    let make_always_readable = |duration: Duration| {
+        let (fd, _unused_writer) = std::io::pipe().unwrap();
+        AlwaysReadable {
+            fd,
+            cutoff: Instant::now() + duration,
+        }
     };
 
-    let (reader, writer_handle) = spawn_continuous_pipe(Duration::from_millis(250));
     let began = Instant::now();
     let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         read_string_bounded(
-            reader,
+            make_always_readable(Duration::from_millis(500)),
             Duration::from_millis(30),
             "stderr",
             "synthetic-continuous-pipe-read",
         )
     }))
-    .expect_err("continuously readable pipe must time out in read_string_bounded");
+    .expect_err("always-readable stream must time out in read_string_bounded");
     let elapsed = began.elapsed();
-    writer_handle.join().unwrap();
     assert!(
-        elapsed < Duration::from_millis(200),
-        "read_string_bounded overrun on continuously readable pipe: {elapsed:?}"
+        elapsed < Duration::from_millis(250),
+        "read_string_bounded overrun on always-readable stream: {elapsed:?}"
     );
     let message = panic_text(err);
     assert!(
@@ -3391,24 +3399,155 @@ fn bounded_process_helpers_time_out_kill_and_name_configuration() {
         "missing label in continuous pipe read panic: {message}"
     );
 
-    let (reader, writer_handle) = spawn_continuous_pipe(Duration::from_millis(250));
-    let drain = PipeDrain::start(reader, "stderr", "synthetic-continuous-pipe-drain");
+    let drain = PipeDrain::start(
+        make_always_readable(Duration::from_millis(500)),
+        "stderr",
+        "synthetic-continuous-pipe-drain",
+    );
     let began = Instant::now();
     let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         drain.finish_string(Duration::from_millis(30))
     }))
-    .expect_err("continuously readable pipe must time out in PipeDrain::finish_string");
+    .expect_err("always-readable stream must time out in PipeDrain::finish_string");
     let elapsed = began.elapsed();
-    writer_handle.join().unwrap();
     assert!(
-        elapsed < Duration::from_millis(200),
-        "PipeDrain::finish_string overrun on continuously readable pipe: {elapsed:?}"
+        elapsed < Duration::from_millis(250),
+        "PipeDrain::finish_string overrun on always-readable stream: {elapsed:?}"
     );
     let message = panic_text(err);
     assert!(
         message.contains("synthetic-continuous-pipe-drain"),
         "missing label in continuous PipeDrain panic: {message}"
     );
+
+    struct InterruptedReader {
+        fd: std::io::PipeReader,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        interruptions: usize,
+    }
+    impl std::os::fd::AsFd for InterruptedReader {
+        fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.fd.as_fd()
+        }
+    }
+    impl std::io::Read for InterruptedReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            let idx = self.calls.fetch_add(1, Ordering::Relaxed);
+            if idx < self.interruptions {
+                Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+            } else {
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+        }
+    }
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (fd, _keep_open) = std::io::pipe().unwrap();
+    let reader = InterruptedReader {
+        fd,
+        calls: Arc::clone(&calls),
+        interruptions: 12,
+    };
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_string_bounded(
+            reader,
+            Duration::from_millis(20),
+            "stderr",
+            "synthetic-interrupted-pipe-case",
+        )
+    }))
+    .expect_err("interrupted+wouldblock stream must time out");
+    assert!(
+        panic_text(err).contains("synthetic-interrupted-pipe-case"),
+        "missing label on interrupted reader timeout"
+    );
+    // Initial pass stops at <= 8 attempts (`MAX_READS_PER_PASS`), and post-deadline preview makes
+    // at most 1 attempt without retrying `Interrupted`.
+    let zero_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (fd_zero, _keep_zero) = std::io::pipe().unwrap();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_string_bounded(
+            InterruptedReader {
+                fd: fd_zero,
+                calls: Arc::clone(&zero_calls),
+                interruptions: 12,
+            },
+            Duration::ZERO,
+            "stderr",
+            "synthetic-zero-deadline-interrupted",
+        )
+    }))
+    .expect_err("zero-deadline interrupted stream must time out");
+    assert_eq!(
+        zero_calls.load(Ordering::Relaxed),
+        1,
+        "post-deadline preview must not retry Interrupted"
+    );
+
+    struct SlowInterruptedReader {
+        fd: std::io::PipeReader,
+        cutoff: Instant,
+    }
+    impl std::os::fd::AsFd for SlowInterruptedReader {
+        fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.fd.as_fd()
+        }
+    }
+    impl std::io::Read for SlowInterruptedReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            if Instant::now() >= self.cutoff {
+                return Ok(0);
+            }
+            thread::sleep(Duration::from_millis(2));
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+        }
+    }
+    let (fd_storm, _keep_storm) = std::io::pipe().unwrap();
+    let storm_drain = PipeDrain::start(
+        SlowInterruptedReader {
+            fd: fd_storm,
+            cutoff: Instant::now() + Duration::from_secs(2),
+        },
+        "stderr",
+        "synthetic-interrupted-storm-drain",
+    );
+    thread::sleep(Duration::from_millis(10));
+    let drop_began = Instant::now();
+    drop(storm_drain);
+    assert!(
+        drop_began.elapsed() < Duration::from_millis(250),
+        "PipeDrain::drop stalled during Interrupted storm: {:?}",
+        drop_began.elapsed()
+    );
+
+    // 9. Empty pipe closing at 65 ms within a 75 ms timeout succeeds without false timeout.
+    let (close_reader, close_writer) = std::io::pipe().unwrap();
+    let closer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(65));
+        drop(close_writer);
+    });
+    let closed_text = read_string_bounded(
+        close_reader,
+        Duration::from_millis(75),
+        "stderr",
+        "synthetic-close-before-deadline-read",
+    );
+    closer.join().unwrap();
+    assert_eq!(closed_text, "");
+
+    let (drain_close_reader, drain_close_writer) = std::io::pipe().unwrap();
+    let drain_close = PipeDrain::start(
+        drain_close_reader,
+        "stderr",
+        "synthetic-close-before-deadline-drain",
+    );
+    let closer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(65));
+        drop(drain_close_writer);
+    });
+    let drained_text = drain_close.finish_string(Duration::from_millis(75));
+    closer.join().unwrap();
+    assert_eq!(drained_text, "");
 
     let mut continuous_child = Command::new("yes");
     continuous_child.arg("continuously-readable-marker");

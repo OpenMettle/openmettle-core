@@ -7,12 +7,21 @@ use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use std::{
     io::{self, Read, Write},
     net::{SocketAddr, TcpStream},
-    os::fd::AsFd,
+    os::fd::{AsFd, BorrowedFd, OwnedFd},
     process::{Child, Command, ExitStatus, Output, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
+
+static PIPE_POLLER: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("failed to build test pipe poller runtime")
+});
 
 const INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const MAX_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -61,10 +70,11 @@ pub(crate) fn wait_output_bounded(
     let mut stderr = PipeCollector::new(process.0.stderr.take(), "stderr", context);
     let mut sleep = INITIAL_POLL_INTERVAL;
     let mut exited: Option<ExitStatus> = None;
+    let mut waited_for_ready = false;
 
     loop {
-        let progressed = stdout.drain_pass("stdout", context, Some(deadline))
-            | stderr.drain_pass("stderr", context, Some(deadline));
+        let progressed = stdout.drain_pass("stdout", context, Some(deadline), waited_for_ready)
+            | stderr.drain_pass("stderr", context, Some(deadline), waited_for_ready);
 
         if exited.is_none() {
             exited = process
@@ -75,10 +85,10 @@ pub(crate) fn wait_output_bounded(
 
         if let Some(status) = exited {
             if !stdout.eof {
-                stdout.drain_pass("stdout", context, Some(deadline));
+                stdout.drain_pass("stdout", context, Some(deadline), false);
             }
             if !stderr.eof {
-                stderr.drain_pass("stderr", context, Some(deadline));
+                stderr.drain_pass("stderr", context, Some(deadline), false);
             }
             if stdout.eof && stderr.eof {
                 assert_eq!(
@@ -120,9 +130,21 @@ pub(crate) fn wait_output_bounded(
         }
 
         if progressed {
+            waited_for_ready = false;
             sleep = INITIAL_POLL_INTERVAL;
         } else {
-            thread::sleep(sleep.min(deadline.saturating_duration_since(now)));
+            let mut open_fds = Vec::with_capacity(2);
+            if let Some(fd) = stdout.borrowed_fd() {
+                open_fds.push(fd);
+            }
+            if let Some(fd) = stderr.borrowed_fd() {
+                open_fds.push(fd);
+            }
+            wait_for_pipes(
+                &open_fds,
+                sleep.min(deadline.saturating_duration_since(now)),
+            );
+            waited_for_ready = true;
             sleep = (sleep * 2).min(MAX_POLL_INTERVAL);
         }
     }
@@ -163,8 +185,9 @@ pub(crate) fn read_string_bounded<R: Read + AsFd>(
     let deadline = Instant::now() + timeout;
     let mut collector = PipeCollector::new(Some(pipe), stream, context);
     let mut sleep = INITIAL_POLL_INTERVAL;
+    let mut waited_for_ready = false;
     loop {
-        let progressed = collector.drain_pass(stream, context, Some(deadline));
+        let progressed = collector.drain_pass(stream, context, Some(deadline), waited_for_ready);
         if collector.eof {
             assert_eq!(
                 collector.truncated_bytes, 0,
@@ -182,9 +205,12 @@ pub(crate) fn read_string_bounded<R: Read + AsFd>(
             );
         }
         if progressed {
+            waited_for_ready = false;
             sleep = INITIAL_POLL_INTERVAL;
         } else {
-            thread::sleep(sleep.min(deadline.saturating_duration_since(now)));
+            let fds: Vec<BorrowedFd<'_>> = collector.borrowed_fd().into_iter().collect();
+            wait_for_pipes(&fds, sleep.min(deadline.saturating_duration_since(now)));
+            waited_for_ready = true;
             sleep = (sleep * 2).min(MAX_POLL_INTERVAL);
         }
     }
@@ -214,11 +240,13 @@ impl PipeDrain {
         let handle = thread::spawn(move || {
             let mut collector = PipeCollector::from_nonblocking(pipe);
             let mut sleep = INITIAL_POLL_INTERVAL;
+            let mut waited_for_ready = false;
             loop {
                 let maybe_deadline = *thread_deadline
                     .lock()
                     .unwrap_or_else(|err| err.into_inner());
-                let progressed = collector.drain_pass(stream, &thread_context, maybe_deadline);
+                let progressed =
+                    collector.drain_pass(stream, &thread_context, maybe_deadline, waited_for_ready);
                 if collector.eof {
                     assert_eq!(
                         collector.truncated_bytes, 0,
@@ -233,15 +261,22 @@ impl PipeDrain {
                         return Err(preview(&collector.buf, collector.truncated_bytes));
                     }
                     if progressed {
+                        waited_for_ready = false;
                         sleep = INITIAL_POLL_INTERVAL;
                     } else {
-                        thread::sleep(sleep.min(deadline.saturating_duration_since(now)));
+                        let fds: Vec<BorrowedFd<'_>> =
+                            collector.borrowed_fd().into_iter().collect();
+                        wait_for_pipes(&fds, sleep.min(deadline.saturating_duration_since(now)));
+                        waited_for_ready = true;
                         sleep = (sleep * 2).min(MAX_POLL_INTERVAL);
                     }
                 } else if progressed {
+                    waited_for_ready = false;
                     sleep = INITIAL_POLL_INTERVAL;
                 } else {
-                    thread::sleep(sleep);
+                    let fds: Vec<BorrowedFd<'_>> = collector.borrowed_fd().into_iter().collect();
+                    wait_for_pipes(&fds, sleep);
+                    waited_for_ready = true;
                     sleep = (sleep * 2).min(MAX_POLL_INTERVAL);
                 }
             }
@@ -397,15 +432,26 @@ impl<R: Read + AsFd> PipeCollector<R> {
         }
     }
 
-    fn drain_pass(&mut self, stream: &str, context: &str, deadline: Option<Instant>) -> bool {
+    fn borrowed_fd(&self) -> Option<BorrowedFd<'_>> {
+        self.pipe.as_ref().map(AsFd::as_fd)
+    }
+
+    fn drain_pass(
+        &mut self,
+        stream: &str,
+        context: &str,
+        deadline: Option<Instant>,
+        allow_initial_after_wait: bool,
+    ) -> bool {
         let Some(pipe) = self.pipe.as_mut() else {
             return false;
         };
         let mut progressed = false;
         let mut chunk = [0u8; 8192];
-        let mut reads = 0;
-        while reads < MAX_READS_PER_PASS {
-            if deadline.is_some_and(|d| Instant::now() >= d) {
+        for attempt in 0..MAX_READS_PER_PASS {
+            if !(attempt == 0 && allow_initial_after_wait)
+                && deadline.is_some_and(|d| Instant::now() >= d)
+            {
                 return progressed;
             }
             match pipe.read(&mut chunk) {
@@ -415,7 +461,6 @@ impl<R: Read + AsFd> PipeCollector<R> {
                     return true;
                 }
                 Ok(n) => {
-                    reads += 1;
                     progressed = true;
                     let remaining_cap = MAX_CAPTURED_BYTES.saturating_sub(self.buf.len());
                     let keep = n.min(remaining_cap);
@@ -438,25 +483,60 @@ impl<R: Read + AsFd> PipeCollector<R> {
             return;
         };
         let mut chunk = [0u8; 8192];
-        loop {
-            match pipe.read(&mut chunk) {
-                Ok(0) => {
-                    self.pipe = None;
-                    return;
-                }
-                Ok(n) => {
-                    let remaining_cap = MAX_CAPTURED_BYTES.saturating_sub(self.buf.len());
-                    let keep = n.min(remaining_cap);
-                    self.buf.extend_from_slice(&chunk[..keep]);
-                    self.truncated_bytes = self.truncated_bytes.saturating_add(n - keep);
-                    return;
-                }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return,
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                Err(err) => panic!("failed reading {stream} for {context}: {err}"),
+        match pipe.read(&mut chunk) {
+            Ok(0) => {
+                self.pipe = None;
             }
+            Ok(n) => {
+                let remaining_cap = MAX_CAPTURED_BYTES.saturating_sub(self.buf.len());
+                let keep = n.min(remaining_cap);
+                self.buf.extend_from_slice(&chunk[..keep]);
+                self.truncated_bytes = self.truncated_bytes.saturating_add(n - keep);
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
+            Err(err) => panic!("failed reading {stream} for {context}: {err}"),
         }
     }
+}
+
+fn wait_for_pipes(fds: &[BorrowedFd<'_>], max_wait: Duration) {
+    if max_wait.is_zero() {
+        return;
+    }
+    let owned: Vec<OwnedFd> = fds
+        .iter()
+        .filter_map(|fd| fd.try_clone_to_owned().ok())
+        .collect();
+    if owned.is_empty() {
+        thread::sleep(max_wait);
+        return;
+    }
+    let (tx, rx) = mpsc::sync_channel(1);
+    PIPE_POLLER.spawn(async move {
+        let receivers: Vec<_> = owned
+            .into_iter()
+            .filter_map(|fd| tokio::net::unix::pipe::Receiver::from_owned_fd(fd).ok())
+            .collect();
+        if receivers.is_empty() {
+            tokio::time::sleep(max_wait).await;
+        } else if receivers.len() == 1 {
+            let _ = tokio::time::timeout(max_wait, receivers[0].readable()).await;
+        } else {
+            let _ = tokio::time::timeout(max_wait, async {
+                tokio::select! {
+                    _ = receivers[0].readable() => {}
+                    _ = receivers[1].readable() => {}
+                }
+            })
+            .await;
+        }
+        let _ = tx.send(());
+    });
+    let _ = rx.recv_timeout(max_wait + Duration::from_millis(50));
 }
 
 fn set_nonblocking<F: AsFd>(fd: &F, stream: &str, context: &str) {
