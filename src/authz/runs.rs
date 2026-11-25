@@ -365,33 +365,35 @@ fn conversation_snapshot_model(
     let Some(eff) = root.get("effective").and_then(serde_json::Value::as_object) else {
         return Err(());
     };
-    if !eff.keys().all(|k| {
-        matches!(
-            k.as_str(),
-            "catalog_revision"
-                | "model"
-                | "model_source"
-                | "profile"
-                | "preset"
-                | "preset_source"
-                | "preset_revision"
-                | "project_revision"
-                | "reasoning_format"
-                | "instructions"
-                | "omissions"
-                | "temperature"
-                | "top_p"
-                | "reasoning_effort"
-                | "context_window"
-                | "ceiling"
-                | "output_reserve"
-        )
-    }) || !eff
-        .get("model_source")
-        .is_some_and(serde_json::Value::is_string)
+    if eff.len() != 17
+        || !eff.keys().all(|k| {
+            matches!(
+                k.as_str(),
+                "catalog_revision"
+                    | "model"
+                    | "model_source"
+                    | "profile"
+                    | "preset"
+                    | "preset_source"
+                    | "preset_revision"
+                    | "project_revision"
+                    | "reasoning_format"
+                    | "instructions"
+                    | "omissions"
+                    | "temperature"
+                    | "top_p"
+                    | "reasoning_effort"
+                    | "context_window"
+                    | "ceiling"
+                    | "output_reserve"
+            )
+        })
+        || !eff
+            .get("model_source")
+            .is_some_and(serde_json::Value::is_string)
         || !eff
             .get("preset_source")
-            .is_none_or(|v| v.is_null() || v.is_string())
+            .is_some_and(|v| v.is_null() || v.is_string())
         || !eff.get("profile").is_some_and(serde_json::Value::is_object)
         || ![
             "temperature",
@@ -406,7 +408,8 @@ fn conversation_snapshot_model(
             eff.get(k)
                 .and_then(serde_json::Value::as_object)
                 .is_some_and(|f| {
-                    f.keys().all(|fk| matches!(fk.as_str(), "value" | "source"))
+                    f.len() == 2
+                        && f.keys().all(|fk| matches!(fk.as_str(), "value" | "source"))
                         && f.get("source").is_some_and(serde_json::Value::is_string)
                 })
         })
@@ -416,7 +419,8 @@ fn conversation_snapshot_model(
             .is_some_and(|items| {
                 items.iter().all(|item| {
                     item.as_object().is_some_and(|o| {
-                        o.keys().all(|ik| matches!(ik.as_str(), "source" | "text"))
+                        o.len() == 2
+                            && o.keys().all(|ik| matches!(ik.as_str(), "source" | "text"))
                             && o.get("source").is_some_and(serde_json::Value::is_string)
                     })
                 })
@@ -427,8 +431,9 @@ fn conversation_snapshot_model(
             .is_some_and(|items| {
                 items.iter().all(|item| {
                     item.as_object().is_some_and(|o| {
-                        o.keys()
-                            .all(|ok| matches!(ok.as_str(), "source" | "control" | "reason"))
+                        o.len() == 3
+                            && o.keys()
+                                .all(|ok| matches!(ok.as_str(), "source" | "control" | "reason"))
                             && o.get("source").is_some_and(serde_json::Value::is_string)
                     })
                 })

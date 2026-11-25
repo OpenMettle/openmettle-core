@@ -3279,3 +3279,156 @@ async fn family_policy_review_3_snapshot_rejects_enum_map_encodings() {
         );
     }
 }
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn family_policy_review_4_snapshot_rejects_omitted_effective_and_field_keys() {
+    let db = TestDb::new().await;
+    let settings = db.settings(Duration::from_secs(10));
+    migrate::apply(&settings, &MIGRATIONS[..23]).await.unwrap();
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let actor = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let scope = personal_of(&db, &actor).await;
+    migrate::apply(&settings, MIGRATIONS).await.unwrap();
+    let conv_id = chat(&db, &scope, "personal", &actor).await;
+
+    let catalog = openmettle_core::model_config::Catalog::load(CATALOG).unwrap();
+    let sel: openmettle_core::model_config::Selection =
+        serde_json::from_value(json!({"model": "a"})).unwrap();
+    let eff = catalog
+        .resolve(&Default::default(), &sel, None, |_, _| true)
+        .unwrap();
+    let base_doc = serde_json::to_value(openmettle_core::model_config::ConfigSnapshot {
+        effective: eff,
+        required_capabilities: Default::default(),
+        policy_revision: "openmettle.authz/1".into(),
+        cost_bound: None,
+    })
+    .unwrap();
+
+    // Omitting `effective.temperature.value` silently drops model `a`'s pinned `0.2` in Serde;
+    // omitting `effective.preset_source` removes a required serialized member of `Effective`.
+    let mut missing_temp_val = base_doc.clone();
+    missing_temp_val["effective"]["temperature"]
+        .as_object_mut()
+        .unwrap()
+        .remove("value");
+    let mut missing_preset_source = base_doc.clone();
+    missing_preset_source["effective"]
+        .as_object_mut()
+        .unwrap()
+        .remove("preset_source");
+
+    let mut api = connect(&db.0, API).await;
+    let mut worker = connect(&db.0, WORKER).await;
+    for (idx, bad_doc) in [missing_temp_val, missing_preset_source]
+        .into_iter()
+        .enumerate()
+    {
+        let (branch, msg) = quotas::branch_and_message(&mut api, &scope, &conv_id).await;
+        let bad_bytes = serde_json::to_vec(&bad_doc).unwrap();
+        let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+        let Admission::Admitted { run_id, .. } = queue::admit_run(
+            &mut tx,
+            &RunAdmission {
+                input: RunInput {
+                    scope: &scope,
+                    actor: &actor.user,
+                    conversation: &conv_id,
+                    branch: &branch,
+                    message: &msg,
+                    key: &format!("r4-missing-key-{idx}"),
+                    format: SNAPSHOT_FORMAT,
+                    version: SNAPSHOT_VERSION,
+                    input: b"{}",
+                    config: &bad_bytes,
+                },
+                actor_approval_id: &actor.approval,
+                capabilities: &[],
+                requested_rounds: Some(1),
+                now_ms: NOW,
+                cost_qualified: None,
+            },
+            &LIMITS,
+        )
+        .await
+        .unwrap() else {
+            panic!("expected admission");
+        };
+        tx.commit().await.unwrap();
+
+        assert_eq!(
+            queue::recheck_run(
+                &mut worker,
+                &RunRecheckRequest {
+                    scope_id: &scope,
+                    run_id: &run_id,
+                    actor_approval_id: &actor.approval,
+                    capabilities: &[],
+                    extra_target: None,
+                    now_ms: NOW,
+                },
+            )
+            .await
+            .unwrap(),
+            RunRecheckOutcome::Invalidated(DenialReason::Policy(PolicyReason::FamilyPolicy)),
+            "omitted member case {idx} must be rejected"
+        );
+    }
+
+    // Explicit `null` on nullable members (`preset_source: null`, `top_p.value: null`) remains valid.
+    assert!(base_doc["effective"]["preset_source"].is_null());
+    assert!(base_doc["effective"]["top_p"]["value"].is_null());
+    let (branch, msg) = quotas::branch_and_message(&mut api, &scope, &conv_id).await;
+    let valid_bytes = serde_json::to_vec(&base_doc).unwrap();
+    let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
+    let Admission::Admitted {
+        run_id: valid_run_id,
+        ..
+    } = queue::admit_run(
+        &mut tx,
+        &RunAdmission {
+            input: RunInput {
+                scope: &scope,
+                actor: &actor.user,
+                conversation: &conv_id,
+                branch: &branch,
+                message: &msg,
+                key: "r4-explicit-null-ok",
+                format: SNAPSHOT_FORMAT,
+                version: SNAPSHOT_VERSION,
+                input: b"{}",
+                config: &valid_bytes,
+            },
+            actor_approval_id: &actor.approval,
+            capabilities: &[],
+            requested_rounds: Some(1),
+            now_ms: NOW,
+            cost_qualified: None,
+        },
+        &LIMITS,
+    )
+    .await
+    .unwrap()
+    else {
+        panic!("expected admission");
+    };
+    tx.commit().await.unwrap();
+    assert_eq!(
+        queue::recheck_run(
+            &mut worker,
+            &RunRecheckRequest {
+                scope_id: &scope,
+                run_id: &valid_run_id,
+                actor_approval_id: &actor.approval,
+                capabilities: &[],
+                extra_target: None,
+                now_ms: NOW,
+            },
+        )
+        .await
+        .unwrap(),
+        RunRecheckOutcome::Continue
+    );
+}
