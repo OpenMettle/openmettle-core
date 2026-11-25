@@ -947,14 +947,23 @@ fn is_json_number_literal(trimmed: &str) -> bool {
     i == b.len()
 }
 
+const JSON_WHITESPACE: [char; 4] = [' ', '\t', '\r', '\n'];
+
 fn sanitize_text_block(block: &str, handle_field: Option<&str>, handle: Option<&str>) -> String {
     if handle_field.is_none() && handle.is_none() {
         return block.to_owned();
     }
-    // Preserve standalone RFC 8259 JSON number literals verbatim so integers exceeding `u64::MAX`
-    // (e.g. `18446744073709551617`) or wide decimals never lose precision through `serde_json` `f64`
-    // conversion while short handles (e.g. `"1"`) still do not corrupt numeric tokens.
-    if is_json_number_literal(block.trim_ascii()) {
+    let json_trimmed = block.trim_matches(JSON_WHITESPACE);
+    if let Some(h) = handle
+        && json_trimmed == h
+    {
+        return choose_safe_marker(h);
+    }
+    // Preserve standalone RFC 8259 JSON number literals (trimmed only of RFC 8259 whitespace,
+    // never form-feed/vertical-tab) verbatim so integers exceeding `u64::MAX`
+    // (e.g. `18446744073709551617`) never lose precision through `serde_json` `f64` conversion
+    // while short handles (e.g. `"1"`) still do not corrupt numeric tokens.
+    if is_json_number_literal(json_trimmed) {
         return block.to_owned();
     }
     if let Ok(mut parsed) = serde_json::from_str::<Value>(block) {
@@ -1816,6 +1825,43 @@ mod tests {
         };
         let (bh_out, _) = sanitize_tool_success(&bool_handle, Some("handle")).unwrap();
         assert_eq!(bh_out, "true\nfalse\nnull");
+
+        // Exact numeric handle echo in a standalone block is redacted, while form-feed (`\x0c`)
+        // padded digits are NOT treated as RFC 8259 JSON numbers and fall back to plain redaction.
+        let exact_numeric_echo = ToolCallSuccess {
+            text: String::new(),
+            content_blocks: vec![
+                "18446744073709551617".into(),
+                " 18446744073709551617 ".into(),
+                "18446744073709551618".into(),
+            ],
+            structured: Some(json!({"handle": "18446744073709551617"})),
+            meta: None,
+        };
+        let (ene_out, ene_h) = sanitize_tool_success(&exact_numeric_echo, Some("handle")).unwrap();
+        assert_eq!(ene_h.as_deref(), Some("18446744073709551617"));
+        assert!(!ene_out.contains("18446744073709551617"));
+        assert_eq!(
+            ene_out.lines().collect::<Vec<_>>(),
+            vec!["[REDACTED]", "[REDACTED]", "18446744073709551618"]
+        );
+
+        let form_feed_padded = ToolCallSuccess {
+            text: String::new(),
+            content_blocks: vec!["\x0c10\x0c".into(), "\x0c18446744073709551617\x0c".into()],
+            structured: Some(json!({"handle": "1"})),
+            meta: None,
+        };
+        let (ff_out, ff_h) = sanitize_tool_success(&form_feed_padded, Some("handle")).unwrap();
+        assert_eq!(ff_h.as_deref(), Some("1"));
+        assert!(!ff_out.contains('1'));
+        assert_eq!(
+            ff_out.lines().collect::<Vec<_>>(),
+            vec![
+                "\x0c[REDACTED]0\x0c",
+                "\x0c[REDACTED]844674407370955[REDACTED]6[REDACTED]7\x0c"
+            ]
+        );
 
         // 10. Linear per-base cursor disambiguates 500 distinct keys that ALL redact to the exact
         //     same `base`, advancing `cursors[&base].0` across insertions without quadratic re-probing.
