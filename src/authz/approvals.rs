@@ -1817,6 +1817,10 @@ pub async fn record_fenced_intent(
             let attempts: Option<i32> = old.try_get("dispatched_attempts")?;
             let capability: &str = old.try_get("capability")?;
             if outcome == "intent" && attempts == Some(0) && capability != "repeatable_read" {
+                if policy.requires_two_phase_writes() && !two_phase_effect_intents_enabled(c).await?
+                {
+                    return Err(DENIED);
+                }
                 let decision = sqlx::query(REQUEST)
                     .bind(lease.run_id)
                     .bind(effective_approval)
@@ -2324,6 +2328,14 @@ pub(crate) async fn check_operation(
         let (id, committed, endpoint) = committed_binding(c, &s, p, approval, &op).await?;
         if id != operation {
             return Err(CONFLICT);
+        }
+        if action == ReplayAction::StartWriteFirst
+            && policy.requires_two_phase_writes()
+            && op.try_get::<&str, _>("outcome")? == "intent"
+            && op.try_get::<Option<i32>, _>("dispatched_attempts")? == Some(0)
+            && !two_phase_effect_intents_enabled(c).await?
+        {
+            return Err(DENIED);
         }
         let decision = sqlx::query(REQUEST)
             .bind(lease.run_id)

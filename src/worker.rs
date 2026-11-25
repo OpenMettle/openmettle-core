@@ -183,6 +183,32 @@ pub enum PreflightError {
     Store(StoreError),
 }
 
+/// Server-owned tool declaration paired with its pinned external MCP contract version, if any.
+#[derive(Clone)]
+pub struct DeclaredTool {
+    pub tool: crate::provider_http::inference::Tool,
+    pub external_version: Option<String>,
+}
+
+impl DeclaredTool {
+    pub fn internal(tool: crate::provider_http::inference::Tool) -> Self {
+        Self {
+            tool,
+            external_version: None,
+        }
+    }
+
+    pub fn external(
+        tool: crate::provider_http::inference::Tool,
+        version: impl Into<String>,
+    ) -> Self {
+        Self {
+            tool,
+            external_version: Some(version.into()),
+        }
+    }
+}
+
 /// A reviewed adapter receives only committed bytes. It records observations with a Hold fence.
 pub trait ApprovedAdapter: Send + Sync {
     /// Pre-intent server-side gate run strictly before `record_fenced_intent` commits any
@@ -197,13 +223,23 @@ pub trait ApprovedAdapter: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
+    /// Verify that a model tool `call` maps faithfully to `proposal` (allowing deterministic
+    /// schema-default expansion on external MCP contracts while rejecting route-injected fields).
+    fn verify_turn_call_proposal(
+        &self,
+        call: &crate::provider_http::inference::Call,
+        proposal: &Proposal,
+    ) -> bool {
+        proposal.tool == call.name && proposal.arguments() == &call.arguments
+    }
+
     /// Filter model-facing tool declarations before starting a turn round (e.g. verifying
     /// external MCP `tools/list` catalogs before offering those tools to the model).
-    /// Defaults to returning `tools` unchanged.
+    /// Defaults to returning the inner `Tool` declarations unchanged.
     fn filter_turn_tools<'a>(
         &'a self,
         _run: &'a ActiveRun,
-        tools: Vec<crate::provider_http::inference::Tool>,
+        tools: Vec<DeclaredTool>,
         _step: &'a StepContext,
     ) -> std::pin::Pin<
         Box<
@@ -212,7 +248,7 @@ pub trait ApprovedAdapter: Send + Sync {
                 + 'a,
         >,
     > {
-        Box::pin(async move { Ok(tools) })
+        Box::pin(async move { Ok(tools.into_iter().map(|t| t.tool).collect()) })
     }
 
     fn send<'a>(

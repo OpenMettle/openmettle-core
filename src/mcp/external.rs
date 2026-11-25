@@ -16,23 +16,23 @@ use crate::{
         store::StoreError,
     },
     provider_http::{
-        inference::Tool,
+        inference::{Call, Tool},
         mcp::{
             FaultKind, IdempotencyHeader, IdempotencyMeta, McpTransport, RetryAfter,
             ToolCallRequest, ToolCallSuccess, TransportFault,
         },
     },
     worker::{
-        ActiveRun, ApprovedAdapter, ApprovedEffects, EffectDispatch, OwnedObservation,
-        PreflightError, StepContext, StepResult, Stop, start_permit, stopped_step,
-        turns::lease_step,
+        ActiveRun, ApprovedAdapter, ApprovedEffects, DeclaredTool, EffectDispatch,
+        OwnedObservation, PreflightError, StepContext, StepResult, Stop, start_permit,
+        stopped_step, turns::lease_step,
     },
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{Map, Value};
 use sqlx::{PgPool, Row};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     future::Future,
     pin::Pin,
@@ -795,9 +795,35 @@ fn redact_value_strings(value: &mut Value, handle: &str) {
             }
         }
         Value::Object(map) => {
-            for v in map.values_mut() {
-                redact_value_strings(v, handle);
+            let entries = std::mem::take(map);
+            let original_keys: BTreeSet<String> = entries.keys().cloned().collect();
+            let sep = if handle.contains('#') { "_" } else { "#" };
+            let mut out = Map::with_capacity(entries.len());
+            for (k, mut v) in entries {
+                redact_value_strings(&mut v, handle);
+                let new_key = if k.contains(handle) {
+                    let base = k.replace(handle, "[REDACTED]");
+                    if !out.contains_key(&base) && !original_keys.contains(&base) {
+                        base
+                    } else {
+                        let mut n = 2usize;
+                        loop {
+                            let candidate = format!("{base}{sep}{n}");
+                            if !out.contains_key(&candidate)
+                                && !original_keys.contains(&candidate)
+                                && (base.contains(handle) || !candidate.contains(handle))
+                            {
+                                break candidate;
+                            }
+                            n += 1;
+                        }
+                    }
+                } else {
+                    k
+                };
+                out.insert(new_key, v);
             }
+            *map = out;
         }
         _ => {}
     }
@@ -813,9 +839,9 @@ fn sanitize_tool_success(
         ExtractedHandle::Malformed => return Err(ToolFault::TerminalRefusal),
     };
     let text = if let Some(content) = &success.content_text {
-        if handle_field.is_some()
+        if (handle_field.is_some() || handle.is_some())
             && let Ok(mut parsed) = serde_json::from_str::<Value>(content)
-            && (parsed.is_object() || parsed.is_array())
+            && (parsed.is_object() || parsed.is_array() || parsed.is_string())
         {
             if let (Some(field), Some(map)) = (handle_field, parsed.as_object_mut()) {
                 map.remove(field);
@@ -860,15 +886,31 @@ impl ApprovedAdapter for ExternalMcpAdapter {
         Box::pin(async move { self.admit_pre_intent(run, proposal, step).await })
     }
 
+    fn verify_turn_call_proposal(&self, call: &Call, proposal: &Proposal) -> bool {
+        let Some(contract) = self.registry.get(&proposal.tool, &proposal.version) else {
+            return false;
+        };
+        let Ok(raw_bytes) = serde_json::to_vec(&call.arguments) else {
+            return false;
+        };
+        let Ok(expected) = contract.proposal(&proposal.logical_key, &raw_bytes) else {
+            return false;
+        };
+        expected.tool == call.name
+            && expected.version == proposal.version
+            && expected.destination() == proposal.destination()
+            && expected.arguments() == proposal.arguments()
+    }
+
     fn filter_turn_tools<'a>(
         &'a self,
         run: &'a ActiveRun,
-        tools: Vec<Tool>,
+        tools: Vec<DeclaredTool>,
         step: &'a StepContext,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Tool>, StepResult>> + Send + 'a>> {
         Box::pin(async move {
             if tools.is_empty() {
-                return Ok(tools);
+                return Ok(Vec::new());
             }
             if let Some(why) = *step.stop.borrow() {
                 return Err(stopped_step(why));
@@ -894,12 +936,26 @@ impl ApprovedAdapter for ExternalMcpAdapter {
             };
             let mut checked: BTreeMap<(String, String), bool> = BTreeMap::new();
             let mut kept = Vec::with_capacity(tools.len());
-            for tool in tools {
-                let contracts = self.registry.find_by_tool_id(&tool.name);
-                if contracts.is_empty() {
-                    kept.push(tool);
-                    continue;
-                }
+            for dt in tools {
+                let contracts: Vec<&ExternalToolContract> = match dt.external_version.as_deref() {
+                    Some(ver) => {
+                        let Some(contract) = self.registry.get(&dt.tool.name, ver) else {
+                            continue;
+                        };
+                        if contract.declaration() != dt.tool {
+                            continue;
+                        }
+                        vec![contract]
+                    }
+                    None => {
+                        let matched = self.registry.find_by_tool_id(&dt.tool.name);
+                        if matched.is_empty() {
+                            kept.push(dt.tool);
+                            continue;
+                        }
+                        matched
+                    }
+                };
                 if !two_phase_enabled {
                     continue;
                 }
@@ -933,7 +989,7 @@ impl ApprovedAdapter for ExternalMcpAdapter {
                     }
                 }
                 if ok {
-                    kept.push(tool);
+                    kept.push(dt.tool);
                 }
             }
             Ok(kept)
@@ -958,21 +1014,59 @@ impl ApprovedAdapter for ExternalMcpAdapter {
             let Some(transport) = self.transports.get(&contract.connection_id) else {
                 return StepResult::ToolResponse(Err(ToolFault::TerminalRefusal));
             };
+            // Whole logical tool call budget across setup, attempts, and retry backoffs (PLAN-10).
+            let logical_call_deadline = step.deadline.min(Instant::now() + contract.call_timeout);
             let actor_user_id = {
-                let Ok(mut c) = self.pool.acquire().await else {
-                    return StepResult::LeaseLost;
+                enum ActorWait {
+                    Stopped(Stop),
+                    TimedOut,
+                    Done(Result<String, StepResult>),
+                }
+                let stopped = *step.stop.borrow();
+                if let Some(why) = stopped {
+                    return if why == Stop::LeaseLost {
+                        StepResult::LeaseLost
+                    } else {
+                        stopped_step(why)
+                    };
+                }
+                if Instant::now() >= logical_call_deadline {
+                    return StepResult::ToolResponse(Err(ToolFault::Transient));
+                }
+                let mut stop_rx = step.stop.clone();
+                let wait = tokio::select! {
+                    biased;
+                    waited = stop_rx.wait_for(Option::is_some) => {
+                        ActorWait::Stopped(
+                            waited.ok().and_then(|v| *v).unwrap_or(Stop::LeaseLost),
+                        )
+                    }
+                    timed = timeout_at(logical_call_deadline, async {
+                        let Ok(mut c) = self.pool.acquire().await else {
+                            return Err(StepResult::LeaseLost);
+                        };
+                        sqlx::query_scalar::<_, String>(
+                            "SELECT actor_user_id::text FROM openmettle.runs WHERE scope_id=$1::uuid AND id=$2::uuid",
+                        )
+                        .bind(lease.scope_id)
+                        .bind(lease.run_id)
+                        .fetch_one(&mut *c)
+                        .await
+                        .map_err(|_| StepResult::LeaseLost)
+                    }) => match timed {
+                        Ok(res) => ActorWait::Done(res),
+                        Err(_) => ActorWait::TimedOut,
+                    },
                 };
-                let Ok(actor) = sqlx::query_scalar::<_, String>(
-                    "SELECT actor_user_id::text FROM openmettle.runs WHERE scope_id=$1::uuid AND id=$2::uuid",
-                )
-                .bind(lease.scope_id)
-                .bind(lease.run_id)
-                .fetch_one(&mut *c)
-                .await
-                else {
-                    return StepResult::LeaseLost;
-                };
-                actor
+                match wait {
+                    ActorWait::Stopped(Stop::LeaseLost) => return StepResult::LeaseLost,
+                    ActorWait::Stopped(why) => return stopped_step(why),
+                    ActorWait::TimedOut => {
+                        return StepResult::ToolResponse(Err(ToolFault::Transient));
+                    }
+                    ActorWait::Done(Err(e)) => return e,
+                    ActorWait::Done(Ok(actor)) => actor,
+                }
             };
 
             let is_read = review.class == EffectClass::Read;
@@ -984,8 +1078,6 @@ impl ApprovedAdapter for ExternalMcpAdapter {
             // an uncertain write as a known failure.
             let mut sent_uncertain = false;
             let mut prior_attempt_ambiguous = false;
-            // Whole logical tool call budget across all attempts and retry backoffs (PLAN-10).
-            let logical_call_deadline = step.deadline.min(Instant::now() + contract.call_timeout);
 
             loop {
                 let call_deadline = logical_call_deadline.min(step.deadline);
@@ -1400,6 +1492,79 @@ mod tests {
         let (ptext, phandle) = sanitize_tool_success(&plain_content, Some("handle")).unwrap();
         assert_eq!(phandle.as_deref(), Some(escaped_handle));
         assert_eq!(ptext, "done [REDACTED] end");
+
+        // 5. Object keys containing the handle (including collision with pre-existing `[REDACTED]`
+        //    and single-char handles like `"2"` or `"#"` whose suffix must not re-introduce handle).
+        let key_collision = ToolCallSuccess {
+            text: String::new(),
+            content_text: None,
+            structured: Some(json!({
+                "handle": "h-key",
+                "[REDACTED]": "keep",
+                "h-key": {"nested-h-key": "val-h-key"}
+            })),
+            meta: None,
+        };
+        let (ktext, khandle) = sanitize_tool_success(&key_collision, Some("handle")).unwrap();
+        assert_eq!(khandle.as_deref(), Some("h-key"));
+        assert!(!ktext.contains("h-key"));
+        let parsed_k: Value = serde_json::from_str(&ktext).expect("valid JSON");
+        assert_eq!(parsed_k["[REDACTED]"], "keep");
+        assert_eq!(
+            parsed_k["[REDACTED]#2"]["nested-[REDACTED]"],
+            "val-[REDACTED]"
+        );
+
+        let digit_two = ToolCallSuccess {
+            text: String::new(),
+            content_text: None,
+            structured: Some(json!({
+                "handle": "2",
+                "[REDACTED]": 1,
+                "2": 2
+            })),
+            meta: None,
+        };
+        let (dtext, dhandle) = sanitize_tool_success(&digit_two, Some("handle")).unwrap();
+        assert_eq!(dhandle.as_deref(), Some("2"));
+        let parsed_d: Value = serde_json::from_str(&dtext).expect("valid JSON");
+        assert_eq!(parsed_d["[REDACTED]"], 1);
+        assert_eq!(parsed_d["[REDACTED]#3"], 2);
+        assert!(parsed_d.get("[REDACTED]#2").is_none());
+
+        let hash_handle = ToolCallSuccess {
+            text: String::new(),
+            content_text: None,
+            structured: Some(json!({
+                "handle": "#",
+                "[REDACTED]": "a",
+                "#": "b"
+            })),
+            meta: None,
+        };
+        let (htext, hhandle) = sanitize_tool_success(&hash_handle, Some("handle")).unwrap();
+        assert_eq!(hhandle.as_deref(), Some("#"));
+        assert!(!htext.contains('#'));
+        let parsed_h: Value = serde_json::from_str(&htext).expect("valid JSON");
+        assert_eq!(parsed_h["[REDACTED]"], "a");
+        assert_eq!(parsed_h["[REDACTED]_2"], "b");
+
+        // 6. Top-level JSON string scalar in `content_text` containing a JSON-escaped handle.
+        let top_level_json_string = ToolCallSuccess {
+            text: String::new(),
+            content_text: Some(json!(format!("prefix {escaped_handle} suffix")).to_string()),
+            structured: Some(json!({"handle": escaped_handle})),
+            meta: None,
+        };
+        let (stext, shandle) =
+            sanitize_tool_success(&top_level_json_string, Some("handle")).unwrap();
+        assert_eq!(shandle.as_deref(), Some(escaped_handle));
+        assert!(!stext.contains("quote"));
+        assert!(!stext.contains(escaped_handle));
+        assert_eq!(
+            serde_json::from_str::<Value>(&stext).unwrap(),
+            json!("prefix [REDACTED] suffix")
+        );
     }
 
     #[test]

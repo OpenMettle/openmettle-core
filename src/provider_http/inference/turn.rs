@@ -46,7 +46,7 @@ pub struct Call {
 }
 
 /// Model-visible recovery for a rejected group. No member of the group is executable.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolError {
     pub call_id: String,
     pub(super) name: String,

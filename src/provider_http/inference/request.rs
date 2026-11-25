@@ -4,6 +4,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 
+#[derive(Clone, PartialEq, Eq)]
 pub struct Tool {
     pub name: String,
     pub description: String,

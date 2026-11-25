@@ -172,6 +172,12 @@ impl ExternalToolContract {
         }
     }
 
+    /// Build a [`crate::worker::DeclaredTool`] carrying this contract's pinned version for
+    /// [`crate::worker::ApprovedAdapter::filter_turn_tools`].
+    pub fn declared_tool(&self) -> crate::worker::DeclaredTool {
+        crate::worker::DeclaredTool::external(self.declaration(), self.version.clone())
+    }
+
     /// Validate raw JSON arguments against this closed-object contract and expand defaults.
     pub fn validate_arguments(&self, raw: &[u8]) -> Result<Value, ToolFault> {
         if raw.len() > MAX_ARG_BYTES {
