@@ -2,7 +2,7 @@
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    process::{Child, Command, Stdio},
+    process::{Command, Output, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -10,6 +10,9 @@ use std::{
 #[path = "support/env.rs"]
 mod env_support;
 use env_support::scrub_env;
+#[path = "support/proc.rs"]
+mod proc_support;
+use proc_support::{Process, run_bounded, wait_exit_bounded, wait_output_bounded};
 #[path = "auth_config_support/mod.rs"]
 mod auth_config_support;
 #[path = "support/pg.rs"]
@@ -19,12 +22,16 @@ mod pg;
 #[path = "provider_http_support/ca.rs"]
 mod ca;
 
-struct Process(Child);
-impl Drop for Process {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
+/// Bound for start-up refusal, offline check and immediate-failure runs.
+const REFUSAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound for graceful signal shutdown in runtime tests (`SHUTDOWN_TIMEOUT_MS=1000`).
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn role_name(worker: bool) -> &'static str {
+    if worker { "worker" } else { "api" }
+}
+fn run(command: &mut Command, context: &str) -> Output {
+    run_bounded(command, REFUSAL_TIMEOUT, context)
 }
 fn address() -> String {
     TcpListener::bind("127.0.0.1:0")
@@ -81,10 +88,9 @@ fn send(address: &str, request: &str) -> std::io::Result<String> {
 fn wait_status(process: &mut Process, address: &str, path: &str, code: u16) {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        assert!(
-            process.0.try_wait().unwrap().is_none(),
-            "process exited before health check"
-        );
+        if let Some(status) = process.0.try_wait().unwrap() {
+            panic!("process exited before health check ({path} expected {code}): {status}");
+        }
         if response(address, path).is_ok_and(|r| r.starts_with(&format!("HTTP/1.1 {code}"))) {
             return;
         }
@@ -103,20 +109,18 @@ fn stop(process: &mut Process, signal: &str) {
             .unwrap()
             .success()
     );
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if let Some(status) = process.0.try_wait().unwrap() {
-            assert!(status.success());
-            return;
-        }
-        assert!(Instant::now() < deadline, "shutdown did not finish");
-        thread::sleep(Duration::from_millis(20));
-    }
+    let status = wait_exit_bounded(
+        &mut process.0,
+        SHUTDOWN_TIMEOUT,
+        &format!("shutdown ({signal})"),
+    );
+    assert!(status.success(), "shutdown ({signal}) exited {status}");
 }
 
 #[test]
 fn rejects_invalid_config_without_disclosing_values() {
     for worker in [false, true] {
+        let role = role_name(worker);
         let prefix = if worker {
             "OPENMETTLE_WORKER"
         } else {
@@ -129,18 +133,23 @@ fn rejects_invalid_config_without_disclosing_values() {
             ("DB_TIMEOUT_MS", "30001"),
             ("SHUTDOWN_TIMEOUT_MS", "-1"),
         ] {
-            let output = command(worker)
-                .env(
-                    format!("{prefix}_DATABASE_URL"),
-                    "postgres://localhost/test",
-                )
-                .env(format!("{prefix}_{key}"), value)
-                .output()
-                .unwrap();
-            assert_eq!(output.status.code(), Some(78));
+            let context = format!("{role} invalid {prefix}_{key}");
+            let mut cmd = command(worker);
+            cmd.env(
+                format!("{prefix}_DATABASE_URL"),
+                "postgres://localhost/test",
+            )
+            .env(format!("{prefix}_{key}"), value);
+            let output = run(&mut cmd, &context);
+            assert_eq!(output.status.code(), Some(78), "{context}");
             assert!(!String::from_utf8_lossy(&output.stderr).contains("synthetic-secret"));
         }
-        assert_eq!(command(worker).output().unwrap().status.code(), Some(78));
+        let missing = format!("{role} missing {prefix}_DATABASE_URL");
+        assert_eq!(
+            run(&mut command(worker), &missing).status.code(),
+            Some(78),
+            "{missing}"
+        );
     }
 }
 
@@ -150,35 +159,41 @@ fn rejects_invalid_config_without_disclosing_values() {
 fn rejects_invalid_telemetry_settings_with_a_fixed_line() {
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
     for worker in [false, true] {
+        let role = role_name(worker);
         let prefix = if worker {
             "OPENMETTLE_WORKER"
         } else {
             "OPENMETTLE_API"
         };
-        for (key, value) in [
-            ("LOG_FORMAT", "synthetic-secret"),
-            ("LOG_FORMAT", "JSON"),
-            ("LOG_LEVEL", "trace"),
-            ("LOG_LEVEL", "info,synthetic-secret=debug"),
+        for (label, key, value) in [
+            ("unknown format", "LOG_FORMAT", "synthetic-secret"),
+            ("uppercase format", "LOG_FORMAT", "JSON"),
+            ("trace level", "LOG_LEVEL", "trace"),
+            (
+                "filter directive",
+                "LOG_LEVEL",
+                "info,synthetic-secret=debug",
+            ),
         ] {
-            let output = command(worker)
-                .env(
-                    format!("{prefix}_DATABASE_URL"),
-                    "postgres://localhost/test",
-                )
-                // Serving would exit 1 on this occupied address instead.
-                .env(
-                    format!("{prefix}_BIND"),
-                    occupied.local_addr().unwrap().to_string(),
-                )
-                .env(format!("{prefix}_{key}"), value)
-                .output()
-                .unwrap();
-            assert_eq!(output.status.code(), Some(78), "{key}={value}");
-            assert!(output.stdout.is_empty());
+            let context = format!("{role} {prefix}_{key} ({label})");
+            let mut cmd = command(worker);
+            cmd.env(
+                format!("{prefix}_DATABASE_URL"),
+                "postgres://localhost/test",
+            )
+            // Serving would exit 1 on this occupied address instead.
+            .env(
+                format!("{prefix}_BIND"),
+                occupied.local_addr().unwrap().to_string(),
+            )
+            .env(format!("{prefix}_{key}"), value);
+            let output = run(&mut cmd, &context);
+            assert_eq!(output.status.code(), Some(78), "{context}");
+            assert!(output.stdout.is_empty(), "{context}");
             assert_eq!(
                 String::from_utf8(output.stderr).unwrap(),
-                format!("configuration error: invalid {key}\n")
+                format!("configuration error: invalid {key}\n"),
+                "{context}"
             );
         }
     }
@@ -314,7 +329,7 @@ fn issuance_settings_are_refused_with_a_fixed_line() {
             "invalid numeric configuration",
         ),
     ];
-    for (auth, database, issuance, extra, line) in cases {
+    for (index, (auth, database, issuance, extra, line)) in cases.iter().enumerate() {
         let mut command = command(false);
         command
             .env("OPENMETTLE_API_BIND", &bind)
@@ -325,34 +340,42 @@ fn issuance_settings_are_refused_with_a_fixed_line() {
         command
             .envs(issuance.iter().copied())
             .envs(extra.iter().copied());
-        let output = command.output().unwrap();
-        assert_eq!(output.status.code(), Some(78), "{line}");
-        assert!(output.stdout.is_empty());
+        let context = format!("api issuance refusal case #{index} ({line})");
+        let output = run(&mut command, &context);
+        assert_eq!(output.status.code(), Some(78), "{context}");
+        assert!(output.stdout.is_empty(), "{context}");
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
-            format!("configuration error: {line}\n")
+            format!("configuration error: {line}\n"),
+            "{context}"
         );
     }
     // A user filled from `PGUSER` counts as that user, on either URL.
-    for (database, issuance) in [
+    for (label, database, issuance) in [
         (
+            "PGUSER fills primary DATABASE_URL",
             "postgres://localhost/test",
             "postgres://openmettle_api@localhost/other",
         ),
-        (primary, "postgres://localhost/other"),
+        (
+            "PGUSER fills ISSUANCE_DATABASE_URL",
+            primary,
+            "postgres://localhost/other",
+        ),
     ] {
-        let output = command(false)
-            .env("PGUSER", "openmettle_api")
+        let context = format!("api issuance PGUSER collision ({label})");
+        let mut cmd = command(false);
+        cmd.env("PGUSER", "openmettle_api")
             .env("OPENMETTLE_API_BIND", &bind)
             .env("OPENMETTLE_API_DATABASE_URL", database)
             .env("OPENMETTLE_API_AUTH_CONFIG", "/CANARY-absent/auth.json")
-            .env("OPENMETTLE_API_ISSUANCE_DATABASE_URL", issuance)
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(78), "{database} {issuance}");
+            .env("OPENMETTLE_API_ISSUANCE_DATABASE_URL", issuance);
+        let output = run(&mut cmd, &context);
+        assert_eq!(output.status.code(), Some(78), "{context}");
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
-            "configuration error: ISSUANCE_DATABASE_URL must use a different user\n"
+            "configuration error: ISSUANCE_DATABASE_URL must use a different user\n",
+            "{context}"
         );
     }
     // Accepted settings reach the document loader, which reports the absent file instead.
@@ -366,38 +389,41 @@ fn issuance_settings_are_refused_with_a_fixed_line() {
         if let Some(max) = max {
             command.env("OPENMETTLE_API_ISSUANCE_DB_MAX_CONNECTIONS", max);
         }
-        let output = command.output().unwrap();
-        assert_eq!(output.status.code(), Some(78), "{max:?}");
+        let context = format!("api issuance accepted with ISSUANCE_DB_MAX_CONNECTIONS={max:?}");
+        let output = run(&mut command, &context);
+        assert_eq!(output.status.code(), Some(78), "{context}");
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
-            "auth configuration error: configuration is not a readable regular file within bounds\n"
+            "auth configuration error: configuration is not a readable regular file within bounds\n",
+            "{context}"
         );
     }
     // The worker refuses the API's issuance URL whatever its value, and reads no issuance
     // setting under its own prefix.
-    for value in [
-        OsStr::new(issuance),
-        OsStr::new(""),
-        OsStr::from_bytes(b"CANARY-\xff"),
+    for (label, value) in [
+        ("url", OsStr::new(issuance)),
+        ("empty", OsStr::new("")),
+        ("non-utf8", OsStr::from_bytes(b"CANARY-\xff")),
     ] {
-        let output = command(true)
-            .env("OPENMETTLE_WORKER_BIND", &bind)
+        let context = format!("worker refuses OPENMETTLE_API_ISSUANCE_DATABASE_URL ({label})");
+        let mut cmd = command(true);
+        cmd.env("OPENMETTLE_WORKER_BIND", &bind)
             .env(
                 "OPENMETTLE_WORKER_DATABASE_URL",
                 "postgres://localhost/test",
             )
-            .env("OPENMETTLE_API_ISSUANCE_DATABASE_URL", value)
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(78), "{value:?}");
+            .env("OPENMETTLE_API_ISSUANCE_DATABASE_URL", value);
+        let output = run(&mut cmd, &context);
+        assert_eq!(output.status.code(), Some(78), "{context}");
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
-            "configuration error: OPENMETTLE_API_ISSUANCE_DATABASE_URL is refused outside the API\n"
+            "configuration error: OPENMETTLE_API_ISSUANCE_DATABASE_URL is refused outside the API\n",
+            "{context}"
         );
     }
     // Under its own prefix, unread: the occupied listener is the first failure.
-    let output = command(true)
-        .env("OPENMETTLE_WORKER_BIND", &bind)
+    let mut cmd = command(true);
+    cmd.env("OPENMETTLE_WORKER_BIND", &bind)
         .env(
             "OPENMETTLE_WORKER_DATABASE_URL",
             "postgres://localhost/test",
@@ -406,9 +432,11 @@ fn issuance_settings_are_refused_with_a_fixed_line() {
             "OPENMETTLE_WORKER_ISSUANCE_DATABASE_URL",
             "invalid://CANARY",
         )
-        .env("OPENMETTLE_WORKER_ISSUANCE_DB_MAX_CONNECTIONS", "CANARY")
-        .output()
-        .unwrap();
+        .env("OPENMETTLE_WORKER_ISSUANCE_DB_MAX_CONNECTIONS", "CANARY");
+    let output = run(
+        &mut cmd,
+        "worker unread OPENMETTLE_WORKER_ISSUANCE_* on occupied listener",
+    );
     assert_eq!(output.status.code(), Some(1));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("CANARY"));
 }
@@ -719,12 +747,13 @@ fn rejects_invalid_otlp_settings_with_a_fixed_line() {
         ),
     ];
     for worker in [false, true] {
+        let role = role_name(worker);
         let prefix = if worker {
             "OPENMETTLE_WORKER"
         } else {
             "OPENMETTLE_API"
         };
-        for (pairs, key) in &cases {
+        for (index, (pairs, key)) in cases.iter().enumerate() {
             let mut command = command(worker);
             command
                 .env(
@@ -739,13 +768,16 @@ fn rejects_invalid_otlp_settings_with_a_fixed_line() {
             for (name, value) in pairs {
                 command.env(format!("{prefix}_{name}"), value);
             }
-            let output = command.output().unwrap();
-            assert_eq!(output.status.code(), Some(78), "{pairs:?}");
-            assert!(output.stdout.is_empty());
+            let keys: Vec<&str> = pairs.iter().map(|(name, _)| *name).collect();
+            let context =
+                format!("{role} invalid OTLP case #{index} (expected {key}; keys={keys:?})");
+            let output = run(&mut command, &context);
+            assert_eq!(output.status.code(), Some(78), "{context}");
+            assert!(output.stdout.is_empty(), "{context}");
             assert_eq!(
                 String::from_utf8(output.stderr).unwrap(),
                 format!("configuration error: invalid {key}\n"),
-                "{pairs:?}"
+                "{context}"
             );
         }
     }
@@ -959,13 +991,13 @@ fn auth_config_check_succeeds_offline_without_serving_settings() {
     let mut native = auth_config_support::document_v2_native(&dir, &bundle);
     native["cursor_keys"] = auth_config_support::cursor_keys(&dir);
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
-    for (document, serving_settings) in [
-        (&v1, false),
-        (&v1, true),
-        (&v2, false),
-        (&v2, true),
-        (&native, false),
-        (&native, true),
+    for (label, document, serving_settings) in [
+        ("v1", &v1, false),
+        ("v1", &v1, true),
+        ("v2", &v2, false),
+        ("v2", &v2, true),
+        ("v2-native", &native, false),
+        ("v2-native", &native, true),
     ] {
         let path = dir.write("auth.json", document.to_string().as_bytes());
         let mut command = command(false);
@@ -978,16 +1010,17 @@ fn auth_config_check_succeeds_offline_without_serving_settings() {
                     occupied.local_addr().unwrap().to_string(),
                 );
         }
-        let output = command
-            .args(["--check-auth-config", &path])
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(0));
+        command.args(["--check-auth-config", &path]);
+        let context =
+            format!("api --check-auth-config ({label}, serving_settings={serving_settings})");
+        let output = run(&mut command, &context);
+        assert_eq!(output.status.code(), Some(0), "{context}");
         assert_eq!(
             String::from_utf8(output.stdout).unwrap(),
-            "auth configuration valid (local files only)\n"
+            "auth configuration valid (local files only)\n",
+            "{context}"
         );
-        assert!(output.stderr.is_empty());
+        assert!(output.stderr.is_empty(), "{context}");
     }
 }
 
@@ -1161,24 +1194,24 @@ fn auth_config_check_rejects_with_fixed_redacted_categories() {
         reused.to_string().into_bytes(),
         "cursor key count, identifiers or key separation are invalid",
     ));
-    for (bytes, category) in cases {
+    for (index, (bytes, category)) in cases.into_iter().enumerate() {
         let path = dir.write("synthetic-secret.json", &bytes);
-        let output = command(false)
-            .args(["--check-auth-config", &path])
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(78));
-        assert!(output.stdout.is_empty());
+        let context = format!("api --check-auth-config refusal case #{index} ({category})");
+        let mut cmd = command(false);
+        cmd.args(["--check-auth-config", &path]);
+        let output = run(&mut cmd, &context);
+        assert_eq!(output.status.code(), Some(78), "{context}");
+        assert!(output.stdout.is_empty(), "{context}");
         // The whole diagnostic is one fixed line: no path, value or parser text.
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
-            format!("auth configuration error: {category}\n")
+            format!("auth configuration error: {category}\n"),
+            "{context}"
         );
     }
-    let output = command(false)
-        .args(["--check-auth-config", &dir.path("synthetic-secret-absent")])
-        .output()
-        .unwrap();
+    let mut cmd = command(false);
+    cmd.args(["--check-auth-config", &dir.path("synthetic-secret-absent")]);
+    let output = run(&mut cmd, "api --check-auth-config absent file");
     assert_eq!(output.status.code(), Some(78));
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
@@ -1192,7 +1225,7 @@ fn malformed_check_invocation_is_refused_and_worker_is_unchanged() {
     let document = auth_config_support::document(&dir, &ca::Ca::new().pem());
     let path = dir.write("auth.json", document.to_string().as_bytes());
     let joined = format!("--check-auth-config={path}");
-    for arguments in [
+    for (index, arguments) in [
         vec!["--check-auth-config"],
         vec!["--check-auth-config", &path, "synthetic-secret"],
         vec!["--check-auth-confg", &path],
@@ -1200,18 +1233,30 @@ fn malformed_check_invocation_is_refused_and_worker_is_unchanged() {
         vec![path.as_str()],
         vec!["--help"],
         vec![""],
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         // A fall-through to serving would report the missing database URL instead.
-        let output = command(false).args(&arguments).output().unwrap();
-        assert_eq!(output.status.code(), Some(78), "{arguments:?}");
-        assert!(output.stdout.is_empty());
-        assert_eq!(String::from_utf8(output.stderr).unwrap(), USAGE);
+        let context = format!(
+            "api malformed check invocation case #{index} (argc={})",
+            arguments.len()
+        );
+        let mut cmd = command(false);
+        cmd.args(&arguments);
+        let output = run(&mut cmd, &context);
+        assert_eq!(output.status.code(), Some(78), "{context}");
+        assert!(output.stdout.is_empty(), "{context}");
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            USAGE,
+            "{context}"
+        );
     }
     // The worker has no check mode and no auth settings: it reports its own configuration.
-    let output = command(true)
-        .args(["--check-auth-config", &path])
-        .output()
-        .unwrap();
+    let mut cmd = command(true);
+    cmd.args(["--check-auth-config", &path]);
+    let output = run(&mut cmd, "worker --check-auth-config missing DATABASE_URL");
     assert_eq!(output.status.code(), Some(78));
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
@@ -1279,18 +1324,20 @@ fn api_refuses_invalid_auth_config_with_a_fixed_redacted_line() {
         "auth configuration error: configuration is not a readable regular file within bounds";
     const COLLISION: &str =
         "auth configuration error: browser profile refused: login paths collide";
-    let cases: Vec<(String, &str)> = vec![
-        (String::new(), SETTING),
-        ("CANARY-relative/auth.json".into(), SETTING),
-        ("./CANARY-auth.json".into(), SETTING),
-        (dir.path("CANARY-absent.json"), ABSENT),
+    let cases: Vec<(&str, String, &str)> = vec![
+        ("empty path", String::new(), SETTING),
+        ("relative path", "CANARY-relative/auth.json".into(), SETTING),
+        ("dot-relative path", "./CANARY-auth.json".into(), SETTING),
+        ("absent file", dir.path("CANARY-absent.json"), ABSENT),
         // A directory is not a regular file.
-        (dir.path(""), ABSENT),
+        ("directory", dir.path(""), ABSENT),
         (
+            "broken JSON",
             dir.write("CANARY-broken.json", br#"{"version": 2, "CANARY-member":"#),
             "auth configuration error: configuration is not valid JSON",
         ),
         (
+            "v1 document",
             write("CANARY-v1.json", &v1),
             "auth configuration error: serving requires a version 2 browser profile",
         ),
@@ -1324,9 +1371,10 @@ fn api_refuses_invalid_auth_config_with_a_fixed_redacted_line() {
         ),
     ];
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
-    let run = |path: &str, line: &str| {
-        let output = command(false)
-            .env("OPENMETTLE_API_DATABASE_URL", "postgres://localhost/test")
+    let run_case = |label: &str, path: &str, line: &str| {
+        let context = format!("api AUTH_CONFIG refusal ({label}; expected: {line})");
+        let mut cmd = command(false);
+        cmd.env("OPENMETTLE_API_DATABASE_URL", "postgres://localhost/test")
             // Serving would exit 1 on this occupied address instead.
             .env(
                 "OPENMETTLE_API_BIND",
@@ -1337,21 +1385,25 @@ fn api_refuses_invalid_auth_config_with_a_fixed_redacted_line() {
             .env(
                 "OPENMETTLE_API_ISSUANCE_DATABASE_URL",
                 "postgres://fixture-issuance@localhost/test",
-            )
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(78), "{line}");
-        assert!(output.stdout.is_empty());
+            );
+        let output = run(&mut cmd, &context);
+        assert_eq!(output.status.code(), Some(78), "{context}");
+        assert!(output.stdout.is_empty(), "{context}");
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
-            format!("{line}\n")
+            format!("{line}\n"),
+            "{context}"
         );
     };
-    for (path, line) in cases {
-        run(&path, line);
+    for (label, path, line) in cases {
+        run_case(label, &path, line);
     }
-    for (pointer, value, line) in later {
-        run(&changed(pointer, value), line);
+    for (index, (pointer, value, line)) in later.into_iter().enumerate() {
+        run_case(
+            &format!("case #{index} {pointer}"),
+            &changed(pointer, value),
+            line,
+        );
     }
     // ADR 0029: a refused native profile is the same kind of fixed line, before any listener.
     let native = auth_config_support::document_v2_native(&dir, &bundle);
@@ -1370,14 +1422,13 @@ fn api_refuses_invalid_auth_config_with_a_fixed_redacted_line() {
         } else {
             "auth configuration error: native profile refused: native routes or app link collide with another route"
         };
-        run(&write("CANARY-native.json", &document), line);
+        run_case(pointer, &write("CANARY-native.json", &document), line);
     }
     // Earlier settings are still reported first, and a valid file does not excuse them.
-    let output = command(false)
-        .env("OPENMETTLE_API_DATABASE_URL", "invalid://CANARY")
-        .env("OPENMETTLE_API_AUTH_CONFIG", write("auth.json", &v2))
-        .output()
-        .unwrap();
+    let mut cmd = command(false);
+    cmd.env("OPENMETTLE_API_DATABASE_URL", "invalid://CANARY")
+        .env("OPENMETTLE_API_AUTH_CONFIG", write("auth.json", &v2));
+    let output = run(&mut cmd, "api invalid DATABASE_URL with valid AUTH_CONFIG");
     assert_eq!(output.status.code(), Some(78));
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
@@ -1396,36 +1447,38 @@ fn artifacts_dir_is_validated_before_serving_with_a_fixed_line() {
     std::os::unix::fs::symlink(&target, dir.path("CANARY-link")).unwrap();
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
     for worker in [false, true] {
+        let role = role_name(worker);
         let prefix = if worker {
             "OPENMETTLE_WORKER"
         } else {
             "OPENMETTLE_API"
         };
-        for path in [
-            String::new(),
-            "CANARY-relative".into(),
-            dir.path("CANARY-absent"),
-            file.clone(),
-            dir.path("CANARY-link"),
+        for (label, path) in [
+            ("empty", String::new()),
+            ("relative", "CANARY-relative".into()),
+            ("absent", dir.path("CANARY-absent")),
+            ("regular file", file.clone()),
+            ("symlink", dir.path("CANARY-link")),
         ] {
-            let output = command(worker)
-                .env(
-                    format!("{prefix}_DATABASE_URL"),
-                    "postgres://localhost/test",
-                )
-                // Serving would exit 1 on this occupied address instead.
-                .env(
-                    format!("{prefix}_BIND"),
-                    occupied.local_addr().unwrap().to_string(),
-                )
-                .env(format!("{prefix}_ARTIFACTS_DIR"), &path)
-                .output()
-                .unwrap();
-            assert_eq!(output.status.code(), Some(78), "{path:?}");
-            assert!(output.stdout.is_empty());
+            let context = format!("{role} {prefix}_ARTIFACTS_DIR refusal ({label})");
+            let mut cmd = command(worker);
+            cmd.env(
+                format!("{prefix}_DATABASE_URL"),
+                "postgres://localhost/test",
+            )
+            // Serving would exit 1 on this occupied address instead.
+            .env(
+                format!("{prefix}_BIND"),
+                occupied.local_addr().unwrap().to_string(),
+            )
+            .env(format!("{prefix}_ARTIFACTS_DIR"), &path);
+            let output = run(&mut cmd, &context);
+            assert_eq!(output.status.code(), Some(78), "{context}");
+            assert!(output.stdout.is_empty(), "{context}");
             assert_eq!(
                 String::from_utf8(output.stderr).unwrap(),
-                "configuration error: invalid ARTIFACTS_DIR\n"
+                "configuration error: invalid ARTIFACTS_DIR\n",
+                "{context}"
             );
         }
         let root = dir.path(if worker { "worker" } else { "api" });
@@ -2177,7 +2230,7 @@ fn gateway_refuses_incomplete_or_unsupported_settings_with_a_fixed_line() {
             "invalid CACHE_MODE",
         ),
     ];
-    for (settings, line) in cases {
+    for (index, (settings, line)) in cases.iter().enumerate() {
         let mut command = gateway();
         command.env(
             "OPENMETTLE_GATEWAY_BIND",
@@ -2186,25 +2239,30 @@ fn gateway_refuses_incomplete_or_unsupported_settings_with_a_fixed_line() {
         for (key, value) in *settings {
             command.env(format!("OPENMETTLE_GATEWAY_{key}"), value);
         }
-        let output = command.output().unwrap();
-        assert_eq!(output.status.code(), Some(78), "{line}");
-        assert!(output.stdout.is_empty());
+        let keys: Vec<&str> = settings.iter().map(|(k, _)| *k).collect();
+        let context = format!("gateway refusal case #{index} ({line}; keys={keys:?})");
+        let output = run(&mut command, &context);
+        assert_eq!(output.status.code(), Some(78), "{context}");
+        assert!(output.stdout.is_empty(), "{context}");
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
-            format!("configuration error: {line}\n")
+            format!("configuration error: {line}\n"),
+            "{context}"
         );
     }
     // The API's issuance credential is refused here as in the worker.
-    let output = gateway()
-        .env("OPENMETTLE_GATEWAY_DATABASE_URL", database.1)
+    let mut cmd = gateway();
+    cmd.env("OPENMETTLE_GATEWAY_DATABASE_URL", database.1)
         .env("OPENMETTLE_GATEWAY_UPSTREAM_URL", upstream.1)
         .env("OPENMETTLE_GATEWAY_MODEL", model.1)
         .env(
             "OPENMETTLE_API_ISSUANCE_DATABASE_URL",
             "postgres://CANARY@localhost/test",
-        )
-        .output()
-        .unwrap();
+        );
+    let output = run(
+        &mut cmd,
+        "gateway refuses OPENMETTLE_API_ISSUANCE_DATABASE_URL",
+    );
     assert_eq!(output.status.code(), Some(78));
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
@@ -2359,14 +2417,13 @@ fn gateway_serves_probes_and_its_route_and_stops_on_a_signal() {
 #[test]
 fn occupied_listener_exits_with_runtime_error() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let output = command(false)
-        .env(
-            "OPENMETTLE_API_BIND",
-            listener.local_addr().unwrap().to_string(),
-        )
-        .env("OPENMETTLE_API_DATABASE_URL", "postgres://localhost/test")
-        .output()
-        .unwrap();
+    let mut cmd = command(false);
+    cmd.env(
+        "OPENMETTLE_API_BIND",
+        listener.local_addr().unwrap().to_string(),
+    )
+    .env("OPENMETTLE_API_DATABASE_URL", "postgres://localhost/test");
+    let output = run(&mut cmd, "api occupied listener bind failure");
     assert_eq!(output.status.code(), Some(1));
     // One JSON event names the failure class; nothing goes to stdout.
     assert!(output.stdout.is_empty());
@@ -2632,6 +2689,7 @@ fn worker_scheduling_configuration_is_validated_before_serving() {
         ("EXECUTING_PER_SCOPE", "1"),
     ];
     let invoke = |worker: bool, vars: &[(&str, &str)], message: &str| {
+        let role = role_name(worker);
         let prefix = if worker {
             "OPENMETTLE_WORKER"
         } else {
@@ -2645,11 +2703,18 @@ fn worker_scheduling_configuration_is_validated_before_serving() {
         for (key, value) in vars {
             child.env(format!("OPENMETTLE_WORKER_{key}"), value);
         }
-        let output = child.output().unwrap();
-        assert_eq!(output.status.code(), Some(78));
+        let config = vars
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let context = format!("{role} scheduling config [{config}] (expected: {message})");
+        let output = run(&mut child, &context);
+        assert_eq!(output.status.code(), Some(78), "{context}");
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
-            format!("configuration error: {message}\n")
+            format!("configuration error: {message}\n"),
+            "{context}"
         );
     };
     for (key, below, above) in [
@@ -2735,10 +2800,12 @@ fn worker_validates_its_inference_document_before_serving() {
     );
     let mut cases = vec![
         (
+            "invalid installation UUID",
             json_with(&valid, "/installation", "CANARY-installation"),
             "gateway installation is not a canonical UUID",
         ),
         (
+            "invalid route endpoint query",
             json_with(
                 &valid,
                 "/routes/a/endpoint",
@@ -2747,6 +2814,7 @@ fn worker_validates_its_inference_document_before_serving() {
             "an inference route endpoint, trust, address policy or timeout is invalid",
         ),
         (
+            "mismatched route catalog pin",
             json_with(&valid, "/routes/b/pin/revision", "CANARY-revision"),
             "an inference route does not match its catalog profile",
         ),
@@ -2757,7 +2825,11 @@ fn worker_validates_its_inference_document_before_serving() {
         "active": {"id": "gateway-b", "path": dir.write("CANARY-key", &[0xc2; 32])},
         "decrypt_only": []
     });
-    cases.push((ring, "configuration has an unknown field"));
+    cases.push((
+        "legacy gateway_keys field",
+        ring,
+        "configuration has an unknown field",
+    ));
     // A plain route names no range to hold the gateway's addresses.
     let mut plain = valid.clone();
     plain["routes"]["a"]["endpoint"] = "http://canary-gateway.example.test:8082/CANARY".into();
@@ -2766,16 +2838,18 @@ fn worker_validates_its_inference_document_before_serving() {
         .unwrap()
         .remove("trust");
     cases.push((
+        "plain HTTP route without private_cidrs",
         plain,
         "a plain HTTP inference route needs private_cidrs holding every gateway address",
     ));
     let mut uncovered = valid.clone();
     uncovered["routes"].as_object_mut().unwrap().remove("b");
     cases.push((
+        "missing catalog model route",
         uncovered,
         "inference routes do not name exactly the catalog's models",
     ));
-    for (document, message) in cases {
+    for (label, document, message) in cases {
         let path = dir.write("inference.json", document.to_string().as_bytes());
         let mut child = command(true);
         child
@@ -2784,12 +2858,14 @@ fn worker_validates_its_inference_document_before_serving() {
         for (key, value) in policy {
             child.env(format!("OPENMETTLE_WORKER_{key}"), value);
         }
-        let output = child.output().unwrap();
-        assert_eq!(output.status.code(), Some(78), "{message}");
-        assert!(output.stdout.is_empty());
+        let context = format!("worker inference document refusal ({label}; expected: {message})");
+        let output = run(&mut child, &context);
+        assert_eq!(output.status.code(), Some(78), "{context}");
+        assert!(output.stdout.is_empty(), "{context}");
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
-            format!("inference configuration error: {message}\n")
+            format!("inference configuration error: {message}\n"),
+            "{context}"
         );
     }
     // No refused process dialled the database.
@@ -2866,4 +2942,143 @@ fn failed_sweeps_report_fixed_categories_and_retry_next_tick() {
     }
     stop(&mut process, "-TERM");
     reader.join().unwrap();
+}
+
+fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else {
+        String::new()
+    }
+}
+
+/// Regression test for the shared bounded process helpers:
+/// 1. A service that starts and serves when it should refuse fails within the deadline, is
+///    killed and reaped, and reports the configuration label.
+/// 2. `wait_exit_bounded` and `wait_output_bounded` time out promptly, kill and reap a
+///    long-running child, and name the configuration label.
+/// 3. `run_bounded` drains stdout and stderr concurrently past OS pipe buffer sizes without
+///    deadlocking.
+#[test]
+fn bounded_process_helpers_time_out_kill_and_name_configuration() {
+    // 1. Real binary starting instead of refusing.
+    let (_database, url) = unavailable_database();
+    let bind = address();
+    let label = "synthetic-refusal-case: OPENMETTLE_API_BIND=ephemeral";
+    let mut cmd = command(false);
+    cmd.env("OPENMETTLE_API_BIND", &bind)
+        .env("OPENMETTLE_API_DATABASE_URL", &url)
+        .env("OPENMETTLE_API_DB_TIMEOUT_MS", "150")
+        .env("OPENMETTLE_API_SHUTDOWN_TIMEOUT_MS", "1000");
+    let began = Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_bounded(&mut cmd, Duration::from_millis(300), label)
+    }))
+    .expect_err("serving binary must time out");
+    assert!(
+        began.elapsed() < Duration::from_secs(3),
+        "run_bounded took too long: {:?}",
+        began.elapsed()
+    );
+    let message = panic_text(err);
+    assert!(message.contains(label), "missing label in panic: {message}");
+    assert!(
+        TcpStream::connect_timeout(&bind.parse().unwrap(), Duration::from_millis(200)).is_err(),
+        "timed-out binary kept listening on {bind}"
+    );
+
+    // 2. `wait_exit_bounded` kills and reaps a long-running child.
+    let mut sleeper = Process(
+        Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let pid = sleeper.0.id();
+    let began = Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_exit_bounded(
+            &mut sleeper.0,
+            Duration::from_millis(150),
+            "synthetic-sleep-exit-case",
+        )
+    }))
+    .expect_err("sleep child must time out");
+    assert!(
+        began.elapsed() < Duration::from_secs(3),
+        "wait_exit_bounded took too long: {:?}",
+        began.elapsed()
+    );
+    let message = panic_text(err);
+    assert!(
+        message.contains("synthetic-sleep-exit-case"),
+        "missing label in panic: {message}"
+    );
+    assert!(
+        sleeper.0.try_wait().unwrap().is_some(),
+        "timed-out child was not reaped"
+    );
+    let alive = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success();
+    assert!(!alive, "timed-out child pid {pid} is still alive");
+
+    // 3. `wait_output_bounded` kills and reaps an already-spawned piped child.
+    let sleeper = Process(
+        Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let pid = sleeper.0.id();
+    let began = Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_output_bounded(
+            sleeper,
+            Duration::from_millis(150),
+            "synthetic-sleep-output-case",
+        )
+    }))
+    .expect_err("piped sleep child must time out");
+    assert!(
+        began.elapsed() < Duration::from_secs(3),
+        "wait_output_bounded took too long: {:?}",
+        began.elapsed()
+    );
+    let message = panic_text(err);
+    assert!(
+        message.contains("synthetic-sleep-output-case"),
+        "missing label in panic: {message}"
+    );
+    let alive = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success();
+    assert!(!alive, "timed-out piped child pid {pid} is still alive");
+
+    // 4. `run_bounded` drains stdout and stderr past typical 64 KiB pipe buffers without deadlock.
+    let mut flood = Command::new("sh");
+    flood.args([
+        "-c",
+        "dd if=/dev/zero bs=1024 count=128 2>/dev/null && dd if=/dev/zero bs=1024 count=128 1>&2 2>/dev/null",
+    ]);
+    let output = run_bounded(&mut flood, Duration::from_secs(5), "pipe-flood-drain");
+    assert!(output.status.success());
+    assert_eq!(output.stdout.len(), 128 * 1024);
+    assert_eq!(output.stderr.len(), 128 * 1024);
 }

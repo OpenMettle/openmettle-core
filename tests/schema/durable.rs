@@ -99,7 +99,7 @@ async fn populated_v2_upgrade_and_authentic_old_binaries() {
                 }
             }
         }
-        old_cmd.output().unwrap()
+        run_cli(&mut old_cmd, "old openmettle-migrate (v2)")
     };
     let output = old_migrate();
     assert!(output.status.success(), "{}", stderr(&output));
@@ -180,8 +180,9 @@ async fn populated_v2_upgrade_and_authentic_old_binaries() {
             .unwrap();
         let mut process = Process(child);
         wait_ready(&mut process, &bind);
-        signal(&process.0, "-TERM");
-        assert!(process.0.wait().unwrap().success());
+        assert!(
+            stop_process(&mut process, "-TERM", &format!("old {name} shutdown (v2)")).success()
+        );
     }
     assert_eq!(snapshot(&mut api, &tables).await, before);
     // Existing v2 writes still work after the upgrade.
@@ -599,15 +600,17 @@ async fn killed_migration_three_preserves_version_two() {
         .unwrap();
     let mut admin = db.admin().await;
     for kill in ["-TERM", "-KILL"] {
-        let mut child = migrate_command(
-            &db.url(OWNER),
-            &[
-                ("LOCK_TIMEOUT_MS", "60000"),
-                ("STATEMENT_TIMEOUT_MS", "60000"),
-            ],
-        )
-        .spawn()
-        .unwrap();
+        let mut child = Process(
+            migrate_command(
+                &db.url(OWNER),
+                &[
+                    ("LOCK_TIMEOUT_MS", "60000"),
+                    ("STATEMENT_TIMEOUT_MS", "60000"),
+                ],
+            )
+            .spawn()
+            .unwrap(),
+        );
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let state: Option<(bool, bool)> = sqlx::query_as(
@@ -631,11 +634,17 @@ async fn killed_migration_three_preserves_version_two() {
                 Instant::now() < deadline,
                 "migrator never blocked inside migration 3 holding the lock: {state:?}"
             );
-            assert!(child.try_wait().unwrap().is_none(), "migrator exited early");
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "migrator exited early"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        signal(&child, kill);
-        let status = child.wait().unwrap();
+        let status = stop_process(
+            &mut child,
+            kill,
+            &format!("migrator mid-migration 3 ({kill})"),
+        );
         if kill == "-TERM" {
             assert_eq!(status.code(), Some(1));
         }
@@ -648,9 +657,8 @@ async fn killed_migration_three_preserves_version_two() {
         assert_eq!(db.history().await, [1, 2], "{kill}");
     }
     blocker.execute("ROLLBACK").await.unwrap();
-    let output = migrate_command(&db.url(OWNER), &[("LOCK_TIMEOUT_MS", "1000")])
-        .output()
-        .unwrap();
+    let mut cmd = migrate_command(&db.url(OWNER), &[("LOCK_TIMEOUT_MS", "1000")]);
+    let output = run_cli(&mut cmd, "migrate after migration 3 rollback");
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(db.history().await, all_versions());
     db.wait_no_migration_session().await;
@@ -690,11 +698,14 @@ async fn version_three_failure_timeout_concurrent_upgrade() {
     assert_eq!(db.history().await, [1, 2]);
     assert!(!db.exists("openmettle.conversation_branches").await);
     tx.rollback().await.unwrap();
-    let children: Vec<_> = (0..4)
-        .map(|_| migrate_command(&db.url(OWNER), &[]).spawn().unwrap())
+    let children: Vec<Process> = (0..4)
+        .map(|_| Process(migrate_command(&db.url(OWNER), &[]).spawn().unwrap()))
         .collect();
-    for child in children {
-        let out = child.wait_with_output().unwrap();
+    for (index, child) in children.into_iter().enumerate() {
+        let out = wait_output(
+            child,
+            &format!("concurrent migrator after migration 3 #{index}"),
+        );
         assert!(out.status.success(), "{}", stderr(&out));
     }
     assert_eq!(db.history().await, all_versions());

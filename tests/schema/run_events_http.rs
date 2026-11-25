@@ -334,7 +334,7 @@ async fn replacement_drains_live_bodies_and_resumes_on_another_replica() {
     signal(&f.api.process.0, "-TERM");
     assert_eq!(queued.next().await, None);
     assert_eq!(running.next().await, None);
-    assert!(f.api.process.0.wait().unwrap().success());
+    assert!(wait_exit(&mut f.api.process.0, "run_events_http api shutdown").success());
     let mut resumed = Stream::open(&b, f.native(), &path, Some(&first)).await;
     assert_eq!(resumed.next().await.unwrap(), started);
     let snapshot = success(b.call(f.browser(), "GET", &f.path(), None, None), 200);

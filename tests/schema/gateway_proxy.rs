@@ -1419,7 +1419,9 @@ impl Harness {
             ..
         } = self;
         signal(&gateway.0, "-TERM");
-        let status = tokio::task::block_in_place(|| gateway.0.wait()).unwrap();
+        let status = tokio::task::block_in_place(|| {
+            wait_exit(&mut gateway.0, "gateway proxy shutdown (-TERM)")
+        });
         assert!(status.success());
         let stderr = stderr.join().unwrap();
         for secret in [COOKIE, "Count from 1 to 5"] {

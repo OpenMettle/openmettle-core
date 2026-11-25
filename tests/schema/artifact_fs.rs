@@ -1021,8 +1021,7 @@ async fn worker_purges_unlocked_revisions_and_sweeps_runs_while_a_revision_stays
     seed.commit().await.unwrap();
     assert_swept(&f, &ids).await;
 
-    signal(&process.0, "-TERM");
-    assert!(process.0.wait().unwrap().success());
+    assert!(stop_process(&mut process, "-TERM", "artifact_fs worker shutdown").success());
     let mut logs = String::new();
     process
         .0
@@ -1125,7 +1124,10 @@ async fn worker_binary_sweeps_with_and_without_payloads_and_recovers_after_signa
         .unwrap();
         signal(&process.0, sig);
         lock.commit().await.unwrap();
-        let status = process.0.wait().unwrap();
+        let status = wait_exit(
+            &mut process.0,
+            &format!("artifact_fs worker ({sig}, artifacts={artifacts})"),
+        );
         if artifacts {
             assert_eq!(status.signal(), Some(9));
         } else {
@@ -1134,8 +1136,14 @@ async fn worker_binary_sweeps_with_and_without_payloads_and_recovers_after_signa
     }
     let mut replacement = sweep_process(&f, true);
     assert_swept(&f, &ids).await;
-    signal(&replacement.0, "-TERM");
-    assert!(replacement.0.wait().unwrap().success());
+    assert!(
+        stop_process(
+            &mut replacement,
+            "-TERM",
+            "artifact_fs replacement worker shutdown",
+        )
+        .success()
+    );
     assert_eq!(f.state("abandoned").await.as_deref(), Some("released"));
     assert_totals(&f.db).await;
 }
@@ -1459,11 +1467,10 @@ async fn admin_cli_adopts_populated_upgrade_only_after_verifying_the_original_pa
     let payload = root.join("revisions").join(&reserved);
     fs::write(&payload, b"bad").unwrap();
     let admin = |args: &[&str]| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_openmettle-admin"))
-            .env("OPENMETTLE_ADMIN_DATABASE_URL", db.url(OWNER))
-            .args(args)
-            .output()
-            .unwrap()
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_openmettle-admin"));
+        cmd.env("OPENMETTLE_ADMIN_DATABASE_URL", db.url(OWNER))
+            .args(args);
+        run_cli(&mut cmd, &format!("openmettle-admin {args:?}"))
     };
     let path = root.to_str().unwrap();
     let failed = admin(&["storage", "adopt", path]);

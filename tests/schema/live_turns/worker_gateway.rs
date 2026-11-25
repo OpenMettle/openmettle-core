@@ -257,8 +257,7 @@ async fn fetch_branch_messages(chat: &Chat) -> Value {
     assert!(headers.starts_with("HTTP/1.1 200 "), "{headers}");
     let mut body = String::new();
     reader.read_to_string(&mut body).unwrap();
-    signal(&api.0, "-TERM");
-    assert!(api.0.wait().unwrap().success());
+    assert!(stop_process(&mut api, "-TERM", "live_turns api shutdown").success());
     serde_json::from_str(&body).unwrap()
 }
 

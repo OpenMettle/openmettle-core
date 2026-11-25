@@ -993,15 +993,17 @@ async fn migration_four_failure_kill_timeout_and_concurrent_retry() {
     assert_eq!(db.history().await, [1, 2, 3]);
     let mut admin = db.admin().await;
     for kill in ["-TERM", "-KILL"] {
-        let mut child = migrate_command(
-            &db.url(OWNER),
-            &[
-                ("LOCK_TIMEOUT_MS", "60000"),
-                ("STATEMENT_TIMEOUT_MS", "60000"),
-            ],
-        )
-        .spawn()
-        .unwrap();
+        let mut child = Process(
+            migrate_command(
+                &db.url(OWNER),
+                &[
+                    ("LOCK_TIMEOUT_MS", "60000"),
+                    ("STATEMENT_TIMEOUT_MS", "60000"),
+                ],
+            )
+            .spawn()
+            .unwrap(),
+        );
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let state: Option<(bool, bool)> = sqlx::query_as(
@@ -1023,11 +1025,17 @@ async fn migration_four_failure_kill_timeout_and_concurrent_retry() {
                 Instant::now() < deadline,
                 "migrator never blocked inside migration 4: {state:?}"
             );
-            assert!(child.try_wait().unwrap().is_none(), "migrator exited early");
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "migrator exited early"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        signal(&child, kill);
-        let status = child.wait().unwrap();
+        let status = stop_process(
+            &mut child,
+            kill,
+            &format!("migrator mid-migration 4 ({kill})"),
+        );
         if kill == "-TERM" {
             assert_eq!(status.code(), Some(1));
         }
@@ -1036,11 +1044,14 @@ async fn migration_four_failure_kill_timeout_and_concurrent_retry() {
         assert_eq!(db.history().await, [1, 2, 3], "{kill}");
     }
     blocker.execute("ROLLBACK").await.unwrap();
-    let children: Vec<_> = (0..4)
-        .map(|_| migrate_command(&db.url(OWNER), &[]).spawn().unwrap())
+    let children: Vec<Process> = (0..4)
+        .map(|_| Process(migrate_command(&db.url(OWNER), &[]).spawn().unwrap()))
         .collect();
-    for child in children {
-        let out = child.wait_with_output().unwrap();
+    for (index, child) in children.into_iter().enumerate() {
+        let out = wait_output(
+            child,
+            &format!("concurrent migrator after migration 4 #{index}"),
+        );
         assert!(out.status.success(), "{}", stderr(&out));
     }
     assert_eq!(db.history().await, all_versions());
@@ -1073,13 +1084,12 @@ async fn populated_v3_upgrade_and_authentic_v3_binaries() {
         std::env::var("V3_BINARY_DIR").expect("build released 2f1be94 binaries first"),
     );
     let old_migrate = || {
-        old_command(
+        let mut cmd = old_command(
             &old,
             "openmettle-migrate",
             &migrate_command(&db.url(OWNER), &[]),
-        )
-        .output()
-        .unwrap()
+        );
+        run_cli(&mut cmd, "old openmettle-migrate (v3)")
     };
     let output = old_migrate();
     assert!(output.status.success(), "{}", stderr(&output));
@@ -1193,8 +1203,9 @@ async fn populated_v3_upgrade_and_authentic_v3_binaries() {
             .unwrap();
         let mut process = Process(child);
         wait_ready(&mut process, &bind);
-        signal(&process.0, "-TERM");
-        assert!(process.0.wait().unwrap().success());
+        assert!(
+            stop_process(&mut process, "-TERM", &format!("old {name} shutdown (v3)")).success()
+        );
     }
     // Scopes written before the upgrade (and by a previous API afterwards) account lazily.
     configure(&db, Some(10_000), Some(1_000), Some(1_000)).await;

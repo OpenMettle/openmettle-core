@@ -2403,9 +2403,11 @@ mod live_turns {
         ));
         // Drain the first process while the replacement still owns the claim.
         drop(old.0.stdin.take());
-        tokio::task::spawn_blocking(move || assert!(old.0.wait().unwrap().success()))
-            .await
-            .unwrap();
+        tokio::task::spawn_blocking(move || {
+            assert!(wait_exit(&mut old.0, "deposed turn worker drain").success());
+        })
+        .await
+        .unwrap();
         assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
         fresh_request.respond(completion(json!("replacement"), None, Value::Null));
         chat.done(&id, "succeeded", None).await;
