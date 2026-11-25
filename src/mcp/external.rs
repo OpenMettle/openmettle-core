@@ -813,6 +813,7 @@ fn disambiguate_redacted_key(
     handle: &str,
     out: &Map<String, Value>,
     original_keys: &BTreeSet<String>,
+    cursors: &mut BTreeMap<String, (usize, usize)>,
 ) -> String {
     debug_assert!(!base.contains(handle));
     if !out.contains_key(&base) && !original_keys.contains(&base) {
@@ -823,7 +824,10 @@ fn disambiguate_redacted_key(
         .saturating_add(original_keys.len())
         .saturating_add(3);
     let sep = if handle.contains('#') { "_" } else { "#" };
-    for n in 2..=max_probe {
+    let (next_n, next_pad_len) = cursors.entry(base.clone()).or_insert((2, 1));
+    while *next_n <= max_probe {
+        let n = *next_n;
+        *next_n += 1;
         let candidate = format!("{base}{sep}{n}");
         if !candidate.contains(handle)
             && !out.contains_key(&candidate)
@@ -839,7 +843,9 @@ fn disambiguate_redacted_key(
         .find(|b| !handle.as_bytes().contains(b))
         .map(char::from)
         .unwrap_or('~');
-    for len in 1..=max_probe {
+    while *next_pad_len <= max_probe {
+        let len = *next_pad_len;
+        *next_pad_len += 1;
         let fallback: String = std::iter::repeat_n(safe_pad, len).collect();
         if !fallback.contains(handle)
             && !out.contains_key(&fallback)
@@ -866,12 +872,13 @@ fn redact_value_strings(value: &mut Value, handle: &str) {
         Value::Object(map) => {
             let entries = std::mem::take(map);
             let original_keys: BTreeSet<String> = entries.keys().cloned().collect();
+            let mut cursors: BTreeMap<String, (usize, usize)> = BTreeMap::new();
             let mut out = Map::with_capacity(entries.len());
             for (k, mut v) in entries {
                 redact_value_strings(&mut v, handle);
                 let new_key = if k.contains(handle) {
                     let base = redact_plain_str(&k, handle);
-                    disambiguate_redacted_key(base, handle, &out, &original_keys)
+                    disambiguate_redacted_key(base, handle, &out, &original_keys, &mut cursors)
                 } else {
                     k
                 };
@@ -883,11 +890,28 @@ fn redact_value_strings(value: &mut Value, handle: &str) {
     }
 }
 
+fn has_json_escape_sequence(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'\\'
+            && matches!(
+                bytes[i + 1],
+                b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' | b'u' | b'U'
+            )
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 fn sanitize_text_block(block: &str, handle_field: Option<&str>, handle: Option<&str>) -> String {
-    if (handle_field.is_some() || handle.is_some())
-        && let Ok(mut parsed) = serde_json::from_str::<Value>(block)
-        && (parsed.is_object() || parsed.is_array() || parsed.is_string())
-    {
+    if handle_field.is_none() && handle.is_none() {
+        return block.to_owned();
+    }
+    if let Ok(mut parsed) = serde_json::from_str::<Value>(block) {
         if let (Some(field), Some(map)) = (handle_field, parsed.as_object_mut()) {
             map.remove(field);
         }
@@ -895,12 +919,24 @@ fn sanitize_text_block(block: &str, handle_field: Option<&str>, handle: Option<&
             redact_value_strings(&mut parsed, h);
         }
         parsed.sort_all_objects();
-        parsed.to_string()
-    } else {
-        match handle {
-            Some(h) => redact_plain_str(block, h),
-            None => block.to_owned(),
+        return parsed.to_string();
+    }
+    match handle {
+        Some(h) => {
+            // Withhold any JSON-looking block that failed `serde_json::from_str` (e.g. exceeding
+            // recursion depth or truncated JSON) or any non-JSON text retaining JSON string escape
+            // sequences after literal redaction, so escaped handle encodings cannot survive.
+            if block.trim_ascii().starts_with(['{', '[', '"']) {
+                return choose_safe_marker(h);
+            }
+            let plain = redact_plain_str(block, h);
+            if has_json_escape_sequence(&plain) {
+                choose_safe_marker(h)
+            } else {
+                plain
+            }
         }
+        None => block.to_owned(),
     }
 }
 
@@ -998,17 +1034,21 @@ impl ApprovedAdapter for ExternalMcpAdapter {
                 let Ok(enabled) = approvals::two_phase_effect_intents_enabled(&mut c).await else {
                     return Err(StepResult::LeaseLost);
                 };
-                let Ok(actor) = sqlx::query_scalar::<_, String>(
-                    "SELECT actor_user_id::text FROM openmettle.runs WHERE scope_id=$1::uuid AND id=$2::uuid",
-                )
-                .bind(&run.claim.scope_id)
-                .bind(&run.claim.run_id)
-                .fetch_one(&mut *c)
-                .await
-                else {
-                    return Err(StepResult::LeaseLost);
-                };
-                (enabled, actor)
+                if !enabled {
+                    (false, String::new())
+                } else {
+                    let Ok(actor) = sqlx::query_scalar::<_, String>(
+                        "SELECT actor_user_id::text FROM openmettle.runs WHERE scope_id=$1::uuid AND id=$2::uuid",
+                    )
+                    .bind(&run.claim.scope_id)
+                    .bind(&run.claim.run_id)
+                    .fetch_one(&mut *c)
+                    .await
+                    else {
+                        return Err(StepResult::LeaseLost);
+                    };
+                    (true, actor)
+                }
             };
             let mut checked: BTreeMap<(String, String), bool> = BTreeMap::new();
             let mut kept = Vec::with_capacity(tools.len());
@@ -1031,7 +1071,7 @@ impl ApprovedAdapter for ExternalMcpAdapter {
                         continue;
                     }
                 };
-                if contract.capability != "repeatable_read" && !two_phase_enabled {
+                if !two_phase_enabled {
                     continue;
                 }
                 let conn_key = (contract.connection_id.clone(), contract.account_id.clone());
@@ -1683,6 +1723,63 @@ mod tests {
             let parsed_t: Value = serde_json::from_str(&t_out).expect("valid JSON");
             assert_eq!(parsed_t.as_object().unwrap().len(), 5);
         }
+
+        // 9. Deeply nested JSON text block (> serde_json 128 recursion limit) containing a
+        //    JSON-escaped handle is withheld when a handle is present, while standalone JSON
+        //    numbers/booleans/null are preserved without corrupting digits/letters.
+        let mut deep_json = format!("{{\"leaf\":{}}}", json!(format!("leak {escaped_handle}")));
+        for _ in 0..150 {
+            deep_json = format!("[{deep_json}]");
+        }
+        assert!(serde_json::from_str::<Value>(&deep_json).is_err());
+        let deep_and_primitives = ToolCallSuccess {
+            text: String::new(),
+            content_blocks: vec![
+                deep_json,
+                "10".into(),
+                "true".into(),
+                "false".into(),
+                "null".into(),
+            ],
+            structured: Some(json!({"handle": "1"})),
+            meta: None,
+        };
+        let (dp_out, dp_h) = sanitize_tool_success(&deep_and_primitives, Some("handle")).unwrap();
+        assert_eq!(dp_h.as_deref(), Some("1"));
+        assert!(!dp_out.contains("quote"));
+        assert!(!dp_out.contains("slash"));
+        let dp_lines: Vec<&str> = dp_out.lines().collect();
+        assert_eq!(dp_lines, vec!["[REDACTED]", "10", "true", "false", "null"]);
+
+        let bool_handle = ToolCallSuccess {
+            text: String::new(),
+            content_blocks: vec!["true".into(), "false".into(), "null".into()],
+            structured: Some(json!({"handle": "t"})),
+            meta: None,
+        };
+        let (bh_out, _) = sanitize_tool_success(&bool_handle, Some("handle")).unwrap();
+        assert_eq!(bh_out, "true\nfalse\nnull");
+
+        // 10. Linear per-base cursor disambiguates hundreds of colliding keys without quadratic probing.
+        let mut many_keys = Map::new();
+        many_keys.insert("handle".into(), json!("hk"));
+        for i in 0..500usize {
+            many_keys.insert(
+                format!("same_{}", "hk".repeat(i + 1)),
+                json!(format!("v_{i}_hk")),
+            );
+        }
+        let many = ToolCallSuccess {
+            text: String::new(),
+            content_blocks: Vec::new(),
+            structured: Some(Value::Object(many_keys)),
+            meta: None,
+        };
+        let (m_out, m_h) = sanitize_tool_success(&many, Some("handle")).unwrap();
+        assert_eq!(m_h.as_deref(), Some("hk"));
+        assert!(!m_out.contains("hk"));
+        let m_parsed: Value = serde_json::from_str(&m_out).expect("valid JSON");
+        assert_eq!(m_parsed.as_object().unwrap().len(), 500);
     }
 
     #[test]

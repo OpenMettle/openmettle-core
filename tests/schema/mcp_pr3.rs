@@ -8232,6 +8232,27 @@ async fn review4_version_pin_key_redaction_multiblock_collision_and_abandoned_ro
                 .to_string();
                 http_response(200, &[("content-type", "application/json")], body.as_bytes())
             }
+            ("mcp_idem", "deep-json-spilled") => {
+                let h = "h\"deep\\1";
+                let mut deep = format!("{{\"leaf\":{}}}", json!(format!("x {h} y")));
+                for _ in 0..150 {
+                    deep = format!("[{deep}]");
+                }
+                let body = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "content": [
+                            {"type": "text", "text": deep},
+                            {"type": "text", "text": "10"},
+                            {"type": "text", "text": pad_srv}
+                        ],
+                        "structuredContent": {"handle": h}
+                    }
+                })
+                .to_string();
+                http_response(200, &[("content-type", "application/json")], body.as_bytes())
+            }
             ("mcp_idem", "tricky-key-inline") => {
                 let h = "D]#";
                 let body = json!({
@@ -8418,6 +8439,34 @@ async fn review4_version_pin_key_redaction_multiblock_collision_and_abandoned_ro
         )
         .await;
         assert!(!mb_full.contains("mb"));
+
+        let StepResult::ToolOutput(dj_sp) = adapter
+            .call(
+                &active,
+                step.clone(),
+                ExternalCall {
+                    key: "k-r5-dj-sp",
+                    tool: "mcp_idem",
+                    version: "1",
+                    raw_args: br#"{"item":"deep-json-spilled"}"#,
+                    approval: None,
+                },
+            )
+            .await
+        else {
+            panic!("expected deep-json-spilled ToolOutput");
+        };
+        assert!(!dj_sp.contains("deep"));
+        let dj_env: Value = serde_json::from_str(&dj_sp).unwrap();
+        assert_eq!(dj_env["storage"], "spilled");
+        let dj_full = read_all_spilled(
+            dj_env["provenance"]["artifact_id"].as_str().unwrap(),
+            dj_env["provenance"]["revision_id"].as_str().unwrap(),
+            "r5-dj",
+        )
+        .await;
+        assert!(!dj_full.contains("deep"));
+        assert!(dj_full.starts_with("[REDACTED]\n10\n"));
 
         let StepResult::ToolOutput(tk_in) = adapter
             .call(
@@ -9336,12 +9385,12 @@ async fn review4_version_pin_key_redaction_multiblock_collision_and_abandoned_ro
             .expect("claim3b rec-ver")
             .run;
         let exec3b = TurnExecutor::new(
-            worker_pool,
+            worker_pool.clone(),
             catalog.clone(),
             LEASES,
             VersionSwitchRoutes {
                 gateway: make_gateway(&model_srv),
-                registry,
+                registry: registry.clone(),
                 propose_version: "1",
             },
         )
@@ -9361,5 +9410,324 @@ async fn review4_version_pin_key_redaction_multiblock_collision_and_abandoned_ro
         leases::settle(&mut w, &claim3b.lease(), &LEASES, Settle::Succeeded)
             .await
             .unwrap();
+    }
+
+    // --- (f) Review #5 regressions: gate-off read filter, spilled >128-nested JSON withholding, and transcript row bounds ---
+    {
+        let cred_lookups = Arc::new(AtomicUsize::new(0));
+        let adapter_r5 = Arc::new(
+            ExternalMcpAdapter::new(
+                worker_pool.clone(),
+                LEASES,
+                registry.clone(),
+                transports.clone(),
+                Arc::new(CountingCredentials {
+                    token: Some("tok-r5".into()),
+                    lookups: cred_lookups.clone(),
+                }),
+                Arc::new(ToggleReconcileAuth {
+                    allowed: Arc::new(AtomicBool::new(true)),
+                    checks: Arc::new(AtomicUsize::new(0)),
+                }),
+            )
+            .with_artifacts(store.clone()),
+        );
+
+        // 1. Gate-disabled `filter_turn_tools` skips ALL external declarations (including `repeatable_read`)
+        //    with zero credential lookups, while preserving non-colliding internal tools.
+        sqlx::query(
+            "UPDATE openmettle.runtime_feature_gates SET two_phase_effect_intents_enabled = false",
+        )
+        .execute(&mut owner)
+        .await
+        .unwrap();
+        let rr_gate = f.claim("r5-filter-gate-off", "yolo").await;
+        let (_st_g, step_g) = fresh_step(25);
+        let active_g = ActiveRun {
+            claim: rr_gate.clone(),
+            state: leases::ExecState::Running,
+            execution_deadline: step_g.deadline,
+        };
+        let internal_tool = Tool {
+            name: mcp::READ_RANGE.into(),
+            description: "read range".into(),
+            parameters: json!({"type": "object", "additionalProperties": false}),
+        };
+        let Ok(kept_off) = adapter_r5
+            .filter_turn_tools(
+                &active_g,
+                vec![
+                    registry.get("mcp_read", "1").unwrap().declared_tool(),
+                    registry.get("mcp_idem", "1").unwrap().declared_tool(),
+                    DeclaredTool::internal(internal_tool.clone()),
+                ],
+                &step_g,
+            )
+            .await
+        else {
+            panic!("expected filter_turn_tools Ok");
+        };
+        assert!(kept_off == vec![internal_tool]);
+        assert_eq!(
+            cred_lookups.load(Ordering::SeqCst),
+            0,
+            "gate-disabled worker must not perform credential lookup or tools/list for external reads"
+        );
+        sqlx::query(
+            "UPDATE openmettle.runtime_feature_gates SET two_phase_effect_intents_enabled = true",
+        )
+        .execute(&mut owner)
+        .await
+        .unwrap();
+        leases::settle(&mut w, &rr_gate.lease(), &LEASES, Settle::Succeeded)
+            .await
+            .unwrap();
+
+        // 2. Recovery rejects extra out-of-bounds `turn-result:1:1` or unsupported `format_version = 2`
+        //    on `turn-calls` BEFORE resuming a pending write (`0` MCP HTTP calls).
+        for (idx_case, bad_version) in [(0usize, false), (1usize, true)] {
+            let key: &'static str = if bad_version {
+                "r5-bad-fmt-ver"
+            } else {
+                "r5-oob-result"
+            };
+            let msg_id: &'static str = if bad_version {
+                "00000000-0000-4000-8000-000000004502"
+            } else {
+                "00000000-0000-4000-8000-000000004501"
+            };
+            let run_id = admit_yolo_turn(key, msg_id, 3).await;
+            let claim_a = f.next().await.expect("claim r5 transcript");
+            assert_eq!(claim_a.run_id, run_id);
+
+            if bad_version {
+                // Pre-populate Round 1 with `model-round:1` + `turn-calls:1` at unsupported `format_version = 2`
+                // (append-only via `append_event`, testing that recovery never mistakes an unknown-version
+                // `turn-calls:1` row for an abandoned round).
+                leases::with_lease(
+                    &mut w,
+                    &claim_a.lease(),
+                    leases::Fence::Step,
+                    async |tx, _| {
+                        openmettle_core::runs::append_event(
+                            tx,
+                            &claim_a.scope_id,
+                            &claim_a.run_id,
+                            "model-round:1",
+                            openmettle_core::runs::Payload {
+                                format: "openmettle.model-round",
+                                version: 1,
+                                bytes: b"{}",
+                            },
+                        )
+                        .await?;
+                        openmettle_core::runs::append_event(
+                            tx,
+                            &claim_a.scope_id,
+                            &claim_a.run_id,
+                            "turn-calls:1",
+                            openmettle_core::runs::Payload {
+                                format: "openmettle.turn-calls",
+                                version: 2,
+                                bytes: b"{}",
+                            },
+                        )
+                        .await?;
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap();
+            }
+
+            let m_srv = SyntheticMcpServer::start(move |_| {
+                let body = json!({
+                    "id": "chatcmpl-r5",
+                    "object": "chat.completion",
+                    "model": "a",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_r5_0",
+                                "type": "function",
+                                "function": {"name": "mcp_idem", "arguments": "{\"item\":\"r5\"}"}
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+                })
+                .to_string();
+                http_response(
+                    200,
+                    &[("content-type", "application/json")],
+                    body.as_bytes(),
+                )
+            })
+            .await;
+
+            struct StopAtPreflight {
+                inner: Arc<ExternalMcpAdapter>,
+            }
+            impl ApprovedAdapter for StopAtPreflight {
+                fn preflight<'a>(
+                    &'a self,
+                    _: &'a ActiveRun,
+                    _: &'a Proposal,
+                    _: &'a StepContext,
+                ) -> Pin<Box<dyn Future<Output = Result<(), worker::PreflightError>> + Send + 'a>>
+                {
+                    Box::pin(async {
+                        Err(worker::PreflightError::Store(StoreError::Conflict(
+                            "stop-r5",
+                        )))
+                    })
+                }
+                fn verify_turn_call_proposal(
+                    &self,
+                    call: &Call,
+                    proposal: &Proposal,
+                    expected_external_version: Option<&str>,
+                ) -> bool {
+                    self.inner
+                        .verify_turn_call_proposal(call, proposal, expected_external_version)
+                }
+                fn filter_turn_tools<'a>(
+                    &'a self,
+                    run: &'a ActiveRun,
+                    tools: Vec<DeclaredTool>,
+                    step: &'a StepContext,
+                ) -> Pin<Box<dyn Future<Output = Result<Vec<Tool>, StepResult>> + Send + 'a>>
+                {
+                    self.inner.filter_turn_tools(run, tools, step)
+                }
+                fn send<'a>(
+                    &'a self,
+                    run: &'a ActiveRun,
+                    operation_id: String,
+                    request: Vec<u8>,
+                    step: StepContext,
+                ) -> Pin<Box<dyn Future<Output = StepResult> + Send + 'a>> {
+                    self.inner.send(run, operation_id, request, step)
+                }
+            }
+
+            let exec_a = TurnExecutor::new(
+                worker_pool.clone(),
+                catalog.clone(),
+                LEASES,
+                VersionSwitchRoutes {
+                    gateway: make_gateway(&m_srv),
+                    registry: registry.clone(),
+                    propose_version: "1",
+                },
+            )
+            .with_effects(Arc::new(ApprovedEffects {
+                policy: registry.clone(),
+                adapter: Arc::new(StopAtPreflight {
+                    inner: adapter_r5.clone(),
+                }),
+            }));
+            let (_st_a, step_a) = fresh_step(30);
+            let active_a = ActiveRun {
+                claim: claim_a.clone(),
+                state: leases::ExecState::Running,
+                execution_deadline: Instant::now() + Duration::from_secs(120),
+            };
+            assert!(matches!(
+                exec_a.step(&active_a, step_a).await,
+                StepResult::LeaseLost
+            ));
+            let prop_r5 = registry
+                .proposal("call_r5_0", "mcp_idem", "1", br#"{"item":"r5"}"#)
+                .unwrap();
+            assert!(matches!(
+                record_fenced_intent(
+                    &mut w,
+                    &claim_a.lease(),
+                    &prop_r5,
+                    None,
+                    registry.as_ref(),
+                    &LEASES
+                )
+                .await
+                .unwrap(),
+                IntentResult::Applied(_)
+            ));
+
+            if !bad_version {
+                // Inject an out-of-bounds `turn-result:{round}:1` row on a 1-call round (`idx_case == 0`).
+                let _ = idx_case;
+                leases::with_lease(
+                    &mut w,
+                    &claim_a.lease(),
+                    leases::Fence::Step,
+                    async |tx, _| {
+                        openmettle_core::runs::append_event(
+                            tx,
+                            &claim_a.scope_id,
+                            &claim_a.run_id,
+                            "turn-result:1:1",
+                            openmettle_core::runs::Payload {
+                                format: "openmettle.turn-result",
+                                version: 1,
+                                bytes: br#"{"call_id":"bogus","operation_id":null,"output":"x"}"#,
+                            },
+                        )
+                        .await?;
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            leases::release_lease(&mut w, &claim_a.lease())
+                .await
+                .unwrap();
+
+            let idem_before = v1_idem_calls.load(Ordering::SeqCst);
+            let claim_b = leases::reclaim_next(&mut w, &LEASES)
+                .await
+                .unwrap()
+                .expect("reclaim r5 corrupted transcript")
+                .run;
+            let exec_b = TurnExecutor::new(
+                worker_pool.clone(),
+                catalog.clone(),
+                LEASES,
+                VersionSwitchRoutes {
+                    gateway: make_gateway(&m_srv),
+                    registry: registry.clone(),
+                    propose_version: "1",
+                },
+            )
+            .with_effects(Arc::new(adapter_r5.approved_effects()));
+            let (_st_b, step_b) = fresh_step(30);
+            let active_b = ActiveRun {
+                claim: claim_b.clone(),
+                state: leases::ExecState::Running,
+                execution_deadline: Instant::now() + Duration::from_secs(120),
+            };
+            assert!(matches!(
+                exec_b.step(&active_b, step_b).await,
+                StepResult::Failed(leases::FailReason::StepFailed)
+            ));
+            assert_eq!(
+                v1_idem_calls.load(Ordering::SeqCst),
+                idem_before,
+                "corrupted transcript must fail closed before dispatching pending write"
+            );
+            leases::settle(
+                &mut w,
+                &claim_b.lease(),
+                &LEASES,
+                Settle::Failed(leases::FailReason::StepFailed),
+            )
+            .await
+            .unwrap();
+        }
     }
 }

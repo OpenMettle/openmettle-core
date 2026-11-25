@@ -762,7 +762,6 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                               WHERE scope_id=$1::uuid AND run_id=$2::uuid
                                 AND append_key=$3
                                 AND format='openmettle.turn-handoff'
-                                AND format_version=1
                          )",
                     )
                     .bind(&run.claim.scope_id)
@@ -797,66 +796,91 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                         if used <= 0 {
                             return Err(crate::runs::Error::Conflict);
                         }
-                        let handoff_bytes: Option<Vec<u8>> = sqlx::query_scalar(
-                            "SELECT payload FROM openmettle.run_events
+                        let transcript_rows: Vec<(String, i64, String, Vec<u8>)> = sqlx::query_as(
+                            "SELECT format, format_version::bigint, append_key, payload
+                               FROM openmettle.run_events
                               WHERE scope_id=$1::uuid AND run_id=$2::uuid
-                                AND append_key=$3
-                                AND format='openmettle.turn-handoff'
-                                AND format_version=1",
-                        )
-                        .bind(&run.claim.scope_id)
-                        .bind(&run.claim.run_id)
-                        .bind(format!("turn-handoff:{used}"))
-                        .fetch_optional(&mut *conn)
-                        .await?;
-                        let saved_handoff = match handoff_bytes {
-                            Some(bytes) => Some(
-                                serde_json::from_slice::<SavedHandoff>(&bytes)
-                                    .map_err(|_| crate::runs::Error::Conflict)?,
-                            ),
-                            None => None,
-                        };
-                        if has_turn_handoff && saved_handoff.is_none() {
-                            return Err(crate::runs::Error::Conflict);
-                        }
-                        let call_rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
-                            "SELECT append_key, payload FROM openmettle.run_events
-                              WHERE scope_id=$1::uuid AND run_id=$2::uuid
-                                AND format='openmettle.turn-calls' AND format_version=1",
+                                AND format IN (
+                                    'openmettle.turn-handoff',
+                                    'openmettle.turn-calls',
+                                    'openmettle.turn-result'
+                                )",
                         )
                         .bind(&run.claim.scope_id)
                         .bind(&run.claim.run_id)
                         .fetch_all(&mut *conn)
                         .await?;
+                        let mut handoff_rows: std::collections::BTreeMap<i64, SavedHandoff> =
+                            std::collections::BTreeMap::new();
                         let mut saved_rounds: std::collections::BTreeMap<i64, SavedCallGroup> =
                             std::collections::BTreeMap::new();
-                        for (append_key, bytes) in call_rows {
-                            let Some(round_str) = append_key.strip_prefix("turn-calls:") else {
-                                return Err(crate::runs::Error::Conflict);
-                            };
-                            let Ok(r) = round_str.parse::<i64>() else {
-                                return Err(crate::runs::Error::Conflict);
-                            };
-                            if r < 1 || r > used {
+                        let mut raw_results: Vec<(String, Vec<u8>)> = Vec::new();
+                        for (format, format_version, append_key, bytes) in transcript_rows {
+                            if format_version != 1 {
                                 return Err(crate::runs::Error::Conflict);
                             }
-                            let saved: SavedCallGroup = serde_json::from_slice(&bytes)
-                                .map_err(|_| crate::runs::Error::Conflict)?;
-                            if !saved.is_valid_shape(r) {
-                                return Err(crate::runs::Error::Conflict);
+                            match format.as_str() {
+                                "openmettle.turn-handoff" => {
+                                    let Some(r_str) = append_key.strip_prefix("turn-handoff:")
+                                    else {
+                                        return Err(crate::runs::Error::Conflict);
+                                    };
+                                    let Ok(r) = r_str.parse::<i64>() else {
+                                        return Err(crate::runs::Error::Conflict);
+                                    };
+                                    if r < 1 || r > used || r.to_string() != r_str {
+                                        return Err(crate::runs::Error::Conflict);
+                                    }
+                                    let ho: SavedHandoff = serde_json::from_slice(&bytes)
+                                        .map_err(|_| crate::runs::Error::Conflict)?;
+                                    if ho.continuation_rounds.is_empty()
+                                        || ho.continuation_rounds.last() != Some(&r)
+                                    {
+                                        return Err(crate::runs::Error::Conflict);
+                                    }
+                                    if handoff_rows.insert(r, ho).is_some() {
+                                        return Err(crate::runs::Error::Conflict);
+                                    }
+                                }
+                                "openmettle.turn-calls" => {
+                                    let Some(round_str) = append_key.strip_prefix("turn-calls:")
+                                    else {
+                                        return Err(crate::runs::Error::Conflict);
+                                    };
+                                    let Ok(r) = round_str.parse::<i64>() else {
+                                        return Err(crate::runs::Error::Conflict);
+                                    };
+                                    if r < 1 || r > used || r.to_string() != round_str {
+                                        return Err(crate::runs::Error::Conflict);
+                                    }
+                                    let saved: SavedCallGroup = serde_json::from_slice(&bytes)
+                                        .map_err(|_| crate::runs::Error::Conflict)?;
+                                    if !saved.is_valid_shape(r) {
+                                        return Err(crate::runs::Error::Conflict);
+                                    }
+                                    if saved_rounds.insert(r, saved).is_some() {
+                                        return Err(crate::runs::Error::Conflict);
+                                    }
+                                }
+                                "openmettle.turn-result" => {
+                                    raw_results.push((append_key, bytes));
+                                }
+                                _ => return Err(crate::runs::Error::Conflict),
                             }
-                            if saved_rounds.insert(r, saved).is_some() {
-                                return Err(crate::runs::Error::Conflict);
-                            }
+                        }
+                        if has_turn_handoff && !handoff_rows.contains_key(&used) {
+                            return Err(crate::runs::Error::Conflict);
                         }
                         let Some(last_group) = saved_rounds.get(&used) else {
                             return Err(crate::runs::Error::Conflict);
                         };
                         let expected_rounds = last_group.continuation_rounds().to_vec();
-                        if let Some(ref ho) = saved_handoff
-                            && ho.continuation_rounds != expected_rounds
-                        {
-                            return Err(crate::runs::Error::Conflict);
+                        for (&hr, ho) in &handoff_rows {
+                            if saved_rounds.get(&hr).map(SavedCallGroup::continuation_rounds)
+                                != Some(ho.continuation_rounds.as_slice())
+                            {
+                                return Err(crate::runs::Error::Conflict);
+                            }
                         }
                         if expected_rounds.is_empty()
                             || expected_rounds.last() != Some(&used)
@@ -871,20 +895,11 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                                 return Err(crate::runs::Error::Conflict);
                             }
                         }
-                        let result_rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
-                            "SELECT append_key, payload FROM openmettle.run_events
-                              WHERE scope_id=$1::uuid AND run_id=$2::uuid
-                                AND format='openmettle.turn-result' AND format_version=1",
-                        )
-                        .bind(&run.claim.scope_id)
-                        .bind(&run.claim.run_id)
-                        .fetch_all(&mut *conn)
-                        .await?;
                         let mut saved_results: std::collections::BTreeMap<
                             (i64, usize),
                             SavedCallResult,
                         > = std::collections::BTreeMap::new();
-                        for (append_key, bytes) in result_rows {
+                        for (append_key, bytes) in raw_results {
                             let Some(rest) = append_key.strip_prefix("turn-result:") else {
                                 return Err(crate::runs::Error::Conflict);
                             };
@@ -895,11 +910,21 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                             else {
                                 return Err(crate::runs::Error::Conflict);
                             };
-                            if !saved_rounds.contains_key(&r) {
+                            if r.to_string() != r_str || idx.to_string() != idx_str {
+                                return Err(crate::runs::Error::Conflict);
+                            }
+                            let Some(SavedCallGroup::Valid { calls, .. }) = saved_rounds.get(&r)
+                            else {
+                                return Err(crate::runs::Error::Conflict);
+                            };
+                            if idx >= calls.len() {
                                 return Err(crate::runs::Error::Conflict);
                             }
                             let res: SavedCallResult = serde_json::from_slice(&bytes)
                                 .map_err(|_| crate::runs::Error::Conflict)?;
+                            if res.call_id != calls[idx].id {
+                                return Err(crate::runs::Error::Conflict);
+                            }
                             if saved_results.insert((r, idx), res).is_some() {
                                 return Err(crate::runs::Error::Conflict);
                             }
@@ -1021,6 +1046,13 @@ impl<R: TurnRoutes> TurnExecutor<R> {
                                 } else if must_be_saved {
                                     return Err(FAILED);
                                 } else {
+                                    if saved_results
+                                        .range((r, idx + 1)..=(r, usize::MAX))
+                                        .next()
+                                        .is_some()
+                                    {
+                                        return Err(FAILED);
+                                    }
                                     let effective_decl =
                                         if route_declared.get(&call.name) == Some(saved_decl) {
                                             saved_decl
