@@ -339,9 +339,78 @@ fn conversation_snapshot_model(
         return Ok(None);
     }
     let doc = crate::provider_keys::documents::unique(config_snapshot).map_err(|_| ())?;
+    // Serde accepts positional arrays for derived structs (`visit_seq`). Require the documented
+    // JSON object shapes at root and nested structs so worker recheck matches SQL handoff, while
+    // retaining optional flattened `execution_mode` written by `/v1/runs` admission.
+    let Some(root) = doc.as_object() else {
+        return Err(());
+    };
+    if !root.keys().all(|k| {
+        matches!(
+            k.as_str(),
+            "effective"
+                | "required_capabilities"
+                | "policy_revision"
+                | "cost_bound"
+                | "execution_mode"
+        )
+    }) {
+        return Err(());
+    }
+    if let Some(mode) = root.get("execution_mode")
+        && !matches!(mode.as_str(), Some("standard" | "yolo"))
+    {
+        return Err(());
+    }
+    let Some(eff) = root.get("effective").and_then(serde_json::Value::as_object) else {
+        return Err(());
+    };
+    if !eff.get("profile").is_some_and(serde_json::Value::is_object)
+        || ![
+            "temperature",
+            "top_p",
+            "reasoning_effort",
+            "context_window",
+            "ceiling",
+            "output_reserve",
+        ]
+        .into_iter()
+        .all(|k| eff.get(k).is_some_and(serde_json::Value::is_object))
+        || !["instructions", "omissions"].into_iter().all(|k| {
+            eff.get(k)
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|items| items.iter().all(serde_json::Value::is_object))
+        })
+    {
+        return Err(());
+    }
+    if !root
+        .get("required_capabilities")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        return Err(());
+    }
+    if let Some(cb) = root.get("cost_bound")
+        && !cb.is_null()
+        && !cb.is_object()
+    {
+        return Err(());
+    }
     let snapshot: crate::model_config::ConfigSnapshot =
         serde_json::from_value(doc).map_err(|_| ())?;
-    if !crate::model_config::name(&snapshot.effective.model) {
+    if !crate::model_config::name(&snapshot.effective.model)
+        || !snapshot
+            .required_capabilities
+            .keys()
+            .all(|k| super::valid_capability(k))
+    {
+        return Err(());
+    }
+    if let Some(cb) = snapshot.cost_bound
+        && (cb.fixed_micros > i64::MAX as u64
+            || cb.micros_per_token > i64::MAX as u64
+            || (cb.fixed_micros == 0 && cb.micros_per_token == 0))
+    {
         return Err(());
     }
     Ok(Some(snapshot.effective.model))

@@ -255,10 +255,10 @@ BEGIN
           JOIN openmettle.local_identity_approvals a ON a.id = mo.approval_id
           JOIN openmettle.user_identities i ON i.id = a.identity_id AND i.user_id = p_user
           JOIN openmettle.users u ON u.id = i.user_id
-          JOIN openmettle.grant_mapping_rules r ON r.id = mo.rule_id
-          JOIN openmettle.grant_mapping_revisions v_enrolled
+          LEFT JOIN openmettle.grant_mapping_rules r ON r.id = mo.rule_id
+          LEFT JOIN openmettle.grant_mapping_revisions v_enrolled
             ON v_enrolled.rule_id = mo.rule_id AND v_enrolled.revision = mo.rule_revision
-          JOIN openmettle.grant_mapping_revisions v_latest
+          LEFT JOIN openmettle.grant_mapping_revisions v_latest
             ON v_latest.rule_id = r.id AND v_latest.revision = r.last_revision
           LEFT JOIN openmettle.grant_assignments g
             ON g.scope_id = mo.scope_id
@@ -279,7 +279,13 @@ BEGIN
           ) e ON true
          WHERE mo.approval_id = p_approval
            AND (
-               (v_enrolled.selector_kind = 'group' AND EXISTS (
+               ((r.id IS NULL OR v_enrolled.rule_id IS NULL) AND EXISTS (
+                   SELECT 1
+                     FROM openmettle.family_policies ofp
+                    WHERE ofp.grantee_kind = 'oidc_group'
+                      AND ofp.active
+               ))
+               OR (v_enrolled.selector_kind = 'group' AND EXISTS (
                    SELECT 1
                      FROM openmettle.family_policies ofp
                     WHERE ofp.grantee_kind = 'oidc_group'
@@ -298,6 +304,7 @@ BEGIN
                CASE
                    WHEN NOT mo.enabled
                         OR NOT a.active OR a.expires_ms <= ms OR u.disabled_at IS NOT NULL
+                        OR r.id IS NULL OR v_enrolled.rule_id IS NULL OR v_latest.rule_id IS NULL
                         OR r.provider_config_id <> a.provider_id OR r.issuer <> i.issuer
                         OR r.last_revision <> mo.rule_revision
                         OR NOT v_enrolled.enabled
@@ -315,9 +322,13 @@ BEGIN
                         OR ms >= least(mo.expires_ms,
                                        mo.issued_ms + 1000::bigint * mo.max_age_seconds) THEN 'stale'
                    WHEN (mo.observation).state = 'present'
-                        AND (h.decision <> 'grant'
+                        AND (h.id IS NULL
+                             OR h.decision IS DISTINCT FROM 'grant'
                              OR h.cycle_id IS DISTINCT FROM h.id
-                             OR h.mapping_revision <> mo.rule_revision) THEN 'failed'
+                             OR h.mapping_revision IS DISTINCT FROM mo.rule_revision) THEN 'failed'
+                   WHEN (mo.observation).state = 'absent'
+                        AND h.id IS NOT NULL
+                        AND h.decision IS DISTINCT FROM 'revoke' THEN 'failed'
                    ELSE (mo.observation).state
                END
            ) NOT IN ('present', 'absent')
@@ -697,8 +708,23 @@ BEGIN
        AND NOT EXISTS (SELECT FROM openmettle.gateway_settlements s WHERE s.request_id = q.id)
        AND EXISTS (SELECT FROM openmettle.runs r
             WHERE r.id = q.run_id AND r.state = 'running' AND r.cancel_reason IS NULL
+              AND r.actor_user_id = q.actor_user_id AND r.actor_approval_id = q.approval_id
               AND sha256(uuid_send(r.claim_token)) = q.claim_hash
               AND r.lease_expires_at > clock.t AND r.execution_expires_at > clock.t)
+       AND EXISTS (SELECT FROM openmettle.local_identity_approvals a
+             JOIN openmettle.user_identities i ON i.id = a.identity_id AND i.user_id = q.actor_user_id
+             JOIN openmettle.users u ON u.id = i.user_id AND u.disabled_at IS NULL
+             JOIN openmettle.login_providers p ON p.id = a.provider_id AND p.issuer = i.issuer
+             JOIN LATERAL (
+                 SELECT pr.revision
+                   FROM openmettle.login_provider_revisions pr
+                  WHERE pr.provider_id = p.id
+                  ORDER BY pr.epoch DESC
+                  LIMIT 1
+             ) current ON current.revision IS NOT NULL
+            WHERE a.id = q.approval_id
+              AND a.active
+              AND a.expires_ms > floor(extract(epoch FROM clock.t) * 1000)::bigint)
        AND openmettle.family_policy_permits(q.actor_user_id, q.approval_id, q.model, clock.t)
     RETURNING false, q.installation::text, q.scope_id::text, q.report_source::text,
               q.actor_user_id::text, q.model;

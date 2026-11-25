@@ -454,7 +454,19 @@ async fn write_with(
             .bind(ctx.actor_user_id)
             .execute(&mut *c)
             .await?;
-        let actor = acting(c, ctx).await?;
+        // Advance `now_ms` monotonically to at least the primary's post-lock `clock_timestamp()`
+        // so approvals that expire while waiting on locks are rejected on hydration, while keeping
+        // synthetic future test clocks monotonic.
+        let post_lock_ms: i64 = sqlx::query_scalar(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+        )
+        .fetch_one(&mut *c)
+        .await?;
+        let post_lock_ctx = AuditContext {
+            now_ms: ctx.now_ms.max(post_lock_ms),
+            ..*ctx
+        };
+        let actor = acting(c, &post_lock_ctx).await?;
         check(super::authorize_admin(
             &actor,
             AdminChange {
@@ -464,7 +476,7 @@ async fn write_with(
             },
         ))?;
         let change = build_change(c, &actor).await?;
-        let outcome = record(c, ctx, &change).await?;
+        let outcome = record(c, &post_lock_ctx, &change).await?;
         if let WriteOutcome::Applied { target_id } = &outcome {
             apply(c, &actor, target_id).await?;
         }
