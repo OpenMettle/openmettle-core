@@ -135,6 +135,9 @@ class ManifestTests(unittest.TestCase):
             if role == "gateway":
                 self.assertEqual(env["OPENMETTLE_GATEWAY_UPSTREAM_URL"], "http://127.0.0.1:30000")
                 self.assertEqual(env["OPENMETTLE_GATEWAY_MODEL"], "synthetic-model")
+                self.assertEqual(env["OPENMETTLE_GATEWAY_LOG_LEVEL"], "debug")
+            else:
+                self.assertNotIn(f"{prefix}LOG_LEVEL", env)
             self.assertEqual(
                 container["volumeMounts"],
                 [{"name": "otlp-ca", "mountPath": qualify.OTLP_CA_MOUNT_DIR, "readOnly": True}],
@@ -355,6 +358,73 @@ class SeriesValidationAndParserTests(unittest.TestCase):
             'otelcol_receiver_refused_spans_total{receiver="otelcol.receiver.otlp.default"} 0\n'
         )
         self.assertEqual(qualify.parse_alloy_accepted_spans(sample), 4.0)
+
+    def test_parses_gateway_debug_request_logs(self):
+        lines = [
+            "not json",
+            json.dumps({
+                "level": "INFO",
+                "event": "process.started",
+                "role": "gateway",
+            }),
+            # Probe request at DEBUG must not count as /v1/chat/completions 401.
+            json.dumps({
+                "level": "DEBUG",
+                "event": "http.request.completed",
+                "request_id": "44444444-4444-4444-8444-444444444444",
+                "http.route": "/readyz",
+                "http.request.method": "GET",
+                "http.response.status_code": 200,
+                "duration_us": 120,
+            }),
+            # Echoing client x-request-id instead of generating a server UUID must not match.
+            json.dumps({
+                "level": "DEBUG",
+                "event": "http.request.completed",
+                "request_id": qualify.GATEWAY_PROBE_REQUEST_ID,
+                "http.route": "/v1/chat/completions",
+                "http.request.method": "POST",
+                "http.response.status_code": 401,
+                "duration_us": 250,
+            }),
+            # Boolean duration_us must not match as int.
+            json.dumps({
+                "level": "DEBUG",
+                "event": "http.request.completed",
+                "request_id": "55555555-5555-4555-8555-555555555555",
+                "http.route": "/v1/chat/completions",
+                "http.request.method": "POST",
+                "http.response.status_code": 401,
+                "duration_us": True,
+            }),
+            # Valid DEBUG 401 request completion entries.
+            json.dumps({
+                "level": "DEBUG",
+                "event": "http.request.completed",
+                "request_id": "66666666-6666-4666-8666-666666666666",
+                "http.route": "/v1/chat/completions",
+                "http.request.method": "POST",
+                "http.response.status_code": 401,
+                "duration_us": 310,
+            }),
+            json.dumps({
+                "level": "DEBUG",
+                "event": "http.request.completed",
+                "request_id": "77777777-7777-4777-8777-777777777777",
+                "http.route": "/v1/chat/completions",
+                "http.request.method": "POST",
+                "http.response.status_code": 401,
+                "duration_us": 295,
+            }),
+        ]
+        matched = qualify.parse_gateway_request_logs("\n".join(lines))
+        self.assertEqual(
+            [e["request_id"] for e in matched],
+            [
+                "66666666-6666-4666-8666-666666666666",
+                "77777777-7777-4777-8777-777777777777",
+            ],
+        )
 
 
 class GuardTests(unittest.TestCase):

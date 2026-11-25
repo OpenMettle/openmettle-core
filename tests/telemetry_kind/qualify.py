@@ -109,6 +109,7 @@ CANARY_TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736"
 CANARY_TRACEPARENT = f"00-{CANARY_TRACE_ID}-00f067aa0ba902b7-01"
 CANARY_QUERY_SECRET = "openmettle-synthetic-query-secret-never-log"
 CANARY_BEARER_TOKEN = "openmettle-synthetic-bearer-token-never-log"
+GATEWAY_PROBE_REQUEST_ID = "00000000-0000-4000-8000-000000000001"
 EXPECTED_ALERTS = (
     "OpenMettleApiHighServerErrorRatio",
     "OpenMettleDatabaseReadinessFailing",
@@ -574,6 +575,7 @@ def render_manifests(
                 "valueFrom": {"secretKeyRef": {"name": f"{name}-database", "key": "url"}},
             },
             *[{"name": prefix + k, "value": v} for k, v in FIXTURE_SETTINGS[role].items()],
+            *([{"name": f"{prefix}LOG_LEVEL", "value": "debug"}] if role == "gateway" else []),
             {"name": f"{prefix}OTLP_TRACES_ENDPOINT", "value": traces_url},
             {"name": f"{prefix}OTLP_METRICS_ENDPOINT", "value": metrics_url},
             {"name": f"{prefix}OTLP_CA_FILE", "value": OTLP_CA_FILE},
@@ -764,6 +766,35 @@ def parse_alloy_accepted_spans(metrics_text: str) -> float:
         if match:
             total += float(match.group(1))
     return total
+
+
+def parse_gateway_request_logs(logs: str) -> list[dict]:
+    """Extract DEBUG `http.request.completed` JSON entries for unauthenticated gateway probes."""
+    matches = []
+    for line in logs.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        request_id = entry.get("request_id")
+        duration_us = entry.get("duration_us")
+        if (
+            entry.get("level") == "DEBUG"
+            and entry.get("event") == "http.request.completed"
+            and entry.get("http.route") == "/v1/chat/completions"
+            and entry.get("http.request.method") == "POST"
+            and entry.get("http.response.status_code") == 401
+            and isinstance(request_id, str)
+            and UUIDV4_RE.fullmatch(request_id)
+            and request_id != GATEWAY_PROBE_REQUEST_ID
+            and isinstance(duration_us, int)
+            and not isinstance(duration_us, bool)
+        ):
+            matches.append(entry)
+    return matches
 
 
 # --- Safety guards & HTTP/port-forward helpers -------------------------------------------
@@ -1186,7 +1217,7 @@ class TelemetryQualification:
                     gateway_pf.port,
                     f"/v1/chat/completions?secret={CANARY_QUERY_SECRET}",
                     headers={
-                        "x-request-id": "00000000-0000-4000-8000-000000000001",
+                        "x-request-id": GATEWAY_PROBE_REQUEST_ID,
                         "traceparent": CANARY_TRACEPARENT,
                         "Authorization": f"Bearer {CANARY_BEARER_TOKEN}-invalid",
                         "Content-Type": "application/json",
@@ -1434,9 +1465,20 @@ class TelemetryQualification:
                 self.expect(restarts and all(r == 0 for r in restarts),
                             f"{role} restarted during collector outage: {restarts}")
 
-            # Verify structured stderr logs contain telemetry.dropped events and zero canary leaks.
-            for role_name, pod_name in (("openmettle-api", api_pod), ("openmettle-gateway", gateway_pod)):
-                pod_logs = self.kube("--namespace", APP_NAMESPACE, "logs", pod_name).stdout
+            # Verify structured stderr logs contain gateway DEBUG request completion entries,
+            # telemetry.dropped events and zero canary leaks.
+            api_logs = self.kube("--namespace", APP_NAMESPACE, "logs", api_pod).stdout
+            gateway_logs = self.kube("--namespace", APP_NAMESPACE, "logs", gateway_pod).stdout
+            gateway_request_events = parse_gateway_request_logs(gateway_logs)
+            self.expect(
+                len(gateway_request_events) >= 3,
+                "expected at least 3 DEBUG http.request.completed 401 entries in "
+                f"openmettle-gateway stderr logs, found {len(gateway_request_events)}",
+            )
+            for role_name, pod_logs in (
+                ("openmettle-api", api_logs),
+                ("openmettle-gateway", gateway_logs),
+            ):
                 for forbidden in (CANARY_TRACE_ID, CANARY_QUERY_SECRET, CANARY_BEARER_TOKEN):
                     self.expect(forbidden not in pod_logs,
                                 f"forbidden canary leaked into {role_name} stderr logs: {forbidden}")
@@ -1494,6 +1536,7 @@ class TelemetryQualification:
                 drop_counter_baseline=ingested["api_drop_baseline"],
                 drop_counter_after_outage=drops_after_outage,
                 stderr_dropped_events=len(dropped_events),
+                gateway_debug_request_events=len(gateway_request_events),
                 alert_state=firing_alert.get("state"),
                 alert_labels=alert_labels,
             )

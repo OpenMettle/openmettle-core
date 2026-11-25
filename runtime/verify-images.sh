@@ -6,16 +6,19 @@ db_url='postgres://fixture:fixture@127.0.0.1:5432/fixture?sslmode=disable'
 api=""
 worker=""
 gateway=""
+probe_cid=""
 cleanup() {
   local status=$?
   if [ "$status" -ne 0 ]; then
     if [ -n "$api" ]; then docker logs "$api" >&2 || true; fi
     if [ -n "$worker" ]; then docker logs "$worker" >&2 || true; fi
     if [ -n "$gateway" ]; then docker logs "$gateway" >&2 || true; fi
+    if [ -n "$probe_cid" ]; then docker logs "$probe_cid" >&2 || true; fi
   fi
   if [ -n "$api" ]; then docker rm -f "$api" >/dev/null || true; fi
   if [ -n "$worker" ]; then docker rm -f "$worker" >/dev/null || true; fi
   if [ -n "$gateway" ]; then docker rm -f "$gateway" >/dev/null || true; fi
+  if [ -n "$probe_cid" ]; then docker rm -f "$probe_cid" >/dev/null || true; fi
   docker start "$POSTGRES_CONTAINER" >/dev/null || true
   return "$status"
 }
@@ -36,9 +39,15 @@ check_image_isolation() {
 }
 expect_gateway_config_error() {
   local status=0
-  docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-    "$@" openmettle-gateway:test >/dev/null 2>&1 || status=$?
-  test "$status" = 78
+  probe_cid=$(docker create --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+    "$@" openmettle-gateway:test)
+  timeout 10 docker start -a "$probe_cid" >/dev/null 2>&1 || status=$?
+  if [ "$status" -ne 78 ]; then
+    echo "Expected gateway configuration error exit 78; received $status" >&2
+    return 1
+  fi
+  docker rm -f "$probe_cid" >/dev/null
+  probe_cid=""
 }
 wait_status() {
   local port="$1" path="$2" expected="$3" actual

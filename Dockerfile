@@ -27,14 +27,14 @@ ENV OPENMETTLE_API_BIND=0.0.0.0:8080
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/openmettle-api"]
 
-FROM runtime AS worker
-COPY --from=build /source/target/release/openmettle-worker /usr/local/bin/openmettle-worker
-ENV OPENMETTLE_WORKER_BIND=0.0.0.0:8081
-EXPOSE 8081
-ENTRYPOINT ["/usr/local/bin/openmettle-worker"]
-
 FROM runtime AS gateway
 COPY --from=build /source/target/release/openmettle-gateway /usr/local/bin/openmettle-gateway
 ENV OPENMETTLE_GATEWAY_BIND=0.0.0.0:8082
 EXPOSE 8082
 ENTRYPOINT ["/usr/local/bin/openmettle-gateway"]
+
+FROM runtime AS worker
+COPY --from=build /source/target/release/openmettle-worker /usr/local/bin/openmettle-worker
+ENV OPENMETTLE_WORKER_BIND=0.0.0.0:8081
+EXPOSE 8081
+ENTRYPOINT ["/usr/local/bin/openmettle-worker"]
