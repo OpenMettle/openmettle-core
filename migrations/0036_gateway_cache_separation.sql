@@ -21,28 +21,106 @@ DECLARE
     v_scope uuid;
     v_approval uuid;
     v_actor uuid;
+    v_conversation uuid;
+    v_collabs uuid[];
 BEGIN
     IF current_setting('transaction_isolation') <> 'read committed' THEN
         RAISE EXCEPTION 'gateway dispatch requires READ COMMITTED' USING ERRCODE = '25000';
     END IF;
-    SELECT q.run_id, q.scope_id, q.approval_id, q.actor_user_id
-      INTO v_run, v_scope, v_approval, v_actor
+    SELECT q.run_id, q.scope_id, q.approval_id, q.actor_user_id, r.conversation_id
+      INTO v_run, v_scope, v_approval, v_actor, v_conversation
       FROM openmettle.gateway_requests q
+      JOIN openmettle.runs r ON r.id = q.run_id
      WHERE q.id = p_request
        AND q.bearer_hash = p_bearer_hash
        AND pg_has_role(session_user, 'openmettle_gateway', 'USAGE');
     IF NOT FOUND THEN RETURN; END IF;
 
-    -- Acquire canonical shared authorization locks in ADR 0040 / migration 35 order so
-    -- concurrent conversation shares/unshares, project membership/lifecycle updates, user/group
-    -- admin writes, approval withdrawals and run cancellations serialize without lock inversions.
+    -- Acquire canonical shared authorization locks in ADR 0040 / ADR 0021 / migration 35 order
+    -- (`account_admin_lock -> projects -> login_providers -> local_identity_approvals -> users ->
+    -- membership_observations -> grant_mapping_rules -> runs -> gateway_requests`), covering both
+    -- the acting principal and any direct-user share recipients on the conversation (whose share
+    -- rows cannot change once `projects FOR SHARE` is held). Concurrent conversation shares or
+    -- unshares, project membership/lifecycle updates, user/group admin writes, operator approval
+    -- or mapped-membership withdrawals (`identity-approval-change.psql`,
+    -- `configure-project-membership.psql`, `withdraw-project-membership.psql`), mapping-rule
+    -- updates and run cancellations all serialize without lock-order inversions.
     PERFORM FROM openmettle.account_admin_lock FOR SHARE;
     PERFORM FROM openmettle.projects p WHERE p.scope_id = v_scope FOR SHARE;
-    PERFORM FROM openmettle.login_providers p
-       JOIN openmettle.local_identity_approvals a ON a.provider_id = p.id
-      WHERE a.id = v_approval
-        FOR SHARE OF p, a;
-    PERFORM FROM openmettle.users u WHERE u.id = v_actor FOR SHARE;
+
+    SELECT coalesce(array_agg(DISTINCT ga.grantee_user_id), ARRAY[]::uuid[])
+      INTO v_collabs
+      FROM openmettle.scopes sc
+      JOIN openmettle.conversations c ON c.id = v_conversation AND c.scope_id = sc.id
+      JOIN openmettle.grant_assignments ga
+        ON ga.scope_id = sc.id
+       AND ga.target_kind = 'conversation'
+       AND ga.target_id = c.id
+       AND ga.grantee_kind = 'user'
+       AND ga.grantee_user_id <> c.owner_user_id
+       AND ga.assignment_format = 'openmettle.resource-grant'
+       AND ga.assignment_version = 1
+       AND ga.assignment_key IN ('read', 'write')
+       AND ga.source_kind = 'direct'
+      JOIN openmettle.grant_changes gh
+        ON gh.assignment_id = ga.id
+       AND gh.revision = ga.last_revision
+       AND gh.decision = 'grant'
+     WHERE sc.id = v_scope
+       AND sc.kind = 'project'
+       AND sc.project_id IS NOT NULL;
+
+    PERFORM p.id
+      FROM openmettle.login_providers p
+     WHERE EXISTS (
+         SELECT 1
+           FROM openmettle.local_identity_approvals a
+           JOIN openmettle.user_identities i ON i.id = a.identity_id
+          WHERE a.provider_id = p.id
+            AND (a.id = v_approval OR i.user_id = ANY(v_collabs))
+     )
+     ORDER BY p.id
+       FOR SHARE;
+    PERFORM a.id
+      FROM openmettle.local_identity_approvals a
+     WHERE a.id = v_approval
+        OR EXISTS (
+            SELECT 1
+              FROM openmettle.user_identities i
+             WHERE i.id = a.identity_id
+               AND i.user_id = ANY(v_collabs)
+        )
+     ORDER BY a.id
+       FOR SHARE;
+    PERFORM u.id
+      FROM openmettle.users u
+     WHERE u.id = v_actor OR u.id = ANY(v_collabs)
+     ORDER BY u.id
+       FOR SHARE;
+    PERFORM m.approval_id
+      FROM openmettle.membership_observations m
+     WHERE m.approval_id = v_approval
+        OR EXISTS (
+            SELECT 1
+              FROM openmettle.local_identity_approvals a
+              JOIN openmettle.user_identities i ON i.id = a.identity_id
+             WHERE a.id = m.approval_id
+               AND i.user_id = ANY(v_collabs)
+        )
+     ORDER BY m.approval_id
+       FOR SHARE;
+    PERFORM mr.id
+      FROM openmettle.grant_mapping_rules mr
+     WHERE EXISTS (
+         SELECT 1
+           FROM openmettle.membership_observations m
+           JOIN openmettle.local_identity_approvals a ON a.id = m.approval_id
+           JOIN openmettle.user_identities i ON i.id = a.identity_id
+          WHERE m.rule_id = mr.id
+            AND (a.id = v_approval OR i.user_id = ANY(v_collabs))
+     )
+     ORDER BY mr.id
+       FOR SHARE;
     PERFORM FROM openmettle.runs r WHERE r.id = v_run FOR SHARE;
     PERFORM FROM openmettle.gateway_requests q
       WHERE q.id = p_request
@@ -254,40 +332,13 @@ BEGIN
        AND q.dispatched_at IS NULL
        AND sc.id = q.scope_id
        AND r.id = q.run_id
-       AND r.state = 'running'
-       AND r.cancel_reason IS NULL
-       AND r.actor_user_id = q.actor_user_id
-       AND r.actor_approval_id = q.approval_id
+       AND r.claim_token IS NOT NULL
        AND sha256(uuid_send(r.claim_token)) = q.claim_hash
-       AND r.lease_expires_at > clock.t
-       AND r.execution_expires_at > clock.t
        AND NOT EXISTS (
            SELECT FROM openmettle.gateway_settlements s
             WHERE s.request_id = q.id
        )
-       AND (sc.kind <> 'project' OR NOT EXISTS (
-           SELECT FROM openmettle.project_settings ps
-            WHERE ps.project_id = sc.project_id
-              AND (ps.archived_at IS NOT NULL OR ps.deleted_at IS NOT NULL)
-       ))
-       AND (sc.kind = 'personal' OR c.owner_user_id = q.actor_user_id OR share.effective)
-       AND EXISTS (
-           SELECT FROM openmettle.local_identity_approvals a
-             JOIN openmettle.user_identities i ON i.id = a.identity_id AND i.user_id = q.actor_user_id
-             JOIN openmettle.users u ON u.id = i.user_id AND u.disabled_at IS NULL
-             JOIN openmettle.login_providers p ON p.id = a.provider_id AND p.issuer = i.issuer
-             JOIN LATERAL (
-                 SELECT pr.revision
-                   FROM openmettle.login_provider_revisions pr
-                  WHERE pr.provider_id = p.id
-                  ORDER BY pr.epoch DESC
-                  LIMIT 1
-             ) current ON current.revision IS NOT NULL
-            WHERE a.id = q.approval_id
-              AND a.active
-              AND a.expires_ms > clock.ms
-       )
-       AND openmettle.family_policy_permits(q.actor_user_id, q.approval_id, q.model, clock.t)
+       AND openmettle.gateway_round_authority(q.id, r.claim_token, clock.t)
     RETURNING
         false,
         q.installation::text,

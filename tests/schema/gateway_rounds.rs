@@ -7198,3 +7198,316 @@ async fn migration_35_to_36_upgrade_adds_scoped_dispatch_and_preserves_existing_
     // 6-column `gateway_dispatch` remains compatible on pre-36 personal round.
     assert_eq!(f.dispatch(&pre_upgrade_personal).await, [f.routed()]);
 }
+
+/// Review #1 P1: first dispatch must verify the actor's own current `editor`/`owner` project role
+/// and conversation `write` access independently of `share.effective` (`cache_owner`).
+/// - Revoking or downgrading collaborator Bob's `write` share while Carol's `read` share survives
+///   must refuse Bob's first dispatch while keeping `cache_owner = NULL` for Alice.
+/// - Demoting conversation owner Alice to `viewer` (after adding a second project owner) must
+///   refuse Alice's first dispatch.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn review_1_p1_dispatch_requires_actor_own_role_and_write_share() {
+    let mut f = Rounds::new().await;
+    let alice = f.actor.clone();
+    let bob = account(&mut f.owner, PROVIDER, true, FUTURE).await;
+    let carol = account(&mut f.owner, PROVIDER, true, FUTURE).await;
+    let dave = account(&mut f.owner, PROVIDER, true, FUTURE).await;
+
+    let (project_id, project_scope) =
+        run_admission::new_project(&f.db, &alice, "rev1-p1-proj").await;
+    let expected_owner = |actor: &Account, cache_owner: Option<&str>| {
+        vec![(
+            false,
+            Some(INSTALL.to_owned()),
+            Some(project_scope.clone()),
+            Some(INSTALL.to_owned()),
+            Some(actor.user.clone()),
+            Some("a".to_owned()),
+            cache_owner.map(str::to_owned),
+        )]
+    };
+    for (key, target, role) in [
+        ("rev1-p1-bob-ed", &bob.user, ProjectRole::Editor),
+        ("rev1-p1-carol-vw", &carol.user, ProjectRole::Viewer),
+        ("rev1-p1-dave-own", &dave.user, ProjectRole::Owner),
+    ] {
+        applied(
+            projects::set_project_member_role(
+                &mut connect(&f.db.0, API).await,
+                &ctx(&alice, key),
+                &project_id,
+                &Grantee::User(target.clone()),
+                role,
+            )
+            .await,
+        );
+    }
+
+    let chat = authz_runs::chat(&f.db, &project_scope, "project", &alice).await;
+    applied(
+        projects::share_resource(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "rev1-p1-share-bob-w"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::User(bob.user.clone()),
+            ResourceAccess::Write,
+        )
+        .await,
+    );
+    applied(
+        projects::share_resource(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "rev1-p1-share-carol-r"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::User(carol.user.clone()),
+            ResourceAccess::Read,
+        )
+        .await,
+    );
+
+    // 1a. Bob hands off two rounds while holding Write; then Bob's share is downgraded to Read
+    //     while Carol's Read share remains active (`share.effective = true`).
+    let r_bob_downgraded = handoff_round_on(&mut f, &bob, &project_scope, &chat).await;
+    let r_bob_unshared = handoff_round_on(&mut f, &bob, &project_scope, &chat).await;
+    applied(
+        projects::share_resource(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "rev1-p1-downgrade-bob-r"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::User(bob.user.clone()),
+            ResourceAccess::Read,
+        )
+        .await,
+    );
+    assert_eq!(
+        dispatch_scoped(&f, &r_bob_downgraded).await,
+        [],
+        "collaborator downgraded to read must be refused even when share.effective is true"
+    );
+    assert!(!f.stored(&r_bob_downgraded).await.3);
+
+    // 1b. Unshare Bob completely while Carol's Read share survives (`share.effective = true`).
+    applied(
+        projects::unshare_resource(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "rev1-p1-unshare-bob"),
+            ResourceKind::Conversation,
+            &chat,
+            &Grantee::User(bob.user.clone()),
+        )
+        .await,
+    );
+    assert_eq!(
+        dispatch_scoped(&f, &r_bob_unshared).await,
+        [],
+        "unshared collaborator must be refused even when another collaborator share survives"
+    );
+    assert!(!f.stored(&r_bob_unshared).await.3);
+
+    // Alice (owner) still dispatches and sees `cache_owner = NULL` because Carol's Read share lives.
+    let r_alice_shared = handoff_round_on(&mut f, &alice, &project_scope, &chat).await;
+    assert_eq!(
+        dispatch_scoped(&f, &r_alice_shared).await,
+        expected_owner(&alice, None)
+    );
+
+    // 2. Owner demoted to Viewer after handoff -> owner shortcut must NOT bypass current role check!
+    let private_chat = authz_runs::chat(&f.db, &project_scope, "project", &alice).await;
+    let r_alice_demoted = handoff_round_on(&mut f, &alice, &project_scope, &private_chat).await;
+    applied(
+        projects::set_project_member_role(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&dave, "rev1-p1-demote-alice-vw"),
+            &project_id,
+            &Grantee::User(alice.user.clone()),
+            ProjectRole::Viewer,
+        )
+        .await,
+    );
+    assert_eq!(
+        dispatch_scoped(&f, &r_alice_demoted).await,
+        [],
+        "conversation owner demoted to viewer must be refused at first dispatch"
+    );
+    assert!(!f.stored(&r_alice_demoted).await.3);
+}
+
+/// Review #1 P2: an in-flight withdrawal of the sole direct-user collaborator's approval
+/// (`identity-approval-change.psql`, `local_identity_approvals FOR UPDATE`) or mapped membership
+/// (`configure-project-membership.psql` / `withdraw-project-membership.psql`,
+/// `membership_observations FOR UPDATE`) blocks `gateway_dispatch_scoped` until commit so dispatch
+/// observes the revocation and isolates `cache_owner` back to the conversation owner.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn review_1_p2_dispatch_blocks_on_inflight_collaborator_approval_and_membership_withdrawal() {
+    let mut f = Rounds::new().await;
+    let alice = f.actor.clone();
+    let bob = account(&mut f.owner, PROVIDER, true, FUTURE).await;
+    let eve = account(&mut f.owner, PROVIDER, true, FUTURE).await;
+
+    let (project_id, project_scope) =
+        run_admission::new_project(&f.db, &alice, "rev1-p2-collab-lock-proj").await;
+    let expected_owner = |actor: &Account, cache_owner: Option<&str>| {
+        vec![(
+            false,
+            Some(INSTALL.to_owned()),
+            Some(project_scope.clone()),
+            Some(INSTALL.to_owned()),
+            Some(actor.user.clone()),
+            Some("a".to_owned()),
+            cache_owner.map(str::to_owned),
+        )]
+    };
+    applied(
+        projects::set_project_member_role(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "rev1-p2-bob-vw"),
+            &project_id,
+            &Grantee::User(bob.user.clone()),
+            ProjectRole::Viewer,
+        )
+        .await,
+    );
+    let chat_bob = authz_runs::chat(&f.db, &project_scope, "project", &alice).await;
+    applied(
+        projects::share_resource(
+            &mut connect(&f.db.0, API).await,
+            &ctx(&alice, "rev1-p2-share-bob"),
+            ResourceKind::Conversation,
+            &chat_bob,
+            &Grantee::User(bob.user.clone()),
+            ResourceAccess::Read,
+        )
+        .await,
+    );
+    let r_alice_bob = handoff_round_on(&mut f, &alice, &project_scope, &chat_bob).await;
+
+    // 1. In-flight approval withdrawal on sole collaborator `bob` (`local_identity_approvals FOR UPDATE`).
+    {
+        let mut writer = connect(&f.db.0, OWNER).await;
+        let writer_pid = backend_pid(&mut writer).await;
+        let mut tx = WriteTransaction::begin(&mut writer).await.unwrap();
+        sqlx::query(
+            "SELECT id FROM openmettle.local_identity_approvals WHERE id = $1::uuid FOR UPDATE",
+        )
+        .bind(&bob.approval)
+        .execute(tx.connection().unwrap())
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.local_identity_approvals
+                SET active = false, revision = revision + 1, access_generation = access_generation + 1
+              WHERE id = $1::uuid",
+        )
+        .bind(&bob.approval)
+        .execute(tx.connection().unwrap())
+        .await
+        .unwrap();
+
+        let mut gw = connect(&f.db.0, pg::GATEWAY).await;
+        let (req_id, bearer) = (r_alice_bob.request.clone(), r_alice_bob.bearer);
+        let waiting = tokio::spawn(async move {
+            sqlx::query_as::<_, ScopedDispatched>(DISPATCH_SCOPED)
+                .bind(req_id)
+                .bind(bearer.as_slice())
+                .fetch_all(&mut gw)
+                .await
+                .unwrap()
+        });
+        wait_for_blocked_peer(&f.db, writer_pid).await;
+        tx.commit().await.unwrap();
+
+        assert_eq!(
+            waiting.await.unwrap(),
+            expected_owner(&alice, Some(&alice.user)),
+            "dispatch must wait for collaborator approval withdrawal and isolate to owner"
+        );
+    }
+
+    // 2. In-flight mapped membership disablement on sole collaborator `eve`
+    //    (`membership_observations FOR UPDATE`, matching configure/withdraw-project-membership.psql).
+    let now_ms: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&mut f.owner)
+            .await
+            .unwrap();
+    enroll_mapped_member(
+        &f.db,
+        &eve,
+        &project_id,
+        &project_scope,
+        "00000000-0000-4000-8000-00000000c299",
+        "app_role",
+        "rev1-p2-mapped-role",
+        "eve-approle",
+    )
+    .await;
+    let chat_eve = authz_runs::chat(&f.db, &project_scope, "project", &alice).await;
+    applied(
+        projects::share_resource(
+            &mut connect(&f.db.0, API).await,
+            &openmettle_core::authz::store::AuditContext {
+                now_ms,
+                ..ctx(&alice, "rev1-p2-share-eve")
+            },
+            ResourceKind::Conversation,
+            &chat_eve,
+            &Grantee::User(eve.user.clone()),
+            ResourceAccess::Read,
+        )
+        .await,
+    );
+    let r_alice_eve = handoff_round_on(&mut f, &alice, &project_scope, &chat_eve).await;
+
+    {
+        let mut writer = connect(&f.db.0, OWNER).await;
+        let writer_pid = backend_pid(&mut writer).await;
+        let mut tx = WriteTransaction::begin(&mut writer).await.unwrap();
+        sqlx::query(
+            "SELECT id FROM openmettle.local_identity_approvals WHERE id = $1::uuid FOR SHARE",
+        )
+        .bind(&eve.approval)
+        .execute(tx.connection().unwrap())
+        .await
+        .unwrap();
+        sqlx::query(
+            "SELECT approval_id FROM openmettle.membership_observations
+              WHERE approval_id = $1::uuid FOR UPDATE",
+        )
+        .bind(&eve.approval)
+        .execute(tx.connection().unwrap())
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.membership_observations SET enabled = false
+              WHERE approval_id = $1::uuid",
+        )
+        .bind(&eve.approval)
+        .execute(tx.connection().unwrap())
+        .await
+        .unwrap();
+
+        let mut gw = connect(&f.db.0, pg::GATEWAY).await;
+        let (req_id, bearer) = (r_alice_eve.request.clone(), r_alice_eve.bearer);
+        let waiting = tokio::spawn(async move {
+            sqlx::query_as::<_, ScopedDispatched>(DISPATCH_SCOPED)
+                .bind(req_id)
+                .bind(bearer.as_slice())
+                .fetch_all(&mut gw)
+                .await
+                .unwrap()
+        });
+        wait_for_blocked_peer(&f.db, writer_pid).await;
+        tx.commit().await.unwrap();
+
+        assert_eq!(
+            waiting.await.unwrap(),
+            expected_owner(&alice, Some(&alice.user)),
+            "dispatch must wait for collaborator mapped membership withdrawal and isolate to owner"
+        );
+    }
+}

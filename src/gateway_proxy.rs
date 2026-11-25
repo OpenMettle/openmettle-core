@@ -18,9 +18,11 @@
 //!   lowercase hex `cache_salt` (scoped per authorized scope/owner/model or fresh per request) and
 //!   appends it right before the JSON object's closing `}`, preserving caller bytes verbatim. Only
 //!   `Content-Type`, `Accept`, `Accept-Encoding: identity` and the request ID are forwarded;
-//!   `Authorization`, cookies and fields the caller names in `Connection` are not forwarded. The
-//!   upstream status, `Content-Type` and body are relayed chunk by chunk as they arrive. Only
-//!   identity bodies pass in either direction, and only HTTP/1.1 callers are served.
+//!   `Authorization`, cookies and fields the caller names in `Connection` are not forwarded. For
+//!   `200 OK`, the upstream `Content-Type` and body are relayed chunk by chunk as they arrive; any
+//!   other upstream status closes the upstream body without relaying it and returns a value-free
+//!   problem document so an upstream error can never echo the injected `cache_salt`. Only identity
+//!   bodies pass in either direction, and only HTTP/1.1 callers are served.
 //! - **Usage.** One relay task per request copies each upstream chunk to the caller and to the
 //!   usage reader and then writes one final report itself, so the write does not depend on the
 //!   caller staying connected. A completed 200 with a usage object is reported with its counts.
@@ -41,7 +43,7 @@ use crate::{
         projects::hex,
     },
     bounded_positive,
-    provider_http::{gateway::UsageReport, inference::json},
+    provider_http::gateway::{UsageReport, problem::retry_delay},
     runs::{digest, identity as framed_identity, is_canonical_uuid},
     telemetry::{self, RequestId, UsageGap},
     v1::{Problem, problem},
@@ -62,8 +64,13 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use ring::rand::{SecureRandom, SystemRandom};
+use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde_json::Value;
 use sqlx::PgPool;
 use std::{
+    cell::Cell,
+    collections::HashSet,
+    fmt,
     future::Future,
     net::Ipv6Addr,
     pin::Pin,
@@ -183,6 +190,43 @@ const UPSTREAM_TIMEOUT: Problem = problem(
     "timeout",
     "The model server did not answer in time.",
 );
+const UPSTREAM_STATUS: Problem = problem(
+    StatusCode::BAD_GATEWAY,
+    "provider_failure",
+    "The model server answered with an unexpected status.",
+);
+const UPSTREAM_RATE_LIMITED: Problem = problem(
+    StatusCode::TOO_MANY_REQUESTS,
+    "rate_limited",
+    "The model server rate limited the request.",
+);
+
+#[derive(Clone, Copy)]
+struct ProxyError {
+    problem: Problem,
+    retry_after: Option<u32>,
+}
+
+impl From<Problem> for ProxyError {
+    fn from(problem: Problem) -> Self {
+        Self {
+            problem,
+            retry_after: None,
+        }
+    }
+}
+
+fn upstream_status_error(status: StatusCode, headers: &HeaderMap) -> ProxyError {
+    match status {
+        StatusCode::TOO_MANY_REQUESTS => ProxyError {
+            problem: UPSTREAM_RATE_LIMITED,
+            retry_after: retry_delay(headers),
+        },
+        StatusCode::SERVICE_UNAVAILABLE => UNAVAILABLE.into(),
+        StatusCode::GATEWAY_TIMEOUT => UPSTREAM_TIMEOUT.into(),
+        _ => UPSTREAM_STATUS.into(),
+    }
+}
 
 /// The gateway's own settings, read after the shared process settings.
 #[derive(Clone, Debug)]
@@ -388,12 +432,17 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
     let id = request.extensions().get::<RequestId>().copied();
     match proxy.forward(request).await {
         Ok(response) => response,
-        Err(problem) => {
-            let mut response = problem.response(id);
-            if problem == UNAUTHENTICATED {
+        Err(err) => {
+            let mut response = err.problem.response(id);
+            if err.problem == UNAUTHENTICATED {
                 response
                     .headers_mut()
                     .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+            }
+            if let Some(seconds) = err.retry_after
+                && let Ok(value) = HeaderValue::try_from(seconds.to_string())
+            {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
             }
             response
         }
@@ -438,17 +487,112 @@ enum BodyRejection {
     ReservedField,
 }
 
+/// Scans one root JSON object, visiting every top-level key and nested value even when keys
+/// repeat so top-level `RESERVED_KEYS` are never masked by duplicate keys or a mismatched `model`.
+fn scan_request_object(bytes: &[u8]) -> Result<(Option<String>, bool, bool), ()> {
+    struct Nested<'a>(&'a Cell<bool>);
+    impl<'de> DeserializeSeed<'de> for Nested<'_> {
+        type Value = Value;
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
+            d.deserialize_any(self)
+        }
+    }
+    impl<'de> Visitor<'de> for Nested<'_> {
+        type Value = Value;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("JSON value")
+        }
+        fn visit_unit<E>(self) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+        fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
+            Ok(v.into())
+        }
+        fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
+            Ok(v.into())
+        }
+        fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
+            Ok(v.into())
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Value, E> {
+            serde_json::Number::from_f64(v)
+                .map(Value::Number)
+                .ok_or_else(|| E::custom("invalid number"))
+        }
+        fn visit_str<E>(self, v: &str) -> Result<Value, E> {
+            Ok(v.into())
+        }
+        fn visit_string<E>(self, v: String) -> Result<Value, E> {
+            Ok(v.into())
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+            while seq.next_element_seed(Nested(self.0))?.is_some() {}
+            Ok(Value::Null)
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+            let mut seen = HashSet::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if !seen.insert(key) {
+                    self.0.set(true);
+                }
+                map.next_value_seed(Nested(self.0))?;
+            }
+            Ok(Value::Null)
+        }
+    }
+
+    struct Root<'a>(&'a Cell<bool>);
+    impl<'de> DeserializeSeed<'de> for Root<'_> {
+        type Value = (Option<String>, bool);
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            d.deserialize_map(self)
+        }
+    }
+    impl<'de> Visitor<'de> for Root<'_> {
+        type Value = (Option<String>, bool);
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("JSON object")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut seen = HashSet::new();
+            let mut model = None;
+            let mut has_reserved = false;
+            while let Some(key) = map.next_key::<String>()? {
+                if RESERVED_KEYS.contains(&key.as_str()) {
+                    has_reserved = true;
+                }
+                let first = seen.insert(key.clone());
+                if !first {
+                    self.0.set(true);
+                }
+                let val = map.next_value_seed(Nested(self.0))?;
+                if first && key == "model" {
+                    model = val.as_str().map(str::to_owned);
+                }
+            }
+            Ok((model, has_reserved))
+        }
+    }
+
+    let duplicate = Cell::new(false);
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    let (model, has_reserved) = Root(&duplicate).deserialize(&mut de).map_err(|_| ())?;
+    de.end().map_err(|_| ())?;
+    Ok((model, duplicate.get(), has_reserved))
+}
+
 /// Validates that `body` is one unique-key JSON object whose top-level `model` equals `model`
-/// and that sets none of SGLang's proxy-owned cache/routing fields (`RESERVED_KEYS`).
+/// and that sets none of SGLang's proxy-owned cache/routing fields (`RESERVED_KEYS`). Top-level
+/// reserved-key evidence takes precedence over duplicate-key or `model` mismatches.
 fn validate_body(body: &[u8], model: &str) -> Result<(), BodyRejection> {
-    let Ok(serde_json::Value::Object(request)) = json::parse(body) else {
+    let Ok((named_model, has_duplicate_key, has_reserved_key)) = scan_request_object(body) else {
         return Err(BodyRejection::ModelMismatch);
     };
-    if request.get("model").and_then(|named| named.as_str()) != Some(model) {
-        return Err(BodyRejection::ModelMismatch);
-    }
-    if RESERVED_KEYS.iter().any(|key| request.contains_key(*key)) {
+    if has_reserved_key {
         return Err(BodyRejection::ReservedField);
+    }
+    if has_duplicate_key || named_model.as_deref() != Some(model) {
+        return Err(BodyRejection::ModelMismatch);
     }
     Ok(())
 }
@@ -495,9 +639,9 @@ fn derive_cache_salt(
     Ok(hex(&digest(&input)))
 }
 
-/// Appends `,"cache_salt":"<salt_hex>"` immediately before the validated JSON object's closing
-/// `}`, stripping only trailing RFC 8259 whitespace and leaving all caller bytes before `}`
-/// untouched.
+/// Splices `,"cache_salt":"<salt_hex>"` immediately before the validated JSON object's closing
+/// `}`, leaving every caller byte before `}` and every trailing RFC 8259 whitespace byte after
+/// `}` untouched.
 fn inject_cache_salt(body: &[u8], salt_hex: &str) -> Result<Bytes, Problem> {
     debug_assert_eq!(salt_hex.len(), 64);
     debug_assert!(
@@ -505,22 +649,19 @@ fn inject_cache_salt(body: &[u8], salt_hex: &str) -> Result<Bytes, Problem> {
             .bytes()
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     );
-    let trimmed_len = body
+    let close = body
         .iter()
         .rposition(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
-        .map_or(0, |i| i + 1);
-    let trimmed = &body[..trimmed_len];
-    if trimmed.last() != Some(&b'}') {
-        return Err(MODEL);
-    }
+        .filter(|&i| body[i] == b'}')
+        .ok_or(MODEL)?;
     const PREFIX: &[u8] = br#","cache_salt":""#;
-    const SUFFIX: &[u8] = br#""}"#;
-    let mut out =
-        Vec::with_capacity(trimmed.len() - 1 + PREFIX.len() + salt_hex.len() + SUFFIX.len());
-    out.extend_from_slice(&trimmed[..trimmed.len() - 1]);
+    const QUOTE: &[u8] = br#"""#;
+    let mut out = Vec::with_capacity(body.len() + PREFIX.len() + salt_hex.len() + QUOTE.len());
+    out.extend_from_slice(&body[..close]);
     out.extend_from_slice(PREFIX);
     out.extend_from_slice(salt_hex.as_bytes());
-    out.extend_from_slice(SUFFIX);
+    out.extend_from_slice(QUOTE);
+    out.extend_from_slice(&body[close..]);
     Ok(Bytes::from(out))
 }
 
@@ -542,22 +683,22 @@ fn prepare_outbound_body(
 }
 
 impl Proxy {
-    async fn forward(&self, request: Request) -> Result<Response, Problem> {
+    async fn forward(&self, request: Request) -> Result<Response, ProxyError> {
         let (parts, body) = request.into_parts();
         // HTTP/1.0 ends an unsized body by closing the connection, so a cut stream would look
         // complete to the caller.
         if parts.version != Version::HTTP_11 {
-            return Err(VERSION);
+            return Err(VERSION.into());
         }
         // An unreadable `Connection` value could name `Authorization` or the request ID as
         // hop-by-hop without `end_to_end` seeing it. Refuse before either is looked at.
         if !connection_readable(&parts.headers) {
-            return Err(CONNECTION);
+            return Err(CONNECTION.into());
         }
         let id = correlation(&parts.headers)?;
         let bearer = credential(&parts.headers)?;
         if !identity(&parts.headers) {
-            return Err(ENCODED_REQUEST);
+            return Err(ENCODED_REQUEST.into());
         }
         // From here on the request's one dispatch is spent, or may be. Every early end,
         // including the server dropping this handler because the caller left, logs why there is
@@ -577,26 +718,26 @@ impl Proxy {
                     // Refused or a replay: this call spent nothing.
                     unrecorded.gap = None;
                 }
-                return Err(problem);
+                return Err(problem.into());
             }
         };
         unrecorded.routing = Some(routing.clone());
         if routing.model != self.settings.model {
             unrecorded.gap = Some(UsageGap::ModelNotServed);
-            return Err(NOT_SERVED);
+            return Err(NOT_SERVED.into());
         }
         unrecorded.gap = Some(UsageGap::RequestBody);
         let body = match timeout(REQUEST_READ, axum::body::to_bytes(body, MAX_REQUEST_BYTES)).await
         {
             Ok(Ok(body)) => body,
-            _ => return Err(BODY),
+            _ => return Err(BODY.into()),
         };
         let outbound_body =
             match prepare_outbound_body(&body, self.settings.cache_mode, &routing, &id) {
                 Ok(outbound) => outbound,
                 Err((gap, problem)) => {
                     unrecorded.gap = Some(gap);
-                    return Err(problem);
+                    return Err(problem.into());
                 }
             };
         let mut outbound = hyper::Request::post(ROUTE)
@@ -622,14 +763,23 @@ impl Proxy {
                 return Err(match gap {
                     UsageGap::UpstreamTimeout => UPSTREAM_TIMEOUT,
                     _ => UPSTREAM,
-                });
+                }
+                .into());
             }
         };
         let (head, body) = response.into_parts();
+        // Never relay a non-200 upstream body: validation errors can echo the submitted JSON and
+        // leak the proxy-injected `cache_salt`. Drop the upstream connection immediately, record
+        // `upstream_status`, and answer with a value-free problem document.
+        if head.status != StatusCode::OK {
+            drop((upstream, body));
+            unrecorded.gap = Some(UsageGap::UpstreamStatus);
+            return Err(upstream_status_error(head.status, &head.headers));
+        }
         // Neither relayed unlabelled nor read for usage; the upstream connection closes here.
         if !identity(&head.headers) {
             unrecorded.gap = Some(UsageGap::UpstreamEncoding);
-            return Err(ENCODED_RESPONSE);
+            return Err(ENCODED_RESPONSE.into());
         }
         unrecorded.gap = None;
         drop(unrecorded);
@@ -648,8 +798,7 @@ impl Proxy {
                 .append(header::CONTENT_TYPE, value.clone());
         }
         let relay = Relay {
-            extract: (head.status == StatusCode::OK)
-                .then(|| Extract::new(head.headers.get(header::CONTENT_TYPE))),
+            extract: Some(Extract::new(head.headers.get(header::CONTENT_TYPE))),
             id,
             routing,
             upstream,
@@ -989,6 +1138,7 @@ async fn record(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider_http::inference::json;
     use sqlx::postgres::PgPoolOptions;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1333,16 +1483,17 @@ mod tests {
     #[test]
     fn body_validation_and_injection_preserve_bytes_and_reject_reserved_fields() {
         let base = routing();
-        // Exact byte-preserving injection: preserves key order, whitespace, nested strings
-        // mentioning reserved keys, and exact float literals (e.g. 0.70, 1e-5, 1.0).
-        let raw = br#"{  "temperature": 0.70, "top_p": 1.0, "eps": 1e-5, "model": "synthetic-model", "messages": [{"role":"user","content":"{\"cache_salt\":\"ignored\",\"extra_key\":\"ok\"}"}], "metadata": {"extra_key": "nested-ok"} }  "#;
-        let out = prepare_outbound_body(raw, CacheMode::Scoped, &base, ID).unwrap();
+        // Exact byte-preserving injection: preserves key order, internal and trailing whitespace
+        // (spaces, tabs, CR, LF), nested strings mentioning reserved keys, and exact float literals.
+        let mut raw = br#"{  "temperature": 0.70, "top_p": 1.0, "eps": 1e-5, "model": "synthetic-model", "messages": [{"role":"user","content":"{\"cache_salt\":\"ignored\",\"extra_key\":\"ok\"}"}], "metadata": {"extra_key": "nested-ok"} }"#.to_vec();
+        raw.extend_from_slice(b"  \t\r\n");
+        let out = prepare_outbound_body(&raw, CacheMode::Scoped, &base, ID).unwrap();
         let expected_salt = derive_cache_salt(CacheMode::Scoped, &base, ID).unwrap();
         let expected_prefix = br#"{  "temperature": 0.70, "top_p": 1.0, "eps": 1e-5, "model": "synthetic-model", "messages": [{"role":"user","content":"{\"cache_salt\":\"ignored\",\"extra_key\":\"ok\"}"}], "metadata": {"extra_key": "nested-ok"} ,"cache_salt":""#;
         let mut expected = Vec::new();
         expected.extend_from_slice(expected_prefix);
         expected.extend_from_slice(expected_salt.as_bytes());
-        expected.extend_from_slice(br#""}"#);
+        expected.extend_from_slice(b"\"}  \t\r\n");
         assert_eq!(out.as_ref(), expected.as_slice());
         // Result is valid unique-key JSON carrying the derived `cache_salt`.
         let parsed = json::parse(&out).unwrap();
@@ -1367,7 +1518,8 @@ mod tests {
         );
         assert!(json::parse(&max_out).is_ok());
 
-        // Every top-level reserved field is refused (including null and unicode-escaped keys).
+        // Every top-level reserved field is refused (including null, unicode-escaped keys,
+        // duplicated reserved keys, duplicated sibling keys, and mismatched/missing model).
         for key in RESERVED_KEYS {
             for val in [r#""x""#, "null", "123"] {
                 let body = format!(r#"{{"model":"synthetic-model","{key}":{val}}}"#);
@@ -1378,12 +1530,22 @@ mod tests {
                 );
             }
         }
-        let escaped = br#"{"model":"synthetic-model","\u0063ache_salt":"sneaky"}"#;
-        assert_eq!(
-            prepare_outbound_body(escaped, CacheMode::Scoped, &base, ID),
-            Err((UsageGap::RequestBody, RESERVED_FIELD))
-        );
-        // Duplicate keys still fail as ModelMismatch.
+        for reserved_edge in [
+            &br#"{"model":"synthetic-model","\u0063ache_salt":"sneaky"}"#[..],
+            br#"{"model":"synthetic-model","cache_salt":"a","cache_salt":"b"}"#,
+            br#"{"model":"synthetic-model","messages":[],"messages":[],"extra_key":"x"}"#,
+            br#"{"model":"wrong-model","session_id":"s"}"#,
+            br#"{"rid":"r","messages":[]}"#,
+            br#"{"messages":[{"dup":1,"dup":2}],"lora_path":"/tmp/x"}"#,
+        ] {
+            assert_eq!(
+                prepare_outbound_body(reserved_edge, CacheMode::Scoped, &base, ID),
+                Err((UsageGap::RequestBody, RESERVED_FIELD)),
+                "{}",
+                String::from_utf8_lossy(reserved_edge)
+            );
+        }
+        // Duplicate keys without any top-level reserved field still fail as ModelMismatch.
         let dup = br#"{"model":"synthetic-model","messages":[],"messages":[]}"#;
         assert_eq!(
             prepare_outbound_body(dup, CacheMode::Scoped, &base, ID),

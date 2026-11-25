@@ -673,32 +673,26 @@ fn is_hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-fn trim_json_ws_end(bytes: &[u8]) -> &[u8] {
-    let end = bytes
-        .iter()
-        .rposition(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
-        .map_or(0, |i| i + 1);
-    &bytes[..end]
-}
-
-/// Strips the trailing `,"cache_salt":"<64 lowercase hex>"` member appended by `openmettle-gateway`
-/// before the closing `}` of a forwarded JSON object, returning `(restored_json, salt_hex)`.
+/// Strips the `,"cache_salt":"<64 lowercase hex>"` member spliced by `openmettle-gateway`
+/// immediately before the closing `}` of a forwarded JSON object (preserving any trailing RFC 8259
+/// whitespace after `}`), returning `(restored_json, salt_hex)`.
 fn strip_injected_cache_salt(body: &[u8]) -> Option<(Vec<u8>, String)> {
     const PREFIX: &[u8] = br#","cache_salt":""#;
-    const SUFFIX: &[u8] = br#""}"#;
-    let without_suffix = body.strip_suffix(SUFFIX)?;
-    if without_suffix.len() < PREFIX.len() + 64 {
+    let close = body
+        .iter()
+        .rposition(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))?;
+    if body[close] != b'}' || close < PREFIX.len() + 64 + 1 || body[close - 1] != b'"' {
         return None;
     }
-    let split = without_suffix.len() - 64;
-    let salt = std::str::from_utf8(&without_suffix[split..]).ok()?;
+    let salt_start = close - 1 - 64;
+    let salt = std::str::from_utf8(&body[salt_start..close - 1]).ok()?;
     if !is_hex64(salt) {
         return None;
     }
-    let head = without_suffix[..split].strip_suffix(PREFIX)?;
-    let mut restored = Vec::with_capacity(head.len() + 1);
+    let head = body[..salt_start].strip_suffix(PREFIX)?;
+    let mut restored = Vec::with_capacity(head.len() + body.len() - close);
     restored.extend_from_slice(head);
-    restored.push(b'}');
+    restored.extend_from_slice(&body[close..]);
     Some((restored, salt.to_owned()))
 }
 
@@ -712,9 +706,7 @@ fn script(body: &[u8]) -> Option<Script> {
         .iter()
         .map(|(case, ..)| *case)
         .chain([ABORTED, UPSTREAM_500])
-        .find(|case| {
-            trim_json_ws_end(&recorded::file(case, "request.json")) == candidate.as_slice()
-        });
+        .find(|case| recorded::file(case, "request.json") == candidate);
     if let Some(case) = recorded_case {
         return Some(recorded_script(case, true));
     }
@@ -777,6 +769,67 @@ fn script(body: &[u8]) -> Option<Script> {
                 );
                 let writes = vec![head.into_bytes(), response];
                 (Box::new(writes.into_iter()), false, Duration::ZERO, false)
+            }
+            // An upstream validation error that echoes the submitted request JSON (including the
+            // proxy-injected `cache_salt`) back in its 422 response body.
+            "echo-422" => {
+                let mut echoed =
+                    br#"{"detail":[{"msg":"Extra inputs are not permitted","input":"#.to_vec();
+                echoed.extend_from_slice(body);
+                echoed.extend_from_slice(b"}]}");
+                let head = format!(
+                    "HTTP/1.1 422 Unprocessable Entity\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\n\r\n",
+                    echoed.len()
+                );
+                (
+                    Box::new(vec![head.into_bytes(), echoed].into_iter()),
+                    false,
+                    Duration::ZERO,
+                    false,
+                )
+            }
+            "status-429" => {
+                let body = b"rate limited by upstream".to_vec();
+                let head = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nretry-after: 7\r\n\
+                     content-type: text/plain\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                );
+                (
+                    Box::new(vec![head.into_bytes(), body].into_iter()),
+                    false,
+                    Duration::ZERO,
+                    false,
+                )
+            }
+            "status-503" => {
+                let body = b"upstream overloaded".to_vec();
+                let head = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\ncontent-type: text/plain\r\n\
+                     content-length: {}\r\n\r\n",
+                    body.len()
+                );
+                (
+                    Box::new(vec![head.into_bytes(), body].into_iter()),
+                    false,
+                    Duration::ZERO,
+                    false,
+                )
+            }
+            "status-504" => {
+                let body = b"upstream gateway timeout".to_vec();
+                let head = format!(
+                    "HTTP/1.1 504 Gateway Timeout\r\ncontent-type: text/plain\r\n\
+                     content-length: {}\r\n\r\n",
+                    body.len()
+                );
+                (
+                    Box::new(vec![head.into_bytes(), body].into_iter()),
+                    false,
+                    Duration::ZERO,
+                    false,
+                )
             }
             _ => return None,
         };
@@ -1448,8 +1501,8 @@ async fn relays_recorded_answers_unchanged_and_settles_their_usage_as_the_gatewa
                 .unwrap_or_else(|| panic!("{case}: missing injected 64-hex cache_salt"));
             assert_eq!(
                 restored,
-                trim_json_ws_end(&recorded::file(case, "request.json")),
-                "{case}: the upstream receives the caller's bytes with only cache_salt appended"
+                recorded::file(case, "request.json"),
+                "{case}: removing cache_salt recovers the exact caller bytes including trailing whitespace"
             );
             if let Some(expected) = &personal_salt {
                 assert_eq!(
@@ -1553,11 +1606,8 @@ async fn closes_the_hold_with_the_reason_when_the_upstream_reported_no_usage() {
         "the caller's response is cut like the upstream's"
     );
     let reply = h.send_case(UPSTREAM_500, &failed).await;
-    assert_eq!(
-        (reply.status, content_type(&reply.head).as_deref()),
-        (500, Some("text/plain; charset=utf-8"))
-    );
-    assert!(reply.body == recorded::body(UPSTREAM_500) && reply.complete);
+    assert_eq!(refusal(&reply), (502, "provider_failure".to_owned(), None));
+    assert!(reply.complete);
     // Both streams reach the caller whole: only their accounting is incomplete.
     for (name, id) in [("no-usage", &silent), ("garbled", &garbled)] {
         let reply = h.send_synthetic(name, id, Then::Read).await;
@@ -3878,7 +3928,10 @@ async fn cost_holds_settle_from_recorded_profile_prices_through_the_proxy() {
         .request_with_pricing(MODEL, false, Some(pricing))
         .await;
     let err_reply = h.send_case(UPSTREAM_500, &err_id).await;
-    assert_eq!(err_reply.status, 500);
+    assert_eq!(
+        refusal(&err_reply),
+        (502, "provider_failure".to_owned(), None)
+    );
 
     // Stop the proxy to drain all three report writes cleanly before reading DB state.
     let (f, _upstream, events) = h.stop().await;
@@ -4335,6 +4388,10 @@ async fn refuses_reserved_cache_and_routing_keys_without_forwarding_and_closes_h
         format!(r#"{{"model":"{MODEL}","rid":"rid-1","messages":[]}}"#),
         format!(r#"{{"model":"{MODEL}","lora_path":"/tmp/lora","messages":[]}}"#),
         format!(r#"{{"model":"{MODEL}","lora_path":null,"messages":[]}}"#),
+        format!(r#"{{"model":"{MODEL}","cache_salt":"a","cache_salt":"b","messages":[]}}"#),
+        format!(r#"{{"model":"{MODEL}","messages":[],"messages":[],"extra_key":"attacker"}}"#),
+        r#"{"model":"wrong-model","session_id":"sess-1","messages":[]}"#.to_owned(),
+        r#"{"rid":"rid-1","messages":[]}"#.to_owned(),
     ] {
         let id = h
             .fixture
@@ -4477,5 +4534,60 @@ async fn pre_36_schema_falls_back_to_per_principal_cache_isolation() {
     );
     let (fixture, _, events) = h.stop().await;
     assert_eq!(events, []);
+    assert_eq!(fixture.drift().await, (0, 0, 0, 0));
+}
+
+/// Review #1 P2: when an upstream answers with a non-200 status whose body echoes the submitted
+/// request (including the injected `cache_salt`), the proxy returns a value-free problem body
+/// without relaying the upstream body or leaking `cache_salt`, preserves retryable status
+/// classifications (`429`, `503`, `504`), and settles every case as `upstream_status` at `0`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn review_1_p2_upstream_non_200_withholds_echoed_cache_salt_and_settles_upstream_status() {
+    let h = Harness::start().await;
+    let cases = [
+        ("echo-422", 502, "provider_failure", None),
+        ("status-429", 429, "rate_limited", Some("7")),
+        ("status-503", 503, "unavailable", None),
+        ("status-504", 504, "timeout", None),
+    ];
+    let mut ids = Vec::new();
+    for (idx, (name, expected_status, expected_code, expected_retry_after)) in
+        cases.into_iter().enumerate()
+    {
+        let id = h.fixture.request(false).await;
+        let reply = h.send_synthetic(name, &id, Then::Read).await;
+        assert_eq!(
+            refusal(&reply),
+            (expected_status, expected_code.to_owned(), None),
+            "{name}"
+        );
+        assert_eq!(
+            header(&reply.head, "retry-after"),
+            expected_retry_after,
+            "{name}: retry-after"
+        );
+        assert!(reply.complete, "{name}");
+        let (_, salt) = strip_injected_cache_salt(&h.upstream.body(idx))
+            .expect("upstream received injected cache_salt");
+        let body_text = String::from_utf8_lossy(&reply.body);
+        assert!(
+            !reply.head.contains(&salt) && !body_text.contains(&salt),
+            "{name}: response must never leak derived cache_salt"
+        );
+        assert!(
+            !body_text.contains("Extra inputs are not permitted"),
+            "{name}: upstream error body must not be relayed"
+        );
+        ids.push(id);
+    }
+    let (fixture, _, events) = h.stop().await;
+    let mut expected_events = Vec::new();
+    for id in &ids {
+        fixture.assert_closed(id, "upstream_status").await;
+        expected_events.push(unrecorded(id, "upstream_status"));
+    }
+    expected_events.sort();
+    assert_eq!(events, expected_events);
     assert_eq!(fixture.drift().await, (0, 0, 0, 0));
 }

@@ -73,13 +73,17 @@ policy is provisioned for it.
   before anything is sent upstream. An upstream answer with either is not relayed: the caller
   gets `502 provider_failure` and the upstream connection is closed without reading the
   body.
-- **Relay.** The upstream status, `Content-Type` (unless the upstream names it in
+- **Relay.** For `200 OK`, the upstream `Content-Type` (unless the upstream names it in
   `Connection`) and body are relayed chunk by chunk as they arrive. A server-sent event
   reaches the caller before the upstream has finished. The caller's response ends cleanly only
   if the upstream body completed and the caller received every chunk. Otherwise the caller
   receives a prefix of the upstream bytes and an unclean end of the HTTP body (no terminal
   chunk, or fewer bytes than `Content-Length`); how much of that prefix arrives is not
-  promised.
+  promised. Any non-`200` upstream status closes the upstream body without relaying it and
+  answers with a value-free `application/problem+json` response (`429 rate_limited` with a
+  validated numeric `Retry-After` if present, `503 unavailable`, `504 timeout`, or
+  `502 provider_failure`) so an upstream validation error cannot echo the injected
+  `cache_salt`.
 - **Usage.** A copy of each chunk is read for the usage object. When the upstream answered
   200, the body completed (a JSON document, or a stream ending with `data: [DONE]`) and a
   valid usage object arrived, one final report is written. In a stream, only a usage object
@@ -151,7 +155,7 @@ one alone:
 | `not_dispatched` | No (worker sweep, revision 0) | The request was handed off without a binding, never dispatched, and its run can no longer dispatch it (failed, cancelled, reclaimed, or past its lease or execution deadline) |
 | `upstream_transport` | Yes or unknown | The exchange on an open upstream connection failed before a response head (`502 provider_failure`) |
 | `upstream_timeout` | Yes or unknown | No response head or no further body bytes within the idle timeout (`504 timeout` if no head arrived), or the upstream did not finish within one idle timeout after the caller left |
-| `upstream_status` | Yes | The upstream answered with a status other than 200; its response is still relayed |
+| `upstream_status` | Yes | The upstream answered with a status other than 200; the upstream body is closed without relaying and the caller receives a value-free problem document (`429`, `503`, `504` or `502`) |
 | `upstream_encoding` | Yes | The upstream answered with a content coding other than `identity` or a transfer coding other than `chunked` (`502 provider_failure`) |
 | `incomplete` | Yes | The body broke off, or a stream ended without `[DONE]` |
 | `caller_disconnected` | Yes or unknown | The caller left or stopped reading before the usage was in hand, or the usage went out of reach while the relay read on; the upstream connection is closed |
@@ -204,8 +208,15 @@ gateway process serves one model.
 
 `CACHE_MODE` defaults to `scoped`, sharing prefix cache within a user's personal scope, within
 each owner's unshared conversations inside a project, and across a project's effectively shared
-conversations (migration 36). Set `per_request` to disable cross-request prefix reuse where live
-upstream `cache_salt` isolation has not yet been qualified.
+conversations (migration 36). `per_request` emits a fresh random `cache_salt` per request, which
+prevents cross-request prefix reuse **only on an upstream tier verified to partition its prefix
+cache on `cache_salt`**. If a backend or elastic KV tier ignores `cache_salt`, `per_request` at the
+proxy cannot stop backend prefix reuse: disable prefix caching at the backend (for example
+`--disable-radix-cache` on SGLang) or keep an unqualified tier out of multi-user service until
+owner-gated live qualification passes (`#7` / `#9`). During a rolling upgrade before migration 36,
+`gateway::consume` falls back to per-principal isolation (`cache_owner = Some(principal)`) only for
+traffic served by upgraded `openmettle-gateway` binaries; pre-Increment-5 gateway binaries emit no
+`cache_salt`.
 
 A refusal exits 78 with one fixed line, for example `configuration error: UPSTREAM_URL is
 required`, `configuration error: UPSTREAM_URL must use http://`, `configuration error:
@@ -248,8 +259,9 @@ on a connection that stopped answering: the pool waits for every connection when
 - **Live upstream `cache_salt` qualification pending.** Proxy-side derivation, sanitation and wire
   injection are tested against the stand-in SGLang; live verification of `cache_salt` isolation
   on the deployment's patched SGLang build and elastic KV tail (`0031–0033`) remains an
-  owner-gated live check (`#7` / `#9`). Use `OPENMETTLE_GATEWAY_CACHE_MODE=per_request` where
-  cross-request prefix reuse must stay disabled until live qualification passes.
+  owner-gated live check (`#7` / `#9`). `OPENMETTLE_GATEWAY_CACHE_MODE=per_request` prevents
+  cross-request reuse only on tiers that honor `cache_salt`; disable prefix caching at the backend
+  or keep an unqualified tier out of multi-user service until live qualification passes.
 
 ## Testing
 

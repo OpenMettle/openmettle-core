@@ -3,7 +3,7 @@ use super::Error;
 pub use crate::telemetry::metrics::{GatewayCause as Cause, GatewayStep};
 use hyper::header::{HeaderMap, RETRY_AFTER};
 
-pub(super) fn retry_delay(headers: &HeaderMap) -> Option<u32> {
+pub(crate) fn retry_delay(headers: &HeaderMap) -> Option<u32> {
     let mut values = headers.get_all(RETRY_AFTER).iter();
     let s = values.next()?.to_str().ok()?;
     if values.next().is_some() || s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {

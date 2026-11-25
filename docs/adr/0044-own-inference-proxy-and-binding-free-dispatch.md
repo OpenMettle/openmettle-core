@@ -652,12 +652,15 @@ hit one another's cached prefixes, and a caller could set SGLang's cache or rout
   text`, while `openmettle.gateway_dispatch(uuid, bytea)` becomes a thin 1-query wrapper over it
   preserving its exact 6-column signature and privileges. Wrong bearers still take zero locks.
   For valid bearers, `gateway_dispatch_scoped` acquires canonical shared authorization locks in
-  ADR 0040 / migration 35 order (`account_admin_lock -> projects -> login_providers/approvals ->
-  users -> runs -> gateway_requests`) so concurrent `share_resource`/`unshare_resource`, project
-  membership/lifecycle changes, user/group administration, approval withdrawals and run
-  cancellations serialize without lock-order inversions. It preserves every migration 35 check,
-  refuses archived or deleted projects (`project_settings`) and non-owner dispatches on unshared
-  project conversations, and computes `cache_owner` at the single `clock_timestamp()` reading:
+  ADR 0040 / ADR 0021 / migration 35 order (`account_admin_lock -> projects -> login_providers ->
+  local_identity_approvals -> users -> membership_observations -> grant_mapping_rules -> runs ->
+  gateway_requests`) across both the acting principal and any direct-user share recipients on the
+  conversation so concurrent `share_resource`/`unshare_resource`, project membership/lifecycle
+  changes, user/group administration, operator approval or mapped-membership withdrawals and run
+  cancellations serialize without lock-order inversions. It evaluates the actor's own live
+  `editor`/`owner` role, conversation `write` authority, capabilities and family policy via
+  `openmettle.gateway_round_authority` at `clock_timestamp()` independently of `share.effective`,
+  and computes `cache_owner` at the same clock reading:
   - **Personal scope (`scopes.kind = 'personal'`):** `cache_owner = NULL`, sharing prefix cache
     within `(installation, scope_id, model)`.
   - **Project scope (`scopes.kind = 'project'`):** `cache_owner = NULL` (shared within
@@ -670,33 +673,36 @@ hit one another's cached prefixes, and a caller could set SGLang's cache or rout
     `(installation, scope_id, owner_user_id, model)`.
   - **Rolling-upgrade fallback.** `gateway::consume` probes
     `to_regprocedure('openmettle.gateway_dispatch_scoped(uuid,bytea)')` and falls back to
-    `gateway_dispatch` with `cache_owner = Some(principal)` on pre-36 schemas so distinct users
-    never share prefixes before migration 36 applies.
+    `gateway_dispatch` with `cache_owner = Some(principal)` on pre-36 schemas for traffic served
+    by upgraded `openmettle-gateway` binaries (pre-Increment-5 binaries emit no `cache_salt`).
 - **Proxy cache mode and derivation (`OPENMETTLE_GATEWAY_CACHE_MODE`).**
   - `scoped` (default): `SHA-256` over length-prefixed domain `openmettle.cache-salt.v1\0` and
     `(installation, scope_id, "shared" | "owner", "" | cache_owner, model)`.
   - `per_request`: `SHA-256` over length-prefixed domain `openmettle.cache-salt-request.v1\0` and
-    `(installation, request_id, 32-byte SystemRandom nonce)`, disabling cross-request prefix reuse.
-    An RNG failure before upstream connect refuses with `503 unavailable` and settles the spent
-    hold as `upstream_connect` (`0` charged).
+    `(installation, request_id, 32-byte SystemRandom nonce)`, preventing cross-request prefix reuse
+    on upstream tiers that honor `cache_salt`. An RNG failure before upstream connect refuses with
+    `503 unavailable` and settles the spent hold as `upstream_connect` (`0` charged).
   - Invalid values exit `78` with `configuration error: invalid CACHE_MODE` (value-free). The
     derived 64-character lowercase hex `cache_salt` is never logged, emitted in telemetry or
-    returned in error responses.
+    returned in error responses: non-`200` upstream statuses close the upstream body without
+    relaying it and return a value-free `application/problem+json` response (`429`, `503`, `504`
+    or `502`), still settling as `upstream_status` at `0`.
 - **Caller body sanitation and byte-preserving injection.** After spending the dispatch and
-  parsing the unique-key JSON object once (`provider_http::inference::json::parse`), any top-level
-  `cache_salt`, `extra_key`, `session_id`, `rid` or `lora_path` key (including `null` or
-  unicode-escaped spellings; nested strings inside `messages` are allowed) is refused with
-  `400 validation` (`UsageGap::RequestBody`), sending zero bytes upstream and closing token and
-  cost holds at `0`. Valid bodies have trailing RFC 8259 whitespace trimmed and
-  `,"cache_salt":"<64 hex>"` appended directly before the closing `}`, preserving caller key
-  order, internal whitespace and float literals byte for byte while `hyper` sets the updated
+  scanning the root JSON object once (`scan_request_object`), any top-level
+  `cache_salt`, `extra_key`, `session_id`, `rid` or `lora_path` key (including `null`,
+  unicode-escaped spellings, duplicate keys or mismatched `model`; nested strings inside `messages`
+  are allowed) is refused with `400 validation` (`UsageGap::RequestBody`), sending zero bytes
+  upstream and closing token and cost holds at `0`. Valid bodies have `,"cache_salt":"<64 hex>"`
+  spliced directly before the closing `}`, preserving caller key order, internal and trailing
+  RFC 8259 whitespace and float literals byte for byte while `hyper` sets the updated
   `Content-Length` (including for full 2 MiB caller bodies).
 - **Qualification boundary.** Unit and PostgreSQL 18 tests verify namespace derivation, ADR 0027
   share transitions, concurrency serialization and wire injection against the stand-in SGLang.
   Live verification that `cache_salt` isolates cached prefixes on the deployment's `serving-fork`
-  and elastic KV tail (`0031–0033`) remains an owner-gated live check (`#7` / `#9`); operators
-  can set `OPENMETTLE_GATEWAY_CACHE_MODE=per_request` to disable cross-request prefix reuse where
-  live backend qualification is pending (`ARCHITECTURE-v1.md`).
+  and elastic KV tail (`0031–0033`) remains an owner-gated live check (`#7` / `#9`). `per_request`
+  prevents cross-request reuse only on tiers that honor `cache_salt`; operators must disable prefix
+  caching at the backend or keep an unqualified tier out of multi-user service until live
+  qualification passes (`ARCHITECTURE-v1.md`).
 
 ### Evidence
 
