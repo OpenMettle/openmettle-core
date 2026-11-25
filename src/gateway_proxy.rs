@@ -100,10 +100,10 @@ const RELAY_BUFFER: usize = 8;
 /// Pauses before the second and third attempt to store a report after a transient failure.
 const WRITE_RETRIES: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(500)];
 /// Longest wall-clock window to keep retrying a report write blocked by PostgreSQL `lock_timeout`
-/// (`55P03`), matching `openmettle-migrate`'s default 5-minute `STATEMENT_TIMEOUT_MS` so streams
+/// (`55P03`) or `PgPool` connection-acquisition contention (`PoolTimedOut`), so concurrent streams
 /// finishing while a schema migration holds exclusive DDL locks settle once the migration commits.
 const LOCK_RETRY_WINDOW: Duration = Duration::from_secs(300);
-/// Pause between lock-timeout (`55P03`) report write retries after rolling back the connection.
+/// Pause between lock-timeout (`55P03`) or pool-contention (`PoolTimedOut`) report write retries.
 const LOCK_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 /// Each write transaction, spending a dispatch or storing a report, gets this many
 /// `DB_TIMEOUT_MS` before the proxy stops waiting for it, also when its database connection has
@@ -1112,8 +1112,9 @@ fn report(id: String, routing: Routing, usage: Option<Usage>) -> UsageReport {
 /// is none. Either closes the request's token hold; a report without counts is never written
 /// without its reason, because settlement would then keep the hold for good. Transient database
 /// failures retry twice (`WRITE_RETRIES`); PostgreSQL lock timeouts (`SQLSTATE 55P03`, such as
-/// exclusive DDL locks held by `openmettle-migrate`) retry every `LOCK_RETRY_BACKOFF` for up to
-/// `LOCK_RETRY_WINDOW` without consuming `WRITE_RETRIES`. No local spool.
+/// exclusive DDL locks held by `openmettle-migrate`) and `PgPool` connection-acquisition timeouts
+/// (`PoolTimedOut`) retry every `LOCK_RETRY_BACKOFF` for up to `LOCK_RETRY_WINDOW` without
+/// consuming `WRITE_RETRIES`. No local spool.
 ///
 /// Each attempt runs in its own task and is never cancelled in flight: sqlx counts a transaction
 /// only once the server acknowledges `BEGIN`, so a cancelled `BEGIN` could put its connection
@@ -1145,7 +1146,10 @@ async fn record(
         };
         match outcome {
             Ok(_) => return,
-            Err(settlement::ProxyStoreError::LockTimeout) => {
+            Err(
+                settlement::ProxyStoreError::LockTimeout
+                | settlement::ProxyStoreError::PoolTimedOut,
+            ) => {
                 if Instant::now() < lock_deadline {
                     tokio::time::sleep(LOCK_RETRY_BACKOFF).await;
                     continue;

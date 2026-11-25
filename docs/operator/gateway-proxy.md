@@ -122,18 +122,18 @@ object.
 The report is written by the task that relays the response, so the write does not depend on
 the caller staying connected. Each attempt is bounded by five `DB_TIMEOUT_MS` (10 s by
 default), also when its database connection stops answering. Non-lock transient failures and
-expired attempts retry twice (after 100 ms and 500 ms). PostgreSQL lock timeouts (`SQLSTATE
-55P03`, such as exclusive DDL locks held by `openmettle-migrate`) roll back the connection and
-keep retrying every 250 ms for up to 5 minutes (300 s, matching `openmettle-migrate`'s default
-`STATEMENT_TIMEOUT_MS`) without consuming the two transient retries. An attempt is never
-cancelled in flight: one past its bound is left to finish or fail on its own while the retry
-runs, which is safe because settlement accepts the identical report once. There is no local
-spool. If no attempt confirms the write, the proxy logs `gateway.usage.failed`: the gateway
-could not confirm the write, and an earlier attempt may still have committed it. Check the
-request's usage report and hold before acting. If no report exists, the worker's maintenance
-sweep closes the hold as `unreported` at revision `0` once 15 minutes have passed after the
-run's execution deadline (increment 3b). This applies to a report with usage and to one
-without.
+expired attempts retry twice (after 100 ms and 500 ms). Both PostgreSQL lock timeouts
+(`SQLSTATE 55P03`, such as exclusive DDL locks held by `openmettle-migrate`) and `PgPool`
+connection-acquisition timeouts under DDL contention roll back any open connection, retain the
+final report in memory, and keep retrying every 250 ms for up to 5 minutes (300 s) without
+consuming the two transient retries. An attempt is never cancelled in flight: one past its
+bound is left to finish or fail on its own while the retry runs, which is safe because
+settlement accepts the identical report once. There is no local spool. If no attempt confirms
+the write, the proxy logs `gateway.usage.failed`: the gateway could not confirm the write, and
+an earlier attempt may still have committed it. Check the request's usage report and hold
+before acting. If no report exists, the worker's maintenance sweep closes the hold as
+`unreported` at revision `0` once 15 minutes have passed after the run's execution deadline
+(increment 3b). This applies to a report with usage and to one without.
 
 The report identity is derived from the request, so a retried write stores the same report.
 
@@ -215,13 +215,15 @@ lost and later closed as `unreported`. Roll out in three steps:
 2. Drain all pre-`0037` (`0036`) `openmettle-gateway` replicas until their in-flight streams and
    final usage report writes complete.
 3. Apply migration `0037` via `openmettle-migrate`: live `0037`-capable gateway replicas retain
-   final reports across `55P03` lock timeouts every 250 ms for up to 5 minutes (300 s, matching
-   `openmettle-migrate`'s default `STATEMENT_TIMEOUT_MS`) without consuming their two transient
+   final reports in memory across both `55P03` lock timeouts and `PgPool` connection-acquisition
+   timeouts every 250 ms for up to 5 minutes (300 s) without consuming their two transient
    retries, and transition automatically on the next settlement transaction after commit to
-   `openmettle.gateway_settle_report(...)` without losing in-flight stream usage. If
-   `OPENMETTLE_MIGRATE_STATEMENT_TIMEOUT_MS` is raised above `300_000` so migration `0037`
-   could hold exclusive locks longer than 5 minutes, pause dispatches and drain replicas before
-   migrating.
+   `openmettle.gateway_settle_report(...)` without losing in-flight stream usage. Because
+   PostgreSQL's `statement_timeout` bounds each individual SQL statement while table locks
+   persist until the migration transaction commits, pause dispatches and drain gateway replicas
+   before migrating whenever migration `0037`'s **total lock-hold duration** could exceed
+   300 seconds (5 minutes), including at the default `OPENMETTLE_MIGRATE_STATEMENT_TIMEOUT_MS`
+   setting.
 
 | Setting (`OPENMETTLE_GATEWAY_` prefix) | Range | Default |
 | --- | --- | --- |

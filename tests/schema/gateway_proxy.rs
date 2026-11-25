@@ -4652,27 +4652,58 @@ async fn review_1_p2_upstream_non_200_withholds_echoed_cache_salt_and_settles_up
     assert_eq!(fixture.drift().await, (0, 0, 0, 0));
 }
 
-/// Review #1 & #2 P1: gateway-first `0036 -> 0037` live cutover while an in-flight stream
-/// finishes *during* migration 37's held exclusive DDL locks (> 8 s).
+/// Review #1, #2 & #3 P1: gateway-first `0036 -> 0037` live cutover while **24 concurrent**
+/// in-flight SSE streams finish *during* a **12-second** migration 37 DDL lock hold against the
+/// default 4-connection `openmettle_gateway` pool (`DB_MAX_CONNECTIONS = 4`, `DB_TIMEOUT_MS =
+/// 2000`): 4 report writers block on `AccessExclusiveLock` (`SQLSTATE 55P03`) while the other 20
+/// hit `sqlx::Error::PoolTimedOut` at 2 s.
 ///
 /// 1. Start the `0037`-capable `openmettle-gateway` binary against a schema-36 database and
 ///    complete request 1 (`02-chat-plain`), proving settlement succeeds via the pre-37 fallback.
-/// 2. Dispatch request 2 (`03-chat-stream-usage`) on schema 36 and hold its SSE stream open at
-///    the upstream while `openmettle-migrate` runs migration 37 through `FaultyPostgres` paused
-///    before `COMMIT` (holding migration 37's real `AccessExclusiveLock` on `gateway_requests`,
-///    `gateway_usage_reports`, and `gateway_settlements`).
-/// 3. Release request 2's SSE stream *while* migration 37's locks are held, confirm the caller
-///    receives the full stream, and keep `COMMIT` paused past the old ~6.6 s transient-retry
-///    budget (observing >= 4 distinct `55P03` lock-waiting attempts across >= 8 s).
-/// 4. Release `COMMIT`, verify `openmettle_gateway` now receives `42501` on direct table/helper
-///    access, and confirm the live gateway pool transitions to `openmettle.gateway_settle_report`
-///    and settles both token (`29`) and cost (`340` micros) holds with zero drift and zero error
-///    events.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// 2. Dispatch 24 concurrent `03-chat-stream-usage` streams on schema 36 and hold all 24 streams
+///    open at the upstream while `openmettle-migrate` runs migration 37 through `FaultyPostgres`
+///    paused before `COMMIT` (holding migration 37's real `AccessExclusiveLock` on
+///    `gateway_requests`, `gateway_usage_reports`, and `gateway_settlements`).
+/// 3. Release all 24 SSE streams *while* migration 37's locks are held, confirm all 24 callers
+///    receive their complete relayed streams before `COMMIT`, and keep `COMMIT` paused for 12 s
+///    (requiring >= 4 distinct `55P03` lock-waiting attempts across 12 s so both `55P03` and
+///    `PoolTimedOut` writers must retain their final reports without exhausting `WRITE_RETRIES`).
+/// 4. Release `COMMIT`, verify zero `idle in transaction` connections and `42501` on direct
+///    table/helper access, and confirm all 24 streams settle via `openmettle.gateway_settle_report`
+///    (`29` tokens, `340` micros each) with zero drift and zero error events.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_gateway_settle_report()
  {
     use std::collections::HashSet;
+
+    const CONCURRENT_STREAMS: usize = 24;
+
+    async fn send_read(bind: String, id: String, body: Vec<u8>) -> Reply {
+        let mut socket = tokio::net::TcpStream::connect(&bind).await.unwrap();
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: gateway.test\r\n\
+             Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\n\
+             Authorization: Bearer {}\r\nCookie: session={COOKIE}\r\n\
+             Content-Length: {}\r\nConnection: close\r\nX-Request-Id: {id}\r\n\r\n",
+            bearer(&id),
+            body.len()
+        );
+        socket.write_all(request.as_bytes()).await.unwrap();
+        socket.write_all(&body).await.unwrap();
+        let mut raw = Vec::new();
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let n = tokio::time::timeout(Duration::from_secs(20), socket.read(&mut buf))
+                .await
+                .expect("the proxy response stalled")
+                .unwrap_or(0);
+            if n == 0 {
+                return parse(&raw);
+            }
+            raw.extend_from_slice(&buf[..n]);
+        }
+    }
 
     let db = TestDb::new().await;
     migrate::apply(&db.settings(Duration::from_secs(10)), &MIGRATIONS[..36])
@@ -4692,7 +4723,7 @@ async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_
         .execute(
             "INSERT INTO openmettle.quota_defaults(scope_kind,resource_kind,hard_limit)
              VALUES ('personal','usage_tokens',1000000),
-                    ('personal','usage_cost_micros',100000)",
+                    ('personal','usage_cost_micros',1000000)",
         )
         .await
         .unwrap();
@@ -4748,13 +4779,20 @@ async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_
         ("settled".to_owned(), 0, "240".to_owned())
     );
 
-    // 2. Request 2 dispatches on schema 36; migration 37 runs through `FaultyPostgres` paused
-    //    right before `COMMIT`, holding its real `AccessExclusiveLock` while request 2 finishes
-    //    streaming and retries its final report across > 8 s of `55P03` lock timeouts.
-    let req2 = h
-        .fixture
-        .request_with_pricing(MODEL, false, Some(pricing))
-        .await;
+    // 2. Mint 24 priced requests and dispatch all 24 concurrently on schema 36; migration 37
+    //    pauses right before `COMMIT` for 12 s while all 24 streams finish relaying and retry
+    //    their final reports across both `55P03` lock timeouts and `PoolTimedOut` contention on
+    //    the default 4-connection pool.
+    let mut reqs = Vec::with_capacity(CONCURRENT_STREAMS);
+    for _ in 0..CONCURRENT_STREAMS {
+        reqs.push(
+            h.fixture
+                .request_with_pricing(MODEL, false, Some(pricing))
+                .await,
+        );
+    }
+    let stream_req_body = recorded::file("03-chat-stream-usage", "request.json");
+    let expected_stream_body = recorded::body("03-chat-stream-usage");
     let mig_pg = FaultyPostgres::start(COMMIT, 0, Fault::HoldBeforeSend).await;
     let (mig_host, mig_port) = mig_pg.address.rsplit_once(':').unwrap();
     let mut mig_settings = h.fixture.db.settings(Duration::from_secs(30));
@@ -4763,25 +4801,37 @@ async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_
         .host(mig_host)
         .port(mig_port.parse().unwrap());
 
+    let mut client_tasks = Vec::with_capacity(CONCURRENT_STREAMS);
+    for id in &reqs {
+        client_tasks.push(tokio::spawn(send_read(
+            h.bind.clone(),
+            id.clone(),
+            stream_req_body.clone(),
+        )));
+    }
+
     let start_mig = tokio::sync::Notify::new();
-    let send2 = h.send_recorded("03-chat-stream-usage", &req2, Then::Read);
     let mig_run = async {
         start_mig.notified().await;
         migrate::apply(&mig_settings, MIGRATIONS).await
     };
     let cutover = async {
-        eventually(Duration::from_secs(10), "req2 reached stand-in", || {
-            h.upstream.count() >= 2
-        })
+        eventually(
+            Duration::from_secs(10),
+            "all 24 streams reached stand-in",
+            || h.upstream.count() > CONCURRENT_STREAMS,
+        )
         .await;
-        assert!(
-            h.fixture.dispatched(&req2).await,
-            "req2 must already be dispatched on schema 36 before migration 37"
-        );
-        assert!(
-            h.fixture.settlement(&req2).await.is_none(),
-            "req2 must still be unsettled while stream is held open"
-        );
+        for id in &reqs {
+            assert!(
+                h.fixture.dispatched(id).await,
+                "request {id} must already be dispatched on schema 36 before migration 37"
+            );
+            assert!(
+                h.fixture.settlement(id).await.is_none(),
+                "request {id} must still be unsettled while stream is held open"
+            );
+        }
 
         start_mig.notify_one();
 
@@ -4818,28 +4868,53 @@ async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_
         assert_eq!(
             h.upstream.gate.timeouts.load(Ordering::SeqCst),
             0,
-            "migration 37 must pause at COMMIT before the held stream times out"
+            "migration 37 must pause at COMMIT before any held stream times out"
         );
 
-        // Release req2's upstream SSE stream *during* migration 37's held DDL locks so the proxy
-        // finishes relaying and must retain the final report across repeated `55P03` lock timeouts.
-        h.upstream.gate.released.notify_one();
+        // Release all 24 upstream SSE streams *during* migration 37's held DDL locks, waking any
+        // stand-in task that reaches `notified()` a few ms later so none hits the 5 s hold timeout.
+        let wake_deadline = Instant::now() + Duration::from_secs(10);
+        while h.upstream.gate.finished.load(Ordering::SeqCst) < 1 + CONCURRENT_STREAMS {
+            h.upstream.gate.released.notify_waiters();
+            assert!(
+                Instant::now() < wake_deadline,
+                "not all 24 stand-in streams finished after release"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            h.upstream.gate.timeouts.load(Ordering::SeqCst),
+            0,
+            "no held stand-in stream may time out"
+        );
 
-        // Keep `COMMIT` held past the old ~6.6 s transient-retry ceiling, requiring >= 4 distinct
-        // `55P03` lock-waiting attempts over >= 8 s before letting migration 37 commit.
+        // Confirm all 24 callers receive their full relayed stream *while* migration 37 is still
+        // paused before COMMIT.
+        for task in client_tasks {
+            let reply = task.await.unwrap();
+            assert_eq!(reply.status, 200);
+            assert!(reply.complete);
+            assert!(
+                reply.body == expected_stream_body,
+                "caller must receive the complete relayed stream across the 36 -> 37 cutover"
+            );
+        }
+
+        // Keep `COMMIT` held for 12 s after streams finish (past multiple 2 s `PoolTimedOut` and
+        // `55P03` cycles) and verify >= 4 distinct `55P03` lock-waiting attempts before commit.
         let hold_start = Instant::now();
         let mut seen_attempts = HashSet::new();
-        let retry_deadline = hold_start + Duration::from_secs(18);
+        let retry_deadline = hold_start + Duration::from_secs(20);
         loop {
             for attempt in blocked_attempts(&h.fixture).await {
                 seen_attempts.insert(attempt);
             }
-            if seen_attempts.len() >= 4 && hold_start.elapsed() >= Duration::from_secs(8) {
+            if seen_attempts.len() >= 4 && hold_start.elapsed() >= Duration::from_secs(12) {
                 break;
             }
             assert!(
                 Instant::now() < retry_deadline,
-                "proxy stopped retrying during migration 37 DDL lock (saw {} distinct lock-waiting attempts in {:?})",
+                "proxy stopped retrying during 12 s migration 37 DDL lock (saw {} distinct lock-waiting attempts in {:?})",
                 seen_attempts.len(),
                 hold_start.elapsed()
             );
@@ -4848,9 +4923,29 @@ async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_
 
         mig_pg.release();
     };
-    let (reply2, mig_res, ()) = tokio::join!(send2, mig_run, cutover);
-    mig_res.expect("live migration 37 during in-flight stream must succeed");
+    let (mig_res, ()) = tokio::join!(mig_run, cutover);
+    mig_res.expect("live migration 37 during 24 in-flight streams must succeed");
     assert_eq!(mig_pg.late.load(Ordering::SeqCst), 1);
+
+    // Wait for all 24 retained reports to settle on schema 37 via `gateway_settle_report`.
+    let post_settle_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let mut settled_count = 0;
+        for id in &reqs {
+            if h.fixture.settlement(id).await.is_some() {
+                settled_count += 1;
+            }
+        }
+        if settled_count == CONCURRENT_STREAMS {
+            break;
+        }
+        assert!(
+            Instant::now() < post_settle_deadline,
+            "only {settled_count}/{CONCURRENT_STREAMS} retained streams settled after migration 37 commit"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(idle_in_transaction(&h.fixture).await, 0);
 
     let mut gw = connect(&h.fixture.db.0, pg::GATEWAY).await;
     for sql in [
@@ -4863,39 +4958,39 @@ async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_
             "post-37 gateway role must have zero direct table/helper access: {sql}"
         );
     }
-    assert_eq!(reply2.status, 200);
-    assert!(reply2.complete);
-    assert!(
-        reply2.body == recorded::body("03-chat-stream-usage"),
-        "caller must receive the complete relayed stream across the 36 -> 37 cutover"
-    );
 
     let (fixture, _, events) = h.stop().await;
     assert_eq!(events, []);
-    assert_eq!(
-        fixture.reports(&req2).await,
-        [(
-            req2.clone(),
-            INSTALL.to_owned(),
-            1,
-            true,
-            Some(23),
-            Some(6),
-            Some(0),
-            Some(true),
-        )]
-    );
-    assert_eq!(
-        fixture.settlement(&req2).await,
-        Some((1, true, Some("29".to_owned()), 0))
-    );
-    assert_eq!(
-        fixture.hold_of(&req2, "usage_tokens").await,
-        ("settled".to_owned(), 0, "29".to_owned())
-    );
-    assert_eq!(
-        fixture.hold_of(&req2, "usage_cost_micros").await,
-        ("settled".to_owned(), 0, "340".to_owned())
-    );
+    for id in &reqs {
+        assert_eq!(
+            fixture.reports(id).await,
+            [(
+                id.clone(),
+                INSTALL.to_owned(),
+                1,
+                true,
+                Some(23),
+                Some(6),
+                Some(0),
+                Some(true),
+            )],
+            "missing or mismatched report for {id}"
+        );
+        assert_eq!(
+            fixture.settlement(id).await,
+            Some((1, true, Some("29".to_owned()), 0)),
+            "settlement mismatch for {id}"
+        );
+        assert_eq!(
+            fixture.hold_of(id, "usage_tokens").await,
+            ("settled".to_owned(), 0, "29".to_owned()),
+            "token hold mismatch for {id}"
+        );
+        assert_eq!(
+            fixture.hold_of(id, "usage_cost_micros").await,
+            ("settled".to_owned(), 0, "340".to_owned()),
+            "cost hold mismatch for {id}"
+        );
+    }
     assert_eq!(fixture.drift().await, (0, 0, 0, 0));
 }

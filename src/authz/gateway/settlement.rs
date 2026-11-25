@@ -14,18 +14,22 @@ pub enum Outcome {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ProxyStoreError {
     LockTimeout,
+    PoolTimedOut,
     Store(Error),
 }
 
 impl ProxyStoreError {
     fn into_store_error(self) -> Error {
         match self {
-            Self::LockTimeout => Error::Database,
+            Self::LockTimeout | Self::PoolTimedOut => Error::Database,
             Self::Store(err) => err,
         }
     }
 
     fn from_sqlx_check_refused(err: sqlx::Error) -> Self {
+        if matches!(err, sqlx::Error::PoolTimedOut) {
+            return Self::PoolTimedOut;
+        }
         match err.as_database_error().and_then(|d| d.code()).as_deref() {
             Some("55P03") => Self::LockTimeout,
             _ if err
@@ -41,6 +45,9 @@ impl ProxyStoreError {
 
 impl From<sqlx::Error> for ProxyStoreError {
     fn from(err: sqlx::Error) -> Self {
+        if matches!(err, sqlx::Error::PoolTimedOut) {
+            return Self::PoolTimedOut;
+        }
         match err.as_database_error().and_then(|d| d.code()).as_deref() {
             Some("55P03") => Self::LockTimeout,
             _ => Self::Store(err.into()),
@@ -509,5 +516,34 @@ async fn store_pre37(
             apply(c, r, amount, held).await?;
         }
         Ok(Outcome::Applied)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pool_timed_out_maps_to_proxy_pool_timed_out_and_public_database() {
+        assert_eq!(
+            ProxyStoreError::from(sqlx::Error::PoolTimedOut),
+            ProxyStoreError::PoolTimedOut
+        );
+        assert_eq!(
+            ProxyStoreError::from(crate::runs::Error::Database(sqlx::Error::PoolTimedOut)),
+            ProxyStoreError::PoolTimedOut
+        );
+        assert_eq!(
+            ProxyStoreError::from_sqlx_check_refused(sqlx::Error::PoolTimedOut),
+            ProxyStoreError::PoolTimedOut
+        );
+        assert_eq!(
+            ProxyStoreError::PoolTimedOut.into_store_error(),
+            Error::Database
+        );
+        assert_eq!(
+            ProxyStoreError::LockTimeout.into_store_error(),
+            Error::Database
+        );
     }
 }

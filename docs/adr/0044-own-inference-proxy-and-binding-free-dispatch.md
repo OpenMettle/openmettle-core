@@ -749,16 +749,19 @@ Increment 6 (migration 37). Refs #7.
    migration `37`) and the proxy has no persistent report spool, `0036` → `0037` deployments
    must roll out gateway-first: (1) deploy the `0037`-capable `openmettle-gateway` binary
    against schema `36`, (2) drain all pre-`0037` gateway replicas until in-flight streams and
-   final usage reports complete, and (3) apply migration `0037`. To cover in-flight streams
-   that finish *while* migration `0037` holds exclusive DDL locks, `gateway_proxy::record`
-   distinguishes PostgreSQL lock timeouts (`SQLSTATE 55P03` via `settlement::ingest_for_proxy`)
-   from non-lock transient failures (`WRITE_RETRIES = [100 ms, 500 ms]`): on `55P03`, it rolls
-   back the connection and retains the final report in memory, retrying every `250 ms` for up
-   to `5 minutes` (`300 s`, matching `openmettle-migrate`'s default `STATEMENT_TIMEOUT_MS`)
-   without consuming the two transient retries, so after migration `0037` commits live replicas
-   transition automatically to `gateway_settle_report(...)` (operators raising
-   `OPENMETTLE_MIGRATE_STATEMENT_TIMEOUT_MS` above `300_000` must pause dispatches and drain
-   replicas before migrating).
+   final usage reports complete, and (3) apply migration `0037`. To cover concurrent in-flight
+   streams that finish *while* migration `0037` holds exclusive DDL locks, `gateway_proxy::record`
+   distinguishes both PostgreSQL lock timeouts (`SQLSTATE 55P03`) and `PgPool`
+   connection-acquisition timeouts (`PoolTimedOut`) via `settlement::ingest_for_proxy` from
+   non-lock transient failures (`WRITE_RETRIES = [100 ms, 500 ms]`): on `55P03` or `PoolTimedOut`,
+   it rolls back any open connection and retains the final report in memory, retrying every
+   `250 ms` for up to `5 minutes` (`300 s`) without consuming the two transient retries, so after
+   migration `0037` commits live replicas transition automatically to `gateway_settle_report(...)`.
+   Because PostgreSQL's `statement_timeout` bounds individual SQL statements while table locks
+   persist until the migration transaction commits, operators must pause dispatches and drain
+   gateway replicas before migrating whenever migration `0037`'s **total lock-hold duration**
+   could exceed `300 seconds` (`5 minutes`), including at the default
+   `OPENMETTLE_MIGRATE_STATEMENT_TIMEOUT_MS` setting.
 2. **Superseded tables, columns, code and caller-session removal.** Under an autocommit-safe
    bounded `NOWAIT` lock-retry `DO` block (locking FK parent tables
    `local_identity_approvals`, `users`, `scopes` and `grant_changes` before the gateway tables
@@ -788,7 +791,8 @@ Increment 6 (migration 37). Refs #7.
   `42501` checks, end-to-end `gateway_settle_report` matrix, `openmettle_api` `42501` and
   `23502` (`gateway_reservations.run_id NOT NULL`) vs run-admission `hold_with_cost`,
   `NOWAIT` FK-parent (`scopes`) `55P03` timeout and zero-deadlock concurrent-admission retry,
-  live gateway-first `36 -> 37` in-flight stream cutover finishing *during* >8 s of migration
-  37's held `AccessExclusiveLock` (`55P03` retention across `>= 4` lock-waiting attempts) and
-  settling cleanly through `gateway_settle_report`, boundary-tamper refusals and `36 -> 37`
+  live gateway-first `36 -> 37` cutover with 24 concurrent in-flight SSE streams on the default
+  4-connection pool finishing *during* 12 s of migration 37's held `AccessExclusiveLock` (both
+  `55P03` and `PoolTimedOut` retention across `>= 4` lock-waiting attempts) and settling all 24
+  streams cleanly through `gateway_settle_report`, boundary-tamper refusals and `36 -> 37`
   fail-closed preflight plus populated upgrade replay with zero accounting drift.
