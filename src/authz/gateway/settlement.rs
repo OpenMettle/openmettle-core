@@ -2,12 +2,65 @@
 use super::Error;
 use crate::{provider_http::gateway::UsageReport, runs::WriteTransaction};
 use sqlx::{PgConnection, PgPool, Row};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Applied,
     Duplicate,
     Superseded,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ProxyStoreError {
+    LockTimeout,
+    Store(Error),
+}
+
+impl ProxyStoreError {
+    fn into_store_error(self) -> Error {
+        match self {
+            Self::LockTimeout => Error::Database,
+            Self::Store(err) => err,
+        }
+    }
+
+    fn from_sqlx_check_refused(err: sqlx::Error) -> Self {
+        match err.as_database_error().and_then(|d| d.code()).as_deref() {
+            Some("55P03") => Self::LockTimeout,
+            _ if err
+                .as_database_error()
+                .is_some_and(|d| d.is_check_violation()) =>
+            {
+                Self::Store(Error::Refused)
+            }
+            _ => Self::Store(err.into()),
+        }
+    }
+}
+
+impl From<sqlx::Error> for ProxyStoreError {
+    fn from(err: sqlx::Error) -> Self {
+        match err.as_database_error().and_then(|d| d.code()).as_deref() {
+            Some("55P03") => Self::LockTimeout,
+            _ => Self::Store(err.into()),
+        }
+    }
+}
+
+impl From<crate::runs::Error> for ProxyStoreError {
+    fn from(err: crate::runs::Error) -> Self {
+        match err {
+            crate::runs::Error::Database(db) => Self::from(db),
+            other => Self::Store(other.into()),
+        }
+    }
+}
+
+impl From<Error> for ProxyStoreError {
+    fn from(err: Error) -> Self {
+        Self::Store(err)
+    }
 }
 
 const SETTLE_REPORT_PROC: &str = "openmettle.gateway_settle_report(uuid,uuid,uuid,uuid,uuid,uuid,bigint,boolean,bigint,bigint,bigint,boolean,numeric,text,text)";
@@ -46,7 +99,7 @@ async fn apply(
     r: &UsageReport,
     measured: Option<String>,
     held: i64,
-) -> Result<(), Error> {
+) -> Result<(), ProxyStoreError> {
     sqlx::query("INSERT INTO openmettle.gateway_settlements (request_id,revision,final,measured,outstanding)
         VALUES ($1::uuid,$2,$3,$4::text::numeric,$5) ON CONFLICT (request_id) DO UPDATE
         SET revision=excluded.revision,final=excluded.final,measured=excluded.measured,outstanding=excluded.outstanding")
@@ -54,7 +107,7 @@ async fn apply(
     settle_quota(c, r).await
 }
 
-async fn settle_quota(c: &mut PgConnection, r: &UsageReport) -> Result<(), Error> {
+async fn settle_quota(c: &mut PgConnection, r: &UsageReport) -> Result<(), ProxyStoreError> {
     sqlx::query("SELECT openmettle.quota_settle_gateway_usage($1::uuid,$2::uuid,$3::uuid,$4)")
         .bind(&r.request)
         .bind(&r.source)
@@ -62,15 +115,7 @@ async fn settle_quota(c: &mut PgConnection, r: &UsageReport) -> Result<(), Error
         .bind(r.revision)
         .execute(c)
         .await
-        .map_err(|e| {
-            if e.as_database_error()
-                .is_some_and(|d| d.is_check_violation())
-            {
-                Error::Refused
-            } else {
-                e.into()
-            }
-        })?;
+        .map_err(ProxyStoreError::from_sqlx_check_refused)?;
     Ok(())
 }
 
@@ -142,7 +187,7 @@ async fn is_accepted_report(
     source: &str,
     report_id: &str,
     revision: i64,
-) -> Result<bool, Error> {
+) -> Result<bool, ProxyStoreError> {
     sqlx::query("SAVEPOINT accepted_report")
         .execute(&mut *c)
         .await?;
@@ -185,7 +230,7 @@ async fn legacy_outstanding(
     c: &mut PgConnection,
     r: &UsageReport,
     units: i64,
-) -> Result<(i64, bool), Error> {
+) -> Result<(i64, bool), ProxyStoreError> {
     let mut fold = TokenFold::default();
     let mut after = -1_i64;
     loop {
@@ -235,7 +280,9 @@ async fn legacy_outstanding(
 /// `WriteTransaction` so `openmettle_gateway` holds zero table or column privileges; on pre-37
 /// schemas falls back to the unbound SQL path for rolling-upgrade compatibility.
 pub async fn ingest(pool: &PgPool, r: &UsageReport) -> Result<Outcome, Error> {
-    store(pool, r, None).await
+    store_inner(pool, r, None, Duration::from_secs(2))
+        .await
+        .map_err(ProxyStoreError::into_store_error)
 }
 
 /// [`ingest`] for a request that ended without usage (ADR 0044): the final report `r` carries
@@ -246,10 +293,30 @@ pub async fn ingest_incomplete(
     r: &UsageReport,
     reason: &str,
 ) -> Result<Outcome, Error> {
-    store(pool, r, Some(reason)).await
+    store_inner(pool, r, Some(reason), Duration::from_secs(2))
+        .await
+        .map_err(ProxyStoreError::into_store_error)
 }
 
-async fn store(pool: &PgPool, r: &UsageReport, incomplete: Option<&str>) -> Result<Outcome, Error> {
+/// Proxy-internal settlement entrypoint that preserves PostgreSQL lock timeouts (`SQLSTATE 55P03`)
+/// as [`ProxyStoreError::LockTimeout`] and bounds `SET LOCAL lock_timeout` to `lock_timeout`
+/// (clamped to `1..=2000 ms`) so `gateway_proxy::record` can retain reports across schema DDL
+/// locks without consuming transient retries.
+pub(crate) async fn ingest_for_proxy(
+    pool: &PgPool,
+    r: &UsageReport,
+    incomplete: Option<&str>,
+    lock_timeout: Duration,
+) -> Result<Outcome, ProxyStoreError> {
+    store_inner(pool, r, incomplete, lock_timeout).await
+}
+
+async fn store_inner(
+    pool: &PgPool,
+    r: &UsageReport,
+    incomplete: Option<&str>,
+    lock_timeout: Duration,
+) -> Result<Outcome, ProxyStoreError> {
     let carries_usage = r.prompt_tokens.is_some()
         || r.completion_tokens.is_some()
         || r.reasoning_tokens.is_some()
@@ -261,63 +328,64 @@ async fn store(pool: &PgPool, r: &UsageReport, incomplete: Option<&str>) -> Resu
             carries_usage || matches!(reason, "not_dispatched" | "unreported")
         })
     {
-        return Err(Error::Refused);
+        return Err(ProxyStoreError::Store(Error::Refused));
     }
     let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
-    let c = tx.connection()?;
-    let has_settle_fn: bool = sqlx::query_scalar("SELECT to_regprocedure($1) IS NOT NULL")
-        .bind(SETTLE_REPORT_PROC)
-        .fetch_one(&mut *c)
-        .await?;
-    let outcome = if has_settle_fn {
-        let verdict: String = sqlx::query_scalar(
-            "SELECT openmettle.gateway_settle_report($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6::uuid,$7,$8,$9,$10,$11,$12,$13::text::numeric,$14,$15)",
-        )
-        .bind(&r.request)
-        .bind(&r.installation)
-        .bind(&r.principal)
-        .bind(&r.scope)
-        .bind(&r.source)
-        .bind(&r.report_id)
-        .bind(r.revision)
-        .bind(r.r#final)
-        .bind(r.prompt_tokens)
-        .bind(r.completion_tokens)
-        .bind(r.reasoning_tokens)
-        .bind(r.reasoning_included)
-        .bind(&r.cost)
-        .bind(&r.unit)
-        .bind(incomplete)
-        .fetch_one(&mut *c)
-        .await
-        .map_err(|e| {
-            if e.as_database_error()
-                .is_some_and(|d| d.is_check_violation())
-            {
-                Error::Refused
-            } else {
-                e.into()
+    let lock_ms = format!("{}ms", lock_timeout.as_millis().clamp(1, 2000));
+    let result: Result<Outcome, ProxyStoreError> = async {
+        let c = tx.connection()?;
+        sqlx::query("SELECT pg_catalog.set_config('lock_timeout', $1, true)")
+            .bind(&lock_ms)
+            .execute(&mut *c)
+            .await?;
+        let has_settle_fn: bool = sqlx::query_scalar("SELECT to_regprocedure($1) IS NOT NULL")
+            .bind(SETTLE_REPORT_PROC)
+            .fetch_one(&mut *c)
+            .await?;
+        if has_settle_fn {
+            let verdict: String = sqlx::query_scalar(
+                "SELECT openmettle.gateway_settle_report($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6::uuid,$7,$8,$9,$10,$11,$12,$13::text::numeric,$14,$15)",
+            )
+            .bind(&r.request)
+            .bind(&r.installation)
+            .bind(&r.principal)
+            .bind(&r.scope)
+            .bind(&r.source)
+            .bind(&r.report_id)
+            .bind(r.revision)
+            .bind(r.r#final)
+            .bind(r.prompt_tokens)
+            .bind(r.completion_tokens)
+            .bind(r.reasoning_tokens)
+            .bind(r.reasoning_included)
+            .bind(&r.cost)
+            .bind(&r.unit)
+            .bind(incomplete)
+            .fetch_one(&mut *c)
+            .await
+            .map_err(ProxyStoreError::from_sqlx_check_refused)?;
+            match verdict.as_str() {
+                "applied" => Ok(Outcome::Applied),
+                "duplicate" => Ok(Outcome::Duplicate),
+                "superseded" => Ok(Outcome::Superseded),
+                "conflict" => Err(ProxyStoreError::Store(Error::Conflict)),
+                _ => Err(ProxyStoreError::Store(Error::Database)),
             }
-        })?;
-        match verdict.as_str() {
-            "applied" => Outcome::Applied,
-            "duplicate" => Outcome::Duplicate,
-            "superseded" => Outcome::Superseded,
-            "conflict" => return Err(Error::Conflict),
-            _ => return Err(Error::Database),
+        } else {
+            store_pre37(c, r, incomplete).await
         }
-    } else {
-        store_pre37(c, r, incomplete).await?
+    }
+    .await;
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err);
+        }
     };
     tx.commit().await.map_err(|e| match e {
-        crate::runs::Error::Database(ref db)
-            if db
-                .as_database_error()
-                .is_some_and(|d| d.is_check_violation()) =>
-        {
-            Error::Refused
-        }
-        other => other.into(),
+        crate::runs::Error::Database(db) => ProxyStoreError::from_sqlx_check_refused(db),
+        other => ProxyStoreError::Store(other.into()),
     })?;
     Ok(outcome)
 }
@@ -326,7 +394,7 @@ async fn store_pre37(
     c: &mut PgConnection,
     r: &UsageReport,
     incomplete: Option<&str>,
-) -> Result<Outcome, Error> {
+) -> Result<Outcome, ProxyStoreError> {
     sqlx::query("SELECT openmettle.quota_lock_gateway_request_for_settlement($1::uuid)")
         .bind(&r.request)
         .execute(&mut *c)
@@ -370,31 +438,23 @@ async fn store_pre37(
             .await?
             .try_get::<bool, _>(0)?
         {
-            return Err(Error::Conflict);
+            return Err(Error::Conflict.into());
         }
         if is_accepted_report(c, &r.request, &r.source, &r.report_id, r.revision).await? {
             return Ok(Outcome::Duplicate);
         }
         if reject_shape {
-            return Err(Error::Refused);
+            return Err(Error::Refused.into());
         }
         0
     } else {
         if reject_shape {
-            return Err(Error::Refused);
+            return Err(Error::Refused.into());
         }
         let rows = evidence(INSERT_REPORT, r, incomplete)
             .execute(&mut *c)
             .await
-            .map_err(|e| {
-                if e.as_database_error()
-                    .is_some_and(|d| d.is_check_violation())
-                {
-                    Error::Refused
-                } else {
-                    e.into()
-                }
-            })?
+            .map_err(ProxyStoreError::from_sqlx_check_refused)?
             .rows_affected();
         if rows == 0
             && !evidence(EXACT_REPORT, r, incomplete)
@@ -402,7 +462,7 @@ async fn store_pre37(
                 .await?
                 .try_get::<bool, _>(0)?
         {
-            return Err(Error::Conflict);
+            return Err(Error::Conflict.into());
         }
         rows
     };
@@ -440,7 +500,7 @@ async fn store_pre37(
             None => legacy_outstanding(c, r, units).await?,
         };
         if r.r#final && !closed {
-            return Err(Error::Refused);
+            return Err(Error::Refused.into());
         }
         if held != previous {
             sqlx::query("ROLLBACK TO SAVEPOINT gateway_fold")

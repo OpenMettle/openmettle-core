@@ -1022,6 +1022,8 @@ enum Fault {
     Delay(Duration),
     /// The trigger reaches the server, but the next reply is held back until released.
     Hold,
+    /// The trigger packet is held back before reaching the server until released.
+    HoldBeforeSend,
 }
 
 /// Forwards connections to the test PostgreSQL service, with one [`Fault`] on the connection
@@ -1162,6 +1164,10 @@ async fn forward(client: tokio::net::TcpStream, server: tokio::net::TcpStream, f
                         *hold.lock().unwrap() = Some(tokio::time::Instant::now() + delay);
                     }
                     Fault::Hold => gate.store(true, Ordering::SeqCst),
+                    Fault::HoldBeforeSend => {
+                        faults.release.notified().await;
+                        faults.late.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
             }
             // Keep less than one trigger, so an occurrence is counted once.
@@ -4646,20 +4652,28 @@ async fn review_1_p2_upstream_non_200_withholds_echoed_cache_salt_and_settles_up
     assert_eq!(fixture.drift().await, (0, 0, 0, 0));
 }
 
-/// Review #1 P1: gateway-first `0036 -> 0037` live cutover.
+/// Review #1 & #2 P1: gateway-first `0036 -> 0037` live cutover while an in-flight stream
+/// finishes *during* migration 37's held exclusive DDL locks (> 8 s).
 ///
 /// 1. Start the `0037`-capable `openmettle-gateway` binary against a schema-36 database and
 ///    complete request 1 (`02-chat-plain`), proving settlement succeeds via the pre-37 fallback.
 /// 2. Dispatch request 2 (`03-chat-stream-usage`) on schema 36 and hold its SSE stream open at
-///    the upstream while `openmettle-migrate` applies migration 37 on the same database.
-/// 3. Verify `openmettle_gateway` now receives `42501` on direct table/helper access, release
-///    the upstream stream, and verify the live gateway pool automatically switches to
-///    `openmettle.gateway_settle_report(...)` and settles both token and cost holds with zero
-///    drift and zero error events.
+///    the upstream while `openmettle-migrate` runs migration 37 through `FaultyPostgres` paused
+///    before `COMMIT` (holding migration 37's real `AccessExclusiveLock` on `gateway_requests`,
+///    `gateway_usage_reports`, and `gateway_settlements`).
+/// 3. Release request 2's SSE stream *while* migration 37's locks are held, confirm the caller
+///    receives the full stream, and keep `COMMIT` paused past the old ~6.6 s transient-retry
+///    budget (observing >= 4 distinct `55P03` lock-waiting attempts across >= 8 s).
+/// 4. Release `COMMIT`, verify `openmettle_gateway` now receives `42501` on direct table/helper
+///    access, and confirm the live gateway pool transitions to `openmettle.gateway_settle_report`
+///    and settles both token (`29`) and cost (`340` micros) holds with zero drift and zero error
+///    events.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "isolated PostgreSQL 18 required"]
 async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_gateway_settle_report()
  {
+    use std::collections::HashSet;
+
     let db = TestDb::new().await;
     migrate::apply(&db.settings(Duration::from_secs(10)), &MIGRATIONS[..36])
         .await
@@ -4734,13 +4748,27 @@ async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_
         ("settled".to_owned(), 0, "240".to_owned())
     );
 
-    // 2. Request 2 dispatches on schema 36, holds its SSE stream open while migration 37 runs,
-    //    then finishes streaming and settles on schema 37 via `gateway_settle_report`.
+    // 2. Request 2 dispatches on schema 36; migration 37 runs through `FaultyPostgres` paused
+    //    right before `COMMIT`, holding its real `AccessExclusiveLock` while request 2 finishes
+    //    streaming and retries its final report across > 8 s of `55P03` lock timeouts.
     let req2 = h
         .fixture
         .request_with_pricing(MODEL, false, Some(pricing))
         .await;
+    let mig_pg = FaultyPostgres::start(COMMIT, 0, Fault::HoldBeforeSend).await;
+    let (mig_host, mig_port) = mig_pg.address.rsplit_once(':').unwrap();
+    let mut mig_settings = h.fixture.db.settings(Duration::from_secs(30));
+    mig_settings.database = mig_settings
+        .database
+        .host(mig_host)
+        .port(mig_port.parse().unwrap());
+
+    let start_mig = tokio::sync::Notify::new();
     let send2 = h.send_recorded("03-chat-stream-usage", &req2, Then::Read);
+    let mig_run = async {
+        start_mig.notified().await;
+        migrate::apply(&mig_settings, MIGRATIONS).await
+    };
     let cutover = async {
         eventually(Duration::from_secs(10), "req2 reached stand-in", || {
             h.upstream.count() >= 2
@@ -4755,30 +4783,86 @@ async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_
             "req2 must still be unsettled while stream is held open"
         );
 
-        migrate::apply(&h.fixture.db.settings(Duration::from_secs(10)), MIGRATIONS)
+        start_mig.notify_one();
+
+        // Wait until migration 37 has executed its entire body and paused right before `COMMIT`
+        // while holding `AccessExclusiveLock` on `openmettle.gateway_requests`.
+        let lock_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let holds_lock: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1
+                       FROM pg_locks l
+                       JOIN pg_stat_activity a ON a.pid = l.pid
+                      WHERE a.datname = $1
+                        AND a.application_name = $2
+                        AND l.relation = 'openmettle.gateway_requests'::regclass
+                        AND l.mode = 'AccessExclusiveLock'
+                        AND l.granted
+                 )",
+            )
+            .bind(&h.fixture.db.0)
+            .bind(migrate::APPLICATION_NAME)
+            .fetch_one(&mut h.fixture.db.admin().await)
             .await
-            .expect("live migration 37 during in-flight stream must succeed");
+            .unwrap();
+            if holds_lock && mig_pg.attempts.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < lock_deadline,
+                "migration 37 did not reach COMMIT while holding AccessExclusiveLock"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert_eq!(
             h.upstream.gate.timeouts.load(Ordering::SeqCst),
             0,
-            "migration 37 must finish before the held stream times out"
+            "migration 37 must pause at COMMIT before the held stream times out"
         );
 
-        let mut gw = connect(&h.fixture.db.0, pg::GATEWAY).await;
-        for sql in [
-            "SELECT id FROM openmettle.gateway_requests",
-            "SELECT openmettle.quota_lock_gateway_request_for_settlement(gen_random_uuid())",
-        ] {
-            assert_eq!(
-                sqlstate(gw.execute(sql).await),
-                "42501",
-                "post-37 gateway role must have zero direct table/helper access: {sql}"
+        // Release req2's upstream SSE stream *during* migration 37's held DDL locks so the proxy
+        // finishes relaying and must retain the final report across repeated `55P03` lock timeouts.
+        h.upstream.gate.released.notify_one();
+
+        // Keep `COMMIT` held past the old ~6.6 s transient-retry ceiling, requiring >= 4 distinct
+        // `55P03` lock-waiting attempts over >= 8 s before letting migration 37 commit.
+        let hold_start = Instant::now();
+        let mut seen_attempts = HashSet::new();
+        let retry_deadline = hold_start + Duration::from_secs(18);
+        loop {
+            for attempt in blocked_attempts(&h.fixture).await {
+                seen_attempts.insert(attempt);
+            }
+            if seen_attempts.len() >= 4 && hold_start.elapsed() >= Duration::from_secs(8) {
+                break;
+            }
+            assert!(
+                Instant::now() < retry_deadline,
+                "proxy stopped retrying during migration 37 DDL lock (saw {} distinct lock-waiting attempts in {:?})",
+                seen_attempts.len(),
+                hold_start.elapsed()
             );
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        h.upstream.gate.released.notify_one();
+        mig_pg.release();
     };
-    let (reply2, ()) = tokio::join!(send2, cutover);
+    let (reply2, mig_res, ()) = tokio::join!(send2, mig_run, cutover);
+    mig_res.expect("live migration 37 during in-flight stream must succeed");
+    assert_eq!(mig_pg.late.load(Ordering::SeqCst), 1);
+
+    let mut gw = connect(&h.fixture.db.0, pg::GATEWAY).await;
+    for sql in [
+        "SELECT id FROM openmettle.gateway_requests",
+        "SELECT openmettle.quota_lock_gateway_request_for_settlement(gen_random_uuid())",
+    ] {
+        assert_eq!(
+            sqlstate(gw.execute(sql).await),
+            "42501",
+            "post-37 gateway role must have zero direct table/helper access: {sql}"
+        );
+    }
     assert_eq!(reply2.status, 200);
     assert!(reply2.complete);
     assert!(
