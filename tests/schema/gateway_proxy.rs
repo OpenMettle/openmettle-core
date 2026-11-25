@@ -4652,32 +4652,28 @@ async fn review_1_p2_upstream_non_200_withholds_echoed_cache_salt_and_settles_up
     assert_eq!(fixture.drift().await, (0, 0, 0, 0));
 }
 
-/// Review #1, #2 & #3 P1: gateway-first `0036 -> 0037` live cutover while **24 concurrent**
-/// in-flight SSE streams finish *during* a **12-second** migration 37 DDL lock hold against the
-/// default 4-connection `openmettle_gateway` pool (`DB_MAX_CONNECTIONS = 4`, `DB_TIMEOUT_MS =
-/// 2000`): 4 report writers block on `AccessExclusiveLock` (`SQLSTATE 55P03`) while the other 20
-/// hit `sqlx::Error::PoolTimedOut` at 2 s.
+/// Shared driver for gateway-first `0036 -> 0037` live cutover tests:
 ///
 /// 1. Start the `0037`-capable `openmettle-gateway` binary against a schema-36 database and
 ///    complete request 1 (`02-chat-plain`), proving settlement succeeds via the pre-37 fallback.
-/// 2. Dispatch 24 concurrent `03-chat-stream-usage` streams on schema 36 and hold all 24 streams
-///    open at the upstream while `openmettle-migrate` runs migration 37 through `FaultyPostgres`
-///    paused before `COMMIT` (holding migration 37's real `AccessExclusiveLock` on
-///    `gateway_requests`, `gateway_usage_reports`, and `gateway_settlements`).
-/// 3. Release all 24 SSE streams *while* migration 37's locks are held, confirm all 24 callers
-///    receive their complete relayed streams before `COMMIT`, and keep `COMMIT` paused for 12 s
-///    (requiring >= 4 distinct `55P03` lock-waiting attempts across 12 s so both `55P03` and
-///    `PoolTimedOut` writers must retain their final reports without exhausting `WRITE_RETRIES`).
+/// 2. Dispatch `stream_count` concurrent `03-chat-stream-usage` streams on schema 36 and hold
+///    them open at the upstream while `openmettle-migrate` runs migration 37 through
+///    `FaultyPostgres` paused before `COMMIT` (holding migration 37's real `AccessExclusiveLock`
+///    on `gateway_requests`, `gateway_usage_reports`, and `gateway_settlements`).
+/// 3. Release all upstream SSE streams *while* migration 37's locks are held, confirm every
+///    caller receives its complete relayed stream before `COMMIT`, and keep `COMMIT` paused for
+///    at least `min_hold` while observing at least `min_distinct_lock_attempts` distinct
+///    lock-waiting settlement transactions (`55P03`).
 /// 4. Release `COMMIT`, verify zero `idle in transaction` connections and `42501` on direct
-///    table/helper access, and confirm all 24 streams settle via `openmettle.gateway_settle_report`
-///    (`29` tokens, `340` micros each) with zero drift and zero error events.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "isolated PostgreSQL 18 required"]
-async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_gateway_settle_report()
- {
+///    table/helper access, and confirm all `stream_count` streams settle via
+///    `openmettle.gateway_settle_report` (`29` tokens, `340` micros each) with zero drift and
+///    zero error events.
+async fn run_gateway_first_36_to_37_cutover(
+    stream_count: usize,
+    min_hold: Duration,
+    min_distinct_lock_attempts: usize,
+) {
     use std::collections::HashSet;
-
-    const CONCURRENT_STREAMS: usize = 24;
 
     async fn send_read(bind: String, id: String, body: Vec<u8>) -> Reply {
         let mut socket = tokio::net::TcpStream::connect(&bind).await.unwrap();
@@ -4779,12 +4775,10 @@ async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_
         ("settled".to_owned(), 0, "240".to_owned())
     );
 
-    // 2. Mint 24 priced requests and dispatch all 24 concurrently on schema 36; migration 37
-    //    pauses right before `COMMIT` for 12 s while all 24 streams finish relaying and retry
-    //    their final reports across both `55P03` lock timeouts and `PoolTimedOut` contention on
-    //    the default 4-connection pool.
-    let mut reqs = Vec::with_capacity(CONCURRENT_STREAMS);
-    for _ in 0..CONCURRENT_STREAMS {
+    // 2. Mint `stream_count` priced requests and dispatch them concurrently on schema 36 while
+    //    migration 37 pauses right before `COMMIT` for at least `min_hold`.
+    let mut reqs = Vec::with_capacity(stream_count);
+    for _ in 0..stream_count {
         reqs.push(
             h.fixture
                 .request_with_pricing(MODEL, false, Some(pricing))
@@ -4801,7 +4795,7 @@ async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_
         .host(mig_host)
         .port(mig_port.parse().unwrap());
 
-    let mut client_tasks = Vec::with_capacity(CONCURRENT_STREAMS);
+    let mut client_tasks = Vec::with_capacity(stream_count);
     for id in &reqs {
         client_tasks.push(tokio::spawn(send_read(
             h.bind.clone(),
@@ -4818,8 +4812,8 @@ async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_
     let cutover = async {
         eventually(
             Duration::from_secs(10),
-            "all 24 streams reached stand-in",
-            || h.upstream.count() > CONCURRENT_STREAMS,
+            "all in-flight streams reached stand-in",
+            || h.upstream.count() > stream_count,
         )
         .await;
         for id in &reqs {
@@ -4871,14 +4865,15 @@ async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_
             "migration 37 must pause at COMMIT before any held stream times out"
         );
 
-        // Release all 24 upstream SSE streams *during* migration 37's held DDL locks, waking any
+        // Release all upstream SSE streams *during* migration 37's held DDL locks, waking any
         // stand-in task that reaches `notified()` a few ms later so none hits the 5 s hold timeout.
+        let expected_finished = stream_count + 1;
         let wake_deadline = Instant::now() + Duration::from_secs(10);
-        while h.upstream.gate.finished.load(Ordering::SeqCst) < 1 + CONCURRENT_STREAMS {
+        while h.upstream.gate.finished.load(Ordering::SeqCst) < expected_finished {
             h.upstream.gate.released.notify_waiters();
             assert!(
                 Instant::now() < wake_deadline,
-                "not all 24 stand-in streams finished after release"
+                "not all {stream_count} stand-in streams finished after release"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -4888,7 +4883,7 @@ async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_
             "no held stand-in stream may time out"
         );
 
-        // Confirm all 24 callers receive their full relayed stream *while* migration 37 is still
+        // Confirm every caller receives its full relayed stream *while* migration 37 is still
         // paused before COMMIT.
         for task in client_tasks {
             let reply = task.await.unwrap();
@@ -4900,22 +4895,25 @@ async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_
             );
         }
 
-        // Keep `COMMIT` held for 12 s after streams finish (past multiple 2 s `PoolTimedOut` and
-        // `55P03` cycles) and verify >= 4 distinct `55P03` lock-waiting attempts before commit.
+        // Keep `COMMIT` held for at least `min_hold` after streams finish and require at least
+        // `min_distinct_lock_attempts` distinct `55P03` lock-waiting attempts before commit.
         let hold_start = Instant::now();
         let mut seen_attempts = HashSet::new();
-        let retry_deadline = hold_start + Duration::from_secs(20);
+        let retry_deadline = hold_start + min_hold + Duration::from_secs(10);
         loop {
             for attempt in blocked_attempts(&h.fixture).await {
                 seen_attempts.insert(attempt);
             }
-            if seen_attempts.len() >= 4 && hold_start.elapsed() >= Duration::from_secs(12) {
+            if seen_attempts.len() >= min_distinct_lock_attempts && hold_start.elapsed() >= min_hold
+            {
                 break;
             }
             assert!(
                 Instant::now() < retry_deadline,
-                "proxy stopped retrying during 12 s migration 37 DDL lock (saw {} distinct lock-waiting attempts in {:?})",
+                "proxy stopped retrying during {:?} migration 37 DDL lock (saw {}/{} distinct lock-waiting attempts in {:?})",
+                min_hold,
                 seen_attempts.len(),
+                min_distinct_lock_attempts,
                 hold_start.elapsed()
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -4924,10 +4922,10 @@ async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_
         mig_pg.release();
     };
     let (mig_res, ()) = tokio::join!(mig_run, cutover);
-    mig_res.expect("live migration 37 during 24 in-flight streams must succeed");
+    mig_res.expect("live migration 37 during in-flight streams must succeed");
     assert_eq!(mig_pg.late.load(Ordering::SeqCst), 1);
 
-    // Wait for all 24 retained reports to settle on schema 37 via `gateway_settle_report`.
+    // Wait for all retained reports to settle on schema 37 via `gateway_settle_report`.
     let post_settle_deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let mut settled_count = 0;
@@ -4936,12 +4934,12 @@ async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_
                 settled_count += 1;
             }
         }
-        if settled_count == CONCURRENT_STREAMS {
+        if settled_count == stream_count {
             break;
         }
         assert!(
             Instant::now() < post_settle_deadline,
-            "only {settled_count}/{CONCURRENT_STREAMS} retained streams settled after migration 37 commit"
+            "only {settled_count}/{stream_count} retained streams settled after migration 37 commit"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -4993,4 +4991,26 @@ async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_
         );
     }
     assert_eq!(fixture.drift().await, (0, 0, 0, 0));
+}
+
+/// Review #1, #2 & #4: single-stream `0036 -> 0037` live cutover across a 9 s DDL lock hold on
+/// the 4-connection pool. With only 1 writer in flight, zero `PoolTimedOut` occurs and that lone
+/// report writer must reach at least its 4th `55P03` lock-waiting attempt (past `WRITE_RETRIES`)
+/// before `COMMIT` releases and settles through `openmettle.gateway_settle_report`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_gateway_settle_report()
+ {
+    run_gateway_first_36_to_37_cutover(1, Duration::from_secs(9), 4).await;
+}
+
+/// Review #3 & #4: 24 concurrent streams finishing during a 12 s `0036 -> 0037` DDL lock hold on
+/// the default 4-connection pool (`DB_MAX_CONNECTIONS = 4`, `DB_TIMEOUT_MS = 2000`), exercising
+/// both `55P03` lock-timeout retention on the 4 active slots and `PoolTimedOut` retention on the
+/// 20 queued writers so all 24 settle through `openmettle.gateway_settle_report`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn review_3_p1_gateway_first_36_to_37_cutover_settles_24_concurrent_streams_across_pool_contention()
+ {
+    run_gateway_first_36_to_37_cutover(24, Duration::from_secs(12), 4).await;
 }
