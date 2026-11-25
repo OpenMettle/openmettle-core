@@ -4,11 +4,14 @@ Accepted with its implementation, 23 November 2026 (V1-06 proxy increments 2a an
 2c delivered 24 November 2026. Amended 24 November 2026 with increments 3a (migration 31),
 3b (migration 32), 3c (migration 33), proxy cost-hold settlement (migration 34, issue #166) and
 increment 4 family policy tables & enforcement (migration 35), and 25 November 2026 with
-increment 5 prefix-cache separation and caller body sanitation (migration 36): see
+increment 5 prefix-cache separation and caller body sanitation (migration 36) and increment 6
+removal of superseded code/tables and function-only `openmettle_gateway` database boundary
+(migration 37): see
 [requests that end without usage](#amendment-24-november-2026-requests-that-end-without-usage),
 [cost-hold settlement from recorded profile pricing](#amendment-24-november-2026-cost-hold-settlement-from-recorded-profile-pricing),
-[family policy tables and enforcement](#amendment-24-november-2026-family-policy-tables-and-enforcement)
-and [prefix-cache separation](#amendment-25-november-2026-prefix-cache-separation).
+[family policy tables and enforcement](#amendment-24-november-2026-family-policy-tables-and-enforcement),
+[prefix-cache separation](#amendment-25-november-2026-prefix-cache-separation) and
+[removal of superseded code and tables](#amendment-25-november-2026-removal-of-superseded-code-and-tables).
 Refs #7, #9, #17, #166.
 Supersedes [ADR 0037](0037-gateway-provisioning-and-usage-reconciliation.md) in part: see
 [What ADR 0037 still decides](#what-adr-0037-still-decides) and [Superseded](#superseded).
@@ -194,31 +197,36 @@ upstream's own usage object, as in increment 1.
 Per-user virtual keys and their generations; sealing and the key ring; remote reconciliation,
 intents and their audit trail; the admin profile and its client.
 
-### Left in place, unused, until increment 6
+### Removed in increment 6 (migration 37)
 
-Removing this code is a separate increment so that this one stays reviewable. Until then the
-following exists and nothing in a deployment reaches it:
+Delivered 25 November 2026 (see the
+[increment 6 amendment](#amendment-25-november-2026-removal-of-superseded-code-and-tables)):
 
 - Tables `gateway_bindings`, `gateway_generations`, `gateway_nonces`, `gateway_policy`,
   `gateway_intents` and `gateway_audit`, with their grants.
-- The columns `binding_id`, `generation` and `policy_revision` of `gateway_requests` and their
-  three foreign keys.
-- SQL function `openmettle.gateway_handoff`.
+- Columns `binding_id`, `generation`, `policy_revision` and `session_id` of `gateway_requests`,
+  their foreign keys, `gateway_requests_caller_reservation_idx` and
+  `gateway_requests_unbound_outstanding_idx` (`run_id` and `round` are now `NOT NULL`).
+- SQL functions `openmettle.gateway_handoff` and `openmettle.quota_commit_handoff(uuid, bytea)`.
 - `src/authz/gateway/reconcile.rs`.
-- `Pending::handoff`, `handoff_in`, `intent` and `publish_generation` in `src/authz/gateway.rs`.
+- `Authority::Session`, `Pending::handoff`, `handoff_in`, `intent` and `publish_generation` in
+  `src/authz/gateway.rs`, plus `CallerDispatch` and `BillableDispatch` in `src/provider_http.rs`.
 - The usage backfill (`settlement::Backfill`) and its `backfill.sql` and `legacy_backfill.sql`.
-- The admin client (`src/provider_http/gateway.rs`) and `gateway/profile.rs`, except
-  `UsageReport`, which settlement uses.
-- The gateway key ring and sealer (`src/provider_keys/gateway.rs`) and the API document's
-  `gateway_keys` member. The worker no longer has either (increment 2c).
-- The family-policy client flag.
+- The admin client (`src/provider_http/gateway.rs`), `gateway/profile.rs` and
+  `gateway/problem.rs` (keeping `UsageReport`, which settlement uses).
+- The gateway key ring and sealer (`src/provider_keys/gateway.rs`) and the API auth document's
+  `gateway_keys` member (refused as an unknown field in v2, matching the worker document from
+  increment 2c).
+- The legacy `FamilyPolicy` client struct and `Gateway::with_family_policy_v1` client flag.
 
 ### Session callers
 
-`gateway::reserve` with a session and `Pending::handoff` have no caller outside tests: no API
-route performs a caller-owned completion. That path stays on the unreachable
-`gateway_handoff`. It is deleted with the code above or rebuilt on this design when a caller
-exists.
+On 25 November 2026 the owner confirmed full removal of the unwired caller-session inference
+scaffolding (`Authority::Session`, `Pending::handoff`, `CallerDispatch`, `BillableDispatch`,
+`gateway_requests.session_id`, and `openmettle_api`'s round-level `gateway_requests` /
+`gateway_release` / `quota_recover_lost_handoff` privileges). `openmettle_api` keeps run-level
+admission holds (`INSERT` on `gateway_reservations` and quota admission helpers). Any future
+caller-owned completion route will be designed fresh on binding-free dispatch.
 
 ## Alternatives
 
@@ -267,7 +275,7 @@ exists.
 | 3d | Running usage for cut streams. |
 | 4 | Family policy tables, SQL evaluator, four-point enforcement, audited store API and `openmettle-admin family` CLI; migration 35 (delivered 24 November 2026, see the amendment). |
 | 5 | Prefix-cache separation (`cache_salt`) and caller body sanitation; migration 36 (delivered 25 November 2026, see the amendment). |
-| 6 | Removal of the superseded code and tables. |
+| 6 | Removal of the superseded ADR 0037 code, tables and unwired caller-session scaffolding, plus function-only `openmettle_gateway` database boundary (`gateway_settle_report`); migration 37 (delivered 25 November 2026, see the amendment). |
 | 7 | Deployment, TLS and network policy. |
 
 ## Open points
@@ -284,9 +292,10 @@ exists.
   only workers to the proxy is the mitigation, and TLS terminated in front of the proxy is
   the stricter option. The proxy has no TLS listener of its own, and mutual TLS is a possible
   later option. The proxy stays undeployable until increments 3 and 7.
-- **Broad database role.** `openmettle_gateway` still has the grants the reconciler needed. A
-  network-facing process needs only the dispatch and settlement functions. Increment 6
-  narrows the role.
+- **Broad database role (resolved in increment 6).** Migration 37 revoked all table, column and
+  internal quota helper privileges from `openmettle_gateway`, leaving only `CONNECT`, schema
+  `USAGE` and `EXECUTE` on `gateway_dispatch`, `gateway_dispatch_scoped` and
+  `gateway_settle_report`.
 
 ## Amendment, 24 November 2026: requests that end without usage
 
@@ -719,3 +728,71 @@ hit one another's cached prefixes, and a caller could set SGLang's cache or rout
   pre-36 fallback `cache_salt`s; reserved-key `400 validation` + `request_body` zero-charge token
   and cost settlement with zero drift; and packaged `openmettle-worker` -> `openmettle-gateway`
   end-to-end `cache_salt` forwarding.
+
+## Amendment, 25 November 2026: removal of superseded code and tables
+
+Increment 6 (migration 37). Refs #7.
+
+### Decision
+
+1. **Function-only `openmettle_gateway` database boundary.** Proxy usage settlement moves into
+   `openmettle.gateway_settle_report(...)` (`SECURITY DEFINER`, `SET search_path = pg_catalog`,
+   `EXECUTE` granted solely to `openmettle_gateway`, verifying `READ COMMITTED` and
+   `pg_has_role(session_user, 'openmettle_gateway', 'USAGE')`). Migration 37 revokes every table
+   and column privilege and `EXECUTE` on `quota_lock_gateway_request_for_settlement(uuid)` and
+   `quota_settle_gateway_usage(uuid, uuid, uuid, bigint)` from `openmettle_gateway`, leaving
+   only database `CONNECT`, schema `USAGE` and `EXECUTE` on `gateway_dispatch(uuid, bytea)`,
+   `gateway_dispatch_scoped(uuid, bytea)` and `gateway_settle_report(...)`. During rolling
+   upgrades against pre-37 schemas, `settlement::store` probes `to_regprocedure` per transaction
+   and falls back to the unbound pre-37 SQL path. Because pre-`0037` `openmettle-gateway`
+   replicas call `quota_lock_gateway_request_for_settlement` (which returns `42501` after
+   migration `37`) and the proxy has no persistent report spool, `0036` → `0037` deployments
+   must roll out gateway-first: (1) deploy the `0037`-capable `openmettle-gateway` binary
+   against schema `36`, (2) drain all pre-`0037` gateway replicas until in-flight streams and
+   final usage reports complete, and (3) apply migration `0037`. To cover concurrent in-flight
+   streams that finish *while* migration `0037` holds exclusive DDL locks, `gateway_proxy::record`
+   distinguishes both PostgreSQL lock timeouts (`SQLSTATE 55P03`) and `PgPool`
+   connection-acquisition timeouts (`PoolTimedOut`) via `settlement::ingest_for_proxy` from
+   non-lock transient failures (`WRITE_RETRIES = [100 ms, 500 ms]`): on `55P03` or `PoolTimedOut`,
+   it rolls back any open connection and retains the final report in memory, retrying every
+   `250 ms` for up to `5 minutes` (`300 s`) without consuming the two transient retries, so after
+   migration `0037` commits live replicas transition automatically to `gateway_settle_report(...)`.
+   Because PostgreSQL's `statement_timeout` bounds individual SQL statements while table locks
+   persist until the migration transaction commits, operators must pause dispatches and drain
+   gateway replicas before migrating whenever migration `0037`'s **total lock-hold duration**
+   could exceed `300 seconds` (`5 minutes`), including at the default
+   `OPENMETTLE_MIGRATE_STATEMENT_TIMEOUT_MS` setting.
+2. **Superseded tables, columns, code and caller-session removal.** Under an autocommit-safe
+   bounded `NOWAIT` lock-retry `DO` block (locking FK parent tables
+   `local_identity_approvals`, `users`, `scopes` and `grant_changes` before the gateway tables
+   so concurrent admission/policy transactions cannot deadlock with `DROP TABLE`), migration 37
+   fails closed (`23514`) if any legacy bound `gateway_requests`, caller-session
+   `gateway_requests`/`gateway_reservations` or caller-priced `gateway_usage_reports` rows
+   remain; drops `gateway_handoff`, `quota_commit_handoff(uuid, bytea)`, the six ADR 0037
+   provisioning tables (`gateway_audit`, `gateway_intents`, `gateway_policy`,
+   `gateway_generations`, `gateway_nonces`, `gateway_bindings`) and
+   `gateway_requests.{binding_id, generation, policy_revision, session_id}` (setting
+   `gateway_reservations.run_id`, `gateway_requests.run_id` and `gateway_requests.round`
+   `NOT NULL`); revokes `openmettle_api`'s round-level privileges on `gateway_requests`,
+   `gateway_release(uuid, bytea)` and `quota_recover_lost_handoff` while keeping run-admission
+   `gateway_reservations` holds (`gateway::hold` / `hold_with_cost` taking non-optional
+   `run: &str`); and removes the corresponding Rust reconciler, admin client, key ring/sealer,
+   `auth_config.gateway_keys`, legacy `FamilyPolicy`, `with_family_policy_v1` and caller-session
+   dispatch types. Versioned telemetry definitions in `contracts/telemetry/v1.json` and
+   `src/telemetry/metrics.rs` stay unchanged for v1 contract compatibility.
+
+### Evidence
+
+- `migrations/0037_gateway_remove_superseded.sql`, `src/boundaries.sql` (version-gated
+  pre-37 vs `>= 37` contract), `src/authz/gateway.rs`, `src/authz/gateway/settlement.rs`,
+  `src/auth_config/tests.rs`.
+- `tests/schema/gateway_rounds.rs`, `tests/schema/gateway.rs`, `tests/schema/gateway_proxy.rs`,
+  `tests/schema/grants.rs`: dropped-object assertions, `openmettle_gateway` zero-table/column
+  `42501` checks, end-to-end `gateway_settle_report` matrix, `openmettle_api` `42501` and
+  `23502` (`gateway_reservations.run_id NOT NULL`) vs run-admission `hold_with_cost`,
+  `NOWAIT` FK-parent (`scopes`) `55P03` timeout and zero-deadlock concurrent-admission retry,
+  live gateway-first `36 -> 37` cutover with 24 concurrent in-flight SSE streams on the default
+  4-connection pool finishing *during* 12 s of migration 37's held `AccessExclusiveLock` (both
+  `55P03` and `PoolTimedOut` retention across `>= 4` lock-waiting attempts) and settling all 24
+  streams cleanly through `gateway_settle_report`, boundary-tamper refusals and `36 -> 37`
+  fail-closed preflight plus populated upgrade replay with zero accounting drift.

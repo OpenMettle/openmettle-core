@@ -99,6 +99,12 @@ const REQUEST_READ: Duration = Duration::from_secs(10);
 const RELAY_BUFFER: usize = 8;
 /// Pauses before the second and third attempt to store a report after a transient failure.
 const WRITE_RETRIES: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(500)];
+/// Longest wall-clock window to keep retrying a report write blocked by PostgreSQL `lock_timeout`
+/// (`55P03`) or `PgPool` connection-acquisition contention (`PoolTimedOut`), so concurrent streams
+/// finishing while a schema migration holds exclusive DDL locks settle once the migration commits.
+const LOCK_RETRY_WINDOW: Duration = Duration::from_secs(300);
+/// Pause between lock-timeout (`55P03`) or pool-contention (`PoolTimedOut`) report write retries.
+const LOCK_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 /// Each write transaction, spending a dispatch or storing a report, gets this many
 /// `DB_TIMEOUT_MS` before the proxy stops waiting for it, also when its database connection has
 /// stopped answering. A report write is then retried.
@@ -1104,8 +1110,11 @@ fn report(id: String, routing: Routing, usage: Option<Usage>) -> UsageReport {
 
 /// Stores the one report of request `id`: the usage the upstream reported, or the reason there
 /// is none. Either closes the request's token hold; a report without counts is never written
-/// without its reason, because settlement would then keep the hold for good. A transient
-/// database failure is retried twice. No local spool.
+/// without its reason, because settlement would then keep the hold for good. Transient database
+/// failures retry twice (`WRITE_RETRIES`); PostgreSQL lock timeouts (`SQLSTATE 55P03`, such as
+/// exclusive DDL locks held by `openmettle-migrate`) and `PgPool` connection-acquisition timeouts
+/// (`PoolTimedOut`) retry every `LOCK_RETRY_BACKOFF` for up to `LOCK_RETRY_WINDOW` without
+/// consuming `WRITE_RETRIES`. No local spool.
 ///
 /// Each attempt runs in its own task and is never cancelled in flight: sqlx counts a transaction
 /// only once the server acknowledges `BEGIN`, so a cancelled `BEGIN` could put its connection
@@ -1122,27 +1131,40 @@ async fn record(
 ) {
     let report = report(id, routing, usage.ok());
     let reason = usage.err().map(UsageGap::as_str);
+    let lock_timeout = (limit / 2).clamp(Duration::from_millis(1), Duration::from_secs(2));
+    let lock_deadline = Instant::now() + LOCK_RETRY_WINDOW;
     let mut attempt = 0;
     loop {
         let (pool, owned) = (pool.clone(), report.clone());
         let task = tokio::spawn(async move {
-            match reason {
-                None => settlement::ingest(&pool, &owned).await,
-                Some(reason) => settlement::ingest_incomplete(&pool, &owned, reason).await,
-            }
+            settlement::ingest_for_proxy(&pool, &owned, reason, lock_timeout).await
         });
         let outcome = match timeout(limit, task).await {
             Ok(Ok(outcome)) => outcome,
             // Abandoned past `limit`, or the attempt panicked.
-            _ => Err(StoreError::Database),
+            _ => Err(settlement::ProxyStoreError::Store(StoreError::Database)),
         };
         match outcome {
             Ok(_) => return,
-            Err(StoreError::Database | StoreError::Retryable) if attempt < WRITE_RETRIES.len() => {
+            Err(
+                settlement::ProxyStoreError::LockTimeout
+                | settlement::ProxyStoreError::PoolTimedOut,
+            ) => {
+                if Instant::now() < lock_deadline {
+                    tokio::time::sleep(LOCK_RETRY_BACKOFF).await;
+                    continue;
+                }
+                return telemetry::gateway_usage_failed(&report.request, &StoreError::Database);
+            }
+            Err(settlement::ProxyStoreError::Store(
+                StoreError::Database | StoreError::Retryable,
+            )) if attempt < WRITE_RETRIES.len() => {
                 tokio::time::sleep(WRITE_RETRIES[attempt]).await;
                 attempt += 1;
             }
-            Err(error) => return telemetry::gateway_usage_failed(&report.request, &error),
+            Err(settlement::ProxyStoreError::Store(error)) => {
+                return telemetry::gateway_usage_failed(&report.request, &error);
+            }
         }
     }
 }

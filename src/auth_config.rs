@@ -75,7 +75,6 @@ pub enum Error {
     CursorKeyFile,
     /// Invalid cursor key count, identifier or key separation.
     CursorKeyRing,
-    GatewayKeyRing,
     Catalog,
     AdmissionLimits,
     /// No provider, or more than the configured manager capacity.
@@ -120,7 +119,6 @@ impl fmt::Display for Error {
             Self::CursorKeyFile => {
                 "a cursor key is not a readable regular file of exactly 32 bytes"
             }
-            Self::GatewayKeyRing => "gateway key files, identifiers or key separation are invalid",
             Self::Catalog => "model catalog is unreadable or invalid",
             Self::AdmissionLimits => "run admission limits are invalid",
             Self::CursorKeyRing => "cursor key count, identifiers or key separation are invalid",
@@ -230,17 +228,7 @@ impl CursorKeys {
     }
 }
 
-fn shared_key_material(left: &[(String, SharedSecret)], right: &[(String, SharedSecret)]) -> bool {
-    let mut shared = subtle::Choice::from(0);
-    for (_, key) in left {
-        for (_, other) in right {
-            shared |= key.secret_bytes().ct_eq(other.secret_bytes());
-        }
-    }
-    bool::from(shared)
-}
-
-/// One active key file and its previous keys: cursor keys, or the gateway unseal ring.
+/// One active cursor key file and its previous verify-only keys.
 pub(crate) struct CursorFiles {
     active: KeyFile,
     verify_only: Vec<KeyFile>,
@@ -260,24 +248,12 @@ impl CursorFiles {
         })
     }
 
-    /// The raw gateway unseal ring (ADR 0037): the active key first, then previous keys.
-    pub(crate) fn gateway_material(&self) -> Result<Vec<(String, SharedSecret)>, Error> {
-        key_material(&self.active, &self.verify_only).map_err(|_| Error::GatewayKeyRing)
-    }
-
-    fn load(
-        &self,
-        login: &[(String, SharedSecret)],
-        gateway: &[(String, SharedSecret)],
-    ) -> Result<CursorKeys, Error> {
+    fn load(&self, login: &[(String, SharedSecret)]) -> Result<CursorKeys, Error> {
         let keys = key_material(&self.active, &self.verify_only).map_err(|error| match error {
             Error::KeyRing => Error::CursorKeyRing,
             Error::KeyFile => Error::CursorKeyFile,
             other => other,
         })?;
-        if shared_key_material(&keys, gateway) {
-            return Err(Error::GatewayKeyRing);
-        }
         for (i, (id, material)) in keys.iter().enumerate() {
             if !CursorKeys::valid_id(id)
                 || keys[..i].iter().any(|(other, _)| other == id)
@@ -548,7 +524,6 @@ struct Document {
     login_lifetime_seconds: u64,
     active_key: KeyFile,
     cursor_keys: Option<CursorFiles>,
-    gateway_keys: Option<CursorFiles>,
     catalog_file: Option<String>,
     admission_limits: Option<crate::authz::runs::AdmissionLimits>,
     decrypt_only_keys: Vec<KeyFile>,
@@ -659,13 +634,6 @@ impl Document {
                     .transpose()?,
                 _ => None,
             },
-            gateway_keys: match version {
-                VERSION_2 => root
-                    .optional_object("gateway_keys")?
-                    .map(|keys| CursorFiles::parse(keys, "decrypt_only"))
-                    .transpose()?,
-                _ => None,
-            },
             native: match version {
                 VERSION_2 => root
                     .optional_object("native")?
@@ -742,23 +710,12 @@ pub(crate) fn catalog(path: &str) -> Result<crate::model_config::Catalog, Error>
         .map_err(|_| Error::Catalog)
 }
 
-/// Unseal-only gateway keys from validated ring material (ADR 0037).
-pub(crate) fn gateway_keys(
-    material: &[(String, SharedSecret)],
-) -> Result<provider_keys::gateway::GatewayKeys, Error> {
-    provider_keys::gateway::GatewayKeys::from_bytes(
-        material.iter().map(|(id, key)| (id, key.secret_bytes())),
-    )
-    .map_err(|_| Error::GatewayKeyRing)
-}
-
 /// Everything the browser-auth runtime needs, constructed together or not at all. The manager
 /// is the single process-lifetime owner required by ADR 0011; providers are in document order.
 pub struct AuthConfig {
     pub(crate) catalog: Option<crate::model_config::Catalog>,
     pub(crate) admission_limits: Option<crate::authz::runs::AdmissionLimits>,
     pub(crate) cursor_keys: Option<CursorKeys>,
-    pub gateway_keys: Option<provider_keys::gateway::GatewayKeys>,
     keys: KeyRing,
     login_lifetime: Duration,
     token_policy: auth::Policy,
@@ -819,7 +776,6 @@ impl AuthConfig {
             manager,
             providers,
             cursor_keys: None,
-            gateway_keys: None,
             catalog: None,
             admission_limits: None,
             browser: None,
@@ -873,26 +829,11 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
     let material = key_material(&document.active_key, &document.decrypt_only_keys)?;
     // The login ring protects session handoff and cookie material in this config version.
     // Compare raw material before it is consumed by the AEAD and cursor HMAC constructors.
-    let gateway_material = document
-        .gateway_keys
-        .as_ref()
-        .map(CursorFiles::gateway_material)
-        .transpose()?;
-    let gateway_keys = gateway_material
-        .as_deref()
-        .map(|gateway| {
-            if shared_key_material(gateway, &material) {
-                return Err(Error::GatewayKeyRing);
-            }
-            gateway_keys(gateway)
-        })
-        .transpose()?;
     let cursor_keys = document
         .cursor_keys
         .as_ref()
-        .map(|files| files.load(&material, gateway_material.as_deref().unwrap_or_default()))
+        .map(|files| files.load(&material))
         .transpose()?;
-    drop(gateway_material);
     let login_keys = material
         .into_iter()
         .map(|(id, key)| {
@@ -954,7 +895,6 @@ pub fn load(path: &Path) -> Result<AuthConfig, Error> {
         catalog,
         admission_limits: document.admission_limits,
         cursor_keys,
-        gateway_keys,
         keys,
         login_lifetime,
         token_policy,

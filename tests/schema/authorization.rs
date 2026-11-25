@@ -294,7 +294,7 @@ async fn migration_15_grants_exactly_the_contract() {
     .unwrap()
     .into_iter()
     .collect();
-    let mut expected: BTreeSet<(String, String, String, String)> = API_COLUMNS
+    let expected: BTreeSet<(String, String, String, String)> = API_COLUMNS
         .iter()
         .flat_map(|(table, privilege, columns)| {
             columns.iter().map(move |column| {
@@ -307,12 +307,6 @@ async fn migration_15_grants_exactly_the_contract() {
             })
         })
         .collect();
-    expected.insert((
-        "account_admin_lock".into(),
-        "lock_guard".into(),
-        pg::GATEWAY.into(),
-        "UPDATE".into(),
-    ));
     assert_eq!(observed, expected);
     // Both roles may change only a run's lifecycle columns, never ownership or input.
     let run_columns = [

@@ -419,12 +419,15 @@ impl Fixture {
         .unwrap()
     }
 
-    /// Rows in the ADR 0037 provisioning tables: none is ever needed.
+    /// Superseded ADR 0037 provisioning tables: none exists after migration 37.
     async fn provisioned(&self) -> i64 {
         sqlx::query_scalar(
-            "SELECT (SELECT count(*) FROM openmettle.gateway_bindings)
-                  + (SELECT count(*) FROM openmettle.gateway_generations)
-                  + (SELECT count(*) FROM openmettle.gateway_policy)",
+            "SELECT (to_regclass('openmettle.gateway_bindings') IS NOT NULL)::int::bigint
+                  + (to_regclass('openmettle.gateway_generations') IS NOT NULL)::int::bigint
+                  + (to_regclass('openmettle.gateway_policy') IS NOT NULL)::int::bigint
+                  + (to_regclass('openmettle.gateway_nonces') IS NOT NULL)::int::bigint
+                  + (to_regclass('openmettle.gateway_intents') IS NOT NULL)::int::bigint
+                  + (to_regclass('openmettle.gateway_audit') IS NOT NULL)::int::bigint",
         )
         .fetch_one(&self.owner)
         .await
@@ -1004,8 +1007,9 @@ pub(crate) fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
 
 // --- faulty database connection ---------------------------------------------------------------
 
-/// Text of the first statement settlement sends inside its transaction.
-const SETTLEMENT_LOCK: &[u8] = b"quota_lock_gateway_request_for_settlement";
+/// Text of the settlement function call inside its transaction (matches the call, not the
+/// `to_regprocedure` probe).
+const SETTLEMENT_LOCK: &[u8] = b"gateway_settle_report($1";
 /// The simple query that opens every transaction.
 const BEGIN: &[u8] = b"BEGIN\0";
 
@@ -1018,6 +1022,8 @@ enum Fault {
     Delay(Duration),
     /// The trigger reaches the server, but the next reply is held back until released.
     Hold,
+    /// The trigger packet is held back before reaching the server until released.
+    HoldBeforeSend,
 }
 
 /// Forwards connections to the test PostgreSQL service, with one [`Fault`] on the connection
@@ -1158,6 +1164,10 @@ async fn forward(client: tokio::net::TcpStream, server: tokio::net::TcpStream, f
                         *hold.lock().unwrap() = Some(tokio::time::Instant::now() + delay);
                     }
                     Fault::Hold => gate.store(true, Ordering::SeqCst),
+                    Fault::HoldBeforeSend => {
+                        faults.release.notified().await;
+                        faults.late.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
             }
             // Keep less than one trigger, so an occurrence is counted once.
@@ -2902,8 +2912,9 @@ async fn a_later_report_corrects_an_incomplete_one_and_nothing_reopens_a_complet
 }
 
 /// One final report of `id` at revision 1 and its settlement, written directly in SQL as the
-/// gateway role in one transaction. `columns` and `values` continue the report's column and
-/// value lists, and `fold` says whether the quota fold is called. Returns the first error, the
+/// schema owner in one transaction (since migration 37 revokes all direct table/helper grants
+/// from `openmettle_gateway`). `columns` and `values` continue the report's column and value
+/// lists, and `fold` says whether the quota fold is called. Returns the first error, the
 /// commit's included.
 async fn settle_in_sql(
     f: &Fixture,
@@ -2913,7 +2924,7 @@ async fn settle_in_sql(
     outstanding: i64,
 ) -> Result<(), sqlx::Error> {
     use sqlx::Connection;
-    let mut c = connect(&f.db.0, pg::GATEWAY).await;
+    let mut c = connect(&f.db.0, OWNER).await;
     let mut tx = c.begin().await?;
     let report = format!(
         "INSERT INTO openmettle.gateway_usage_reports
@@ -3034,7 +3045,7 @@ async fn the_database_refuses_a_final_settlement_that_leaves_the_hold_open() {
     let undispatched = f.request(false).await;
     {
         use sqlx::Connection;
-        let mut c = connect(&f.db.0, pg::GATEWAY).await;
+        let mut c = connect(&f.db.0, OWNER).await;
         let mut tx = c.begin().await.unwrap();
         sqlx::query(
             "INSERT INTO openmettle.gateway_usage_reports
@@ -3131,7 +3142,7 @@ async fn the_database_refuses_a_final_settlement_that_leaves_the_hold_open() {
         ("reason", ",incomplete", ",'incomplete'", None),
     ] {
         use sqlx::Connection;
-        let mut c = connect(&f.db.0, pg::GATEWAY).await;
+        let mut c = connect(&f.db.0, OWNER).await;
         let mut tx = c.begin().await.unwrap();
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO openmettle.gateway_usage_reports
@@ -3657,8 +3668,25 @@ async fn a_direct_sql_correction_after_unreported_must_fold_its_holds() {
         ("settled".to_owned(), 0, "0".to_owned())
     );
 
-    // Direct SQL as openmettle_gateway: write measured revision 1 + settlement WITHOUT folding.
-    let mut direct = connect(&f.db.0, pg::GATEWAY).await;
+    // Migration 37: `openmettle_gateway` itself is refused direct table/helper writes (42501).
+    let mut gw_direct = connect(&f.db.0, pg::GATEWAY).await;
+    assert_eq!(
+        sqlstate(
+            sqlx::query(
+                "INSERT INTO openmettle.gateway_usage_reports
+                     (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens)
+                 VALUES ($1::uuid,$2::uuid,gen_random_uuid(),1,true,17,2)",
+            )
+            .bind(&id)
+            .bind(INSTALL)
+            .execute(&mut gw_direct)
+            .await
+        ),
+        "42501"
+    );
+
+    // Direct SQL as owner: write measured revision 1 + settlement WITHOUT folding.
+    let mut direct = connect(&f.db.0, OWNER).await;
     {
         let mut tx = direct.begin().await.unwrap();
         sqlx::query(
@@ -3802,9 +3830,9 @@ async fn a_bare_or_partial_final_report_cannot_replace_unreported() {
         [(id.clone(), 0, true, Some("unreported".to_owned()), 0)]
     );
 
-    // Through direct SQL as `openmettle_gateway` even with `quota_settle_gateway_usage(..., 1)`:
+    // Through direct SQL as owner even with `quota_settle_gateway_usage(..., 1)`:
     // bare and single-count final reports are refused at commit with 23514.
-    let mut direct = connect(&f.db.0, pg::GATEWAY).await;
+    let mut direct = connect(&f.db.0, OWNER).await;
     for (what, cols, vals, measured) in [
         ("bare", "", "", None::<i64>),
         ("prompt_only", ",prompt_tokens", ",10", Some(10)),
@@ -4082,7 +4110,9 @@ async fn cost_holds_settle_from_recorded_profile_prices_through_the_proxy() {
         settlement::ingest(&gateway, &bad_report).await,
         Err(StoreError::Refused)
     );
-    for role in [pg::GATEWAY, OWNER] {
+    // `openmettle_gateway` has no direct table privilege (42501); `openmettle_owner` hits the
+    // table trigger guard (23514).
+    for (role, expected_code) in [(pg::GATEWAY, "42501"), (OWNER, "23514")] {
         let mut c = connect(&f.db.0, role).await;
         let err = sqlx::query(
             "INSERT INTO openmettle.gateway_usage_reports
@@ -4095,14 +4125,14 @@ async fn cost_holds_settle_from_recorded_profile_prices_through_the_proxy() {
         .await;
         assert_eq!(
             sqlstate(err),
-            "23514",
+            expected_code,
             "role {role} supplied cost on unbound"
         );
     }
-    // Direct SQL writing a complete report + settlement WITHOUT running quota_settle_gateway_usage
-    // is refused at commit by enforce_gateway_final_settlement_closes().
+    // Direct SQL as owner writing a complete report + settlement WITHOUT running
+    // quota_settle_gateway_usage is refused at commit by enforce_gateway_final_settlement_closes().
     {
-        let mut c = connect(&f.db.0, pg::GATEWAY).await;
+        let mut c = connect(&f.db.0, OWNER).await;
         let mut tx = c.begin().await.unwrap();
         sqlx::query(
             "INSERT INTO openmettle.gateway_usage_reports
@@ -4620,4 +4650,367 @@ async fn review_1_p2_upstream_non_200_withholds_echoed_cache_salt_and_settles_up
     expected_events.sort();
     assert_eq!(events, expected_events);
     assert_eq!(fixture.drift().await, (0, 0, 0, 0));
+}
+
+/// Shared driver for gateway-first `0036 -> 0037` live cutover tests:
+///
+/// 1. Start the `0037`-capable `openmettle-gateway` binary against a schema-36 database and
+///    complete request 1 (`02-chat-plain`), proving settlement succeeds via the pre-37 fallback.
+/// 2. Dispatch `stream_count` concurrent `03-chat-stream-usage` streams on schema 36 and hold
+///    them open at the upstream while `openmettle-migrate` runs migration 37 through
+///    `FaultyPostgres` paused before `COMMIT` (holding migration 37's real `AccessExclusiveLock`
+///    on `gateway_requests`, `gateway_usage_reports`, and `gateway_settlements`).
+/// 3. Release all upstream SSE streams *while* migration 37's locks are held, confirm every
+///    caller receives its complete relayed stream before `COMMIT`, and keep `COMMIT` paused for
+///    at least `min_hold` while observing at least `min_distinct_lock_attempts` distinct
+///    lock-waiting settlement transactions (`55P03`).
+/// 4. Release `COMMIT`, verify zero `idle in transaction` connections and `42501` on direct
+///    table/helper access, and confirm all `stream_count` streams settle via
+///    `openmettle.gateway_settle_report` (`29` tokens, `340` micros each) with zero drift and
+///    zero error events.
+async fn run_gateway_first_36_to_37_cutover(
+    stream_count: usize,
+    min_hold: Duration,
+    min_distinct_lock_attempts: usize,
+) {
+    use std::collections::HashSet;
+
+    async fn send_read(bind: String, id: String, body: Vec<u8>) -> Reply {
+        let mut socket = tokio::net::TcpStream::connect(&bind).await.unwrap();
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: gateway.test\r\n\
+             Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\n\
+             Authorization: Bearer {}\r\nCookie: session={COOKIE}\r\n\
+             Content-Length: {}\r\nConnection: close\r\nX-Request-Id: {id}\r\n\r\n",
+            bearer(&id),
+            body.len()
+        );
+        socket.write_all(request.as_bytes()).await.unwrap();
+        socket.write_all(&body).await.unwrap();
+        let mut raw = Vec::new();
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let n = tokio::time::timeout(Duration::from_secs(20), socket.read(&mut buf))
+                .await
+                .expect("the proxy response stalled")
+                .unwrap_or(0);
+            if n == 0 {
+                return parse(&raw);
+            }
+            raw.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    let db = TestDb::new().await;
+    migrate::apply(&db.settings(Duration::from_secs(10)), &MIGRATIONS[..36])
+        .await
+        .unwrap();
+    db.admin()
+        .await
+        .execute(
+            "UPDATE openmettle.quota_defaults
+                SET cost_denomination = 'usd_micros'
+              WHERE scope_kind = 'instance' AND resource_kind = 'usage_cost_micros'",
+        )
+        .await
+        .unwrap();
+    db.admin()
+        .await
+        .execute(
+            "INSERT INTO openmettle.quota_defaults(scope_kind,resource_kind,hard_limit)
+             VALUES ('personal','usage_tokens',1000000),
+                    ('personal','usage_cost_micros',1000000)",
+        )
+        .await
+        .unwrap();
+    let mut c = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut c).await;
+    let actor =
+        authz_store::account(&mut c, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let scope = authz_runs::personal_of(&db, &actor).await;
+    let fixture = Fixture {
+        owner: pool(&db, OWNER),
+        worker: pool(&db, WORKER),
+        route: TurnHandoffFixture::chat(INSTALL, MODEL, UNITS, None, false),
+        other_route: TurnHandoffFixture::chat(INSTALL, OTHER_MODEL, UNITS, None, false),
+        runs: AtomicUsize::new(0),
+        issued: Mutex::default(),
+        db,
+        actor,
+        scope,
+    };
+    let h = Harness::launch(fixture, StandIn::start().await, &[]).await;
+
+    let pricing = openmettle_core::model_config::CostBound {
+        fixed_micros: 50,
+        micros_per_token: 10,
+    };
+
+    // 1. Request 1 settles cleanly on schema 36 via `store_pre37`.
+    let req1 = h
+        .fixture
+        .request_with_pricing(MODEL, false, Some(pricing))
+        .await;
+    let reply1 = h.send_case("02-chat-plain", &req1).await;
+    assert_eq!(reply1.status, 200);
+    assert!(reply1.complete);
+    let settle_deadline = Instant::now() + Duration::from_secs(10);
+    while h.fixture.settlement(&req1).await.is_none() {
+        assert!(
+            Instant::now() < settle_deadline,
+            "req1 did not settle on schema 36"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        h.fixture.settlement(&req1).await,
+        Some((1, true, Some("19".to_owned()), 0))
+    );
+    assert_eq!(
+        h.fixture.hold_of(&req1, "usage_tokens").await,
+        ("settled".to_owned(), 0, "19".to_owned())
+    );
+    assert_eq!(
+        h.fixture.hold_of(&req1, "usage_cost_micros").await,
+        ("settled".to_owned(), 0, "240".to_owned())
+    );
+
+    // 2. Mint `stream_count` priced requests and dispatch them concurrently on schema 36 while
+    //    migration 37 pauses right before `COMMIT` for at least `min_hold`.
+    let mut reqs = Vec::with_capacity(stream_count);
+    for _ in 0..stream_count {
+        reqs.push(
+            h.fixture
+                .request_with_pricing(MODEL, false, Some(pricing))
+                .await,
+        );
+    }
+    let stream_req_body = recorded::file("03-chat-stream-usage", "request.json");
+    let expected_stream_body = recorded::body("03-chat-stream-usage");
+    let mig_pg = FaultyPostgres::start(COMMIT, 0, Fault::HoldBeforeSend).await;
+    let (mig_host, mig_port) = mig_pg.address.rsplit_once(':').unwrap();
+    let mut mig_settings = h.fixture.db.settings(Duration::from_secs(30));
+    mig_settings.database = mig_settings
+        .database
+        .host(mig_host)
+        .port(mig_port.parse().unwrap());
+
+    let mut client_tasks = Vec::with_capacity(stream_count);
+    for id in &reqs {
+        client_tasks.push(tokio::spawn(send_read(
+            h.bind.clone(),
+            id.clone(),
+            stream_req_body.clone(),
+        )));
+    }
+
+    let start_mig = tokio::sync::Notify::new();
+    let mig_run = async {
+        start_mig.notified().await;
+        migrate::apply(&mig_settings, MIGRATIONS).await
+    };
+    let cutover = async {
+        eventually(
+            Duration::from_secs(10),
+            "all in-flight streams reached stand-in",
+            || h.upstream.count() > stream_count,
+        )
+        .await;
+        for id in &reqs {
+            assert!(
+                h.fixture.dispatched(id).await,
+                "request {id} must already be dispatched on schema 36 before migration 37"
+            );
+            assert!(
+                h.fixture.settlement(id).await.is_none(),
+                "request {id} must still be unsettled while stream is held open"
+            );
+        }
+
+        start_mig.notify_one();
+
+        // Wait until migration 37 has executed its entire body and paused right before `COMMIT`
+        // while holding `AccessExclusiveLock` on `openmettle.gateway_requests`.
+        let lock_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let holds_lock: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1
+                       FROM pg_locks l
+                       JOIN pg_stat_activity a ON a.pid = l.pid
+                      WHERE a.datname = $1
+                        AND a.application_name = $2
+                        AND l.relation = 'openmettle.gateway_requests'::regclass
+                        AND l.mode = 'AccessExclusiveLock'
+                        AND l.granted
+                 )",
+            )
+            .bind(&h.fixture.db.0)
+            .bind(migrate::APPLICATION_NAME)
+            .fetch_one(&mut h.fixture.db.admin().await)
+            .await
+            .unwrap();
+            if holds_lock && mig_pg.attempts.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < lock_deadline,
+                "migration 37 did not reach COMMIT while holding AccessExclusiveLock"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            h.upstream.gate.timeouts.load(Ordering::SeqCst),
+            0,
+            "migration 37 must pause at COMMIT before any held stream times out"
+        );
+
+        // Release all upstream SSE streams *during* migration 37's held DDL locks, waking any
+        // stand-in task that reaches `notified()` a few ms later so none hits the 5 s hold timeout.
+        let expected_finished = stream_count + 1;
+        let wake_deadline = Instant::now() + Duration::from_secs(10);
+        while h.upstream.gate.finished.load(Ordering::SeqCst) < expected_finished {
+            h.upstream.gate.released.notify_waiters();
+            assert!(
+                Instant::now() < wake_deadline,
+                "not all {stream_count} stand-in streams finished after release"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            h.upstream.gate.timeouts.load(Ordering::SeqCst),
+            0,
+            "no held stand-in stream may time out"
+        );
+
+        // Confirm every caller receives its full relayed stream *while* migration 37 is still
+        // paused before COMMIT.
+        for task in client_tasks {
+            let reply = task.await.unwrap();
+            assert_eq!(reply.status, 200);
+            assert!(reply.complete);
+            assert!(
+                reply.body == expected_stream_body,
+                "caller must receive the complete relayed stream across the 36 -> 37 cutover"
+            );
+        }
+
+        // Keep `COMMIT` held for at least `min_hold` after streams finish and require at least
+        // `min_distinct_lock_attempts` distinct `55P03` lock-waiting attempts before commit.
+        let hold_start = Instant::now();
+        let mut seen_attempts = HashSet::new();
+        let retry_deadline = hold_start + min_hold + Duration::from_secs(10);
+        loop {
+            for attempt in blocked_attempts(&h.fixture).await {
+                seen_attempts.insert(attempt);
+            }
+            if seen_attempts.len() >= min_distinct_lock_attempts && hold_start.elapsed() >= min_hold
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < retry_deadline,
+                "proxy stopped retrying during {:?} migration 37 DDL lock (saw {}/{} distinct lock-waiting attempts in {:?})",
+                min_hold,
+                seen_attempts.len(),
+                min_distinct_lock_attempts,
+                hold_start.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        mig_pg.release();
+    };
+    let (mig_res, ()) = tokio::join!(mig_run, cutover);
+    mig_res.expect("live migration 37 during in-flight streams must succeed");
+    assert_eq!(mig_pg.late.load(Ordering::SeqCst), 1);
+
+    // Wait for all retained reports to settle on schema 37 via `gateway_settle_report`.
+    let post_settle_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let mut settled_count = 0;
+        for id in &reqs {
+            if h.fixture.settlement(id).await.is_some() {
+                settled_count += 1;
+            }
+        }
+        if settled_count == stream_count {
+            break;
+        }
+        assert!(
+            Instant::now() < post_settle_deadline,
+            "only {settled_count}/{stream_count} retained streams settled after migration 37 commit"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(idle_in_transaction(&h.fixture).await, 0);
+
+    let mut gw = connect(&h.fixture.db.0, pg::GATEWAY).await;
+    for sql in [
+        "SELECT id FROM openmettle.gateway_requests",
+        "SELECT openmettle.quota_lock_gateway_request_for_settlement(gen_random_uuid())",
+    ] {
+        assert_eq!(
+            sqlstate(gw.execute(sql).await),
+            "42501",
+            "post-37 gateway role must have zero direct table/helper access: {sql}"
+        );
+    }
+
+    let (fixture, _, events) = h.stop().await;
+    assert_eq!(events, []);
+    for id in &reqs {
+        assert_eq!(
+            fixture.reports(id).await,
+            [(
+                id.clone(),
+                INSTALL.to_owned(),
+                1,
+                true,
+                Some(23),
+                Some(6),
+                Some(0),
+                Some(true),
+            )],
+            "missing or mismatched report for {id}"
+        );
+        assert_eq!(
+            fixture.settlement(id).await,
+            Some((1, true, Some("29".to_owned()), 0)),
+            "settlement mismatch for {id}"
+        );
+        assert_eq!(
+            fixture.hold_of(id, "usage_tokens").await,
+            ("settled".to_owned(), 0, "29".to_owned()),
+            "token hold mismatch for {id}"
+        );
+        assert_eq!(
+            fixture.hold_of(id, "usage_cost_micros").await,
+            ("settled".to_owned(), 0, "340".to_owned()),
+            "cost hold mismatch for {id}"
+        );
+    }
+    assert_eq!(fixture.drift().await, (0, 0, 0, 0));
+}
+
+/// Review #1, #2 & #4: single-stream `0036 -> 0037` live cutover across a 9 s DDL lock hold on
+/// the 4-connection pool. With only 1 writer in flight, zero `PoolTimedOut` occurs and that lone
+/// report writer must reach at least its 4th `55P03` lock-waiting attempt (past `WRITE_RETRIES`)
+/// before `COMMIT` releases and settles through `openmettle.gateway_settle_report`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn review_1_p1_gateway_first_36_to_37_cutover_settles_inflight_stream_via_gateway_settle_report()
+ {
+    run_gateway_first_36_to_37_cutover(1, Duration::from_secs(9), 4).await;
+}
+
+/// Review #3 & #4: 24 concurrent streams finishing during a 12 s `0036 -> 0037` DDL lock hold on
+/// the default 4-connection pool (`DB_MAX_CONNECTIONS = 4`, `DB_TIMEOUT_MS = 2000`), exercising
+/// both `55P03` lock-timeout retention on the 4 active slots and `PoolTimedOut` retention on the
+/// 20 queued writers so all 24 settle through `openmettle.gateway_settle_report`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn review_3_p1_gateway_first_36_to_37_cutover_settles_24_concurrent_streams_across_pool_contention()
+ {
+    run_gateway_first_36_to_37_cutover(24, Duration::from_secs(12), 4).await;
 }

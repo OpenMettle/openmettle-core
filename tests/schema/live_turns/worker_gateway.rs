@@ -158,11 +158,10 @@ async fn stop_gateway(
         .collect()
 }
 
-/// The run's one gateway request: its ID, state, whether it was dispatched and whether it has
-/// a binding.
-async fn round(chat: &Chat, run: &str) -> (String, String, bool, bool) {
-    let rounds: Vec<(String, String, bool, bool)> = sqlx::query_as(
-        "SELECT id::text, state, dispatched_at IS NOT NULL, binding_id IS NOT NULL
+/// The run's one gateway request: its ID, state and whether it was dispatched.
+async fn round(chat: &Chat, run: &str) -> (String, String, bool) {
+    let rounds: Vec<(String, String, bool)> = sqlx::query_as(
+        "SELECT id::text, state, dispatched_at IS NOT NULL
            FROM openmettle.gateway_requests WHERE run_id = $1::uuid",
     )
     .bind(run)
@@ -305,11 +304,8 @@ async fn settles_through_the_gateway(
     assert_eq!(stop_gateway(gateway, logs).await, []);
 
     // One round, handed off without a binding and dispatched once by the gateway.
-    let (id, state, dispatched, bound) = round(&chat, &run).await;
-    assert_eq!(
-        (state.as_str(), dispatched, bound),
-        ("handed_off", true, false)
-    );
+    let (id, state, dispatched) = round(&chat, &run).await;
+    assert_eq!((state.as_str(), dispatched), ("handed_off", true));
     // The upstream received the worker's request once, correlated, without the bearer.
     assert_eq!(upstream.count(), 1);
     let head = upstream.head(0);
@@ -377,16 +373,16 @@ async fn settles_through_the_gateway(
     assert_eq!(items[0]["stop_reason"], json!(expected_stop_reason));
     assert_eq!(items[1]["role"], "user");
     assert_eq!(items[1]["stop_reason"], Value::Null);
-    // No ADR 0037 provisioning took part, and the accounting has no drift.
-    let provisioned: i64 = sqlx::query_scalar(
-        "SELECT (SELECT count(*) FROM openmettle.gateway_bindings)
-              + (SELECT count(*) FROM openmettle.gateway_generations)
-              + (SELECT count(*) FROM openmettle.gateway_policy)",
+    // Superseded ADR 0037 provisioning tables no longer exist, and the accounting has no drift.
+    let superseded_exists: bool = sqlx::query_scalar(
+        "SELECT to_regclass('openmettle.gateway_bindings') IS NOT NULL
+             OR to_regclass('openmettle.gateway_generations') IS NOT NULL
+             OR to_regclass('openmettle.gateway_policy') IS NOT NULL",
     )
     .fetch_one(&mut owner)
     .await
     .unwrap();
-    assert_eq!(provisioned, 0);
+    assert!(!superseded_exists);
     let drift: (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT storage_mismatches, budget_mismatches, settlement_mismatches,
                 pending_gateway_reconciliations
@@ -454,7 +450,7 @@ async fn a_gateway_serving_another_model_refuses_the_round_and_closes_its_hold()
     chat.done(&run, "failed", Some("step_failed")).await;
     let events = stop_gateway(gateway, logs).await;
 
-    let (id, state, dispatched, _) = round(&chat, &run).await;
+    let (id, state, dispatched) = round(&chat, &run).await;
     assert_eq!((state.as_str(), dispatched), ("handed_off", true));
     assert_eq!(upstream.count(), 0);
     assert_eq!(
@@ -533,7 +529,7 @@ async fn an_unreachable_gateway_fails_the_turn_and_the_sweep_closes_its_hold() {
     );
     chat.done(&run, "failed", Some("step_failed")).await;
 
-    let (id, state, dispatched, _) = round(&chat, &run).await;
+    let (id, state, dispatched) = round(&chat, &run).await;
     assert_eq!((state.as_str(), dispatched), ("handed_off", false));
     let mut owner = connect(&chat.f.db.0, OWNER).await;
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -778,11 +774,8 @@ async fn a_cost_metered_turn_settles_through_the_gateway_with_recorded_prices() 
     chat.done(&run, "succeeded", None).await;
     assert_eq!(stop_gateway(gateway, logs).await, []);
 
-    let (id, state, dispatched, bound) = round(&chat, &run).await;
-    assert_eq!(
-        (state.as_str(), dispatched, bound),
-        ("handed_off", true, false)
-    );
+    let (id, state, dispatched) = round(&chat, &run).await;
+    assert_eq!((state.as_str(), dispatched), ("handed_off", true));
     assert_eq!(
         hold(&chat, &id).await,
         ("settled".to_owned(), 0, "19".to_owned())

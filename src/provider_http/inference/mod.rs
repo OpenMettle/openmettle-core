@@ -16,7 +16,6 @@ pub use turn::{
 };
 
 use super::{Trust, transport};
-use crate::authz::gateway::problem::{Cause, GatewayStep, Problem as GatewayProblem};
 use crate::{
     authz::leases::FailReason,
     model_config::{Catalog, Effective, ProfilePin},
@@ -74,7 +73,6 @@ pub struct Timeouts {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
-    Gateway(GatewayProblem),
     Validation,
     Provisioning,
     Credential,
@@ -92,7 +90,6 @@ impl Error {
     /// Fixed application projection. A timeout after headers uses the same code in the active stream.
     pub fn problem(self) -> (u16, &'static str, &'static str) {
         match self {
-            Self::Gateway(p) => p.public(),
             Self::Validation => (
                 400,
                 "validation",
@@ -118,29 +115,6 @@ impl Error {
             Protocol::Chat => json!({"error":{"code":code,"message":message}}),
             Protocol::Responses => json!({"type":"error","code":code,"message":message}),
         }
-    }
-    fn for_profile(self, qualified: bool) -> Self {
-        if !qualified {
-            return self;
-        }
-        let problem = match self {
-            Self::Gateway(p) => p,
-            Self::Credential => GatewayProblem::Failure(Cause::Protection),
-            Self::Provisioning => GatewayProblem::Provisioning,
-            Self::RateLimited(delay) => GatewayProblem::RateLimited(delay),
-            Self::Unavailable => GatewayProblem::Unavailable,
-            Self::Timeout => GatewayProblem::Timeout,
-            Self::Malformed | Self::Incomplete | Self::Provider => {
-                GatewayProblem::Failure(Cause::Protocol)
-            }
-            Self::Filtered | Self::Stopped(_) | Self::Validation => return self,
-        };
-        problem.record(match problem {
-            GatewayProblem::Policy => GatewayStep::Policy,
-            GatewayProblem::Failure(Cause::Unknown | Cause::Protection) => GatewayStep::Key,
-            _ => GatewayStep::Readiness,
-        });
-        Self::Gateway(problem)
     }
     pub fn step_result(self) -> StepResult {
         match self {
@@ -255,7 +229,6 @@ pub struct Gateway {
     tls: Option<Arc<rustls::ClientConfig>>,
     lookup: transport::Lookup,
     qualification: Qualification,
-    family_policy_v1: bool,
     timeouts: Timeouts,
     #[cfg(test)]
     loopback: bool,
@@ -327,18 +300,10 @@ impl Gateway {
                 .transpose()?,
             lookup: Arc::new(transport::system_lookup),
             qualification,
-            family_policy_v1: false,
             timeouts,
             #[cfg(test)]
             loopback: false,
         })
-    }
-
-    /// Enable ADR 0037 error semantics on this exact HTTPS route after qualifying its
-    /// family-policy-v1 refusal header. Generic external provider profiles retain ADR 0038.
-    pub fn with_family_policy_v1(mut self) -> Self {
-        self.family_policy_v1 = true;
-        self
     }
 
     fn route(&self) -> transport::Route<'_> {
@@ -385,13 +350,11 @@ impl Gateway {
         prepared: &PreparedRequest<'_>,
     ) -> Result<(), Error> {
         if !std::ptr::eq(self, prepared.gateway) {
-            return Err(Error::Validation.for_profile(self.family_policy_v1));
+            return Err(Error::Validation);
         }
-        let headers = headers(credential, prepared.request.stream)
-            .map_err(|e| e.for_profile(self.family_policy_v1))?;
+        let headers = headers(credential, prepared.request.stream)?;
         self.build_outbound_with_headers(headers, Vec::new(), prepared.body.len())
             .map(|_| ())
-            .map_err(|e| e.for_profile(self.family_policy_v1))
     }
 
     /// Validate model/profile selection against this route and wire-encode the outbound JSON body
@@ -404,7 +367,6 @@ impl Gateway {
         server: bool,
     ) -> Result<PreparedRequest<'a>, Error> {
         self.prepare_inner(catalog, effective, request, server)
-            .map_err(|e| e.for_profile(self.family_policy_v1))
     }
 
     fn prepare_inner<'a>(
@@ -477,7 +439,6 @@ impl Gateway {
             visible,
         )
         .await
-        .map_err(|e| e.for_profile(self.family_policy_v1))
     }
 
     /// Transmit a pre-validated, pre-encoded caller request without repeating wire encoding.
@@ -489,7 +450,6 @@ impl Gateway {
     ) -> Result<Turn, Error> {
         self.complete_prepared(Outbound::Prepared(prepared), credential, None, visible)
             .await
-            .map_err(|e| e.for_profile(self.family_policy_v1))
     }
 
     /// One model step after the executor's leased authority check. The executor owns
@@ -510,7 +470,6 @@ impl Gateway {
             visible,
         )
         .await
-        .map_err(|e| e.for_profile(self.family_policy_v1))
     }
 
     /// Transmit a pre-validated, pre-encoded leased server request without repeating wire encoding.
@@ -523,7 +482,6 @@ impl Gateway {
     ) -> Result<Turn, Error> {
         self.complete_prepared(Outbound::Prepared(prepared), credential, Some(run), visible)
             .await
-            .map_err(|e| e.for_profile(self.family_policy_v1))
     }
 
     async fn complete_prepared<F: Future<Output = ()>>(
@@ -574,16 +532,10 @@ impl Gateway {
                 setup: self.timeouts.setup,
                 total: self.timeouts.overall,
             };
-            let connection =
-                route
-                    .connect(start + self.timeouts.setup)
-                    .await
-                    .map_err(|e| match e {
-                        super::Error::Tls | super::Error::Address if self.family_policy_v1 => {
-                            Error::Unavailable
-                        }
-                        e => Error::from(e),
-                    })?;
+            let connection = route
+                .connect(start + self.timeouts.setup)
+                .await
+                .map_err(Error::from)?;
             route
                 .exchange(
                     connection,

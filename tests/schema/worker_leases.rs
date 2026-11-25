@@ -1573,140 +1573,7 @@ mod live_turns {
         }
 
         async fn ensure_metered_gateway(&self) -> String {
-            use openmettle_core::provider_keys::gateway::{
-                Bearer, Context, GatewayKeys, GatewaySealer,
-            };
-            use sqlx::postgres::PgPoolOptions;
-
             const INSTALL: &str = "00000000-0000-4000-8000-000000000091";
-            const PRINCIPAL: &str = "00000000-0000-4000-8000-000000000092";
-            const BUDGET: &str = "00000000-0000-4000-8000-000000000093";
-            const KEY_ID: &str = "live-turns-k1";
-            const KEY_BYTES: [u8; 32] = [61; 32];
-
-            let g_pool = PgPoolOptions::new()
-                .max_connections(2)
-                .connect_lazy_with(self.f.db.1.options(pg::GATEWAY));
-            let existing: Option<String> = sqlx::query_scalar(
-                "SELECT id::text FROM openmettle.gateway_bindings
-                  WHERE installation = $1::uuid AND user_id = $2::uuid",
-            )
-            .bind(INSTALL)
-            .bind(&self.f.actor.user)
-            .fetch_optional(&g_pool)
-            .await
-            .unwrap();
-            if existing.is_some() {
-                return INSTALL.into();
-            }
-            let binding: String = sqlx::query_scalar(
-                "INSERT INTO openmettle.gateway_bindings (installation, user_id, principal, budget)
-                 VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid) RETURNING id::text",
-            )
-            .bind(INSTALL)
-            .bind(&self.f.actor.user)
-            .bind(PRINCIPAL)
-            .bind(BUDGET)
-            .fetch_one(&g_pool)
-            .await
-            .unwrap();
-            let mut owner = connect(&self.f.db.0, OWNER).await;
-            let report_source: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
-                .fetch_one(&mut owner)
-                .await
-                .unwrap();
-            let scope_kind: String =
-                sqlx::query_scalar("SELECT kind FROM openmettle.scopes WHERE id = $1::uuid")
-                    .bind(&self.f.scope)
-                    .fetch_one(&mut owner)
-                    .await
-                    .unwrap();
-            let grant_cycle: Option<String> = if scope_kind == "project" {
-                sqlx::query_scalar(
-                    "SELECT h.cycle_id::text
-                       FROM openmettle.grant_assignments g
-                       JOIN openmettle.grant_changes h
-                         ON h.assignment_id = g.id AND h.revision = g.last_revision
-                      WHERE g.scope_id = $1::uuid
-                        AND g.grantee_user_id = $2::uuid
-                        AND g.target_kind = 'project'
-                        AND g.assignment_format = 'openmettle.project-role'
-                        AND g.assignment_key IN ('editor', 'owner')
-                        AND h.decision = 'grant'
-                      LIMIT 1",
-                )
-                .bind(&self.f.scope)
-                .bind(&self.f.actor.user)
-                .fetch_optional(&mut owner)
-                .await
-                .unwrap()
-            } else {
-                None
-            };
-            let keys = GatewayKeys::new(&[(KEY_ID.into(), KEY_BYTES)]).unwrap();
-            let (finger, env) = GatewaySealer::new(keys, g_pool.clone())
-                .seal(
-                    &Context {
-                        installation: INSTALL,
-                        user_id: &self.f.actor.user,
-                        binding_id: &binding,
-                        principal: PRINCIPAL,
-                        generation: 1,
-                    },
-                    &Bearer::new(b"synthetic-turn-credential").unwrap(),
-                )
-                .await
-                .unwrap();
-            sqlx::query(
-                "INSERT INTO openmettle.gateway_generations
-                     (binding_id, generation, remote_key, expires_at, key_id, key_fingerprint, nonce, ciphertext)
-                 VALUES ($1::uuid, 1, gen_random_uuid(), clock_timestamp() + interval '1 hour', $2, $3, $4, $5)",
-            )
-            .bind(&binding)
-            .bind(&env.key_id)
-            .bind(finger.as_slice())
-            .bind(env.nonce.as_slice())
-            .bind(env.ciphertext)
-            .execute(&g_pool)
-            .await
-            .unwrap();
-            let models = self.catalog["models"].as_object().unwrap();
-            for (model_name, model_cfg) in models {
-                let mut caps = serde_json::Map::new();
-                if let Some(req_caps) = model_cfg
-                    .get("required_capabilities")
-                    .and_then(Value::as_object)
-                {
-                    for (cap, gate) in req_caps {
-                        caps.insert(cap.clone(), Value::Bool(gate.as_str() == Some("opt_in")));
-                    }
-                }
-                sqlx::query(
-                    "INSERT INTO openmettle.gateway_policy
-                         (binding_id, revision, scope_id, approval_id, model, report_source,
-                          provider_generation, approval_generation, user_generation, capabilities, grant_cycle)
-                     VALUES ($1::uuid, 1, $2::uuid, $3::uuid, $4, $5::uuid, 0, 0, 0, $6::jsonb, $7::uuid)",
-                )
-                .bind(&binding)
-                .bind(&self.f.scope)
-                .bind(&self.f.actor.approval)
-                .bind(model_name)
-                .bind(&report_source)
-                .bind(Value::Object(caps).to_string())
-                .bind(grant_cycle.as_deref())
-                .execute(&g_pool)
-                .await
-                .unwrap();
-            }
-            sqlx::query(
-                "UPDATE openmettle.gateway_bindings
-                    SET active_generation = 1, observed_revision = 1, state = 'ready'
-                  WHERE id = $1::uuid",
-            )
-            .bind(&binding)
-            .execute(&g_pool)
-            .await
-            .unwrap();
             INSTALL.into()
         }
 
@@ -2921,15 +2788,11 @@ mod live_turns {
                 runs::{self as authz_queue, ClaimLimits},
             },
             provider_http::gateway::UsageReport,
-            provider_keys::gateway::{Bearer, Context, GatewayKeys, GatewaySealer},
             runs::Payload,
         };
         use sqlx::postgres::PgPoolOptions;
 
         const INSTALL: &str = "00000000-0000-4000-8000-0000000000d1";
-        const PRINCIPAL: &str = "00000000-0000-4000-8000-0000000000d2";
-        const BUDGET: &str = "00000000-0000-4000-8000-0000000000d3";
-        const KEY_BYTES: [u8; 32] = [79; 32];
 
         for rounds in [1i64, 2i64] {
             let db = TestDb::migrated().await;
@@ -2960,70 +2823,6 @@ mod live_turns {
             let g_pool = PgPoolOptions::new()
                 .max_connections(2)
                 .connect_lazy_with(db.1.options(pg::GATEWAY));
-            let binding: String = sqlx::query_scalar(
-                "INSERT INTO openmettle.gateway_bindings (installation, user_id, principal, budget)
-                 VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid) RETURNING id::text",
-            )
-            .bind(INSTALL)
-            .bind(&alice.user)
-            .bind(PRINCIPAL)
-            .bind(BUDGET)
-            .fetch_one(&g_pool)
-            .await
-            .unwrap();
-            let report_source: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
-                .fetch_one(&mut owner)
-                .await
-                .unwrap();
-            let keys = GatewayKeys::new(&[("prehandoff-k1".into(), KEY_BYTES)]).unwrap();
-            let (finger, env) = GatewaySealer::new(keys, g_pool.clone())
-                .seal(
-                    &Context {
-                        installation: INSTALL,
-                        user_id: &alice.user,
-                        binding_id: &binding,
-                        principal: PRINCIPAL,
-                        generation: 1,
-                    },
-                    &Bearer::new(b"prehandoff-round-token").unwrap(),
-                )
-                .await
-                .unwrap();
-            sqlx::query(
-                "INSERT INTO openmettle.gateway_generations
-                     (binding_id, generation, remote_key, expires_at, key_id, key_fingerprint, nonce, ciphertext)
-                 VALUES ($1::uuid, 1, gen_random_uuid(), clock_timestamp() + interval '1 hour', $2, $3, $4, $5)",
-            )
-            .bind(&binding)
-            .bind(&env.key_id)
-            .bind(finger.as_slice())
-            .bind(env.nonce.as_slice())
-            .bind(env.ciphertext)
-            .execute(&g_pool)
-            .await
-            .unwrap();
-            sqlx::query(
-                "INSERT INTO openmettle.gateway_policy
-                     (binding_id, revision, scope_id, approval_id, model, report_source,
-                      provider_generation, approval_generation, user_generation, capabilities)
-                 VALUES ($1::uuid, 1, $2::uuid, $3::uuid, 'a', $4::uuid, 0, 0, 0, '{}'::jsonb)",
-            )
-            .bind(&binding)
-            .bind(&scope)
-            .bind(&alice.approval)
-            .bind(&report_source)
-            .execute(&g_pool)
-            .await
-            .unwrap();
-            sqlx::query(
-                "UPDATE openmettle.gateway_bindings
-                    SET active_generation = 1, observed_revision = 1, state = 'ready'
-                  WHERE id = $1::uuid",
-            )
-            .bind(&binding)
-            .execute(&g_pool)
-            .await
-            .unwrap();
 
             let dir = Dir::new();
             std::fs::create_dir(dir.path("artifacts")).unwrap();
@@ -3301,16 +3100,9 @@ mod live_turns {
     #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
     async fn bearer_crash_replaced_by_metered_worker_preserves_round_budget() {
         use crate::authz_http::{Api, As, browser, success};
-        use openmettle_core::{
-            migrate,
-            provider_keys::gateway::{Bearer, Context, GatewayKeys, GatewaySealer},
-        };
-        use sqlx::postgres::PgPoolOptions;
+        use openmettle_core::migrate;
 
         const INSTALL: &str = "00000000-0000-4000-8000-0000000000e1";
-        const PRINCIPAL: &str = "00000000-0000-4000-8000-0000000000e2";
-        const BUDGET: &str = "00000000-0000-4000-8000-0000000000e3";
-        const KEY_BYTES: [u8; 32] = [83; 32];
 
         for rounds in [1i64, 2i64] {
             // Upgrade from schema 23 -> latest so metering_enforced starts false and a pre-activation
@@ -3346,76 +3138,6 @@ mod live_turns {
                 )
                 .await
                 .unwrap();
-
-            // Provision gateway binding with sealed `synthetic-bearer` so both bearer Worker 1 and
-            // metered Worker 2 target the same loopback TLS Provider.
-            let g_pool = PgPoolOptions::new()
-                .max_connections(2)
-                .connect_lazy_with(db.1.options(pg::GATEWAY));
-            let binding: String = sqlx::query_scalar(
-                "INSERT INTO openmettle.gateway_bindings (installation, user_id, principal, budget)
-                 VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid) RETURNING id::text",
-            )
-            .bind(INSTALL)
-            .bind(&alice.user)
-            .bind(PRINCIPAL)
-            .bind(BUDGET)
-            .fetch_one(&g_pool)
-            .await
-            .unwrap();
-            let report_source: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
-                .fetch_one(&mut owner)
-                .await
-                .unwrap();
-            let keys = GatewayKeys::new(&[("b2m-k1".into(), KEY_BYTES)]).unwrap();
-            let (finger, env) = GatewaySealer::new(keys, g_pool.clone())
-                .seal(
-                    &Context {
-                        installation: INSTALL,
-                        user_id: &alice.user,
-                        binding_id: &binding,
-                        principal: PRINCIPAL,
-                        generation: 1,
-                    },
-                    &Bearer::new(b"synthetic-turn-credential").unwrap(),
-                )
-                .await
-                .unwrap();
-            sqlx::query(
-                "INSERT INTO openmettle.gateway_generations
-                     (binding_id, generation, remote_key, expires_at, key_id, key_fingerprint, nonce, ciphertext)
-                 VALUES ($1::uuid, 1, gen_random_uuid(), clock_timestamp() + interval '1 hour', $2, $3, $4, $5)",
-            )
-            .bind(&binding)
-            .bind(&env.key_id)
-            .bind(finger.as_slice())
-            .bind(env.nonce.as_slice())
-            .bind(env.ciphertext)
-            .execute(&g_pool)
-            .await
-            .unwrap();
-            sqlx::query(
-                "INSERT INTO openmettle.gateway_policy
-                     (binding_id, revision, scope_id, approval_id, model, report_source,
-                      provider_generation, approval_generation, user_generation, capabilities)
-                 VALUES ($1::uuid, 1, $2::uuid, $3::uuid, 'a', $4::uuid, 0, 0, 0, '{}'::jsonb)",
-            )
-            .bind(&binding)
-            .bind(&scope)
-            .bind(&alice.approval)
-            .bind(&report_source)
-            .execute(&g_pool)
-            .await
-            .unwrap();
-            sqlx::query(
-                "UPDATE openmettle.gateway_bindings
-                    SET active_generation = 1, observed_revision = 1, state = 'ready'
-                  WHERE id = $1::uuid",
-            )
-            .bind(&binding)
-            .execute(&g_pool)
-            .await
-            .unwrap();
 
             let dir = Dir::new();
             std::fs::create_dir(dir.path("artifacts")).unwrap();
@@ -3855,17 +3577,11 @@ mod live_turns {
     async fn bearer_round_replaced_by_metered_worker_fits_tight_single_round_budget() {
         use crate::authz_http::{Api, As, browser, success};
         use openmettle_core::{
-            authz::gateway::settlement,
-            migrate,
-            provider_http::gateway::UsageReport,
-            provider_keys::gateway::{Bearer, Context, GatewayKeys, GatewaySealer},
+            authz::gateway::settlement, migrate, provider_http::gateway::UsageReport,
         };
         use sqlx::postgres::PgPoolOptions;
 
         const INSTALL: &str = "00000000-0000-4000-8000-0000000000ea";
-        const PRINCIPAL: &str = "00000000-0000-4000-8000-0000000000eb";
-        const BUDGET: &str = "00000000-0000-4000-8000-0000000000ec";
-        const KEY_BYTES: [u8; 32] = [94; 32];
 
         // Upgrade from schema 23 -> latest so metering_enforced starts false and a pre-activation
         // Route::bearer worker dispatches Round 1 before metering activates.
@@ -3906,70 +3622,6 @@ mod live_turns {
         let g_pool = PgPoolOptions::new()
             .max_connections(2)
             .connect_lazy_with(db.1.options(pg::GATEWAY));
-        let binding: String = sqlx::query_scalar(
-            "INSERT INTO openmettle.gateway_bindings (installation, user_id, principal, budget)
-             VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid) RETURNING id::text",
-        )
-        .bind(INSTALL)
-        .bind(&alice.user)
-        .bind(PRINCIPAL)
-        .bind(BUDGET)
-        .fetch_one(&g_pool)
-        .await
-        .unwrap();
-        let report_source: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
-            .fetch_one(&mut owner)
-            .await
-            .unwrap();
-        let keys = GatewayKeys::new(&[("b2m-tight-k1".into(), KEY_BYTES)]).unwrap();
-        let (finger, env) = GatewaySealer::new(keys, g_pool.clone())
-            .seal(
-                &Context {
-                    installation: INSTALL,
-                    user_id: &alice.user,
-                    binding_id: &binding,
-                    principal: PRINCIPAL,
-                    generation: 1,
-                },
-                &Bearer::new(b"synthetic-turn-credential").unwrap(),
-            )
-            .await
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO openmettle.gateway_generations
-                 (binding_id, generation, remote_key, expires_at, key_id, key_fingerprint, nonce, ciphertext)
-             VALUES ($1::uuid, 1, gen_random_uuid(), clock_timestamp() + interval '1 hour', $2, $3, $4, $5)",
-        )
-        .bind(&binding)
-        .bind(&env.key_id)
-        .bind(finger.as_slice())
-        .bind(env.nonce.as_slice())
-        .bind(env.ciphertext)
-        .execute(&g_pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO openmettle.gateway_policy
-                 (binding_id, revision, scope_id, approval_id, model, report_source,
-                  provider_generation, approval_generation, user_generation, capabilities)
-             VALUES ($1::uuid, 1, $2::uuid, $3::uuid, 'a', $4::uuid, 0, 0, 0, '{}'::jsonb)",
-        )
-        .bind(&binding)
-        .bind(&scope)
-        .bind(&alice.approval)
-        .bind(&report_source)
-        .execute(&g_pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE openmettle.gateway_bindings
-                SET active_generation = 1, observed_revision = 1, state = 'ready'
-              WHERE id = $1::uuid",
-        )
-        .bind(&binding)
-        .execute(&g_pool)
-        .await
-        .unwrap();
 
         let dir = Dir::new();
         std::fs::create_dir(dir.path("artifacts")).unwrap();
@@ -4671,17 +4323,10 @@ mod live_turns {
 
     async fn metered_turn_scenario(packaged: bool) {
         use crate::authz_http::{Api, As, browser, success};
-        use openmettle_core::{
-            authz::gateway::settlement,
-            provider_http::gateway::UsageReport,
-            provider_keys::gateway::{Bearer, Context, GatewayKeys, GatewaySealer},
-        };
+        use openmettle_core::{authz::gateway::settlement, provider_http::gateway::UsageReport};
         use sqlx::postgres::PgPoolOptions;
 
         const INSTALL: &str = "00000000-0000-4000-8000-000000000083";
-        const PRINCIPAL: &str = "00000000-0000-4000-8000-000000000084";
-        const BUDGET: &str = "00000000-0000-4000-8000-000000000085";
-        const KEY_BYTES: [u8; 32] = [77; 32];
 
         let db = TestDb::migrated().await;
         let mut owner = connect(&db.0, OWNER).await;
@@ -4709,74 +4354,9 @@ mod live_turns {
             .await
             .unwrap();
 
-        // Provision gateway binding, sealed bearer generation, and active policy for model `a`.
         let g_pool = PgPoolOptions::new()
             .max_connections(2)
             .connect_lazy_with(db.1.options(pg::GATEWAY));
-        let binding: String = sqlx::query_scalar(
-            "INSERT INTO openmettle.gateway_bindings (installation, user_id, principal, budget)
-             VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid) RETURNING id::text",
-        )
-        .bind(INSTALL)
-        .bind(&alice.user)
-        .bind(PRINCIPAL)
-        .bind(BUDGET)
-        .fetch_one(&g_pool)
-        .await
-        .unwrap();
-        let report_source: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
-            .fetch_one(&mut owner)
-            .await
-            .unwrap();
-        let keys = GatewayKeys::new(&[("metered-k1".into(), KEY_BYTES)]).unwrap();
-        let (finger, env) = GatewaySealer::new(keys, g_pool.clone())
-            .seal(
-                &Context {
-                    installation: INSTALL,
-                    user_id: &alice.user,
-                    binding_id: &binding,
-                    principal: PRINCIPAL,
-                    generation: 1,
-                },
-                &Bearer::new(b"metered-round-token").unwrap(),
-            )
-            .await
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO openmettle.gateway_generations
-                 (binding_id, generation, remote_key, expires_at, key_id, key_fingerprint, nonce, ciphertext)
-             VALUES ($1::uuid, 1, gen_random_uuid(), clock_timestamp() + interval '1 hour', $2, $3, $4, $5)",
-        )
-        .bind(&binding)
-        .bind(&env.key_id)
-        .bind(finger.as_slice())
-        .bind(env.nonce.as_slice())
-        .bind(env.ciphertext)
-        .execute(&g_pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO openmettle.gateway_policy
-                 (binding_id, revision, scope_id, approval_id, model, report_source,
-                  provider_generation, approval_generation, user_generation, capabilities)
-             VALUES ($1::uuid, 1, $2::uuid, $3::uuid, 'a', $4::uuid, 0, 0, 0, '{}'::jsonb)",
-        )
-        .bind(&binding)
-        .bind(&scope)
-        .bind(&alice.approval)
-        .bind(&report_source)
-        .execute(&g_pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE openmettle.gateway_bindings
-                SET active_generation = 1, observed_revision = 1, state = 'ready'
-              WHERE id = $1::uuid",
-        )
-        .bind(&binding)
-        .execute(&g_pool)
-        .await
-        .unwrap();
 
         // Mount real API binary with qualified `cost_bound` (1 micro/token) and `prompt_bound`.
         let dir = Dir::new();
@@ -5127,17 +4707,10 @@ mod live_turns {
     #[ignore = "isolated PostgreSQL 18 and synthetic TLS gateway"]
     async fn token_only_deployment_dispatches_cost_bound_model() {
         use crate::authz_http::{Api, As, browser, success};
-        use openmettle_core::{
-            authz::gateway::settlement,
-            provider_http::gateway::UsageReport,
-            provider_keys::gateway::{Bearer, Context, GatewayKeys, GatewaySealer},
-        };
+        use openmettle_core::{authz::gateway::settlement, provider_http::gateway::UsageReport};
         use sqlx::postgres::PgPoolOptions;
 
         const INSTALL: &str = "00000000-0000-4000-8000-000000000094";
-        const PRINCIPAL: &str = "00000000-0000-4000-8000-000000000095";
-        const BUDGET: &str = "00000000-0000-4000-8000-000000000096";
-        const KEY_BYTES: [u8; 32] = [88; 32];
 
         let db = TestDb::migrated().await;
         let mut owner = connect(&db.0, OWNER).await;
@@ -5159,70 +4732,6 @@ mod live_turns {
         let g_pool = PgPoolOptions::new()
             .max_connections(2)
             .connect_lazy_with(db.1.options(pg::GATEWAY));
-        let binding: String = sqlx::query_scalar(
-            "INSERT INTO openmettle.gateway_bindings (installation, user_id, principal, budget)
-             VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid) RETURNING id::text",
-        )
-        .bind(INSTALL)
-        .bind(&alice.user)
-        .bind(PRINCIPAL)
-        .bind(BUDGET)
-        .fetch_one(&g_pool)
-        .await
-        .unwrap();
-        let report_source: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
-            .fetch_one(&mut owner)
-            .await
-            .unwrap();
-        let keys = GatewayKeys::new(&[("token-only-k1".into(), KEY_BYTES)]).unwrap();
-        let (finger, env) = GatewaySealer::new(keys, g_pool.clone())
-            .seal(
-                &Context {
-                    installation: INSTALL,
-                    user_id: &alice.user,
-                    binding_id: &binding,
-                    principal: PRINCIPAL,
-                    generation: 1,
-                },
-                &Bearer::new(b"token-only-round-bearer").unwrap(),
-            )
-            .await
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO openmettle.gateway_generations
-                 (binding_id, generation, remote_key, expires_at, key_id, key_fingerprint, nonce, ciphertext)
-             VALUES ($1::uuid, 1, gen_random_uuid(), clock_timestamp() + interval '1 hour', $2, $3, $4, $5)",
-        )
-        .bind(&binding)
-        .bind(&env.key_id)
-        .bind(finger.as_slice())
-        .bind(env.nonce.as_slice())
-        .bind(env.ciphertext)
-        .execute(&g_pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO openmettle.gateway_policy
-                 (binding_id, revision, scope_id, approval_id, model, report_source,
-                  provider_generation, approval_generation, user_generation, capabilities)
-             VALUES ($1::uuid, 1, $2::uuid, $3::uuid, 'a', $4::uuid, 0, 0, 0, '{}'::jsonb)",
-        )
-        .bind(&binding)
-        .bind(&scope)
-        .bind(&alice.approval)
-        .bind(&report_source)
-        .execute(&g_pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE openmettle.gateway_bindings
-                SET active_generation = 1, observed_revision = 1, state = 'ready'
-              WHERE id = $1::uuid",
-        )
-        .bind(&binding)
-        .execute(&g_pool)
-        .await
-        .unwrap();
 
         let dir = Dir::new();
         std::fs::create_dir(dir.path("artifacts")).unwrap();
@@ -5666,17 +5175,10 @@ mod live_turns {
     async fn funded_parent_cost_hold_completes_both_rounds_after_limit_lowered_and_refuses_new_admission()
      {
         use crate::authz_http::{Api, As, browser, success};
-        use openmettle_core::{
-            authz::gateway::settlement,
-            provider_http::gateway::UsageReport,
-            provider_keys::gateway::{Bearer, Context, GatewayKeys, GatewaySealer},
-        };
+        use openmettle_core::{authz::gateway::settlement, provider_http::gateway::UsageReport};
         use sqlx::postgres::PgPoolOptions;
 
         const INSTALL: &str = "00000000-0000-4000-8000-000000001920";
-        const PRINCIPAL: &str = "00000000-0000-4000-8000-000000001921";
-        const BUDGET: &str = "00000000-0000-4000-8000-000000001922";
-        const KEY_BYTES: [u8; 32] = [0x71; 32];
 
         let db = TestDb::migrated().await;
         let mut owner = connect(&db.0, OWNER).await;
@@ -5710,70 +5212,6 @@ mod live_turns {
         let g_pool = PgPoolOptions::new()
             .max_connections(2)
             .connect_lazy_with(db.1.options(pg::GATEWAY));
-        let binding: String = sqlx::query_scalar(
-            "INSERT INTO openmettle.gateway_bindings (installation, user_id, principal, budget)
-             VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid) RETURNING id::text",
-        )
-        .bind(INSTALL)
-        .bind(&alice.user)
-        .bind(PRINCIPAL)
-        .bind(BUDGET)
-        .fetch_one(&g_pool)
-        .await
-        .unwrap();
-        let report_source: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
-            .fetch_one(&mut owner)
-            .await
-            .unwrap();
-        let keys = GatewayKeys::new(&[("lowered-k1".into(), KEY_BYTES)]).unwrap();
-        let (finger, env) = GatewaySealer::new(keys, g_pool.clone())
-            .seal(
-                &Context {
-                    installation: INSTALL,
-                    user_id: &alice.user,
-                    binding_id: &binding,
-                    principal: PRINCIPAL,
-                    generation: 1,
-                },
-                &Bearer::new(b"lowered-limit-bearer").unwrap(),
-            )
-            .await
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO openmettle.gateway_generations
-                 (binding_id, generation, remote_key, expires_at, key_id, key_fingerprint, nonce, ciphertext)
-             VALUES ($1::uuid, 1, gen_random_uuid(), clock_timestamp() + interval '1 hour', $2, $3, $4, $5)",
-        )
-        .bind(&binding)
-        .bind(&env.key_id)
-        .bind(finger.as_slice())
-        .bind(env.nonce.as_slice())
-        .bind(env.ciphertext)
-        .execute(&g_pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO openmettle.gateway_policy
-                 (binding_id, revision, scope_id, approval_id, model, report_source,
-                  provider_generation, approval_generation, user_generation, capabilities)
-             VALUES ($1::uuid, 1, $2::uuid, $3::uuid, 'a', $4::uuid, 0, 0, 0, '{}'::jsonb)",
-        )
-        .bind(&binding)
-        .bind(&scope)
-        .bind(&alice.approval)
-        .bind(&report_source)
-        .execute(&g_pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE openmettle.gateway_bindings
-                SET active_generation = 1, observed_revision = 1, state = 'ready'
-              WHERE id = $1::uuid",
-        )
-        .bind(&binding)
-        .execute(&g_pool)
-        .await
-        .unwrap();
 
         let dir = Dir::new();
         std::fs::create_dir(dir.path("artifacts")).unwrap();

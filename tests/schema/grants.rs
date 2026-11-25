@@ -385,47 +385,105 @@ async fn cancellation_and_unknown_commit_keep_grant_identity() {
 async fn gateway_usage_and_settlement_column_grants() {
     let db = TestDb::migrated().await;
     let mut c = db.admin().await;
-    for (table, column, insert, update) in [
-        ("gateway_usage_reports", "reasoning_included", true, false),
-        ("gateway_usage_reports", "incomplete", true, false),
-        ("gateway_settlements", "final", true, true),
-        ("gateway_settlements", "updated_at", false, false),
-        ("gateway_requests", "settled_final", false, false),
-        ("gateway_requests", "dispatched_at", false, false),
-        ("gateway_requests", "bearer_hash", false, false),
-        ("gateway_requests", "claim_hash", false, false),
-        ("gateway_requests", "cost_fixed_micros", false, false),
-        ("gateway_requests", "cost_micros_per_token", false, false),
+    // After migration 37, `openmettle_gateway` has zero table or column privileges anywhere in
+    // `openmettle`, and `openmettle_api` has zero privileges on `gateway_requests`.
+    for (table, column) in [
+        ("gateway_usage_reports", "reasoning_included"),
+        ("gateway_usage_reports", "incomplete"),
+        ("gateway_settlements", "final"),
+        ("gateway_settlements", "updated_at"),
+        ("gateway_requests", "settled_final"),
+        ("gateway_requests", "dispatched_at"),
+        ("gateway_requests", "bearer_hash"),
+        ("gateway_requests", "claim_hash"),
+        ("gateway_requests", "cost_fixed_micros"),
+        ("gateway_requests", "cost_micros_per_token"),
     ] {
         for role in [pg::GATEWAY, API, WORKER, ISSUANCE, "public"] {
             let writes: (bool, bool) = sqlx::query_as(
                 "SELECT has_column_privilege($1,$2,$3,'INSERT'), has_column_privilege($1,$2,$3,'UPDATE')",
             )
-            .bind(role).bind(format!("openmettle.{table}")).bind(column)
-            .fetch_one(&mut c).await.unwrap();
-            assert_eq!(
-                writes,
-                (role == pg::GATEWAY && insert, role == pg::GATEWAY && update),
-                "{role} {table}.{column}"
-            );
+            .bind(role)
+            .bind(format!("openmettle.{table}"))
+            .bind(column)
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+            assert_eq!(writes, (false, false), "{role} {table}.{column}");
         }
     }
-    for (function, worker_exec) in [
+    // `openmettle_gateway` holds zero SELECT/INSERT/UPDATE/DELETE privileges on every table in `openmettle`.
+    let gateway_table_privs: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM pg_class cl
+           JOIN pg_namespace ns ON ns.oid = cl.relnamespace
+          WHERE ns.nspname = 'openmettle'
+            AND cl.relkind IN ('r', 'p')
+            AND (has_table_privilege('openmettle_gateway', cl.oid, 'SELECT')
+                 OR has_table_privilege('openmettle_gateway', cl.oid, 'INSERT')
+                 OR has_table_privilege('openmettle_gateway', cl.oid, 'UPDATE')
+                 OR has_table_privilege('openmettle_gateway', cl.oid, 'DELETE'))",
+    )
+    .fetch_one(&mut c)
+    .await
+    .unwrap();
+    assert_eq!(gateway_table_privs, 0);
+
+    // `openmettle_gateway` holds EXECUTE ONLY on `gateway_dispatch`, `gateway_dispatch_scoped`,
+    // and `gateway_settle_report`.
+    let gateway_exec_fns: Vec<String> = sqlx::query_scalar(
+        "SELECT p.oid::regprocedure::text
+           FROM pg_proc p
+           JOIN pg_namespace ns ON ns.oid = p.pronamespace
+          WHERE ns.nspname = 'openmettle'
+            AND has_function_privilege('openmettle_gateway', p.oid, 'EXECUTE')
+          ORDER BY p.oid::regprocedure::text COLLATE \"C\"",
+    )
+    .fetch_all(&mut c)
+    .await
+    .unwrap();
+    assert_eq!(
+        gateway_exec_fns,
+        vec![
+            "openmettle.gateway_dispatch(uuid,bytea)",
+            "openmettle.gateway_dispatch_scoped(uuid,bytea)",
+            "openmettle.gateway_settle_report(uuid,uuid,uuid,uuid,uuid,uuid,bigint,boolean,bigint,bigint,bigint,boolean,numeric,text,text)",
+        ]
+    );
+
+    for (function, allowed_role) in [
         (
             "openmettle.gateway_unreported_candidates(timestamptz,uuid,timestamptz,uuid,integer)",
-            true,
+            Some(WORKER),
         ),
-        ("openmettle.gateway_close_unreported(uuid)", true),
-        ("openmettle.enforce_gateway_report_sweep_only()", false),
+        ("openmettle.gateway_close_unreported(uuid)", Some(WORKER)),
+        ("openmettle.enforce_gateway_report_sweep_only()", None),
         (
             "openmettle.gateway_handoff_round(uuid,bytea,uuid,bytea,bigint,bigint)",
-            true,
+            Some(WORKER),
         ),
-        ("openmettle.enforce_gateway_report_bound_cost()", false),
-        ("openmettle.gateway_snapshot_cost_bound(text)", false),
+        ("openmettle.enforce_gateway_report_bound_cost()", None),
+        ("openmettle.gateway_snapshot_cost_bound(text)", None),
         (
             "openmettle.gateway_backfill_legacy_request_cost_bound(uuid,bigint,bigint)",
-            false,
+            None,
+        ),
+        ("openmettle.gateway_release(uuid,bytea)", Some(WORKER)),
+        (
+            "openmettle.quota_recover_lost_handoff(uuid,bytea,uuid,uuid,uuid)",
+            Some(WORKER),
+        ),
+        (
+            "openmettle.quota_lock_gateway_request_for_settlement(uuid)",
+            None,
+        ),
+        (
+            "openmettle.quota_settle_gateway_usage(uuid,uuid,uuid,bigint)",
+            None,
+        ),
+        (
+            "openmettle.gateway_settle_report(uuid,uuid,uuid,uuid,uuid,uuid,bigint,boolean,bigint,bigint,bigint,boolean,numeric,text,text)",
+            Some(pg::GATEWAY),
         ),
     ] {
         for role in [pg::GATEWAY, API, WORKER, ISSUANCE, "public"] {
@@ -438,7 +496,7 @@ async fn gateway_usage_and_settlement_column_grants() {
                     .unwrap();
             assert_eq!(
                 can_exec,
-                worker_exec && role == WORKER,
+                allowed_role == Some(role),
                 "{role} EXECUTE {function}"
             );
         }
@@ -1619,10 +1677,8 @@ async fn populated_upgrade(binary_env: &str, versions: &[i64], with_grants: bool
         for violation in &reported {
             let later = violation.contains("openmettle.native_handoffs")
                 || violation.ends_with(" on function openmettle.redeem_home_invitation(uuid,text,text,text,bigint,bytea)")
-                || [API, WORKER].iter().any(|role| {
-                    ["gateway_handoff(uuid,bytea,bytea,bytea,uuid)", "gateway_release(uuid,bytea)"]
-                        .iter().any(|signature| **violation == format!("{role} has EXECUTE on function openmettle.{signature}"))
-                })
+                || **violation
+                    == format!("{WORKER} has EXECUTE on function openmettle.gateway_release(uuid,bytea)")
                 || quota_grants.iter().any(|grant| grant==violation)
                 || worker_reads.contains(violation)
                 || later_objects.iter().any(|object| {

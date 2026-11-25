@@ -121,13 +121,17 @@ object.
 
 The report is written by the task that relays the response, so the write does not depend on
 the caller staying connected. Each attempt is bounded by five `DB_TIMEOUT_MS` (10 s by
-default), also when its database connection stops answering, and a transient failure or an
-expired attempt is retried twice (after 100 ms and 500 ms). An attempt is never cancelled in
-flight: one past its bound is left to finish or fail on its own while the retry runs, which is
-safe because settlement accepts the identical report once. There is no local spool. If no
-attempt confirms the write, the proxy logs `gateway.usage.failed`: the gateway could not confirm
-the write, and an earlier attempt may still have committed it. Check the request's usage report
-and hold before acting. If no report exists, the worker's maintenance sweep closes the hold as
+default), also when its database connection stops answering. Non-lock transient failures and
+expired attempts retry twice (after 100 ms and 500 ms). Both PostgreSQL lock timeouts
+(`SQLSTATE 55P03`, such as exclusive DDL locks held by `openmettle-migrate`) and `PgPool`
+connection-acquisition timeouts under DDL contention roll back any open connection, retain the
+final report in memory, and keep retrying every 250 ms for up to 5 minutes (300 s) without
+consuming the two transient retries. An attempt is never cancelled in flight: one past its
+bound is left to finish or fail on its own while the retry runs, which is safe because
+settlement accepts the identical report once. There is no local spool. If no attempt confirms
+the write, the proxy logs `gateway.usage.failed`: the gateway could not confirm the write, and
+an earlier attempt may still have committed it. Check the request's usage report and hold
+before acting. If no report exists, the worker's maintenance sweep closes the hold as
 `unreported` at revision `0` once 15 minutes have passed after the run's execution deadline
 (increment 3b). This applies to a report with usage and to one without.
 
@@ -188,10 +192,38 @@ spent:
 The gateway reads the same process settings as the API and the worker under the
 `OPENMETTLE_GATEWAY_` prefix: `BIND` (default `127.0.0.1:8082`), `DATABASE_URL`,
 `DB_MAX_CONNECTIONS`, `DB_TIMEOUT_MS`, `SHUTDOWN_TIMEOUT_MS`, `LOG_FORMAT`, `LOG_LEVEL` and the
-`OTLP_*` export settings, with the ranges in the README. `DATABASE_URL` must be a login of
-`openmettle_gateway`; the proxy needs only that role's existing grants. It never reads
-`ARTIFACTS_DIR` or `AUTH_CONFIG`, and it refuses to start while
+`OTLP_*` export settings, with the ranges in the README. `DATABASE_URL` must be a login of `openmettle_gateway`. As of migration `0037` (ADR 0044
+increment 6), `openmettle_gateway` holds zero table or column privileges: its entire database
+surface is database `CONNECT`, schema `USAGE` on `openmettle`, and `EXECUTE` on
+`openmettle.gateway_dispatch(uuid, bytea)`, `openmettle.gateway_dispatch_scoped(uuid, bytea)` and
+`openmettle.gateway_settle_report(...)` (during rolling upgrades against pre-37 schemas,
+settlement probes `to_regprocedure` per transaction and falls back to the unbound pre-37 SQL
+path). The proxy never reads `ARTIFACTS_DIR` or `AUTH_CONFIG`, and it refuses to start while
 `OPENMETTLE_API_ISSUANCE_DATABASE_URL` is present.
+
+**`0036` → `0037` rollout order (mandatory gateway-first cutover):** Migration `0037` revokes
+`openmettle_gateway`'s table privileges and `EXECUTE` on
+`quota_lock_gateway_request_for_settlement`. A pre-`0037` (`0036`) `openmettle-gateway` binary
+starts every settlement with `quota_lock_gateway_request_for_settlement`, so if it is still
+serving an in-flight stream when migration `0037` commits, its final report write fails with
+`42501` and (because the proxy has no persistent report spool) the stream's measured usage is
+lost and later closed as `unreported`. Roll out in three steps:
+
+1. Deploy the `0037`-capable `openmettle-gateway` binary against schema `36` (it probes
+   `to_regprocedure('openmettle.gateway_settle_report(...)')` per transaction and uses the
+   unbound pre-`37` settlement path).
+2. Drain all pre-`0037` (`0036`) `openmettle-gateway` replicas until their in-flight streams and
+   final usage report writes complete.
+3. Apply migration `0037` via `openmettle-migrate`: live `0037`-capable gateway replicas retain
+   final reports in memory across both `55P03` lock timeouts and `PgPool` connection-acquisition
+   timeouts every 250 ms for up to 5 minutes (300 s) without consuming their two transient
+   retries, and transition automatically on the next settlement transaction after commit to
+   `openmettle.gateway_settle_report(...)` without losing in-flight stream usage. Because
+   PostgreSQL's `statement_timeout` bounds each individual SQL statement while table locks
+   persist until the migration transaction commits, pause dispatches and drain gateway replicas
+   before migrating whenever migration `0037`'s **total lock-hold duration** could exceed
+   300 seconds (5 minutes), including at the default `OPENMETTLE_MIGRATE_STATEMENT_TIMEOUT_MS`
+   setting.
 
 | Setting (`OPENMETTLE_GATEWAY_` prefix) | Range | Default |
 | --- | --- | --- |
@@ -255,8 +287,6 @@ on a connection that stopped answering: the pool waits for every connection when
   of the proxy and give the worker an `https://` route; see
   [plain HTTP inside the cluster](worker-turn-execution.md#plain-http-inside-the-cluster).
   The default bind is loopback.
-- **A broad database role.** `openmettle_gateway` still has the grants the superseded
-  reconciler needed. Increment 6 narrows it to what the proxy uses.
 - **Chat completions only.** The Responses API is not routed.
 - **No concurrency limit** on relayed requests.
 - **Identity bodies only.** Compressed requests and answers are refused rather than relayed.

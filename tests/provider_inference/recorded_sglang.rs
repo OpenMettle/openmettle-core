@@ -3,7 +3,6 @@
 //! request each case sent, substitutions and limits: `tests/fixtures/sglang-recorded/README.md`.
 //! Tests named `known_gap_*` pin today's behaviour for gaps recorded on issue #9. A later
 //! increment is expected to change each of them; update the assertion together with that fix.
-use crate::authz::gateway::problem::{Cause, Problem};
 use crate::{
     provider_http::{fixture::Reply, inference::*},
     sglang_recorded::*,
@@ -142,7 +141,6 @@ struct Replay {
     visible: String,
     /// The request core sent to the fixture.
     sent: Value,
-    family: bool,
 }
 impl Replay {
     fn turn(&self) -> &Turn {
@@ -151,13 +149,8 @@ impl Replay {
             Err(e) => panic!("{}: {e:?}", self.label),
         }
     }
-    /// The recorded decoder error, and its ADR 0037 projection on a family-policy route.
-    fn failed(&self, plain: Error) {
-        let expected = if self.family {
-            Error::Gateway(Problem::Failure(Cause::Protocol))
-        } else {
-            plain
-        };
+    /// The recorded decoder error.
+    fn failed(&self, expected: Error) {
         assert_eq!(
             self.result.as_ref().err(),
             Some(&expected),
@@ -167,39 +160,33 @@ impl Replay {
     }
 }
 
-/// Every applicable re-chunking, with and without the family policy.
+/// Every applicable re-chunking.
 async fn replays(case: &str, configure: impl Fn(&mut Qualification)) -> Vec<Replay> {
     let mut out = Vec::new();
     for &chunking in chunkings(case) {
-        for family in [false, true] {
-            let (protocol, request) = request(case);
-            let c = catalog(protocol, true);
-            let e = effective(&c, false);
-            let bytes = response(case, chunking);
-            let mock = Mock::new(protocol, move |_| Reply::Bytes(bytes.clone())).await;
-            let mut gateway = mock.configured(&e, NORMAL, &configure);
-            if family {
-                gateway = gateway.with_family_policy_v1();
-            }
-            let seen = Arc::new(Mutex::new(String::new()));
-            let sink = seen.clone();
-            let result = gateway
-                .caller(&c, &e, &request, Credential::Bearer(TOKEN), move |d| {
-                    sink.lock().unwrap().push_str(&d.text);
-                    async {}
-                })
-                .await;
-            mock.assert_inference_only(1);
-            let sent = mock.captured.lock().unwrap()[0].clone();
-            let visible = seen.lock().unwrap().clone();
-            out.push(Replay {
-                label: format!("{case} {chunking:?} family_policy_v1={family}"),
-                result,
-                visible,
-                sent,
-                family,
-            });
-        }
+        let (protocol, request) = request(case);
+        let c = catalog(protocol, true);
+        let e = effective(&c, false);
+        let bytes = response(case, chunking);
+        let mock = Mock::new(protocol, move |_| Reply::Bytes(bytes.clone())).await;
+        let gateway = mock.configured(&e, NORMAL, &configure);
+        let seen = Arc::new(Mutex::new(String::new()));
+        let sink = seen.clone();
+        let result = gateway
+            .caller(&c, &e, &request, Credential::Bearer(TOKEN), move |d| {
+                sink.lock().unwrap().push_str(&d.text);
+                async {}
+            })
+            .await;
+        mock.assert_inference_only(1);
+        let sent = mock.captured.lock().unwrap()[0].clone();
+        let visible = seen.lock().unwrap().clone();
+        out.push(Replay {
+            label: format!("{case} {chunking:?}"),
+            result,
+            visible,
+            sent,
+        });
     }
     out
 }

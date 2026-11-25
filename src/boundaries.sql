@@ -36,6 +36,12 @@
 -- Version 36 adds `gateway_dispatch_scoped` (gateway only) for prefix-cache owner isolation and
 -- delegates 6-column `gateway_dispatch` to it with unchanged signature, security and privileges
 -- (ADR 0044, increment 5).
+-- Version 37 removes the superseded ADR 0037 provisioning tables (`gateway_bindings`,
+-- `gateway_nonces`, `gateway_generations`, `gateway_policy`, `gateway_intents`, `gateway_audit`),
+-- drops `gateway_handoff` and `quota_commit_handoff(uuid,bytea)`, revokes `openmettle_api`'s
+-- round-level `gateway_requests`/`gateway_release`/`quota_recover_lost_handoff` privileges, adds
+-- `gateway_settle_report` (`openmettle_gateway` only), and revokes all table, column, and internal
+-- quota-settlement helper privileges from `openmettle_gateway` (ADR 0044, increment 6).
 -- Each version's explicit grants are allowed only once that version is recorded as applied.
 -- Principals are openmettle_api, openmettle_issuance, openmettle_worker, openmettle_gateway, every role that is
 -- directly or indirectly a member of one of them (for example their login roles), and PUBLIC.
@@ -90,7 +96,8 @@ quota_tables (relation,role,privilege) AS (
     SELECT relation,role,'SELECT' FROM unnest(ARRAY['quota_defaults','quota_enforcement','quota_overrides',
         'quota_reservations','quota_budgets','quota_reservation_charges','quota_reconciliations','quota_warning_events',
         'storage_volume_control']) relation, unnest(ARRAY['openmettle_api','openmettle_worker','openmettle_gateway']) role
-    WHERE $1 >= 24 AND (relation<>'storage_volume_control' OR role<>'openmettle_gateway')
+    WHERE ($1 >= 24 AND role <> 'openmettle_gateway')
+       OR ($1 BETWEEN 24 AND 36 AND role = 'openmettle_gateway' AND relation <> 'storage_volume_control')
 ),
 -- Version 27 (ADR 0042): the worker reads the capacity store; every write is a function call.
 capacity_tables (relation,role,privilege) AS (
@@ -140,11 +147,13 @@ gateway_columns (relation,attribute,role,privilege) AS (
         ('gateway_usage_reports','openmettle_gateway','INSERT',ARRAY['request_id','source','report_id','revision','final','prompt_tokens','completion_tokens','reasoning_tokens','reasoning_included','cost','unit']),
         ('gateway_settlements','openmettle_gateway','INSERT',ARRAY['request_id','revision','final','measured','outstanding']),
         ('gateway_settlements','openmettle_gateway','UPDATE',ARRAY['revision','final','measured','outstanding']),
+        ('gateway_requests','openmettle_api','INSERT',ARRAY['id','reservation_id','scope_id','actor_user_id','approval_id','installation','model','units','dispatch_hash','session_id'])
+    ) AS t(relation,role,privilege,columns), unnest(columns) attribute WHERE $1 BETWEEN 23 AND 36
+    UNION ALL SELECT relation, attribute, role, privilege FROM (VALUES
         ('gateway_reservations','openmettle_api','INSERT',ARRAY['id','scope_id','actor_user_id','approval_id','run_id','units']),
-        ('gateway_requests','openmettle_api','INSERT',ARRAY['id','reservation_id','scope_id','actor_user_id','approval_id','installation','model','units','dispatch_hash','session_id']),
         ('gateway_requests','openmettle_worker','INSERT',ARRAY['id','reservation_id','scope_id','actor_user_id','approval_id','installation','model','units','dispatch_hash','run_id','round'])
     ) AS t(relation,role,privilege,columns), unnest(columns) attribute WHERE $1 >= 23
-    UNION ALL SELECT 'gateway_usage_reports','incomplete','openmettle_gateway','INSERT' WHERE $1 >= 31
+    UNION ALL SELECT 'gateway_usage_reports','incomplete','openmettle_gateway','INSERT' WHERE $1 BETWEEN 31 AND 36
 ),
 runtime_functions(signature,definer,roles) AS (
     SELECT * FROM (VALUES
@@ -155,7 +164,8 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.enforce_gateway_report_cost_unit()',true,ARRAY[]::text[]),
         ('openmettle.enforce_quota_enforcement_write_once()',false,ARRAY[]::text[]),
         ('openmettle.enforce_gateway_handoff_holds()',true,ARRAY[]::text[]),
-        ('openmettle.quota_lock_gateway_request_for_settlement(uuid)',true,ARRAY['openmettle_gateway']::text[]),
+        ('openmettle.quota_lock_gateway_request_for_settlement(uuid)',true,
+            CASE WHEN $1 < 37 THEN ARRAY['openmettle_gateway']::text[] ELSE ARRAY[]::text[] END),
         ('openmettle.enforce_tool_spill_reservation_binding()',false,ARRAY[]::text[]),
         ('openmettle.storage_lock_pinned_volume()',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
         ('openmettle.storage_pin_volume_id(uuid)',true,ARRAY['openmettle_api']::text[]),
@@ -168,13 +178,14 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.quota_cost_ceiling(uuid,uuid)',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
         ('openmettle.quota_ensure_legacy_run_holds(uuid,uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.quota_allocate_round(uuid,bytea,uuid,text,bigint)',true,ARRAY['openmettle_worker']::text[]),
-        ('openmettle.quota_commit_handoff(uuid,bytea)',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
         ('openmettle.quota_gateway_fold(uuid,text,bigint,bigint)',false,ARRAY[]::text[]),
         ('openmettle.quota_adjust(uuid,numeric,numeric)',false,ARRAY[]::text[]),
-        ('openmettle.quota_settle_gateway_usage(uuid,uuid,uuid,bigint)',true,ARRAY['openmettle_gateway']::text[]),
+        ('openmettle.quota_settle_gateway_usage(uuid,uuid,uuid,bigint)',true,
+            CASE WHEN $1 < 37 THEN ARRAY['openmettle_gateway']::text[] ELSE ARRAY[]::text[] END),
         ('openmettle.quota_unwind_hold(uuid,text)',false,ARRAY[]::text[]),
         ('openmettle.quota_unwind_request(uuid,text)',false,ARRAY[]::text[]),
-        ('openmettle.quota_recover_lost_handoff(uuid,bytea,uuid,uuid,uuid)',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
+        ('openmettle.quota_recover_lost_handoff(uuid,bytea,uuid,uuid,uuid)',true,
+            CASE WHEN $1 < 37 THEN ARRAY['openmettle_api','openmettle_worker']::text[] ELSE ARRAY['openmettle_worker']::text[] END),
         ('openmettle.quota_unwind_superseded_round(uuid,uuid,uuid,integer)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.quota_release_orphan_gateway_requests(interval,timestamptz,uuid,timestamptz,uuid,integer)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.quota_renew_lease(uuid,uuid,uuid,timestamptz)',true,ARRAY['openmettle_worker']::text[]),
@@ -187,6 +198,7 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.quota_release_device_slot(uuid,uuid)',true,ARRAY['openmettle_worker']::text[]),
         ('openmettle.quota_commit_handoff(uuid,uuid)',true,ARRAY['openmettle_api','openmettle_worker']::text[]),
         ('openmettle.quota_bump_config_revision()',false,ARRAY[]::text[])) AS f WHERE $1 >= 24
+    UNION ALL SELECT 'openmettle.quota_commit_handoff(uuid,bytea)',true,ARRAY['openmettle_api','openmettle_worker']::text[] WHERE $1 BETWEEN 24 AND 36
     UNION ALL SELECT * FROM (VALUES
         ('openmettle.quota_upsert_scope_override(uuid,uuid,text,bigint,timestamptz,text)',true,ARRAY['openmettle_api']::text[]),
         ('openmettle.quota_revoke_scope_override(uuid,uuid,text,text)',true,ARRAY['openmettle_api']::text[])) AS f WHERE $1 BETWEEN 24 AND 25
@@ -252,13 +264,20 @@ runtime_functions(signature,definer,roles) AS (
         ('openmettle.family_policy_filter_models(uuid,uuid,text[],timestamptz)',true,ARRAY['openmettle_api']::text[]),
         ('openmettle.family_policy_permits(uuid,uuid,text,timestamptz)',true,ARRAY['openmettle_api','openmettle_worker']::text[])) AS f WHERE $1 >= 35
     UNION ALL SELECT 'openmettle.gateway_dispatch_scoped(uuid,bytea)',true,ARRAY['openmettle_gateway']::text[] WHERE $1 >= 36
+    UNION ALL SELECT 'openmettle.gateway_settle_report(uuid,uuid,uuid,uuid,uuid,uuid,bigint,boolean,bigint,bigint,bigint,boolean,numeric,text,text)',true,ARRAY['openmettle_gateway']::text[] WHERE $1 >= 37
 ),
-gateway_functions (signature,definer,inference) AS (
-    SELECT * FROM (VALUES ('openmettle.gateway_allocate()',true,false), ('openmettle.gateway_run_hold()',true,false),
-        ('openmettle.gateway_advance_settlement()',false,false),
-        ('openmettle.gateway_mark_settled_final()',true,false),
-        ('openmettle.gateway_handoff(uuid,bytea,bytea,bytea,uuid)',true,true),
-        ('openmettle.gateway_release(uuid,bytea)',true,true)) AS f WHERE $1 >= 23
+gateway_functions (signature,definer,roles) AS (
+    SELECT * FROM (VALUES
+        ('openmettle.gateway_allocate()',true,ARRAY[]::text[]),
+        ('openmettle.gateway_run_hold()',true,ARRAY[]::text[]),
+        ('openmettle.gateway_advance_settlement()',false,ARRAY[]::text[]),
+        ('openmettle.gateway_mark_settled_final()',true,ARRAY[]::text[]),
+        ('openmettle.gateway_release(uuid,bytea)',true,
+            CASE WHEN $1 < 37 THEN ARRAY['openmettle_api','openmettle_worker']::text[]
+                 ELSE ARRAY['openmettle_worker']::text[] END)
+    ) AS f WHERE $1 >= 23
+    UNION ALL SELECT 'openmettle.gateway_handoff(uuid,bytea,bytea,bytea,uuid)',true,
+        ARRAY['openmettle_api','openmettle_worker']::text[] WHERE $1 BETWEEN 23 AND 36
 ),
 contract (relation, role, privilege) AS (
     VALUES
@@ -366,7 +385,7 @@ contract (relation, role, privilege) AS (
         'user_identities','scopes','local_identity_approvals','login_providers',
         'login_provider_revisions','grant_assignments','grant_changes','local_groups',
         'local_group_memberships','membership_observations','grant_mapping_rules','grant_mapping_revisions',
-        'project_settings','platform_capability_denies','user_capability_denies','user_capability_grants']), 'openmettle_gateway', 'SELECT' WHERE $1 >= 23
+        'project_settings','platform_capability_denies','user_capability_denies','user_capability_grants']), 'openmettle_gateway', 'SELECT' WHERE $1 BETWEEN 23 AND 36
     UNION ALL SELECT * FROM quota_tables
     UNION ALL SELECT * FROM capacity_tables
     UNION ALL SELECT * FROM retention_tables
@@ -816,9 +835,8 @@ violations (violation) AS (
                         = 'function openmettle.redeem_home_invitation(uuid,text,text,text,bigint)')
                     OR ($1 >= 13 AND g.target
                         = 'function openmettle.redeem_home_invitation(uuid,text,text,text,bigint,bytea)')))
-      AND NOT (g.kind='function' AND g.privilege='EXECUTE'
-               AND pg_get_userbyid(g.grantee) IN ('openmettle_api','openmettle_worker')
-               AND EXISTS (SELECT FROM gateway_functions f WHERE f.inference AND g.target='function ' || f.signature))
+      AND NOT (g.kind='function' AND g.privilege='EXECUTE' AND EXISTS (SELECT FROM gateway_functions f
+               WHERE g.target='function ' || f.signature AND pg_get_userbyid(g.grantee)=ANY(f.roles)))
       AND NOT (g.kind='function' AND g.privilege='EXECUTE' AND EXISTS (SELECT FROM runtime_functions f
                WHERE g.target='function ' || to_regprocedure(f.signature)::text AND pg_get_userbyid(g.grantee)=ANY(f.roles)))
       AND NOT (g.kind = 'column' AND g.schema_name = 'openmettle'
@@ -845,10 +863,8 @@ violations (violation) AS (
     WHERE p.oid IS NULL OR p.prosecdef <> f.definer OR pg_get_userbyid(p.proowner)<>'openmettle_owner'
        OR p.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog']
        OR EXISTS (SELECT FROM aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a
-                  WHERE a.grantee<>p.proowner AND (NOT f.inference OR a.is_grantable OR
-                    a.grantee NOT IN (SELECT oid FROM pg_roles WHERE rolname IN ('openmettle_api','openmettle_worker'))))
-       OR (f.inference AND EXISTS (SELECT FROM pg_roles r WHERE r.rolname IN ('openmettle_api','openmettle_worker')
-            AND NOT has_function_privilege(r.oid,p.oid,'EXECUTE')))
+                  WHERE a.grantee<>p.proowner AND (a.is_grantable OR NOT(pg_get_userbyid(a.grantee)=ANY(f.roles))))
+       OR EXISTS (SELECT FROM unnest(f.roles) role WHERE NOT has_function_privilege(role,p.oid,'EXECUTE'))
     UNION ALL
     SELECT format('unsafe or missing quota function %s',f.signature)
     FROM runtime_functions f LEFT JOIN pg_proc p ON p.oid=to_regprocedure(f.signature)
