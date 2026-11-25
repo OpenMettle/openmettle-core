@@ -9,7 +9,7 @@ use std::{
     net::{SocketAddr, TcpStream},
     os::fd::{AsFd, BorrowedFd, OwnedFd},
     process::{Child, Command, ExitStatus, Output, Stdio},
-    sync::{Arc, LazyLock, Mutex, mpsc},
+    sync::{LazyLock, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -70,11 +70,12 @@ pub(crate) fn wait_output_bounded(
     let mut stderr = PipeCollector::new(process.0.stderr.take(), "stderr", context);
     let mut sleep = INITIAL_POLL_INTERVAL;
     let mut exited: Option<ExitStatus> = None;
-    let mut waited_for_ready = false;
+    let mut stdout_ready = false;
+    let mut stderr_ready = false;
 
     loop {
-        let progressed = stdout.drain_pass("stdout", context, Some(deadline), waited_for_ready)
-            | stderr.drain_pass("stderr", context, Some(deadline), waited_for_ready);
+        let progressed = stdout.drain_pass("stdout", context, Some(deadline), stdout_ready)
+            | stderr.drain_pass("stderr", context, Some(deadline), stderr_ready);
 
         if exited.is_none() {
             exited = process
@@ -130,17 +131,17 @@ pub(crate) fn wait_output_bounded(
         }
 
         if progressed {
-            waited_for_ready = false;
+            stdout_ready = false;
+            stderr_ready = false;
             sleep = INITIAL_POLL_INTERVAL;
         } else {
-            let mut open_fds = Vec::with_capacity(2);
-            if let Some(fd) = stdout.borrowed_fd() {
-                open_fds.push(fd);
-            }
-            if let Some(fd) = stderr.borrowed_fd() {
-                open_fds.push(fd);
-            }
-            waited_for_ready = wait_for_pipes(&open_fds, deadline.min(now + sleep), None, None);
+            (stdout_ready, stderr_ready) = wait_for_pipes(
+                stdout.borrowed_fd(),
+                stderr.borrowed_fd(),
+                deadline.min(now + sleep),
+                None,
+                Some(deadline),
+            );
             sleep = (sleep * 2).min(MAX_POLL_INTERVAL);
         }
     }
@@ -204,8 +205,13 @@ pub(crate) fn read_string_bounded<R: Read + AsFd>(
             waited_for_ready = false;
             sleep = INITIAL_POLL_INTERVAL;
         } else {
-            let fds: Vec<BorrowedFd<'_>> = collector.borrowed_fd().into_iter().collect();
-            waited_for_ready = wait_for_pipes(&fds, deadline.min(now + sleep), None, None);
+            (waited_for_ready, _) = wait_for_pipes(
+                collector.borrowed_fd(),
+                None,
+                deadline.min(now + sleep),
+                None,
+                Some(deadline),
+            );
             sleep = (sleep * 2).min(MAX_POLL_INTERVAL);
         }
     }
@@ -217,8 +223,7 @@ pub(crate) fn read_string_bounded<R: Read + AsFd>(
 pub(crate) struct PipeDrain {
     stream: &'static str,
     context: String,
-    deadline: Arc<Mutex<Option<Instant>>>,
-    wake: Arc<tokio::sync::Notify>,
+    deadline_tx: tokio::sync::watch::Sender<Option<Instant>>,
     handle: Option<thread::JoinHandle<Result<Vec<u8>, String>>>,
 }
 
@@ -230,19 +235,14 @@ impl PipeDrain {
     ) -> Self {
         let context = context.into();
         set_nonblocking(&pipe, stream, &context);
-        let deadline = Arc::new(Mutex::new(None::<Instant>));
-        let wake = Arc::new(tokio::sync::Notify::new());
-        let thread_deadline = Arc::clone(&deadline);
-        let thread_wake = Arc::clone(&wake);
+        let (deadline_tx, mut deadline_rx) = tokio::sync::watch::channel(None::<Instant>);
         let thread_context = context.clone();
         let handle = thread::spawn(move || {
             let mut collector = PipeCollector::from_nonblocking(pipe);
             let mut sleep = INITIAL_POLL_INTERVAL;
             let mut waited_for_ready = false;
             loop {
-                let maybe_deadline = *thread_deadline
-                    .lock()
-                    .unwrap_or_else(|err| err.into_inner());
+                let maybe_deadline = *deadline_rx.borrow_and_update();
                 let progressed =
                     collector.drain_pass(stream, &thread_context, maybe_deadline, waited_for_ready);
                 if collector.eof {
@@ -262,13 +262,12 @@ impl PipeDrain {
                         waited_for_ready = false;
                         sleep = INITIAL_POLL_INTERVAL;
                     } else {
-                        let fds: Vec<BorrowedFd<'_>> =
-                            collector.borrowed_fd().into_iter().collect();
-                        waited_for_ready = wait_for_pipes(
-                            &fds,
+                        (waited_for_ready, _) = wait_for_pipes(
+                            collector.borrowed_fd(),
+                            None,
                             deadline.min(now + sleep),
-                            Some(&thread_wake),
-                            Some(&thread_deadline),
+                            None,
+                            Some(deadline),
                         );
                         sleep = (sleep * 2).min(MAX_POLL_INTERVAL);
                     }
@@ -276,12 +275,12 @@ impl PipeDrain {
                     waited_for_ready = false;
                     sleep = INITIAL_POLL_INTERVAL;
                 } else {
-                    let fds: Vec<BorrowedFd<'_>> = collector.borrowed_fd().into_iter().collect();
-                    waited_for_ready = wait_for_pipes(
-                        &fds,
+                    (waited_for_ready, _) = wait_for_pipes(
+                        collector.borrowed_fd(),
+                        None,
                         Instant::now() + sleep,
-                        Some(&thread_wake),
-                        Some(&thread_deadline),
+                        Some(deadline_rx.clone()),
+                        None,
                     );
                     sleep = (sleep * 2).min(MAX_POLL_INTERVAL);
                 }
@@ -290,16 +289,13 @@ impl PipeDrain {
         Self {
             stream,
             context,
-            deadline,
-            wake,
+            deadline_tx,
             handle: Some(handle),
         }
     }
 
     pub(crate) fn finish_string(mut self, timeout: Duration) -> String {
-        *self.deadline.lock().unwrap_or_else(|err| err.into_inner()) =
-            Some(Instant::now() + timeout);
-        self.wake.notify_one();
+        let _ = self.deadline_tx.send(Some(Instant::now() + timeout));
         let handle = self.handle.take().expect("PipeDrain handle missing");
         let result = handle
             .join()
@@ -319,8 +315,7 @@ impl PipeDrain {
 impl Drop for PipeDrain {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
-            *self.deadline.lock().unwrap_or_else(|err| err.into_inner()) = Some(Instant::now());
-            self.wake.notify_one();
+            let _ = self.deadline_tx.send(Some(Instant::now()));
             let _ = handle.join();
         }
     }
@@ -513,87 +508,117 @@ impl<R: Read + AsFd> PipeCollector<R> {
 }
 
 fn wait_for_pipes(
-    fds: &[BorrowedFd<'_>],
+    first: Option<BorrowedFd<'_>>,
+    second: Option<BorrowedFd<'_>>,
     until: Instant,
-    wake: Option<&Arc<tokio::sync::Notify>>,
-    shared_deadline: Option<&Arc<Mutex<Option<Instant>>>>,
-) -> bool {
+    arm_wake: Option<tokio::sync::watch::Receiver<Option<Instant>>>,
+    hard_deadline: Option<Instant>,
+) -> (bool, bool) {
     let Some(initial_wait) = remaining_until(until) else {
-        return false;
+        return (false, false);
     };
-    let owned: Vec<OwnedFd> = fds
-        .iter()
-        .filter_map(|fd| fd.try_clone_to_owned().ok())
-        .collect();
-    if owned.is_empty() {
-        if let Some(notify) = wake.cloned() {
+    let owned_first: Option<OwnedFd> = first.and_then(|fd| fd.try_clone_to_owned().ok());
+    let owned_second: Option<OwnedFd> = second.and_then(|fd| fd.try_clone_to_owned().ok());
+    if owned_first.is_none() && owned_second.is_none() {
+        if let Some(mut rx_wake) = arm_wake {
             let (tx, rx) = mpsc::sync_channel(1);
-            PIPE_POLLER.spawn(async move {
+            let task = PIPE_POLLER.spawn(async move {
                 tokio::select! {
                     _ = tokio::time::sleep_until(tokio::time::Instant::from_std(until)) => {}
-                    _ = notify.notified() => {}
+                    _ = rx_wake.wait_for(Option::is_some) => {}
                 }
                 let _ = tx.send(());
             });
-            let _ = rx.recv_timeout(remaining_until(until).unwrap_or(Duration::ZERO));
+            if rx
+                .recv_timeout(remaining_until(until).unwrap_or(Duration::ZERO))
+                .is_err()
+            {
+                task.abort();
+            }
         } else {
             thread::sleep(initial_wait);
         }
-        return false;
+        return (false, false);
     }
-    let wake = wake.cloned();
-    let shared_deadline = shared_deadline.cloned();
     let (tx, rx) = mpsc::sync_channel(1);
-    PIPE_POLLER.spawn(async move {
-        let receivers: Vec<_> = owned
-            .into_iter()
-            .filter_map(|fd| tokio::net::unix::pipe::Receiver::from_owned_fd(fd).ok())
-            .collect();
-        let ready = if receivers.is_empty() {
-            if let Some(notify) = wake {
+    let task = PIPE_POLLER.spawn(async move {
+        let recv_first =
+            owned_first.and_then(|fd| tokio::net::unix::pipe::Receiver::from_owned_fd(fd).ok());
+        let recv_second =
+            owned_second.and_then(|fd| tokio::net::unix::pipe::Receiver::from_owned_fd(fd).ok());
+        let ready = if recv_first.is_none() && recv_second.is_none() {
+            if let Some(mut rx_wake) = arm_wake {
                 tokio::select! {
                     _ = tokio::time::sleep_until(tokio::time::Instant::from_std(until)) => {}
-                    _ = notify.notified() => {}
+                    _ = rx_wake.wait_for(Option::is_some) => {}
                 }
             } else {
                 tokio::time::sleep_until(tokio::time::Instant::from_std(until)).await;
             }
-            false
+            (false, false)
         } else {
-            let wait_ready = async {
-                if receivers.len() == 1 {
-                    let _ = receivers[0].readable().await;
-                } else {
-                    tokio::select! {
-                        _ = receivers[0].readable() => {}
-                        _ = receivers[1].readable() => {}
-                    }
-                }
-            };
+            let arm_check = arm_wake.clone();
             tokio::select! {
                 biased;
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(until)) => false,
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(until)) => (false, false),
                 _ = async {
-                    match wake {
-                        Some(notify) => notify.notified().await,
+                    match arm_wake {
+                        Some(mut rx_wake) => {
+                            let _ = rx_wake.wait_for(Option::is_some).await;
+                        }
                         None => std::future::pending().await,
                     }
-                } => false,
-                () = wait_ready => {
+                } => (false, false),
+                which = async {
+                    match (&recv_first, &recv_second) {
+                        (None, None) => std::future::pending::<(bool, bool)>().await,
+                        (Some(r1), None) => {
+                            let _ = r1.readable().await;
+                            (true, false)
+                        }
+                        (None, Some(r2)) => {
+                            let _ = r2.readable().await;
+                            (false, true)
+                        }
+                        (Some(r1), Some(r2)) => {
+                            tokio::select! {
+                                _ = r1.readable() => {
+                                    let r2_also =
+                                        tokio::time::timeout(Duration::ZERO, r2.readable())
+                                            .await
+                                            .is_ok();
+                                    (true, r2_also)
+                                }
+                                _ = r2.readable() => {
+                                    let r1_also =
+                                        tokio::time::timeout(Duration::ZERO, r1.readable())
+                                            .await
+                                            .is_ok();
+                                    (r1_also, true)
+                                }
+                            }
+                        }
+                    }
+                } => {
                     let now = Instant::now();
-                    now < until
-                        && shared_deadline.is_none_or(|d| {
-                            d.lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .is_none_or(|dl| now < dl)
-                        })
+                    let in_time = now < until
+                        && hard_deadline.is_none_or(|d| now < d)
+                        && arm_check
+                            .as_ref()
+                            .is_none_or(|rx_wake| rx_wake.borrow().is_none_or(|d| now < d));
+                    if in_time { which } else { (false, false) }
                 }
             }
         };
         let _ = tx.send(ready);
     });
-    rx.recv_timeout(remaining_until(until).unwrap_or(Duration::ZERO))
-        .unwrap_or(false)
+    match rx.recv_timeout(remaining_until(until).unwrap_or(Duration::ZERO)) {
+        Ok(ready) => ready,
+        Err(_) => {
+            task.abort();
+            (false, false)
+        }
+    }
 }
 
 fn set_nonblocking<F: AsFd>(fd: &F, stream: &str, context: &str) {

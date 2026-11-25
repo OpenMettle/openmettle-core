@@ -3520,24 +3520,28 @@ fn bounded_process_helpers_time_out_kill_and_name_configuration() {
         drop_began.elapsed()
     );
 
-    // 9. Empty pipe closing at 65 ms during the final polling wait before a 75 ms deadline
-    //    succeeds without false timeout (synchronized start + verified in-window close), while
-    //    `PipeDrain::finish_string` wakes an existing idle wait and rejects a late EOF.
+    // 9. Empty pipe closing inside [56 ms, 72 ms) relative to the reader's start (during the
+    //    final polling wait before a 75 ms deadline) succeeds without false timeout, while
+    //    `PipeDrain::finish_string` immediately wakes an existing 25 ms idle wait (failing if the
+    //    wake were absent) and per-descriptor readiness never lets an early stdout close admit a
+    //    post-deadline stderr close.
     let mut verified_read_close = false;
-    for _ in 0..5 {
+    for _ in 0..8 {
         let (close_reader, close_writer) = std::io::pipe().unwrap();
-        let barrier = Arc::new(std::sync::Barrier::new(2));
-        let closer_barrier = Arc::clone(&barrier);
+        let (go_tx, go_rx) = std::sync::mpsc::sync_channel(1);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let closed_at = Arc::new(std::sync::Mutex::new(None::<Instant>));
         let closer_closed_at = Arc::clone(&closed_at);
         let closer = thread::spawn(move || {
-            closer_barrier.wait();
-            thread::sleep(Duration::from_millis(65));
+            ready_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            thread::sleep(Duration::from_millis(62));
             drop(close_writer);
             *closer_closed_at.lock().unwrap() = Some(Instant::now());
         });
-        barrier.wait();
+        ready_rx.recv().unwrap();
         let start = Instant::now();
+        go_tx.send(()).unwrap();
         let read_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             read_string_bounded(
                 close_reader,
@@ -3547,10 +3551,12 @@ fn bounded_process_helpers_time_out_kill_and_name_configuration() {
             )
         }));
         closer.join().unwrap();
-        if closed_at.lock().unwrap().unwrap() < start + Duration::from_millis(72) {
+        let closed = closed_at.lock().unwrap().unwrap();
+        if closed >= start + Duration::from_millis(56) && closed < start + Duration::from_millis(72)
+        {
             assert_eq!(
                 read_outcome
-                    .expect("in-window 65ms/75ms close must succeed in read_string_bounded"),
+                    .expect("in-window 62ms/75ms close must succeed in read_string_bounded"),
                 ""
             );
             verified_read_close = true;
@@ -3559,37 +3565,41 @@ fn bounded_process_helpers_time_out_kill_and_name_configuration() {
     }
     assert!(
         verified_read_close,
-        "failed to observe an in-window 65ms/75ms close across 5 attempts"
+        "failed to observe a [56ms, 72ms) close across 8 attempts"
     );
 
     let mut verified_drain_close = false;
-    for _ in 0..5 {
+    for _ in 0..8 {
         let (drain_close_reader, drain_close_writer) = std::io::pipe().unwrap();
         let drain_close = PipeDrain::start(
             drain_close_reader,
             "stderr",
             "synthetic-close-before-deadline-drain",
         );
-        let barrier = Arc::new(std::sync::Barrier::new(2));
-        let closer_barrier = Arc::clone(&barrier);
+        let (go_tx, go_rx) = std::sync::mpsc::sync_channel(1);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let closed_at = Arc::new(std::sync::Mutex::new(None::<Instant>));
         let closer_closed_at = Arc::clone(&closed_at);
         let closer = thread::spawn(move || {
-            closer_barrier.wait();
-            thread::sleep(Duration::from_millis(65));
+            ready_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            thread::sleep(Duration::from_millis(62));
             drop(drain_close_writer);
             *closer_closed_at.lock().unwrap() = Some(Instant::now());
         });
-        barrier.wait();
+        ready_rx.recv().unwrap();
         let start = Instant::now();
+        go_tx.send(()).unwrap();
         let drain_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             drain_close.finish_string(Duration::from_millis(75))
         }));
         closer.join().unwrap();
-        if closed_at.lock().unwrap().unwrap() < start + Duration::from_millis(72) {
+        let closed = closed_at.lock().unwrap().unwrap();
+        if closed >= start + Duration::from_millis(56) && closed < start + Duration::from_millis(72)
+        {
             assert_eq!(
                 drain_outcome
-                    .expect("in-window 65ms/75ms close must succeed in PipeDrain::finish_string"),
+                    .expect("in-window 62ms/75ms close must succeed in PipeDrain::finish_string"),
                 ""
             );
             verified_drain_close = true;
@@ -3598,36 +3608,60 @@ fn bounded_process_helpers_time_out_kill_and_name_configuration() {
     }
     assert!(
         verified_drain_close,
-        "failed to observe an in-window 65ms/75ms PipeDrain close across 5 attempts"
+        "failed to observe a [56ms, 72ms) PipeDrain close across 8 attempts"
     );
 
-    let (late_reader, late_writer) = std::io::pipe().unwrap();
-    let late_drain = PipeDrain::start(late_reader, "stderr", "synthetic-late-eof-pipe-drain");
-    // Let `PipeDrain` reach its 25 ms polling interval before arming a short `finish_string`
-    // deadline while the writer stays open past that deadline.
-    thread::sleep(Duration::from_millis(40));
-    let barrier = Arc::new(std::sync::Barrier::new(2));
-    let closer_barrier = Arc::clone(&barrier);
-    let late_closer = thread::spawn(move || {
-        closer_barrier.wait();
-        thread::sleep(Duration::from_millis(60));
+    let mut verified_fast_wake = false;
+    for _ in 0..5 {
+        let (late_reader, late_writer) = std::io::pipe().unwrap();
+        let late_drain = PipeDrain::start(late_reader, "stderr", "synthetic-late-eof-pipe-drain");
+        // After ~35 ms (`2 + 4 + 8 + 16 = 30 ms`), `PipeDrain` is ~5 ms into its 25 ms polling
+        // wait (~20 ms remaining without an explicit deadline wake).
+        thread::sleep(Duration::from_millis(35));
+        let began = Instant::now();
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            late_drain.finish_string(Duration::from_millis(2))
+        }))
+        .expect_err("PipeDrain::finish_string must reject EOF arriving after its deadline");
+        let elapsed = began.elapsed();
         drop(late_writer);
-    });
-    barrier.wait();
+        assert!(
+            panic_text(err).contains("synthetic-late-eof-pipe-drain"),
+            "missing label on late-EOF PipeDrain failure"
+        );
+        if elapsed < Duration::from_millis(12) {
+            verified_fast_wake = true;
+            break;
+        }
+    }
+    assert!(
+        verified_fast_wake,
+        "PipeDrain::finish_string did not wake its 25ms idle wait within 12ms across 5 attempts"
+    );
+
+    // Two-descriptor isolation: stdout closing before the deadline must not grant stderr an extra
+    // post-deadline read when stderr stays open past the deadline (subshell closes fd 1 via
+    // `exec >/dev/null` so only stderr remains open past 35 ms).
+    let mut mixed_pipes = Command::new("sh");
+    mixed_pipes.args(["-c", "(exec >/dev/null; sleep 0.08) & echo stdout-early"]);
     let began = Instant::now();
     let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        late_drain.finish_string(Duration::from_millis(5))
+        run_bounded(
+            &mut mixed_pipes,
+            Duration::from_millis(35),
+            "synthetic-stdout-early-stderr-late",
+        )
     }))
-    .expect_err("PipeDrain::finish_string must reject EOF arriving after its deadline");
-    let elapsed = began.elapsed();
-    late_closer.join().unwrap();
+    .expect_err("post-deadline stderr close must time out despite early stdout EOF");
     assert!(
-        elapsed < Duration::from_millis(50),
-        "PipeDrain::finish_string waited for pre-existing polling interval: {elapsed:?}"
+        began.elapsed() < Duration::from_millis(250),
+        "mixed-pipe timeout overrun: {:?}",
+        began.elapsed()
     );
+    let message = panic_text(err);
     assert!(
-        panic_text(err).contains("synthetic-late-eof-pipe-drain"),
-        "missing label on late-EOF PipeDrain failure"
+        message.contains("synthetic-stdout-early-stderr-late") && message.contains("stdout-early"),
+        "missing label or stdout preview on mixed-pipe timeout: {message}"
     );
 
     let mut continuous_child = Command::new("yes");
