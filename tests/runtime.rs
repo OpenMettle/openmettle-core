@@ -3678,7 +3678,25 @@ fn bounded_process_helpers_time_out_kill_and_name_configuration() {
                 None,
             ),
             (true, false),
-            "closed stdout + idle stderr must report (true, false)"
+            "closed stdout + idle stderr must report (true, false) at 20ms"
+        );
+        let mut verified_1ms_reverse = false;
+        for _ in 0..5 {
+            if wait_for_pipes(
+                Some(err_r.as_fd()),
+                Some(out_r.as_fd()),
+                Instant::now() + Duration::from_millis(1),
+                None,
+                None,
+            ) == (false, true)
+            {
+                verified_1ms_reverse = true;
+                break;
+            }
+        }
+        assert!(
+            verified_1ms_reverse,
+            "idle first pipe suppressed 1ms second-pipe readiness in wait_for_pipes"
         );
         assert_eq!(
             wait_for_pipes(
@@ -3689,7 +3707,7 @@ fn bounded_process_helpers_time_out_kill_and_name_configuration() {
                 None,
             ),
             (false, true),
-            "idle first + closed second must report (false, true)"
+            "idle first + closed second must report (false, true) at 20ms"
         );
         let (idle_a, _keep_a) = std::io::pipe().unwrap();
         let a_flags = rustix::fs::fcntl_getfl(&idle_a).unwrap();
@@ -3698,12 +3716,23 @@ fn bounded_process_helpers_time_out_kill_and_name_configuration() {
             wait_for_pipes(
                 Some(idle_a.as_fd()),
                 Some(err_r.as_fd()),
-                Instant::now() + Duration::from_millis(5),
+                Instant::now() + Duration::from_millis(1),
                 None,
                 None,
             ),
             (false, false),
-            "two idle pipes must report (false, false) on timeout"
+            "two idle pipes must report (false, false) at 1ms"
+        );
+        assert_eq!(
+            wait_for_pipes(
+                Some(idle_a.as_fd()),
+                Some(err_r.as_fd()),
+                Instant::now() + Duration::from_millis(20),
+                None,
+                None,
+            ),
+            (false, false),
+            "two idle pipes must report (false, false) at 20ms"
         );
     }
 
