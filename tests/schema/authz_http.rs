@@ -4520,11 +4520,9 @@ async fn schema_25_to_26_upgrade_gates_manage_quotas_until_overrides_enforced() 
     for _ in 0..2 {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_openmettle-admin"));
         scrub_env(&mut cmd);
-        let out = cmd
-            .env("OPENMETTLE_ADMIN_DATABASE_URL", db.url(OWNER))
-            .args(["quota", "activate"])
-            .output()
-            .unwrap();
+        cmd.env("OPENMETTLE_ADMIN_DATABASE_URL", db.url(OWNER))
+            .args(["quota", "activate"]);
+        let out = run_cli(&mut cmd, "openmettle-admin quota activate");
         assert!(out.status.success(), "{}", stderr(&out));
     }
     let (post_metering, post_metering_at, post_overrides, post_overrides_at): (

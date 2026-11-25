@@ -1359,12 +1359,11 @@ mod live_turns {
     /// the test instead of hanging it. The default 5-second shutdown budget bounds a healthy
     /// exit; the margin absorbs a loaded runner.
     async fn exited(mut process: Process) -> (std::process::ExitStatus, String) {
-        let mut pipe = process.0.stderr.take().unwrap();
-        let stderr = tokio::task::spawn_blocking(move || {
-            let mut text = String::new();
-            let _ = pipe.read_to_string(&mut text);
-            text
-        });
+        let stderr = PipeDrain::start(
+            process.0.stderr.take().unwrap(),
+            "stderr",
+            "packaged worker stderr",
+        );
         let deadline = Instant::now() + Duration::from_secs(10);
         let status = loop {
             if let Some(status) = process.0.try_wait().unwrap() {
@@ -1376,7 +1375,10 @@ mod live_turns {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
-        (status, stderr.await.unwrap())
+        let text = tokio::task::spawn_blocking(move || stderr.finish_string(PIPE_DRAIN_TIMEOUT))
+            .await
+            .unwrap();
+        (status, text)
     }
 
     async fn terminate(process: Process) -> (std::process::ExitStatus, String) {
@@ -2403,9 +2405,11 @@ mod live_turns {
         ));
         // Drain the first process while the replacement still owns the claim.
         drop(old.0.stdin.take());
-        tokio::task::spawn_blocking(move || assert!(old.0.wait().unwrap().success()))
-            .await
-            .unwrap();
+        tokio::task::spawn_blocking(move || {
+            assert!(wait_exit(&mut old.0, "deposed turn worker drain").success());
+        })
+        .await
+        .unwrap();
         assert_eq!(chat.graph().await, (1, 1, 1, Some(input)));
         fresh_request.respond(completion(json!("replacement"), None, Value::Null));
         chat.done(&id, "succeeded", None).await;

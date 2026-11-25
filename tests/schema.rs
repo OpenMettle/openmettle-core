@@ -4,6 +4,12 @@
 #[path = "support/env.rs"]
 mod env_support;
 use env_support::scrub_env;
+#[path = "support/proc.rs"]
+mod proc_support;
+use proc_support::{
+    PipeDrain, Process, probe_http_status_line, read_string_bounded, run_bounded,
+    wait_exit_bounded, wait_http_status_bounded, wait_output_bounded,
+};
 #[path = "support/pg.rs"]
 mod pg;
 use openmettle_core::migrate::{self, Failure, MIGRATIONS, Settings, Source};
@@ -17,7 +23,7 @@ use std::{
     collections::BTreeSet,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    process::{Child, Command, Output, Stdio},
+    process::{Child, Command, ExitStatus, Output, Stdio},
     sync::{Arc, atomic::Ordering},
     thread,
     time::{Duration, Instant},
@@ -25,12 +31,34 @@ use std::{
 
 // --- process helpers ------------------------------------------------------------------------
 
-struct Process(Child);
-impl Drop for Process {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
+/// Bound for immediate start-up / configuration refusal checks.
+const REFUSAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound for one-shot migrator or admin CLI invocations.
+const CLI_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound for graceful or forced child termination after signaling.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
+/// Bound for post-exit stdout/stderr pipe draining once the process has exited.
+const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn run_refusal(command: &mut Command, context: &str) -> Output {
+    run_bounded(command, REFUSAL_TIMEOUT, context)
+}
+
+fn run_cli(command: &mut Command, context: &str) -> Output {
+    run_bounded(command, CLI_TIMEOUT, context)
+}
+
+fn wait_output(process: Process, context: &str) -> Output {
+    wait_output_bounded(process, CLI_TIMEOUT, context)
+}
+
+fn wait_exit(child: &mut Child, context: &str) -> ExitStatus {
+    wait_exit_bounded(child, SHUTDOWN_TIMEOUT, context)
+}
+
+fn stop_process(process: &mut Process, sig: &str, context: &str) -> ExitStatus {
+    signal(&process.0, sig);
+    wait_exit(&mut process.0, context)
 }
 
 fn binary(name: &str) -> Command {
@@ -67,18 +95,7 @@ fn address() -> String {
 }
 
 fn http_status(address: &str, path: &str) -> Option<String> {
-    let mut stream =
-        TcpStream::connect_timeout(&address.parse().unwrap(), Duration::from_millis(300)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    stream
-        .write_all(
-            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                .as_bytes(),
-        )
-        .ok()?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response).ok()?;
-    response.lines().next().map(str::to_owned)
+    probe_http_status_line(address, path, Instant::now() + Duration::from_secs(2))
 }
 
 fn start_service(worker: bool, url: &str) -> (Process, String) {
@@ -100,15 +117,7 @@ fn start_service(worker: bool, url: &str) -> (Process, String) {
 }
 
 fn wait_ready(process: &mut Process, bind: &str) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        assert!(process.0.try_wait().unwrap().is_none(), "process exited");
-        if http_status(bind, "/readyz").is_some_and(|s| s.starts_with("HTTP/1.1 200")) {
-            return;
-        }
-        assert!(Instant::now() < deadline, "readiness deadline");
-        thread::sleep(Duration::from_millis(50));
-    }
+    wait_http_status_bounded(process, bind, "/readyz", 200, Duration::from_secs(15));
 }
 
 fn signal(child: &Child, signal: &str) {
@@ -1521,33 +1530,43 @@ fn migrate_rejects_invalid_config_without_disclosing_values() {
         ("LOG_FORMAT", "synthetic-secret"),
         ("LOG_LEVEL", "trace"),
     ] {
-        let output = migrate_command("postgres://localhost/test", &[(key, value)])
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(78), "{key}");
+        let context = format!("migrate invalid OPENMETTLE_MIGRATE_{key}");
+        let mut cmd = migrate_command("postgres://localhost/test", &[(key, value)]);
+        let output = run_refusal(&mut cmd, &context);
+        assert_eq!(output.status.code(), Some(78), "{context}");
         // One fixed line written before telemetry exists: no event, no value.
         let text = stderr(&output);
         assert!(text.starts_with("configuration error: ") && text.lines().count() == 1);
         assert!(!text.contains("synthetic-secret"));
     }
-    let output = binary("migrate").output().unwrap();
+    let output = run_refusal(
+        &mut binary("migrate"),
+        "migrate missing OPENMETTLE_MIGRATE_DATABASE_URL",
+    );
     assert_eq!(output.status.code(), Some(78));
     // ADR 0030: the API's issuance credential is refused while present, whatever its value,
     // before any other setting is read and without echoing it.
     use std::os::unix::ffi::OsStrExt;
-    for value in [
-        std::ffi::OsStr::new("postgres://openmettle_issuance:synthetic-secret@host/db"),
-        std::ffi::OsStr::new(""),
-        std::ffi::OsStr::from_bytes(b"synthetic-secret-\xff"),
+    for (label, value) in [
+        (
+            "url",
+            std::ffi::OsStr::new("postgres://openmettle_issuance:synthetic-secret@host/db"),
+        ),
+        ("empty", std::ffi::OsStr::new("")),
+        (
+            "non-utf8",
+            std::ffi::OsStr::from_bytes(b"synthetic-secret-\xff"),
+        ),
     ] {
-        let output = migrate_command("invalid://synthetic-secret", &[])
-            .env("OPENMETTLE_API_ISSUANCE_DATABASE_URL", value)
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(78), "{value:?}");
+        let context = format!("migrate refuses OPENMETTLE_API_ISSUANCE_DATABASE_URL ({label})");
+        let mut cmd = migrate_command("invalid://synthetic-secret", &[]);
+        cmd.env("OPENMETTLE_API_ISSUANCE_DATABASE_URL", value);
+        let output = run_refusal(&mut cmd, &context);
+        assert_eq!(output.status.code(), Some(78), "{context}");
         assert_eq!(
             stderr(&output),
-            "configuration error: OPENMETTLE_API_ISSUANCE_DATABASE_URL is refused outside the API\n"
+            "configuration error: OPENMETTLE_API_ISSUANCE_DATABASE_URL is refused outside the API\n",
+            "{context}"
         );
     }
 }
@@ -1561,9 +1580,11 @@ fn migrate_connection_deadline_exits_one_without_disclosing_url() {
         silent.local_addr().unwrap()
     );
     let began = Instant::now();
-    let output = migrate_command(&url, &[("CONNECT_TIMEOUT_MS", "300")])
-        .output()
-        .unwrap();
+    let mut cmd = migrate_command(&url, &[("CONNECT_TIMEOUT_MS", "300")]);
+    let output = run_refusal(
+        &mut cmd,
+        "migrate CONNECT_TIMEOUT_MS=300 against silent listener",
+    );
     assert_eq!(output.status.code(), Some(1));
     assert!(began.elapsed() < Duration::from_secs(5));
     let text = stderr(&output);
@@ -1615,9 +1636,8 @@ fn migrate_failures_report_their_class_through_the_binary() {
         ),
     ] {
         let url = format!("postgres://fixture:synthetic-secret@{address}/fixture?sslmode=disable");
-        let output = migrate_command(&url, &[("CONNECT_TIMEOUT_MS", "300")])
-            .output()
-            .unwrap();
+        let mut cmd = migrate_command(&url, &[("CONNECT_TIMEOUT_MS", "300")]);
+        let output = run_refusal(&mut cmd, &format!("migrate failure class {class}"));
         assert_eq!(output.status.code(), Some(1));
         assert!(output.stdout.is_empty());
         let text = stderr(&output);
@@ -1671,13 +1691,24 @@ fn interrupted_migrator_reports_at_error_level() {
         };
         signal(&child.0, flag);
         let began = Instant::now();
-        let status = child.0.wait().unwrap();
+        let status = wait_exit(
+            &mut child.0,
+            &format!("interrupted migrator ({format}, {signal_name})"),
+        );
         assert!(began.elapsed() < Duration::from_secs(5));
         assert_eq!(status.code(), Some(1));
-        let (mut stdout, mut text) = (String::new(), String::new());
-        let pipes = (child.0.stdout.take(), child.0.stderr.take());
-        pipes.0.unwrap().read_to_string(&mut stdout).unwrap();
-        pipes.1.unwrap().read_to_string(&mut text).unwrap();
+        let stdout = read_string_bounded(
+            child.0.stdout.take().unwrap(),
+            PIPE_DRAIN_TIMEOUT,
+            "stdout",
+            &format!("interrupted migrator stdout ({format}, {signal_name})"),
+        );
+        let text = read_string_bounded(
+            child.0.stderr.take().unwrap(),
+            PIPE_DRAIN_TIMEOUT,
+            "stderr",
+            &format!("interrupted migrator stderr ({format}, {signal_name})"),
+        );
         assert!(stdout.is_empty());
         assert!(!text.contains("synthetic-secret"), "{text}");
         let lines: Vec<&str> = text.lines().collect();
@@ -1709,7 +1740,10 @@ fn interrupted_migrator_reports_at_error_level() {
 #[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
 async fn fresh_install_is_idempotent_and_owned() {
     let db = TestDb::new().await;
-    let output = migrate_command(&db.url(OWNER), &[]).output().unwrap();
+    let output = run_cli(
+        &mut migrate_command(&db.url(OWNER), &[]),
+        "migrate fresh install",
+    );
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(db.history().await, all_versions());
 
@@ -1732,7 +1766,10 @@ async fn fresh_install_is_idempotent_and_owned() {
     .await
     .unwrap();
 
-    let rerun = migrate_command(&db.url(OWNER), &[]).output().unwrap();
+    let rerun = run_cli(
+        &mut migrate_command(&db.url(OWNER), &[]),
+        "migrate idempotent rerun",
+    );
     assert_eq!(rerun.status.code(), Some(0), "{}", stderr(&rerun));
     let reinstalled: Vec<String> = sqlx::query_scalar(
         "SELECT installed_on::text FROM openmettle._sqlx_migrations ORDER BY version",
@@ -1792,7 +1829,10 @@ async fn populated_upgrade_preserves_identity_and_ownership() {
     let before = snapshot_at(&mut api, &tables, 1).await;
     drop(api);
 
-    let output = migrate_command(&db.url(OWNER), &[]).output().unwrap();
+    let output = run_cli(
+        &mut migrate_command(&db.url(OWNER), &[]),
+        "migrate populated v1 upgrade",
+    );
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(db.history().await, all_versions());
 
@@ -1821,11 +1861,11 @@ async fn populated_upgrade_preserves_identity_and_ownership() {
 #[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
 async fn concurrent_migrators_apply_each_version_once() {
     let db = TestDb::new().await;
-    let children: Vec<Child> = (0..4)
-        .map(|_| migrate_command(&db.url(OWNER), &[]).spawn().unwrap())
+    let children: Vec<Process> = (0..4)
+        .map(|_| Process(migrate_command(&db.url(OWNER), &[]).spawn().unwrap()))
         .collect();
-    for child in children {
-        let output = child.wait_with_output().unwrap();
+    for (index, child) in children.into_iter().enumerate() {
+        let output = wait_output(child, &format!("concurrent migrator #{index}"));
         assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     }
     let rows: Vec<(i64, i64)> = sqlx::query_as(
@@ -1853,15 +1893,14 @@ async fn held_lock_times_out_and_is_released_for_retry() {
     holder.lock().await.unwrap();
 
     let began = Instant::now();
-    let output = migrate_command(
+    let mut cmd = migrate_command(
         &db.url(OWNER),
         &[
             ("LOCK_TIMEOUT_MS", "300"),
             ("STATEMENT_TIMEOUT_MS", "60000"),
         ],
-    )
-    .output()
-    .unwrap();
+    );
+    let output = run_cli(&mut cmd, "migrate held lock timeout (LOCK_TIMEOUT_MS=300)");
     // lock_not_available (not the 60 s statement timeout) proves lock_timeout bounds the wait.
     assert_eq!(output.status.code(), Some(1));
     assert!(
@@ -1875,9 +1914,8 @@ async fn held_lock_times_out_and_is_released_for_retry() {
     holder.unlock().await.unwrap();
     holder.close().await.unwrap();
     db.wait_no_migration_session().await;
-    let retry = migrate_command(&db.url(OWNER), &[("LOCK_TIMEOUT_MS", "1000")])
-        .output()
-        .unwrap();
+    let mut cmd = migrate_command(&db.url(OWNER), &[("LOCK_TIMEOUT_MS", "1000")]);
+    let retry = run_cli(&mut cmd, "migrate retry after lock release");
     assert_eq!(retry.status.code(), Some(0), "{}", stderr(&retry));
     assert_eq!(db.history().await, all_versions());
 }
@@ -1889,9 +1927,11 @@ async fn interrupted_or_killed_migrator_leaves_no_session() {
     let mut holder = connect(&db.0, OWNER).await;
     holder.lock().await.unwrap();
     for kill in ["-TERM", "-KILL"] {
-        let mut child = migrate_command(&db.url(OWNER), &[("LOCK_TIMEOUT_MS", "60000")])
-            .spawn()
-            .unwrap();
+        let mut child = Process(
+            migrate_command(&db.url(OWNER), &[("LOCK_TIMEOUT_MS", "60000")])
+                .spawn()
+                .unwrap(),
+        );
         // Wait until the migrator's backend is blocked on the advisory lock.
         let mut admin = db.admin().await;
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1914,8 +1954,11 @@ async fn interrupted_or_killed_migrator_leaves_no_session() {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        signal(&child, kill);
-        let status = child.wait().unwrap();
+        let status = stop_process(
+            &mut child,
+            kill,
+            &format!("migrator waiting on lock ({kill})"),
+        );
         if kill == "-TERM" {
             assert_eq!(status.code(), Some(1));
         }
@@ -1946,9 +1989,8 @@ async fn interrupted_or_killed_migrator_leaves_no_session() {
     }
     holder.unlock().await.unwrap();
     holder.close().await.unwrap();
-    let output = migrate_command(&db.url(OWNER), &[("LOCK_TIMEOUT_MS", "1000")])
-        .output()
-        .unwrap();
+    let mut cmd = migrate_command(&db.url(OWNER), &[("LOCK_TIMEOUT_MS", "1000")]);
+    let output = run_cli(&mut cmd, "migrate after interrupted/killed lock wait");
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
 }
 
@@ -1969,15 +2011,17 @@ async fn killed_migrator_holding_the_lock_mid_migration_rolls_back() {
         .unwrap();
     let mut admin = db.admin().await;
     for kill in ["-TERM", "-KILL"] {
-        let mut child = migrate_command(
-            &db.url(OWNER),
-            &[
-                ("LOCK_TIMEOUT_MS", "60000"),
-                ("STATEMENT_TIMEOUT_MS", "60000"),
-            ],
-        )
-        .spawn()
-        .unwrap();
+        let mut child = Process(
+            migrate_command(
+                &db.url(OWNER),
+                &[
+                    ("LOCK_TIMEOUT_MS", "60000"),
+                    ("STATEMENT_TIMEOUT_MS", "60000"),
+                ],
+            )
+            .spawn()
+            .unwrap(),
+        );
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let state: Option<(bool, bool)> = sqlx::query_as(
@@ -2001,11 +2045,17 @@ async fn killed_migrator_holding_the_lock_mid_migration_rolls_back() {
                 Instant::now() < deadline,
                 "migrator never blocked inside migration 2 holding the lock: {state:?}"
             );
-            assert!(child.try_wait().unwrap().is_none(), "migrator exited early");
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "migrator exited early"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        signal(&child, kill);
-        let status = child.wait().unwrap();
+        let status = stop_process(
+            &mut child,
+            kill,
+            &format!("migrator mid-migration 2 ({kill})"),
+        );
         if kill == "-TERM" {
             assert_eq!(status.code(), Some(1));
         }
@@ -2015,9 +2065,8 @@ async fn killed_migrator_holding_the_lock_mid_migration_rolls_back() {
         assert_eq!(db.history().await, [1], "{kill}");
     }
     blocker.execute("ROLLBACK").await.unwrap();
-    let output = migrate_command(&db.url(OWNER), &[("LOCK_TIMEOUT_MS", "1000")])
-        .output()
-        .unwrap();
+    let mut cmd = migrate_command(&db.url(OWNER), &[("LOCK_TIMEOUT_MS", "1000")]);
+    let output = run_cli(&mut cmd, "migrate after mid-migration 2 rollback");
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(db.history().await, all_versions());
 }
@@ -2158,7 +2207,10 @@ async fn checksum_drift_and_newer_database_are_refused() {
     assert!(!db.exists("openmettle.probe_three").await);
 
     // Before version 3 exists, the release binary detects the different version-2 source.
-    let output = migrate_command(&db.url(OWNER), &[]).output().unwrap();
+    let output = run_cli(
+        &mut migrate_command(&db.url(OWNER), &[]),
+        "migrate checksum drift refusal",
+    );
     assert_eq!(output.status.code(), Some(1));
     assert!(
         stderr(&output).contains("checksum mismatch"),
@@ -2185,9 +2237,10 @@ async fn checksum_drift_and_newer_database_are_refused() {
         other => panic!("unexpected result: {other:?}"),
     }
     let before = future_db.history().await;
-    let output = migrate_command(&future_db.url(OWNER), &[])
-        .output()
-        .unwrap();
+    let output = run_cli(
+        &mut migrate_command(&future_db.url(OWNER), &[]),
+        "migrate newer database version refusal",
+    );
     assert_eq!(output.status.code(), Some(1));
     assert!(
         stderr(&output).contains(&format!(
@@ -2226,9 +2279,8 @@ async fn wrong_login_is_refused_before_bootstrap_and_owner_retry_succeeds() {
         assert!(!db.schema_exists().await);
     }
     db.wait_no_migration_session().await;
-    let output = migrate_command(&db.url(OWNER), &[("LOCK_TIMEOUT_MS", "1000")])
-        .output()
-        .unwrap();
+    let mut cmd = migrate_command(&db.url(OWNER), &[("LOCK_TIMEOUT_MS", "1000")]);
+    let output = run_cli(&mut cmd, "migrate owner retry after wrong login");
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(db.history().await, all_versions());
 
@@ -2880,15 +2932,25 @@ async fn runtime_readiness_with_bounded_roles_never_migrates() {
         .unwrap();
     assert_eq!(schema, None, "the API must not create schema");
 
-    let output = migrate_command(&db.url(OWNER), &[]).output().unwrap();
+    let output = run_cli(
+        &mut migrate_command(&db.url(OWNER), &[]),
+        "migrate before bounded-role readiness check",
+    );
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     let (mut api, api_bind) = start_service(false, &db.url(API));
     let (mut worker, worker_bind) = start_service(true, &db.url(WORKER));
     wait_ready(&mut api, &api_bind);
     wait_ready(&mut worker, &worker_bind);
     for (process, worker) in [(&mut worker, true), (&mut api, false)] {
-        signal(&process.0, "-TERM");
-        let status = process.0.wait().unwrap();
+        let status = stop_process(
+            process,
+            "-TERM",
+            if worker {
+                "bounded-role worker shutdown"
+            } else {
+                "bounded-role api shutdown"
+            },
+        );
         assert!(status.success(), "worker={worker}");
     }
     assert_eq!(db.history().await, all_versions());

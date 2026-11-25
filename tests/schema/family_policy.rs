@@ -1313,10 +1313,17 @@ async fn family_policy_admin_cli_e2e_and_audit() {
     let user = account(&mut owner, PROVIDER, true, FUTURE).await;
     make_admin(&mut owner, &user).await;
 
+    let run_admin = |label: &str, args: &[&str]| {
+        let mut cmd = admin_binary();
+        cmd.env("OPENMETTLE_ADMIN_DATABASE_URL", db.url(OWNER))
+            .args(args);
+        run_cli(&mut cmd, &format!("openmettle-admin family ({label})"))
+    };
+
     // 1. Set household OIDC-group policy via real openmettle-admin binary.
-    let out = admin_binary()
-        .env("OPENMETTLE_ADMIN_DATABASE_URL", db.url(OWNER))
-        .args([
+    let out = run_admin(
+        "set-policy initial",
+        &[
             "family",
             "set-policy",
             "--oidc-group",
@@ -1333,15 +1340,14 @@ async fn family_policy_admin_cli_e2e_and_audit() {
             "cli-fam-1",
             "--reason",
             "initial household schedule",
-        ])
-        .output()
-        .unwrap();
+        ],
+    );
     assert!(out.status.success(), "set-policy failed: {}", stderr(&out));
 
     // 2. Exact replay with same request-key succeeds idempotently (revision stays 1).
-    let replay = admin_binary()
-        .env("OPENMETTLE_ADMIN_DATABASE_URL", db.url(OWNER))
-        .args([
+    let replay = run_admin(
+        "set-policy replay",
+        &[
             "family",
             "set-policy",
             "--oidc-group",
@@ -1358,9 +1364,8 @@ async fn family_policy_admin_cli_e2e_and_audit() {
             "cli-fam-1",
             "--reason",
             "initial household schedule",
-        ])
-        .output()
-        .unwrap();
+        ],
+    );
     assert!(
         replay.status.success(),
         "replay failed: {}",
@@ -1368,9 +1373,9 @@ async fn family_policy_admin_cli_e2e_and_audit() {
     );
 
     // 3. Conflicting request-key reuse fails.
-    let conflict_out = admin_binary()
-        .env("OPENMETTLE_ADMIN_DATABASE_URL", db.url(OWNER))
-        .args([
+    let conflict_out = run_admin(
+        "set-policy conflicting request-key",
+        &[
             "family",
             "set-policy",
             "--oidc-group",
@@ -1383,15 +1388,14 @@ async fn family_policy_admin_cli_e2e_and_audit() {
             "cli-fam-1",
             "--reason",
             "conflicting reuse",
-        ])
-        .output()
-        .unwrap();
+        ],
+    );
     assert!(!conflict_out.status.success());
 
     // 4. Add a study_allow model and verify audit rows.
-    let model_out = admin_binary()
-        .env("OPENMETTLE_ADMIN_DATABASE_URL", db.url(OWNER))
-        .args([
+    let model_out = run_admin(
+        "set-model study_allow",
+        &[
             "family",
             "set-model",
             "--oidc-group",
@@ -1407,9 +1411,8 @@ async fn family_policy_admin_cli_e2e_and_audit() {
             "cli-fam-2",
             "--reason",
             "allow study model b",
-        ])
-        .output()
-        .unwrap();
+        ],
+    );
     assert!(
         model_out.status.success(),
         "set-model failed: {}",
@@ -1417,65 +1420,70 @@ async fn family_policy_admin_cli_e2e_and_audit() {
     );
 
     // 5. Reject invalid HH:MM-HH:MM (equal start/end, out-of-range) and override on group.
-    for bad_args in [
-        &[
-            "family",
-            "set-policy",
-            "--oidc-group",
-            "Family",
-            "--zone",
-            "UTC",
-            "--quiet",
-            "22:00-22:00",
-            "--operator-id",
-            OPERATOR_ID,
-            "--request-key",
-            "cli-bad-1",
-            "--reason",
-            "bad window",
-        ][..],
-        &[
-            "family",
-            "set-policy",
-            "--oidc-group",
-            "Family",
-            "--zone",
-            "UTC",
-            "--override-group-schedules",
-            "--operator-id",
-            OPERATOR_ID,
-            "--request-key",
-            "cli-bad-2",
-            "--reason",
-            "override on group",
-        ][..],
-        &[
-            "family",
-            "set-policy",
-            "--oidc-group",
-            "Family",
-            "--zone",
-            "Mars/Olympus",
-            "--operator-id",
-            OPERATOR_ID,
-            "--request-key",
-            "cli-bad-3",
-            "--reason",
-            "unknown tz",
-        ][..],
+    for (label, bad_args) in [
+        (
+            "equal start/end quiet window",
+            &[
+                "family",
+                "set-policy",
+                "--oidc-group",
+                "Family",
+                "--zone",
+                "UTC",
+                "--quiet",
+                "22:00-22:00",
+                "--operator-id",
+                OPERATOR_ID,
+                "--request-key",
+                "cli-bad-1",
+                "--reason",
+                "bad window",
+            ][..],
+        ),
+        (
+            "override-group-schedules on group",
+            &[
+                "family",
+                "set-policy",
+                "--oidc-group",
+                "Family",
+                "--zone",
+                "UTC",
+                "--override-group-schedules",
+                "--operator-id",
+                OPERATOR_ID,
+                "--request-key",
+                "cli-bad-2",
+                "--reason",
+                "override on group",
+            ][..],
+        ),
+        (
+            "unknown timezone",
+            &[
+                "family",
+                "set-policy",
+                "--oidc-group",
+                "Family",
+                "--zone",
+                "Mars/Olympus",
+                "--operator-id",
+                OPERATOR_ID,
+                "--request-key",
+                "cli-bad-3",
+                "--reason",
+                "unknown tz",
+            ][..],
+        ),
     ] {
-        let bad = admin_binary()
-            .env("OPENMETTLE_ADMIN_DATABASE_URL", db.url(OWNER))
-            .args(bad_args)
-            .output()
-            .unwrap();
-        assert!(!bad.status.success(), "expected failure for {bad_args:?}");
+        let bad = run_admin(label, bad_args);
+        assert!(!bad.status.success(), "expected failure for {label}");
     }
 
     // 6. Clear policy and verify operator audit trail.
-    let clear = admin_binary()
-        .env("OPENMETTLE_ADMIN_DATABASE_URL", db.url(OWNER))
-        .args([
+    let clear = run_admin(
+        "clear-policy",
+        &[
             "family",
             "clear-policy",
             "--oidc-group",
@@ -1486,9 +1494,8 @@ async fn family_policy_admin_cli_e2e_and_audit() {
             "cli-fam-3",
             "--reason",
             "holiday pause",
-        ])
-        .output()
-        .unwrap();
+        ],
+    );
     assert!(
         clear.status.success(),
         "clear-policy failed: {}",

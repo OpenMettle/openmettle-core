@@ -2,7 +2,7 @@
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    process::{Child, Command, Stdio},
+    process::{Command, Output, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -10,6 +10,12 @@ use std::{
 #[path = "support/env.rs"]
 mod env_support;
 use env_support::scrub_env;
+#[path = "support/proc.rs"]
+mod proc_support;
+use proc_support::{
+    PipeDrain, Process, read_string_bounded, run_bounded, wait_exit_bounded, wait_for_pipes,
+    wait_http_status_bounded, wait_output_bounded,
+};
 #[path = "auth_config_support/mod.rs"]
 mod auth_config_support;
 #[path = "support/pg.rs"]
@@ -19,12 +25,18 @@ mod pg;
 #[path = "provider_http_support/ca.rs"]
 mod ca;
 
-struct Process(Child);
-impl Drop for Process {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
+/// Bound for start-up refusal, offline check and immediate-failure runs.
+const REFUSAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound for graceful signal shutdown in runtime tests (`SHUTDOWN_TIMEOUT_MS=1000`).
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// Bound for post-exit stdout/stderr pipe draining once the process has exited.
+const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn role_name(worker: bool) -> &'static str {
+    if worker { "worker" } else { "api" }
+}
+fn run(command: &mut Command, context: &str) -> Output {
+    run_bounded(command, REFUSAL_TIMEOUT, context)
 }
 fn address() -> String {
     TcpListener::bind("127.0.0.1:0")
@@ -79,21 +91,7 @@ fn send(address: &str, request: &str) -> std::io::Result<String> {
     Ok(response)
 }
 fn wait_status(process: &mut Process, address: &str, path: &str, code: u16) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        assert!(
-            process.0.try_wait().unwrap().is_none(),
-            "process exited before health check"
-        );
-        if response(address, path).is_ok_and(|r| r.starts_with(&format!("HTTP/1.1 {code}"))) {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "health check deadline: {path} expected {code}"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
+    wait_http_status_bounded(process, address, path, code, Duration::from_secs(15));
 }
 fn stop(process: &mut Process, signal: &str) {
     assert!(
@@ -103,20 +101,18 @@ fn stop(process: &mut Process, signal: &str) {
             .unwrap()
             .success()
     );
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if let Some(status) = process.0.try_wait().unwrap() {
-            assert!(status.success());
-            return;
-        }
-        assert!(Instant::now() < deadline, "shutdown did not finish");
-        thread::sleep(Duration::from_millis(20));
-    }
+    let status = wait_exit_bounded(
+        &mut process.0,
+        SHUTDOWN_TIMEOUT,
+        &format!("shutdown ({signal})"),
+    );
+    assert!(status.success(), "shutdown ({signal}) exited {status}");
 }
 
 #[test]
 fn rejects_invalid_config_without_disclosing_values() {
     for worker in [false, true] {
+        let role = role_name(worker);
         let prefix = if worker {
             "OPENMETTLE_WORKER"
         } else {
@@ -129,18 +125,23 @@ fn rejects_invalid_config_without_disclosing_values() {
             ("DB_TIMEOUT_MS", "30001"),
             ("SHUTDOWN_TIMEOUT_MS", "-1"),
         ] {
-            let output = command(worker)
-                .env(
-                    format!("{prefix}_DATABASE_URL"),
-                    "postgres://localhost/test",
-                )
-                .env(format!("{prefix}_{key}"), value)
-                .output()
-                .unwrap();
-            assert_eq!(output.status.code(), Some(78));
+            let context = format!("{role} invalid {prefix}_{key}");
+            let mut cmd = command(worker);
+            cmd.env(
+                format!("{prefix}_DATABASE_URL"),
+                "postgres://localhost/test",
+            )
+            .env(format!("{prefix}_{key}"), value);
+            let output = run(&mut cmd, &context);
+            assert_eq!(output.status.code(), Some(78), "{context}");
             assert!(!String::from_utf8_lossy(&output.stderr).contains("synthetic-secret"));
         }
-        assert_eq!(command(worker).output().unwrap().status.code(), Some(78));
+        let missing = format!("{role} missing {prefix}_DATABASE_URL");
+        assert_eq!(
+            run(&mut command(worker), &missing).status.code(),
+            Some(78),
+            "{missing}"
+        );
     }
 }
 
@@ -150,35 +151,41 @@ fn rejects_invalid_config_without_disclosing_values() {
 fn rejects_invalid_telemetry_settings_with_a_fixed_line() {
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
     for worker in [false, true] {
+        let role = role_name(worker);
         let prefix = if worker {
             "OPENMETTLE_WORKER"
         } else {
             "OPENMETTLE_API"
         };
-        for (key, value) in [
-            ("LOG_FORMAT", "synthetic-secret"),
-            ("LOG_FORMAT", "JSON"),
-            ("LOG_LEVEL", "trace"),
-            ("LOG_LEVEL", "info,synthetic-secret=debug"),
+        for (label, key, value) in [
+            ("unknown format", "LOG_FORMAT", "synthetic-secret"),
+            ("uppercase format", "LOG_FORMAT", "JSON"),
+            ("trace level", "LOG_LEVEL", "trace"),
+            (
+                "filter directive",
+                "LOG_LEVEL",
+                "info,synthetic-secret=debug",
+            ),
         ] {
-            let output = command(worker)
-                .env(
-                    format!("{prefix}_DATABASE_URL"),
-                    "postgres://localhost/test",
-                )
-                // Serving would exit 1 on this occupied address instead.
-                .env(
-                    format!("{prefix}_BIND"),
-                    occupied.local_addr().unwrap().to_string(),
-                )
-                .env(format!("{prefix}_{key}"), value)
-                .output()
-                .unwrap();
-            assert_eq!(output.status.code(), Some(78), "{key}={value}");
-            assert!(output.stdout.is_empty());
+            let context = format!("{role} {prefix}_{key} ({label})");
+            let mut cmd = command(worker);
+            cmd.env(
+                format!("{prefix}_DATABASE_URL"),
+                "postgres://localhost/test",
+            )
+            // Serving would exit 1 on this occupied address instead.
+            .env(
+                format!("{prefix}_BIND"),
+                occupied.local_addr().unwrap().to_string(),
+            )
+            .env(format!("{prefix}_{key}"), value);
+            let output = run(&mut cmd, &context);
+            assert_eq!(output.status.code(), Some(78), "{context}");
+            assert!(output.stdout.is_empty(), "{context}");
             assert_eq!(
                 String::from_utf8(output.stderr).unwrap(),
-                format!("configuration error: invalid {key}\n")
+                format!("configuration error: invalid {key}\n"),
+                "{context}"
             );
         }
     }
@@ -314,7 +321,7 @@ fn issuance_settings_are_refused_with_a_fixed_line() {
             "invalid numeric configuration",
         ),
     ];
-    for (auth, database, issuance, extra, line) in cases {
+    for (index, (auth, database, issuance, extra, line)) in cases.iter().enumerate() {
         let mut command = command(false);
         command
             .env("OPENMETTLE_API_BIND", &bind)
@@ -325,34 +332,42 @@ fn issuance_settings_are_refused_with_a_fixed_line() {
         command
             .envs(issuance.iter().copied())
             .envs(extra.iter().copied());
-        let output = command.output().unwrap();
-        assert_eq!(output.status.code(), Some(78), "{line}");
-        assert!(output.stdout.is_empty());
+        let context = format!("api issuance refusal case #{index} ({line})");
+        let output = run(&mut command, &context);
+        assert_eq!(output.status.code(), Some(78), "{context}");
+        assert!(output.stdout.is_empty(), "{context}");
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
-            format!("configuration error: {line}\n")
+            format!("configuration error: {line}\n"),
+            "{context}"
         );
     }
     // A user filled from `PGUSER` counts as that user, on either URL.
-    for (database, issuance) in [
+    for (label, database, issuance) in [
         (
+            "PGUSER fills primary DATABASE_URL",
             "postgres://localhost/test",
             "postgres://openmettle_api@localhost/other",
         ),
-        (primary, "postgres://localhost/other"),
+        (
+            "PGUSER fills ISSUANCE_DATABASE_URL",
+            primary,
+            "postgres://localhost/other",
+        ),
     ] {
-        let output = command(false)
-            .env("PGUSER", "openmettle_api")
+        let context = format!("api issuance PGUSER collision ({label})");
+        let mut cmd = command(false);
+        cmd.env("PGUSER", "openmettle_api")
             .env("OPENMETTLE_API_BIND", &bind)
             .env("OPENMETTLE_API_DATABASE_URL", database)
             .env("OPENMETTLE_API_AUTH_CONFIG", "/CANARY-absent/auth.json")
-            .env("OPENMETTLE_API_ISSUANCE_DATABASE_URL", issuance)
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(78), "{database} {issuance}");
+            .env("OPENMETTLE_API_ISSUANCE_DATABASE_URL", issuance);
+        let output = run(&mut cmd, &context);
+        assert_eq!(output.status.code(), Some(78), "{context}");
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
-            "configuration error: ISSUANCE_DATABASE_URL must use a different user\n"
+            "configuration error: ISSUANCE_DATABASE_URL must use a different user\n",
+            "{context}"
         );
     }
     // Accepted settings reach the document loader, which reports the absent file instead.
@@ -366,38 +381,41 @@ fn issuance_settings_are_refused_with_a_fixed_line() {
         if let Some(max) = max {
             command.env("OPENMETTLE_API_ISSUANCE_DB_MAX_CONNECTIONS", max);
         }
-        let output = command.output().unwrap();
-        assert_eq!(output.status.code(), Some(78), "{max:?}");
+        let context = format!("api issuance accepted with ISSUANCE_DB_MAX_CONNECTIONS={max:?}");
+        let output = run(&mut command, &context);
+        assert_eq!(output.status.code(), Some(78), "{context}");
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
-            "auth configuration error: configuration is not a readable regular file within bounds\n"
+            "auth configuration error: configuration is not a readable regular file within bounds\n",
+            "{context}"
         );
     }
     // The worker refuses the API's issuance URL whatever its value, and reads no issuance
     // setting under its own prefix.
-    for value in [
-        OsStr::new(issuance),
-        OsStr::new(""),
-        OsStr::from_bytes(b"CANARY-\xff"),
+    for (label, value) in [
+        ("url", OsStr::new(issuance)),
+        ("empty", OsStr::new("")),
+        ("non-utf8", OsStr::from_bytes(b"CANARY-\xff")),
     ] {
-        let output = command(true)
-            .env("OPENMETTLE_WORKER_BIND", &bind)
+        let context = format!("worker refuses OPENMETTLE_API_ISSUANCE_DATABASE_URL ({label})");
+        let mut cmd = command(true);
+        cmd.env("OPENMETTLE_WORKER_BIND", &bind)
             .env(
                 "OPENMETTLE_WORKER_DATABASE_URL",
                 "postgres://localhost/test",
             )
-            .env("OPENMETTLE_API_ISSUANCE_DATABASE_URL", value)
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(78), "{value:?}");
+            .env("OPENMETTLE_API_ISSUANCE_DATABASE_URL", value);
+        let output = run(&mut cmd, &context);
+        assert_eq!(output.status.code(), Some(78), "{context}");
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
-            "configuration error: OPENMETTLE_API_ISSUANCE_DATABASE_URL is refused outside the API\n"
+            "configuration error: OPENMETTLE_API_ISSUANCE_DATABASE_URL is refused outside the API\n",
+            "{context}"
         );
     }
     // Under its own prefix, unread: the occupied listener is the first failure.
-    let output = command(true)
-        .env("OPENMETTLE_WORKER_BIND", &bind)
+    let mut cmd = command(true);
+    cmd.env("OPENMETTLE_WORKER_BIND", &bind)
         .env(
             "OPENMETTLE_WORKER_DATABASE_URL",
             "postgres://localhost/test",
@@ -406,9 +424,11 @@ fn issuance_settings_are_refused_with_a_fixed_line() {
             "OPENMETTLE_WORKER_ISSUANCE_DATABASE_URL",
             "invalid://CANARY",
         )
-        .env("OPENMETTLE_WORKER_ISSUANCE_DB_MAX_CONNECTIONS", "CANARY")
-        .output()
-        .unwrap();
+        .env("OPENMETTLE_WORKER_ISSUANCE_DB_MAX_CONNECTIONS", "CANARY");
+    let output = run(
+        &mut cmd,
+        "worker unread OPENMETTLE_WORKER_ISSUANCE_* on occupied listener",
+    );
     assert_eq!(output.status.code(), Some(1));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("CANARY"));
 }
@@ -438,22 +458,18 @@ fn start_logging(worker: bool, address: &str, url: &str, settings: &[(&str, &str
     )
 }
 fn drain(process: &mut Process) -> (String, String) {
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    process
-        .0
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut stdout)
-        .unwrap();
-    process
-        .0
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .unwrap();
+    let stdout = read_string_bounded(
+        process.0.stdout.take().unwrap(),
+        PIPE_DRAIN_TIMEOUT,
+        "stdout",
+        "post-exit process stdout",
+    );
+    let stderr = read_string_bounded(
+        process.0.stderr.take().unwrap(),
+        PIPE_DRAIN_TIMEOUT,
+        "stderr",
+        "post-exit process stderr",
+    );
     (stdout, stderr)
 }
 
@@ -719,12 +735,13 @@ fn rejects_invalid_otlp_settings_with_a_fixed_line() {
         ),
     ];
     for worker in [false, true] {
+        let role = role_name(worker);
         let prefix = if worker {
             "OPENMETTLE_WORKER"
         } else {
             "OPENMETTLE_API"
         };
-        for (pairs, key) in &cases {
+        for (index, (pairs, key)) in cases.iter().enumerate() {
             let mut command = command(worker);
             command
                 .env(
@@ -739,13 +756,16 @@ fn rejects_invalid_otlp_settings_with_a_fixed_line() {
             for (name, value) in pairs {
                 command.env(format!("{prefix}_{name}"), value);
             }
-            let output = command.output().unwrap();
-            assert_eq!(output.status.code(), Some(78), "{pairs:?}");
-            assert!(output.stdout.is_empty());
+            let keys: Vec<&str> = pairs.iter().map(|(name, _)| *name).collect();
+            let context =
+                format!("{role} invalid OTLP case #{index} (expected {key}; keys={keys:?})");
+            let output = run(&mut command, &context);
+            assert_eq!(output.status.code(), Some(78), "{context}");
+            assert!(output.stdout.is_empty(), "{context}");
             assert_eq!(
                 String::from_utf8(output.stderr).unwrap(),
                 format!("configuration error: invalid {key}\n"),
-                "{pairs:?}"
+                "{context}"
             );
         }
     }
@@ -802,14 +822,12 @@ fn configured_export_ignores_proxies_and_keeps_shutdown_bounded() {
     stop(&mut process, "-TERM");
     let stopping = began.elapsed();
     assert!(stopping < Duration::from_secs(2), "{stopping:?}");
-    let mut stderr = String::new();
-    process
-        .0
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .unwrap();
+    let stderr = read_string_bounded(
+        process.0.stderr.take().unwrap(),
+        PIPE_DRAIN_TIMEOUT,
+        "stderr",
+        "configured export api stderr",
+    );
     assert!(!stderr.contains("CANARY"), "{stderr}");
     let names: Vec<String> = stderr
         .lines()
@@ -959,13 +977,13 @@ fn auth_config_check_succeeds_offline_without_serving_settings() {
     let mut native = auth_config_support::document_v2_native(&dir, &bundle);
     native["cursor_keys"] = auth_config_support::cursor_keys(&dir);
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
-    for (document, serving_settings) in [
-        (&v1, false),
-        (&v1, true),
-        (&v2, false),
-        (&v2, true),
-        (&native, false),
-        (&native, true),
+    for (label, document, serving_settings) in [
+        ("v1", &v1, false),
+        ("v1", &v1, true),
+        ("v2", &v2, false),
+        ("v2", &v2, true),
+        ("v2-native", &native, false),
+        ("v2-native", &native, true),
     ] {
         let path = dir.write("auth.json", document.to_string().as_bytes());
         let mut command = command(false);
@@ -978,16 +996,17 @@ fn auth_config_check_succeeds_offline_without_serving_settings() {
                     occupied.local_addr().unwrap().to_string(),
                 );
         }
-        let output = command
-            .args(["--check-auth-config", &path])
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(0));
+        command.args(["--check-auth-config", &path]);
+        let context =
+            format!("api --check-auth-config ({label}, serving_settings={serving_settings})");
+        let output = run(&mut command, &context);
+        assert_eq!(output.status.code(), Some(0), "{context}");
         assert_eq!(
             String::from_utf8(output.stdout).unwrap(),
-            "auth configuration valid (local files only)\n"
+            "auth configuration valid (local files only)\n",
+            "{context}"
         );
-        assert!(output.stderr.is_empty());
+        assert!(output.stderr.is_empty(), "{context}");
     }
 }
 
@@ -1161,24 +1180,24 @@ fn auth_config_check_rejects_with_fixed_redacted_categories() {
         reused.to_string().into_bytes(),
         "cursor key count, identifiers or key separation are invalid",
     ));
-    for (bytes, category) in cases {
+    for (index, (bytes, category)) in cases.into_iter().enumerate() {
         let path = dir.write("synthetic-secret.json", &bytes);
-        let output = command(false)
-            .args(["--check-auth-config", &path])
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(78));
-        assert!(output.stdout.is_empty());
+        let context = format!("api --check-auth-config refusal case #{index} ({category})");
+        let mut cmd = command(false);
+        cmd.args(["--check-auth-config", &path]);
+        let output = run(&mut cmd, &context);
+        assert_eq!(output.status.code(), Some(78), "{context}");
+        assert!(output.stdout.is_empty(), "{context}");
         // The whole diagnostic is one fixed line: no path, value or parser text.
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
-            format!("auth configuration error: {category}\n")
+            format!("auth configuration error: {category}\n"),
+            "{context}"
         );
     }
-    let output = command(false)
-        .args(["--check-auth-config", &dir.path("synthetic-secret-absent")])
-        .output()
-        .unwrap();
+    let mut cmd = command(false);
+    cmd.args(["--check-auth-config", &dir.path("synthetic-secret-absent")]);
+    let output = run(&mut cmd, "api --check-auth-config absent file");
     assert_eq!(output.status.code(), Some(78));
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
@@ -1192,7 +1211,7 @@ fn malformed_check_invocation_is_refused_and_worker_is_unchanged() {
     let document = auth_config_support::document(&dir, &ca::Ca::new().pem());
     let path = dir.write("auth.json", document.to_string().as_bytes());
     let joined = format!("--check-auth-config={path}");
-    for arguments in [
+    for (index, arguments) in [
         vec!["--check-auth-config"],
         vec!["--check-auth-config", &path, "synthetic-secret"],
         vec!["--check-auth-confg", &path],
@@ -1200,18 +1219,30 @@ fn malformed_check_invocation_is_refused_and_worker_is_unchanged() {
         vec![path.as_str()],
         vec!["--help"],
         vec![""],
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         // A fall-through to serving would report the missing database URL instead.
-        let output = command(false).args(&arguments).output().unwrap();
-        assert_eq!(output.status.code(), Some(78), "{arguments:?}");
-        assert!(output.stdout.is_empty());
-        assert_eq!(String::from_utf8(output.stderr).unwrap(), USAGE);
+        let context = format!(
+            "api malformed check invocation case #{index} (argc={})",
+            arguments.len()
+        );
+        let mut cmd = command(false);
+        cmd.args(&arguments);
+        let output = run(&mut cmd, &context);
+        assert_eq!(output.status.code(), Some(78), "{context}");
+        assert!(output.stdout.is_empty(), "{context}");
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            USAGE,
+            "{context}"
+        );
     }
     // The worker has no check mode and no auth settings: it reports its own configuration.
-    let output = command(true)
-        .args(["--check-auth-config", &path])
-        .output()
-        .unwrap();
+    let mut cmd = command(true);
+    cmd.args(["--check-auth-config", &path]);
+    let output = run(&mut cmd, "worker --check-auth-config missing DATABASE_URL");
     assert_eq!(output.status.code(), Some(78));
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
@@ -1279,18 +1310,20 @@ fn api_refuses_invalid_auth_config_with_a_fixed_redacted_line() {
         "auth configuration error: configuration is not a readable regular file within bounds";
     const COLLISION: &str =
         "auth configuration error: browser profile refused: login paths collide";
-    let cases: Vec<(String, &str)> = vec![
-        (String::new(), SETTING),
-        ("CANARY-relative/auth.json".into(), SETTING),
-        ("./CANARY-auth.json".into(), SETTING),
-        (dir.path("CANARY-absent.json"), ABSENT),
+    let cases: Vec<(&str, String, &str)> = vec![
+        ("empty path", String::new(), SETTING),
+        ("relative path", "CANARY-relative/auth.json".into(), SETTING),
+        ("dot-relative path", "./CANARY-auth.json".into(), SETTING),
+        ("absent file", dir.path("CANARY-absent.json"), ABSENT),
         // A directory is not a regular file.
-        (dir.path(""), ABSENT),
+        ("directory", dir.path(""), ABSENT),
         (
+            "broken JSON",
             dir.write("CANARY-broken.json", br#"{"version": 2, "CANARY-member":"#),
             "auth configuration error: configuration is not valid JSON",
         ),
         (
+            "v1 document",
             write("CANARY-v1.json", &v1),
             "auth configuration error: serving requires a version 2 browser profile",
         ),
@@ -1324,9 +1357,10 @@ fn api_refuses_invalid_auth_config_with_a_fixed_redacted_line() {
         ),
     ];
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
-    let run = |path: &str, line: &str| {
-        let output = command(false)
-            .env("OPENMETTLE_API_DATABASE_URL", "postgres://localhost/test")
+    let run_case = |label: &str, path: &str, line: &str| {
+        let context = format!("api AUTH_CONFIG refusal ({label}; expected: {line})");
+        let mut cmd = command(false);
+        cmd.env("OPENMETTLE_API_DATABASE_URL", "postgres://localhost/test")
             // Serving would exit 1 on this occupied address instead.
             .env(
                 "OPENMETTLE_API_BIND",
@@ -1337,21 +1371,25 @@ fn api_refuses_invalid_auth_config_with_a_fixed_redacted_line() {
             .env(
                 "OPENMETTLE_API_ISSUANCE_DATABASE_URL",
                 "postgres://fixture-issuance@localhost/test",
-            )
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(78), "{line}");
-        assert!(output.stdout.is_empty());
+            );
+        let output = run(&mut cmd, &context);
+        assert_eq!(output.status.code(), Some(78), "{context}");
+        assert!(output.stdout.is_empty(), "{context}");
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
-            format!("{line}\n")
+            format!("{line}\n"),
+            "{context}"
         );
     };
-    for (path, line) in cases {
-        run(&path, line);
+    for (label, path, line) in cases {
+        run_case(label, &path, line);
     }
-    for (pointer, value, line) in later {
-        run(&changed(pointer, value), line);
+    for (index, (pointer, value, line)) in later.into_iter().enumerate() {
+        run_case(
+            &format!("case #{index} {pointer}"),
+            &changed(pointer, value),
+            line,
+        );
     }
     // ADR 0029: a refused native profile is the same kind of fixed line, before any listener.
     let native = auth_config_support::document_v2_native(&dir, &bundle);
@@ -1370,14 +1408,13 @@ fn api_refuses_invalid_auth_config_with_a_fixed_redacted_line() {
         } else {
             "auth configuration error: native profile refused: native routes or app link collide with another route"
         };
-        run(&write("CANARY-native.json", &document), line);
+        run_case(pointer, &write("CANARY-native.json", &document), line);
     }
     // Earlier settings are still reported first, and a valid file does not excuse them.
-    let output = command(false)
-        .env("OPENMETTLE_API_DATABASE_URL", "invalid://CANARY")
-        .env("OPENMETTLE_API_AUTH_CONFIG", write("auth.json", &v2))
-        .output()
-        .unwrap();
+    let mut cmd = command(false);
+    cmd.env("OPENMETTLE_API_DATABASE_URL", "invalid://CANARY")
+        .env("OPENMETTLE_API_AUTH_CONFIG", write("auth.json", &v2));
+    let output = run(&mut cmd, "api invalid DATABASE_URL with valid AUTH_CONFIG");
     assert_eq!(output.status.code(), Some(78));
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
@@ -1396,36 +1433,38 @@ fn artifacts_dir_is_validated_before_serving_with_a_fixed_line() {
     std::os::unix::fs::symlink(&target, dir.path("CANARY-link")).unwrap();
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
     for worker in [false, true] {
+        let role = role_name(worker);
         let prefix = if worker {
             "OPENMETTLE_WORKER"
         } else {
             "OPENMETTLE_API"
         };
-        for path in [
-            String::new(),
-            "CANARY-relative".into(),
-            dir.path("CANARY-absent"),
-            file.clone(),
-            dir.path("CANARY-link"),
+        for (label, path) in [
+            ("empty", String::new()),
+            ("relative", "CANARY-relative".into()),
+            ("absent", dir.path("CANARY-absent")),
+            ("regular file", file.clone()),
+            ("symlink", dir.path("CANARY-link")),
         ] {
-            let output = command(worker)
-                .env(
-                    format!("{prefix}_DATABASE_URL"),
-                    "postgres://localhost/test",
-                )
-                // Serving would exit 1 on this occupied address instead.
-                .env(
-                    format!("{prefix}_BIND"),
-                    occupied.local_addr().unwrap().to_string(),
-                )
-                .env(format!("{prefix}_ARTIFACTS_DIR"), &path)
-                .output()
-                .unwrap();
-            assert_eq!(output.status.code(), Some(78), "{path:?}");
-            assert!(output.stdout.is_empty());
+            let context = format!("{role} {prefix}_ARTIFACTS_DIR refusal ({label})");
+            let mut cmd = command(worker);
+            cmd.env(
+                format!("{prefix}_DATABASE_URL"),
+                "postgres://localhost/test",
+            )
+            // Serving would exit 1 on this occupied address instead.
+            .env(
+                format!("{prefix}_BIND"),
+                occupied.local_addr().unwrap().to_string(),
+            )
+            .env(format!("{prefix}_ARTIFACTS_DIR"), &path);
+            let output = run(&mut cmd, &context);
+            assert_eq!(output.status.code(), Some(78), "{context}");
+            assert!(output.stdout.is_empty(), "{context}");
             assert_eq!(
                 String::from_utf8(output.stderr).unwrap(),
-                "configuration error: invalid ARTIFACTS_DIR\n"
+                "configuration error: invalid ARTIFACTS_DIR\n",
+                "{context}"
             );
         }
         let root = dir.path(if worker { "worker" } else { "api" });
@@ -2177,7 +2216,7 @@ fn gateway_refuses_incomplete_or_unsupported_settings_with_a_fixed_line() {
             "invalid CACHE_MODE",
         ),
     ];
-    for (settings, line) in cases {
+    for (index, (settings, line)) in cases.iter().enumerate() {
         let mut command = gateway();
         command.env(
             "OPENMETTLE_GATEWAY_BIND",
@@ -2186,25 +2225,30 @@ fn gateway_refuses_incomplete_or_unsupported_settings_with_a_fixed_line() {
         for (key, value) in *settings {
             command.env(format!("OPENMETTLE_GATEWAY_{key}"), value);
         }
-        let output = command.output().unwrap();
-        assert_eq!(output.status.code(), Some(78), "{line}");
-        assert!(output.stdout.is_empty());
+        let keys: Vec<&str> = settings.iter().map(|(k, _)| *k).collect();
+        let context = format!("gateway refusal case #{index} ({line}; keys={keys:?})");
+        let output = run(&mut command, &context);
+        assert_eq!(output.status.code(), Some(78), "{context}");
+        assert!(output.stdout.is_empty(), "{context}");
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
-            format!("configuration error: {line}\n")
+            format!("configuration error: {line}\n"),
+            "{context}"
         );
     }
     // The API's issuance credential is refused here as in the worker.
-    let output = gateway()
-        .env("OPENMETTLE_GATEWAY_DATABASE_URL", database.1)
+    let mut cmd = gateway();
+    cmd.env("OPENMETTLE_GATEWAY_DATABASE_URL", database.1)
         .env("OPENMETTLE_GATEWAY_UPSTREAM_URL", upstream.1)
         .env("OPENMETTLE_GATEWAY_MODEL", model.1)
         .env(
             "OPENMETTLE_API_ISSUANCE_DATABASE_URL",
             "postgres://CANARY@localhost/test",
-        )
-        .output()
-        .unwrap();
+        );
+    let output = run(
+        &mut cmd,
+        "gateway refuses OPENMETTLE_API_ISSUANCE_DATABASE_URL",
+    );
     assert_eq!(output.status.code(), Some(78));
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
@@ -2359,14 +2403,13 @@ fn gateway_serves_probes_and_its_route_and_stops_on_a_signal() {
 #[test]
 fn occupied_listener_exits_with_runtime_error() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let output = command(false)
-        .env(
-            "OPENMETTLE_API_BIND",
-            listener.local_addr().unwrap().to_string(),
-        )
-        .env("OPENMETTLE_API_DATABASE_URL", "postgres://localhost/test")
-        .output()
-        .unwrap();
+    let mut cmd = command(false);
+    cmd.env(
+        "OPENMETTLE_API_BIND",
+        listener.local_addr().unwrap().to_string(),
+    )
+    .env("OPENMETTLE_API_DATABASE_URL", "postgres://localhost/test");
+    let output = run(&mut cmd, "api occupied listener bind failure");
     assert_eq!(output.status.code(), Some(1));
     // One JSON event names the failure class; nothing goes to stdout.
     assert!(output.stdout.is_empty());
@@ -2632,6 +2675,7 @@ fn worker_scheduling_configuration_is_validated_before_serving() {
         ("EXECUTING_PER_SCOPE", "1"),
     ];
     let invoke = |worker: bool, vars: &[(&str, &str)], message: &str| {
+        let role = role_name(worker);
         let prefix = if worker {
             "OPENMETTLE_WORKER"
         } else {
@@ -2645,11 +2689,18 @@ fn worker_scheduling_configuration_is_validated_before_serving() {
         for (key, value) in vars {
             child.env(format!("OPENMETTLE_WORKER_{key}"), value);
         }
-        let output = child.output().unwrap();
-        assert_eq!(output.status.code(), Some(78));
+        let config = vars
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let context = format!("{role} scheduling config [{config}] (expected: {message})");
+        let output = run(&mut child, &context);
+        assert_eq!(output.status.code(), Some(78), "{context}");
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
-            format!("configuration error: {message}\n")
+            format!("configuration error: {message}\n"),
+            "{context}"
         );
     };
     for (key, below, above) in [
@@ -2735,10 +2786,12 @@ fn worker_validates_its_inference_document_before_serving() {
     );
     let mut cases = vec![
         (
+            "invalid installation UUID",
             json_with(&valid, "/installation", "CANARY-installation"),
             "gateway installation is not a canonical UUID",
         ),
         (
+            "invalid route endpoint query",
             json_with(
                 &valid,
                 "/routes/a/endpoint",
@@ -2747,6 +2800,7 @@ fn worker_validates_its_inference_document_before_serving() {
             "an inference route endpoint, trust, address policy or timeout is invalid",
         ),
         (
+            "mismatched route catalog pin",
             json_with(&valid, "/routes/b/pin/revision", "CANARY-revision"),
             "an inference route does not match its catalog profile",
         ),
@@ -2757,7 +2811,11 @@ fn worker_validates_its_inference_document_before_serving() {
         "active": {"id": "gateway-b", "path": dir.write("CANARY-key", &[0xc2; 32])},
         "decrypt_only": []
     });
-    cases.push((ring, "configuration has an unknown field"));
+    cases.push((
+        "legacy gateway_keys field",
+        ring,
+        "configuration has an unknown field",
+    ));
     // A plain route names no range to hold the gateway's addresses.
     let mut plain = valid.clone();
     plain["routes"]["a"]["endpoint"] = "http://canary-gateway.example.test:8082/CANARY".into();
@@ -2766,16 +2824,18 @@ fn worker_validates_its_inference_document_before_serving() {
         .unwrap()
         .remove("trust");
     cases.push((
+        "plain HTTP route without private_cidrs",
         plain,
         "a plain HTTP inference route needs private_cidrs holding every gateway address",
     ));
     let mut uncovered = valid.clone();
     uncovered["routes"].as_object_mut().unwrap().remove("b");
     cases.push((
+        "missing catalog model route",
         uncovered,
         "inference routes do not name exactly the catalog's models",
     ));
-    for (document, message) in cases {
+    for (label, document, message) in cases {
         let path = dir.write("inference.json", document.to_string().as_bytes());
         let mut child = command(true);
         child
@@ -2784,12 +2844,14 @@ fn worker_validates_its_inference_document_before_serving() {
         for (key, value) in policy {
             child.env(format!("OPENMETTLE_WORKER_{key}"), value);
         }
-        let output = child.output().unwrap();
-        assert_eq!(output.status.code(), Some(78), "{message}");
-        assert!(output.stdout.is_empty());
+        let context = format!("worker inference document refusal ({label}; expected: {message})");
+        let output = run(&mut child, &context);
+        assert_eq!(output.status.code(), Some(78), "{context}");
+        assert!(output.stdout.is_empty(), "{context}");
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
-            format!("inference configuration error: {message}\n")
+            format!("inference configuration error: {message}\n"),
+            "{context}"
         );
     }
     // No refused process dialled the database.
@@ -2823,7 +2885,37 @@ fn json_with(document: &serde_json::Value, pointer: &str, value: &str) -> serde_
 
 #[test]
 fn failed_sweeps_report_fixed_categories_and_retry_next_tick() {
-    use std::io::{BufRead, BufReader};
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    struct ReaderGuard {
+        abort: Arc<AtomicBool>,
+        stop_deadline: Arc<Mutex<Option<Instant>>>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+    impl ReaderGuard {
+        fn finish(mut self, timeout: Duration) {
+            *self.stop_deadline.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(Instant::now() + timeout);
+            let handle = self.handle.take().expect("sweep reader handle missing");
+            handle
+                .join()
+                .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+        }
+    }
+    impl Drop for ReaderGuard {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.take() {
+                self.abort.store(true, Ordering::Relaxed);
+                *self.stop_deadline.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(Instant::now());
+                let _ = handle.join();
+            }
+        }
+    }
+
     let dir = auth_config_support::Dir::new();
     let root = dir.path("payloads");
     std::fs::create_dir(&root).unwrap();
@@ -2838,21 +2930,72 @@ fn failed_sweeps_report_fixed_categories_and_retry_next_tick() {
         &url,
         &[("SWEEP_MS", "1000"), ("ARTIFACTS_DIR", &root)],
     );
-    let pipe = process.0.stderr.take().unwrap();
+    let mut pipe = process.0.stderr.take().unwrap();
+    let flags = fcntl_getfl(&pipe).unwrap();
+    fcntl_setfl(&pipe, flags | OFlags::NONBLOCK).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
-    let reader = thread::spawn(move || {
-        for line in BufReader::new(pipe).lines() {
-            let line = line.unwrap();
-            assert!(!line.contains("CANARY"));
-            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
-            if event["event"] == "worker.sweep.failed" {
-                assert_eq!(event["level"], "WARN");
-                assert_eq!(event["role"], "worker");
-                tx.send(event["error.type"].as_str().unwrap().to_owned())
-                    .unwrap();
+    let abort = Arc::new(AtomicBool::new(false));
+    let reader_abort = Arc::clone(&abort);
+    let stop_deadline = Arc::new(Mutex::new(None::<Instant>));
+    let reader_deadline = Arc::clone(&stop_deadline);
+    let reader = ReaderGuard {
+        abort,
+        stop_deadline,
+        handle: Some(thread::spawn(move || {
+            let mut pending = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut sleep = Duration::from_millis(2);
+            loop {
+                if reader_abort.load(Ordering::Relaxed) {
+                    return;
+                }
+                let maybe_deadline = *reader_deadline.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(deadline) = maybe_deadline {
+                    assert!(
+                        Instant::now() < deadline,
+                        "worker sweep stderr did not reach EOF within {PIPE_DRAIN_TIMEOUT:?}"
+                    );
+                }
+                match pipe.read(&mut chunk) {
+                    Ok(0) => {
+                        assert!(pending.is_empty(), "trailing partial stderr line");
+                        return;
+                    }
+                    Ok(n) => {
+                        pending.extend_from_slice(&chunk[..n]);
+                        while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+                            let raw: Vec<u8> = pending.drain(..=pos).collect();
+                            let line = String::from_utf8(raw).unwrap();
+                            let line = line.trim_end_matches('\n');
+                            assert!(!line.contains("CANARY"));
+                            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+                            if event["event"] == "worker.sweep.failed" {
+                                assert_eq!(event["level"], "WARN");
+                                assert_eq!(event["role"], "worker");
+                                let _ = tx.send(event["error.type"].as_str().unwrap().to_owned());
+                            }
+                        }
+                        sleep = Duration::from_millis(2);
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        if let Some(deadline) = maybe_deadline {
+                            let now = Instant::now();
+                            assert!(
+                                now < deadline,
+                                "worker sweep stderr did not reach EOF within {PIPE_DRAIN_TIMEOUT:?}"
+                            );
+                            thread::sleep(sleep.min(deadline.saturating_duration_since(now)));
+                        } else {
+                            thread::sleep(sleep);
+                        }
+                        sleep = (sleep * 2).min(Duration::from_millis(25));
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(err) => panic!("failed reading worker sweep stderr: {err}"),
+                }
             }
-        }
-    });
+        })),
+    };
     for _ in 0..2 {
         for expected in [
             "expire_queued",
@@ -2865,5 +3008,780 @@ fn failed_sweeps_report_fixed_categories_and_retry_next_tick() {
         }
     }
     stop(&mut process, "-TERM");
-    reader.join().unwrap();
+    reader.finish(PIPE_DRAIN_TIMEOUT);
+}
+
+fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else {
+        String::new()
+    }
+}
+
+/// Regression test for the shared bounded process and readiness helpers:
+/// 1. A real `openmettle-api` binary that starts instead of refusing fails within the deadline,
+///    emits `process.started` into the captured timeout diagnostics, names the configuration label
+///    and stops listening after being killed and reaped.
+/// 2. `wait_exit_bounded` and `wait_output_bounded` time out promptly, kill and reap a
+///    long-running child, and name the configuration label.
+/// 3. A child whose background descendant inherits stdout/stderr still times out promptly with its
+///    pre-hang diagnostic marker intact and zero leaked reader threads; bounded post-exit pipe
+///    readers (`read_string_bounded` and `PipeDrain`) likewise fail within their deadline when a
+///    descendant keeps the write end open.
+/// 4. `wait_http_status_bounded` fails promptly at its deadline against a slow-drip HTTP peer.
+/// 5. `run_bounded` drains stdout and stderr concurrently past OS pipe buffer sizes without
+///    deadlocking.
+#[test]
+fn bounded_process_helpers_time_out_kill_and_name_configuration() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    // 1. Real binary starting instead of refusing.
+    let (_database, url) = unavailable_database();
+    let bind = address();
+    let label = "synthetic-refusal-case: OPENMETTLE_API_BIND=ephemeral";
+    let mut cmd = command(false);
+    cmd.env("OPENMETTLE_API_BIND", &bind)
+        .env("OPENMETTLE_API_DATABASE_URL", &url)
+        .env("OPENMETTLE_API_DB_TIMEOUT_MS", "150")
+        .env("OPENMETTLE_API_SHUTDOWN_TIMEOUT_MS", "1000");
+    let began = Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_bounded(&mut cmd, Duration::from_secs(1), label)
+    }))
+    .expect_err("serving binary must time out");
+    assert!(
+        began.elapsed() < Duration::from_secs(3),
+        "run_bounded took too long: {:?}",
+        began.elapsed()
+    );
+    let message = panic_text(err);
+    assert!(
+        message.contains("timed out after"),
+        "expected timeout failure message, got: {message}"
+    );
+    assert!(message.contains(label), "missing label in panic: {message}");
+    assert!(
+        message.contains("process.started"),
+        "expected openmettle-api startup event in timeout diagnostics, got: {message}"
+    );
+    assert!(
+        TcpStream::connect_timeout(&bind.parse().unwrap(), Duration::from_millis(200)).is_err(),
+        "timed-out binary kept listening on {bind}"
+    );
+
+    // 2. `wait_exit_bounded` kills and reaps a long-running child.
+    let mut sleeper = Process(
+        Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let pid = sleeper.0.id();
+    let began = Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_exit_bounded(
+            &mut sleeper.0,
+            Duration::from_millis(150),
+            "synthetic-sleep-exit-case",
+        )
+    }))
+    .expect_err("sleep child must time out");
+    assert!(
+        began.elapsed() < Duration::from_secs(3),
+        "wait_exit_bounded took too long: {:?}",
+        began.elapsed()
+    );
+    let message = panic_text(err);
+    assert!(
+        message.contains("timed out after"),
+        "expected timeout failure message, got: {message}"
+    );
+    assert!(
+        message.contains("synthetic-sleep-exit-case"),
+        "missing label in panic: {message}"
+    );
+    assert!(
+        sleeper.0.try_wait().unwrap().is_some(),
+        "timed-out child was not reaped"
+    );
+    let alive = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success();
+    assert!(!alive, "timed-out child pid {pid} is still alive");
+
+    // 3. `wait_output_bounded` kills and reaps an already-spawned piped child.
+    let sleeper = Process(
+        Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let pid = sleeper.0.id();
+    let began = Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_output_bounded(
+            sleeper,
+            Duration::from_millis(150),
+            "synthetic-sleep-output-case",
+        )
+    }))
+    .expect_err("piped sleep child must time out");
+    assert!(
+        began.elapsed() < Duration::from_secs(3),
+        "wait_output_bounded took too long: {:?}",
+        began.elapsed()
+    );
+    let message = panic_text(err);
+    assert!(
+        message.contains("timed out after"),
+        "expected timeout failure message, got: {message}"
+    );
+    assert!(
+        message.contains("synthetic-sleep-output-case"),
+        "missing label in panic: {message}"
+    );
+    let alive = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success();
+    assert!(!alive, "timed-out piped child pid {pid} is still alive");
+
+    // 4. Inherited descendant pipe: timeout fails well before `sleep 5`, retains pre-hang stderr
+    //    diagnostics, and spawns no leaking reader threads.
+    let mut inherited = Command::new("sh");
+    inherited.args(["-c", "echo marker-before-hang >&2; sleep 5 & wait"]);
+    let began = Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_bounded(
+            &mut inherited,
+            Duration::from_millis(150),
+            "synthetic-inherited-pipe-case",
+        )
+    }))
+    .expect_err("child with inherited grandchild pipe must time out");
+    assert!(
+        began.elapsed() < Duration::from_millis(1500),
+        "run_bounded waited for descendant pipe: {:?}",
+        began.elapsed()
+    );
+    let message = panic_text(err);
+    assert!(
+        message.contains("timed out after"),
+        "expected timeout failure message, got: {message}"
+    );
+    assert!(
+        message.contains("synthetic-inherited-pipe-case"),
+        "missing label in panic: {message}"
+    );
+    assert!(
+        message.contains("marker-before-hang"),
+        "lost pre-hang stderr marker in panic: {message}"
+    );
+
+    // 5. Post-exit bounded pipe readers (`read_string_bounded` and `PipeDrain`) fail promptly and
+    //    preserve already-written diagnostics when a descendant keeps stderr open after child exit.
+    let mut lingering = Process(
+        Command::new("sh")
+            .args(["-c", "echo post-exit-marker >&2; sleep 5 &"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    assert!(
+        wait_exit_bounded(
+            &mut lingering.0,
+            Duration::from_secs(2),
+            "post-exit-marker child",
+        )
+        .success()
+    );
+    let began = Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_string_bounded(
+            lingering.0.stderr.take().unwrap(),
+            Duration::from_millis(150),
+            "stderr",
+            "synthetic-post-exit-pipe-case",
+        )
+    }))
+    .expect_err("read_string_bounded must time out on inherited pipe");
+    assert!(
+        began.elapsed() < Duration::from_millis(1500),
+        "read_string_bounded waited for descendant pipe: {:?}",
+        began.elapsed()
+    );
+    let message = panic_text(err);
+    assert!(
+        message.contains("synthetic-post-exit-pipe-case") && message.contains("post-exit-marker"),
+        "missing label or marker in post-exit pipe panic: {message}"
+    );
+
+    let mut lingering_drain = Process(
+        Command::new("sh")
+            .args(["-c", "echo pipe-drain-marker >&2; sleep 5 &"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let drain = PipeDrain::start(
+        lingering_drain.0.stderr.take().unwrap(),
+        "stderr",
+        "synthetic-pipe-drain-case",
+    );
+    assert!(
+        wait_exit_bounded(
+            &mut lingering_drain.0,
+            Duration::from_secs(2),
+            "pipe-drain-marker child",
+        )
+        .success()
+    );
+    let began = Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drain.finish_string(Duration::from_millis(150))
+    }))
+    .expect_err("PipeDrain must time out on inherited pipe");
+    assert!(
+        began.elapsed() < Duration::from_millis(1500),
+        "PipeDrain waited for descendant pipe: {:?}",
+        began.elapsed()
+    );
+    let message = panic_text(err);
+    assert!(
+        message.contains("synthetic-pipe-drain-case") && message.contains("pipe-drain-marker"),
+        "missing label or marker in PipeDrain panic: {message}"
+    );
+
+    // 6. Readiness probe (`wait_http_status_bounded`) fails promptly against a slow-drip peer
+    //    sending 1 byte every 200 ms with no newline or EOF (with an independent 3 s server cutoff
+    //    beyond the 1.5 s assertion threshold so a read-until-EOF regression still terminates).
+    let drip_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let drip_addr = drip_listener.local_addr().unwrap().to_string();
+    drip_listener.set_nonblocking(true).unwrap();
+    let stop_drip = Arc::new(AtomicBool::new(false));
+    let drip_flag = Arc::clone(&stop_drip);
+    let drip_server = thread::spawn(move || {
+        let server_cutoff = Instant::now() + Duration::from_secs(3);
+        while !drip_flag.load(Ordering::Relaxed) && Instant::now() < server_cutoff {
+            match drip_listener.accept() {
+                Ok((mut stream, _)) => {
+                    while !drip_flag.load(Ordering::Relaxed) && Instant::now() < server_cutoff {
+                        if stream.write_all(b"H").is_err() {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(200));
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let mut dummy = Process(
+        Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let began = Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_http_status_bounded(
+            &mut dummy,
+            &drip_addr,
+            "/readyz",
+            200,
+            Duration::from_millis(500),
+        )
+    }))
+    .expect_err("slow-drip readiness probe must time out");
+    stop_drip.store(true, Ordering::Relaxed);
+    drip_server.join().unwrap();
+    assert!(
+        began.elapsed() < Duration::from_millis(1500),
+        "slow-drip readiness probe outlived its deadline: {:?}",
+        began.elapsed()
+    );
+    let message = panic_text(err);
+    assert!(
+        message.contains("deadline") && message.contains("/readyz"),
+        "unexpected slow-drip probe panic: {message}"
+    );
+
+    // 7. `run_bounded` drains stdout and stderr past typical 64 KiB pipe buffers without deadlock.
+    let mut flood = Command::new("sh");
+    flood.args([
+        "-c",
+        "dd if=/dev/zero bs=1024 count=128 2>/dev/null && dd if=/dev/zero bs=1024 count=128 1>&2 2>/dev/null",
+    ]);
+    let output = run_bounded(&mut flood, Duration::from_secs(5), "pipe-flood-drain");
+    assert!(output.status.success());
+    assert_eq!(output.stdout.len(), 128 * 1024);
+    assert_eq!(output.stderr.len(), 128 * 1024);
+
+    // 8. Continuously readable streams (never returning `WouldBlock` through the assertion window,
+    //    with an independent cutoff), `Interrupted` storms, and empty pipes closing during the
+    //    final wait window all obey their exact deadline/read contracts.
+    struct AlwaysReadable {
+        fd: std::io::PipeReader,
+        cutoff: Instant,
+    }
+    impl std::os::fd::AsFd for AlwaysReadable {
+        fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.fd.as_fd()
+        }
+    }
+    impl std::io::Read for AlwaysReadable {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if Instant::now() >= self.cutoff {
+                return Ok(0);
+            }
+            thread::sleep(Duration::from_millis(5));
+            let n = buf.len().min(64);
+            buf[..n].fill(b'x');
+            Ok(n)
+        }
+    }
+
+    let make_always_readable = |duration: Duration| {
+        let (fd, _unused_writer) = std::io::pipe().unwrap();
+        AlwaysReadable {
+            fd,
+            cutoff: Instant::now() + duration,
+        }
+    };
+
+    let began = Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_string_bounded(
+            make_always_readable(Duration::from_millis(500)),
+            Duration::from_millis(30),
+            "stderr",
+            "synthetic-continuous-pipe-read",
+        )
+    }))
+    .expect_err("always-readable stream must time out in read_string_bounded");
+    let elapsed = began.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "read_string_bounded overrun on always-readable stream: {elapsed:?}"
+    );
+    let message = panic_text(err);
+    assert!(
+        message.contains("synthetic-continuous-pipe-read"),
+        "missing label in continuous pipe read panic: {message}"
+    );
+
+    let drain = PipeDrain::start(
+        make_always_readable(Duration::from_millis(500)),
+        "stderr",
+        "synthetic-continuous-pipe-drain",
+    );
+    let began = Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drain.finish_string(Duration::from_millis(30))
+    }))
+    .expect_err("always-readable stream must time out in PipeDrain::finish_string");
+    let elapsed = began.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "PipeDrain::finish_string overrun on always-readable stream: {elapsed:?}"
+    );
+    let message = panic_text(err);
+    assert!(
+        message.contains("synthetic-continuous-pipe-drain"),
+        "missing label in continuous PipeDrain panic: {message}"
+    );
+
+    struct InterruptedReader {
+        fd: std::io::PipeReader,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        interruptions: usize,
+    }
+    impl std::os::fd::AsFd for InterruptedReader {
+        fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.fd.as_fd()
+        }
+    }
+    impl std::io::Read for InterruptedReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            let idx = self.calls.fetch_add(1, Ordering::Relaxed);
+            if idx < self.interruptions {
+                Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+            } else {
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+        }
+    }
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (fd, _keep_open) = std::io::pipe().unwrap();
+    let reader = InterruptedReader {
+        fd,
+        calls: Arc::clone(&calls),
+        interruptions: 12,
+    };
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_string_bounded(
+            reader,
+            Duration::from_millis(20),
+            "stderr",
+            "synthetic-interrupted-pipe-case",
+        )
+    }))
+    .expect_err("interrupted+wouldblock stream must time out");
+    assert!(
+        panic_text(err).contains("synthetic-interrupted-pipe-case"),
+        "missing label on interrupted reader timeout"
+    );
+    // Initial pass stops at <= 8 attempts (`MAX_READS_PER_PASS`), and post-deadline preview makes
+    // at most 1 attempt without retrying `Interrupted`.
+    let zero_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (fd_zero, _keep_zero) = std::io::pipe().unwrap();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_string_bounded(
+            InterruptedReader {
+                fd: fd_zero,
+                calls: Arc::clone(&zero_calls),
+                interruptions: 12,
+            },
+            Duration::ZERO,
+            "stderr",
+            "synthetic-zero-deadline-interrupted",
+        )
+    }))
+    .expect_err("zero-deadline interrupted stream must time out");
+    assert_eq!(
+        zero_calls.load(Ordering::Relaxed),
+        1,
+        "post-deadline preview must not retry Interrupted"
+    );
+
+    struct SlowInterruptedReader {
+        fd: std::io::PipeReader,
+        cutoff: Instant,
+    }
+    impl std::os::fd::AsFd for SlowInterruptedReader {
+        fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.fd.as_fd()
+        }
+    }
+    impl std::io::Read for SlowInterruptedReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            if Instant::now() >= self.cutoff {
+                return Ok(0);
+            }
+            thread::sleep(Duration::from_millis(2));
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+        }
+    }
+    let (fd_storm, _keep_storm) = std::io::pipe().unwrap();
+    let storm_drain = PipeDrain::start(
+        SlowInterruptedReader {
+            fd: fd_storm,
+            cutoff: Instant::now() + Duration::from_secs(2),
+        },
+        "stderr",
+        "synthetic-interrupted-storm-drain",
+    );
+    thread::sleep(Duration::from_millis(10));
+    let drop_began = Instant::now();
+    drop(storm_drain);
+    assert!(
+        drop_began.elapsed() < Duration::from_millis(250),
+        "PipeDrain::drop stalled during Interrupted storm: {:?}",
+        drop_began.elapsed()
+    );
+
+    // 9. Empty pipe closing inside [56 ms, 72 ms) relative to the reader's start (during the
+    //    final polling wait before a 75 ms deadline) succeeds without false timeout, while
+    //    `PipeDrain::finish_string` immediately wakes an existing 25 ms idle wait (failing if the
+    //    wake were absent) and per-descriptor readiness never lets an early stdout close admit a
+    //    post-deadline stderr close.
+    let mut verified_read_close = false;
+    for _ in 0..8 {
+        let (close_reader, close_writer) = std::io::pipe().unwrap();
+        let (go_tx, go_rx) = std::sync::mpsc::sync_channel(1);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let closed_at = Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let closer_closed_at = Arc::clone(&closed_at);
+        let closer = thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            thread::sleep(Duration::from_millis(62));
+            drop(close_writer);
+            *closer_closed_at.lock().unwrap() = Some(Instant::now());
+        });
+        ready_rx.recv().unwrap();
+        let start = Instant::now();
+        go_tx.send(()).unwrap();
+        let read_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            read_string_bounded(
+                close_reader,
+                Duration::from_millis(75),
+                "stderr",
+                "synthetic-close-before-deadline-read",
+            )
+        }));
+        closer.join().unwrap();
+        let closed = closed_at.lock().unwrap().unwrap();
+        if closed >= start + Duration::from_millis(56) && closed < start + Duration::from_millis(72)
+        {
+            assert_eq!(
+                read_outcome
+                    .expect("in-window 62ms/75ms close must succeed in read_string_bounded"),
+                ""
+            );
+            verified_read_close = true;
+            break;
+        }
+    }
+    assert!(
+        verified_read_close,
+        "failed to observe a [56ms, 72ms) close across 8 attempts"
+    );
+
+    let mut verified_drain_close = false;
+    for _ in 0..8 {
+        let (drain_close_reader, drain_close_writer) = std::io::pipe().unwrap();
+        let drain_close = PipeDrain::start(
+            drain_close_reader,
+            "stderr",
+            "synthetic-close-before-deadline-drain",
+        );
+        let (go_tx, go_rx) = std::sync::mpsc::sync_channel(1);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let closed_at = Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let closer_closed_at = Arc::clone(&closed_at);
+        let closer = thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            thread::sleep(Duration::from_millis(62));
+            drop(drain_close_writer);
+            *closer_closed_at.lock().unwrap() = Some(Instant::now());
+        });
+        ready_rx.recv().unwrap();
+        let start = Instant::now();
+        go_tx.send(()).unwrap();
+        let drain_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drain_close.finish_string(Duration::from_millis(75))
+        }));
+        closer.join().unwrap();
+        let closed = closed_at.lock().unwrap().unwrap();
+        if closed >= start + Duration::from_millis(56) && closed < start + Duration::from_millis(72)
+        {
+            assert_eq!(
+                drain_outcome
+                    .expect("in-window 62ms/75ms close must succeed in PipeDrain::finish_string"),
+                ""
+            );
+            verified_drain_close = true;
+            break;
+        }
+    }
+    assert!(
+        verified_drain_close,
+        "failed to observe a [56ms, 72ms) PipeDrain close across 8 attempts"
+    );
+
+    let mut verified_fast_wake = false;
+    for _ in 0..5 {
+        let (late_reader, late_writer) = std::io::pipe().unwrap();
+        let late_drain = PipeDrain::start(late_reader, "stderr", "synthetic-late-eof-pipe-drain");
+        // After ~35 ms (`2 + 4 + 8 + 16 = 30 ms`), `PipeDrain` is ~5 ms into its 25 ms polling
+        // wait (~20 ms remaining without an explicit deadline wake).
+        thread::sleep(Duration::from_millis(35));
+        let began = Instant::now();
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            late_drain.finish_string(Duration::from_millis(2))
+        }))
+        .expect_err("PipeDrain::finish_string must reject EOF arriving after its deadline");
+        let elapsed = began.elapsed();
+        drop(late_writer);
+        assert!(
+            panic_text(err).contains("synthetic-late-eof-pipe-drain"),
+            "missing label on late-EOF PipeDrain failure"
+        );
+        if elapsed < Duration::from_millis(12) {
+            verified_fast_wake = true;
+            break;
+        }
+    }
+    assert!(
+        verified_fast_wake,
+        "PipeDrain::finish_string did not wake its 25ms idle wait within 12ms across 5 attempts"
+    );
+
+    // Two-descriptor isolation: direct `(true, false)` / `(false, true)` / `(false, false)` checks
+    // when one pipe is at EOF and the sibling is idle (including under a tight deadline), plus an
+    // end-to-end `run_bounded` check using a preview marker distinct from the context label.
+    {
+        use std::os::fd::AsFd;
+        let (out_r, out_w) = std::io::pipe().unwrap();
+        let (err_r, _err_w_open) = std::io::pipe().unwrap();
+        let out_flags = rustix::fs::fcntl_getfl(&out_r).unwrap();
+        rustix::fs::fcntl_setfl(&out_r, out_flags | rustix::fs::OFlags::NONBLOCK).unwrap();
+        let err_flags = rustix::fs::fcntl_getfl(&err_r).unwrap();
+        rustix::fs::fcntl_setfl(&err_r, err_flags | rustix::fs::OFlags::NONBLOCK).unwrap();
+        drop(out_w);
+        let mut verified_1ms_pair = false;
+        for _ in 0..5 {
+            if wait_for_pipes(
+                Some(out_r.as_fd()),
+                Some(err_r.as_fd()),
+                Instant::now() + Duration::from_millis(1),
+                None,
+                None,
+            ) == (true, false)
+            {
+                verified_1ms_pair = true;
+                break;
+            }
+        }
+        assert!(
+            verified_1ms_pair,
+            "idle stderr suppressed 1ms stdout readiness in wait_for_pipes"
+        );
+        assert_eq!(
+            wait_for_pipes(
+                Some(out_r.as_fd()),
+                Some(err_r.as_fd()),
+                Instant::now() + Duration::from_millis(20),
+                None,
+                None,
+            ),
+            (true, false),
+            "closed stdout + idle stderr must report (true, false) at 20ms"
+        );
+        let mut verified_1ms_reverse = false;
+        for _ in 0..5 {
+            if wait_for_pipes(
+                Some(err_r.as_fd()),
+                Some(out_r.as_fd()),
+                Instant::now() + Duration::from_millis(1),
+                None,
+                None,
+            ) == (false, true)
+            {
+                verified_1ms_reverse = true;
+                break;
+            }
+        }
+        assert!(
+            verified_1ms_reverse,
+            "idle first pipe suppressed 1ms second-pipe readiness in wait_for_pipes"
+        );
+        assert_eq!(
+            wait_for_pipes(
+                Some(err_r.as_fd()),
+                Some(out_r.as_fd()),
+                Instant::now() + Duration::from_millis(20),
+                None,
+                None,
+            ),
+            (false, true),
+            "idle first + closed second must report (false, true) at 20ms"
+        );
+        let (idle_a, _keep_a) = std::io::pipe().unwrap();
+        let a_flags = rustix::fs::fcntl_getfl(&idle_a).unwrap();
+        rustix::fs::fcntl_setfl(&idle_a, a_flags | rustix::fs::OFlags::NONBLOCK).unwrap();
+        assert_eq!(
+            wait_for_pipes(
+                Some(idle_a.as_fd()),
+                Some(err_r.as_fd()),
+                Instant::now() + Duration::from_millis(1),
+                None,
+                None,
+            ),
+            (false, false),
+            "two idle pipes must report (false, false) at 1ms"
+        );
+        assert_eq!(
+            wait_for_pipes(
+                Some(idle_a.as_fd()),
+                Some(err_r.as_fd()),
+                Instant::now() + Duration::from_millis(20),
+                None,
+                None,
+            ),
+            (false, false),
+            "two idle pipes must report (false, false) at 20ms"
+        );
+    }
+
+    let mut mixed_pipes = Command::new("sh");
+    mixed_pipes.args([
+        "-c",
+        "(exec >/dev/null; sleep 0.08) & echo distinct-stdout-payload",
+    ]);
+    let began = Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_bounded(
+            &mut mixed_pipes,
+            Duration::from_millis(35),
+            "synthetic-mixed-pipe-label",
+        )
+    }))
+    .expect_err("post-deadline stderr close must time out despite early stdout EOF");
+    assert!(
+        began.elapsed() < Duration::from_millis(250),
+        "mixed-pipe timeout overrun: {:?}",
+        began.elapsed()
+    );
+    let message = panic_text(err);
+    assert!(
+        message.contains("synthetic-mixed-pipe-label")
+            && message.contains("distinct-stdout-payload"),
+        "missing label or stdout preview on mixed-pipe timeout: {message}"
+    );
+
+    let mut continuous_child = Command::new("yes");
+    continuous_child.arg("continuously-readable-marker");
+    let began = Instant::now();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_bounded(
+            &mut continuous_child,
+            Duration::from_millis(60),
+            "synthetic-continuous-yes-case",
+        )
+    }))
+    .expect_err("yes child must time out promptly");
+    assert!(
+        began.elapsed() < Duration::from_millis(1000),
+        "run_bounded overrun on yes child: {:?}",
+        began.elapsed()
+    );
+    let message = panic_text(err);
+    assert!(
+        message.contains("synthetic-continuous-yes-case")
+            && message.contains("continuously-readable-marker"),
+        "missing label or marker in continuous yes panic: {message}"
+    );
 }

@@ -504,7 +504,10 @@ async fn migration_eighteen_requires_the_issuance_role_and_rolls_back_whole() {
         ) && failure.to_string().contains("SQLSTATE P0001"),
         "{failure}"
     );
-    let output = migrate_command(&db.url(OWNER), &[]).output().unwrap();
+    let output = run_cli(
+        &mut migrate_command(&db.url(OWNER), &[]),
+        "migrate migration 18 failure",
+    );
     assert_eq!(output.status.code(), Some(1));
     assert!(
         stderr(&output).contains("migration 18 failed (SQLSTATE P0001)"),

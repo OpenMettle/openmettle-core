@@ -1187,7 +1187,10 @@ async fn populated_v14_upgrade_keeps_rows_and_adds_empty_authorization_state() {
     drop(worker);
     let before = everything(&db).await;
 
-    let output = migrate_command(&db.url(OWNER), &[]).output().unwrap();
+    let output = run_cli(
+        &mut migrate_command(&db.url(OWNER), &[]),
+        "migrate v14 upgrade",
+    );
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(db.history().await, all_versions());
     let after = everything(&db).await;
@@ -1270,7 +1273,10 @@ async fn populated_v14_upgrade_keeps_rows_and_adds_empty_authorization_state() {
     .unwrap();
     assert_eq!(invalidated, 1);
     // Rerunning the migrator changes nothing.
-    let rerun = migrate_command(&db.url(OWNER), &[]).output().unwrap();
+    let rerun = run_cli(
+        &mut migrate_command(&db.url(OWNER), &[]),
+        "migrate v14 upgrade idempotent rerun",
+    );
     assert_eq!(rerun.status.code(), Some(0), "{}", stderr(&rerun));
     assert_eq!(db.history().await, all_versions());
 }

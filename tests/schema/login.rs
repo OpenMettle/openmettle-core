@@ -516,8 +516,10 @@ async fn killed_consumer_rolls_back_without_releasing_permit() {
             .unwrap();
         let mut child = Process(child);
         barrier.wait_reached().await;
-        signal(&child.0, "-KILL");
-        assert_eq!(child.0.wait().unwrap().signal(), Some(9));
+        assert_eq!(
+            stop_process(&mut child, "-KILL", "login consume child (-KILL)").signal(),
+            Some(9)
+        );
         drop(barrier);
         let result = login::consume(
             &mut connect(&db.0, API).await,

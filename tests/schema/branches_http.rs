@@ -213,8 +213,7 @@ impl Client {
 }
 impl Server {
     fn assert_logs(mut self, private: &[&str]) {
-        signal(&self.process.0, "-TERM");
-        assert!(self.process.0.wait().unwrap().success());
+        assert!(stop_process(&mut self.process, "-TERM", "branches_http api shutdown").success());
         let log = fs::read_to_string(self.dir.path("log")).unwrap();
         assert!(log.contains("http.request.completed") && log.contains("/v1/runs"));
         for canary in [PROMPT, INSTRUCTIONS, KEY]

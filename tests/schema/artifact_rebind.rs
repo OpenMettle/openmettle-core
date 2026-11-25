@@ -10,10 +10,11 @@ use std::{
 };
 
 fn run(command: &mut Command) -> Output {
-    let output = command.output().unwrap();
+    let context = format!("{command:?}");
+    let output = run_cli(command, &context);
     assert!(
         output.status.success(),
-        "{command:?}: {}",
+        "{context}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     output
@@ -64,11 +65,10 @@ fn copy_tree(tool: &str, from: &Path, dir: &Dir) -> Option<PathBuf> {
 }
 
 fn admin(db: &TestDb, role: &str, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_openmettle-admin"))
-        .env("OPENMETTLE_ADMIN_DATABASE_URL", db.url(role))
-        .args(args)
-        .output()
-        .unwrap()
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_openmettle-admin"));
+    cmd.env("OPENMETTLE_ADMIN_DATABASE_URL", db.url(role))
+        .args(args);
+    run_cli(&mut cmd, &format!("openmettle-admin ({role}) {args:?}"))
 }
 
 fn rebind(db: &TestDb, root: &Path, extra: &[&str]) -> (bool, String, String) {
@@ -915,13 +915,15 @@ async fn rebind_holds_a_bounded_number_of_descriptors() {
     let dir = Dir::new();
     let root = copy_tree("cp", &f.root, &dir).unwrap();
     // More interrupted uploads than the process may hold open files.
-    let output = Command::new("sh")
-        .args(["-c", "ulimit -n 64 && exec \"$@\"", "sh"])
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "ulimit -n 64 && exec \"$@\"", "sh"])
         .arg(env!("CARGO_BIN_EXE_openmettle-admin"))
         .env("OPENMETTLE_ADMIN_DATABASE_URL", f.db.url(OWNER))
-        .args(["storage", "rebind", root.to_str().unwrap()])
-        .output()
-        .unwrap();
+        .args(["storage", "rebind", root.to_str().unwrap()]);
+    let output = run_cli(
+        &mut cmd,
+        "openmettle-admin storage rebind under ulimit -n 64",
+    );
     assert!(
         output.status.success(),
         "{}",
@@ -1052,20 +1054,14 @@ async fn a_worker_refuses_a_copied_volume_until_rebind_has_run() {
     };
     // Started before rebind, the worker exits instead of sweeping: its reconciler would
     // quarantine the crashed upload and its purge would claim the retained revision.
-    let mut early = worker(&root);
-    let status = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(status) = early.0.try_wait().unwrap() {
-                break status;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("the worker started on a copied volume");
-    assert_eq!(status.code(), Some(78));
-    let mut refusal = String::new();
-    std::io::Read::read_to_string(early.0.stderr.as_mut().unwrap(), &mut refusal).unwrap();
+    let early = worker(&root);
+    let output = wait_output_bounded(
+        early,
+        REFUSAL_TIMEOUT,
+        "worker refusal on copied volume before rebind",
+    );
+    assert_eq!(output.status.code(), Some(78));
+    let refusal = stderr(&output);
     assert!(refusal.contains("invalid ARTIFACTS_DIR"), "{refusal}");
     assert!(
         refusal.contains("openmettle-admin storage rebind"),
@@ -1100,8 +1096,7 @@ async fn a_worker_refuses_a_copied_volume_until_rebind_has_run() {
     .await
     .expect("the worker did not sweep the rebound volume");
     let mut started = started;
-    signal(&started.0, "-TERM");
-    assert!(started.0.wait().unwrap().success());
+    assert!(stop_process(&mut started, "-TERM", "worker shutdown after rebind sweep").success());
     let store = Store::open(&root).unwrap();
     store.initialize_api(&f.api).await.unwrap();
     assert_eq!(read(&store, &live, 0, 12).await.unwrap(), b"live payload");
