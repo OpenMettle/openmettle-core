@@ -5336,10 +5336,9 @@ async fn post_runs_queued_replay_rechecks_authority_on_quota_refusal_and_gates_b
         200,
     );
     assert_eq!(replayed_linked["run_id"], run_linked);
-    let (linked_qr, linked_gw, held_linked): (i64, i64, i64) = sqlx::query_as(
+    let (linked_qr, held_linked): (i64, i64) = sqlx::query_as(
         "SELECT
             (SELECT count(*) FROM openmettle.quota_reservations WHERE run_id = $1::uuid),
-            (SELECT count(*) FROM openmettle.gateway_reservations WHERE run_id = $1::uuid),
             (SELECT coalesce(sum(reserved_held), 0)::bigint FROM openmettle.quota_budgets)",
     )
     .bind(&run_linked)
@@ -5347,11 +5346,16 @@ async fn post_runs_queued_replay_rechecks_authority_on_quota_refusal_and_gates_b
     .await
     .unwrap();
     assert_eq!(
-        (linked_qr, linked_gw, held_linked),
-        (0, 0, 0),
+        (linked_qr, held_linked),
+        (0, 0),
         "linked-approval replay must evaluate stored actor_approval_id and roll back unusable holds"
     );
 
+    sqlx::query("DELETE FROM openmettle.family_policy_models WHERE policy_id = $1::uuid")
+        .bind(&oidc_policy_id)
+        .execute(&mut owner)
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM openmettle.family_policies WHERE id = $1::uuid")
         .bind(&oidc_policy_id)
         .execute(&mut owner)
@@ -5442,6 +5446,43 @@ async fn post_runs_queued_replay_rechecks_authority_on_quota_refusal_and_gates_b
     .await
     .unwrap();
     assert_eq!((run2_qr, held2), (0, 0));
+
+    // Positive control for step 1b: with the OIDC group policy removed and token budget restored,
+    // replaying run_linked from alice_linked now commits the backfilled quota holds.
+    success(
+        api.call(
+            admin_n,
+            "PUT",
+            &format!("/v1/admin/scopes/{scope}/quotas/usage_tokens"),
+            Some("r3-rep-restore-tokens"),
+            Some(&json!({"hard_limit": "100000", "reason": "restore token quota for positive control"})),
+        ),
+        200,
+    );
+    let replayed_linked_allowed = success(
+        api.call(
+            alice_linked_b,
+            "POST",
+            "/v1/runs",
+            Some("r3-rep-key-linked"),
+            Some(&run_linked_body),
+        ),
+        200,
+    );
+    assert_eq!(replayed_linked_allowed["run_id"], run_linked);
+    let (linked_qr_after, held_linked_after): (i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT count(*) FROM openmettle.quota_reservations WHERE run_id = $1::uuid),
+            (SELECT coalesce(sum(reserved_held), 0)::bigint FROM openmettle.quota_budgets)",
+    )
+    .bind(&run_linked)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert!(
+        linked_qr_after > 0 && held_linked_after > 0,
+        "expected backfilled holds once stored approval permits model, got ({linked_qr_after}, {held_linked_after})"
+    );
 }
 
 #[path = "run_events_http.rs"]

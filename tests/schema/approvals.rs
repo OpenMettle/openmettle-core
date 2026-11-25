@@ -2345,73 +2345,76 @@ async fn session_bound_admission_honors_monotonic_min_now_ms_floor() {
         .await
         .unwrap();
 
-    let db_url = f.db.url(API);
-    let scope_c = f.scope.clone();
-    let actor_user = f.actor.user.clone();
-    let actor_approval = f.actor.approval.clone();
-    let conv_c = f.conv.clone();
-    let branch_c = f.branch.clone();
-    let msg_c = f.message.clone();
-    let user_session = f.user.clone();
-    let admit_task = tokio::spawn(async move {
-        let mut c = sqlx::PgConnection::connect(&db_url).await.unwrap();
-        let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+    let scope_ref = &f.scope;
+    let actor_user = &f.actor.user;
+    let actor_approval = &f.actor.approval;
+    let conv_ref = &f.conv;
+    let branch_ref = &f.branch;
+    let msg_ref = &f.message;
+    let user_session = &f.user;
+    let mut admit_conn = api(&f.db).await;
+
+    let admit_fut = async {
+        let mut tx = WriteTransaction::begin(&mut admit_conn).await.unwrap();
         let config = json!({"execution_mode": "ordinary"}).to_string();
         let request = RunAdmission {
             input: RunInput {
-                scope: &scope_c,
-                actor: &actor_user,
-                conversation: &conv_c,
-                branch: &branch_c,
-                message: &msg_c,
+                scope: scope_ref,
+                actor: actor_user,
+                conversation: conv_ref,
+                branch: branch_ref,
+                message: msg_ref,
                 key: "post-insert-floor-advance",
                 format: "synthetic.run",
                 version: 1,
                 input: b"message",
                 config: config.as_bytes(),
             },
-            actor_approval_id: &actor_approval,
+            actor_approval_id: actor_approval,
             capabilities: &[],
             requested_rounds: None,
             now_ms: pre_lock_ms,
             cost_qualified: None,
         };
-        let res = queue::admit_run_with_mode_at(&mut tx, &request, &LIMITS, &user_session).await;
+        let res = queue::admit_run_with_mode_at(&mut tx, &request, &LIMITS, user_session).await;
         tx.commit().await.unwrap();
         res
-    });
+    };
 
-    let wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let blocked: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
+    let release_fut = async {
+        let wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let blocked: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
+            )
+            .bind(lock_pid)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+            if blocked {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < wait_deadline,
+                "timed out waiting for insert_admitted to block on openmettle.runs"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        while sqlx::query_scalar::<_, i64>(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
         )
-        .bind(lock_pid)
         .fetch_one(&mut owner)
         .await
-        .unwrap();
-        if blocked {
-            break;
+        .unwrap()
+            <= target_post_insert_ms
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(
-            std::time::Instant::now() < wait_deadline,
-            "timed out waiting for insert_admitted to block on openmettle.runs"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    while sqlx::query_scalar::<_, i64>(
-        "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
-    )
-    .fetch_one(&mut owner)
-    .await
-    .unwrap()
-        <= target_post_insert_ms
-    {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    lock_tx.rollback().await.unwrap();
+        lock_tx.rollback().await.unwrap();
+    };
 
-    let (admitted, verified_post_insert_ms) = admit_task.await.unwrap().unwrap();
+    let (admit_res, ()) = tokio::join!(admit_fut, release_fut);
+    let (admitted, verified_post_insert_ms) = admit_res.unwrap();
     assert!(matches!(admitted, Admission::Admitted { .. }));
     assert!(
         verified_post_insert_ms > target_post_insert_ms,
