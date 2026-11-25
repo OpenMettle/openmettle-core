@@ -820,7 +820,7 @@ fn script(body: &[u8]) -> Option<Script> {
             "status-429-bad-conn" => {
                 let body = b"rate limited unreadable connection".to_vec();
                 let head = format!(
-                    "HTTP/1.1 429 Too Many Requests\r\nconnection: \tRetry-After\r\n\
+                    "HTTP/1.1 429 Too Many Requests\r\nconnection: close,\tX-Test\r\n\
                      retry-after: 7\r\ncontent-type: text/plain\r\ncontent-length: {}\r\n\r\n",
                     body.len()
                 );

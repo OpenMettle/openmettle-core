@@ -1344,6 +1344,24 @@ mod tests {
             headers.insert(header::CONNECTION, value);
             assert!(!connection_readable(&headers));
         }
+        headers.clear();
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("7"));
+        assert_eq!(upstream_retry_after(&headers), Some(7));
+        headers.insert(
+            header::CONNECTION,
+            HeaderValue::from_static("close, Retry-After"),
+        );
+        assert_eq!(upstream_retry_after(&headers), None);
+        headers.insert(
+            header::CONNECTION,
+            HeaderValue::from_bytes(b"close,\tX-Test").unwrap(),
+        );
+        assert_eq!(upstream_retry_after(&headers), None);
+        headers.insert(
+            header::CONNECTION,
+            HeaderValue::from_bytes(b"X-Test\xff").unwrap(),
+        );
+        assert_eq!(upstream_retry_after(&headers), None);
     }
 
     #[test]

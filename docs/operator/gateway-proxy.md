@@ -77,8 +77,8 @@ policy is provisioned for it.
   body without reading it).
 - **Relay.** For `200 OK`, the upstream `Content-Type` (unless the upstream names it in
   `Connection`) and body—including any in-band SSE payload—are relayed chunk by chunk as they
-  arrive without rewriting (upstream model servers must not echo request fields inside `200 OK`
-  bodies; SGLang does not). A server-sent event
+  arrive without rewriting (the upstream model server must not echo the injected `cache_salt`
+  inside `200 OK` JSON or SSE payloads; the recorded SGLang responses omit it). A server-sent event
   reaches the caller before the upstream has finished. The caller's response ends cleanly only
   if the upstream body completed and the caller received every chunk. Otherwise the caller
   receives a prefix of the upstream bytes and an unclean end of the HTTP body (no terminal
