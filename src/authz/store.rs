@@ -248,7 +248,7 @@ pub(super) struct Change {
     pub(super) details: Value,
 }
 
-pub(super) const UNCHANGED: StoreError =
+pub(crate) const UNCHANGED: StoreError =
     StoreError::Conflict("target is already in the requested state");
 
 /// The [`StoreError::Conflict`] of a request key that already recorded another change. The API
@@ -399,7 +399,10 @@ async fn write(
         action == Action::ManageAccounts && change.target_id.as_deref() == Some(ctx.actor_user_id);
     transact(c, ctx, async move |tx| {
         let c = tx.connection()?;
-        if matches!(action, Action::ManageAccountAdmin | Action::ManageAccounts) {
+        if matches!(
+            action,
+            Action::ManageAccountAdmin | Action::ManageAccounts | Action::ManageFamilyPolicies
+        ) {
             sqlx::query("SELECT id FROM openmettle.account_admin_lock WHERE id FOR UPDATE")
                 .fetch_one(&mut *c)
                 .await?;
@@ -479,7 +482,7 @@ async fn keep_last_admin(
 }
 
 /// Whether the user exists and is enabled, holding the row lock for the rest of the transaction.
-pub(super) async fn lock_user(
+pub(crate) async fn lock_user(
     c: &mut PgConnection,
     user_id: &str,
     exclusive: bool,
@@ -666,7 +669,7 @@ fn group_name(name: &str) -> Result<(), StoreError> {
 const DUPLICATE_GROUP: &str = "a local group already has this name";
 
 /// (name, enabled) of a group, locked for the rest of the transaction.
-pub(super) async fn lock_group(
+pub(crate) async fn lock_group(
     c: &mut PgConnection,
     group_id: &str,
     exclusive: bool,
@@ -1037,6 +1040,135 @@ pub async fn set_user_capability_grant(
         "capability.user_revoke"
     };
     set_flag(c, ctx, USER_GRANTS, action, name, Some(user_id), granted).await
+}
+
+// --- family policy administration (ADR 0044, increment 4) --------------------------------------
+
+async fn write_family_policy(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'_>,
+    grantee: &super::gateway::family::FamilyGrantee,
+    action: &'static str,
+    details: Value,
+    apply: impl AsyncFnOnce(&mut PgConnection, &str) -> Result<(), StoreError>,
+) -> Result<WriteOutcome, StoreError> {
+    grantee.validate()?;
+    transact(c, ctx, async move |tx| {
+        let c = tx.connection()?;
+        sqlx::query("SELECT id FROM openmettle.account_admin_lock WHERE id FOR UPDATE")
+            .fetch_one(&mut *c)
+            .await?;
+        // Serialize with sessions::disable_user so a concurrently disabled admin cannot commit.
+        sqlx::query("SELECT FROM openmettle.users WHERE id = $1::uuid FOR SHARE")
+            .bind(ctx.actor_user_id)
+            .execute(&mut *c)
+            .await?;
+        let actor = acting(c, ctx).await?;
+        check(super::authorize_admin(
+            &actor,
+            AdminChange {
+                action: Action::ManageFamilyPolicies,
+                removes_enabled_admin: false,
+                enabled_account_admins: 0,
+            },
+        ))?;
+        let existing = super::gateway::family::existing_policy_id(c, grantee).await?;
+        let change = Change {
+            action,
+            target_kind: "family_policy",
+            target_id: existing,
+            details,
+        };
+        let outcome = record(c, ctx, &change).await?;
+        if let WriteOutcome::Applied { target_id } = &outcome {
+            apply(c, target_id).await?;
+        }
+        Ok(outcome)
+    })
+    .await
+}
+
+/// Create or update a family schedule/override policy for a user, local group or OIDC group.
+/// Serialized under `account_admin_lock` and audited as `actor_kind = 'user'`.
+pub async fn set_family_policy(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'_>,
+    grantee: &super::gateway::family::FamilyGrantee,
+    input: &super::gateway::family::FamilyPolicyInput,
+) -> Result<WriteOutcome, StoreError> {
+    input.validate(grantee)?;
+    let details = super::gateway::family::set_policy_details(grantee, input);
+    write_family_policy(
+        c,
+        ctx,
+        grantee,
+        "family_policy.set",
+        details,
+        async |c, id| {
+            super::gateway::family::apply_set_policy(c, id, grantee, input, Some(ctx.actor_user_id))
+                .await
+        },
+    )
+    .await
+}
+
+/// Deactivate (`active = false`) an active family policy row without deleting history.
+pub async fn clear_family_policy(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'_>,
+    grantee: &super::gateway::family::FamilyGrantee,
+) -> Result<WriteOutcome, StoreError> {
+    let details = super::gateway::family::clear_policy_details(grantee);
+    write_family_policy(
+        c,
+        ctx,
+        grantee,
+        "family_policy.clear",
+        details,
+        async |c, id| {
+            super::gateway::family::apply_clear_policy(c, id, grantee, Some(ctx.actor_user_id))
+                .await
+        },
+    )
+    .await
+}
+
+/// Activate (`true`) or deactivate (`false`) a `study_allow` or `disabled` model rule on an
+/// existing family policy row.
+pub async fn set_family_policy_model(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'_>,
+    grantee: &super::gateway::family::FamilyGrantee,
+    kind: super::gateway::family::FamilyPolicyRuleKind,
+    model: &str,
+    active: bool,
+) -> Result<WriteOutcome, StoreError> {
+    if !super::gateway::family::valid_model(model) {
+        return Err(StoreError::InvalidInput("model"));
+    }
+    let action = kind.audit_action(active);
+    let details = super::gateway::family::set_model_details(grantee, kind, model, active);
+    write_family_policy(c, ctx, grantee, action, details, async |c, id| {
+        super::gateway::family::apply_set_model(
+            c,
+            id,
+            grantee,
+            kind,
+            model,
+            active,
+            Some(ctx.actor_user_id),
+        )
+        .await
+    })
+    .await
+}
+
+/// Read the current-state family policy record and active model rules for `grantee`.
+pub async fn load_family_policy(
+    c: &mut PgConnection,
+    grantee: &super::gateway::family::FamilyGrantee,
+) -> Result<Option<super::gateway::family::FamilyPolicyRecord>, StoreError> {
+    super::gateway::family::load_family_policy(c, grantee).await
 }
 
 #[cfg(test)]

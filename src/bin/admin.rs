@@ -1,7 +1,13 @@
 //! Owner-operated offline maintenance.
-use openmettle_core::artifact_fs::{
-    adoption::{self, Options},
-    rebind,
+use openmettle_core::{
+    artifact_fs::{
+        adoption::{self, Options},
+        rebind,
+    },
+    authz::{
+        gateway::family,
+        store::{StoreError, WriteOutcome},
+    },
 };
 use sqlx::{Connection, PgConnection};
 use std::{env, path::Path, process::ExitCode};
@@ -21,6 +27,34 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), &'static str> {
     let mut args = env::args().skip(1);
     let command = (args.next(), args.next());
+    if command.0.as_deref() == Some("family") {
+        let mut family_args = Vec::new();
+        if let Some(sub) = command.1 {
+            family_args.push(sub);
+        }
+        family_args.extend(args);
+        let parsed = family::parse_admin_args(&family_args)?;
+        let url = env::var("OPENMETTLE_ADMIN_DATABASE_URL")
+            .map_err(|_| "OPENMETTLE_ADMIN_DATABASE_URL is required")?;
+        let mut c = PgConnection::connect(&url)
+            .await
+            .map_err(|_| "owner connection failed")?;
+        let (action, outcome) = family::execute_admin_command(&mut c, &parsed)
+            .await
+            .map_err(|err| match err {
+                StoreError::InvalidInput("zone") => "unknown family policy timezone",
+                StoreError::InvalidInput(_) => "invalid family policy input",
+                StoreError::NotFound => "family policy target not found",
+                StoreError::Conflict(msg) => msg,
+                StoreError::Denied(_) => "family policy write denied",
+                StoreError::Database(_) => "family policy write failed",
+            })?;
+        match outcome {
+            WriteOutcome::Applied { target_id } => println!("applied {action} {target_id}"),
+            WriteOutcome::Replayed { target_id } => println!("replayed {action} {target_id}"),
+        }
+        return Ok(());
+    }
     if command.0.as_deref() == Some("quota") {
         let artifact_root = args.next();
         if args.next().is_some()

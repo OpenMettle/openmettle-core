@@ -667,3 +667,74 @@ fn cost_bound_and_device_slot_catalog_rules() {
     assert_eq!(reloaded.model("a").unwrap().cost_bound, p.cost_bound);
     assert!(reloaded.model("a").unwrap().requires_device_slot);
 }
+
+#[test]
+fn resolve_with_fallback_skips_restricted_defaults_without_relaxing_explicit_selections() {
+    let c = Catalog::load(FIXTURE).unwrap();
+    let project_a = selection(json!({
+        "preset": "study",
+        "layer": {"instructions": "Project guide.", "controls": {"reasoning_effort": "high"}}
+    }));
+    let empty = Selection::default();
+
+    // Explicit disallowed model or preset never falls back.
+    assert_eq!(
+        c.resolve_with_fallback(&empty, &selection(json!({"model": "a"})), None, |m, _| m
+            == "b")
+            .err(),
+        Some(Error::Unauthorized)
+    );
+    assert_eq!(
+        c.resolve_with_fallback(&empty, &study(), None, |m, _| m == "b")
+            .err(),
+        Some(Error::Unauthorized)
+    );
+
+    // Omitted request selection with disallowed project default falls back deterministically to "b",
+    // dropping project controls unsupported by "b" into omissions and preserving instructions.
+    let e = c
+        .resolve_with_fallback(&project_a, &empty, Some(4), |m, _| m == "b")
+        .unwrap();
+    assert_eq!(e.model, "b");
+    assert_eq!(e.model_source, Source::Model);
+    assert_eq!(e.preset, None);
+    assert_eq!(e.project_revision, Some(4));
+    assert_eq!(
+        omissions(&e),
+        vec![(Source::Project, "reasoning_effort", "unsupported_by_target")]
+    );
+    assert!(
+        e.instructions
+            .iter()
+            .any(|i| i.source == Source::Project && i.text == "Project guide.")
+    );
+
+    // Active quiet hours (zero models permitted): unauthorized with or without a project default.
+    assert_eq!(
+        c.resolve_with_fallback(&project_a, &empty, None, |_, _| false)
+            .err(),
+        Some(Error::Unauthorized)
+    );
+    assert_eq!(
+        c.resolve_with_fallback(&empty, &empty, None, |_, _| false)
+            .err(),
+        Some(Error::Unauthorized)
+    );
+
+    // Empty catalog with no selection still returns Invalid("model selection").
+    let bare =
+        Catalog::load(br#"{"version":1,"revision":"empty","models":{},"presets":{}}"#).unwrap();
+    assert_eq!(
+        bare.resolve_with_fallback(&empty, &empty, None, |_, _| true)
+            .err(),
+        Some(Error::Invalid("model selection"))
+    );
+
+    // Retired/unknown project preset is not masked by fallback.
+    let broken_project = selection(json!({"preset": "retired"}));
+    assert_eq!(
+        c.resolve_with_fallback(&broken_project, &empty, None, |_, _| true)
+            .err(),
+        Some(Error::Invalid("preset"))
+    );
+}

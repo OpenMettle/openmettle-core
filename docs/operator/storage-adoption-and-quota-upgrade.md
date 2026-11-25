@@ -168,6 +168,25 @@ SELECT openmettle.gateway_backfill_legacy_request_cost_bound(
 
 - **Proxy configuration:** `openmettle-gateway` requires no catalog file or new environment variable; it continues reporting token counts with `cost = NULL, unit = NULL`, and PostgreSQL settles both `usage_tokens` and `usage_cost_micros` holds atomically.
 
+## Upgrade from 0034 to 0035 (family policy tables and enforcement)
+
+Migration `0035` ([ADR 0044](../adr/0044-own-inference-proxy-and-binding-free-dispatch.md), increment 4) needs no activation step and no backfill. It creates `openmettle.family_policies` and `openmettle.family_policy_models` (`openmettle_api` `SELECT` and column-scoped `INSERT`/`UPDATE` only; no `DELETE` for any runtime role; no table privileges for `openmettle_worker`, `openmettle_gateway` or `openmettle_issuance`), widens `openmettle.authorization_audit` CHECK constraints under a bounded `NOWAIT` lock retry loop, installs the authoritative SQL evaluator `openmettle.family_policy_permits` (`openmettle_api` and `openmettle_worker`), and enforces it inside `openmettle.gateway_round_authority`, `openmettle.gateway_handoff_round` and `openmettle.gateway_dispatch`.
+
+- **Rollout order:** Apply migration `0035` with `openmettle-migrate` before configuring family policies or rolling API and worker binaries of this release. While no active rows exist in `openmettle.family_policies`, `family_policy_permits` returns `true` for all requests so older and newer binaries operate identically. Once family policies are configured, all API and worker replicas should be on `0035` so admission/preview (`403 policy`, study-hours default fallback) and worker recheck (`cancel_reason = 'revoked'`) enforce the same schedule as PostgreSQL handoff and proxy dispatch.
+- **Operator CLI (`openmettle-admin family`):** Operators manage household/group/user schedules and model rules using `OPENMETTLE_ADMIN_DATABASE_URL` (`openmettle_owner`), recording append-only `'operator'` rows in `openmettle.authorization_audit`:
+
+```sh
+openmettle-admin family set-policy --oidc-group Family --zone Europe/London \
+  --quiet 22:00-07:00 --study 16:00-18:00 \
+  --operator-id "$OPERATOR_UUID" --request-key "$KEY" --reason "household schedule"
+openmettle-admin family set-model --oidc-group Family --kind study_allow --model fast --enable \
+  --operator-id "$OPERATOR_UUID" --request-key "$KEY2" --reason "allow fast model during study hours"
+openmettle-admin family clear-policy --oidc-group Family \
+  --operator-id "$OPERATOR_UUID" --request-key "$KEY3" --reason "pause household schedule"
+```
+
+In `set-model`, `--enable` activates the specified rule (`active = true`: `family_policy.model_study_allow` for `--kind study_allow`, `family_policy.model_disable` for `--kind disabled`) and `--disable` deactivates it (`active = false`: `family_policy.model_study_revoke` or `family_policy.model_enable`).
+
 ## Monitor overdue handoffs
 
 The worker records up to 100 overdue committed handoffs per maintenance sweep in `openmettle_quota_overdue_handoffs_total`. The counter measures observations across sweeps. An outstanding handoff can contribute more than once. Use the database ledger to identify the holds. The observation leaves quota charges intact.

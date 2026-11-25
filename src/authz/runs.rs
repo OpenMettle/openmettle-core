@@ -276,14 +276,70 @@ pub(super) async fn recheck_decision(
         .iter()
         .map(|c| (c.name.to_owned(), c.gate))
         .collect();
-    Ok(evaluate(
+    let decision = evaluate(
         principal.as_ref(),
         &platform,
         scope,
         target,
         extra,
         capabilities,
-    ))
+    );
+    if decision != RunContinuation::Continue {
+        return Ok(decision);
+    }
+    let Some((snapshot_format, snapshot_version, config_snapshot)): Option<(String, i32, Vec<u8>)> =
+        sqlx::query_as(
+            "SELECT snapshot_format, snapshot_version, config_snapshot
+               FROM openmettle.runs
+              WHERE scope_id = $1::uuid AND id = $2::uuid",
+        )
+        .bind(r.scope_id)
+        .bind(r.run_id)
+        .fetch_optional(&mut *c)
+        .await?
+    else {
+        return Ok(RunContinuation::Invalidate(DenialReason::NotFound));
+    };
+    let Some(model) =
+        (match conversation_snapshot_model(&snapshot_format, snapshot_version, &config_snapshot) {
+            Ok(model) => model,
+            Err(()) => {
+                return Ok(RunContinuation::Invalidate(DenialReason::Policy(
+                    super::PolicyReason::FamilyPolicy,
+                )));
+            }
+        })
+    else {
+        return Ok(RunContinuation::Continue);
+    };
+    if !super::gateway::family::permits_at(c, owner, r.actor_approval_id, &model, r.now_ms).await? {
+        return Ok(RunContinuation::Invalidate(DenialReason::Policy(
+            super::PolicyReason::FamilyPolicy,
+        )));
+    }
+    Ok(RunContinuation::Continue)
+}
+
+fn conversation_snapshot_model(
+    snapshot_format: &str,
+    snapshot_version: i32,
+    config_snapshot: &[u8],
+) -> Result<Option<String>, ()> {
+    if snapshot_format != crate::model_config::SNAPSHOT_FORMAT
+        || snapshot_version != crate::model_config::SNAPSHOT_VERSION
+    {
+        return Ok(None);
+    }
+    let doc = crate::provider_keys::documents::unique(config_snapshot).map_err(|_| ())?;
+    let model = doc
+        .as_object()
+        .and_then(|o| o.get("effective"))
+        .and_then(|e| e.as_object())
+        .and_then(|e| e.get("model"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or(())?;
+    Ok(Some(model.to_owned()))
 }
 
 /// Recheck the claimed run before dispatch. A denial settles stopped work under the same fence.

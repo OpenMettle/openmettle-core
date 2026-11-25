@@ -416,6 +416,58 @@ impl Catalog {
         }
         Ok(e)
     }
+
+    /// Resolve model → preset → project → request for run admission and preview, falling back
+    /// to the first deterministic permitted catalog model when the request omits both `model` and
+    /// `preset` and no project default is set or the project default is unauthorized (for example
+    /// during active study hours). An explicit request `model` or `preset` never falls back.
+    pub fn resolve_with_fallback(
+        &self,
+        project: &Selection,
+        request: &Selection,
+        project_revision: Option<i64>,
+        mut authorized: impl FnMut(&str, Option<&str>) -> bool,
+    ) -> Result<Effective, Error> {
+        if request.model.is_some() || request.preset.is_some() {
+            return self.resolve(project, request, project_revision, |m, p| authorized(m, p));
+        }
+        if project.model.is_some() || project.preset.is_some() {
+            match self.resolve(project, request, project_revision, |m, p| authorized(m, p)) {
+                Ok(effective) => return Ok(effective),
+                Err(Error::Unauthorized) => {}
+                Err(error) => return Err(error),
+            }
+        } else if self.0.models.is_empty() {
+            return Err(Error::Invalid("model selection"));
+        }
+        let Some(fallback) = self
+            .0
+            .models
+            .keys()
+            .find(|id| authorized(id, None))
+            .cloned()
+        else {
+            return Err(Error::Unauthorized);
+        };
+        let fallback_project = Selection {
+            model: None,
+            preset: None,
+            layer: project.layer.clone(),
+        };
+        let fallback_request = Selection {
+            model: Some(fallback),
+            preset: None,
+            layer: request.layer.clone(),
+        };
+        let mut effective = self.resolve(
+            &fallback_project,
+            &fallback_request,
+            project_revision,
+            |m, p| authorized(m, p),
+        )?;
+        effective.model_source = Source::Model;
+        Ok(effective)
+    }
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]

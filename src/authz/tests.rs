@@ -94,7 +94,7 @@ const READS: [Action; 4] = [
     Action::Search,
     Action::Download,
 ];
-const ALL: [Action; 17] = [
+const ALL: [Action; 18] = [
     Action::Read,
     Action::Write,
     Action::Stream,
@@ -110,6 +110,7 @@ const ALL: [Action; 17] = [
     Action::ManageLocalGroups,
     Action::ManageUserCapabilityDenies,
     Action::ManageQuotas,
+    Action::ManageFamilyPolicies,
     Action::ManageAccountAdmin,
     Action::ManageAccounts,
 ];
@@ -320,6 +321,7 @@ fn scope_rejects_actions_outside_its_domain() {
         Action::ManageLocalGroups,
         Action::ManageUserCapabilityDenies,
         Action::ManageQuotas,
+        Action::ManageFamilyPolicies,
         Action::ManageAccountAdmin,
         Action::ManageAccounts,
     ] {
@@ -983,6 +985,7 @@ fn account_admin_manages_accounts_groups_denies_quotas_and_admins() {
         Action::ManageLocalGroups,
         Action::ManageUserCapabilityDenies,
         Action::ManageQuotas,
+        Action::ManageFamilyPolicies,
         Action::ManageAccountAdmin,
     ] {
         assert_eq!(
@@ -1037,10 +1040,12 @@ fn admin_rejects_content_and_project_actions() {
         );
     }
     // Only lifecycle actions can remove an admin.
-    assert_eq!(
-        authorize_admin(&admin("adm"), admin_change(Action::ManageQuotas, true, 3)),
-        refused(PolicyReason::NotApplicable)
-    );
+    for a in [Action::ManageQuotas, Action::ManageFamilyPolicies] {
+        assert_eq!(
+            authorize_admin(&admin("adm"), admin_change(a, true, 3)),
+            refused(PolicyReason::NotApplicable)
+        );
+    }
 }
 
 // --- Capabilities ---------------------------------------------------------------------------

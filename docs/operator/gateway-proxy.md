@@ -32,9 +32,10 @@ policy is provisioned for it.
   missing, repeated or malformed header, one named in `Connection`, a wrong bearer, an
   unknown request and a request not handed off are all refused alike with
   `401 unauthenticated` and `WWW-Authenticate: Bearer`. So is a request that was not
-  dispatched yet and whose run is cancelled, finished, claimed again by another worker, or
-  past its lease or its execution deadline. Nothing is sent upstream, and the answer does not
-  reveal whether the request exists.
+  dispatched yet and whose run is cancelled, finished, claimed again by another worker, past
+  its lease or execution deadline, or blocked by an active family policy (`quiet` hours,
+  `study` hours, disabled model, or stale/missing OIDC group evidence, migration 35). Nothing
+  is sent upstream, and the answer does not reveal whether the request exists.
 - **Single dispatch.** The database records the request's one dispatch before the body is
   read. A second dispatch with the right bearer is refused with `409 conflict`, also after
   the run was cancelled or has finished. Of two concurrent dispatches at most one is
@@ -225,7 +226,6 @@ on a connection that stopped answering: the pool waits for every connection when
   The default bind is loopback.
 - **A broad database role.** `openmettle_gateway` still has the grants the superseded
   reconciler needed. Increment 6 narrows it to what the proxy uses.
-- **No family policy.** Quiet and study hours are enforced nowhere until increment 4.
 - **Chat completions only.** The Responses API is not routed.
 - **No concurrency limit** on relayed requests.
 - **Identity bodies only.** Compressed requests and answers are refused rather than relayed.
