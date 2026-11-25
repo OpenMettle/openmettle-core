@@ -419,12 +419,15 @@ impl Fixture {
         .unwrap()
     }
 
-    /// Rows in the ADR 0037 provisioning tables: none is ever needed.
+    /// Superseded ADR 0037 provisioning tables: none exists after migration 37.
     async fn provisioned(&self) -> i64 {
         sqlx::query_scalar(
-            "SELECT (SELECT count(*) FROM openmettle.gateway_bindings)
-                  + (SELECT count(*) FROM openmettle.gateway_generations)
-                  + (SELECT count(*) FROM openmettle.gateway_policy)",
+            "SELECT (to_regclass('openmettle.gateway_bindings') IS NOT NULL)::int::bigint
+                  + (to_regclass('openmettle.gateway_generations') IS NOT NULL)::int::bigint
+                  + (to_regclass('openmettle.gateway_policy') IS NOT NULL)::int::bigint
+                  + (to_regclass('openmettle.gateway_nonces') IS NOT NULL)::int::bigint
+                  + (to_regclass('openmettle.gateway_intents') IS NOT NULL)::int::bigint
+                  + (to_regclass('openmettle.gateway_audit') IS NOT NULL)::int::bigint",
         )
         .fetch_one(&self.owner)
         .await
@@ -1004,8 +1007,9 @@ pub(crate) fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
 
 // --- faulty database connection ---------------------------------------------------------------
 
-/// Text of the first statement settlement sends inside its transaction.
-const SETTLEMENT_LOCK: &[u8] = b"quota_lock_gateway_request_for_settlement";
+/// Text of the settlement function call inside its transaction (matches the call, not the
+/// `to_regprocedure` probe).
+const SETTLEMENT_LOCK: &[u8] = b"gateway_settle_report($1";
 /// The simple query that opens every transaction.
 const BEGIN: &[u8] = b"BEGIN\0";
 
@@ -2902,8 +2906,9 @@ async fn a_later_report_corrects_an_incomplete_one_and_nothing_reopens_a_complet
 }
 
 /// One final report of `id` at revision 1 and its settlement, written directly in SQL as the
-/// gateway role in one transaction. `columns` and `values` continue the report's column and
-/// value lists, and `fold` says whether the quota fold is called. Returns the first error, the
+/// schema owner in one transaction (since migration 37 revokes all direct table/helper grants
+/// from `openmettle_gateway`). `columns` and `values` continue the report's column and value
+/// lists, and `fold` says whether the quota fold is called. Returns the first error, the
 /// commit's included.
 async fn settle_in_sql(
     f: &Fixture,
@@ -2913,7 +2918,7 @@ async fn settle_in_sql(
     outstanding: i64,
 ) -> Result<(), sqlx::Error> {
     use sqlx::Connection;
-    let mut c = connect(&f.db.0, pg::GATEWAY).await;
+    let mut c = connect(&f.db.0, OWNER).await;
     let mut tx = c.begin().await?;
     let report = format!(
         "INSERT INTO openmettle.gateway_usage_reports
@@ -3034,7 +3039,7 @@ async fn the_database_refuses_a_final_settlement_that_leaves_the_hold_open() {
     let undispatched = f.request(false).await;
     {
         use sqlx::Connection;
-        let mut c = connect(&f.db.0, pg::GATEWAY).await;
+        let mut c = connect(&f.db.0, OWNER).await;
         let mut tx = c.begin().await.unwrap();
         sqlx::query(
             "INSERT INTO openmettle.gateway_usage_reports
@@ -3131,7 +3136,7 @@ async fn the_database_refuses_a_final_settlement_that_leaves_the_hold_open() {
         ("reason", ",incomplete", ",'incomplete'", None),
     ] {
         use sqlx::Connection;
-        let mut c = connect(&f.db.0, pg::GATEWAY).await;
+        let mut c = connect(&f.db.0, OWNER).await;
         let mut tx = c.begin().await.unwrap();
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO openmettle.gateway_usage_reports
@@ -3657,8 +3662,25 @@ async fn a_direct_sql_correction_after_unreported_must_fold_its_holds() {
         ("settled".to_owned(), 0, "0".to_owned())
     );
 
-    // Direct SQL as openmettle_gateway: write measured revision 1 + settlement WITHOUT folding.
-    let mut direct = connect(&f.db.0, pg::GATEWAY).await;
+    // Migration 37: `openmettle_gateway` itself is refused direct table/helper writes (42501).
+    let mut gw_direct = connect(&f.db.0, pg::GATEWAY).await;
+    assert_eq!(
+        sqlstate(
+            sqlx::query(
+                "INSERT INTO openmettle.gateway_usage_reports
+                     (request_id,source,report_id,revision,final,prompt_tokens,completion_tokens)
+                 VALUES ($1::uuid,$2::uuid,gen_random_uuid(),1,true,17,2)",
+            )
+            .bind(&id)
+            .bind(INSTALL)
+            .execute(&mut gw_direct)
+            .await
+        ),
+        "42501"
+    );
+
+    // Direct SQL as owner: write measured revision 1 + settlement WITHOUT folding.
+    let mut direct = connect(&f.db.0, OWNER).await;
     {
         let mut tx = direct.begin().await.unwrap();
         sqlx::query(
@@ -3802,9 +3824,9 @@ async fn a_bare_or_partial_final_report_cannot_replace_unreported() {
         [(id.clone(), 0, true, Some("unreported".to_owned()), 0)]
     );
 
-    // Through direct SQL as `openmettle_gateway` even with `quota_settle_gateway_usage(..., 1)`:
+    // Through direct SQL as owner even with `quota_settle_gateway_usage(..., 1)`:
     // bare and single-count final reports are refused at commit with 23514.
-    let mut direct = connect(&f.db.0, pg::GATEWAY).await;
+    let mut direct = connect(&f.db.0, OWNER).await;
     for (what, cols, vals, measured) in [
         ("bare", "", "", None::<i64>),
         ("prompt_only", ",prompt_tokens", ",10", Some(10)),
@@ -4082,7 +4104,9 @@ async fn cost_holds_settle_from_recorded_profile_prices_through_the_proxy() {
         settlement::ingest(&gateway, &bad_report).await,
         Err(StoreError::Refused)
     );
-    for role in [pg::GATEWAY, OWNER] {
+    // `openmettle_gateway` has no direct table privilege (42501); `openmettle_owner` hits the
+    // table trigger guard (23514).
+    for (role, expected_code) in [(pg::GATEWAY, "42501"), (OWNER, "23514")] {
         let mut c = connect(&f.db.0, role).await;
         let err = sqlx::query(
             "INSERT INTO openmettle.gateway_usage_reports
@@ -4095,14 +4119,14 @@ async fn cost_holds_settle_from_recorded_profile_prices_through_the_proxy() {
         .await;
         assert_eq!(
             sqlstate(err),
-            "23514",
+            expected_code,
             "role {role} supplied cost on unbound"
         );
     }
-    // Direct SQL writing a complete report + settlement WITHOUT running quota_settle_gateway_usage
-    // is refused at commit by enforce_gateway_final_settlement_closes().
+    // Direct SQL as owner writing a complete report + settlement WITHOUT running
+    // quota_settle_gateway_usage is refused at commit by enforce_gateway_final_settlement_closes().
     {
-        let mut c = connect(&f.db.0, pg::GATEWAY).await;
+        let mut c = connect(&f.db.0, OWNER).await;
         let mut tx = c.begin().await.unwrap();
         sqlx::query(
             "INSERT INTO openmettle.gateway_usage_reports

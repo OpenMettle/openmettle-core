@@ -401,6 +401,7 @@ struct AdditiveColumn {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AdditiveTable {
     since: i64,
+    dropped_in: Option<i64>,
     table: &'static str,
     /// Optional singleton seed row inserted by the migration, as JSON text.
     seed_row: Option<&'static str>,
@@ -739,131 +740,157 @@ const ADDITIVE_COLUMNS: &[AdditiveColumn] = &[
 const ADDITIVE_TABLES: &[AdditiveTable] = &[
     AdditiveTable {
         since: 15,
+        dropped_in: None,
         table: "account_admin_lock",
         seed_row: Some(SINGLETON_LOCK_SEED),
     },
     AdditiveTable {
         since: 15,
+        dropped_in: None,
         table: "account_admins",
         seed_row: None,
     },
     AdditiveTable {
         since: 15,
+        dropped_in: None,
         table: "authorization_audit",
         seed_row: None,
     },
     AdditiveTable {
         since: 15,
+        dropped_in: None,
         table: "local_group_memberships",
         seed_row: None,
     },
     AdditiveTable {
         since: 15,
+        dropped_in: None,
         table: "local_groups",
         seed_row: None,
     },
     AdditiveTable {
         since: 15,
+        dropped_in: None,
         table: "platform_capability_denies",
         seed_row: None,
     },
     AdditiveTable {
         since: 15,
+        dropped_in: None,
         table: "project_settings",
         seed_row: None,
     },
     AdditiveTable {
         since: 15,
+        dropped_in: None,
         table: "user_capability_denies",
         seed_row: None,
     },
     AdditiveTable {
         since: 15,
+        dropped_in: None,
         table: "user_capability_grants",
         seed_row: None,
     },
     AdditiveTable {
         since: 19,
+        dropped_in: None,
         table: "run_dispatch_lock",
         seed_row: Some(SINGLETON_LOCK_SEED),
     },
     AdditiveTable {
         since: 21,
+        dropped_in: None,
         table: "branch_heads",
         seed_row: None,
     },
     AdditiveTable {
         since: 21,
+        dropped_in: None,
         table: "message_parts",
         seed_row: None,
     },
     AdditiveTable {
         since: 21,
+        dropped_in: None,
         table: "message_turns",
         seed_row: None,
     },
     AdditiveTable {
         since: 22,
+        dropped_in: None,
         table: "run_approvals",
         seed_row: None,
     },
     AdditiveTable {
         since: 22,
+        dropped_in: None,
         table: "run_approval_decisions",
         seed_row: None,
     },
     AdditiveTable {
         since: 23,
+        dropped_in: Some(37),
         table: "gateway_bindings",
         seed_row: None,
     },
     AdditiveTable {
         since: 23,
+        dropped_in: Some(37),
         table: "gateway_nonces",
         seed_row: None,
     },
     AdditiveTable {
         since: 23,
+        dropped_in: Some(37),
         table: "gateway_generations",
         seed_row: None,
     },
     AdditiveTable {
         since: 23,
+        dropped_in: Some(37),
         table: "gateway_policy",
         seed_row: None,
     },
     AdditiveTable {
         since: 23,
+        dropped_in: Some(37),
         table: "gateway_intents",
         seed_row: None,
     },
     AdditiveTable {
         since: 23,
+        dropped_in: Some(37),
         table: "gateway_audit",
         seed_row: None,
     },
     AdditiveTable {
         since: 23,
+        dropped_in: None,
         table: "gateway_reservations",
         seed_row: None,
     },
     AdditiveTable {
         since: 23,
+        dropped_in: None,
         table: "gateway_requests",
         seed_row: None,
     },
     AdditiveTable {
         since: 23,
+        dropped_in: None,
         table: "gateway_usage_reports",
         seed_row: None,
     },
     AdditiveTable {
         since: 23,
+        dropped_in: None,
         table: "gateway_settlements",
         seed_row: None,
     },
     AdditiveTable {
         since: 24,
+        dropped_in: None,
         table: "storage_volume_control",
         seed_row: Some(
             r#"{"id":true,"volume_id":null,"bootstrap_auto_pin_allowed":false,"adoption_run_id":null}"#,
@@ -871,11 +898,13 @@ const ADDITIVE_TABLES: &[AdditiveTable] = &[
     },
     AdditiveTable {
         since: 24,
+        dropped_in: None,
         table: "quota_accepted_gateway_reports",
         seed_row: None,
     },
     AdditiveTable {
         since: 24,
+        dropped_in: None,
         table: "quota_defaults",
         seed_row: Some(
             r#"{"scope_kind":"instance","resource_kind":"usage_cost_micros","hard_limit":null,"window_seconds":null,"cost_denomination":null,"warn_pct_1":80,"warn_pct_2":90,"config_revision":1}"#,
@@ -883,11 +912,13 @@ const ADDITIVE_TABLES: &[AdditiveTable] = &[
     },
     AdditiveTable {
         since: 24,
+        dropped_in: None,
         table: "quota_cost_unit_lock",
         seed_row: Some(r#"{"id":true}"#),
     },
     AdditiveTable {
         since: 24,
+        dropped_in: None,
         table: "quota_enforcement",
         seed_row: Some(
             r#"{"id":true,"metering_enforced":false,"metering_enforced_at":null,"overrides_enforced":false,"overrides_enforced_at":null}"#,
@@ -895,91 +926,109 @@ const ADDITIVE_TABLES: &[AdditiveTable] = &[
     },
     AdditiveTable {
         since: 24,
+        dropped_in: None,
         table: "quota_gateway_handoffs",
         seed_row: None,
     },
     AdditiveTable {
         since: 24,
+        dropped_in: None,
         table: "quota_overrides",
         seed_row: None,
     },
     AdditiveTable {
         since: 24,
+        dropped_in: None,
         table: "quota_budgets",
         seed_row: None,
     },
     AdditiveTable {
         since: 24,
+        dropped_in: None,
         table: "quota_reservations",
         seed_row: None,
     },
     AdditiveTable {
         since: 24,
+        dropped_in: None,
         table: "quota_reservation_charges",
         seed_row: None,
     },
     AdditiveTable {
         since: 24,
+        dropped_in: None,
         table: "quota_reconciliations",
         seed_row: None,
     },
     AdditiveTable {
         since: 24,
+        dropped_in: None,
         table: "quota_warning_events",
         seed_row: None,
     },
     AdditiveTable {
         since: 27,
+        dropped_in: None,
         table: "capacity_groups",
         seed_row: None,
     },
     AdditiveTable {
         since: 27,
+        dropped_in: None,
         table: "capacity_devices",
         seed_row: None,
     },
     AdditiveTable {
         since: 27,
+        dropped_in: None,
         table: "capacity_observations",
         seed_row: None,
     },
     AdditiveTable {
         since: 27,
+        dropped_in: None,
         table: "capacity_grants",
         seed_row: None,
     },
     AdditiveTable {
         since: 27,
+        dropped_in: None,
         table: "capacity_grant_devices",
         seed_row: None,
     },
     AdditiveTable {
         since: 28,
+        dropped_in: None,
         table: "retention_policy",
         seed_row: Some(RETENTION_POLICY_SEED),
     },
     AdditiveTable {
         since: 28,
+        dropped_in: None,
         table: "artifact_retention_holds",
         seed_row: None,
     },
     AdditiveTable {
         since: 28,
+        dropped_in: None,
         table: "deletion_journal",
         seed_row: None,
     },
     AdditiveTable {
         since: 28,
+        dropped_in: None,
         table: "deletion_journal_head",
         seed_row: Some(DELETION_JOURNAL_HEAD_SEED),
     },
     AdditiveTable {
         since: 35,
+        dropped_in: None,
         table: "family_policies",
         seed_row: None,
     },
     AdditiveTable {
         since: 35,
+        dropped_in: None,
         table: "family_policy_models",
         seed_row: None,
     },
@@ -998,7 +1047,7 @@ fn expected_added_tables_since(base_version: i64) -> impl Iterator<Item = &'stat
     );
     ADDITIVE_TABLES
         .iter()
-        .filter(move |entry| entry.since > base_version)
+        .filter(move |entry| entry.since > base_version && entry.dropped_in.is_none())
 }
 
 fn canonical_json(raw: &str) -> String {
@@ -1156,6 +1205,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "cd6543f8de7857b1814c635e691cbe472ac488754bb8ddaaabfb56001c462420",
         "ed518dd9b187d34053dc16444c8c9d50ba1947a75bb0986e960502acb1fb51d3",
         "911d89606c1f322b82dc5085bedae506c210b59c69c36ee1a46a8647d403bee7",
+        "5cffa8f7df4e9f594cd1bdb81a67fc05e847d9027e1610e267fba94006702c28",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));
@@ -1214,6 +1264,12 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
             versions.contains(&entry.since),
             "unknown version: {entry:?}"
         );
+        if let Some(dropped) = entry.dropped_in {
+            assert!(
+                versions.contains(&dropped) && dropped > entry.since,
+                "invalid dropped_in: {entry:?}"
+            );
+        }
         assert!(valid_ident(entry.table), "invalid table: {entry:?}");
         assert!(
             seen_tables.insert(entry.table),
@@ -1225,10 +1281,11 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
         }
     }
 
-    // Cross-check the registry 1-to-1 against every ADD COLUMN and post-v14 CREATE TABLE in
-    // the embedded migration SQL so future additive migrations cannot drift from the registry.
+    // Cross-check the registry 1-to-1 against every ADD COLUMN, post-v14 CREATE TABLE, and
+    // DROP TABLE in the embedded migration SQL so future migrations cannot drift from the registry.
     let mut sql_columns = BTreeSet::new();
     let mut sql_tables = BTreeSet::new();
+    let mut sql_dropped = BTreeSet::new();
     for migration in MIGRATIONS {
         let stripped: String = migration
             .sql
@@ -1264,6 +1321,14 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
             {
                 sql_tables.insert((migration.version, table.trim_end_matches('(').to_owned()));
             }
+            if migration.version > 14
+                && tokens.len() >= 3
+                && tokens[0].eq_ignore_ascii_case("DROP")
+                && tokens[1].eq_ignore_ascii_case("TABLE")
+                && let Some(table) = tokens[2].strip_prefix("openmettle.")
+            {
+                sql_dropped.insert((migration.version, table.trim_end_matches('(').to_owned()));
+            }
         }
     }
     let registered_columns: BTreeSet<(i64, String, String)> = ADDITIVE_COLUMNS
@@ -1276,12 +1341,18 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
         .map(|e| (e.since, e.table.to_owned()))
         .collect();
     assert_eq!(registered_tables, sql_tables);
+    let registered_dropped: BTreeSet<(i64, String)> = ADDITIVE_TABLES
+        .iter()
+        .filter_map(|e| e.dropped_in.map(|v| (v, e.table.to_owned())))
+        .collect();
+    assert_eq!(registered_dropped, sql_dropped);
 
-    // `expected_added_tables_since` filters accurately and preserves singleton lock seeds.
+    // `expected_added_tables_since` filters accurately (excluding dropped tables) and preserves
+    // singleton lock seeds.
     let after_14: Vec<(&str, Option<&str>)> = expected_added_tables_since(14)
         .map(|e| (e.table, e.seed_row))
         .collect();
-    assert_eq!(after_14.len(), 48);
+    assert_eq!(after_14.len(), 42);
     assert!(after_14.contains(&("account_admin_lock", Some(SINGLETON_LOCK_SEED))));
     assert!(after_14.contains(&("run_dispatch_lock", Some(SINGLETON_LOCK_SEED))));
     let after_18: Vec<(&str, Option<&str>)> = expected_added_tables_since(18)
@@ -1296,12 +1367,6 @@ fn additive_schema_registry_normalizes_and_validates_defaults() {
             ("message_turns", None),
             ("run_approvals", None),
             ("run_approval_decisions", None),
-            ("gateway_bindings", None),
-            ("gateway_nonces", None),
-            ("gateway_generations", None),
-            ("gateway_policy", None),
-            ("gateway_intents", None),
-            ("gateway_audit", None),
             ("gateway_reservations", None),
             ("gateway_requests", None),
             ("gateway_usage_reports", None),

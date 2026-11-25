@@ -19,24 +19,22 @@ pub(crate) async fn prepare_round(
     call: &Call<'_>,
     cost_ceiling: Option<i64>,
 ) -> Result<(), Error> {
-    if let Authority::Lease { run, round, token } = call.authority {
-        let has_actor_prefix: bool = sqlx::query_scalar(
-            "SELECT to_regprocedure(
-                 'openmettle.quota_lock_run_actor_prefix(uuid,uuid)'
-             ) IS NOT NULL",
-        )
-        .fetch_one(tx.connection()?)
-        .await?;
-        if has_actor_prefix {
-            sqlx::query("SELECT openmettle.quota_lock_run_actor_prefix($1::uuid,$2::uuid)")
-                .bind(call.reservation.scope_id)
-                .bind(run)
-                .execute(tx.connection()?)
-                .await?;
-        }
-        sqlx::query(
-            "SELECT openmettle.quota_unwind_superseded_round($1::uuid,$2::uuid,$3::uuid,$4)",
-        )
+    let Authority::Lease { run, round, token } = call.authority;
+    let has_actor_prefix: bool = sqlx::query_scalar(
+        "SELECT to_regprocedure(
+             'openmettle.quota_lock_run_actor_prefix(uuid,uuid)'
+         ) IS NOT NULL",
+    )
+    .fetch_one(tx.connection()?)
+    .await?;
+    if has_actor_prefix {
+        sqlx::query("SELECT openmettle.quota_lock_run_actor_prefix($1::uuid,$2::uuid)")
+            .bind(call.reservation.scope_id)
+            .bind(run)
+            .execute(tx.connection()?)
+            .await?;
+    }
+    sqlx::query("SELECT openmettle.quota_unwind_superseded_round($1::uuid,$2::uuid,$3::uuid,$4)")
         .bind(call.reservation.scope_id)
         .bind(run)
         .bind(token)
@@ -44,38 +42,35 @@ pub(crate) async fn prepare_round(
         .execute(tx.connection()?)
         .await
         .map_err(crate::authz::gateway::map_stale_lease)?;
-        let has_v26_prepare: bool = sqlx::query_scalar(
-            "SELECT to_regprocedure(
-                 'openmettle.quota_prepare_turn_round(uuid,uuid,uuid,bigint,bigint,boolean,boolean,boolean,boolean)'
-             ) IS NOT NULL",
+    let has_v26_prepare: bool = sqlx::query_scalar(
+        "SELECT to_regprocedure(
+             'openmettle.quota_prepare_turn_round(uuid,uuid,uuid,bigint,bigint,boolean,boolean,boolean,boolean)'
+         ) IS NOT NULL",
+    )
+    .fetch_one(tx.connection()?)
+    .await?;
+    if has_v26_prepare {
+        sqlx::query(
+            "SELECT openmettle.quota_prepare_turn_round(
+                 $1::uuid,$2::uuid,$3::uuid,$4,$5,false,false,false,true
+             )",
         )
-        .fetch_one(tx.connection()?)
-        .await?;
-        if has_v26_prepare {
-            sqlx::query(
-                "SELECT openmettle.quota_prepare_turn_round(
-                     $1::uuid,$2::uuid,$3::uuid,$4,$5,false,false,false,true
-                 )",
-            )
-            .bind(call.reservation.scope_id)
-            .bind(run)
-            .bind(token)
-            .bind(call.units)
-            .bind(cost_ceiling)
-            .execute(tx.connection()?)
-            .await
-            .map_err(crate::authz::gateway::map_stale_lease)?;
-        } else {
-            sqlx::query(
-                "SELECT openmettle.quota_ensure_legacy_run_holds($1::uuid,$2::uuid,$3::uuid)",
-            )
+        .bind(call.reservation.scope_id)
+        .bind(run)
+        .bind(token)
+        .bind(call.units)
+        .bind(cost_ceiling)
+        .execute(tx.connection()?)
+        .await
+        .map_err(crate::authz::gateway::map_stale_lease)?;
+    } else {
+        sqlx::query("SELECT openmettle.quota_ensure_legacy_run_holds($1::uuid,$2::uuid,$3::uuid)")
             .bind(call.reservation.scope_id)
             .bind(run)
             .bind(token)
             .execute(tx.connection()?)
             .await
             .map_err(crate::authz::gateway::map_stale_lease)?;
-        }
     }
     Ok(())
 }
@@ -327,7 +322,6 @@ pub(crate) enum BindOutcome {
     Bound {
         enforced_at_bind: bool,
         cost_bound_at_bind: bool,
-        bound_cost: Option<u128>,
     },
     /// `metering_enforced` flipped `false -> true` after `quota_prepare_turn_round` skipped
     /// creating run-level parent holds; caller must roll back and retry preparation with
@@ -347,39 +341,12 @@ pub(crate) async fn bind_request(
         sqlx::query_scalar("SELECT metering_enforced FROM openmettle.quota_enforcement WHERE id")
             .fetch_one(tx.connection()?)
             .await?;
-    match call.authority {
-        Authority::Session { .. } => {
-            let cost = cost_ceiling(tx, &call.reservation, None, Some(id), spec).await?;
-            for (resource, amount) in [
-                ("usage_cost_micros", cost),
-                ("usage_tokens", Some(call.units)),
-            ] {
-                let Some(amount) = amount else { continue };
-                sqlx::query(
-                    "SELECT openmettle.quota_reserve($1::uuid,$2::uuid,$3,$4,$5,NULL,$6::uuid,$7,
-                    clock_timestamp()+interval '15 minutes')",
-                )
-                .bind(call.reservation.scope_id)
-                .bind(call.reservation.actor)
-                .bind(resource)
-                .bind(amount)
-                .bind(format!("request:{id}"))
-                .bind(id)
-                .bind(secret)
-                .execute(tx.connection()?)
-                .await?;
-            }
-            Ok(BindOutcome::Bound {
-                enforced_at_bind: true,
-                cost_bound_at_bind: cost.is_some(),
-                bound_cost: cost.and_then(|n| u128::try_from(n).ok()),
-            })
-        }
-        Authority::Lease { run, token, .. } => {
-            // Query already-charged parent holds on this run in BOTH activation states and resolve
-            // cost-limit state in one atomic `clock_timestamp()` snapshot so an expiring cost limit
-            // can never drop a cost child when a held cost parent exists.
-            let parents: Vec<(String, i64)> = sqlx::query_as(
+    let Authority::Lease { run, token, .. } = call.authority;
+    {
+        // Query already-charged parent holds on this run in BOTH activation states and resolve
+        // cost-limit state in one atomic `clock_timestamp()` snapshot so an expiring cost limit
+        // can never drop a cost child when a held cost parent exists.
+        let parents: Vec<(String, i64)> = sqlx::query_as(
                 "SELECT resource_kind, held_units
                    FROM openmettle.quota_reservations
                   WHERE scope_id = $1::uuid
@@ -395,61 +362,59 @@ pub(crate) async fn bind_request(
             .bind(run)
             .fetch_all(tx.connection()?)
             .await?;
-            let mut parent_cost_held = None;
-            let mut has_token_parent = false;
-            let mut has_device_parent = false;
-            for (kind, held) in parents {
-                match kind.as_str() {
-                    "usage_cost_micros" => parent_cost_held = Some(held),
-                    "usage_tokens" => has_token_parent = true,
-                    "device_reservations" => has_device_parent = true,
-                    _ => {}
-                }
+        let mut parent_cost_held = None;
+        let mut has_token_parent = false;
+        let mut has_device_parent = false;
+        for (kind, held) in parents {
+            match kind.as_str() {
+                "usage_cost_micros" => parent_cost_held = Some(held),
+                "usage_tokens" => has_token_parent = true,
+                "device_reservations" => has_device_parent = true,
+                _ => {}
             }
-            if enforced && (!has_token_parent || (requires_device_slot && !has_device_parent)) {
-                return Ok(BindOutcome::NeedsParentHolds);
-            }
-            let state = cost_limit_state(
-                tx.connection()?,
-                call.reservation.scope_id,
-                call.reservation.actor,
-            )
-            .await?;
-            let cost = resolve_cost_from_state(
-                tx.connection()?,
-                &state,
-                &call.reservation,
-                Some(run),
-                Some(id),
-                parent_cost_held,
-                enforced,
-                spec,
-            )
-            .await?;
-            if parent_cost_held.is_some() && cost.is_none() {
-                return Err(Error::Refused);
-            }
-            if enforced && cost.is_some() && parent_cost_held.is_none() {
-                return Ok(BindOutcome::NeedsParentHolds);
-            }
-            let tokens = (enforced || has_token_parent).then_some(call.units);
-            for (resource, amount) in [("usage_cost_micros", cost), ("usage_tokens", tokens)] {
-                let Some(amount) = amount else { continue };
-                sqlx::query("SELECT openmettle.quota_allocate_round($1::uuid,$2,$3::uuid,$4,$5)")
-                    .bind(id)
-                    .bind(secret)
-                    .bind(token)
-                    .bind(resource)
-                    .bind(amount)
-                    .execute(tx.connection()?)
-                    .await?;
-            }
-            Ok(BindOutcome::Bound {
-                enforced_at_bind: enforced,
-                cost_bound_at_bind: cost.is_some(),
-                bound_cost: cost.and_then(|n| u128::try_from(n).ok()),
-            })
         }
+        if enforced && (!has_token_parent || (requires_device_slot && !has_device_parent)) {
+            return Ok(BindOutcome::NeedsParentHolds);
+        }
+        let state = cost_limit_state(
+            tx.connection()?,
+            call.reservation.scope_id,
+            call.reservation.actor,
+        )
+        .await?;
+        let cost = resolve_cost_from_state(
+            tx.connection()?,
+            &state,
+            &call.reservation,
+            Some(run),
+            Some(id),
+            parent_cost_held,
+            enforced,
+            spec,
+        )
+        .await?;
+        if parent_cost_held.is_some() && cost.is_none() {
+            return Err(Error::Refused);
+        }
+        if enforced && cost.is_some() && parent_cost_held.is_none() {
+            return Ok(BindOutcome::NeedsParentHolds);
+        }
+        let tokens = (enforced || has_token_parent).then_some(call.units);
+        for (resource, amount) in [("usage_cost_micros", cost), ("usage_tokens", tokens)] {
+            let Some(amount) = amount else { continue };
+            sqlx::query("SELECT openmettle.quota_allocate_round($1::uuid,$2,$3::uuid,$4,$5)")
+                .bind(id)
+                .bind(secret)
+                .bind(token)
+                .bind(resource)
+                .bind(amount)
+                .execute(tx.connection()?)
+                .await?;
+        }
+        Ok(BindOutcome::Bound {
+            enforced_at_bind: enforced,
+            cost_bound_at_bind: cost.is_some(),
+        })
     }
 }
 

@@ -729,7 +729,6 @@ async fn operator_writers_serialize_in_commit_order() {
 mod admission;
 mod approval_change;
 mod browser;
-mod gateway;
 mod handoff;
 mod invitations;
 mod membership;

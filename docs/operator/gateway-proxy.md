@@ -188,9 +188,13 @@ spent:
 The gateway reads the same process settings as the API and the worker under the
 `OPENMETTLE_GATEWAY_` prefix: `BIND` (default `127.0.0.1:8082`), `DATABASE_URL`,
 `DB_MAX_CONNECTIONS`, `DB_TIMEOUT_MS`, `SHUTDOWN_TIMEOUT_MS`, `LOG_FORMAT`, `LOG_LEVEL` and the
-`OTLP_*` export settings, with the ranges in the README. `DATABASE_URL` must be a login of
-`openmettle_gateway`; the proxy needs only that role's existing grants. It never reads
-`ARTIFACTS_DIR` or `AUTH_CONFIG`, and it refuses to start while
+`OTLP_*` export settings, with the ranges in the README. `DATABASE_URL` must be a login of `openmettle_gateway`. As of migration `0037` (ADR 0044
+increment 6), `openmettle_gateway` holds zero table or column privileges: its entire database
+surface is database `CONNECT`, schema `USAGE` on `openmettle`, and `EXECUTE` on
+`openmettle.gateway_dispatch(uuid, bytea)`, `openmettle.gateway_dispatch_scoped(uuid, bytea)` and
+`openmettle.gateway_settle_report(...)` (during rolling upgrades against pre-37 schemas,
+settlement probes `to_regprocedure` and falls back to the unbound pre-37 SQL path). The proxy
+never reads `ARTIFACTS_DIR` or `AUTH_CONFIG`, and it refuses to start while
 `OPENMETTLE_API_ISSUANCE_DATABASE_URL` is present.
 
 | Setting (`OPENMETTLE_GATEWAY_` prefix) | Range | Default |
@@ -255,8 +259,6 @@ on a connection that stopped answering: the pool waits for every connection when
   of the proxy and give the worker an `https://` route; see
   [plain HTTP inside the cluster](worker-turn-execution.md#plain-http-inside-the-cluster).
   The default bind is loopback.
-- **A broad database role.** `openmettle_gateway` still has the grants the superseded
-  reconciler needed. Increment 6 narrows it to what the proxy uses.
 - **Chat completions only.** The Responses API is not routed.
 - **No concurrency limit** on relayed requests.
 - **Identity bodies only.** Compressed requests and answers are refused rather than relayed.

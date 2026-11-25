@@ -1,7 +1,6 @@
 //! Wall-clock family schedules, per-user overrides and model switches (ADR 0044, increment 4).
 //! Convert an instant to local time in PostgreSQL (`pg_timezone_names`): missing spring minutes
 //! never occur and both autumn occurrences resolve to the same local minute.
-use super::Error;
 use crate::authz::store::{self, KEY_REUSED, StoreError, UNCHANGED, WriteOutcome, uuid};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -58,14 +57,6 @@ impl Hours {
             self.end_minute % 60
         )
     }
-
-    fn contains(&self, m: u16) -> bool {
-        if self.start_minute < self.end_minute {
-            (self.start_minute..self.end_minute).contains(&m)
-        } else {
-            m >= self.start_minute || m < self.end_minute
-        }
-    }
 }
 
 /// Timezone syntax rule, matching `openmettle.family_policies.zone`'s `CHECK` constraint.
@@ -84,73 +75,6 @@ pub fn valid_model(model: &str) -> bool {
 /// OIDC group claim rule, matching `openmettle.family_policies.grantee_oidc_group_id`'s `CHECK`.
 pub fn valid_oidc_group_id(claim: &str) -> bool {
     (1..=1024).contains(&claim.len()) && !claim.chars().any(char::is_control)
-}
-
-/// Legacy ADR 0037 in-memory family policy structure retained until increment 6 removal.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct FamilyPolicy {
-    pub revision: i64,
-    pub zone: String,
-    pub quiet: Option<Hours>,
-    pub study: Option<Hours>,
-    pub study_models: BTreeSet<String>,
-    pub disabled_models: BTreeSet<String>,
-}
-
-impl FamilyPolicy {
-    pub fn valid(&self) -> bool {
-        self.revision > 0
-            && valid_zone(&self.zone)
-            && [self.quiet.as_ref(), self.study.as_ref()]
-                .into_iter()
-                .flatten()
-                .all(Hours::valid)
-    }
-
-    pub(super) async fn local_minute(
-        &self,
-        c: &mut PgConnection,
-        instant_ms: Option<i64>,
-    ) -> Result<u16, Error> {
-        if !self.valid() {
-            return Err(Error::Refused);
-        }
-        let minute: i32 = sqlx::query_scalar(
-            "SELECT extract(hour FROM local_time)::int * 60 + extract(minute FROM local_time)::int
-               FROM (
-                   SELECT coalesce(
-                       timestamptz 'epoch' + ($2::bigint * interval '1 millisecond'),
-                       clock_timestamp()
-                   ) AT TIME ZONE name AS local_time
-                     FROM pg_catalog.pg_timezone_names
-                    WHERE name = $1
-               ) z",
-        )
-        .bind(&self.zone)
-        .bind(instant_ms)
-        .fetch_optional(c)
-        .await?
-        .ok_or(Error::Refused)?;
-        Ok(minute as u16)
-    }
-
-    pub async fn permits(
-        &self,
-        c: &mut PgConnection,
-        model: &str,
-        instant_ms: Option<i64>,
-    ) -> Result<bool, Error> {
-        let minute = self.local_minute(c, instant_ms).await?;
-        Ok(self.permits_minute(model, minute))
-    }
-
-    pub(super) fn permits_minute(&self, model: &str, minute: u16) -> bool {
-        !self.disabled_models.contains(model)
-            && !self.quiet.as_ref().is_some_and(|h| h.contains(minute))
-            && (!self.study.as_ref().is_some_and(|h| h.contains(minute))
-                || self.study_models.contains(model))
-    }
 }
 
 // --- Increment 4: PostgreSQL family policy tables, evaluator & operator CLI ----------------------

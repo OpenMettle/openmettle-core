@@ -206,6 +206,11 @@ pub const MIGRATIONS: &[Source] = &[
         description: "gateway cache separation",
         sql: include_str!("../migrations/0036_gateway_cache_separation.sql"),
     },
+    Source {
+        version: 37,
+        description: "gateway remove superseded",
+        sql: include_str!("../migrations/0037_gateway_remove_superseded.sql"),
+    },
 ];
 
 /// Connection and deadline settings for one migration run.

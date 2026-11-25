@@ -1,14 +1,9 @@
-//! Gateway reservation, handoff, dispatch and settlement store (ADRs 0037 and 0044). A run round
+//! Gateway reservation, handoff, dispatch and settlement store (ADR 0044). A run round
 //! is handed off without a gateway binding, under a per-round bearer of which the database
 //! holds a hash, and dispatched once through OpenMettle's own proxy.
-//! The ADR 0037 provisioning and sealed-key code here has no caller and awaits removal.
-use crate::{
-    provider_keys::gateway::{Context, Envelope, GatewayKeys},
-    runs::WriteTransaction,
-};
+use crate::runs::WriteTransaction;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::rand::{SecureRandom, SystemRandom};
-use rustls::crypto::SharedSecret;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::fmt;
@@ -111,10 +106,6 @@ pub async fn hold_with_cost(
     Ok(())
 }
 pub enum Authority<'a> {
-    Session {
-        credential: &'a str,
-        native_audience: Option<&'a [u8; 32]>,
-    },
     Lease {
         run: &'a str,
         round: i32,
@@ -135,8 +126,6 @@ pub struct Pending<'a> {
     pub id: String,
     secret: [u8; 32],
     call: Call<'a>,
-    explicit_cost: Option<u128>,
-    bound_cost: Option<u128>,
 }
 pub async fn reserve<'a>(pool: &PgPool, call: Call<'a>) -> Result<Pending<'a>, Error> {
     reserve_with_cost(pool, call, None).await
@@ -155,26 +144,25 @@ pub async fn reserve_with_cost<'a>(
     let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
     let res = async {
         crate::quotas::prepare_round(&mut tx, &call, cost_ceiling).await?;
-        let mut pending = reserve_in(&mut tx, call).await?;
+        let pending = reserve_in(&mut tx, call).await?;
         let spec = match explicit_cost {
             Some(c) => crate::quotas::CostBoundSpec::Profile(Some(c)),
             None => crate::quotas::CostBoundSpec::Legacy,
         };
-        let bound_cost = match crate::quotas::bind_request(
-            &mut tx,
-            &pending.call,
-            &pending.id,
-            &pending.secret,
-            spec,
-            false,
-        )
-        .await?
-        {
-            crate::quotas::BindOutcome::NeedsParentHolds => return Err(Error::Refused),
-            crate::quotas::BindOutcome::Bound { bound_cost, .. } => bound_cost,
-        };
-        pending.explicit_cost = explicit_cost;
-        pending.bound_cost = bound_cost;
+        if matches!(
+            crate::quotas::bind_request(
+                &mut tx,
+                &pending.call,
+                &pending.id,
+                &pending.secret,
+                spec,
+                false,
+            )
+            .await?,
+            crate::quotas::BindOutcome::NeedsParentHolds
+        ) {
+            return Err(Error::Refused);
+        }
         Ok(pending)
     }
     .await;
@@ -205,7 +193,7 @@ pub struct TurnRound<'a> {
     pub requires_device_slot: bool,
 }
 
-pub use crate::provider_http::{BillableDispatch, CallerDispatch, TurnDispatch};
+pub use crate::provider_http::TurnDispatch;
 
 /// Owned unsent turn-round reservation handle. Never cloned or serialized.
 pub struct TurnPending {
@@ -257,8 +245,6 @@ impl TurnPending {
                     token: &self.claim_token,
                 },
             },
-            explicit_cost: self.round_cost,
-            bound_cost: self.cost_bound_at_bind.then_some(self.round_cost).flatten(),
         }
     }
 
@@ -720,9 +706,7 @@ async fn reserve_in<'a>(
     tx: &mut WriteTransaction<'_>,
     call: Call<'a>,
 ) -> Result<Pending<'a>, Error> {
-    if let Authority::Session { credential, .. } = call.authority {
-        crate::sessions::well_formed(credential).map_err(|_| Error::Refused)?;
-    }
+    let Authority::Lease { run, round, .. } = call.authority;
     let mut secret = [0; 32];
     SystemRandom::new()
         .fill(&mut secret)
@@ -731,39 +715,24 @@ async fn reserve_in<'a>(
         .fetch_one(tx.connection()?)
         .await?;
     let r = &call.reservation;
-    let sql = match call.authority {
-        Authority::Session { .. } => {
-            hold(tx, r, None, call.units).await?;
-            "INSERT INTO openmettle.gateway_requests (id,reservation_id,scope_id,actor_user_id,approval_id,installation,model,units,dispatch_hash,session_id)
-             VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6::uuid,$7,$8,$9,$10)"
-        }
-        Authority::Lease { .. } =>
-            "INSERT INTO openmettle.gateway_requests (id,reservation_id,scope_id,actor_user_id,approval_id,installation,model,units,dispatch_hash,run_id,round)
-             VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6::uuid,$7,$8,$9,$10::uuid,$11)"
-    };
-    let q = sqlx::query(sql)
-        .bind(&id)
-        .bind(r.id)
-        .bind(r.scope_id)
-        .bind(r.actor)
-        .bind(r.approval)
-        .bind(call.installation)
-        .bind(call.model)
-        .bind(call.units)
-        .bind(Sha256::digest(secret).to_vec());
-    match call.authority {
-        Authority::Session { credential, .. } => q.bind(&credential[..43]),
-        Authority::Lease { run, round, .. } => q.bind(run).bind(round),
-    }
+    sqlx::query(
+        "INSERT INTO openmettle.gateway_requests (id,reservation_id,scope_id,actor_user_id,approval_id,installation,model,units,dispatch_hash,run_id,round)
+         VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6::uuid,$7,$8,$9,$10::uuid,$11)",
+    )
+    .bind(&id)
+    .bind(r.id)
+    .bind(r.scope_id)
+    .bind(r.actor)
+    .bind(r.approval)
+    .bind(call.installation)
+    .bind(call.model)
+    .bind(call.units)
+    .bind(Sha256::digest(secret).to_vec())
+    .bind(run)
+    .bind(round)
     .execute(tx.connection()?)
     .await?;
-    Ok(Pending {
-        id,
-        secret,
-        call,
-        explicit_cost: None,
-        bound_cost: None,
-    })
+    Ok(Pending { id, secret, call })
 }
 /// The prepared wire round equals the reserved token units and carries a positive output cap
 /// within them, so the funded hold bounds what the provider may generate.
@@ -804,12 +773,11 @@ impl Pending<'_> {
         Ok(released)
     }
     async fn release_in(&self, tx: &mut WriteTransaction<'_>) -> Result<bool, Error> {
-        if let Authority::Lease { run, .. } = self.call.authority {
-            sqlx::query("SELECT FROM openmettle.runs WHERE id=$1::uuid FOR NO KEY UPDATE")
-                .bind(run)
-                .execute(tx.connection()?)
-                .await?;
-        }
+        let Authority::Lease { run, .. } = self.call.authority;
+        sqlx::query("SELECT FROM openmettle.runs WHERE id=$1::uuid FOR NO KEY UPDATE")
+            .bind(run)
+            .execute(tx.connection()?)
+            .await?;
         let released = sqlx::query_scalar("SELECT openmettle.gateway_release($1::uuid,$2)")
             .bind(&self.id)
             .bind(self.secret.as_slice())
@@ -820,94 +788,8 @@ impl Pending<'_> {
         }
         Ok(released)
     }
-    /// Commit the gateway handoff and quota holds only after `prepared` is proven to fit them:
-    /// the request mode matches the authority, the wire round equals the reserved units with a
-    /// positive output cap inside it, a caller session never needs a device slot, and the round
-    /// cost matches the explicit ceiling or fits the cost hold bound at reservation. The route
-    /// binding and complete outbound headers are validated inside the transaction; cost-unqualified
-    /// and device-slot requests are marked so the deferred `enforce_gateway_handoff_holds` trigger
-    /// raises `OMQ04` when a cost limit or required device hold is missing at commit. Every refusal
-    /// rolls back and leaves the request `reserved` for [`Self::release`]. Returns a single-use
-    /// [`BillableDispatch`] bound to `prepared`'s originating gateway: `Server` for a lease,
-    /// `Caller` for a session. Markers carry the database-canonical request id so a rewritten
-    /// spelling of [`Self::id`] cannot evade the trigger.
-    pub async fn handoff<'p>(
-        &self,
-        pool: &PgPool,
-        keys: &GatewayKeys,
-        billable: &crate::provider_http::BillableInferenceRef<'_>,
-        prepared: crate::provider_http::inference::PreparedRequest<'p>,
-    ) -> Result<BillableDispatch<'p>, Error> {
-        let server = matches!(self.call.authority, Authority::Lease { .. });
-        let cost_ok = match (self.explicit_cost, self.bound_cost, prepared.round_cost()) {
-            (Some(explicit), _, cost) => cost == Some(explicit),
-            (None, Some(held), cost) => cost.is_some_and(|c| c > 0 && c <= held),
-            (None, None, _) => true,
-        };
-        if prepared.is_server() != server
-            || !round_fits(&prepared, self.call.units)
-            || (!server && prepared.requires_device_slot())
-            || !cost_ok
-        {
-            return Err(Error::Refused);
-        }
-        let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
-        let res = async {
-            let dispatch = self.handoff_in(&mut tx, keys).await?;
-            validate_bound(billable, &dispatch, &prepared)?;
-            for (setting, mark) in [
-                (
-                    "openmettle.turn_cost_unqualified_requests",
-                    prepared.round_cost().is_none(),
-                ),
-                (
-                    "openmettle.turn_device_required_requests",
-                    prepared.requires_device_slot(),
-                ),
-            ] {
-                if mark {
-                    sqlx::query(
-                        "SELECT set_config($1, coalesce(current_setting($1, true), '') || ',' || $2::uuid::text || ',', true)",
-                    )
-                    .bind(setting)
-                    .bind(&self.id)
-                    .execute(tx.connection()?)
-                    .await?;
-                }
-            }
-            sqlx::query("SELECT openmettle.quota_commit_handoff($1::uuid,$2::bytea)")
-                .bind(&self.id)
-                .bind(self.secret.as_slice())
-                .execute(tx.connection()?)
-                .await?;
-            Ok::<_, Error>(dispatch)
-        }
-        .await;
-        let dispatch = match res {
-            Ok(dispatch) => dispatch,
-            Err(err) => {
-                let _ = tx.rollback().await;
-                return Err(err);
-            }
-        };
-        if let Err(err) = tx.commit().await {
-            if let crate::runs::Error::Database(ref db) = err
-                && db.as_database_error().and_then(|e| e.code()).as_deref() == Some("OMQ04")
-            {
-                return Err(Error::Refused);
-            }
-            let mut recovery = WriteTransaction::begin_bounded_pool(pool, false).await?;
-            self.recover_in(&mut recovery).await?;
-            recovery.commit().await?;
-            return Err(Error::Database);
-        }
-        Ok(BillableDispatch::new(dispatch, prepared))
-    }
     async fn recover_in(&self, tx: &mut WriteTransaction<'_>) -> Result<String, Error> {
-        let run = match self.call.authority {
-            Authority::Lease { run, .. } => Some(run),
-            _ => None,
-        };
+        let Authority::Lease { run, .. } = self.call.authority;
         Ok(sqlx::query_scalar(
             "SELECT openmettle.quota_recover_lost_handoff($1::uuid,$2,$3::uuid,$4::uuid,$5::uuid)",
         )
@@ -918,67 +800,6 @@ impl Pending<'_> {
         .bind(run)
         .fetch_one(tx.connection()?)
         .await?)
-    }
-    async fn handoff_in(
-        &self,
-        tx: &mut WriteTransaction<'_>,
-        keys: &GatewayKeys,
-    ) -> Result<Dispatch, Error> {
-        let (proof, audience, lease) = match self.call.authority {
-            Authority::Session {
-                credential,
-                native_audience,
-            } => (
-                Some(SharedSecret::from(
-                    URL_SAFE_NO_PAD
-                        .decode(&credential[44..])
-                        .map_err(|_| Error::Refused)?,
-                )),
-                native_audience,
-                None,
-            ),
-            Authority::Lease { token, .. } => (None, None, Some(token)),
-        };
-        // `id` is caller-visible; dispatch the database-canonical spelling so the wire
-        // `x-request-id` always correlates with gateway usage reports.
-        let row = sqlx::query(
-            "SELECT h.*,$1::uuid::text AS request \
-             FROM openmettle.gateway_handoff($1::uuid,$2,$3,$4,$5::uuid) h",
-        )
-        .bind(&self.id)
-        .bind(self.secret.as_slice())
-        .bind(proof.as_ref().map(SharedSecret::secret_bytes))
-        .bind(audience.map(|a| a.as_slice()))
-        .bind(lease)
-        .fetch_optional(tx.connection()?)
-        .await?
-        .ok_or(Error::Refused)?;
-        let ctx = Context {
-            installation: row.try_get("installation")?,
-            user_id: row.try_get("actor")?,
-            binding_id: row.try_get("binding")?,
-            principal: row.try_get("principal")?,
-            generation: row.try_get("generation")?,
-        };
-        let envelope = Envelope {
-            key_id: row.try_get("key_id")?,
-            nonce: row
-                .try_get::<&[u8], _>("nonce")?
-                .try_into()
-                .map_err(|_| Error::Protection)?,
-            ciphertext: row.try_get("ciphertext")?,
-        };
-        let authorization = keys
-            .open(&ctx, &envelope)
-            .map_err(|_| Error::Protection)?
-            .authorization();
-        Ok(Dispatch {
-            id: row.try_get("request")?,
-            installation: self.call.installation.into(),
-            model: self.call.model.into(),
-            server: lease.is_some(),
-            authorization,
-        })
     }
 }
 
@@ -1069,105 +890,5 @@ pub(crate) async fn consume(
     Ok(consumed)
 }
 
-/// Coalesce a logical mutation under its immutable parameters. A conflict cannot
-/// replace the original operation ID. Read after INSERT in a fresh statement snapshot.
-pub struct Intent<'a> {
-    pub binding: &'a str,
-    pub revision: i64,
-    pub generation: i64,
-    pub action: &'a str,
-    pub expected_revision: i64,
-    pub parameters: &'a serde_json::Value,
-}
-pub async fn intent(pool: &PgPool, i: &Intent<'_>) -> Result<String, Error> {
-    let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
-    let current: Option<i64> = sqlx::query_scalar(
-        "SELECT desired_revision FROM openmettle.gateway_bindings WHERE id=$1::uuid FOR SHARE",
-    )
-    .bind(i.binding)
-    .fetch_optional(tx.connection()?)
-    .await?;
-    if current != Some(i.revision) {
-        return Err(Error::Conflict);
-    }
-    let params = i.parameters.to_string();
-    sqlx::query("INSERT INTO openmettle.gateway_intents (binding_id,desired_revision,generation,action,expected_revision,parameters)
-        VALUES ($1::uuid,$2,$3,$4,$5,$6::jsonb) ON CONFLICT DO NOTHING")
-        .bind(i.binding)
-        .bind(i.revision)
-        .bind(i.generation)
-        .bind(i.action)
-        .bind(i.expected_revision)
-        .bind(&params)
-        .execute(tx.connection()?)
-        .await?;
-    let id = sqlx::query_scalar("SELECT operation_id::text FROM openmettle.gateway_intents WHERE
-        binding_id=$1::uuid AND desired_revision=$2 AND generation=$3 AND action=$4 AND expected_revision=$5 AND parameters=$6::jsonb")
-        .bind(i.binding)
-        .bind(i.revision)
-        .bind(i.generation)
-        .bind(i.action)
-        .bind(i.expected_revision)
-        .bind(params)
-        .fetch_optional(tx.connection()?)
-        .await?
-        .ok_or(Error::Conflict)?;
-    tx.commit().await?;
-    Ok(id)
-}
-
-/// Publish a confirmed issue/rotation only for the live claim, revision and predecessor.
-/// A delayed observation belongs in the intent audit even if this guard refuses it.
-pub async fn publish_generation(
-    pool: &PgPool,
-    binding: &str,
-    operation: &str,
-    claim: &str,
-    previous: Option<i64>,
-) -> Result<bool, Error> {
-    let mut tx = WriteTransaction::begin_bounded_pool(pool, false).await?;
-    sqlx::query("SELECT id FROM openmettle.gateway_bindings WHERE id=$1::uuid FOR UPDATE")
-        .bind(binding)
-        .execute(tx.connection()?)
-        .await?;
-    let row = sqlx::query("SELECT generation,desired_revision FROM openmettle.gateway_intents WHERE binding_id=$1::uuid
-        AND operation_id=$2::uuid AND claim=$3::uuid AND due_at>clock_timestamp() AND NOT complete AND action IN ('issue','rotate') AND NOT (parameters ? 'signature') FOR UPDATE")
-        .bind(binding)
-        .bind(operation)
-        .bind(claim)
-        .fetch_optional(tx.connection()?)
-        .await?;
-    let Some(row) = row else { return Ok(false) };
-    let generation: i64 = row.try_get(0)?;
-    let changed = sqlx::query("UPDATE openmettle.gateway_bindings b SET state='ready',observed_revision=desired_revision,
-        active_generation=$2 WHERE id=$1::uuid AND desired_revision=$3 AND active_generation IS NOT DISTINCT FROM $4::bigint
-        AND $2>coalesce(active_generation,0) AND state IN ('provisioning','ready')
-        AND EXISTS (SELECT FROM openmettle.gateway_generations e JOIN openmettle.gateway_audit a
-                ON a.binding_id=e.binding_id AND a.remote_handle=e.remote_key
-                WHERE e.binding_id=b.id AND e.generation=$2 AND e.expires_at>clock_timestamp()
-                  AND a.operation_id=$5::uuid AND a.step='key' AND a.outcome='confirmed')")
-        .bind(binding)
-        .bind(generation)
-        .bind(row.try_get::<i64, _>(1)?)
-        .bind(previous)
-        .bind(operation)
-        .execute(tx.connection()?)
-        .await?
-        .rows_affected() == 1;
-    if changed {
-        sqlx::query(
-            "UPDATE openmettle.gateway_intents SET complete=true,claim=NULL WHERE operation_id=$1::uuid",
-        )
-        .bind(operation)
-        .execute(tx.connection()?)
-        .await?;
-    }
-    tx.commit().await?;
-    Ok(changed)
-}
-
-/// Fixed caller-facing classification shared by preflight and the pinned inference decoder.
-pub use crate::provider_http::gateway::problem;
 pub mod family;
-pub mod reconcile;
 pub mod settlement;

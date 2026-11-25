@@ -210,10 +210,7 @@ fn endpoints_are_canonical_https_dns_names_only() {
 /// tests, and it cannot reach the gateway route's parser, which is private to `provider_http`.
 #[test]
 fn only_the_metered_gateway_route_accepts_plain_http() {
-    use crate::provider_http::{
-        gateway::Admin,
-        inference::{Gateway, Protocol, Qualification, Timeouts},
-    };
+    use crate::provider_http::inference::{Gateway, Protocol, Qualification, Timeouts};
     let ca = Ca::new();
     let pem = ca.pem();
     let plain = "http://gateway.example.test:8082/v1/chat/completions";
@@ -246,25 +243,6 @@ fn only_the_metered_gateway_route_accepts_plain_http() {
     let document = "http://provider.example.test/.well-known/openid-configuration";
     assert!(ProviderDocuments::configured(&token, document, &fixture::url(8443)).is_err());
     assert!(ProviderDocuments::configured(&token, &fixture::url(8443), document).is_err());
-    let admin = || crate::provider_keys::gateway::Bearer::new(b"synthetic-admin").unwrap();
-    assert!(
-        Admin::new(
-            "http://gateway.example.test/",
-            Trust::Bundle(&pem),
-            &[],
-            admin()
-        )
-        .is_err()
-    );
-    assert!(
-        Admin::new(
-            "https://gateway.example.test/",
-            Trust::Bundle(&pem),
-            &[],
-            admin()
-        )
-        .is_ok()
-    );
     assert!(Gateway::new(plain, Trust::Bundle(&pem), &[], qualification(), timeouts).is_err());
     assert!(Gateway::new(secure, Trust::Bundle(&pem), &[], qualification(), timeouts).is_ok());
 
@@ -1221,11 +1199,11 @@ async fn plain_http_turn_dispatch_sends_its_bearer_and_request_id_without_tls() 
 }
 
 #[tokio::test]
-async fn billable_dispatch_follows_mode_and_requires_output_cap() {
+async fn turn_dispatch_requires_output_cap_and_sends_once() {
     use crate::{
         model_config::{Catalog, Selection},
         provider_http::{
-            BillableDispatch, BillableInferenceRef,
+            BillableInferenceRef, TurnDispatch,
             inference::{Gateway, History, Protocol, Qualification, Request, RunStop, Timeouts},
         },
         worker::ActiveRun,
@@ -1323,21 +1301,17 @@ async fn billable_dispatch_follows_mode_and_requires_output_cap() {
         stream: false,
     };
 
-    // Missing output_reserve fails BillableInferenceRef::prepare for BOTH caller and server modes.
-    assert_eq!(
-        billable.prepare(&catalog, &missing_cap, &req, false).err(),
-        Some(crate::provider_http::inference::Error::Validation)
-    );
+    // Missing output_reserve fails BillableInferenceRef::prepare.
     assert_eq!(
         billable.prepare(&catalog, &missing_cap, &req, true).err(),
         Some(crate::provider_http::inference::Error::Validation)
     );
 
-    let mk_dispatch = |server_flag: bool| Dispatch {
+    let dispatch = Dispatch {
         id: expected_id.to_owned(),
         installation: "00000000-0000-4000-8000-000000002102".to_owned(),
         model: valid_eff.model.clone(),
-        server: server_flag,
+        server: true,
         authorization: HeaderValue::from_str(&format!("Bearer {expected_bearer}")).unwrap(),
     };
     let (_tx, stop_rx) = watch::channel(None);
@@ -1355,26 +1329,15 @@ async fn billable_dispatch_follows_mode_and_requires_output_cap() {
         execution_deadline: tokio::time::Instant::now() + Duration::from_secs(10),
     };
 
-    // The validated request mode selects the variant, so each committed dispatch exposes only
-    // its matching send and each transmits once with x-request-id.
-    let BillableDispatch::Caller(caller) = BillableDispatch::new(
-        mk_dispatch(false),
-        billable.prepare(&catalog, &valid_eff, &req, false).unwrap(),
-    ) else {
-        panic!("a caller-mode request must yield BillableDispatch::Caller");
-    };
-    let caller_turn = caller.send(|_| async {}).await.unwrap();
-    assert_eq!(caller_turn.answers[0].parts, ["billable ok"]);
-    let BillableDispatch::Server(leased) = BillableDispatch::new(
-        mk_dispatch(true),
+    // A committed server-mode dispatch transmits once with x-request-id and bearer.
+    let leased = TurnDispatch::new(
+        dispatch,
         billable.prepare(&catalog, &valid_eff, &req, true).unwrap(),
-    ) else {
-        panic!("a server-mode request must yield BillableDispatch::Server");
-    };
+    );
     let server_turn = leased
         .send(RunStop::from_worker(&run, stop_rx), |_| async {})
         .await
         .unwrap();
     assert_eq!(server_turn.answers[0].parts, ["billable ok"]);
-    assert_eq!(server.requests.load(Ordering::SeqCst), 2);
+    assert_eq!(server.requests.load(Ordering::SeqCst), 1);
 }

@@ -378,17 +378,14 @@ fn dispatch_credential(
 async fn transmit<F: Future<Output = ()>>(
     dispatch: Dispatch,
     prepared: inference::PreparedRequest<'_>,
-    run: Option<inference::RunStop>,
+    run: inference::RunStop,
     visible: impl FnMut(inference::VisibleDelta) -> F,
 ) -> Result<inference::Turn, inference::Error> {
     let gateway = prepared.gateway();
     let (id, cred) = dispatch_credential(&dispatch)?;
     transport::BILLABLE_REQUEST
         .scope(std::cell::Cell::new(Some(id)), async {
-            match run {
-                Some(run) => gateway.server_prepared(prepared, cred, run, visible).await,
-                None => gateway.caller_prepared(prepared, cred, visible).await,
-            }
+            gateway.server_prepared(prepared, cred, run, visible).await
         })
         .await
 }
@@ -413,45 +410,7 @@ impl<'a> TurnDispatch<'a> {
         run: inference::RunStop,
         visible: impl FnMut(inference::VisibleDelta) -> F,
     ) -> Result<inference::Turn, inference::Error> {
-        transmit(self.dispatch, self.prepared, Some(run), visible).await
-    }
-}
-
-/// Single-use committed caller-session handoff bound to its originating inference route and
-/// prepared wire payload. Consumed by [`Self::send`].
-pub struct CallerDispatch<'a> {
-    dispatch: Dispatch,
-    prepared: inference::PreparedRequest<'a>,
-}
-
-impl CallerDispatch<'_> {
-    /// Transmit the committed caller-session request through its originating
-    /// [`inference::Gateway`] with the single-use credential and `x-request-id` header.
-    pub async fn send<F: Future<Output = ()>>(
-        self,
-        visible: impl FnMut(inference::VisibleDelta) -> F,
-    ) -> Result<inference::Turn, inference::Error> {
-        transmit(self.dispatch, self.prepared, None, visible).await
-    }
-}
-
-/// Single-use committed billable handoff returned by [`crate::authz::gateway::Pending::handoff`],
-/// bound to its originating inference route and the prepared wire payload whose token, output and
-/// cost bounds were checked against the funded reservation. The variant follows the validated
-/// request mode, so a committed handoff exposes only the matching send operation.
-pub enum BillableDispatch<'a> {
-    Caller(CallerDispatch<'a>),
-    Server(TurnDispatch<'a>),
-}
-
-impl<'a> BillableDispatch<'a> {
-    /// Wrap a dispatch whose mode `validate_dispatch` already matched to `prepared`.
-    pub(crate) fn new(dispatch: Dispatch, prepared: inference::PreparedRequest<'a>) -> Self {
-        if prepared.is_server() {
-            Self::Server(TurnDispatch::new(dispatch, prepared))
-        } else {
-            Self::Caller(CallerDispatch { dispatch, prepared })
-        }
+        transmit(self.dispatch, self.prepared, run, visible).await
     }
 }
 

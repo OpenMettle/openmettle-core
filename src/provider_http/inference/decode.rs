@@ -4,15 +4,20 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use tokio::time::timeout;
 
-fn status(code: u16, headers: &HeaderMap, qualified: bool) -> Error {
-    let problem = GatewayProblem::from_inference(code, headers, qualified);
-    if qualified {
-        return Error::Gateway(problem);
+fn retry_delay(headers: &HeaderMap) -> Option<u32> {
+    let mut values = headers.get_all(header::RETRY_AFTER).iter();
+    let s = values.next()?.to_str().ok()?;
+    if values.next().is_some() || s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
-    match problem {
-        GatewayProblem::RateLimited(delay) => Error::RateLimited(delay),
-        GatewayProblem::Unavailable => Error::Unavailable,
-        GatewayProblem::Timeout => Error::Timeout,
+    s.parse().ok().filter(|n| *n <= 86400)
+}
+
+fn status(code: u16, headers: &HeaderMap) -> Error {
+    match code {
+        429 => Error::RateLimited(retry_delay(headers)),
+        503 => Error::Unavailable,
+        504 => Error::Timeout,
         _ => Error::Provider,
     }
 }
@@ -91,11 +96,7 @@ pub(super) async fn receive<F: Future<Output = ()>>(
     let idle = gateway.timeouts.idle;
     let (head, mut body) = response.into_parts();
     if !head.status.is_success() {
-        return Err(status(
-            head.status.as_u16(),
-            &head.headers,
-            gateway.family_policy_v1,
-        ));
+        return Err(status(head.status.as_u16(), &head.headers));
     }
     if head.status != hyper::StatusCode::OK {
         return Err(Error::Malformed);
