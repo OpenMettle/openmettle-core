@@ -309,11 +309,165 @@ pub(crate) async fn transact<T>(
     }
 }
 
-/// The actor re-hydrated from the primary inside the write transaction; it must be active.
-pub(crate) async fn acting(
+/// Lock the actor's login provider and local identity approval `FOR SHARE` in canonical order
+/// (`login_providers -> local_identity_approvals`) so concurrent provider retirement
+/// (`docs/operator/restore-login-provider.psql`) and approval withdrawal
+/// (`docs/operator/identity-approval-change.psql`) serialize with writes.
+pub(crate) async fn lock_actor_approval(
+    c: &mut PgConnection,
+    approval_id: &str,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "SELECT FROM openmettle.login_providers
+          WHERE id = (SELECT provider_id FROM openmettle.local_identity_approvals
+                       WHERE id = $1::uuid)
+            FOR SHARE",
+    )
+    .bind(approval_id)
+    .execute(&mut *c)
+    .await?;
+    sqlx::query(
+        "SELECT FROM openmettle.local_identity_approvals
+          WHERE id = $1::uuid
+            FOR SHARE",
+    )
+    .bind(approval_id)
+    .execute(c)
+    .await?;
+    Ok(())
+}
+
+/// Row-lock strength on `openmettle.users`, ordered weakest to strongest so locking the same user
+/// twice in one canonical acquisition takes the stronger mode once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum UserLock {
+    Share,
+    NoKeyUpdate,
+    Update,
+}
+
+async fn lock_one_user(
+    c: &mut PgConnection,
+    user_id: &str,
+    mode: UserLock,
+) -> Result<(), StoreError> {
+    let sql = match mode {
+        UserLock::Share => "SELECT FROM openmettle.users WHERE id = $1::uuid FOR SHARE",
+        UserLock::NoKeyUpdate => {
+            "SELECT FROM openmettle.users WHERE id = $1::uuid FOR NO KEY UPDATE"
+        }
+        UserLock::Update => "SELECT FROM openmettle.users WHERE id = $1::uuid FOR UPDATE",
+    };
+    sqlx::query(sql).bind(user_id).execute(c).await?;
+    Ok(())
+}
+
+/// Lock one or two `users` rows in ascending UUID order (`ORDER BY id`) so concurrent multi-user
+/// writes (disable/enable, personal-scope overrides, shared personal branch writes, member
+/// grants) never form a 2-way or lock-queue-fairness 3-way wait cycle on `openmettle.users`.
+/// When both entries refer to the same user, locks that row once at the stronger mode.
+pub(crate) async fn lock_users_ordered(
+    c: &mut PgConnection,
+    first: (&str, UserLock),
+    second: Option<(&str, UserLock)>,
+) -> Result<(), StoreError> {
+    let Some(second) = second else {
+        return lock_one_user(c, first.0, first.1).await;
+    };
+    match first
+        .0
+        .to_ascii_lowercase()
+        .cmp(&second.0.to_ascii_lowercase())
+    {
+        std::cmp::Ordering::Equal => lock_one_user(c, first.0, first.1.max(second.1)).await,
+        std::cmp::Ordering::Less => {
+            lock_one_user(c, first.0, first.1).await?;
+            lock_one_user(c, second.0, second.1).await
+        }
+        std::cmp::Ordering::Greater => {
+            lock_one_user(c, second.0, second.1).await?;
+            lock_one_user(c, first.0, first.1).await
+        }
+    }
+}
+
+/// Lock the actor's authority rows in canonical order
+/// (`login_providers -> local_identity_approvals -> users` in ascending `id` order).
+/// `sessions::disable_user` locks only the user row: hold the actor's row so a disable in flight
+/// is waited for and seen, and a later one waits for this commit. When a write also locks a
+/// second user row, pass it as `target_user` so both rows are locked in ascending UUID order.
+pub(crate) async fn lock_actor_authority_with(
     c: &mut PgConnection,
     ctx: &AuditContext<'_>,
-) -> Result<Principal, StoreError> {
+    actor_mode: UserLock,
+    target_user: Option<(&str, UserLock)>,
+) -> Result<(), StoreError> {
+    lock_actor_approval(c, ctx.actor_approval_id).await?;
+    lock_users_ordered(c, (ctx.actor_user_id, actor_mode), target_user).await
+}
+
+/// Lock the actor's provider, approval and user rows `FOR SHARE`.
+pub(crate) async fn lock_actor_authority(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'_>,
+) -> Result<(), StoreError> {
+    lock_actor_authority_with(c, ctx, UserLock::Share, None).await
+}
+
+/// Advance `caller_now_ms` monotonically to at least the primary's post-lock `clock_timestamp()`
+/// so approvals that expire while waiting on locks are rejected on hydration, while keeping
+/// synthetic future test clocks monotonic.
+pub(crate) async fn post_lock_clock_ms(
+    c: &mut PgConnection,
+    caller_now_ms: i64,
+) -> Result<i64, StoreError> {
+    let post_lock_ms: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(c)
+            .await?;
+    Ok(caller_now_ms.max(post_lock_ms))
+}
+
+/// Re-read the primary clock after lock waits and re-hydrate the actor from the primary; it must
+/// be active at the post-lock instant.
+pub(crate) async fn post_lock_acting<'a>(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'a>,
+) -> Result<(Principal, AuditContext<'a>), StoreError> {
+    let post_lock_ctx = AuditContext {
+        now_ms: post_lock_clock_ms(c, ctx.now_ms).await?,
+        ..*ctx
+    };
+    let actor = acting(c, &post_lock_ctx).await?;
+    Ok((actor, post_lock_ctx))
+}
+
+/// Re-check approval expiry against post-lock `clock_timestamp()` after a target or ledger lock
+/// wait. All authority rows are already held, so only wall-clock expiry can change while waiting.
+pub(crate) async fn ensure_approval_unexpired(
+    c: &mut PgConnection,
+    ctx: &AuditContext<'_>,
+) -> Result<(), StoreError> {
+    let now_ms = post_lock_clock_ms(c, ctx.now_ms).await?;
+    let active: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT FROM openmettle.local_identity_approvals
+              WHERE id = $1::uuid AND active AND expires_ms > $2
+         )",
+    )
+    .bind(ctx.actor_approval_id)
+    .bind(now_ms)
+    .fetch_one(c)
+    .await?;
+    if active {
+        Ok(())
+    } else {
+        Err(StoreError::Denied(DenialReason::InactivePrincipal))
+    }
+}
+
+/// The actor re-hydrated from the primary inside the write transaction; it must be active.
+async fn acting(c: &mut PgConnection, ctx: &AuditContext<'_>) -> Result<Principal, StoreError> {
     let actor =
         hydrate_api_principal(c, ctx.actor_user_id, ctx.actor_approval_id, ctx.now_ms).await?;
     super::require(actor.as_ref())
@@ -381,93 +535,41 @@ pub(super) async fn record(
     }
 }
 
-/// The administration write protocol, in one transaction:
-/// 1. account administration, user lifecycle, local-group and family-policy writes lock
-///    `account_admin_lock FOR UPDATE` before anything else;
-/// 2. the actor's provider and approval rows are locked `FOR SHARE`, then the actor's user row is
-///    locked `FOR SHARE` (`FOR UPDATE` when a user disable or enable targets the actor), then the
-///    actor is re-hydrated from the primary and must be an active `account_admin`;
+/// The administration write protocol, in one transaction (ADR 0027 canonical lock order):
+/// 1. every administrative write locks `account_admin_lock FOR UPDATE` before anything else;
+/// 2. the actor's provider and approval rows are locked `FOR SHARE` in order
+///    (`login_providers -> local_identity_approvals`), then the actor's user row (and any target
+///    user row, in ascending UUID order) is locked, then the primary clock is re-read and the
+///    actor is re-hydrated and must be an active `account_admin`;
 /// 3. the audit row is inserted first, so a reused request key is detected before any change;
-/// 4. `apply` checks the target and changes current state, or the whole transaction rolls back.
+/// 4. `apply` checks the target and changes current state, then approval expiry is re-checked
+///    after any target lock wait, or the whole transaction rolls back.
 async fn write(
     c: &mut PgConnection,
     ctx: &AuditContext<'_>,
     action: Action,
+    target_user: Option<(&str, UserLock)>,
     change: Change,
     apply: impl AsyncFnOnce(&mut PgConnection, &Principal, &str) -> Result<(), StoreError>,
 ) -> Result<WriteOutcome, StoreError> {
-    let self_lifecycle =
-        action == Action::ManageAccounts && change.target_id.as_deref() == Some(ctx.actor_user_id);
-    write_with(
-        c,
-        ctx,
-        action,
-        self_lifecycle,
-        async |_, _| Ok(change),
-        apply,
-    )
-    .await
+    write_with(c, ctx, action, target_user, async |_, _| Ok(change), apply).await
 }
 
 async fn write_with(
     c: &mut PgConnection,
     ctx: &AuditContext<'_>,
     action: Action,
-    self_lifecycle: bool,
+    target_user: Option<(&str, UserLock)>,
     build_change: impl AsyncFnOnce(&mut PgConnection, &Principal) -> Result<Change, StoreError>,
     apply: impl AsyncFnOnce(&mut PgConnection, &Principal, &str) -> Result<(), StoreError>,
 ) -> Result<WriteOutcome, StoreError> {
     transact(c, ctx, async move |tx| {
         let c = tx.connection()?;
-        if matches!(
-            action,
-            Action::ManageAccountAdmin
-                | Action::ManageAccounts
-                | Action::ManageLocalGroups
-                | Action::ManageUserCapabilityDenies
-                | Action::ManageFamilyPolicies
-        ) {
-            sqlx::query("SELECT id FROM openmettle.account_admin_lock WHERE id FOR UPDATE")
-                .fetch_one(&mut *c)
-                .await?;
-        }
-        // Hold the actor's provider and approval FOR SHARE before locking users so concurrent
-        // approval withdrawals (docs/operator/identity-approval-change.psql) serialize cleanly.
-        sqlx::query(
-            "SELECT FROM openmettle.login_providers p
-               JOIN openmettle.local_identity_approvals a ON a.provider_id = p.id
-              WHERE a.id = $1::uuid
-                FOR SHARE OF p, a",
-        )
-        .bind(ctx.actor_approval_id)
-        .execute(&mut *c)
-        .await?;
-        // sessions::disable_user locks only the user row: hold the actor's row so a disable in
-        // flight is waited for and seen, and a later one waits for this commit. User disable and
-        // enable lock their target FOR UPDATE: on their own actor they take it here, never
-        // upgrading from FOR SHARE while another write by the actor waits on their audit key.
-        let sql = if self_lifecycle {
-            "SELECT FROM openmettle.users WHERE id = $1::uuid FOR UPDATE"
-        } else {
-            "SELECT FROM openmettle.users WHERE id = $1::uuid FOR SHARE"
-        };
-        sqlx::query(sql)
-            .bind(ctx.actor_user_id)
-            .execute(&mut *c)
+        sqlx::query("SELECT id FROM openmettle.account_admin_lock WHERE id FOR UPDATE")
+            .fetch_one(&mut *c)
             .await?;
-        // Advance `now_ms` monotonically to at least the primary's post-lock `clock_timestamp()`
-        // so approvals that expire while waiting on locks are rejected on hydration, while keeping
-        // synthetic future test clocks monotonic.
-        let post_lock_ms: i64 = sqlx::query_scalar(
-            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
-        )
-        .fetch_one(&mut *c)
-        .await?;
-        let post_lock_ctx = AuditContext {
-            now_ms: ctx.now_ms.max(post_lock_ms),
-            ..*ctx
-        };
-        let actor = acting(c, &post_lock_ctx).await?;
+        lock_actor_authority_with(c, ctx, UserLock::Share, target_user).await?;
+        let (actor, post_lock_ctx) = post_lock_acting(c, ctx).await?;
         check(super::authorize_admin(
             &actor,
             AdminChange {
@@ -480,6 +582,7 @@ async fn write_with(
         let outcome = record(c, &post_lock_ctx, &change).await?;
         if let WriteOutcome::Applied { target_id } = &outcome {
             apply(c, &actor, target_id).await?;
+            ensure_approval_unexpired(c, &post_lock_ctx).await?;
         }
         Ok(outcome)
     })
@@ -567,6 +670,7 @@ pub async fn grant_account_admin(
         c,
         ctx,
         Action::ManageAccountAdmin,
+        Some((user_id, UserLock::Share)),
         change,
         async |c, _, user| {
             if !lock_user(c, user, false).await? {
@@ -603,6 +707,7 @@ pub async fn revoke_account_admin(
         c,
         ctx,
         Action::ManageAccountAdmin,
+        Some((user_id, UserLock::Share)),
         change,
         async |c, actor, user| {
             let enabled = lock_user(c, user, false).await?;
@@ -640,6 +745,7 @@ pub async fn disable_user(
         c,
         ctx,
         Action::ManageAccounts,
+        Some((user_id, UserLock::Update)),
         change,
         async |c, actor, user| {
             if !lock_user(c, user, true).await? {
@@ -675,6 +781,7 @@ pub async fn enable_user(
         c,
         ctx,
         Action::ManageAccounts,
+        Some((user_id, UserLock::Update)),
         change,
         async |c, _, user| {
             if lock_user(c, user, true).await? {
@@ -746,6 +853,7 @@ pub async fn create_local_group(
         c,
         ctx,
         Action::ManageLocalGroups,
+        None,
         change,
         async |c, _, group| {
             sqlx::query(
@@ -780,6 +888,7 @@ pub async fn rename_local_group(
         c,
         ctx,
         Action::ManageLocalGroups,
+        None,
         change,
         async |c, _, group| {
             if lock_group(c, group, true).await?.0 == name {
@@ -820,6 +929,7 @@ async fn set_group_enabled(
         c,
         ctx,
         Action::ManageLocalGroups,
+        None,
         change,
         async |c, _, group| {
             if lock_group(c, group, true).await?.1 == enabled {
@@ -877,6 +987,7 @@ pub async fn add_local_group_member(
         c,
         ctx,
         Action::ManageLocalGroups,
+        Some((user_id, UserLock::Share)),
         change,
         async |c, _, group| {
             if !lock_group(c, group, false).await?.1 {
@@ -924,6 +1035,7 @@ pub async fn remove_local_group_member(
         c,
         ctx,
         Action::ManageLocalGroups,
+        None,
         change,
         async |c, _, group| {
             lock_group(c, group, false).await?;
@@ -1016,6 +1128,7 @@ async fn set_flag(
         c,
         ctx,
         Action::ManageUserCapabilityDenies,
+        user_id.map(|id| (id, UserLock::Share)),
         change,
         async |c, _, _| {
             if let Some(user) = user_id {
@@ -1101,11 +1214,15 @@ async fn write_family_policy(
     apply: impl AsyncFnOnce(&mut PgConnection, &str) -> Result<(), StoreError>,
 ) -> Result<WriteOutcome, StoreError> {
     grantee.validate()?;
+    let target_user = match grantee {
+        super::gateway::family::FamilyGrantee::User(id) => Some((id.as_str(), UserLock::Share)),
+        _ => None,
+    };
     write_with(
         c,
         ctx,
         Action::ManageFamilyPolicies,
-        false,
+        target_user,
         async |c, _| {
             let existing = super::gateway::family::existing_policy_id(c, grantee).await?;
             Ok(Change {

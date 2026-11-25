@@ -21,18 +21,20 @@ pub struct Conversation<'a> {
     pub id: &'a str,
 }
 
-async fn write_access(
+async fn write_access<'a>(
     c: &mut PgConnection,
-    ctx: &AuditContext<'_>,
+    ctx: &AuditContext<'a>,
     chat: Conversation<'_>,
     action: Action,
-) -> Result<(Principal, bool), StoreError> {
+) -> Result<(Principal, bool, AuditContext<'a>), StoreError> {
     store::uuid(chat.scope, "scope_id")?;
-    let (_, project) = runs::lock_scope_actor(c, chat.scope, ctx.actor_user_id).await?;
-    let actor = store::acting(c, ctx).await?;
-    let resource = projects::hydrate_resource(c, ResourceKind::Conversation, chat.id, ctx.now_ms)
-        .await?
-        .ok_or(HIDDEN)?;
+    let (_, project) =
+        runs::lock_scope_actor(c, chat.scope, ctx.actor_user_id, ctx.actor_approval_id).await?;
+    let (actor, post_lock_ctx) = store::post_lock_acting(c, ctx).await?;
+    let resource =
+        projects::hydrate_resource(c, ResourceKind::Conversation, chat.id, post_lock_ctx.now_ms)
+            .await?
+            .ok_or(HIDDEN)?;
     let in_scope = match &resource.scope {
         Scope::Personal { scope_id, .. } => scope_id == chat.scope,
         Scope::Project(p) => project.as_ref() == Some(&p.id),
@@ -52,7 +54,7 @@ async fn write_access(
         false
     };
     store::check(authorize_resource(&actor, &resource, action))?;
-    Ok((actor, archived))
+    Ok((actor, archived, post_lock_ctx))
 }
 
 async fn insert_branch(
@@ -107,16 +109,47 @@ pub async fn create_conversation(
     store::uuid(scope, "scope_id")?;
     store::transact(c, &ctx, async |tx| {
         let c = tx.connection()?;
-        runs::lock_scope_actor(c, scope, ctx.actor_user_id).await?;
-        let actor = store::acting(c, &ctx).await?;
-        let archived = projects::authorized_create_scope_is_archived(c, &actor, scope, ctx.now_ms).await?;
+        let (personal_owner, project_id): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT personal_user_id::text, project_id::text FROM openmettle.scopes
+              WHERE id = $1::uuid",
+        )
+        .bind(scope)
+        .fetch_optional(&mut *c)
+        .await?
+        .unwrap_or_default();
+        if let Some(project) = &project_id {
+            sqlx::query("SELECT FROM openmettle.projects WHERE id = $1::uuid FOR NO KEY UPDATE")
+                .bind(project)
+                .execute(&mut *c)
+                .await?;
+        }
+        store::lock_actor_approval(c, ctx.actor_approval_id).await?;
+        if personal_owner.as_deref() == Some(ctx.actor_user_id) || project_id.is_some() {
+            sqlx::query("SELECT FROM openmettle.users WHERE id = $1::uuid FOR NO KEY UPDATE")
+                .bind(ctx.actor_user_id)
+                .execute(&mut *c)
+                .await?;
+        } else {
+            sqlx::query("SELECT FROM openmettle.users WHERE id = $1::uuid FOR SHARE")
+                .bind(ctx.actor_user_id)
+                .execute(&mut *c)
+                .await?;
+        }
+        let (actor, post_lock_ctx) = store::post_lock_acting(c, &ctx).await?;
+        let archived = projects::authorized_create_scope_is_archived(
+            c,
+            &actor,
+            scope,
+            post_lock_ctx.now_ms,
+        )
+        .await?;
         let change = Change {
             action: "conversation.create",
             target_kind: "conversation",
             target_id: None,
             details: json!({"scope_id": scope, "request_digest": projects::hex(&digest(scope.as_bytes()))}),
         };
-        let outcome = store::record(c, &ctx, &change).await?;
+        let outcome = store::record(c, &post_lock_ctx, &change).await?;
         let id = outcome.target_id();
         let branch_id = if matches!(outcome, WriteOutcome::Applied { .. }) {
             if archived { return Err(projects::ARCHIVED); }
@@ -204,18 +237,19 @@ pub async fn create_branch(
     );
     store::transact(c, &ctx, async |tx| {
         let c = tx.connection()?;
-        let (_, archived) = write_access(c, &ctx, chat, Action::Write).await?;
+        let (_, archived, post_lock_ctx) = write_access(c, &ctx, chat, Action::Write).await?;
         let change = Change {
             action: "branch.create",
             target_kind: "branch",
             target_id: None,
             details: json!({"conversation_id": chat.id, "request_digest": projects::hex(&digest(&normalized))}),
         };
-        let result = store::record(c, &ctx, &change).await?;
+        let result = store::record(c, &post_lock_ctx, &change).await?;
         if matches!(result, WriteOutcome::Applied { .. }) {
             if archived { return Err(projects::ARCHIVED); }
             if let Some(source) = source {
                 let head = lock_head(c, chat, source.branch).await?;
+                store::ensure_approval_unexpired(c, &post_lock_ctx).await?;
                 ancestor(c, chat, head.as_deref(), source.ancestor).await?;
             }
             insert_branch(c, chat, Some(result.target_id()), branch, fork).await?;
@@ -402,11 +436,12 @@ pub async fn prepare_turn(
         store::uuid(id, "expected_head_message_id")?;
     }
     let c = tx.connection()?;
-    let (actor, archived) = write_access(c, ctx, chat, Action::RunExecute).await?;
+    let (actor, archived, post_lock_ctx) = write_access(c, ctx, chat, Action::RunExecute).await?;
     if archived {
         return Err(projects::ARCHIVED);
     }
     let head = lock_head(c, chat, branch).await?;
+    store::ensure_approval_unexpired(c, &post_lock_ctx).await?;
     if head.as_deref() != expected_head {
         return Err(StoreError::Conflict(HEAD_MISMATCH));
     }
@@ -444,7 +479,7 @@ pub async fn prepare_turn(
                 openmettle.message_parts WHERE message_id=$1::uuid AND kind='attachment' ORDER BY ordinal")
                 .bind(&id).fetch_all(&mut *c).await?;
             for revision in revisions {
-                readable_revision(c, &actor, chat.scope, &revision, ctx.now_ms).await?;
+                readable_revision(c, &actor, chat.scope, &revision, post_lock_ctx.now_ms).await?;
             }
             return Ok(RunTarget {
                 branch_id: insert_branch(c, chat, None, Some(branch), Some(&id)).await?,
@@ -455,7 +490,7 @@ pub async fn prepare_turn(
     validate_parts(input.parts, true)?;
     for p in input.parts {
         if let Part::Attachment(id) = p {
-            readable_revision(c, &actor, chat.scope, id, ctx.now_ms).await?;
+            readable_revision(c, &actor, chat.scope, id, post_lock_ctx.now_ms).await?;
         }
     }
     insert_message(c, chat, input.id, parent.as_deref()).await?;
@@ -478,6 +513,7 @@ pub async fn prepare_turn(
         input.parts,
     )
     .await?;
+    store::ensure_approval_unexpired(c, &post_lock_ctx).await?;
     Ok(RunTarget {
         branch_id: destination,
         input_message_id: input.id.to_owned(),

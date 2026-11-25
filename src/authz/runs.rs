@@ -990,13 +990,14 @@ const LIVE_COUNTS: &str = concat!(
     " AND state = 'queued' LIMIT $5) q)"
 );
 
-const LOCK_USER: &str = "SELECT FROM openmettle.users WHERE id = $1::uuid FOR NO KEY UPDATE";
-
-/// Scope and actor locks shared with graph writers. Acquire these before a run or branch head.
+/// Scope and actor locks shared with graph writers in canonical order:
+/// `[projects] -> login_providers -> local_identity_approvals -> users` (ascending `id`).
+/// Acquire these before a run or branch head.
 pub(crate) async fn lock_scope_actor(
     c: &mut PgConnection,
     scope: &str,
     actor: &str,
+    approval: &str,
 ) -> Result<(Option<String>, Option<String>), StoreError> {
     let (personal_owner, project_id): (Option<String>, Option<String>) = sqlx::query_as(
         "SELECT personal_user_id::text, project_id::text FROM openmettle.scopes
@@ -1006,16 +1007,32 @@ pub(crate) async fn lock_scope_actor(
     .fetch_optional(&mut *c)
     .await?
     .unwrap_or_default();
-    // Steps 1 and 2: the scope row, then the actor's row. In a personal scope the owner is the
-    // only actor `RunExecute` admits, so the first lock covers both.
-    if let Some(owner) = &personal_owner {
-        sqlx::query(LOCK_USER).bind(owner).execute(&mut *c).await?;
-    } else if let Some(project) = &project_id {
+    if let Some(project) = &project_id {
         sqlx::query("SELECT FROM openmettle.projects WHERE id = $1::uuid FOR NO KEY UPDATE")
             .bind(project)
             .execute(&mut *c)
             .await?;
-        sqlx::query(LOCK_USER).bind(actor).execute(&mut *c).await?;
+    }
+    store::lock_actor_approval(c, approval).await?;
+    // Lock `users` in canonical ascending UUID order (`ORDER BY id`) so personal scope writes by a
+    // collaborator (`branches::create_branch`) serialize with both owner unshares and collaborator
+    // disablement without forming a two-user wait cycle. When `owner == actor` the row is locked
+    // once `FOR NO KEY UPDATE`.
+    match (&personal_owner, &project_id) {
+        (Some(owner), _) => {
+            store::lock_users_ordered(
+                c,
+                (owner, store::UserLock::NoKeyUpdate),
+                Some((actor, store::UserLock::Share)),
+            )
+            .await?;
+        }
+        (_, Some(_)) => {
+            store::lock_users_ordered(c, (actor, store::UserLock::NoKeyUpdate), None).await?;
+        }
+        (None, None) => {
+            store::lock_users_ordered(c, (actor, store::UserLock::Share), None).await?;
+        }
     }
     Ok((personal_owner, project_id))
 }
@@ -1074,7 +1091,8 @@ async fn admit(
     if isolation != "read committed" {
         return Err(StoreError::InvalidInput("transaction isolation"));
     }
-    let (personal_owner, project_id) = lock_scope_actor(c, r.scope, r.actor).await?;
+    let (personal_owner, project_id) =
+        lock_scope_actor(c, r.scope, r.actor, request.actor_approval_id).await?;
     let scope_kind = if personal_owner.is_some() {
         "personal"
     } else {

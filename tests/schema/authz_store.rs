@@ -962,26 +962,6 @@ async fn account_admin_lock_serializes_removal_of_the_last_two_admins() {
     }
 }
 
-async fn backend_pid(c: &mut PgConnection) -> i32 {
-    sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(c)
-        .await
-        .unwrap()
-}
-
-/// The one session waiting on a lock that `holder` holds.
-async fn waiter_on(db: &TestDb, holder: i32) -> i32 {
-    wait_for_blocked_peer(db, holder).await;
-    sqlx::query_scalar(
-        "SELECT pid FROM pg_stat_activity
-          WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid))",
-    )
-    .bind(holder)
-    .fetch_one(&mut db.admin().await)
-    .await
-    .unwrap()
-}
-
 async fn reenable(owner: &mut PgConnection, account: &Account) {
     sqlx::query("UPDATE openmettle.users SET disabled_at = NULL WHERE id = $1::uuid")
         .bind(&account.user)
@@ -1278,4 +1258,501 @@ async fn a_self_disable_and_a_same_key_write_by_the_same_actor_do_not_deadlock()
         })
         .count();
     assert_eq!((applied, refused), (1, 1), "{results:?}");
+}
+
+/// Issue #160 gap 1: local-group and capability administrative writes acquire
+/// `account_admin_lock FOR UPDATE`, so they serialize in both directions with a concurrent
+/// demotion of the acting administrator.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn local_group_and_capability_writes_serialize_with_concurrent_demotion() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let boss = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let member = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &admin).await;
+    make_admin(&mut owner, &boss).await;
+    let group = applied(
+        store::create_local_group(&mut connect(&db.0, API).await, &ctx(&admin, "g0"), "Before")
+            .await,
+    );
+
+    // 1. Demotion in flight (holding account_admin_lock FOR UPDATE) blocks every local-group and
+    //    capability write; once the demotion commits, every write is refused with NotAccountAdmin.
+    for write in [
+        "local_group.create",
+        "local_group.rename",
+        "capability.platform_deny",
+        "capability.user_deny",
+        "capability.user_grant",
+    ] {
+        let audited = audit(&db).await.len();
+        let mut demoter = connect(&db.0, OWNER).await;
+        let demoter_pid = backend_pid(&mut demoter).await;
+        let mut tx = WriteTransaction::begin(&mut demoter).await.unwrap();
+        sqlx::query("SELECT id FROM openmettle.account_admin_lock WHERE id FOR UPDATE")
+            .execute(tx.connection().unwrap())
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.account_admins
+                SET active = false, revision = revision + 1, updated_at = clock_timestamp()
+              WHERE user_id = $1::uuid",
+        )
+        .bind(&admin.user)
+        .execute(tx.connection().unwrap())
+        .await
+        .unwrap();
+
+        let writer = tokio::spawn({
+            let (name, admin, member, group) =
+                (db.0.clone(), admin.clone(), member.clone(), group.clone());
+            async move {
+                let mut c = connect(&name, API).await;
+                let audit_ctx = ctx(&admin, write);
+                match write {
+                    "local_group.create" => {
+                        store::create_local_group(&mut c, &audit_ctx, "CreatedAfterDemote").await
+                    }
+                    "local_group.rename" => {
+                        store::rename_local_group(&mut c, &audit_ctx, &group, "RenamedAfterDemote")
+                            .await
+                    }
+                    "capability.platform_deny" => {
+                        store::set_platform_capability_deny(&mut c, &audit_ctx, "web_search", true)
+                            .await
+                    }
+                    "capability.user_deny" => {
+                        store::set_user_capability_deny(
+                            &mut c,
+                            &audit_ctx,
+                            &member.user,
+                            "web_search",
+                            true,
+                        )
+                        .await
+                    }
+                    _ => {
+                        store::set_user_capability_grant(
+                            &mut c,
+                            &audit_ctx,
+                            &member.user,
+                            "runs.use_yolo",
+                            true,
+                        )
+                        .await
+                    }
+                }
+            }
+        });
+        wait_for_blocked_peer(&db, demoter_pid).await;
+        tx.commit().await.unwrap();
+        assert_eq!(denied(writer.await.unwrap()), NOT_ADMIN, "{write}");
+        assert_eq!(group_name(&mut owner, &group).await, "Before", "{write}");
+        assert!(
+            store::load_platform_capabilities(&mut connect(&db.0, API).await)
+                .await
+                .unwrap()
+                .denied_capabilities
+                .is_empty(),
+            "{write}"
+        );
+        assert!(
+            principal(&db, &member).await.denied_capabilities.is_empty()
+                && principal(&db, &member)
+                    .await
+                    .granted_capabilities
+                    .is_empty(),
+            "{write}"
+        );
+        assert_eq!(audit(&db).await.len(), audited, "{write}");
+
+        // Restore admin for the next case.
+        sqlx::query(
+            "UPDATE openmettle.account_admins SET active = true, revision = revision + 1
+              WHERE user_id = $1::uuid",
+        )
+        .bind(&admin.user)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    }
+
+    // 2. Mirror order: a capability write that has already taken account_admin_lock and pauses on
+    //    its target user row blocks a concurrent revoke_account_admin until the write commits.
+    let mut fixture = connect(&db.0, OWNER).await;
+    let fixture_pid = backend_pid(&mut fixture).await;
+    fixture.execute("BEGIN").await.unwrap();
+    sqlx::query("SELECT FROM openmettle.users WHERE id = $1::uuid FOR UPDATE")
+        .bind(&member.user)
+        .execute(&mut fixture)
+        .await
+        .unwrap();
+    let writer = tokio::spawn({
+        let (name, admin, member) = (db.0.clone(), admin.clone(), member.clone());
+        async move {
+            let mut c = connect(&name, API).await;
+            store::set_user_capability_grant(
+                &mut c,
+                &ctx(&admin, "mirror-cap-grant"),
+                &member.user,
+                "runs.use_yolo",
+                true,
+            )
+            .await
+        }
+    });
+    let writer_pid = waiter_on(&db, fixture_pid).await;
+    let demoter = tokio::spawn({
+        let (name, boss, admin) = (db.0.clone(), boss.clone(), admin.clone());
+        async move {
+            let mut c = connect(&name, API).await;
+            store::revoke_account_admin(&mut c, &ctx(&boss, "mirror-demote"), &admin.user).await
+        }
+    });
+    wait_for_blocked_peer(&db, writer_pid).await;
+    fixture.execute("ROLLBACK").await.unwrap();
+    applied(writer.await.unwrap());
+    applied(demoter.await.unwrap());
+    assert!(
+        principal(&db, &member)
+            .await
+            .granted_capabilities
+            .contains("runs.use_yolo")
+    );
+    assert_eq!(
+        denied(
+            store::set_platform_capability_deny(
+                &mut connect(&db.0, API).await,
+                &ctx(&admin, "post-demote-cap"),
+                "web_search",
+                true,
+            )
+            .await
+        ),
+        NOT_ADMIN
+    );
+}
+
+/// Issue #160 gap 2: every administrative write locks the actor's login provider and local
+/// identity approval `FOR SHARE` (`login_providers -> local_identity_approvals -> users`),
+/// serializing in both directions with operator approval withdrawal and provider retirement.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn administrative_writes_serialize_with_approval_withdrawal_and_provider_retirement() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let member = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &admin).await;
+    let group = applied(
+        store::create_local_group(&mut connect(&db.0, API).await, &ctx(&admin, "g0"), "Before")
+            .await,
+    );
+
+    for transition in ["withdraw", "retire"] {
+        // 1. Transition in flight (exclusive lock on approval or provider): admin writes block,
+        //    then see the committed withdrawal/retirement and fail with InactivePrincipal.
+        for write in [
+            "account_admin.grant",
+            "local_group.rename",
+            "capability.platform_deny",
+        ] {
+            let audited = audit(&db).await.len();
+            let before_name = group_name(&mut owner, &group).await;
+            let mut op = connect(&db.0, OWNER).await;
+            let op_pid = backend_pid(&mut op).await;
+            let mut tx = WriteTransaction::begin(&mut op).await.unwrap();
+            if transition == "withdraw" {
+                sqlx::query(
+                    "SELECT id FROM openmettle.local_identity_approvals WHERE id = $1::uuid FOR UPDATE",
+                )
+                .bind(&admin.approval)
+                .execute(tx.connection().unwrap())
+                .await
+                .unwrap();
+                sqlx::query(
+                    "UPDATE openmettle.local_identity_approvals
+                        SET active = false, revision = revision + 1,
+                            access_generation = access_generation + 1, changed_at = clock_timestamp()
+                      WHERE id = $1::uuid",
+                )
+                .bind(&admin.approval)
+                .execute(tx.connection().unwrap())
+                .await
+                .unwrap();
+            } else {
+                sqlx::query(
+                    "SELECT id FROM openmettle.login_providers WHERE id = $1::uuid FOR UPDATE",
+                )
+                .bind(PROVIDER)
+                .execute(tx.connection().unwrap())
+                .await
+                .unwrap();
+                sqlx::query(
+                    "INSERT INTO openmettle.login_provider_revisions (provider_id, revision)
+                     VALUES ($1::uuid, NULL)",
+                )
+                .bind(PROVIDER)
+                .execute(tx.connection().unwrap())
+                .await
+                .unwrap();
+                sqlx::query(
+                    "UPDATE openmettle.login_providers
+                        SET access_generation = access_generation + 1, changed_at = clock_timestamp()
+                      WHERE id = $1::uuid",
+                )
+                .bind(PROVIDER)
+                .execute(tx.connection().unwrap())
+                .await
+                .unwrap();
+            }
+            let key = format!("{transition}-{write}");
+            let writer = tokio::spawn({
+                let (name, admin, member, group, key) = (
+                    db.0.clone(),
+                    admin.clone(),
+                    member.clone(),
+                    group.clone(),
+                    key.clone(),
+                );
+                async move {
+                    let mut c = connect(&name, API).await;
+                    let audit_ctx = ctx(&admin, &key);
+                    match write {
+                        "account_admin.grant" => {
+                            store::grant_account_admin(&mut c, &audit_ctx, &member.user).await
+                        }
+                        "local_group.rename" => {
+                            store::rename_local_group(&mut c, &audit_ctx, &group, "After").await
+                        }
+                        _ => {
+                            store::set_platform_capability_deny(
+                                &mut c,
+                                &audit_ctx,
+                                "web_search",
+                                true,
+                            )
+                            .await
+                        }
+                    }
+                }
+            });
+            wait_for_blocked_peer(&db, op_pid).await;
+            tx.commit().await.unwrap();
+            assert_eq!(
+                denied(writer.await.unwrap()),
+                DenialReason::InactivePrincipal,
+                "{transition}/{write}"
+            );
+            assert!(!principal(&db, &member).await.account_admin);
+            assert_eq!(group_name(&mut owner, &group).await, before_name);
+            assert!(
+                store::load_platform_capabilities(&mut connect(&db.0, API).await)
+                    .await
+                    .unwrap()
+                    .denied_capabilities
+                    .is_empty()
+            );
+            assert_eq!(audit(&db).await.len(), audited, "{transition}/{write}");
+
+            // Restore active approval or provider for the next iteration.
+            if transition == "withdraw" {
+                sqlx::query(
+                    "UPDATE openmettle.local_identity_approvals
+                        SET active = true, revision = revision + 1
+                      WHERE id = $1::uuid",
+                )
+                .bind(&admin.approval)
+                .execute(&mut owner)
+                .await
+                .unwrap();
+            } else {
+                sqlx::query(
+                    "INSERT INTO openmettle.login_provider_revisions (provider_id, revision)
+                     VALUES ($1::uuid, 'v-restored')",
+                )
+                .bind(PROVIDER)
+                .execute(&mut owner)
+                .await
+                .unwrap();
+            }
+        }
+
+        // 2. Mirror order: write has decided and pauses on its target lock while holding FOR SHARE
+        //    on provider and approval; operator withdrawal/retirement waits for commit, then
+        //    commits and blocks the actor's next write.
+        let mut fixture = connect(&db.0, OWNER).await;
+        let fixture_pid = backend_pid(&mut fixture).await;
+        fixture.execute("BEGIN").await.unwrap();
+        sqlx::query("SELECT FROM openmettle.local_groups WHERE id = $1::uuid FOR UPDATE")
+            .bind(&group)
+            .execute(&mut fixture)
+            .await
+            .unwrap();
+        let renamed = format!("After-{transition}");
+        let writer = tokio::spawn({
+            let (name, admin, group, renamed) =
+                (db.0.clone(), admin.clone(), group.clone(), renamed.clone());
+            async move {
+                let mut c = connect(&name, API).await;
+                let key = format!("mirror-{transition}");
+                store::rename_local_group(&mut c, &ctx(&admin, &key), &group, &renamed).await
+            }
+        });
+        let writer_pid = waiter_on(&db, fixture_pid).await;
+        let op = tokio::spawn({
+            let (name, approval) = (db.0.clone(), admin.approval.clone());
+            async move {
+                let mut c = connect(&name, OWNER).await;
+                let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+                if transition == "withdraw" {
+                    sqlx::query(
+                        "UPDATE openmettle.local_identity_approvals
+                            SET active = false, revision = revision + 1,
+                                access_generation = access_generation + 1
+                          WHERE id = $1::uuid",
+                    )
+                    .bind(&approval)
+                    .execute(tx.connection().unwrap())
+                    .await
+                    .unwrap();
+                } else {
+                    sqlx::query(
+                        "SELECT id FROM openmettle.login_providers WHERE id = $1::uuid FOR UPDATE",
+                    )
+                    .bind(PROVIDER)
+                    .execute(tx.connection().unwrap())
+                    .await
+                    .unwrap();
+                    sqlx::query(
+                        "INSERT INTO openmettle.login_provider_revisions (provider_id, revision)
+                         VALUES ($1::uuid, NULL)",
+                    )
+                    .bind(PROVIDER)
+                    .execute(tx.connection().unwrap())
+                    .await
+                    .unwrap();
+                }
+                tx.commit().await.unwrap();
+            }
+        });
+        wait_for_blocked_peer(&db, writer_pid).await;
+        fixture.execute("ROLLBACK").await.unwrap();
+        applied(writer.await.unwrap());
+        op.await.unwrap();
+        assert_eq!(group_name(&mut owner, &group).await, renamed);
+        assert_eq!(
+            denied(
+                store::rename_local_group(
+                    &mut connect(&db.0, API).await,
+                    &ctx(&admin, &format!("after-mirror-{transition}")),
+                    &group,
+                    "Refused",
+                )
+                .await
+            ),
+            DenialReason::InactivePrincipal,
+            "{transition}"
+        );
+        if transition == "withdraw" {
+            sqlx::query(
+                "UPDATE openmettle.local_identity_approvals
+                    SET active = true, revision = revision + 1
+                  WHERE id = $1::uuid",
+            )
+            .bind(&admin.approval)
+            .execute(&mut owner)
+            .await
+            .unwrap();
+        } else {
+            sqlx::query(
+                "INSERT INTO openmettle.login_provider_revisions (provider_id, revision)
+                 VALUES ($1::uuid, 'v-restored-2')",
+            )
+            .bind(PROVIDER)
+            .execute(&mut owner)
+            .await
+            .unwrap();
+        }
+    }
+}
+
+/// Issue #160 gap 3: decision time advances to the primary's post-lock `clock_timestamp()`,
+/// rejecting an approval that expires either while waiting on `account_admin_lock` or while
+/// waiting on a target row lock (`local_groups`).
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn administrative_write_rejects_approval_expired_during_lock_wait() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let setup_admin = account(&mut owner, PROVIDER, true, FUTURE).await;
+    make_admin(&mut owner, &setup_admin).await;
+    let group = applied(
+        store::create_local_group(
+            &mut connect(&db.0, API).await,
+            &ctx(&setup_admin, "g0"),
+            "Before",
+        )
+        .await,
+    );
+
+    for wait_on in ["account_admin_lock", "local_groups"] {
+        let db_now_ms: i64 = sqlx::query_scalar(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+        )
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        let expiring = account(&mut owner, PROVIDER, true, db_now_ms + 250).await;
+        make_admin(&mut owner, &expiring).await;
+        let audited = audit(&db).await.len();
+
+        let mut holder = connect(&db.0, OWNER).await;
+        let holder_pid = backend_pid(&mut holder).await;
+        holder.execute("BEGIN").await.unwrap();
+        if wait_on == "account_admin_lock" {
+            holder
+                .execute("SELECT id FROM openmettle.account_admin_lock WHERE id FOR UPDATE")
+                .await
+                .unwrap();
+        } else {
+            sqlx::query("SELECT FROM openmettle.local_groups WHERE id = $1::uuid FOR UPDATE")
+                .bind(&group)
+                .execute(&mut holder)
+                .await
+                .unwrap();
+        }
+
+        let writer = tokio::spawn({
+            let (name, expiring, group) = (db.0.clone(), expiring.clone(), group.clone());
+            async move {
+                let mut c = connect(&name, API).await;
+                let audit_ctx = AuditContext {
+                    actor_user_id: &expiring.user,
+                    actor_approval_id: &expiring.approval,
+                    now_ms: db_now_ms,
+                    request_key: wait_on,
+                    reason: "approval expires during lock wait",
+                };
+                store::rename_local_group(&mut c, &audit_ctx, &group, "Expired").await
+            }
+        });
+
+        wait_for_blocked_peer(&db, holder_pid).await;
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        holder.execute("ROLLBACK").await.unwrap();
+
+        assert_eq!(
+            denied(writer.await.unwrap()),
+            DenialReason::InactivePrincipal,
+            "{wait_on}"
+        );
+        assert_eq!(group_name(&mut owner, &group).await, "Before", "{wait_on}");
+        assert_eq!(audit(&db).await.len(), audited, "{wait_on}");
+    }
 }

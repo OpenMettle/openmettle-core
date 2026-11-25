@@ -266,6 +266,26 @@ async fn wait_for_blocked_peer(db: &TestDb, holder: i32) {
     .expect("expected a peer to wait on the fixture lock");
 }
 
+async fn backend_pid(c: &mut PgConnection) -> i32 {
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(c)
+        .await
+        .unwrap()
+}
+
+/// The one session waiting on a lock that `holder` holds.
+async fn waiter_on(db: &TestDb, holder: i32) -> i32 {
+    wait_for_blocked_peer(db, holder).await;
+    sqlx::query_scalar(
+        "SELECT pid FROM pg_stat_activity
+          WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid))",
+    )
+    .bind(holder)
+    .fetch_one(&mut db.admin().await)
+    .await
+    .unwrap()
+}
+
 fn sqlstate<T: std::fmt::Debug>(result: Result<T, sqlx::Error>) -> String {
     match result {
         Err(sqlx::Error::Database(e)) => e.code().unwrap_or_default().into_owned(),
@@ -1206,6 +1226,7 @@ fn released_migration_sources_match_their_pinned_hashes() {
         "ed518dd9b187d34053dc16444c8c9d50ba1947a75bb0986e960502acb1fb51d3",
         "911d89606c1f322b82dc5085bedae506c210b59c69c36ee1a46a8647d403bee7",
         "d8e59f00d1ce63a3add4fa83191bb6fe62ff01fbce7f27829fa3da4e5f974df7",
+        "7679c374843882e7e3cfca50c7ca7c5c2513b85c08533c36ffdc910b3ac73900",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     assert_eq!(all_versions(), versions_through(MIGRATIONS.len() as i64));

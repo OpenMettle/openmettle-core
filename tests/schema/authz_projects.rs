@@ -1816,3 +1816,236 @@ async fn create_in_scope_needs_an_editor_and_a_live_project() {
         );
     }
 }
+
+/// Issue #160: project, share and conversation writes follow the canonical
+/// `projects -> login_providers -> local_identity_approvals -> users` order and re-read
+/// `clock_timestamp()` after waiting on locks.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to an isolated PostgreSQL test service"]
+async fn project_share_and_conversation_writes_serialize_with_revocation_and_expiry() {
+    use openmettle_core::{authz::branches, runs::WriteTransaction};
+
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    providers(&mut owner).await;
+    let alice = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let bob = account(&mut owner, PROVIDER, true, FUTURE).await;
+    let p = create(&db, &alice, "proj").await;
+    let scope: String =
+        sqlx::query_scalar("SELECT scope_id::text FROM openmettle.projects WHERE id = $1::uuid")
+            .bind(&p)
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    let alice_personal: String = sqlx::query_scalar(
+        "SELECT id::text FROM openmettle.scopes WHERE personal_user_id = $1::uuid AND kind = 'personal'",
+    )
+    .bind(&alice.user)
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    let chat = conversation(&mut owner, &alice_personal, "personal", &alice.user)
+        .await
+        .unwrap();
+
+    // 1. Approval withdrawal in flight blocks project role change, personal share and
+    //    conversation creation, and rejects each with InactivePrincipal after commit.
+    for op in [
+        "project.member_grant",
+        "resource.share",
+        "conversation.create",
+    ] {
+        let audited = audit(&db).await.len();
+        let mut withdrawer = connect(&db.0, OWNER).await;
+        let holder_pid = backend_pid(&mut withdrawer).await;
+        let mut tx = WriteTransaction::begin(&mut withdrawer).await.unwrap();
+        sqlx::query(
+            "SELECT id FROM openmettle.local_identity_approvals WHERE id = $1::uuid FOR UPDATE",
+        )
+        .bind(&alice.approval)
+        .execute(tx.connection().unwrap())
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE openmettle.local_identity_approvals
+                SET active = false, revision = revision + 1,
+                    access_generation = access_generation + 1
+              WHERE id = $1::uuid",
+        )
+        .bind(&alice.approval)
+        .execute(tx.connection().unwrap())
+        .await
+        .unwrap();
+
+        let writer = tokio::spawn({
+            let (db_name, alice, bob, p, scope, chat) = (
+                db.0.clone(),
+                alice.clone(),
+                bob.clone(),
+                p.clone(),
+                scope.clone(),
+                chat.clone(),
+            );
+            async move {
+                let mut c = connect(&db_name, API).await;
+                let audit_ctx = ctx(&alice, op);
+                match op {
+                    "project.member_grant" => projects::set_project_member_role(
+                        &mut c,
+                        &audit_ctx,
+                        &p,
+                        &user(&bob),
+                        ProjectRole::Editor,
+                    )
+                    .await
+                    .map(drop),
+                    "resource.share" => projects::share_resource(
+                        &mut c,
+                        &audit_ctx,
+                        CONVERSATION,
+                        &chat,
+                        &user(&bob),
+                        ResourceAccess::Read,
+                    )
+                    .await
+                    .map(drop),
+                    _ => branches::create_conversation(&mut c, &audit_ctx, &scope)
+                        .await
+                        .map(drop),
+                }
+            }
+        });
+        wait_for_blocked_peer(&db, holder_pid).await;
+        tx.commit().await.unwrap();
+        assert_eq!(
+            denied(writer.await.unwrap()),
+            DenialReason::InactivePrincipal,
+            "{op}"
+        );
+        assert_eq!(audit(&db).await.len(), audited, "{op}");
+        sqlx::query(
+            "UPDATE openmettle.local_identity_approvals
+                SET active = true, revision = revision + 1
+              WHERE id = $1::uuid",
+        )
+        .bind(&alice.approval)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    }
+
+    // 2. Approval expiring while waiting on the project row lock is rejected with InactivePrincipal.
+    let db_now_ms: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&mut owner)
+            .await
+            .unwrap();
+    let expiring = account(&mut owner, PROVIDER, true, db_now_ms + 250).await;
+    applied(
+        set_role(
+            &db,
+            &alice,
+            "grant-expiring-owner",
+            &p,
+            &user(&expiring),
+            ProjectRole::Owner,
+        )
+        .await,
+    );
+    let audited = audit(&db).await.len();
+    let mut holder = connect(&db.0, OWNER).await;
+    let holder_pid = backend_pid(&mut holder).await;
+    holder.execute("BEGIN").await.unwrap();
+    sqlx::query("SELECT FROM openmettle.projects WHERE id = $1::uuid FOR NO KEY UPDATE")
+        .bind(&p)
+        .execute(&mut holder)
+        .await
+        .unwrap();
+    let writer = tokio::spawn({
+        let (db_name, expiring, bob, p) = (db.0.clone(), expiring.clone(), bob.clone(), p.clone());
+        async move {
+            let mut c = connect(&db_name, API).await;
+            let audit_ctx = store::AuditContext {
+                actor_user_id: &expiring.user,
+                actor_approval_id: &expiring.approval,
+                now_ms: db_now_ms,
+                request_key: "proj-expiring",
+                reason: "approval expires waiting on project lock",
+            };
+            projects::set_project_member_role(
+                &mut c,
+                &audit_ctx,
+                &p,
+                &user(&bob),
+                ProjectRole::Editor,
+            )
+            .await
+        }
+    });
+    wait_for_blocked_peer(&db, holder_pid).await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    holder.execute("ROLLBACK").await.unwrap();
+    assert_eq!(
+        denied(writer.await.unwrap()),
+        DenialReason::InactivePrincipal
+    );
+    assert_eq!(audit(&db).await.len(), audited);
+    assert_eq!(role_of(&db, &bob, &p).await, None);
+
+    // 3. Collaborator branch write on a shared personal conversation locks both owner and
+    //    collaborator in ascending users.id order, so an in-flight disable of the collaborator
+    //    blocks create_branch and rejects it with InactivePrincipal after commit.
+    applied(
+        projects::share_resource(
+            &mut api(&db).await,
+            &ctx(&alice, "share-personal-write-bob"),
+            CONVERSATION,
+            &chat,
+            &user(&bob),
+            ResourceAccess::Write,
+        )
+        .await,
+    );
+    let audited = audit(&db).await.len();
+    let mut disabler = connect(&db.0, OWNER).await;
+    let disable_pid = backend_pid(&mut disabler).await;
+    let mut tx = WriteTransaction::begin(&mut disabler).await.unwrap();
+    sqlx::query(
+        "UPDATE openmettle.users
+            SET disabled_at = clock_timestamp(), session_generation = session_generation + 1
+          WHERE id = $1::uuid",
+    )
+    .bind(&bob.user)
+    .execute(tx.connection().unwrap())
+    .await
+    .unwrap();
+    let writer = tokio::spawn({
+        let (db_name, bob, alice_personal, chat) = (
+            db.0.clone(),
+            bob.clone(),
+            alice_personal.clone(),
+            chat.clone(),
+        );
+        async move {
+            let mut c = connect(&db_name, API).await;
+            let audit_ctx = ctx(&bob, "collab-branch-create");
+            branches::create_branch(
+                &mut c,
+                &audit_ctx,
+                branches::Conversation {
+                    scope: &alice_personal,
+                    id: &chat,
+                },
+                None,
+            )
+            .await
+        }
+    });
+    wait_for_blocked_peer(&db, disable_pid).await;
+    tx.commit().await.unwrap();
+    assert_eq!(
+        denied(writer.await.unwrap()),
+        DenialReason::InactivePrincipal
+    );
+    assert_eq!(audit(&db).await.len(), audited);
+}

@@ -43,13 +43,6 @@ async fn step(db: &str, scope: &str, rev: &str, step: Step) -> Result<(), Error>
     result.and(committed)
 }
 
-async fn pid(c: &mut PgConnection) -> i32 {
-    sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(c)
-        .await
-        .unwrap()
-}
-
 struct Fixture {
     db: TestDb,
     c: Context,
@@ -256,38 +249,80 @@ async fn retention_policy_changes_are_bounded_audited_and_stamped() {
         ),
         "42501"
     );
-    let admin = new_user(&mut api).await;
-    sqlx::query("INSERT INTO openmettle.account_admins (user_id, active) VALUES ($1::uuid, true)")
-        .bind(&admin)
-        .execute(&mut owner)
-        .await
-        .unwrap();
-    let set = "SELECT openmettle.retention_set_grace($1::uuid, $2, 'synthetic reason', $3)";
-    let change = async |actor: &str, grace: i32, key: &str| -> Result<i64, sqlx::Error> {
-        sqlx::query_scalar(set)
-            .bind(actor)
-            .bind(grace)
-            .bind(key)
-            .fetch_one(&mut connect(&db.0, API).await)
-            .await
-    };
+    authz_store::providers(&mut owner).await;
+    let admin =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    authz_store::make_admin(&mut owner, &admin).await;
+    let other =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    let withdrawn = authz_store::account(
+        &mut owner,
+        authz_store::PROVIDER,
+        false,
+        authz_store::FUTURE,
+    )
+    .await;
+    authz_store::make_admin(&mut owner, &withdrawn).await;
+    let expired = authz_store::account(&mut owner, authz_store::PROVIDER, true, 1).await;
+    authz_store::make_admin(&mut owner, &expired).await;
+    // Migration 38 removes the unexposed 4-arg signature in favor of the approval-bound 5-arg form.
+    let legacy_exists: bool = sqlx::query_scalar(
+        "SELECT to_regprocedure('openmettle.retention_set_grace(uuid,integer,text,text)') IS NOT NULL",
+    )
+    .fetch_one(&mut owner)
+    .await
+    .unwrap();
+    assert!(!legacy_exists);
+    let set =
+        "SELECT openmettle.retention_set_grace($1::uuid, $2::uuid, $3, 'synthetic reason', $4)";
+    let change =
+        async |actor: &str, approval: &str, grace: i32, key: &str| -> Result<i64, sqlx::Error> {
+            sqlx::query_scalar(set)
+                .bind(actor)
+                .bind(approval)
+                .bind(grace)
+                .bind(key)
+                .fetch_one(&mut connect(&db.0, API).await)
+                .await
+        };
     assert_eq!(
-        sqlstate(change(&c.actor, 2_592_000, "not-admin").await),
+        sqlstate(change(&other.user, &other.approval, 2_592_000, "not-admin").await),
+        "42501"
+    );
+    // Wrong user's approval, withdrawn approval and expired approval are each refused.
+    assert_eq!(
+        sqlstate(change(&admin.user, &other.approval, 2_592_000, "wrong-approval").await),
+        "42501"
+    );
+    assert_eq!(
+        sqlstate(change(&withdrawn.user, &withdrawn.approval, 2_592_000, "withdrawn").await),
+        "42501"
+    );
+    assert_eq!(
+        sqlstate(change(&expired.user, &expired.approval, 2_592_000, "expired").await),
         "42501"
     );
     // The default deployment bounds admit only 30 days.
-    assert_eq!(sqlstate(change(&admin, 86_400, "narrow").await), "23514");
+    assert_eq!(
+        sqlstate(change(&admin.user, &admin.approval, 86_400, "narrow").await),
+        "23514"
+    );
     sqlx::query("UPDATE openmettle.retention_policy SET min_grace_seconds = 0, max_grace_seconds = 31536000")
         .execute(&mut owner)
         .await
         .unwrap();
     assert_eq!(read(&mut api).await, (2, 2_592_000, 0, 31_536_000));
-    assert_eq!(change(&admin, 3600, "hour").await.unwrap(), 3);
+    assert_eq!(
+        change(&admin.user, &admin.approval, 3600, "hour")
+            .await
+            .unwrap(),
+        3
+    );
     let audit: (String, String, String, String, String) = sqlx::query_as(
         "SELECT action, target_kind, request_key, reason, details::text
            FROM openmettle.authorization_audit WHERE actor_user_id = $1::uuid",
     )
-    .bind(&admin)
+    .bind(&admin.user)
     .fetch_one(&mut owner)
     .await
     .unwrap();
@@ -305,7 +340,10 @@ async fn retention_policy_changes_are_bounded_audited_and_stamped() {
         serde_json::json!({"old_grace_seconds": 2_592_000, "new_grace_seconds": 3600, "revision": 3})
     );
     // A reused request key changes nothing.
-    assert_eq!(sqlstate(change(&admin, 60, "hour").await), "23505");
+    assert_eq!(
+        sqlstate(change(&admin.user, &admin.approval, 60, "hour").await),
+        "23505"
+    );
     assert_eq!(read(&mut api).await, (3, 3600, 0, 31_536_000));
 
     // Disassociation applies and stamps the current revision; restore clears the stamp.
@@ -534,7 +572,7 @@ async fn concurrent_references_and_restores_collide_with_the_purge_claim() {
     let rev = f.revision("hold-first", 10, None).await;
     f.step(&rev, Step::Retain).await.unwrap();
     let mut owner = connect(&f.db.0, OWNER).await;
-    let holder = pid(&mut owner).await;
+    let holder = backend_pid(&mut owner).await;
     let mut tx = WriteTransaction::begin(&mut owner).await.unwrap();
     f.hold(tx.connection().unwrap(), &rev).await.unwrap();
     let claim = tokio::spawn({
@@ -549,7 +587,7 @@ async fn concurrent_references_and_restores_collide_with_the_purge_claim() {
     // A claim in flight: a hold (which a retained revision would accept) or an attachment waits
     // for it, then fails on 'purging' instead of acting on the state committed before it.
     let mut worker = connect(&f.db.0, WORKER).await;
-    let claimer = pid(&mut worker).await;
+    let claimer = backend_pid(&mut worker).await;
     for attachment in [false, true] {
         let rev = f
             .revision(&format!("claim-first-{attachment}"), 10, None)
@@ -593,7 +631,7 @@ async fn concurrent_references_and_restores_collide_with_the_purge_claim() {
     // An attachment in flight on a live revision: removal waits for it, so the claim sees it.
     let rev = f.revision("attach-first", 10, None).await;
     let mut api = connect(&f.db.0, API).await;
-    let attacher = pid(&mut api).await;
+    let attacher = backend_pid(&mut api).await;
     let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
     attach(tx.connection().unwrap(), &scope, &f.c.actor, &rev)
         .await
@@ -625,7 +663,7 @@ async fn concurrent_references_and_restores_collide_with_the_purge_claim() {
     .await
     .unwrap();
     let mut api = connect(&f.db.0, API).await;
-    let restorer = pid(&mut api).await;
+    let restorer = backend_pid(&mut api).await;
     let mut tx = WriteTransaction::begin(&mut api).await.unwrap();
     storage::restore_revision(&mut tx, &scope, &rev)
         .await
@@ -685,7 +723,7 @@ async fn confirm_purge_journals_exactly_once_across_retries_duplicates_and_rollb
     let second = f.revision("second", 20, None).await;
     f.step(&second, Step::Retain).await.unwrap();
     f.step(&second, Step::Claim).await.unwrap();
-    let holder = pid(&mut worker).await;
+    let holder = backend_pid(&mut worker).await;
     let mut tx = WriteTransaction::begin(&mut worker).await.unwrap();
     storage::confirm_purge(&mut tx, &f.c.scope, &second)
         .await
@@ -985,7 +1023,7 @@ async fn the_database_sets_every_deadline_from_the_current_policy() {
 
     // Under READ COMMITTED a removal waits for an in-flight policy change and then applies it.
     let waiting = f.revision("in-flight", 10, None).await;
-    let changer = pid(&mut owner).await;
+    let changer = backend_pid(&mut owner).await;
     let mut tx = WriteTransaction::begin(&mut owner).await.unwrap();
     set_grace(tx.connection().unwrap(), 60).await;
     let retain = tokio::spawn({
@@ -1004,13 +1042,10 @@ async fn the_database_sets_every_deadline_from_the_current_policy() {
 async fn a_demoted_administrator_cannot_change_the_policy() {
     let db = TestDb::migrated().await;
     let mut owner = connect(&db.0, OWNER).await;
-    let mut api = connect(&db.0, API).await;
-    let admin = new_user(&mut api).await;
-    sqlx::query("INSERT INTO openmettle.account_admins (user_id, active) VALUES ($1::uuid, true)")
-        .bind(&admin)
-        .execute(&mut owner)
-        .await
-        .unwrap();
+    authz_store::providers(&mut owner).await;
+    let admin =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    authz_store::make_admin(&mut owner, &admin).await;
     sqlx::query("UPDATE openmettle.retention_policy SET min_grace_seconds = 0 WHERE id")
         .execute(&mut owner)
         .await
@@ -1032,7 +1067,7 @@ async fn a_demoted_administrator_cannot_change_the_policy() {
             "UPDATE openmettle.account_admins SET active = $2, revision = revision + 1
               WHERE user_id = $1::uuid",
         )
-        .bind(&admin)
+        .bind(&admin.user)
         .bind(active)
         .execute(c)
         .await
@@ -1040,7 +1075,7 @@ async fn a_demoted_administrator_cannot_change_the_policy() {
     };
     for repeatable in [false, true] {
         let mut demoter = connect(&db.0, OWNER).await;
-        let holder = pid(&mut demoter).await;
+        let holder = backend_pid(&mut demoter).await;
         let mut tx = WriteTransaction::begin(&mut demoter).await.unwrap();
         demote(tx.connection().unwrap(), false).await;
         let (ready, snapshot) = tokio::sync::oneshot::channel::<()>();
@@ -1062,9 +1097,10 @@ async fn a_demoted_administrator_cannot_change_the_policy() {
                     .unwrap();
                 ready.send(()).unwrap();
                 let result = sqlx::query_scalar::<_, i64>(
-                    "SELECT openmettle.retention_set_grace($1::uuid, 60, 'synthetic', $2)",
+                    "SELECT openmettle.retention_set_grace($1::uuid, $2::uuid, 60, 'synthetic', $3)",
                 )
-                .bind(&admin)
+                .bind(&admin.user)
+                .bind(&admin.approval)
                 .bind(format!("demoted-{repeatable}"))
                 .fetch_one(tx.connection().unwrap())
                 .await;
@@ -1094,7 +1130,7 @@ async fn a_demoted_administrator_cannot_change_the_policy() {
     // sessions::disable_user locks only the user row, not account_admin_lock: the setter waits
     // for a disable in flight and is refused once it commits.
     let mut disabler = connect(&db.0, API).await;
-    let holder = pid(&mut disabler).await;
+    let holder = backend_pid(&mut disabler).await;
     let mut tx = WriteTransaction::begin(&mut disabler).await.unwrap();
     for sql in [
         "SELECT session_generation FROM openmettle.users WHERE id = $1::uuid FOR UPDATE",
@@ -1102,7 +1138,7 @@ async fn a_demoted_administrator_cannot_change_the_policy() {
              session_generation = session_generation + 1 WHERE id = $1::uuid",
     ] {
         sqlx::query(sql)
-            .bind(&admin)
+            .bind(&admin.user)
             .execute(tx.connection().unwrap())
             .await
             .unwrap();
@@ -1111,9 +1147,10 @@ async fn a_demoted_administrator_cannot_change_the_policy() {
         let (db, admin) = (db.0.clone(), admin.clone());
         async move {
             sqlx::query_scalar::<_, i64>(
-                "SELECT openmettle.retention_set_grace($1::uuid, 60, 'synthetic', 'disabled')",
+                "SELECT openmettle.retention_set_grace($1::uuid, $2::uuid, 60, 'synthetic', 'disabled')",
             )
-            .bind(&admin)
+            .bind(&admin.user)
+            .bind(&admin.approval)
             .fetch_one(&mut connect(&db, API).await)
             .await
         }
@@ -1122,6 +1159,258 @@ async fn a_demoted_administrator_cannot_change_the_policy() {
     tx.commit().await.unwrap();
     assert_eq!(sqlstate(setter.await.unwrap()), "42501");
     assert_eq!(revision(&mut owner).await, before);
+}
+
+/// Issue #160 (migration 38): `openmettle.retention_set_grace` locks
+/// `account_admin_lock -> login_providers -> local_identity_approvals -> users -> retention_policy`
+/// and checks post-lock `clock_timestamp()`, serializing with approval withdrawal, provider
+/// retirement and approval expiry during lock waits.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL 18 required"]
+async fn retention_set_grace_serializes_with_approval_withdrawal_provider_retirement_and_expiry() {
+    let db = TestDb::migrated().await;
+    let mut owner = connect(&db.0, OWNER).await;
+    authz_store::providers(&mut owner).await;
+    let admin =
+        authz_store::account(&mut owner, authz_store::PROVIDER, true, authz_store::FUTURE).await;
+    authz_store::make_admin(&mut owner, &admin).await;
+    sqlx::query("UPDATE openmettle.retention_policy SET min_grace_seconds = 0 WHERE id")
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    let revision = async |c: &mut PgConnection| -> i64 {
+        sqlx::query_scalar("SELECT revision FROM openmettle.retention_policy")
+            .fetch_one(c)
+            .await
+            .unwrap()
+    };
+
+    // 1. Approval withdrawal and provider retirement in flight block retention_set_grace, then
+    //    refuse it with 42501 once committed.
+    for transition in ["withdraw", "retire"] {
+        let before = revision(&mut owner).await;
+        let mut op = connect(&db.0, OWNER).await;
+        let holder = backend_pid(&mut op).await;
+        let mut tx = WriteTransaction::begin(&mut op).await.unwrap();
+        if transition == "withdraw" {
+            sqlx::query(
+                "SELECT id FROM openmettle.local_identity_approvals WHERE id = $1::uuid FOR UPDATE",
+            )
+            .bind(&admin.approval)
+            .execute(tx.connection().unwrap())
+            .await
+            .unwrap();
+            sqlx::query(
+                "UPDATE openmettle.local_identity_approvals
+                    SET active = false, revision = revision + 1,
+                        access_generation = access_generation + 1
+                  WHERE id = $1::uuid",
+            )
+            .bind(&admin.approval)
+            .execute(tx.connection().unwrap())
+            .await
+            .unwrap();
+        } else {
+            sqlx::query("SELECT id FROM openmettle.login_providers WHERE id = $1::uuid FOR UPDATE")
+                .bind(authz_store::PROVIDER)
+                .execute(tx.connection().unwrap())
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO openmettle.login_provider_revisions (provider_id, revision)
+                 VALUES ($1::uuid, NULL)",
+            )
+            .bind(authz_store::PROVIDER)
+            .execute(tx.connection().unwrap())
+            .await
+            .unwrap();
+        }
+        let setter = tokio::spawn({
+            let (db_name, admin, key) = (db.0.clone(), admin.clone(), format!("ret-{transition}"));
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT openmettle.retention_set_grace($1::uuid, $2::uuid, 60, 'synthetic', $3)",
+                )
+                .bind(&admin.user)
+                .bind(&admin.approval)
+                .bind(&key)
+                .fetch_one(&mut connect(&db_name, API).await)
+                .await
+            }
+        });
+        wait_for_blocked_peer(&db, holder).await;
+        tx.commit().await.unwrap();
+        assert_eq!(sqlstate(setter.await.unwrap()), "42501", "{transition}");
+        assert_eq!(revision(&mut owner).await, before, "{transition}");
+
+        if transition == "withdraw" {
+            sqlx::query(
+                "UPDATE openmettle.local_identity_approvals
+                    SET active = true, revision = revision + 1
+                  WHERE id = $1::uuid",
+            )
+            .bind(&admin.approval)
+            .execute(&mut owner)
+            .await
+            .unwrap();
+        } else {
+            sqlx::query(
+                "INSERT INTO openmettle.login_provider_revisions (provider_id, revision)
+                 VALUES ($1::uuid, 'v-restored')",
+            )
+            .bind(authz_store::PROVIDER)
+            .execute(&mut owner)
+            .await
+            .unwrap();
+        }
+
+        // 2. Mirror order: retention_set_grace paused on retention_policy FOR UPDATE holds
+        //    FOR SHARE on login_providers and local_identity_approvals, blocking withdrawal or
+        //    retirement until commit.
+        let mut fixture = connect(&db.0, OWNER).await;
+        let fixture_pid = backend_pid(&mut fixture).await;
+        fixture.execute("BEGIN").await.unwrap();
+        fixture
+            .execute("SELECT FROM openmettle.retention_policy WHERE id FOR UPDATE")
+            .await
+            .unwrap();
+        let setter = tokio::spawn({
+            let (db_name, admin, key) = (
+                db.0.clone(),
+                admin.clone(),
+                format!("ret-mirror-{transition}"),
+            );
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT openmettle.retention_set_grace($1::uuid, $2::uuid, 120, 'synthetic', $3)",
+                )
+                .bind(&admin.user)
+                .bind(&admin.approval)
+                .bind(&key)
+                .fetch_one(&mut connect(&db_name, API).await)
+                .await
+            }
+        });
+        let setter_pid = waiter_on(&db, fixture_pid).await;
+        let op = tokio::spawn({
+            let (db_name, approval) = (db.0.clone(), admin.approval.clone());
+            async move {
+                let mut c = connect(&db_name, OWNER).await;
+                let mut tx = WriteTransaction::begin(&mut c).await.unwrap();
+                if transition == "withdraw" {
+                    sqlx::query(
+                        "UPDATE openmettle.local_identity_approvals
+                            SET active = false, revision = revision + 1,
+                                access_generation = access_generation + 1
+                          WHERE id = $1::uuid",
+                    )
+                    .bind(&approval)
+                    .execute(tx.connection().unwrap())
+                    .await
+                    .unwrap();
+                } else {
+                    sqlx::query(
+                        "SELECT id FROM openmettle.login_providers WHERE id = $1::uuid FOR UPDATE",
+                    )
+                    .bind(authz_store::PROVIDER)
+                    .execute(tx.connection().unwrap())
+                    .await
+                    .unwrap();
+                    sqlx::query(
+                        "INSERT INTO openmettle.login_provider_revisions (provider_id, revision)
+                         VALUES ($1::uuid, NULL)",
+                    )
+                    .bind(authz_store::PROVIDER)
+                    .execute(tx.connection().unwrap())
+                    .await
+                    .unwrap();
+                }
+                tx.commit().await.unwrap();
+            }
+        });
+        wait_for_blocked_peer(&db, setter_pid).await;
+        fixture.execute("ROLLBACK").await.unwrap();
+        assert_eq!(setter.await.unwrap().unwrap(), before + 1);
+        op.await.unwrap();
+        let next = sqlx::query_scalar::<_, i64>(
+            "SELECT openmettle.retention_set_grace($1::uuid, $2::uuid, 180, 'synthetic', $3)",
+        )
+        .bind(&admin.user)
+        .bind(&admin.approval)
+        .bind(format!("ret-after-mirror-{transition}"))
+        .fetch_one(&mut connect(&db.0, API).await)
+        .await;
+        assert_eq!(sqlstate(next), "42501", "{transition}");
+
+        if transition == "withdraw" {
+            sqlx::query(
+                "UPDATE openmettle.local_identity_approvals
+                    SET active = true, revision = revision + 1
+                  WHERE id = $1::uuid",
+            )
+            .bind(&admin.approval)
+            .execute(&mut owner)
+            .await
+            .unwrap();
+        } else {
+            sqlx::query(
+                "INSERT INTO openmettle.login_provider_revisions (provider_id, revision)
+                 VALUES ($1::uuid, 'v-restored-2')",
+            )
+            .bind(authz_store::PROVIDER)
+            .execute(&mut owner)
+            .await
+            .unwrap();
+        }
+    }
+
+    // 3. Approval expiring while waiting on either account_admin_lock or retention_policy is
+    //    rejected with 42501 and leaves retention_policy unchanged.
+    for wait_on in ["account_admin_lock", "retention_policy"] {
+        let before = revision(&mut owner).await;
+        let db_now_ms: i64 = sqlx::query_scalar(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+        )
+        .fetch_one(&mut owner)
+        .await
+        .unwrap();
+        let expiring =
+            authz_store::account(&mut owner, authz_store::PROVIDER, true, db_now_ms + 250).await;
+        authz_store::make_admin(&mut owner, &expiring).await;
+
+        let mut holder = connect(&db.0, OWNER).await;
+        let holder_pid = backend_pid(&mut holder).await;
+        holder.execute("BEGIN").await.unwrap();
+        if wait_on == "account_admin_lock" {
+            holder
+                .execute("SELECT id FROM openmettle.account_admin_lock WHERE id FOR UPDATE")
+                .await
+                .unwrap();
+        } else {
+            holder
+                .execute("SELECT FROM openmettle.retention_policy WHERE id FOR UPDATE")
+                .await
+                .unwrap();
+        }
+        let setter = tokio::spawn({
+            let (db_name, expiring) = (db.0.clone(), expiring.clone());
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT openmettle.retention_set_grace($1::uuid, $2::uuid, 30, 'synthetic', $3)",
+                )
+                .bind(&expiring.user)
+                .bind(&expiring.approval)
+                .bind(format!("ret-exp-{wait_on}"))
+                .fetch_one(&mut connect(&db_name, API).await)
+                .await
+            }
+        });
+        wait_for_blocked_peer(&db, holder_pid).await;
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        holder.execute("ROLLBACK").await.unwrap();
+        assert_eq!(sqlstate(setter.await.unwrap()), "42501", "{wait_on}");
+        assert_eq!(revision(&mut owner).await, before, "{wait_on}");
+    }
 }
 
 #[tokio::test]
@@ -1170,7 +1459,7 @@ async fn the_wall_clock_decides_restore_and_claim_in_long_transactions() {
     // The clock is read after every lock: a restore or removal that waits for the owner's
     // storage account judges, or stamps, the time after the wait.
     let mut owner = connect(&f.db.0, OWNER).await;
-    let holder = pid(&mut owner).await;
+    let holder = backend_pid(&mut owner).await;
     let lock_account =
         "SELECT FROM openmettle.storage_accounts WHERE scope_id = $1::uuid FOR UPDATE";
     let restored = f.revision("restore-after-wait", 10, None).await;

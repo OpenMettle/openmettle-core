@@ -1451,14 +1451,43 @@ fn map_override_sql_error(error: sqlx::Error) -> QuotaError {
     QuotaError::Store(StoreError::Database(error))
 }
 
-async fn authorize_manage_quotas_and_check_upgrade(
+async fn authorize_manage_quotas_and_check_upgrade<'a>(
     c: &mut PgConnection,
-    ctx: &AuditContext<'_>,
-) -> Result<(), QuotaError> {
+    ctx: &AuditContext<'a>,
+    scope_id: &str,
+) -> Result<AuditContext<'a>, QuotaError> {
+    // Canonical lock order (ADR 0027): account_admin_lock -> projects (if project scope) ->
+    // login_providers -> local_identity_approvals -> users (ascending id when locking personal
+    // owner + actor) -> storage_volume_control -> [run_dispatch_lock] -> [storage_accounts |
+    // quota_budgets].
     sqlx::query("SELECT id FROM openmettle.account_admin_lock WHERE id FOR UPDATE")
         .fetch_one(&mut *c)
         .await?;
-    let actor = store::acting(c, ctx).await?;
+    let scope_target: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT personal_user_id::text, project_id::text
+           FROM openmettle.scopes
+          WHERE id = $1::uuid",
+    )
+    .bind(scope_id)
+    .fetch_optional(&mut *c)
+    .await?;
+    let (personal_owner, project_id) = scope_target.unwrap_or((None, None));
+    if let Some(project_id) = &project_id {
+        sqlx::query("SELECT FROM openmettle.projects WHERE id = $1::uuid FOR NO KEY UPDATE")
+            .bind(project_id)
+            .execute(&mut *c)
+            .await?;
+    }
+    store::lock_actor_approval(c, ctx.actor_approval_id).await?;
+    store::lock_users_ordered(
+        c,
+        (ctx.actor_user_id, store::UserLock::Share),
+        personal_owner
+            .as_deref()
+            .map(|owner| (owner, store::UserLock::NoKeyUpdate)),
+    )
+    .await?;
+    let (actor, post_lock_ctx) = store::post_lock_acting(c, ctx).await?;
     store::check(authz::authorize_admin(
         &actor,
         AdminChange {
@@ -1483,7 +1512,8 @@ async fn authorize_manage_quotas_and_check_upgrade(
         .execute(&mut *c)
         .await
         .map_err(map_override_sql_error)?;
-    Ok(())
+    store::ensure_approval_unexpired(c, &post_lock_ctx).await?;
+    Ok(post_lock_ctx)
 }
 
 async fn check_override_idempotency(
@@ -1573,7 +1603,7 @@ pub async fn set_scope_override(
     let mut tx = store::begin(c).await?;
     let outcome = async {
         let c = tx.connection()?;
-        authorize_manage_quotas_and_check_upgrade(c, ctx).await?;
+        let post_lock_ctx = authorize_manage_quotas_and_check_upgrade(c, ctx, scope_id).await?;
         let req = json!({
             "op": "set",
             "scope_id": scope_id,
@@ -1583,7 +1613,8 @@ pub async fn set_scope_override(
             "reason": ctx.reason,
         });
         if let Some(replayed) =
-            check_override_idempotency(c, ctx, "quota.override.set", scope_id, &req).await?
+            check_override_idempotency(c, &post_lock_ctx, "quota.override.set", scope_id, &req)
+                .await?
         {
             return Ok(replayed);
         }
@@ -1605,6 +1636,7 @@ pub async fn set_scope_override(
         .fetch_one(&mut *c)
         .await
         .map_err(map_override_sql_error)?;
+        store::ensure_approval_unexpired(c, &post_lock_ctx).await?;
         read_override_row(c, scope_id, resource).await
     }
     .await;
@@ -1637,7 +1669,7 @@ pub async fn revoke_scope_override(
     let mut tx = store::begin(c).await?;
     let outcome = async {
         let c = tx.connection()?;
-        authorize_manage_quotas_and_check_upgrade(c, ctx).await?;
+        let post_lock_ctx = authorize_manage_quotas_and_check_upgrade(c, ctx, scope_id).await?;
         let req = json!({
             "op": "revoke",
             "scope_id": scope_id,
@@ -1645,7 +1677,8 @@ pub async fn revoke_scope_override(
             "reason": ctx.reason,
         });
         if let Some(replayed) =
-            check_override_idempotency(c, ctx, "quota.override.revoke", scope_id, &req).await?
+            check_override_idempotency(c, &post_lock_ctx, "quota.override.revoke", scope_id, &req)
+                .await?
         {
             return Ok(replayed);
         }
@@ -1665,6 +1698,7 @@ pub async fn revoke_scope_override(
         .fetch_one(&mut *c)
         .await
         .map_err(map_override_sql_error)?;
+        store::ensure_approval_unexpired(c, &post_lock_ctx).await?;
         if revoked.is_none() {
             let exists: bool = sqlx::query_scalar(
                 "SELECT EXISTS (

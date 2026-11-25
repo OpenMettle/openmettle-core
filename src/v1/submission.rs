@@ -508,7 +508,7 @@ async fn admission(
 ) -> Result<(Admission, bool), Problem> {
     let c = tx.connection()?;
     let ctx = call.context;
-    queue::lock_scope_actor(c, scope, ctx.user_id()).await?;
+    queue::lock_scope_actor(c, scope, ctx.user_id(), ctx.approval_id()).await?;
     let actor = principal(c, ctx).await?;
     let view = projects::resource_view(
         c,
